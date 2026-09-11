@@ -30,6 +30,8 @@ write created paid journal holes on disk failure.
 
 from __future__ import annotations
 
+from reliquary.shared.decision_telemetry import capture as decision_capture, group_ref as decision_group
+
 import logging
 import threading
 from typing import Any, Callable, NamedTuple, Sequence
@@ -410,6 +412,8 @@ class FillClosedBatchAssembler:
                 self.durable_tombstone_count += 1
             else:
                 self.durable_payload_count += 1
+            decision_capture("assembly_committed", lambda: dict(window=self.window_start, journal_key=entry.key, checkpoint=self._checkpoint_revision, tombstone=entry.is_tombstone, groups=[decision_group(g, window=self.window_start, environment=env)
+                                  for env, groups in (entry.window_batches or {}).items() for g in groups], cumulative_reward_mass=sum(self._rewards_by_hotkey.values())))
         except Exception:
             self._restore_join_state_locked(before)
             raise

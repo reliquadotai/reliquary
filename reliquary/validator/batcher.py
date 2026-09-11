@@ -6,6 +6,8 @@ validator's shared ``CooldownMap``.
 
 from __future__ import annotations
 
+from reliquary.shared.decision_telemetry import capture as decision_capture, group_ref as decision_group, observe as decision_observe
+
 import asyncio
 import hashlib
 import itertools
@@ -1770,6 +1772,7 @@ class GrpoWindowBatcher:
 
         with self.fill_state.lock:
             self._arrival_proof_sequence += 1
+            decision_capture("candidate_eligible", lambda: dict(window=self.window_start, checkpoint=self.current_checkpoint_hash, environment=environment, receipt_id=str(receipt_id or ""), ordinal=self._arrival_proof_sequence, payload_bytes=int(payload_bytes), rate=rate, group=decision_group(pending, window=self.window_start, environment=environment), rewards=list(pending.rewards)))
             self._arrival_proof_buffer.append(
                 _BufferedArrivalProof(
                     pending=pending,
@@ -1807,8 +1810,15 @@ class GrpoWindowBatcher:
                 if not self.fill_state.may_admit(environment):
                     return
                 self._arrival_proof_buffer.sort(key=_arrival_buffer_sort_key)
+                decision_capture("proof_ready_set", lambda: dict(
+                    window=self.window_start, environment=environment,
+                    candidates=[dict(receipt_id=e.receipt_id, ordinal=e.sequence,
+                                     payload_bytes=e.payload_bytes, rate=e.rate)
+                                for e in self._arrival_proof_buffer],
+                    chosen_receipts=[self._arrival_proof_buffer[0].receipt_id]))
                 entry = self._arrival_proof_buffer.pop(0)
                 self.fill_state.reserve(environment)
+                decision_capture("proof_reserved", lambda: dict(window=self.window_start, environment=environment, receipt_id=entry.receipt_id, ordinal=entry.sequence, state=self.fill_state.snapshot()))
 
             pending = entry.pending
             operator = self._operator_for_hotkey(pending.hotkey)
@@ -1850,6 +1860,7 @@ class GrpoWindowBatcher:
                     # decide it, and the reconcile that follows must find
                     # the rate already there.
                     job_id = candidate.job_id
+                    decision_capture("proof_job_bound", lambda: dict(window=self.window_start, environment=environment, receipt_id=entry.receipt_id, job_id=job_id, ordinal=entry.sequence))
                     self._arrival_proof_meta[job_id] = (
                         entry.rate, entry.payload_bytes, entry.receipt_id,
                     )
@@ -1910,6 +1921,7 @@ class GrpoWindowBatcher:
                         decision.job_id, (None, 0, "")
                     )
                 )
+                decision_capture("proof_terminal", lambda: dict(window=self.window_start, environment=environment, job_id=decision.job_id, receipt_id=receipt_id, status=decision.status.value))
                 if decision.status is ProofDecisionStatus.PASSED:
                     self.fill_state.record_proven(environment)
                     self._proven_groups.setdefault(environment, []).append(
@@ -2076,6 +2088,11 @@ class GrpoWindowBatcher:
                 return None
             pool.sort(key=_pick_sort_key)
             claimed = pool[:B_BATCH]
+            decision_capture("pick_ready_set", lambda: dict(window=self.window_start, environment=environment, checkpoint=self.current_checkpoint_hash, ordinal=self.fill_state.picks_taken(environment), candidates=[{"receipt_id": g.receipt_id, "rate": g.rate,
+                                       "payload_bytes": g.payload_bytes,
+                                       "group": decision_group(g.value, window=self.window_start,
+                                                               environment=environment)}
+                                      for g in pool], chosen_receipts=[g.receipt_id for g in claimed]))
             # Accounted BEFORE the claim: ``record_pick``'s divergence
             # guard raises on a miscall, and it must do so without
             # leaving half a pool flagged. Caught here rather than left
@@ -5562,6 +5579,7 @@ class GrpoWindowBatcher:
         )
         return new_sub
 
+    @decision_observe("proof_callable")
     def _execute_scheduled_proof(
         self,
         pending: PendingSubmission,

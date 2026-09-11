@@ -8,6 +8,8 @@ behavior). Otherwise consume exactly one journal entry or report
 
 from __future__ import annotations
 
+from reliquary.shared.decision_telemetry import capture as decision_capture, journal_received
+
 import logging
 import time
 from typing import Any, Callable
@@ -145,6 +147,7 @@ class TrainerWorker:
         started = time.monotonic()
         self.last_published_revision = self._publish_fn(reason)
         self.last_publish_seconds = time.monotonic() - started
+        decision_capture("checkpoint_published", lambda: dict(cursor=self.cursor, checkpoint=self.last_published_revision, seconds=self.last_publish_seconds))
         logger.info("trainer_publish cursor=%d seconds=%.3f", self.cursor, self.last_publish_seconds)
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
@@ -187,6 +190,7 @@ class TrainerWorker:
                 if self._finish_fn():
                     self.trained_since_publish += 1
             except TrainingStepSkipped as exc:
+                decision_capture("trainer_boundary_skipped", lambda: dict(cursor=self.cursor, reason=exc.reason))
                 self.health_skips += 1
                 logger.warning("boundary train step skipped at %s: %s", self.cursor, exc.reason)
             return self._publish("fill_closed_boundary")
@@ -198,14 +202,17 @@ class TrainerWorker:
         if entry is None:
             return "waited"
         kind, value = entry
+        decision_capture("trainer_journal_received", lambda: dict(journal_key=self.cursor + self.stride, kind=kind, window=getattr(value, "window_start", None), checkpoint=getattr(value, "checkpoint_revision", None)))
         if kind == "tombstone":
             self._advance_cursor()
             self.tombstones_seen += 1
             logger.warning("window %s tombstoned: %s", self.cursor, value)
             return "tombstone"
+        journal_received(value, self.cursor + self.stride)
         window_quarantined = bool(value.window_quarantine.get("quarantined"))
         if window_quarantined:
             self.quarantined_seen += 1
+            decision_capture("trainer_payload_skipped", lambda: dict(journal_key=self.cursor + self.stride, reason="quarantined"))
         if window_quarantined:
             self._advance_cursor(payload=True)
             logger.warning(
@@ -217,6 +224,7 @@ class TrainerWorker:
         try:
             trained = self._train_fn(value)
         except TrainingStepSkipped as exc:
+            decision_capture("trainer_payload_skipped", lambda: dict(journal_key=self.cursor + self.stride, reason=exc.reason))
             self._advance_cursor(payload=True)
             self.health_skips += 1
             if exc.reason == "policy_ratio_drift" and self.trained_since_publish > 0:
@@ -231,6 +239,7 @@ class TrainerWorker:
             self.last_train_seconds = time.monotonic() - train_started
             logger.info("trainer_step cursor=%d train_seconds=%.3f fetch_seconds=%.3f",
                         self.cursor, self.last_train_seconds, self.last_fetch_seconds)
+        decision_capture("trainer_payload_result", lambda: dict(journal_key=self.cursor + self.stride, reported_trained=bool(trained)))
         self._advance_cursor(payload=True)
         if trained:
             self.trained_since_publish += 1

@@ -7,6 +7,8 @@ Merkle root commitment, HTTP batch submission to validator.
 
 from __future__ import annotations
 
+from reliquary.shared.decision_telemetry import capture as decision_capture, observe as decision_observe, begin_attempt as decision_begin_attempt
+
 import asyncio
 import hashlib
 import logging
@@ -530,6 +532,7 @@ class MiningEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    @decision_observe("miner_proof_group")
     def build_batch_request_from_generations(
         self,
         *,
@@ -905,6 +908,8 @@ class MiningEngine:
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
+                decision_begin_attempt(window=state.window_n, environment=env_name,
+                                       prompt_idx=prompt_idx, checkpoint=local_hash)
                 environment_spec = get_environment_spec(env_name)
                 if environment_spec.interaction_mode == "episode":
                     generations = self._generate_m_episode_rollouts(
@@ -919,6 +924,7 @@ class MiningEngine:
                         prompt_idx=prompt_idx, checkpoint_hash=local_hash,
                     )
                 if len(generations) < M_ROLLOUTS:
+                    decision_capture("miner_attempt_discarded", lambda: dict(reason="incomplete_generation"))
                     logger.warning(
                         "generated %d/%d for prompt %d; skipping",
                         len(generations), M_ROLLOUTS, prompt_idx,
@@ -995,6 +1001,7 @@ class MiningEngine:
                     accepting_submissions=release_accepting,
                 )
                 if mismatch is not None:
+                    decision_capture("miner_attempt_discarded", lambda: dict(reason=mismatch))
                     logger.info(
                         "discarding prepared work before ingress: reason=%s "
                         "window=%d prompt=%d",
@@ -1017,12 +1024,14 @@ class MiningEngine:
                         state.window_n, prompt_idx, resp.accepted,
                         resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
+                    decision_capture("miner_submit_result", lambda: dict(window=state.window_n, environment=env_name, checkpoint=local_hash, prompt_idx=prompt_idx, accepted=resp.accepted, reason=str(resp.reason)))
                     results.append(resp)
                     if resp.accepted:
                         submitted.set()
                     elif resp._retry_after_seconds is not None:
                         await asyncio.sleep(resp._retry_after_seconds)
                 except SubmissionError as exc:
+                    decision_capture("miner_attempt_submit_error", lambda: dict(error_type=type(exc).__name__))
                     logger.error("submit failed: %s", exc)
 
         return results
@@ -1128,6 +1137,7 @@ class MiningEngine:
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
 
+    @decision_observe("miner_generation")
     def _generate_m_rollouts(
         self, problem, randomness, *, env_name: str | None = None,
         prompt_idx: int, checkpoint_hash: str,
@@ -1259,6 +1269,7 @@ class MiningEngine:
             })
         return rollouts
 
+    @decision_observe("miner_generation")
     def _generate_m_episode_rollouts(
         self,
         env,

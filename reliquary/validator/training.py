@@ -12,6 +12,8 @@ By default, uses miner-provided token log-probs (from the GRAIL commit) as
 
 from __future__ import annotations
 
+from reliquary.shared.decision_telemetry import capture as decision_capture, observe as decision_observe, optimizer_receipt
+
 import gc
 import logging
 import math
@@ -1859,6 +1861,7 @@ def _accumulate_grouped_grads(
 # Main entry point — one GRPO step per call
 # ---------------------------------------------------------------------------
 
+@decision_observe("training_call")
 def train_step(
     model,
     batches: list,
@@ -2020,7 +2023,11 @@ def train_step(
             grad_norm_value,
             metrics=failure_metrics,
         )
+    decision_capture("optimizer_started", lambda: dict(window=window_index))
     _optimizer.step()
+    optimizer_receipt(plan, n_processed=n_processed, window=window_index,
+                      step_index=getattr(_scheduler, "last_epoch", None),
+                      item_builder=_build_microbatch_items)
     _scheduler.step()
     # Backward (and its checkpoint recomputes) are done: release this
     # thread's pinned unpad slot so the ~1 MB goes back to the allocator.

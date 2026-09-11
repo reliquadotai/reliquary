@@ -5,6 +5,8 @@ quarantine runs here."""
 
 from __future__ import annotations
 
+from reliquary.shared.decision_telemetry import capture as decision_capture, group_ref as decision_group, observe as decision_observe, annotate_origins
+
 import logging
 from typing import Any, Callable
 
@@ -95,6 +97,7 @@ class TrainRunner:
                     kept.append(group)
                 else:
                     self.groups_dropped_missing_pi_old += 1
+                    decision_capture("trainer_group_filtered", lambda: dict(reason="missing_pi_old", group=decision_group(group, environment=env)))
                     logger.warning(
                         "dropping group prompt_idx=%s (%s): missing "
                         "validator pi_old; refusing miner-claim fallback",
@@ -120,6 +123,9 @@ class TrainRunner:
             [group for batch in batches for group in batch],
             reject_counts={},
         )
+        decision_capture("trainer_batch_assessed", lambda: dict(
+            window=decoded.window_start, quarantined=bool(verdict.quarantined),
+            groups=[decision_group(g) for batch in batches for g in batch]))
         if verdict.quarantined:
             logger.warning(
                 "accumulated batch quarantined: %s",
@@ -143,10 +149,14 @@ class TrainRunner:
                 "reload the last published checkpoint before resuming"
             ) from exc
         finally:
+            decision_capture("trainer_accumulator_released", lambda: dict(
+                window=decoded.window_start,
+                groups=[decision_group(g) for batch in batches for g in batch]))
             self._accumulator.reset()
         return True
 
 
+    @decision_observe("trainer_payload")
     def step(self, decoded: Any) -> bool:
         """Feed one journal lane; return True only when an optimizer step ran."""
         payload_targets = dict(getattr(decoded, "env_targets", {}) or {})
@@ -158,7 +168,7 @@ class TrainRunner:
             (
                 {}
                 if bool(decoded.window_quarantine.get("quarantined"))
-                else self._filter_missing_pi_old(decoded.batches())
+                else self._filter_missing_pi_old(annotate_origins(decoded.batches(), decoded))
             ),
             window_n=decoded.window_start,
             checkpoint_revision=decoded.checkpoint_revision,
