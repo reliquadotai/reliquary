@@ -261,6 +261,7 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
         "get_current_block": AsyncMock(return_value=current_block),
     }
     captured["chain_mocks"] = chain_mocks
+    captured["weight_wait"] = AsyncMock(return_value=0)
     storage_mocks = {
         "list_all_window_keys": AsyncMock(return_value=[1, 2, 3]),
         "list_recent_datasets": AsyncMock(return_value=[
@@ -270,9 +271,11 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
         ]),
     }
     originals = {
+        "weight_wait": wov_mod.weights_submission_wait_blocks,
         "chain": {k: getattr(wov_mod.chain, k) for k in chain_mocks},
         "storage": {k: getattr(wov_mod.storage, k) for k in storage_mocks},
     }
+    wov_mod.weights_submission_wait_blocks = captured["weight_wait"]
     for k, v in chain_mocks.items():
         setattr(wov_mod.chain, k, v)
     for k, v in storage_mocks.items():
@@ -282,6 +285,7 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
 
 def _restore(originals):
     import reliquary.validator.weight_only as wov_mod
+    wov_mod.weights_submission_wait_blocks = originals["weight_wait"]
     for k, v in originals["chain"].items():
         setattr(wov_mod.chain, k, v)
     for k, v in originals["storage"].items():
@@ -329,6 +333,55 @@ async def test_failed_attempt_does_not_hammer_same_epoch():
         _restore(originals)
     assert captured["submit_calls"] == 1
     assert wov._last_submit_epoch == 1_000_200
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_defers_without_consuming_epoch():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    captured["weight_wait"].side_effect = [1, 0]
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov)
+        assert captured["submit_calls"] == 0
+        assert wov._last_submit_epoch is None
+        await _run_one_iteration(wov)
+        assert captured["submit_calls"] == 1
+    finally:
+        _restore(originals)
+
+
+@pytest.mark.asyncio
+async def test_restart_restores_signer_attempt_and_never_replays_epoch():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    signer = MagicMock(last_weight_epoch=AsyncMock(return_value=1_000_005))
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81, signer_client=signer)
+    originals, captured = _patch_chain_and_storage(blocks_until=5)
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov)
+        assert captured["submit_calls"] == 0
+        assert wov._last_submit_epoch == 1_000_005
+    finally:
+        _restore(originals)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed,expected", [(9, 2), (10, 1), (11, 0)])
+async def test_weight_rate_limit_uses_strict_sdk_boundary_at_one_block(elapsed, expected):
+    from reliquary.signer.backend import weights_submission_wait_blocks
+
+    subtensor = MagicMock(
+        get_uid_for_hotkey_on_subnet=AsyncMock(return_value=237),
+        blocks_since_last_update=AsyncMock(return_value=elapsed),
+        weights_rate_limit=AsyncMock(return_value=10),
+    )
+    assert await weights_submission_wait_blocks(subtensor, 81, "hotkey", block=500) == expected
+    subtensor.blocks_since_last_update.assert_awaited_once_with(81, 237, block=500)
+    subtensor.weights_rate_limit.assert_awaited_once_with(81, block=500)
 
 
 @pytest.mark.asyncio

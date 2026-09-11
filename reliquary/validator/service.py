@@ -3304,7 +3304,9 @@ class ValidationService:
             for b in batcher_list:
                 b.beacon_invalid = True
 
-    def _record_auction_final_verdicts(self, batcher: GrpoWindowBatcher) -> None:
+    def _record_auction_final_verdicts(
+        self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
+    ) -> None:
         """Publish the final lifecycle state of every auction candidate.
 
         Admission and final selection are deliberately separate in auction mode:
@@ -3324,9 +3326,22 @@ class ValidationService:
             return
 
         metadata = getattr(batcher, "difficulty_auction_metadata_by_id", {})
+        # Fill-closed pending and proven submissions are different objects.
+        # Match the same identity archived by the durable batch assembler.
+        paid = {
+            (group.hotkey, group.prompt_idx, bytes(group.merkle_root)): group
+            for group in (paid_groups or ())
+        }
         for pending in batcher.pending_submissions():
             row = metadata.get(id(pending), {}) if isinstance(metadata, dict) else {}
             selected = bool(row.get("selected", False))
+            rewarded = selected
+            if paid_groups is not None:
+                group = paid.get((
+                    pending.hotkey, pending.prompt_idx, bytes(pending.merkle_root),
+                ))
+                selected = group is not None
+                rewarded = selected and int(getattr(group, "eos_tokens", 0)) > 0
             proof_reject = pending.reject_response
             accepted = proof_reject is None
             reason = (
@@ -3354,7 +3369,7 @@ class ValidationService:
                     canonical_rank=canonical_rank,
                     accepted_into_pool=True,
                     selected_for_batch=selected,
-                    rewarded=selected,
+                    rewarded=rewarded,
                     sigma=rewards_std(list(pending.rewards or ())),
                 )
                 log_structured(
@@ -3362,7 +3377,10 @@ class ValidationService:
                     logging.INFO if accepted else logging.WARNING,
                     "validator_submit_lifecycle",
                     {
-                        "stage": "auction_finalized",
+                        "stage": (
+                            "fill_closed_finalized" if paid_groups is not None
+                            else "auction_finalized"
+                        ),
                         "window_n": batcher.window_start,
                         "env_name": str(getattr(batcher.env, "name", "")),
                         "prompt_idx": pending.prompt_idx,
@@ -3372,7 +3390,7 @@ class ValidationService:
                         "canonical_rank": canonical_rank,
                         "accepted_into_pool": True,
                         "selected_for_batch": selected,
-                        "rewarded": selected,
+                        "rewarded": rewarded,
                         "auction_status": row.get("status"),
                     },
                 )
@@ -3619,13 +3637,18 @@ class ValidationService:
         # second, final /verdicts record after seal so miners can distinguish a
         # selected/rewarded candidate, an honest non-winner, and a deferred-proof
         # failure. This is observability only and cannot change selection.
-        for batcher in batchers.values():
-            self._record_auction_final_verdicts(batcher)
+        if not FILL_CLOSED_ENABLED:
+            for batcher in batchers.values():
+                self._record_auction_final_verdicts(batcher)
 
         # Emit per-submission lifecycle telemetry for every env's accepted
         # pool. Carried over from PR #40 (validator observability) and
         # extended with env_name so downstream consumers can split by env.
         for env_name, batcher in batchers.items():
+            if FILL_CLOSED_ENABLED:
+                # Its final selection is available after assembler.close(),
+                # alongside the durable archive, below.
+                continue
             selection_meta = getattr(batcher, "selection_metadata_by_id", {})
             for sub in batcher.valid_submissions():
                 meta = selection_meta.get(id(sub), {})
@@ -4793,7 +4816,11 @@ class ValidationService:
             ),
             batchers=batcher_dict,
             selected_by_environment={
-                env_name: list(sealed_dict.get(env_name, ([], {}))[0])
+                env_name: (
+                    [group for _index, group in fill_closed_batches.get(env_name, ())]
+                    if FILL_CLOSED_ENABLED
+                    else list(sealed_dict.get(env_name, ([], {}))[0])
+                )
                 for env_name in batcher_dict
             },
         )
@@ -4819,6 +4846,14 @@ class ValidationService:
         else:
             get_archive_queue().enqueue(archived_window, archive)
         self._archive_enqueued_windows.add(archived_window)
+        if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
+            for env_name, batcher in batcher_dict.items():
+                self._record_auction_final_verdicts(
+                    batcher,
+                    paid_groups=[
+                        group for _index, group in fill_closed_batches.get(env_name, ())
+                    ],
+                )
         self._cooldown_durable_window = max(
             getattr(self, "_cooldown_durable_window", 0),
             archived_window,

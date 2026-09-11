@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import ssl
 from dataclasses import dataclass
@@ -17,11 +18,14 @@ from reliquary.signer.protocol import (
     SetWeightsRequest,
     SetWeightsResponse,
     SignerHealth,
+    WeightSubmissionStatus,
     axon_operation_id,
     checkpoint_operation_id,
     checkpoint_payload,
     weights_operation_id,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,16 @@ class RemoteSignerClient:
             raise RuntimeError("remote checkpoint signature verification failed")
         return signature
 
+    async def last_weight_epoch(self) -> int | None:
+        async with httpx.AsyncClient(
+            verify=self._tls_context, timeout=10.0, trust_env=False,
+        ) as client:
+            response = await client.get(f"{self.base_url}/v1/weights/status")
+            response.raise_for_status()
+        result = WeightSubmissionStatus.model_validate(response.json())
+        self._check_hotkey(result.signer_hotkey)
+        return result.last_attempt_epoch
+
     async def set_weights(
         self,
         *,
@@ -197,6 +211,11 @@ class RemoteSignerClient:
         self._check_hotkey(result.signer_hotkey)
         if result.operation_id != operation:
             raise RuntimeError("signer weight response is not bound to the request")
+        logger.log(
+            logging.INFO if result.accepted else logging.WARNING,
+            "Signer weights: epoch=%d accepted=%s cached=%s message=%s",
+            epoch_id, result.accepted, result.cached, result.message,
+        )
         return result.accepted
 
     async def serve_axon(self, *, netuid: int, ip: str, port: int) -> bool:

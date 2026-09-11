@@ -17,6 +17,7 @@ from reliquary.constants import (
     POLL_INTERVAL_SECONDS,
 )
 from reliquary.infrastructure import chain, storage
+from reliquary.signer.backend import weights_submission_wait_blocks
 
 # EMA history depth — number of past windows replayed to compute miner
 # scores. Independent of the on-chain tempo: 72 windows ≈ ~6 hours on a
@@ -38,8 +39,8 @@ class WeightOnlyValidator:
     inside a shared ~EPOCH_SUBMIT_LEAD_BLOCKS-block window and converge to
     identical weights from the deterministic EMA replay.
 
-    A freshly-booted validator submits immediately on its first poll, then
-    joins the synced cadence from the next epoch onward.
+    A freshly-booted validator submits when chain rate limits permit, then
+    joins the synced cadence. Remote signer attempts survive controller restarts.
 
     No local state: every submit recomputes from scratch.
     """
@@ -86,13 +87,31 @@ class WeightOnlyValidator:
                     # current epoch (current_block + blocks_until is invariant).
                     current_epoch_id = current_block + blocks_until
 
-                    if self._last_submit_epoch == current_epoch_id:
+                    if self.signer_client is not None:
+                        self._last_submit_epoch = await self.signer_client.last_weight_epoch()
+                    if (
+                        self._last_submit_epoch is not None
+                        and self._last_submit_epoch >= current_epoch_id
+                    ):
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
                         continue
 
                     bootstrap = self._last_submit_epoch is None
                     in_lead_window = blocks_until <= EPOCH_SUBMIT_LEAD_BLOCKS
                     if not bootstrap and not in_lead_window:
+                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                        continue
+
+                    wait_blocks = await weights_submission_wait_blocks(
+                        subtensor, self.netuid, self.validator_hotkey,
+                        block=current_block,
+                    )
+                    if wait_blocks:
+                        logger.info(
+                            "Weight submission deferred: epoch=%d snapshot_block=%d "
+                            "retry_after_blocks=%d",
+                            current_epoch_id, current_block, wait_blocks,
+                        )
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
                         continue
 
