@@ -199,12 +199,16 @@ def test_checkpoint_counter_is_monotonic(signer):
 
 def test_weights_are_content_bound_monotonic_and_idempotent(signer):
     client, backend, _journal = signer
+    assert client.get("/v1/weights/status").json()["last_attempt_epoch"] is None
     request = _weight_request(100)
     assert client.post("/v1/weights/set", json=request).status_code == 200
     cached = client.post("/v1/weights/set", json=request)
     assert cached.status_code == 200
     assert cached.json()["cached"] is True
     assert backend.weight_calls == 1
+    assert client.get("/v1/weights/status").json() == {
+        "signer_hotkey": HOTKEY, "last_attempt_epoch": 100,
+    }
 
     older = client.post("/v1/weights/set", json=_weight_request(99))
     assert older.status_code == 409
@@ -222,6 +226,7 @@ def test_uncertain_chain_outcome_is_never_replayed(signer):
     request = _weight_request(100)
     first = client.post("/v1/weights/set", json=request)
     assert first.status_code == 503
+    assert client.get("/v1/weights/status").json()["last_attempt_epoch"] == 100
     backend.chain_error = None
     second = client.post("/v1/weights/set", json=request)
     assert second.status_code == 409

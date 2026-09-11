@@ -23,6 +23,7 @@ from reliquary.signer.protocol import (
     SetWeightsRequest,
     SetWeightsResponse,
     SignerHealth,
+    WeightSubmissionStatus,
     checkpoint_payload,
 )
 
@@ -79,6 +80,13 @@ def create_signer_app(
             repo_id=policy.repo_id,
             axon_ip=policy.axon_ip,
             axon_port=policy.axon_port,
+        )
+
+    @app.get("/v1/weights/status")
+    async def weight_status() -> WeightSubmissionStatus:
+        return WeightSubmissionStatus(
+            signer_hotkey=backend.hotkey_address,
+            last_attempt_epoch=journal.last_weight_epoch(),
         )
 
     @app.post("/v1/checkpoints/sign")
@@ -157,11 +165,12 @@ def create_signer_app(
             )
             journal.complete(request.operation_id, response.model_dump())
             logger.info(
-                "weights attempted operation=%s epoch=%d uids=%d accepted=%s",
+                "weights attempted operation=%s epoch=%d uids=%d accepted=%s message=%s",
                 request.operation_id[:12],
                 request.epoch_id,
                 len(request.uids),
                 result.accepted,
+                result.message,
             )
             return response
         except Exception as exc:

@@ -155,6 +155,11 @@ class SignerHealth(_StrictModel):
     axon_port: int | None = None
 
 
+class WeightSubmissionStatus(_StrictModel):
+    signer_hotkey: str = Field(min_length=10, max_length=100)
+    last_attempt_epoch: int | None = Field(default=None, ge=0)
+
+
 def checkpoint_operation_id(
     *, netuid: int, checkpoint_n: int, repo_id: str, revision: str
 ) -> str:

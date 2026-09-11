@@ -13,6 +13,32 @@ class ChainResult:
     message: str
 
 
+async def weights_submission_wait_blocks(
+    subtensor, netuid: int, hotkey: str, *, block: int | None = None,
+) -> int:
+    """Mirror the SDK's strict rate-limit gate before reserving a signer epoch."""
+    if block is None:
+        block = await asyncio.wait_for(
+            subtensor.get_current_block(), timeout=30.0,
+        )
+    uid = await asyncio.wait_for(
+        subtensor.get_uid_for_hotkey_on_subnet(hotkey, netuid, block=block),
+        timeout=30.0,
+    )
+    if uid is None:
+        raise RuntimeError("weight signer hotkey is not registered")
+    elapsed, limit = await asyncio.wait_for(
+        asyncio.gather(
+            subtensor.blocks_since_last_update(netuid, uid, block=block),
+            subtensor.weights_rate_limit(netuid, block=block),
+        ),
+        timeout=30.0,
+    )
+    if elapsed is None or limit is None:
+        raise RuntimeError("weight rate-limit state is unavailable")
+    return max(0, int(limit) + 1 - int(elapsed))
+
+
 class SignerBackend(Protocol):
     hotkey_address: str
 
@@ -82,6 +108,14 @@ class BittensorSignerBackend:
     ) -> ChainResult:
         subtensor = await self._subtensor()
         try:
+            wait_blocks = await weights_submission_wait_blocks(
+                subtensor, netuid, self.hotkey_address,
+            )
+            if wait_blocks:
+                return ChainResult(
+                    accepted=False,
+                    message=f"weights_rate_limited: retry_after_blocks={wait_blocks}",
+                )
             response = await asyncio.wait_for(
                 subtensor.set_weights(
                     wallet=self.wallet,
@@ -92,7 +126,10 @@ class BittensorSignerBackend:
                 timeout=self.chain_timeout_seconds,
             )
             accepted = bool(getattr(response, "success", False))
-            message = str(getattr(response, "message", None) or "")[:500]
+            message = str(
+                getattr(response, "message", None)
+                or ("accepted" if accepted else "SDK rejected weights without a reason")
+            )[:500]
             return ChainResult(accepted=accepted, message=message)
         finally:
             await self._close(subtensor)

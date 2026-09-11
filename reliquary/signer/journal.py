@@ -75,6 +75,14 @@ class SignerJournal:
         with self._lock:
             self._connection.close()
 
+    def last_weight_epoch(self) -> int | None:
+        """Include pending/uncertain attempts: none of them may be replayed."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM cursors WHERE name='weight_epoch'"
+            ).fetchone()
+            return int(row[0]) if row is not None else None
+
     def reserve(
         self,
         *,

@@ -372,7 +372,8 @@ def test_record_verdict_accepts_str_reason_for_late_drops() -> None:
     assert v[0]["reason"] == "worker_dropped"
 
 
-def test_auction_seal_publishes_selected_loser_and_proof_failure() -> None:
+@pytest.mark.parametrize("fill_closed", [False, True])
+def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) -> None:
     """Auction admission is provisional until seal. The final records must
     distinguish a paid winner, an accepted non-winner, and a deferred-proof
     rejection without turning the non-winner into a protocol failure."""
@@ -416,16 +417,28 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure() -> None:
     service = ValidationService.__new__(ValidationService)
     service.server = server
 
-    service._record_auction_final_verdicts(batcher)
-    service._record_auction_final_verdicts(batcher)  # idempotent
+    kwargs = {}
+    winner_index, loser_index = 0, 1
+    if fill_closed:
+        # The old auction marks hk0 selected; only hk1 reached the durable
+        # training payload. Proven and pending objects have different ids.
+        kwargs["paid_groups"] = [SimpleNamespace(
+            hotkey=pending[1].hotkey,
+            prompt_idx=pending[1].prompt_idx,
+            merkle_root=pending[1].merkle_root,
+            eos_tokens=50,
+        )]
+        winner_index, loser_index = 1, 0
+    service._record_auction_final_verdicts(batcher, **kwargs)
+    service._record_auction_final_verdicts(batcher, **kwargs)  # idempotent
 
-    winner = server._verdicts["hk0"][0]
+    winner = server._verdicts[f"hk{winner_index}"][0]
     assert winner["accepted"] is True
     assert winner["selected_for_batch"] is True
     assert winner["rewarded"] is True
-    assert winner["canonical_rank"] == 1
+    assert winner["canonical_rank"] == winner_index + 1
 
-    loser = server._verdicts["hk1"][0]
+    loser = server._verdicts[f"hk{loser_index}"][0]
     assert loser["accepted"] is True
     assert loser["reason"] == RejectReason.ACCEPTED.value
     assert loser["accepted_into_pool"] is True
