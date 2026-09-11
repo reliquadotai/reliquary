@@ -253,6 +253,8 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
     from unittest.mock import AsyncMock, MagicMock
     import reliquary.validator.weight_only as wov_mod
 
+    import reliquary.signer.backend as signer_backend
+
     captured = {"submit_calls": 0}
     chain_mocks = {
         "get_subtensor": AsyncMock(return_value=MagicMock()),
@@ -271,11 +273,11 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
         ]),
     }
     originals = {
-        "weight_wait": wov_mod.weights_submission_wait_blocks,
+        "weight_wait": signer_backend.weights_submission_wait_blocks,
         "chain": {k: getattr(wov_mod.chain, k) for k in chain_mocks},
         "storage": {k: getattr(wov_mod.storage, k) for k in storage_mocks},
     }
-    wov_mod.weights_submission_wait_blocks = captured["weight_wait"]
+    signer_backend.weights_submission_wait_blocks = captured["weight_wait"]
     for k, v in chain_mocks.items():
         setattr(wov_mod.chain, k, v)
     for k, v in storage_mocks.items():
@@ -285,7 +287,8 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
 
 def _restore(originals):
     import reliquary.validator.weight_only as wov_mod
-    wov_mod.weights_submission_wait_blocks = originals["weight_wait"]
+    import reliquary.signer.backend as signer_backend
+    signer_backend.weights_submission_wait_blocks = originals["weight_wait"]
     for k, v in originals["chain"].items():
         setattr(wov_mod.chain, k, v)
     for k, v in originals["storage"].items():

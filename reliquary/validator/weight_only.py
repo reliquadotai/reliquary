@@ -17,7 +17,6 @@ from reliquary.constants import (
     POLL_INTERVAL_SECONDS,
 )
 from reliquary.infrastructure import chain, storage
-from reliquary.signer.backend import weights_submission_wait_blocks
 
 # EMA history depth — number of past windows replayed to compute miner
 # scores. Independent of the on-chain tempo: 72 windows ≈ ~6 hours on a
@@ -61,6 +60,8 @@ class WeightOnlyValidator:
         stall the loop. The trainer service runs on a separate subtensor,
         so neither side can poison the other's connection state.
         """
+        from reliquary.signer.backend import weights_submission_wait_blocks
+
         logger.info(
             "Weight-only validator started (netuid=%d, hotkey=%s)",
             self.netuid, self.validator_hotkey,
