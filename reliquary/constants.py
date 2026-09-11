@@ -967,6 +967,10 @@ TRAINING_RUN_ID = (
     _os.environ.get("RELIQUARY_TRAINING_RUN_ID", "default").strip() or "default"
 )
 
+# Which task this process serves. "default" keeps the legacy archive paths, so
+# the running task is untouched by the existence of any other.
+TASK_ID = _os.environ.get("RELIQUARY_TASK_ID", "default").strip() or "default"
+
 # How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
 # checkpoint-publish cadence. Publishing can stall (training starvation, HF
 # publish failures) while windows keep advancing, which would let the snapshot

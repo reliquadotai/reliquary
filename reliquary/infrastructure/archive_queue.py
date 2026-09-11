@@ -69,6 +69,13 @@ def _default_queue_dir() -> str:
     return os.path.join(state_dir, "pending_archives")
 
 
+def upload_key(window_n: int) -> str:
+    """The R2 key this queue uploads to; shared with ``storage`` so they cannot drift."""
+    from reliquary.infrastructure.storage import dataset_object_key
+
+    return dataset_object_key(window_n)
+
+
 class ArchiveQueue:
     """Persistent retry queue for ``upload_window_dataset`` payloads."""
 
@@ -316,7 +323,7 @@ class ArchiveQueue:
         )
         region = os.getenv("R2_REGION", "us-east-1")
         bucket = os.getenv("R2_BUCKET_ID", "reliquary")
-        key = f"reliquary/dataset/window-{window_n}.json.gz"
+        key = upload_key(window_n)
 
         try:
             await asyncio.to_thread(

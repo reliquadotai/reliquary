@@ -23,6 +23,7 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
+    TASK_ID,
     TRAINING_RUN_ID,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
@@ -4718,6 +4719,7 @@ class ValidationService:
         archive = {
             "archive_schema_version": 2,
             "window_status": "completed",
+            "task_id": TASK_ID,
             "window_start": first_batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": first_batcher.randomness,
@@ -5168,6 +5170,7 @@ class ValidationService:
         archive = {
             "archive_schema_version": 2,
             "window_status": "aborted",
+            "task_id": TASK_ID,
             "window_start": int(first_batcher.window_start),
             "validator_hotkey": validator_hotkey,
             "randomness": str(getattr(first_batcher, "randomness", "")),
