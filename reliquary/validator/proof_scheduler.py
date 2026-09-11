@@ -482,7 +482,11 @@ class GlobalProofScheduler:
             state.candidates = state.candidates + added
             for candidate in added:
                 state.candidate_by_id[candidate.job_id] = candidate
-                state.phases[candidate.job_id] = _JobPhase.PENDING
+                state.phases[candidate.job_id] = (
+                    _JobPhase.SKIPPED
+                    if candidate.prompt_key in state.claimed_prompts
+                    else _JobPhase.PENDING
+                )
                 chain = state.prompt_chains.get(candidate.prompt_key, ())
                 state.prompt_chains[candidate.prompt_key] = chain + (
                     candidate.job_id,

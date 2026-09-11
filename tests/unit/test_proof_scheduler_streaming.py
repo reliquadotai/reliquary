@@ -79,6 +79,24 @@ def test_extend_feeds_candidates_to_a_running_plan():
         scheduler.close()
 
 
+def test_late_duplicate_of_a_claimed_prompt_does_not_block_new_work():
+    proven = []
+    scheduler = _scheduler(lambda invocation: proven.append(invocation.candidate.rank) or True)
+    try:
+        handle = scheduler.submit(
+            _plan("w", MATH, [_candidate(0, prompt="claimed")], required=2, open_ended=True)
+        )
+        _wait_until(lambda: len(handle.decisions()) == 1)
+        scheduler.extend("w", [_candidate(1, prompt="claimed"), _candidate(2)])
+        _wait_until(handle.done)
+        assert proven == [0, 2]
+        assert [decision.status.value for decision in handle.decisions()] == [
+            "passed", "skipped_prompt_claimed", "passed",
+        ]
+    finally:
+        scheduler.close()
+
+
 def test_sealing_an_open_plan_lets_it_finalise_short_of_its_target():
     """The backstop: the window closes on its maximum duration, batch unfilled.
 
