@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from reliquary.constants import (
@@ -165,14 +166,24 @@ class WeightOnlyValidator:
         connection cannot stall a submission. We open many of these per
         day (one per epoch), and ``initialize`` is cheap (~0.5s).
         """
-        windows = await storage.list_all_window_keys()
-        if not windows:
+        by_task: dict[str, list[dict]] = {}
+        for task_id in await storage.list_task_ids():
+            windows = await storage.list_all_window_keys(task_id=task_id)
+            if not windows:
+                continue
+            by_task[task_id] = await storage.list_recent_datasets(
+                current_window=max(windows) + 1,
+                n=ROLLING_WINDOWS_HISTORY * 3,
+                task_id=task_id,
+            )
+        if not by_task:
             logger.info("No archives yet; nothing to submit")
             return False
 
-        archives = await storage.list_recent_datasets(
-            current_window=max(windows) + 1,
-            n=ROLLING_WINDOWS_HISTORY * 3,
+        archives = self._merge_archives(by_task)
+        logger.info(
+            "Replaying %d archives across %d task(s): %s",
+            len(archives), len(by_task), ", ".join(sorted(by_task)),
         )
         ema = self._replay_ema(archives)
         miner_weights = dict(ema)
@@ -191,6 +202,19 @@ class WeightOnlyValidator:
         return submitted
 
     @staticmethod
+    def _merge_archives(by_task: Mapping[str, list[dict]]) -> list[dict]:
+        """One ordered stream out of every task's archives."""
+        merged = [
+            {**archive, "task_id": archive.get("task_id", task_id)}
+            for task_id, archives in by_task.items()
+            for archive in archives
+        ]
+        return sorted(
+            merged,
+            key=lambda record: (int(record["window_start"]), str(record.get("task_id", ""))),
+        )
+
+    @staticmethod
     def _replay_ema(archives: list[dict]) -> dict[str, float]:
         """Replay the per-window emission distribution into an EMA.
 
@@ -204,20 +228,41 @@ class WeightOnlyValidator:
         contain same-prompt/boundary splits; auction-v2 archives contain one
         uniform share per proven winner. Replaying the authoritative field
         preserves both eras without asking weight-only nodes to reimplement
-        selection. Its sum remains at most one pool and unfilled shares burn.
+        selection.
+
+        Archives may come from several tasks (see ``_merge_archives``). Each
+        task's own decay clock only ticks on that task's own windows — a task
+        with no archives yet, or one that never pays a given hotkey, must not
+        touch that hotkey's EMA. So every task is replayed independently
+        first; only the combined total is capped to the single on-chain pool,
+        and only when it actually exceeds it, by scaling every hotkey down
+        proportionally. One task alone never reaches that cap, so this is a
+        no-op for the pre-existing single-task deployment.
         """
-        ema: dict[str, float] = {}
-        alpha = EMA_ALPHA
-        for record in sorted(archives, key=lambda r: int(r["window_start"])):
-            if record.get("window_status", "completed") == "aborted":
-                continue
-            rewards: dict[str, float] = record.get("rewards_by_hotkey", {})
-            all_hotkeys = set(ema) | set(rewards)
-            for hk in all_hotkeys:
-                fraction = rewards.get(hk, 0.0)
-                ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
-            ema = {hk: v for hk, v in ema.items() if v > 1e-6}
-        return ema
+        by_task: dict[str, list[dict]] = {}
+        for record in archives:
+            by_task.setdefault(record.get("task_id", ""), []).append(record)
+
+        combined: dict[str, float] = {}
+        for records in by_task.values():
+            ema: dict[str, float] = {}
+            alpha = EMA_ALPHA
+            for record in sorted(records, key=lambda r: int(r["window_start"])):
+                if record.get("window_status", "completed") == "aborted":
+                    continue
+                rewards: dict[str, float] = record.get("rewards_by_hotkey", {})
+                all_hotkeys = set(ema) | set(rewards)
+                for hk in all_hotkeys:
+                    fraction = rewards.get(hk, 0.0)
+                    ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
+                ema = {hk: v for hk, v in ema.items() if v > 1e-6}
+            for hk, v in ema.items():
+                combined[hk] = combined.get(hk, 0.0) + v
+
+        total = sum(combined.values())
+        if total > 1.0:
+            combined = {hk: v / total for hk, v in combined.items()}
+        return combined
 
     def _resolve_burn_uid(self, hotkey_to_uid: dict) -> int:
         """Where the unpayable share goes.

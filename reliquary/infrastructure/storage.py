@@ -52,6 +52,29 @@ def dataset_object_key(window_start: int, task_id: str | None = None) -> str:
     return f"{dataset_prefix(task_id)}{int(window_start)}.json.gz"
 
 
+async def list_task_ids(*, strict: bool = False, **client_kwargs) -> list[str]:
+    """Every task with an archive namespace, ``default`` always included."""
+    from botocore.exceptions import ClientError
+
+    bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+    tasks = {"default"}
+    async with get_s3_client(**client_kwargs) as client:
+        paginator = client.get_paginator("list_objects_v2")
+        try:
+            async for page in paginator.paginate(
+                Bucket=bucket, Prefix="reliquary/tasks/", Delimiter="/"
+            ):
+                for entry in page.get("CommonPrefixes", []) or []:
+                    candidate = entry.get("Prefix", "")[len("reliquary/tasks/"):].strip("/")
+                    if _TASK_ID_RE.match(candidate):
+                        tasks.add(candidate)
+        except ClientError:
+            if strict:
+                raise
+            logger.exception("list_task_ids failed")
+    return sorted(tasks)
+
+
 def get_s3_client(
     account_id: str | None = None,
     access_key_id: str | None = None,

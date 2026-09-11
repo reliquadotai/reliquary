@@ -265,6 +265,7 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
     captured["chain_mocks"] = chain_mocks
     captured["weight_wait"] = AsyncMock(return_value=0)
     storage_mocks = {
+        "list_task_ids": AsyncMock(return_value=["default"]),
         "list_all_window_keys": AsyncMock(return_value=[1, 2, 3]),
         "list_recent_datasets": AsyncMock(return_value=[
             _archive(1, ["alice"]),
