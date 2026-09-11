@@ -149,7 +149,7 @@ class CheckpointIntake:
             field="candidate checkpoint",
         )
 
-    def _require_successor(
+    def _require_installed_successor(
         self,
         candidate: tuple[int, str, str],
     ) -> None:
@@ -165,6 +165,9 @@ class CheckpointIntake:
                 candidate,
                 field="candidate checkpoint",
             )
+
+    def _require_successor(self, candidate: tuple[int, str, str]) -> None:
+        self._require_installed_successor(candidate)
         if self._staged is not None:
             require_checkpoint_successor(
                 self._manifest_identity(self._staged[0]),
@@ -325,7 +328,9 @@ class CheckpointIntake:
         candidate = self._manifest_identity(self._taken_manifest)
         if candidate[2] != revision:
             raise ValueError("installed checkpoint revision mismatch")
-        self._require_successor(candidate)
+        # A newer download can overlap this swap. It is not installed yet and
+        # must not make completion of the already-taken checkpoint a rollback.
+        self._require_installed_successor(candidate)
         self.installed_checkpoint_n = candidate[0]
         self.installed_repo_id = candidate[1]
         self.installed_revision = candidate[2]

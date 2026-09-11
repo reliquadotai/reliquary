@@ -157,6 +157,40 @@ def test_stage_failure_degrades_to_staleness(tmp_path):
     assert intake.last_error is not None
 
 
+@pytest.mark.parametrize("pending", ["downloading", "staged"])
+def test_install_taken_checkpoint_while_successor_is_pending(tmp_path, pending):
+    next_revision = "8" * 40
+    r2 = _R2(files={
+        f"reliquary/checkpoints/{rev}/model.safetensors": b"weights"
+        for rev in (REV_7, next_revision)
+    })
+    intake = CheckpointIntake(
+        r2_client=r2, bucket="b", staging_dir=str(tmp_path),
+        installed_checkpoint_n=4, installed_repo_id="org/repo",
+        installed_revision=REV_6, validate_fn=lambda p: {"ok": True},
+    )
+    assert intake.stage(_manifest())
+    _, taken_dir = intake.take_staged()
+    successor = _manifest(next_revision, checkpoint_n=6)
+    if pending == "staged":
+        assert intake.stage(successor)
+    else:
+        intake._staging_identity = intake._manifest_identity(successor)
+        intake._staging_revision = next_revision
+
+    intake.mark_installed(REV_7, taken_dir)
+
+    assert intake.installed_checkpoint_n == 5
+    assert intake.installed_revision == REV_7
+    assert intake._taken_manifest is None
+    assert not taken_dir.exists()
+    if pending == "staged":
+        assert intake.staged_revision == next_revision
+        assert (tmp_path / next_revision / "model.safetensors").exists()
+    else:
+        assert intake._staging_identity == (6, "org/repo", next_revision)
+
+
 def test_validation_failure_clears_staged(tmp_path):
     r2 = _R2(
         manifest=_manifest(),
