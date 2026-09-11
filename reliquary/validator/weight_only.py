@@ -51,6 +51,7 @@ class WeightOnlyValidator:
         self.validator_hotkey = str(wallet.hotkey.ss58_address)
         self._last_submit_epoch: int | None = None
         self._active_submit_epoch: int | None = None
+        self._bootstrap_pending = True
 
     async def run(self) -> None:
         """Poll the epoch boundary and submit weights once per epoch.
@@ -97,7 +98,10 @@ class WeightOnlyValidator:
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
                         continue
 
-                    bootstrap = self._last_submit_epoch is None
+                    # Restart catch-up still waits for an unattempted epoch and
+                    # chain eligibility; a consumed epoch must not turn it into
+                    # another full epoch of delay before the first refresh.
+                    bootstrap = self._bootstrap_pending
                     in_lead_window = blocks_until <= EPOCH_SUBMIT_LEAD_BLOCKS
                     if not bootstrap and not in_lead_window:
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -119,13 +123,15 @@ class WeightOnlyValidator:
                     self._active_submit_epoch = current_epoch_id
                     submitted = await self.submit_once()
                     self._last_submit_epoch = current_epoch_id
+                    self._bootstrap_pending = False
                     logger.info(
                         "Weight epoch attempt: epoch=%d snapshot_block=%d "
-                        "blocks_until=%d success=%s",
+                        "blocks_until=%d success=%s bootstrap=%s",
                         current_epoch_id,
                         current_block,
                         blocks_until,
                         submitted,
+                        bootstrap,
                     )
                     if not submitted:
                         logger.warning(

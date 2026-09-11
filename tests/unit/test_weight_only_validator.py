@@ -368,6 +368,13 @@ async def test_restart_restores_signer_attempt_and_never_replays_epoch():
         await _run_one_iteration(wov)
         assert captured["submit_calls"] == 0
         assert wov._last_submit_epoch == 1_000_005
+        # First unattempted epoch after restart: catch up as soon as eligible,
+        # even outside the usual lead window, then rejoin the normal cadence.
+        captured["chain_mocks"]["get_current_block"].return_value = 1_000_006
+        captured["chain_mocks"]["blocks_until_next_epoch"].return_value = 300
+        await _run_one_iteration(wov)
+        assert captured["submit_calls"] == 1
+        assert wov._bootstrap_pending is False
     finally:
         _restore(originals)
 
@@ -394,6 +401,7 @@ async def test_in_lead_window_submits():
     from reliquary.constants import EPOCH_SUBMIT_LEAD_BLOCKS
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     wov._last_submit_epoch = 999_000  # earlier epoch — not the current one
+    wov._bootstrap_pending = False
     originals, captured = _patch_chain_and_storage(
         blocks_until=EPOCH_SUBMIT_LEAD_BLOCKS,
     )
@@ -412,6 +420,7 @@ async def test_outside_lead_window_skips():
     from reliquary.constants import EPOCH_SUBMIT_LEAD_BLOCKS
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     wov._last_submit_epoch = 999_000  # earlier epoch
+    wov._bootstrap_pending = False
     originals, captured = _patch_chain_and_storage(
         blocks_until=EPOCH_SUBMIT_LEAD_BLOCKS + 50,  # well outside
     )
