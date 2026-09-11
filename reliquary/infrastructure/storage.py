@@ -29,19 +29,15 @@ from aiobotocore.session import get_session
 from botocore.config import Config
 
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.task_id import TASK_ID_RE as _TASK_ID_RE, normalise_task_id
 
 logger = logging.getLogger(__name__)
-
-_TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
 
 def _task_id(task_id: str | None) -> str:
     """The task whose archives we are addressing. Env-read like the R2 config."""
-    resolved = (task_id if task_id is not None else os.getenv("RELIQUARY_TASK_ID", "default")).strip()
-    resolved = resolved or "default"
-    if not _TASK_ID_RE.match(resolved):
-        raise ValueError(f"unusable task id {resolved!r}")
-    return resolved
+    resolved = task_id if task_id is not None else os.getenv("RELIQUARY_TASK_ID")
+    return normalise_task_id(resolved)
 
 
 def dataset_prefix(task_id: str | None = None) -> str:

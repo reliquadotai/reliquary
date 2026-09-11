@@ -13,6 +13,7 @@ from reliquary.environment.grader import (
     GRADER_POOL_SIZE as GRADER_POOL_SIZE,
     GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
 )
+from reliquary.shared.task_id import normalise_task_id
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
@@ -969,7 +970,7 @@ TRAINING_RUN_ID = (
 
 # Which task this process serves. "default" keeps the legacy archive paths, so
 # the running task is untouched by the existence of any other.
-TASK_ID = _os.environ.get("RELIQUARY_TASK_ID", "default").strip() or "default"
+TASK_ID = normalise_task_id(_os.environ.get("RELIQUARY_TASK_ID"))
 
 # How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
 # checkpoint-publish cadence. Publishing can stall (training starvation, HF

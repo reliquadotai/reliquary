@@ -7,9 +7,18 @@ same weight replay.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+
 import pytest
 
 from reliquary.infrastructure import storage
+from reliquary.shared.task_id import normalise_task_id
+
+# Same malformed values storage._task_id must refuse; shared so the direct
+# normaliser test and the storage-level test cannot silently drift apart.
+_BAD_TASK_IDS = ("../escape", "UPPER", "with space", "a" * 64, "-lead")
 
 
 def test_the_legacy_task_keeps_its_flat_path(monkeypatch):
@@ -38,12 +47,46 @@ def test_an_explicit_task_beats_the_environment(monkeypatch):
     assert storage.dataset_object_key(7, "other") == "reliquary/tasks/other/dataset/window-7.json.gz"
 
 
-@pytest.mark.parametrize("bad", ["../escape", "UPPER", "with space", "a" * 64, "-lead"])
+@pytest.mark.parametrize("bad", _BAD_TASK_IDS)
 def test_an_unusable_task_id_is_refused(monkeypatch, bad):
     monkeypatch.setenv("RELIQUARY_TASK_ID", bad)
 
     with pytest.raises(ValueError):
         storage.dataset_prefix()
+
+
+def test_the_shared_normaliser_treats_unset_and_empty_as_default():
+    assert normalise_task_id(None) == "default"
+    assert normalise_task_id("") == "default"
+
+
+def test_the_shared_normaliser_passes_through_a_valid_slug():
+    assert normalise_task_id("logic-probe") == "logic-probe"
+
+
+@pytest.mark.parametrize("bad", _BAD_TASK_IDS)
+def test_the_shared_normaliser_refuses_the_same_ids_storage_does(bad):
+    with pytest.raises(ValueError):
+        normalise_task_id(bad)
+
+
+def test_a_malformed_task_id_fails_the_process_at_import_not_at_upload():
+    """The validator must refuse to start rather than silently loop retrying
+    an upload it can never complete (see archive_queue's unbounded retry
+    without this root-cause fix)."""
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("RELIQUARY_")
+    }
+    env["RELIQUARY_TASK_ID"] = "../escape"
+    completed = subprocess.run(
+        [sys.executable, "-c", "import reliquary.constants"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert completed.returncode != 0
+    assert "../escape" in completed.stderr
 
 
 def test_the_queue_uploads_to_the_same_key(monkeypatch):
