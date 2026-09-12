@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import functools
 import gzip
 import hashlib
@@ -170,6 +171,69 @@ def _bind_public_window_randomness(
     digest.update(len(encoded_randomness).to_bytes(4, "big"))
     digest.update(encoded_randomness)
     return digest.hexdigest()
+
+
+def _price_signal_int(value: Any) -> int | None:
+    """An honest int, or nothing. Mocks and floats are nothing."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    return None
+
+
+# How many windows of outcomes the shadow keeps in memory. Only the trailing
+# ``median_rounds`` matter to the controller, which filters what it is handed;
+# this is the bound that keeps the deque from growing.
+_PRICE_SHADOW_HISTORY_WINDOWS = 64
+
+
+def _window_price_signal(first_batcher, batcher_dict, target_for):
+    """The window's price signal for the archive, or None if unmeasurable.
+
+    Everything it needs already exists at seal: ``window_open_drand_round`` is
+    stamped from the real beacon, ``_seal_trigger_round`` from the seal, and
+    ``_submissions_per_prompt`` retains every admitted candidate for the
+    window's life -- appended to, never pruned. Nothing new is recorded in the
+    admission path.
+
+    Returning None rather than a partial record matters: a record carrying the
+    window bounds but no readiness reads downstream as a SHORTAGE, the one
+    regime that snaps the price up without confirmation. The archive tests
+    drive this with ``MagicMock`` batchers, whose every attribute answers with
+    another Mock, so "no real per-prompt index" has to read as silence.
+    """
+    from reliquary.validator.emission_price import price_signal_fields
+
+    arrivals: dict[str, dict[int, list[int]]] = {}
+    targets: dict[str, int] = {}
+    for env_name, env_batcher in batcher_dict.items():
+        index = getattr(env_batcher, "_submissions_per_prompt", None)
+        if not isinstance(index, dict):
+            return None
+        arrivals[str(env_name)] = {
+            int(prompt_idx): [
+                round_
+                for round_ in (
+                    _price_signal_int(getattr(pending, "drand_round", None))
+                    for pending in pendings
+                )
+                if round_ is not None
+            ]
+            for prompt_idx, pendings in index.items()
+        }
+        target = _price_signal_int(target_for(env_name, env_batcher))
+        if target is None:
+            return None
+        targets[str(env_name)] = target
+    return price_signal_fields(
+        open_round=_price_signal_int(
+            getattr(first_batcher, "window_open_drand_round", None)
+        ),
+        close_round=_price_signal_int(
+            getattr(first_batcher, "_seal_trigger_round", None)
+        ),
+        arrivals_by_environment=arrivals,
+        targets_by_environment=targets,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -4163,6 +4227,55 @@ class ValidationService:
         if owns_routing:
             self._set_state(WindowState.READY)
 
+    def _advance_price_shadow(
+        self, price_signal: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """What the armed controller WOULD have paid, having paid none of it.
+
+        Phase 1 exists to answer a question no amount of reasoning settles: is
+        the capturable gap 5x or 50x? It answers by publishing the number and
+        applying nothing, so ``applied`` is False and stays False until the
+        window pool actually consumes it.
+
+        The state lives in memory rather than being recovered from the archive.
+        A restart therefore resets the walk to ``start``, which costs a shadow
+        run nothing -- but arming this will need the state seeded from the last
+        archive, or a restart would silently hand miners back the full pool.
+        """
+        if price_signal is None:
+            return None
+        from reliquary.validator.emission_price import (
+            PRODUCTION_PRICE_PARAMS,
+            PriceState,
+            advance,
+            outcome_from_archive,
+        )
+
+        outcome = outcome_from_archive(
+            {"window_status": "completed", **price_signal}
+        )
+        if outcome is None:
+            return None
+        history = getattr(self, "_price_shadow_outcomes", None)
+        if history is None:
+            history = collections.deque(maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
+            self._price_shadow_outcomes = history
+        state = getattr(self, "_price_shadow_state", None) or PriceState(
+            price=PRODUCTION_PRICE_PARAMS.start,
+            last_good=PRODUCTION_PRICE_PARAMS.start,
+        )
+        history.append(outcome)
+        decision = advance(state, list(history), PRODUCTION_PRICE_PARAMS)
+        self._price_shadow_state = decision.state
+        return {
+            "price": decision.price,
+            "last_good": decision.last_good,
+            "r": decision.r,
+            "r_smoothed": decision.r_smoothed,
+            "regime": decision.regime,
+            "applied": False,
+        }
+
     async def _archive_window(
         self, batchers, sealed, late_drops=None, server_reject_counts=None,
     ) -> None:
@@ -4220,6 +4333,21 @@ class ValidationService:
             return int(
                 getattr(self, "env_targets", {}).get(env_name, B_BATCH)
             )
+
+        def _price_target_for(env_name: str, batcher) -> int:
+            """Groups the window must HOLD to close, not the training batch.
+
+            Under fill-closed a window closes on
+            FILL_CLOSED_TARGET_GROUPS_PER_ENV proven groups.
+            ``_archive_batch_target`` is the per-emission training batch
+            (B_BATCH), sixteen times smaller, and would call the window ready
+            long before it was.
+            """
+            if FILL_CLOSED_ENABLED:
+                from reliquary.constants import FILL_CLOSED_TARGET_GROUPS_PER_ENV
+
+                return int(FILL_CLOSED_TARGET_GROUPS_PER_ENV)
+            return _archive_batch_target(env_name, batcher)
 
         def _environment_manifest_digest(env_name: str) -> str | None:
             from reliquary.environment.registry import get_environment_spec
@@ -4718,6 +4846,13 @@ class ValidationService:
             env_name: _difficulty_auction_payload(env_batcher)
             for env_name, env_batcher in batcher_dict.items()
         }
+        # Absent when the window could not be measured: window bounds without a
+        # readiness read downstream as a SHORTAGE, which snaps the price up
+        # without confirmation. See ``_window_price_signal``.
+        price_signal = _window_price_signal(
+            first_batcher, batcher_dict, _price_target_for
+        )
+        price_shadow = self._advance_price_shadow(price_signal)
         archive = {
             "archive_schema_version": 2,
             "window_status": "completed",
@@ -4728,6 +4863,8 @@ class ValidationService:
             "randomness": first_batcher.randomness,
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
+            **(price_signal or {}),
+            **({"emission_price_shadow": price_shadow} if price_shadow else {}),
             "batch_targets": {
                 env_name: _archive_batch_target(env_name, env_batcher)
                 for env_name, env_batcher in batcher_dict.items()
