@@ -13,11 +13,9 @@ from typing import Any
 
 from reliquary.environment.abi import canonical_sha256
 from reliquary.shared.task_registry import (
-    KNOWN_MECHANISMS,
     PRICE_PARAM_FIELDS,
     RegistryError,
     TaskEntry,
-    total_cap,
     validate_registry,
 )
 from reliquary.validator.emission_price import PriceParams
@@ -46,10 +44,7 @@ def resolve_task_config(
     try:
         validate_registry(entries)
     except RegistryError as exc:
-        raise TaskConfigError(
-            f"task registry is unusable ({exc}); declared caps total "
-            f"{total_cap(entries):.4f}"
-        ) from exc
+        raise TaskConfigError(f"task registry is unusable: {exc}") from exc
 
     entry = entries.get(task_id)
     if entry is None:
@@ -59,11 +54,6 @@ def resolve_task_config(
         )
     if entry.status != "active":
         raise TaskConfigError(f"task {task_id!r} is {entry.status}, not active")
-    if entry.mechanism not in KNOWN_MECHANISMS:
-        raise TaskConfigError(
-            f"task {task_id!r} names incentive mechanism {entry.mechanism!r}, "
-            f"which this build does not implement"
-        )
     if entry.profile_id != profile_id:
         raise TaskConfigError(
             f"task {task_id!r} declares profile {entry.profile_id!r} but this "

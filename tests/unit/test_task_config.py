@@ -75,6 +75,8 @@ def test_a_profile_id_mismatch_refuses():
 
 
 def test_an_unknown_mechanism_refuses():
+    # Refused by delegation: validate_registry rejects the entry before we
+    # ever look it up, and the wrapper names the mechanism.
     with pytest.raises(TaskConfigError, match="vibes"):
         _resolve({"default": _entry(mechanism="vibes")})
 
