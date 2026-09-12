@@ -46,7 +46,10 @@ class TaskEntry:
 def _number(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RegistryError(f"{field} must be a number, got {value!r}")
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError as exc:
+        raise RegistryError(f"{field} is too large to be a weight: {value!r}") from exc
 
 
 def validate_entry(entry: TaskEntry) -> None:
@@ -89,7 +92,7 @@ def validate_entry(entry: TaskEntry) -> None:
 def total_cap(entries: Mapping[str, TaskEntry]) -> float:
     """Every entry counts, retired included: a retired task keeps paying while
     its EMA decays, so its budget is not free yet."""
-    return sum(float(e.params["cap"]) for e in entries.values())
+    return sum(_number(e.params.get("cap"), "cap") for e in entries.values())
 
 
 def validate_registry(entries: Mapping[str, TaskEntry]) -> None:

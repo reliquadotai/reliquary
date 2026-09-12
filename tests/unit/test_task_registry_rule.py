@@ -208,3 +208,27 @@ def test_a_fractional_retired_at_in_the_file_is_refused():
 
     with pytest.raises(RegistryError, match="retired_at"):
         parse_registry(raw)
+
+
+def test_a_number_too_large_for_a_float_is_refused():
+    huge = int("9" * 400)
+    entry = replace(_entry("a", 0.5), params={**PARAMS, "cap": 0.5, "decay": huge})
+
+    with pytest.raises(RegistryError, match="decay"):
+        add_task({}, entry)
+
+
+def test_an_oversized_cap_is_refused_when_summing():
+    entry = replace(_entry("a", 0.5), params={**PARAMS, "cap": int("9" * 400)})
+
+    with pytest.raises(RegistryError, match="cap"):
+        total_cap({"a": entry})
+
+
+def test_summing_an_entry_with_no_cap_is_a_registry_error():
+    entry = replace(
+        _entry("a", 0.5), params={k: v for k, v in PARAMS.items() if k != "cap"}
+    )
+
+    with pytest.raises(RegistryError, match="cap"):
+        total_cap({"a": entry})
