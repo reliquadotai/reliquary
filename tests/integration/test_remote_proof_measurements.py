@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import time
 from types import SimpleNamespace
 
@@ -14,7 +13,10 @@ from reliquary.validator.proof_scheduler import GlobalProofScheduler, ProofPlan,
 from reliquary.validator.proof_worker import ProofWorkerUnavailable
 from reliquary.validator.service import ValidationService
 from tests.integration.test_remote_proof_mtls import (
-    CPUProofBackend, IDENTITY, REV, endpoint, payload, pki,
+    CPUProofBackend, IDENTITY, REV, endpoint, payload,
+)
+from tests.integration.test_remote_proof_mtls import (
+    pki as pki,  # noqa: PLC0414 -- pytest fixture re-export
 )
 
 
