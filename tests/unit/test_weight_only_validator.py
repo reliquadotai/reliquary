@@ -273,16 +273,23 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
             _archive(3, ["bob"]),
         ]),
     }
+    # `read_registry` talks to R2; these tests exercise the epoch/lead-window
+    # state machine, not the registry, so declare "default" the way a real
+    # registry would once one exists.
+    read_registry_mock = AsyncMock(return_value=({"default": object()}, "etag"))
     originals = {
         "weight_wait": signer_backend.weights_submission_wait_blocks,
         "chain": {k: getattr(wov_mod.chain, k) for k in chain_mocks},
         "storage": {k: getattr(wov_mod.storage, k) for k in storage_mocks},
+        "read_registry": wov_mod.read_registry,
     }
     signer_backend.weights_submission_wait_blocks = captured["weight_wait"]
     for k, v in chain_mocks.items():
         setattr(wov_mod.chain, k, v)
     for k, v in storage_mocks.items():
         setattr(wov_mod.storage, k, v)
+    wov_mod.read_registry = read_registry_mock
+    captured["read_registry"] = read_registry_mock
     return originals, captured
 
 
@@ -294,6 +301,7 @@ def _restore(originals):
         setattr(wov_mod.chain, k, v)
     for k, v in originals["storage"].items():
         setattr(wov_mod.storage, k, v)
+    wov_mod.read_registry = originals["read_registry"]
 
 
 async def _wire_submit_counter(wov, captured, *, result=True):

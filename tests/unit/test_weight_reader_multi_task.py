@@ -44,3 +44,26 @@ def test_a_paying_task_does_take_a_share():
     # between tasks cannot affect either value.
     assert ema["hk_a"] == ema["hk_b"]
     assert abs(ema["hk_a"] + ema["hk_b"] - 1.0) < 1e-6
+
+
+def test_a_task_with_archives_but_no_registry_entry_is_flagged():
+    """Paying a task nobody declared is paying under rules nobody agreed to."""
+    undeclared = WeightOnlyValidator._undeclared_tasks(
+        {"default": [], "ghost": []}, {"default": object()}
+    )
+
+    assert undeclared == ["ghost"]
+
+
+def test_declared_tasks_are_not_flagged():
+    assert WeightOnlyValidator._undeclared_tasks(
+        {"a": [], "b": []}, {"a": object(), "b": object()}
+    ) == []
+
+
+def test_every_archived_task_missing_from_the_registry_is_named():
+    undeclared = WeightOnlyValidator._undeclared_tasks(
+        {"b": [], "a": [], "ok": []}, {"ok": object()}
+    )
+
+    assert undeclared == ["a", "b"]

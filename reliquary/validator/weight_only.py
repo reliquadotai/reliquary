@@ -18,6 +18,7 @@ from reliquary.constants import (
     POLL_INTERVAL_SECONDS,
 )
 from reliquary.infrastructure import chain, storage
+from reliquary.infrastructure.task_registry_store import read_registry
 
 # EMA history depth — number of past windows replayed to compute miner
 # scores. Independent of the on-chain tempo: 72 windows ≈ ~6 hours on a
@@ -189,6 +190,20 @@ class WeightOnlyValidator:
             logger.info("No archives yet; nothing to submit")
             return False
 
+        try:
+            declared, _ = await read_registry()
+        except Exception:
+            logger.exception("Task registry unreadable; abstaining from this epoch")
+            return False
+        undeclared = self._undeclared_tasks(by_task, declared)
+        if undeclared:
+            logger.error(
+                "Tasks %s have archives but are not declared in the registry; "
+                "abstaining rather than paying under unknown rules",
+                undeclared,
+            )
+            return False
+
         archives = self._merge_archives(by_task)
         logger.info(
             "Replaying %d archives across %d task(s): %s",
@@ -229,6 +244,11 @@ class WeightOnlyValidator:
             merged,
             key=lambda record: (int(record["window_start"]), str(record.get("task_id", ""))),
         )
+
+    @staticmethod
+    def _undeclared_tasks(by_task, declared) -> list[str]:
+        """Archived tasks the registry does not know about."""
+        return sorted(set(by_task) - set(declared))
 
     @staticmethod
     def _replay_ema(archives: list[dict]) -> dict[str, float]:
