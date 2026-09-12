@@ -14,7 +14,6 @@ from typing import Any
 from reliquary.constants import (
     FILL_CLOSED_EMISSIONS_PER_WINDOW,
     FILL_CLOSED_PICKS_PER_WINDOW,
-    TASK_EMISSION_SHARE,
     TASK_ID,
 )
 from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
@@ -216,7 +215,8 @@ class FillClosedRecoveryStore:
         archive = {
             "archive_schema_version": 2, "window_start": window,
             "window_status": "recovered_partial" if rows else "aborted",
-            "task_id": TASK_ID, "task_emission_share": TASK_EMISSION_SHARE,
+            "task_id": TASK_ID,
+            "task_emission_share": float(record.get("window_pool", 1.0)),
             "failure_stage": "active_window_recovery", "failure_type": "interrupted_window",
             "environments": environments, "environment": environments[0],
             "batch_targets": record["batch_targets"], "batch": rows,

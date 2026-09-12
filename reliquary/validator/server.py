@@ -1238,9 +1238,13 @@ class ValidatorServer:
         prompt_mismatch_namespace: str = PROTOCOL_PROFILE_ID,
         no_reveal_state_path: str | os.PathLike[str] | None = None,
         no_reveal_namespace: str = PROTOCOL_PROFILE_ID,
+        emission_cap: float = 1.0,
     ) -> None:
         self.host = host
         self.port = port
+        # What this task may pay per window, for the /tasks discovery listing.
+        # 1.0 is the legacy single-task pool.
+        self._emission_cap = float(emission_cap)
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
         self._runtime_fingerprint = collect_runtime_fingerprint()
@@ -5756,7 +5760,6 @@ class ValidatorServer:
             from reliquary.constants import (
                 PROTOCOL_MODEL_ID,
                 PROTOCOL_MODEL_REVISION,
-                TASK_EMISSION_SHARE,
                 TASK_ID,
             )
 
@@ -5766,7 +5769,7 @@ class ValidatorServer:
                 "task_id": TASK_ID,
                 "profile_id": PROTOCOL_PROFILE_ID,
                 "model": {"model_id": PROTOCOL_MODEL_ID, "model_revision": PROTOCOL_MODEL_REVISION},
-                "emission_share": TASK_EMISSION_SHARE,
+                "emission_share": self._emission_cap,
                 "url": None,
                 "window": {
                     "window_n": batcher.window_start if batcher is not None else None,

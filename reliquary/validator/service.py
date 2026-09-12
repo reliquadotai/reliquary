@@ -25,7 +25,6 @@ from reliquary.constants import (
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
     TASK_ID,
-    TASK_EMISSION_SHARE,
     TRAINING_RUN_ID,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
@@ -728,6 +727,8 @@ class ValidationService:
         proof_devices: tuple[str, ...] | None = None,
         proof_models: dict[str, Any] | None = None,
         proof_capacity_qualification: dict[str, Any] | None = None,
+        emission_cap: float = 1.0,
+        price_params: Any | None = None,
         proof_worker_pool: Any = None,
         signer_client: Any | None = None,
     ) -> None:
@@ -854,6 +855,9 @@ class ValidationService:
         self.proof_capacity_qualification = dict(
             proof_capacity_qualification or {}
         )
+        # What this task may pay per window. 1.0 is the legacy single-task pool.
+        self._emission_cap = float(emission_cap)
+        self._price_params = price_params
         from reliquary.validator.proof_measurements import ProofMeasurements
         self._proof_measurements = ProofMeasurements.from_environment(proof_worker_pool)
         self.proof_scheduler: GlobalProofScheduler | None = None
@@ -959,6 +963,7 @@ class ValidationService:
                 validator_hotkey=validator_hotkey,
             ),
             no_reveal_namespace=f"no-reveal-v1:{prompt_mismatch_namespace}",
+            emission_cap=self._emission_cap,
         )
         self.server.set_late_drop_callback(self.record_late_drop)
         self.server.configure_prompt_source_health(
@@ -2468,7 +2473,7 @@ class ValidationService:
         if FILL_CLOSED_ENABLED and recovery is not None:
             recovery.begin(target_window, checkpoint_n=cp.checkpoint_n,
                            revision=cp_hash, targets=dict(self.env_mix),
-                           window_pool=TASK_EMISSION_SHARE)
+                           window_pool=self._emission_cap)
         fill_closed_assembler = (
             FillClosedBatchAssembler(
                 window_start=target_window,
@@ -2479,7 +2484,7 @@ class ValidationService:
                 # splits it per environment and per batch itself -- it is
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
-                window_pool=TASK_EMISSION_SHARE,
+                window_pool=self._emission_cap,
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
@@ -4857,7 +4862,7 @@ class ValidationService:
             "archive_schema_version": 2,
             "window_status": "completed",
             "task_id": TASK_ID,
-            "task_emission_share": TASK_EMISSION_SHARE,
+            "task_emission_share": self._emission_cap,
             "window_start": first_batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": first_batcher.randomness,
@@ -5311,7 +5316,7 @@ class ValidationService:
             "archive_schema_version": 2,
             "window_status": "aborted",
             "task_id": TASK_ID,
-            "task_emission_share": TASK_EMISSION_SHARE,
+            "task_emission_share": self._emission_cap,
             "window_start": int(first_batcher.window_start),
             "validator_hotkey": validator_hotkey,
             "randomness": str(getattr(first_batcher, "randomness", "")),

@@ -616,6 +616,48 @@ def validate(
         subtensor = await get_subtensor()
 
         if train:
+            from reliquary.constants import (
+                PROTOCOL_GENERATION_CONTRACT,
+                PROTOCOL_PROFILE_ID,
+                TASK_ID,
+            )
+            from reliquary.infrastructure.task_registry_store import read_registry
+            from reliquary.validator.task_config import (
+                TaskConfigError,
+                resolve_task_config,
+            )
+
+            try:
+                # `_run` is itself the coroutine `_run_validator_event_loop`
+                # drives with `asyncio.run`, so a loop is already running here;
+                # the registry read is awaited in place rather than started
+                # with a second, nested `asyncio.run`. Done before any GPU or
+                # model work below so an undeclared task fails fast.
+                registry_entries, _ = await read_registry()
+                task_config = resolve_task_config(
+                    registry_entries,
+                    TASK_ID,
+                    profile_id=PROTOCOL_PROFILE_ID,
+                    generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                )
+            except TaskConfigError as exc:
+                # Unlike a missing GPU lease, this is not an environment
+                # fault we can run through: we would not know what we are
+                # allowed to pay. 3 is the device lease, 2 is click.
+                logger.critical(
+                    "%s; declare it with `reliquary tasks create` before "
+                    "starting this validator",
+                    exc,
+                )
+                raise typer.Exit(code=4) from exc
+            except Exception as exc:
+                logger.critical(
+                    "task registry could not be read (%s); refusing to start "
+                    "rather than pay under unknown rules",
+                    exc,
+                )
+                raise typer.Exit(code=4) from exc
+
             import torch
             from reliquary.constants import ATTN_IMPLEMENTATION
             from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
@@ -896,6 +938,8 @@ def validate(
                 proof_capacity_qualification=(
                     proof_capacity_qualification
                 ),
+                emission_cap=task_config.emission_cap,
+                price_params=task_config.price_params,
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,
             )

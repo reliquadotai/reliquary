@@ -972,22 +972,6 @@ TRAINING_RUN_ID = (
 # the running task is untouched by the existence of any other.
 TASK_ID = normalise_task_id(_os.environ.get("RELIQUARY_TASK_ID"))
 
-# What fraction of the miner emission this task may pay. A task other than the
-# legacy one starts at zero: creating it cannot take anything from the one
-# already running. Keeping the sum of the shares at or below 1.0 is the
-# operator's call -- above it the chain renormalises and the burn disappears.
-_TASK_EMISSION_SHARE_RAW = _os.environ.get(
-    "RELIQUARY_TASK_EMISSION_SHARE", "1.0" if TASK_ID == "default" else "0.0"
-)
-try:
-    TASK_EMISSION_SHARE = float(_TASK_EMISSION_SHARE_RAW)
-except ValueError as _exc:
-    raise ValueError(
-        f"RELIQUARY_TASK_EMISSION_SHARE={_TASK_EMISSION_SHARE_RAW!r} is not a number"
-    ) from _exc
-if not 0.0 <= TASK_EMISSION_SHARE <= 1.0 or TASK_EMISSION_SHARE != TASK_EMISSION_SHARE:
-    raise ValueError("RELIQUARY_TASK_EMISSION_SHARE must be between 0.0 and 1.0")
-
 # How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
 # checkpoint-publish cadence. Publishing can stall (training starvation, HF
 # publish failures) while windows keep advancing, which would let the snapshot

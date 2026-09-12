@@ -6,7 +6,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from reliquary.constants import PROTOCOL_PROFILE_ID, TASK_EMISSION_SHARE, TASK_ID
+from reliquary.constants import PROTOCOL_PROFILE_ID, TASK_ID
 from reliquary.validator.server import ValidatorServer, _load_declared_tasks
 
 
@@ -15,7 +15,9 @@ def test_a_validator_always_lists_its_own_task():
 
     assert body["tasks"][0]["task_id"] == TASK_ID
     assert body["tasks"][0]["profile_id"] == PROTOCOL_PROFILE_ID
-    assert body["tasks"][0]["emission_share"] == TASK_EMISSION_SHARE
+    # ValidatorServer's own default: the legacy single-task pool, now sourced
+    # from the registry (via ValidationService) rather than an env var.
+    assert body["tasks"][0]["emission_share"] == 1.0
     assert body["tasks"][0]["url"] is None
 
 
