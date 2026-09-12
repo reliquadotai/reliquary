@@ -672,7 +672,7 @@ def test_no_reveal_circuit_rejects_operator_before_receipt_registration():
         server._no_reveal_circuit.record_no_reveal(
             environment=FakeEnv.name,
             operator=operator,
-            window=request.window_start,
+            window=request.window_start - 3 + index,
             precommit_signature=f"expired-receipt-{index}",
             precommit_arrival_ts=float(index + 1),
         )
