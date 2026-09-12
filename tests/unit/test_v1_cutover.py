@@ -309,6 +309,64 @@ def test_recovery_preserves_original_payment_denominator_and_journal_stride(tmp_
     assert rotation.load().required_journal_key == 42 * 16 + 15
 
 
+def test_recovery_bridge_accepts_v6_record_and_keeps_v1_writer(tmp_path, monkeypatch):
+    import reliquary.validator.fill_closed_recovery as recovery
+    from reliquary.validator.control import write_json
+
+    monkeypatch.setattr(recovery, "B_BATCH", 16)
+    store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch, picks=10)
+    active = store.load(42)
+    assert active["schema_version"] == 1
+    assert not {"journal_slots", "payment_policy", "selection_policy", "window_pool"} & active.keys()
+
+    active.update(
+        schema_version=2,
+        journal_slots=16,
+        payment_policy="fixed-selected-group/v1",
+        selection_policy="fifo-ingress/v1",
+        window_pool=0.8,
+    )
+    for field, invalid, error in (
+        ("payment_policy", "wrong", "payment policy"),
+        ("selection_policy", "wrong", "selection policy"),
+        ("journal_slots", 15, "journal stride"),
+        ("window_pool", -0.1, "window pool"),
+    ):
+        malformed = {**active, field: invalid}
+        write_json(store._path(42), malformed)
+        with pytest.raises(ValueError, match=error):
+            store.load(42)
+
+    write_json(store._path(42), active)
+    rows = [
+        {"env_name": env, "batch_index": 0, "hotkey": hotkey,
+         "prompt_idx": index, "eos_tokens": tokens,
+         "claimed_checkpoint_hash": "a" * 40}
+        for index, (env, hotkey, tokens) in enumerate((
+            ("math", "alice", 30), ("math", "bob", 0), ("code", "bob", 4)
+        ))
+    ]
+    queue.enqueue_committed_payload(42 * 16, b"body", accounting=rows)
+    store.recover(42, queue=queue, archives=archives, rotation=rotation)
+
+    archive = archives.pending_archives(start_window=42, end_window=42)[42]
+    share = 0.8 / 2 / 10 / 16
+    assert archive["rewards_by_hotkey"] == pytest.approx({"alice": share, "bob": 2 * share})
+    assert archive["batch"] == [
+        {**row, "selected_for_batch": True, "rewarded": True,
+         "payment_source": "fill_closed_fixed_group"}
+        for row in rows
+    ]
+    assert {key: archive[key] for key in (
+        "journal_slots", "payment_policy", "selection_policy", "window_pool"
+    )} == {
+        "journal_slots": 16,
+        "payment_policy": "fixed-selected-group/v1",
+        "selection_policy": "fifo-ingress/v1",
+        "window_pool": 0.8,
+    }
+
+
 def test_control_heartbeat_never_acknowledges_a_new_request(tmp_path):
     from reliquary.validator.control import ControlStore
     store = ControlStore(tmp_path)
