@@ -166,16 +166,25 @@ class WeightOnlyValidator:
         connection cannot stall a submission. We open many of these per
         day (one per epoch), and ``initialize`` is cheap (~0.5s).
         """
+        from botocore.exceptions import ClientError
+
         by_task: dict[str, list[dict]] = {}
-        for task_id in await storage.list_task_ids():
-            windows = await storage.list_all_window_keys(task_id=task_id)
-            if not windows:
-                continue
-            by_task[task_id] = await storage.list_recent_datasets(
-                current_window=max(windows) + 1,
-                n=ROLLING_WINDOWS_HISTORY * 3,
-                task_id=task_id,
-            )
+        try:
+            for task_id in await storage.list_task_ids(strict=True):
+                windows = await storage.list_all_window_keys(task_id=task_id, strict=True)
+                if not windows:
+                    continue
+                by_task[task_id] = await storage.list_recent_datasets(
+                    current_window=max(windows) + 1,
+                    n=ROLLING_WINDOWS_HISTORY * 3,
+                    task_id=task_id,
+                )
+        except ClientError:
+            # A partial listing would submit a confident vector that pays
+            # only the tasks we managed to see — worse than submitting
+            # nothing. Abstain and let the next epoch retry the listing.
+            logger.exception("Archive listing failed; abstaining from this epoch")
+            return False
         if not by_task:
             logger.info("No archives yet; nothing to submit")
             return False
@@ -203,9 +212,16 @@ class WeightOnlyValidator:
 
     @staticmethod
     def _merge_archives(by_task: Mapping[str, list[dict]]) -> list[dict]:
-        """One ordered stream out of every task's archives."""
+        """One ordered stream out of every task's archives.
+
+        Trusts the bucket key each archive was read under, not any
+        ``task_id`` field in its body — the body can't forge which
+        namespace an object physically lives in, and that's the only thing
+        that should decide which task's decay clock and payout pool it
+        joins.
+        """
         merged = [
-            {**archive, "task_id": archive.get("task_id", task_id)}
+            {**archive, "task_id": task_id}
             for task_id, archives in by_task.items()
             for archive in archives
         ]
@@ -231,13 +247,16 @@ class WeightOnlyValidator:
         selection.
 
         Archives may come from several tasks (see ``_merge_archives``). Each
-        task's own decay clock only ticks on that task's own windows — a task
-        with no archives yet, or one that never pays a given hotkey, must not
-        touch that hotkey's EMA. So every task is replayed independently
-        first; only the combined total is capped to the single on-chain pool,
-        and only when it actually exceeds it, by scaling every hotkey down
-        proportionally. One task alone never reaches that cap, so this is a
-        no-op for the pre-existing single-task deployment.
+        task replays on its own decay clock, independent of every other
+        task's windows — a task with no archives yet, or one that never pays
+        a given hotkey, must not touch that hotkey's EMA. Each task's own
+        ``rewards_by_hotkey`` already sums to at most that task's configured
+        emission share (``window_pool``), so its own EMA sums to at most that
+        share too; the combined total across tasks is therefore at most one
+        pool when shares are configured correctly, and whatever is not paid
+        burns. The clamp below is only a backstop against a misconfigured
+        sum of shares exceeding one pool — it is logged, never silent,
+        because it rescales every miner's emission.
         """
         by_task: dict[str, list[dict]] = {}
         for record in archives:
@@ -261,6 +280,12 @@ class WeightOnlyValidator:
 
         total = sum(combined.values())
         if total > 1.0:
+            logger.warning(
+                "Combined EMA across tasks %s totals %.4f (> 1.0 pool); "
+                "rescaling every hotkey proportionally — check that "
+                "configured task emission shares sum to at most 1.0",
+                sorted(by_task), total,
+            )
             combined = {hk: v / total for hk, v in combined.items()}
         return combined
 

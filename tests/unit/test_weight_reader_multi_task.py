@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from reliquary.validator.weight_only import WeightOnlyValidator
 
 
@@ -41,8 +39,8 @@ def test_a_paying_task_does_take_a_share():
 
     ema = WeightOnlyValidator._replay_ema(both)
 
-    # Equal archive rates, equal pools: the two tasks split the mass.
-    # Not exactly equal: default sorts before logic-probe within each
-    # window, so it decays once more after its own last credit.
-    assert ema["hk_a"] == pytest.approx(ema["hk_b"], rel=0.05)
-    assert abs(ema["hk_a"] + ema["hk_b"] - 1.0) < 1e-3
+    # Equal archive rates, equal pools: the two tasks split the mass exactly.
+    # Each task replays on its own decay clock, so within-window ordering
+    # between tasks cannot affect either value.
+    assert ema["hk_a"] == ema["hk_b"]
+    assert abs(ema["hk_a"] + ema["hk_b"] - 1.0) < 1e-6
