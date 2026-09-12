@@ -19,6 +19,7 @@ from reliquary.constants import (
 )
 from reliquary.infrastructure import chain, storage
 from reliquary.infrastructure.task_registry_store import read_registry
+from reliquary.shared.task_id import DEFAULT_TASK_ID
 
 # EMA history depth — number of past windows replayed to compute miner
 # scores. Independent of the on-chain tempo: 72 windows ≈ ~6 hours on a
@@ -197,12 +198,23 @@ class WeightOnlyValidator:
             return False
         undeclared = self._undeclared_tasks(by_task, declared)
         if undeclared:
-            logger.error(
-                "Tasks %s have archives but are not declared in the registry; "
-                "abstaining rather than paying under unknown rules",
-                undeclared,
-            )
-            return False
+            if not declared and set(by_task) == {DEFAULT_TASK_ID}:
+                # No registry object yet. The legacy task predates it and the
+                # startup path admits it for the same reason; abstaining here
+                # would stop paying everyone instead of protecting anyone.
+                logger.warning(
+                    "No task registry in R2; paying the legacy task alone. "
+                    "Declare it with `reliquary tasks create` to enable the "
+                    "cross-task check."
+                )
+            else:
+                logger.error(
+                    "Tasks %s have archives but are not declared in the "
+                    "registry; abstaining rather than paying under unknown "
+                    "rules",
+                    undeclared,
+                )
+                return False
 
         archives = self._merge_archives(by_task)
         logger.info(

@@ -806,3 +806,43 @@ async def test_burn_falls_back_to_uid_zero_when_self_is_not_registered():
 
     assert captured[0] == pytest.approx(0.6)
     assert sum(captured.values()) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_submit_once_abstains_when_a_task_is_undeclared():
+    """An undeclared task's archives must not move the vector: paying it
+    would be paying under rules nobody agreed to. Pure-function coverage of
+    the rule itself lives in test_weight_reader_multi_task.py; this pins
+    what submit_once actually does with it."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    captured["read_registry"].return_value = ({"some-other-task": object()}, "etag")
+    await _wire_submit_counter(wov, captured)
+    try:
+        result = await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert result is False
+    assert captured["submit_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_once_pays_the_legacy_task_with_no_registry_at_all():
+    """Before any registry object has ever been written, R2 returns
+    NoSuchKey and read_registry reports ({}, None). The lone legacy
+    "default" task predates the registry and must still get paid every
+    epoch, not abstained on forever until an operator declares it."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    captured["read_registry"].return_value = ({}, None)
+    await _wire_submit_counter(wov, captured)
+    try:
+        result = await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert result is True
+    assert captured["submit_calls"] == 1
