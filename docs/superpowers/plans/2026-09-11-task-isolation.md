@@ -4,7 +4,7 @@
 
 **Goal:** Let a second task be created and run while the first keeps going, without touching the first task's process, its miners, or its emission.
 
-**Architecture:** A task is a validator process with its own `RELIQUARY_TASK_ID`. Everything that task writes is namespaced by that id — the R2 archive prefix above all, which is the only shared mutable state between tasks today. A task declares its emission share, which is `0.0` for any task other than the legacy one, so creating a task provably cannot dilute the running one. Miners find tasks through a new `/tasks` route and reach a second task with the `--validator-url` the CLI already accepts, so no router is needed. Physical GPUs are leased per task so a new task cannot claim a card the running one qualified.
+**Architecture:** A task is a validator process with its own `RELIQUARY_TASK_ID`. Everything that task writes to R2 is namespaced by that id — the archive prefix above all. The local state volume stays shared: the device leases in Task 5 work *because* `<state>/device-leases` is visible to every task on the host, while `fill_active`, `pending_archives`, `control.json` and the cooldown directory sit there unscoped. A task declares its emission share, which is `0.0` for any task other than the legacy one, so creating a task provably cannot dilute the running one. Miners find tasks through a new `/tasks` route and reach a second task with the `--validator-url` the CLI already accepts, so no router is needed. Physical GPUs are leased per task so a new task cannot claim a card the running one qualified.
 
 **Tech Stack:** Python 3.11, pytest, FastAPI (`TestClient`).
 

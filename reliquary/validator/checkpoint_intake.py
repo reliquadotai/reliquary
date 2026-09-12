@@ -26,6 +26,8 @@ from reliquary.shared.strict_json import strict_json_loads
 
 logger = logging.getLogger(__name__)
 
+# Knowingly NOT task-scoped: it sits on the live checkpoint-adoption path and
+# cannot collide until a second task runs a trainer. Scope it before one does.
 CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
 R2_CHECKPOINT_PREFIX = "reliquary/checkpoints"
 

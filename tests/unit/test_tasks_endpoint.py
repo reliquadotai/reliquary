@@ -109,6 +109,31 @@ def test_an_out_of_range_emission_share_is_listed_as_none(tmp_path, monkeypatch)
     assert tasks[1]["emission_share"] is None
 
 
+def test_a_peer_reusing_our_own_task_id_is_not_listed(tmp_path, monkeypatch):
+    """Two entries with the same id and different URLs would make a miner
+    selecting by id pick arbitrarily."""
+    directory = tmp_path / "tasks.json"
+    directory.write_text(json.dumps([
+        {"task_id": TASK_ID, "url": "http://10.0.0.9:8080"},
+        {"task_id": "logic-probe", "url": "http://10.0.0.10:8080"},
+    ]))
+    monkeypatch.setenv("RELIQUARY_TASK_DIRECTORY_PATH", str(directory))
+
+    tasks = TestClient(ValidatorServer().app).get("/tasks").json()["tasks"]
+
+    assert [t["task_id"] for t in tasks] == [TASK_ID, "logic-probe"]
+    assert tasks[0]["url"] is None
+
+
+def test_load_declared_tasks_skips_our_own_task_id(tmp_path):
+    directory = tmp_path / "tasks.json"
+    directory.write_text(json.dumps([
+        {"task_id": TASK_ID, "url": "http://10.0.0.9:8080"},
+    ]))
+
+    assert _load_declared_tasks(str(directory)) == []
+
+
 def test_load_declared_tasks_returns_empty_for_a_missing_path(tmp_path):
     assert _load_declared_tasks(str(tmp_path / "does-not-exist.json")) == []
 

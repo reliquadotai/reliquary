@@ -31,6 +31,8 @@ from reliquary.trainer.storage_guard import HfStorageGuard
 from reliquary.validator.control import write_json
 
 logger = logging.getLogger(__name__)
+# Knowingly NOT task-scoped: it sits on the live checkpoint-adoption path and
+# cannot collide until a second task runs a trainer. Scope it before one does.
 CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
 R2_CHECKPOINT_PREFIX = "reliquary/checkpoints"
 PUBLICATION_RECEIPT = "reliquary_publication.json"

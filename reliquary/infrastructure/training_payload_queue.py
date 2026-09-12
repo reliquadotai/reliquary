@@ -2,9 +2,10 @@
 
 Same design as ``archive_queue.ArchiveQueue`` (atomic .tmp+rename enqueue,
 background drain with per-file exponential backoff, restart rescan), but
-files are opaque bytes and land under the ``reliquary/training/`` R2
-prefix — deliberately disjoint from ``reliquary/dataset/`` which the
-dashboard consumes.
+files are opaque bytes and land under the task's training prefix
+(``reliquary/training/`` for ``default``, see ``training_prefix``) —
+deliberately disjoint from ``reliquary/dataset/`` which the dashboard
+consumes.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from reliquary.shared.strict_json import strict_json_loads
 
 logger = logging.getLogger(__name__)
 
+# Legacy name kept for importers only; ``training_prefix`` decides every key.
 R2_TRAINING_PREFIX = "reliquary/training"
 
 # Same backoff table as ArchiveQueue — tuned on observed R2 outages.
@@ -45,12 +47,28 @@ _STEP_CURSOR_SCHEMA_VERSION = 1
 _STEP_CURSOR_CACHE_TTL_SECONDS = 2.0
 
 
-def payload_key(window_start: int) -> str:
-    return f"{R2_TRAINING_PREFIX}/window-{int(window_start)}{_PAYLOAD_SUFFIX}"
+def training_prefix(task_id: str | None = None) -> str:
+    """Where a task's training payloads live. ``default`` keeps the legacy flat path."""
+    # Local import: storage pulls this module in lazily too (see _default_upload).
+    from reliquary.infrastructure.storage import _task_id
+
+    resolved = _task_id(task_id)
+    if resolved == "default":
+        return "reliquary/training"
+    return f"reliquary/tasks/{resolved}/training"
 
 
-def tombstone_key(window_start: int) -> str:
-    return f"{R2_TRAINING_PREFIX}/window-{int(window_start)}{_TOMBSTONE_SUFFIX}"
+def payload_key(window_start: int, task_id: str | None = None) -> str:
+    return (
+        f"{training_prefix(task_id)}/window-{int(window_start)}{_PAYLOAD_SUFFIX}"
+    )
+
+
+def tombstone_key(window_start: int, task_id: str | None = None) -> str:
+    return (
+        f"{training_prefix(task_id)}/window-{int(window_start)}"
+        f"{_TOMBSTONE_SUFFIX}"
+    )
 
 
 def encoded_window_journal_key(window_start: int, batch_index: int = 0) -> int:
@@ -87,14 +105,14 @@ def encoded_window_journal_key(window_start: int, batch_index: int = 0) -> int:
     )
 
 
-def step_cursor_key() -> str:
+def step_cursor_key(task_id: str | None = None) -> str:
     """R2 key for the trainer's single per-step consumption cursor (v6.1).
 
-    One object for the whole trainer, overwritten every step -- there is
-    no window/batch_index in this key, unlike ``payload_key``/
+    One object per TASK, overwritten every step -- there is no
+    window/batch_index in this key, unlike ``payload_key``/
     ``tombstone_key``.
     """
-    return f"{R2_TRAINING_PREFIX}/{_STEP_CURSOR_FILENAME}"
+    return f"{training_prefix(task_id)}/{_STEP_CURSOR_FILENAME}"
 
 
 
@@ -775,7 +793,7 @@ class TrainingPayloadQueue:
         if name.startswith("window-") and (
             name.endswith(_TOMBSTONE_SUFFIX) or name.endswith(_PAYLOAD_SUFFIX)
         ):
-            return f"{R2_TRAINING_PREFIX}/{name}"
+            return f"{training_prefix()}/{name}"
         return None
 
     def _backoff_delay(self, attempts: int) -> float:

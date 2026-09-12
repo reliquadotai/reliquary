@@ -45,7 +45,13 @@ _HELD: dict[Path, _Lease] = {}
 
 
 def default_lease_directory() -> Path:
-    """Beside the validator's other state, so no new mount is needed."""
+    """Beside the validator's other state, so no new mount is needed.
+
+    This path must stay SHARED by every task on the host: if tasks are ever
+    given separate ``RELIQUARY_STATE_DIR``s, ``RELIQUARY_DEVICE_LEASE_DIR``
+    must be set explicitly to a shared path or the lease silently stops
+    binding across tasks and two of them take the same card.
+    """
     explicit = os.environ.get("RELIQUARY_DEVICE_LEASE_DIR", "").strip()
     if explicit:
         return Path(explicit)

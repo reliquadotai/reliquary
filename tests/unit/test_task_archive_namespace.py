@@ -97,6 +97,68 @@ def test_the_queue_uploads_to_the_same_key(monkeypatch):
     assert archive_queue.upload_key(42) == storage.dataset_object_key(42)
 
 
+def _capture_puts(monkeypatch) -> list[str]:
+    keys: list[str] = []
+    monkeypatch.setattr(
+        storage,
+        "_sync_boto3_put",
+        lambda bucket, key, body, *rest: keys.append(key),
+    )
+    return keys
+
+
+@pytest.mark.asyncio
+async def test_a_queued_archive_uploads_under_the_task_that_wrote_it(
+    tmp_path, monkeypatch,
+):
+    """The queue is persistent on disk: a restart under a different
+    RELIQUARY_TASK_ID must not divert a window default's miners are still
+    waiting to be paid for."""
+    from reliquary.infrastructure import archive_queue
+
+    queue = archive_queue.ArchiveQueue(queue_dir=str(tmp_path))
+    path = queue.enqueue(45700, {"window_start": 45700, "task_id": "default"})
+    monkeypatch.setenv("RELIQUARY_TASK_ID", "logic-probe")
+    keys = _capture_puts(monkeypatch)
+
+    assert await queue._try_upload(path)
+    assert keys == ["reliquary/dataset/window-45700.json.gz"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_tasks_archive_uploads_under_its_own_prefix(
+    tmp_path, monkeypatch,
+):
+    from reliquary.infrastructure import archive_queue
+
+    monkeypatch.delenv("RELIQUARY_TASK_ID", raising=False)
+    queue = archive_queue.ArchiveQueue(queue_dir=str(tmp_path))
+    path = queue.enqueue(
+        45700, {"window_start": 45700, "task_id": "logic-probe"}
+    )
+    keys = _capture_puts(monkeypatch)
+
+    assert await queue._try_upload(path)
+    assert keys == ["reliquary/tasks/logic-probe/dataset/window-45700.json.gz"]
+
+
+@pytest.mark.asyncio
+async def test_an_archive_queued_before_task_ids_uploads_where_it_always_did(
+    tmp_path, monkeypatch,
+):
+    """Files written before this branch carry no task_id; they must still
+    upload exactly where they do today."""
+    from reliquary.infrastructure import archive_queue
+
+    monkeypatch.delenv("RELIQUARY_TASK_ID", raising=False)
+    queue = archive_queue.ArchiveQueue(queue_dir=str(tmp_path))
+    path = queue.enqueue(45700, {"window_start": 45700})
+    keys = _capture_puts(monkeypatch)
+
+    assert await queue._try_upload(path)
+    assert keys == ["reliquary/dataset/window-45700.json.gz"]
+
+
 @pytest.mark.asyncio
 async def test_the_archive_says_which_task_wrote_it(monkeypatch):
     from unittest.mock import MagicMock, patch

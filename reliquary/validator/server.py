@@ -974,6 +974,8 @@ def _load_declared_tasks(directory_path: str) -> list[dict]:
     except (OSError, ValueError):
         logger.warning("task directory %s unreadable", directory_path, exc_info=True)
         return []
+    from reliquary.constants import TASK_ID
+
     if not isinstance(declared, list):
         return []
     peers: list[dict] = []
@@ -982,6 +984,10 @@ def _load_declared_tasks(directory_path: str) -> list[dict]:
             continue
         task_id, url = entry.get("task_id"), entry.get("url")
         if not isinstance(task_id, str) or not isinstance(url, str):
+            continue
+        # Our own id is already listed first; a duplicate entry with another
+        # URL would make a miner selecting by id pick arbitrarily.
+        if task_id == TASK_ID:
             continue
         profile_id = entry.get("profile_id")
         model = entry.get("model")
