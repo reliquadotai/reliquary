@@ -172,7 +172,8 @@ def test_cli_remote_boot_never_resolves_cuda_or_loads_local_weights(monkeypatch)
     monkeypatch.setattr(chain, "get_subtensor", subtensor)
     pool = MetadataPool()
     pool.start = lambda: None
-    pool.proxies = lambda: {"cuda:0": ProofModelProxy("cuda:0")}
+    pool.dispatch_devices = ("cuda:0", "cuda:0 lane")
+    pool.proxies = lambda: {device: ProofModelProxy(device) for device in pool.dispatch_devices}
     pool.qualify = lambda revision: {"revision": revision}
     monkeypatch.setattr(remote.RemoteProofPool, "from_environment", lambda **kw: pool)
     seen = []
@@ -180,7 +181,8 @@ def test_cli_remote_boot_never_resolves_cuda_or_loads_local_weights(monkeypatch)
         def __init__(self, wallet, model, tokenizer, **kwargs):
             assert isinstance(model, ProofModelProxy)
             assert kwargs["proof_worker_pool"] is pool
-            assert kwargs["proof_devices"] == ("cuda:0",)
+            assert kwargs["proof_devices"] == ("cuda:0", "cuda:0 lane")
+            assert set(kwargs["proof_models"]) == set(kwargs["proof_devices"])
             seen.append(kwargs)
         async def run(self, subtensor):
             pass
@@ -206,7 +208,8 @@ def test_capacity_qualifier_checks_network_scope_in_every_sample(tmp_path):
     spec = importlib.util.spec_from_file_location("remote_capacity_test", script)
     qualifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(qualifier)
-    marker = RemoteProofMeasurement(worker_id="proof-test", transport_sha256=transport_hash()).model_dump()
+    marker = RemoteProofMeasurement(worker_id="proof-test", transport_sha256=transport_hash(),
+                                    pipeline_depth=1).model_dump()
     rows = [dict(environment=environment, seconds=.1, proof_passed=True,
         profile_id=qualifier.PROTOCOL_PROFILE_ID, model_revision=qualifier.PROTOCOL_MODEL_REVISION,
         software_revision=REV, checkpoint_revision=REV, runtime_fingerprint_hash="b" * 64,

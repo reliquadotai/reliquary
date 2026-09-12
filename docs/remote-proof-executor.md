@@ -61,12 +61,25 @@ configuration, and configure:
 | `RELIQUARY_PROOF_TLS_CA` | Worker server CA |
 | `RELIQUARY_PROOF_TLS_CERT` / `RELIQUARY_PROOF_TLS_KEY` | Dedicated controller client leaf/key |
 | `RELIQUARY_PROOF_EXPECTED_WORKER_ID` | Exact worker identity |
+| `RELIQUARY_PROOF_PIPELINE_DEPTH` | Proof batches kept in flight per worker slot, 1 to 4 (default 1) |
 | `RELIQUARY_PROOF_CAPACITY_MANIFEST` / `RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256` | Pinned capacity evidence |
 
 The existing `RELIQUARY_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS` and
 `RELIQUARY_PROOF_WORKER_RELOAD_TIMEOUT_SECONDS` also bound network proof and
 adoption calls. Allow enough reload time for all configured replicas to install.
 Transport deadlines are absolute; keep the hosts' clocks synchronized.
+
+`RELIQUARY_PROOF_PIPELINE_DEPTH` above 1 gives the scheduler that many dispatch
+lanes per worker slot, so uploads and downloads overlap GPU work instead of
+alternating with it. The worker still runs one proof per slot at a time and
+queues the rest, up to `MAX_PROOF_PIPELINE_DEPTH` (4); a request beyond that is
+refused, and a queued proof gives up at its own deadline. Lanes exist only on
+the controller: the wire, receipts and capacity evidence carry the physical slot.
+
+For rollout analysis, `/state` reports the configured depth, dispatch-lane count,
+current/maximum in-flight proof RPCs, failures, bytes, reconnects and elapsed RPC
+time. Worker `proof_backend` logs separate queue wait, GPU backend time and total
+request time; `proof_queue_full` identifies saturation at the bounded queue.
 
 Remote mode uses metadata proxies for every scheduled, forensic and legacy
 proof path. The initial SHA resume downloads only profile/tokenizer/config
@@ -134,7 +147,7 @@ be relabelled as these samples.
 Each source measurement must contain the same `remote_proof` object:
 
 ```json
-{"protocol":"reliquary.remote-proof/v1","worker_id":"<worker-id>","transport_sha256":"<64-hex>","measurement_scope":"validator-end-to-end-mtls"}
+{"protocol":"reliquary.remote-proof/v1","worker_id":"<worker-id>","transport_sha256":"<64-hex>","pipeline_depth":2,"measurement_scope":"validator-end-to-end-mtls"}
 ```
 
 The worker's `/v1/health` returns `transport_sha256`; both hosts must have the
@@ -142,8 +155,8 @@ same adapter bytes. Run the existing `scripts/qualify_proof_capacity.py` with
 its normal evidence flags and `--remote-proof-worker-id <worker-id>`. It requires
 the matching marker in every source row and writes it into the pinned manifest.
 An old local manifest, another worker, changed transport implementation or
-unmeasured physical GPU is refused in remote mode. Obtain fresh measurements
-after a transport change; the historical faster-runtime option cannot bypass
+unmeasured pipeline depth or physical GPU is refused in remote mode. Obtain fresh measurements
+after a transport or pipeline-depth change; the historical faster-runtime option cannot bypass
 this extra transport binding.
 
 The manifest's checkpoint pin is checked against the startup activation

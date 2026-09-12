@@ -21,7 +21,8 @@ IDENTITY = {'profile_id': 'test-profile', 'model_revision': 'a'*40,
             'software_revision': 'b'*40, 'checkpoint_revision': 'c'*40,
             'runtime_fingerprint_hash': 'e'*64, 'hardware_class': 'H100'}
 REMOTE = {'worker_id': 'test-worker', 'transport_sha256': 'f'*64,
-          'protocol': 'reliquary.remote-proof/v1', 'measurement_scope': 'validator-end-to-end-mtls'}
+          'pipeline_depth': 1, 'protocol': 'reliquary.remote-proof/v1',
+          'measurement_scope': 'validator-end-to-end-mtls'}
 BINDING = {'checkpoint_n': 1821, 'repo_id': 'test/model', 'training_run_id': 'new-v1',
            'revision': 'c'*40, 'profile_id': 'test-profile', 'generation_contract_sha256': 'a'*64}
 
@@ -270,7 +271,8 @@ def test_real_group_serializer_retains_environment_identity_and_false_verdict(mo
         receipts.append({'job_id':str(len(receipts))})
         return ProofResult(all_passed=False, passed=0, checked=32, sketch_diff_max=999,
             seed_n_positions=8192, seed_n_hard_mismatch=8192, completion_chosen_probs=[0.]*8192)
-    pool = SimpleNamespace(_adopted=binding, health=health, proxies=lambda:{'cuda:0':object()},
+    pool = SimpleNamespace(_adopted=binding, health=health, pipeline_depth=1,
+                           proxies=lambda:{'cuda:0':object()},
                            measure_group=measure_group, prove=prove)
     invocation = SimpleNamespace(device_id='cuda:0',environment=ENV[0],candidate=SimpleNamespace(job_id='unit-group'))
     row=script.measure_group(invocation,pool=pool,tokenizer=object(),

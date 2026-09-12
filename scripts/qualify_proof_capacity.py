@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
 from reliquary.constants import (  # noqa: E402
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
     M_ROLLOUTS,
+    PROOF_PIPELINE_DEPTH,
     PROTOCOL_MODEL_REVISION,
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
@@ -241,6 +242,7 @@ def main() -> int:
         from reliquary.validator.remote_proof_protocol import RemoteProofMeasurement, transport_hash
         remote_proof = RemoteProofMeasurement(
             worker_id=args.remote_proof_worker_id, transport_sha256=transport_hash(),
+            pipeline_depth=PROOF_PIPELINE_DEPTH,
         ).model_dump()
     if args.stress_samples and (remote_proof is None or not args.maximum_context_tokens or not args.natural_corpus):
         parser.error("combined v4 requires --remote-proof-worker-id, --maximum-context-tokens and --natural-corpus")

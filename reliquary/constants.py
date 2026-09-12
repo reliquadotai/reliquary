@@ -1780,6 +1780,9 @@ if PROOF_WORKER_REQUEST_TIMEOUT_SECONDS <= 0:
     raise ValueError(
         "RELIQUARY_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS must be positive"
     )
+# Proof batches the controller keeps in flight per remote slot, so uploads and
+# downloads overlap GPU work. 1 keeps slot ids and behaviour unchanged.
+PROOF_PIPELINE_DEPTH = int(_os.environ.get("RELIQUARY_PROOF_PIPELINE_DEPTH", "1"))
 
 # Loading an 8 GB replica from a staged snapshot is slower than a proof.
 PROOF_WORKER_RELOAD_TIMEOUT_SECONDS = float(

@@ -32,9 +32,11 @@ def rollout(tmp_path, monkeypatch):
         checkpoint=cp, slots=[slot], transport_sha256="d" * 64, proof_path_hash="e" * 64,
         **{k: getattr(cp, k) for k in ("generation_contract_sha256", "training_run_id", "repo_id")})
     pool = SimpleNamespace(is_remote=True, health=health,
-        runtime_fingerprint={"profile_hash": "f" * 64}, _validate_health=Mock(side_effect=lambda h: h))
+        pipeline_depth=2, runtime_fingerprint={"profile_hash": "f" * 64},
+        _validate_health=Mock(side_effect=lambda h: h))
     identity = {"controller_software_revision": source, "worker_software_revision": source,
         "worker_id": health.worker_id, "session_id": health.session_id,
+        "proof_pipeline_depth": pool.pipeline_depth,
         "runtime_fingerprint_hash": "f" * 64, "transport_sha256": health.transport_sha256,
         "proof_path_hash": health.proof_path_hash, "profile_id": c.PROTOCOL_PROFILE_ID,
         "model_revision": c.PROTOCOL_MODEL_REVISION, "generation_contract_sha256": cp.generation_contract_sha256,
@@ -84,7 +86,7 @@ def test_live_authorization_retains_real_numeric_rejection_and_never_qualifies(r
 
 
 @pytest.mark.parametrize("field", ["controller_software_revision", "worker_software_revision",
-    "worker_id", "session_id", "runtime_fingerprint_hash", "transport_sha256", "proof_path_hash",
+    "worker_id", "session_id", "proof_pipeline_depth", "runtime_fingerprint_hash", "transport_sha256", "proof_path_hash",
     "checkpoint_revision", "device_uuid", "environments"])
 def test_wrong_pinned_identity_fails(rollout, field):
     rollout.manifest["identity"][field] = "wrong"

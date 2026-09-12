@@ -29,6 +29,9 @@ MAX_PROOF_BATCH = 16
 # single mTLS peer can make the worker allocate.
 MAX_BATCH_REQUEST_BYTES = 4 * MAX_REQUEST_BYTES + 1024
 MAX_BATCH_RESPONSE_BYTES = 4 * MAX_RESPONSE_BYTES + 1024
+# Requests one slot holds at once: one on the GPU, the rest waiting their turn, so a
+# controller can keep uploads and downloads in flight while the GPU works.
+MAX_PROOF_PIPELINE_DEPTH = 4
 MAX_TOKENS = 65536
 Hash = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 OID = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
@@ -84,6 +87,7 @@ class RemoteProofMeasurement(WireModel):
     protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
     worker_id: Name
     transport_sha256: Hash
+    pipeline_depth: Annotated[int, Field(ge=1, le=MAX_PROOF_PIPELINE_DEPTH)]
     measurement_scope: Literal["validator-end-to-end-mtls"] = "validator-end-to-end-mtls"
 
 

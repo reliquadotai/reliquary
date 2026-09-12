@@ -107,7 +107,8 @@ def measure_group(invocation, *, pool, tokenizer, environments, controller, fore
                             'checked': p.checked, 'seed_n_hard_mismatch': p.seed_n_hard_mismatch}
                            for p in proofs],
         'remote_proof': RemoteProofMeasurement(worker_id=health.worker_id,
-                            transport_sha256=health.transport_sha256).model_dump()}
+                            transport_sha256=health.transport_sha256,
+                            pipeline_depth=pool.pipeline_depth).model_dump()}
 
 
 def measure(*, pool, tokenizer, environments, output, groups, timeout):
