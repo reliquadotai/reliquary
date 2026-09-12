@@ -310,6 +310,7 @@ class PromptMismatchCircuitBreaker:
         window: int,
         precommit_signature: str,
         precommit_arrival_ts: float,
+        dedupe_window: bool = False,
     ) -> PromptMismatchUpdate:
         """Record one terminal mismatch and arm or escalate when warranted."""
         if not self.enabled:
@@ -346,14 +347,25 @@ class PromptMismatchCircuitBreaker:
                     continue
 
                 if state.cooldown_level < 0:
-                    if signature in state.failure_events:
+                    if signature in state.failure_events or (
+                        dedupe_window
+                        and any(
+                            failure.window == current_window
+                            for failure in state.failure_events.values()
+                        )
+                    ):
                         self._duplicate_outcomes_ignored_total += 1
                         continue
                     state.failure_events[signature] = event
                     reference_window = max(current_window, state.last_window)
                     self._trim_failure_events_locked(state, reference_window)
                     state_changed = True
-                    if len(state.failure_events) >= self.failure_threshold:
+                    failure_count = (
+                        len({failure.window for failure in state.failure_events.values()})
+                        if dedupe_window
+                        else len(state.failure_events)
+                    )
+                    if failure_count >= self.failure_threshold:
                         state.failure_events.clear()
                         state.cooldown_level = 0
                         state.cooldown_until_window = (

@@ -83,6 +83,8 @@ class NoRevealCircuitBreaker:
             window=window,
             precommit_signature=precommit_signature,
             precommit_arrival_ts=precommit_arrival_ts,
+            # One transport incident must not scale with miner throughput.
+            dedupe_window=True,
         )
 
     def record_reveal(
