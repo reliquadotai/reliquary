@@ -20,6 +20,7 @@ import collections
 import functools
 import hashlib
 import importlib.metadata
+import json
 import logging
 import multiprocessing
 import os
@@ -963,6 +964,43 @@ def _proof_free_submission_reject(
             return RejectReason.BAD_TERMINATION, "termination_preflight"
 
     return None, None
+
+
+def _load_declared_tasks(directory_path: str) -> list[dict]:
+    """Peer tasks an operator declared in a file. Never raises: a bad file means no peers."""
+    try:
+        with open(directory_path, "rb") as handle:
+            declared = json.loads(handle.read())
+    except (OSError, ValueError):
+        logger.warning("task directory %s unreadable", directory_path, exc_info=True)
+        return []
+    if not isinstance(declared, list):
+        return []
+    peers: list[dict] = []
+    for entry in declared:
+        if not isinstance(entry, dict):
+            continue
+        task_id, url = entry.get("task_id"), entry.get("url")
+        if not isinstance(task_id, str) or not isinstance(url, str):
+            continue
+        profile_id = entry.get("profile_id")
+        model = entry.get("model")
+        emission_share = entry.get("emission_share")
+        peers.append({
+            "task_id": task_id,
+            "profile_id": profile_id if isinstance(profile_id, str) else None,
+            "model": model if isinstance(model, dict) else None,
+            "emission_share": (
+                emission_share
+                if isinstance(emission_share, (int, float))
+                and not isinstance(emission_share, bool)
+                and 0.0 <= emission_share <= 1.0
+                else None
+            ),
+            "url": url,
+            "window": None,
+        })
+    return peers
 
 
 class _Health(BaseModel):
@@ -5709,9 +5747,6 @@ class ValidatorServer:
 
         @app.get("/tasks")
         async def get_tasks():
-            import json
-            import os
-
             from reliquary.constants import (
                 PROTOCOL_MODEL_ID,
                 PROTOCOL_MODEL_REVISION,
@@ -5735,27 +5770,7 @@ class ValidatorServer:
             # Read per request: adding a task must not restart this one.
             directory_path = os.environ.get("RELIQUARY_TASK_DIRECTORY_PATH", "").strip()
             if directory_path:
-                try:
-                    declared = json.loads(open(directory_path, "rb").read())
-                except (OSError, ValueError):
-                    logger.warning("task directory %s unreadable", directory_path, exc_info=True)
-                    declared = []
-                if not isinstance(declared, list):
-                    declared = []
-                for entry in declared:
-                    if not isinstance(entry, dict):
-                        continue
-                    task_id, url = entry.get("task_id"), entry.get("url")
-                    if not isinstance(task_id, str) or not isinstance(url, str):
-                        continue
-                    tasks.append({
-                        "task_id": task_id,
-                        "profile_id": entry.get("profile_id"),
-                        "model": entry.get("model"),
-                        "emission_share": entry.get("emission_share"),
-                        "url": url,
-                        "window": None,
-                    })
+                tasks.extend(await asyncio.to_thread(_load_declared_tasks, directory_path))
             return {"tasks": tasks}
 
 

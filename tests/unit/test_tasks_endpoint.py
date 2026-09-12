@@ -7,7 +7,7 @@ import json
 from fastapi.testclient import TestClient
 
 from reliquary.constants import PROTOCOL_PROFILE_ID, TASK_EMISSION_SHARE, TASK_ID
-from reliquary.validator.server import ValidatorServer
+from reliquary.validator.server import ValidatorServer, _load_declared_tasks
 
 
 def test_a_validator_always_lists_its_own_task():
@@ -69,3 +69,52 @@ def test_a_malformed_entry_is_skipped(tmp_path, monkeypatch):
     tasks = TestClient(ValidatorServer().app).get("/tasks").json()["tasks"]
 
     assert [t["task_id"] for t in tasks] == [TASK_ID, "ok"]
+
+
+def test_a_nonsense_emission_share_is_listed_as_none(tmp_path, monkeypatch):
+    directory = tmp_path / "tasks.json"
+    directory.write_text(json.dumps([
+        {"task_id": "logic-probe", "url": "http://10.0.0.9:8080", "emission_share": "high"},
+    ]))
+    monkeypatch.setenv("RELIQUARY_TASK_DIRECTORY_PATH", str(directory))
+
+    tasks = TestClient(ValidatorServer().app).get("/tasks").json()["tasks"]
+
+    assert [t["task_id"] for t in tasks] == [TASK_ID, "logic-probe"]
+    assert tasks[1]["emission_share"] is None
+
+
+def test_a_string_model_is_listed_as_none(tmp_path, monkeypatch):
+    directory = tmp_path / "tasks.json"
+    directory.write_text(json.dumps([
+        {"task_id": "logic-probe", "url": "http://10.0.0.9:8080", "model": "gpt-4"},
+    ]))
+    monkeypatch.setenv("RELIQUARY_TASK_DIRECTORY_PATH", str(directory))
+
+    tasks = TestClient(ValidatorServer().app).get("/tasks").json()["tasks"]
+
+    assert [t["task_id"] for t in tasks] == [TASK_ID, "logic-probe"]
+    assert tasks[1]["model"] is None
+
+
+def test_an_out_of_range_emission_share_is_listed_as_none(tmp_path, monkeypatch):
+    directory = tmp_path / "tasks.json"
+    directory.write_text(json.dumps([
+        {"task_id": "logic-probe", "url": "http://10.0.0.9:8080", "emission_share": 1.5},
+    ]))
+    monkeypatch.setenv("RELIQUARY_TASK_DIRECTORY_PATH", str(directory))
+
+    tasks = TestClient(ValidatorServer().app).get("/tasks").json()["tasks"]
+
+    assert tasks[1]["emission_share"] is None
+
+
+def test_load_declared_tasks_returns_empty_for_a_missing_path(tmp_path):
+    assert _load_declared_tasks(str(tmp_path / "does-not-exist.json")) == []
+
+
+def test_load_declared_tasks_returns_empty_for_invalid_json(tmp_path):
+    directory = tmp_path / "tasks.json"
+    directory.write_text("{ not json")
+
+    assert _load_declared_tasks(str(directory)) == []
