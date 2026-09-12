@@ -204,4 +204,5 @@ def test_a_dispatch_lane_is_measured_against_its_physical_slot(pki, tmp_path):
         ValidationService._execute_scheduled_proof(context, invocation)
         row = json.loads(path.read_text())
         assert row["complete_remote_group"] and row["device_id"] == "cuda:0"
+        assert row["remote_proof"]["pipeline_depth"] == 2
         assert backend.calls == M_ROLLOUTS

@@ -142,7 +142,7 @@ be relabelled as these samples.
 Each source measurement must contain the same `remote_proof` object:
 
 ```json
-{"protocol":"reliquary.remote-proof/v1","worker_id":"<worker-id>","transport_sha256":"<64-hex>","measurement_scope":"validator-end-to-end-mtls"}
+{"protocol":"reliquary.remote-proof/v1","worker_id":"<worker-id>","transport_sha256":"<64-hex>","pipeline_depth":2,"measurement_scope":"validator-end-to-end-mtls"}
 ```
 
 The worker's `/v1/health` returns `transport_sha256`; both hosts must have the
@@ -150,8 +150,8 @@ same adapter bytes. Run the existing `scripts/qualify_proof_capacity.py` with
 its normal evidence flags and `--remote-proof-worker-id <worker-id>`. It requires
 the matching marker in every source row and writes it into the pinned manifest.
 An old local manifest, another worker, changed transport implementation or
-unmeasured physical GPU is refused in remote mode. Obtain fresh measurements
-after a transport change; the historical faster-runtime option cannot bypass
+unmeasured pipeline depth or physical GPU is refused in remote mode. Obtain fresh measurements
+after a transport or pipeline-depth change; the historical faster-runtime option cannot bypass
 this extra transport binding.
 
 The manifest's checkpoint pin is checked against the startup activation

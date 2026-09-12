@@ -446,7 +446,7 @@ def test_capacity_requires_network_measurements_and_actual_gpu_identity(pki, tmp
     monkeypatch.setattr(c, "FILL_CLOSED_MAX_SECONDS", 1800.)
     wall_seconds, proof_count = (1800., 512) if fill_closed else (240., 1)
     manifest_path = tmp_path / "capacity.json"
-    with endpoint(pki, CPUProofBackend()) as client:
+    with endpoint(pki, CPUProofBackend(), pipeline_depth=2) as client:
         manifest = dict(schema_version=3, profile_id=IDENTITY["profile_id"],
             model_revision="1" * 40, software_revision="c" * 40, checkpoint_revision=REV,
             samples_sha256="2" * 64, runtime_fingerprint_hash=client.runtime_fingerprint["profile_hash"],
@@ -467,9 +467,16 @@ def test_capacity_requires_network_measurements_and_actual_gpu_identity(pki, tmp
         write()
         with pytest.raises(ValueError):
             client.qualify(REV)  # Local GPU measurements cannot qualify remote execution.
-        manifest["remote_proof"] = RemoteProofMeasurement(worker_id="proof-test", transport_sha256=transport_hash()).model_dump()
+        manifest["remote_proof"] = RemoteProofMeasurement(worker_id="proof-test",
+            transport_sha256=transport_hash(), pipeline_depth=2).model_dump()
         write()
         assert client.qualify(REV)["qualified"] is True
+        manifest["remote_proof"]["pipeline_depth"] = 1
+        write()
+        with pytest.raises(ProofWorkerUnavailable, match="measured"):
+            client.qualify(REV)
+        manifest["remote_proof"]["pipeline_depth"] = 2
+        write()
         if fill_closed:
             # Legacy wall and attempt limits cannot qualify a fill window,
             # even with authentic remote measurements and the correct GPU.

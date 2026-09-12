@@ -82,7 +82,8 @@ class ProofMeasurements:
                     "plan_id": invocation.plan_id, "job_id": invocation.candidate.job_id,
                     "window": payload.batcher.window_start, "wire_receipts": receipts,
                     "remote_proof": RemoteProofMeasurement(worker_id=health.worker_id,
-                        transport_sha256=health.transport_sha256).model_dump()}
+                        transport_sha256=health.transport_sha256,
+                        pipeline_depth=self.pool.pipeline_depth).model_dump()}
                 try:
                     with self._lock:
                         fd = os.open(self.path, os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW)

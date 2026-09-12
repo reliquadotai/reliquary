@@ -87,6 +87,7 @@ class RemoteProofMeasurement(WireModel):
     protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
     worker_id: Name
     transport_sha256: Hash
+    pipeline_depth: Annotated[int, Field(ge=1, le=MAX_PROOF_PIPELINE_DEPTH)]
     measurement_scope: Literal["validator-end-to-end-mtls"] = "validator-end-to-end-mtls"
 
 

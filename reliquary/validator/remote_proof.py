@@ -64,7 +64,7 @@ class RemoteProofPool:
         # Keep one connection per dispatch lane plus health: a reconnect is a TLS handshake.
         self._client = httpx.Client(base_url=base_url.rstrip("/"), verify=tls,
                                     trust_env=False, follow_redirects=False,
-                                    limits=httpx.Limits(max_connections=66, max_keepalive_connections=pipeline_depth + 1,
+                                    limits=httpx.Limits(max_connections=66, max_keepalive_connections=66,
                                                         keepalive_expiry=90))
         self.worker_id = expected_worker_id
         self.pipeline_depth = pipeline_depth
@@ -335,6 +335,7 @@ class RemoteProofPool:
             strict_json_loads(raw).get("remote_proof"))
         if measurement != RemoteProofMeasurement(
             worker_id=self.worker_id, transport_sha256=self.health.transport_sha256,
+            pipeline_depth=self.pipeline_depth,
         ):
             raise ProofWorkerUnavailable("capacity was not measured through this remote proof plane")
         physical = {}
