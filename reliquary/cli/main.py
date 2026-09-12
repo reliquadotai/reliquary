@@ -686,6 +686,18 @@ def validate(
                 proof_device_identities = _configured_proof_device_identities(
                     torch
                 )
+                if proof_device_identities:
+                    from reliquary.constants import TASK_ID
+                    from reliquary.validator.device_lease import (
+                        acquire_device_leases,
+                        default_lease_directory,
+                    )
+
+                    acquire_device_leases(
+                        [identity.device_uuid for identity in proof_device_identities],
+                        task_id=TASK_ID,
+                        directory=default_lease_directory(),
+                    )
                 proof_devices = tuple(
                     identity.device_id for identity in proof_device_identities
                 )
