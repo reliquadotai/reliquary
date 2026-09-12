@@ -283,7 +283,7 @@ class FillClosedRecoveryStore:
             required_journal_key=(window + 1) * journal_slots - 1,
             parent_checkpoint_n=record["parent_checkpoint_n"], parent_revision=record["parent_revision"],
             durable_payload_count=payload_count,
-            requires_successor=payload_count >= journal_slots,
+            requires_successor=payload_count > 0,
         )
         existing = rotation.load()
         if existing is None or existing.source_window <= window:

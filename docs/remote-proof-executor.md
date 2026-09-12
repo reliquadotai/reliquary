@@ -210,8 +210,10 @@ proof gates are rechecked. This offline corpus is not evidence of live HTTP
 arrival timing, admission fairness or metagraph eligibility. No historical
 cooldown or economic state is copied into the benchmark; each group is isolated
 and never selected for payment/training. Identical input groups are refused.
-The existing Code grader must be available; no unsandboxed grading fallback is
-introduced. The ordinary prompt range applies to the recorded randomness.
+The benchmark starts the same local Code-grader coordinator as the validator;
+its configured sandbox executor must be available. No unsandboxed grading
+fallback is introduced. The ordinary prompt range applies to the recorded
+randomness.
 
 With the remote TLS/profile/run environment configured as above, run in the
 CPU benchmark image (paths and identities below are placeholders):
@@ -248,6 +250,8 @@ contain 24,576 prompt tokens and 8,192 policy tokens; they exercise the real
 32,768-token forward, full forced-seed CDF checks, 32 GRAIL challenges, sparse
 outputs, and authenticated mTLS. Their invalid GRAIL verdicts remain invalid.
 They never become submissions, rewards, training data or passing proofs.
+Every dispatch lane is active during stress, so a pipeline depth above one
+measures the worker's real per-slot queue contention.
 
 The CPU supplement executes native post-proof helpers on the actual responses,
 then explicitly labeled CPU-only fixtures cover full scans that random invalid

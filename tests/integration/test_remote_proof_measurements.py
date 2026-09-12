@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import time
 from types import SimpleNamespace
 
@@ -14,7 +13,10 @@ from reliquary.validator.proof_scheduler import GlobalProofScheduler, ProofPlan,
 from reliquary.validator.proof_worker import ProofWorkerUnavailable
 from reliquary.validator.service import ValidationService
 from tests.integration.test_remote_proof_mtls import (
-    CPUProofBackend, IDENTITY, REV, endpoint, payload, pki,
+    CPUProofBackend, IDENTITY, REV, endpoint, payload,
+)
+from tests.integration.test_remote_proof_mtls import (
+    pki as pki,  # noqa: PLC0414 -- pytest fixture re-export
 )
 
 
@@ -159,7 +161,17 @@ def test_corpus_refuses_wrong_checkpoint_and_unsigned_request_before_admission(p
 
 def test_isolated_harness_reuses_service_scheduler_and_refuses_duplicate_corpus(pki, tmp_path, monkeypatch):
     import scripts.measure_remote_proof_capacity as benchmark
-    with endpoint(pki, CPUProofBackend()) as client:
+    from reliquary.validator import proof_scheduler
+    real_scheduler = proof_scheduler.GlobalProofScheduler
+    scheduled_devices = []
+
+    def scheduler(**kwargs):
+        scheduled_devices.append(tuple(kwargs["devices"]))
+        return real_scheduler(**kwargs)
+
+    monkeypatch.setattr(proof_scheduler, "GlobalProofScheduler", scheduler)
+    with endpoint(pki, CPUProofBackend(), pipeline_depth=2) as client:
+        expected_devices = client.dispatch_devices
         client.qualify = lambda *args: pytest.fail("benchmark must not depend on prior capacity")
         monkeypatch.setattr(benchmark, "prepare_candidate", lambda row, **kwargs:
             ("openmathinstruct", group(client, index=kwargs["index"])))
@@ -188,6 +200,7 @@ def test_isolated_harness_reuses_service_scheduler_and_refuses_duplicate_corpus(
             benchmark.measure(corpus, output=tmp_path / "duplicate-output", pool=client,
                 tokenizer=None, environments={"openmathinstruct": object()}, timeout=10)
         assert not (tmp_path / "duplicate-output").exists()
+    assert scheduled_devices == [expected_devices]
 
 
 def test_a_dispatch_lane_is_measured_against_its_physical_slot(pki, tmp_path):

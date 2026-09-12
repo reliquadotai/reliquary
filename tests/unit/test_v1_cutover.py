@@ -162,7 +162,7 @@ def test_crash_after_payload_upload_keeps_paid_groups_and_pads_only_unwritten_sl
     assert len(list(queue._journal_commit_dir.glob("window-*.json"))) == 16
     assert not store.windows()
     assert rotation.load().required_journal_key == 42 * 16 + 15
-    assert not rotation.load().requires_successor
+    assert rotation.load().requires_successor
     first = json.loads((queue._journal_commit_dir / f"window-{42 * 16}.json").read_text())
     assert first["kind"] == "payload"
 

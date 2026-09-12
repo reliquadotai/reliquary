@@ -1516,7 +1516,9 @@ class ValidationService:
                     window_n,
                 )
 
-    async def _poll_and_stage_checkpoint_candidate(self, intake) -> bool:
+    async def _poll_and_stage_checkpoint_candidate(
+        self, intake, *, reconcile_rotation: bool = False,
+    ) -> bool:
         """Ask R2 for a new candidate manifest; start staging it if there
         is one. Returns whether a NEW candidate was DETECTED.
 
@@ -1530,9 +1532,15 @@ class ValidationService:
         task = self._intake_stage_task
         if task is not None and not task.done():
             return False
-        manifest = await asyncio.to_thread(intake.poll)
+        manifest = await asyncio.to_thread(
+            intake.poll, include_installed=reconcile_rotation,
+        )
         if manifest is None:
             return False
+        if reconcile_rotation:
+            self._record_fill_closed_checkpoint_candidate(manifest)
+            if manifest.get("revision") == intake.installed_revision:
+                return True
         self._intake_stage_task = asyncio.create_task(
             asyncio.to_thread(intake.stage, manifest),
             name="checkpoint_intake_stage",
@@ -1545,12 +1553,11 @@ class ValidationService:
         """Persist the exact barrier the next experimental window must clear.
 
         Every window waits for measured consumption of its last durable
-        entry.  A window that produced a complete cadence of real payloads
-        additionally expects a newly trained checkpoint: the next open is
-        forbidden until a candidate manifest covering that cursor is both
-        published and installed into the verify/proof plane.  Underfilled or
-        quarantined windows do not invent a publication that the trainer's
-        counter will never produce.
+        entry.  A window containing any real payload additionally expects the
+        boundary checkpoint the fill-closed trainer publishes: the next open
+        is forbidden until a candidate manifest covering that cursor is both
+        published and installed into the verify/proof plane.  Tombstone-only
+        windows do not invent a publication.
         """
         from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
         from reliquary.infrastructure.training_payload_queue import (
@@ -1595,9 +1602,7 @@ class ValidationService:
             parent_checkpoint_n=checkpoint.checkpoint_n,
             parent_revision=checkpoint.revision,
             durable_payload_count=payload_count,
-            requires_successor=(
-                payload_count >= FILL_CLOSED_EMISSIONS_PER_WINDOW
-            ),
+            requires_successor=payload_count > 0,
         )
         self._persist_fill_closed_rotation_gate(gate)
 
@@ -1735,7 +1740,9 @@ class ValidationService:
             await self._swap_staged_checkpoint(self._window_n)
             return
         if getattr(self, "_intake_stage_task", None) is None:
-            await self._poll_and_stage_checkpoint_candidate(intake)
+            await self._poll_and_stage_checkpoint_candidate(
+                intake, reconcile_rotation=True,
+            )
 
     async def _wait_for_fill_closed_rotation(self) -> str:
         """Hold the next open until consumption and expected adoption agree.
@@ -1749,6 +1756,14 @@ class ValidationService:
         gate = getattr(self, "_fill_closed_rotation_gate", None)
         if gate is None:
             return "not_armed"
+        if gate.durable_payload_count > 0 and not gate.requires_successor:
+            # Older validators treated partial windows as consumption-only.
+            # Upgrade with checkpoint context available so an already-installed
+            # covering candidate can be reconciled instead of lost by dedup.
+            from dataclasses import replace
+
+            gate = replace(gate, requires_successor=True)
+            self._persist_fill_closed_rotation_gate(gate)
         if os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {
             "1", "true", "yes", "on",
         }:

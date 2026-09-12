@@ -350,7 +350,7 @@ and retained SHA-256 receipt before making a journal slot visible. The
 assembler advances its index and accrues rewards only after that durable
 commit; identical retries are no-ops and conflicting bytes fail closed. Its
 persisted between-window barrier binds the complete journal range to the
-parent checkpoint and, for a full publication cadence, stays closed until both
+parent checkpoint and, for every nonempty fill window, stays closed until both
 trainer consumption and exact successor-checkpoint adoption are observed.
 
 This does not yet reconstruct ownership of a partially completed live window.
