@@ -113,10 +113,10 @@ class FillClosedBatchAssembler:
         # environment's slot for THAT cycle is present, never from
         # whichever environment's callback happened to arrive last.
         self.next_batch_index: int = 0
-        # Counts only entries whose local durable enqueue completed.  The
-        # rotation gate uses the payload count to decide whether a successor
-        # checkpoint is actually expected; padding/quarantine tombstones do
-        # not create optimizer steps.
+        # Counts only entries whose local durable enqueue completed. The
+        # trainer publishes at every nonempty fill-window boundary, so the
+        # rotation gate requires a successor whenever this count is nonzero.
+        # Padding/quarantine tombstones do not create that obligation.
         self.durable_payload_count: int = 0
         self.durable_tombstone_count: int = 0
         # One lock: two per-environment batchers can call ``accept`` from

@@ -116,7 +116,7 @@ def measure(corpus, *, output, pool, tokenizer, environments, timeout, combined_
         raise ValueError("corpus must exercise every active environment")
     recorder = ProofMeasurements(output, pool)
     context = SimpleNamespace(_proof_models=pool.proxies(), _proof_measurements=recorder)
-    with GlobalProofScheduler(devices=pool.devices, environments=tuple(environments),
+    with GlobalProofScheduler(devices=pool.dispatch_devices, environments=tuple(environments),
         checkpoint_revision=revision,
         proof_callable=lambda invocation: ValidationService._execute_scheduled_proof(context, invocation)) as scheduler:
         plans = [ProofPlan(plan_id=f"benchmark:{env}", environment=env,
@@ -237,7 +237,7 @@ def _measure_combined_natural(corpus, *, output, pool, tokenizer, environments, 
             recorder = ProofMeasurements(raw_path, pool)
             context = SimpleNamespace(_proof_models=pool.proxies(), _proof_measurements=recorder)
             by_job = {candidate.job_id: candidate for values in candidates.values() for candidate in values}
-            with GlobalProofScheduler(devices=pool.devices, environments=tuple(environments),
+            with GlobalProofScheduler(devices=pool.dispatch_devices, environments=tuple(environments),
                     checkpoint_revision=checkpoint.revision,
                     proof_callable=lambda invocation: ValidationService._execute_scheduled_proof(context, invocation)) as scheduler:
                 plans = [ProofPlan(plan_id=f"benchmark:{env}", environment=env,
@@ -255,7 +255,7 @@ def _measure_combined_natural(corpus, *, output, pool, tokenizer, environments, 
                         event = {"event": "proof", "job_id": decision.job_id,
                             "input_sha256": inputs[decision.job_id], "environment": result.environment,
                             "outcome": decision.status.value, "reason": reason,
-                            "device_id": decision.device_id}
+                            "device_id": pool.slot_for(decision.device_id)}
                         record(event)
                         if decision.status is ProofDecisionStatus.PASSED:
                             if not isinstance(decision.value, ValidSubmission) or len(decision.value.rollouts) != M_ROLLOUTS:
@@ -328,6 +328,8 @@ def main():
     from reliquary.validator.remote_proof import RemoteProofPool, executor_mode
     if executor_mode() != "remote":
         parser.error("select explicit remote proof mode and a dedicated isolated worker")
+    environments = load_environments(list(c.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV))
+    _ensure_code_grader_bridge(environments)
     pool = RemoteProofPool.from_environment(repo_id=args.hf_repo_id)
     try:
         pool.start()
@@ -337,11 +339,24 @@ def main():
         pool.reload(pool.devices[0], None, args.checkpoint_revision, args.hf_repo_id)
         tokenizer = load_tokenizer(args.hf_repo_id, revision=args.checkpoint_revision, token=False)
         report = measure(args.corpus, output=args.output, pool=pool, tokenizer=tokenizer,
-            environments=load_environments(list(c.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV)), timeout=args.timeout_seconds,
+            environments=environments, timeout=args.timeout_seconds,
             combined_natural=args.combined_natural)
         print(json.dumps(report, sort_keys=True))
     finally:
         pool.close(force=True)
+
+
+def _ensure_code_grader_bridge(environments):
+    if "opencodeinstruct" not in environments:
+        return
+    from reliquary.cli.main import _ensure_grader_running, _grader_is_running
+    from reliquary.constants import GRADER_SOCKET_PATH
+    # Qualification uses host networking but does not expose grader metrics.
+    # An ephemeral port avoids colliding with a live role on the same host.
+    os.environ["GRADER_METRICS_PORT"] = "0"
+    _ensure_grader_running()
+    if not _grader_is_running(GRADER_SOCKET_PATH):
+        raise RuntimeError("the code grader bridge did not become ready")
 
 
 if __name__ == "__main__":

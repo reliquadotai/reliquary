@@ -56,8 +56,19 @@ def run_fixture(client, tmp_path, monkeypatch, modes, *, combined=True):
 
 
 def test_combined_keeps_all_normal_rejects_and_binds_only_complete_real_passes(pki, tmp_path, monkeypatch):
-    with endpoint(pki, CPUProofBackend()) as client:
+    from reliquary.validator import proof_scheduler
+    real_scheduler = proof_scheduler.GlobalProofScheduler
+    scheduled_devices = []
+
+    def scheduler(**kwargs):
+        scheduled_devices.append(tuple(kwargs["devices"]))
+        return real_scheduler(**kwargs)
+
+    monkeypatch.setattr(proof_scheduler, "GlobalProofScheduler", scheduler)
+    with endpoint(pki, CPUProofBackend(), pipeline_depth=2) as client:
+        expected_devices = client.dispatch_devices
         report = run_fixture(client, tmp_path, monkeypatch, ["pass", "zone", "reject", "pass"])
+    assert scheduled_devices == [expected_devices]
     assert report["qualified"] is False
     assert report["full_http_or_grader_capacity_qualified"] is False
     assert report["admitted_groups"] == 3 and report["passing_groups"] == 2
@@ -70,6 +81,11 @@ def test_combined_keeps_all_normal_rejects_and_binds_only_complete_real_passes(p
     decisions = [row for row in attempts if row["event"] == "proof"]
     assert len(admissions) == 4 and all(row["admission_seconds"] >= .01 for row in admissions)
     assert len(decisions) == len(raw) == 3
+    assert {row["device_id"] for row in decisions} == {"cuda:0"}
+    assert all(
+        row["device_id"] == next(value for value in raw if value["job_id"] == row["job_id"])["device_id"]
+        for row in decisions
+    )
     assert {row["job_id"] for row in samples} == {"test:0", "test:3"}
     assert next(row for row in raw if row["job_id"] == "test:2")["proof_passed"] is False
     selection = {"input_sha256", "attempt_ledger_sha256", "proof_attempts_sha256", "corpus_sha256"}
@@ -85,6 +101,22 @@ def test_combined_keeps_all_normal_rejects_and_binds_only_complete_real_passes(p
             assert row[field] == report[field] == hashlib.sha256(Path(file).read_bytes()).hexdigest()
     assert all(Path(report[key]).stat().st_mode & 0o777 == 0o600
                for key in ("attempt_ledger", "proof_attempts", "samples"))
+
+
+def test_code_corpus_requires_the_local_grader_bridge(monkeypatch):
+    from reliquary.cli import main as cli
+
+    starts = []
+    monkeypatch.setenv("GRADER_METRICS_PORT", "19877")
+    monkeypatch.setattr(cli, "_ensure_grader_running", lambda: starts.append(True))
+    monkeypatch.setattr(cli, "_grader_is_running", lambda _path: True)
+    benchmark._ensure_code_grader_bridge({"opencodeinstruct": object()})
+    assert starts == [True]
+    assert benchmark.os.environ["GRADER_METRICS_PORT"] == "0"
+
+    monkeypatch.setattr(cli, "_grader_is_running", lambda _path: False)
+    with pytest.raises(RuntimeError, match="grader bridge"):
+        benchmark._ensure_code_grader_bridge({"opencodeinstruct": object()})
 
 
 @pytest.mark.parametrize("failure", ["partial", "infrastructure", "bad_signature"])

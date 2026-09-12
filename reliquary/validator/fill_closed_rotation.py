@@ -2,8 +2,8 @@
 
 The gate is intentionally small and dependency-free.  It records the last
 locally committed trainer-journal key for one closed window and, when that
-window produced a complete publication cadence, the parent checkpoint that a
-successor must replace.  Absence is not success: the validator clears this
+window contained a real payload, the parent checkpoint that its boundary
+publication must replace.  Absence is not success: the validator clears this
 file only after the measured trainer cursor and (when required) an adopted
 checkpoint both cover the gate.
 """

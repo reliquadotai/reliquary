@@ -187,8 +187,12 @@ class CheckpointIntake:
                 field="candidate checkpoint",
             )
 
-    def poll(self) -> dict[str, Any] | None:
-        """Return a NEW candidate manifest, or None. Never raises."""
+    def poll(self, *, include_installed: bool = False) -> dict[str, Any] | None:
+        """Return a candidate manifest, or None. Never raises.
+
+        Rotation recovery may request the installed manifest to reconstruct a
+        cursor binding that an older validator did not persist.
+        """
         try:
             body = self._r2.get_object(
                 Bucket=self._bucket, Key=CANDIDATE_MANIFEST_KEY,
@@ -217,11 +221,10 @@ class CheckpointIntake:
                 + ", ".join(sorted(mismatches))
             )
             return None
-        if revision in {
-            self.installed_revision,
-            self.staged_revision,
-            self._staging_revision,
-        }:
+        ignored = {self.staged_revision, self._staging_revision}
+        if not include_installed:
+            ignored.add(self.installed_revision)
+        if revision in ignored:
             return None
         return manifest
 

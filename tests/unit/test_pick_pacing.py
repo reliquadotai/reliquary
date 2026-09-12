@@ -17,13 +17,10 @@ No constant encodes the trainer's step time (R31): the cadence is
 measured off the cursor, so it survives any model/hardware change on the
 train worker unchanged.
 
-And R39, which replaced R35's checkpoint reading: after a v6 window
-closes, the next one does not open until the trainer has CONSUMED the
-batches that window emitted. Waiting on a PUBLICATION was structurally
-wrong -- the trainer publishes at 16 TRAINED batches cumulative, not per
-window, so an underfilled window waited a full backstop for a checkpoint
-that was never coming and a mid-window publish over-armed the next
-window. Consumption has neither failure mode.
+After a v6 window closes, the next one does not open until the trainer has
+consumed its complete journal range. A later amendment publishes at every
+nonempty fill-window boundary, so work-bearing windows additionally wait for
+the exact covering successor checkpoint; tombstone-only windows do not.
 """
 import asyncio
 import logging
@@ -547,7 +544,7 @@ def _rotation_service(monkeypatch, *, key, cursor=None, enabled=True,
             required_journal_key=key,
             parent_checkpoint_n=7,
             parent_revision="7" * 40,
-            durable_payload_count=3,
+            durable_payload_count=3 if requires_successor else 0,
             requires_successor=requires_successor,
         )
     service._checkpoint_store = SimpleNamespace(
@@ -563,13 +560,18 @@ def _rotation_service(monkeypatch, *, key, cursor=None, enabled=True,
     return service
 
 
-def test_an_underfilled_window_waits_only_for_its_own_batches(monkeypatch):
-    """R39, the case revision-comparison got wrong. This window emitted 3
-    batches, not 16, so the trainer will NOT publish a checkpoint off it
-    -- and rotation must not wait for one. It waits for exactly what this
-    window put in the journal: the cursor reaching batch 2."""
+def test_an_underfilled_nonempty_window_waits_for_its_successor(monkeypatch):
+    """Boundary publication makes even a three-payload window produce a
+    covering successor after its complete journal range is consumed."""
     last = encoded_window_journal_key(WINDOW, 2)
-    service = _rotation_service(monkeypatch, key=last, cursor=last - 1)
+    service = _rotation_service(
+        monkeypatch, key=last, cursor=last - 1, requires_successor=True,
+    )
+
+    async def no_poll():
+        return None
+
+    service._advance_fill_closed_checkpoint_adoption = no_poll
 
     async def drive():
         task = asyncio.create_task(service._wait_for_fill_closed_rotation())
@@ -577,9 +579,20 @@ def test_an_underfilled_window_waits_only_for_its_own_batches(monkeypatch):
             await asyncio.sleep(0)
         assert not task.done()  # still holding on batch 2
         service._training_payload_queue.cursor = last
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()  # consumed, but successor is not adopted yet
+        service._fill_closed_rotation_gate = service._fill_closed_rotation_gate.record_adoption(
+            checkpoint_n=8, revision="8" * 40, trained_cursor=last,
+        )
+        service._checkpoint_store = SimpleNamespace(
+            current_manifest=lambda: SimpleNamespace(
+                checkpoint_n=8, revision="8" * 40,
+            )
+        )
         return await task
 
-    assert _run(drive()) == "batches_consumed"
+    assert _run(drive()) == "checkpoint_adopted"
 
 
 def test_rotation_releases_at_once_when_the_cursor_is_already_past(
@@ -692,7 +705,7 @@ def test_the_arming_records_the_last_emitted_batchs_journal_key(monkeypatch):
     assert gate.required_journal_key == encoded_window_journal_key(WINDOW, 2)
     assert gate.parent_checkpoint_n == 7
     assert gate.parent_revision == "7" * 40
-    assert gate.requires_successor is False
+    assert gate.requires_successor is True
 
 
 @pytest.mark.parametrize(
@@ -788,6 +801,56 @@ def test_full_window_requires_covering_checkpoint_adoption(monkeypatch):
         return await task
 
     assert _run(drive()) == "checkpoint_adopted"
+    assert service._fill_closed_rotation_gate is None
+
+
+def test_legacy_partial_gate_reconciles_an_installed_successor(monkeypatch):
+    import reliquary.constants as constants_module
+    from reliquary.validator.fill_closed_rotation import FillClosedRotationGate
+
+    monkeypatch.setattr(constants_module, "DETACHED_TRAINER", True)
+    last = encoded_window_journal_key(WINDOW, 2)
+    service = _rotation_service(monkeypatch, key=last, cursor=last)
+    service._fill_closed_rotation_gate = FillClosedRotationGate(
+        source_window=WINDOW,
+        required_journal_key=last,
+        parent_checkpoint_n=7,
+        parent_revision="7" * 40,
+        durable_payload_count=3,
+        requires_successor=False,
+    )
+    service._checkpoint_store = SimpleNamespace(
+        repo_id="org/repo",
+        current_manifest=lambda: SimpleNamespace(
+            checkpoint_n=8, revision="8" * 40,
+        ),
+    )
+    persisted = []
+    service._fill_closed_rotation_store = SimpleNamespace(
+        save=persisted.append, clear=lambda: None,
+    )
+
+    class Intake:
+        installed_revision = "8" * 40
+        staged_ready = False
+
+        @staticmethod
+        def poll(*, include_installed=False):
+            assert include_installed
+            return {
+                "checkpoint_n": 8,
+                "repo_id": "org/repo",
+                "revision": "8" * 40,
+                "trained_window_cursor": last,
+            }
+
+    service._checkpoint_intake = Intake()
+    service._detached_intake_ref = lambda: service._checkpoint_intake
+    service._intake_stage_task = None
+
+    assert _run(service._wait_for_fill_closed_rotation()) == "checkpoint_adopted"
+    assert persisted[0].requires_successor is True
+    assert persisted[-1].adopted_revision == "8" * 40
     assert service._fill_closed_rotation_gate is None
 
 

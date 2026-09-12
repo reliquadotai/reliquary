@@ -159,7 +159,17 @@ def test_corpus_refuses_wrong_checkpoint_and_unsigned_request_before_admission(p
 
 def test_isolated_harness_reuses_service_scheduler_and_refuses_duplicate_corpus(pki, tmp_path, monkeypatch):
     import scripts.measure_remote_proof_capacity as benchmark
-    with endpoint(pki, CPUProofBackend()) as client:
+    from reliquary.validator import proof_scheduler
+    real_scheduler = proof_scheduler.GlobalProofScheduler
+    scheduled_devices = []
+
+    def scheduler(**kwargs):
+        scheduled_devices.append(tuple(kwargs["devices"]))
+        return real_scheduler(**kwargs)
+
+    monkeypatch.setattr(proof_scheduler, "GlobalProofScheduler", scheduler)
+    with endpoint(pki, CPUProofBackend(), pipeline_depth=2) as client:
+        expected_devices = client.dispatch_devices
         client.qualify = lambda *args: pytest.fail("benchmark must not depend on prior capacity")
         monkeypatch.setattr(benchmark, "prepare_candidate", lambda row, **kwargs:
             ("openmathinstruct", group(client, index=kwargs["index"])))
@@ -188,6 +198,7 @@ def test_isolated_harness_reuses_service_scheduler_and_refuses_duplicate_corpus(
             benchmark.measure(corpus, output=tmp_path / "duplicate-output", pool=client,
                 tokenizer=None, environments={"openmathinstruct": object()}, timeout=10)
         assert not (tmp_path / "duplicate-output").exists()
+    assert scheduled_devices == [expected_devices]
 
 
 def test_a_dispatch_lane_is_measured_against_its_physical_slot(pki, tmp_path):
