@@ -121,3 +121,49 @@ def test_a_registry_that_is_not_json_is_refused():
 
 def test_an_empty_registry_parses_to_nothing():
     assert parse_registry(render_registry({})) == {}
+
+
+def test_parsing_an_oversubscribed_registry_is_refused():
+    raw = render_registry({"a": _entry("a", 0.9), "b": _entry("b", 0.9)})
+
+    with pytest.raises(RegistryError, match="1.8"):
+        parse_registry(raw)
+
+
+def test_an_oversubscribed_registry_can_still_be_inspected():
+    raw = render_registry({"a": _entry("a", 0.9), "b": _entry("b", 0.9)})
+
+    assert set(parse_registry(raw, strict=False)) == {"a", "b"}
+
+
+def test_an_unusable_task_id_is_a_registry_error():
+    raw = json.dumps({
+        "registry_version": 1,
+        "tasks": {"BadID": {
+            "profile_id": "p",
+            "profile_sha256": "a" * 64,
+            "incentive": {
+                "mechanism": MECHANISM_RL_DISCOVERED_PRICE,
+                "params": {**PARAMS, "cap": 0.5},
+            },
+            "status": "active",
+            "retired_at": None,
+        }},
+    }).encode()
+
+    with pytest.raises(RegistryError, match="BadID"):
+        parse_registry(raw)
+
+
+def test_a_non_integer_retired_at_is_a_registry_error():
+    with pytest.raises(RegistryError, match="retired_at"):
+        retire_task({"a": _entry("a", 0.5)}, "a", retired_at=None)
+
+
+def test_a_retired_entry_round_trips_still_reserving_its_cap():
+    entries = retire_task({"a": _entry("a", 0.5)}, "a", retired_at=12345)
+
+    restored = parse_registry(render_registry(entries))
+
+    assert restored == entries
+    assert total_cap(restored) == pytest.approx(0.5)

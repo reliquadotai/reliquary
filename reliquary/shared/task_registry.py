@@ -51,7 +51,10 @@ def _number(value: Any, field: str) -> float:
 
 def validate_entry(entry: TaskEntry) -> None:
     """Everything checkable about one entry without reading the image or R2."""
-    normalise_task_id(entry.task_id)
+    try:
+        normalise_task_id(entry.task_id)
+    except ValueError as exc:
+        raise RegistryError(str(exc)) from exc
     if entry.mechanism not in KNOWN_MECHANISMS:
         raise RegistryError(f"unknown incentive mechanism {entry.mechanism!r}")
     if entry.status not in {"active", "retired"}:
@@ -100,11 +103,17 @@ def retire_task(
 ) -> dict[str, TaskEntry]:
     if task_id not in entries:
         raise RegistryError(f"task {task_id!r} is not in the registry")
-    retired = replace(entries[task_id], status="retired", retired_at=int(retired_at))
+    try:
+        stamp = int(retired_at)
+    except (TypeError, ValueError) as exc:
+        raise RegistryError(
+            f"retired_at must be an integer round, got {retired_at!r}"
+        ) from exc
+    retired = replace(entries[task_id], status="retired", retired_at=stamp)
     return {**entries, task_id: retired}
 
 
-def parse_registry(raw: bytes) -> dict[str, TaskEntry]:
+def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
     try:
         document = json.loads(raw)
     except ValueError as exc:
@@ -133,8 +142,11 @@ def parse_registry(raw: bytes) -> dict[str, TaskEntry]:
             status=str(body.get("status", "active")),
             retired_at=body.get("retired_at"),
         )
-    for entry in entries.values():
-        validate_entry(entry)
+    if strict:
+        validate_registry(entries)
+    else:
+        for entry in entries.values():
+            validate_entry(entry)
     return entries
 
 
