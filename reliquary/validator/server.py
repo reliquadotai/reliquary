@@ -20,6 +20,7 @@ import collections
 import functools
 import hashlib
 import importlib.metadata
+import json
 import logging
 import multiprocessing
 import os
@@ -182,6 +183,12 @@ logger = logging.getLogger(__name__)
 
 PRECOMMIT_HEADER = "X-Reliquary-Precommit"
 MAX_PRECOMMIT_BODY_BYTES = 16 * 1024
+
+
+_NO_REVEAL_WIRE_VIOLATIONS = frozenset({
+    "upload_started_after_collection", "upload_payload_exceeded",
+    "upload_payload_incomplete", "upload_body_empty",
+})
 
 
 @dataclass
@@ -1549,7 +1556,7 @@ class ValidatorServer:
                     )
                 )
             ):
-                self._record_no_reveal(receipt)
+                self._record_no_reveal(receipt, cause="reveal_deadline_missed")
             resolver = getattr(
                 type(receipt.batcher), "resolve_upload_precommit", None
             )
@@ -1730,10 +1737,23 @@ class ValidatorServer:
         # Keep them bounded without shortening the established upload grace.
         return request_started_at + SUBMISSION_UPLOAD_GRACE_SECONDS
 
-    def _record_no_reveal(self, receipt: _UploadPrecommitReceipt) -> None:
+    def _record_no_reveal(
+        self, receipt: _UploadPrecommitReceipt, *, cause: str
+    ) -> None:
         if receipt.reveal_success_recorded or receipt.reveal_failure_recorded:
             return
         receipt.reveal_failure_recorded = True
+        logger.warning("no_reveal_incident %s", json.dumps({
+            "cause": cause, "receipt_id": receipt.receipt_id,
+            "hotkey": receipt.miner_hotkey, "operator": receipt.operator,
+            "environment": receipt.environment, "window": receipt.window_start,
+            "policy_window": receipt.admission_policy_window,
+            "prompt_idx": receipt.prompt_idx,
+            "precommit_arrival_ts": receipt.precommit_arrival_ts,
+            "upload_started_at": receipt.upload_started_at_wall,
+            "body_completed_at": receipt.body_completed_at_wall,
+            "deadline": receipt.expires_at_wall, "recorded_at": time.time(),
+        }, sort_keys=True))
         update = self._no_reveal_circuit.record_no_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
@@ -1806,10 +1826,12 @@ class ValidatorServer:
         *,
         reason: RejectReason = RejectReason.PRECOMMIT_INVALID,
         expired: bool = False,
+        incident_cause: str | None = "payload_mismatch",
     ) -> None:
         if receipt.terminal:
             return
-        self._record_no_reveal(receipt)
+        if incident_cause is not None:
+            self._record_no_reveal(receipt, cause=incident_cause)
         receipt.consumed = True
         self._complete_upload_receipt(
             receipt,
@@ -1840,7 +1862,12 @@ class ValidatorServer:
                 chunk_bytes=int(chunk_bytes),
             )
             if not accepted:
-                self._fail_upload_receipt(receipt)
+                self._fail_upload_receipt(
+                    receipt,
+                    incident_cause=(
+                        reason if reason in _NO_REVEAL_WIRE_VIOLATIONS else None
+                    ),
+                )
             return accepted, reason
         if event == "complete":
             marker = getattr(
@@ -1859,11 +1886,20 @@ class ValidatorServer:
             if accepted:
                 receipt.body_completed_at_wall = float(at)
             else:
-                self._fail_upload_receipt(receipt)
+                self._fail_upload_receipt(
+                    receipt,
+                    incident_cause=(
+                        reason if reason in _NO_REVEAL_WIRE_VIOLATIONS else None
+                    ),
+                )
             return bool(accepted), reason
         if event == "aborted":
             if state.get("wire_body_completed_at") is None:
-                self._fail_upload_receipt(receipt)
+                self._fail_upload_receipt(
+                    receipt, incident_cause=("reveal_deadline_missed"
+                        if state.get("wire_body_timed_out")
+                        and at > receipt.expires_at_wall else None),
+                )
                 return False, "upload_body_incomplete"
             return True, None
         return False, "wire_event_invalid"
@@ -1911,7 +1947,7 @@ class ValidatorServer:
                     and receipt.body_completed_at_wall > receipt.expires_at_wall
                 )
             ):
-                self._record_no_reveal(receipt)
+                self._record_no_reveal(receipt, cause="reveal_deadline_missed")
             resolver = getattr(
                 type(receipt.batcher), "resolve_upload_precommit", None
             )
@@ -2004,6 +2040,10 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause=("upload_started_after_collection"
+                    if upload_started_at > self._receipt_upload_start_deadline(receipt)
+                    else _start_reason if _start_reason in _NO_REVEAL_WIRE_VIOLATIONS
+                    else None),
             )
             return "expired", receipt
         if body_completed_at > receipt.expires_at_wall:
@@ -2011,6 +2051,7 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause="reveal_deadline_missed",
             )
             return "expired", receipt
         if not self._precommit_matches_submission(
@@ -3516,7 +3557,7 @@ class ValidatorServer:
         if receipt.consumed:
             return "replay", receipt
         if body_completed_at > receipt.expires_at_wall:
-            self._record_no_reveal(receipt)
+            self._record_no_reveal(receipt, cause="reveal_deadline_missed")
             receipt.consumed = True
             self._complete_upload_receipt(
                 receipt,
@@ -3534,7 +3575,7 @@ class ValidatorServer:
                 payload_sha256.lower(), receipt.payload_sha256
             )
         ):
-            self._record_no_reveal(receipt)
+            self._record_no_reveal(receipt, cause="payload_mismatch")
             receipt.consumed = True
             self._complete_upload_receipt(
                 receipt,
@@ -3549,6 +3590,8 @@ class ValidatorServer:
         )
         if revealed is not None:
             revealed(receipt.batcher, receipt.receipt_id)
+        receipt.body_completed_at_wall = body_completed_at
+        self._record_valid_reveal(receipt)
         receipt.consumed = True
         return "valid", receipt
 
@@ -3668,6 +3711,7 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause="reveal_deadline_missed",
             )
             outcome = receipt.outcome or BatchSubmissionResponse(
                 accepted=False, reason=RejectReason.PRECOMMIT_EXPIRED
@@ -3750,6 +3794,8 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause=(start_reason
+                    if start_reason in _NO_REVEAL_WIRE_VIOLATIONS else None),
             )
             outcome = receipt.outcome or BatchSubmissionResponse(
                 accepted=False, reason=RejectReason.PRECOMMIT_EXPIRED
@@ -4060,6 +4106,7 @@ class ValidatorServer:
         async def precommit(
             request: SubmissionPrecommitRequest,
             http_request: Request,
+            response: Response,
         ) -> SubmissionPrecommitResponse:
             """Reserve one bounded reveal for a body committed before cutoff."""
             from reliquary.protocol.submission import WindowState
@@ -4304,6 +4351,13 @@ class ValidatorServer:
                 precommit_signature=request.precommit_signature,
             )
             if not no_reveal_decision.allowed:
+                response.headers["X-Reliquary-Reject-Detail"] = "no_reveal_cooldown"
+                response.headers["X-Reliquary-Circuit-Status"] = no_reveal_decision.status
+                response.headers["X-Reliquary-Circuit-Scope"] = "operator_environment"
+                if no_reveal_decision.retry_after_window is not None:
+                    response.headers["X-Reliquary-Retry-After-Window"] = str(
+                        no_reveal_decision.retry_after_window
+                    )
                 logger.warning(
                     "no_reveal_circuit_rejected window=%d env=%s "
                     "hotkey=%s operator=%s status=%s retry_after_window=%s",
@@ -5911,7 +5965,6 @@ class ValidatorServer:
             telemetry.body_parse_ms = prepared.body_parse_ms
             telemetry.admission_prepare_ms = prepared.preparation_ms
             if request is None:
-                self._record_no_reveal(receipt)
                 reject_stage = prepared.reject_stage or "admission_worker"
                 response = reject_without_request(
                     prepared.reject_reason or RejectReason.BAD_SCHEMA,
