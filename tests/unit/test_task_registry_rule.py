@@ -167,3 +167,44 @@ def test_a_retired_entry_round_trips_still_reserving_its_cap():
 
     assert restored == entries
     assert total_cap(restored) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("bad", ["0.99", None, True])
+def test_a_non_numeric_price_parameter_is_refused(bad):
+    entry = replace(_entry("a", 0.5), params={**PARAMS, "cap": 0.5, "decay": bad})
+
+    with pytest.raises(RegistryError, match="decay"):
+        add_task({}, entry)
+
+
+def test_a_fractional_round_count_is_refused():
+    entry = replace(
+        _entry("a", 0.5), params={**PARAMS, "cap": 0.5, "rounds_per_step": 10.5}
+    )
+
+    with pytest.raises(RegistryError, match="rounds_per_step"):
+        add_task({}, entry)
+
+
+def test_an_infinite_retired_at_is_a_registry_error():
+    with pytest.raises(RegistryError, match="retired_at"):
+        retire_task({"a": _entry("a", 0.5)}, "a", retired_at=float("inf"))
+
+
+def test_a_fractional_retired_at_in_the_file_is_refused():
+    raw = json.dumps({
+        "registry_version": 1,
+        "tasks": {"a": {
+            "profile_id": "p",
+            "profile_sha256": "a" * 64,
+            "incentive": {
+                "mechanism": MECHANISM_RL_DISCOVERED_PRICE,
+                "params": {**PARAMS, "cap": 0.5},
+            },
+            "status": "retired",
+            "retired_at": 1.5,
+        }},
+    }).encode()
+
+    with pytest.raises(RegistryError, match="retired_at"):
+        parse_registry(raw)

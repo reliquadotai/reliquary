@@ -62,6 +62,22 @@ def validate_entry(entry: TaskEntry) -> None:
     missing = [f for f in PRICE_PARAM_FIELDS if f not in entry.params]
     if missing:
         raise RegistryError(f"missing price parameters: {', '.join(missing)}")
+    # Every controller parameter must be a number here: a string that survives
+    # to live arithmetic fails a window instead of refusing a start.
+    for field in PRICE_PARAM_FIELDS:
+        _number(entry.params[field], field)
+    for field in ("rounds_per_step", "median_rounds"):
+        value = entry.params[field]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RegistryError(
+                f"{field} must be a whole number of rounds, got {value!r}"
+            )
+    if entry.retired_at is not None and (
+        isinstance(entry.retired_at, bool) or not isinstance(entry.retired_at, int)
+    ):
+        raise RegistryError(
+            f"retired_at must be an integer round or null, got {entry.retired_at!r}"
+        )
     cap = _number(entry.params["cap"], "cap")
     if not 0.0 <= cap <= 1.0:
         raise RegistryError(f"cap must be between 0.0 and 1.0, got {cap}")
@@ -105,7 +121,7 @@ def retire_task(
         raise RegistryError(f"task {task_id!r} is not in the registry")
     try:
         stamp = int(retired_at)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise RegistryError(
             f"retired_at must be an integer round, got {retired_at!r}"
         ) from exc
