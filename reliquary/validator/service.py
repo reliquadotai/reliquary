@@ -24,6 +24,7 @@ from reliquary.constants import (
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
     TASK_ID,
+    TASK_EMISSION_SHARE,
     TRAINING_RUN_ID,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
@@ -2413,7 +2414,7 @@ class ValidationService:
                 # splits it per environment and per batch itself -- it is
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
-                window_pool=1.0,
+                window_pool=TASK_EMISSION_SHARE,
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
@@ -4720,6 +4721,7 @@ class ValidationService:
             "archive_schema_version": 2,
             "window_status": "completed",
             "task_id": TASK_ID,
+            "task_emission_share": TASK_EMISSION_SHARE,
             "window_start": first_batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": first_batcher.randomness,
@@ -5171,6 +5173,7 @@ class ValidationService:
             "archive_schema_version": 2,
             "window_status": "aborted",
             "task_id": TASK_ID,
+            "task_emission_share": TASK_EMISSION_SHARE,
             "window_start": int(first_batcher.window_start),
             "validator_hotkey": validator_hotkey,
             "randomness": str(getattr(first_batcher, "randomness", "")),
