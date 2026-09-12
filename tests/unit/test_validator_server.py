@@ -686,6 +686,10 @@ def test_no_reveal_circuit_rejects_operator_before_receipt_registration():
             headers={"Content-Type": "application/json"},
         )
 
+    assert response.headers["X-Reliquary-Reject-Detail"] == "no_reveal_cooldown"
+    assert response.headers["X-Reliquary-Retry-After-Window"] == "510"
+    assert response.headers["X-Reliquary-Circuit-Scope"] == "operator_environment"
+    assert set(response.json()) == {"accepted", "reason", "receipt_id", "upload_deadline_ts"}
     assert response.status_code == 200
     assert response.json()["reason"] == RejectReason.RATE_LIMITED.value
     assert server._upload_precommit_receipts == {}
@@ -1113,7 +1117,8 @@ def test_inactive_signed_precommit_does_not_extend_collection():
     assert circuit["partial_strike_entries"] == 1
 
 
-def test_abandoned_started_upload_is_terminal_and_releases_bytes():
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_interrupted_upload_releases_bytes_and_only_deadline_counts(timed_out):
     from reliquary.protocol.submission import WindowState
 
     server = ValidatorServer()
@@ -1148,7 +1153,9 @@ def test_abandoned_started_upload_is_terminal_and_releases_bytes():
         None,
     )
     assert batcher.upload_precommit_payload_bytes == 1
-    assert server._wire_upload_event("aborted", scope, started_at + 0.1, 0) == (
+    scope["state"]["wire_body_timed_out"] = timed_out
+    ended_at = committed["upload_deadline_ts"] + 1 if timed_out else started_at + 0.1
+    assert server._wire_upload_event("aborted", scope, ended_at, 0) == (
         False,
         "upload_body_incomplete",
     )
@@ -1162,7 +1169,7 @@ def test_abandoned_started_upload_is_terminal_and_releases_bytes():
     assert batcher.pending_upload_precommits == 0
     assert batcher.upload_precommit_payload_bytes == 0
     circuit = server._no_reveal_circuit.health_snapshot(current_window=500)
-    assert circuit["no_reveals_total"] == 1
+    assert circuit["no_reveals_total"] == int(timed_out)
     assert circuit["valid_reveals_total"] == 0
 
 
@@ -1208,7 +1215,11 @@ def test_wire_complete_reveal_is_not_expired_during_application_delay():
 
 
 @pytest.mark.asyncio
-async def test_exact_malformed_body_is_not_counted_as_valid_reveal():
+@pytest.mark.parametrize("reason,stage", [
+    (RejectReason.BAD_SCHEMA, "body_parse"),
+    (RejectReason.WORKER_DROPPED, "admission_worker"),
+])
+async def test_exact_body_reveal_survives_preparation_failure(reason, stage):
     from reliquary.protocol.submission import WindowState
 
     server = ValidatorServer()
@@ -1256,8 +1267,8 @@ async def test_exact_malformed_body_is_not_counted_as_valid_reveal():
         rewards=[],
         rollout_hashes=[],
         selection_digest=None,
-        reject_reason=RejectReason.BAD_SCHEMA,
-        reject_stage="body_parse",
+        reject_reason=reason,
+        reject_stage=stage,
     )
     server._admission_materialization_pool = ThreadPoolExecutor(max_workers=1)
     server._run_admission_process = AsyncMock(return_value=prepared)
@@ -1273,11 +1284,11 @@ async def test_exact_malformed_body_is_not_counted_as_valid_reveal():
     assert receipt.terminal is True
     assert receipt.outcome == BatchSubmissionResponse(
         accepted=False,
-        reason=RejectReason.BAD_SCHEMA,
+        reason=reason,
     )
     circuit = server._no_reveal_circuit.health_snapshot(current_window=500)
-    assert circuit["no_reveals_total"] == 1
-    assert circuit["valid_reveals_total"] == 0
+    assert circuit["no_reveals_total"] == 0
+    assert circuit["valid_reveals_total"] == 1
 
 
 def test_precommit_headers_cannot_prime_before_window_open():
@@ -2993,3 +3004,44 @@ async def test_worker_drops_late_items_for_stale_batcher():
     )
     assert old_batcher.pending_proof_reservations == 0
     assert old_batcher.proof_grading_attempts == 0
+
+
+@pytest.mark.parametrize("wire_reason,charged", [
+    ("upload_payload_exceeded", True),
+    ("upload_started_after_collection", True),
+    ("payload_capacity_exceeded", False),
+    ("upload_precommit_missing", False),
+])
+def test_wire_failure_only_charges_attributable_incidents(monkeypatch, caplog, wire_reason, charged):
+    from reliquary.protocol.submission import WindowState
+
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.difficulty_auction_enabled = True
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    request = _request(valid_merkle=True)
+    server.set_registered_hotkeys(
+        {request.miner_hotkey}, operator_by_hotkey={request.miner_hotkey: "operator"},
+    )
+    payload = request.model_dump_json().encode()
+    precommit = _precommit_for(request, payload_bytes=len(payload))
+    committed = TestClient(server.app).post(
+        "/submit/precommit", content=precommit.model_dump_json(),
+        headers={"Content-Type": "application/json"},
+    ).json()
+    receipt = server._upload_precommit_receipts[committed["receipt_id"]]
+    monkeypatch.setattr(server, "_account_upload_chunk", lambda *a, **kw: (False, wire_reason))
+    scope = {"state": {"wire_receipt_id": receipt.receipt_id}}
+    server._wire_upload_event("chunk", scope, time.time(), 1)
+    server._wire_upload_event("chunk", scope, time.time(), 1)
+    health = server._no_reveal_circuit.health_snapshot(current_window=500)
+    assert health["no_reveals_total"] == int(charged)
+    incidents = [r for r in caplog.records if r.message.startswith("no_reveal_incident ")]
+    assert len(incidents) == int(charged)
+    if charged:
+        import json
+        event = json.loads(incidents[0].message.split(" ", 1)[1])
+        assert event["hotkey"] == request.miner_hotkey
+        assert event["receipt_id"] == receipt.receipt_id
+        assert event["cause"] == wire_reason

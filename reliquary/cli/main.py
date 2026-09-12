@@ -652,7 +652,7 @@ def validate(
                 remote_pool.start()
             if proof_mode == "remote":
                 proof_worker_pool = remote_pool
-                proof_slots = remote_pool.devices
+                proof_slots = remote_pool.dispatch_devices
                 proof_models = remote_pool.proxies()
                 model = next(iter(proof_models.values()))
                 from reliquary.validator.observed_proof_rollout import (
