@@ -698,8 +698,10 @@ def validate(
                 TASK_ID,
             )
             from reliquary.infrastructure.task_registry_store import read_registry
+            from reliquary.shared.task_id import DEFAULT_TASK_ID
             from reliquary.validator.task_config import (
                 TaskConfigError,
+                legacy_task_config,
                 resolve_task_config,
             )
 
@@ -709,13 +711,31 @@ def validate(
                 # the registry read is awaited in place rather than started
                 # with a second, nested `asyncio.run`. Done before any GPU or
                 # model work below so an undeclared task fails fast.
+                #
+                # An R2 outage must still refuse (we cannot tell what we may
+                # pay), which is why the read stays inside this try -- but a
+                # registry that reads back wholly EMPTY, for the legacy
+                # "default" task only, is not that: it is every validator
+                # running today, before anyone has ever written one. Falling
+                # back there is what keeps this branch from taking `default`
+                # down the day it ships.
                 registry_entries, _ = await read_registry()
-                task_config = resolve_task_config(
-                    registry_entries,
-                    TASK_ID,
-                    profile_id=PROTOCOL_PROFILE_ID,
-                    generation_contract=PROTOCOL_GENERATION_CONTRACT,
-                )
+                if not registry_entries and TASK_ID == DEFAULT_TASK_ID:
+                    logger.warning(
+                        "No task registry in R2; starting the legacy task at "
+                        "the full pool. Declare it with `reliquary tasks "
+                        "create --task-id default --profile-id %s --cap 1.0` "
+                        "and this fallback stops being used.",
+                        PROTOCOL_PROFILE_ID,
+                    )
+                    task_config = legacy_task_config()
+                else:
+                    task_config = resolve_task_config(
+                        registry_entries,
+                        TASK_ID,
+                        profile_id=PROTOCOL_PROFILE_ID,
+                        generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                    )
             except TaskConfigError as exc:
                 # Unlike a missing GPU lease, this is not an environment
                 # fault we can run through: we would not know what we are

@@ -727,6 +727,11 @@ class ValidationService:
         proof_devices: tuple[str, ...] | None = None,
         proof_models: dict[str, Any] | None = None,
         proof_capacity_qualification: dict[str, Any] | None = None,
+        # 1.0 is the legacy single-task pool, not a safe default for a new
+        # task: the env var this replaced had a fail-safe of 0.0 for anything
+        # other than "default". Every non-default construction must pass
+        # this explicitly, from the registry (see resolve_task_config /
+        # TaskConfig.emission_cap).
         emission_cap: float = 1.0,
         price_params: Any | None = None,
         proof_worker_pool: Any = None,
@@ -4256,6 +4261,11 @@ class ValidationService:
             outcome_from_archive,
         )
 
+        # This task's own declared parameters, if the registry gave us any;
+        # PRODUCTION_PRICE_PARAMS is the fallback for a task that hasn't
+        # (or, today, for the whole legacy fleet -- see legacy_task_config).
+        price_params = self._price_params or PRODUCTION_PRICE_PARAMS
+
         outcome = outcome_from_archive(
             {"window_status": "completed", **price_signal}
         )
@@ -4266,11 +4276,11 @@ class ValidationService:
             history = collections.deque(maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
             self._price_shadow_outcomes = history
         state = getattr(self, "_price_shadow_state", None) or PriceState(
-            price=PRODUCTION_PRICE_PARAMS.start,
-            last_good=PRODUCTION_PRICE_PARAMS.start,
+            price=price_params.start,
+            last_good=price_params.start,
         )
         history.append(outcome)
-        decision = advance(state, list(history), PRODUCTION_PRICE_PARAMS)
+        decision = advance(state, list(history), price_params)
         self._price_shadow_state = decision.state
         return {
             "price": decision.price,

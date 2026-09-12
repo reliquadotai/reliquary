@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from reliquary.environment.abi import canonical_sha256
+from reliquary.shared.task_id import DEFAULT_TASK_ID
 from reliquary.shared.task_registry import (
     PRICE_PARAM_FIELDS,
     RegistryError,
@@ -28,7 +29,7 @@ class TaskConfigError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class TaskConfig:
     task_id: str
-    entry: TaskEntry
+    entry: TaskEntry | None
     price_params: PriceParams
     emission_cap: float
 
@@ -72,4 +73,19 @@ def resolve_task_config(
         entry=entry,
         price_params=params,
         emission_cap=float(entry.params["cap"]),
+    )
+
+
+def legacy_task_config() -> TaskConfig:
+    """The pre-registry behaviour of the single task that predates it.
+
+    Only for a wholly absent registry: a present-but-wrong one still refuses.
+    """
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    return TaskConfig(
+        task_id=DEFAULT_TASK_ID,
+        entry=None,
+        price_params=PRODUCTION_PRICE_PARAMS,
+        emission_cap=1.0,
     )
