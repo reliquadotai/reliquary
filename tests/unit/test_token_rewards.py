@@ -1,5 +1,11 @@
-"""Characterize the token accounting retained for fill qualification."""
-from reliquary.validator.token_rewards import AcceptedGroup, split_environment_pool
+"""Characterize legacy and fixed-slot fill payment."""
+import pytest
+
+from reliquary.validator.token_rewards import (
+    AcceptedGroup,
+    split_environment_pool,
+    split_fixed_environment_pool,
+)
 
 
 def _g(hotkey, tokens, operator=None):
@@ -62,3 +68,21 @@ def test_two_hotkeys_under_the_same_operator_are_paid_independently():
     assert abs(rewards["operator-a-1"] - 0.45) < 1e-9
     assert abs(rewards["operator-a-2"] - 0.05) < 1e-9
     assert abs(rewards["operator-b-1"] - 0.5) < 1e-9
+
+
+def test_fixed_slots_ignore_length_and_burn_unfilled_capacity():
+    rewards = split_fixed_environment_pool(
+        [_g("short", 1), _g("long", 9_000), _g("no-eos", 0)],
+        pool=1.0,
+        slots=4,
+    )
+
+    assert rewards == {"short": 0.25, "long": 0.25, "no-eos": 0.25}
+    assert sum(rewards.values()) == 0.75
+
+
+def test_fixed_slots_reject_over_capacity():
+    with pytest.raises(ValueError, match="exceed"):
+        split_fixed_environment_pool(
+            [_g("a", 1), _g("b", 1)], pool=1.0, slots=1
+        )

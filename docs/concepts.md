@@ -33,27 +33,27 @@ Miners poll `GET /state` continuously. The response (`GrpoBatchState`) carries `
 The miner selects a `prompt_idx` from one active environment that is not in that environment's cooldown set. OpenMath uses OpenMathInstruct-2 (`nvidia/OpenMathInstruct-2`) with public labels and validator-recomputed local reward claims. OpenCode uses the pinned public curated prompt/case dataset, while the validator remains authoritative by executing cases in its sandbox. The reference engine uses uniform-random sampling with rejection against the cooldown set. This is a baseline: smarter miner-side selection — predicting which prompts will pass the zone filter for the current checkpoint — is expected. See [mining.md §Prompt selection strategy](mining.md#prompt-selection-strategy).
 
 **3. Miner generates M=16 rollouts.**
-The miner runs exactly `M_ROLLOUTS = 16` completions with the protocol-v5 forced sampling stream. The stream is derived from window randomness, prompt, checkpoint, rollout index, and token position; it deliberately excludes hotkey identity. The validator recomputes the same stream. Multiple hotkeys therefore cannot obtain different legal draws for one prompt, and clients advertising any protocol version or generation profile other than the active v5 contract are rejected before grading. The contract uses signed step-by-step Math and Code prompt templates, raw prompt encoding, full-support sampling (`T=1`, `top_p=1`, `top_k=0`), an 8192-token cap, and no BFT.
+The miner runs exactly `M_ROLLOUTS = 16` completions with the protocol-v6 forced sampling stream. The stream is derived from window randomness, prompt, checkpoint, rollout index, and token position; it deliberately excludes hotkey identity. The validator recomputes the same stream. Multiple hotkeys therefore cannot obtain different legal draws for one prompt, and clients advertising any protocol version or generation profile other than the active v6 contract are rejected before grading. The contract uses signed step-by-step Math and Code prompts plus the pinned Logic environment contract, raw prompt encoding, full-support sampling (`T=1`, `top_p=1`, `top_k=0`), an 8192-token cap, and no BFT. A natural EOS is valid only when it is the exact public forced inverse-CDF pick at that position; an EOS with merely plausible probability is not enough. A cap hit without EOS counts against the bounded truncation allowance.
 
 **4. Miner builds GRAIL sketches.**
 For each rollout the miner runs a bit-identical HuggingFace forward pass on the proof GPU to construct a GRAIL sketch commitment. The sketch binds the completion to the model's hidden-state activations. The miner signs the commit and packages everything into a `BatchSubmissionRequest` that includes `checkpoint_hash` (the HF revision from the last `/state` response). In OpenMath, `rollout.reward` must match the miner's local `env.compute_reward` value; the validator recomputes it and rejects mismatches. In OpenCode, local reward fields are placeholders and the validator computes sandboxed structured-case rewards before applying the zone filter.
 
 **5. Miner submits.**
-The miner serializes and hashes its final signed body, obtains a signed upload receipt from `POST /submit/precommit`, then sends the exact bytes to `POST /submit`. A predeadline receipt grants bounded upload grace without extending generation. In production, the body response is provisional (`accepted=True, reason="submitted"`) once queued. A background worker runs bounded admission and reward grading. Its later `ACCEPTED` verdict means the group entered the pending auction pool; it is not yet a GRAIL pass or a paid slot.
+The miner serializes and hashes its final signed body, obtains a signed upload receipt from `POST /submit/precommit`, then sends the exact bytes to `POST /submit`. A predeadline receipt grants bounded upload grace without extending generation. In production, the body response is provisional (`accepted=True, reason="submitted"`) once queued. A background worker runs bounded admission and reward grading. Its later `ACCEPTED` verdict means the group entered the proof queue; it is not yet a GRAIL pass or a paid slot.
 
-**6. Validator admits, ranks, proves, and selects.**
-Math and Code each collect an independent pending population of up to 96 productive candidates. The profile's 100 seconds is a hard ceiling; after 60 seconds an environment may close only when its primary 64-candidate population is trainable, the previous pipelined GPU half has finished, uploads and admission are drained, and candidate arrivals have been quiet for one drand round. Admission checks the window, checkpoint, protocol, registration/operator mapping, prompt, payload bounds, signatures, randomness, dedup, validator-authoritative rewards, and zone filter (`sigma >= 0.24`) without running the expensive model proof. Once frozen, each population ranks by `std(rewards) * (1 - mean(rewards))`; equal-difficulty v5 candidates use capped tokens per validator-observed elapsed round, then a post-seal drand tie-break. Arrival is the synchronized throughput clock, not a second standalone preference. The validator proves candidates top-down until it has at most 16 distinct-prompt winners, under the unchanged 32-attempt ranked proof limit and proof wall, with no operator winner cap. A failed high-ranked proof promotes the next candidate; an unselected candidate is never paid.
+**6. Validator admits, proves FIFO, and fills batches.**
+Each active environment admits independently. Cheap admission checks the window, checkpoint, protocol, registration/operator mapping, prompt, payload bounds, signatures, randomness, dedup, validator-authoritative rewards, termination shape, and zone filter (`sigma >= 0.24`) before GPU proof; proof then enforces GRAIL and the exact forced terminal pick. Eligible groups enter one monotone FIFO proof plan: observed upload rate, payload bytes, token count, difficulty, and submitted drand cannot improve order or payment. The scheduler asks for exactly `FILL_CLOSED_TARGET_GROUPS_PER_ENV = FILL_CLOSED_PICKS_PER_WINDOW × B_BATCH` successful groups per environment and stops speculative dispatch once that demand is met. Failed proofs consume the separate bounded admission budget. Every `B_BATCH=16` proven groups form one pick; the configured pick target closes the window. There is no seal-time auction or forensic proof tail.
 
-**7. Validator accumulates clean signal and runs a balanced GRPO step.**
-State transitions to `TRAINING`. Before retention, the validator assesses the selected groups and current reject profile. Quarantined windows remain archived and credited but do not enter training. Clean partial batches are retained across windows under the exact public checkpoint revision, capped at one target batch per environment. Once every active environment is full, the validator assesses the balanced retained batch again and runs `train_step()`. A checkpoint change discards pending samples before any new-revision samples are retained, so one optimizer step never mixes generation policies.
+**7. Validator emits clean training batches.**
+Each completed pick emits one immutable training payload containing up to 16 selected groups per active environment. The detached trainer consumes those payloads in journal order and runs GRPO without mixing checkpoint revisions. Before training, quarantine checks may archive and credit a suspicious payload while excluding it from optimizer and publish work. If the 1800-second backstop closes a short window, only complete or explicitly sealed partial picks are paid; missing fixed slots burn rather than being redistributed.
 
 **8. Validator publishes a new checkpoint.**
-State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 16` trained windows the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. If the PPO ratio gate detects behavior-policy drift sooner, the rejected step is excluded and the previously accepted in-memory updates are published immediately. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2, including quarantine metadata when present.
+Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 16` successful V6 payloads the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. If the PPO ratio gate detects behavior-policy drift sooner, the rejected step is excluded and the previously accepted in-memory updates are published immediately. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2, including quarantine metadata when present.
 
 **9. State → READY → OPEN.**
 The next window opens immediately. Winning prompts enter one-shot cooldown. Once per subnet epoch the validator calls `set_weights` on-chain with the current EMA snapshot.
 
-**Safety net.** Auction windows have an unconditional 100-second collection ceiling. Adaptive close cannot fire before 60 seconds or without the primary population, previous GPU completion, quiet arrivals, and drained work; no generic liveness breaker can bypass those gates. Queue drain and ranked proof work are bounded independently, and incomplete batches advance with unpaid slots burned. The legacy sparse-window breakers remain relevant only when the auction kill switch restores the old selector. Clean partial winners may complete a later checkpoint-consistent balanced training batch.
+**Safety net.** A v6 window normally closes after its configured pick target and has an unconditional 1800-second backstop. The default shape is 16 picks, 256 required passes, 512 productive admissions, and 1024 grading starts per environment; production overrides are valid only with matching capacity qualification. Incomplete fixed slots are unpaid and burn. The older 60–100-second adaptive auction constants apply only to legacy profiles.
 
 ---
 
@@ -71,9 +71,9 @@ Because each rollout's sketch is bound to the specific token sequence and the mo
 
 Binary equivalence note: OpenMath rewards are binary `{0, 1}` (the validator extracts the final `\boxed{...}`/`\fbox{...}` answer and compares after conservative normalization). With binary rewards, `σ = sqrt(p(1−p))` where `p = k/16`. The extreme non-degenerate groups have `σ(k=1 or 15) ≈ 0.242`, so `σ ≥ 0.24` admits k=1..15 while still rejecting k=0 and k=16.
 
-Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): threshold relaxes to `σ ≥ 0.22` to keep continuous-reward groups filling while miner population and env coverage are thin. For binary Math rewards, both v5 thresholds admit k=1..15.
+Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): threshold relaxes to `σ ≥ 0.22` to keep continuous-reward groups filling while miner population and env coverage are thin. For binary Math rewards, both v6 thresholds admit k=1..15.
 
-The v5 Math prompt explicitly asks for step-by-step reasoning and requires a boxed final answer; only that final channel can earn positive reward. Plain trailing numbers and `Answer:` lines score zero. A missing box is not treated as a trustworthy negative for auction economics: the validator evaluates the group under both attainable binary outcomes and uses the least favorable gated utility. This means deleting a naturally generated box cannot manufacture eligibility or a higher difficulty score. Empty, special-token, or unclosed final boxes are rejected separately as malformed.
+The v6 Math prompt explicitly asks for step-by-step reasoning and requires a boxed final answer; only that final channel can earn positive reward. Plain trailing numbers and `Answer:` lines score zero. A missing box is not treated as a trustworthy negative for admission: the validator evaluates the group under both attainable binary outcomes and requires every interpretation to remain in-zone. Deleting a naturally generated box therefore cannot manufacture eligibility. Empty, special-token, or unclosed final boxes are rejected separately as malformed.
 
 ### Cooldown — one-shot prompt rotation
 
@@ -104,17 +104,13 @@ This is the blast-radius control: if a new exploit appears, the network can
 observe and account for the window without immediately teaching the model that
 pattern.
 
-### Difficulty auction under protocol v5
+### Fill-closed FIFO under protocol v6
 
-> **Current production design.** Protocol v5 uses an adaptive 60–100-second collection, top-down deferred-proof auction, and profile-bound throughput tie-break. Its generation delta is the signed reasoning prompt. The original selector and payout contract is documented in [difficulty-auction-v2-design.md](superpowers/specs/2026-07-15-difficulty-auction-v2-design.md).
+Protocol v6 replaces the timed auction with a fill-closed stream. Per-window randomness remains drand-derived and exposed by `/state`; the submitted drand round is checked for freshness at precommit arrival but is never a ranking key. After admission, proof dispatch and selection use monotone FIFO ingress. Rate and payload measurements remain observability fields only.
 
-Per-window randomness remains drand-derived and exposed by `/state`. Submissions carry the current drand round, with stale/future rounds rejected at signed precommit arrival. Submitted drand is not a ranking key. Candidates rank by difficulty. Equal-difficulty v5 candidates rank by capped generated tokens per validator-observed elapsed drand round. Exact remaining ties use a post-seal drand salt bound to checkpoint, window, environment, operator, and prompt, never hotkey or miner-controlled payload metadata. Arrival is already the synchronized elapsed-time denominator and is not applied a second time. A bounded seal-beacon outage uses the same deterministic operator/prompt ticket without randomness; it does not restore exact-arrival priority.
+Multiple distinct operators may enter the same prompt pool, bounded at ten groups, while one operator may reserve only one logical claim per prompt. There is no per-operator winner cap and no runner-up split. Prompt uniqueness is canonical-content based, not index-only.
 
-Multiple distinct operators may enter the same prompt pool, bounded at ten groups, but only the first ranked candidate for that prompt that passes deferred proof can win. One operator may reserve only one logical claim per prompt; there is no per-operator winner cap. The active selector does not split a prompt slot among runners-up.
-
-Prompt uniqueness is canonical-content based, not index-only. The observation-only foundation for a future validator-authoritative utility tie-break is documented in [Auction v3 Utility Foundation](auction-v3-utility-foundation.md). It does not alter the active v5 difficulty-auction order or payout.
-
-This removes the old hotkey-count dilution surface: extra hotkeys neither produce different forced draws, reserve additional operator/prompt claims, nor create additional equal-score tie tickets.
+Every selected group occupies one fixed slot and receives the same slot share regardless of completion length, byte size, arrival rate, reward vector, or difficulty. A missing group leaves that share unpaid; it is never redistributed among winners. Extra hotkeys do not create different forced draws or additional operator/prompt claims, although FIFO still gives earlier valid arrivals a residual advantage until the window fills.
 
 ### EMA scoring — one payment per window, not per submission
 
@@ -126,9 +122,9 @@ The EMA fixes this: after each window, every hotkey's score is updated as:
 score_new = α × share_this_window + (1 − α) × score_old
 ```
 
-where `share_this_window` is the final per-hotkey share from proven auction slots. Each selected group earns one uniform slot; there is no active same-prompt split. `alpha = EMA_ALPHA = 2 / (72 + 1) ~= 0.027`. With a 72-window history, this gives a roughly 25-window half-life. A miner that stops contributing loses half its score in about 25 windows. The EMA is replayed from R2 archives at startup, so loss of local disk does not lose scoring history.
+where `share_this_window` is the final per-hotkey share from fixed FIFO slots. Each selected group earns one uniform slot; there is no active same-prompt split. `alpha = EMA_ALPHA = 2 / (72 + 1) ~= 0.027`. With a 72-window history, this gives a roughly 25-window half-life. A miner that stops contributing loses half its score in about 25 windows. The EMA is replayed from R2 archives at startup, so loss of local disk does not lose scoring history.
 
-At each `set_weights` call the validator submits the current EMA values directly. The sum of all EMA scores is the smoothed fill rate; `burn = max(0, 1 − sum)` goes to `UID_BURN = 0`.
+At each `set_weights` call the validator submits the current EMA values directly. The sum of all EMA scores is the smoothed fill rate; `burn = max(0, 1 − sum)` goes to the current subnet owner's UID, unless `RELIQUARY_UID_BURN` explicitly overrides it.
 
 ### Checkpoint hash gate — miners always run the current model
 
@@ -136,9 +132,9 @@ Every `BatchSubmissionRequest` includes `checkpoint_hash` — the HF commit revi
 
 This guarantees that training data always reflects the currently-published policy. Without it, a stale miner could produce rollouts from an old model, creating a training distribution mismatch.
 
-### Publish every N trained windows — HF cannot keep up with per-step pushes
+### Publish every 16 successful payloads — HF cannot keep up with per-step pushes
 
-The base model is Qwen3-4B-Base, used with raw prompt text rather than a chat template. Pushing a new safetensors snapshot to HF Hub on every window is infeasible due to Git LFS latency and HF rate limits. The validator therefore publishes after 16 successful balanced optimizer steps by default; operators can set `RELIQUARY_CHECKPOINT_PUBLISH_INTERVAL_WINDOWS` explicitly. A partial window may contribute retained samples but does not increment the cadence by itself. Quarantined windows are archived/credited but excluded from the accumulator. If `policy_ratio_drift` rejects a later step, that rejected step never reaches the optimizer and the validator publishes the preceding safe updates, refreshes the serving behavior policy, and retries a failed upload without training again. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
+The base model is Qwen3-4B-Base, used with raw prompt text rather than a chat template. Pushing a new safetensors snapshot to HF Hub after every payload is infeasible due to Git LFS latency and HF rate limits. The trainer therefore publishes after 16 successful optimizer steps by default; the legacy constant name remains `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS`. Quarantined or ratio-rejected payloads do not increment the successful-step cadence. If `policy_ratio_drift` rejects a later step, that rejected step never reaches the optimizer and the trainer publishes the preceding safe updates, refreshes the serving behavior policy, and retries a failed upload without training again. Between publishes, miners stay on the last-published revision — the hash gate keeps them there. `checkpoint_n` only increments on a successful publish, so the gate remains stable across the publish gap.
 
 ---
 
@@ -146,20 +142,20 @@ The base model is Qwen3-4B-Base, used with raw prompt text rather than a chat te
 
 ### How a miner earns
 
-1. Submit a protocol-v5, valid, in-zone group on a non-cooldown prompt during the 100-second collection interval.
-2. Rank highly enough by difficulty and pass the validator's deferred proof.
-3. Be the first proven candidate for that prompt. Each selected group earns one `pool / B_BATCH` environment slot.
+1. Submit a protocol-v6, valid, in-zone group on a non-cooldown prompt before the fill/backstop closes.
+2. Pass the validator's continuous proof early enough to enter a FIFO pick.
+3. Each selected group earns one fixed `window_pool / (environment_count × picks_target × B_BATCH)` slot.
 4. Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with the current EMA values. All validators submit inside a shared ~20-block window before the epoch boundary so they converge on identical weights. Your emission for the epoch is proportional to your EMA score.
 
 ### Rough expected earnings
 
-Suppose the network emits `E` TAO per epoch. You land on an average of `s` unshared winning prompts per window. The EMA converges to approximately `s / B_BATCH = s / 16` of the total filled-slot budget. Your share of emissions per epoch is approximately:
+Suppose the network emits `E` TAO per epoch. You land on an average of `s` selected groups per window, across `n_env` environments and `picks_target` picks. The EMA converges to this share of the total window budget:
 
 ```
-(s / 16) / (sum of all miners' EMA scores)
+s / (n_env * picks_target * B_BATCH)
 ```
 
-A miner consistently landing two winning prompts in one environment earns roughly `2/16 = 12.5%` of that environment's filled-slot budget before cross-window EMA normalization.
+The final emission share is that fixed-slot value divided by the sum of all miners' EMA scores. Completion length never changes it.
 
 ### What disqualifies a submission
 
@@ -169,10 +165,10 @@ A miner consistently landing two winning prompts in one environment earns roughl
 | `WINDOW_MISMATCH` | `window_start` in request does not match current window | Refresh `/state` and retry |
 | `WRONG_CHECKPOINT` | `checkpoint_hash` is stale | Re-poll `/state`, update revision, retry |
 | `BAD_PROMPT_IDX` | `prompt_idx >= len(env)` | Use a valid index from the environment |
-| `PROMPT_MISMATCH` | `tokens[:prompt_length]` does not match the canonical raw tokenization of `env.get_problem(prompt_idx).prompt` (chat template, altered reasoning cue, custom system prompt, etc.) | Render the v5 contract's exact environment template and use the pinned tokenizer; do not apply a chat template |
+| `PROMPT_MISMATCH` | `tokens[:prompt_length]` does not match the canonical raw tokenization of `env.get_problem(prompt_idx).prompt` (chat template, altered reasoning cue, custom system prompt, etc.) | Render the v6 contract's exact environment template and use the pinned tokenizer; do not apply a chat template |
 | `PROMPT_IN_COOLDOWN` | Prompt is in the active one-shot cooldown set | Pick a different `prompt_idx` |
 | `PROMPT_FULL` | The prompt's bounded pending population is full | Pick a less crowded prompt |
-| `SEED_MISMATCH` / `PROTOCOL_MISMATCH` | Client does not advertise protocol v5 or its forced sampled stream disagrees | Upgrade the miner and rebuild against the current generation contract |
+| `SEED_MISMATCH` / `PROTOCOL_MISMATCH` | Client does not advertise protocol v6 or its forced sampled stream disagrees | Upgrade the miner and rebuild against the current generation contract |
 | `HASH_DUPLICATE` | Rollout tokens duplicate a recently accepted rollout hash | Generate fresh tokens; do not replay |
 | `REWARD_MISMATCH` | Validator reward computation failed or produced a non-finite value | Treat as malformed output/env failure; miner rewards are not trusted |
 | `OUT_OF_ZONE` | `σ < 0.24` (or `σ < 0.22` during bootstrap), including the conservative interpretation of unboxed Math outcomes | Pick a different prompt and always produce a valid boxed final Math answer |
@@ -180,6 +176,7 @@ A miner consistently landing two winning prompts in one environment earns roughl
 | `WRONG_ROLLOUT_COUNT` | Submission does not have exactly `M_ROLLOUTS = 16` rollouts | Always submit exactly 16 |
 | `BAD_SIGNATURE` | GRAIL commit signature verification failed | Check wallet hotkey and signing code |
 | `GRAIL_FAIL` | Sketch does not match validator's forward pass | Check checkpoint, `attn_implementation`, and CUDA version |
+| `BAD_TERMINATION` | EOS is not the exact forced inverse-CDF pick, EOS appears before the final token, or the cap-truncation allowance is exceeded | Preserve the forced stream exactly and stop at its first configured EOS |
 
 ---
 
@@ -193,7 +190,7 @@ A miner consistently landing two winning prompts in one environment earns roughl
 | Delete or omit answer boxes to manufacture zero rewards | Boxless output scores zero, then conservative uncertain-outcome utility removes any manufactured eligibility/value | No economic advantage; the group may be out of zone |
 | Spam the same prompt every window | One-shot cooldown blocks re-entry after the prompt wins | 0 earnings after first winning inclusion |
 | Generate extra rollouts to select favorable reward vectors | Monitoring and training quarantine reduce blast radius; long-term private tasks / commit-first sampling are the durable fix | Some shaping value remains until durable mitigations land |
-| Submit extremely fast | 96-candidate pool, 60-second floor, GPU/quiet/drain gates | Difficulty ranks first; equal-throughput ties go to sealed drand, not raw arrival |
+| Inflate rate, payload bytes, or completion length | Those fields are telemetry only; FIFO order and fixed slot payment ignore them | No direct scoring or payment gain |
 | Register many hotkeys | Hotkey-free seed, operator/prompt dedup, and operator-bound equal-score ties | No extra legal draw or tie ticket for the same operator/prompt |
 | Run a stale model | `WRONG_CHECKPOINT` rejects before GRAIL | 0 earnings |
 

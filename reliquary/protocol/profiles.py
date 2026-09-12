@@ -530,7 +530,7 @@ _PROFILE_VALUES = (
                 prompt_template=_CODE_REASONING_PROMPT,
             ),
         },
-        # No ranking in v6, so no tie-break to rank with.
+        # Fill-closed uses FIFO; rate and payload size never rank a group.
         throughput_tiebreak=None,
     ),
     ProtocolProfile(

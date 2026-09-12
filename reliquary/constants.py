@@ -582,12 +582,10 @@ FORENSIC_SAMPLE_PER_WINDOW = 2
 
 # UID that receives unused slot emission budget (the burn address).
 #
-# Unset (the default) means "this validator's own uid", resolved from the
-# metagraph by its own hotkey at weight-submission time. The historical hard 0
-# was the SUBNET OWNER's uid, which is not a stable address: subnet ownership
-# changes, and a uid can move on re-registration — a stale literal silently
-# pays the wrong account every epoch. Set RELIQUARY_UID_BURN=<n> to pin an
-# explicit target (0 restores the legacy owner-burn) without a code release.
+# Unset resolves the current subnet owner's hotkey on-chain, then its current
+# metagraph UID. This follows ownership and re-registration instead of assuming
+# the owner stays at UID 0. RELIQUARY_UID_BURN remains an emergency explicit
+# override.
 _UID_BURN_RAW = _os.environ.get("RELIQUARY_UID_BURN", "").strip()
 UID_BURN: int | None = int(_UID_BURN_RAW) if _UID_BURN_RAW else None
 if UID_BURN is not None and UID_BURN < 0:
@@ -794,8 +792,9 @@ FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
 if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
     raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
 
-# Explicit opt-in: bounded online service may leave admitted work unproved.
-# Strict qualification retains its complete admission-budget guarantee.
+# Explicit opt-in: bounded online service may stop before trainer demand.
+# Strict service has no early dispatch cutoff and uses the admission budget
+# only to replace completed failures until trainer demand is met.
 FILL_CLOSED_PROOF_SERVICE_MODE = _os.environ.get(
     "RELIQUARY_FILL_CLOSED_PROOF_SERVICE_MODE", "strict"
 )
@@ -890,7 +889,7 @@ if (
     )
 
 FILL_CLOSED_PICK_PIPELINE_DEPTH = int(_os.environ.get(
-    "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH", "2"
+    "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH", "1"
 ))
 if not (
     1 <= FILL_CLOSED_PICK_PIPELINE_DEPTH <= FILL_CLOSED_EMISSIONS_PER_WINDOW
@@ -903,6 +902,11 @@ if not (
         "RELIQUARY_FILL_CLOSED_PICK_PIPELINE_DEPTH must be in [1, "
         f"{FILL_CLOSED_EMISSIONS_PER_WINDOW}]"
     )
+
+# Public identifiers for the v6 ordering change. Historical schema-v1 active
+# windows used rate then payload size; new windows use monotone FIFO.
+LEGACY_FILL_CLOSED_SELECTION_POLICY = "throughput-payload/v1"
+FILL_CLOSED_SELECTION_POLICY = "fifo-ingress/v1"
 
 # Runtime default for CLI/Docker operators. OpenCode remains available through
 # ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
@@ -1130,12 +1134,15 @@ MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW = 2
 # miners are publishing envelope sigs, set to True (default). The
 # False path is the pre-PR behaviour and remains DoS-exposed.
 
-# Armed production mechanism. The kill switch restores the legacy selection
-# path without changing the public schema. Math and Code use the same auction;
-# their independent resource accounting is enforced per environment.
+# Armed production mechanism. Math and Code use the same admission path; their
+# independent resource accounting is enforced per environment.
 DIFFICULTY_AUCTION_ENFORCE = _os.environ.get(
     "RELIQUARY_DIFFICULTY_AUCTION_ENFORCE", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
+if FILL_CLOSED_ENABLED and not DIFFICULTY_AUCTION_ENFORCE:
+    raise ValueError(
+        "v6 fill-closed requires RELIQUARY_DIFFICULTY_AUCTION_ENFORCE=1"
+    )
 DIFFICULTY_AUCTION_ENVIRONMENTS = tuple(
     ACTIVE_PROTOCOL_PROFILE.environments
 )
@@ -1292,8 +1299,11 @@ SUBNET_START_BLOCK = 0
 # if fewer than B valid submissions have landed. The unused slots burn.
 # Set generously — this is a backstop, not the cadence.
 WINDOW_TIMEOUT_SECONDS = 7200
-if FILL_CLOSED_BOUNDED_PROOFS and FILL_CLOSED_MAX_SECONDS > WINDOW_TIMEOUT_SECONDS:
-    raise ValueError("bounded fill backstop must not exceed the service window timeout")
+if FILL_CLOSED_ENABLED and (
+    FILL_CLOSED_MAX_SECONDS * (1 if FILL_CLOSED_BOUNDED_PROOFS else 2)
+    >= WINDOW_TIMEOUT_SECONDS
+):
+    raise ValueError("fill proof deadline must finish before the service window timeout")
 
 
 # Local directory for staged checkpoint files before R2 upload.

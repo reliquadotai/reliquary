@@ -1,10 +1,11 @@
-"""v6 pays by token; the archive must carry what the payment divides."""
+"""V6 pays fixed selected-group slots and archives the payment policy."""
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from reliquary.constants import (
+    B_BATCH,
     BFT_ANSWER_BUDGET,
     BFT_THINKING_BUDGET,
     FILL_CLOSED_EMISSIONS_PER_WINDOW,
@@ -98,7 +99,7 @@ def test_selection_telemetry_names_who_actually_paid(monkeypatch):
     monkeypatch.setattr(selection, "FILL_CLOSED_ENABLED", True)
     meta = selection.explain_batch_selection(submissions, **kwargs)
     assert {row["payment_source"] for row in meta.values()} == {
-        "fill_closed_token_split"
+        "fill_closed_fixed_group"
     }
 
 
@@ -133,7 +134,7 @@ def test_auction_telemetry_names_who_actually_paid(monkeypatch):
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
     assert {row["payment_source"] for row in _finalize()} == {
-        "fill_closed_token_split"
+        "fill_closed_fixed_group"
     }
 
 
@@ -324,8 +325,7 @@ def _one_batch(assembler, math_groups, code_groups, window=42):
     assembler.close()
 
 
-def test_the_assembler_splits_a_batch_pool_by_eos_tokens(monkeypatch):
-    """R20 + R15: nine times the tokens, nine times the share."""
+def test_the_assembler_ignores_completion_length_for_payment(monkeypatch):
     assembler = _assembler(monkeypatch)
     _one_batch(
         assembler,
@@ -337,10 +337,10 @@ def test_the_assembler_splits_a_batch_pool_by_eos_tokens(monkeypatch):
     )
 
     rewards = assembler.reward_map()
-    # One batch draws window_pool / envs / emissions-per-window per env.
     env_batch_pool = 1.0 / len(ENV_ORDER) / FILL_CLOSED_EMISSIONS_PER_WINDOW
-    assert abs(rewards["short"] - 0.1 * env_batch_pool) < 1e-12
-    assert abs(rewards["long"] - 0.9 * env_batch_pool) < 1e-12
+    group_share = env_batch_pool / B_BATCH
+    assert rewards["short"] == pytest.approx(group_share)
+    assert rewards["long"] == pytest.approx(group_share)
 
 
 def test_one_environments_token_mass_cannot_eat_the_others_share(monkeypatch):
@@ -358,9 +358,7 @@ def test_one_environments_token_mass_cannot_eat_the_others_share(monkeypatch):
     assert abs(rewards["mather"] - rewards["coder"]) < 1e-12
 
 
-def test_a_group_with_no_eos_tokens_is_paid_nothing(monkeypatch):
-    """A group whose every rollout hit the cap without EOS pays zero --
-    the admission-side property, carried through to the split."""
+def test_eos_token_count_is_telemetry_not_payment(monkeypatch):
     assembler = _assembler(monkeypatch)
     _one_batch(
         assembler,
@@ -372,14 +370,13 @@ def test_a_group_with_no_eos_tokens_is_paid_nothing(monkeypatch):
     )
 
     rewards = assembler.reward_map()
-    assert "padder" not in rewards
     env_batch_pool = 1.0 / len(ENV_ORDER) / FILL_CLOSED_EMISSIONS_PER_WINDOW
-    assert abs(rewards["finisher"] - env_batch_pool) < 1e-12
+    group_share = env_batch_pool / B_BATCH
+    assert rewards["padder"] == pytest.approx(group_share)
+    assert rewards["finisher"] == pytest.approx(group_share)
 
 
-def test_one_batch_draws_exactly_its_even_share_of_the_window(monkeypatch):
-    """The divisor: one window's pool spread evenly over its batches, so
-    the totals match a once-per-window split."""
+def test_unfilled_group_slots_burn_instead_of_redistributing(monkeypatch):
     assembler = _assembler(monkeypatch)
     _one_batch(
         assembler,
@@ -388,7 +385,13 @@ def test_one_batch_draws_exactly_its_even_share_of_the_window(monkeypatch):
     )
 
     total = sum(assembler.reward_map().values())
-    assert abs(total - 1.0 / FILL_CLOSED_EMISSIONS_PER_WINDOW) < 1e-12
+    expected = (
+        2
+        / B_BATCH
+        / FILL_CLOSED_EMISSIONS_PER_WINDOW
+        / len(ENV_ORDER)
+    )
+    assert total == pytest.approx(expected)
 
 
 def test_a_quarantined_batch_still_pays(monkeypatch):
@@ -416,7 +419,12 @@ def test_a_quarantined_batch_still_pays(monkeypatch):
     assert assembler.reward_map()["mather"] > 0.0
 
 
-async def _archive_one_v6_window(assembler=None):
+async def _archive_one_v6_window(
+    assembler=None,
+    *,
+    older_assemblers=None,
+    return_service=False,
+):
     from reliquary.validator.service import ValidationService
 
     fake_tok = MagicMock()
@@ -459,6 +467,7 @@ async def _archive_one_v6_window(assembler=None):
 
     if assembler is not None:
         svc._fill_closed_assemblers[assembler.window_start] = assembler
+    svc._fill_closed_assemblers.update(older_assemblers or {})
 
     with patch(
         "reliquary.infrastructure.archive_queue.get_archive_queue",
@@ -466,20 +475,54 @@ async def _archive_one_v6_window(assembler=None):
     ):
         await svc._archive_window(batcher, batch)
 
-    return captured["data"]
+    result = captured["data"]
+    return (result, svc) if return_service else result
 
 
 @pytest.mark.asyncio
 async def test_the_archive_records_eos_tokens_per_accepted_group(monkeypatch):
-    """The weight-only replay divides by tokens, so the archive must carry
-    them or two validators cannot converge on the same weights."""
+    """Completion length remains observable even though payment is fixed."""
     import reliquary.validator.service as service
     monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
 
-    archive = await _archive_one_v6_window()
+    assembler = _single_env_assembler(monkeypatch)
+    assembler.accept(
+        "fake",
+        [_paid_valid_submission(101, "paid", 42)],
+        42,
+        "rev",
+    )
+    archive = await _archive_one_v6_window(assembler=assembler)
 
     for entry in archive["batch"]:
         assert isinstance(entry["eos_tokens"], int)
+
+
+@pytest.mark.asyncio
+async def test_v6_archive_without_assembler_fails_closed(monkeypatch):
+    import reliquary.validator.service as service
+
+    monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
+    with pytest.raises(RuntimeError, match="has no assembler"):
+        await _archive_one_v6_window()
+
+
+@pytest.mark.asyncio
+async def test_archiving_a_window_does_not_drop_older_recovery_state(
+    monkeypatch,
+):
+    import reliquary.validator.service as service
+
+    monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
+    current = _single_env_assembler(monkeypatch)
+    older = object()
+    _archive, svc = await _archive_one_v6_window(
+        assembler=current,
+        older_assemblers={41: older},
+        return_service=True,
+    )
+
+    assert svc._fill_closed_assemblers[41] is older
 
 
 @pytest.mark.asyncio
@@ -490,11 +533,15 @@ async def test_the_archive_pays_from_the_assembler_not_the_auction(monkeypatch):
     import reliquary.validator.service as service
     monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
 
-    assembler = _assembler(monkeypatch, window=42)
-    _one_batch(
-        assembler,
-        [_paying_group("openmathinstruct", "mather", 700, 1)],
-        [_paying_group("opencodeinstruct", "coder", 2_100, 2)],
+    assembler = _single_env_assembler(monkeypatch)
+    assembler.accept(
+        "fake",
+        [
+            _paid_valid_submission(1, "mather", 700),
+            _paid_valid_submission(2, "coder", 2_100),
+        ],
+        42,
+        "rev",
     )
 
     archive = await _archive_one_v6_window(assembler=assembler)
@@ -512,17 +559,16 @@ async def test_the_archive_closes_the_window_it_is_archiving(monkeypatch):
     import reliquary.validator.service as service
     monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
 
-    assembler = _assembler(monkeypatch, window=42)
+    assembler = _single_env_assembler(monkeypatch)
     # Chunks handed over, but nothing closed: the remainder is still held.
     assembler.accept(
-        "openmathinstruct",
-        [_paying_group("openmathinstruct", "mather", 700, 1)],
-        42, "rev",
-    )
-    assembler.accept(
-        "opencodeinstruct",
-        [_paying_group("opencodeinstruct", "coder", 700, 2)],
-        42, "rev",
+        "fake",
+        [
+            _paid_valid_submission(1, "mather", 700),
+            _paid_valid_submission(2, "coder", 700),
+        ],
+        42,
+        "rev",
     )
     assert assembler.reward_map() == {}
 
@@ -659,15 +705,16 @@ async def test_the_archive_batch_is_the_assembler_paid_set(monkeypatch):
     archived = {(e["hotkey"], e["prompt_idx"]) for e in archive["batch"]}
     assert archived == {("paid1", 101), ("paid2", 102)}
     assert set(archive["rewards_by_hotkey"]) == {"paid1", "paid2"}
+    assert all(e["selected_for_batch"] for e in archive["batch"])
+    assert all(e["rewarded"] for e in archive["batch"])
+    assert {
+        e["payment_source"] for e in archive["batch"]
+    } == {"fill_closed_fixed_group"}
 
 
 @pytest.mark.asyncio
 async def test_the_archived_batch_replays_the_reward_map_per_batch(monkeypatch):
-    """R28: a weight-only validator divides the pool over the archive's
-    ``eos_tokens`` -- but payment is per assembled BATCH, so the replay
-    has to divide per batch too. The archive carries ``batch_index`` per
-    entry for exactly that; without it the replay is only right for a
-    single-batch window, which no real window is."""
+    """Archived policy and slot capacity reproduce the fixed reward map."""
     import reliquary.validator.service as service
     monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
 
@@ -699,18 +746,13 @@ async def test_the_archived_batch_replays_the_reward_map_per_batch(monkeypatch):
     assert {int(e["batch_index"]) for e in entries} == {0, 1}
     live = archive["rewards_by_hotkey"]
 
-    env_batch_pool = 1.0 / 1 / FILL_CLOSED_EMISSIONS_PER_WINDOW
-    by_batch: dict[int, list] = {}
-    for entry in entries:
-        by_batch.setdefault(int(entry["batch_index"]), []).append(entry)
+    assert archive["payment_policy"] == "fixed-selected-group/v1"
+    slot_share = 1.0 / FILL_CLOSED_EMISSIONS_PER_WINDOW / 3
     replayed: dict[str, float] = {}
-    for batch in by_batch.values():
-        batch_tokens = sum(int(e["eos_tokens"]) for e in batch)
-        for entry in batch:
-            share = env_batch_pool * int(entry["eos_tokens"]) / batch_tokens
-            replayed[entry["hotkey"]] = (
-                replayed.get(entry["hotkey"], 0.0) + share
-            )
+    for entry in entries:
+        replayed[entry["hotkey"]] = (
+            replayed.get(entry["hotkey"], 0.0) + slot_share
+        )
 
     assert set(replayed) == set(live) == {"a", "b", "c", "d"}
     for hotkey, share in replayed.items():
@@ -718,11 +760,7 @@ async def test_the_archived_batch_replays_the_reward_map_per_batch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_flat_replay_of_a_multi_batch_window_is_wrong(monkeypatch):
-    """The counter-example R28 rests on: dividing the whole window's pool
-    over the whole window's tokens does NOT reproduce the live map once a
-    hotkey is paid in two batches. Pinned so a future reader cannot mistake
-    the single-batch case for the general one."""
+async def test_partial_batch_burn_is_visible_in_the_archive(monkeypatch):
     import reliquary.validator.service as service
     monkeypatch.setattr(service, "FILL_CLOSED_ENABLED", True)
 
@@ -747,16 +785,10 @@ async def test_a_flat_replay_of_a_multi_batch_window_is_wrong(monkeypatch):
 
     archive = await _archive_one_v6_window(assembler=assembler)
 
-    entries = archive["batch"]
-    live = archive["rewards_by_hotkey"]
-    window_pool = sum(live.values())
-    window_tokens = sum(int(e["eos_tokens"]) for e in entries)
-    flat: dict[str, float] = {}
-    for entry in entries:
-        share = window_pool * int(entry["eos_tokens"]) / window_tokens
-        flat[entry["hotkey"]] = flat.get(entry["hotkey"], 0.0) + share
-
-    assert abs(flat["b"] - live["b"]) > 1e-6
+    assert len(archive["batch"]) == 5
+    assert sum(archive["rewards_by_hotkey"].values()) == pytest.approx(
+        5 / 3 / FILL_CLOSED_EMISSIONS_PER_WINDOW
+    )
 
 
 # --- Minor: a duplicate payload digest is refused at precommit --------

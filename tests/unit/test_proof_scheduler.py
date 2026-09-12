@@ -333,12 +333,12 @@ def test_hidden_resource_failure_is_applied_before_lower_rank_dispatch():
             required=2,
         )
         handle = scheduler.submit(replace(plan, allow_shortfall=True))
-        # This proves the second worker has inspected the queue.  On the broken
-        # scheduler it dispatches rank 3 before rank 4, so the negative
-        # assertion below fails without relying on a timing-only sleep.
-        assert unrelated_finished.wait(2)
+        # Rank 3 reserves the remaining potential winner slot while hidden rank
+        # 2 owns its resource. Lower rank 4 must wait for that chain to settle.
+        assert not unrelated_finished.wait(0.1)
         assert not lower_shared_started.is_set()
         leader_release.set()
+        assert unrelated_finished.wait(2)
         result = handle.result(2)
 
         assert set(invoked) == {"job-1", "job-2", "job-4"}
@@ -354,13 +354,11 @@ def test_hidden_resource_failure_is_applied_before_lower_rank_dispatch():
 
 
 def test_buffered_target_does_not_strand_an_earlier_rank_gap():
-    """A later RAW result cannot reserve a winner through a PENDING gap.
+    """An ineligible ranked head blocks lower work instead of creating a gap.
 
-    Ranks 1 and 2 reject.  Rank 3 then passes while rank 6 finishes out of
-    order.  Rank 5 was correctly held behind rank 4's unresolved resource
-    claim, but becomes the next applicable candidate when rank 3 claims that
-    prompt and skips rank 4.  Counting rank 6 as an outstanding winner at that
-    point must not leave rank 5 pending with both devices idle.
+    Ranks 1 and 2 reject. Rank 5 is held behind rank 4's unresolved resource
+    claim while rank 3 runs, so lower-ranked rank 6 must not jump the gap.
+    Once rank 3 passes and skips rank 4, rank 5 becomes the next proof.
     """
 
     leaders_started = threading.Barrier(3)
@@ -425,7 +423,7 @@ def test_buffered_target_does_not_strand_an_earlier_rank_gap():
         leaders_started.wait(timeout=2)
         release_leaders.set()
         assert rank_three_started.wait(2)
-        assert rank_six_finished.wait(2)
+        assert not rank_six_finished.wait(0.1)
         release_rank_three.set()
 
         assert rank_five_started.wait(2)
@@ -433,6 +431,7 @@ def test_buffered_target_does_not_strand_an_earlier_rank_gap():
 
         assert result.outcome is ProofPlanOutcome.COMPLETED
         assert result.abort_reason is None
+        assert result.attempts_started == 4
         assert result.winner_job_ids == ("job-3", "job-5")
         assert [decision.status for decision in result.decisions] == [
             ProofDecisionStatus.REJECTED,
@@ -449,6 +448,82 @@ def test_buffered_target_does_not_strand_an_earlier_rank_gap():
     finally:
         release_leaders.set()
         release_rank_three.set()
+        assert scheduler.close()
+
+
+@pytest.mark.parametrize("leader_passes", [True, False])
+def test_proof_credit_only_replaces_completed_failures(leader_passes):
+    leader_started = threading.Event()
+    release_leader = threading.Event()
+    peer_finished = threading.Event()
+    replacement_started = threading.Event()
+    unexpected_started = threading.Event()
+
+    def prove(invocation):
+        rank = invocation.candidate.rank
+        if rank == 1:
+            leader_started.set()
+            assert release_leader.wait(2)
+            return leader_passes
+        if rank == 2 and not leader_passes:
+            replacement_started.set()
+        elif rank == 3:
+            peer_finished.set()
+        else:
+            unexpected_started.set()
+        return True
+
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0", "gpu-1", "gpu-2", "gpu-3"),
+        environments=(MATH, CODE),
+        proof_callable=prove,
+        checkpoint_revision="rev-a",
+    )
+    try:
+        handle = scheduler.submit(
+            _plan(
+                "bounded-speculation",
+                MATH,
+                [
+                    _candidate(1, prompt="same"),
+                    _candidate(2, prompt="same"),
+                    *[_candidate(rank) for rank in range(3, 9)],
+                ],
+                required=2,
+                max_attempts=8,
+            )
+        )
+        assert leader_started.wait(2)
+        assert peer_finished.wait(2)
+        assert not unexpected_started.wait(0.1)
+        release_leader.set()
+        if not leader_passes:
+            assert replacement_started.wait(2)
+
+        result = handle.result(2)
+        assert result.attempts_started == 2 + int(not leader_passes)
+        assert result.winner_job_ids == (
+            ("job-1", "job-3")
+            if leader_passes
+            else ("job-2", "job-3")
+        )
+        assert [decision.status for decision in result.decisions] == [
+            (
+                ProofDecisionStatus.PASSED
+                if leader_passes
+                else ProofDecisionStatus.REJECTED
+            ),
+            (
+                ProofDecisionStatus.SKIPPED_PROMPT_CLAIMED
+                if leader_passes
+                else ProofDecisionStatus.PASSED
+            ),
+            ProofDecisionStatus.PASSED,
+            *[ProofDecisionStatus.NOT_NEEDED] * 5,
+        ]
+        assert not unexpected_started.is_set()
+    finally:
+        release_leader.set()
         assert scheduler.close()
 
 
@@ -941,6 +1016,51 @@ def test_active_proof_deadline_faults_without_waiting_for_cuda_return():
         assert scheduler.snapshot()["totals"]["late_results"] == 1
     finally:
         release.set()
+        assert scheduler.close()
+
+
+def test_proof_does_not_start_when_deadline_crosses_during_dispatch():
+    class BoundaryClock:
+        armed = False
+        worker_reads = 0
+
+        def __call__(self):
+            if self.armed and threading.current_thread().name.startswith(
+                "proof-device-"
+            ):
+                self.worker_reads += 1
+                return 9.0 if self.worker_reads == 1 else 10.0
+            return 0.0
+
+    clock = BoundaryClock()
+    invoked = []
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(MATH, CODE),
+        proof_callable=lambda invocation: invoked.append(invocation) or True,
+        checkpoint_revision="rev-a",
+        clock=clock,
+    )
+    try:
+        # Keep the worker outside until the plan is installed and the clock is
+        # armed: expiry observes t=9, the dispatch recheck observes t=10.
+        with scheduler._condition:
+            clock.armed = True
+            handle = scheduler.submit(
+                _plan(
+                    "deadline-dispatch-boundary",
+                    MATH,
+                    [_candidate(1)],
+                    required=1,
+                    deadline=10.0,
+                )
+            )
+
+        result = handle.result(2)
+        assert invoked == []
+        assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
+        assert result.abort_reason is CapacityAbortReason.DEADLINE_EXCEEDED
+    finally:
         assert scheduler.close()
 
 

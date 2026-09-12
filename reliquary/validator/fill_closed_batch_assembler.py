@@ -43,6 +43,11 @@ from reliquary.shared.training_payload import (
     encode_training_payload,
 )
 from reliquary.validator.quarantine import assess_training_batch
+from reliquary.validator.token_rewards import (
+    FIXED_GROUP_PAYMENT_POLICY,
+    AcceptedGroup,
+    split_fixed_environment_pool,
+)
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
 
 logger = logging.getLogger(__name__)
@@ -78,21 +83,16 @@ class FillClosedBatchAssembler:
         self._enqueue_fn = enqueue_fn
         self._tombstone_fn = tombstone_fn
         self._commit_fn = commit_fn
-        # R20: this window's whole emission budget. v6 has no auction --
-        # and the seal path IS the auction -- so payment is computed here,
-        # the only place a v6 window's ASSEMBLED batches are known. See
-        # ``_accrue_payment_locked`` for how one batch's draw is derived.
+        # This window's whole emission budget. Payment is computed here, the
+        # only place a v6 window's assembled batches are known.
         self._window_pool = float(window_pool)
         self._rewards_by_hotkey: dict[str, float] = {}
         # R24: every group this window actually PAID, in payment order, per
         # environment, each paired with the batch index it was paid in
         # (R28). The archive reads this in place of the auction's
         # winners -- under v6 the seal path selects nothing, so a
-        # weight-only validator replaying ``rewards_by_hotkey`` from
-        # ``eos_tokens`` has to divide over exactly the set the live
-        # validator divided over, batch by batch: the pool is split per
-        # assembled batch, so a hotkey paid in two batches does not
-        # reproduce from one flat per-window division.
+        # weight-only validator replaying ``rewards_by_hotkey`` has to use
+        # exactly the set the live validator paid.
         self._paid_groups: dict[str, list[tuple[int, Any]]] = {
             environment: [] for environment in self._env_order
         }
@@ -421,11 +421,9 @@ class FillClosedBatchAssembler:
         """Credit one assembled batch into this window's reward map (R20).
 
         Under v6 there is no auction to pay at seal, so this is where
-        emission is decided: per assembled batch, by EOS-terminated
-        completion tokens (``split_environment_pool``), never by a flat
-        slot share. ``eos_tokens`` was produced once at admission
-        (``admission.count_eos_completion_tokens``) and is read here as a
-        plain attribute -- never recomputed.
+        emission is decided. Every selected group receives one fixed slot
+        share. Completion length does not affect payment, and missing slots
+        burn instead of being redistributed.
 
         Two divisors, both deliberate:
 
@@ -433,8 +431,8 @@ class FillClosedBatchAssembler:
           exactly as the seal path's ``pool_per_env`` does. Pooling the
           environments together would let a long-completion environment
           take a short one's emission through raw token mass alone.
-        * ``FILL_CLOSED_EMISSIONS_PER_WINDOW`` (R15) -- a v6 window emits
-          up to that many batches where the seal path emitted exactly
+        * ``picks_target`` -- a v6 window emits up to that many batches
+          where the seal path emitted exactly
           one, so one window's pool is spread evenly over its batches.
           Totals are identical to splitting the pool once per window: N
           batches x pool/N. A window that closes with fewer batches pays
@@ -444,11 +442,6 @@ class FillClosedBatchAssembler:
 
         Called with ``_lock`` held and does no I/O, per R17.
         """
-        from reliquary.validator.token_rewards import (
-            AcceptedGroup,
-            split_environment_pool,
-        )
-
         if not self._env_order:
             return
         batch_pool_per_env = (
@@ -460,7 +453,7 @@ class FillClosedBatchAssembler:
             self._paid_groups.setdefault(environment, []).extend(
                 (int(batch_index), group) for group in env_batch
             )
-            shares = split_environment_pool(
+            shares = split_fixed_environment_pool(
                 [
                     AcceptedGroup(
                         hotkey=str(getattr(group, "hotkey", "")),
@@ -476,6 +469,7 @@ class FillClosedBatchAssembler:
                     for group in env_batch
                 ],
                 pool=batch_pool_per_env,
+                slots=B_BATCH,
             )
             for hotkey, share in shares.items():
                 self._rewards_by_hotkey[hotkey] = (
@@ -494,6 +488,14 @@ class FillClosedBatchAssembler:
         with self._lock:
             return dict(self._rewards_by_hotkey)
 
+    @property
+    def payment_policy(self) -> str:
+        return FIXED_GROUP_PAYMENT_POLICY
+
+    @property
+    def window_pool(self) -> float:
+        return self._window_pool
+
     def paid_groups(self) -> dict[str, list[tuple[int, Any]]]:
         """The groups this window's reward map was computed over (R24),
         each as ``(batch_index, group)`` (R28).
@@ -503,11 +505,8 @@ class FillClosedBatchAssembler:
         section, so the archive can never carry a payment whose group is
         missing or a group that was never paid.
 
-        The batch index is not decoration: ``_accrue_payment_locked``
-        splits ``pool / n_envs / EMISSIONS`` WITHIN each batch, so the
-        archive's replay has to group by it. Divide one window's whole
-        pool over one window's whole token mass and any hotkey paid in
-        two batches comes out wrong.
+        The batch index remains useful for auditing which fixed slots were
+        paid and which unfilled slots burned.
         """
         with self._lock:
             return {

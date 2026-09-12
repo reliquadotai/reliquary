@@ -79,7 +79,7 @@ docker logs watchtower | tail -20
 You need:
 
 - A GPU host with NVIDIA driver, CUDA 12.8+, and the NVIDIA Container Toolkit.
-- A capacity-qualified GPU fleet for the active profile, 64 GB RAM, and 150 GB disk. Protocol v6 qualification must cover 16-rollout, near-8192-token proofs and all 34 ranked-plus-forensic attempts per environment.
+- A capacity-qualified GPU fleet for the active profile, 64 GB RAM, and 150 GB disk. Protocol v6 qualification must cover 16-rollout, near-8192-token proofs for the 512-attempt admission budget per environment; normal dispatch stops once the 256 trainer-required passes are reached.
 - A public IP and an open inbound TCP port (default 8080) — miners must reach you.
 - HF Hub token with **write** access to your checkpoint repo.
 - R2 **write** credentials.
@@ -99,16 +99,16 @@ Trainer-specific `.env` keys (full list in `.env.example.trainer`):
 ```bash
 RELIQUARY_TRAIN=1
 # A pair: startup refuses the profile without the capability, and the
-# capability without exactly this profile. Every process that imports the
-# constants needs both — validator, detached train-worker, and miners.
-RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-fill-closed-v6
+# capability without exactly this profile. Every validator-side process that
+# imports the constants needs both.
+RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1
 RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1
 RELIQUARY_CHECKPOINT=Qwen/Qwen3-4B-Base
 RELIQUARY_HF_REPO_ID=your-org/reliquary-sn   # HF repo to push checkpoints to
 HF_TOKEN=hf_xxx                              # write access to that repo
 RELIQUARY_EXTERNAL_IP=<your-public-ip>       # advertised on-chain
 RELIQUARY_EXTERNAL_PORT=8080
-# Required fresh, v6-stamped base-reset checkpoint for protocol v6:
+# Preserve the immutable checkpoint currently advertised for this V1 run:
 RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
 RELIQUARY_PROOF_DEVICES=<qualified-canonical-device-list>
 RELIQUARY_PROOF_CAPACITY_MANIFEST=/root/reliquary/state/proof-capacity.json
@@ -206,8 +206,8 @@ appears (host daemon, `.env`, compose bind).
    nothing either way. The only real confirmation is the clock: time a window
    at one slot against N.
 
-The CLI compatibility default remains `openmathinstruct`, but the production
-auction contract is mixed Math+Code. Configure the trainer explicitly:
+The runtime default is `openmathinstruct`. OpenCode remains an explicit
+operator choice until its sandbox and miner rollout are qualified:
 
 ```bash
 RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
@@ -216,8 +216,8 @@ RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
 Both validator and miner load the same public curated dataset
 (`R0mAI/opencodeinstruct-curated`, pinned by default) lazily — the
 `structured_cases` ship with it, and the validator runs the grader and
-recomputes the code reward authoritatively. Auction, deferred proof, resource
-caps, and operator/prompt dedup apply independently to both environments. Do not start
+recomputes the code reward authoritatively. FIFO proof, fixed-slot payment,
+resource caps, and operator/prompt dedup apply independently to all environments. Do not start
 the mixed trainer until the image contains the grader rootfs, `runsc` starts
 successfully, and the loopback grader canaries pass.
 
@@ -239,48 +239,37 @@ checkpoint carries the v6 lineage stamp, and the exact proof fleet/runtime has
 a release-bound capacity manifest. Re-run qualification whenever the proof
 path, runtime fingerprint, checkpoint, or hardware identity changes.
 
-The v6 baseline must use a newly published, v6-stamped Qwen3-4B-Base reset and
-a new `RELIQUARY_TRAINING_RUN_ID`; an earlier-protocol checkpoint is only a
-separately labelled warm-start experiment. The prompt-protocol half of the
-cutover is unchanged from the
-[reasoning-prompt v5 cutover](reasoning-prompt-v5-cutover.md); v6 keeps the
-same model, templates and sampling and changes the window regime.
+The V5→V6 metadata transition preserves the exact weights, training-run ID,
+LR step, and last fully consumed archive boundary. Run
+`scripts/prepare_v5_fill_checkpoint.py` against the immutable V5 HEAD, review
+its create-only commit plan, and publish only after the final V5 window is
+drained. V6 keeps the model, templates, and sampling and changes the window,
+selection, proof, and payment regime.
 
 The 16-step checkpoint cadence limits behavior-policy staleness. If the ratio
 gate still trips before cadence, the rejected update is excluded and the
 validator publishes only the previously accepted in-memory steps before
 resuming against the refreshed behavior policy.
 
-### Adaptive 60–100 second collection
+### Fill-closed FIFO collection
 
-`RELIQUARY_AUCTION_EARLY_CLOSE_MODE` (default `shadow`):
+V6 has no adaptive 60–100-second auction. Each environment continuously admits
+and proves eligible groups in monotone FIFO order. Every `B_BATCH=16` proven
+groups form one pick; `FILL_CLOSED_PICKS_PER_WINDOW` closes the window.
+The default is 16 picks and 256 groups per environment.
+`FILL_CLOSED_MAX_SECONDS=1800` is only a stalled-window backstop.
 
-- `off` — use only the 100-second ceiling.
-- `shadow` — record when the adaptive gates would have closed, without sealing.
-- `enforce` — enable the adaptive close. The live validator already uses this
-  value; there is no additional staging-only activation flag.
+The global proof plan sets `required_passes` to the exact derived group target
+and stops dispatching the speculative tail as soon as that demand is met.
+The default 256-group shape permits 512 proof attempts and 1024 cheap grading
+starts. The default service mode is `strict`. Any smaller operational shape or
+bounded service is valid only with matching proof-capacity qualification; none
+of these values is an economic score input.
 
-Enforce never seals before 60 seconds and never waits past the profile's
-100-second ceiling. Between them, one environment is eligible only after:
-
-1. at least the primary 64 productive candidates and `B_BATCH` trainable
-   prompts exist;
-2. the previous pipelined GPU half has finished;
-3. no upload receipt, pending admission, or in-flight grading remains; and
-4. no candidate was accepted for at least one actual drand round.
-
-Productive admission defaults to 96, leaving 32 challenger positions after the
-primary population. Override it with
-`RELIQUARY_MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW=128` if later evidence calls
-for more collection headroom; this does not change the 32 ranked GPU-proof
-attempts, proof wall, generation contract, or miner protocol.
-
-The old 64-cap dominance close was self-confirming: it refused all later bodies
-and then treated their absence as proof that the winner set could not change.
-The adaptive close makes no dominance claim and performs no mid-window proof.
-`collection_seconds=100` remains the hard ceiling miners advertise and poll
-against; window numbering and the `/state` OPEN edge already support variable
-observed durations.
+The first pick cannot occur before 30 seconds. With the default pipeline depth
+of one, later picks are paced by the durable trainer cursor. Upload rate,
+payload bytes, completion tokens, reward difficulty, and submitted drand are
+recorded for audit but cannot reorder FIFO or change the fixed group payment.
 
 ### Cooldown on training restart
 
@@ -322,11 +311,11 @@ The trainer exposes the last `VERDICT_CAP_PER_HOTKEY = 200` lifecycle verdicts p
 
 - HTTP-level early rejects (`rate_limited`, `window_not_active`, `batch_filled`)
 - Worker admission outcomes after bounded checks and reward grading
-- Auction-seal outcomes with final rank, deferred-proof result, selection, and reward flags
+- Continuous-proof outcomes with selection and reward flags
 - Worker drains on window swap (`worker_dropped`)
 - Inline accepts under TestClient (`accepted`)
 
-An admission `accepted` is not a win. The final auction record is the one with
+An admission `accepted` is not a win. The final lifecycle record is the one with
 non-null `selected_for_batch` and `rewarded`. Public read is intentional and
 uses the same trust model as the R2 archive.
 
@@ -361,30 +350,31 @@ current constants are explained from the miner's perspective in
 
 | Constant | Value | Effect |
 |---|---|---|
-| `PROTOCOL_PROFILE_ID` | `qwen3-4b-base-dapo-fill-closed-v6` | Signed generation profile required from miners and validators |
+| `PROTOCOL_PROFILE_ID` | `qwen3-4b-base-dapo-reliquary-v1` | Signed three-environment protocol-v6 profile required from miners and validators |
 | `PROTOCOL_MODEL_ID` | `Qwen/Qwen3-4B-Base` | Base model; revision `906bfd4b4dc7f14ee4320094d8b41684abff8539` |
-| `B_BATCH` | 16 | Maximum proven winners and uniform reward slots per active environment |
+| `B_BATCH` | 16 | Proven groups and uniform reward slots per pick/environment |
 | `M_ROLLOUTS` | 16 | Required rollout count per submission |
 | `prompt_encoding` | `raw` | Tokenize the canonical prompt directly; applying a chat template is a mismatch |
 | Math / Code `prompt_template` | signed step-by-step templates | Exact template ID, renderer, text, and SHA-256 are advertised in `/state.generation_contract` |
+| Logic contract | `reliquary/answer-json/v1` | Pinned external task manifest with validator-authoritative JSON answer verification |
 | `T_PROTO` / `TOP_P_PROTO` / `TOP_K_PROTO` | `1.0` / `1.0` / `0` | Full-support profile sampling reproduced by the validator |
 | Math `answer_format` | `boxed` | Only a valid final `\boxed{...}` or `\fbox{...}` can earn positive Math reward |
 | Code `answer_format` | `null` | Code grading is validator-authoritative and has no boxed-answer contract |
-| Math / Code `max_new_tokens` | `8192` / `8192` | Per-rollout generation cap for both environments |
-| Math / Code `bft` | `null` / `null` | Budget-forced termination is disabled in v6 |
-| `FORCED_SEED_PROTOCOL_VERSION` | 5 | Mandatory hotkey-free forced stream while enforcement is active |
-| `FILL_CLOSED_EMISSIONS_PER_WINDOW` | 16 | Picks that close a window, and training batches it emits |
-| `FILL_CLOSED_TARGET_GROUPS_PER_ENV` | 256 | Proven groups per environment per window; refused unless it equals emissions x `B_BATCH` |
+| Math / Code / Logic `max_new_tokens` | `8192` | Per-rollout generation cap for every active environment |
+| Math / Code / Logic `bft` | `null` | Budget-forced termination is disabled in v6 |
+| `FORCED_SEED_PROTOCOL_VERSION` | 6 | Mandatory hotkey-free forced stream while enforcement is active |
+| `FILL_CLOSED_EMISSIONS_PER_WINDOW` | 16 | Immutable journal slots/stride reserved per window |
+| `FILL_CLOSED_PICKS_PER_WINDOW` | 16 default | Operational pick target; a smaller value requires matching qualification |
+| `FILL_CLOSED_TARGET_GROUPS_PER_ENV` | 256 default | Derived as picks per window × `B_BATCH` |
 | `FILL_CLOSED_MAX_SECONDS` | 1800 | Backstop for a window that never fills — not a collection target |
+| `FILL_CLOSED_PROOF_SERVICE_MODE` | `strict` | Dispatch until trainer demand is met; bounded mode is an explicit qualified override |
+| `FILL_CLOSED_ADMISSION_BUDGET_PER_ENV` | 512 | Maximum proof attempts per environment, including failed proofs |
+| `FILL_CLOSED_GRADING_START_BUDGET_PER_ENV` | 1024 | Cheap grading-start anti-DoS ceiling per environment |
+| `FILL_CLOSED_FIRST_PICK_SECONDS` | 30 | Earliest first pick after window open |
+| `FILL_CLOSED_PICK_PIPELINE_DEPTH` | 1 | Later picks are paced by the durable trainer cursor |
+| `FILL_CLOSED_SELECTION_POLICY` | `fifo-ingress/v1` | Monotone eligible ingress; rate and payload measurements are telemetry only |
+| `MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW` | 512 | Per-environment hotkey quota for the full fill-closed window |
 | `SUBMISSION_UPLOAD_GRACE_SECONDS` | 33 | Reveal grace for an exact body precommitted before the cutoff |
-| `WINDOW_COLLECTION_SECONDS` | 100 | Classic timed window only; a v6 window closes on its 16th pick, not on this clock |
-| `AUCTION_EARLY_CLOSE_MIN_SECONDS` | 60 | Classic timed window only; the adaptive-close path is not reached under v6 |
-| `PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 64 | Primary population for the classic adaptive close; inert under v6 |
-| `MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW` | 96 | Productive candidate ceiling per environment/window; 32 default challenger positions |
-| `MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW` | 32 | Ranked seal-time GPU proof ceiling per environment/window |
-| `FORENSIC_SAMPLE_PER_WINDOW` | 2 | Unpaid non-winner proof sample; cannot affect auction selection |
-| `MAX_PROOF_WALL_SECONDS` | 240 | Seal-time proof wall-clock ceiling per environment |
-| `MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW` | 4 | Operator-wide seal GPU debt limit per environment |
 | `MAX_SUBMISSION_PAYLOAD_BYTES` | 64 MiB | Per-request parsed JSON payload limit |
 | `MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY` | 128 MiB | Retained pending payload cap per hotkey/environment |
 | `MAX_PENDING_SUBMISSION_BYTES_PER_ENV` | 512 MiB | Retained pending payload cap per environment |
@@ -395,35 +385,25 @@ current constants are explained from the miner's perspective in
 | `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |
 | `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
 | `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |
-| `MIN_EOS_PROBABILITY` | 0.001 | Required EOS token probability for proper termination |
+| exact forced terminal pick | required | A natural EOS must be the public forced inverse-CDF token; probability alone cannot authorize it |
 | `MAX_TRUNCATED_PER_SUBMISSION` | 1 | Steady-state cap/non-EOS truncation allowance; accepted cap hits still pass GRAIL/logprob/distribution/boxed checks |
 | `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
 | `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
 | `TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH` | 32768 | Rollout length that counts as extreme-length telemetry |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS` | 4 | Minimum long/cap rollouts before length alone can quarantine a window |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS` | 3 | Minimum groups with long/cap rollouts before length alone can quarantine a window |
-| `MAX_SEAL_QUEUE_DRAIN_SECONDS` | 60 | Deadline work-drain bound before the auction population freezes |
-| `SPARSE_VALID_*` / `WINDOW_TIMEOUT_SECONDS` | legacy fallback | Used when the auction kill switch restores count/idle-based selection |
 | `EMA_ALPHA` | ≈0.0274 | Weight-update smoothing (`2/(72+1)` — ~25-window half-life) |
 | `REJECTED_LIST_CAP_PER_HOTKEY` | 5 | Max rejected samples retained per hotkey per window archive |
 
 Source of truth: `reliquary/constants.py`. If any of these change, this table and `concepts.md` need a sync.
 
-### Balanced training accumulation
+### Fill-closed training journal
 
-Sparse seals no longer discard otherwise valid gradient signal. The validator
-retains at most the configured target for each active environment and trains
-only when all targets are present. Pending groups are bound to one checkpoint
-revision and are cleared on revision drift, accumulated-batch quarantine, or a
-completed or failed training attempt. A process restart also clears this
-in-memory buffer; window archives and miner rewards are independent and remain
-durable.
-
-Operators can inspect `training_accumulator_checkpoint_revision`,
-`training_accumulator_targets`, `training_accumulator_counts`, and
-`training_accumulator_ready` in `/health`. Every archive also includes a
-`training_accumulator` record with per-window additions, overflow, source
-windows, reset reason, and whether a step was attempted.
+Each pick writes one immutable checkpoint-bound payload containing up to 16
+fixed slots per active environment. The detached trainer consumes the 16
+consecutive journal keys in order. Create-only receipts, the window recovery
+record, and the trainer cursor make replay idempotent across controller or
+trainer restarts; payloads from different checkpoint revisions never mix.
 
 ### Submission pipeline
 
@@ -433,7 +413,7 @@ Upgraded miners first send a small signed `/submit/precommit` containing the
 final body's SHA-256, byte count, routing fields, nonce, checkpoint, protocol,
 and current drand round. A receipt accepted before the collection cutoff allows
 only that exact body to finish within `SUBMISSION_UPLOAD_GRACE_SECONDS = 33`.
-It consumes normal hotkey quota but no prompt or auction slot, so abandoned
+It consumes normal hotkey quota but no prompt or proof slot, so abandoned
 precommits cannot squat economic capacity. Direct `/submit` remains valid
 before cutoff for compatibility; after cutoff a matching receipt is required.
 
@@ -443,23 +423,18 @@ HTTP/pre-queue                 environment worker
 window/checkpoint/protocol     prompt/token/randomness/signature checks
 envelope/registration          validator-authoritative reward grading
 operator logical claim         zone and cheap authenticity guards
-rate/queue/payload bounds      -> pending auction pool
+rate/queue/payload bounds      -> monotone FIFO proof queue
 -> reason="submitted"          -> first /verdicts lifecycle record
 
-60–100 s adaptive collection
--> after 60 s: require primary population + previous GPU half complete
--> require one drand round quiet + no uploads/pending/in-flight admission
--> otherwise continue to the 100 s hard ceiling
--> stop new admission and drain pre-seal work
--> freeze Math and Code populations independently
--> fetch post-seal drand salt
--> rank by difficulty, capped throughput bucket, sealed operator/prompt tie hash
-   (validator arrival is only the throughput clock denominator)
--> prove top-down under attempt/wall/operator-debt bounds
--> at most 16 distinct prompts; no operator winner cap
--> pay exactly the selected training groups; no boundary split
+continuous fill-closed proof
+-> dispatch eligible groups FIFO; rate/bytes/tokens never reorder them
+-> stop speculative dispatch at 256 successful proofs per environment
+-> proof failures consume the independent 512-attempt budget
+-> assemble one pick from each 16 proven groups
+-> pay one fixed share per selected group; missing slots burn
+-> close after 16 picks or the 1800 s backstop
 -> final /verdicts lifecycle records
--> R2 archive + rewards + balanced training accumulator
+-> immutable training journal + R2 archive + rewards
 ```
 
 Code grader candidate failures produce legitimate zero rewards. Grader
@@ -467,9 +442,10 @@ infrastructure failures are counted separately: retryable outages return
 `WORKER_DROPPED` and refund quota, while ambiguous worker crashes fail closed as
 `REWARD_MISMATCH` and consume the logical claim.
 
-R2's canonical mechanism payload is `difficulty_auction`; the historical
-`difficulty_auction_shadow` field is retained as an identical compatibility
-alias. In active mode its `mode` is `production`, not a counterfactual shadow.
+R2 retains the historical `difficulty_auction` and
+`difficulty_auction_shadow` field names for schema compatibility. Under v6
+their policy metadata records FIFO/fixed-slot behavior; the fields do not mean
+that a seal-time auction ran.
 
 The wire-v1 root check is validator-only and defaults to shadow mode
 (`RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE=false`). It recomputes the exact root
@@ -487,7 +463,7 @@ checks, five hotkeys, 24 windows, both active environments, zero compute
 errors, and zero unexplained mismatches. `/health` exposes the cumulative
 counts and the active enforcement flag.
 
-`/health` also reports the auction policy, per-environment queue/proof state,
+`/health` also reports the selection policy, per-environment queue/proof state,
 operator mapping, forced-seed ratio/CDF policy, Code grader failures, and the
 persistent archive queue. A nonzero `archive_queue_depth` is safe during a
 transient R2 failure, but growing depth or old
@@ -517,7 +493,9 @@ cannot serve from either path changes health to `degraded`; `/submit` returns a
 retryable HTTP 503 and refunds the request's rate-limit reservation. Prompt
 source failures are operator outages, not miner protocol verdicts.
 
-Forced-seed CDF enforcement also defaults off. Private schema-v3 calibration
+All-token forced-seed CDF enforcement defaults off. This is distinct from the
+v6 terminal rule: a natural EOS is already required to be the exact public
+forced inverse-CDF pick. Private schema-v3 calibration
 rows bind each observation to its window, environment, and checkpoint and
 count CDF misses above 0.01, 0.05, and 0.10. Run:
 
@@ -532,7 +510,7 @@ not raise the boundary epsilon merely to make the report pass: first separate
 environment, checkpoint, forced-span, and numerical-kernel effects using the
 schema-v3 fields.
 
-Termination keeps its exact current gate, but interesting low-probability EOS,
+Termination keeps that exact forced-terminal gate, but interesting low-probability EOS,
 natural-close, and cap-truncation decisions are written privately to
 `auth_forensics/termination-shadow.jsonl`. The rows include the distance from
 the public uniform to the submitted stop token's CDF interval. Summarize them
@@ -547,20 +525,19 @@ the matching checkpoint and generation stack. It does not authorize a wider
 acceptance interval: a miner can also search for near-boundary injected stops,
 so adversarial controls are required before any termination rule changes.
 
-Before `train_step`, the validator runs the training-quarantine gate. If the
-selected batch has high-confidence poison signals, the archive still publishes
-and emissions remain replayable from `rewards_by_hotkey`, but GRPO is skipped
-for that window. Checkpoint publish cadence is counted by successful trained
-windows, so a quarantined modulo-boundary window does not by itself freeze the
-public checkpoint. The archive field is:
+Before `train_step`, the validator runs the training-quarantine gate. If a
+selected payload has high-confidence poison signals, the archive still
+publishes and emissions remain replayable from `rewards_by_hotkey`, but that
+payload is excluded from GRPO. Checkpoint publish cadence is counted by
+successful trained steps. The archive field is:
 
 ```text
 training_quarantine = {quarantined, reasons, metrics}
 ```
 
-Submissions that get HTTP-accepted but reach the worker after population freeze
-are dropped as `WORKER_DROPPED`. They receive a `/verdicts` record, and aggregate
-per-hotkey/reason late-drop counts are persisted in the window archive.
+Submissions that get HTTP-accepted but reach the worker after the fill/backstop
+has closed are dropped as `WORKER_DROPPED`. They receive a `/verdicts` record,
+and aggregate per-hotkey/reason late-drop counts are persisted in the archive.
 
 ---
 

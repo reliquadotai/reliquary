@@ -50,14 +50,13 @@ WINDOW = 500
 # ------------------------------------------------------------------ #
 
 def test_the_pacing_constants_have_the_amendments_defaults():
-    """Spec 'Configuration added': first pick 30 s after open, pipeline
-    depth 2 (R34 -- the trainer always holds one batch in hand)."""
+    """First pick waits 30 s; only one unconsumed batch may lead."""
     from reliquary.constants import (
         FILL_CLOSED_FIRST_PICK_SECONDS,
         FILL_CLOSED_PICK_PIPELINE_DEPTH,
     )
     assert FILL_CLOSED_FIRST_PICK_SECONDS == 30.0
-    assert FILL_CLOSED_PICK_PIPELINE_DEPTH == 2
+    assert FILL_CLOSED_PICK_PIPELINE_DEPTH == 1
 
 
 # ------------------------------------------------------------------ #

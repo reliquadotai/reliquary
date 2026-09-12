@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -117,6 +118,7 @@ def _recovery_setup(tmp_path, monkeypatch, picks=16):
 
     monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr(queue_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
+    monkeypatch.setattr(recovery_module, "B_BATCH", 16)
     monkeypatch.setattr(recovery_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
     monkeypatch.setattr(recovery_module, "FILL_CLOSED_PICKS_PER_WINDOW", picks)
     store = FillClosedRecoveryStore(tmp_path)
@@ -144,8 +146,19 @@ def test_crash_after_payload_upload_keeps_paid_groups_and_pads_only_unwritten_sl
     store.recover(42, queue=restarted, archives=archives, rotation=rotation)
     archive = archives.pending_archives(start_window=42, end_window=42)[42]
     assert archive["window_status"] == "recovered_partial"
-    assert archive["batch"] == rows
-    assert archive["rewards_by_hotkey"] == {"alice": 0.75 / 32, "bob": 1.25 / 32}
+    assert archive["batch"] == [
+        {
+            **row,
+            "selected_for_batch": True,
+            "rewarded": True,
+            "payment_source": "fill_closed_fixed_group",
+        }
+        for row in rows
+    ]
+    assert archive["rewards_by_hotkey"] == {
+        "alice": 1 / 512,
+        "bob": 2 / 512,
+    }
     assert len(list(queue._journal_commit_dir.glob("window-*.json"))) == 16
     assert not store.windows()
     assert rotation.load().required_journal_key == 42 * 16 + 15
@@ -156,13 +169,76 @@ def test_crash_after_payload_upload_keeps_paid_groups_and_pads_only_unwritten_sl
 
 def test_crash_during_archive_enqueue_replays_exact_archive(tmp_path, monkeypatch):
     store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch)
-    archive = {"window_start": 42, "batch": [], "window_status": "completed"}
+    archive = {
+        "window_start": 42,
+        "batch": [],
+        "window_status": "completed",
+        "payment_policy": "fixed-selected-group/v1",
+        "selection_policy": "fifo-ingress/v1",
+        "picks_target": 16,
+        "journal_slots": 16,
+        "window_pool": 1.0,
+    }
     broken = SimpleNamespace(enqueue=lambda *args: (_ for _ in ()).throw(OSError("disk")))
     with pytest.raises(OSError):
         store.finish(42, archive, broken)
     FillClosedRecoveryStore(tmp_path).recover(42, queue=queue, archives=archives, rotation=rotation)
     assert archives.pending_archives(start_window=42, end_window=42)[42] == archive
     assert not store.windows()
+
+
+def test_new_window_rejects_archive_with_different_payment_policy(tmp_path, monkeypatch):
+    store, _, _, _ = _recovery_setup(tmp_path, monkeypatch)
+    archive = {
+        "payment_policy": "eos-tokens-per-batch/v1",
+        "selection_policy": "fifo-ingress/v1",
+        "picks_target": 16,
+        "journal_slots": 16,
+        "window_pool": 1.0,
+    }
+    with pytest.raises(RuntimeError, match="archive policy"):
+        store.finish(42, archive, SimpleNamespace(enqueue=lambda *_: None))
+
+
+def test_new_window_fails_closed_if_journal_stride_changes(tmp_path, monkeypatch):
+    import reliquary.validator.fill_closed_recovery as recovery
+
+    store, _, _, _ = _recovery_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(recovery, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 32)
+    with pytest.raises(ValueError, match="journal stride mismatch"):
+        store.load(42)
+    assert store._path(42).exists()
+
+
+def test_new_window_fails_closed_if_batch_target_differs_from_live_assembler(
+    tmp_path, monkeypatch
+):
+    from reliquary.validator.control import write_json
+
+    store, _, _, _ = _recovery_setup(tmp_path, monkeypatch)
+    record = store.load(42)
+    record["batch_targets"]["math"] = 3
+    write_json(store._path(42), record)
+
+    with pytest.raises(ValueError, match="batch target mismatch"):
+        store.load(42)
+
+
+def test_new_window_does_not_persist_an_invalid_batch_target(
+    tmp_path, monkeypatch
+):
+    import reliquary.validator.fill_closed_recovery as recovery
+
+    monkeypatch.setattr(recovery, "B_BATCH", 16)
+    store = FillClosedRecoveryStore(tmp_path)
+    with pytest.raises(ValueError, match="batch target mismatch"):
+        store.begin(
+            42,
+            checkpoint_n=7,
+            revision="a" * 40,
+            targets={"math": 3, "code": 16},
+        )
+    assert not store._path(42).exists()
 
 
 def test_quarantined_training_still_preserves_miner_payment_after_crash(tmp_path, monkeypatch):
@@ -173,7 +249,7 @@ def test_quarantined_training_still_preserves_miner_payment_after_crash(tmp_path
     queue.enqueue_committed_tombstone(672, b"training-quarantine", accounting=rows)
     store.recover(42, queue=queue, archives=archives, rotation=rotation)
     archive = archives.pending_archives(start_window=42, end_window=42)[42]
-    assert archive["rewards_by_hotkey"] == {"alice": 1 / 16}
+    assert archive["rewards_by_hotkey"] == {"alice": 1 / 256}
     assert archive["durable_payload_count"] == 0
     assert not rotation.load().requires_successor
 
@@ -251,7 +327,7 @@ queue=TrainingPayloadQueue(str(root/"payloads"))
 archives=ArchiveQueue(str(root/"archives"))
 store.recover(42,queue=queue,archives=archives,rotation=FillClosedRotationStore(root))
 archive=archives.pending_archives(start_window=42,end_window=42)[42]
-expected={} if sys.argv[2]=="body" else {"alice":1/16}
+expected={} if sys.argv[2]=="body" else {"alice":1/256}
 assert archive["rewards_by_hotkey"]==expected, archive
 assert len(list(queue._journal_commit_dir.glob("window-*.json")))==16
 assert not store.windows()
@@ -278,92 +354,120 @@ def test_live_accounting_commit_and_abort_release_stale_assembler(tmp_path, monk
     assert json.loads(original)["accounting"][0]["rollouts"][0]["hash"] == (b"h" * 32).hex()
     monkeypatch.setattr("reliquary.validator.service.FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr("reliquary.infrastructure.archive_queue.get_archive_queue", lambda: archives)
-    stale = SimpleNamespace(window_start=42)
-    svc = SimpleNamespace(_active_batchers={"math": SimpleNamespace(window_start=42)},
+    events = []
+    batcher = MagicMock(window_start=42)
+    batcher.prepare_fill_closed_paid_side_effects.side_effect = (
+        lambda groups: events.append(("prepare", groups))
+    )
+    batcher.commit_seal_side_effects.side_effect = (
+        lambda: events.append("commit")
+    )
+    assembler = MagicMock(window_start=42)
+    assembler.close.side_effect = lambda: events.append("close")
+    assembler.paid_groups.side_effect = lambda: (
+        events.append("paid") or {"math": [(0, group)]}
+    )
+    original_quarantine = store.quarantine_uncommitted
+    original_recover = store.recover
+
+    def quarantine(*args, **kwargs):
+        events.append("quarantine")
+        return original_quarantine(*args, **kwargs)
+
+    def recover(*args, **kwargs):
+        events.append("recover")
+        return original_recover(*args, **kwargs)
+
+    monkeypatch.setattr(store, "quarantine_uncommitted", quarantine)
+    monkeypatch.setattr(store, "recover", recover)
+    svc = SimpleNamespace(_active_batchers={"math": batcher},
         _archive_enqueued_windows=set(), _fill_closed_recovery_store=store,
         _training_payload_queue_ref=lambda: queue, _fill_closed_rotation_store=rotation,
-        _fill_closed_assemblers={42: stale}, _fill_closed_assembler=stale)
+        _fill_closed_assemblers={42: assembler}, _fill_closed_assembler=assembler,
+        _close_and_commit_fill_closed_paid_side_effects=(
+            ValidationService._close_and_commit_fill_closed_paid_side_effects
+        ))
     ValidationService._enqueue_aborted_window(svc, failure_stage="active", failure_type="RuntimeError")
     assert svc._fill_closed_assembler is None and not svc._fill_closed_assemblers
+    assert events[:6] == [
+        "close", "paid", ("prepare", [group]), "commit", "quarantine", "recover",
+    ]
     assert receipt_path.read_bytes() == original
-    assert archives.pending_archives(start_window=42, end_window=42)[42]["batch"] == rows
+    assert archives.pending_archives(start_window=42, end_window=42)[42][
+        "batch"
+    ] == [
+        {
+            **row,
+            "selected_for_batch": True,
+            "rewarded": True,
+            "payment_source": "fill_closed_fixed_group",
+        }
+        for row in rows
+    ]
 
 
 @pytest.mark.parametrize('legacy', [False, True])
-def test_recovery_preserves_original_payment_denominator_and_journal_stride(tmp_path, monkeypatch, legacy):
+def test_recovery_preserves_payment_policy_and_journal_stride(tmp_path, monkeypatch, legacy):
     import reliquary.validator.fill_closed_recovery as recovery
     from reliquary.validator.control import write_json
     monkeypatch.setattr(recovery, 'FILL_CLOSED_PICKS_PER_WINDOW', 10)
     store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch, picks=10)
     if legacy:
         record = store.load(42)
+        record['schema_version'] = 1
         record.pop('picks_target')
+        record.pop('journal_slots')
+        record.pop('payment_policy')
+        record.pop('selection_policy')
+        record.pop('window_pool')
         write_json(store._path(42), record)
     rows = [{'env_name': env, 'batch_index': 0, 'hotkey': 'alice', 'prompt_idx': 1,
              'eos_tokens': 16, 'claimed_checkpoint_hash': 'a' * 40} for env in ('math', 'code')]
     queue.enqueue_committed_payload(42 * 16, b'committed-training-body', accounting=rows)
     store.recover(42, queue=queue, archives=archives, rotation=rotation)
     record = archives.pending_archives(start_window=42, end_window=42)[42]
-    assert record['rewards_by_hotkey'] == {'alice': 1 / (16 if legacy else 10)}
+    assert record['rewards_by_hotkey'] == {
+        'alice': 1 / 16 if legacy else 1 / 160
+    }
+    assert record['payment_policy'] == (
+        'eos-tokens-per-batch/v1' if legacy
+        else 'fixed-selected-group/v1'
+    )
     assert len(list(queue._journal_commit_dir.glob('window-*.json'))) == 16
     assert rotation.load().required_journal_key == 42 * 16 + 15
 
 
-def test_recovery_bridge_accepts_v6_record_and_keeps_v1_writer(tmp_path, monkeypatch):
-    import reliquary.validator.fill_closed_recovery as recovery
+def test_schema1_recovery_keeps_token_weighted_rewards(tmp_path, monkeypatch):
     from reliquary.validator.control import write_json
 
-    monkeypatch.setattr(recovery, "B_BATCH", 16)
-    store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch, picks=10)
+    store, queue, archives, rotation = _recovery_setup(tmp_path, monkeypatch)
     active = store.load(42)
-    assert active["schema_version"] == 1
-    assert not {"journal_slots", "payment_policy", "selection_policy", "window_pool"} & active.keys()
-
-    active.update(
-        schema_version=2,
-        journal_slots=16,
-        payment_policy="fixed-selected-group/v1",
-        selection_policy="fifo-ingress/v1",
-        window_pool=0.8,
-    )
-    for field, invalid, error in (
-        ("payment_policy", "wrong", "payment policy"),
-        ("selection_policy", "wrong", "selection policy"),
-        ("journal_slots", 15, "journal stride"),
-        ("window_pool", -0.1, "window pool"),
+    active['schema_version'] = 1
+    for key in (
+        'journal_slots', 'payment_policy', 'selection_policy',
+        'window_pool', 'picks_target'
     ):
-        malformed = {**active, field: invalid}
-        write_json(store._path(42), malformed)
-        with pytest.raises(ValueError, match=error):
-            store.load(42)
-
+        active.pop(key)
     write_json(store._path(42), active)
     rows = [
-        {"env_name": env, "batch_index": 0, "hotkey": hotkey,
-         "prompt_idx": index, "eos_tokens": tokens,
-         "claimed_checkpoint_hash": "a" * 40}
-        for index, (env, hotkey, tokens) in enumerate((
-            ("math", "alice", 30), ("math", "bob", 0), ("code", "bob", 4)
-        ))
+        {'env_name': 'math', 'batch_index': 0, 'hotkey': 'alice',
+         'prompt_idx': 1, 'eos_tokens': 30,
+         'claimed_checkpoint_hash': 'a' * 40},
+        {'env_name': 'math', 'batch_index': 0, 'hotkey': 'bob',
+         'prompt_idx': 2, 'eos_tokens': 10,
+         'claimed_checkpoint_hash': 'a' * 40},
+        {'env_name': 'code', 'batch_index': 0, 'hotkey': 'bob',
+         'prompt_idx': 3, 'eos_tokens': 4,
+         'claimed_checkpoint_hash': 'a' * 40},
     ]
-    queue.enqueue_committed_payload(42 * 16, b"body", accounting=rows)
+    queue.enqueue_committed_payload(42 * 16, b'body', accounting=rows)
+
     store.recover(42, queue=queue, archives=archives, rotation=rotation)
 
     archive = archives.pending_archives(start_window=42, end_window=42)[42]
-    share = 0.8 / 2 / 10 / 16
-    assert archive["rewards_by_hotkey"] == pytest.approx({"alice": share, "bob": 2 * share})
-    assert archive["batch"] == [
-        {**row, "selected_for_batch": True, "rewarded": True,
-         "payment_source": "fill_closed_fixed_group"}
-        for row in rows
-    ]
-    assert {key: archive[key] for key in (
-        "journal_slots", "payment_policy", "selection_policy", "window_pool"
-    )} == {
-        "journal_slots": 16,
-        "payment_policy": "fixed-selected-group/v1",
-        "selection_policy": "fifo-ingress/v1",
-        "window_pool": 0.8,
+    assert archive['rewards_by_hotkey'] == {
+        'alice': 0.75 / 32,
+        'bob': 1.25 / 32,
     }
 
 

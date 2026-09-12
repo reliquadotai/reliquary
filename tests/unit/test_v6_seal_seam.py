@@ -2,7 +2,7 @@
 
 Under v6 a window's batches are proven on arrival, assembled by the
 service-level ``FillClosedBatchAssembler``, emitted to the trainer journal
-under the encoded key space, and PAID from the assembler's token split.
+under the encoded key space, and paid by the assembler's fixed-slot split.
 The seal path -- which is the auction -- therefore has nothing left to do:
 proving again re-charges proof-failure debt and submits a second plan, and
 writing again lands a duplicate payload under a RAW journal key that
@@ -75,44 +75,53 @@ def test_a_v6_seal_proves_nothing_and_selects_nothing(monkeypatch):
     assert dict(batcher._expensive_proof_failures_by_operator) == {}
 
 
-def test_a_v6_seal_still_records_the_cooldown_of_what_it_proved(monkeypatch):
-    """The seal path is the only writer of prompt/content cooldown and the
-    rollout-hash dedup set. v6 selects nothing NEW, but the groups it
-    already proved must still cool their prompts down, or the next window
-    re-serves them.
-
-    v6.1: ``_proven_groups`` holds pick-pool records now, and the cooldown
-    covers every one of them -- the group a pick took AND the group the
-    close burned (R32). The sets are a replay defence, not a payment
-    record: a burned group was graded, proved and seen all the same.
-    """
+def test_a_v6_seal_cools_only_groups_durably_paid_by_the_assembler(monkeypatch):
+    """Seal commits paid curriculum before a pipelined successor can open."""
     import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.dedup import RolloutHashSet
+    from reliquary.validator.service import ValidationService
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
-    batcher = _make_batcher()
+    batcher = _make_batcher(hash_set=RolloutHashSet(retention_windows=50))
     batcher.difficulty_auction_enabled = True
 
     def _pool_record(prompt_idx: int, *, picked: bool):
         value = MagicMock()
         value.prompt_idx = prompt_idx
-        value.prompt_content_sha256 = "c" * 64
+        value.prompt_content_sha256 = hashlib.sha256(
+            f"prompt:{prompt_idx}".encode()
+        ).hexdigest()
         value.rollout_hashes = [bytes([prompt_idx]) * 32]
         return batcher_module._ProvenGroup(
             value=value, rate=1.0, payload_bytes=1_000,
             receipt_id=str(prompt_idx), picked=picked,
         )
 
-    batcher._proven_groups = {
-        "openmathinstruct": [
-            _pool_record(17, picked=True), _pool_record(18, picked=False),
-        ]
-    }
+    paid = _pool_record(17, picked=True)
+    unpaid = _pool_record(18, picked=True)
+    batcher._proven_groups = {"openmathinstruct": [paid, unpaid]}
 
     batcher.seal_batch(pool=0.5)
 
+    assert not batcher._cooldown.current_cooldown_set(
+        batcher.window_start + 1
+    )
+    assembler = MagicMock()
+    assembler.paid_groups.return_value = {
+        "openmathinstruct": [(0, paid.value)]
+    }
+    ValidationService._close_and_commit_fill_closed_paid_side_effects(
+        {"openmathinstruct": batcher},
+        assembler,
+    )
+
     cooled = batcher._cooldown.current_cooldown_set(batcher.window_start + 1)
-    assert 17 in cooled
-    assert 18 in cooled
+    assert cooled == {17}
+    assert batcher._content_cooldown.current_cooldown_set(
+        batcher.window_start + 1
+    ) == {hashlib.sha256(b"prompt:17").hexdigest()}
+    assert paid.value.rollout_hashes[0] in batcher._hash_set
+    assert unpaid.value.rollout_hashes[0] not in batcher._hash_set
 
 
 @pytest.mark.classic_window

@@ -482,6 +482,56 @@ def test_failed_preopen_reuses_candidate_until_activation():
     assert health.last_window_preparation_failure is None
 
 
+def test_v6_preopen_failure_leaves_no_phantom_recovery_window(
+    tmp_path, monkeypatch,
+):
+    import reliquary.validator.service as service_module
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", True)
+    real_open = service_module.open_grpo_window
+    attempts = 0
+
+    def flaky_open(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("batcher construction failed")
+        return real_open(**kwargs)
+
+    monkeypatch.setattr(service_module, "open_grpo_window", flaky_open)
+    svc = _make_service()
+    recovery = FillClosedRecoveryStore(tmp_path / "recovery")
+    svc._fill_closed_recovery_store = recovery
+    svc._checkpoint_store = MagicMock()
+    svc._checkpoint_store.current_manifest.return_value = SimpleNamespace(
+        checkpoint_n=7,
+        revision="a" * 40,
+    )
+    candidate = svc._window_n + 1
+
+    with pytest.raises(RuntimeError, match="batcher construction failed") as error:
+        svc._open_window()
+    svc._rollback_preopen_window(error.value)
+
+    assert recovery.windows() == []
+    assert svc._fill_closed_assemblers == {}
+    assert svc._candidate_fill_closed_assembler is None
+
+    # A later preparation failure is still pre-open: no journal exists yet.
+    svc._open_window()
+    assert recovery.windows() == []
+    assert svc._candidate_fill_closed_assembler.window_start == candidate
+    svc._rollback_preopen_window(RuntimeError("prompt source failed"))
+    assert recovery.windows() == []
+
+    # The exact same candidate can now open and becomes durable at activation.
+    svc._open_window()
+    svc._activate_window()
+    assert recovery.windows() == [candidate]
+    assert set(svc._fill_closed_assemblers) == {candidate}
+
+
 @pytest.mark.asyncio
 async def test_prompt_preparation_failure_does_not_retry_randomness():
     from reliquary.environment.virtual_parquet import PromptSourceUnavailable
