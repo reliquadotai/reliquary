@@ -651,6 +651,11 @@ def validate(
                 remote_pool = RemoteProofPool.from_environment(repo_id=hf_repo_id)
                 remote_pool.start()
             if proof_mode == "remote":
+                # No device lease here: every slot below is a card on the
+                # executor host, reached over HTTPS, and this controller holds
+                # no local CUDA context at all. Cards are leased where they are
+                # actually bound -- in the local-proof branch below, which also
+                # covers shadow mode because its local pool is authoritative.
                 proof_worker_pool = remote_pool
                 proof_slots = remote_pool.devices
                 proof_models = remote_pool.proxies()
@@ -689,15 +694,29 @@ def validate(
                 if proof_device_identities:
                     from reliquary.constants import TASK_ID
                     from reliquary.validator.device_lease import (
+                        DeviceLeaseError,
                         acquire_device_leases,
                         default_lease_directory,
                     )
 
-                    acquire_device_leases(
-                        [identity.device_uuid for identity in proof_device_identities],
-                        task_id=TASK_ID,
-                        directory=default_lease_directory(),
-                    )
+                    try:
+                        acquire_device_leases(
+                            [identity.device_uuid for identity in proof_device_identities],
+                            task_id=TASK_ID,
+                            directory=default_lease_directory(),
+                        )
+                    except DeviceLeaseError as exc:
+                        # A raw traceback under `restart: unless-stopped` is a
+                        # crash loop that says nothing. Name the card, the
+                        # holder and the remedy once, then exit on a code of
+                        # our own (1 is the fatal proof plane, 2 is click's
+                        # usage error).
+                        logger.critical(
+                            "%s; stop that task or point this one at free cards "
+                            "with RELIQUARY_PROOF_DEVICES before starting it again",
+                            exc,
+                        )
+                        raise typer.Exit(code=3) from exc
                 proof_devices = tuple(
                     identity.device_id for identity in proof_device_identities
                 )
