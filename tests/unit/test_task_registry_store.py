@@ -147,3 +147,20 @@ async def test_retiring_keeps_the_cap_reserved(fake):
     entry = parse_registry(client.body)["a"]
     assert entry.status == "retired"
     assert entry.params["cap"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_an_oversubscribed_registry_is_refused_by_default(fake):
+    fake(render_registry({"a": _entry("a", 0.9), "b": _entry("b", 0.9)}))
+
+    with pytest.raises(RegistryError):
+        await store.read_registry()
+
+
+@pytest.mark.asyncio
+async def test_an_oversubscribed_registry_is_readable_when_not_strict(fake):
+    fake(render_registry({"a": _entry("a", 0.9), "b": _entry("b", 0.9)}))
+
+    entries, _ = await store.read_registry(strict=False)
+
+    assert set(entries) == {"a", "b"}

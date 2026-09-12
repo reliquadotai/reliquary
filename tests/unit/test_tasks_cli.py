@@ -43,6 +43,19 @@ def test_an_unknown_profile_is_refused():
         )
 
 
+def test_a_built_entry_passes_registry_validation():
+    from reliquary.shared.task_registry import validate_entry
+
+    entry = build_task_entry(
+        task_id="logic-probe",
+        profile_id="qwen3-4b-base-dapo-fill-closed-v6",
+        cap=0.25,
+        overrides={"start": 0.2, "decay": 0.95},
+    )
+
+    validate_entry(entry)
+
+
 def test_list_reads_a_registry_whose_declared_caps_exceed_one(monkeypatch):
     """``tasks list`` exists to let an operator see a broken registry so they
     can repair it, so it must not itself raise on an oversubscribed one."""
