@@ -5707,6 +5707,57 @@ class ValidatorServer:
                 "signature": cp.signature,
             }
 
+        @app.get("/tasks")
+        async def get_tasks():
+            import json
+            import os
+
+            from reliquary.constants import (
+                PROTOCOL_MODEL_ID,
+                PROTOCOL_MODEL_REVISION,
+                TASK_EMISSION_SHARE,
+                TASK_ID,
+            )
+
+            batcher = self.active_batcher
+            state = getattr(self, "_current_state", None)
+            tasks = [{
+                "task_id": TASK_ID,
+                "profile_id": PROTOCOL_PROFILE_ID,
+                "model": {"model_id": PROTOCOL_MODEL_ID, "model_revision": PROTOCOL_MODEL_REVISION},
+                "emission_share": TASK_EMISSION_SHARE,
+                "url": None,
+                "window": {
+                    "window_n": batcher.window_start if batcher is not None else None,
+                    "state": getattr(state, "value", None if state is None else str(state)),
+                },
+            }]
+            # Read per request: adding a task must not restart this one.
+            directory_path = os.environ.get("RELIQUARY_TASK_DIRECTORY_PATH", "").strip()
+            if directory_path:
+                try:
+                    declared = json.loads(open(directory_path, "rb").read())
+                except (OSError, ValueError):
+                    logger.warning("task directory %s unreadable", directory_path, exc_info=True)
+                    declared = []
+                if not isinstance(declared, list):
+                    declared = []
+                for entry in declared:
+                    if not isinstance(entry, dict):
+                        continue
+                    task_id, url = entry.get("task_id"), entry.get("url")
+                    if not isinstance(task_id, str) or not isinstance(url, str):
+                        continue
+                    tasks.append({
+                        "task_id": task_id,
+                        "profile_id": entry.get("profile_id"),
+                        "model": entry.get("model"),
+                        "emission_share": entry.get("emission_share"),
+                        "url": url,
+                        "window": None,
+                    })
+            return {"tasks": tasks}
+
 
 
 
