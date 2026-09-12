@@ -37,8 +37,16 @@ def _error_code(exc) -> str:
     return exc.response.get("Error", {}).get("Code", "")
 
 
-async def read_registry(**client_kwargs) -> tuple[dict[str, TaskEntry], str | None]:
-    """The registry and the ETag to write it back against. Absent reads empty."""
+async def read_registry(
+    *, strict: bool = True, **client_kwargs
+) -> tuple[dict[str, TaskEntry], str | None]:
+    """The registry and the ETag to write it back against. Absent reads empty.
+
+    ``strict=False`` skips the sum-of-caps invariant so an oversubscribed
+    registry can still be read back (e.g. by ``tasks list``, whose whole job
+    is letting an operator see a broken registry in order to repair it).
+    Every other caller keeps the strict default.
+    """
     from botocore.exceptions import ClientError
 
     bucket = client_kwargs.pop("bucket_name", None) or os.getenv(
@@ -52,7 +60,7 @@ async def read_registry(**client_kwargs) -> tuple[dict[str, TaskEntry], str | No
                 return {}, None
             raise
         body = await response["Body"].read()
-        return parse_registry(body), response.get("ETag")
+        return parse_registry(body, strict=strict), response.get("ETag")
 
 
 async def write_registry(

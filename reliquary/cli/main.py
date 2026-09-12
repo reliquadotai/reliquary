@@ -43,6 +43,82 @@ logger = logging.getLogger(__name__)
 _grader_proc: "subprocess.Popen | None" = None
 
 
+def build_task_entry(*, task_id, profile_id, cap, overrides):
+    """One registry entry: shipped controller defaults, then explicit overrides."""
+    from dataclasses import asdict
+
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_registry import (
+        MECHANISM_RL_DISCOVERED_PRICE,
+        TaskEntry,
+    )
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    profile = resolve_protocol_profile(profile_id)
+    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params.update(overrides)
+    params["cap"] = float(cap)
+    return TaskEntry(
+        task_id=task_id,
+        profile_id=profile.profile_id,
+        profile_sha256=canonical_sha256(profile.to_generation_contract()),
+        mechanism=MECHANISM_RL_DISCOVERED_PRICE,
+        params=params,
+        status="active",
+        retired_at=None,
+    )
+
+
+tasks_app = typer.Typer(name="tasks", help="Declare and retire subnet tasks")
+app.add_typer(tasks_app)
+
+
+@tasks_app.command("create")
+def tasks_create(
+    task_id: str = typer.Option(..., "--task-id"),
+    profile_id: str = typer.Option(..., "--profile-id"),
+    cap: float = typer.Option(..., "--cap", help="Most of the pool this task may pay"),
+    start: float = typer.Option(None, "--start"),
+    decay: float = typer.Option(None, "--decay"),
+) -> None:
+    from reliquary.infrastructure.task_registry_store import create_task
+
+    overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
+    entry = build_task_entry(
+        task_id=task_id, profile_id=profile_id, cap=cap, overrides=overrides
+    )
+    asyncio.run(create_task(entry))
+    typer.echo(f"declared task {task_id} on {entry.profile_id} with cap {cap}")
+
+
+@tasks_app.command("list")
+def tasks_list() -> None:
+    from reliquary.infrastructure.task_registry_store import read_registry
+    from reliquary.shared.task_registry import total_cap
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    for task_id, entry in sorted(entries.items()):
+        typer.echo(
+            f"{task_id:24s} {entry.status:8s} cap={entry.params['cap']:.3f} "
+            f"{entry.profile_id}"
+        )
+    typer.echo(f"total declared cap: {total_cap(entries):.4f} / 1.0")
+
+
+@tasks_app.command("retire")
+def tasks_retire(
+    task_id: str = typer.Option(..., "--task-id"),
+    retired_at: int = typer.Option(..., "--retired-at", help="drand round"),
+) -> None:
+    from reliquary.infrastructure.task_registry_store import retire_task_entry
+
+    asyncio.run(retire_task_entry(task_id, retired_at))
+    typer.echo(
+        f"retired {task_id}; its cap stays reserved until its EMA tail decays"
+    )
+
+
 def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
     names = [name.strip() for name in value.split(",")]
     return resolve_environment_mix(
