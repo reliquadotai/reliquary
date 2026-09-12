@@ -121,6 +121,13 @@ def test_the_default_target_sits_exactly_on_the_emission_ceiling():
     assert target == emissions * b_batch
 
 
+def test_fill_closed_refuses_the_legacy_admission_bypass():
+    result = _constants_under(RELIQUARY_DIFFICULTY_AUCTION_ENFORCE="0")
+
+    assert result.returncode != 0
+    assert "v6 fill-closed requires" in result.stderr
+
+
 def test_a_target_past_the_emission_ceiling_refuses_to_import():
     """I2: the target is env-overridable, the emission count is a literal.
     Raising the target alone lets a window fill past its own key range --
@@ -177,6 +184,15 @@ def test_fill_closed_refuses_incoherent_operator_bounds():
     assert "ADMISSION_BUDGET_PER_ENV" in too_small.stderr
     assert too_late.returncode != 0
     assert "leave SUBMISSION_UPLOAD_GRACE_SECONDS" in too_late.stderr
+
+
+def test_strict_fill_closed_deadline_must_fit_the_service_timeout():
+    result = _constants_under(
+        RELIQUARY_FILL_CLOSED_MAX_SECONDS="3600",
+    )
+
+    assert result.returncode != 0
+    assert "fill proof deadline must finish before" in result.stderr
 
 
 def test_real_v6_service_accepts_after_100_seconds_and_can_reach_16_picks():

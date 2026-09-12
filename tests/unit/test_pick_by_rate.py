@@ -1,4 +1,4 @@
-"""Characterization tests for the disabled rate-pick qualification path.
+"""Characterization tests for fill-closed FIFO picks.
 
 The tests pin its deterministic priority, tie-break, explicit pick boundary,
 and terminal accounting without selecting this policy for the v1 market.
@@ -65,8 +65,7 @@ def _names(groups) -> set[str]:
     return {group.name for group in groups}
 
 
-def test_higher_rate_precedes_lower_rate_regardless_of_record_order(monkeypatch):
-    """Configured rate priority is independent of pool insertion order."""
+def test_higher_rate_does_not_overtake_fifo(monkeypatch):
     batcher = _fill_closed_batcher(monkeypatch)
     picked = _capture_picks(batcher)
 
@@ -81,14 +80,13 @@ def test_higher_rate_precedes_lower_rate_regardless_of_record_order(monkeypatch)
     environment, groups = picked[0]
     assert environment == ENV
     assert len(groups) == B_BATCH
-    assert "last-high" in _names(groups)
-    assert "first-low" not in _names(groups)
+    assert "first-low" in _names(groups)
+    assert "last-high" not in _names(groups)
 
 
-def test_rate_tie_uses_payload_size_before_insertion_order(
+def test_payload_size_does_not_overtake_fifo(
     monkeypatch,
 ):
-    """The configured secondary key is applied before insertion order."""
     batcher = _fill_closed_batcher(monkeypatch)
     picked = _capture_picks(batcher)
 
@@ -100,14 +98,11 @@ def test_rate_tie_uses_payload_size_before_insertion_order(
     assert batcher.pick_training_batch() is True
 
     _environment, groups = picked[0]
-    assert "last-large" in _names(groups)
-    assert "first-small" not in _names(groups)
+    assert "first-small" in _names(groups)
+    assert "last-large" not in _names(groups)
 
 
-def test_an_unknown_rate_sorts_last_instead_of_crashing_the_pick(monkeypatch):
-    """``rate_of`` misses when a receipt fell out of the admission queue.
-    The buffered arrival entry already degrades that to lowest priority;
-    the pick must degrade it the same way rather than raise."""
+def test_an_unknown_rate_does_not_change_fifo(monkeypatch):
     batcher = _fill_closed_batcher(monkeypatch)
     picked = _capture_picks(batcher)
 
@@ -118,7 +113,7 @@ def test_an_unknown_rate_sorts_last_instead_of_crashing_the_pick(monkeypatch):
     assert batcher.pick_training_batch() is True
 
     _environment, groups = picked[0]
-    assert "unknown" not in _names(groups)
+    assert "unknown" in _names(groups)
 
 
 def test_a_pick_never_emits_a_partial_batch(monkeypatch):
@@ -162,8 +157,7 @@ def test_a_second_pick_never_reuses_the_first_picks_groups(monkeypatch):
     first, second = _names(picked[0][1]), _names(picked[1][1])
     assert first & second == set()
     assert first | second == {f"g{i}" for i in range(2 * B_BATCH)}
-    # The configured priority determines the first disjoint batch.
-    assert first == {f"g{i}" for i in range(B_BATCH, 2 * B_BATCH)}
+    assert first == {f"g{i}" for i in range(B_BATCH)}
 
 
 def test_a_completed_proof_no_longer_emits_on_its_own(monkeypatch):
@@ -232,6 +226,7 @@ def test_the_rate_and_payload_size_travel_with_the_proven_group(monkeypatch):
 
     assert len(extended) == 1
     batcher._open_proof_plan_handle = SimpleNamespace(
+        done=lambda: False,
         decisions=lambda: (
             ProofDecision(
                 job_id=extended[0].job_id,
@@ -471,14 +466,10 @@ def test_a_pick_is_refused_once_this_environment_has_taken_them_all(
     assert len(picked) == 1
 
 
-def test_identical_groups_are_ordered_by_sequence_not_by_list_position(
+def test_groups_are_ordered_by_sequence_not_by_list_position(
     monkeypatch,
 ):
-    """Minor (c): with an empty ``receipt_id`` and equal payload bytes the
-    first three key components all tie, and a stable sort then silently
-    fell back to pool order -- the arrival tie-break the docstring
-    forswears. A monotone per-batcher sequence, assigned when the group is
-    appended to the pool, makes the order total and explicit.
+    """The monotone sequence is the whole selection key.
 
     Pinned in both directions: the same two groups in the opposite pool
     order must still resolve the same way.
@@ -489,15 +480,18 @@ def test_identical_groups_are_ordered_by_sequence_not_by_list_position(
         batcher = _fill_closed_batcher(monkeypatch)
         picked = _capture_picks(batcher)
         for i in range(B_BATCH - 1):
-            _prove(batcher, f"filler-{i}", rate=99.0, payload_bytes=10)
+            _prove(
+                batcher, f"filler-{i}", rate=99.0,
+                payload_bytes=10,
+            )
         pool = batcher._proven_groups[ENV]
         first = batcher_module._ProvenGroup(
             value=SimpleNamespace(name="first", eos_tokens=0),
-            rate=1.0, payload_bytes=10, receipt_id="", sequence=1,
+            rate=1.0, payload_bytes=10, receipt_id="", sequence=0,
         )
         second = batcher_module._ProvenGroup(
             value=SimpleNamespace(name="second", eos_tokens=0),
-            rate=1.0, payload_bytes=10, receipt_id="", sequence=2,
+            rate=1.0, payload_bytes=10, receipt_id="", sequence=10**12,
         )
         with batcher.fill_state.lock:
             for group in order(first, second):

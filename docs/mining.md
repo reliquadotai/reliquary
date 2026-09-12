@@ -17,41 +17,37 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 The boot query ensures a miner joining an already-running subnet lands directly on the current model, skipping an initial reject cycle.
 
 `/state.generation_profile_id` and `/state.generation_contract` are
-authoritative. Protocol v6 uses `qwen3-4b-base-dapo-fill-closed-v6`. This is a coordinated
-hard cutover, not an optional local model or token-cap change: the reference
-miner refuses to generate unless its active profile exactly matches the
-validator contract. Custom miners should read `prompt_encoding`, `sampling`,
+authoritative. The live protocol-v6 profile is
+`qwen3-4b-base-dapo-reliquary-v1`. The reference miner refuses to generate
+unless its active profile exactly matches the validator contract. Custom miners
+should read `prompt_encoding`, `sampling`,
 and each environment's `prompt_template`, `answer_format`, `max_new_tokens`,
 and `bft` fields.
 
 ## What a miner does (protocol v6)
 
-**A v6 window closes on fill, not on a clock.** This is the change from v5, so
-read it before porting a v5 miner: there is no 100-second deadline to race and
-no seal-time auction. Math and Code each accumulate proven groups until the
-environment has taken **16 picks of 16 groups** — 256 groups — and the window
-ends there, having emitted 16 training batches instead of one. The 1800-second
-ceiling is a backstop for a window that never fills, not a target, so a window
-can last minutes or half an hour depending on supply.
+**A v6 window closes on fill, not on a clock.** There is no 100-second deadline
+or seal-time auction. Each environment accumulates proven groups until it has
+taken the configured number of 16-group picks (16 picks and 256 groups by
+default). The 1800-second ceiling is a backstop for a window that never fills,
+not a target, so a window can last minutes or half an hour depending on supply.
 
 Two consequences for how you mine:
 
 - **Proof is continuous, not deferred to a seal.** Groups are proven as they
-  arrive rather than ranked top-down in one burst at a deadline. Arriving
-  early no longer buys a place in a ranking that closes behind you.
-- **There is no throughput tie-break.** v5 ranked ties by tokens per round,
-  which paid for volume; the v6 profile drops it entirely. Generating faster
-  does not by itself win slots.
+  arrive rather than ranked top-down in one burst at a deadline.
+- **Selection is FIFO.** Validator-observed throughput and payload size remain
+  telemetry, but cannot move a group ahead of an earlier eligible group.
+  Earlier arrival still has a residual advantage because the window closes on
+  fill; removing that race requires a later protocol design, not another v6
+  scoring knob.
 
 Proven groups that no pick takes when the window closes **burn** — nothing
 that skips the assembler is paid. There is no per-operator winner cap.
 
-Everything else is unchanged from v5: same base model and revision, same
-per-environment prompt templates, same sampling, same forced-seed protocol.
-
-> **Hard cutover:** deferred proof and the auction are replaced, not tuned.
-> Forced-seed protocol v6 is mandatory for both `openmathinstruct` and
-> `opencodeinstruct`, and BFT stays disabled for both under the v6 profile.
+This FIFO/fixed-payment update does not change the miner wire or generation
+contract: miners already using the live Reliquary V1 profile need no cutover.
+Forced-seed protocol v6 remains mandatory and BFT remains disabled.
 
 Every miner runs a continuous poll-submit loop:
 
@@ -63,7 +59,7 @@ Every miner runs a continuous poll-submit loop:
 
 3. **Generates M=16 rollouts.** Runs exactly 16 completions with the repository's forced-seed sampler. The deterministic stream excludes hotkey identity and is derived from window randomness, prompt, checkpoint, rollout index, and token position. Set `protocol_version=6`, render the generation contract's exact step-by-step environment template, encode that canonical prompt as raw text (do not apply a chat template), use `temperature=1.0`, `top_p=1.0`, and `top_k=0`, terminate at the first configured EOS, and do not add a presence/repetition processor that the validator does not reproduce.
 
-4. **Provides rollout rewards.** OpenMath miners compute `env.compute_reward(problem, completion_text)` locally and send that value as `rollout.reward`; the validator recomputes it and rejects mismatches. The v6 Math contract requires a valid final `\boxed{...}`/`\fbox{...}` answer. A completion without one scores zero, and the validator conservatively treats that outcome as uncertain when deciding zone eligibility and auction value, so removing a box cannot create useful variance. OpenCode is validator-authoritative: miners send placeholder rewards if the client shape requires them, and the validator recomputes the real code reward and overwrites local claims before the zone filter. Miners never run the grader.
+4. **Provides rollout rewards.** OpenMath miners compute `env.compute_reward(problem, completion_text)` locally and send that value as `rollout.reward`; the validator recomputes it and rejects mismatches. The v6 Math contract requires a valid final `\boxed{...}`/`\fbox{...}` answer. A completion without one scores zero, and the validator conservatively treats that outcome as uncertain when deciding zone eligibility, so removing a box cannot create useful variance. OpenCode is validator-authoritative: miners send placeholder rewards if the client shape requires them, and the validator recomputes the real code reward and overwrites local claims before the zone filter. Miners never run the grader.
 
 5. **Builds GRAIL sketches.** Runs the bit-identical HuggingFace forward pass on the proof GPU to construct sketch commitments that bind the completions to the model. The r_vec seed **must** come from `state.randomness` exactly — local re-derivation will diverge from the validator's seed and the binding check rejects with `WRONG_RANDOMNESS`.
 
@@ -86,27 +82,26 @@ Every miner runs a continuous poll-submit loop:
      only when an older validator returns 404 for `/submit/precommit`.
 
 Under v6 there is no seal-time auction to win. The validator grades during
-collection and proves continuously as budget allows, rather than deferring
-GRAIL and auth proof to a deadline burst over a frozen, difficulty-ranked
-population. A group that proves joins the pool its environment's picks draw
-from; a proven group no pick takes when the window closes burns.
+collection and proves continuously as budget allows. A group that proves
+joins its environment's FIFO pick queue; a proven group no pick takes before
+the window closes is unpaid.
 
-The v5 tie-break on tokens per validator-observed round is gone — the v6
-profile declares no throughput tie-break at all, so generating faster does not
-by itself win slots. Submitted drand remains a freshness check, not an
-economic ordering key. Hotkey count, Merkle-root grinding, and harmless
-payload variation still cannot mint extra tickets for one operator/prompt.
+The v5 tie-break on tokens per validator-observed round is gone. Submitted
+drand is a freshness check, not an economic ordering key, and payload length
+does not affect priority or payment. Faster generation can still reach FIFO
+first; that remaining arrival race is explicit rather than hidden in a score.
 
 ### Prompt competition and payment
 
 Up to `MAX_SUBMISSIONS_PER_PROMPT = 10` bounded pending groups may exist for one
-prompt, but an operator can reserve only one logical claim for that prompt. At
-seal, the first ranked candidate for a prompt that passes proof wins. If it
-fails, the next candidate is promoted. Runners-up do not split emission.
+prompt, but an operator can reserve only one logical claim for that prompt.
+Eligible groups are proved and selected in FIFO order; a failed proof is
+unpaid and the queue continues. Runners-up do not split emission.
 
-Each selected group earns `pool / B_BATCH` for its environment. An operator can
-win any number of distinct prompt slots on merit. Missing winners are not
-redistributed; their shares burn to `UID_BURN = 0`.
+Each selected group earns
+`window_pool / (environment_count × picks_target × B_BATCH)`, independent of
+completion length. Missing groups are not redistributed; their shares go to
+the validator's configured burn UID.
 
 ### One-shot prompts
 
@@ -114,28 +109,26 @@ redistributed; their shares burn to `UID_BURN = 0`.
 
 ## Submission lifecycle — where your rollout actually ends up
 
-The most common miner question is *"the validator returned `accepted=True`, but I earned no slot — what's going on?"* Auction mode has three lifecycle stages.
+The most common miner question is *"the validator returned `accepted=True`, but I earned no slot — what's going on?"* V6 has three lifecycle stages.
 
 ```
-miner                 HTTP/worker admission             100 s seal
------                 ---------------------             ----------
-POST precommit   ->   signed upload receipt             freeze pending pool
-POST exact body  ->   reason="submitted"                rank by difficulty
-                      cheap checks + grading            rank by difficulty
-                      first ACCEPTED verdict            prove top-down
-                      pending pool only                 final verdict + reward
+miner                 HTTP/worker admission             continuous proof/pick
+-----                 ---------------------             ---------------------
+POST precommit   ->   signed upload receipt             FIFO proof dispatch
+POST exact body  ->   reason="submitted"                proof checks
+                      cheap checks + grading            selected or unpaid
+                      first ACCEPTED verdict            final verdict + reward
 ```
 
 1. **HTTP enqueue.** `accepted=True reason="submitted"` means only that the request entered the worker queue.
 
-2. **Pool admission.** The worker runs bounded schema, identity, reward, zone, and authenticity-independent checks. Its `ACCEPTED` verdict means your group is in the pending auction pool. Code grader infrastructure failures are not converted into zero rewards.
+2. **Pool admission.** The worker runs bounded schema, identity, reward, zone, and authenticity-independent checks. Its `ACCEPTED` verdict means your group is pending proof, not paid. Code grader infrastructure failures are not converted into zero rewards.
 
-3. **Seal result.** The validator publishes a second verdict after ranking and deferred proof. A paid winner has `selected_for_batch=true` and `rewarded=true`. An honest non-winner remains `accepted=true` with both fields false. A candidate that reaches proof and fails gets its actual rejection with `reject_stage="auction_seal"`.
+3. **Final result.** Continuous proof and FIFO selection publish a second verdict. A paid group has `selected_for_batch=true` and `rewarded=true`. An eligible group that the closing window never selects remains accepted but unpaid; a failed proof gets its actual rejection.
 
 The R2 archive (`reliquary/dataset/window-<N>.json.gz`) contains selected rows,
-rejections, and the full auction candidate metadata under `difficulty_auction`.
-The historical `difficulty_auction_shadow` key is an identical compatibility
-alias.
+rejections, policy identifiers, the exact reward map, and compatibility
+candidate metadata.
 
 ### How to look up your specific submission
 
@@ -158,8 +151,8 @@ GET /state  →  GrpoBatchState
 
 **This is a baseline, not a ceiling.** The protocol enforces no further constraint on `prompt_idx`, but the economics strongly reward miners who can predict which prompts will pass the validator's frontier checks for the current checkpoint:
 
-- An `OUT_OF_ZONE` rejection wastes the 16 generations, although deferred proof prevents it from consuming seal-time GRAIL.
-- A good picker puts more binary-reward groups near the `k=4` score peak and high enough in the frozen ranking to justify proof. Coverage matters because only one proven winner can occupy each prompt, but there is no operator winner cap.
+- An `OUT_OF_ZONE` rejection wastes the 16 generations but is removed before GRAIL proof.
+- A good picker puts more non-degenerate binary-reward groups into the proof queue. Coverage matters because only one proven winner can occupy each prompt, but there is no operator winner cap.
 
 Techniques miners are expected to develop (non-exhaustive):
 
@@ -180,14 +173,16 @@ For OpenMath's binary `{0, 1}` rewards, this admits every non-degenerate group, 
 Earning is EMA-based, not flat per-submission. After each window the validator computes a per-hotkey reward share for the window, then updates each miner's score:
 
 ```
-# One uniform slot per proven distinct-prompt winner.
-share_this_window = winning_slots * (pool / B_BATCH)
+# One uniform slot per selected group across the whole v6 window.
+share_this_window = selected_groups * (
+    window_pool / (environment_count * picks_target * B_BATCH)
+)
 score_new = α × share_this_window + (1 − α) × score_old
 ```
 
 where `α ≈ 0.027` (`EMA_ALPHA = 2 / (72 + 1)`). Once per subnet epoch (~360 blocks), the validator calls `set_weights` on-chain with these EMA values. Your emission for the epoch is proportional to your EMA score relative to other miners.
 
-A miner may win multiple distinct prompt slots in one environment. Unused slots burn; there is no boundary-tier payment, runner-up split, or redistribution. In auction mode `rewarded=true` if and only if `selected_for_batch=true`.
+A miner may win multiple distinct prompt slots in one environment. Unused slots burn; completion length, boundary tier, and runner-up count do not change a selected group's payment. In v6 `rewarded=true` if and only if `selected_for_batch=true`.
 
 See [docs/concepts.md](concepts.md#economic-model) for the full economic model.
 
@@ -205,13 +200,13 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `PRECOMMIT_EXPIRED` | The exact body did not finish inside the bounded reveal grace | Start finalization earlier or improve the upload path; do not increase generation after precommit |
 | `MERKLE_ROOT_MISMATCH` | After the validator operator enables the calibrated gate, the signed wire-v1 root does not equal its byte-compatible recomputation | Use the repository's existing `_compute_merkle_root` output without altering its serialization |
 | `RATE_LIMITED` | You exhausted the per-hotkey window quota: **512 attempts with V6 fill-closed enabled**, or **32 in V4/V5**. Other admission and proof-failure limits still apply | Throttle locally; the counter resets at every window boundary |
-| `BATCH_FILLED` | The collection population, queue, or resource reservation is closed/full; auction mode does not emit this merely because 16 candidates arrived | Re-poll `/state`; if still open, back off and inspect validator capacity telemetry |
+| `BATCH_FILLED` | The collection population, queue, or resource reservation is closed/full | Re-poll `/state`; if still open, back off and inspect validator capacity telemetry |
 | `WINDOW_MISMATCH` | `window_start` in your request doesn't match the active batcher | Refresh `/state` and retry with the current `window_n` |
 | `STALE_ROUND` | Your signed `drand_round` is older than the validator round at precommit/direct-body arrival. Backward tolerance is zero. | Compute the drand round immediately before final serialization and precommit, never at sketch-build time. |
 | `FUTURE_ROUND` | (v2.3) Your `drand_round` field is newer than the validator's current round. Implies clock skew. | Ensure miner host is NTP-synced. Drand quicknet rounds advance on a fixed wall-clock schedule; sending a future round means your clock is ahead of UTC. |
 | `PROMPT_FULL` | `MAX_SUBMISSIONS_PER_PROMPT = 10` pending groups already occupy this prompt | Pick a different prompt |
 | `HASH_DUPLICATE` | Your operator already reserved this prompt or your tokens duplicate retained/recent content | Do not rotate hotkeys or replay a forced group; choose another prompt |
-| `SEED_MISMATCH` / `PROTOCOL_MISMATCH` | The client does not advertise the active forced-seed protocol | Pull the current miner, rebuild, and confirm `protocol_version=6` and `generation_profile_id=qwen3-4b-base-dapo-fill-closed-v6` |
+| `SEED_MISMATCH` / `PROTOCOL_MISMATCH` | The client does not advertise the active forced-seed protocol | Pull the current miner, rebuild, and confirm `protocol_version=6` and `generation_profile_id=qwen3-4b-base-dapo-reliquary-v1` |
 
 **Rejected asynchronously by the worker (look up via `GET /verdicts/{hotkey}` or the R2 archive):**
 
@@ -221,10 +216,10 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `WRONG_RANDOMNESS` | `commit.beacon.randomness` doesn't match the validator's per-window seed (`state.randomness` on v2.3+; locally-derived `H(block_hash + drand)` on v2.2). Almost always caused by reusing a sketch built for an earlier window. | (v2.3) Read `state.randomness` from `/state` directly; do not re-derive locally. (v2.2) Derive per-window from chain + drand. In both cases: tag each sketch with the window it was built for and discard before firing if the window has advanced. |
 | `BAD_PROMPT_IDX` | `prompt_idx` out of range for the active environment | Use the env's prompt-index space (`0..N-1`). v2.3 / OpenMathInstruct-2: `N ≈ 14_000_000`. |
 | `PROMPT_IN_COOLDOWN` | `prompt_idx` was in the active cooldown set | v2.3: `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` makes prompts effectively single-use. Read `cooldown_prompts[]` from `/state` **before each pick** and skip anything in the list. |
-| `SUPERSEDED` | Historical only; current same-prompt competition resolves at auction seal | Upgrade parsers that still expect the old runner-up flow |
+| `SUPERSEDED` | Historical only; current same-prompt competition resolves during continuous proof | Upgrade parsers that still expect the old runner-up flow |
 | `OUT_OF_ZONE` | σ of your 16 rewards is below threshold (`SIGMA_MIN = 0.24` steady, `0.22` during the first `BOOTSTRAP_WINDOWS = 100` windows), or an uncertain off-format outcome can move the group out of zone | Pick a prompt with at least one success and one failure; always emit a valid boxed Math answer |
 | `REWARD_MISMATCH` | OpenMath reward claim disagreed with recomputation, or a Code grader worker crashed ambiguously while handling the candidate | Recheck Math parsing; for Code, report repeatable crash-triggering output rather than retrying indefinitely |
-| `GRAIL_FAIL` | At seal, a ranked or forensic-sampled sketch differs from the validator forward pass beyond tolerance | Match checkpoint, tokenizer, attention/runtime stack, and proof construction exactly |
+| `GRAIL_FAIL` | A proved sketch differs from the validator forward pass beyond tolerance | Match checkpoint, tokenizer, attention/runtime stack, and proof construction exactly |
 | `LOGPROB_MISMATCH` | Per-token log-prob deviation from validator's recompute exceeds `LOGPROB_IS_EPS = 0.10` | Same root cause as `GRAIL_FAIL` — quantization, attention kernel, or precision drift |
 | `BAD_TERMINATION` | A rollout did not terminate naturally, hit the cap without EOS, or contains EOS padding/repeated stop-token tails | Confirm generation config matches protocol. Do not force `min_new_tokens`, suppress EOS, ride the 8192 cap, or append tokens after first EOS |
 | `MALFORMED_FINAL_ANSWER` | A zero-reward Math completion ends in an empty, special-token, or unclosed answer box | Preserve genuine generation and emit one well-formed final box; do not append or cut answer markers |
@@ -239,7 +234,7 @@ The validator emits one of the following reasons on every failed submission. Eac
 
 ### Real-time verdict feedback (`/verdicts/{hotkey}`)
 
-Under the production worker path `/submit` returns only `accepted=True reason="submitted"`. The first `/verdicts` result reports pool admission. The final result arrives after the collection deadline and seal-time proof. Identify it by non-null `selected_for_batch` and `rewarded`; do not treat the first `ACCEPTED` as a win.
+Under the production worker path `/submit` returns only `accepted=True reason="submitted"`. The first `/verdicts` result reports pool admission. The final result follows proof and selection. Identify it by non-null `selected_for_batch` and `rewarded`; do not treat the first `ACCEPTED` as a win.
 
 The validator exposes the real per-submission verdicts via:
 
@@ -310,9 +305,9 @@ async def poll_verdicts(client, hotkey, validator_url):
         await asyncio.sleep(5)
 ```
 
-Log the fire-time response as `SUBMITTED`, the worker result as `POOL_ACCEPTED`, and only the seal-time selected result as `WON`. A non-winner is ordinary auction competition, not a rejection or a reason to quarantine the model.
+Log the fire-time response as `SUBMITTED`, the worker result as `POOL_ACCEPTED`, and only the final selected result as `WON`. A non-winner is ordinary competition, not a rejection or a reason to quarantine the model.
 
-Polling is optional for protocol validity, but it is the authoritative live feedback path for auction outcome.
+Polling is optional for protocol validity, but it is the authoritative live feedback path for selection outcome.
 
 ---
 
@@ -387,7 +382,7 @@ Confirm your hotkey appears in `btcli subnet metagraph --netuid 81` with a valid
 
 ```bash
 # Both are required, and the miner refuses to start with only one of them.
-export RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-fill-closed-v6
+export RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1
 export RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1
 
 reliquary mine \

@@ -40,12 +40,15 @@ from reliquary.constants import (
     DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR,
     ENVIRONMENT_MIX,
     FILL_CLOSED_ADMISSION_BUDGET_PER_ENV,
+    FILL_CLOSED_EMISSIONS_PER_WINDOW,
     FILL_CLOSED_ENABLED,
     FILL_CLOSED_FIRST_PICK_SECONDS,
     FILL_CLOSED_GRADING_START_BUDGET_PER_ENV,
     FILL_CLOSED_MAX_SECONDS,
+    FILL_CLOSED_PICKS_PER_WINDOW,
     FILL_CLOSED_PICK_PIPELINE_DEPTH,
     FILL_CLOSED_PRECOMMIT_SECONDS,
+    FILL_CLOSED_SELECTION_POLICY,
     FORCED_SEED_CDF_BOUNDARY_EPSILON,
     FORCED_SEED_CDF_ENFORCE,
     FORCED_SEED_CONSISTENCY_FLOOR,
@@ -79,6 +82,7 @@ from reliquary.constants import (
     PROTOCOL_PROFILE_ID,
     PROTOCOL_VERSION,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
+    PROOF_PIPELINE_DEPTH,
     PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW,
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
     REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS,
@@ -131,6 +135,7 @@ from reliquary.validator.resume import checkpoint_n_from_commit_title
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import TrainingStepSkipped, train_step
 from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
+from reliquary.validator.token_rewards import FIXED_GROUP_PAYMENT_POLICY
 from reliquary.validator.utility_telemetry import UtilityTelemetryWriter
 
 
@@ -859,7 +864,7 @@ class ValidationService:
         self._archive_enqueued_windows: set[int] = set()
         # Highest window whose archive/tombstone is durably queued. Periodic
         # cooldown snapshots may cover this watermark, never a merely opened
-        # or pipelined-stashed window whose seal side effects are still pending.
+        # or pipelined-stashed window whose archive is still pending.
         self._cooldown_durable_window: int = 0
         self._window_iteration_stage = "startup"
         self._utility_telemetry = UtilityTelemetryWriter()
@@ -980,13 +985,14 @@ class ValidationService:
         # the last window generated under the previous checkpoint is proven.
         # (batchers, window_n, verify_task, late_drops_snapshot)
         self._gpu_backlog: tuple | None = None
-        # v6 (R20). The assembler that computed a window's per-token
-        # payment, keyed by window, so ``_archive_window`` can read the
+        # v6. The assembler that computed a window's fixed-slot payment,
+        # keyed by window, so ``_archive_window`` can read the
         # map belonging to the window it is ARCHIVING. ``_fill_closed_
         # assembler`` alone is not enough: in pipelined mode the next
         # window's ``_open_window_batchers`` has already replaced it by
         # the time the stashed window is archived.
         self._fill_closed_assemblers: dict[int, Any] = {}
+        self._candidate_fill_closed_assembler = None
         # Experimental fill mode: a restart-safe barrier from the last
         # durably emitted trainer entry to the next window.  A full cadence
         # also binds the exact successor checkpoint publication/adoption.
@@ -2149,6 +2155,7 @@ class ValidationService:
         self.server.record_window_preparation_failure(failure)
         self._window_preparation_stage = None
         self._active_batchers = {}
+        self._candidate_fill_closed_assembler = None
         self.server.set_active_batchers({})
         self._publish_window_preparation_state()
 
@@ -2367,41 +2374,10 @@ class ValidationService:
         # batch), so it cannot join every environment's B_BATCH chunk
         # into one DAPO training batch by itself -- only the service,
         # which sees every environment's batcher for this window, can.
-        # One assembler per window, injected as every batcher's
-        # ``emit_training_batch_fn`` below. Logged (not raised) before
-        # being replaced: a still-open PREVIOUS window's assembler may
-        # hold a remainder that never became a full B_BATCH-per-
-        # environment payload -- by design (see FillClosedBatchAssembler's
-        # module docstring: a partial batch is exactly what its
-        # carry-forward exists to avoid), but it should stay observable.
-        #
-        # R16: ``close()`` is what actually disposes of that remainder
-        # now -- emitted as one final partial batch when every
-        # environment contributed at least one group, tombstoned
-        # otherwise -- instead of the WARNING below being the only
-        # signal, one window later, that proven, paid rollouts were
-        # dropped with no marker. The snapshot is still read FIRST,
-        # before ``close()`` resets it, purely so this log line keeps
-        # reporting what was actually outstanding.
-        previous_assembler = getattr(self, "_fill_closed_assembler", None)
-        if previous_assembler is not None:
-            remainder = previous_assembler.remainder_snapshot()
-            has_remainder = any(remainder["in_accumulator"].values()) or any(
-                remainder["pending"].values()
-            )
-            previous_assembler.close()
-            logger.log(
-                logging.WARNING if has_remainder else logging.DEBUG,
-                "FillClosedBatchAssembler: window %d closed with remainder "
-                "%s (close() emitted it as a final partial batch, or "
-                "tombstoned it, so the trainer's cursor still advances -- "
-                "see the assembler's own log line for which)",
-                previous_assembler.window_start, remainder,
-            )
+        # One assembler per window is injected into every batcher below, but
+        # remains pre-open state until ``_activate_window`` makes its recovery
+        # journal durable and exposes the batchers together.
         recovery = getattr(self, "_fill_closed_recovery_store", None)
-        if FILL_CLOSED_ENABLED and recovery is not None:
-            recovery.begin(target_window, checkpoint_n=cp.checkpoint_n,
-                           revision=cp_hash, targets=dict(self.env_mix))
         fill_closed_assembler = (
             FillClosedBatchAssembler(
                 window_start=target_window,
@@ -2418,11 +2394,6 @@ class ValidationService:
             if FILL_CLOSED_ENABLED
             else None
         )
-        self._fill_closed_assembler = fill_closed_assembler
-        if fill_closed_assembler is not None:
-            self._fill_closed_assemblers[target_window] = (
-                fill_closed_assembler
-            )
         for env_name, env in self.envs.items():
             open_kwargs = {
                 "window_start": target_window,
@@ -2483,6 +2454,7 @@ class ValidationService:
             if shared_fill_state is not None:
                 batcher.fill_state = shared_fill_state
             batchers[env_name] = batcher
+        self._candidate_fill_closed_assembler = fill_closed_assembler
         return batchers
 
     def _activate_window(self) -> None:
@@ -2514,10 +2486,57 @@ class ValidationService:
             batcher.mark_window_opened()
             if loop is not None:
                 batcher.bind_event_loop(loop)
-        self.server.set_active_batchers(self._active_batchers)
-        self._window_n = int(self._candidate_window_n)
-        self._candidate_window_n = None
-        self._candidate_activation_nonce = None
+        candidate_window = int(self._candidate_window_n)
+        candidate_assembler = self._candidate_fill_closed_assembler
+        if FILL_CLOSED_ENABLED:
+            if (
+                candidate_assembler is None
+                or candidate_assembler.window_start != candidate_window
+            ):
+                raise RuntimeError("prepared v6 window has no matching assembler")
+            previous_assembler = getattr(self, "_fill_closed_assembler", None)
+            if previous_assembler is not None:
+                remainder = previous_assembler.remainder_snapshot()
+                has_remainder = any(
+                    remainder["in_accumulator"].values()
+                ) or any(remainder["pending"].values())
+                previous_assembler.close()
+                logger.log(
+                    logging.WARNING if has_remainder else logging.DEBUG,
+                    "FillClosedBatchAssembler: window %d closed with "
+                    "remainder %s",
+                    previous_assembler.window_start,
+                    remainder,
+                )
+            recovery = getattr(self, "_fill_closed_recovery_store", None)
+            if recovery is not None:
+                checkpoint = self._checkpoint_store.current_manifest()
+                revision = next(
+                    iter(self._active_batchers.values())
+                ).current_checkpoint_hash
+                if checkpoint is None or checkpoint.revision != revision:
+                    raise RuntimeError(
+                        "prepared v6 checkpoint changed before activation"
+                    )
+                recovery.begin(
+                    candidate_window,
+                    checkpoint_n=checkpoint.checkpoint_n,
+                    revision=revision,
+                    targets=dict(self.env_mix),
+                )
+            self._fill_closed_assembler = candidate_assembler
+            self._fill_closed_assemblers[candidate_window] = candidate_assembler
+            # From here the recovery journal owns this logical window.
+            self._window_n = candidate_window
+            self._candidate_window_n = None
+            self._candidate_activation_nonce = None
+            self._candidate_fill_closed_assembler = None
+            self.server.set_active_batchers(self._active_batchers)
+        else:
+            self.server.set_active_batchers(self._active_batchers)
+            self._window_n = candidate_window
+            self._candidate_window_n = None
+            self._candidate_activation_nonce = None
         self._window_preparation_stage = None
         self.server.clear_window_preparation_failure()
         self._publish_window_preparation_state()
@@ -3341,7 +3360,7 @@ class ValidationService:
                     pending.hotkey, pending.prompt_idx, bytes(pending.merkle_root),
                 ))
                 selected = group is not None
-                rewarded = selected and int(getattr(group, "eos_tokens", 0)) > 0
+                rewarded = selected
             proof_reject = pending.reject_response
             accepted = proof_reject is None
             reason = (
@@ -3542,10 +3561,13 @@ class ValidationService:
             # Exact v2 compatibility: both batchers share one verify model.
             seal_results = []
             for _name, batcher in seal_items:
+                seal_kwargs = {"pool": pool_per_env}
+                if FILL_CLOSED_ENABLED:
+                    seal_kwargs["commit_side_effects"] = False
                 seal_results.append(
                     await asyncio.to_thread(
                         batcher.seal_batch,
-                        pool=pool_per_env,
+                        **seal_kwargs,
                     )
                 )
         else:
@@ -3600,8 +3622,9 @@ class ValidationService:
             for batcher in batchers.values():
                 batcher.discard_seal_side_effects()
             logger.error(
-                "Window %d: proof capacity aborted %s; skipping rewards, "
-                "training and checkpoint publication",
+                "Window %d: proof capacity aborted %s; preserving committed "
+                "batches and skipping uncommitted rewards, further training "
+                "and checkpoint publication",
                 window_n,
                 proof_capacity_aborts,
             )
@@ -3625,7 +3648,7 @@ class ValidationService:
                     "another window"
                 )
             return
-        if self.proof_scheduler is not None:
+        if self.proof_scheduler is not None and not FILL_CLOSED_ENABLED:
             # Cooldowns and rollout-hash reservations are committed only after
             # every environment has sealed successfully.
             for batcher in batchers.values():
@@ -4160,6 +4183,24 @@ class ValidationService:
         if owns_routing:
             self._set_state(WindowState.READY)
 
+    @staticmethod
+    def _close_and_commit_fill_closed_paid_side_effects(
+        batchers: dict,
+        assembler,
+    ) -> dict[str, list[tuple[int, Any]]]:
+        """Close one v6 journal and cool exactly the groups it paid."""
+        assembler.close()
+        paid = assembler.paid_groups()
+        if set(paid) != set(batchers):
+            raise RuntimeError("fill-closed paid environments do not match")
+        for name, batcher in batchers.items():
+            batcher.prepare_fill_closed_paid_side_effects([
+                group for _batch_index, group in paid[name]
+            ])
+        for batcher in batchers.values():
+            batcher.commit_seal_side_effects()
+        return paid
+
     async def _archive_window(
         self, batchers, sealed, late_drops=None, server_reject_counts=None,
     ) -> None:
@@ -4233,9 +4274,23 @@ class ValidationService:
                 return None
             return arrived_at - window_opened_at
 
-        def _submission_obs_payload(s, batcher, *, rejected: bool = False):
+        def _submission_obs_payload(
+            s,
+            batcher,
+            *,
+            rejected: bool = False,
+            fill_closed_paid: bool = False,
+        ):
             selection_meta = getattr(batcher, "selection_metadata_by_id", {})
             meta = selection_meta.get(id(s), {})
+            if fill_closed_paid:
+                # The v6 seal intentionally clears auction metadata.  The
+                # assembler's paid set is the authoritative selection record.
+                meta = {
+                    "selected_for_batch": True,
+                    "rewarded": True,
+                    "payment_source": "fill_closed_fixed_group",
+                }
             difficulty_by_id = getattr(
                 batcher, "difficulty_auction_metadata_by_id", {}
             )
@@ -4416,13 +4471,13 @@ class ValidationService:
                 out.append(entry)
             return out
 
-        # R20/R24: under v6 the seal path pays nothing and selects nothing
+        # Under v6 the seal path pays nothing and selects nothing
         # -- the spec removes the auction and the seal path IS the auction --
         # so BOTH the archive's per-hotkey emission and its ``batch`` entries
-        # come from the assembler: the token split it computed, over exactly
+        # come from the assembler: the fixed-slot map it computed, over exactly
         # the groups it paid. ``sealed_dict`` is empty under v6 (see
         # ``_seal_fill_closed_window``), and a weight-only validator replaying
-        # the map from ``eos_tokens`` must divide over the same set.
+        # the map must use the same selected set and fixed-slot policy.
         # Resolved BEFORE the per-env loop below, which reads its batches.
         fill_closed_assembler = None
         fill_closed_batches: dict[str, list] = {}
@@ -4431,37 +4486,21 @@ class ValidationService:
             fill_closed_assembler = self._fill_closed_assemblers.get(
                 archived_window
             )
-            # Any assembler older than the window being archived belongs to
-            # a window that was dropped before it ever reached here; nothing
-            # will read it again.
-            for stale in [
-                key for key in self._fill_closed_assemblers
-                if key < archived_window
-            ]:
-                self._fill_closed_assemblers.pop(stale, None)
             if fill_closed_assembler is None:
-                # Not a silent zero: with no assembler this window pays
-                # nobody and archives an empty batch, which is a wiring
-                # failure, not an outcome.
-                logger.error(
-                    "Window %d: v6 archive found no batch assembler; the "
-                    "window pays nothing and archives no batch",
-                    archived_window,
+                # The recovery journal may already contain paid groups. Never
+                # replace it with an empty completed archive.
+                raise RuntimeError(
+                    f"window {archived_window}: v6 archive has no assembler"
                 )
-            else:
-                # Idempotent (R16). The window's LAST batch is the partial
-                # remainder ``close()`` forces out, and in serial mode
-                # ``close()`` otherwise runs at the next window's open --
-                # after this archive is written -- so that batch's pay and
-                # its groups would never reach the archive a weight-only
-                # validator replays. In pipelined mode this is a no-op.
-                fill_closed_assembler.close()
-                fill_closed_batches = fill_closed_assembler.paid_groups()
-                # Only release the recovery handle after close() has made the
-                # complete journal range durable.  On failure the aborted-
-                # window path needs this assembler's committed index to pad
-                # exactly the remaining keys without overwriting earlier ones.
-                self._fill_closed_assemblers.pop(archived_window, None)
+            # Idempotent (R16). ``close()`` forces out the last partial
+            # remainder, then the assembler's paid set becomes the sole
+            # authority for cooldown and dedup side effects.
+            fill_closed_batches = (
+                self._close_and_commit_fill_closed_paid_side_effects(
+                    batcher_dict,
+                    fill_closed_assembler,
+                )
+            )
 
         # Build the combined batch entries and runners_up from all envs.
         batch_entries = []
@@ -4532,11 +4571,8 @@ class ValidationService:
                     "merkle_root": s.merkle_root_bytes.hex(),
                     "selection_digest": s.selection_digest.hex(),
                     "claimed_checkpoint_hash": s.claimed_checkpoint_hash,
-                    # v6: completion tokens over genuinely EOS-terminated
-                    # rollouts, produced once at admission. Additive field --
-                    # a weight-only validator replaying per-token payment
-                    # from the archive needs this to divide the same way the
-                    # live validator did (see token_rewards.py).
+                    # Retained as training/diagnostic telemetry. V6 fixed-slot
+                    # payment does not use completion length.
                     "eos_tokens": int(getattr(s, "eos_tokens", 0) or 0),
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
@@ -4565,13 +4601,14 @@ class ValidationService:
                     "code_semantic_auth_positive_min_prob": getattr(
                         s, "code_semantic_auth_positive_min_prob", None
                     ),
-                    **_submission_obs_payload(s, batcher),
+                    **_submission_obs_payload(
+                        s,
+                        batcher,
+                        fill_closed_paid=paid_batch_index is not None,
+                    ),
                 }
                 if paid_batch_index is not None:
-                    # R28: v6 pays per assembled batch, so a weight-only
-                    # validator replaying the map from ``eos_tokens`` has to
-                    # divide within each batch. Additive: v4/v5 entries and
-                    # older readers are untouched.
+                    # Identifies the fixed slots paid in each assembled batch.
                     entry["batch_index"] = int(paid_batch_index)
                 batch_entries.append(entry)
 
@@ -4719,6 +4756,25 @@ class ValidationService:
             "archive_schema_version": 2,
             "window_status": "completed",
             "window_start": first_batcher.window_start,
+            **({
+                "selection_policy": FILL_CLOSED_SELECTION_POLICY,
+                "payment_policy": (
+                    fill_closed_assembler.payment_policy
+                    if fill_closed_assembler is not None
+                    else FIXED_GROUP_PAYMENT_POLICY
+                ),
+                "picks_target": (
+                    fill_closed_assembler.picks_target
+                    if fill_closed_assembler is not None
+                    else FILL_CLOSED_PICKS_PER_WINDOW
+                ),
+                "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
+                "window_pool": (
+                    fill_closed_assembler.window_pool
+                    if fill_closed_assembler is not None
+                    else 1.0
+                ),
+            } if FILL_CLOSED_ENABLED else {}),
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": first_batcher.randomness,
             "environment": env_names_list[0],   # legacy singular, kept for compat
@@ -4846,6 +4902,10 @@ class ValidationService:
         else:
             get_archive_queue().enqueue(archived_window, archive)
         self._archive_enqueued_windows.add(archived_window)
+        if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
+            self._fill_closed_assemblers.pop(archived_window, None)
+            if getattr(self, "_fill_closed_assembler", None) is fill_closed_assembler:
+                self._fill_closed_assembler = None
         if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
             for env_name, batcher in batcher_dict.items():
                 self._record_auction_final_verdicts(
@@ -5093,6 +5153,17 @@ class ValidationService:
         if FILL_CLOSED_ENABLED and recovery is not None:
             from reliquary.infrastructure.archive_queue import get_archive_queue
 
+            assembler = getattr(self, "_fill_closed_assemblers", {}).get(
+                window_start
+            )
+            if assembler is None:
+                raise RuntimeError(
+                    f"window {window_start}: v6 recovery has no assembler"
+                )
+            self._close_and_commit_fill_closed_paid_side_effects(
+                batchers,
+                assembler,
+            )
             recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
             recovery.recover(window_start, queue=self._training_payload_queue_ref(),
                              archives=get_archive_queue(), rotation=self._fill_closed_rotation_store)
@@ -5169,6 +5240,13 @@ class ValidationService:
             "archive_schema_version": 2,
             "window_status": "aborted",
             "window_start": int(first_batcher.window_start),
+            **({
+                "selection_policy": FILL_CLOSED_SELECTION_POLICY,
+                "payment_policy": FIXED_GROUP_PAYMENT_POLICY,
+                "picks_target": FILL_CLOSED_PICKS_PER_WINDOW,
+                "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
+                "window_pool": 1.0,
+            } if FILL_CLOSED_ENABLED else {}),
             "validator_hotkey": validator_hotkey,
             "randomness": str(getattr(first_batcher, "randomness", "")),
             "environment": env_names[0] if env_names else "",
@@ -5328,6 +5406,14 @@ class ValidationService:
                 "forced_seed_cdf_boundary_epsilon": (
                     FORCED_SEED_CDF_BOUNDARY_EPSILON
                 ),
+                "fill_closed_selection_policy": (
+                    FILL_CLOSED_SELECTION_POLICY
+                ),
+                "fill_closed_payment_policy": FIXED_GROUP_PAYMENT_POLICY,
+                "fill_closed_pick_pipeline_depth": (
+                    FILL_CLOSED_PICK_PIPELINE_DEPTH
+                ),
+                "proof_pipeline_depth": PROOF_PIPELINE_DEPTH,
                 "legacy_merkle_root_enforce": LEGACY_MERKLE_ROOT_ENFORCE,
                 "difficulty_auction_enforce": DIFFICULTY_AUCTION_ENFORCE,
                 "difficulty_auction_environments": list(
@@ -5703,7 +5789,10 @@ class ValidationService:
                         self._arm_fill_closed_rotation_gate(
                             reserve_full_range=True
                         )
-                        self._fill_closed_assembler.close()
+                        self._close_and_commit_fill_closed_paid_side_effects(
+                            self._active_batchers,
+                            self._fill_closed_assembler,
+                        )
                         self._arm_fill_closed_rotation_gate()
 
                     from reliquary.constants import PIPELINED_WINDOWS

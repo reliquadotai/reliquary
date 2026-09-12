@@ -404,7 +404,7 @@ def test_the_pool_grows_from_the_reconcile_walk_not_from_record_proven(
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
         batcher.fill_state = batcher_module.FillState(
-            budgets={env: 1}, picks_target=16
+            budgets={env: 1}, picks_target=1
         )
         batcher._emit_training_batch_fn = (
             lambda environment, groups, window_start, checkpoint_revision: (
@@ -459,6 +459,7 @@ def test_backstop_seals_the_open_plan_so_it_finalises_instead_of_hanging(
     from tests.unit.test_proof_scheduler import _wait_until
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
     env = "openmathinstruct"
 
     scheduler = GlobalProofScheduler(
@@ -472,7 +473,7 @@ def test_backstop_seals_the_open_plan_so_it_finalises_instead_of_hanging(
         # target=4: far short of what we ever submit, so the plan can only
         # finalise via an explicit seal, never by reaching its target.
         batcher.fill_state = batcher_module.FillState(
-            budgets={"openmathinstruct": 4}, picks_target=16
+            budgets={"openmathinstruct": 4}, picks_target=4
         )
         batcher.mark_window_opened()
 
@@ -517,12 +518,79 @@ def test_backstop_seals_the_open_plan_so_it_finalises_instead_of_hanging(
         assert scheduler.close()
 
 
+def test_terminal_proof_abort_cannot_pay_a_partial_v6_window(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import (
+        CapacityAbortReason,
+        GlobalProofScheduler,
+        ProofPlanOutcome,
+    )
+    from tests.unit.test_grpo_window_batcher import (
+        _execute_scheduler_payload,
+        _request,
+    )
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_BOUNDED_PROOFS", False)
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_MAX_SECONDS", 10.0)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
+    now = [0.0]
+    emitted = []
+    env = "openmathinstruct"
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(env, "opencodeinstruct"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+        clock=lambda: now[0],
+    )
+    try:
+        batcher = _make_batcher(
+            proof_scheduler=scheduler,
+            time_fn=lambda: now[0],
+            emit_training_batch_fn=lambda *args: emitted.append(args),
+        )
+        batcher.fill_state = batcher_module.FillState(
+            budgets={env: 2}, picks_target=2
+        )
+        batcher.mark_window_opened(monotonic_time=0.0)
+        assert batcher.accept_submission(
+            _request(prompt_idx=21, hotkey="miner")
+        ).accepted
+
+        def _one_proven() -> bool:
+            batcher._drain_arrival_proof_buffer(env)
+            return batcher.fill_state.snapshot()["proven"][env] == 1
+
+        _wait_until(_one_proven, timeout=5.0)
+        handle = batcher._open_proof_plan_handle
+        assert handle is not None
+        assert handle._state.plan.deadline_at == 20.0
+
+        now[0] = 20.0
+        scheduler.expire_deadlines()
+        result = handle.result(timeout=1.0)
+        assert result.outcome is ProofPlanOutcome.CAPACITY_ABORTED
+        assert result.abort_reason is CapacityAbortReason.DEADLINE_EXCEEDED
+
+        assert batcher.can_pick() is False
+        assert batcher.pick_training_batch() is False
+        assert batcher.proof_capacity_aborted is True
+        assert batcher.proof_capacity_abort_reason == "deadline_exceeded"
+        assert emitted == []
+        assert batcher.poll_deadline() is True
+        assert batcher.is_sealed()
+        assert batcher._burned_unpicked_groups == 1
+    finally:
+        assert scheduler.close()
+
+
 def test_fill_close_also_seals_the_plan_which_finalises_completed(
     monkeypatch,
 ):
-    """Reaching the plan's own ``required_passes`` (still sized off the
-    admission budget, see ``_extend_proof_plan``) already finalises the
-    plan on its own (see ``_finalize_if_terminal_locked``); this only
+    """Reaching the plan's trainer-sized ``required_passes`` already
+    finalises the plan (see ``_finalize_if_terminal_locked``); this only
     confirms the new, unconditional seal call at fill-close is a safe,
     idempotent no-op there, not a second, conflicting way to close it.
     ``record_pick()`` is called directly to reach fill-close here (Task
@@ -537,6 +605,7 @@ def test_fill_close_also_seals_the_plan_which_finalises_completed(
     from tests.unit.test_proof_scheduler import _wait_until
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
     env = "openmathinstruct"
 
     scheduler = GlobalProofScheduler(

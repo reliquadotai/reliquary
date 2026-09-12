@@ -206,10 +206,8 @@ def test_ranks_handed_to_extend_strictly_increase_across_drains(monkeypatch):
     assert len(set(ranks)) == len(ranks)
 
 
-def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
-    """``rate_of`` misses when a receipt was never offered (or was offered
-    in a different window). The group must still drain -- after every
-    known-rate group, however small its rate -- rather than raise.
+def test_an_unknown_rate_remains_telemetry_and_does_not_change_fifo(monkeypatch):
+    """A missing precommit rate is retained as telemetry, not priority.
 
     Driven through the REAL intake (``_submit_arrival_proof`` doing its
     own ``rate_of``/``payload_bytes_of`` lookups), with only the
@@ -229,7 +227,7 @@ def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     extended = []
-    batcher = _make_batcher()
+    batcher = _make_batcher(time_fn=lambda: 1001.0)
     batcher.mark_window_opened(monotonic_time=1000.0, wall_time=1000.0)
     env = "openmathinstruct"
     batcher.admission_queue = batcher_module.ThroughputAdmissionQueue(
@@ -260,29 +258,30 @@ def test_an_unknown_rate_falls_back_to_lowest_priority_not_a_crash(monkeypatch):
     batcher._drain_arrival_proof_buffer(env)
 
     assert len(extended) == 1
-    assert extended[0].payload.pending.prompt_idx == 72  # "known" wins
+    assert extended[0].payload.pending.prompt_idx == 71  # first arrival wins
     assert len(batcher._arrival_proof_buffer) == 1
-    assert batcher._arrival_proof_buffer[0] is unknown
+    assert batcher._arrival_proof_buffer[0] is known
 
 
-def test_a_plan_extension_failure_releases_the_reservation(monkeypatch):
+def test_a_premature_plan_close_releases_and_raises(monkeypatch):
     import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import ProofPlanClosed
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
 
     batcher = _make_batcher()
     batcher.fill_state = batcher_module.FillState(
-        budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=16
     )
 
-    def _boom(candidates):
-        raise RuntimeError("scheduler unavailable")
+    def _boom(_candidates):
+        raise ProofPlanClosed("scheduler closed before target")
 
     batcher._extend_proof_plan = _boom
 
     try:
         batcher._submit_arrival_proof(_pending_stub(prompt_idx=4))
         raised = False
-    except RuntimeError:
+    except ProofPlanClosed:
         raised = True
 
     assert raised is True
@@ -306,6 +305,7 @@ def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
     from tests.unit.test_proof_scheduler import _wait_until
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
     env = "openmathinstruct"
 
     passing_scheduler = GlobalProofScheduler(
@@ -317,7 +317,7 @@ def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
     try:
         passing = _make_batcher(proof_scheduler=passing_scheduler)
         passing.fill_state = batcher_module.FillState(
-            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
+            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=4
         )
         assert passing.accept_submission(
             _request(prompt_idx=11, hotkey="miner-pass")
@@ -348,7 +348,7 @@ def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
             verify_commitment_proofs_fn=_always_false_grail,
         )
         failing.fill_state = batcher_module.FillState(
-            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
+            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=4
         )
         assert failing.accept_submission(
             _request(prompt_idx=12, hotkey="miner-fail")
@@ -365,6 +365,61 @@ def test_a_passing_proof_records_proven_and_a_failing_one_releases(monkeypatch):
         assert snap["in_flight"][env] == 0
     finally:
         assert failing_scheduler.close()
+
+
+def test_v6_proof_plan_stops_at_trainer_demand(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import (
+        GlobalProofScheduler,
+        ProofExecution,
+    )
+    from tests.unit.test_grpo_window_batcher import _request
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_BOUNDED_PROOFS", False)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 2)
+    environment = "openmathinstruct"
+    outcomes = iter((False, True, True, True, True))
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=(environment,),
+        proof_callable=lambda _invocation: ProofExecution(
+            passed=next(outcomes), value=object()
+        ),
+        checkpoint_revision="",
+    )
+    try:
+        batcher = _make_batcher(
+            proof_scheduler=scheduler,
+            batch_target=2,
+        )
+        batcher.fill_state = batcher_module.FillState(
+            budgets={environment: 5}, picks_target=2
+        )
+        queued = _request(prompt_idx=99, hotkey="queued")
+        assert batcher.try_reserve_proof_admission(queued) == (True, None)
+        for prompt_idx in range(5):
+            batcher._submit_arrival_proof(_pending_stub(prompt_idx))
+
+        handle = batcher._open_proof_plan_handle
+        _wait_until(handle.done, timeout=5.0)
+        assert len(handle.result().winner_job_ids) == 4
+        assert handle.result().attempts_started == 5
+
+        batcher._submit_arrival_proof(_pending_stub(5))
+        snapshot = batcher.fill_state.snapshot()
+        assert len(handle.result().winner_job_ids) == 4
+        assert snapshot["admitted"][environment] == 5
+        assert snapshot["proven"][environment] == 4
+        assert snapshot["in_flight"][environment] == 0
+        assert batcher.start_proof_admission(queued) == (
+            False,
+            "proof_dispatch_closed",
+        )
+        assert batcher.pending_proof_reservations == 0
+    finally:
+        assert scheduler.close()
 
 
 def test_v6_does_not_consult_the_seal_time_proof_wall(monkeypatch):
@@ -406,6 +461,7 @@ def test_a_skipped_prompt_claimed_decision_releases_its_reservation(monkeypatch)
     from tests.unit.test_proof_scheduler import _wait_until
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
     env = "openmathinstruct"
 
     scheduler = GlobalProofScheduler(
@@ -417,7 +473,7 @@ def test_a_skipped_prompt_claimed_decision_releases_its_reservation(monkeypatch)
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
         batcher.fill_state = batcher_module.FillState(
-            budgets={"openmathinstruct": 3, "opencodeinstruct": 3}, picks_target=16
+            budgets={"openmathinstruct": 3, "opencodeinstruct": 3}, picks_target=3
         )
 
         # Two submissions competing for the SAME prompt (only one can win
@@ -461,6 +517,7 @@ def test_a_raising_proof_callable_releases_its_reservation(monkeypatch):
     from tests.unit.test_proof_scheduler import _wait_until
 
     monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
     env = "openmathinstruct"
 
     def _boom(_invocation):
@@ -475,7 +532,7 @@ def test_a_raising_proof_callable_releases_its_reservation(monkeypatch):
     try:
         batcher = _make_batcher(proof_scheduler=scheduler)
         batcher.fill_state = batcher_module.FillState(
-            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=16
+            budgets={"openmathinstruct": 4, "opencodeinstruct": 4}, picks_target=4
         )
         assert batcher.accept_submission(
             _request(prompt_idx=5, hotkey="hk-fault")
@@ -522,6 +579,9 @@ def test_a_decision_is_accounted_exactly_once_across_repeated_walks(monkeypatch)
         def decisions(self):
             return self._decisions
 
+        def done(self):
+            return False
+
     batcher._open_proof_plan_handle = _FakeHandle([
         ProofDecision(
             job_id="j1", rank=1, prompt_key=("prompt", 1),
@@ -546,6 +606,59 @@ def test_a_decision_is_accounted_exactly_once_across_repeated_walks(monkeypatch)
     snap = batcher.fill_state.snapshot()
     assert snap["proven"][env] == 1
     assert snap["in_flight"][env] == 0
+
+
+def test_strict_mode_observers_reconcile_the_last_scheduler_decision(
+    monkeypatch,
+):
+    """A worker returns before its PASSED decision is published."""
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.validator.proof_scheduler import GlobalProofScheduler
+    from tests.unit.test_grpo_window_batcher import (
+        _execute_scheduler_payload,
+        _make_batcher,
+        _request,
+    )
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_BOUNDED_PROOFS", False)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
+    env = "openmathinstruct"
+
+    for observer in ("can_pick", "poll_deadline"):
+        now = [0.0]
+        scheduler = GlobalProofScheduler(
+            devices=("gpu-0",),
+            environments=(env,),
+            proof_callable=_execute_scheduler_payload,
+            checkpoint_revision="",
+            clock=lambda: now[0],
+        )
+        try:
+            batcher = _make_batcher(
+                proof_scheduler=scheduler,
+                time_fn=lambda: now[0],
+            )
+            batcher.fill_state = batcher_module.FillState(
+                budgets={env: 1}, picks_target=1,
+            )
+            assert batcher.accept_submission(
+                _request(prompt_idx=21, hotkey="miner")
+            ).accepted
+            handle = batcher._open_proof_plan_handle
+            _wait_until(handle.done, timeout=5.0)
+
+            if observer == "can_pick":
+                assert batcher.can_pick() is True
+            else:
+                now[0] = 1799.0
+                assert batcher.poll_deadline() is False
+            snapshot = batcher.fill_state.snapshot()
+            assert snapshot["proven"][env] == 1
+            assert snapshot["in_flight"][env] == 0
+        finally:
+            assert scheduler.close()
 
 
 def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
@@ -587,16 +700,22 @@ def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
     # Standard technique for a concurrency bug: this is test-only
     # instrumentation, not a change to the code under test's logic.
     original_ranked_proof_for = batcher_module.GrpoWindowBatcher._ranked_proof_for
+    ranked_prompts = []
 
-    def _slow_ranked_proof_for(self, *args, **kwargs):
+    def _slow_ranked_proof_for(self, pending, *args, **kwargs):
         time.sleep(0.005)
-        return original_ranked_proof_for(self, *args, **kwargs)
+        candidate = original_ranked_proof_for(
+            self, pending, *args, **kwargs
+        )
+        ranked_prompts.append((candidate.rank, pending.prompt_idx))
+        return candidate
 
     monkeypatch.setattr(
         batcher_module.GrpoWindowBatcher,
         "_ranked_proof_for",
         _slow_ranked_proof_for,
     )
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
 
     env = "openmathinstruct"
     n_threads = 8
@@ -605,6 +724,7 @@ def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
         return ProofExecution(passed=True, value=object())
 
     for attempt in range(20):
+        ranked_prompts.clear()
         scheduler = GlobalProofScheduler(
             devices=("gpu-0", "gpu-1"),
             environments=("openmathinstruct", "opencodeinstruct"),
@@ -614,7 +734,8 @@ def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
         try:
             batcher = _make_batcher(proof_scheduler=scheduler)
             batcher.fill_state = batcher_module.FillState(
-                budgets={"openmathinstruct": n_threads, "opencodeinstruct": n_threads}, picks_target=16
+                budgets={"openmathinstruct": n_threads, "opencodeinstruct": n_threads},
+                picks_target=n_threads,
             )
 
             # Pre-populate the buffer directly -- this test targets
@@ -667,5 +788,9 @@ def test_concurrent_drains_do_not_race_on_rank_allocation(monkeypatch):
             ranks = [decision.rank for decision in handle.decisions()]
             assert ranks == sorted(ranks), (attempt, ranks)
             assert len(set(ranks)) == len(ranks), (attempt, ranks)
+            prompts = [prompt for _rank, prompt in ranked_prompts]
+            assert prompts == list(
+                range(attempt * 100, attempt * 100 + n_threads)
+            ), (attempt, prompts)
         finally:
             scheduler.close()

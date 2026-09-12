@@ -475,6 +475,147 @@ async def test_grader_crash_prepared_result_retains_operator_prompt_claim():
 
 
 @pytest.mark.asyncio
+async def test_v6_post_grade_commit_preserves_ingress_order(monkeypatch):
+    """Parallel grading cannot let a later body commit first."""
+    import reliquary.validator.server as server_module
+
+    monkeypatch.setattr(server_module, "FILL_CLOSED_ENABLED", True)
+    batcher = _batcher()
+    batcher.difficulty_auction_enabled = True
+    committed = []
+    monkeypatch.setattr(
+        batcher,
+        "reserve_prepared_identity",
+        lambda *_args: (True, None, None),
+    )
+    monkeypatch.setattr(
+        batcher,
+        "start_revealed_admission",
+        lambda *_args: (True, None),
+    )
+    monkeypatch.setattr(
+        batcher,
+        "accept_prepared_submission",
+        lambda prepared, **_kwargs: (
+            committed.append(prepared.request.prompt_idx)
+            or BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.SUBMITTED,
+            )
+        ),
+    )
+    monkeypatch.setattr(batcher, "finish_proof_admission", lambda *_args: None)
+    monkeypatch.setattr(
+        type(batcher), "resolve_upload_precommit", lambda *_args, **_kwargs: None,
+    )
+
+    server = ValidatorServer()
+    server.set_active_batchers({FakeEnv.name: batcher})
+    server._admission_materialization_pool = ThreadPoolExecutor(max_workers=2)
+    requests = [_request(prompt_idx=index) for index in (1, 2)]
+    prepared = {
+        index: PreparedSubmission(
+            request=request,
+            completion_texts=[],
+            rewards=[],
+            rollout_hashes=[bytes([i]) * 32 for i in range(M_ROLLOUTS)],
+            selection_digest=compute_rollouts_selection_digest(
+                request.rollouts
+            ),
+        )
+        for index, request in zip((1, 2), requests)
+    }
+    first_started = asyncio.Event()
+    second_prepared = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def prepare(
+        _environment,
+        _function,
+        raw_body,
+        *_args,
+        wall_seconds,
+    ):
+        del wall_seconds
+        index = int(raw_body.decode())
+        if index == 1:
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_prepared.set()
+        return prepared[index]
+
+    server._run_admission_process = prepare
+    loop = asyncio.get_running_loop()
+    first_done = loop.create_future()
+    second_done = loop.create_future()
+
+    def item(index, predecessor, completion):
+        request = requests[index - 1]
+        receipt = _UploadPrecommitReceipt(
+            receipt_id=f"receipt-{index}",
+            precommit_signature=f"signed-{index}",
+            miner_hotkey=request.miner_hotkey,
+            prompt_idx=request.prompt_idx,
+            window_start=request.window_start,
+            merkle_root=request.merkle_root,
+            checkpoint_hash=request.checkpoint_hash,
+            environment=FakeEnv.name,
+            payload_bytes=1,
+            payload_sha256=hashlib.sha256(str(index).encode()).hexdigest(),
+            drand_round=request.drand_round,
+            protocol_version=request.protocol_version,
+            nonce=request.nonce,
+            expires_at_wall=time.time() + 30.0,
+            precommit_arrival_ts=time.time(),
+            drand_observation=DrandRoundObservation(
+                submitted_drand_round=request.drand_round,
+                arrival_drand_round=request.drand_round,
+                drand_delta=0,
+                drand_tolerance=0,
+                drand_status="current",
+                reject_reason=None,
+            ),
+            batcher=batcher,
+            consumed=True,
+        )
+        return _QueuedAuctionSubmission(
+            raw_body=str(index).encode(),
+            receipt=receipt,
+            batcher=batcher,
+            telemetry=SubmitTelemetry.from_request(
+                request, t_arrival=time.time(),
+            ),
+            enqueued_monotonic=float(index),
+            admission_predecessor=predecessor,
+            admission_completion=completion,
+        )
+
+    first = item(1, None, first_done)
+    second = item(2, first_done, second_done)
+    server._admission_order_tail[id(batcher)] = second_done
+    try:
+        first_task = asyncio.create_task(
+            server._process_auction_submission(first, asyncio.Queue())
+        )
+        await first_started.wait()
+        second_task = asyncio.create_task(
+            server._process_auction_submission(second, asyncio.Queue())
+        )
+        await asyncio.wait_for(second_prepared.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert committed == []
+        assert not second_task.done()
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+    finally:
+        server._admission_materialization_pool.shutdown(wait=True)
+
+    assert committed == [1, 2]
+    assert first_done.done() and second_done.done()
+    assert server._admission_order_tail == {}
+
+
+@pytest.mark.asyncio
 async def test_prepared_prompt_mismatch_releases_received_bytes(monkeypatch):
     """Reproduce the production ordering missed by the grading-refund tests.
 
@@ -2311,14 +2452,17 @@ def test_state_endpoint_returns_grpo_batch_state():
 
 
 def test_fill_closed_state_advertises_cutoff_progress_and_budget(monkeypatch):
+    import reliquary.validator.batcher as batcher_module
     import reliquary.validator.server as server_module
     from reliquary.protocol.submission import WindowState
     from reliquary.validator.fill_window import FillState
 
     monkeypatch.setattr(server_module, "FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr(server_module, "FILL_CLOSED_MAX_SECONDS", 300.0)
+    monkeypatch.setattr(batcher_module, "B_BATCH", 1)
     now = [1_000.0]
     batcher = _batcher(window_start=500)
+    batcher.env.name = "openmathinstruct"
     batcher._time_fn = lambda: now[0]
     batcher.collection_seconds = 200.0
     batcher.mark_window_opened(
@@ -2371,10 +2515,45 @@ def test_fill_closed_state_advertises_cutoff_progress_and_budget(monkeypatch):
     assert updated["remaining"] == {"openmathinstruct": 31}
     assert updated["picks_emitted"] == 1
 
+    with batcher.fill_state.lock:
+        batcher.fill_state.reserve("openmathinstruct")
+        batcher.fill_state.record_proven("openmathinstruct")
+    filled = client.get("/state").json()["fill_closed"]
+    assert filled["phase"] == "draining"
+    assert filled["remaining"] == {"openmathinstruct": 0}
+
     now[0] = 1_201.0
     assert client.get("/state").json()["fill_closed"]["phase"] == "draining"
     batcher.force_seal("test")
     assert client.get("/state").json()["fill_closed"]["phase"] == "sealed"
+
+
+def test_state_refuses_a_fill_transition_during_payload_build(monkeypatch):
+    import reliquary.validator.server as server_module
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator.fill_window import FillState
+
+    monkeypatch.setattr(server_module, "FILL_CLOSED_ENABLED", True)
+    batcher = _batcher(window_start=500)
+    batcher.env.name = "openmathinstruct"
+    batcher.fill_state = FillState(
+        budgets={"openmathinstruct": 1}, picks_target=1
+    )
+    server = ValidatorServer()
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    original = server._fill_closed_state_payload
+
+    def close_after_snapshot(active_batcher):
+        payload = original(active_batcher)
+        active_batcher.force_seal("state_build_race")
+        return payload
+
+    monkeypatch.setattr(server, "_fill_closed_state_payload", close_after_snapshot)
+    response = TestClient(server.app).get("/state")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "window_changed_during_state_build"
 
 
 def test_disabled_fill_closed_keeps_legacy_state_bytes(monkeypatch):

@@ -462,7 +462,11 @@ class GlobalProofScheduler:
             if not state.plan.open_ended:
                 raise ValueError(f"plan {plan_id!r} is not open-ended")
             self._stop_at_dispatch_deadline_locked(state)
-            if state.sealed or state.final_result is not None:
+            if (
+                state.stop_dispatch
+                or state.sealed
+                or state.final_result is not None
+            ):
                 raise ProofPlanClosed(f"plan {plan_id!r} no longer accepts work")
 
             added = tuple(sorted(candidates, key=lambda item: item.rank))
@@ -879,6 +883,17 @@ class GlobalProofScheduler:
                     if selected is not None:
                         state, candidate = selected
                         started_at = self._clock()
+                        if started_at >= state.plan.deadline_at:
+                            if state.active_job_ids:
+                                self._fault_scheduler_locked(
+                                    CapacityAbortReason.ACTIVE_PROOF_TIMEOUT
+                                )
+                            else:
+                                self._abort_plan_locked(
+                                    state,
+                                    CapacityAbortReason.DEADLINE_EXCEEDED,
+                                )
+                            continue
                         if (state.plan.dispatch_deadline_at is not None
                                 and started_at >= state.plan.dispatch_deadline_at):
                             self._stop_dispatch_locked(state, "dispatch_budget_exhausted")
@@ -959,7 +974,7 @@ class GlobalProofScheduler:
                     self._fault_scheduler_locked(
                         CapacityAbortReason.PROOF_EXECUTION_ERROR
                     )
-                elif finished_at > state.plan.deadline_at:
+                elif finished_at >= state.plan.deadline_at:
                     self._fault_scheduler_locked(
                         CapacityAbortReason.ACTIVE_PROOF_TIMEOUT
                     )
@@ -1024,22 +1039,15 @@ class GlobalProofScheduler:
         ):
             return None
         if not state.plan.complete_all:
-            # Only work in the contiguous applicable prefix can reserve a
-            # potential winner.  A RAW result behind a PENDING rank gap cannot
-            # be applied yet; counting it here can idle every device forever:
-            # the gap is not dispatched because the target appears covered,
-            # while strict rank order prevents the RAW result from advancing.
-            applicable_outstanding = 0
-            for candidate in state.candidates[state.next_apply_index:]:
-                phase = state.phases[candidate.job_id]
-                if phase is _JobPhase.PENDING:
-                    break
-                if phase in (_JobPhase.ACTIVE, _JobPhase.RAW):
-                    applicable_outstanding += 1
-            if (
-                state.passed + applicable_outstanding
-                >= state.plan.required_passes
-            ):
+            # Every active or completed proof reserves one possible winner.
+            # A rejection releases exactly one slot; a pass consumes it. This
+            # bounds speculative work independently of rank-application gaps.
+            outstanding = sum(
+                phase in (_JobPhase.ACTIVE, _JobPhase.RAW)
+                for phase in state.phases.values()
+            )
+            remaining = state.plan.required_passes - state.passed - outstanding
+            if remaining <= 0:
                 return None
         eligible: list[RankedProof] = []
         newly_limited = True
@@ -1088,7 +1096,29 @@ class GlobalProofScheduler:
                 self._apply_ready_locked(state)
                 if state.final_result is not None:
                     break
-        return min(eligible, key=lambda item: item.rank) if eligible else None
+        if state.plan.complete_all:
+            return min(eligible, key=lambda item: item.rank) if eligible else None
+
+        eligible_ids = {candidate.job_id for candidate in eligible}
+        for candidate in state.candidates:
+            prompt = candidate.prompt_key
+            if prompt in state.claimed_prompts:
+                continue
+            position = state.prompt_positions[prompt]
+            chain = state.prompt_chains[prompt]
+            if position >= len(chain) or chain[position] != candidate.job_id:
+                continue
+            phase = state.phases[candidate.job_id]
+            if phase in (_JobPhase.ACTIVE, _JobPhase.RAW):
+                continue
+            if candidate.job_id in eligible_ids:
+                return candidate
+            # An unresolved head can still consume one winner slot. Reserve it
+            # before allowing unrelated lower-ranked work around the blocker.
+            remaining -= 1
+            if remaining <= 0:
+                return None
+        return None
 
     @staticmethod
     def _has_earlier_unresolved_resource_candidate_locked(
