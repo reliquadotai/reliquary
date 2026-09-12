@@ -116,26 +116,28 @@ async def test_creating_the_first_task_writes_the_object(fake):
 @pytest.mark.asyncio
 async def test_a_lost_race_recomputes_and_refuses_when_it_no_longer_fits(fake):
     # We read a registry holding 0.5 free, but a rival takes 0.6 first.
-    client = fake(render_registry({"a": _entry("a", 0.5)}))
+    # `default` is present throughout: the bootstrap-order rule is a separate
+    # refusal, and this one must be about the sum of the caps.
+    client = fake(render_registry({"default": _entry("default", 0.5)}))
     client.steal_once = render_registry(
-        {"a": _entry("a", 0.5), "rival": _entry("rival", 0.4)}
+        {"default": _entry("default", 0.5), "rival": _entry("rival", 0.4)}
     )
 
-    with pytest.raises(RegistryError):
+    with pytest.raises(RegistryError, match="total"):
         await store.create_task(_entry("b", 0.4))
 
 
 @pytest.mark.asyncio
 async def test_a_lost_race_retries_and_succeeds_when_it_still_fits(fake):
-    client = fake(render_registry({"a": _entry("a", 0.2)}))
+    client = fake(render_registry({"default": _entry("default", 0.2)}))
     client.steal_once = render_registry(
-        {"a": _entry("a", 0.2), "rival": _entry("rival", 0.2)}
+        {"default": _entry("default", 0.2), "rival": _entry("rival", 0.2)}
     )
 
     await store.create_task(_entry("b", 0.2))
 
     entries = parse_registry(client.body)
-    assert set(entries) == {"a", "rival", "b"}
+    assert set(entries) == {"default", "rival", "b"}
 
 
 @pytest.mark.asyncio
@@ -164,3 +166,29 @@ async def test_an_oversubscribed_registry_is_readable_when_not_strict(fake):
     entries, _ = await store.read_registry(strict=False)
 
     assert set(entries) == {"a", "b"}
+
+
+# --- The first entry may only be `default`: both legacy fallbacks are armed
+# by an EMPTY registry, so any other first entry un-arms them fleet-wide. ---
+
+@pytest.mark.asyncio
+async def test_the_first_task_declared_may_not_be_something_other_than_default(fake):
+    """Without this, `tasks create --task-id foo` writes a registry holding
+    only `foo`, and every validator running today exits 4 on its next
+    restart while every submitter abstains."""
+    client = fake(None)
+
+    with pytest.raises(RegistryError, match="default"):
+        await store.create_task(_entry("logic-probe", 0.3))
+
+    assert client.body is None
+    assert client.puts == 0
+
+
+@pytest.mark.asyncio
+async def test_a_second_task_is_fine_once_default_is_declared(fake):
+    client = fake(render_registry({"default": _entry("default", 0.7)}))
+
+    await store.create_task(_entry("logic-probe", 0.3))
+
+    assert set(parse_registry(client.body)) == {"default", "logic-probe"}

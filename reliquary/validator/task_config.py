@@ -7,7 +7,7 @@ condition already lives.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +74,24 @@ def resolve_task_config(
         price_params=params,
         emission_cap=float(entry.params["cap"]),
     )
+
+
+def legacy_registry_fallback(
+    entries: Mapping[str, TaskEntry], task_ids: Iterable[str]
+) -> bool:
+    """True iff the legacy pre-registry behaviour is the right one to take.
+
+    One predicate, called by both the startup path (which passes the single
+    task this process is) and the weight submitter (which passes the set of
+    tasks that have archives). Written independently they drifted, and the
+    only safe answer is the narrow one: no registry object exists AT ALL and
+    the only task in play is the legacy ``default``. A registry that exists
+    but does not name us is a refusal, not a fallback -- otherwise a task
+    nobody declared gets paid, which is what the check is for.
+    """
+    if entries:
+        return False
+    return set(task_ids) == {DEFAULT_TASK_ID}
 
 
 def legacy_task_config() -> TaskConfig:

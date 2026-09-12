@@ -96,3 +96,177 @@ def test_list_reads_a_registry_whose_declared_caps_exceed_one(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "a" in result.output and "b" in result.output
     assert "1.3000" in result.output
+
+
+# --- The id an operator types becomes the registry KEY. ---
+
+def test_a_padded_task_id_is_normalised_before_it_becomes_a_key():
+    """`" default"` keyed under the raw string validates but can never be
+    looked up again, so the padding dies here, at the one place typing
+    becomes an entry."""
+    entry = build_task_entry(
+        task_id=" default",
+        profile_id="qwen3-4b-base-dapo-fill-closed-v6",
+        cap=1.0,
+        overrides={},
+    )
+
+    assert entry.task_id == "default"
+
+
+def test_an_unusable_task_id_is_refused_by_the_builder():
+    with pytest.raises(ValueError, match="unusable task id"):
+        build_task_entry(
+            task_id="Logic Probe",
+            profile_id="qwen3-4b-base-dapo-fill-closed-v6",
+            cap=0.25, overrides={},
+        )
+
+
+def test_a_non_canonical_entry_can_never_be_written():
+    """The builder normalises, but the registry refuses anyway: a
+    hand-constructed entry does not get a different rule."""
+    from dataclasses import replace
+
+    from reliquary.shared.task_registry import RegistryError, add_task
+
+    entry = replace(
+        build_task_entry(
+            task_id="default",
+            profile_id="qwen3-4b-base-dapo-fill-closed-v6",
+            cap=1.0, overrides={},
+        ),
+        task_id=" default",
+    )
+
+    with pytest.raises(RegistryError, match="canonical"):
+        add_task({}, entry)
+
+
+# --- Declaring the first task is the one CLI command that can stop the fleet. ---
+
+def _fake_store(monkeypatch, state):
+    """Wire `tasks create` onto an in-memory registry."""
+    from reliquary.infrastructure import task_registry_store as store
+
+    async def _read(**kwargs):
+        return dict(state["entries"]), state["etag"]
+
+    async def _write(entries, etag, **kwargs):
+        from reliquary.shared.task_registry import validate_registry
+
+        validate_registry(entries)
+        state["entries"] = dict(entries)
+        state["etag"] = '"v2"'
+        return state["etag"]
+
+    monkeypatch.setattr(store, "read_registry", _read)
+    monkeypatch.setattr(store, "write_registry", _write)
+
+
+def test_declaring_a_non_default_task_first_is_refused_by_the_cli(monkeypatch):
+    """`reliquary tasks create --task-id foo` is the first command anyone
+    runs. On an empty registry it must not write: from that moment every
+    training validator exits 4 on restart and every submitter abstains."""
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    state = {"entries": {}, "etag": None}
+    _fake_store(monkeypatch, state)
+
+    result = CliRunner().invoke(app, [
+        "tasks", "create", "--task-id", "logic-probe",
+        "--profile-id", "qwen3-4b-base-dapo-fill-closed-v6", "--cap", "0.3",
+    ])
+
+    assert result.exit_code == 1, result.output
+    assert "default" in (result.output + str(result.exception))
+    assert state["entries"] == {}
+
+
+def test_declaring_default_then_a_second_task_both_succeed(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    state = {"entries": {}, "etag": None}
+    _fake_store(monkeypatch, state)
+    runner = CliRunner()
+
+    first = runner.invoke(app, [
+        "tasks", "create", "--task-id", "default",
+        "--profile-id", "qwen3-4b-base-dapo-fill-closed-v6", "--cap", "0.7",
+    ])
+    second = runner.invoke(app, [
+        "tasks", "create", "--task-id", "logic-probe",
+        "--profile-id", "qwen3-4b-base-dapo-fill-closed-v6", "--cap", "0.3",
+    ])
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert set(state["entries"]) == {"default", "logic-probe"}
+
+
+# --- A transient R2 error at startup is not a boot failure. ---
+
+def test_the_startup_registry_read_retries_a_raising_client():
+    import asyncio
+
+    from reliquary.cli.main import read_task_registry_with_retry
+
+    calls = {"n": 0}
+
+    async def _flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("503 Service Unavailable")
+        return {"default": object()}, '"etag"'
+
+    entries, etag = asyncio.run(
+        read_task_registry_with_retry(_flaky, attempts=4, backoff_seconds=0.0)
+    )
+
+    assert calls["n"] == 3
+    assert set(entries) == {"default"}
+
+
+def test_the_startup_registry_read_still_refuses_after_the_bound():
+    import asyncio
+
+    from reliquary.cli.main import read_task_registry_with_retry
+
+    calls = {"n": 0}
+
+    async def _dead():
+        calls["n"] += 1
+        raise RuntimeError("503 Service Unavailable")
+
+    with pytest.raises(RuntimeError, match="503"):
+        asyncio.run(
+            read_task_registry_with_retry(_dead, attempts=3, backoff_seconds=0.0)
+        )
+
+    assert calls["n"] == 3
+
+
+def test_an_absent_registry_is_not_an_error_and_is_never_retried():
+    """`read_registry` reports an absent object as ({}, None), which is the
+    legacy fallback's own signal — retrying it would add 14s to every boot
+    of every validator running today."""
+    import asyncio
+
+    from reliquary.cli.main import read_task_registry_with_retry
+
+    calls = {"n": 0}
+
+    async def _absent():
+        calls["n"] += 1
+        return {}, None
+
+    entries, etag = asyncio.run(
+        read_task_registry_with_retry(_absent, attempts=4, backoff_seconds=0.0)
+    )
+
+    assert (entries, etag) == ({}, None)
+    assert calls["n"] == 1

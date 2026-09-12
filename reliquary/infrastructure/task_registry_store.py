@@ -17,6 +17,7 @@ from reliquary.shared.task_registry import (
     add_task,
     parse_registry,
     render_registry,
+    require_default_declared_first,
     retire_task,
     validate_registry,
 )
@@ -109,8 +110,16 @@ async def _mutate(change, *, attempts: int, **client_kwargs) -> None:
     )
 
 
+def _create(entries: Mapping[str, TaskEntry], entry: TaskEntry):
+    # Checked inside the change function, not before the read: `_mutate`
+    # re-applies it against the winner of a lost race, so two operators
+    # racing cannot slip a non-`default` first entry past each other.
+    require_default_declared_first(entries, entry)
+    return add_task(entries, entry)
+
+
 async def create_task(entry: TaskEntry, *, attempts: int = 5, **client_kwargs) -> None:
-    await _mutate(lambda e: add_task(e, entry), attempts=attempts, **client_kwargs)
+    await _mutate(lambda e: _create(e, entry), attempts=attempts, **client_kwargs)
 
 
 async def retire_task_entry(

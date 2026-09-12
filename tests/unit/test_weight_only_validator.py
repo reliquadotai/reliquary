@@ -846,3 +846,137 @@ async def test_submit_once_pays_the_legacy_task_with_no_registry_at_all():
 
     assert result is True
     assert captured["submit_calls"] == 1
+
+
+# --- FIX 1: one horizon across every task. Anchoring the archive slice to
+# each task's OWN last window hands a task that stopped producing its final
+# 216 windows forever, so its EMA is recomputed at full strength and
+# retirement never decays anything. ---
+
+def _patch_task_archives(windows_by_task, rewards_per_window=1.0):
+    """Emulate the real windowing: each task lists its own window keys, and
+    `list_recent_datasets` serves only the requested [current-n, current) slice.
+    Returns the dict recording what horizon each task was asked for."""
+    import reliquary.validator.weight_only as wov_mod
+
+    asked: dict[str, tuple[int, int]] = {}
+
+    async def _list_task_ids(strict=False, **kw):
+        return sorted(windows_by_task)
+
+    async def _list_all_window_keys(*, task_id=None, strict=False, **kw):
+        return list(windows_by_task[task_id])
+
+    async def _list_recent(current_window, n, *, task_id=None, **kw):
+        asked[task_id] = (current_window, n)
+        low = max(0, current_window - n)
+        return [
+            {"window_start": w, "task_id": task_id,
+             "rewards_by_hotkey": {f"hk-{task_id}": rewards_per_window}}
+            for w in windows_by_task[task_id]
+            if low <= w < current_window
+        ]
+
+    wov_mod.storage.list_task_ids = _list_task_ids
+    wov_mod.storage.list_all_window_keys = _list_all_window_keys
+    wov_mod.storage.list_recent_datasets = _list_recent
+    return asked
+
+
+def _capture_weights(wov, captured):
+    async def _fake_submit(subtensor, miner_weights):
+        captured["submit_calls"] += 1
+        captured["weights"] = dict(miner_weights)
+        return True
+    wov._submit_weights = _fake_submit
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_stopped_producing_decays_out_of_the_horizon():
+    """`retired-task` last archived at window 10; `default` is at 5010. The
+    retired task must not be handed its own last 216 windows forever."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    asked = _patch_task_archives({
+        "default": list(range(5000, 5011)),
+        "retired-task": list(range(1, 11)),
+    })
+    captured["read_registry"].return_value = (
+        {"default": object(), "retired-task": object()}, "etag",
+    )
+    _capture_weights(wov, captured)
+    try:
+        assert await wov.submit_once() is True
+    finally:
+        _restore(originals)
+
+    # One horizon, taken across every task, not each task's own maximum.
+    assert asked["default"][0] == 5011
+    assert asked["retired-task"][0] == 5011
+    assert "hk-default" in captured["weights"]
+    assert "hk-retired-task" not in captured["weights"]
+
+
+@pytest.mark.asyncio
+async def test_one_task_alone_still_anchors_on_its_own_last_window():
+    """`default` alone: the global maximum IS its own maximum, so the slice
+    read is byte-for-byte the one it read before."""
+    from reliquary.validator.weight_only import (
+        ROLLING_WINDOWS_HISTORY,
+        WeightOnlyValidator,
+    )
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    asked = _patch_task_archives({"default": list(range(45000, 45642))})
+    _capture_weights(wov, captured)
+    try:
+        assert await wov.submit_once() is True
+    finally:
+        _restore(originals)
+
+    assert asked == {"default": (45642, ROLLING_WINDOWS_HISTORY * 3)}
+
+
+# --- FIX 2: the declared cap binds where money is assigned. ---
+
+@pytest.mark.asyncio
+async def test_a_task_over_its_declared_cap_does_not_dilute_default():
+    """A box on a stale image archives a full pool for a task declared at cap
+    0.0. Without the per-task clamp the combined total reaches ~2.0 and the
+    global backstop rescales EVERYONE, halving `default`'s miners."""
+    from reliquary.shared.task_registry import MECHANISM_RL_DISCOVERED_PRICE, TaskEntry
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    def _entry(task_id, cap):
+        return TaskEntry(
+            task_id=task_id, profile_id="p", profile_sha256="a" * 64,
+            mechanism=MECHANISM_RL_DISCOVERED_PRICE,
+            params={"start": 1.0, "decay": 0.99, "rounds_per_step": 1000,
+                    "deadband": 0.8, "snap": 1.2, "floor": 0.05, "cap": cap,
+                    "median_rounds": 4800},
+            status="active", retired_at=None,
+        )
+
+    windows = list(range(4800, 5011))
+
+    async def _run(tasks, declared):
+        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+        originals, captured = _patch_chain_and_storage(blocks_until=200)
+        _patch_task_archives({t: list(windows) for t in tasks})
+        captured["read_registry"].return_value = (declared, "etag")
+        _capture_weights(wov, captured)
+        try:
+            assert await wov.submit_once() is True
+        finally:
+            _restore(originals)
+        return captured["weights"]
+
+    alone = await _run(["default"], {"default": _entry("default", 1.0)})
+    beside = await _run(
+        ["default", "stale"],
+        {"default": _entry("default", 1.0), "stale": _entry("stale", 0.0)},
+    )
+
+    assert beside["hk-default"] == alone["hk-default"]
+    assert "hk-stale" not in beside

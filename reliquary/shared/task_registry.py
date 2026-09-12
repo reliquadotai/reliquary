@@ -7,11 +7,12 @@ Kept free of I/O so the sum invariant is testable without R2, the same way
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from reliquary.shared.task_id import normalise_task_id
+from reliquary.shared.task_id import DEFAULT_TASK_ID, normalise_task_id
 
 REGISTRY_VERSION = 1
 MECHANISM_RL_DISCOVERED_PRICE = "rl-discovered-price"
@@ -44,20 +45,39 @@ class TaskEntry:
 
 
 def _number(value: Any, field: str) -> float:
+    """The one guarded coercion every numeric field goes through.
+
+    Non-finite values are refused here rather than by the range checks below:
+    every comparison against NaN is False, so ``floor > cap`` would wave a NaN
+    floor straight through. Infinity is refused for the same reason and
+    because ``json.dumps`` would then write a literal only Python can read.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RegistryError(f"{field} must be a number, got {value!r}")
     try:
-        return float(value)
+        number = float(value)
     except OverflowError as exc:
         raise RegistryError(f"{field} is too large to be a weight: {value!r}") from exc
+    if not math.isfinite(number):
+        raise RegistryError(f"{field} must be a finite number, got {value!r}")
+    return number
 
 
 def validate_entry(entry: TaskEntry) -> None:
     """Everything checkable about one entry without reading the image or R2."""
     try:
-        normalise_task_id(entry.task_id)
+        canonical = normalise_task_id(entry.task_id)
     except ValueError as exc:
         raise RegistryError(str(exc)) from exc
+    # `parse_registry` builds every entry with task_id=<the file's key>, so
+    # this is also the check on the key itself. Refuse rather than rewrite:
+    # " default" and "" both normalise to "default" while staying keyed under
+    # the raw string, producing a registry that validates but that
+    # `resolve_task_config` can never look up.
+    if canonical != entry.task_id:
+        raise RegistryError(
+            f"task id {entry.task_id!r} is not canonical; write it as {canonical!r}"
+        )
     if entry.mechanism not in KNOWN_MECHANISMS:
         raise RegistryError(f"unknown incentive mechanism {entry.mechanism!r}")
     if entry.status not in {"active", "retired"}:
@@ -115,6 +135,28 @@ def add_task(
     merged = {**entries, entry.task_id: entry}
     validate_registry(merged)
     return merged
+
+
+def require_default_declared_first(
+    entries: Mapping[str, TaskEntry], entry: TaskEntry
+) -> None:
+    """Refuse to make ``default`` the task nobody declared.
+
+    Every validator running today is the legacy ``default`` task, and both
+    legacy fallbacks are armed by an EMPTY registry (see
+    ``reliquary.validator.task_config.legacy_registry_fallback``). Writing any
+    other task first therefore un-arms them fleet-wide: trainers exit 4 on
+    their next restart and submitters abstain, with no registry entry for the
+    task actually running. Deliberately NOT part of ``add_task``: this is the
+    bootstrap ordering of a live subnet, not an invariant of the object.
+    """
+    if DEFAULT_TASK_ID in entries or entry.task_id == DEFAULT_TASK_ID:
+        return
+    raise RegistryError(
+        f"refusing to declare {entry.task_id!r} while {DEFAULT_TASK_ID!r} is "
+        f"absent from the registry: that would stop every validator running "
+        f"today. Declare {DEFAULT_TASK_ID!r} first, then add this task."
+    )
 
 
 def retire_task(
@@ -187,4 +229,8 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
             for task_id, entry in sorted(entries.items())
         },
     }
-    return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    # allow_nan=False: the Python default emits bare NaN/Infinity literals that
+    # no other JSON reader accepts, so an unreadable object would reach R2.
+    return json.dumps(
+        document, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()

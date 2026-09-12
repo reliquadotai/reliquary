@@ -15,8 +15,10 @@ from reliquary.shared.task_registry import (
     add_task,
     parse_registry,
     render_registry,
+    require_default_declared_first,
     retire_task,
     total_cap,
+    validate_entry,
     validate_registry,
 )
 
@@ -232,3 +234,101 @@ def test_summing_an_entry_with_no_cap_is_a_registry_error():
 
     with pytest.raises(RegistryError, match="cap"):
         total_cap({"a": entry})
+
+
+# --- The KEY is the id: `parse_registry` builds every entry with
+# task_id=<the file's key>, so validating the value validates the key. ---
+
+@pytest.mark.parametrize("raw_id", [" default", "default ", "", "  "])
+def test_a_non_canonical_task_id_is_refused_rather_than_rewritten(raw_id):
+    """Both of these normalise to "default" while staying keyed under the raw
+    string: the registry validates, `resolve_task_config` cannot find the
+    task, and every validator exits 4."""
+    with pytest.raises(RegistryError, match="canonical"):
+        validate_registry({raw_id: _entry(raw_id, 0.5)})
+
+
+def test_a_hand_edited_non_canonical_key_is_refused_on_parse():
+    raw = json.dumps({
+        "registry_version": 1,
+        "tasks": {" default": {
+            "profile_id": "p",
+            "profile_sha256": "a" * 64,
+            "incentive": {
+                "mechanism": MECHANISM_RL_DISCOVERED_PRICE,
+                "params": {**PARAMS, "cap": 0.5},
+            },
+            "status": "active",
+            "retired_at": None,
+        }},
+    }).encode()
+
+    with pytest.raises(RegistryError, match="canonical"):
+        parse_registry(raw)
+
+
+def test_a_non_canonical_id_cannot_be_added():
+    with pytest.raises(RegistryError, match="canonical"):
+        add_task({}, _entry(" default", 0.5))
+
+
+# --- Non-finite parameters: every range check below is a comparison, and
+# every comparison against NaN is False. ---
+
+@pytest.mark.parametrize("field", ["floor", "cap", "start", "decay", "deadband", "snap"])
+def test_a_nan_parameter_is_refused(field):
+    entry = replace(_entry("a", 0.5), params={**PARAMS, "cap": 0.5, field: float("nan")})
+
+    with pytest.raises(RegistryError, match=field):
+        validate_entry(entry)
+
+
+def test_a_nan_floor_does_not_slip_past_the_floor_cap_comparison():
+    """`float('nan') > 0.5` is False, so the range check alone waves it
+    through — the refusal has to happen in the coercion."""
+    entry = replace(_entry("a", 0.5), params={**PARAMS, "cap": 0.5, "floor": float("nan")})
+
+    assert not (float("nan") > 0.5)
+    with pytest.raises(RegistryError, match="floor"):
+        add_task({}, entry)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+def test_an_infinite_parameter_is_refused(bad):
+    entry = replace(_entry("a", 0.5), params={**PARAMS, "cap": 0.5, "snap": bad})
+
+    with pytest.raises(RegistryError, match="snap"):
+        validate_entry(entry)
+
+
+def test_render_refuses_to_write_a_non_finite_literal():
+    """`json.dumps` defaults emit bare NaN/Infinity, which only Python reads:
+    jq, Go, Rust and JSON.parse all reject the object we just put in R2."""
+    entry = replace(_entry("a", 0.5), params={**PARAMS, "cap": 0.5, "snap": float("nan")})
+
+    with pytest.raises(ValueError):
+        render_registry({"a": entry})
+
+
+def test_a_rendered_registry_never_contains_a_bare_nan():
+    raw = render_registry({"a": _entry("a", 0.5)})
+
+    assert b"NaN" not in raw and b"Infinity" not in raw
+    assert json.loads(raw)
+
+
+# --- Bootstrap order: `default` before anything else. ---
+
+def test_declaring_a_non_default_task_first_is_refused():
+    with pytest.raises(RegistryError, match="default"):
+        require_default_declared_first({}, _entry("logic-probe", 0.3))
+
+
+def test_declaring_default_first_is_allowed():
+    require_default_declared_first({}, _entry("default", 1.0))
+
+
+def test_a_second_task_is_allowed_once_default_exists():
+    require_default_declared_first(
+        {"default": _entry("default", 0.7)}, _entry("logic-probe", 0.3)
+    )

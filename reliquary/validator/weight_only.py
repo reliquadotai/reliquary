@@ -19,7 +19,7 @@ from reliquary.constants import (
 )
 from reliquary.infrastructure import chain, storage
 from reliquary.infrastructure.task_registry_store import read_registry
-from reliquary.shared.task_id import DEFAULT_TASK_ID
+from reliquary.validator.task_config import legacy_registry_fallback
 
 # EMA history depth — number of past windows replayed to compute miner
 # scores. Independent of the on-chain tempo: 72 windows ≈ ~6 hours on a
@@ -172,15 +172,31 @@ class WeightOnlyValidator:
 
         by_task: dict[str, list[dict]] = {}
         try:
+            windows_by_task: dict[str, list[int]] = {}
             for task_id in await storage.list_task_ids(strict=True):
                 windows = await storage.list_all_window_keys(task_id=task_id, strict=True)
-                if not windows:
-                    continue
-                by_task[task_id] = await storage.list_recent_datasets(
-                    current_window=max(windows) + 1,
+                if windows:
+                    windows_by_task[task_id] = windows
+            # ONE horizon, taken across every task, not each task's own last
+            # window. Anchoring per task hands a task that stopped producing
+            # its own final 216 windows forever, so its EMA is recomputed at
+            # full strength and retirement never decays anything. With a
+            # single task the global maximum IS its own maximum, so `default`
+            # alone reads exactly the same archives as before.
+            horizon = max(
+                (max(w) for w in windows_by_task.values()), default=0
+            ) + 1
+            for task_id in windows_by_task:
+                archives = await storage.list_recent_datasets(
+                    current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
                     task_id=task_id,
                 )
+                # A task whose last window fell out of the shared horizon
+                # contributes nothing, and must not be counted as an
+                # archived task either.
+                if archives:
+                    by_task[task_id] = archives
         except ClientError:
             # A partial listing would submit a confident vector that pays
             # only the tasks we managed to see — worse than submitting
@@ -198,7 +214,7 @@ class WeightOnlyValidator:
             return False
         undeclared = self._undeclared_tasks(by_task, declared)
         if undeclared:
-            if not declared and set(by_task) == {DEFAULT_TASK_ID}:
+            if legacy_registry_fallback(declared, by_task):
                 # No registry object yet. The legacy task predates it and the
                 # startup path admits it for the same reason; abstaining here
                 # would stop paying everyone instead of protecting anyone.
@@ -221,7 +237,7 @@ class WeightOnlyValidator:
             "Replaying %d archives across %d task(s): %s",
             len(archives), len(by_task), ", ".join(sorted(by_task)),
         )
-        ema = self._replay_ema(archives)
+        ema = self._replay_ema(archives, caps=self._caps_by_task(declared))
         miner_weights = dict(ema)
 
         subtensor = await chain.get_subtensor()
@@ -263,7 +279,30 @@ class WeightOnlyValidator:
         return sorted(set(by_task) - set(declared))
 
     @staticmethod
-    def _replay_ema(archives: list[dict]) -> dict[str, float]:
+    def _caps_by_task(declared: Mapping[str, Any]) -> dict[str, float]:
+        """The most each declared task may pay, keyed by task id.
+
+        ``read_registry`` validates every entry before returning it, so a real
+        registry always yields a finite numeric ``cap`` here. An entry that
+        does not carry one is left out rather than assumed: an unclamped task
+        still meets the global backstop below, whereas guessing a cap would
+        invent a number nobody declared.
+        """
+        caps: dict[str, float] = {}
+        for task_id, entry in (declared or {}).items():
+            params = getattr(entry, "params", None)
+            if not isinstance(params, Mapping):
+                continue
+            try:
+                caps[str(task_id)] = float(params["cap"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return caps
+
+    @staticmethod
+    def _replay_ema(
+        archives: list[dict], *, caps: Mapping[str, float] | None = None
+    ) -> dict[str, float]:
         """Replay the per-window emission distribution into an EMA.
 
         Reads ``rewards_by_hotkey`` from each archive — the single source of
@@ -286,16 +325,28 @@ class WeightOnlyValidator:
         emission share (``window_pool``), so its own EMA sums to at most that
         share too; the combined total across tasks is therefore at most one
         pool when shares are configured correctly, and whatever is not paid
-        burns. The clamp below is only a backstop against a misconfigured
-        sum of shares exceeding one pool — it is logged, never silent,
-        because it rescales every miner's emission.
+        burns.
+
+        ``caps`` is what the registry says each task may pay, and it is
+        enforced HERE because this is where money is assigned. The producing
+        validator's ``window_pool`` binds only itself: a box running a stale
+        image, or one whose task was declared at a lower cap after it started,
+        archives a full pool regardless. Clamping per task before combining
+        keeps that task inside its own declared budget instead of letting the
+        global backstop rescale every other task's miners to pay for it. A
+        task with no declared cap (the legacy pre-registry fallback) is not
+        clamped, so ``default`` alone is byte-for-byte unchanged.
+
+        The global clamp at the end stays as a backstop against a
+        misconfigured sum of shares exceeding one pool — it is logged, never
+        silent, because it rescales every miner's emission.
         """
         by_task: dict[str, list[dict]] = {}
         for record in archives:
             by_task.setdefault(record.get("task_id", ""), []).append(record)
 
         combined: dict[str, float] = {}
-        for records in by_task.values():
+        for task_id, records in by_task.items():
             ema: dict[str, float] = {}
             alpha = EMA_ALPHA
             for record in sorted(records, key=lambda r: int(r["window_start"])):
@@ -307,6 +358,9 @@ class WeightOnlyValidator:
                     fraction = rewards.get(hk, 0.0)
                     ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
                 ema = {hk: v for hk, v in ema.items() if v > 1e-6}
+            ema = WeightOnlyValidator._clamp_to_cap(
+                task_id, ema, None if caps is None else caps.get(task_id)
+            )
             for hk, v in ema.items():
                 combined[hk] = combined.get(hk, 0.0) + v
 
@@ -320,6 +374,27 @@ class WeightOnlyValidator:
             )
             combined = {hk: v / total for hk, v in combined.items()}
         return combined
+
+    @staticmethod
+    def _clamp_to_cap(
+        task_id: str, ema: dict[str, float], cap: float | None
+    ) -> dict[str, float]:
+        """One task's EMA, scaled down to the most that task may pay."""
+        if cap is None:
+            return ema
+        share = sum(ema.values())
+        if share <= cap:
+            return ema
+        logger.warning(
+            "Task %r replays to %.4f of the pool but is declared at cap "
+            "%.4f; scaling its miners down to its own budget rather than "
+            "letting it dilute the other tasks",
+            task_id, share, cap,
+        )
+        if cap <= 0.0 or share <= 0.0:
+            return {}
+        scale = cap / share
+        return {hk: v * scale for hk, v in ema.items()}
 
     def _resolve_burn_uid(self, hotkey_to_uid: dict) -> int:
         """Where the unpayable share goes.

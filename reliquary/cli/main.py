@@ -43,18 +43,63 @@ logger = logging.getLogger(__name__)
 _grader_proc: "subprocess.Popen | None" = None
 
 
+# Startup registry read: how hard we try before refusing to boot. 3 sleeps of
+# 2/4/8s bound the delay at 14s -- far below the time the model load below
+# takes anyway, and far above an R2 503 that clears on its own.
+REGISTRY_READ_ATTEMPTS = 4
+REGISTRY_READ_BACKOFF_SECONDS = 2.0
+
+
+async def read_task_registry_with_retry(
+    read_registry,
+    *,
+    attempts: int = REGISTRY_READ_ATTEMPTS,
+    backoff_seconds: float = REGISTRY_READ_BACKOFF_SECONDS,
+):
+    """Read the registry, retrying a RAISING client a bounded number of times.
+
+    Refusing to start is correct when we cannot learn what we may pay, but a
+    transient R2 error during an ordinary restart is not that, and the V1
+    controller runs ``restart: no`` -- an unretried 503 leaves the validator
+    down until a human notices. An ABSENT registry is not an error: it returns
+    ``({}, None)`` and is handed straight back, never retried.
+    """
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await read_registry()
+        except Exception as exc:
+            last = exc
+            if attempt >= attempts:
+                break
+            delay = backoff_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "task registry read failed (attempt %d/%d): %s; retrying in %.1fs",
+                attempt, attempts, exc, delay,
+            )
+            await asyncio.sleep(delay)
+    assert last is not None
+    raise last
+
+
 def build_task_entry(*, task_id, profile_id, cap, overrides):
     """One registry entry: shipped controller defaults, then explicit overrides."""
     from dataclasses import asdict
 
     from reliquary.environment.abi import canonical_sha256
     from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_id import normalise_task_id
     from reliquary.shared.task_registry import (
         MECHANISM_RL_DISCOVERED_PRICE,
         TaskEntry,
     )
     from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
+    # The entry's id IS the registry key. Normalise it here, at the one place
+    # an operator's typing becomes an entry, so a stray space can never key a
+    # task under something `resolve_task_config` will not find; a value that
+    # is not a usable id at all still raises.
+    task_id = normalise_task_id(task_id)
     profile = resolve_protocol_profile(profile_id)
     params = asdict(PRODUCTION_PRICE_PARAMS)
     params.update(overrides)
@@ -83,13 +128,24 @@ def tasks_create(
     decay: float = typer.Option(None, "--decay"),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
+    from reliquary.shared.task_registry import RegistryError
 
     overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
     entry = build_task_entry(
         task_id=task_id, profile_id=profile_id, cap=cap, overrides=overrides
     )
-    asyncio.run(create_task(entry))
-    typer.echo(f"declared task {task_id} on {entry.profile_id} with cap {cap}")
+    try:
+        asyncio.run(create_task(entry))
+    except RegistryError as exc:
+        # Declaring the first task is the one CLI command that can stop the
+        # whole fleet: both legacy fallbacks are armed by an EMPTY registry,
+        # so a first entry that is not `default` un-arms them for a task
+        # nobody declared. Refuse here rather than weaken the fallbacks.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"declared task {entry.task_id} on {entry.profile_id} with cap {cap}"
+    )
 
 
 @tasks_app.command("list")
@@ -698,9 +754,9 @@ def validate(
                 TASK_ID,
             )
             from reliquary.infrastructure.task_registry_store import read_registry
-            from reliquary.shared.task_id import DEFAULT_TASK_ID
             from reliquary.validator.task_config import (
                 TaskConfigError,
+                legacy_registry_fallback,
                 legacy_task_config,
                 resolve_task_config,
             )
@@ -719,8 +775,10 @@ def validate(
                 # running today, before anyone has ever written one. Falling
                 # back there is what keeps this branch from taking `default`
                 # down the day it ships.
-                registry_entries, _ = await read_registry()
-                if not registry_entries and TASK_ID == DEFAULT_TASK_ID:
+                registry_entries, _ = await read_task_registry_with_retry(
+                    read_registry
+                )
+                if legacy_registry_fallback(registry_entries, [TASK_ID]):
                     logger.warning(
                         "No task registry in R2; starting the legacy task at "
                         "the full pool. Declare it with `reliquary tasks "
