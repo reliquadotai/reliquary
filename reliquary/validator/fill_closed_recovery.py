@@ -11,7 +11,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW, FILL_CLOSED_PICKS_PER_WINDOW
+from reliquary.constants import (
+    FILL_CLOSED_EMISSIONS_PER_WINDOW,
+    FILL_CLOSED_PICKS_PER_WINDOW,
+    TASK_EMISSION_SHARE,
+    TASK_ID,
+)
 from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
 from reliquary.shared.strict_json import strict_json_loads
 from reliquary.shared.training_payload import (
@@ -22,6 +27,23 @@ from reliquary.shared.training_payload import (
 from reliquary.validator.control import write_json
 from reliquary.validator.fill_closed_rotation import FillClosedRotationGate
 from reliquary.validator.token_rewards import AcceptedGroup, split_environment_pool
+
+
+def _valid_window_pool(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0.0 <= value <= 1.0
+    )
+
+
+def window_environment_pool(record: dict) -> float:
+    """One environment's share of one batch, from the pool the window opened with."""
+    return (
+        float(record.get("window_pool", 1.0))
+        / len(record["environments"])
+        / record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW)
+    )
 
 
 def accounting_rows(batches: dict | None, *, batch_index: int) -> list[dict]:
@@ -59,7 +81,7 @@ class FillClosedRecoveryStore:
 
     def load(self, window: int) -> dict:
         value = strict_json_loads(self._path(window).read_bytes())
-        if not isinstance(value, dict) or set(value) - {"picks_target"} != {
+        if not isinstance(value, dict) or set(value) - {"picks_target", "window_pool"} != {
             "schema_version", "window_start", "identity", "parent_checkpoint_n",
             "parent_revision", "environments", "batch_targets", "archive",
         } or type(value["schema_version"]) is not int or value["schema_version"] != 1:
@@ -78,6 +100,8 @@ class FillClosedRecoveryStore:
         picks = value.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW)
         if type(picks) is not int or not 1 <= picks <= FILL_CLOSED_EMISSIONS_PER_WINDOW:
             raise ValueError("invalid active window pick target")
+        if "window_pool" in value and not _valid_window_pool(value["window_pool"]):
+            raise ValueError("invalid active window pool")
         return value
 
     def windows(self) -> list[int]:
@@ -88,15 +112,19 @@ class FillClosedRecoveryStore:
             windows.append(window)
         return sorted(windows)
 
-    def begin(self, window: int, *, checkpoint_n: int, revision: str, targets: dict) -> None:
+    def begin(self, window: int, *, checkpoint_n: int, revision: str, targets: dict,
+              window_pool: float = 1.0) -> None:
         if self._path(window).exists():
             raise RuntimeError("active window requires recovery before reuse")
+        if not _valid_window_pool(window_pool):
+            raise ValueError("invalid active window pool")
         write_json(self._path(window), {
             "schema_version": 1, "window_start": window,
             "identity": active_training_identity(), "parent_checkpoint_n": checkpoint_n,
             "parent_revision": revision, "environments": list(targets),
             "batch_targets": targets, "archive": None,
             "picks_target": FILL_CLOSED_PICKS_PER_WINDOW,
+            "window_pool": float(window_pool),
         })
         self.load(window)
 
@@ -172,7 +200,7 @@ class FillClosedRecoveryStore:
                 shares = split_environment_pool([
                     AcceptedGroup(row["hotkey"], row["hotkey"], row["eos_tokens"])
                     for row in paid if row["env_name"] == environment
-                ], pool=1.0 / len(environments) / record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW))
+                ], pool=window_environment_pool(record))
                 for hotkey, reward in shares.items():
                     rewards[hotkey] = rewards.get(hotkey, 0.0) + reward
         gate = FillClosedRotationGate(
@@ -188,6 +216,7 @@ class FillClosedRecoveryStore:
         archive = {
             "archive_schema_version": 2, "window_start": window,
             "window_status": "recovered_partial" if rows else "aborted",
+            "task_id": TASK_ID, "task_emission_share": TASK_EMISSION_SHARE,
             "failure_stage": "active_window_recovery", "failure_type": "interrupted_window",
             "environments": environments, "environment": environments[0],
             "batch_targets": record["batch_targets"], "batch": rows,

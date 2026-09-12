@@ -2403,7 +2403,8 @@ class ValidationService:
         recovery = getattr(self, "_fill_closed_recovery_store", None)
         if FILL_CLOSED_ENABLED and recovery is not None:
             recovery.begin(target_window, checkpoint_n=cp.checkpoint_n,
-                           revision=cp_hash, targets=dict(self.env_mix))
+                           revision=cp_hash, targets=dict(self.env_mix),
+                           window_pool=TASK_EMISSION_SHARE)
         fill_closed_assembler = (
             FillClosedBatchAssembler(
                 window_start=target_window,
