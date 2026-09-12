@@ -76,6 +76,11 @@ queues the rest, up to `MAX_PROOF_PIPELINE_DEPTH` (4); a request beyond that is
 refused, and a queued proof gives up at its own deadline. Lanes exist only on
 the controller: the wire, receipts and capacity evidence carry the physical slot.
 
+For rollout analysis, `/state` reports the configured depth, dispatch-lane count,
+current/maximum in-flight proof RPCs, failures, bytes, reconnects and elapsed RPC
+time. Worker `proof_backend` logs separate queue wait, GPU backend time and total
+request time; `proof_queue_full` identifies saturation at the bounded queue.
+
 Remote mode uses metadata proxies for every scheduled, forensic and legacy
 proof path. The initial SHA resume downloads only profile/tokenizer/config
 metadata on the controller. Subsequent R2 checkpoint intake still stages the

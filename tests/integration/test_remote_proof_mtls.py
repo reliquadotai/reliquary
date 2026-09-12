@@ -799,6 +799,10 @@ def test_every_dispatch_lane_keeps_its_connection_alive(pki):
         reconnects = client._rpc_stats["reconnects"]
         three_overlapping_batches()
         assert client._rpc_stats["reconnects"] == reconnects
+        snapshot = client.readiness_snapshot()
+        assert snapshot["pipeline_depth"] == snapshot["dispatch_lanes"] == 3
+        assert snapshot["transport"]["max_in_flight"] == 3
+        assert snapshot["transport"]["in_flight"] == snapshot["transport"]["failures"] == 0
 
 
 def test_a_queued_proof_gives_up_at_its_deadline_without_reaching_the_gpu(pki):

@@ -83,7 +83,8 @@ class RemoteProofPool:
         self._measurements = threading.local()
         self._rpc_lock = threading.Lock()
         self._rpc_stats = dict(calls=0, reconnects=0, seconds=0.0,
-                               request_bytes=0, response_bytes=0, rollouts=0)
+                               request_bytes=0, response_bytes=0, rollouts=0,
+                               in_flight=0, max_in_flight=0, failures=0)
 
     @contextmanager
     def measure_group(self):
@@ -305,7 +306,9 @@ class RemoteProofPool:
             self._health_probe.start()
         with self._rpc_lock:
             transport = dict(self._rpc_stats)
-        return {"mode": "remote", "worker_id": self.worker_id, "transport": transport,
+        return {"mode": "remote", "worker_id": self.worker_id,
+                "pipeline_depth": self.pipeline_depth,
+                "dispatch_lanes": len(self.dispatch_devices), "transport": transport,
                 "ready": self._adopted is not None and not self._closed
                     and time.monotonic() - self._health_checked_at <= 10,
                 "revision": self._adopted.revision if self._adopted else None}
@@ -394,9 +397,15 @@ class RemoteProofPool:
         slot = self.slot_for(device_id)
         if self._closed or checkpoint != self._adopted or slot is None:
             raise ProofWorkerUnavailable("remote proof device/checkpoint is not ready")
+        tracked = succeeded = False
         try:
             if not 1 <= len(inputs) <= MAX_PROOF_BATCH:
                 raise ValueError("proof batch size exceeded")
+            with self._rpc_lock:
+                self._rpc_stats["in_flight"] += 1
+                self._rpc_stats["max_in_flight"] = max(
+                    self._rpc_stats["max_in_flight"], self._rpc_stats["in_flight"])
+            tracked = True
             requests = []
             for commit, seed_u_values in inputs:
                 payload = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
@@ -440,6 +449,7 @@ class RemoteProofPool:
                          "policy_tokens": len(result.result.completion_chosen_probs)})
             with self._rpc_lock:
                 self._rpc_stats["rollouts"] += len(results)
+            succeeded = True
             return [result.result.to_kernel() for result in results]
         except ProofWorkerUnavailable:
             self._adopted = None
@@ -447,6 +457,12 @@ class RemoteProofPool:
         except (ValueError, TypeError, KeyError, IndexError) as exc:
             self._adopted = None
             raise ProofWorkerUnavailable("invalid remote proof payload/result") from exc
+        finally:
+            if tracked:
+                with self._rpc_lock:
+                    self._rpc_stats["in_flight"] -= 1
+                    if not succeeded:
+                        self._rpc_stats["failures"] += 1
 
     def call(self, *_args, **_kwargs):
         raise ProofWorkerUnavailable("remote proof calls require the trusted window/environment binding")

@@ -275,6 +275,7 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
         key = ("batch:" + digest(hashes), 0) if batch else (first.job_id, first.attempt)
         request_hash = digest(hashes) if batch else hashes[0]
         limit = MAX_BATCH_RESPONSE_BYTES if batch else MAX_RESPONSE_BYTES
+        queued_at = time.perf_counter()
         with state_lock:
             if any(value.checkpoint != checkpoint for value in values):
                 raise HTTPException(409, "checkpoint not adopted")
@@ -293,6 +294,9 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
             if lock is None:
                 raise HTTPException(409, "unknown proof slot")
             if pending[first.device_id] >= MAX_PROOF_PIPELINE_DEPTH:
+                logger.warning("proof_queue_full slot=%s pending=%d limit=%d",
+                               first.device_id, pending[first.device_id],
+                               MAX_PROOF_PIPELINE_DEPTH)
                 raise HTTPException(503, "proof slot queue full")
             reserved = {key} | {(value.job_id, value.attempt) for value in values}
             # Reserve room for both the batch envelope and per-item receipts.
@@ -305,6 +309,7 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
                 cache_bytes -= len(old_body)
             cache[key] = (request_hash, None)
             pending[first.device_id] += 1
+            pending_at_accept = pending[first.device_id]
 
         def execute():
             nonlocal cache_bytes
@@ -316,6 +321,7 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
                 acquired = lock.acquire(timeout=max(0.0, deadline - clock()))
                 if not acquired:
                     raise ProofWorkerUnavailable("proof deadline expired waiting for its slot")
+                queue_wait_ms = (time.perf_counter() - queued_at) * 1000
                 for value, bound_hash in zip(values, hashes):
                     item_key = (value.job_id, value.attempt)
                     if int(clock() * 1000) >= value.expires_at_ms:
@@ -350,10 +356,12 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
                         with state_lock:
                             cache[item_key] = (bound_hash, raw)
                             cache_bytes += len(raw)
-                        logger.info("proof_backend job=%s window=%d env=%s identity_ms=%.3f backend_ms=%.3f total_ms=%.3f",
+                        logger.info("proof_backend job=%s window=%d env=%s queue_wait_ms=%.3f slot_pending=%d identity_ms=%.3f backend_ms=%.3f total_ms=%.3f request_ms=%.3f",
                                     value.job_id, value.window, value.environment,
+                                    queue_wait_ms, pending_at_accept,
                                     (backend_started - started) * 1000, backend_ms,
-                                    (time.perf_counter() - started) * 1000)
+                                    (time.perf_counter() - started) * 1000,
+                                    (time.perf_counter() - queued_at) * 1000)
                     results.append(result)
                     if not result.result.all_passed:
                         break
@@ -392,7 +400,8 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
             raw = await asyncio.wrap_future(future)
             return Response(raw, media_type="application/json")
         except Exception as exc:
-            logger.warning("proof failed job=%s cause=%s", first.job_id, type(exc).__name__)
+            logger.warning("proof failed job=%s cause=%s detail=%s",
+                           first.job_id, type(exc).__name__, exc)
             raise HTTPException(503, "proof infrastructure failure") from exc
 
     @app.post("/v1/prove")
