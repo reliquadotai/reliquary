@@ -240,6 +240,18 @@ class WeightOnlyValidator:
         )
         ema = self._replay_ema(archives, caps=self._caps_by_task(declared))
         miner_weights = dict(ema)
+        # A hotkey below MIN_INCENTIVE_SHARE of the pool is not paid at all.
+        # Applied here, at the submission boundary — after _replay_ema's own
+        # per-task cap clamp and global >1.0 backstop — rather than inside
+        # the EMA arithmetic itself. Dropping (not rescaling) is what keeps
+        # the freed mass unallocated: _submit_weights' burn_weight = max(0,
+        # 1 - registered_total) absorbs it instead of it being shared out
+        # among the miners that clear the floor.
+        if MIN_INCENTIVE_SHARE > 0.0:
+            miner_weights = {
+                hk: v for hk, v in miner_weights.items()
+                if v >= MIN_INCENTIVE_SHARE
+            }
 
         subtensor = await chain.get_subtensor()
         try:
@@ -374,10 +386,6 @@ class WeightOnlyValidator:
                 sorted(by_task), total,
             )
             combined = {hk: v / total for hk, v in combined.items()}
-        if MIN_INCENTIVE_SHARE > 0.0:
-            combined = {
-                hk: v for hk, v in combined.items() if v >= MIN_INCENTIVE_SHARE
-            }
         return combined
 
     @staticmethod

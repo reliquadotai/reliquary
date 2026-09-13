@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from reliquary.validator import weight_only
 from reliquary.validator.weight_only import WeightOnlyValidator
 
 
@@ -143,68 +142,3 @@ def test_an_entry_with_no_readable_cap_is_left_unclamped_not_guessed():
     every entry, so a real one always carries a finite numeric cap."""
     assert WeightOnlyValidator._caps_by_task({"default": object()}) == {}
     assert WeightOnlyValidator._caps_by_task({}) == {}
-
-
-# --- Minimum incentive floor: a hotkey below MIN_INCENTIVE_SHARE of the pool
-# is dropped entirely, and the freed mass is left for the burn — never
-# reassigned to the survivors. ---
-
-def test_a_hotkey_above_the_floor_keeps_its_value_one_below_is_absent(monkeypatch):
-    monkeypatch.setattr(weight_only, "MIN_INCENTIVE_SHARE", 0.02)
-    archives = WeightOnlyValidator._merge_archives({
-        "default": [_archive(1, "default", {"hk_big": 1.0, "hk_small": 0.5})],
-    })
-
-    ema = WeightOnlyValidator._replay_ema(archives)
-
-    # Single window: ema[hk] = EMA_ALPHA * reward exactly.
-    assert ema["hk_big"] == weight_only.EMA_ALPHA
-    assert "hk_small" not in ema
-
-
-def test_a_hotkey_exactly_on_the_floor_is_kept():
-    """The comparison is `>=`, not `>`."""
-    # A single window makes ema[hk] = EMA_ALPHA * 1.0 == EMA_ALPHA exactly, so
-    # pinning the floor to that same value lands precisely on the boundary.
-    from unittest.mock import patch
-
-    with patch.object(weight_only, "MIN_INCENTIVE_SHARE", weight_only.EMA_ALPHA):
-        archives = WeightOnlyValidator._merge_archives({
-            "default": [_archive(1, "default", {"hk_edge": 1.0})],
-        })
-
-        ema = WeightOnlyValidator._replay_ema(archives)
-
-    assert ema["hk_edge"] == weight_only.EMA_ALPHA
-
-
-def test_freed_mass_is_burned_not_redistributed(monkeypatch):
-    """The one test that must fail loudly if the floor is ever implemented as
-    a renormalisation instead of a drop. Survivors keep their exact
-    pre-floor value; the sum is correspondingly lower than 1.0, not
-    rescaled back up to it."""
-    archives = WeightOnlyValidator._merge_archives({
-        "default": [_archive(1, "default", {"hk_big": 1.0, "hk_small": 0.5})],
-    })
-
-    monkeypatch.setattr(weight_only, "MIN_INCENTIVE_SHARE", 0.0)
-    without_floor = WeightOnlyValidator._replay_ema(archives)
-
-    monkeypatch.setattr(weight_only, "MIN_INCENTIVE_SHARE", 0.02)
-    with_floor = WeightOnlyValidator._replay_ema(archives)
-
-    assert "hk_small" not in with_floor
-    # Byte-identical: not scaled down, not scaled up, just dropped.
-    assert with_floor["hk_big"] == without_floor["hk_big"]
-    assert sum(with_floor.values()) < sum(without_floor.values())
-
-
-def test_floor_disabled_drops_nothing(monkeypatch):
-    monkeypatch.setattr(weight_only, "MIN_INCENTIVE_SHARE", 0.0)
-    archives = WeightOnlyValidator._merge_archives({
-        "default": [_archive(1, "default", {"hk_big": 1.0, "hk_tiny": 0.01})],
-    })
-
-    ema = WeightOnlyValidator._replay_ema(archives)
-
-    assert set(ema) == {"hk_big", "hk_tiny"}

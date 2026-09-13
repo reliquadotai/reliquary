@@ -808,6 +808,155 @@ async def test_burn_falls_back_to_uid_zero_when_self_is_not_registered():
     assert sum(captured.values()) == pytest.approx(1.0)
 
 
+# --- Minimum incentive floor: applied in submit_once, at the submission
+# boundary — after _replay_ema's own per-task cap clamp and global backstop,
+# never inside the EMA arithmetic itself. A hotkey below MIN_INCENTIVE_SHARE
+# of the pool is dropped entirely; the freed mass is left for the existing
+# burn conservation in _submit_weights, never reassigned to survivors. ---
+
+@pytest.mark.asyncio
+async def test_submit_once_drops_hotkey_below_floor_keeps_hotkey_above():
+    """The floor lives at the submission boundary in submit_once, not
+    inside _replay_ema's pure EMA arithmetic."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_small": 0.5}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        with patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.02):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    # Single window: ema[hk] = EMA_ALPHA * reward exactly.
+    assert submitted_weights["hk_big"] == wov_mod.EMA_ALPHA
+    assert "hk_small" not in submitted_weights
+
+
+@pytest.mark.asyncio
+async def test_submit_once_keeps_hotkey_exactly_on_the_floor():
+    """The comparison is `>=`, not `>`."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_edge": 1.0}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        # Single window: ema[hk] = EMA_ALPHA * 1.0 == EMA_ALPHA exactly, so
+        # pinning the floor to that same value lands precisely on the
+        # boundary.
+        with patch.object(wov_mod, "MIN_INCENTIVE_SHARE", wov_mod.EMA_ALPHA):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert submitted_weights["hk_edge"] == wov_mod.EMA_ALPHA
+
+
+@pytest.mark.asyncio
+async def test_submit_once_burns_freed_mass_without_redistributing():
+    """The property that matters most. If the floor were ever implemented as
+    a renormalisation instead of a drop, hk_big's on-chain weight would rise
+    to absorb hk_small's freed share; here it must not move at all, and the
+    freed mass must land on the burn uid via the existing conservation
+    backstop in _submit_weights."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    fake_meta = MagicMock(hotkeys=["hk_big", "hk_small"], uids=[10, 20])
+
+    async def _run_once(min_share):
+        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+        originals, _ = _patch_chain_and_storage(blocks_until=200)
+        wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+            _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_small": 0.5}),
+        ])
+        captured = {}
+
+        async def _capture_set_weights(_subtensor, _wallet, _netuid, uids, weights):
+            captured.update(zip(uids, weights))
+            return True
+
+        try:
+            with (
+                patch.object(wov_mod, "MIN_INCENTIVE_SHARE", min_share),
+                patch(
+                    "reliquary.validator.weight_only.chain.get_metagraph",
+                    new=AsyncMock(return_value=fake_meta),
+                ),
+                patch(
+                    "reliquary.validator.weight_only.chain.set_weights",
+                    new=_capture_set_weights,
+                ),
+            ):
+                await wov.submit_once()
+        finally:
+            _restore(originals)
+        return captured
+
+    without_floor = await _run_once(0.0)
+    with_floor = await _run_once(0.02)
+
+    # hk_big (uid 10): byte-identical — not rescaled up to absorb hk_small's
+    # freed share.
+    assert with_floor[10] == without_floor[10]
+    # hk_small (uid 20): dropped entirely rather than paid a tiny amount.
+    assert 20 not in with_floor
+    # Its freed mass lands on the burn uid (this validator's own hotkey is
+    # absent from the fake metagraph, so the burn falls back to uid 0) — not
+    # spread across the survivors.
+    assert with_floor[0] == pytest.approx(without_floor[0] + without_floor[20])
+    assert sum(with_floor.values()) == pytest.approx(1.0)
+    assert sum(without_floor.values()) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_submit_once_floor_disabled_drops_nothing():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_tiny": 0.01}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        with patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.0):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert set(submitted_weights) == {"hk_big", "hk_tiny"}
+
+
 @pytest.mark.asyncio
 async def test_submit_once_abstains_when_a_task_is_undeclared():
     """An undeclared task's archives must not move the vector: paying it
