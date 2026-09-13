@@ -1241,7 +1241,7 @@ class GrpoWindowBatcher:
         # each decision is accounted, so this holds only what is actually
         # in flight.
         self._arrival_proof_meta: dict[
-            str, tuple[float | None, int, str]
+            str, tuple[float | None, int, str, PendingSubmission | None]
         ] = {}
         # v6 only. ``FillState`` has no internal locking of its own (see
         # fill_window.py) -- its ``.lock`` is what callers hold. It lives ON
@@ -1724,6 +1724,10 @@ class GrpoWindowBatcher:
             truncated_indices=truncated_indices,
             attainable_rewards=pending.attainable_rewards or (0.0, 1.0),
         ):
+            self.difficulty_auction_metadata_by_id[id(pending)] = {
+                "rank": None,
+                "status": "utility_ineligible",
+            }
             return
 
         rate = None
@@ -1742,13 +1746,18 @@ class GrpoWindowBatcher:
 
         with self.fill_state.lock:
             self._arrival_proof_sequence += 1
+            rank = self._arrival_proof_sequence
+            self.difficulty_auction_metadata_by_id[id(pending)] = {
+                "rank": rank,
+                "status": "queued_for_proof",
+            }
             self._arrival_proof_buffer.append(
                 _BufferedArrivalProof(
                     pending=pending,
                     rate=rate,
                     payload_bytes=int(payload_bytes),
                     receipt_id=str(receipt_id or ""),
-                    sequence=self._arrival_proof_sequence,
+                    sequence=rank,
                 )
             )
 
@@ -1787,11 +1796,37 @@ class GrpoWindowBatcher:
                             # These buffered bodies never reserved a proof.
                             # Their retained pending records remain available
                             # to the seal audit; none can be paid or trained.
+                            if (
+                                snapshot["proven"][environment]
+                                >= snapshot["picks_target"] * B_BATCH
+                            ):
+                                status = "proof_not_needed_target_reached"
+                            elif self._time_fn() >= (
+                                self.window_opened_at
+                                + FILL_CLOSED_PROOF_DISPATCH_SECONDS
+                            ):
+                                status = "proof_dispatch_deadline_reached"
+                            elif self._seal_flag.is_set() or snapshot["closed"]:
+                                status = "window_closed_before_proof"
+                            else:
+                                status = "proof_plan_closed_before_candidate"
+                            for buffered in self._arrival_proof_buffer:
+                                self.difficulty_auction_metadata_by_id.setdefault(
+                                    id(buffered.pending),
+                                    {"rank": buffered.sequence},
+                                )["status"] = status
                             self._arrival_proof_buffer.clear()
                             return
                         if not self._arrival_proof_buffer:
                             return
                         if not self.fill_state.may_admit(environment):
+                            for buffered in self._arrival_proof_buffer:
+                                self.difficulty_auction_metadata_by_id.setdefault(
+                                    id(buffered.pending),
+                                    {"rank": buffered.sequence},
+                                )["status"] = (
+                                    "proof_admission_budget_exhausted"
+                                )
                             return
                         self._arrival_proof_buffer.sort(
                             key=_arrival_buffer_sort_key
@@ -1813,6 +1848,9 @@ class GrpoWindowBatcher:
                     )
                     self._arrival_proof_rank += 1
                     rank = self._arrival_proof_rank
+                    self.difficulty_auction_metadata_by_id.setdefault(
+                        id(pending), {}
+                    ).update({"rank": rank, "status": "proof_pending"})
                     candidate = self._ranked_proof_for(
                         pending,
                         rank=rank,
@@ -1830,6 +1868,7 @@ class GrpoWindowBatcher:
                     job_id = candidate.job_id
                     self._arrival_proof_meta[job_id] = (
                         entry.rate, entry.payload_bytes, entry.receipt_id,
+                        pending,
                     )
                     self._extend_proof_plan([candidate])
             except Exception as exc:
@@ -1895,13 +1934,42 @@ class GrpoWindowBatcher:
                 if decision.job_id in self._accounted_arrival_decisions:
                     continue
                 self._accounted_arrival_decisions.add(decision.job_id)
-                rate, payload_bytes, receipt_id = (
+                rate, payload_bytes, receipt_id, pending = (
                     self._arrival_proof_meta.pop(
-                        decision.job_id, (None, 0, "")
+                        decision.job_id, (None, 0, "", None)
                     )
                 )
+                row = (
+                    self.difficulty_auction_metadata_by_id.get(id(pending))
+                    if pending is not None
+                    else None
+                )
+                if row is not None:
+                    if decision.status is ProofDecisionStatus.PASSED:
+                        status = "proof_passed"
+                    elif decision.status is ProofDecisionStatus.REJECTED:
+                        status = "proof_rejected"
+                    elif decision.status is ProofDecisionStatus.SKIPPED_PROMPT_CLAIMED:
+                        status = "same_prompt_or_content_already_proven"
+                    elif decision.status is ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT:
+                        status = "proof_failure_debt"
+                    elif decision.status is ProofDecisionStatus.NOT_NEEDED:
+                        status = (
+                            f"proof_not_needed_{decision.reason or 'target_reached'}"
+                        )
+                    elif decision.status is ProofDecisionStatus.CAPACITY_ABORTED:
+                        status = (
+                            f"proof_capacity_aborted_{decision.reason or 'unknown'}"
+                        )
+                    else:
+                        status = f"proof_{decision.status.value}"
+                    row["status"] = status
                 if decision.status is ProofDecisionStatus.PASSED:
                     self.fill_state.record_proven(environment)
+                    if row is not None:
+                        self.difficulty_auction_metadata_by_id[
+                            id(decision.value)
+                        ] = row
                     self._proven_groups.setdefault(environment, []).append(
                         _ProvenGroup(
                             value=decision.value,
@@ -2033,6 +2101,11 @@ class GrpoWindowBatcher:
                 with self.fill_state.lock:
                     for group in claimed:
                         group.picked = False
+                        row = self.difficulty_auction_metadata_by_id.get(
+                            id(group.value)
+                        )
+                        if row is not None:
+                            row["status"] = "proof_passed"
                 raise
         return True
 
@@ -2107,6 +2180,11 @@ class GrpoWindowBatcher:
                 return None
             for group in claimed:
                 group.picked = True
+                row = self.difficulty_auction_metadata_by_id.get(
+                    id(group.value)
+                )
+                if row is not None:
+                    row["status"] = "picked_fifo"
             chunk = [group.value for group in claimed]
             window_start = self.window_start
             checkpoint_revision = self.current_checkpoint_hash

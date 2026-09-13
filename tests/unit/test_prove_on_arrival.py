@@ -204,6 +204,16 @@ def test_ranks_handed_to_extend_strictly_increase_across_drains(monkeypatch):
     ranks = [candidate.rank for candidate in extended]
     assert ranks == sorted(ranks)
     assert len(set(ranks)) == len(ranks)
+    assert [
+        batcher.difficulty_auction_metadata_by_id[
+            id(candidate.payload.pending)
+        ]
+        for candidate in extended
+    ] == [
+        {"rank": 1, "status": "proof_pending"},
+        {"rank": 2, "status": "proof_pending"},
+        {"rank": 3, "status": "proof_pending"},
+    ]
 
 
 def test_an_unknown_rate_remains_telemetry_and_does_not_change_fifo(monkeypatch):

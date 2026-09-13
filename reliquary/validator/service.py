@@ -3389,6 +3389,24 @@ class ValidationService:
                 canonical_rank, bool
             ):
                 canonical_rank = None
+            if paid_groups is None:
+                selection_reason = str(
+                    row.get("status") or "not_selected_status_unavailable"
+                )
+            elif selected:
+                selection_reason = "selected_fifo"
+            else:
+                selection_reason = str(
+                    row.get("status") or "not_selected_status_unavailable"
+                )
+                if selection_reason == "picked_fifo":
+                    selection_reason = (
+                        "picked_but_unpaid_incomplete_cross_environment_batch"
+                    )
+                elif selection_reason == "proof_passed":
+                    selection_reason = "proven_not_selected_before_window_close"
+                elif selection_reason in {"queued_for_proof", "proof_pending"}:
+                    selection_reason = "proof_not_completed_before_window_close"
 
             from reliquary.validator.verifier import rewards_std
 
@@ -3402,6 +3420,7 @@ class ValidationService:
                     telemetry=pending.telemetry,
                     reject_stage=None if accepted else "auction_seal",
                     canonical_rank=canonical_rank,
+                    selection_reason=selection_reason,
                     accepted_into_pool=True,
                     selected_for_batch=selected,
                     rewarded=rewarded,
@@ -3423,6 +3442,7 @@ class ValidationService:
                         "accepted": accepted,
                         "reason": reason.value,
                         "canonical_rank": canonical_rank,
+                        "selection_reason": selection_reason,
                         "accepted_into_pool": True,
                         "selected_for_batch": selected,
                         "rewarded": rewarded,

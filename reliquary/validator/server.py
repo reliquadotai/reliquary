@@ -2429,6 +2429,7 @@ class ValidatorServer:
         telemetry: SubmitTelemetry | None = None,
         reject_stage: str | None = None,
         canonical_rank: int | None = None,
+        selection_reason: str | None = None,
         accepted_into_pool: bool | None = None,
         selected_for_batch: bool | None = None,
         rewarded: bool | None = None,
@@ -2479,6 +2480,8 @@ class ValidatorServer:
             entry["reject_reason"] = reason_str
         if canonical_rank is not None:
             entry["canonical_rank"] = canonical_rank
+        if selection_reason is not None:
+            entry["selection_reason"] = selection_reason
         if accepted_into_pool is not None:
             entry["accepted_into_pool"] = accepted_into_pool
         if selected_for_batch is not None:
