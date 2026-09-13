@@ -15,6 +15,7 @@ from typing import Any
 from reliquary.constants import (
     EMA_ALPHA,
     EPOCH_SUBMIT_LEAD_BLOCKS,
+    MIN_INCENTIVE_RAMP_START,
     MIN_INCENTIVE_SHARE,
     POLL_INTERVAL_SECONDS,
 )
@@ -240,18 +241,26 @@ class WeightOnlyValidator:
         )
         ema = self._replay_ema(archives, caps=self._caps_by_task(declared))
         miner_weights = dict(ema)
-        # A hotkey below MIN_INCENTIVE_SHARE of the pool is not paid at all.
-        # Applied here, at the submission boundary — after _replay_ema's own
-        # per-task cap clamp and global >1.0 backstop — rather than inside
-        # the EMA arithmetic itself. Dropping (not rescaling) is what keeps
-        # the freed mass unallocated: _submit_weights' burn_weight = max(0,
-        # 1 - registered_total) absorbs it instead of it being shared out
-        # among the miners that clear the floor.
+        # A hotkey below MIN_INCENTIVE_SHARE of the pool is paid a ramped-down
+        # share rather than its full one, down to nothing at all below
+        # MIN_INCENTIVE_RAMP_START. Applied here, at the submission boundary —
+        # after _replay_ema's own per-task cap clamp and global >1.0 backstop —
+        # rather than inside the EMA arithmetic itself. Ramping down (never
+        # rescaling anyone up) is what keeps the freed mass unallocated:
+        # _submit_weights' burn_weight = max(0, 1 - registered_total) absorbs
+        # it instead of it being shared out among the miners that clear the
+        # floor. The ramp only softens WHERE that mass starts getting freed —
+        # a hard cliff at MIN_INCENTIVE_SHARE alone gives an infinite marginal
+        # return to crossing it, which pays miners to merge hotkeys.
         if MIN_INCENTIVE_SHARE > 0.0:
-            miner_weights = {
-                hk: v for hk, v in miner_weights.items()
-                if v >= MIN_INCENTIVE_SHARE
-            }
+            ramped = {}
+            for hk, v in miner_weights.items():
+                paid = self._ramped_incentive(
+                    v, start=MIN_INCENTIVE_RAMP_START, threshold=MIN_INCENTIVE_SHARE
+                )
+                if paid > 0.0:
+                    ramped[hk] = paid
+            miner_weights = ramped
 
         subtensor = await chain.get_subtensor()
         try:
@@ -290,6 +299,29 @@ class WeightOnlyValidator:
     def _undeclared_tasks(by_task, declared) -> list[str]:
         """Archived tasks the registry does not know about."""
         return sorted(set(by_task) - set(declared))
+
+    @staticmethod
+    def _ramped_incentive(value: float, *, start: float, threshold: float) -> float:
+        """How much of ``value`` a hotkey holding that share of the pool is paid.
+
+        Linear ramp: nothing at or below ``start``, ``value`` in full at or
+        above ``threshold``, and in between a fraction of ``value`` itself
+        that grows linearly from 0 to 1 across the ramp -- replacing a hard
+        cliff at ``threshold`` alone, which gives an infinite marginal return
+        to crossing it and so pays miners to merge hotkeys.
+
+        ``start == threshold`` collapses the ramp to zero width: every value
+        is then either at/above it (paid in full) or below it (paid
+        nothing), which is exactly today's cliff. Guarded explicitly so the
+        division is never attempted for a zero- (or negative-) width ramp,
+        even though that case cannot otherwise be reached with a validated
+        ``start <= threshold``.
+        """
+        if value >= threshold:
+            return value
+        if start >= threshold or value < start:
+            return 0.0
+        return value * (value - start) / (threshold - start)
 
     @staticmethod
     def _caps_by_task(declared: Mapping[str, Any]) -> dict[str, float]:

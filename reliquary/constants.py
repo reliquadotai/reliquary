@@ -1323,6 +1323,33 @@ except ValueError as _exc:
 if not 0.0 <= MIN_INCENTIVE_SHARE < 1.0 or MIN_INCENTIVE_SHARE != MIN_INCENTIVE_SHARE:
     raise ValueError("RELIQUARY_MIN_INCENTIVE_SHARE must be in [0.0, 1.0)")
 
+# Below this share, a hotkey is paid nothing at all; between here and
+# MIN_INCENTIVE_SHARE it is paid a linearly ramping fraction of its share
+# rather than falling off a cliff at the floor. A 2%-or-nothing cliff gives an
+# infinite marginal return to crossing it, which pays miners to merge
+# hotkeys — concentration is exactly what a floor meant to protect against
+# should not reward. `start == MIN_INCENTIVE_SHARE` degenerates to today's
+# cliff exactly.
+_MIN_INCENTIVE_RAMP_START_RAW = _os.environ.get(
+    "RELIQUARY_MIN_INCENTIVE_RAMP_START", "0.01"
+)
+try:
+    MIN_INCENTIVE_RAMP_START = float(_MIN_INCENTIVE_RAMP_START_RAW)
+except ValueError as _exc:
+    raise ValueError(
+        f"RELIQUARY_MIN_INCENTIVE_RAMP_START={_MIN_INCENTIVE_RAMP_START_RAW!r} "
+        "is not a number"
+    ) from _exc
+if (
+    not 0.0 <= MIN_INCENTIVE_RAMP_START <= MIN_INCENTIVE_SHARE
+    or MIN_INCENTIVE_RAMP_START != MIN_INCENTIVE_RAMP_START
+):
+    raise ValueError(
+        "RELIQUARY_MIN_INCENTIVE_RAMP_START="
+        f"{MIN_INCENTIVE_RAMP_START} must be between 0.0 and "
+        f"MIN_INCENTIVE_SHARE={MIN_INCENTIVE_SHARE}"
+    )
+
 # ────────────────  GRPO TRAINING (v2.1)  ────────────────
 
 # Learning rate for AdamW. RL fine-tuning on pretrained LLMs is sensitive;
