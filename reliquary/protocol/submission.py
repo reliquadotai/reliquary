@@ -554,6 +554,7 @@ class Verdict(BaseModel):
     seal_trigger_round: int | None = None
     prompt_hash_lead: str | None = None
     canonical_rank: int | None = None
+    selection_reason: str | None = None
     accepted_into_pool: bool | None = None
     selected_for_batch: bool | None = None
     rewarded: bool | None = None

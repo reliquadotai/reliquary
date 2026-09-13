@@ -12,7 +12,6 @@ outcome. The endpoint here closes that gap to a few seconds.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -398,7 +397,11 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
         reason=RejectReason.GRAIL_FAIL,
     )
     metadata = {
-        id(pending[0]): {"rank": 1, "selected": True, "status": "selected"},
+        id(pending[0]): {
+            "rank": 1,
+            "selected": True,
+            "status": "picked_fifo" if fill_closed else "selected",
+        },
         id(pending[1]): {"rank": 2, "selected": False, "status": "not_needed"},
         id(pending[2]): {
             "rank": 3,
@@ -437,6 +440,9 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
     assert winner["selected_for_batch"] is True
     assert winner["rewarded"] is True
     assert winner["canonical_rank"] == winner_index + 1
+    assert winner["selection_reason"] == (
+        "selected_fifo" if fill_closed else "selected"
+    )
 
     loser = server._verdicts[f"hk{loser_index}"][0]
     assert loser["accepted"] is True
@@ -444,6 +450,10 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
     assert loser["accepted_into_pool"] is True
     assert loser["selected_for_batch"] is False
     assert loser["rewarded"] is False
+    assert loser["selection_reason"] == (
+        "picked_but_unpaid_incomplete_cross_environment_batch"
+        if fill_closed else "not_needed"
+    )
 
     failed = server._verdicts["hk2"][0]
     assert failed["accepted"] is False
@@ -452,6 +462,7 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
     assert failed["selected_for_batch"] is False
     assert failed["rewarded"] is False
     assert failed["reject_stage"] == "auction_seal"
+    assert failed["selection_reason"] == "proof_failed"
 
 
 def test_verdict_carries_sigma_and_stays_backward_compatible():
@@ -486,6 +497,22 @@ def test_record_verdict_stores_and_serves_sigma() -> None:
     body = client.get("/verdicts/hk").json()
 
     assert body["verdicts"][-1]["sigma"] == pytest.approx(0.4841)
+
+
+def test_record_verdict_stores_selection_reason() -> None:
+    server, client = _make_server_open()
+    server.record_verdict(
+        "hk", "d" * 64, True, "accepted", window_n=1,
+        canonical_rank=113,
+        selected_for_batch=False,
+        rewarded=False,
+        selection_reason="proof_not_needed_target_reached",
+    )
+
+    verdict = client.get("/miner-verdicts/hk").json()["verdicts"][-1]
+
+    assert verdict["canonical_rank"] == 113
+    assert verdict["selection_reason"] == "proof_not_needed_target_reached"
 
 
 def test_verdict_without_sigma_omits_the_field() -> None:
