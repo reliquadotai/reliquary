@@ -102,10 +102,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
     task_id = normalise_task_id(task_id)
     profile = resolve_protocol_profile(profile_id)
     if env_split is not None:
-        # The profile's own environments are the resolved `ProtocolProfile`'s,
-        # not a shape read back out of the generation contract: naming an
-        # environment the profile does not declare would otherwise put a real
-        # budget decision on the "spread evenly" fallback, silently.
+        # Fail fast here; `resolve_task_config` is the runtime authority.
         declared = set(profile.environments)
         named = set(env_split)
         unknown = named - declared

@@ -43,10 +43,7 @@ class TaskEntry:
     status: str
     retired_at: int | None
     # How the task's cap divides between its environments, e.g.
-    # {"math": 0.6, "code": 0.4}. None means "not declared": the assembler
-    # spreads the cap evenly instead. Kept separate from `params["cap"]` on
-    # purpose -- the total budget and the relative worth of an environment
-    # move at different times and for different reasons.
+    # {"math": 0.6, "code": 0.4}. None means "not declared".
     env_split: Mapping[str, float] | None = None
 
 

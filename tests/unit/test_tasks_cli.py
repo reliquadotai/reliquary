@@ -208,6 +208,76 @@ def test_declaring_default_then_a_second_task_both_succeed(monkeypatch):
     assert set(state["entries"]) == {"default", "logic-probe"}
 
 
+# --- --env-split: a name the profile does not declare is a refusal, not a
+# fallback -- that is what puts a real budget decision on the wrong path. ---
+
+@pytest.mark.parametrize("value", ["math=,code", "math=abc", ""])
+def test_a_malformed_env_split_string_is_refused(value):
+    from reliquary.cli.main import _parse_env_split_option
+
+    with pytest.raises(ValueError):
+        _parse_env_split_option(value)
+
+
+def test_a_well_formed_env_split_is_declared(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    state = {"entries": {}, "etag": None}
+    _fake_store(monkeypatch, state)
+
+    result = CliRunner().invoke(app, [
+        "tasks", "create", "--task-id", "default",
+        "--profile-id", "qwen3-4b-base-dapo-fill-closed-v6", "--cap", "0.6",
+        "--env-split", "openmathinstruct=0.6,opencodeinstruct=0.4",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert state["entries"]["default"].env_split == {
+        "openmathinstruct": 0.6, "opencodeinstruct": 0.4,
+    }
+
+
+def test_an_env_split_naming_an_undeclared_environment_is_refused(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    state = {"entries": {}, "etag": None}
+    _fake_store(monkeypatch, state)
+
+    result = CliRunner().invoke(app, [
+        "tasks", "create", "--task-id", "default",
+        "--profile-id", "qwen3-4b-base-dapo-fill-closed-v6", "--cap", "0.6",
+        "--env-split", "math=0.6,code=0.4",
+    ])
+
+    assert result.exit_code == 1, result.output
+    assert "math" in result.output and "code" in result.output
+    assert "openmathinstruct" in result.output and "opencodeinstruct" in result.output
+    assert state["entries"] == {}
+
+
+def test_an_env_split_not_summing_to_one_is_refused(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    state = {"entries": {}, "etag": None}
+    _fake_store(monkeypatch, state)
+
+    result = CliRunner().invoke(app, [
+        "tasks", "create", "--task-id", "default",
+        "--profile-id", "qwen3-4b-base-dapo-fill-closed-v6", "--cap", "0.6",
+        "--env-split", "openmathinstruct=0.6,opencodeinstruct=0.6",
+    ])
+
+    assert result.exit_code == 1, result.output
+    assert "env_split" in result.output
+    assert state["entries"] == {}
+
+
 # --- A transient R2 error at startup is not a boot failure. ---
 
 def test_the_startup_registry_read_retries_a_raising_client():

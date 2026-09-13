@@ -32,10 +32,7 @@ class TaskConfig:
     entry: TaskEntry | None
     price_params: PriceParams
     emission_cap: float
-    # Per-environment share of `emission_cap`, i.e. `cap * env_split_e`. An
-    # entry with no declared `env_split` spreads the cap evenly over the
-    # profile's own environments -- the assembler's behaviour before this
-    # field existed.
+    # Per-environment share of `emission_cap`: `cap * env_split_e`.
     env_caps: dict[str, float]
 
 
@@ -71,10 +68,18 @@ def resolve_task_config(
             f"task {task_id!r} pins profile contract {entry.profile_sha256[:12]}… "
             f"but this build computes {digest[:12]}…"
         )
+    environments = list(generation_contract.get("environments") or ())
+    if entry.env_split is not None:
+        unknown = set(entry.env_split) - set(environments)
+        if unknown:
+            raise TaskConfigError(
+                f"task {task_id!r} declares env_split for "
+                f"{sorted(unknown)}, which profile {profile_id!r} does not "
+                f"have; it declares {sorted(environments)}"
+            )
 
     params = PriceParams(**{f: entry.params[f] for f in PRICE_PARAM_FIELDS})
     cap = float(entry.params["cap"])
-    environments = list(generation_contract.get("environments") or ())
     if entry.env_split is not None:
         env_caps = {
             environment: cap * float(share)

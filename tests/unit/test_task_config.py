@@ -55,7 +55,23 @@ def test_env_caps_are_the_cap_times_the_split():
 def test_no_env_split_spreads_the_cap_evenly_over_the_profile():
     config = _resolve({"default": _entry()})
 
+    expected = config.emission_cap / len(CONTRACT["environments"])
+    assert config.env_caps == {
+        environment: pytest.approx(expected) for environment in CONTRACT["environments"]
+    }
     assert sum(config.env_caps.values()) == pytest.approx(config.emission_cap)
+
+
+def test_an_env_split_naming_an_undeclared_environment_refuses():
+    """The runtime check, not just the CLI's: a hand-built entry (exactly how
+    the registry-rule tests build them) must not silently produce env_caps
+    keyed by a name nothing will ever look up."""
+    with pytest.raises(TaskConfigError) as exc_info:
+        _resolve({"default": _entry(env_split={"math": 0.6, "fake": 0.4})})
+
+    message = str(exc_info.value)
+    assert "fake" in message
+    assert "math" in message and "code" in message
 
 
 def test_an_undeclared_task_refuses():
