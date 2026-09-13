@@ -307,8 +307,28 @@ def ready_round(arrival_rounds: Sequence[int], target: int) -> int | None:
     return sorted(arrival_rounds)[target - 1]
 
 
+def ready_rounds_by_environment(
+    arrivals_by_environment: Mapping[str, Mapping[int, Sequence[int]]],
+    targets_by_environment: Mapping[str, int],
+) -> dict[str, int | None]:
+    """When each environment reached its own target, or None for one that did not.
+
+    ``window_ready_round`` computes exactly this and keeps only the maximum;
+    a per-environment price needs the values it throws away.
+    """
+    return {
+        environment: ready_round(
+            distinct_prompt_arrival_rounds(
+                arrivals_by_environment.get(environment, {})
+            ),
+            target,
+        )
+        for environment, target in targets_by_environment.items()
+    }
+
+
 def window_ready_round(
-    arrivals_by_environment: Mapping[str, Sequence[int]],
+    arrivals_by_environment: Mapping[str, Mapping[int, Sequence[int]]],
     targets_by_environment: Mapping[str, int],
 ) -> int | None:
     """The round the SLOWEST environment reached its target.
@@ -316,13 +336,12 @@ def window_ready_round(
     A fill-closed window is not ready until every environment holds its own
     target, so averaging across them would report a readiness neither one had.
     """
-    rounds = []
-    for environment, target in targets_by_environment.items():
-        reached = ready_round(arrivals_by_environment.get(environment, ()), target)
-        if reached is None:
-            return None
-        rounds.append(reached)
-    return max(rounds) if rounds else None
+    rounds = ready_rounds_by_environment(
+        arrivals_by_environment, targets_by_environment
+    )
+    if any(reached is None for reached in rounds.values()):
+        return None
+    return max(rounds.values(), default=None)
 
 
 def price_signal_fields(
@@ -348,11 +367,11 @@ def price_signal_fields(
         "window_open_round": int(open_round),
         "window_close_round": int(close_round),
         "collect_ready_round": window_ready_round(
-            {
-                environment: distinct_prompt_arrival_rounds(arrivals)
-                for environment, arrivals in arrivals_by_environment.items()
-            },
+            arrivals_by_environment,
             targets_by_environment,
+        ),
+        "collect_ready_round_by_environment": ready_rounds_by_environment(
+            arrivals_by_environment, targets_by_environment
         ),
     }
 

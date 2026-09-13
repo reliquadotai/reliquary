@@ -23,6 +23,7 @@ def test_a_measurable_window_yields_all_three():
         "window_open_round": 1000,
         "window_close_round": 1100,
         "collect_ready_round": 1020,
+        "collect_ready_round_by_environment": {"openmathinstruct": 1020},
     }
 
 
@@ -39,6 +40,7 @@ def test_a_target_never_met_is_reported_as_a_shortage():
         "window_open_round": 1000,
         "window_close_round": 1100,
         "collect_ready_round": None,
+        "collect_ready_round_by_environment": {"openmathinstruct": None},
     }
 
 
@@ -79,3 +81,40 @@ def test_a_window_that_never_stamped_its_seal_yields_nothing():
         )
         is None
     )
+
+
+def test_ready_rounds_are_reported_per_environment():
+    from reliquary.validator.emission_price import ready_rounds_by_environment
+
+    rounds = ready_rounds_by_environment(
+        {"math": {1: [10], 2: [12]}, "code": {3: [20], 4: [99]}},
+        {"math": 2, "code": 2},
+    )
+
+    assert rounds == {"math": 12, "code": 99}
+
+
+def test_an_environment_that_never_reached_its_target_reports_none():
+    from reliquary.validator.emission_price import ready_rounds_by_environment
+
+    rounds = ready_rounds_by_environment(
+        {"math": {1: [10], 2: [12]}, "code": {3: [20]}},
+        {"math": 2, "code": 2},
+    )
+
+    assert rounds == {"math": 12, "code": None}
+
+
+def test_the_signal_carries_both_the_scalar_and_the_map():
+    from reliquary.validator.emission_price import price_signal_fields
+
+    fields = price_signal_fields(
+        open_round=100,
+        close_round=200,
+        arrivals_by_environment={"math": {1: [110]}, "code": {2: [130]}},
+        targets_by_environment={"math": 1, "code": 1},
+    )
+
+    # The scalar is the slowest environment, as before; the map is per env.
+    assert fields["collect_ready_round"] == 130
+    assert fields["collect_ready_round_by_environment"] == {"math": 110, "code": 130}
