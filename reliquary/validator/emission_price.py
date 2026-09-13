@@ -32,8 +32,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+import logging
 import math
 import statistics
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +353,12 @@ def outcomes_by_environment_from_archive(
 
     Archives written before the map existed carry only the scalar; they keep
     replaying through ``outcome_from_archive`` and contribute nothing here.
+
+    Each environment's entry is converted independently: a hand-repaired
+    archive that leaves ONE environment's ready round unreadable -- a typo, a
+    bool, a list -- costs only that environment a signal. Failing the whole
+    record for one bad entry would defeat the isolation this module exists to
+    create, taking down every other environment's price along with it.
     """
     if record.get("window_status", "completed") == "aborted":
         return None
@@ -359,16 +368,40 @@ def outcomes_by_environment_from_archive(
     scalar = outcome_from_archive(record)
     if scalar is None:
         return None
-    return {
-        environment: EnvironmentOutcome(
+    outcomes: dict[str, EnvironmentOutcome] = {}
+    for environment, ready in by_environment.items():
+        if not isinstance(environment, str):
+            logger.warning(
+                "archive %s carries a non-string environment key (%r); "
+                "skipping that entry only",
+                record.get("window_open_round"), environment,
+            )
+            continue
+        try:
+            # bool is an int subclass -- int(True) == 1 -- so it must be
+            # refused explicitly rather than silently converted to a round.
+            if isinstance(ready, bool):
+                raise TypeError(f"bool is not a valid ready round: {ready!r}")
+            resolved = None if ready is None else int(ready)
+        except (TypeError, ValueError):
+            # None means MEASURED and it did not fill -- the shortage that
+            # snaps the price up. An unreadable entry means we do not know,
+            # which is no signal at all, so it is omitted rather than given
+            # None's shortage meaning: that would raise a price on a typo.
+            logger.warning(
+                "archive %s carries an unreadable ready round for "
+                "environment %s (%r); skipping that environment only",
+                record.get("window_open_round"), environment, ready,
+            )
+            continue
+        outcomes[environment] = EnvironmentOutcome(
             environment=environment,
             open_round=scalar.open_round,
             close_round=scalar.close_round,
-            ready_round=None if ready is None else int(ready),
+            ready_round=resolved,
             incompressible_rounds=scalar.incompressible_rounds,
         )
-        for environment, ready in by_environment.items()
-    }
+    return outcomes
 
 
 def distinct_prompt_arrival_rounds(

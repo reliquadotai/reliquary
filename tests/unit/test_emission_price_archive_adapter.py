@@ -13,7 +13,10 @@ Conflating them would push the price up every time an old archive scrolled past.
 
 from __future__ import annotations
 
-from reliquary.validator.emission_price import outcome_from_archive
+from reliquary.validator.emission_price import (
+    outcome_from_archive,
+    outcomes_by_environment_from_archive,
+)
 
 
 def _instrumented(**overrides) -> dict:
@@ -101,3 +104,57 @@ def test_measured_stages_take_precedence_over_the_span():
 
     assert outcome is not None
     assert outcome.ratio == 0.5    # 25 rounds against max(50, 20), not against 100
+
+
+def test_a_bad_entry_costs_only_its_own_environment():
+    """A hand-repaired archive with a typo in one environment must not take
+    down every environment's price signal -- that isolation is the point of
+    per-environment prices."""
+    record = _instrumented(
+        collect_ready_round_by_environment={"math": 120, "code": "n/a"},
+    )
+
+    outcomes = outcomes_by_environment_from_archive(record)
+
+    assert outcomes is not None
+    assert set(outcomes) == {"math"}
+    assert outcomes["math"].ready_round == 120
+
+
+def test_a_bool_ready_round_is_refused_not_silently_converted():
+    """``int(True) == 1`` would read as a real ready round; it must not."""
+    record = _instrumented(
+        collect_ready_round_by_environment={"math": 120, "code": True},
+    )
+
+    outcomes = outcomes_by_environment_from_archive(record)
+
+    assert outcomes is not None
+    assert set(outcomes) == {"math"}
+
+
+def test_an_entirely_unreadable_map_yields_an_empty_mapping():
+    """Every entry unreadable is not an error -- it is a record with no
+    per-environment signal at all, not a crash."""
+    record = _instrumented(
+        collect_ready_round_by_environment={"math": "n/a", "code": [1, 2]},
+    )
+
+    outcomes = outcomes_by_environment_from_archive(record)
+
+    assert outcomes == {}
+
+
+def test_a_clean_map_still_yields_every_environment():
+    """The good path is unchanged: nothing about the per-entry isolation
+    should cost a well-formed record any of its environments."""
+    record = _instrumented(
+        collect_ready_round_by_environment={"math": 120, "code": None},
+    )
+
+    outcomes = outcomes_by_environment_from_archive(record)
+
+    assert outcomes is not None
+    assert set(outcomes) == {"math", "code"}
+    assert outcomes["math"].filled
+    assert not outcomes["code"].filled
