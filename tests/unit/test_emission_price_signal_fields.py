@@ -87,7 +87,7 @@ def test_ready_rounds_are_reported_per_environment():
     from reliquary.validator.emission_price import ready_rounds_by_environment
 
     rounds = ready_rounds_by_environment(
-        {"math": {1: [10], 2: [12]}, "code": {3: [20], 4: [99]}},
+        {"math": [10, 12], "code": [20, 99]},
         {"math": 2, "code": 2},
     )
 
@@ -98,7 +98,7 @@ def test_an_environment_that_never_reached_its_target_reports_none():
     from reliquary.validator.emission_price import ready_rounds_by_environment
 
     rounds = ready_rounds_by_environment(
-        {"math": {1: [10], 2: [12]}, "code": {3: [20]}},
+        {"math": [10, 12], "code": [20]},
         {"math": 2, "code": 2},
     )
 

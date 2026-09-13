@@ -397,7 +397,7 @@ def ready_round(arrival_rounds: Sequence[int], target: int) -> int | None:
 
 
 def ready_rounds_by_environment(
-    arrivals_by_environment: Mapping[str, Mapping[int, Sequence[int]]],
+    arrivals_by_environment: Mapping[str, Sequence[int]],
     targets_by_environment: Mapping[str, int],
 ) -> dict[str, int | None]:
     """When each environment reached its own target, or None for one that did not.
@@ -407,9 +407,7 @@ def ready_rounds_by_environment(
     """
     return {
         environment: ready_round(
-            distinct_prompt_arrival_rounds(
-                arrivals_by_environment.get(environment, {})
-            ),
+            arrivals_by_environment.get(environment, []),
             target,
         )
         for environment, target in targets_by_environment.items()
@@ -417,7 +415,7 @@ def ready_rounds_by_environment(
 
 
 def window_ready_round(
-    arrivals_by_environment: Mapping[str, Mapping[int, Sequence[int]]],
+    arrivals_by_environment: Mapping[str, Sequence[int]],
     targets_by_environment: Mapping[str, int],
 ) -> int | None:
     """The round the SLOWEST environment reached its target.
@@ -452,15 +450,19 @@ def price_signal_fields(
     """
     if open_round is None or close_round is None or arrivals_by_environment is None:
         return None
+    collapsed = {
+        environment: distinct_prompt_arrival_rounds(arrivals)
+        for environment, arrivals in arrivals_by_environment.items()
+    }
     return {
         "window_open_round": int(open_round),
         "window_close_round": int(close_round),
         "collect_ready_round": window_ready_round(
-            arrivals_by_environment,
+            collapsed,
             targets_by_environment,
         ),
         "collect_ready_round_by_environment": ready_rounds_by_environment(
-            arrivals_by_environment, targets_by_environment
+            collapsed, targets_by_environment
         ),
     }
 
