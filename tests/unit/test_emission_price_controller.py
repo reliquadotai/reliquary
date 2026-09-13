@@ -386,3 +386,54 @@ def test_a_state_without_the_recent_fills_tuple_still_loads():
     assert decision.regime == "snap"
     assert decision.price == pytest.approx(max(0.30, 0.25) * 1.20)
     assert decision.last_good == pytest.approx(0.25)
+
+
+def test_a_starving_environment_does_not_raise_the_other_ones_price():
+    """The defect this work exists to fix: today one starving env snaps the
+    price for every env, because the window's readiness is the slowest env's."""
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    states = {
+        "math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,)),
+        "code": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,)),
+    }
+    recent = {
+        # math never reached its target; code reached it comfortably early.
+        "math": [EnvironmentOutcome("math", 0, 1000, None, 500.0)],
+        "code": [EnvironmentOutcome("code", 0, 1000, 100, 500.0)],
+    }
+
+    decisions = advance_by_environment(states, recent, PRODUCTION_PRICE_PARAMS)
+
+    assert decisions["math"].regime == "snap"
+    assert decisions["math"].price > 0.5
+    assert decisions["code"].regime != "snap"
+    assert decisions["code"].price <= 0.5
+
+
+def test_each_environment_keeps_its_own_walk():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    states = {
+        "math": PriceState(price=0.8, last_good=0.8, recent_fill_prices=(0.8,)),
+        "code": PriceState(price=0.2, last_good=0.2, recent_fill_prices=(0.2,)),
+    }
+    recent = {
+        "math": [EnvironmentOutcome("math", 0, 1000, 900, 500.0)],
+        "code": [EnvironmentOutcome("code", 0, 1000, 900, 500.0)],
+    }
+
+    decisions = advance_by_environment(states, recent, PRODUCTION_PRICE_PARAMS)
+
+    # Same outcome shape, different starting prices: the walks do not merge.
+    assert decisions["math"].price != decisions["code"].price

@@ -221,6 +221,67 @@ def advance(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class EnvironmentOutcome:
+    """One environment's contribution to one window's price signal.
+
+    The numerator is this environment's own readiness; the denominator is the
+    window's, because collecting one environment faster than the shared
+    training step can consume buys nothing.
+    """
+
+    environment: str
+    open_round: int
+    close_round: int
+    ready_round: int | None
+    incompressible_rounds: float
+
+    @property
+    def elapsed_rounds(self) -> int:
+        return int(self.close_round) - int(self.open_round)
+
+    @property
+    def filled(self) -> bool:
+        return self.ready_round is not None
+
+    @property
+    def ratio(self) -> float | None:
+        if self.ready_round is None or self.incompressible_rounds <= 0:
+            return None
+        return (
+            int(self.ready_round) - int(self.open_round)
+        ) / self.incompressible_rounds
+
+
+def advance_by_environment(
+    states: Mapping[str, PriceState],
+    recent_by_environment: Mapping[str, Sequence[EnvironmentOutcome]],
+    params: PriceParams,
+) -> dict[str, PriceDecision]:
+    """Decide every environment's price independently, on one shared rule.
+
+    ``advance`` is reused unchanged: one environment's price is decided by
+    exactly the rule that decided the window's, so there is still one
+    controller to calibrate, not one per environment.
+    """
+    return {
+        environment: advance(
+            states.get(
+                environment,
+                PriceState(
+                    price=params.start,
+                    last_good=params.start,
+                    recent_fill_prices=(),
+                ),
+            ),
+            recent,
+            params,
+        )
+        for environment, recent in recent_by_environment.items()
+        if recent
+    }
+
+
 def replay(
     outcomes: Sequence[WindowOutcome], params: PriceParams
 ) -> PriceDecision:
@@ -280,6 +341,34 @@ def outcome_from_archive(record: Mapping[str, Any]) -> WindowOutcome | None:
         collect_ready_round=None if ready is None else int(ready),
         incompressible_rounds=incompressible,
     )
+
+
+def outcomes_by_environment_from_archive(
+    record: Mapping[str, Any],
+) -> dict[str, EnvironmentOutcome] | None:
+    """Per-environment outcomes, or None when the record carries no map.
+
+    Archives written before the map existed carry only the scalar; they keep
+    replaying through ``outcome_from_archive`` and contribute nothing here.
+    """
+    if record.get("window_status", "completed") == "aborted":
+        return None
+    by_environment = record.get("collect_ready_round_by_environment")
+    if not isinstance(by_environment, dict):
+        return None
+    scalar = outcome_from_archive(record)
+    if scalar is None:
+        return None
+    return {
+        environment: EnvironmentOutcome(
+            environment=environment,
+            open_round=scalar.open_round,
+            close_round=scalar.close_round,
+            ready_round=None if ready is None else int(ready),
+            incompressible_rounds=scalar.incompressible_rounds,
+        )
+        for environment, ready in by_environment.items()
+    }
 
 
 def distinct_prompt_arrival_rounds(
