@@ -116,6 +116,34 @@ def test_round_trip_is_canonical():
     assert list(json.loads(raw)["tasks"]) == ["a", "b"]
 
 
+# --- env_split: how the cap divides between environments. ---
+
+def test_an_env_split_must_sum_to_one():
+    entry = replace(_entry("a", 0.5), env_split={"math": 0.6, "code": 0.5})
+
+    with pytest.raises(RegistryError, match="env_split"):
+        add_task({}, entry)
+
+
+def test_an_env_split_that_sums_to_one_is_accepted():
+    entry = replace(_entry("a", 0.5), env_split={"math": 0.6, "code": 0.4})
+
+    assert set(add_task({}, entry)) == {"a"}
+
+
+def test_a_negative_env_share_is_refused():
+    entry = replace(_entry("a", 0.5), env_split={"math": 1.2, "code": -0.2})
+
+    with pytest.raises(RegistryError, match="env_split"):
+        add_task({}, entry)
+
+
+def test_an_env_split_round_trips():
+    entries = {"a": replace(_entry("a", 0.5), env_split={"math": 0.6, "code": 0.4})}
+
+    assert parse_registry(render_registry(entries)) == entries
+
+
 def test_a_registry_that_is_not_json_is_refused():
     with pytest.raises(RegistryError):
         parse_registry(b"{ not json")

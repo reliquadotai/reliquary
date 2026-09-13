@@ -32,6 +32,11 @@ class TaskConfig:
     entry: TaskEntry | None
     price_params: PriceParams
     emission_cap: float
+    # Per-environment share of `emission_cap`, i.e. `cap * env_split_e`. An
+    # entry with no declared `env_split` spreads the cap evenly over the
+    # profile's own environments -- the assembler's behaviour before this
+    # field existed.
+    env_caps: dict[str, float]
 
 
 def resolve_task_config(
@@ -68,11 +73,23 @@ def resolve_task_config(
         )
 
     params = PriceParams(**{f: entry.params[f] for f in PRICE_PARAM_FIELDS})
+    cap = float(entry.params["cap"])
+    environments = list(generation_contract.get("environments") or ())
+    if entry.env_split is not None:
+        env_caps = {
+            environment: cap * float(share)
+            for environment, share in entry.env_split.items()
+        }
+    elif environments:
+        env_caps = {environment: cap / len(environments) for environment in environments}
+    else:
+        env_caps = {}
     return TaskConfig(
         task_id=task_id,
         entry=entry,
         price_params=params,
-        emission_cap=float(entry.params["cap"]),
+        emission_cap=cap,
+        env_caps=env_caps,
     )
 
 
@@ -99,11 +116,20 @@ def legacy_task_config() -> TaskConfig:
 
     Only for a wholly absent registry: a present-but-wrong one still refuses.
     """
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
     from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
+    cap = 1.0
+    environments = list(ACTIVE_PROTOCOL_PROFILE.environments)
+    env_caps = (
+        {environment: cap / len(environments) for environment in environments}
+        if environments
+        else {}
+    )
     return TaskConfig(
         task_id=DEFAULT_TASK_ID,
         entry=None,
         price_params=PRODUCTION_PRICE_PARAMS,
-        emission_cap=1.0,
+        emission_cap=cap,
+        env_caps=env_caps,
     )

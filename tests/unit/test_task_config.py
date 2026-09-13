@@ -8,7 +8,7 @@ from reliquary.environment.abi import canonical_sha256
 from reliquary.shared.task_registry import MECHANISM_RL_DISCOVERED_PRICE, TaskEntry
 from reliquary.validator.task_config import TaskConfigError, resolve_task_config
 
-CONTRACT = {"model_id": "demo", "environments": {}}
+CONTRACT = {"model_id": "demo", "environments": {"math": {}, "code": {}}}
 DIGEST = canonical_sha256(CONTRACT)
 PARAMS = {
     "start": 1.0, "decay": 0.99, "rounds_per_step": 1000,
@@ -42,6 +42,20 @@ def test_a_declared_task_yields_its_price_parameters():
     assert config.emission_cap == 0.6
     assert config.price_params.cap == 0.6
     assert config.price_params.median_rounds == 4800
+
+
+def test_env_caps_are_the_cap_times_the_split():
+    config = _resolve(
+        {"default": _entry(env_split={"math": 0.6, "code": 0.4})}
+    )
+
+    assert config.env_caps == {"math": 0.36, "code": 0.24}
+
+
+def test_no_env_split_spreads_the_cap_evenly_over_the_profile():
+    config = _resolve({"default": _entry()})
+
+    assert sum(config.env_caps.values()) == pytest.approx(config.emission_cap)
 
 
 def test_an_undeclared_task_refuses():

@@ -82,7 +82,7 @@ async def read_task_registry_with_retry(
     raise last
 
 
-def build_task_entry(*, task_id, profile_id, cap, overrides):
+def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
     """One registry entry: shipped controller defaults, then explicit overrides."""
     from dataclasses import asdict
 
@@ -101,6 +101,20 @@ def build_task_entry(*, task_id, profile_id, cap, overrides):
     # is not a usable id at all still raises.
     task_id = normalise_task_id(task_id)
     profile = resolve_protocol_profile(profile_id)
+    if env_split is not None:
+        # The profile's own environments are the resolved `ProtocolProfile`'s,
+        # not a shape read back out of the generation contract: naming an
+        # environment the profile does not declare would otherwise put a real
+        # budget decision on the "spread evenly" fallback, silently.
+        declared = set(profile.environments)
+        named = set(env_split)
+        unknown = named - declared
+        if unknown:
+            raise ValueError(
+                f"env_split names {sorted(unknown)}, which profile "
+                f"{profile.profile_id!r} does not declare; it has "
+                f"{sorted(declared)}"
+            )
     params = asdict(PRODUCTION_PRICE_PARAMS)
     params.update(overrides)
     params["cap"] = float(cap)
@@ -112,11 +126,38 @@ def build_task_entry(*, task_id, profile_id, cap, overrides):
         params=params,
         status="active",
         retired_at=None,
+        env_split=env_split,
     )
 
 
 tasks_app = typer.Typer(name="tasks", help="Declare and retire subnet tasks")
 app.add_typer(tasks_app)
+
+
+def _parse_env_split_option(value: str | None) -> dict[str, float] | None:
+    """``"math=0.6,code=0.4"`` -> ``{"math": 0.6, "code": 0.4}``, or None."""
+    if value is None:
+        return None
+    shares: dict[str, float] = {}
+    for chunk in value.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(
+                f"--env-split entries must be name=share, got {chunk!r}"
+            )
+        name, _, raw_share = chunk.partition("=")
+        name = name.strip()
+        try:
+            shares[name] = float(raw_share.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"--env-split share for {name!r} is not a number: {raw_share!r}"
+            ) from exc
+    if not shares:
+        raise ValueError("--env-split must name at least one environment")
+    return shares
 
 
 @tasks_app.command("create")
@@ -126,17 +167,26 @@ def tasks_create(
     cap: float = typer.Option(..., "--cap", help="Most of the pool this task may pay"),
     start: float = typer.Option(None, "--start"),
     decay: float = typer.Option(None, "--decay"),
+    env_split: str = typer.Option(
+        None,
+        "--env-split",
+        help="How the cap divides between environments, e.g. math=0.6,code=0.4",
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
 
     overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
-    entry = build_task_entry(
-        task_id=task_id, profile_id=profile_id, cap=cap, overrides=overrides
-    )
     try:
+        entry = build_task_entry(
+            task_id=task_id,
+            profile_id=profile_id,
+            cap=cap,
+            overrides=overrides,
+            env_split=_parse_env_split_option(env_split),
+        )
         asyncio.run(create_task(entry))
-    except RegistryError as exc:
+    except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
         # whole fleet: both legacy fallbacks are armed by an EMPTY registry,
         # so a first entry that is not `default` un-arms them for a task

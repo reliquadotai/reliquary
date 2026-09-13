@@ -42,6 +42,12 @@ class TaskEntry:
     params: Mapping[str, float]
     status: str
     retired_at: int | None
+    # How the task's cap divides between its environments, e.g.
+    # {"math": 0.6, "code": 0.4}. None means "not declared": the assembler
+    # spreads the cap evenly instead. Kept separate from `params["cap"]` on
+    # purpose -- the total budget and the relative worth of an environment
+    # move at different times and for different reasons.
+    env_split: Mapping[str, float] | None = None
 
 
 def _number(value: Any, field: str) -> float:
@@ -107,6 +113,21 @@ def validate_entry(entry: TaskEntry) -> None:
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
         raise RegistryError(f"floor {floor} exceeds cap {cap}")
+    if entry.env_split is not None:
+        if not isinstance(entry.env_split, Mapping) or not entry.env_split:
+            raise RegistryError("env_split must be a non-empty object")
+        total = 0.0
+        for environment, share in entry.env_split.items():
+            value = _number(share, f"env_split[{environment}]")
+            if not 0.0 <= value <= 1.0:
+                raise RegistryError(
+                    f"env_split[{environment}] must be between 0.0 and 1.0"
+                )
+            total += value
+        if abs(total - 1.0) > _SUM_TOLERANCE:
+            raise RegistryError(
+                f"env_split shares total {total:.4f}, which is not 1.0"
+            )
 
 
 def total_cap(entries: Mapping[str, TaskEntry]) -> float:
@@ -202,6 +223,7 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             params=dict(params),
             status=str(body.get("status", "active")),
             retired_at=body.get("retired_at"),
+            env_split=body.get("env_split"),
         )
     if strict:
         validate_registry(entries)
@@ -225,6 +247,9 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
                 },
                 "status": entry.status,
                 "retired_at": entry.retired_at,
+                "env_split": (
+                    None if entry.env_split is None else dict(entry.env_split)
+                ),
             }
             for task_id, entry in sorted(entries.items())
         },
