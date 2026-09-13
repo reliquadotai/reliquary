@@ -129,8 +129,27 @@ numbers that have to be published and defended.
 **In the assembler.** `FillClosedBatchAssembler(window_pool: float)` becomes a
 per-environment map. `batch_pool_per_env` stops being an even division of one
 scalar and becomes each environment's own pool divided by its assembled
-batches. The rest of the payment machinery — per-batch division, `paid_groups`,
-`eos_tokens` — is untouched.
+batches.
+
+**How a pool divides *within* an environment is not this design's business, and
+that is the point.** Since PR #253 the split is policy-driven:
+`split_fixed_environment_pool` pays one fixed share per selected group
+(`share = pool / slots`) and, in its own words, *"unfilled slot shares burn"*;
+`split_environment_pool` remains for the legacy policy that divided by
+`eos_tokens`. This design changes only *which pool each environment receives*,
+never how that pool divides inside it, so it composes with either policy.
+
+That independence is worth stating, because the fixed-group policy answers a
+question this design otherwise had to: whether supply should be counted in
+groups or in tokens. Counting groups removes the length incentive, and the
+per-environment price then absorbs the fact that one environment's groups cost
+a miner more than another's — which is what a price is for. We do not have to
+model the cost ratio; the market finds it.
+
+And it makes the burn principle uniform at every level: unfilled slots burn
+inside an environment, an unspent environment pool burns inside a task, an
+unspent task cap burns inside the subnet. PR #253 reached that choice
+independently, one level below this design.
 
 **The residue burns with no new code.** An environment whose price sits below
 its cap simply never has the difference assigned to anyone, and
