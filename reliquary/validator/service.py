@@ -179,6 +179,7 @@ logger = logging.getLogger(__name__)
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 180.0
+_STARTUP_HASH_REBUILD_CHUNK_WINDOWS = 16
 
 # v6.1 (R39): how often the between-windows rotation gate re-asks the
 # trainer's consumption cursor. Deliberately NOT the seal loop's 0.5 s --
@@ -6868,21 +6869,38 @@ class ValidationService:
                 1,
                 current_window + 1 - HASH_DEDUP_RETENTION_WINDOWS,
             )
-            archives = await asyncio.wait_for(
-                self._load_archive_range(
-                    start_window=start_window,
-                    end_window=current_window,
-                    require_all=True,
-                ),
-                timeout=_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
-            )
-            self._hash_set.rebuild_from_history(
-                archives, current_window=current_window,
+            async def rebuild() -> int:
+                self._hash_set.rebuild_from_history(
+                    [], current_window=current_window,
+                )
+                restored = 0
+                for chunk_start in range(
+                    start_window,
+                    current_window + 1,
+                    _STARTUP_HASH_REBUILD_CHUNK_WINDOWS,
+                ):
+                    chunk_end = min(
+                        current_window,
+                        chunk_start + _STARTUP_HASH_REBUILD_CHUNK_WINDOWS - 1,
+                    )
+                    archives = await self._load_archive_range(
+                        start_window=chunk_start,
+                        end_window=chunk_end,
+                        require_all=True,
+                    )
+                    self._hash_set.apply_history(
+                        archives, current_window=current_window,
+                    )
+                    restored += len(archives)
+                return restored
+
+            restored = await asyncio.wait_for(
+                rebuild(), timeout=_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
             )
             logger.info(
                 "Rebuilt hash set from %d/%d archive windows "
                 "(current=%d, size=%d)",
-                len(archives), HASH_DEDUP_RETENTION_WINDOWS,
+                restored, HASH_DEDUP_RETENTION_WINDOWS,
                 current_window, len(self._hash_set),
             )
         except Exception as exc:

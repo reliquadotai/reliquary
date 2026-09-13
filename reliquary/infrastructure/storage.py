@@ -85,6 +85,14 @@ def _encode_json_payload(key: str, data: Any) -> bytes:
     return payload
 
 
+async def _read_object_body(response: dict) -> bytes:
+    body = response["Body"]
+    try:
+        return await body.read()
+    finally:
+        body.close()
+
+
 async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
     """Upload JSON without serializing or compressing on the event loop."""
     payload = await asyncio.to_thread(_encode_json_payload, key, data)
@@ -112,7 +120,7 @@ async def download_json(
         async with get_s3_client(**client_kwargs) as client:
             bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
             resp = await client.get_object(Bucket=bucket, Key=key)
-            body = await resp["Body"].read()
+            body = await _read_object_body(resp)
             def _decode() -> dict:
                 decoded = gzip.decompress(body) if key.endswith(".gz") else body
                 return strict_json_loads(decoded)
@@ -252,7 +260,7 @@ async def list_recent_datasets(
         for window_start, key in keys:
             try:
                 resp = await client.get_object(Bucket=bucket, Key=key)
-                body = await resp["Body"].read()
+                body = await _read_object_body(resp)
                 data = strict_json_loads(gzip.decompress(body))
                 if (
                     not isinstance(data, dict)
