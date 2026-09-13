@@ -48,6 +48,11 @@ class PriceParams:
     floor: float
     cap: float
     median_rounds: int
+    # How many of the most recent FILLING windows ``last_good`` is the rolling
+    # minimum over -- a count of fills, not of windows, so a run of shortages
+    # does not shrink it and a single expensive fill cannot raise it. See
+    # ``PriceState.recent_fill_prices``.
+    last_good_fills: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,10 +98,22 @@ class WindowOutcome:
 
 @dataclass(frozen=True, slots=True)
 class PriceState:
-    """What one archive carries forward. Bounded on purpose: see ``advance``."""
+    """What one archive carries forward. Bounded on purpose: see ``advance``.
+
+    ``recent_fill_prices`` is capped at ``params.last_good_fills`` entries --
+    fixed-size, so it costs ``replay()`` nothing to re-fold from genesis.
+    ``last_good`` stays as the reported scalar so nothing downstream breaks;
+    it is DERIVED as the minimum of the tuple when the tuple is non-empty.
+
+    An archive written before this field existed carries none: the default,
+    an empty tuple, makes that state read as "no fills recorded yet", and
+    ``advance`` falls back to the carried scalar rather than treating the
+    empty tuple as a fresh, unfilled controller.
+    """
 
     price: float
     last_good: float
+    recent_fill_prices: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,13 +122,18 @@ class PriceDecision:
 
     price: float
     last_good: float
+    recent_fill_prices: tuple[float, ...]
     r: float | None
     r_smoothed: float | None
     regime: str
 
     @property
     def state(self) -> PriceState:
-        return PriceState(price=self.price, last_good=self.last_good)
+        return PriceState(
+            price=self.price,
+            last_good=self.last_good,
+            recent_fill_prices=self.recent_fill_prices,
+        )
 
 
 def _smoothed_ratio(
@@ -162,7 +184,14 @@ def advance(
     r = outcome.ratio
     r_smoothed = _smoothed_ratio(recent, params.median_rounds)
     price = state.price
-    last_good = state.last_good
+    recent_fill_prices = state.recent_fill_prices
+    # ``last_good`` is DERIVED from the rolling tuple, not carried as an
+    # independent value: a fill at a raised price appends to the tuple, it
+    # never overwrites it, so one expensive incident cannot lift the floor
+    # the next snap escalates from. An empty tuple -- genesis, or a state
+    # revived from an archive written before this field existed -- falls
+    # back to the carried scalar instead of reading as "nothing ever filled".
+    last_good = min(recent_fill_prices) if recent_fill_prices else state.last_good
     if not outcome.filled:
         # The window never gathered its target, so the trainer is stopped:
         # there is no graceful degradation to ride out. Escalating from the
@@ -177,11 +206,15 @@ def advance(
         regime = "hold"
     price = min(max(price, params.floor), params.cap)
     if outcome.filled:
-        # Only a window that actually filled proves a price works.
-        last_good = price
+        # Only a window that actually filled proves a price works. It joins
+        # the rolling window rather than replacing ``last_good`` outright, so
+        # the minimum -- not the latest fill -- is what the next snap reads.
+        recent_fill_prices = (*recent_fill_prices, price)[-params.last_good_fills:]
+        last_good = min(recent_fill_prices)
     return PriceDecision(
         price=price,
         last_good=last_good,
+        recent_fill_prices=recent_fill_prices,
         r=r,
         r_smoothed=r_smoothed,
         regime=regime,
@@ -196,6 +229,7 @@ def replay(
     decision = PriceDecision(
         price=params.start,
         last_good=params.start,
+        recent_fill_prices=(),
         r=None,
         r_smoothed=None,
         regime="hold",
@@ -348,4 +382,8 @@ PRODUCTION_PRICE_PARAMS = PriceParams(
     # ~4 hours: several windows of confirmation before spending less, against a
     # loop delay of one miner spin-up plus one window.
     median_rounds=4800,
+    # A starting point, to be calibrated during the shadow phase like every
+    # other number in this block: the rolling minimum tracks the last 50
+    # filling windows.
+    last_good_fills=50,
 )

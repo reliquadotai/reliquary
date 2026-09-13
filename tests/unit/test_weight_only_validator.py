@@ -1103,7 +1103,7 @@ async def test_a_task_over_its_declared_cap_does_not_dilute_default():
             mechanism=MECHANISM_RL_DISCOVERED_PRICE,
             params={"start": 1.0, "decay": 0.99, "rounds_per_step": 1000,
                     "deadband": 0.8, "snap": 1.2, "floor": 0.05, "cap": cap,
-                    "median_rounds": 4800},
+                    "median_rounds": 4800, "last_good_fills": 50},
             status="active", retired_at=None,
         )
 

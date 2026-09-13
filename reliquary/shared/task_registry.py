@@ -22,7 +22,7 @@ KNOWN_MECHANISMS = frozenset({MECHANISM_RL_DISCOVERED_PRICE})
 # a half-specified controller is not a controller.
 PRICE_PARAM_FIELDS = (
     "start", "decay", "rounds_per_step", "deadband",
-    "snap", "floor", "cap", "median_rounds",
+    "snap", "floor", "cap", "median_rounds", "last_good_fills",
 )
 
 # Float addition of exact decimals is not exact; 1.0 must not fail by 1e-16.
@@ -89,7 +89,7 @@ def validate_entry(entry: TaskEntry) -> None:
     # to live arithmetic fails a window instead of refusing a start.
     for field in PRICE_PARAM_FIELDS:
         _number(entry.params[field], field)
-    for field in ("rounds_per_step", "median_rounds"):
+    for field in ("rounds_per_step", "median_rounds", "last_good_fills"):
         value = entry.params[field]
         if isinstance(value, bool) or not isinstance(value, int):
             raise RegistryError(

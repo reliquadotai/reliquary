@@ -25,7 +25,7 @@ from reliquary.shared.task_registry import (
 PARAMS = {
     "start": 1.0, "decay": 0.99, "rounds_per_step": 1000,
     "deadband": 0.80, "snap": 1.20, "floor": 0.05, "cap": 0.6,
-    "median_rounds": 4800,
+    "median_rounds": 4800, "last_good_fills": 50,
 }
 
 

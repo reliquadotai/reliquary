@@ -35,6 +35,7 @@ def _params(**overrides) -> PriceParams:
         floor=0.01,
         cap=1.0,
         median_rounds=1_000_000,   # effectively "all history" unless overridden
+        last_good_fills=1_000_000,  # effectively "all fills" unless overridden
     )
     base.update(overrides)
     return PriceParams(**base)
@@ -296,3 +297,92 @@ def test_an_unmeasured_window_does_not_enter_the_median():
     # The median is over [0.1, 0.1], not over [0.1, <nothing>, 0.1] read as noise.
     assert decision.regime == "descend"
     assert decision.r_smoothed == pytest.approx(0.1)
+
+
+def test_a_fill_at_a_raised_price_does_not_raise_last_good():
+    """A snap that succeeds must not lift the floor the NEXT snap escalates
+    from -- that is the ratchet the rolling minimum exists to break.
+
+    Without it, every incident would raise `last_good` the moment the market
+    recovers at the raised price, and a run of incidents would walk the snap
+    floor toward the cap even though a lower price is known to work.
+    """
+    params = _params(snap=1.20, deadband=0.80)
+
+    decision = replay(
+        [
+            _masked(0, 200),              # fills at 0.25
+            _window(200, 100, r=None),    # snap to 0.30
+            _window(300, 100, r=0.9),     # fills AT the raised price, 0.30
+        ],
+        params,
+    )
+
+    assert decision.price == pytest.approx(0.30)
+    assert decision.last_good == pytest.approx(0.25)
+
+
+def test_last_good_is_a_rolling_minimum_not_a_permanent_one():
+    """Over enough filling windows the floor DOES follow the market up -- it
+    just cannot be raised by any SINGLE expensive fill."""
+    params = _params(snap=1.20, deadband=0.80, cap=2.0, last_good_fills=2)
+
+    decision = replay(
+        [
+            _window(0, 100, r=0.9),      # fills at 1.0
+            _window(100, 100, r=None),   # snap to 1.2
+            _window(200, 100, r=0.9),    # fills at 1.2
+            _window(300, 100, r=None),   # snap to 1.44
+            _window(400, 100, r=0.9),    # fills at 1.44
+        ],
+        params,
+    )
+
+    # Three fills happened, at 1.0, 1.2 and 1.44; with a lookback of 2 only
+    # the last two count, so the floor followed the market up to 1.2 -- but
+    # never all the way to today's price, 1.44.
+    assert decision.last_good == pytest.approx(1.2)
+
+
+def test_replay_equals_the_incremental_fold_with_the_new_field():
+    """`replay()` must land on the identical state -- price, last_good, AND
+    the new rolling-fill tuple -- as folding `advance()` one window at a time.
+
+    This is the property that lets a weight-only node replay an archive and a
+    validator's live walk agree: neither may depend on anything `advance()`
+    does not receive as an explicit argument.
+    """
+    params = _params(snap=1.20, deadband=0.80, cap=2.0, last_good_fills=3)
+    history = [
+        _window(0, 100, r=0.9),
+        _window(100, 100, r=None),
+        _window(200, 100, r=0.9),
+        _window(300, 100, r=None),
+        _window(400, 100, r=0.9),
+        _window(500, 100, r=0.9),
+    ]
+
+    folded = replay(history, params)
+
+    state = PriceState(price=params.start, last_good=params.start)
+    for index in range(len(history)):
+        decision = advance(state, history[: index + 1], params)
+        state = decision.state
+
+    assert state.price == pytest.approx(folded.price)
+    assert state.last_good == pytest.approx(folded.last_good)
+    assert state.recent_fill_prices == folded.state.recent_fill_prices
+
+
+def test_a_state_without_the_recent_fills_tuple_still_loads():
+    """An archive written before this shipped carries no tuple: reviving a
+    `PriceState` from its two plain scalars must not crash, and a snap must
+    still escalate from the carried `last_good`, not from an empty window."""
+    params = _params(snap=1.20)
+    legacy_state = PriceState(price=0.30, last_good=0.25)
+
+    decision = advance(legacy_state, [_window(1000, 100, r=None)], params)
+
+    assert decision.regime == "snap"
+    assert decision.price == pytest.approx(max(0.30, 0.25) * 1.20)
+    assert decision.last_good == pytest.approx(0.25)
