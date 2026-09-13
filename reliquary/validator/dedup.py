@@ -214,3 +214,14 @@ class RolloutHashSet:
                         w,
                     )
         self._entries = restored
+
+    def apply_history(
+        self, archives: list[dict], current_window: int,
+    ) -> None:
+        """Merge validated history into the current state."""
+        previous = self._entries
+        self.rebuild_from_history(archives, current_window)
+        restored = self._entries
+        self._entries = previous
+        for digest, window in restored.items():
+            self.add(digest, window)
