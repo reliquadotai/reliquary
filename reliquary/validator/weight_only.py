@@ -15,6 +15,7 @@ from typing import Any
 from reliquary.constants import (
     EMA_ALPHA,
     EPOCH_SUBMIT_LEAD_BLOCKS,
+    MIN_INCENTIVE_SHARE,
     POLL_INTERVAL_SECONDS,
 )
 from reliquary.infrastructure import chain, storage
@@ -373,6 +374,10 @@ class WeightOnlyValidator:
                 sorted(by_task), total,
             )
             combined = {hk: v / total for hk, v in combined.items()}
+        if MIN_INCENTIVE_SHARE > 0.0:
+            combined = {
+                hk: v for hk, v in combined.items() if v >= MIN_INCENTIVE_SHARE
+            }
         return combined
 
     @staticmethod

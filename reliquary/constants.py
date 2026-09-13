@@ -1311,6 +1311,18 @@ CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
 # half their score in ~25 windows.
 EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 
+# A hotkey below this share of the pool is not paid at all, and the freed mass
+# is burned rather than shared out among the miners above it.
+_MIN_INCENTIVE_SHARE_RAW = _os.environ.get("RELIQUARY_MIN_INCENTIVE_SHARE", "0.02")
+try:
+    MIN_INCENTIVE_SHARE = float(_MIN_INCENTIVE_SHARE_RAW)
+except ValueError as _exc:
+    raise ValueError(
+        f"RELIQUARY_MIN_INCENTIVE_SHARE={_MIN_INCENTIVE_SHARE_RAW!r} is not a number"
+    ) from _exc
+if not 0.0 <= MIN_INCENTIVE_SHARE < 1.0 or MIN_INCENTIVE_SHARE != MIN_INCENTIVE_SHARE:
+    raise ValueError("RELIQUARY_MIN_INCENTIVE_SHARE must be in [0.0, 1.0)")
+
 # ────────────────  GRPO TRAINING (v2.1)  ────────────────
 
 # Learning rate for AdamW. RL fine-tuning on pretrained LLMs is sensitive;
