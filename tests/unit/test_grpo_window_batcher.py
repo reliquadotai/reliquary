@@ -1819,7 +1819,9 @@ def _set_eos_completion_lengths(req: BatchSubmissionRequest, lengths: list[int])
 def _grail_with_terminal_pick(
     *,
     p_stop: float,
-    terminal_pick_ok: bool,
+    terminal_pick_ok: bool | None,
+    seed_n_stochastic: int = 0,
+    seed_n_match: int = 0,
 ):
     def _fn(commit, model, randomness):
         prompt_length = int(commit["rollout"]["prompt_length"])
@@ -1834,6 +1836,8 @@ def _grail_with_terminal_pick(
             has_sparse_outputs=True,
             p_stop=p_stop,
             terminal_pick_ok=terminal_pick_ok,
+            seed_n_stochastic=seed_n_stochastic,
+            seed_n_match=seed_n_match,
             challenge_lp_indices=challenge_idxs,
             challenge_lp_values=[0.0] * CHALLENGE_K,
         )
@@ -1877,6 +1881,64 @@ def test_accepts_low_probability_eos_when_forced_seed_picked_it():
         batcher._verify_expensive(batcher.pending_submissions()[-1])
         is not None
     )
+
+
+def test_v6_rejects_high_probability_eos_not_picked_by_forced_seed(
+    monkeypatch,
+):
+    monkeypatch.setattr(batcher_mod, "PROTOCOL_VERSION", 6)
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", True)
+    req = _request()
+    _set_eos_completion_lengths(req, [CHALLENGE_K] * M_ROLLOUTS)
+    batcher = _make_batcher(
+        verify_commitment_proofs_fn=_grail_with_terminal_pick(
+            p_stop=0.05,
+            terminal_pick_ok=False,
+            seed_n_stochastic=32,
+            seed_n_match=31,
+        ),
+    )
+    batcher.current_checkpoint_hash = req.checkpoint_hash
+
+    assert batcher.accept_submission(req).accepted is True
+    assert batcher._verify_expensive(
+        batcher.pending_submissions()[-1]
+    ) is None
+    assert batcher.reject_counts[
+        RejectReason.BAD_TERMINATION.value
+    ] == 1
+
+
+def test_terminal_mismatch_is_recorded_when_v6_kill_switch_is_off(
+    monkeypatch,
+):
+    recorded = []
+    monkeypatch.setattr(batcher_mod, "PROTOCOL_VERSION", 6)
+    monkeypatch.setattr(batcher_mod, "FORCED_SEED_ENFORCE", False)
+    monkeypatch.setattr(
+        batcher_mod,
+        "record_termination_shadow",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+    req = _request()
+    _set_eos_completion_lengths(req, [CHALLENGE_K] * M_ROLLOUTS)
+    batcher = _make_batcher(
+        verify_commitment_proofs_fn=_grail_with_terminal_pick(
+            p_stop=0.05,
+            terminal_pick_ok=False,
+            seed_n_stochastic=32,
+            seed_n_match=31,
+        ),
+    )
+    batcher.current_checkpoint_hash = req.checkpoint_hash
+
+    assert batcher.accept_submission(req).accepted is True
+    assert batcher._verify_expensive(
+        batcher.pending_submissions()[-1]
+    ) is not None
+    assert len(recorded) == M_ROLLOUTS
+    assert all(row["terminal_pick_ok"] is False for row in recorded)
+    assert all(row["termination_ok"] is True for row in recorded)
 
 
 def test_reject_cap_path_truncations_over_budget():

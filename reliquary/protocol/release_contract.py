@@ -36,6 +36,7 @@ CAP_ANSWER_JSON_ABI = "environment.answer-json-abi/v1"
 CAP_PROGRESSIVE_PROOFS = "verification.progressive-proofs/v1"
 CAP_EOS_TOKEN_REWARD = "reward.eos-tokens-per-batch/v1"
 CAP_TRAINER_PACED_ADMISSION = "training.trainer-paced-admission/v1"
+CAP_FILL_CLOSED_FIFO = "market.fill-closed-fifo/v1"
 
 _IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,126}[a-z0-9]$")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}$")
@@ -180,7 +181,7 @@ class CapabilityBundle:
         return capability_id in self.capabilities
 
 
-RELIQUARY_1_CAPABILITIES = CapabilityBundle.from_iterable(
+RELIQUARY_1_LEGACY_CAPABILITIES = CapabilityBundle.from_iterable(
     "reliquary-1-fill-closed/v1",
     (
         CAP_CHECKPOINT_ADOPTION_GATE,
@@ -190,6 +191,20 @@ RELIQUARY_1_CAPABILITIES = CapabilityBundle.from_iterable(
         CAP_FILL_CLOSED_WINDOWS,
         CAP_PROGRESSIVE_PROOFS,
         CAP_EOS_TOKEN_REWARD,
+        CAP_TRAINER_PACED_ADMISSION,
+    ),
+)
+
+RELIQUARY_1_CAPABILITIES = CapabilityBundle.from_iterable(
+    "reliquary-1-fill-closed/v2",
+    (
+        CAP_CHECKPOINT_ADOPTION_GATE,
+        CAP_DURABLE_LANE_JOURNAL,
+        CAP_ENVIRONMENT_EPISODE_ABI,
+        CAP_ANSWER_JSON_ABI,
+        CAP_FILL_CLOSED_FIFO,
+        CAP_PROGRESSIVE_PROOFS,
+        CAP_SELECTED_SLOT_REWARD,
         CAP_TRAINER_PACED_ADMISSION,
     ),
 )
@@ -421,6 +436,7 @@ __all__ = [
     "CAP_DURABLE_LANE_JOURNAL",
     "CAP_ENVIRONMENT_EPISODE_ABI",
     "CAP_EOS_TOKEN_REWARD",
+    "CAP_FILL_CLOSED_FIFO",
     "CAP_FILL_CLOSED_WINDOWS",
     "CAP_FRESH_POST_SEAL_ORDERING",
     "CAP_MANIFEST_16_LANES",
@@ -436,6 +452,7 @@ __all__ = [
     "RELEASE_CONTRACT_DOMAIN",
     "RELEASE_CONTRACT_SCHEMA",
     "RELIQUARY_1_CAPABILITIES",
+    "RELIQUARY_1_LEGACY_CAPABILITIES",
     "ReleaseContract",
     "ReleaseContractError",
     "canonical_json_bytes",

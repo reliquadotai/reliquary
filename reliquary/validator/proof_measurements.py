@@ -42,7 +42,8 @@ class ProofMeasurements:
                 or payload.batcher.window_start != payload.pending.request.window_start
                 or invocation.environment != payload.batcher.env.name):
             raise ProofWorkerUnavailable("measurement checkpoint/window/profile is not ready")
-        slot = next((s for s in health.slots if s.device_id == invocation.device_id), None)
+        slot_id = self.pool.slot_for(invocation.device_id)
+        slot = next((s for s in health.slots if s.device_id == slot_id), None)
         if slot is None or slot.revision != checkpoint.revision:
             raise ProofWorkerUnavailable("measurement GPU slot is not adopted")
         started = time.perf_counter()
@@ -60,7 +61,7 @@ class ProofMeasurements:
                 complete = (len(rollouts) == len(receipts) == M_ROLLOUTS
                     and len({r["job_id"] for r in receipts}) == M_ROLLOUTS
                     and self.pool._adopted == checkpoint
-                    and all(r["device_id"] == invocation.device_id
+                    and all(r["device_id"] == slot.device_id
                         and r["window"] == payload.batcher.window_start
                         and r["environment"] == invocation.environment
                         and r["checkpoint"] == checkpoint.model_dump() for r in receipts))
@@ -81,7 +82,8 @@ class ProofMeasurements:
                     "plan_id": invocation.plan_id, "job_id": invocation.candidate.job_id,
                     "window": payload.batcher.window_start, "wire_receipts": receipts,
                     "remote_proof": RemoteProofMeasurement(worker_id=health.worker_id,
-                        transport_sha256=health.transport_sha256).model_dump()}
+                        transport_sha256=health.transport_sha256,
+                        pipeline_depth=self.pool.pipeline_depth).model_dump()}
                 try:
                     with self._lock:
                         fd = os.open(self.path, os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW)

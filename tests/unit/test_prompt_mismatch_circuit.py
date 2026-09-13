@@ -136,6 +136,34 @@ def test_ordinary_binding_success_cannot_reset_rolling_mismatch_debt():
     assert health["noncanary_successes_ignored_total"] == 2
 
 
+def test_window_dedupe_counts_a_failure_burst_once():
+    circuit = _circuit()
+
+    # Two legacy receipt-level entries may already exist in persisted state.
+    for index in range(2):
+        _mismatch(circuit, f"legacy-burst-{index}", window=100)
+    for window in (100, 101):
+        update = circuit.record_mismatch(
+            environment=ENVIRONMENT,
+            identities=_identities(),
+            window=window,
+            precommit_signature=f"new-{window}",
+            precommit_arrival_ts=_arrival(window),
+            dedupe_window=True,
+        )
+        assert update.activated_scopes == ()
+
+    armed = circuit.record_mismatch(
+        environment=ENVIRONMENT,
+        identities=_identities(),
+        window=102,
+        precommit_signature="third-window",
+        precommit_arrival_ts=_arrival(102),
+        dedupe_window=True,
+    )
+    assert armed.activated_scopes == ("hotkey", "operator")
+
+
 def test_partial_debt_expires_outside_rolling_window():
     circuit = _circuit()
     _mismatch(circuit, "old-1", window=100)

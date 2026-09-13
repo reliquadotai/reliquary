@@ -104,8 +104,9 @@ async def test_submit_weights_maps_hotkeys_to_uids():
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
 
     fake_meta = MagicMock()
-    fake_meta.hotkeys = ["alice", "bob", "carol"]
-    fake_meta.uids = [10, 20, 30]
+    fake_meta.hotkeys = ["owner", "alice", "bob", "carol"]
+    fake_meta.uids = [0, 10, 20, 30]
+    fake_meta.owner_hotkey = "owner"
 
     import reliquary.validator.weight_only as wov_mod
     original_get_meta = wov_mod.chain.get_metagraph
@@ -131,8 +132,7 @@ async def test_submit_weights_maps_hotkeys_to_uids():
 
     assert 10 in captured["uids"]   # alice → uid 10
     assert 20 in captured["uids"]   # bob → uid 20
-    # This validator is absent from the fake metagraph, so the burn falls back
-    # to uid 0 (mass must stay conserved).
+    # The subnet owner is the burn target.
     assert 0 in captured["uids"]
     assert sum(captured["weights"]) == pytest.approx(1.0)
 
@@ -148,12 +148,16 @@ async def test_remote_signer_submits_semantic_weight_vector_without_local_key():
         netuid=81,
         signer_client=signer,
     )
-    fake_meta = MagicMock(hotkeys=["alice", "5FReader"], uids=[10, 11])
+    fake_meta = MagicMock(
+        hotkeys=["alice", "owner"], uids=[10, 11], owner_hotkey="owner",
+    )
     wov._active_submit_epoch = 1234
 
-    with patch(
-        "reliquary.validator.weight_only.chain.get_metagraph",
-        new=AsyncMock(return_value=fake_meta),
+    with (
+        patch(
+            "reliquary.validator.weight_only.chain.get_metagraph",
+            new=AsyncMock(return_value=fake_meta),
+        ),
     ):
         submitted = await wov._submit_weights(MagicMock(), {"alice": 0.4})
 
@@ -173,7 +177,9 @@ async def test_deregistered_ema_mass_is_conserved_as_burn():
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-    fake_meta = MagicMock(hotkeys=["alice"], uids=[10])
+    fake_meta = MagicMock(
+        hotkeys=["owner", "alice"], uids=[0, 10], owner_hotkey="owner",
+    )
     captured = {}
 
     async def capture(_subtensor, _wallet, _netuid, uids, weights):
@@ -196,7 +202,7 @@ async def test_deregistered_ema_mass_is_conserved_as_burn():
 
     assert submitted is True
     assert captured[10] == pytest.approx(0.4)
-    # Validator not in this metagraph → burn falls back to uid 0.
+    # The deregistered mass goes to the subnet owner's UID.
     assert captured[0] == pytest.approx(0.6)
     assert sum(captured.values()) == pytest.approx(1.0)
 
@@ -207,7 +213,9 @@ async def test_uid_burn_earned_weight_is_aggregated_without_duplicate_uid():
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-    fake_meta = MagicMock(hotkeys=["owner", "alice"], uids=[0, 10])
+    fake_meta = MagicMock(
+        hotkeys=["owner", "alice"], uids=[0, 10], owner_hotkey="owner",
+    )
     captured = {}
 
     async def capture(_subtensor, _wallet, _netuid, uids, weights):
@@ -717,17 +725,18 @@ async def test_replay_ema_conservation_bound():
 
 
 @pytest.mark.asyncio
-async def test_burn_defaults_to_the_validators_own_uid():
-    """Unset RELIQUARY_UID_BURN burns to THIS validator's uid, resolved from
-    the metagraph by its own hotkey. Hardcoding 0 pointed at the subnet
-    owner's uid, which is not stable across ownership changes."""
+async def test_burn_defaults_to_the_current_subnet_owner_uid():
+    """Unset RELIQUARY_UID_BURN follows the owner's current metagraph UID."""
     import reliquary.constants as C
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     with patch.object(C, "UID_BURN", None):
         wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-        # "5FReader" is this validator; it sits at uid 237, not 0.
-        fake_meta = MagicMock(hotkeys=["alice", "5FReader"], uids=[10, 237])
+        fake_meta = MagicMock(
+            hotkeys=["alice", "owner", "5FReader"],
+            uids=[10, 42, 237],
+            owner_hotkey="owner",
+        )
         captured = {}
 
         async def capture(_subtensor, _wallet, _netuid, uids, weights):
@@ -746,13 +755,14 @@ async def test_burn_defaults_to_the_validators_own_uid():
             ) is True
 
     assert captured[10] == pytest.approx(0.4)
-    assert captured[237] == pytest.approx(0.6)   # burn to self, not uid 0
+    assert captured[42] == pytest.approx(0.6)
+    assert 237 not in captured
     assert 0 not in captured
     assert sum(captured.values()) == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
-async def test_explicit_burn_uid_overrides_self_resolution():
+async def test_explicit_burn_uid_overrides_owner_resolution():
     """An operator can still pin the burn target without a code release."""
     import reliquary.constants as C
     from reliquary.validator.weight_only import WeightOnlyValidator
@@ -779,16 +789,15 @@ async def test_explicit_burn_uid_overrides_self_resolution():
 
 
 @pytest.mark.asyncio
-async def test_burn_falls_back_to_uid_zero_when_self_is_not_registered():
-    """Mass MUST stay conserved: if this validator is absent from the
-    metagraph the burn cannot go to self, and dropping it would let chain-side
-    normalization redistribute that mass to miners."""
+async def test_burn_fails_closed_when_owner_has_no_uid():
     import reliquary.constants as C
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     with patch.object(C, "UID_BURN", None):
         wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-        fake_meta = MagicMock(hotkeys=["alice"], uids=[10])   # no "5FReader"
+        fake_meta = MagicMock(
+            hotkeys=["alice"], uids=[10], owner_hotkey="owner",
+        )
         captured = {}
 
         async def capture(_subtensor, _wallet, _netuid, uids, weights):
@@ -800,12 +809,15 @@ async def test_burn_falls_back_to_uid_zero_when_self_is_not_registered():
                 "reliquary.validator.weight_only.chain.get_metagraph",
                 new=AsyncMock(return_value=fake_meta),
             ),
-            patch("reliquary.validator.weight_only.chain.set_weights", new=capture),
+            patch(
+                "reliquary.validator.weight_only.chain.set_weights",
+                new=capture,
+            ),
         ):
-            await wov._submit_weights(MagicMock(), {"alice": 0.4})
+            with pytest.raises(RuntimeError, match="owner hotkey has no UID"):
+                await wov._submit_weights(MagicMock(), {"alice": 0.4})
 
-    assert captured[0] == pytest.approx(0.6)
-    assert sum(captured.values()) == pytest.approx(1.0)
+    assert captured == {}
 
 
 # --- Minimum incentive floor: applied in submit_once, at the submission
@@ -902,7 +914,10 @@ async def test_submit_once_burns_freed_mass_without_redistributing():
     from reliquary.validator.weight_only import WeightOnlyValidator
     import reliquary.validator.weight_only as wov_mod
 
-    fake_meta = MagicMock(hotkeys=["hk_big", "hk_small"], uids=[10, 20])
+    fake_meta = MagicMock(
+        hotkeys=["owner", "hk_big", "hk_small"], uids=[0, 10, 20],
+        owner_hotkey="owner",
+    )
 
     async def _run_once(ramp_start, min_share):
         wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
@@ -950,10 +965,10 @@ async def test_submit_once_burns_freed_mass_without_redistributing():
     # to something else.
     assert with_ramp[20] == pytest.approx(expected_paid_small)
     # The exact shortfall -- not a whole share, only the ramped-down
-    # difference -- lands on the burn uid (this validator's own hotkey is
-    # absent from the fake metagraph, so burn falls back to uid 0) and
-    # nowhere else. This is the assertion that fails loudly if anyone ever
-    # renormalises the survivors instead of burning the difference.
+    # difference -- lands on the burn uid (the subnet owner, uid 0 in this
+    # fake metagraph) and nowhere else. This is the assertion that fails
+    # loudly if anyone ever renormalises the survivors instead of burning
+    # the difference.
     assert with_ramp[0] == pytest.approx(
         without_floor[0] + (without_floor[20] - with_ramp[20])
     )
@@ -1147,7 +1162,10 @@ async def test_submit_once_ramp_burns_the_freed_mass_without_redistributing():
     from reliquary.validator.weight_only import WeightOnlyValidator
     import reliquary.validator.weight_only as wov_mod
 
-    fake_meta = MagicMock(hotkeys=["hk_big", "hk_mid"], uids=[10, 20])
+    fake_meta = MagicMock(
+        hotkeys=["owner", "hk_big", "hk_mid"], uids=[0, 10, 20],
+        owner_hotkey="owner",
+    )
 
     async def _run_once(ramp_start, share):
         wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
@@ -1189,9 +1207,8 @@ async def test_submit_once_ramp_burns_the_freed_mass_without_redistributing():
     # hk_mid (uid 20): ramped down, but still present (it clears the ramp
     # start), so strictly less than its unfloored share, not absent.
     assert 0.0 < with_ramp[20] < without_floor[20]
-    # The exact shortfall lands on the burn uid (this validator's own
-    # hotkey is absent from the fake metagraph, so burn falls back to uid 0)
-    # -- never spread across hk_big.
+    # The exact shortfall lands on the burn uid (the subnet owner, uid 0 in
+    # this fake metagraph) -- never spread across hk_big.
     assert with_ramp[0] == pytest.approx(
         without_floor[0] + (without_floor[20] - with_ramp[20])
     )

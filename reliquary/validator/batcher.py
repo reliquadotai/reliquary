@@ -640,10 +640,8 @@ class PendingSubmission:
     unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
-    # v6 per-token payment: completion tokens over genuinely EOS-terminated
-    # rollouts, computed once at admission (see
-    # ``admission.count_eos_completion_tokens``) and merely carried from here
-    # onto ``ValidSubmission`` -- never recomputed at distribution.
+    # Completion-token telemetry retained for training, archives and recovery
+    # of windows opened under the legacy token-weighted payment policy.
     eos_tokens: int = 0
     value: float = field(init=False, default=0.0)
 
@@ -713,8 +711,7 @@ class ValidSubmission:
     reward_shape: dict[str, Any] = field(default_factory=dict)
     ingress_observability: dict[str, Any] = field(default_factory=dict)
     utility_rollouts: list[dict[str, Any]] = field(default_factory=list)
-    # v6 per-token payment: carried from ``PendingSubmission.eos_tokens``
-    # (computed once at admission), not recomputed here or at distribution.
+    # Completion-token telemetry carried from ``PendingSubmission``.
     eos_tokens: int = 0
 
     def __post_init__(self):
@@ -806,16 +803,9 @@ class _UploadPrecommitReservation:
 class _BufferedArrivalProof:
     """One graded body waiting in ``_arrival_proof_buffer`` for the plan.
 
-    ``rate`` is ``None`` when the receipt fell out of the admission queue
-    (no precommit, a different window, or the queue itself is off) -- the
-    sort key below sends that to the back rather than raising, so a queue
-    miss degrades the group's priority instead of stalling admission.
-
     ``rate`` and ``payload_bytes`` are read ONCE here, at arrival, while
     the precommit that registered them is still in this window's
-    ``ThroughputAdmissionQueue``. Both then travel with the group all the
-    way onto ``_ProvenGroup`` (amendment v6.1), because the pick that
-    finally spends them runs long after -- and must not re-derive either.
+    ``ThroughputAdmissionQueue``. Both remain telemetry only.
     """
 
     pending: PendingSubmission = field(repr=False)
@@ -827,21 +817,13 @@ class _BufferedArrivalProof:
 
 def _arrival_buffer_sort_key(
     entry: _BufferedArrivalProof,
-) -> tuple[int, float, int]:
-    """Return the deterministic proof-dispatch key for the fill experiment.
-
-    Dispatch priority controls verification scheduling only. Final selection
-    uses ``_pick_sort_key`` and is evaluated separately.
-    """
-    if entry.rate is None:
-        return (1, 0.0, entry.sequence)
-    return (0, -entry.rate, entry.sequence)
+) -> int:
+    """Dispatch graded bodies in monotone arrival order."""
+    return entry.sequence
 
 
-# Monotone across every ``_ProvenGroup`` this process builds. Only ever
-# compared WITHIN one batcher's own pool, where it is the order in which
-# proofs completed; process-wide simply removes any way to construct a
-# record without one (see ``_pick_sort_key``'s final component).
+# Monotone across every ``_ProvenGroup`` this process builds. Only compared
+# within one batcher's pool; process-wide scope makes every order total.
 _proven_group_sequence = itertools.count(1)
 
 
@@ -850,7 +832,7 @@ class _ProvenGroup:
     """One PASSED group sitting in this environment's pick pool (v6.1).
 
     Proof completion establishes eligibility, not selection. A later
-    ``pick_training_batch`` call applies the experimental selection key, and
+    ``pick_training_batch`` call applies FIFO selection, and
     ``picked`` prevents a selected group from entering another batch. Because
     selection may claim a subset of the pool, a single prefix watermark cannot
     represent this state.
@@ -869,26 +851,9 @@ class _ProvenGroup:
 
 def _pick_sort_key(
     group: _ProvenGroup,
-) -> tuple[int, float, int, str, int]:
-    """Return the fill experiment's total, deterministic selection key.
-
-    Known priorities precede unknown priorities. Remaining components are the
-    receipt-bound payload size, receipt identifier, and unique append sequence;
-    together they make the ordering total without consulting proof completion
-    order as an implicit fallback.
-    """
-    if group.rate is None:
-        return (
-            1, 0.0, -int(group.payload_bytes), str(group.receipt_id),
-            int(group.sequence),
-        )
-    return (
-        0,
-        -float(group.rate),
-        -int(group.payload_bytes),
-        str(group.receipt_id),
-        int(group.sequence),
-    )
+) -> int:
+    """Select proven groups FIFO; rate and payload size are telemetry only."""
+    return group.sequence
 
 
 @dataclass(frozen=True)
@@ -1232,7 +1197,7 @@ class GrpoWindowBatcher:
         # Per-window like the fields above: a fresh set every window because
         # a new ``GrpoWindowBatcher`` is constructed per window.
         self._payload_digests_seen: set[str] = set()
-        # Qualification-only precommit queue with deterministic priority.
+        # Qualification-only precommit queue; rate remains telemetry.
         self.admission_queue: ThroughputAdmissionQueue | None = None
         # v6 only. None on the auction path, which proves at seal instead of
         # on arrival. Set by the window activation code once every
@@ -1263,15 +1228,9 @@ class GrpoWindowBatcher:
         # dispatch order (see ``GlobalProofScheduler.extend``); arrival order
         # is not otherwise available as an integer, so this counts it.
         self._arrival_proof_rank: int = 0
-        # v6 only. The rate-ordered queue (Task 5) never hands out a
-        # provable candidate of its own -- a ``PendingSubmission`` does not
-        # exist until the body has arrived and graded, later and on a
-        # different path than the precommit the queue holds. So its ORDER
-        # becomes this buffer's drain order instead: every graded body
-        # waits here, keyed by the rate its own precommit registered, until
-        # ``_drain_arrival_proof_buffer`` pulls it into the plan highest
-        # rate first. ``_arrival_proof_sequence`` is the buffer's own
-        # insertion counter, used only to break rate ties deterministically.
+        # v6 only. Graded bodies wait here until the proof plan can accept
+        # them. The server serializes post-grade commits in ingress order, so
+        # this buffer's insertion sequence is the economic FIFO order.
         self._arrival_proof_buffer: list[_BufferedArrivalProof] = []
         self._arrival_proof_sequence: int = 0
         # v6.1 only. job_id -> the (rate, payload_bytes, receipt_id) that
@@ -1310,14 +1269,9 @@ class GrpoWindowBatcher:
         # scheduler refuses (rank <= its current highest). This also
         # protects ``_extend_proof_plan``'s lazy first ``scheduler.submit``:
         # its ``_open_proof_plan_id is None`` check-then-act is unsafe
-        # without it. Deliberately separate from ``fill_state.lock``
-        # (buffer/reserve/release/record_proven) rather than reused for it,
-        # so the two never need to nest in more than one fixed order: this
-        # lock is always the OUTER one, on the single path
-        # (``_drain_arrival_proof_buffer``'s except clause) where both are
-        # ever touched by the same call -- and there, the ``with`` block
-        # for this lock has already exited before ``fill_state.lock`` is
-        # taken, so they never actually nest at all.
+        # without it. Deliberately separate from ``fill_state.lock`` and
+        # always outer when dequeue and rank allocation touch both. Failure
+        # release takes ``fill_state.lock`` only after this lock is released.
         self._proof_plan_lock = threading.Lock()
         # v6 only. Monotonic count of picks THIS batcher's environment has
         # taken. Read-modify-written inside ``_claim_pick_chunk`` under
@@ -1624,11 +1578,24 @@ class GrpoWindowBatcher:
         self._payload_digests_seen.discard(str(digest))
 
     def _fill_proof_admission_closed(self) -> bool:
-        if not FILL_CLOSED_BOUNDED_PROOFS or self.fill_state is None:
+        if self.fill_state is None:
             return False
+        environment = str(getattr(self.env, "name", ""))
+        self._reconcile_fill_state_decisions(environment)
+        handle = self._open_proof_plan_handle
+        if handle is not None and handle.done():
+            return True
         with self.fill_state.lock:
-            return (self._seal_flag.is_set() or self.fill_state.is_closed()
-                    or self._time_fn() >= self.window_opened_at + FILL_CLOSED_PROOF_DISPATCH_SECONDS)
+            snapshot = self.fill_state.snapshot()
+            return (
+                self._seal_flag.is_set()
+                or snapshot["closed"]
+                or snapshot["proven"][environment]
+                >= snapshot["picks_target"] * B_BATCH
+                or self._time_fn()
+                >= self.window_opened_at
+                + FILL_CLOSED_PROOF_DISPATCH_SECONDS
+            )
 
     def _extend_proof_plan(self, candidates: list[RankedProof]) -> None:
         """Hand newly-admitted candidates to this window's open-ended plan.
@@ -1647,22 +1614,28 @@ class GrpoWindowBatcher:
         environment = str(getattr(self.env, "name", ""))
         if self._open_proof_plan_id is None:
             plan_id = f"{self.window_start}:{environment}:fill-closed"
-            # Proof work is bounded by the monotonic admission budget;
-            # window completion is tracked separately by pick ordinals.
-            budget = self.fill_state.snapshot()["budgets"][environment]
+            snapshot = self.fill_state.snapshot()
+            budget = snapshot["budgets"][environment]
+            target = snapshot["picks_target"] * B_BATCH
+            if budget < target:
+                raise RuntimeError(
+                    "fill-closed proof budget is below trainer demand"
+                )
             handle = scheduler.submit(
                 ProofPlan(
                     plan_id=plan_id,
                     environment=environment,
                     checkpoint_revision=self.current_checkpoint_hash,
                     candidates=tuple(candidates),
-                    required_passes=budget,
-                    # The scheduler's own deadline is a second, independent
-                    # backstop under the window-duration one Task 7 polls
-                    # (``FILL_CLOSED_MAX_SECONDS``) -- belt and braces, not
-                    # a redundant knob to keep in sync by hand.
+                    required_passes=target,
+                    max_attempts=budget,
+                    # Strict mode admits until MAX, then leaves the full
+                    # qualified MAX horizon to drain that admitted budget.
+                    # Bounded mode already reserves its drain before MAX.
                     deadline_at=(
-                        self.window_opened_at + FILL_CLOSED_MAX_SECONDS
+                        self.window_opened_at
+                        + FILL_CLOSED_MAX_SECONDS
+                        * (1 if FILL_CLOSED_BOUNDED_PROOFS else 2)
                     ),
                     priority=0,
                     allow_shortfall=True,
@@ -1762,8 +1735,7 @@ class GrpoWindowBatcher:
         if payload_bytes is None:
             # Queue miss (no precommit, another window, queue off): fall
             # back to the size the revealed body itself accounted for, and
-            # to 0 when even that is unknown -- which sorts last on the
-            # pick's tie-break, the same direction an unknown rate does.
+            # to 0 when even that is unknown.
             payload_bytes = int(
                 getattr(pending.request, "_payload_bytes", 0) or 0
             )
@@ -1792,45 +1764,53 @@ class GrpoWindowBatcher:
             return
         self._reconcile_fill_state_decisions(environment)
         while True:
-            with self.fill_state.lock:
-                if FILL_CLOSED_BOUNDED_PROOFS and (
-                    self._seal_flag.is_set() or self.fill_state.is_closed()
-                    or self._time_fn() >= self.window_opened_at + FILL_CLOSED_PROOF_DISPATCH_SECONDS
-                ):
-                    # These buffered bodies never reserved a proof. Their
-                    # retained pending records remain available to the seal
-                    # audit; none can earn a payment or trainer payload.
-                    self._arrival_proof_buffer.clear()
-                    return
-                if not self._arrival_proof_buffer:
-                    return
-                if not self.fill_state.may_admit(environment):
-                    return
-                self._arrival_proof_buffer.sort(key=_arrival_buffer_sort_key)
-                entry = self._arrival_proof_buffer.pop(0)
-                self.fill_state.reserve(environment)
-
-            pending = entry.pending
-            operator = self._operator_for_hotkey(pending.hotkey)
-            operator_remaining = (
-                MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
-                - self.operator_proof_failure_debt(operator)
-                if operator is not None
-                else 0
-            )
-            hotkey_remaining = (
-                MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
-                - self.proof_failure_debt(pending.hotkey)
-            )
             job_id: str | None = None
             try:
-                # Rank allocation and the call that consumes it
-                # (``_extend_proof_plan``, which both reads-or-creates the
-                # plan id and calls ``submit``/``extend``) must be one
-                # atomic step: releasing the lock in between is exactly
-                # what let two concurrent drainers allocate ranks 5 then 6
-                # and call ``extend`` in the opposite order.
+                # One lock covers dequeue through scheduler submission. This
+                # keeps FIFO sequence mapped to scheduler rank even when two
+                # submission threads drain concurrently.
                 with self._proof_plan_lock:
+                    handle = self._open_proof_plan_handle
+                    plan_done = handle is not None and handle.done()
+                    with self.fill_state.lock:
+                        snapshot = self.fill_state.snapshot()
+                        if (
+                            self._seal_flag.is_set()
+                            or snapshot["closed"]
+                            or snapshot["proven"][environment]
+                            >= snapshot["picks_target"] * B_BATCH
+                            or plan_done
+                            or self._time_fn()
+                            >= self.window_opened_at
+                            + FILL_CLOSED_PROOF_DISPATCH_SECONDS
+                        ):
+                            # These buffered bodies never reserved a proof.
+                            # Their retained pending records remain available
+                            # to the seal audit; none can be paid or trained.
+                            self._arrival_proof_buffer.clear()
+                            return
+                        if not self._arrival_proof_buffer:
+                            return
+                        if not self.fill_state.may_admit(environment):
+                            return
+                        self._arrival_proof_buffer.sort(
+                            key=_arrival_buffer_sort_key
+                        )
+                        entry = self._arrival_proof_buffer.pop(0)
+                        self.fill_state.reserve(environment)
+
+                    pending = entry.pending
+                    operator = self._operator_for_hotkey(pending.hotkey)
+                    operator_remaining = (
+                        MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW
+                        - self.operator_proof_failure_debt(operator)
+                        if operator is not None
+                        else 0
+                    )
+                    hotkey_remaining = (
+                        MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW
+                        - self.proof_failure_debt(pending.hotkey)
+                    )
                     self._arrival_proof_rank += 1
                     rank = self._arrival_proof_rank
                     candidate = self._ranked_proof_for(
@@ -1843,32 +1823,42 @@ class GrpoWindowBatcher:
                     )
                     # v6.1: the scheduler's decision carries a job_id and
                     # a proven value, nothing else -- this is where the
-                    # buffered entry's rate and payload size are pinned to
-                    # that job_id so the pick pool can be built from a
-                    # decision alone. Written BEFORE ``extend``: the moment
-                    # the plan holds the candidate, a device thread can
-                    # decide it, and the reconcile that follows must find
-                    # the rate already there.
+                    # buffered entry's telemetry is pinned to that job_id so
+                    # the pick pool can be audited from a decision alone.
+                    # Written before ``extend`` because a worker may decide
+                    # the candidate immediately.
                     job_id = candidate.job_id
                     self._arrival_proof_meta[job_id] = (
                         entry.rate, entry.payload_bytes, entry.receipt_id,
                     )
                     self._extend_proof_plan([candidate])
             except Exception as exc:
-                # ``_proof_plan_lock`` has already been released by the
-                # ``with`` block above by the time control reaches here, so
-                # this never nests the two locks -- no ordering to keep
-                # consistent against any other call site.
                 if job_id is not None:
                     # No candidate reached the plan, so no decision will
                     # ever carry this job_id away again.
                     self._arrival_proof_meta.pop(job_id, None)
+                plan_closed = isinstance(exc, ProofPlanClosed)
                 with self.fill_state.lock:
                     self.fill_state.release(environment)
-                if FILL_CLOSED_BOUNDED_PROOFS and isinstance(exc, ProofPlanClosed):
-                    # The cutoff can race expensive admission preparation.
-                    # Admission stays spent; only concurrency releases.
-                    continue
+                if plan_closed:
+                    self._reconcile_fill_state_decisions(environment)
+                    with self.fill_state.lock:
+                        snapshot = self.fill_state.snapshot()
+                        legitimately_closed = (
+                            self._seal_flag.is_set()
+                            or snapshot["closed"]
+                            or snapshot["proven"][environment]
+                            >= snapshot["picks_target"] * B_BATCH
+                            or self._time_fn()
+                            >= self.window_opened_at
+                            + FILL_CLOSED_PROOF_DISPATCH_SECONDS
+                        )
+                        if legitimately_closed:
+                            self._arrival_proof_buffer.clear()
+                    if legitimately_closed:
+                        # Target completion or cutoff can race admission. The
+                        # attempt stays spent, but no closed plan is extended.
+                        return
                 raise
 
     def _reconcile_fill_state_decisions(self, environment: str) -> None:
@@ -1922,6 +1912,19 @@ class GrpoWindowBatcher:
                     )
                 else:
                     self.fill_state.release(environment)
+        if handle.done():
+            result = handle.result(timeout=0)
+            if result.outcome is ProofPlanOutcome.CAPACITY_ABORTED:
+                self.proof_capacity_aborted = True
+                self.proof_capacity_abort_reason = (
+                    result.abort_reason.value
+                    if result.abort_reason is not None
+                    else "unknown"
+                )
+                self.proof_wall_exhausted = result.abort_reason in {
+                    CapacityAbortReason.DEADLINE_EXCEEDED,
+                    CapacityAbortReason.ACTIVE_PROOF_TIMEOUT,
+                }
 
     def can_pick(self) -> bool:
         """Could a pick seat a full batch from THIS environment right now?
@@ -1953,8 +1956,9 @@ class GrpoWindowBatcher:
         environment = str(getattr(self.env, "name", ""))
         # A final scheduler notification may occur after the verifier callback
         # returned; always reconcile terminal facts before the service picks.
-        if FILL_CLOSED_BOUNDED_PROOFS:
-            self._reconcile_fill_state_decisions(environment)
+        self._reconcile_fill_state_decisions(environment)
+        if self.proof_capacity_aborted:
+            return False
         with self.fill_state.lock:
             # This environment's OWN ordinal, not the window-wide close
             # (R37): while a sibling still owes its half of the event in
@@ -2062,6 +2066,9 @@ class GrpoWindowBatcher:
         the seal is a normal outcome, not a fault.
         """
         environment = str(getattr(self.env, "name", ""))
+        self._reconcile_fill_state_decisions(environment)
+        if self.proof_capacity_aborted:
+            return None
         with self.fill_state.lock:
             if self.is_sealed() or self.fill_state.picks_taken(
                 environment
@@ -2289,13 +2296,9 @@ class GrpoWindowBatcher:
                 self._upload_precommit_peak_pending,
                 len(self._upload_precommits),
             )
-            # v6 only. Feed the rate-ordered queue right here, at accept —
-            # not at reveal — so it can prioritise whose body to pull next
-            # instead of only ordering work already on disk. ``now`` (not
-            # ``t_arrival_wall``) matches ``window_opened_at``'s clock: both
-            # are ``self._time_fn()``, the monotonic base the rest of this
-            # class measures elapsed against; wall time and monotonic time
-            # are not interchangeable in the rate formula's denominator.
+            # v6 only. Register throughput telemetry at precommit accept.
+            # ``now`` (not ``t_arrival_wall``) matches ``window_opened_at``'s
+            # monotonic clock used by the rate calculation.
             if FILL_CLOSED_ENABLED and self.admission_queue is not None:
                 self.admission_queue.offer(
                     receipt_id=receipt_id,
@@ -2401,6 +2404,8 @@ class GrpoWindowBatcher:
         request: BatchSubmissionRequest,
     ) -> tuple[bool, str | None]:
         """Atomically transfer precommit bytes into one started worker job."""
+        if self._fill_proof_admission_closed():
+            return False, "proof_dispatch_closed"
         with self._upload_precommit_lock:
             reservation = self._upload_precommits.get(receipt_id)
             if reservation is None:
@@ -2780,19 +2785,19 @@ class GrpoWindowBatcher:
             return False
         now = self._time_fn()
         if FILL_CLOSED_ENABLED and self.fill_state is not None:
+            environment = str(self.env.name)
             if FILL_CLOSED_BOUNDED_PROOFS:
                 # The native scheduler owns the exact cutoff under its lock.
                 # Poll only reconciles and prevents sealing over active work.
                 if self._proof_scheduler is not None:
                     self._proof_scheduler.expire_deadlines()
-                self._reconcile_fill_state_decisions(str(self.env.name))
-                with self.fill_state.lock:
-                    filled = self.fill_state.is_closed()
-                if filled:
-                    self._seal_v6_proof_plan()
-                    handle = self._open_proof_plan_handle
-                    if handle is not None and not handle.done():
-                        return False
+            # A worker returns before the scheduler publishes its decision.
+            # Reconcile on every observation path, including strict mode.
+            self._reconcile_fill_state_decisions(environment)
+            if self.proof_capacity_aborted:
+                self._burn_unpicked_proven_groups()
+                self._seal_flag.set()
+                return True
             # v6 replaces the clock with a count: the auction's early-close
             # and fixed-deadline branches below never run for this window,
             # and neither does the seal-time proof wall they share (v6
@@ -2805,6 +2810,10 @@ class GrpoWindowBatcher:
                 # pool can still hold proven groups no pick took. They
                 # burn (R32) -- see ``_burn_unpicked_proven_groups``.
                 self._seal_v6_proof_plan()
+                handle = self._open_proof_plan_handle
+                if handle is not None and not handle.done():
+                    return False
+                self._reconcile_fill_state_decisions(environment)
                 self._burn_unpicked_proven_groups()
                 self._seal_flag.set()
                 return True
@@ -2813,6 +2822,10 @@ class GrpoWindowBatcher:
                 # Everything proven is unpicked here, and burns for the
                 # same reason: nothing that skips the assembler is paid.
                 self._seal_v6_proof_plan()
+                handle = self._open_proof_plan_handle
+                if handle is not None and not handle.done():
+                    return False
+                self._reconcile_fill_state_decisions(environment)
                 self._burn_unpicked_proven_groups()
                 self._seal_flag.set()
                 return True
@@ -3192,6 +3205,8 @@ class GrpoWindowBatcher:
         request: BatchSubmissionRequest,
     ) -> tuple[bool, str | None]:
         """Reserve direct work without oversubscribing upload reservations."""
+        if self._fill_proof_admission_closed():
+            return False, "proof_dispatch_closed"
         now = self._time_fn()
         with self._upload_precommit_lock:
             self._prune_upload_precommits_locked(now)
@@ -3290,6 +3305,9 @@ class GrpoWindowBatcher:
         request: BatchSubmissionRequest,
     ) -> tuple[bool, str | None]:
         """Move one pending reservation into irreversible started work."""
+        if self._fill_proof_admission_closed():
+            self.cancel_proof_admission(request)
+            return False, "proof_dispatch_closed"
         with self._proof_admission_lock:
             reservation_id = id(request)
             reservation = self._pending_proof_reservations.pop(
@@ -4268,9 +4286,8 @@ class GrpoWindowBatcher:
             drand_round=request.drand_round,
             merkle_root=bytes.fromhex(request.merkle_root),
             selection_digest=compute_rollouts_selection_digest(request.rollouts),
-            # I1: the prepared path sets this from the admission worker's own
-            # count; this compatibility path has to produce it itself, or
-            # every group admitted here is paid 0 by the token split.
+            # The prepared path sets this telemetry from the admission
+            # worker's count; direct callers must preserve the same value.
             eos_tokens=self._count_eos_completion_tokens(request),
             prompt_content_sha256=prompt_content_sha256(
                 str(getattr(self.env, "name", "")),
@@ -4805,6 +4822,11 @@ class GrpoWindowBatcher:
             # Skipped when the stub didn't populate sparse outputs (legacy
             # test fixtures that opted out of behavioural enforcement).
             if proof.has_sparse_outputs and not _is_episode:
+                require_forced_terminal_pick = (
+                    PROTOCOL_VERSION == 6
+                    and FORCED_SEED_ENFORCE
+                    and bool(self.current_checkpoint_hash)
+                )
                 if has_eos_padding(
                     rollout.commit,
                     self.tokenizer,
@@ -4822,6 +4844,9 @@ class GrpoWindowBatcher:
                     proof,
                     proof_model,
                     env_name=getattr(self.env, "name", ""),
+                    require_forced_terminal_pick=(
+                        require_forced_terminal_pick
+                    ),
                 )
                 _t_term += time.perf_counter() - _tmark
                 cap_truncated = is_cap_truncation(
@@ -4830,6 +4855,9 @@ class GrpoWindowBatcher:
                     proof,
                     proof_model,
                     env_name=getattr(self.env, "name", ""),
+                    require_forced_terminal_pick=(
+                        require_forced_terminal_pick
+                    ),
                 )
                 terminal_pick_ok = getattr(proof, "terminal_pick_ok", None)
                 terminal_pick_cdf_miss = getattr(
@@ -4852,6 +4880,7 @@ class GrpoWindowBatcher:
                     and p_stop is not None
                     and float(p_stop) < MIN_EOS_PROBABILITY
                 )
+                terminal_pick_mismatch = terminal_pick_ok is False
                 # The truncation allowance is exclusively for a genuine
                 # protocol-cap hit without an authenticated EOS.  Treating an
                 # arbitrary bad termination as a truncation lets a miner append
@@ -4863,6 +4892,7 @@ class GrpoWindowBatcher:
                     not termination_ok
                     or increments_truncation
                     or low_probability_terminal
+                    or terminal_pick_mismatch
                     or natural_cap_candidate
                 ):
                     record_termination_shadow(
@@ -6341,12 +6371,10 @@ class GrpoWindowBatcher:
 
         slot_share = pool / self.batch_target
         # ``reward_amount`` below is this slot share. Under v6 the seal path
-        # pays nothing -- payment is the per-token split
-        # ``FillClosedBatchAssembler`` computes over assembled batches (R20)
-        # -- so reporting the share unqualified would hand an operator a
-        # number that was never credited. Name the payer.
+        # pays nothing; ``FillClosedBatchAssembler`` computes fixed shares
+        # over assembled batches, so name the actual payer.
         payment_source = (
-            "fill_closed_token_split" if FILL_CLOSED_ENABLED else "slot_share"
+            "fill_closed_fixed_group" if FILL_CLOSED_ENABLED else "slot_share"
         )
         rewards: dict[str, float] = {}
         metadata: dict[int, dict[str, Any]] = {}
@@ -6932,42 +6960,31 @@ class GrpoWindowBatcher:
         C1. Under v6 every group was proved when it ARRIVED, assembled into
         DAPO batches by the service's ``FillClosedBatchAssembler``, written
         to the trainer journal under the encoded key space, and paid by the
-        per-token split (R20). ``self._pending`` still holds every graded
+        fixed-slot split. ``self._pending`` still holds every graded
         body, so letting the auction's seal run over it would prove each one
         a SECOND time — a second ``{w}:{env}:auction-winners`` plan on the
         same device, a second charge of operator proof-failure debt, and a
         selection whose reward map contradicts the one already paid.
 
-        What still belongs here is the seal path's OTHER job: it is the only
-        writer of the prompt cooldown, the content cooldown and the
-        rollout-hash dedup set. Those are recorded for the groups this
-        environment actually proved (``self._proven_groups``, picked or
-        burned), so the next window does not re-serve a prompt v6 has
-        already spent.
+        Prompt/content cooldown and rollout-hash dedup are committed later by
+        the service from the assembler's durably-paid set. A pick alone is not
+        payment: an incomplete cross-environment batch can still tombstone.
         Nothing is selected: the returned batch is empty, and the service's
         ``sealed_dict`` is empty with it.
         """
-        environment = str(getattr(self.env, "name", ""))
-        # Read the proven groups under the lock that guards them
-        # (``_reconcile_fill_state_decisions`` appends under
-        # ``fill_state.lock``), before taking ``self._lock`` — the two are
-        # never held together anywhere else and must not start here.
-        #
-        # v6.1: every PROVEN group, picked or burned (R32). The cooldown
-        # sets are a replay defence, not a payment record: a burned group
-        # was still graded, proved and seen, so its prompt and rollout
-        # hashes stay spent for the next window exactly as a picked one's
-        # do. ``.value`` unwraps the pick-pool record.
-        if self.fill_state is not None:
-            with self.fill_state.lock:
-                proven = list(self._proven_groups.get(environment, []))
-        else:
-            proven = list(self._proven_groups.get(environment, []))
-        recorded = [group.value for group in proven]
         with self._lock:
             self.selection_metadata_by_id = {}
             self.rewards_by_hotkey = {}
             self.rewarded_but_not_selected_by_hotkey = {}
+        return [], {}
+
+    def prepare_fill_closed_paid_side_effects(
+        self, recorded: list[ValidSubmission]
+    ) -> None:
+        """Replace tentative pick effects with the exact durably-paid set."""
+        with self._lock:
+            if self._seal_side_effects_committed:
+                return
             self._pending_seal_side_effects = _SealSideEffects(
                 rewarded_prompts=tuple(sorted({
                     int(group.prompt_idx) for group in recorded
@@ -6983,9 +7000,6 @@ class GrpoWindowBatcher:
                     for rollout_hash in group.rollout_hashes
                 ),
             )
-            if commit_side_effects:
-                self._commit_seal_side_effects_locked()
-        return [], {}
 
     def _seal_batch_inner(
         self,

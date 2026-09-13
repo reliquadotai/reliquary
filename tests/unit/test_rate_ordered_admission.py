@@ -1,4 +1,4 @@
-"""A precommit that lands later is served first if it was produced faster.
+"""Proof dispatch is FIFO; rate and payload size are telemetry only.
 
 The queue itself (``ThroughputAdmissionQueue``) never hands out a provable
 candidate -- a ``PendingSubmission`` does not exist until the body has
@@ -8,8 +8,7 @@ BUFFER drain order instead: both bodies below grade and land in the buffer
 before either's own drain runs (what a genuine concurrent race would
 produce -- see the R33 note in the test below, since under the budget
 model a release no longer reopens room for a SECOND drain to matter), and
-when the one drain that has room runs, the higher-rate precommit is what
-gets extended, regardless of which body arrived -- and buffered -- first.
+when the one drain that has room runs, the first buffered body is extended.
 """
 import types
 
@@ -23,7 +22,7 @@ def _pending_for_receipt(prompt_idx, receipt_id):
     return pending
 
 
-def test_a_faster_later_precommit_is_extended_before_a_slower_earlier_one(
+def test_a_faster_later_precommit_does_not_overtake_the_first_body(
     monkeypatch,
 ):
     """R33: ``admitted`` is monotone, so a release no longer reopens
@@ -75,10 +74,9 @@ def test_a_faster_later_precommit_is_extended_before_a_slower_earlier_one(
     assert extended == []
     assert len(batcher._arrival_proof_buffer) == 2
 
-    # Budget for only one. It must go to "fast", not to "slow" merely
-    # because "slow" graded first.
+    # Budget for only one. Rate and bytes cannot overtake FIFO.
     batcher._drain_arrival_proof_buffer(env)
 
     assert len(extended) == 1
-    assert extended[0].payload.pending.prompt_idx == 2  # the "fast" group
+    assert extended[0].payload.pending.prompt_idx == 1  # the first group
     assert len(batcher._arrival_proof_buffer) == 1

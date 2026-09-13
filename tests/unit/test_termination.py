@@ -141,6 +141,27 @@ def test_forced_seed_pick_mismatch_still_rejects_low_p_stop():
     assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is False
 
 
+@pytest.mark.parametrize("terminal_pick_ok", [False, None])
+def test_v6_requires_the_exact_forced_terminal_pick(terminal_pick_ok):
+    tokens = [10, 20, 30, 99]
+    proof = _proof_from_logits(_make_logits(4), eos_token_id=99)
+    assert proof.p_stop > MIN_EOS_PROBABILITY
+    proof.terminal_pick_ok = terminal_pick_ok
+
+    assert verify_termination(
+        _commit(tokens),
+        _FakeTokenizer(),
+        proof,
+        require_forced_terminal_pick=True,
+    ) is False
+    assert verify_termination(
+        _commit(tokens),
+        _FakeTokenizer(),
+        proof,
+        require_forced_terminal_pick=False,
+    ) is True
+
+
 def test_forced_seed_pick_cannot_rescue_a_non_eos_final_token():
     """The escape never waives the structural requirement that the rollout
     actually ends on a stop token."""
@@ -416,6 +437,34 @@ def test_cap_hit_with_natural_eos_is_not_truncation():
 
     assert verify_termination(commit, _FakeTokenizer(), proof) is True
     assert is_cap_truncation(commit, _FakeTokenizer(), proof) is False
+
+
+def test_v6_cap_eos_mismatch_is_accepted_but_counted_as_truncation():
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt_length = 33
+    completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP - prompt_length
+    tokens = [42] * (MAX_NEW_TOKENS_PROTOCOL_CAP - 1) + [99]
+    proof = ProofResult(
+        all_passed=True,
+        passed=1,
+        checked=1,
+        has_sparse_outputs=True,
+        p_stop=0.99,
+        terminal_pick_ok=False,
+    )
+    commit = _commit_with_lengths(
+        tokens, prompt_length, completion_length
+    )
+
+    assert verify_termination(
+        commit, _FakeTokenizer(), proof,
+        require_forced_terminal_pick=True,
+    ) is True
+    assert is_cap_truncation(
+        commit, _FakeTokenizer(), proof,
+        require_forced_terminal_pick=True,
+    ) is True
 
 
 def test_single_terminal_eos_is_not_padding():

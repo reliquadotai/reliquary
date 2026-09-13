@@ -283,7 +283,7 @@ def test_native_batcher_retains_active_valid_submission_for_pick_and_releases_pe
     )
     try:
         batcher = _make_batcher(proof_scheduler=scheduler, time_fn=lambda: now[0])
-        batcher.fill_state = module.FillState(budgets={ENVIRONMENTS[0]: 4}, picks_target=16)
+        batcher.fill_state = module.FillState(budgets={ENVIRONMENTS[0]: 4}, picks_target=4)
         batcher._emit_training_batch_fn = lambda env, groups, *_args: emitted.append((env, groups))
         with scheduler._condition:
             assert batcher.accept_submission(_request(prompt_idx=21, hotkey="a")).accepted
@@ -467,12 +467,13 @@ def test_cutoff_racing_after_reserve_before_extend_releases_once_without_refund(
     monkeypatch.setattr(module, "FILL_CLOSED_BOUNDED_PROOFS", True)
     monkeypatch.setattr(module, "FILL_CLOSED_PROOF_DISPATCH_SECONDS", 60.0)
     monkeypatch.setattr(module, "FILL_CLOSED_MAX_SECONDS", 100.0)
+    monkeypatch.setattr(module, "B_BATCH", 1)
     now = [10.0]
     scheduler = GlobalProofScheduler(devices=("gpu-0",), environments=ENVIRONMENTS,
         proof_callable=_execute_scheduler_payload, checkpoint_revision="", clock=lambda: now[0])
     try:
         batcher = _make_batcher(proof_scheduler=scheduler, time_fn=lambda: now[0])
-        batcher.fill_state = module.FillState(budgets={ENVIRONMENTS[0]: 4}, picks_target=16)
+        batcher.fill_state = module.FillState(budgets={ENVIRONMENTS[0]: 4}, picks_target=4)
         assert batcher.accept_submission(_request(prompt_idx=21, hotkey="a")).accepted
         handle = batcher._open_proof_plan_handle
         _wait_until(lambda: len(handle.decisions()) == 1, timeout=5)
@@ -502,7 +503,7 @@ def test_cutoff_racing_after_reserve_before_extend_releases_once_without_refund(
         assert scheduler.close()
 
 
-def test_early_filled_close_waits_for_last_actual_result_before_burning(monkeypatch):
+def test_early_fill_stops_surplus_proofs_before_close(monkeypatch):
     from reliquary.validator import batcher as module
     from tests.unit.test_grpo_window_batcher import _execute_scheduler_payload, _make_batcher, _request
 
@@ -511,13 +512,9 @@ def test_early_filled_close_waits_for_last_actual_result_before_burning(monkeypa
                         ("FILL_CLOSED_MAX_SECONDS", 100.0), ("B_BATCH", 1)):
         monkeypatch.setattr(module, name, value)
     now = [10.0]
-    second_started, release = threading.Event(), threading.Event()
     executed, emitted = [], []
 
     def prove(invocation):
-        if executed:
-            second_started.set()
-            assert release.wait(5)
         result = _execute_scheduler_payload(invocation)
         executed.append(result)
         return result
@@ -531,26 +528,21 @@ def test_early_filled_close_waits_for_last_actual_result_before_burning(monkeypa
         with scheduler._condition:
             for prompt in (21, 22, 23):
                 assert batcher.accept_submission(_request(prompt_idx=prompt, hotkey=str(prompt))).accepted
-        assert second_started.wait(2)
-        assert batcher.can_pick() and batcher.pick_training_batch()
-        assert batcher.fill_state.is_closed()
-        assert batcher.poll_deadline() is False
-        assert not batcher.is_sealed()
-        assert not batcher._unpicked_groups_burned
-        release.set()
         handle = batcher._open_proof_plan_handle
         _wait_until(handle.done, timeout=5)
+        assert batcher.can_pick() and batcher.pick_training_batch()
         assert batcher.poll_deadline() is True
         assert batcher.is_sealed()
-        assert len(executed) == 2 and all(result.passed for result in executed)
+        assert len(executed) == 1 and executed[0].passed
         assert [d.status for d in handle.decisions()] == [
-            ProofDecisionStatus.PASSED, ProofDecisionStatus.PASSED, ProofDecisionStatus.NOT_NEEDED,
+            ProofDecisionStatus.PASSED,
+            ProofDecisionStatus.NOT_NEEDED,
+            ProofDecisionStatus.NOT_NEEDED,
         ]
         assert batcher.fill_state.snapshot()["in_flight"][ENVIRONMENTS[0]] == 0
         assert batcher.fill_state.snapshot()["admitted"][ENVIRONMENTS[0]] == 3
         assert emitted == [(ENVIRONMENTS[0], [executed[0].value])]
-        assert batcher._burned_unpicked_groups == 1
-        assert len(batcher._proven_groups[ENVIRONMENTS[0]]) == 2
+        assert batcher._burned_unpicked_groups == 0
+        assert len(batcher._proven_groups[ENVIRONMENTS[0]]) == 1
     finally:
-        release.set()
         assert scheduler.close()

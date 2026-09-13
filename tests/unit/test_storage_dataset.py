@@ -19,9 +19,13 @@ from reliquary.infrastructure.storage import (
 class _AsyncBody:
     def __init__(self, value: bytes) -> None:
         self.value = value
+        self.closed = False
 
     async def read(self) -> bytes:
         return self.value
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _JsonClient:
@@ -181,10 +185,11 @@ async def test_download_json_rejects_duplicate_keys() -> None:
 @pytest.mark.asyncio
 async def test_strict_archive_read_binds_body_to_object_window() -> None:
     payload = gzip.compress(json.dumps({"window_start": 99}).encode())
+    body = _AsyncBody(payload)
 
     class _MismatchedClient:
         async def get_object(self, **_kwargs):
-            return {"Body": _AsyncBody(payload)}
+            return {"Body": body}
 
     with patch(
         "reliquary.infrastructure.storage.get_s3_client",
@@ -196,6 +201,7 @@ async def test_strict_archive_read_binds_body_to_object_window() -> None:
                 n=1,
                 strict=True,
             )
+    assert body.closed
 
 
 @pytest.mark.asyncio

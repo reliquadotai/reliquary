@@ -75,9 +75,8 @@ def _run_full_window():
                 group.eos_tokens = sum(r.commit["rollout"]["completion_length"] for r in group.rollouts)
                 originals[group.prompt_idx] = group
                 groups.append(group)
-            token_mass = sum(group.eos_tokens for group in groups)
             for group in groups:
-                expected_rewards[group.hotkey] += group.eos_tokens / token_mass / 3 / 16
+                expected_rewards[group.hotkey] += 1 / 3 / 16 / 16
             chunks[environment].append(groups)
 
     # Two fast environments cannot produce any emission before Logic arrives.

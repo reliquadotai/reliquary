@@ -7,13 +7,17 @@ become tombstones. A complete archive is retained until its queue commit.
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any
 
 from reliquary.constants import (
+    B_BATCH,
     FILL_CLOSED_EMISSIONS_PER_WINDOW,
     FILL_CLOSED_PICKS_PER_WINDOW,
+    FILL_CLOSED_SELECTION_POLICY,
+    LEGACY_FILL_CLOSED_SELECTION_POLICY,
     TASK_ID,
 )
 from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
@@ -25,7 +29,13 @@ from reliquary.shared.training_payload import (
 )
 from reliquary.validator.control import write_json
 from reliquary.validator.fill_closed_rotation import FillClosedRotationGate
-from reliquary.validator.token_rewards import AcceptedGroup, split_environment_pool
+from reliquary.validator.token_rewards import (
+    EOS_TOKEN_PAYMENT_POLICY,
+    FIXED_GROUP_PAYMENT_POLICY,
+    AcceptedGroup,
+    split_environment_pool,
+    split_fixed_environment_pool,
+)
 
 
 def _valid_window_pool(value: object) -> bool:
@@ -33,15 +43,6 @@ def _valid_window_pool(value: object) -> bool:
         isinstance(value, (int, float))
         and not isinstance(value, bool)
         and 0.0 <= value <= 1.0
-    )
-
-
-def window_environment_pool(record: dict) -> float:
-    """One environment's share of one batch, from the pool the window opened with."""
-    return (
-        float(record.get("window_pool", 1.0))
-        / len(record["environments"])
-        / record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW)
     )
 
 
@@ -80,10 +81,24 @@ class FillClosedRecoveryStore:
 
     def load(self, window: int) -> dict:
         value = strict_json_loads(self._path(window).read_bytes())
-        if not isinstance(value, dict) or set(value) - {"picks_target", "window_pool"} != {
+        base_keys = {
             "schema_version", "window_start", "identity", "parent_checkpoint_n",
             "parent_revision", "environments", "batch_targets", "archive",
-        } or type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        }
+        if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
+            raise ValueError("invalid active window record")
+        schema_version = value["schema_version"]
+        expected_keys = base_keys | {"picks_target"}
+        if schema_version == 2:
+            expected_keys |= {
+                "journal_slots", "payment_policy", "selection_policy",
+                "window_pool",
+            }
+        elif schema_version != 1:
+            raise ValueError("invalid active window record")
+        if not base_keys <= set(value) or set(value) - expected_keys:
+            raise ValueError("invalid active window record")
+        if schema_version == 2 and set(value) != expected_keys:
             raise ValueError("invalid active window record")
         if type(value["window_start"]) is not int or value["window_start"] != window:
             raise ValueError("active window identity mismatch")
@@ -97,7 +112,29 @@ class FillClosedRecoveryStore:
                 or any(type(n) is not int or n <= 0 for n in targets.values())):
             raise ValueError("invalid active window environments")
         picks = value.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW)
-        if type(picks) is not int or not 1 <= picks <= FILL_CLOSED_EMISSIONS_PER_WINDOW:
+        if type(picks) is not int or picks < 1:
+            raise ValueError("invalid active window pick target")
+        if schema_version == 2:
+            if any(target != B_BATCH for target in targets.values()):
+                raise ValueError("active window batch target mismatch")
+            journal_slots = value["journal_slots"]
+            if type(journal_slots) is not int or picks > journal_slots:
+                raise ValueError("invalid active window journal slots")
+            if journal_slots != FILL_CLOSED_EMISSIONS_PER_WINDOW:
+                raise ValueError("active window journal stride mismatch")
+            if value["payment_policy"] != FIXED_GROUP_PAYMENT_POLICY:
+                raise ValueError("invalid active window payment policy")
+            if value["selection_policy"] != FILL_CLOSED_SELECTION_POLICY:
+                raise ValueError("invalid active window selection policy")
+            window_pool = value["window_pool"]
+            if (
+                isinstance(window_pool, bool)
+                or not isinstance(window_pool, (int, float))
+                or not math.isfinite(float(window_pool))
+                or float(window_pool) < 0.0
+            ):
+                raise ValueError("invalid active window pool")
+        elif picks > FILL_CLOSED_EMISSIONS_PER_WINDOW:
             raise ValueError("invalid active window pick target")
         if "window_pool" in value and not _valid_window_pool(value["window_pool"]):
             raise ValueError("invalid active window pool")
@@ -111,18 +148,30 @@ class FillClosedRecoveryStore:
             windows.append(window)
         return sorted(windows)
 
-    def begin(self, window: int, *, checkpoint_n: int, revision: str, targets: dict,
-              window_pool: float = 1.0) -> None:
+    def begin(
+        self,
+        window: int,
+        *,
+        checkpoint_n: int,
+        revision: str,
+        targets: dict,
+        window_pool: float = 1.0,
+    ) -> None:
         if self._path(window).exists():
             raise RuntimeError("active window requires recovery before reuse")
         if not _valid_window_pool(window_pool):
             raise ValueError("invalid active window pool")
+        if any(target != B_BATCH for target in targets.values()):
+            raise ValueError("active window batch target mismatch")
         write_json(self._path(window), {
-            "schema_version": 1, "window_start": window,
+            "schema_version": 2, "window_start": window,
             "identity": active_training_identity(), "parent_checkpoint_n": checkpoint_n,
             "parent_revision": revision, "environments": list(targets),
             "batch_targets": targets, "archive": None,
             "picks_target": FILL_CLOSED_PICKS_PER_WINDOW,
+            "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
+            "payment_policy": FIXED_GROUP_PAYMENT_POLICY,
+            "selection_policy": FILL_CLOSED_SELECTION_POLICY,
             "window_pool": float(window_pool),
         })
         self.load(window)
@@ -155,6 +204,14 @@ class FillClosedRecoveryStore:
 
     def finish(self, window: int, archive: dict, archive_queue: Any) -> None:
         record = self.load(window)
+        if record["schema_version"] == 2 and (
+            archive.get("payment_policy") != record["payment_policy"]
+            or archive.get("selection_policy") != record["selection_policy"]
+            or archive.get("picks_target") != record["picks_target"]
+            or archive.get("journal_slots") != record["journal_slots"]
+            or archive.get("window_pool") != record["window_pool"]
+        ):
+            raise RuntimeError("archive policy differs from active window")
         if record["archive"] is not None and record["archive"] != archive:
             raise RuntimeError("recovered archive differs from committed archive")
         record["archive"] = archive
@@ -170,8 +227,21 @@ class FillClosedRecoveryStore:
             return
         rows, rewards, payload_count = [], {}, 0
         environments = record["environments"]
-        for index in range(FILL_CLOSED_EMISSIONS_PER_WINDOW):
-            key = window * FILL_CLOSED_EMISSIONS_PER_WINDOW + index
+        payment_policy = record.get(
+            "payment_policy", EOS_TOKEN_PAYMENT_POLICY
+        )
+        selection_policy = record.get(
+            "selection_policy", LEGACY_FILL_CLOSED_SELECTION_POLICY
+        )
+        window_pool = float(record.get("window_pool", 1.0))
+        picks_target = record.get(
+            "picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW
+        )
+        journal_slots = record.get(
+            "journal_slots", FILL_CLOSED_EMISSIONS_PER_WINDOW
+        )
+        for index in range(journal_slots):
+            key = window * journal_slots + index
             path = queue._journal_commit_dir / f"window-{key}.json"
             if not path.exists():
                 queue.enqueue_committed_tombstone(key, encode_tombstone(
@@ -187,27 +257,47 @@ class FillClosedRecoveryStore:
                 raise RuntimeError("paid window recovery requires accounting receipts")
             payload_count += int(receipt["kind"] == "payload")
             paid = receipt["accounting"]
-            if (paid or receipt["kind"] == "payload") and index >= record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW):
+            if (paid or receipt["kind"] == "payload") and index >= picks_target:
                 raise RuntimeError("paid batch exceeds the window target")
             for row in paid:
                 if (row["env_name"] not in environments or row["batch_index"] != index
                         or type(row["eos_tokens"]) is not int or row["eos_tokens"] < 0
                         or row["claimed_checkpoint_hash"] != record["parent_revision"]):
                     raise RuntimeError("paid group does not match active window")
+            if payment_policy == FIXED_GROUP_PAYMENT_POLICY:
+                paid = [
+                    {
+                        **row,
+                        "selected_for_batch": True,
+                        "rewarded": True,
+                        "payment_source": "fill_closed_fixed_group",
+                    }
+                    for row in paid
+                ]
             rows.extend(paid)
             for environment in environments:
-                shares = split_environment_pool([
+                groups = [
                     AcceptedGroup(row["hotkey"], row["hotkey"], row["eos_tokens"])
                     for row in paid if row["env_name"] == environment
-                ], pool=window_environment_pool(record))
+                ]
+                pool = window_pool / len(environments) / picks_target
+                shares = (
+                    split_fixed_environment_pool(
+                        groups,
+                        pool=pool,
+                        slots=record["batch_targets"][environment],
+                    )
+                    if payment_policy == FIXED_GROUP_PAYMENT_POLICY
+                    else split_environment_pool(groups, pool=pool)
+                )
                 for hotkey, reward in shares.items():
                     rewards[hotkey] = rewards.get(hotkey, 0.0) + reward
         gate = FillClosedRotationGate(
             source_window=window,
-            required_journal_key=(window + 1) * FILL_CLOSED_EMISSIONS_PER_WINDOW - 1,
+            required_journal_key=(window + 1) * journal_slots - 1,
             parent_checkpoint_n=record["parent_checkpoint_n"], parent_revision=record["parent_revision"],
             durable_payload_count=payload_count,
-            requires_successor=payload_count >= FILL_CLOSED_EMISSIONS_PER_WINDOW,
+            requires_successor=payload_count > 0,
         )
         existing = rotation.load()
         if existing is None or existing.source_window <= window:
@@ -223,7 +313,11 @@ class FillClosedRecoveryStore:
             "rewards_by_hotkey": rewards, "training_identity": record["identity"],
             "checkpoint_revision": record["parent_revision"],
             "durable_payload_count": payload_count,
-            "picks_target": record.get("picks_target", FILL_CLOSED_EMISSIONS_PER_WINDOW),
+            "picks_target": picks_target,
+            "journal_slots": journal_slots,
+            "payment_policy": payment_policy,
+            "selection_policy": selection_policy,
+            "window_pool": window_pool,
             "runners_up": [], "rejected": [], "reject_summary": {},
             "training_quarantine": {"quarantined": False, "reasons": [], "metrics": {}},
         }

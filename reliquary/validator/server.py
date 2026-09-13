@@ -185,6 +185,12 @@ PRECOMMIT_HEADER = "X-Reliquary-Precommit"
 MAX_PRECOMMIT_BODY_BYTES = 16 * 1024
 
 
+_NO_REVEAL_WIRE_VIOLATIONS = frozenset({
+    "upload_started_after_collection", "upload_payload_exceeded",
+    "upload_payload_incomplete", "upload_body_empty",
+})
+
+
 @dataclass
 class _UploadPrecommitReceipt:
     receipt_id: str
@@ -227,6 +233,8 @@ class _QueuedAuctionSubmission:
     batcher: Any
     telemetry: SubmitTelemetry
     enqueued_monotonic: float
+    admission_predecessor: asyncio.Future | None = None
+    admission_completion: asyncio.Future | None = None
 
 
 # How many recent verdicts to remember per hotkey. Bounded so the
@@ -1360,6 +1368,7 @@ class ValidatorServer:
             collections.Counter()
         )
         self._admission_enqueued_at: dict[str, tuple[str, float]] = {}
+        self._admission_order_tail: dict[int, asyncio.Future] = {}
         self._admission_inflight_items: dict[
             str, _QueuedAuctionSubmission
         ] = {}
@@ -1432,6 +1441,11 @@ class ValidatorServer:
             if FILL_CLOSED_ENABLED
             else None
         )
+        fill_admission_closed = (
+            bool(batcher._fill_proof_admission_closed())
+            if fill_state is not None
+            else None
+        )
         fill_revision = (
             getattr(fill_state, "revision", None)
             if fill_state is not None
@@ -1456,6 +1470,7 @@ class ValidatorServer:
             fill_revision,
             fill_collection_closed,
             fill_sealed,
+            fill_admission_closed,
         )
 
     def _miner_state_cache_key(self) -> tuple:
@@ -1479,6 +1494,11 @@ class ValidatorServer:
                     int(getattr(batcher, "max_grading_starts", 0)),
                     (
                         int(batcher.fill_state.revision)
+                        if getattr(batcher, "fill_state", None) is not None
+                        else None
+                    ),
+                    (
+                        bool(batcher._fill_proof_admission_closed())
                         if getattr(batcher, "fill_state", None) is not None
                         else None
                     ),
@@ -1513,9 +1533,10 @@ class ValidatorServer:
             return None
         with fill_state.lock:
             snapshot = fill_state.snapshot()
+        admission_closed = batcher._fill_proof_admission_closed()
         if batcher.is_sealed():
             phase = "sealed"
-        elif batcher.collection_closed():
+        elif batcher.collection_closed() or admission_closed:
             phase = "draining"
         else:
             phase = "collecting"
@@ -1546,7 +1567,9 @@ class ValidatorServer:
             proven=snapshot["proven"],
             in_flight=snapshot["in_flight"],
             remaining={
-                environment: max(0, budget - admitted[environment])
+                environment: (
+                    0 if admission_closed else max(0, budget - admitted[environment])
+                )
                 for environment, budget in budgets.items()
             },
         )
@@ -1597,7 +1620,7 @@ class ValidatorServer:
                     )
                 )
             ):
-                self._record_no_reveal(receipt)
+                self._record_no_reveal(receipt, cause="reveal_deadline_missed")
             resolver = getattr(
                 type(receipt.batcher), "resolve_upload_precommit", None
             )
@@ -1778,10 +1801,23 @@ class ValidatorServer:
         # Keep them bounded without shortening the established upload grace.
         return request_started_at + SUBMISSION_UPLOAD_GRACE_SECONDS
 
-    def _record_no_reveal(self, receipt: _UploadPrecommitReceipt) -> None:
+    def _record_no_reveal(
+        self, receipt: _UploadPrecommitReceipt, *, cause: str
+    ) -> None:
         if receipt.reveal_success_recorded or receipt.reveal_failure_recorded:
             return
         receipt.reveal_failure_recorded = True
+        logger.warning("no_reveal_incident %s", json.dumps({
+            "cause": cause, "receipt_id": receipt.receipt_id,
+            "hotkey": receipt.miner_hotkey, "operator": receipt.operator,
+            "environment": receipt.environment, "window": receipt.window_start,
+            "policy_window": receipt.admission_policy_window,
+            "prompt_idx": receipt.prompt_idx,
+            "precommit_arrival_ts": receipt.precommit_arrival_ts,
+            "upload_started_at": receipt.upload_started_at_wall,
+            "body_completed_at": receipt.body_completed_at_wall,
+            "deadline": receipt.expires_at_wall, "recorded_at": time.time(),
+        }, sort_keys=True))
         update = self._no_reveal_circuit.record_no_reveal(
             environment=receipt.environment,
             operator=receipt.operator,
@@ -1854,10 +1890,12 @@ class ValidatorServer:
         *,
         reason: RejectReason = RejectReason.PRECOMMIT_INVALID,
         expired: bool = False,
+        incident_cause: str | None = "payload_mismatch",
     ) -> None:
         if receipt.terminal:
             return
-        self._record_no_reveal(receipt)
+        if incident_cause is not None:
+            self._record_no_reveal(receipt, cause=incident_cause)
         receipt.consumed = True
         self._complete_upload_receipt(
             receipt,
@@ -1888,7 +1926,12 @@ class ValidatorServer:
                 chunk_bytes=int(chunk_bytes),
             )
             if not accepted:
-                self._fail_upload_receipt(receipt)
+                self._fail_upload_receipt(
+                    receipt,
+                    incident_cause=(
+                        reason if reason in _NO_REVEAL_WIRE_VIOLATIONS else None
+                    ),
+                )
             return accepted, reason
         if event == "complete":
             marker = getattr(
@@ -1907,11 +1950,20 @@ class ValidatorServer:
             if accepted:
                 receipt.body_completed_at_wall = float(at)
             else:
-                self._fail_upload_receipt(receipt)
+                self._fail_upload_receipt(
+                    receipt,
+                    incident_cause=(
+                        reason if reason in _NO_REVEAL_WIRE_VIOLATIONS else None
+                    ),
+                )
             return bool(accepted), reason
         if event == "aborted":
             if state.get("wire_body_completed_at") is None:
-                self._fail_upload_receipt(receipt)
+                self._fail_upload_receipt(
+                    receipt, incident_cause=("reveal_deadline_missed"
+                        if state.get("wire_body_timed_out")
+                        and at > receipt.expires_at_wall else None),
+                )
                 return False, "upload_body_incomplete"
             return True, None
         return False, "wire_event_invalid"
@@ -1959,7 +2011,7 @@ class ValidatorServer:
                     and receipt.body_completed_at_wall > receipt.expires_at_wall
                 )
             ):
-                self._record_no_reveal(receipt)
+                self._record_no_reveal(receipt, cause="reveal_deadline_missed")
             resolver = getattr(
                 type(receipt.batcher), "resolve_upload_precommit", None
             )
@@ -2052,6 +2104,10 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause=("upload_started_after_collection"
+                    if upload_started_at > self._receipt_upload_start_deadline(receipt)
+                    else _start_reason if _start_reason in _NO_REVEAL_WIRE_VIOLATIONS
+                    else None),
             )
             return "expired", receipt
         if body_completed_at > receipt.expires_at_wall:
@@ -2059,6 +2115,7 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause="reveal_deadline_missed",
             )
             return "expired", receipt
         if not self._precommit_matches_submission(
@@ -2075,8 +2132,8 @@ class ValidatorServer:
         receipt.consumed = True
         # v6 only. This is the exact point a body is matched to its
         # precommit -- stamp the receipt onto the request so the arrival
-        # proof path can look up the rate it registered
-        # (``ThroughputAdmissionQueue.rate_of``). ``request`` is the same
+        # proof path can attach its registered throughput telemetry.
+        # ``request`` is the same
         # object batcher.py later stores on ``PendingSubmission.request``.
         request._precommit_receipt_id = receipt_id
         revealed = getattr(
@@ -3564,7 +3621,7 @@ class ValidatorServer:
         if receipt.consumed:
             return "replay", receipt
         if body_completed_at > receipt.expires_at_wall:
-            self._record_no_reveal(receipt)
+            self._record_no_reveal(receipt, cause="reveal_deadline_missed")
             receipt.consumed = True
             self._complete_upload_receipt(
                 receipt,
@@ -3582,7 +3639,7 @@ class ValidatorServer:
                 payload_sha256.lower(), receipt.payload_sha256
             )
         ):
-            self._record_no_reveal(receipt)
+            self._record_no_reveal(receipt, cause="payload_mismatch")
             receipt.consumed = True
             self._complete_upload_receipt(
                 receipt,
@@ -3597,6 +3654,8 @@ class ValidatorServer:
         )
         if revealed is not None:
             revealed(receipt.batcher, receipt.receipt_id)
+        receipt.body_completed_at_wall = body_completed_at
+        self._record_valid_reveal(receipt)
         receipt.consumed = True
         return "valid", receipt
 
@@ -3716,6 +3775,7 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause="reveal_deadline_missed",
             )
             outcome = receipt.outcome or BatchSubmissionResponse(
                 accepted=False, reason=RejectReason.PRECOMMIT_EXPIRED
@@ -3798,6 +3858,8 @@ class ValidatorServer:
                 receipt,
                 reason=RejectReason.PRECOMMIT_EXPIRED,
                 expired=True,
+                incident_cause=(start_reason
+                    if start_reason in _NO_REVEAL_WIRE_VIOLATIONS else None),
             )
             outcome = receipt.outcome or BatchSubmissionResponse(
                 accepted=False, reason=RejectReason.PRECOMMIT_EXPIRED
@@ -3882,16 +3944,32 @@ class ValidatorServer:
 
         queue = self._submission_queue_for_environment(claimed.environment)
         telemetry.mark_enqueued(queue_depth=queue.qsize())
+        predecessor = completion = None
+        order_key = None
+        if FILL_CLOSED_ENABLED:
+            order_key = id(claimed.batcher)
+            predecessor = self._admission_order_tail.get(order_key)
+            completion = asyncio.get_running_loop().create_future()
+            self._admission_order_tail[order_key] = completion
         queued = _QueuedAuctionSubmission(
             raw_body=raw_body,
             receipt=claimed,
             batcher=claimed.batcher,
             telemetry=telemetry,
             enqueued_monotonic=time.monotonic(),
+            admission_predecessor=predecessor,
+            admission_completion=completion,
         )
         try:
             queue.put_nowait(queued)
         except asyncio.QueueFull:
+            if completion is not None and not completion.done():
+                completion.set_result(None)
+                if self._admission_order_tail.get(order_key) is completion:
+                    if predecessor is None:
+                        self._admission_order_tail.pop(order_key, None)
+                    else:
+                        self._admission_order_tail[order_key] = predecessor
             outcome = BatchSubmissionResponse(
                 accepted=False, reason=RejectReason.BATCH_FILLED
             )
@@ -3919,6 +3997,28 @@ class ValidatorServer:
             queue_depth_by_environment=self.submit_queue_depth_by_environment,
         )
         return outcome
+
+    def _finish_admission_turn(
+        self,
+        item: _QueuedAuctionSubmission,
+    ) -> None:
+        """Release this ingress-ordered V6 commit turn exactly once."""
+        completion = item.admission_completion
+        if completion is None or completion.done():
+            return
+        order_key = id(item.batcher)
+
+        def finish(_predecessor=None) -> None:
+            if not completion.done():
+                completion.set_result(None)
+            if self._admission_order_tail.get(order_key) is completion:
+                self._admission_order_tail.pop(order_key, None)
+
+        predecessor = item.admission_predecessor
+        if predecessor is not None and not predecessor.done():
+            predecessor.add_done_callback(finish)
+        else:
+            finish()
 
     async def abort_auction_admission(
         self,
@@ -3955,6 +4055,7 @@ class ValidatorServer:
                         reject_stage="admission_drain",
                     )
                 self._complete_upload_receipt(queued.receipt, outcome)
+                self._finish_admission_turn(queued)
                 self._record_raw_terminal(
                     queued.receipt,
                     queued.telemetry,
@@ -4108,6 +4209,7 @@ class ValidatorServer:
         async def precommit(
             request: SubmissionPrecommitRequest,
             http_request: Request,
+            response: Response,
         ) -> SubmissionPrecommitResponse:
             """Reserve one bounded reveal for a body committed before cutoff."""
             from reliquary.protocol.submission import WindowState
@@ -4352,6 +4454,13 @@ class ValidatorServer:
                 precommit_signature=request.precommit_signature,
             )
             if not no_reveal_decision.allowed:
+                response.headers["X-Reliquary-Reject-Detail"] = "no_reveal_cooldown"
+                response.headers["X-Reliquary-Circuit-Status"] = no_reveal_decision.status
+                response.headers["X-Reliquary-Circuit-Scope"] = "operator_environment"
+                if no_reveal_decision.retry_after_window is not None:
+                    response.headers["X-Reliquary-Retry-After-Window"] = str(
+                        no_reveal_decision.retry_after_window
+                    )
                 logger.warning(
                     "no_reveal_circuit_rejected window=%d env=%s "
                     "hotkey=%s operator=%s status=%s retry_after_window=%s",
@@ -5511,13 +5620,6 @@ class ValidatorServer:
                 batcher = self.active_batcher
                 if batcher is None:
                     raise HTTPException(status_code=503, detail="no_active_window")
-            cp = self._current_checkpoint
-            fill_closed = self._fill_closed_state_payload(batcher)
-            submission_count = (
-                getattr(batcher, "pending_count", batcher.valid_count)
-                if getattr(batcher, "difficulty_auction_enabled", False)
-                else batcher.valid_count
-            )
             # Serialized-bytes cache: everything the payload depends on is in
             # the key, so a hit is byte-identical to a rebuild. ``id(batcher)``
             # covers a same-window batcher swap (fresh cooldown snapshot).
@@ -5531,6 +5633,13 @@ class ValidatorServer:
                 return Response(
                     content=cached[1], media_type="application/json"
                 )
+            cp = self._current_checkpoint
+            fill_closed = self._fill_closed_state_payload(batcher)
+            submission_count = (
+                getattr(batcher, "pending_count", batcher.valid_count)
+                if getattr(batcher, "difficulty_auction_enabled", False)
+                else batcher.valid_count
+            )
             payload = GrpoBatchState(
                 state=self._current_state,
                 window_n=batcher.window_start,
@@ -5572,6 +5681,12 @@ class ValidatorServer:
             body = payload.model_dump_json(
                 exclude=excluded_fields or None,
             ).encode("utf-8")
+            if self._state_cache_key(batcher) != cache_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail="window_changed_during_state_build",
+                    headers={"Retry-After": "1"},
+                )
             self._state_response_cache[cache_slot] = (cache_key, body)
             return Response(content=body, media_type="application/json")
 
@@ -5650,10 +5765,14 @@ class ValidatorServer:
                 if fill_state is not None:
                     with fill_state.lock:
                         fill_snapshot = fill_state.snapshot()
-                    fill_remaining = max(
-                        0,
-                        int(fill_snapshot["budgets"][environment])
-                        - int(fill_snapshot["admitted"][environment]),
+                    fill_remaining = (
+                        0
+                        if batcher._fill_proof_admission_closed()
+                        else max(
+                            0,
+                            int(fill_snapshot["budgets"][environment])
+                            - int(fill_snapshot["admitted"][environment]),
+                        )
                     )
                     admission_remaining = min(
                         productive_remaining,
@@ -5947,6 +6066,16 @@ class ValidatorServer:
                 reject_stage = "worker"
                 return
 
+            admission_closed = getattr(
+                type(batcher), "_fill_proof_admission_closed", None
+            )
+            if admission_closed is not None and admission_closed(batcher):
+                response = reject_without_request(
+                    RejectReason.BATCH_FILLED, "proof_dispatch_closed"
+                )
+                reject_stage = "proof_dispatch_closed"
+                return
+
             telemetry.mark_proof_started(queue_depth=queue.qsize())
             telemetry.mark_admission_started()
             remaining = max(0.001, deadline - time.monotonic())
@@ -5975,6 +6104,16 @@ class ValidatorServer:
                 deadline,
                 wall_seconds=max(0.001, deadline - time.monotonic()),
             )
+            if item.admission_predecessor is not None:
+                # Parsing and grading stay parallel; every state-changing
+                # post-grade decision follows observed ingress order.
+                await asyncio.shield(item.admission_predecessor)
+            if receipt.terminal:
+                response = receipt.outcome or BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.WORKER_DROPPED,
+                )
+                reject_stage = "admission_drain"
+                return
             if prepared.legacy_merkle_status is not None:
                 telemetry.apply_legacy_merkle(
                     status=prepared.legacy_merkle_status,
@@ -5986,7 +6125,6 @@ class ValidatorServer:
             telemetry.body_parse_ms = prepared.body_parse_ms
             telemetry.admission_prepare_ms = prepared.preparation_ms
             if request is None:
-                self._record_no_reveal(receipt)
                 reject_stage = prepared.reject_stage or "admission_worker"
                 response = reject_without_request(
                     prepared.reject_reason or RejectReason.BAD_SCHEMA,
@@ -6173,10 +6311,13 @@ class ValidatorServer:
                     RejectReason.WORKER_DROPPED, reject_stage
                 )
         finally:
-            if cancel_identity_on_exit and request is not None:
-                batcher.cancel_logical_group_reservation(request)
-            if admission_started and request is not None:
-                batcher.finish_proof_admission(request)
+            try:
+                if cancel_identity_on_exit and request is not None:
+                    batcher.cancel_logical_group_reservation(request)
+                if admission_started and request is not None:
+                    batcher.finish_proof_admission(request)
+            finally:
+                self._finish_admission_turn(item)
             if response is None:
                 response = BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.WORKER_DROPPED

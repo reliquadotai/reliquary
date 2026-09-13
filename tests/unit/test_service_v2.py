@@ -539,18 +539,19 @@ async def test_rebuild_hashes_from_history_populates_set():
             ],
         }
     ]
-    with patch.object(
-        svc,
-        "_load_archive_range",
-        new=AsyncMock(return_value=archives),
-    ) as load_range:
+    ranges = []
+
+    async def load_range(*, start_window, end_window, require_all):
+        assert require_all is True
+        ranges.append((start_window, end_window))
+        return archives if start_window <= 100 <= end_window else []
+
+    with patch.object(svc, "_load_archive_range", new=load_range):
         await svc._rebuild_hashes_from_history()
 
-    load_range.assert_awaited_once_with(
-        start_window=1,
-        end_window=110,
-        require_all=True,
-    )
+    assert ranges[0][0] == 1
+    assert ranges[-1][1] == 110
+    assert max(end - start + 1 for start, end in ranges) <= 16
     assert bytes.fromhex(h_explicit) in svc._hash_set
     assert compute_rollout_hash([40, 50, 60]) in svc._hash_set
 

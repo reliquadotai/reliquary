@@ -2,6 +2,8 @@
 import hashlib
 import importlib.util
 import json
+import threading
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -21,7 +23,8 @@ IDENTITY = {'profile_id': 'test-profile', 'model_revision': 'a'*40,
             'software_revision': 'b'*40, 'checkpoint_revision': 'c'*40,
             'runtime_fingerprint_hash': 'e'*64, 'hardware_class': 'H100'}
 REMOTE = {'worker_id': 'test-worker', 'transport_sha256': 'f'*64,
-          'protocol': 'reliquary.remote-proof/v1', 'measurement_scope': 'validator-end-to-end-mtls'}
+          'pipeline_depth': 1, 'protocol': 'reliquary.remote-proof/v1',
+          'measurement_scope': 'validator-end-to-end-mtls'}
 BINDING = {'checkpoint_n': 1821, 'repo_id': 'test/model', 'training_run_id': 'new-v1',
            'revision': 'c'*40, 'profile_id': 'test-profile', 'generation_contract_sha256': 'a'*64}
 
@@ -270,7 +273,9 @@ def test_real_group_serializer_retains_environment_identity_and_false_verdict(mo
         receipts.append({'job_id':str(len(receipts))})
         return ProofResult(all_passed=False, passed=0, checked=32, sketch_diff_max=999,
             seed_n_positions=8192, seed_n_hard_mismatch=8192, completion_chosen_probs=[0.]*8192)
-    pool = SimpleNamespace(_adopted=binding, health=health, proxies=lambda:{'cuda:0':object()},
+    pool = SimpleNamespace(_adopted=binding, health=health, pipeline_depth=1,
+                           proxies=lambda:{'cuda:0':object()},
+                           slot_for=lambda device: device,
                            measure_group=measure_group, prove=prove)
     invocation = SimpleNamespace(device_id='cuda:0',environment=ENV[0],candidate=SimpleNamespace(job_id='unit-group'))
     row=script.measure_group(invocation,pool=pool,tokenizer=object(),
@@ -290,15 +295,33 @@ def test_stress_scheduler_exercises_all_slots_and_retains_failed_attempt(tmp_pat
     script=stress_script()
     import os
     monkeypatch.setattr(combined,'controller_identity',lambda:{**CONTROLLER,'state_filesystem_device':os.stat(tmp_path).st_dev})
-    pool=SimpleNamespace(devices=('cuda:0#0','cuda:0#1'), _adopted=SimpleNamespace(revision='c'*40),
-                         assert_ready=lambda:None)
-    monkeypatch.setattr(script,'measure_group',lambda invocation, **kw:
-                        {'device_id':invocation.device_id,'environment':invocation.environment})
+    devices=('cuda:0#0','cuda:0#1')
+    dispatch_devices=('cuda:0#0','cuda:0#0~1','cuda:0#1','cuda:0#1~1')
+    pool=SimpleNamespace(devices=devices, dispatch_devices=dispatch_devices,
+                         slot_for=lambda lane: lane.split('~', 1)[0],
+                         _adopted=SimpleNamespace(revision='c'*40), assert_ready=lambda:None)
+    dispatched=[]
+    active={device:0 for device in devices}
+    peak={device:0 for device in devices}
+    lock=threading.Lock()
+    def measured(invocation, **kw):
+        slot=pool.slot_for(invocation.device_id)
+        with lock:
+            dispatched.append(invocation.device_id)
+            active[slot]+=1
+            peak[slot]=max(peak[slot],active[slot])
+        time.sleep(.01)
+        with lock:
+            active[slot]-=1
+        return {'device_id':slot,'environment':invocation.environment}
+    monkeypatch.setattr(script,'measure_group',measured)
     output=tmp_path/'slots.jsonl'
     report=script.measure(pool=pool,tokenizer=None,environments={ENV[0]:None},output=output,groups=20,timeout=5)
     assert report['groups']==40 and report['qualified'] is False
     rows=[json.loads(line) for line in output.read_text().splitlines()]
     assert all(sum(row['device_id']==device for row in rows)==20 for device in pool.devices)
+    assert set(dispatched)==set(pool.dispatch_devices)
+    assert peak=={device:2 for device in pool.devices}
     def fail(*args,**kwargs):
         raise ValueError('injected execution failure')
     monkeypatch.setattr(script,'measure_group',fail)
@@ -308,6 +331,7 @@ def test_stress_scheduler_exercises_all_slots_and_retains_failed_attempt(tmp_pat
     failures=[json.loads(line) for line in failed.read_text().splitlines()]
     assert failures
     assert all(row['complete_remote_group'] is False and row['error_type']=='ValueError' for row in failures)
+    assert {row['device_id'] for row in failures} <= set(pool.devices)
 
 
 def test_qualifier_natural_mode_is_explicit_and_retains_true_lengths(evidence, monkeypatch, tmp_path):

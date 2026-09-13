@@ -92,6 +92,55 @@ def test_adaptive_publish_mid_window_still_covers_boundary(monkeypatch):
     assert published[-1][:2] == (31, "fill_closed_boundary")
 
 
+def test_adaptive_publish_in_partial_window_still_covers_boundary(monkeypatch):
+    worker, _, published, _ = _setup(monkeypatch, first_payloads=2)
+    assert worker.run_once() == "trained"
+
+    def skip(_):
+        raise TrainingStepSkipped("policy_ratio_drift", 0.0)
+
+    worker._train_fn = skip
+    assert worker.run_once() == "trained"
+    assert worker.run_once() == "published"
+    assert published[0][:2] == (17, "adaptive_policy_ratio_drift")
+    for _ in range(14):
+        assert worker.run_once() == "tombstone"
+    assert worker.run_once() == "published"
+    assert published[-1][:2] == (31, "fill_closed_boundary")
+
+
+def test_restart_after_mid_window_publish_still_covers_boundary(monkeypatch):
+    worker, _, published, head = _setup(monkeypatch, first_payloads=2)
+    assert worker.run_once() == "trained"
+
+    def skip(_):
+        raise TrainingStepSkipped("policy_ratio_drift", 0.0)
+
+    worker._train_fn = skip
+    assert worker.run_once() == "trained"
+    assert worker.run_once() == "published"
+    assert worker.cursor == 17
+
+    restarted = None
+
+    def publish(reason):
+        head[0] = f"{len(published) + 1:040x}"
+        published.append((restarted.cursor, reason, head[0]))
+        return head[0]
+
+    restarted = TrainerWorker(
+        journal=worker._journal, train_fn=skip,
+        publish_fn=publish, head_revision_fn=lambda: head[0],
+        cursor=worker.cursor, stride=1, publish_every=16,
+        last_published_revision=head[0], fill_closed=True,
+        finish_fn=lambda: False,
+    )
+    for _ in range(14):
+        assert restarted.run_once() == "tombstone"
+    assert restarted.run_once() == "published"
+    assert published[-1][:2] == (31, "fill_closed_boundary")
+
+
 def test_boundary_refuses_to_publish_unflushed_accumulator(monkeypatch):
     worker, _, published, _ = _setup(monkeypatch)
     for _ in range(16):

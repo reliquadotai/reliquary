@@ -19,6 +19,7 @@ from reliquary.validator.proof_worker import (
     ProofModelProxy, ProofWorkerUnavailable, remote_commitment_verifier,
 )
 from reliquary.validator.remote_proof_protocol import (
+    MAX_PROOF_PIPELINE_DEPTH,
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, AdoptionRequest, CheckpointBinding,
     ProofHealth, ProofInput, ProofRequest, ProofResponse, ProofValues,
     RemoteProofMeasurement, canonical_bytes, digest, transport_hash,
@@ -38,25 +39,35 @@ def executor_mode() -> str:
     return mode
 
 
+# Scheduler lanes beyond the first on one worker slot: ``cuda:0`` then ``cuda:0~1``.
+_LANE = "~"
+
+
 class RemoteProofPool:
     is_remote = True
 
     def __init__(self, *, base_url: str, ca_path: str, cert_path: str,
                  key_path: str, expected_worker_id: str, profile_id: str,
                  generation_contract_sha256: str, training_run_id: str,
-                 repo_id: str, request_timeout: float, reload_timeout: float):
+                 repo_id: str, request_timeout: float, reload_timeout: float,
+                 pipeline_depth: int = 1):
         url = urlsplit(base_url)
         if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in {"", "/"}:
             raise ValueError("proof endpoint requires a bare HTTPS origin")
         if not 0 < request_timeout <= 3600 or not 0 < reload_timeout <= 3600:
             raise ValueError("proof timeouts must be positive and bounded")
+        if not 1 <= pipeline_depth <= MAX_PROOF_PIPELINE_DEPTH:
+            raise ValueError(f"proof pipeline depth must be within 1..{MAX_PROOF_PIPELINE_DEPTH}")
         tls = ssl.create_default_context(cafile=ca_path)
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(cert_path, key_path)
+        # Keep one connection per dispatch lane plus health: a reconnect is a TLS handshake.
         self._client = httpx.Client(base_url=base_url.rstrip("/"), verify=tls,
                                     trust_env=False, follow_redirects=False,
-                                    limits=httpx.Limits(max_connections=66, max_keepalive_connections=2, keepalive_expiry=90))
+                                    limits=httpx.Limits(max_connections=66, max_keepalive_connections=66,
+                                                        keepalive_expiry=90))
         self.worker_id = expected_worker_id
+        self.pipeline_depth = pipeline_depth
         self._identity = dict(profile_id=profile_id,
                               generation_contract_sha256=generation_contract_sha256,
                               training_run_id=training_run_id, repo_id=repo_id)
@@ -72,7 +83,8 @@ class RemoteProofPool:
         self._measurements = threading.local()
         self._rpc_lock = threading.Lock()
         self._rpc_stats = dict(calls=0, reconnects=0, seconds=0.0,
-                               request_bytes=0, response_bytes=0, rollouts=0)
+                               request_bytes=0, response_bytes=0, rollouts=0,
+                               in_flight=0, max_in_flight=0, failures=0)
 
     @contextmanager
     def measure_group(self):
@@ -106,7 +118,8 @@ class RemoteProofPool:
                    generation_contract_sha256=digest(c.PROTOCOL_GENERATION_CONTRACT),
                    training_run_id=c.TRAINING_RUN_ID,
                    request_timeout=c.PROOF_WORKER_REQUEST_TIMEOUT_SECONDS,
-                   reload_timeout=c.PROOF_WORKER_RELOAD_TIMEOUT_SECONDS)
+                   reload_timeout=c.PROOF_WORKER_RELOAD_TIMEOUT_SECONDS,
+                   pipeline_depth=c.PROOF_PIPELINE_DEPTH)
 
     def _request(self, method, path, body=None, *, timeout, retry=False,
                  request_limit=MAX_REQUEST_BYTES, response_limit=MAX_RESPONSE_BYTES):
@@ -200,6 +213,18 @@ class RemoteProofPool:
         return tuple(s.device_id for s in self.health.slots) if self.health else ()
 
     @property
+    def dispatch_devices(self):
+        """Scheduler lanes: each slot keeps its id, plus one lane per extra in-flight request."""
+        return tuple(lane for slot in self.devices for lane in self._lanes(slot))
+
+    def _lanes(self, slot):
+        return (slot, *(f"{slot}{_LANE}{n}" for n in range(1, self.pipeline_depth)))
+
+    def slot_for(self, device_id):
+        """The worker slot a lane dispatches to, or None if the id is not a lane of this pool."""
+        return next((slot for slot in self.devices if device_id in self._lanes(slot)), None)
+
+    @property
     def runtime_fingerprint(self):
         if not self.health:
             raise ProofWorkerUnavailable("remote proof pool has not started")
@@ -210,7 +235,7 @@ class RemoteProofPool:
             raise ProofWorkerUnavailable("remote proof pool has not started")
         return {d: ProofModelProxy(d, SimpleNamespace(**self.health.config),
                                    SimpleNamespace(**self.health.generation_config))
-                for d in self.devices}
+                for d in self.dispatch_devices}
 
     def bind_checkpoint(self, checkpoint_n, repo_id, revision):
         cp = CheckpointBinding(**{**self._identity, "repo_id": repo_id},
@@ -228,7 +253,7 @@ class RemoteProofPool:
         del snapshot_dir  # Controller paths are never sent to another host.
         with self._lock:
             cp = self._checkpoint
-            if self._closed or not self.health or cp is None or cp.revision != checkpoint_revision or cp.repo_id != repo_id or device_id not in self.devices:
+            if self._closed or not self.health or cp is None or cp.revision != checkpoint_revision or cp.repo_id != repo_id or self.slot_for(device_id) is None:
                 raise ProofWorkerUnavailable("remote proof adoption requires an exact bound checkpoint")
             if self._adopted == cp:
                 return
@@ -248,7 +273,7 @@ class RemoteProofPool:
                 raise ProofWorkerUnavailable("invalid proof adoption acknowledgement") from exc
 
     def revision(self, device_id):
-        if self._adopted is None or device_id not in self.devices:
+        if self._adopted is None or self.slot_for(device_id) is None:
             return None
         return self._adopted.revision
 
@@ -281,7 +306,9 @@ class RemoteProofPool:
             self._health_probe.start()
         with self._rpc_lock:
             transport = dict(self._rpc_stats)
-        return {"mode": "remote", "worker_id": self.worker_id, "transport": transport,
+        return {"mode": "remote", "worker_id": self.worker_id,
+                "pipeline_depth": self.pipeline_depth,
+                "dispatch_lanes": len(self.dispatch_devices), "transport": transport,
                 "ready": self._adopted is not None and not self._closed
                     and time.monotonic() - self._health_checked_at <= 10,
                 "revision": self._adopted.revision if self._adopted else None}
@@ -311,6 +338,7 @@ class RemoteProofPool:
             strict_json_loads(raw).get("remote_proof"))
         if measurement != RemoteProofMeasurement(
             worker_id=self.worker_id, transport_sha256=self.health.transport_sha256,
+            pipeline_depth=self.pipeline_depth,
         ):
             raise ProofWorkerUnavailable("capacity was not measured through this remote proof plane")
         physical = {}
@@ -366,11 +394,18 @@ class RemoteProofPool:
                                window=window, environment=environment, checkpoint=checkpoint)[0]
 
     def prove_many(self, device_id, inputs, randomness, *, window, environment, checkpoint):
-        if self._closed or checkpoint != self._adopted or device_id not in self.devices:
+        slot = self.slot_for(device_id)
+        if self._closed or checkpoint != self._adopted or slot is None:
             raise ProofWorkerUnavailable("remote proof device/checkpoint is not ready")
+        tracked = succeeded = False
         try:
             if not 1 <= len(inputs) <= MAX_PROOF_BATCH:
                 raise ValueError("proof batch size exceeded")
+            with self._rpc_lock:
+                self._rpc_stats["in_flight"] += 1
+                self._rpc_stats["max_in_flight"] = max(
+                    self._rpc_stats["max_in_flight"], self._rpc_stats["in_flight"])
+            tracked = True
             requests = []
             for commit, seed_u_values in inputs:
                 payload = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
@@ -378,7 +413,7 @@ class RemoteProofPool:
                                      seed_u_values=seed_u_values)
                 requests.append(ProofRequest(job_id=uuid.uuid4().hex, attempt=0,
                     worker_id=self.worker_id, session_id=self.health.session_id,
-                    device_id=device_id, runtime_hash=self.runtime_fingerprint["profile_hash"],
+                    device_id=slot, runtime_hash=self.runtime_fingerprint["profile_hash"],
                     checkpoint=checkpoint, window=window, environment=environment,
                     expires_at_ms=int((time.time() + self.request_timeout) * 1000),
                     content_sha256=digest(payload.model_dump()), payload=payload))
@@ -414,6 +449,7 @@ class RemoteProofPool:
                          "policy_tokens": len(result.result.completion_chosen_probs)})
             with self._rpc_lock:
                 self._rpc_stats["rollouts"] += len(results)
+            succeeded = True
             return [result.result.to_kernel() for result in results]
         except ProofWorkerUnavailable:
             self._adopted = None
@@ -421,6 +457,12 @@ class RemoteProofPool:
         except (ValueError, TypeError, KeyError, IndexError) as exc:
             self._adopted = None
             raise ProofWorkerUnavailable("invalid remote proof payload/result") from exc
+        finally:
+            if tracked:
+                with self._rpc_lock:
+                    self._rpc_stats["in_flight"] -= 1
+                    if not succeeded:
+                        self._rpc_stats["failures"] += 1
 
     def call(self, *_args, **_kwargs):
         raise ProofWorkerUnavailable("remote proof calls require the trusted window/environment binding")

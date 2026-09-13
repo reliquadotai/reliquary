@@ -244,6 +244,7 @@ def verify_termination(
     model: Any = None,
     *,
     env_name: str | None = None,
+    require_forced_terminal_pick: bool = False,
 ) -> bool:
     """Two paths to a valid termination, both gaming-safe:
 
@@ -256,7 +257,8 @@ def verify_termination(
     satisfy ``completion_length ≥ cap``.
 
     Path 2 — natural EOS termination: ``tokens[-1]`` is one of the
-    configured stop tokens AND either
+    configured stop tokens. Under the forced-seed v6 contract it must be the
+    exact inverse-CDF pick. Legacy profiles accept either
 
       (a) its probability mass at the previous position's softmax
           (``p_stop``) is at least ``MIN_EOS_PROBABILITY``, or
@@ -327,7 +329,11 @@ def verify_termination(
         )
         return False
 
-    ok = in_eos and (p_stop >= MIN_EOS_PROBABILITY or forced_pick)
+    ok = in_eos and (
+        forced_pick
+        if require_forced_terminal_pick
+        else p_stop >= MIN_EOS_PROBABILITY or forced_pick
+    )
     if not ok:
         logger.warning(
             "termination_fail prompt_length=%d completion_length=%d "
@@ -348,6 +354,7 @@ def is_cap_truncation(
     model: Any = None,
     *,
     env_name: str | None = None,
+    require_forced_terminal_pick: bool = False,
 ) -> bool:
     """Return True when a cap-hit rollout did not naturally stop on EOS.
 
@@ -398,7 +405,11 @@ def is_cap_truncation(
     return not (
         int(tokens[-1]) in eos_set
         and p_stop is not None
-        and (p_stop >= MIN_EOS_PROBABILITY or forced_pick)
+        and (
+            forced_pick
+            if require_forced_terminal_pick
+            else p_stop >= MIN_EOS_PROBABILITY or forced_pick
+        )
     )
 
 

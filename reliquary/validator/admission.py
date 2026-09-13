@@ -168,9 +168,8 @@ class PreparedSubmission:
     unboxed_count: int = 0
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
-    # v6 per-token payment (see token_rewards.py): completion tokens summed
-    # over rollouts that genuinely terminated on EOS. Computed once here so
-    # distribution only ever reads it (see ``count_eos_completion_tokens``).
+    # Completion-token telemetry used by training, archives and legacy-window
+    # recovery. Fixed-slot payment does not use it.
     eos_tokens: int = 0
     task_family: str | None = None
     generator_version: str | None = None

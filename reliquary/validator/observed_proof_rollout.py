@@ -124,6 +124,7 @@ def authorize_observed_live(pool, activation_revision):
         "controller_software_revision": immutable_build_revision(),
         "worker_software_revision": health.software_revision,
         "worker_id": health.worker_id, "session_id": health.session_id,
+        "proof_pipeline_depth": pool.pipeline_depth,
         "runtime_fingerprint_hash": pool.runtime_fingerprint["profile_hash"],
         "transport_sha256": health.transport_sha256, "proof_path_hash": health.proof_path_hash,
         "profile_id": c.PROTOCOL_PROFILE_ID, "model_revision": c.PROTOCOL_MODEL_REVISION,

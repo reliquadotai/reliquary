@@ -21,11 +21,12 @@ class ProofCapacityQualificationError(RuntimeError):
 
 
 def capacity_budget() -> dict[str, Any]:
-    """Match the active scheduler's real admission budget and hard deadline.
+    """Match the active scheduler's budget and qualified drain horizon.
 
     FillState admits at most its monotone budget (including failed proofs);
     fill windows bypass the seal-time auction/forensic proof plan entirely.
-    Admission grading and trainer pacing are separate from this proof budget.
+    Strict service may admit for one such horizon before draining; its later
+    settlement deadline is not a larger proof-capacity requirement.
     """
     from reliquary import constants as c
     if c.FILL_CLOSED_ENABLED:

@@ -61,7 +61,12 @@ class TrainerWorker:
         self._finish_fn = finish_fn
         self._publication_pending_fn = publication_pending_fn
         self._published_cursor = self.cursor
-        self._payload_since_publish = False
+        # A restart from a published mid-window cursor cannot know whether the
+        # remainder is all tombstones. Rebuild the covering-publication duty;
+        # an extra checkpoint is safer than opening the next fill window early.
+        self._payload_in_fill_window = (
+            self._fill_closed and not self._at_fill_window_boundary()
+        )
         # Amendment v6.1 (trainer-paced picks): advisory pacing telemetry,
         # written every time the live trainer's journal cursor advances,
         # on every profile. Shadow consumption must not pace the validator.
@@ -84,7 +89,7 @@ class TrainerWorker:
         never coming back to be trained).
         """
         self.cursor += self.stride
-        self._payload_since_publish |= payload
+        self._payload_in_fill_window |= payload
         self._write_cursor(self.cursor)
 
     def _write_cursor(self, journal_key: int) -> None:
@@ -107,11 +112,13 @@ class TrainerWorker:
         )
 
     def _window_publication_due(self) -> bool:
+        return self._payload_in_fill_window and self._at_fill_window_boundary()
+
+    def _at_fill_window_boundary(self) -> bool:
         from reliquary.constants import FILL_CLOSED_EMISSIONS_PER_WINDOW
 
         return (
             self._fill_closed
-            and self._payload_since_publish
             and (self.cursor + 1) % FILL_CLOSED_EMISSIONS_PER_WINDOW == 0
         )
 
@@ -122,7 +129,8 @@ class TrainerWorker:
             self.trained_since_publish = 0
             self.adaptive_publication_pending = False
             self._published_cursor = self.cursor
-            self._payload_since_publish = False
+            if not self._fill_closed or self._at_fill_window_boundary():
+                self._payload_in_fill_window = False
             return "published"
         pending = self._publication_pending_fn is not None and self._publication_pending_fn()
         head = self._head_revision_fn() if not pending else None
@@ -149,7 +157,8 @@ class TrainerWorker:
         self.trained_since_publish = 0
         self.adaptive_publication_pending = False
         self._published_cursor = self.cursor
-        self._payload_since_publish = False
+        if not self._fill_closed or self._at_fill_window_boundary():
+            self._payload_in_fill_window = False
         return "published"
 
     def run_once(self) -> str:

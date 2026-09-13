@@ -1,10 +1,4 @@
-"""Deterministic priority queue for the disabled fill experiment.
-
-The module preserves the fill branch's exact qualification policy so it can be
-replayed and compared behind its own capability. It does not admit, grade,
-prove, select, or pay a submission. Reliquary 1 does not use this priority for
-ticket admission or final ranking.
-"""
+"""Receipt-bound upload measurements retained as non-economic telemetry."""
 
 from __future__ import annotations
 
@@ -54,7 +48,7 @@ class ThroughputAdmissionQueue:
         return entry
 
     def rate_of(self, receipt_id: str) -> float | None:
-        """Return the recorded experimental priority, or ``None``."""
+        """Return recorded upload throughput telemetry, or ``None``."""
         entry = self._by_receipt.get(receipt_id)
         return entry.throughput if entry is not None else None
 

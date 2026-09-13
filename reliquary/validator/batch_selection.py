@@ -270,12 +270,10 @@ def explain_batch_selection(
     "rewarded by emission sharing". Keys are ``id(submission)``.
     """
     # ``rewarded``/``reward_amount`` below are the SLOT share this function
-    # mirrors. Under v6 the seal path pays nothing at all -- payment is the
-    # per-token split ``FillClosedBatchAssembler`` computes over assembled
-    # batches (R20) -- so reporting a slot share unqualified would hand an
-    # operator a number that was never credited. Name the payer.
+    # mirrors. Under v6 the seal path pays nothing; the assembler pays fixed
+    # shares over assembled batches, so name the actual payer.
     payment_source = (
-        "fill_closed_token_split" if FILL_CLOSED_ENABLED else "slot_share"
+        "fill_closed_fixed_group" if FILL_CLOSED_ENABLED else "slot_share"
     )
     meta: dict[int, dict[str, Any]] = {
         id(sub): {

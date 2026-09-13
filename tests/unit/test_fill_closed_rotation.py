@@ -40,6 +40,24 @@ def test_rotation_gate_round_trips_byte_identically_across_restart(tmp_path):
     assert store2.path.read_bytes() == original
 
 
+def test_legacy_partial_gate_waits_for_checkpoint_aware_upgrade(tmp_path):
+    store = FillClosedRotationStore(tmp_path)
+    legacy = FillClosedRotationGate(
+        source_window=42,
+        required_journal_key=687,
+        parent_checkpoint_n=7,
+        parent_revision=PARENT_REVISION,
+        durable_payload_count=3,
+        requires_successor=False,
+    )
+    store.path.write_bytes(legacy.to_bytes())
+
+    loaded = store.load()
+
+    assert loaded == legacy
+    assert store.path.read_bytes() == legacy.to_bytes()
+
+
 def test_covering_candidate_requires_the_matching_active_checkpoint(tmp_path):
     store = FillClosedRotationStore(tmp_path)
     candidate = _gate().record_adoption(

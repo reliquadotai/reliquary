@@ -61,7 +61,10 @@ def measure_group(invocation, *, pool, tokenizer, environments, controller, fore
     from reliquary.validator.remote_proof_protocol import RemoteProofMeasurement
     checkpoint, health = pool._adopted, pool.health
     model = pool.proxies()[invocation.device_id]
-    slot = next(s for s in health.slots if s.device_id == invocation.device_id)
+    physical_device = pool.slot_for(invocation.device_id)
+    slot = next((s for s in health.slots if s.device_id == physical_device), None)
+    if slot is None:
+        raise ValueError('stress dispatch lane has no physical worker slot')
     env, group_id = invocation.environment, invocation.candidate.job_id
     randomness = hashlib.sha256(group_id.encode()).hexdigest()
     # Input preparation is outside the GPU timer. Natural E2E timing is added
@@ -107,7 +110,8 @@ def measure_group(invocation, *, pool, tokenizer, environments, controller, fore
                             'checked': p.checked, 'seed_n_hard_mismatch': p.seed_n_hard_mismatch}
                            for p in proofs],
         'remote_proof': RemoteProofMeasurement(worker_id=health.worker_id,
-                            transport_sha256=health.transport_sha256).model_dump()}
+                            transport_sha256=health.transport_sha256,
+                            pipeline_depth=pool.pipeline_depth).model_dump()}
 
 
 def measure(*, pool, tokenizer, environments, output, groups, timeout):
@@ -128,8 +132,8 @@ def measure(*, pool, tokenizer, environments, output, groups, timeout):
     fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     lock = threading.Lock()
     prefix = uuid.uuid4().hex
-    # Exercise every configured slot concurrently, including shared-GPU
-    # contention. The qualifier aggregates by physical UUID, never slot count.
+    # Exercise every configured slot concurrently, including its configured
+    # dispatch-lane contention. The qualifier aggregates by physical UUID.
     devices = tuple(pool.devices)
     count = 0
     with os.fdopen(fd, 'wb') as handle:
@@ -143,7 +147,8 @@ def measure(*, pool, tokenizer, environments, output, groups, timeout):
                 failure = exc
                 row = {'scope': 'full-envelope-stress-failure', 'synthetic': True,
                     'valid_submission': False, 'complete_remote_group': False,
-                    'environment': invocation.environment, 'device_id': invocation.device_id,
+                    'environment': invocation.environment,
+                    'device_id': pool.slot_for(invocation.device_id),
                     'group_id': invocation.candidate.job_id, 'error_type': type(exc).__name__}
             with lock:
                 handle.write(canonical_bytes(row) + b'\n')
@@ -156,7 +161,9 @@ def measure(*, pool, tokenizer, environments, output, groups, timeout):
             return ProofExecution(passed=False, reason='nonadmissible capacity stress')
 
         def on_device(device):
-            with GlobalProofScheduler(devices=(device,), environments=tuple(environments),
+            lanes = tuple(lane for lane in pool.dispatch_devices
+                          if pool.slot_for(lane) == device)
+            with GlobalProofScheduler(devices=lanes, environments=tuple(environments),
                     checkpoint_revision=pool._adopted.revision, proof_callable=execute) as scheduler:
                 plans = [ProofPlan(plan_id=f'{prefix}:{device}:{env}', environment=env,
                     checkpoint_revision=pool._adopted.revision, required_passes=0,

@@ -8,10 +8,13 @@ import pytest
 import reliquary.protocol.release_contract as release_contract_module
 from reliquary.protocol.profiles import to_generation_contract
 from reliquary.protocol.release_contract import (
+    CAP_FILL_CLOSED_FIFO,
     CAP_FRESH_POST_SEAL_ORDERING,
+    CAP_SELECTED_SLOT_REWARD,
     ContractComponent,
     EnvironmentContract,
     RELIQUARY_1_CAPABILITIES,
+    RELIQUARY_1_LEGACY_CAPABILITIES,
     ReleaseContract,
     ReleaseContractError,
     canonical_json_bytes,
@@ -57,6 +60,13 @@ def test_release_contract_round_trip_and_hash_vector_are_stable() -> None:
 
     assert parse_release_contract(release.to_bytes()) == release
     assert release.canonical_sha256 == (
+        "2d915232e6350f84e8d4f68b5c7ab0144e7f28648660b719257165ebbd988f3f"
+    )
+
+    legacy = dataclasses.replace(
+        release, capabilities=RELIQUARY_1_LEGACY_CAPABILITIES
+    )
+    assert legacy.canonical_sha256 == (
         "e12491f2157999c3b5c1035c76eaf7656b4ade05d0c84bb356001c3b6530793f"
     )
 
@@ -116,7 +126,10 @@ def test_capabilities_replace_numeric_feature_dispatch() -> None:
     release = _release()
 
     assert not release.supports(CAP_FRESH_POST_SEAL_ORDERING)
-    assert release.supports("market.fill-closed-rate/v1")
+    assert release.supports(CAP_FILL_CLOSED_FIFO)
+    assert release.supports(CAP_SELECTED_SLOT_REWARD)
+    assert not release.supports("market.fill-closed-rate/v1")
+    assert not release.supports("reward.eos-tokens-per-batch/v1")
 
     source = inspect.getsource(release_contract_module)
     assert "protocol_version" not in source

@@ -63,6 +63,16 @@ def test_poll_returns_new_manifest_once(tmp_path):
     assert intake.poll() is None
 
 
+def test_poll_can_return_installed_manifest_for_rotation_recovery(tmp_path):
+    intake = CheckpointIntake(
+        r2_client=_R2(manifest=_manifest()), bucket="b",
+        staging_dir=str(tmp_path), installed_revision=REV_7,
+        installed_checkpoint_n=5, installed_repo_id="org/repo",
+    )
+
+    assert intake.poll(include_installed=True)["revision"] == REV_7
+
+
 def test_poll_none_when_no_manifest(tmp_path):
     intake = CheckpointIntake(
         r2_client=_R2(), bucket="b", staging_dir=str(tmp_path),

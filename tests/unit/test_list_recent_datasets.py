@@ -30,6 +30,9 @@ async def test_downloads_last_n_windows():
         class _Body:
             async def read(self_inner):
                 return archives_on_r2[Key]
+
+            def close(self_inner):
+                pass
         return {"Body": _Body()}
 
     mock_client = AsyncMock()
@@ -67,6 +70,9 @@ async def test_skips_missing_windows():
         class _Body:
             async def read(self_inner):
                 return archives_on_r2[Key]
+
+            def close(self_inner):
+                pass
         return {"Body": _Body()}
 
     mock_client = AsyncMock()
