@@ -3099,6 +3099,19 @@ class ValidationService:
                 if len(refused) == len(picking)
                 else "the event is half-taken",
             )
+        try:
+            assembler = getattr(self, "_fill_closed_assemblers", {}).get(int(picking[0].window_start))
+            if assembler is not None:
+                paid = assembler.paid_groups()
+                for batcher in picking:
+                    entries = paid.get(str(batcher.env.name), [])
+                    self._record_auction_final_verdicts(
+                        batcher, paid_groups=[g for _index, g in entries],
+                        batch_indices={(g.hotkey, g.prompt_idx, bytes(g.merkle_root)): i for i, g in entries},
+                        finalize=False,
+                    )
+        except Exception:
+            logger.exception("Could not publish committed-pick verdicts")
         return len(refused) < len(picking)
 
     async def _wait_for_window_seal(
@@ -3341,6 +3354,7 @@ class ValidationService:
 
     def _record_auction_final_verdicts(
         self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
+        batch_indices: dict | None = None, finalize: bool = True,
     ) -> None:
         """Publish the final lifecycle state of every auction candidate.
 
@@ -3367,6 +3381,7 @@ class ValidationService:
             (group.hotkey, group.prompt_idx, bytes(group.merkle_root)): group
             for group in (paid_groups or ())
         }
+        records = []
         for pending in batcher.pending_submissions():
             row = metadata.get(id(pending), {}) if isinstance(metadata, dict) else {}
             selected = bool(row.get("selected", False))
@@ -3377,6 +3392,8 @@ class ValidationService:
                 ))
                 selected = group is not None
                 rewarded = selected
+            if not finalize and (not selected or row.get("verdict_selected_published")):
+                continue
             proof_reject = pending.reject_response
             accepted = proof_reject is None
             reason = (
@@ -3411,7 +3428,7 @@ class ValidationService:
             from reliquary.validator.verifier import rewards_std
 
             try:
-                self.server.record_verdict(
+                record = self.server.record_verdict(
                     pending.hotkey,
                     pending.request.merkle_root,
                     accepted,
@@ -3425,7 +3442,30 @@ class ValidationService:
                     selected_for_batch=selected,
                     rewarded=rewarded,
                     sigma=rewards_std(list(pending.rewards or ())),
+                    details={
+                        "environment": str(getattr(batcher.env, "name", "")),
+                        "prompt_idx": pending.prompt_idx,
+                        "checkpoint_revision": str(getattr(batcher, "current_checkpoint_hash", "")),
+                        "receipt_id": getattr(pending.request, "_precommit_receipt_id", None),
+                        "ordering_policy": FILL_CLOSED_SELECTION_POLICY if paid_groups is not None else "difficulty_auction",
+                        "rank_scope": "window_environment",
+                        "proof_status": row.get("proof_status") or (
+                            "passed" if selected or selection_reason == "proven_not_selected_before_window_close"
+                            else "failed" if proof_reject is not None else "unknown"
+                        ),
+                        "proof_reason": proof_reject.reason.value if proof_reject is not None else row.get("proof_reason"),
+                        "proof_recorded_ts": row.get("proof_recorded_ts"),
+                        "proof_duration_seconds": row.get("proof_duration_seconds"),
+                        "reason_details": dict(row.get("proof_details") or {}),
+                        "batch_index": (batch_indices or {}).get((pending.hotkey, pending.prompt_idx, bytes(pending.merkle_root))),
+                        "selection_target": FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH if paid_groups is not None else self._batch_target(batcher),
+                        "selected_count": len(paid) if paid_groups is not None else sum(bool(r.get("selected")) for r in metadata.values()),
+                    },
                 )
+                if isinstance(record, dict):
+                    records.append((pending.hotkey, record))
+                if selected:
+                    row["verdict_selected_published"] = True
                 log_structured(
                     logger,
                     logging.INFO if accepted else logging.WARNING,
@@ -3456,7 +3496,9 @@ class ValidationService:
                     pending.prompt_idx,
                 )
 
-        batcher._auction_final_verdicts_published = True
+        self.server.persist_final_verdicts(records)
+        if finalize:
+            batcher._auction_final_verdicts_published = True
 
     def _lr_global_step_hint(self) -> int:
         """Restored LR-schedule position for a same-run restart.
@@ -4949,6 +4991,10 @@ class ValidationService:
                     paid_groups=[
                         group for _index, group in fill_closed_batches.get(env_name, ())
                     ],
+                    batch_indices={
+                        (group.hotkey, group.prompt_idx, bytes(group.merkle_root)): index
+                        for index, group in fill_closed_batches.get(env_name, ())
+                    },
                 )
         self._cooldown_durable_window = max(
             getattr(self, "_cooldown_durable_window", 0),
@@ -5552,6 +5598,9 @@ class ValidationService:
         from reliquary.infrastructure.archive_queue import get_archive_queue
         from reliquary.validator.control import ControlStore
 
+        self.server.configure_final_verdict_store(
+            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+        )
         self._control_store = ControlStore(
             os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state"),
             start_closed=os.getenv("RELIQUARY_CONTROL_START_CLOSED", "0").lower()

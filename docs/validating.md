@@ -605,3 +605,46 @@ What must NOT be there:
 A safe layout is a dedicated validator-signing directory containing only
 the public coldkey file and the required hotkey file. Keep any coldkey
 private material outside this directory and off the validator host.
+
+### Detailed miner verdicts
+
+Existing verdict responses keep their field set. Opt in to lifecycle details with
+`GET /miner-verdicts/{hotkey}?details=true` (or `/verdicts/{hotkey}?details=true`).
+Use the existing cursor/stream ID to poll; `truncated=true` means events were lost
+from the bounded in-memory feed.
+
+`selection_status` distinguishes `pending`, `selected`, and `not_selected`;
+`is_final` describes this candidate's outcome, not closure of the entire window.
+Admission (`accepted_into_pool`) is not selection. Selection is not evidence that
+training consumed the group or that an on-chain payment has arrived. The legacy
+`rewarded` field keeps its existing accounting meaning.
+
+The detailed record adds environment, prompt, checkpoint and receipt identity when
+available, `outcome_code`, a human-readable `explanation`, and proof status/reason.
+`canonical_rank` is scoped to the window and environment, under `ordering_policy`;
+compare neither different environments nor client upload times. `ts` is when the
+verdict was published; `body_received_ts` is server body completion, and
+`proof_recorded_ts` is when the scheduler result was observed. Proof duration is
+measured separately. Missing evidence stays absent/unknown.
+
+`reason_details` contains proof-plan counters at the decision, and, when known,
+the blocking proof rank/root or exhausted budget scope/count/threshold. Proof-plan
+rank is distinct from admission rank. Budget thresholds describe the remaining
+allowance allocated to that plan, not a global limit or a reset time.
+`batch_index`, `selection_target` and `selected_count` describe selection at the
+time of publication; early selected verdicts can precede completion of the window.
+
+Look up an admitted candidate after feed rollover or a normal controller restart:
+
+```text
+GET /miner-verdicts/{hotkey}/{window_n}/{merkle_root}
+```
+
+Final admitted-candidate records are stored in `miner-verdicts.sqlite3` on the
+validator state volume, retained for 2,048 windows. Preserve that volume during
+replacement. This is not an off-host backup. Persistence starts with this release;
+there is no historical backfill. Early admission rejections remain in the bounded
+feed. A crash before final publication can leave no durable verdict.
+The lookup returns `found`, `pending`, `expired`, `not_recorded`, or `unavailable`;
+missing records do **not** imply non-selection. Storage failures return HTTP 503.
+These diagnostic fields do not instruct miners to resubmit a prompt.

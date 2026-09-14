@@ -37,6 +37,7 @@ from reliquary.constants import (
     MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW,
     MIN_EOS_PROBABILITY,
     FILL_CLOSED_ENABLED,
+    FILL_CLOSED_SELECTION_POLICY,
     FILL_CLOSED_BOUNDED_PROOFS,
     FILL_CLOSED_PROOF_DISPATCH_SECONDS,
     FILL_CLOSED_MAX_SECONDS,
@@ -1747,6 +1748,9 @@ class GrpoWindowBatcher:
         with self.fill_state.lock:
             self._arrival_proof_sequence += 1
             rank = self._arrival_proof_sequence
+            if pending.telemetry is not None:
+                pending.telemetry.admission_rank = rank
+                pending.telemetry.ordering_policy = FILL_CLOSED_SELECTION_POLICY
             self.difficulty_auction_metadata_by_id[id(pending)] = {
                 "rank": rank,
                 "status": "queued_for_proof",
@@ -1945,6 +1949,12 @@ class GrpoWindowBatcher:
                     else None
                 )
                 if row is not None:
+                    row["proof_status"] = decision.details.get("proof_status", "unknown")
+                    row["proof_reason"] = decision.reason
+                    row["proof_recorded_ts"] = time.time()
+                    row["proof_details"] = decision.details
+                    if decision.started_at is not None and decision.finished_at is not None:
+                        row["proof_duration_seconds"] = max(0.0, decision.finished_at - decision.started_at)
                     if decision.status is ProofDecisionStatus.PASSED:
                         status = "proof_passed"
                     elif decision.status is ProofDecisionStatus.REJECTED:
