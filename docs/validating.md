@@ -33,7 +33,51 @@ export BT_WALLETS_DIR=/path/to/validator-signing-wallets
 docker compose -f docker-compose.weight-only.yml up -d
 ```
 
-That's it. Watchtower will pull and restart your container automatically every time a new image is published.
+Watchtower checks `latest` every five minutes and pulls and restarts the
+validator when that tag changes. Publishing a revision tag alone does not
+update `latest`.
+
+### Update an existing weight-only validator
+
+Use `ghcr.io/reliquadotai/reliquary-validator:latest` for the public weight-only
+release. Keep your existing wallet mount, R2 credentials and `RELIQUARY_TRAIN=0`.
+From your existing `reliquary/docker` deployment directory, update immediately:
+
+```bash
+docker compose -f docker-compose.weight-only.yml pull reliquary-weight-only
+docker compose -f docker-compose.weight-only.yml up -d reliquary-weight-only
+docker logs --since 10m -f reliquary-weight-only
+```
+
+Check the revision actually running:
+
+```bash
+docker exec reliquary-weight-only cat /opt/reliquary/.build-revision
+```
+
+For Kubernetes, set the validator container's `image` to
+`ghcr.io/reliquadotai/reliquary-validator:latest` and `imagePullPolicy: Always`
+in your existing workload manifest, apply it, then restart that workload.
+`Always` checks the image when a container starts; it does not replace running
+pods when a tag changes. For a Deployment (replace both placeholders):
+
+```bash
+kubectl -n <namespace> rollout restart deployment/<deployment>
+kubectl -n <namespace> rollout status deployment/<deployment>
+kubectl -n <namespace> logs deployment/<deployment> -c <validator-container> --since=10m
+```
+
+A successful submission logs both `set_weights OK` and `Submitted weights:`.
+After startup, submission waits only for chain eligibility before joining the
+normal epoch cadence. A startup message alone does not prove weights were sent.
+If restarts continue, inspect the container's previous termination reason and
+logs; a restart alone does not establish an out-of-memory failure.
+
+Unused reward mass continues to burn dynamically. The default destination is
+the subnet owner hotkey's current UID, resolved from the metagraph. Leave
+`RELIQUARY_UID_BURN` unset unless deliberately overriding this destination.
+An ordinary validator's self-weight is masked by chain consensus and does not
+implement burn.
 
 ### What goes in `.env`
 
@@ -303,7 +347,9 @@ curl 'http://localhost:8080/verdicts/<miner_hotkey_ss58>?since=0'
 # → {"verdicts":[{"merkle_root":"...","window_n":N,"accepted":true,"reason":"accepted","ts":...}, ...]}
 ```
 
-For the weight-only mode, the only signal that things are working is the log line `Submitting weights: N miners …` once per subnet epoch (~30 minutes on netuid 81).
+For weight-only mode, look for `set_weights OK` followed by `Submitted weights:`
+once per subnet epoch, and verify that the validator's on-chain last-update
+block advances. Startup logs alone are insufficient.
 
 ### `/verdicts/{hotkey}` — what to expect
 
