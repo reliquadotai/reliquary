@@ -31,6 +31,7 @@ write created paid journal holes on disk failure.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections.abc import Mapping
 from typing import Any, Callable, NamedTuple, Sequence
@@ -102,9 +103,13 @@ class FillClosedBatchAssembler:
             # instead of paying it to the ones that are -- so the running
             # subset is rescaled to still sum to the DECLARED total, in the
             # declared proportions. A full mix rescales by exactly 1.0.
-            declared_total = sum(float(v) for v in window_pool.values())
+            # ``fsum``, not ``sum``: these floats are meant to total a declared
+            # value, and the last-bit drift of a naive left-fold both lands
+            # outside the recovery journal's 0.0..1.0 guard and makes a full
+            # mix rescale by something other than exactly 1.0.
+            declared_total = math.fsum(float(v) for v in window_pool.values())
             restricted = {e: float(window_pool[e]) for e in self._env_order}
-            restricted_total = sum(restricted.values())
+            restricted_total = math.fsum(restricted.values())
             if restricted_total > 0:
                 scale = declared_total / restricted_total
                 self._pool_by_env = {e: v * scale for e, v in restricted.items()}

@@ -210,7 +210,8 @@ def test_activating_a_window_journals_the_pool_it_opened_with(tmp_path, monkeypa
     the journal simply falls back to 1.0 and a recovered window pays the whole
     pool instead of this task's share. The value comes from the assembler
     rather than from `_emission_cap`, so the journal holds exactly the number
-    the archive will report; here the two are the same 0.37."""
+    the archive will report -- the two are set apart here so that reading the
+    wrong one is a failure and not a coincidence."""
     import types
 
     import reliquary.validator.service as service_mod
@@ -225,6 +226,8 @@ def test_activating_a_window_journals_the_pool_it_opened_with(tmp_path, monkeypa
     service = types.SimpleNamespace(
         _active_batchers={"math": batcher}, _candidate_window_n=42,
         _set_window_preparation_stage=lambda stage: None,
+        # Deliberately DIFFERENT from _emission_cap below: if the journal
+        # took the cap instead of the assembler's pool, this test must fail.
         _candidate_fill_closed_assembler=types.SimpleNamespace(
             window_start=42, window_pool=0.37),
         _fill_closed_assembler=None, _fill_closed_assemblers={},
@@ -232,7 +235,7 @@ def test_activating_a_window_journals_the_pool_it_opened_with(tmp_path, monkeypa
         _checkpoint_store=types.SimpleNamespace(
             current_manifest=lambda: types.SimpleNamespace(
                 revision="a" * 40, checkpoint_n=7)),
-        env_mix=[("math", 16), ("code", 16)], _emission_cap=0.37,
+        env_mix=[("math", 16), ("code", 16)], _emission_cap=0.21,
         _window_n=None, _candidate_activation_nonce=None,
         _window_preparation_stage=None,
         server=types.SimpleNamespace(
@@ -279,6 +282,41 @@ def test_begin_refuses_an_out_of_range_pool(tmp_path, monkeypatch, bad):
 
     with pytest.raises(ValueError, match="pool"):
         store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1}, window_pool=bad)
+
+
+def test_begin_accepts_a_pool_one_ulp_above_the_pool_it_totals(tmp_path, monkeypatch):
+    """The journalled pool is now a SUM of per-environment caps, so it can land
+    a hair above 1.0 where `_emission_cap` never could. The guard has to accept
+    what `validate_registry` already accepted on the way in, or the window
+    never opens and the archive stream is an unbroken run of `aborted`."""
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    monkeypatch.setattr(recovery_module, "B_BATCH", 1)
+    store = FillClosedRecoveryStore(tmp_path)
+    overshoot = sum([1.0 * 0.33, 1.0 * 0.56, 1.0 * 0.11])
+
+    assert overshoot > 1.0
+
+    store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1},
+                window_pool=overshoot)
+
+    assert store.load(1)["window_pool"] == overshoot
+
+
+def test_begin_still_refuses_a_pool_meaningfully_above_the_whole_pool(
+    tmp_path, monkeypatch,
+):
+    """The widened bound is one rounding step, not a licence to overpay."""
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    monkeypatch.setattr(recovery_module, "B_BATCH", 1)
+    store = FillClosedRecoveryStore(tmp_path)
+
+    with pytest.raises(ValueError, match="pool"):
+        store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1},
+                    window_pool=1.001)
 
 
 def test_a_three_environment_window_at_a_fractional_cap_still_finishes(tmp_path):
@@ -352,7 +390,11 @@ def _activate_with_a_real_assembler(tmp_path, monkeypatch, *, env_caps, emission
         env_order=environments,
         enqueue_fn=lambda key, data: None,
         tombstone_fn=lambda key, data: None,
-        window_pool=env_caps,
+        # Spelled exactly as `_build_window_batchers` spells it, so this
+        # exercises the production MAP path rather than a map handed in
+        # ready-made -- every other prepare/activate test runs the scalar
+        # path at 1.0, where every implementation agrees.
+        window_pool=dict(env_caps) or emission_cap,
     )
     batcher = types.SimpleNamespace(
         window_start=42, mark_window_opened=lambda: None,
@@ -391,6 +433,15 @@ def _activate_with_a_real_assembler(tmp_path, monkeypatch, *, env_caps, emission
     # An explicit --env-split breaks it at TWO environments:
     # 0.9 * 0.6 + 0.9 * 0.4 == 0.9000000000000001.
     (0.9, {"math": 0.6, "code": 0.4}),
+    # At cap 1.0 the naive sum lands one ULP ABOVE the pool, which the
+    # recovery journal's own 0.0..1.0 guard then refuses outright:
+    # 0.33 + 0.56 + 0.11 == 1.0000000000000002. `validate_registry` and
+    # `resolve_task_config` both accept this split at their 1e-9 tolerance,
+    # so nothing upstream stops it reaching `begin()`.
+    (1.0, {"math": 0.33, "code": 0.56, "logic": 0.11}),
+    # The same one-ULP overshoot from a plain even split, which needs no
+    # --env-split at all -- it fires at 9, 11, 18, 20 and 21 environments.
+    (1.0, {f"env{n}": 1 / 9 for n in range(9)}),
 ])
 def test_the_journalled_pool_is_the_number_the_archive_reports(
     tmp_path, monkeypatch, cap, split,

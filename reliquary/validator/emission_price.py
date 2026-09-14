@@ -143,6 +143,16 @@ class PriceDecision:
         )
 
 
+def _timed_out(outcome: Any) -> bool:
+    """Whether this outcome's window timed out.
+
+    Read leniently because both walks share ``advance``: only
+    ``EnvironmentOutcome`` carries the field, and the scalar ``WindowOutcome``
+    walk must stay byte-identical to what it was before it existed.
+    """
+    return bool(getattr(outcome, "timed_out", False))
+
+
 def _smoothed_ratio(
     recent: Sequence[WindowOutcome], median_rounds: int
 ) -> float | None:
@@ -213,9 +223,8 @@ def advance(
         regime = "hold"
     price = min(max(price, params.floor), params.cap)
     # A timed-out window assembled no batch, so it is not evidence that this
-    # price works no matter what its admission clock says. ``WindowOutcome``
-    # carries no such flag, which is how the scalar walk stays unchanged.
-    if outcome.filled and not getattr(outcome, "timed_out", False):
+    # price works no matter what its admission clock says.
+    if outcome.filled and not _timed_out(outcome):
         # Only a window that actually filled proves a price works. It joins
         # the rolling window rather than replacing ``last_good`` outright, so
         # the minimum -- not the latest fill -- is what the next snap reads.
@@ -299,7 +308,8 @@ def advance_by_environment(
         # batch, which is the halting shape the breaker exists for -- and the
         # dominant one.
         if breaker_length and len(trailing) >= breaker_length and all(
-            outcome.timed_out or not outcome.filled for outcome in trailing
+            _timed_out(outcome) or not outcome.filled
+            for outcome in trailing
         ):
             # The regime is the same either way -- go look -- but the two
             # causes are not: no arrivals means the market is not there, while

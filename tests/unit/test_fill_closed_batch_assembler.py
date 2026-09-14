@@ -171,6 +171,37 @@ def test_a_declared_map_reports_its_own_declared_total_exactly():
     assert narrowed.pool_for("math") + narrowed.pool_for("code") != 0.9
 
 
+def test_a_declared_map_totalling_the_whole_pool_does_not_overshoot_it():
+    """A naive left-fold of shares meant to total 1.0 can land one ULP ABOVE
+    it -- `0.33 + 0.56 + 0.11 == 1.0000000000000002`, and likewise a plain even
+    split over 9, 11, 18, 20 or 21 environments. The recovery journal then
+    refuses the pool outright and no window ever opens."""
+    import math
+
+    for declared in (
+        {"math": 0.33, "code": 0.56, "logic": 0.11},
+        {f"env{n}": 1 / 9 for n in range(9)},
+    ):
+        assert sum(declared.values()) > 1.0, "the naive sum must overshoot"
+
+        assembler = _assembler(
+            env_order=list(declared), window_pool=declared
+        )
+
+        assert assembler.window_pool == 1.0
+        assert assembler.window_pool == math.fsum(declared.values())
+
+
+def test_a_full_mix_rescales_by_exactly_one():
+    """The docstring's claim, held to the letter: with every declared
+    environment running, no share may move at all."""
+    declared = {"math": 0.33, "code": 0.56, "logic": 0.11}
+
+    assembler = _assembler(env_order=list(declared), window_pool=declared)
+
+    assert [assembler.pool_for(e) for e in declared] == list(declared.values())
+
+
 def _chunk(tag: int, env: str) -> list:
     return [
         _group([_roll(1.0, 4, env=env)], prompt_idx=tag * 1000 + i)

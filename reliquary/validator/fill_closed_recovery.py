@@ -22,6 +22,7 @@ from reliquary.constants import (
 )
 from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.task_registry import _SUM_TOLERANCE
 from reliquary.shared.training_payload import (
     active_training_identity,
     encode_tombstone,
@@ -39,10 +40,13 @@ from reliquary.validator.token_rewards import (
 
 
 def _valid_window_pool(value: object) -> bool:
+    # The upper bound matches what ``validate_registry`` already accepts on the
+    # way in: a guard stricter than the validator that admitted the value is a
+    # guard that rejects its own valid inputs.
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
-        and 0.0 <= value <= 1.0
+        and 0.0 <= value <= 1.0 + _SUM_TOLERANCE
     )
 
 
