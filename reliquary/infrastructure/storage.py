@@ -232,6 +232,7 @@ async def list_recent_datasets(
     n: int,
     *,
     strict: bool = False,
+    fields: tuple[str, ...] | None = None,
     **client_kwargs,
 ) -> list[dict]:
     """Download last *n* window archives from the flat R2 prefix in ascending order.
@@ -269,7 +270,11 @@ async def list_recent_datasets(
                     raise ValueError(
                         f"archive {key} does not bind window {window_start}"
                     )
-                archives.append(data)
+                archives.append(
+                    data if fields is None else {
+                        field: data[field] for field in fields if field in data
+                    }
+                )
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 if code in ("NoSuchKey", "404"):
