@@ -149,6 +149,18 @@ def _release_state_mismatch_reason(
     return None
 
 
+def _warn_transformers_mismatch(local_runtime, validator_runtime) -> None:
+    local = local_runtime.transformers_version
+    remote = validator_runtime.transformers_version
+    if local and remote and local != remote:
+        logger.warning(
+            "Transformers runtime differs: miner=%s validator_proof_worker=%s. "
+            "Follow the operator's qualified runtime release; a version difference "
+            "may affect numerical agreement but does not establish a proof failure.",
+            local, remote,
+        )
+
+
 def _initial_runtime_bound_nonce(runtime_fingerprint) -> str:
     """Build a schema-valid placeholder before the submitter signs its attempt.
 
@@ -671,6 +683,7 @@ class MiningEngine:
                         proof_model=self.hf_model,
                     )
                 )
+                _warn_transformers_mismatch(runtime_fingerprint, contract.validator_profile)
                 logger.info(
                     "validator runtime telemetry enabled version=%d "
                     "validator_profile=%s",

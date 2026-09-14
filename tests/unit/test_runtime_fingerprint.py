@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from reliquary.miner.engine import _initial_runtime_bound_nonce
+from reliquary.miner.engine import _initial_runtime_bound_nonce, _warn_transformers_mismatch
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -18,6 +18,28 @@ from reliquary.validator.server import ValidatorServer
 
 def _runtime() -> RuntimeFingerprint:
     return RuntimeFingerprint.model_validate(collect_runtime_fingerprint())
+
+
+@pytest.mark.parametrize("local,remote,warns", [
+    ("5.10.4", "5.9.0", True),
+    ("5.9.0", "5.9.0", False),
+    (None, "5.9.0", False),
+    ("5.10.4", None, False),
+])
+def test_transformers_runtime_mismatch_is_advisory(local, remote, warns, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    warning = Mock()
+    monkeypatch.setattr("reliquary.miner.engine.logger.warning", warning)
+
+    _warn_transformers_mismatch(
+        SimpleNamespace(transformers_version=local),
+        SimpleNamespace(transformers_version=remote),
+    )
+    assert warning.called is warns
+    if warns:
+        assert warning.call_args.args[1:] == (local, remote)
 
 
 def _request(runtime: RuntimeFingerprint, nonce: str) -> BatchSubmissionRequest:
