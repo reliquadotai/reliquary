@@ -5005,6 +5005,7 @@ class ValidationService:
             getattr(self, "_cooldown_durable_window", 0),
             archived_window,
         )
+        await asyncio.to_thread(self._cache_archived_hashes, archive)
 
     def _write_training_payload(
         self,
@@ -5431,6 +5432,7 @@ class ValidationService:
             getattr(self, "_cooldown_durable_window", 0),
             window_start,
         )
+        self._cache_archived_hashes(archive)
         logger.error(
             "Window %d archived as aborted stage=%s error_type=%s",
             first_batcher.window_start,
@@ -5603,6 +5605,13 @@ class ValidationService:
         from reliquary.infrastructure.archive_queue import get_archive_queue
         from reliquary.validator.control import ControlStore
 
+        async def startup_step(name, operation):
+            started = time.monotonic()
+            try:
+                return await operation
+            finally:
+                logger.info("startup_stage=%s elapsed_seconds=%.3f", name, time.monotonic() - started)
+
         self.server.configure_final_verdict_store(
             os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state")
         )
@@ -5619,9 +5628,9 @@ class ValidationService:
         self._archive_queue = archive_queue
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
-        await self._refresh_registered_hotkeys(force=True, reason="startup")
+        await startup_step("registration", self._refresh_registered_hotkeys(force=True, reason="startup"))
         await self.server.start()
-        await self._apply_resume_from()                  # ← resume before bootstrap
+        await startup_step("activation_checkpoint", self._apply_resume_from())
         # Authenticate the pinned activation checkpoint before normal bootstrap
         # adopts a trainer-published successor (as it does during a live run).
         if (
@@ -5634,7 +5643,7 @@ class ValidationService:
                 self.proof_capacity_qualification, self._proof_worker_pool,
                 active_manifest.revision if active_manifest is not None else "",
             )
-        await self._bootstrap_state_from_external()
+        await startup_step("durable_history", self._bootstrap_state_from_external())
         if (
             self._local_resume_unadvertised
             and self._checkpoint_store.current_manifest() is None
@@ -5648,11 +5657,11 @@ class ValidationService:
                 "auction-v3 requires configured proof replicas; set "
                 "RELIQUARY_PROOF_DEVICES and qualify capacity before launch"
             )
-        await self._ensure_proof_scheduler_ready()
+        await startup_step("proof_readiness", self._ensure_proof_scheduler_ready())
         self._publish_window_preparation_state()
-        await self._rebuild_cooldown_from_history()
-        await self._restore_content_cooldown()
-        await self._rebuild_hashes_from_history()
+        await startup_step("prompt_cooldown", self._rebuild_cooldown_from_history())
+        await startup_step("content_cooldown", self._restore_content_cooldown())
+        await startup_step("hash_history", self._rebuild_hashes_from_history())
         self._log_startup_config_banner()
 
         # Start the background archive-upload worker. It scans the queue
@@ -6351,6 +6360,19 @@ class ValidationService:
         """
         current_window = self._window_n
         candidates: list[tuple[int, str, dict[str, Any]]] = []
+        # A complete local snapshot at the durable tip needs no remote copy.
+        # Stale/invalid snapshots still use the existing reconciliation path.
+        try:
+            snapshot = await asyncio.to_thread(_read_gzip_json, _cooldown_local_path(TRAINING_RUN_ID))
+            if snapshot is not None and self._validate_cooldown_snapshot(
+                snapshot, set(self._cooldown_per_env), current_window,
+            ) == current_window:
+                for name, cooldown_map in self._cooldown_per_env.items():
+                    cooldown_map.import_state(snapshot["envs"][name])
+                logger.info("Restored cooldown from local durable tip window=%d", current_window)
+                return
+        except Exception:
+            logger.warning("Local cooldown fast restore unavailable; reconciling durable copies")
         remote_snapshot = None
         remote_error: Exception | None = None
         try:
@@ -6651,6 +6673,11 @@ class ValidationService:
             self._window_n,
             getattr(self, "_cooldown_durable_window", 0),
         )
+        if getattr(self, "_hash_cache_window", None) is not None:
+            try:
+                await asyncio.to_thread(self._write_hash_snapshot)
+            except OSError:
+                logger.warning("Hash recovery cache persistence unavailable", exc_info=True)
         return await self._snapshot_all_cooldowns(
             snapshot_window=snapshot_window
         )
@@ -6747,6 +6774,22 @@ class ValidationService:
         """
         env_names = set(self.envs)
         candidates: list[tuple[int, str, dict[str, Any]]] = []
+        try:
+            snapshot = await asyncio.to_thread(_read_gzip_json, _content_cooldown_local_path(TRAINING_RUN_ID))
+            if snapshot is not None and self._validate_content_snapshot(
+                snapshot, env_names, self._window_n,
+            ) == self._window_n:
+                for name, content_map in self._content_cooldown_per_env.items():
+                    content_map.import_state(snapshot["envs"][name])
+                self._content_cooldown_health.update(
+                    complete=True, source="local", snapshot_window=self._window_n,
+                    counts_by_environment={name: len(value) for name, value in self._content_cooldown_per_env.items()},
+                    last_error_type=None,
+                )
+                logger.info("Restored content cooldown from local durable tip window=%d", self._window_n)
+                return
+        except Exception:
+            logger.warning("Local content cooldown fast restore unavailable; reconciling durable copies")
         remote_snapshot: dict[str, Any] | None = None
         try:
             remote_snapshot = await storage.download_json(
@@ -6830,7 +6873,7 @@ class ValidationService:
                 resolved,
                 self._content_cooldown_health["counts_by_environment"],
             )
-            if not await self._snapshot_content_cooldown():
+            if not await self._snapshot_content_cooldown(mirror=False):
                 raise RuntimeError(
                     "content cooldown bootstrap was not persisted locally"
                 )
@@ -6849,6 +6892,7 @@ class ValidationService:
         self,
         *,
         snapshot_window: int | None = None,
+        mirror: bool = True,
     ) -> bool:
         """Persist locally before the best-effort R2 mirror.
 
@@ -6889,6 +6933,12 @@ class ValidationService:
             )
             return False
 
+        if not mirror:
+            # Startup requires local durability. The existing periodic snapshot
+            # mirrors it later, without an extra task or racing remote writes.
+            self._content_cooldown_health.update(source="local", snapshot_window=window)
+            return True
+
         now = time.time()
         try:
             uploaded = await storage.upload_json(
@@ -6926,6 +6976,38 @@ class ValidationService:
             )
         return True
 
+    def _hash_snapshot_identity(self) -> dict:
+        return {"schema_version": 1, "run_id": TRAINING_RUN_ID,
+                "profile_id": PROTOCOL_PROFILE_ID, "repo_id": self.hf_repo_id,
+                "bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
+                "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),
+                "implementation": hashlib.sha256(Path(__file__).with_name("dedup.py").read_bytes()).hexdigest(),
+                "retention_windows": HASH_DEDUP_RETENTION_WINDOWS}
+
+    def _hash_snapshot_path(self) -> Path:
+        return _cooldown_local_path(TRAINING_RUN_ID).parent.parent / "rollout-hashes.json.gz"
+
+    def _write_hash_snapshot(self) -> None:
+        _write_gzip_json_atomic(self._hash_snapshot_path(), {
+            "identity": self._hash_snapshot_identity(),
+            "through_window": self._hash_cache_window,
+            "entries": self._hash_cache.export_state(),
+        })
+
+    def _cache_archived_hashes(self, archive: dict) -> None:
+        # Cache only canonical, durably queued archives, never live admission
+        # state. A skipped window stops advancement; restart replays the gap.
+        window = archive["window_start"]
+        if getattr(self, "_hash_cache_window", None) != window - 1:
+            return
+        try:
+            self._hash_cache.apply_history([archive], current_window=window)
+            self._hash_cache.prune(window)
+            self._hash_cache_window = window
+        except Exception:
+            self._hash_cache_window = None
+            logger.warning("Hash recovery cache update failed; archive replay remains available", exc_info=True)
+
     async def _rebuild_hashes_from_history(self) -> None:
         """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS
         durable archives, merging the remote store with the local pending
@@ -6938,15 +7020,29 @@ class ValidationService:
                 self._hash_set.rebuild_from_history(
                     [], current_window=current_window,
                 )
+                self._hash_cache = RolloutHashSet(HASH_DEDUP_RETENTION_WINDOWS)
+                self._hash_cache_window = current_window
                 return
             start_window = max(
                 1,
                 current_window + 1 - HASH_DEDUP_RETENTION_WINDOWS,
             )
+            self._hash_set.rebuild_from_history([], current_window=current_window)
+            try:
+                snapshot = await asyncio.to_thread(_read_gzip_json, self._hash_snapshot_path())
+                if snapshot is not None:
+                    through = snapshot["through_window"]
+                    if (snapshot["identity"] != self._hash_snapshot_identity()
+                            or type(through) is not int or not 0 <= through <= current_window):
+                        raise ValueError("hash recovery snapshot identity mismatch")
+                    if through >= start_window - 1:
+                        self._hash_set.import_state(snapshot["entries"], through_window=through)
+                        self._hash_set.prune(current_window)
+                        start_window = through + 1
+            except Exception:
+                self._hash_set.rebuild_from_history([], current_window=current_window)
+                logger.warning("Hash recovery cache unavailable; replaying complete horizon", exc_info=True)
             async def rebuild() -> int:
-                self._hash_set.rebuild_from_history(
-                    [], current_window=current_window,
-                )
                 restored = 0
                 for chunk_start in range(
                     start_window,
@@ -6962,8 +7058,8 @@ class ValidationService:
                         end_window=chunk_end,
                         require_all=True,
                     )
-                    self._hash_set.apply_history(
-                        archives, current_window=current_window,
+                    await asyncio.to_thread(
+                        self._hash_set.apply_history, archives, current_window=current_window,
                     )
                     restored += len(archives)
                 return restored
@@ -6971,6 +7067,13 @@ class ValidationService:
             restored = await asyncio.wait_for(
                 rebuild(), timeout=_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
             )
+            self._hash_cache = RolloutHashSet(HASH_DEDUP_RETENTION_WINDOWS)
+            self._hash_cache.import_state(self._hash_set.export_state(), through_window=current_window)
+            self._hash_cache_window = current_window
+            try:
+                await asyncio.to_thread(self._write_hash_snapshot)
+            except OSError:
+                logger.warning("Hash recovery cache persistence unavailable", exc_info=True)
             logger.info(
                 "Rebuilt hash set from %d/%d archive windows "
                 "(current=%d, size=%d)",

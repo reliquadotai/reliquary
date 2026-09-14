@@ -59,3 +59,7 @@ reliquary-infra/inventory/known_hosts
 .DS_Store
 .coverage
 htmlcov/
+
+# Local restart recovery caches
+rollout-hashes.json.gz
+.download-complete.json

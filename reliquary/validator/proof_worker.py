@@ -548,6 +548,14 @@ def reload_proof_context(
     if not checkpoint_revision:
         raise RuntimeError("proof worker reload requires a checkpoint revision")
 
+    # The loader records what it actually read, but startup still reports no
+    # certified revision. Only the authenticated adoption path can bind it.
+    initial_source = context.pop("_initial_source", None)
+    if (not snapshot_dir and repo_id and context.get("model") is not None
+            and initial_source == (repo_id, checkpoint_revision)):
+        context["revision"] = checkpoint_revision
+        return
+
     state: dict[str, Any] = {}
     if snapshot_dir and Path(snapshot_dir).is_dir():
         for path in sorted(Path(snapshot_dir).glob("*.safetensors")):
@@ -654,12 +662,10 @@ def build_proof_context(
     isolated plane must not change a single kernel, only which interpreter
     drives it.
 
-    The returned ``revision`` is deliberately ``None``. Under auction-v3+ the
-    validator bootstraps from the BASE model and only then resumes to the
-    trained checkpoint, so this worker holds weights no checkpoint certifies.
-    Reporting ``None`` forces ``_synchronize_proof_workers`` to install the
-    resumed snapshot before the device is ever marked ready — claiming the
-    caller's sha here is what made every proof run against base weights.
+    The returned ``revision`` is deliberately ``None`` until adoption certifies
+    the checkpoint. The default loads the base model; a pinned proof startup
+    can preload the intended published revision. The initial source records
+    only what this loader read, allowing exact adoption to reuse those weights.
     """
     import torch
 
@@ -685,6 +691,7 @@ def build_proof_context(
         "tokenizer": tokenizer,
         "device": device,
         "revision": None,
+        "_initial_source": (checkpoint, kwargs.get("revision")),
     }
 
 
