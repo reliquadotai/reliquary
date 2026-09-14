@@ -3099,20 +3099,22 @@ class ValidationService:
                 if len(refused) == len(picking)
                 else "the event is half-taken",
             )
+        return len(refused) < len(picking)
+
+    async def _publish_committed_pick_verdicts(self, picking) -> None:
         try:
             assembler = getattr(self, "_fill_closed_assemblers", {}).get(int(picking[0].window_start))
             if assembler is not None:
                 paid = assembler.paid_groups()
                 for batcher in picking:
                     entries = paid.get(str(batcher.env.name), [])
-                    self._record_auction_final_verdicts(
+                    await self._record_auction_final_verdicts(
                         batcher, paid_groups=[g for _index, g in entries],
                         batch_indices={(g.hotkey, g.prompt_idx, bytes(g.merkle_root)): i for i, g in entries},
                         finalize=False,
                     )
         except Exception:
             logger.exception("Could not publish committed-pick verdicts")
-        return len(refused) < len(picking)
 
     async def _wait_for_window_seal(
         self,
@@ -3143,7 +3145,8 @@ class ValidationService:
             # cadence, BEFORE the seal poll -- so the 16th pick closes the
             # window and ``poll_deadline`` seals it on the same tick
             # rather than a tick later. Inert with the gate off.
-            self._drive_fill_closed_picks(batchers)
+            if self._drive_fill_closed_picks(batchers):
+                await self._publish_committed_pick_verdicts(batchers)
             for b in batchers:
                 # The hard ceiling ignores GPU readiness; only adaptive close
                 # is gated by it.
@@ -3352,7 +3355,7 @@ class ValidationService:
             for b in batcher_list:
                 b.beacon_invalid = True
 
-    def _record_auction_final_verdicts(
+    async def _record_auction_final_verdicts(
         self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
         batch_indices: dict | None = None, finalize: bool = True,
     ) -> None:
@@ -3490,13 +3493,14 @@ class ValidationService:
                     },
                 )
             except Exception:
+                self.server._verdict_persistence_error = True
                 logger.exception(
                     "auction final verdict publication failed window=%d prompt=%d",
                     batcher.window_start,
                     pending.prompt_idx,
                 )
 
-        self.server.persist_final_verdicts(records)
+        await asyncio.to_thread(self.server.persist_final_verdicts, records)
         if finalize:
             batcher._auction_final_verdicts_published = True
 
@@ -3740,7 +3744,7 @@ class ValidationService:
         # failure. This is observability only and cannot change selection.
         if not FILL_CLOSED_ENABLED:
             for batcher in batchers.values():
-                self._record_auction_final_verdicts(batcher)
+                await self._record_auction_final_verdicts(batcher)
 
         # Emit per-submission lifecycle telemetry for every env's accepted
         # pool. Carried over from PR #40 (validator observability) and
@@ -4986,7 +4990,7 @@ class ValidationService:
                 self._fill_closed_assembler = None
         if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
             for env_name, batcher in batcher_dict.items():
-                self._record_auction_final_verdicts(
+                await self._record_auction_final_verdicts(
                     batcher,
                     paid_groups=[
                         group for _index, group in fill_closed_batches.get(env_name, ())
@@ -4996,6 +5000,7 @@ class ValidationService:
                         for index, group in fill_closed_batches.get(env_name, ())
                     },
                 )
+        await asyncio.to_thread(self.server.complete_final_verdict_window, archived_window)
         self._cooldown_durable_window = max(
             getattr(self, "_cooldown_durable_window", 0),
             archived_window,

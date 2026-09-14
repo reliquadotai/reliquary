@@ -526,3 +526,14 @@ history requests or resend submissions. Save the JSON lines for support. Its
 cursor is in memory: restarting resumes the server's bounded recent feed and can
 repeat records or leave a historical gap. Use the targeted lookup documented in
 [validator diagnostics](validating.md#detailed-miner-verdicts) when needed.
+
+To recover stored final outcomes for an entire window (100 records per page):
+
+```bash
+reliquary watch-verdicts --validator-url http://62.238.81.36:8000 \
+  --hotkey YOUR_PUBLIC_HOTKEY --window 45829 | tee window-verdicts.jsonl
+```
+
+This exits after the available pages; it makes no submission requests. Historical
+windows before validator persistence was deployed cannot be reconstructed by this
+command. A warning indicates a window whose final history is not marked complete.

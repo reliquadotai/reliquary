@@ -67,6 +67,7 @@ class FinalVerdictStore:
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("CREATE TABLE IF NOT EXISTS verdicts (window INTEGER, hotkey TEXT, root TEXT, payload TEXT, PRIMARY KEY(window,hotkey,root))")
         self._db.execute("CREATE TABLE IF NOT EXISTS coverage (id INTEGER PRIMARY KEY CHECK(id=1), first_window INTEGER, last_window INTEGER)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS completed_windows (window INTEGER PRIMARY KEY)")
         self._db.commit()
 
     def put_many(self, records):
@@ -87,3 +88,23 @@ class FinalVerdictStore:
         status = "found" if row else "expired" if coverage and coverage[0] <= window < oldest else "not_recorded"
         return {"status": status, "verdict": json.loads(row[0]) if row else None,
                 "oldest_retained_window": oldest, "retention_windows": self.RETENTION_WINDOWS}
+
+    def complete_window(self, window):
+        with self._lock, self._db:
+            self._db.execute("INSERT OR IGNORE INTO completed_windows VALUES (?)", (window,))
+            self._db.execute("DELETE FROM completed_windows WHERE window < ?", (window - self.RETENTION_WINDOWS + 1,))
+
+    def page(self, hotkey, window, after="", limit=100):
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT root,payload FROM verdicts WHERE window=? AND hotkey=? AND root>? ORDER BY root LIMIT ?",
+                (window, hotkey, after, limit + 1),
+            ).fetchall()
+            coverage = self._db.execute("SELECT first_window,last_window FROM coverage WHERE id=1").fetchone()
+            complete = self._db.execute("SELECT 1 FROM completed_windows WHERE window=?", (window,)).fetchone() is not None
+        oldest = max(coverage[0], coverage[1] - self.RETENTION_WINDOWS + 1) if coverage else None
+        return {"status": "found" if rows else "expired" if coverage and coverage[0] <= window < oldest else "not_recorded",
+                "window_n": window, "verdicts": [json.loads(row[1]) for row in rows[:limit]],
+                "next_cursor": rows[limit - 1][0] if len(rows) > limit else None,
+                "oldest_retained_window": oldest, "retention_windows": self.RETENTION_WINDOWS,
+                "snapshot_complete": complete}

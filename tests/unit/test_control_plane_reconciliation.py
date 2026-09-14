@@ -173,3 +173,24 @@ def test_watch_verdicts_cli_prints_json_without_loading_a_miner(monkeypatch):
     result = CliRunner().invoke(app, ['watch-verdicts', '--validator-url', 'https://test/', '--hotkey', 'public-hk'])
     assert result.exit_code == 0, result.output
     assert result.stdout.strip() == '{"selection_status":"pending"}'
+
+
+def test_watch_verdicts_cli_recovers_paginated_window(monkeypatch):
+    from typer.testing import CliRunner
+    from reliquary.cli.main import app
+    real_client = httpx.AsyncClient
+    cursors = []
+
+    async def handle(request):
+        cursors.append(request.url.params['after'])
+        return httpx.Response(200, json={
+            'verdicts': [{'merkle_root': 'a' if len(cursors) == 1 else 'b'}],
+            'next_cursor': 'a' if len(cursors) == 1 else None,
+            'snapshot_complete': True,
+        })
+
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs))
+    result = CliRunner().invoke(app, ['watch-verdicts', '--validator-url', 'https://test', '--hotkey', 'hk', '--window', '500'])
+    assert result.exit_code == 0, result.output
+    assert cursors == ['', 'a']
+    assert len(result.stdout.splitlines()) == 2

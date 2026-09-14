@@ -648,3 +648,20 @@ feed. A crash before final publication can leave no durable verdict.
 The lookup returns `found`, `pending`, `expired`, `not_recorded`, or `unavailable`;
 missing records do **not** imply non-selection. Storage failures return HTTP 503.
 These diagnostic fields do not instruct miners to resubmit a prompt.
+
+The cursor feed is bounded to 200 events per hotkey and 1,024 hotkeys per process.
+Hotkey eviction changes its stream identity; it does not erase durable outcomes.
+Recover a publication burst with `GET /miner-verdict-history/{hotkey}/{window}`.
+Pass `limit` (1–200, default 100) and then `after=next_cursor` until `next_cursor`
+is null. `snapshot_complete=true` means final publication for the window finished;
+otherwise later outcomes may still appear. This endpoint reads compact records,
+not training payloads. A missing record never implies rejection.
+
+`GET /http-metrics` provides process-lifetime counters and non-cumulative duration
+buckets per normalized route: requests, active/peak requests, status classes,
+response bytes and diagnostic overload rejections. Compute rates from counter
+deltas and reset on process restart. Roots/hotkeys/query strings are not labels.
+Diagnostic verdict endpoints share a 16-request in-flight budget, independently
+of submissions and readiness. Overload returns 503 `diagnostic_capacity` with
+Retry-After, and does not record a miner failure. This is a read concurrency guard,
+not a network-level DoS limit or proof that a particular production RPS is safe.
