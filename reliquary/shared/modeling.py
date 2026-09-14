@@ -93,8 +93,8 @@ def load_tokenizer(source: str, **kwargs):
 def save_tokenizer(tokenizer: Any, directory) -> Any:
     """Reject untrusted template filenames before the pinned runtime writes them.
 
-    CVE-2026-9856 affects Transformers <5.10. Keep numerical runtime pins while
-    applying the upstream path boundary to every tokenizer save in Reliquary.
+    Transformers 5.10+ includes the CVE-2026-9856 fix. Keep this boundary as
+    defense in depth for every tokenizer save in Reliquary.
     """
     templates = getattr(tokenizer, "chat_template", None)
     if isinstance(templates, dict):

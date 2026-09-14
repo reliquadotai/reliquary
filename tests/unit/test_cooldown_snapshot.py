@@ -64,6 +64,31 @@ def _gap_archives(start: int, stop: int, *, selected_window: int | None = None):
 
 
 @pytest.mark.asyncio
+async def test_complete_local_cooldowns_skip_remote_reads():
+    from reliquary.validator.service import (
+        _write_gzip_json_atomic, _cooldown_local_path, _content_cooldown_local_path,
+    )
+    from reliquary.constants import TRAINING_RUN_ID
+
+    svc = _service(40)
+    digest = "a" * 64
+    _write_gzip_json_atomic(_cooldown_local_path(TRAINING_RUN_ID), {
+        "schema_version": 2, "complete": True, "run_id": TRAINING_RUN_ID,
+        "snapshot_window": 40, "envs": {"fake": {"7": 30}},
+    })
+    _write_gzip_json_atomic(_content_cooldown_local_path(TRAINING_RUN_ID), {
+        "schema_version": 1, "complete": True, "run_id": TRAINING_RUN_ID,
+        "snapshot_window": 40, "envs": {"fake": {digest: 30}},
+    })
+    with patch("reliquary.infrastructure.storage.download_json", new=AsyncMock()) as read:
+        await svc._rebuild_cooldown_from_history()
+        await svc._restore_content_cooldown()
+    read.assert_not_awaited()
+    assert svc._cooldown_per_env["fake"].is_in_cooldown(7, 40)
+    assert svc._content_cooldown_per_env["fake"].export_state() == {digest: 30}
+
+
+@pytest.mark.asyncio
 async def test_restore_from_snapshot_run_match():
     svc = _service(40)
     snap = {"run_id": "default", "snapshot_window": 40, "envs": {"fake": {"7": 30}}}
@@ -623,6 +648,10 @@ async def test_content_cooldown_first_restore_backfills_prompt_state(tmp_path):
     ):
         await svc._restore_content_cooldown()
 
+        assert uploads == []
+        # Remote mirroring runs at the normal snapshot cadence after startup.
+        await svc._snapshot_content_cooldown()
+
     content = svc._content_cooldown_per_env["fake"]
     assert len(content) == 1
     assert svc._content_cooldown_health["complete"] is True
@@ -725,6 +754,8 @@ async def test_content_restore_allows_r2_outage_after_local_persist(tmp_path):
         new=AsyncMock(side_effect=OSError("R2 unavailable")),
     ):
         await svc._restore_content_cooldown()
+        assert svc._content_cooldown_health["last_error_type"] is None
+        await svc._snapshot_content_cooldown()
 
     assert svc._content_cooldown_health["complete"] is True
     assert svc._content_cooldown_health["source"] == "local"

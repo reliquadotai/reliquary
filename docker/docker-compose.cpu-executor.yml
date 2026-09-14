@@ -2,8 +2,8 @@
 # never on the wallet/control machine.
 services:
   reliquary-cpu-executor:
-    image: ${CPU_EXECUTOR_IMAGE:?set the verified immutable image ID}
-    pull_policy: never
+    image: ${CPU_EXECUTOR_IMAGE:-ghcr.io/reliquadotai/reliquary-cpu-executor:latest}
+    pull_policy: always
     container_name: reliquary-cpu-executor
     restart: unless-stopped
     stop_grace_period: 30s

@@ -194,6 +194,8 @@ class WeightOnlyValidator:
                     current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
                     task_id=task_id,
+                    # The replay reads only these; the task comes from the R2 prefix.
+                    fields=("window_start", "window_status", "rewards_by_hotkey"),
                 )
                 # A task whose last window fell out of the shared horizon
                 # contributes nothing, and must not be counted as an

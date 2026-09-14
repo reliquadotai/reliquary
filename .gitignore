@@ -30,3 +30,39 @@ reliquary-infra/inventory/known_hosts
 
 # Agent working notes; plans and specs live under docs/superpowers/.
 /.superpowers/
+
+# Private research — keep new security analyses and agent plans out of Git
+/AGENTS.md
+/docs/security/
+/docs/superpowers/
+/docs/evidence/
+/.private-research/
+/reports/private/
+
+# Generated ML and research artifacts
+/wandb/
+/checkpoints/
+/artifacts/
+/outputs/
+*.log
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.whl
+*.zip
+*.7z
+*.tar
+*.tgz
+*.mp4
+*.mov
+*.pptx
+
+# Local tooling
+.DS_Store
+.coverage
+htmlcov/
+
+# Local restart recovery caches
+rollout-hashes.json.gz
+.download-complete.json

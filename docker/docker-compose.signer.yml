@@ -1,8 +1,8 @@
 # Wallet-owning semantic signer. This specification belongs only on signer-01.
 services:
   reliquary-signer:
-    image: ${SIGNER_IMAGE:?set the verified immutable signer image ID}
-    pull_policy: never
+    image: ${SIGNER_IMAGE:-ghcr.io/reliquadotai/reliquary-signer:latest}
+    pull_policy: always
     container_name: reliquary-signer
     restart: unless-stopped
     stop_grace_period: 30s

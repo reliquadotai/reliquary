@@ -151,6 +151,7 @@ class ProofDecision:
     finished_at: float | None
     value: Any = field(default=None, repr=False)
     reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1325,6 +1326,35 @@ class GlobalProofScheduler:
             if decision is None:
                 break
 
+            # Snapshot the facts used for this decision, before counters move.
+            # No resource identities or submission payloads enter telemetry.
+            details = {
+                "proof_plan_required_passes": state.plan.required_passes,
+                "proof_plan_passes_before_decision": state.passed,
+                "proof_status": (
+                    "passed" if phase is _JobPhase.RAW and raw.execution is not None and raw.execution.passed
+                    else "failed" if phase is _JobPhase.RAW and raw.execution is not None
+                    else "unknown" if phase is _JobPhase.RAW
+                    else "skipped"
+                ),
+            }
+            if decision.status is ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT:
+                details["limits"] = [
+                    {"scope": key[1], "counter_scope": "proof_plan", "count": state.resource_failures[key], "threshold": limit}
+                    for key, limit in candidate.resources
+                    if state.resource_failures[key] >= limit
+                    and isinstance(key, tuple) and len(key) == 3
+                ]
+            if decision.status is ProofDecisionStatus.SKIPPED_PROMPT_CLAIMED:
+                winner = next((d for d in state.decisions
+                               if d.prompt_key == candidate.prompt_key and d.status is ProofDecisionStatus.PASSED), None)
+                if winner is not None:
+                    details["blocking_proof_rank"] = winner.rank
+                    root = getattr(winner.value, "merkle_root", None)
+                    if isinstance(root, bytes):
+                        details["blocking_merkle_root"] = root.hex()
+                    details["conflict_type"] = candidate.prompt_key[0] if isinstance(candidate.prompt_key, tuple) else "prompt"
+            decision = replace(decision, details=details)
             state.decisions.append(decision)
             state.phases[candidate.job_id] = _JobPhase.APPLIED
             state.next_apply_index += 1

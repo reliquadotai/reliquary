@@ -33,7 +33,51 @@ export BT_WALLETS_DIR=/path/to/validator-signing-wallets
 docker compose -f docker-compose.weight-only.yml up -d
 ```
 
-That's it. Watchtower will pull and restart your container automatically every time a new image is published.
+Watchtower checks `latest` every five minutes and pulls and restarts the
+validator when that tag changes. Publishing a revision tag alone does not
+update `latest`.
+
+### Update an existing weight-only validator
+
+Use `ghcr.io/reliquadotai/reliquary-validator:latest` for the public weight-only
+release. Keep your existing wallet mount, R2 credentials and `RELIQUARY_TRAIN=0`.
+From your existing `reliquary/docker` deployment directory, update immediately:
+
+```bash
+docker compose -f docker-compose.weight-only.yml pull reliquary-weight-only
+docker compose -f docker-compose.weight-only.yml up -d reliquary-weight-only
+docker logs --since 10m -f reliquary-weight-only
+```
+
+Check the revision actually running:
+
+```bash
+docker exec reliquary-weight-only cat /opt/reliquary/.build-revision
+```
+
+For Kubernetes, set the validator container's `image` to
+`ghcr.io/reliquadotai/reliquary-validator:latest` and `imagePullPolicy: Always`
+in your existing workload manifest, apply it, then restart that workload.
+`Always` checks the image when a container starts; it does not replace running
+pods when a tag changes. For a Deployment (replace both placeholders):
+
+```bash
+kubectl -n <namespace> rollout restart deployment/<deployment>
+kubectl -n <namespace> rollout status deployment/<deployment>
+kubectl -n <namespace> logs deployment/<deployment> -c <validator-container> --since=10m
+```
+
+A successful submission logs both `set_weights OK` and `Submitted weights:`.
+After startup, submission waits only for chain eligibility before joining the
+normal epoch cadence. A startup message alone does not prove weights were sent.
+If restarts continue, inspect the container's previous termination reason and
+logs; a restart alone does not establish an out-of-memory failure.
+
+Unused reward mass continues to burn dynamically. The default destination is
+the subnet owner hotkey's current UID, resolved from the metagraph. Leave
+`RELIQUARY_UID_BURN` unset unless deliberately overriding this destination.
+An ordinary validator's self-weight is masked by chain consensus and does not
+implement burn.
 
 ### What goes in `.env`
 
@@ -303,7 +347,9 @@ curl 'http://localhost:8080/verdicts/<miner_hotkey_ss58>?since=0'
 # → {"verdicts":[{"merkle_root":"...","window_n":N,"accepted":true,"reason":"accepted","ts":...}, ...]}
 ```
 
-For the weight-only mode, the only signal that things are working is the log line `Submitting weights: N miners …` once per subnet epoch (~30 minutes on netuid 81).
+For weight-only mode, look for `set_weights OK` followed by `Submitted weights:`
+once per subnet epoch, and verify that the validator's on-chain last-update
+block advances. Startup logs alone are insufficient.
 
 ### `/verdicts/{hotkey}` — what to expect
 
@@ -559,3 +605,63 @@ What must NOT be there:
 A safe layout is a dedicated validator-signing directory containing only
 the public coldkey file and the required hotkey file. Keep any coldkey
 private material outside this directory and off the validator host.
+
+### Detailed miner verdicts
+
+Existing verdict responses keep their field set. Opt in to lifecycle details with
+`GET /miner-verdicts/{hotkey}?details=true` (or `/verdicts/{hotkey}?details=true`).
+Use the existing cursor/stream ID to poll; `truncated=true` means events were lost
+from the bounded in-memory feed.
+
+`selection_status` distinguishes `pending`, `selected`, and `not_selected`;
+`is_final` describes this candidate's outcome, not closure of the entire window.
+Admission (`accepted_into_pool`) is not selection. Selection is not evidence that
+training consumed the group or that an on-chain payment has arrived. The legacy
+`rewarded` field keeps its existing accounting meaning.
+
+The detailed record adds environment, prompt, checkpoint and receipt identity when
+available, `outcome_code`, a human-readable `explanation`, and proof status/reason.
+`canonical_rank` is scoped to the window and environment, under `ordering_policy`;
+compare neither different environments nor client upload times. `ts` is when the
+verdict was published; `body_received_ts` is server body completion, and
+`proof_recorded_ts` is when the scheduler result was observed. Proof duration is
+measured separately. Missing evidence stays absent/unknown.
+
+`reason_details` contains proof-plan counters at the decision, and, when known,
+the blocking proof rank/root or exhausted budget scope/count/threshold. Proof-plan
+rank is distinct from admission rank. Budget thresholds describe the remaining
+allowance allocated to that plan, not a global limit or a reset time.
+`batch_index`, `selection_target` and `selected_count` describe selection at the
+time of publication; early selected verdicts can precede completion of the window.
+
+Look up an admitted candidate after feed rollover or a normal controller restart:
+
+```text
+GET /miner-verdicts/{hotkey}/{window_n}/{merkle_root}
+```
+
+Final admitted-candidate records are stored in `miner-verdicts.sqlite3` on the
+validator state volume, retained for 2,048 windows. Preserve that volume during
+replacement. This is not an off-host backup. Persistence starts with this release;
+there is no historical backfill. Early admission rejections remain in the bounded
+feed. A crash before final publication can leave no durable verdict.
+The lookup returns `found`, `pending`, `expired`, `not_recorded`, or `unavailable`;
+missing records do **not** imply non-selection. Storage failures return HTTP 503.
+These diagnostic fields do not instruct miners to resubmit a prompt.
+
+The cursor feed is bounded to 200 events per hotkey and 1,024 hotkeys per process.
+Hotkey eviction changes its stream identity; it does not erase durable outcomes.
+Recover a publication burst with `GET /miner-verdict-history/{hotkey}/{window}`.
+Pass `limit` (1–200, default 100) and then `after=next_cursor` until `next_cursor`
+is null. `snapshot_complete=true` means final publication for the window finished;
+otherwise later outcomes may still appear. This endpoint reads compact records,
+not training payloads. A missing record never implies rejection.
+
+`GET /http-metrics` provides process-lifetime counters and non-cumulative duration
+buckets per normalized route: requests, active/peak requests, status classes,
+response bytes and diagnostic overload rejections. Compute rates from counter
+deltas and reset on process restart. Roots/hotkeys/query strings are not labels.
+Diagnostic verdict endpoints share a 16-request in-flight budget, independently
+of submissions and readiness. Overload returns 503 `diagnostic_capacity` with
+Retry-After, and does not record a miner failure. This is a read concurrency guard,
+not a network-level DoS limit or proof that a particular production RPS is safe.

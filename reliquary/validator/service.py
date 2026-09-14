@@ -3208,6 +3208,21 @@ class ValidationService:
             )
         return len(refused) < len(picking)
 
+    async def _publish_committed_pick_verdicts(self, picking) -> None:
+        try:
+            assembler = getattr(self, "_fill_closed_assemblers", {}).get(int(picking[0].window_start))
+            if assembler is not None:
+                paid = assembler.paid_groups()
+                for batcher in picking:
+                    entries = paid.get(str(batcher.env.name), [])
+                    await self._record_auction_final_verdicts(
+                        batcher, paid_groups=[g for _index, g in entries],
+                        batch_indices={(g.hotkey, g.prompt_idx, bytes(g.merkle_root)): i for i, g in entries},
+                        finalize=False,
+                    )
+        except Exception:
+            logger.exception("Could not publish committed-pick verdicts")
+
     async def _wait_for_window_seal(
         self,
         *,
@@ -3237,7 +3252,8 @@ class ValidationService:
             # cadence, BEFORE the seal poll -- so the 16th pick closes the
             # window and ``poll_deadline`` seals it on the same tick
             # rather than a tick later. Inert with the gate off.
-            self._drive_fill_closed_picks(batchers)
+            if self._drive_fill_closed_picks(batchers):
+                await self._publish_committed_pick_verdicts(batchers)
             for b in batchers:
                 # The hard ceiling ignores GPU readiness; only adaptive close
                 # is gated by it.
@@ -3446,8 +3462,9 @@ class ValidationService:
             for b in batcher_list:
                 b.beacon_invalid = True
 
-    def _record_auction_final_verdicts(
+    async def _record_auction_final_verdicts(
         self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
+        batch_indices: dict | None = None, finalize: bool = True,
     ) -> None:
         """Publish the final lifecycle state of every auction candidate.
 
@@ -3474,6 +3491,7 @@ class ValidationService:
             (group.hotkey, group.prompt_idx, bytes(group.merkle_root)): group
             for group in (paid_groups or ())
         }
+        records = []
         for pending in batcher.pending_submissions():
             row = metadata.get(id(pending), {}) if isinstance(metadata, dict) else {}
             selected = bool(row.get("selected", False))
@@ -3484,6 +3502,8 @@ class ValidationService:
                 ))
                 selected = group is not None
                 rewarded = selected
+            if not finalize and (not selected or row.get("verdict_selected_published")):
+                continue
             proof_reject = pending.reject_response
             accepted = proof_reject is None
             reason = (
@@ -3496,11 +3516,29 @@ class ValidationService:
                 canonical_rank, bool
             ):
                 canonical_rank = None
+            if paid_groups is None:
+                selection_reason = str(
+                    row.get("status") or "not_selected_status_unavailable"
+                )
+            elif selected:
+                selection_reason = "selected_fifo"
+            else:
+                selection_reason = str(
+                    row.get("status") or "not_selected_status_unavailable"
+                )
+                if selection_reason == "picked_fifo":
+                    selection_reason = (
+                        "picked_but_unpaid_incomplete_cross_environment_batch"
+                    )
+                elif selection_reason == "proof_passed":
+                    selection_reason = "proven_not_selected_before_window_close"
+                elif selection_reason in {"queued_for_proof", "proof_pending"}:
+                    selection_reason = "proof_not_completed_before_window_close"
 
             from reliquary.validator.verifier import rewards_std
 
             try:
-                self.server.record_verdict(
+                record = self.server.record_verdict(
                     pending.hotkey,
                     pending.request.merkle_root,
                     accepted,
@@ -3509,11 +3547,35 @@ class ValidationService:
                     telemetry=pending.telemetry,
                     reject_stage=None if accepted else "auction_seal",
                     canonical_rank=canonical_rank,
+                    selection_reason=selection_reason,
                     accepted_into_pool=True,
                     selected_for_batch=selected,
                     rewarded=rewarded,
                     sigma=rewards_std(list(pending.rewards or ())),
+                    details={
+                        "environment": str(getattr(batcher.env, "name", "")),
+                        "prompt_idx": pending.prompt_idx,
+                        "checkpoint_revision": str(getattr(batcher, "current_checkpoint_hash", "")),
+                        "receipt_id": getattr(pending.request, "_precommit_receipt_id", None),
+                        "ordering_policy": FILL_CLOSED_SELECTION_POLICY if paid_groups is not None else "difficulty_auction",
+                        "rank_scope": "window_environment",
+                        "proof_status": row.get("proof_status") or (
+                            "passed" if selected or selection_reason == "proven_not_selected_before_window_close"
+                            else "failed" if proof_reject is not None else "unknown"
+                        ),
+                        "proof_reason": proof_reject.reason.value if proof_reject is not None else row.get("proof_reason"),
+                        "proof_recorded_ts": row.get("proof_recorded_ts"),
+                        "proof_duration_seconds": row.get("proof_duration_seconds"),
+                        "reason_details": dict(row.get("proof_details") or {}),
+                        "batch_index": (batch_indices or {}).get((pending.hotkey, pending.prompt_idx, bytes(pending.merkle_root))),
+                        "selection_target": FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH if paid_groups is not None else self._batch_target(batcher),
+                        "selected_count": len(paid) if paid_groups is not None else sum(bool(r.get("selected")) for r in metadata.values()),
+                    },
                 )
+                if isinstance(record, dict):
+                    records.append((pending.hotkey, record))
+                if selected:
+                    row["verdict_selected_published"] = True
                 log_structured(
                     logger,
                     logging.INFO if accepted else logging.WARNING,
@@ -3530,6 +3592,7 @@ class ValidationService:
                         "accepted": accepted,
                         "reason": reason.value,
                         "canonical_rank": canonical_rank,
+                        "selection_reason": selection_reason,
                         "accepted_into_pool": True,
                         "selected_for_batch": selected,
                         "rewarded": rewarded,
@@ -3537,13 +3600,16 @@ class ValidationService:
                     },
                 )
             except Exception:
+                self.server._verdict_persistence_error = True
                 logger.exception(
                     "auction final verdict publication failed window=%d prompt=%d",
                     batcher.window_start,
                     pending.prompt_idx,
                 )
 
-        batcher._auction_final_verdicts_published = True
+        await asyncio.to_thread(self.server.persist_final_verdicts, records)
+        if finalize:
+            batcher._auction_final_verdicts_published = True
 
     def _lr_global_step_hint(self) -> int:
         """Restored LR-schedule position for a same-run restart.
@@ -3802,7 +3868,7 @@ class ValidationService:
         # failure. This is observability only and cannot change selection.
         if not FILL_CLOSED_ENABLED:
             for batcher in batchers.values():
-                self._record_auction_final_verdicts(batcher)
+                await self._record_auction_final_verdicts(batcher)
 
         # Emit per-submission lifecycle telemetry for every env's accepted
         # pool. Carried over from PR #40 (validator observability) and
@@ -5267,16 +5333,22 @@ class ValidationService:
                 self._fill_closed_assembler = None
         if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
             for env_name, batcher in batcher_dict.items():
-                self._record_auction_final_verdicts(
+                await self._record_auction_final_verdicts(
                     batcher,
                     paid_groups=[
                         group for _index, group in fill_closed_batches.get(env_name, ())
                     ],
+                    batch_indices={
+                        (group.hotkey, group.prompt_idx, bytes(group.merkle_root)): index
+                        for index, group in fill_closed_batches.get(env_name, ())
+                    },
                 )
+        await asyncio.to_thread(self.server.complete_final_verdict_window, archived_window)
         self._cooldown_durable_window = max(
             getattr(self, "_cooldown_durable_window", 0),
             archived_window,
         )
+        await asyncio.to_thread(self._cache_archived_hashes, archive)
 
     def _write_training_payload(
         self,
@@ -5705,6 +5777,7 @@ class ValidationService:
             getattr(self, "_cooldown_durable_window", 0),
             window_start,
         )
+        self._cache_archived_hashes(archive)
         logger.error(
             "Window %d archived as aborted stage=%s error_type=%s",
             first_batcher.window_start,
@@ -5890,6 +5963,16 @@ class ValidationService:
         from reliquary.infrastructure.archive_queue import get_archive_queue
         from reliquary.validator.control import ControlStore
 
+        async def startup_step(name, operation):
+            started = time.monotonic()
+            try:
+                return await operation
+            finally:
+                logger.info("startup_stage=%s elapsed_seconds=%.3f", name, time.monotonic() - started)
+
+        self.server.configure_final_verdict_store(
+            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state")
+        )
         self._control_store = ControlStore(
             os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state"),
             start_closed=os.getenv("RELIQUARY_CONTROL_START_CLOSED", "0").lower()
@@ -5903,9 +5986,9 @@ class ValidationService:
         self._archive_queue = archive_queue
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
-        await self._refresh_registered_hotkeys(force=True, reason="startup")
+        await startup_step("registration", self._refresh_registered_hotkeys(force=True, reason="startup"))
         await self.server.start()
-        await self._apply_resume_from()                  # ← resume before bootstrap
+        await startup_step("activation_checkpoint", self._apply_resume_from())
         # Authenticate the pinned activation checkpoint before normal bootstrap
         # adopts a trainer-published successor (as it does during a live run).
         if (
@@ -5918,7 +6001,7 @@ class ValidationService:
                 self.proof_capacity_qualification, self._proof_worker_pool,
                 active_manifest.revision if active_manifest is not None else "",
             )
-        await self._bootstrap_state_from_external()
+        await startup_step("durable_history", self._bootstrap_state_from_external())
         if (
             self._local_resume_unadvertised
             and self._checkpoint_store.current_manifest() is None
@@ -5932,11 +6015,11 @@ class ValidationService:
                 "auction-v3 requires configured proof replicas; set "
                 "RELIQUARY_PROOF_DEVICES and qualify capacity before launch"
             )
-        await self._ensure_proof_scheduler_ready()
+        await startup_step("proof_readiness", self._ensure_proof_scheduler_ready())
         self._publish_window_preparation_state()
-        await self._rebuild_cooldown_from_history()
-        await self._restore_content_cooldown()
-        await self._rebuild_hashes_from_history()
+        await startup_step("prompt_cooldown", self._rebuild_cooldown_from_history())
+        await startup_step("content_cooldown", self._restore_content_cooldown())
+        await startup_step("hash_history", self._rebuild_hashes_from_history())
         self._log_startup_config_banner()
 
         # Start the background archive-upload worker. It scans the queue
@@ -6652,6 +6735,19 @@ class ValidationService:
         """
         current_window = self._window_n
         candidates: list[tuple[int, str, dict[str, Any]]] = []
+        # A complete local snapshot at the durable tip needs no remote copy.
+        # Stale/invalid snapshots still use the existing reconciliation path.
+        try:
+            snapshot = await asyncio.to_thread(_read_gzip_json, _cooldown_local_path(TRAINING_RUN_ID))
+            if snapshot is not None and self._validate_cooldown_snapshot(
+                snapshot, set(self._cooldown_per_env), current_window,
+            ) == current_window:
+                for name, cooldown_map in self._cooldown_per_env.items():
+                    cooldown_map.import_state(snapshot["envs"][name])
+                logger.info("Restored cooldown from local durable tip window=%d", current_window)
+                return
+        except Exception:
+            logger.warning("Local cooldown fast restore unavailable; reconciling durable copies")
         remote_snapshot = None
         remote_error: Exception | None = None
         try:
@@ -6952,6 +7048,11 @@ class ValidationService:
             self._window_n,
             getattr(self, "_cooldown_durable_window", 0),
         )
+        if getattr(self, "_hash_cache_window", None) is not None:
+            try:
+                await asyncio.to_thread(self._write_hash_snapshot)
+            except OSError:
+                logger.warning("Hash recovery cache persistence unavailable", exc_info=True)
         return await self._snapshot_all_cooldowns(
             snapshot_window=snapshot_window
         )
@@ -7048,6 +7149,22 @@ class ValidationService:
         """
         env_names = set(self.envs)
         candidates: list[tuple[int, str, dict[str, Any]]] = []
+        try:
+            snapshot = await asyncio.to_thread(_read_gzip_json, _content_cooldown_local_path(TRAINING_RUN_ID))
+            if snapshot is not None and self._validate_content_snapshot(
+                snapshot, env_names, self._window_n,
+            ) == self._window_n:
+                for name, content_map in self._content_cooldown_per_env.items():
+                    content_map.import_state(snapshot["envs"][name])
+                self._content_cooldown_health.update(
+                    complete=True, source="local", snapshot_window=self._window_n,
+                    counts_by_environment={name: len(value) for name, value in self._content_cooldown_per_env.items()},
+                    last_error_type=None,
+                )
+                logger.info("Restored content cooldown from local durable tip window=%d", self._window_n)
+                return
+        except Exception:
+            logger.warning("Local content cooldown fast restore unavailable; reconciling durable copies")
         remote_snapshot: dict[str, Any] | None = None
         try:
             remote_snapshot = await storage.download_json(
@@ -7131,7 +7248,7 @@ class ValidationService:
                 resolved,
                 self._content_cooldown_health["counts_by_environment"],
             )
-            if not await self._snapshot_content_cooldown():
+            if not await self._snapshot_content_cooldown(mirror=False):
                 raise RuntimeError(
                     "content cooldown bootstrap was not persisted locally"
                 )
@@ -7150,6 +7267,7 @@ class ValidationService:
         self,
         *,
         snapshot_window: int | None = None,
+        mirror: bool = True,
     ) -> bool:
         """Persist locally before the best-effort R2 mirror.
 
@@ -7190,6 +7308,12 @@ class ValidationService:
             )
             return False
 
+        if not mirror:
+            # Startup requires local durability. The existing periodic snapshot
+            # mirrors it later, without an extra task or racing remote writes.
+            self._content_cooldown_health.update(source="local", snapshot_window=window)
+            return True
+
         now = time.time()
         try:
             uploaded = await storage.upload_json(
@@ -7227,6 +7351,38 @@ class ValidationService:
             )
         return True
 
+    def _hash_snapshot_identity(self) -> dict:
+        return {"schema_version": 1, "run_id": TRAINING_RUN_ID,
+                "profile_id": PROTOCOL_PROFILE_ID, "repo_id": self.hf_repo_id,
+                "bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
+                "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),
+                "implementation": hashlib.sha256(Path(__file__).with_name("dedup.py").read_bytes()).hexdigest(),
+                "retention_windows": HASH_DEDUP_RETENTION_WINDOWS}
+
+    def _hash_snapshot_path(self) -> Path:
+        return _cooldown_local_path(TRAINING_RUN_ID).parent.parent / "rollout-hashes.json.gz"
+
+    def _write_hash_snapshot(self) -> None:
+        _write_gzip_json_atomic(self._hash_snapshot_path(), {
+            "identity": self._hash_snapshot_identity(),
+            "through_window": self._hash_cache_window,
+            "entries": self._hash_cache.export_state(),
+        })
+
+    def _cache_archived_hashes(self, archive: dict) -> None:
+        # Cache only canonical, durably queued archives, never live admission
+        # state. A skipped window stops advancement; restart replays the gap.
+        window = archive["window_start"]
+        if getattr(self, "_hash_cache_window", None) != window - 1:
+            return
+        try:
+            self._hash_cache.apply_history([archive], current_window=window)
+            self._hash_cache.prune(window)
+            self._hash_cache_window = window
+        except Exception:
+            self._hash_cache_window = None
+            logger.warning("Hash recovery cache update failed; archive replay remains available", exc_info=True)
+
     async def _rebuild_hashes_from_history(self) -> None:
         """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS
         durable archives, merging the remote store with the local pending
@@ -7239,15 +7395,29 @@ class ValidationService:
                 self._hash_set.rebuild_from_history(
                     [], current_window=current_window,
                 )
+                self._hash_cache = RolloutHashSet(HASH_DEDUP_RETENTION_WINDOWS)
+                self._hash_cache_window = current_window
                 return
             start_window = max(
                 1,
                 current_window + 1 - HASH_DEDUP_RETENTION_WINDOWS,
             )
+            self._hash_set.rebuild_from_history([], current_window=current_window)
+            try:
+                snapshot = await asyncio.to_thread(_read_gzip_json, self._hash_snapshot_path())
+                if snapshot is not None:
+                    through = snapshot["through_window"]
+                    if (snapshot["identity"] != self._hash_snapshot_identity()
+                            or type(through) is not int or not 0 <= through <= current_window):
+                        raise ValueError("hash recovery snapshot identity mismatch")
+                    if through >= start_window - 1:
+                        self._hash_set.import_state(snapshot["entries"], through_window=through)
+                        self._hash_set.prune(current_window)
+                        start_window = through + 1
+            except Exception:
+                self._hash_set.rebuild_from_history([], current_window=current_window)
+                logger.warning("Hash recovery cache unavailable; replaying complete horizon", exc_info=True)
             async def rebuild() -> int:
-                self._hash_set.rebuild_from_history(
-                    [], current_window=current_window,
-                )
                 restored = 0
                 for chunk_start in range(
                     start_window,
@@ -7263,8 +7433,8 @@ class ValidationService:
                         end_window=chunk_end,
                         require_all=True,
                     )
-                    self._hash_set.apply_history(
-                        archives, current_window=current_window,
+                    await asyncio.to_thread(
+                        self._hash_set.apply_history, archives, current_window=current_window,
                     )
                     restored += len(archives)
                 return restored
@@ -7272,6 +7442,13 @@ class ValidationService:
             restored = await asyncio.wait_for(
                 rebuild(), timeout=_STARTUP_HASH_REBUILD_TIMEOUT_SECONDS,
             )
+            self._hash_cache = RolloutHashSet(HASH_DEDUP_RETENTION_WINDOWS)
+            self._hash_cache.import_state(self._hash_set.export_state(), through_window=current_window)
+            self._hash_cache_window = current_window
+            try:
+                await asyncio.to_thread(self._write_hash_snapshot)
+            except OSError:
+                logger.warning("Hash recovery cache persistence unavailable", exc_info=True)
             logger.info(
                 "Rebuilt hash set from %d/%d archive windows "
                 "(current=%d, size=%d)",

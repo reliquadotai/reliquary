@@ -1335,6 +1335,8 @@ class ValidatorServer:
             no_reveal_state_path,
             namespace=no_reveal_namespace,
         )
+        from reliquary.validator.http_metrics import HttpMetrics
+        self.http_metrics = HttpMetrics()
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -1424,7 +1426,10 @@ class ValidatorServer:
         # site runs on the event loop.
         self._verdicts: dict[str, collections.deque[dict]] = {}
         self._verdict_sequence_by_hotkey = collections.Counter()
+        self._verdict_epoch_by_hotkey = {}
         self._verdict_stream_id = uuid.uuid4().hex
+        self._final_verdict_store = None
+        self._verdict_persistence_error = False
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
     def _state_cache_key(self, batcher) -> tuple:
@@ -2465,6 +2470,34 @@ class ValidatorServer:
         """
         self._late_drop_callback = fn
 
+    def configure_final_verdict_store(self, state_dir: str) -> None:
+        from reliquary.validator.verdicts import FinalVerdictStore
+        try:
+            self._final_verdict_store = FinalVerdictStore(
+                os.path.join(state_dir, "miner-verdicts.sqlite3")
+            )
+        except Exception:
+            self._verdict_persistence_error = True
+            logger.exception("Final verdict storage unavailable")
+
+    def persist_final_verdicts(self, records) -> None:
+        if self._final_verdict_store is None:
+            return
+        try:
+            self._final_verdict_store.put_many(records)
+        except Exception:
+            # A failed diagnostic write must not change selection or payment.
+            self._verdict_persistence_error = True
+            logger.exception("Final verdict persistence failed")
+
+    def complete_final_verdict_window(self, window):
+        if self._final_verdict_store is not None and not self._verdict_persistence_error:
+            try:
+                self._final_verdict_store.complete_window(window)
+            except Exception:
+                self._verdict_persistence_error = True
+                logger.exception("Final verdict completion marker failed")
+
     def record_verdict(
         self,
         hotkey: str,
@@ -2476,11 +2509,13 @@ class ValidatorServer:
         telemetry: SubmitTelemetry | None = None,
         reject_stage: str | None = None,
         canonical_rank: int | None = None,
+        selection_reason: str | None = None,
         accepted_into_pool: bool | None = None,
         selected_for_batch: bool | None = None,
         rewarded: bool | None = None,
         sigma: float | None = None,
-    ) -> None:
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
         Called from every code path that decides a lifecycle stage:
@@ -2502,6 +2537,14 @@ class ValidatorServer:
         and (optionally) by a ``since`` unix timestamp.
         """
         if hotkey not in self._verdicts:
+            # ponytail: insertion-age eviction bounds process-wide diagnostic memory.
+            # Durable final outcomes survive; an evicted hotkey gets a new stream epoch.
+            if len(self._verdicts) >= 1024:
+                oldest = next(iter(self._verdicts))
+                self._verdicts.pop(oldest)
+                self._verdict_sequence_by_hotkey.pop(oldest, None)
+                self._verdict_epoch_by_hotkey.pop(oldest, None)
+            self._verdict_epoch_by_hotkey[hotkey] = uuid.uuid4().hex
             self._verdicts[hotkey] = collections.deque(maxlen=VERDICT_CAP_PER_HOTKEY)
         # Normalise enum → value so the ring is a uniform dict shape.
         reason_str = reason.value if isinstance(reason, RejectReason) else reason
@@ -2520,12 +2563,24 @@ class ValidatorServer:
                 for key, value in telemetry.verdict_fields().items()
                 if value is not None
             })
+            entry["prompt_idx"] = telemetry.prompt_idx
+            if telemetry.t_body_completed is not None:
+                entry["body_received_ts"] = telemetry.t_body_completed
+        from reliquary.validator.verdicts import lifecycle_fields
+        entry.update(lifecycle_fields(
+            accepted=accepted, selected=selected_for_batch,
+            selection_reason=selection_reason, reason=reason_str, now=entry["ts"],
+        ))
+        if details:
+            entry.update(details)
         if reject_stage is not None:
             entry["reject_stage"] = reject_stage
         if not accepted:
             entry["reject_reason"] = reason_str
         if canonical_rank is not None:
             entry["canonical_rank"] = canonical_rank
+        if selection_reason is not None:
+            entry["selection_reason"] = selection_reason
         if accepted_into_pool is not None:
             entry["accepted_into_pool"] = accepted_into_pool
         if selected_for_batch is not None:
@@ -2537,6 +2592,7 @@ class ValidatorServer:
         self._verdict_sequence_by_hotkey[hotkey] += 1
         entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)
+        return {key: value for key, value in entry.items() if key != "_sequence"}
 
     def _current_drand_round_best_effort(self) -> int | None:
         batcher = self.active_batcher
@@ -5912,7 +5968,7 @@ class ValidatorServer:
             response_model=VerdictsResponse,
             response_model_exclude_none=True,
         )
-        async def verdicts(hotkey: str, since: float = 0.0) -> VerdictsResponse:
+        async def verdicts(hotkey: str, since: float = 0.0, details: bool = False) -> VerdictsResponse:
             """Recent per-submission verdicts for ``hotkey``, ordered by
             ``ts`` ascending. The default ``since=0`` returns every verdict
             currently in the ring; pass the timestamp of the last verdict
@@ -5940,11 +5996,62 @@ class ValidatorServer:
             ring = self._verdicts.get(hotkey)
             if not ring:
                 return VerdictsResponse(verdicts=[])
+            from reliquary.validator.verdicts import public_verdict
             out = [
-                Verdict(**{key: value for key, value in entry.items() if key != "_sequence"}) for entry in list(ring)
+                Verdict(**public_verdict(entry, detailed=details)) for entry in list(ring)
                 if entry["ts"] > since
             ]
             return VerdictsResponse(verdicts=out)
+
+        @app.get("/http-metrics")
+        async def http_metrics():
+            return JSONResponse(self.http_metrics.snapshot(), headers={"Cache-Control": "no-store"})
+
+        @app.get("/miner-verdict-history/{hotkey}/{window_n}")
+        async def miner_verdict_history(hotkey: str, window_n: int, after: str = "", limit: int = 100):
+            if (window_n < 0 or not 1 <= len(hotkey) <= 128 or not 1 <= limit <= 200
+                    or (after and (len(after) != 64 or any(c not in "0123456789abcdef" for c in after)))):
+                raise HTTPException(status_code=422, detail="invalid_history_query")
+            if self._final_verdict_store is None or self._verdict_persistence_error:
+                raise HTTPException(status_code=503, detail="verdict_storage_unavailable", headers={"Retry-After": "5"})
+            try:
+                result = await asyncio.to_thread(self._final_verdict_store.page, hotkey, window_n, after, limit)
+            except Exception:
+                raise HTTPException(status_code=503, detail="verdict_storage_unavailable", headers={"Retry-After": "5"})
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+        @app.get("/miner-verdicts/{hotkey}/{window_n}/{merkle_root}")
+        async def final_miner_verdict(hotkey: str, window_n: int, merkle_root: str):
+            if (window_n < 0 or len(hotkey) > 128 or len(merkle_root) != 64
+                    or any(c not in "0123456789abcdefABCDEF" for c in merkle_root)):
+                raise HTTPException(status_code=422, detail="invalid_verdict_identity")
+            root = merkle_root.lower()
+            matches = [v for v in self._verdicts.get(hotkey, ())
+                       if v.get("window_n") == window_n and v["merkle_root"].lower() == root]
+            # An earlier durable selection must not be hidden by a later
+            # duplicate request's rejection with the same Merkle root.
+            candidate = next((v for v in reversed(matches) if v.get("selected_for_batch") is True), None)
+            if candidate is None:
+                candidate = next((v for v in reversed(matches) if v.get("is_final") and v.get("accepted_into_pool")), None)
+            if candidate is not None:
+                return {"status": "found", "source": "memory", "verdict": {
+                    k: v for k, v in candidate.items() if k != "_sequence"}}
+            if self._final_verdict_store is not None:
+                try:
+                    result = await asyncio.to_thread(self._final_verdict_store.lookup, hotkey, window_n, root)
+                except Exception:
+                    raise HTTPException(status_code=503, detail="verdict_storage_unavailable")
+                if result["status"] == "found":
+                    return {**result, "source": "durable"}
+            else:
+                result = {"status": "unavailable", "verdict": None}
+            if matches:
+                value = matches[-1]
+                return {"status": "found" if value.get("is_final") else "pending", "source": "memory",
+                        "verdict": {k: v for k, v in value.items() if k != "_sequence"}}
+            if self._verdict_persistence_error:
+                raise HTTPException(status_code=503, detail="verdict_storage_incomplete")
+            return result
 
         @app.get("/miner-verdicts/{hotkey}", response_model=VerdictsPage, response_model_exclude_none=True)
         async def miner_verdicts(
@@ -5952,17 +6059,19 @@ class ValidatorServer:
             after: int = 0,
             stream_id: str | None = None,
             limit: int = VERDICT_CAP_PER_HOTKEY,
+            details: bool = False,
         ) -> VerdictsPage:
             """Cursor-based verdict feed with explicit ring-gap detection."""
+            current_stream_id = self._verdict_epoch_by_hotkey.get(hotkey, self._verdict_stream_id)
             after = max(0, int(after))
             limit = max(1, min(int(limit), VERDICT_CAP_PER_HOTKEY))
-            reset = stream_id is not None and stream_id != self._verdict_stream_id
+            reset = stream_id is not None and stream_id != current_stream_id
             ring = list(self._verdicts.get(hotkey, ()))
             if not ring:
                 latest = int(self._verdict_sequence_by_hotkey.get(hotkey, 0))
                 cursor_ahead = reset or after > latest
                 return VerdictsPage(
-                    stream_id=self._verdict_stream_id,
+                    stream_id=current_stream_id,
                     verdicts=[],
                     next_cursor=latest if cursor_ahead else max(after, latest),
                     oldest_available_cursor=latest,
@@ -5973,12 +6082,10 @@ class ValidatorServer:
             cursor_ahead = reset or after > latest
             effective_after = oldest - 1 if cursor_ahead else after
             truncated = after < oldest - 1 or cursor_ahead
+            from reliquary.validator.verdicts import public_verdict
             entries = [
                 {
-                    **{
-                        key: value for key, value in entry.items()
-                        if key != "_sequence"
-                    },
+                    **public_verdict(entry, detailed=details),
                     "sequence": int(entry["_sequence"]),
                 }
                 for entry in ring
@@ -5990,7 +6097,7 @@ class ValidatorServer:
                 else max(effective_after, oldest - 1)
             )
             return VerdictsPage(
-                stream_id=self._verdict_stream_id,
+                stream_id=current_stream_id,
                 verdicts=entries,
                 next_cursor=next_cursor,
                 oldest_available_cursor=oldest,
@@ -6016,6 +6123,8 @@ class ValidatorServer:
             "False",
         ):
             app.add_middleware(_StateFastPathMiddleware, server=self)
+        from reliquary.validator.http_metrics import HttpMetricsMiddleware
+        app.add_middleware(HttpMetricsMiddleware, metrics=self.http_metrics)
         return app
 
     async def _process_auction_submission(
@@ -6773,6 +6882,8 @@ class ValidatorServer:
             port=self.port,
             log_level="warning",
             access_log=False,
+            # Keep connections through the miner's 5-6 second verdict poll interval.
+            timeout_keep_alive=15,
             http=protocol_class,
         )
         self._server = uvicorn.Server(config)

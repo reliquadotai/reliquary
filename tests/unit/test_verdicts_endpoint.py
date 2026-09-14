@@ -12,7 +12,6 @@ outcome. The endpoint here closes that gap to a few seconds.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -373,7 +372,8 @@ def test_record_verdict_accepts_str_reason_for_late_drops() -> None:
 
 
 @pytest.mark.parametrize("fill_closed", [False, True])
-def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) -> None:
+@pytest.mark.asyncio
+async def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed, monkeypatch) -> None:
     """Auction admission is provisional until seal. The final records must
     distinguish a paid winner, an accepted non-winner, and a deferred-proof
     rejection without turning the non-winner into a protocol failure."""
@@ -398,7 +398,11 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
         reason=RejectReason.GRAIL_FAIL,
     )
     metadata = {
-        id(pending[0]): {"rank": 1, "selected": True, "status": "selected"},
+        id(pending[0]): {
+            "rank": 1,
+            "selected": True,
+            "status": "picked_fifo" if fill_closed else "selected",
+        },
         id(pending[1]): {"rank": 2, "selected": False, "status": "not_needed"},
         id(pending[2]): {
             "rank": 3,
@@ -416,6 +420,10 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
     server = ValidatorServer()
     service = ValidationService.__new__(ValidationService)
     service.server = server
+    import threading
+    loop_thread = threading.get_ident()
+    persistence_threads = []
+    monkeypatch.setattr(server, "persist_final_verdicts", lambda records: persistence_threads.append(threading.get_ident()))
 
     kwargs = {}
     winner_index, loser_index = 0, 1
@@ -429,14 +437,18 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
             eos_tokens=50,
         )]
         winner_index, loser_index = 1, 0
-    service._record_auction_final_verdicts(batcher, **kwargs)
-    service._record_auction_final_verdicts(batcher, **kwargs)  # idempotent
+    await service._record_auction_final_verdicts(batcher, **kwargs)
+    await service._record_auction_final_verdicts(batcher, **kwargs)  # idempotent
 
+    assert len(persistence_threads) == 1 and persistence_threads[0] != loop_thread
     winner = server._verdicts[f"hk{winner_index}"][0]
     assert winner["accepted"] is True
     assert winner["selected_for_batch"] is True
     assert winner["rewarded"] is True
     assert winner["canonical_rank"] == winner_index + 1
+    assert winner["selection_reason"] == (
+        "selected_fifo" if fill_closed else "selected"
+    )
 
     loser = server._verdicts[f"hk{loser_index}"][0]
     assert loser["accepted"] is True
@@ -444,6 +456,10 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
     assert loser["accepted_into_pool"] is True
     assert loser["selected_for_batch"] is False
     assert loser["rewarded"] is False
+    assert loser["selection_reason"] == (
+        "picked_but_unpaid_incomplete_cross_environment_batch"
+        if fill_closed else "not_needed"
+    )
 
     failed = server._verdicts["hk2"][0]
     assert failed["accepted"] is False
@@ -452,6 +468,7 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
     assert failed["selected_for_batch"] is False
     assert failed["rewarded"] is False
     assert failed["reject_stage"] == "auction_seal"
+    assert failed["selection_reason"] == "proof_failed"
 
 
 def test_verdict_carries_sigma_and_stays_backward_compatible():
@@ -488,6 +505,22 @@ def test_record_verdict_stores_and_serves_sigma() -> None:
     assert body["verdicts"][-1]["sigma"] == pytest.approx(0.4841)
 
 
+def test_record_verdict_stores_selection_reason() -> None:
+    server, client = _make_server_open()
+    server.record_verdict(
+        "hk", "d" * 64, True, "accepted", window_n=1,
+        canonical_rank=113,
+        selected_for_batch=False,
+        rewarded=False,
+        selection_reason="proof_not_needed_target_reached",
+    )
+
+    verdict = client.get("/miner-verdicts/hk").json()["verdicts"][-1]
+
+    assert verdict["canonical_rank"] == 113
+    assert verdict["selection_reason"] == "proof_not_needed_target_reached"
+
+
 def test_verdict_without_sigma_omits_the_field() -> None:
     """Legacy/compact shape is unchanged when sigma was never recorded."""
     server, client = _make_server_open()
@@ -496,3 +529,59 @@ def test_verdict_without_sigma_omits_the_field() -> None:
     body = client.get("/verdicts/hk").json()
 
     assert "sigma" not in body["verdicts"][-1]
+
+
+def test_detailed_verdict_survives_rollover_and_restart_without_changing_legacy_feed(tmp_path):
+    server = ValidatorServer()
+    server.configure_final_verdict_store(str(tmp_path))
+    client = TestClient(server.app)
+    root = 'ab' * 32
+    server.record_verdict('hk', root, True, 'accepted', window_n=500,
+                          accepted_into_pool=True)
+    legacy = client.get('/miner-verdicts/hk').json()['verdicts'][0]
+    assert 'selection_status' not in legacy
+    detailed = client.get('/miner-verdicts/hk?details=true').json()['verdicts'][0]
+    assert detailed['selection_status'] == 'pending'
+    assert detailed['is_final'] is False
+    final = server.record_verdict('hk', root, True, 'accepted', window_n=500,
+        accepted_into_pool=True, selected_for_batch=True, selection_reason='selected_fifo')
+    server.persist_final_verdicts([('hk', final)])
+    duplicate = server.record_verdict('hk', root, False, 'duplicate', window_n=500,
+        accepted_into_pool=True, selected_for_batch=False)
+    server.persist_final_verdicts([('hk', duplicate)])
+    for i in range(VERDICT_CAP_PER_HOTKEY + 1):
+        server.record_verdict('hk', f'{i:064x}', False, 'batch_filled', window_n=501)
+    restored = ValidatorServer()
+    restored.configure_final_verdict_store(str(tmp_path))
+    response = TestClient(restored.app).get(f'/miner-verdicts/hk/500/{root}').json()
+    assert response['source'] == 'durable'
+    assert response['verdict']['selection_status'] == 'selected'
+    assert 'retryable' not in response['verdict']
+    missing = TestClient(restored.app).get('/miner-verdicts/hk/499/' + 'cd' * 32).json()
+    assert missing['status'] == 'not_recorded'
+    assert missing['verdict'] is None
+
+
+def test_history_recovers_entire_burst_and_does_not_claim_an_open_snapshot(tmp_path):
+    server = ValidatorServer()
+    server.configure_final_verdict_store(str(tmp_path))
+    records = [('hk', server.record_verdict('hk', f'{i:064x}', True, 'accepted', window_n=500,
+                accepted_into_pool=True, selected_for_batch=False)) for i in range(224)]
+    server.persist_final_verdicts(records)
+    client = TestClient(server.app)
+    assert client.get('/miner-verdicts/hk').json()['truncated']
+    first = client.get('/miner-verdict-history/hk/500?limit=100').json()
+    assert first['snapshot_complete'] is False
+    server.complete_final_verdict_window(500)
+    cursor, roots = '', []
+    while True:
+        page = client.get(f'/miner-verdict-history/hk/500?limit=100&after={cursor}').json()
+        assert page['snapshot_complete'] is True
+        roots.extend(v['merkle_root'] for v in page['verdicts'])
+        if page['next_cursor'] is None:
+            break
+        cursor = page['next_cursor']
+    assert len(set(roots)) == 224
+    assert client.get('/miner-verdict-history/hk/500?limit=999').status_code == 422
+    metrics = client.get('/http-metrics').json()
+    assert metrics['routes']['GET verdict_history']['requests'] == 5

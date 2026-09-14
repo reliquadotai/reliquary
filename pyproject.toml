@@ -9,9 +9,9 @@ dependencies = [
     "numpy>=1.20.0",
     # Pinned exact: apply_chat_template output (encode_prompt) must be
     # byte-identical across all validators and miners, or PROMPT_MISMATCH
-    # rejects honest miners. Bump only with a regenerated golden encoding in
-    # tests/unit/test_tokens.py. Matches the live validator image.
-    "transformers==5.9.0",
+    # rejects honest miners. Bump only after the frozen encodings in
+    # tests/unit/test_tokens.py still pass.
+    "transformers==5.10.4",
     "safetensors>=0.3.0",
     # NetUid is a SCALE newtype in the current Subtensor runtime. Keep the
     # client and codec stack pinned together so runtime API calls encode it

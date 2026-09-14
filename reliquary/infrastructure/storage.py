@@ -276,6 +276,7 @@ async def list_recent_datasets(
     *,
     strict: bool = False,
     task_id: str | None = None,
+    fields: tuple[str, ...] | None = None,
     **client_kwargs,
 ) -> list[dict]:
     """Download last *n* window archives from the flat R2 prefix in ascending order.
@@ -301,11 +302,13 @@ async def list_recent_datasets(
     archives: list[dict] = []
     async with get_s3_client(**client_kwargs) as client:
         bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
-        for window_start, key in keys:
+        async def download(window_start, key):
             try:
                 resp = await client.get_object(Bucket=bucket, Key=key)
                 body = await _read_object_body(resp)
-                data = strict_json_loads(gzip.decompress(body))
+                def decode():
+                    return strict_json_loads(gzip.decompress(body))
+                data = await asyncio.to_thread(decode)
                 if (
                     not isinstance(data, dict)
                     or data.get("window_start") != window_start
@@ -313,12 +316,16 @@ async def list_recent_datasets(
                     raise ValueError(
                         f"archive {key} does not bind window {window_start}"
                     )
-                archives.append(data)
+                return (
+                    data if fields is None else {
+                        field: data[field] for field in fields if field in data
+                    }
+                )
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 if code in ("NoSuchKey", "404"):
                     logger.debug("skip missing window %d (%s)", window_start, key)
-                    continue
+                    return None
                 if strict:
                     raise
                 logger.warning(
@@ -328,6 +335,20 @@ async def list_recent_datasets(
                 if strict:
                     raise
                 logger.warning("skip window %d: parse failed (%s)", window_start, e)
+        # Bound both downloads and decoded payloads; preserve chronological
+        # results and finish/cancel every task before closing its S3 client.
+        # Projected reward replay deliberately retains its one-archive memory
+        # ceiling; full recovery already requests bounded archive chunks.
+        concurrency = 1 if fields is not None else 4
+        for offset in range(0, len(keys), concurrency):
+            tasks = [asyncio.create_task(download(*item)) for item in keys[offset:offset + concurrency]]
+            try:
+                archives.extend(item for item in await asyncio.gather(*tasks) if item is not None)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
     return archives
 
 
