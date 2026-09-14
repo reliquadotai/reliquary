@@ -82,11 +82,19 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
     when the mirror lacks this revision (bootstrap → HF fallback)."""
     from boto3.s3.transfer import TransferConfig
 
-    from reliquary.trainer.publisher import R2_CHECKPOINT_PREFIX
+    from reliquary.trainer.publisher import R2_CHECKPOINT_PREFIX, checkpoint_key, _file_identity
+    from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
+    from reliquary.shared.strict_json import strict_json_loads
+    from reliquary.validator.control import write_json
 
+    revision = require_immutable_checkpoint_revision(revision)
     prefix = f"{R2_CHECKPOINT_PREFIX}/{revision}/"
     listed = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     contents = listed.get("Contents", [])
+    while listed.get("IsTruncated"):
+        listed = client.list_objects_v2(Bucket=bucket, Prefix=prefix,
+                                       ContinuationToken=listed["NextContinuationToken"])
+        contents.extend(listed.get("Contents", []))
     if not contents:
         return False
     config = TransferConfig(
@@ -95,12 +103,44 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
         max_concurrency=16,
     )
     dest.mkdir(parents=True, exist_ok=True)
+    marker = dest / ".download-complete.json"
+    expected = {}
     for obj in contents:
         key = obj["Key"]
         filename = key[len(prefix):]
-        if not filename or "/" in filename:
+        if not filename:
             continue
-        client.download_file(bucket, key, str(dest / filename), Config=config)
+        checkpoint_key(revision, filename)
+        if filename.startswith(".") or (dest / filename).is_symlink():
+            raise ValueError("checkpoint mirror contains an unsafe filename")
+        expected[filename] = {"etag": obj.get("ETag"), "size": obj.get("Size")}
+    if not expected or any(path.name not in {*expected, marker.name} for path in dest.iterdir()):
+        raise ValueError("checkpoint cache contains files outside the mirrored snapshot")
+    identity = {"bucket": bucket, "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),
+                "revision": revision, "objects": expected}
+    try:
+        cached = strict_json_loads(marker.read_bytes())
+        if (cached["identity"] == identity and set(cached["files"]) == set(expected)
+                and all(expected[name]["etag"] and type(expected[name]["size"]) is int
+                        and (dest / name).is_file()
+                        and _file_identity(dest / name) == cached["files"][name]
+                        and cached["files"][name]["size"] == expected[name]["size"]
+                        for name in expected)):
+            logger.info("Checkpoint cache verified: reused %d files", len(expected))
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    # Invalidate before overwriting any file. Interrupted downloads cannot
+    # turn a partially replaced directory into a complete cache entry.
+    marker.unlink(missing_ok=True)
+    files = {}
+    for filename in expected:
+        client.download_file(bucket, prefix + filename, str(dest / filename), Config=config)
+        files[filename] = _file_identity(dest / filename)
+        size = expected[filename]["size"]
+        if size is not None and files[filename]["size"] != size:
+            raise ValueError("checkpoint download size mismatch")
+    write_json(marker, {"identity": identity, "files": files})
     return True
 
 
@@ -212,9 +252,11 @@ def run_train_worker(*, shadow: bool = False) -> None:
         tokenizer = load_tokenizer(model_path, **load_kwargs)
     else:
         snapshot_dir = state_dir / "resume" / revision
+        started = time.monotonic()
         if not _download_checkpoint(client, bucket, revision, snapshot_dir):
             logger.info("R2 mirror lacks %s; falling back to HF", revision)
             snapshot_dir = Path(_hf_download(repo_id, revision))
+        logger.info("startup_stage=checkpoint_download elapsed_seconds=%.3f", time.monotonic() - started)
         profile = validate_checkpoint_profile(snapshot_dir, required=True)
         # The PROFILE is authoritative for run state; the manifest cursor
         # was only a hint for which snapshot to fetch.
@@ -271,12 +313,14 @@ def run_train_worker(*, shadow: bool = False) -> None:
     )
 
     logger.info("loading model from %s", model_path)
+    started = time.monotonic()
     model = load_text_generation_model(
         model_path,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
         **load_kwargs,
     ).to("cuda:0")
+    logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
     try:
         model.gradient_checkpointing_enable()
     except (AttributeError, NotImplementedError):

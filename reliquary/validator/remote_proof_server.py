@@ -451,10 +451,16 @@ def main():
     devices = tuple(d.device_id for d in identities)
     assert_proof_slots_supported(slots_per_device=c.PROOF_SLOTS_PER_DEVICE,
                                  isolation=True, proof_devices=devices)
+    # Pin this to the controller's activation revision to avoid loading the
+    # base model first. Normal adoption still authenticates its publication.
+    start_revision = os.getenv("RELIQUARY_PROOF_START_REVISION", "").strip()
+    if start_revision:
+        from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
+        start_revision = require_immutable_checkpoint_revision(start_revision)
     pool, _ = build_isolated_proof_plane(
         devices=expand_proof_slots(devices, c.PROOF_SLOTS_PER_DEVICE),
-        checkpoint=c.DEFAULT_BASE_MODEL,
-        load_kwargs={"revision": c.DEFAULT_BASE_MODEL_REVISION},
+        checkpoint=repo_id if start_revision else c.DEFAULT_BASE_MODEL,
+        load_kwargs={"revision": start_revision or c.DEFAULT_BASE_MODEL_REVISION},
     )
     # Validate mandatory TLS before allocating any GPU replicas.
     tls = {"ssl_certfile": required("RELIQUARY_PROOF_TLS_CERT"),
@@ -462,7 +468,9 @@ def main():
            "ssl_ca_certs": required("RELIQUARY_PROOF_CLIENT_CA"),
            "ssl_cert_reqs": ssl.CERT_REQUIRED}
     try:
+        started = time.monotonic()
         pool.start()
+        logger.info("startup_stage=proof_model_load elapsed_seconds=%.3f", time.monotonic() - started)
         app = create_proof_app(
             backend=ProofBackend(pool), worker_id=worker_id,
             profile_id=c.PROTOCOL_PROFILE_ID,

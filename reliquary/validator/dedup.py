@@ -133,6 +133,21 @@ class RolloutHashSet:
             h: w for h, w in self._entries.items() if w > horizon
         }
 
+    def export_state(self) -> dict[str, int]:
+        return {digest.hex(): window for digest, window in self._entries.items()}
+
+    def import_state(self, state: dict, *, through_window: int) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("hash snapshot entries must be an object")
+        parsed = {}
+        for value, window in state.items():
+            digest = _canonical_rollout_digest(value, "snapshot rollout hash")
+            if type(window) is not int or not 0 <= window <= through_window:
+                raise ValueError("hash snapshot window outside committed history")
+            parsed[digest] = window
+        self._entries = parsed
+        self.prune(through_window)
+
     def rebuild_from_history(
         self, archives: list[dict], current_window: int,
     ) -> None:
