@@ -136,6 +136,11 @@ class SubmitTelemetry:
     t_arrival: float
     prompt_hash_lead: str
     merkle_root_lead: str
+    environment: str | None = None
+    checkpoint_revision: str | None = None
+    receipt_id: str | None = None
+    admission_rank: int | None = None
+    ordering_policy: str | None = None
     payload_bytes: int | None = None
     content_length_bytes: int | None = None
     payload_sha256_lead: str | None = None
@@ -208,6 +213,8 @@ class SubmitTelemetry:
             )
         return cls(
             window_n=request.window_start,
+            checkpoint_revision=request.checkpoint_hash,
+            receipt_id=getattr(request, "_precommit_receipt_id", None),
             prompt_idx=request.prompt_idx,
             hotkey=request.miner_hotkey,
             merkle_root=request.merkle_root,
@@ -305,6 +312,7 @@ class SubmitTelemetry:
     ) -> None:
         if batcher is None:
             return
+        self.environment = str(getattr(getattr(batcher, "env", None), "name", "")) or None
         self.window_open_drand_round = getattr(
             batcher, "window_open_drand_round", self.window_open_drand_round
         )
@@ -457,6 +465,12 @@ class SubmitTelemetry:
 
     def verdict_fields(self) -> dict[str, Any]:
         return {
+            "environment": self.environment,
+            "checkpoint_revision": self.checkpoint_revision,
+            "receipt_id": self.receipt_id,
+            "canonical_rank": self.admission_rank,
+            "ordering_policy": self.ordering_policy,
+            "rank_scope": "window_environment" if self.admission_rank is not None else None,
             "arrival_ts": self.t_arrival,
             "decision_ts": self.t_decision,
             "payload_bytes": self.payload_bytes,

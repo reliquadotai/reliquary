@@ -523,3 +523,34 @@ def test_verdict_without_sigma_omits_the_field() -> None:
     body = client.get("/verdicts/hk").json()
 
     assert "sigma" not in body["verdicts"][-1]
+
+
+def test_detailed_verdict_survives_rollover_and_restart_without_changing_legacy_feed(tmp_path):
+    server = ValidatorServer()
+    server.configure_final_verdict_store(str(tmp_path))
+    client = TestClient(server.app)
+    root = 'ab' * 32
+    server.record_verdict('hk', root, True, 'accepted', window_n=500,
+                          accepted_into_pool=True)
+    legacy = client.get('/miner-verdicts/hk').json()['verdicts'][0]
+    assert 'selection_status' not in legacy
+    detailed = client.get('/miner-verdicts/hk?details=true').json()['verdicts'][0]
+    assert detailed['selection_status'] == 'pending'
+    assert detailed['is_final'] is False
+    final = server.record_verdict('hk', root, True, 'accepted', window_n=500,
+        accepted_into_pool=True, selected_for_batch=True, selection_reason='selected_fifo')
+    server.persist_final_verdicts([('hk', final)])
+    duplicate = server.record_verdict('hk', root, False, 'duplicate', window_n=500,
+        accepted_into_pool=True, selected_for_batch=False)
+    server.persist_final_verdicts([('hk', duplicate)])
+    for i in range(VERDICT_CAP_PER_HOTKEY + 1):
+        server.record_verdict('hk', f'{i:064x}', False, 'batch_filled', window_n=501)
+    restored = ValidatorServer()
+    restored.configure_final_verdict_store(str(tmp_path))
+    response = TestClient(restored.app).get(f'/miner-verdicts/hk/500/{root}').json()
+    assert response['source'] == 'durable'
+    assert response['verdict']['selection_status'] == 'selected'
+    assert 'retryable' not in response['verdict']
+    missing = TestClient(restored.app).get('/miner-verdicts/hk/499/' + 'cd' * 32).json()
+    assert missing['status'] == 'not_recorded'
+    assert missing['verdict'] is None

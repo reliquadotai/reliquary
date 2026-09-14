@@ -538,6 +538,27 @@ class Verdict(BaseModel):
     accepted: bool
     reason: RejectReason
     ts: float = Field(..., description="Unix timestamp when the verdict landed")
+    stage: Literal["admission", "final"] | None = None
+    is_final: bool | None = None
+    selection_status: Literal["pending", "selected", "not_selected"] | None = None
+    outcome_code: str | None = None
+    explanation: str | None = None
+    reason_details: dict[str, Any] | None = None
+    environment: str | None = None
+    prompt_idx: int | None = None
+    checkpoint_revision: str | None = None
+    receipt_id: str | None = None
+    ordering_policy: str | None = None
+    rank_scope: Literal["window_environment"] | None = None
+    proof_status: Literal["pending", "passed", "failed", "skipped", "unknown"] | None = None
+    proof_reason: str | None = None
+    body_received_ts: float | None = None
+    proof_recorded_ts: float | None = None
+    proof_duration_seconds: float | None = None
+    finalized_ts: float | None = None
+    batch_index: int | None = None
+    selection_target: int | None = None
+    selected_count: int | None = None
     # Optional observability fields. Older verdict records omit these; the
     # endpoint excludes nulls so legacy consumers keep seeing the compact shape
     # for entries that lack lifecycle metadata.
