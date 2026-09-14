@@ -56,6 +56,10 @@ class PriceParams:
     # does not shrink it and a single expensive fill cannot raise it. See
     # ``PriceState.recent_fill_prices``.
     last_good_fills: int
+    # How many consecutive unfilled windows before an environment's price stops
+    # escalating: past this, the likelier explanation is that the environment is
+    # broken on our side, not that the market is short.
+    breaker_timeouts: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,24 +269,39 @@ def advance_by_environment(
 
     ``advance`` is reused unchanged: one environment's price is decided by
     exactly the rule that decided the window's, so there is still one
-    controller to calibrate, not one per environment.
+    controller to calibrate, not one per environment. The one exception is
+    the breaker below: a structurally dry environment must stop escalating
+    without being dropped from the mix, which ``advance`` alone cannot do.
     """
-    return {
-        environment: advance(
-            states.get(
-                environment,
-                PriceState(
-                    price=params.start,
-                    last_good=params.start,
-                    recent_fill_prices=(),
-                ),
-            ),
-            recent,
-            params,
+    decisions: dict[str, PriceDecision] = {}
+    for environment, recent in recent_by_environment.items():
+        if not recent:
+            continue
+        state = states.get(
+            environment,
+            PriceState(price=params.start, last_good=params.start, recent_fill_prices=()),
         )
-        for environment, recent in recent_by_environment.items()
-        if recent
-    }
+        trailing = list(recent)[-params.breaker_timeouts :]
+        if len(trailing) >= params.breaker_timeouts and all(
+            not outcome.filled for outcome in trailing
+        ):
+            logger.critical(
+                "environment %s has not filled for %d consecutive windows; "
+                "freezing its price at %.4f -- treat this as broken on our side "
+                "until shown otherwise",
+                environment, params.breaker_timeouts, state.price,
+            )
+            decisions[environment] = PriceDecision(
+                price=state.price,
+                last_good=state.last_good,
+                recent_fill_prices=state.recent_fill_prices,
+                r=None,
+                r_smoothed=None,
+                regime="frozen",
+            )
+            continue
+        decisions[environment] = advance(state, recent, params)
+    return decisions
 
 
 def replay(
@@ -537,4 +556,6 @@ PRODUCTION_PRICE_PARAMS = PriceParams(
     # other number in this block: the rolling minimum tracks the last 50
     # filling windows.
     last_good_fills=50,
+    # A starting point, calibrated in shadow like every other number here.
+    breaker_timeouts=3,
 )

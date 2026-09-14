@@ -437,3 +437,37 @@ def test_each_environment_keeps_its_own_walk():
 
     # Same outcome shape, different starting prices: the walks do not merge.
     assert decisions["math"].price != decisions["code"].price
+
+
+def test_a_chronically_dry_environment_stops_escalating():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(states, {"math": dry}, PRODUCTION_PRICE_PARAMS)
+
+    assert decisions["math"].regime == "frozen"
+    assert decisions["math"].price == 0.5
+
+
+def test_two_dry_windows_still_snap():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 2
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(states, {"math": dry}, PRODUCTION_PRICE_PARAMS)
+
+    assert decisions["math"].regime == "snap"
+    assert decisions["math"].price > 0.5
