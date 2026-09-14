@@ -659,7 +659,7 @@ class MiningEngine:
 
         submitted = asyncio.Event()
         async with (
-            httpx.AsyncClient(timeout=30) as client,
+            httpx.AsyncClient(timeout=30, limits=httpx.Limits(keepalive_expiry=30)) as client,
             monitor_submission_verdicts(url, self.wallet.hotkey.ss58_address, client, submitted),
         ):
             runtime_fingerprint = None

@@ -62,6 +62,10 @@ class NoValidatorFoundError(RuntimeError):
 class SubmissionError(RuntimeError):
     """All submission retries exhausted."""
 
+    def __init__(self, message="", *, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 class EndpointNotFoundError(SubmissionError):
     """An optional or versioned validator capability is unavailable."""
@@ -198,7 +202,7 @@ async def _get_with_retry(
                     if retry_after is not None else ""
                 )
                 raise SubmissionError(
-                    f"no active window at {full_url}{suffix}"
+                    f"no active window at {full_url}{suffix}", retry_after=retry_after
                 )
             if resp.status_code == 404:
                 raise EndpointNotFoundError(
@@ -206,15 +210,17 @@ async def _get_with_retry(
                 )
             if 400 <= resp.status_code < 500:
                 raise SubmissionError(
-                    f"HTTP {resp.status_code}: {_safe_detail(resp)}"
+                    f"HTTP {resp.status_code}: {_safe_detail(resp)}",
+                    retry_after=_retry_after_seconds(resp)
                 )
             if resp.status_code >= 500:
-                last_exc = SubmissionError(f"HTTP {resp.status_code}")
+                last_exc = SubmissionError(f"HTTP {resp.status_code}", retry_after=_retry_after_seconds(resp))
                 if attempt < len(retry_delays):
                     await _sleep_retry(delay, jitter=jitter)
                 continue
             return response_model.model_validate(resp.json())
-        raise SubmissionError(f"all retries failed: {last_exc}")
+        raise SubmissionError(f"all retries failed: {last_exc}",
+                              retry_after=getattr(last_exc, "retry_after", None))
     finally:
         if own_client:
             await cli.aclose()
@@ -640,7 +646,7 @@ async def get_verdicts_page_v1(
     """Poll final verdicts without delaying state acquisition on failure."""
     verdict_url = (
         f"{url}/miner-verdicts/{quote(hotkey, safe='')}"
-        f"?after={max(0, int(after))}"
+        f"?after={max(0, int(after))}&details=true"
     )
     if stream_id is not None:
         verdict_url += f"&stream_id={quote(stream_id, safe='')}"
@@ -655,32 +661,48 @@ async def get_verdicts_page_v1(
 
 
 @asynccontextmanager
-async def monitor_submission_verdicts(url, hotkey, client, submitted):
+async def monitor_submission_verdicts(url, hotkey, client, submitted, *, on_verdict=None):
     """Poll after the first accepted submission; own and cancel the HTTP task."""
+    # ponytail: one poller per process; multi-process miners should share a watcher.
     async def poll():
-        cursor, stream_id = 0, None
+        cursor, stream_id, failures = 0, None, 0
         await submitted.wait()
         while True:
             try:
-                page = await get_verdicts_page_v1(
-                    url, hotkey, after=cursor, stream_id=stream_id, client=client,
-                )
+                async with asyncio.timeout(_OPTIONAL_TIMEOUT):
+                    page = await get_verdicts_page_v1(
+                        url, hotkey, after=cursor, stream_id=stream_id, client=client,
+                    )
                 if page.truncated:
                     logger.warning("verdict history gap or validator restart; resuming available feed")
                 for verdict in page.verdicts:
-                    logger.info("verdict window=%s root=%s accepted=%s reason=%s selected=%s",
-                                verdict.window_n, verdict.merkle_root, verdict.accepted,
-                                verdict.reason, verdict.selected_for_batch)
+                    if on_verdict is not None:
+                        on_verdict(verdict)
+                    else:
+                        logger.info(
+                            "verdict window=%s prompt=%s root=%s accepted=%s selected=%s status=%s reason=%s proof=%s details=%s",
+                            verdict.window_n, verdict.prompt_idx, verdict.merkle_root,
+                            verdict.accepted, verdict.selected_for_batch,
+                            verdict.selection_status or "legacy",
+                            verdict.outcome_code or verdict.selection_reason or verdict.reason,
+                            verdict.proof_reason, verdict.reason_details,
+                        )
                 cursor, stream_id = page.next_cursor, page.stream_id
+                failures, delay = 0, 5.0
             except EndpointNotFoundError:
+                logger.warning("validator has no verdict feed; watcher stopped")
                 return
-            except (SubmissionError, ValueError):
-                logger.debug("optional verdict poll unavailable")
-            await asyncio.sleep(2.0)
+            except (SubmissionError, ValueError, TimeoutError) as exc:
+                failures = min(failures + 1, 5)
+                delay = max(min(60.0, 5.0 * 2 ** (failures - 1)),
+                            getattr(exc, "retry_after", None) or 0.0)
+                logger.warning("verdict feed unavailable; next poll in %.0fs: %s", delay, exc)
+            # One sequential request, no per-prompt fan-out or retry tasks.
+            await asyncio.sleep(delay + random.uniform(0.0, 1.0))
 
     task = asyncio.create_task(poll(), name="miner-verdicts")
     try:
-        yield
+        yield task
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

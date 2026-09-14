@@ -115,3 +115,61 @@ async def test_retry_after_stays_private():
     )
     assert response._retry_after_seconds == 1.5
     assert response.model_dump() == {"accepted": False, "reason": RejectReason.WINDOW_NOT_ACTIVE}
+
+
+@pytest.mark.asyncio
+async def test_verdict_monitor_preserves_cursor_backs_off_and_resets(monkeypatch):
+    done, submitted = asyncio.Event(), asyncio.Event()
+    submitted.set()
+    calls, delays = [], []
+
+    async def get(*args, **kwargs):
+        calls.append((kwargs['after'], kwargs['stream_id']))
+        if len(calls) == 2:
+            raise submitter.SubmissionError('busy', retry_after=20)
+        return SimpleNamespace(truncated=False, verdicts=[], next_cursor=7, stream_id='s')
+
+    async def sleep(delay):
+        delays.append(delay)
+        if len(delays) == 3:
+            done.set()
+            await asyncio.Future()
+
+    monkeypatch.setattr(submitter, 'get_verdicts_page_v1', get)
+    monkeypatch.setattr(submitter.asyncio, 'sleep', sleep)
+    monkeypatch.setattr(submitter.random, 'uniform', lambda *_: 0)
+    async with submitter.monitor_submission_verdicts('https://test', 'hk', None, submitted):
+        await asyncio.wait_for(done.wait(), 1)
+    assert calls == [(0, None), (7, 's'), (7, 's')]
+    assert delays == [5, 20, 5]
+
+
+@pytest.mark.asyncio
+async def test_verdict_feed_requests_details_and_retains_retry_after():
+    async def handle(request):
+        assert request.url.params['details'] == 'true'
+        return httpx.Response(429, headers={'Retry-After': '25'}, json={'detail': 'busy'})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        with pytest.raises(submitter.SubmissionError) as exc:
+            await submitter.get_verdicts_page_v1('https://test', 'hk', client=client)
+    assert exc.value.retry_after == 25
+
+
+def test_watch_verdicts_cli_prints_json_without_loading_a_miner(monkeypatch):
+    from contextlib import asynccontextmanager
+    from typer.testing import CliRunner
+    from reliquary.cli.main import app
+
+    @asynccontextmanager
+    async def monitor(url, hotkey, client, submitted, *, on_verdict):
+        assert url == 'https://test' and hotkey == 'public-hk'
+        assert submitted.is_set()
+        on_verdict(SimpleNamespace(model_dump_json=lambda **_: '{"selection_status":"pending"}'))
+        task = asyncio.create_task(asyncio.sleep(0))
+        yield task
+
+    monkeypatch.setattr(submitter, 'monitor_submission_verdicts', monitor)
+    result = CliRunner().invoke(app, ['watch-verdicts', '--validator-url', 'https://test/', '--hotkey', 'public-hk'])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == '{"selection_status":"pending"}'

@@ -6769,6 +6769,8 @@ class ValidatorServer:
             port=self.port,
             log_level="warning",
             access_log=False,
+            # Keep connections through the miner's 5-6 second verdict poll interval.
+            timeout_keep_alive=15,
             http=protocol_class,
         )
         self._server = uvicorn.Server(config)

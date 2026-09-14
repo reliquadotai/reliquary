@@ -43,6 +43,38 @@ logger = logging.getLogger(__name__)
 _grader_proc: "subprocess.Popen | None" = None
 
 
+
+@app.command("watch-verdicts")
+def watch_verdicts(
+    hotkey: str = typer.Option(..., help="Public miner SS58 address; no wallet or private key required"),
+    validator_url: str = typer.Option(..., help="Validator HTTP(S) base URL"),
+):
+    """Watch verdicts as JSON lines. Run once per hotkey; Ctrl-C stops it."""
+    import httpx
+    from reliquary.miner.submitter import monitor_submission_verdicts
+
+    if not validator_url.startswith(("http://", "https://")):
+        raise typer.BadParameter("Use an http:// or https:// validator URL")
+    logging.basicConfig(level=logging.WARNING)
+
+    async def run():
+        submitted = asyncio.Event()
+        submitted.set()
+        async with httpx.AsyncClient(
+            timeout=2, limits=httpx.Limits(max_connections=2, keepalive_expiry=30),
+        ) as client:
+            async with monitor_submission_verdicts(
+                validator_url.rstrip("/"), hotkey, client, submitted,
+                on_verdict=lambda verdict: typer.echo(verdict.model_dump_json(exclude_none=True)),
+            ) as task:
+                await task
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
 def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
     names = [name.strip() for name in value.split(",")]
     return resolve_environment_mix(
