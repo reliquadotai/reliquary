@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Mapping
 from typing import Any, Callable, NamedTuple, Sequence
 
 from reliquary.constants import B_BATCH, FILL_CLOSED_EMISSIONS_PER_WINDOW, FILL_CLOSED_PICKS_PER_WINDOW
@@ -74,7 +75,7 @@ class FillClosedBatchAssembler:
         env_order: Sequence[str],
         enqueue_fn: Callable[[int, bytes], None],
         tombstone_fn: Callable[[int, bytes], None],
-        window_pool: float = 1.0,
+        window_pool: float | Mapping[str, float] = 1.0,
         commit_fn: Callable[[int, bytes, bool, dict | None], None] | None = None,
     ) -> None:
         self.window_start = int(window_start)
@@ -85,7 +86,20 @@ class FillClosedBatchAssembler:
         self._commit_fn = commit_fn
         # This window's whole emission budget. Payment is computed here, the
         # only place a v6 window's assembled batches are known.
-        self._window_pool = float(window_pool)
+        # A scalar keeps today's even split; a map gives each environment its
+        # own pool. Both shapes are accepted so a scalar caller is unchanged.
+        if isinstance(window_pool, Mapping):
+            missing = [e for e in self._env_order if e not in window_pool]
+            if missing:
+                raise ValueError(
+                    f"window_pool is missing environments: {', '.join(missing)}"
+                )
+            self._pool_by_env = {e: float(window_pool[e]) for e in self._env_order}
+        else:
+            total = float(window_pool)
+            share = total / len(self._env_order) if self._env_order else 0.0
+            self._pool_by_env = {e: share for e in self._env_order}
+        self._window_pool = sum(self._pool_by_env.values())
         self._rewards_by_hotkey: dict[str, float] = {}
         # R24: every group this window actually PAID, in payment order, per
         # environment, each paired with the batch index it was paid in
@@ -427,10 +441,13 @@ class FillClosedBatchAssembler:
 
         Two divisors, both deliberate:
 
-        * ``len(self._env_order)`` -- each environment keeps its own pool,
-          exactly as the seal path's ``pool_per_env`` does. Pooling the
-          environments together would let a long-completion environment
-          take a short one's emission through raw token mass alone.
+        * ``self.pool_for(environment)`` -- each environment keeps its own
+          pool, exactly as the seal path's ``pool_per_env`` does. Pooling
+          the environments together would let a long-completion environment
+          take a short one's emission through raw token mass alone. A
+          scalar ``window_pool`` still splits this evenly across
+          environments (see ``__init__``); a per-environment map instead
+          gives each environment exactly its own declared pool.
         * ``picks_target`` -- a v6 window emits up to that many batches
           where the seal path emitted exactly
           one, so one window's pool is spread evenly over its batches.
@@ -444,12 +461,8 @@ class FillClosedBatchAssembler:
         """
         if not self._env_order:
             return
-        batch_pool_per_env = (
-            self._window_pool
-            / len(self._env_order)
-            / self.picks_target
-        )
         for environment, env_batch in window_batches.items():
+            batch_pool_per_env = self.pool_for(environment) / self.picks_target
             self._paid_groups.setdefault(environment, []).extend(
                 (int(batch_index), group) for group in env_batch
             )
@@ -495,6 +508,9 @@ class FillClosedBatchAssembler:
     @property
     def window_pool(self) -> float:
         return self._window_pool
+
+    def pool_for(self, environment: str) -> float:
+        return self._pool_by_env[environment]
 
     def paid_groups(self) -> dict[str, list[tuple[int, Any]]]:
         """The groups this window's reward map was computed over (R24),

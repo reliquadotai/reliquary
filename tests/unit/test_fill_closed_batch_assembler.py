@@ -7,6 +7,8 @@ two environments can arrive in any interleaving. The assembler must pair them
 up correctly regardless of arrival order, write exactly one payload per
 completed cycle, and never skip or duplicate a cycle's chunk.
 """
+import pytest
+
 from reliquary.constants import B_BATCH
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
@@ -23,6 +25,48 @@ from reliquary.validator.fill_closed_batch_assembler import (
 from tests.unit.test_training_payload_codec import _group, _roll
 
 ENV_ORDER = ["openmathinstruct", "opencodeinstruct"]
+
+
+def _assembler(
+    *,
+    env_order: list,
+    window_pool=1.0,
+    window_start: int = 42,
+) -> FillClosedBatchAssembler:
+    """Builds an assembler the same way every other test in this file does
+    inline (there is no shared fixture here -- see e.g. the constructions
+    at :61 and :122): a no-op ``enqueue_fn``/``tombstone_fn`` pair, varying
+    only what these pool tests need, ``env_order`` and ``window_pool``.
+    """
+    return FillClosedBatchAssembler(
+        window_start=window_start,
+        env_order=env_order,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool=window_pool,
+    )
+
+
+def test_a_scalar_pool_still_divides_evenly():
+    """The identity case: today's behaviour, byte for byte."""
+    assembler = _assembler(env_order=["math", "code"], window_pool=1.0)
+
+    assert assembler.pool_for("math") == assembler.pool_for("code")
+    assert assembler.pool_for("math") + assembler.pool_for("code") == pytest.approx(1.0)
+
+
+def test_a_per_environment_pool_is_used_as_given():
+    assembler = _assembler(
+        env_order=["math", "code"], window_pool={"math": 0.6, "code": 0.4}
+    )
+
+    assert assembler.pool_for("math") == pytest.approx(0.6)
+    assert assembler.pool_for("code") == pytest.approx(0.4)
+
+
+def test_an_environment_missing_from_the_map_is_refused():
+    with pytest.raises(ValueError, match="code"):
+        _assembler(env_order=["math", "code"], window_pool={"math": 1.0})
 
 
 def _chunk(tag: int, env: str) -> list:

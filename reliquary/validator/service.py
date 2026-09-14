@@ -739,6 +739,10 @@ class ValidationService:
         # this explicitly, from the registry (see resolve_task_config /
         # TaskConfig.emission_cap).
         emission_cap: float = 1.0,
+        # Per-environment share of ``emission_cap`` (TaskConfig.env_caps).
+        # None/empty means "no split declared" -- the assembler then divides
+        # ``emission_cap`` evenly, exactly as it always has.
+        env_caps: dict[str, float] | None = None,
         price_params: Any | None = None,
         proof_worker_pool: Any = None,
         signer_client: Any | None = None,
@@ -868,6 +872,10 @@ class ValidationService:
         )
         # What this task may pay per window. 1.0 is the legacy single-task pool.
         self._emission_cap = float(emission_cap)
+        # Each environment's own share of ``self._emission_cap``, or empty
+        # when no split was declared -- see the FillClosedBatchAssembler
+        # construction below, which falls back to the scalar in that case.
+        self._env_caps: dict[str, float] = dict(env_caps or {})
         self._price_params = price_params
         from reliquary.validator.proof_measurements import ProofMeasurements
         self._proof_measurements = ProofMeasurements.from_environment(proof_worker_pool)
@@ -2480,7 +2488,9 @@ class ValidationService:
                 # splits it per environment and per batch itself -- it is
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
-                window_pool=self._emission_cap,
+                # A declared per-environment split (self._env_caps) is used
+                # as given; otherwise the scalar cap still divides evenly.
+                window_pool=self._env_caps or self._emission_cap,
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
