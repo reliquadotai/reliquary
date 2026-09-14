@@ -4,6 +4,9 @@ Phase 1 exists to answer a question we cannot answer any other way: is the
 capturable gap 5x or 50x? It answers it by computing exactly what the armed
 controller would have paid, publishing it, and paying none of it. Nothing here
 may change what a miner earns.
+
+These tests pin the disarmed path (``RELIQUARY_EMISSION_PRICE_ARMED=0``); the
+armed pool is covered in test_price_arming.py.
 """
 
 from __future__ import annotations
@@ -17,6 +20,11 @@ from tests.unit.test_archive_window_content import (
     _FakeWallet,
     _valid_submission,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disarmed(monkeypatch):
+    monkeypatch.setattr("reliquary.constants.EMISSION_PRICE_ARMED", False)
 
 
 class _StubQueue:

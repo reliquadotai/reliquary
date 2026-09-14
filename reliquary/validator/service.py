@@ -188,6 +188,12 @@ def _price_signal_int(value: Any) -> int | None:
 # ``median_rounds`` matter to the controller, which filters what it is handed;
 # this is the bound that keeps the deque from growing.
 _PRICE_SHADOW_HISTORY_WINDOWS = 64
+# What the price walk reads back from an archive at startup; nothing else is loaded.
+_PRICE_ARCHIVE_FIELDS = (
+    "window_start", "window_status", "window_open_round", "window_close_round",
+    "collect_ready_round", "collect_ready_round_by_environment",
+    "training_rounds", "validation_rounds", "emission_price_shadow",
+)
 
 
 def _window_price_signal(first_batcher, batcher_dict, target_for):
@@ -2503,9 +2509,10 @@ class ValidationService:
                 # splits it per environment and per batch itself -- it is
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
-                # A declared per-environment split (self._env_caps) is used
-                # as given; otherwise the scalar cap still divides evenly.
-                window_pool=self._env_caps or self._emission_cap,
+                # Each environment's cap, scaled by its own price when armed.
+                window_pool=self._window_pool_for(
+                    [name for name, _ in self.env_mix]
+                ),
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
@@ -4420,17 +4427,10 @@ class ValidationService:
         price_signal: dict[str, Any] | None,
         window_status: str = "completed",
     ) -> dict[str, Any] | None:
-        """What the armed controller WOULD have paid, having paid none of it.
+        """Advance the price walk after a window and publish the decision.
 
-        Phase 1 exists to answer a question no amount of reasoning settles: is
-        the capturable gap 5x or 50x? It answers by publishing the number and
-        applying nothing, so ``applied`` is False and stays False until the
-        window pool actually consumes it.
-
-        The state lives in memory rather than being recovered from the archive.
-        A restart therefore resets the walk to ``start``, which costs a shadow
-        run nothing -- but arming this will need the state seeded from the last
-        archive, or a restart would silently hand miners back the full pool.
+        When armed, the next window's pool reads this walk (``_window_pool_for``),
+        and a restart resumes it from the archives (``_restore_price_walk``).
 
         ``window_status`` defaults to "completed" for every existing caller.
         ``_archive_window`` passes its own real status instead: a hardcoded
@@ -4443,6 +4443,7 @@ class ValidationService:
         """
         if price_signal is None:
             return None
+        from reliquary.constants import EMISSION_PRICE_ARMED
         from reliquary.validator.emission_price import (
             PRODUCTION_PRICE_PARAMS,
             PriceState,
@@ -4477,7 +4478,7 @@ class ValidationService:
             "r": decision.r,
             "r_smoothed": decision.r_smoothed,
             "regime": decision.regime,
-            "applied": False,
+            "applied": EMISSION_PRICE_ARMED,
         }
         # A shadow number is explicitly ``applied: False``, but this method's
         # only caller (``_archive_window``) is wrapped by a handler that
@@ -4497,6 +4498,97 @@ class ValidationService:
             shadow["by_environment"] = by_environment
         self._publish_price_view(shadow, price_params)
         return shadow
+
+    def _window_pool_for(self, env_order: list[str]):
+        """What each environment of a new window may pay: its cap, scaled by its price.
+
+        Returns the declared pool object itself while every price is at its cap, so
+        an unpriced window is identical to one built before the price was armed.
+        """
+        from reliquary.constants import EMISSION_PRICE_ARMED
+        from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+        declared = self._env_caps or self._emission_cap
+        if not EMISSION_PRICE_ARMED or not env_order:
+            return declared
+        if isinstance(declared, dict) and any(env not in declared for env in env_order):
+            return declared
+        params = self._price_params or PRODUCTION_PRICE_PARAMS
+        window_state = getattr(self, "_price_shadow_state", None)
+        states = getattr(self, "_price_shadow_states_by_environment", None) or {}
+        factors = {}
+        for environment in env_order:
+            state = states.get(environment) or window_state
+            price = state.price if state is not None else params.start
+            factors[environment] = (
+                min(1.0, max(0.0, price / params.cap)) if params.cap > 0 else 0.0
+            )
+        if all(factor == 1.0 for factor in factors.values()):
+            return declared
+        if isinstance(declared, dict):
+            # A narrowed mix keeps the task's whole cap, in declared proportions.
+            running = math.fsum(float(declared[env]) for env in env_order)
+            scale = (
+                math.fsum(float(value) for value in declared.values()) / running
+                if running > 0 else 0.0
+            )
+            base = {env: float(declared[env]) * scale for env in env_order}
+        else:
+            base = {env: float(declared) / len(env_order) for env in env_order}
+        return {env: base[env] * factors[env] for env in env_order}
+
+    def _seed_price_walk(self, walk) -> None:
+        """Install a walk rebuilt from the archives as this process's own."""
+        self._price_shadow_outcomes = collections.deque(
+            walk.history, maxlen=_PRICE_SHADOW_HISTORY_WINDOWS
+        )
+        self._price_shadow_state = walk.state
+        self._price_shadow_outcomes_by_environment = {
+            environment: collections.deque(trail, maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
+            for environment, trail in walk.history_by_environment.items()
+        }
+        self._price_shadow_states_by_environment = dict(walk.states_by_environment)
+
+    async def _restore_price_walk(self) -> None:
+        """Resume the price walk from the archives, so a restart never resets the price.
+
+        While armed, an unreadable history refuses startup: starting over would hand
+        miners back the starting pool.
+        """
+        from reliquary.constants import EMISSION_PRICE_ARMED, TASK_ID
+        from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS, restore_walk
+
+        end_window = int(getattr(self, "_window_n", 0) or 0)
+        if end_window <= 0:
+            return
+        params = self._price_params or PRODUCTION_PRICE_PARAMS
+        try:
+            archives = await self._load_archive_range(
+                start_window=max(0, end_window - _PRICE_SHADOW_HISTORY_WINDOWS + 1),
+                end_window=end_window,
+                require_all=False,
+                task_id=TASK_ID,
+                fields=_PRICE_ARCHIVE_FIELDS,
+            )
+        except Exception:
+            if EMISSION_PRICE_ARMED:
+                logger.exception(
+                    "Price history unreadable; refusing startup rather than "
+                    "paying the starting price"
+                )
+                raise
+            logger.exception("Price history unreadable; the published price starts over")
+            return
+        walk = restore_walk(archives, params)
+        self._seed_price_walk(walk)
+        if walk.latest_shadow is not None:
+            self._publish_price_view(walk.latest_shadow, params)
+        logger.info(
+            "Price walk restored from %d archived windows: price=%s armed=%s",
+            len(archives),
+            None if walk.state is None else walk.state.price,
+            EMISSION_PRICE_ARMED,
+        )
 
     def _publish_price_view(self, shadow: dict[str, Any], price_params) -> None:
         """Hand the server the price block ``GET /tasks`` shows miners.
@@ -4536,6 +4628,7 @@ class ValidationService:
         Absent for an archive written before the per-environment map existed,
         so a reader can tell "no split" from "every environment at start".
         """
+        from reliquary.constants import EMISSION_PRICE_ARMED
         from reliquary.validator.emission_price import (
             advance_by_environment,
             outcomes_by_environment_from_archive,
@@ -4577,7 +4670,7 @@ class ValidationService:
                 "r": environment_decision.r,
                 "r_smoothed": environment_decision.r_smoothed,
                 "regime": environment_decision.regime,
-                "applied": False,
+                "applied": EMISSION_PRICE_ARMED,
             }
             for environment, environment_decision in decisions.items()
         }
@@ -6051,6 +6144,7 @@ class ValidationService:
         await startup_step("prompt_cooldown", self._rebuild_cooldown_from_history())
         await startup_step("content_cooldown", self._restore_content_cooldown())
         await startup_step("hash_history", self._rebuild_hashes_from_history())
+        await startup_step("emission_price", self._restore_price_walk())
         self._log_startup_config_banner()
 
         # Start the background archive-upload worker. It scans the queue
@@ -6877,6 +6971,8 @@ class ValidationService:
         start_window: int,
         end_window: int,
         require_all: bool,
+        task_id: str | None = None,
+        fields: tuple[str, ...] | None = None,
     ) -> list[dict]:
         """Merge remote and locally queued archives without identity gaps."""
         if end_window < start_window:
@@ -6888,6 +6984,8 @@ class ValidationService:
                 current_window=end_window + 1,
                 n=len(expected),
                 strict=True,
+                **({"task_id": task_id} if task_id is not None else {}),
+                **({"fields": fields} if fields is not None else {}),
             )
         except Exception as exc:
             remote_error = exc
@@ -6902,6 +7000,11 @@ class ValidationService:
             if archive_queue is not None
             else {}
         )
+        if fields is not None:
+            local = {
+                window: {field: archive[field] for field in fields if field in archive}
+                for window, archive in local.items()
+            }
         merged: dict[int, dict] = {}
         for archive in remote:
             window_start = archive.get("window_start")

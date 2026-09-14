@@ -1361,6 +1361,12 @@ if (
         f"MIN_INCENTIVE_SHARE={MIN_INCENTIVE_SHARE}"
     )
 
+# Whether each window's pool follows the discovered emission price. Armed by
+# default; "0" is the kill switch, and the price is then only published.
+EMISSION_PRICE_ARMED = _os.environ.get(
+    "RELIQUARY_EMISSION_PRICE_ARMED", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # ────────────────  GRPO TRAINING (v2.1)  ────────────────
 
 # Learning rate for AdamW. RL fine-tuning on pretrained LLMs is sensitive;

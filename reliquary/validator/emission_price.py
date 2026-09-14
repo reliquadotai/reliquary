@@ -561,6 +561,102 @@ def window_ready_round(
     return max(rounds.values(), default=None)
 
 
+@dataclass(frozen=True)
+class RestoredWalk:
+    """The price walk as the archives left it, and the last decision they carry."""
+
+    state: PriceState | None
+    history: tuple[WindowOutcome, ...]
+    states_by_environment: dict[str, PriceState]
+    history_by_environment: dict[str, tuple[EnvironmentOutcome, ...]]
+    latest_shadow: dict[str, Any] | None
+
+
+def _archived_price(decision: Any, params: PriceParams) -> tuple[float, float] | None:
+    """An archived decision's price and last_good, clamped, or None if unreadable."""
+    if not isinstance(decision, Mapping):
+        return None
+    values = []
+    for field in ("price", "last_good"):
+        value = decision.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value):
+            return None
+        values.append(min(max(float(value), params.floor), params.cap))
+    return values[0], values[1]
+
+
+def restore_walk(
+    archives: Sequence[Mapping[str, Any]], params: PriceParams
+) -> RestoredWalk:
+    """Rebuild the price walk from archived windows, oldest first.
+
+    Each archive carries its window's decision and the signal behind it, so the
+    walk resumes where it stopped; the rolling minimum is rebuilt with exactly
+    the rule ``advance`` applies, one window at a time.
+    """
+    history: list[WindowOutcome] = []
+    history_by_environment: dict[str, list[EnvironmentOutcome]] = {}
+    state: PriceState | None = None
+    states_by_environment: dict[str, PriceState] = {}
+    fills: tuple[float, ...] = ()
+    fills_by_environment: dict[str, tuple[float, ...]] = {}
+    latest_shadow: dict[str, Any] | None = None
+    for record in archives:
+        if not isinstance(record, Mapping) or record.get("window_status") == "aborted":
+            continue
+        outcome = outcome_from_archive(record)
+        if outcome is not None:
+            history.append(outcome)
+        environment_outcomes = outcomes_by_environment_from_archive(record) or {}
+        for environment, environment_outcome in environment_outcomes.items():
+            history_by_environment.setdefault(environment, []).append(environment_outcome)
+        shadow = record.get("emission_price_shadow")
+        decided = _archived_price(shadow, params)
+        if decided is not None:
+            latest_shadow = dict(shadow)
+            price, last_good = decided
+            if outcome is not None and outcome.filled and not _timed_out(outcome):
+                fills = (*fills, price)[-params.last_good_fills:]
+            state = PriceState(
+                price=price,
+                last_good=min(fills) if fills else last_good,
+                recent_fill_prices=fills,
+            )
+        by_environment = shadow.get("by_environment") if isinstance(shadow, Mapping) else None
+        if not isinstance(by_environment, Mapping):
+            continue
+        for environment, decision in by_environment.items():
+            environment_decided = _archived_price(decision, params)
+            if environment_decided is None:
+                continue
+            price, last_good = environment_decided
+            environment_fills = fills_by_environment.get(environment, ())
+            environment_outcome = environment_outcomes.get(environment)
+            if (
+                environment_outcome is not None
+                and environment_outcome.filled
+                and not _timed_out(environment_outcome)
+            ):
+                environment_fills = (*environment_fills, price)[-params.last_good_fills:]
+                fills_by_environment[environment] = environment_fills
+            states_by_environment[environment] = PriceState(
+                price=price,
+                last_good=min(environment_fills) if environment_fills else last_good,
+                recent_fill_prices=environment_fills,
+            )
+    return RestoredWalk(
+        state=state,
+        history=tuple(history),
+        states_by_environment=states_by_environment,
+        history_by_environment={
+            environment: tuple(trail) for environment, trail in history_by_environment.items()
+        },
+        latest_shadow=latest_shadow,
+    )
+
+
 def price_signal_fields(
     *,
     open_round: int | None,
