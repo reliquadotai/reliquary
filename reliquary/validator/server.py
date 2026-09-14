@@ -1288,6 +1288,8 @@ class ValidatorServer:
             no_reveal_state_path,
             namespace=no_reveal_namespace,
         )
+        from reliquary.validator.http_metrics import HttpMetrics
+        self.http_metrics = HttpMetrics()
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -1377,6 +1379,7 @@ class ValidatorServer:
         # site runs on the event loop.
         self._verdicts: dict[str, collections.deque[dict]] = {}
         self._verdict_sequence_by_hotkey = collections.Counter()
+        self._verdict_epoch_by_hotkey = {}
         self._verdict_stream_id = uuid.uuid4().hex
         self._final_verdict_store = None
         self._verdict_persistence_error = False
@@ -2440,6 +2443,14 @@ class ValidatorServer:
             self._verdict_persistence_error = True
             logger.exception("Final verdict persistence failed")
 
+    def complete_final_verdict_window(self, window):
+        if self._final_verdict_store is not None and not self._verdict_persistence_error:
+            try:
+                self._final_verdict_store.complete_window(window)
+            except Exception:
+                self._verdict_persistence_error = True
+                logger.exception("Final verdict completion marker failed")
+
     def record_verdict(
         self,
         hotkey: str,
@@ -2479,6 +2490,14 @@ class ValidatorServer:
         and (optionally) by a ``since`` unix timestamp.
         """
         if hotkey not in self._verdicts:
+            # ponytail: insertion-age eviction bounds process-wide diagnostic memory.
+            # Durable final outcomes survive; an evicted hotkey gets a new stream epoch.
+            if len(self._verdicts) >= 1024:
+                oldest = next(iter(self._verdicts))
+                self._verdicts.pop(oldest)
+                self._verdict_sequence_by_hotkey.pop(oldest, None)
+                self._verdict_epoch_by_hotkey.pop(oldest, None)
+            self._verdict_epoch_by_hotkey[hotkey] = uuid.uuid4().hex
             self._verdicts[hotkey] = collections.deque(maxlen=VERDICT_CAP_PER_HOTKEY)
         # Normalise enum → value so the ring is a uniform dict shape.
         reason_str = reason.value if isinstance(reason, RejectReason) else reason
@@ -5910,6 +5929,23 @@ class ValidatorServer:
             ]
             return VerdictsResponse(verdicts=out)
 
+        @app.get("/http-metrics")
+        async def http_metrics():
+            return JSONResponse(self.http_metrics.snapshot(), headers={"Cache-Control": "no-store"})
+
+        @app.get("/miner-verdict-history/{hotkey}/{window_n}")
+        async def miner_verdict_history(hotkey: str, window_n: int, after: str = "", limit: int = 100):
+            if (window_n < 0 or not 1 <= len(hotkey) <= 128 or not 1 <= limit <= 200
+                    or (after and (len(after) != 64 or any(c not in "0123456789abcdef" for c in after)))):
+                raise HTTPException(status_code=422, detail="invalid_history_query")
+            if self._final_verdict_store is None or self._verdict_persistence_error:
+                raise HTTPException(status_code=503, detail="verdict_storage_unavailable", headers={"Retry-After": "5"})
+            try:
+                result = await asyncio.to_thread(self._final_verdict_store.page, hotkey, window_n, after, limit)
+            except Exception:
+                raise HTTPException(status_code=503, detail="verdict_storage_unavailable", headers={"Retry-After": "5"})
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
         @app.get("/miner-verdicts/{hotkey}/{window_n}/{merkle_root}")
         async def final_miner_verdict(hotkey: str, window_n: int, merkle_root: str):
             if (window_n < 0 or len(hotkey) > 128 or len(merkle_root) != 64
@@ -5952,15 +5988,16 @@ class ValidatorServer:
             details: bool = False,
         ) -> VerdictsPage:
             """Cursor-based verdict feed with explicit ring-gap detection."""
+            current_stream_id = self._verdict_epoch_by_hotkey.get(hotkey, self._verdict_stream_id)
             after = max(0, int(after))
             limit = max(1, min(int(limit), VERDICT_CAP_PER_HOTKEY))
-            reset = stream_id is not None and stream_id != self._verdict_stream_id
+            reset = stream_id is not None and stream_id != current_stream_id
             ring = list(self._verdicts.get(hotkey, ()))
             if not ring:
                 latest = int(self._verdict_sequence_by_hotkey.get(hotkey, 0))
                 cursor_ahead = reset or after > latest
                 return VerdictsPage(
-                    stream_id=self._verdict_stream_id,
+                    stream_id=current_stream_id,
                     verdicts=[],
                     next_cursor=latest if cursor_ahead else max(after, latest),
                     oldest_available_cursor=latest,
@@ -5986,7 +6023,7 @@ class ValidatorServer:
                 else max(effective_after, oldest - 1)
             )
             return VerdictsPage(
-                stream_id=self._verdict_stream_id,
+                stream_id=current_stream_id,
                 verdicts=entries,
                 next_cursor=next_cursor,
                 oldest_available_cursor=oldest,
@@ -6012,6 +6049,8 @@ class ValidatorServer:
             "False",
         ):
             app.add_middleware(_StateFastPathMiddleware, server=self)
+        from reliquary.validator.http_metrics import HttpMetricsMiddleware
+        app.add_middleware(HttpMetricsMiddleware, metrics=self.http_metrics)
         return app
 
     async def _process_auction_submission(
@@ -6769,6 +6808,8 @@ class ValidatorServer:
             port=self.port,
             log_level="warning",
             access_log=False,
+            # Keep connections through the miner's 5-6 second verdict poll interval.
+            timeout_keep_alive=15,
             http=protocol_class,
         )
         self._server = uvicorn.Server(config)

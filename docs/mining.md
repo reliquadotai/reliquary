@@ -473,7 +473,7 @@ If submissions are rejected, the `reason` field tells you why (see the rejection
 
 ## Monitoring and stopping
 
-The miner loop runs until killed. Between windows (when `/state` returns `state != "open"`) it sleeps 1 s and re-polls. On network errors it backs off for up to 12 s. No per-window state is kept locally, so restarting is safe.
+The miner loop runs until killed. It prefers `/miner-state` with conditional ETag requests and falls back to `/state` when unsupported. Outside OPEN it normally waits 1 second between polls; state-fetch failures wait `POLL_INTERVAL_SECONDS` (10 seconds) after bounded HTTP attempts. The checkpoint identity is persisted locally and checked on restart. The verdict monitor runs independently of generation.
 
 ```bash
 # GPU utilization during generation and proof construction.
@@ -491,3 +491,49 @@ grep -E "submitted|rejected|accepted" ~/miner.log | tail -50
 - **`REWARD_MISMATCH`**: for OpenMath, validator-side reward computation disagreed with the miner's claimed `rollout.reward`. For OpenCode it may also report an ambiguous grader worker crash. Recheck Math parsing or inspect repeatable crash-triggering Code output.
 - **All submissions land `OUT_OF_ZONE`**: the prompts you are selecting are too easy (`sigma ~= 0`) or too hard (`sigma ~= 0`) for the current checkpoint. On OpenCode, this often means all-zero or all-pass structured-case vectors. Split metrics by environment before changing global filters.
 - **Persistent `WRONG_CHECKPOINT`**: the miner is not picking up the latest revision from `/state`. Ensure the poll loop reads `checkpoint_revision` before each submission.
+
+### Start-once verdict watcher
+
+The updated `reliquary mine` command already monitors verdicts after its first
+submission. No extra command is needed for that miner. Custom miners can run:
+
+```bash
+reliquary watch-verdicts \
+  --validator-url http://62.238.81.36:8000 \
+  --hotkey YOUR_PUBLIC_HOTKEY | tee -a verdicts.jsonl
+```
+
+Run once per hotkey, not per GPU or prompt. This requires a Reliquary version
+containing the `watch-verdicts` command; check `reliquary watch-verdicts --help`.
+It needs no private key, wallet, GPU or model load. It writes JSON lines and stops
+with Ctrl-C. Warnings go to stderr. Do not run it alongside the built-in monitor
+unless you intentionally want a second copy of the feed.
+
+Both use the same cursor-based poller: one request at a time, every 5-6 seconds,
+a reused HTTP client, two-second request timeout, and exponential backoff up to
+60 seconds plus jitter on failures. Numeric Retry-After is honored up to 60
+seconds. A successful poll resets backoff. Errors preserve the cursor. Normal
+idle HTTP connections are reused; they do not represent queued mining work.
+
+Extended fields require the corresponding validator rollout. Against an older
+validator the watcher prints the available legacy fields. A missing
+`selected_for_batch` is not false. Admission is not final selection, and selection
+is not confirmation of trainer consumption or an on-chain payout. Read
+`selection_status`, `outcome_code`, `proof_reason` and `reason_details` when present.
+
+The watcher logs feed gaps/restarts; it does not automatically issue per-prompt
+history requests or resend submissions. Save the JSON lines for support. Its
+cursor is in memory: restarting resumes the server's bounded recent feed and can
+repeat records or leave a historical gap. Use the targeted lookup documented in
+[validator diagnostics](validating.md#detailed-miner-verdicts) when needed.
+
+To recover stored final outcomes for an entire window (100 records per page):
+
+```bash
+reliquary watch-verdicts --validator-url http://62.238.81.36:8000 \
+  --hotkey YOUR_PUBLIC_HOTKEY --window 45829 | tee window-verdicts.jsonl
+```
+
+This exits after the available pages; it makes no submission requests. Historical
+windows before validator persistence was deployed cannot be reconstructed by this
+command. A warning indicates a window whose final history is not marked complete.
