@@ -176,13 +176,17 @@ def test_a_declared_map_totalling_the_whole_pool_does_not_overshoot_it():
     it -- `0.33 + 0.56 + 0.11 == 1.0000000000000002`, and likewise a plain even
     split over 9, 11, 18, 20 or 21 environments. The recovery journal then
     refuses the pool outright and no window ever opens."""
+    import functools
     import math
+    import operator
 
     for declared in (
         {"math": 0.33, "code": 0.56, "logic": 0.11},
         {f"env{n}": 1 / 9 for n in range(9)},
     ):
-        assert sum(declared.values()) > 1.0, "the naive sum must overshoot"
+        # Built-in sum() compensates from Python 3.12, so fold explicitly.
+        naive = functools.reduce(operator.add, declared.values())
+        assert naive > 1.0, "a plain left fold must overshoot"
 
         assembler = _assembler(
             env_order=list(declared), window_pool=declared

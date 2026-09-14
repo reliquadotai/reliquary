@@ -55,6 +55,7 @@ def test_readiness_derives_from_the_retained_per_prompt_index():
         # prompt 7 arrived at 1005 (its earliest), prompt 9 at 1020: the
         # second distinct prompt landed at 1020.
         "collect_ready_round": 1020,
+        "collect_ready_round_by_environment": {"math": 1020},
     }
 
 

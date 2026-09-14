@@ -294,7 +294,9 @@ def test_begin_accepts_a_pool_one_ulp_above_the_pool_it_totals(tmp_path, monkeyp
 
     monkeypatch.setattr(recovery_module, "B_BATCH", 1)
     store = FillClosedRecoveryStore(tmp_path)
-    overshoot = sum([1.0 * 0.33, 1.0 * 0.56, 1.0 * 0.11])
+    import math
+
+    overshoot = math.nextafter(1.0, 2.0)
 
     assert overshoot > 1.0
 
