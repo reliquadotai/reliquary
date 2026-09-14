@@ -919,6 +919,294 @@ Claude-Session: https://claude.ai/code/session_01L2Ju5aueTaK3K1WAhGXjB4"
 
 ---
 
+### Task 7: Connect the per-environment machinery to production
+
+> **Added during execution, not at planning time.** Tasks 1-6 build the
+> per-environment pool and the per-environment controller, and nothing
+> reaches either from production. Two independent wiring gaps were found
+> while executing — one in the controller, one in the pool — and they are
+> the same defect one layer apart: the feature is built and unplugged.
+
+**Files:**
+- Modify: `reliquary/cli/main.py` (the production `ValidationService(...)` call, around line 1124-1146)
+- Modify: `reliquary/validator/service.py` (`_advance_price_shadow`, around line 4321)
+- Test: `tests/unit/test_task_pool_from_registry.py` (existing — add to it)
+- Test: `tests/unit/test_archive_carries_price_shadow.py` (existing — add to it)
+
+**Interfaces:**
+- Consumes: `TaskConfig.env_caps` (Task 3), `ValidationService(env_caps=...)` (Task 4),
+  `outcomes_by_environment_from_archive` and `advance_by_environment` (Tasks 2, 5, 6),
+  `price_signal["collect_ready_round_by_environment"]` (Task 1).
+- Produces: `emission_price_shadow["by_environment"]` in the archive.
+
+This task exists because the six planned tasks build the per-environment
+machinery and **none of them connects it**. Two independent wiring gaps were
+found during execution, one by me and one by Task 4's implementer:
+
+1. `reliquary/cli/main.py`'s production `ValidationService(...)` call passes
+   `emission_cap` and `price_params` from `task_config` but **not**
+   `env_caps`, so `self._env_caps` stays `{}` and the per-environment pool
+   built in Task 4 is a no-op in production.
+2. Nothing calls `advance_by_environment` or
+   `outcomes_by_environment_from_archive` outside their own module.
+   `_advance_price_shadow` still runs the single-window `advance`, so the
+   per-environment controller would be implemented, tested, and never run.
+
+Both are the same defect one layer apart: the feature is built and unplugged.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `tests/unit/test_task_pool_from_registry.py`. This file already
+contains a source-scanning test (`test_no_module_still_reads_the_removed_constant`),
+so this idiom is established here:
+
+```python
+def test_the_production_service_is_handed_the_per_environment_caps():
+    """The window pool is per-environment only if the call site says so.
+
+    Task 4 gave ValidationService an ``env_caps`` parameter and the assembler
+    a per-environment pool; neither does anything unless the production
+    construction actually passes it. This asserts the wire, not the plumbing.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("reliquary/cli/main.py").read_text()
+    tree = ast.parse(source)
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ValidationService"
+    ]
+
+    assert calls, "no ValidationService construction found in cli/main.py"
+    for call in calls:
+        passed = {kw.arg for kw in call.keywords}
+        assert "env_caps" in passed, (
+            "the production ValidationService call must pass env_caps, or the "
+            "per-environment window pool is dead code"
+        )
+        assert "emission_cap" in passed
+        assert "price_params" in passed
+```
+
+Add to `tests/unit/test_archive_carries_price_shadow.py`. Read that file
+first and follow its existing construction idiom for a service and a window
+record — do not invent a new one:
+
+```python
+def test_the_shadow_publishes_a_price_per_environment():
+    """Each environment's walk reaches the archive, not just the window's."""
+    service = _service()          # follow this file's own existing helper
+    signal = {
+        "window_open_round": 0,
+        "window_close_round": 1000,
+        "collect_ready_round": 800,
+        "collect_ready_round_by_environment": {"math": 800, "code": 200},
+    }
+
+    shadow = service._advance_price_shadow(signal)
+
+    assert shadow["applied"] is False
+    by_environment = shadow["by_environment"]
+    assert set(by_environment) == {"math", "code"}
+    for entry in by_environment.values():
+        assert entry["applied"] is False
+        assert set(entry) >= {"price", "last_good", "r", "r_smoothed", "regime", "applied"}
+
+
+def test_an_environment_keeps_its_own_shadow_walk_across_windows():
+    """Two windows, and the cheap environment's price must not track the dear one's."""
+    service = _service()
+    for _ in range(3):
+        shadow = service._advance_price_shadow({
+            "window_open_round": 0,
+            "window_close_round": 1000,
+            "collect_ready_round": 900,
+            "collect_ready_round_by_environment": {"math": 900, "code": 100},
+        })
+
+    assert shadow["by_environment"]["math"]["price"] != (
+        shadow["by_environment"]["code"]["price"]
+    )
+
+
+def test_a_record_without_the_map_still_produces_the_window_shadow():
+    """Archives written before the map existed must keep working unchanged."""
+    service = _service()
+
+    shadow = service._advance_price_shadow({
+        "window_open_round": 0,
+        "window_close_round": 1000,
+        "collect_ready_round": 800,
+    })
+
+    assert shadow["applied"] is False
+    assert "by_environment" not in shadow
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run, one command at a time:
+
+```bash
+python -m pytest tests/unit/test_task_pool_from_registry.py -q
+python -m pytest tests/unit/test_archive_carries_price_shadow.py -q
+```
+
+Expected: the new tests FAIL — `env_caps` is absent from the call site, and
+the shadow dict has no `by_environment` key.
+
+- [ ] **Step 3: Wire the per-environment pool**
+
+In `reliquary/cli/main.py`, in the production `ValidationService(...)` call,
+next to the two lines that already read from `task_config`:
+
+```python
+                emission_cap=task_config.emission_cap,
+                price_params=task_config.price_params,
+                env_caps=task_config.env_caps,
+```
+
+Nothing else. `TaskConfig.env_caps` is `{}` for a task with no declared
+split only when the profile has no environments; otherwise it is the even
+spread, which reproduces today's payments exactly. That equivalence is what
+the witness suites assert, so do not add a conditional here.
+
+- [ ] **Step 4: Wire the per-environment controller**
+
+In `reliquary/validator/service.py`'s `_advance_price_shadow`, keep the
+existing single-window walk exactly as it is — it is what the archive's
+top-level `price` / `regime` fields mean, and changing it would change every
+existing reader. Add the per-environment walk **beside** it.
+
+Import `advance_by_environment` and `outcomes_by_environment_from_archive`
+alongside the existing imports in that function. After the existing
+`decision` is computed and `self._price_shadow_state` is assigned, build the
+result as today, then add the per-environment block:
+
+```python
+        shadow = {
+            "price": decision.price,
+            "last_good": decision.last_good,
+            "r": decision.r,
+            "r_smoothed": decision.r_smoothed,
+            "regime": decision.regime,
+            "applied": False,
+        }
+        by_environment = self._advance_price_shadow_by_environment(
+            {"window_status": "completed", **price_signal}, price_params
+        )
+        if by_environment:
+            shadow["by_environment"] = by_environment
+        return shadow
+```
+
+and add the helper as a sibling method. It mirrors the window walk's own
+structure — a history deque and a state, per environment:
+
+```python
+    def _advance_price_shadow_by_environment(
+        self, record: dict[str, Any], price_params
+    ) -> dict[str, dict[str, Any]] | None:
+        """Each environment's own shadow walk, on the same shared rule.
+
+        Absent for an archive written before the per-environment map existed,
+        so a reader can tell "no split" from "every environment at start".
+        """
+        from reliquary.validator.emission_price import (
+            PriceState,
+            advance_by_environment,
+            outcomes_by_environment_from_archive,
+        )
+
+        outcomes = outcomes_by_environment_from_archive(record)
+        if not outcomes:
+            return None
+        history = getattr(self, "_price_shadow_outcomes_by_environment", None)
+        if history is None:
+            history = {}
+            self._price_shadow_outcomes_by_environment = history
+        states = getattr(self, "_price_shadow_states_by_environment", None)
+        if states is None:
+            states = {}
+            self._price_shadow_states_by_environment = states
+        for environment, outcome in outcomes.items():
+            trail = history.get(environment)
+            if trail is None:
+                trail = collections.deque(maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
+                history[environment] = trail
+            trail.append(outcome)
+        decisions = advance_by_environment(
+            states,
+            {environment: list(trail) for environment, trail in history.items()},
+            price_params,
+        )
+        for environment, environment_decision in decisions.items():
+            states[environment] = environment_decision.state
+        return {
+            environment: {
+                "price": environment_decision.price,
+                "last_good": environment_decision.last_good,
+                "r": environment_decision.r,
+                "r_smoothed": environment_decision.r_smoothed,
+                "regime": environment_decision.regime,
+                "applied": False,
+            }
+            for environment, environment_decision in decisions.items()
+        }
+```
+
+`applied: False` is repeated per environment on purpose: a reader that finds
+one environment's block must be able to tell it is shadow without having to
+look up at its parent.
+
+Read `PriceState`'s real constructor before relying on the `states` dict —
+`advance_by_environment` already defaults an unseen environment to
+`params.start`, so this method must NOT pre-seed it.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run, one command at a time:
+
+```bash
+python -m pytest tests/unit/test_task_pool_from_registry.py -q
+python -m pytest tests/unit/test_archive_carries_price_shadow.py -q
+python -m pytest tests/unit/test_emission_price_archive_adapter.py -q
+python -m pytest tests/unit/test_emission_price_controller.py -q
+python -m pytest tests/unit/test_archive_window_content.py -q
+python -m pytest tests/unit/test_v1_cutover.py -q
+python -m pytest tests/unit/test_task_archive_namespace.py -q
+```
+
+Expected: all pass, and the last three (the witness suites) with no file of
+theirs modified.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add reliquary/cli/main.py reliquary/validator/service.py tests/unit/test_task_pool_from_registry.py tests/unit/test_archive_carries_price_shadow.py
+git commit -m "feat(price): connect the per-environment pool and controller
+
+Six tasks built a per-environment window pool and a per-environment price
+walk, and nothing called either. The production ValidationService was handed
+emission_cap and price_params but not env_caps, so the per-environment pool
+divided nothing; and _advance_price_shadow still ran the single-window
+controller, so the per-environment one had no caller outside its own tests.
+
+The window's own shadow walk is unchanged -- it is what the archive's
+top-level price fields have always meant. The per-environment walk is
+published beside it, absent rather than empty for an archive written before
+the map existed, so a reader can tell no split from every environment at
+start.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01L2Ju5aueTaK3K1WAhGXjB4"
+```
+
+---
+
 ## Out of this plan
 
 - **Arming the price.** The controller stays in shadow; `window_pool` is still the declared cap, not the discovered price. Arming still needs the walk seeded from the last archive, or a restart hands miners the full pool.
