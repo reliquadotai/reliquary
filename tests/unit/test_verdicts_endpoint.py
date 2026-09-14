@@ -372,7 +372,8 @@ def test_record_verdict_accepts_str_reason_for_late_drops() -> None:
 
 
 @pytest.mark.parametrize("fill_closed", [False, True])
-def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) -> None:
+@pytest.mark.asyncio
+async def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed, monkeypatch) -> None:
     """Auction admission is provisional until seal. The final records must
     distinguish a paid winner, an accepted non-winner, and a deferred-proof
     rejection without turning the non-winner into a protocol failure."""
@@ -419,6 +420,10 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
     server = ValidatorServer()
     service = ValidationService.__new__(ValidationService)
     service.server = server
+    import threading
+    loop_thread = threading.get_ident()
+    persistence_threads = []
+    monkeypatch.setattr(server, "persist_final_verdicts", lambda records: persistence_threads.append(threading.get_ident()))
 
     kwargs = {}
     winner_index, loser_index = 0, 1
@@ -432,9 +437,10 @@ def test_auction_seal_publishes_selected_loser_and_proof_failure(fill_closed) ->
             eos_tokens=50,
         )]
         winner_index, loser_index = 1, 0
-    service._record_auction_final_verdicts(batcher, **kwargs)
-    service._record_auction_final_verdicts(batcher, **kwargs)  # idempotent
+    await service._record_auction_final_verdicts(batcher, **kwargs)
+    await service._record_auction_final_verdicts(batcher, **kwargs)  # idempotent
 
+    assert len(persistence_threads) == 1 and persistence_threads[0] != loop_thread
     winner = server._verdicts[f"hk{winner_index}"][0]
     assert winner["accepted"] is True
     assert winner["selected_for_batch"] is True
@@ -554,3 +560,28 @@ def test_detailed_verdict_survives_rollover_and_restart_without_changing_legacy_
     missing = TestClient(restored.app).get('/miner-verdicts/hk/499/' + 'cd' * 32).json()
     assert missing['status'] == 'not_recorded'
     assert missing['verdict'] is None
+
+
+def test_history_recovers_entire_burst_and_does_not_claim_an_open_snapshot(tmp_path):
+    server = ValidatorServer()
+    server.configure_final_verdict_store(str(tmp_path))
+    records = [('hk', server.record_verdict('hk', f'{i:064x}', True, 'accepted', window_n=500,
+                accepted_into_pool=True, selected_for_batch=False)) for i in range(224)]
+    server.persist_final_verdicts(records)
+    client = TestClient(server.app)
+    assert client.get('/miner-verdicts/hk').json()['truncated']
+    first = client.get('/miner-verdict-history/hk/500?limit=100').json()
+    assert first['snapshot_complete'] is False
+    server.complete_final_verdict_window(500)
+    cursor, roots = '', []
+    while True:
+        page = client.get(f'/miner-verdict-history/hk/500?limit=100&after={cursor}').json()
+        assert page['snapshot_complete'] is True
+        roots.extend(v['merkle_root'] for v in page['verdicts'])
+        if page['next_cursor'] is None:
+            break
+        cursor = page['next_cursor']
+    assert len(set(roots)) == 224
+    assert client.get('/miner-verdict-history/hk/500?limit=999').status_code == 422
+    metrics = client.get('/http-metrics').json()
+    assert metrics['routes']['GET verdict_history']['requests'] == 5

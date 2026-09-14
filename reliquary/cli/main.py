@@ -43,6 +43,61 @@ logger = logging.getLogger(__name__)
 _grader_proc: "subprocess.Popen | None" = None
 
 
+
+@app.command("watch-verdicts")
+def watch_verdicts(
+    hotkey: str = typer.Option(..., help="Public miner SS58 address; no wallet or private key required"),
+    validator_url: str = typer.Option(..., help="Validator HTTP(S) base URL"),
+    window: int | None = typer.Option(None, min=0, help="Read all stored final outcomes for one window, then exit"),
+):
+    """Watch verdicts as JSON lines. Run once per hotkey; Ctrl-C stops it."""
+    import httpx
+    from reliquary.miner.submitter import monitor_submission_verdicts
+
+    if not validator_url.startswith(("http://", "https://")):
+        raise typer.BadParameter("Use an http:// or https:// validator URL")
+    logging.basicConfig(level=logging.WARNING)
+
+    async def run():
+        submitted = asyncio.Event()
+        submitted.set()
+        async with httpx.AsyncClient(
+            timeout=2, limits=httpx.Limits(max_connections=2, keepalive_expiry=30),
+        ) as client:
+            if window is not None:
+                from urllib.parse import quote
+                cursor = ""
+                while True:
+                    response = await client.get(
+                        f"{validator_url.rstrip('/')}/miner-verdict-history/{quote(hotkey, safe='')}/{window}",
+                        params={"after": cursor, "limit": 100},
+                    )
+                    response.raise_for_status()
+                    page = response.json()
+                    for verdict in page["verdicts"]:
+                        import json
+                        typer.echo(json.dumps(verdict, separators=(",", ":")))
+                    next_cursor = page.get("next_cursor")
+                    if not next_cursor:
+                        if not page.get("snapshot_complete"):
+                            typer.echo("Window history is not marked complete; missing records are not rejections.", err=True)
+                        return
+                    if next_cursor <= cursor:
+                        raise ValueError("history cursor did not advance")
+                    cursor = next_cursor
+                    await asyncio.sleep(0.2)
+            async with monitor_submission_verdicts(
+                validator_url.rstrip("/"), hotkey, client, submitted,
+                on_verdict=lambda verdict: typer.echo(verdict.model_dump_json(exclude_none=True)),
+            ) as task:
+                await task
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
 def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
     names = [name.strip() for name in value.split(",")]
     return resolve_environment_mix(
