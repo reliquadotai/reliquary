@@ -78,8 +78,8 @@ def _r2_client():
 
 
 def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool:
-    """Pull the R2-mirrored snapshot (multipart parallel). Returns False
-    when the mirror lacks this revision (bootstrap → HF fallback)."""
+    """Pull or reuse the R2 snapshot; return False for immutable HF fallback
+    when the revision is absent or the local directory has extra files."""
     from boto3.s3.transfer import TransferConfig
 
     from reliquary.trainer.publisher import R2_CHECKPOINT_PREFIX, checkpoint_key, _file_identity
@@ -115,7 +115,8 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
             raise ValueError("checkpoint mirror contains an unsafe filename")
         expected[filename] = {"etag": obj.get("ETag"), "size": obj.get("Size")}
     if not expected or any(path.name not in {*expected, marker.name} for path in dest.iterdir()):
-        raise ValueError("checkpoint cache contains files outside the mirrored snapshot")
+        logger.warning("Checkpoint cache is not a clean mirrored snapshot; using HF fallback")
+        return False
     identity = {"bucket": bucket, "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),
                 "revision": revision, "objects": expected}
     try:
@@ -254,7 +255,7 @@ def run_train_worker(*, shadow: bool = False) -> None:
         snapshot_dir = state_dir / "resume" / revision
         started = time.monotonic()
         if not _download_checkpoint(client, bucket, revision, snapshot_dir):
-            logger.info("R2 mirror lacks %s; falling back to HF", revision)
+            logger.info("R2 snapshot unavailable for %s; falling back to HF", revision)
             snapshot_dir = Path(_hf_download(repo_id, revision))
         logger.info("startup_stage=checkpoint_download elapsed_seconds=%.3f", time.monotonic() - started)
         profile = validate_checkpoint_profile(snapshot_dir, required=True)

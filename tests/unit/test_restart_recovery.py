@@ -106,6 +106,13 @@ def test_trainer_cache_reuses_bytes_and_recovers_corruption_or_interruption(tmp_
     (tmp_path / "model.safetensors").unlink()
     assert _download_checkpoint(client, "bucket", revision, tmp_path)
     assert (tmp_path / "model.safetensors").read_bytes() == objects["model.safetensors"]
+    # Leftovers from an interrupted downloader must not block immutable HF
+    # fallback or be silently included in the model snapshot.
+    leftover = tmp_path / "model.safetensors.partial"
+    leftover.write_bytes(b"unfinished")
+    before = len(calls)
+    assert _download_checkpoint(client, "bucket", revision, tmp_path) is False
+    assert len(calls) == before and leftover.read_bytes() == b"unfinished"
 
 
 def test_initial_proof_weights_are_reused_only_for_exact_adoption(monkeypatch):
