@@ -120,6 +120,8 @@ class _TombstoneStub:
         self.wallet = None
         self.kl_reference_state = {}
         self._late_drops = {}
+        # The aborted archive records the task's emission share.
+        self._emission_cap = 1.0
 
     def _proof_scheduler_health_snapshot(self):
         return {}
