@@ -192,6 +192,8 @@ async def upload_window_dataset(
 async def list_recent_datasets(
     current_window: int,
     n: int,
+    *,
+    fields: tuple[str, ...] | None = None,
     **client_kwargs,
 ) -> list[dict]:
     """Download last *n* window archives from the flat R2 prefix in ascending order.
@@ -220,9 +222,17 @@ async def list_recent_datasets(
         for window_start, key in keys:
             try:
                 resp = await client.get_object(Bucket=bucket, Key=key)
-                body = await resp["Body"].read()
+                stream = resp["Body"]
+                try:
+                    body = await stream.read()
+                finally:
+                    stream.close()
                 data = json.loads(gzip.decompress(body))
-                archives.append(data)
+                archives.append(
+                    data if fields is None else {
+                        field: data[field] for field in fields if field in data
+                    }
+                )
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 if code in ("NoSuchKey", "404"):

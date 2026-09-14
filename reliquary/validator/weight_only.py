@@ -143,6 +143,7 @@ class WeightOnlyValidator:
         archives = await storage.list_recent_datasets(
             current_window=max(windows) + 1,
             n=ROLLING_WINDOWS_HISTORY * 3,
+            fields=("window_start", "window_status", "rewards_by_hotkey"),
         )
         ema = self._replay_ema(archives)
         miner_weights = dict(ema)

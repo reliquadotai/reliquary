@@ -30,6 +30,9 @@ async def test_downloads_last_n_windows():
         class _Body:
             async def read(self_inner):
                 return archives_on_r2[Key]
+
+            def close(self_inner):
+                pass
         return {"Body": _Body()}
 
     mock_client = AsyncMock()
@@ -46,6 +49,18 @@ async def test_downloads_last_n_windows():
     assert len(result) == 3
     assert [a["window_start"] for a in result] == [100, 101, 102]
     assert result[0]["batch"][0]["prompt_idx"] == 1
+
+    with patch("reliquary.infrastructure.storage.get_s3_client", return_value=mock_ctx):
+        projected = await list_recent_datasets(
+            current_window=103,
+            n=3,
+            fields=("window_start",),
+        )
+    assert projected == [
+        {"window_start": 100},
+        {"window_start": 101},
+        {"window_start": 102},
+    ]
 
 
 @pytest.mark.asyncio
@@ -67,6 +82,9 @@ async def test_skips_missing_windows():
         class _Body:
             async def read(self_inner):
                 return archives_on_r2[Key]
+
+            def close(self_inner):
+                pass
         return {"Body": _Body()}
 
     mock_client = AsyncMock()
