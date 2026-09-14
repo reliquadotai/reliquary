@@ -4361,11 +4361,12 @@ class ValidationService:
 
         ``window_status`` defaults to "completed" for every existing caller.
         ``_archive_window`` passes its own real status instead: a hardcoded
-        "completed" here made ``outcomes_by_environment_from_archive``'s
-        timed-out branch (which zeroes the per-environment denominator, so a
-        window that never filled cannot read as a fast fill) unreachable from
-        production. The status is read once and used for both the scalar
-        walk and the per-environment one below, on the same record.
+        "completed" here made a timed-out window's admission-based ratio read
+        as a real, fast fill on both walks below -- ``outcome_from_archive``
+        zeroes the incompressible denominator for a "timed_out" record (the
+        scalar walk's own read), and ``outcomes_by_environment_from_archive``
+        reads that same zeroed value back for each environment. The status is
+        read once here and used for both, on the same record.
         """
         if price_signal is None:
             return None
@@ -4405,9 +4406,20 @@ class ValidationService:
             "regime": decision.regime,
             "applied": False,
         }
-        by_environment = self._advance_price_shadow_by_environment(
-            {"window_status": window_status, **price_signal}, price_params
-        )
+        # A shadow number is explicitly ``applied: False``, but this method's
+        # only caller (``_archive_window``) is wrapped by a handler that
+        # tombstones the whole window on any exception -- a bug in the
+        # per-environment walk must not be able to cost a window its pay.
+        try:
+            by_environment = self._advance_price_shadow_by_environment(
+                {"window_status": window_status, **price_signal}, price_params
+            )
+        except Exception:
+            logger.warning(
+                "per-environment shadow price walk failed; publishing the "
+                "window's own shadow only", exc_info=True,
+            )
+            by_environment = None
         if by_environment:
             shadow["by_environment"] = by_environment
         return shadow
@@ -4421,7 +4433,6 @@ class ValidationService:
         so a reader can tell "no split" from "every environment at start".
         """
         from reliquary.validator.emission_price import (
-            PriceState,
             advance_by_environment,
             outcomes_by_environment_from_archive,
         )
@@ -4443,9 +4454,14 @@ class ValidationService:
                 trail = collections.deque(maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
                 history[environment] = trail
             trail.append(outcome)
+        # Only THIS window's environments, not every environment ever seen:
+        # ``history`` outlives windows, so an environment absent this window
+        # would otherwise be re-advanced on its last stale outcome forever,
+        # published as if live, and never reach Task 6's breaker (its trail
+        # would never grow past one, so the "consecutive" count never ticks).
         decisions = advance_by_environment(
             states,
-            {environment: list(trail) for environment, trail in history.items()},
+            {environment: list(history[environment]) for environment in outcomes},
             price_params,
         )
         for environment, environment_decision in decisions.items():

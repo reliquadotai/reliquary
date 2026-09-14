@@ -285,10 +285,16 @@ def advance_by_environment(
         if len(trailing) >= params.breaker_timeouts and all(
             not outcome.filled for outcome in trailing
         ):
+            # This is real subnet-halting news -- fill-closed cannot proceed
+            # without this environment -- even though the frozen number is,
+            # today, only ever a SHADOW price (this function's one production
+            # caller is Phase 1's unapplied walk): say so explicitly, so the
+            # critical does not read as money moving.
             logger.critical(
                 "environment %s has not filled for %d consecutive windows; "
-                "freezing its price at %.4f -- treat this as broken on our side "
-                "until shown otherwise",
+                "freezing its SHADOW price (applied: False) at %.4f -- "
+                "treat the environment itself as broken on our side until "
+                "shown otherwise",
                 environment, params.breaker_timeouts, state.price,
             )
             decisions[environment] = PriceDecision(

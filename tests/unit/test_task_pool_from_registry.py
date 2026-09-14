@@ -78,7 +78,8 @@ def test_the_production_service_is_handed_the_per_environment_caps():
     import ast
     import pathlib
 
-    source = pathlib.Path("reliquary/cli/main.py").read_text()
+    root = pathlib.Path(__file__).resolve().parents[2]
+    source = (root / "reliquary" / "cli" / "main.py").read_text()
     tree = ast.parse(source)
     calls = [
         node for node in ast.walk(tree)
@@ -89,13 +90,24 @@ def test_the_production_service_is_handed_the_per_environment_caps():
 
     assert calls, "no ValidationService construction found in cli/main.py"
     for call in calls:
-        passed = {kw.arg for kw in call.keywords}
+        by_arg = {kw.arg: kw.value for kw in call.keywords}
+        passed = set(by_arg)
         assert "env_caps" in passed, (
             "the production ValidationService call must pass env_caps, or the "
             "per-environment window pool is dead code"
         )
         assert "emission_cap" in passed
         assert "price_params" in passed
+        env_caps_value = by_arg["env_caps"]
+        assert (
+            isinstance(env_caps_value, ast.Attribute)
+            and env_caps_value.attr == "env_caps"
+        ), (
+            "env_caps must be passed as a task_config.env_caps attribute read, "
+            "not a literal -- env_caps={} would pass the 'in passed' check "
+            "above while leaving self._env_caps empty, the exact dead-code "
+            "state this test exists to catch"
+        )
 
 
 def test_no_registry_at_all_starts_the_legacy_task_at_the_full_pool():

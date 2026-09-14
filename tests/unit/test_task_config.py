@@ -74,6 +74,17 @@ def test_an_env_split_naming_an_undeclared_environment_refuses():
     assert "math" in message and "code" in message
 
 
+def test_an_env_split_missing_a_declared_environment_refuses():
+    """An incomplete split is accepted at write time and jams the first
+    window's own FillClosedBatchAssembler construction if not refused here,
+    at startup where an operator sees it."""
+    with pytest.raises(TaskConfigError) as exc_info:
+        _resolve({"default": _entry(env_split={"math": 1.0})})
+
+    message = str(exc_info.value)
+    assert "code" in message
+
+
 def test_an_undeclared_task_refuses():
     with pytest.raises(TaskConfigError, match="not declared"):
         _resolve({"other": _entry(task_id="other")}, task_id="default")

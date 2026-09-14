@@ -77,6 +77,17 @@ def resolve_task_config(
                 f"{sorted(unknown)}, which profile {profile_id!r} does not "
                 f"have; it declares {sorted(environments)}"
             )
+        # A partial split is refused here, at startup where an operator sees
+        # it, rather than at the first window: FillClosedBatchAssembler
+        # raises on a window_pool map missing an environment it must run,
+        # which would otherwise jam every window open attempt silently.
+        uncovered = set(environments) - set(entry.env_split)
+        if uncovered:
+            raise TaskConfigError(
+                f"task {task_id!r} declares env_split but it does not cover "
+                f"{sorted(uncovered)}, which profile {profile_id!r} also "
+                f"declares; env_split must name every profile environment"
+            )
 
     params = PriceParams(**{f: entry.params[f] for f in PRICE_PARAM_FIELDS})
     cap = float(entry.params["cap"])

@@ -94,7 +94,26 @@ class FillClosedBatchAssembler:
                 raise ValueError(
                     f"window_pool is missing environments: {', '.join(missing)}"
                 )
-            self._pool_by_env = {e: float(window_pool[e]) for e in self._env_order}
+            # ``window_pool`` is keyed by the PROFILE's declared environments;
+            # ``env_order`` is the RUNNING mix, which can be a strict subset
+            # (e.g. a launch that trims ``RELIQUARY_ENVIRONMENTS`` to one).
+            # Restricting to ``env_order`` without rescaling would silently
+            # burn every declared environment's share that is not running,
+            # instead of paying it to the ones that are -- so the running
+            # subset is rescaled to still sum to the DECLARED total, in the
+            # declared proportions. A full mix rescales by exactly 1.0.
+            declared_total = sum(float(v) for v in window_pool.values())
+            restricted = {e: float(window_pool[e]) for e in self._env_order}
+            restricted_total = sum(restricted.values())
+            if restricted_total > 0:
+                scale = declared_total / restricted_total
+                self._pool_by_env = {e: v * scale for e, v in restricted.items()}
+            else:
+                # Every running environment was declared a zero share: there
+                # is no proportion to preserve, so split the declared total
+                # evenly rather than paying nothing to a mix that is running.
+                share = declared_total / len(self._env_order) if self._env_order else 0.0
+                self._pool_by_env = {e: share for e in self._env_order}
         else:
             total = float(window_pool)
             share = total / len(self._env_order) if self._env_order else 0.0

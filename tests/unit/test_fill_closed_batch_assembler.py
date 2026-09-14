@@ -69,6 +69,30 @@ def test_an_environment_missing_from_the_map_is_refused():
         _assembler(env_order=["math", "code"], window_pool={"math": 1.0})
 
 
+def test_a_running_mix_narrower_than_the_map_still_pays_the_declared_total():
+    """A profile can declare more environments than are actually running
+    (e.g. a launch that trims ``RELIQUARY_ENVIRONMENTS`` to one); the
+    environments not running must not have their share burned."""
+    assembler = _assembler(
+        env_order=["math"],
+        window_pool={"math": 1 / 3, "code": 1 / 3, "logic": 1 / 3},
+    )
+
+    assert assembler.window_pool == pytest.approx(1.0)
+    assert assembler.pool_for("math") == pytest.approx(1.0)
+
+
+def test_two_of_three_running_split_the_declared_total_in_proportion():
+    assembler = _assembler(
+        env_order=["math", "code"],
+        window_pool={"math": 0.6, "code": 0.3, "logic": 0.1},
+    )
+
+    assert assembler.window_pool == pytest.approx(1.0)
+    assert assembler.pool_for("math") == pytest.approx(0.6 / 0.9)
+    assert assembler.pool_for("code") == pytest.approx(0.3 / 0.9)
+
+
 def _chunk(tag: int, env: str) -> list:
     return [
         _group([_roll(1.0, 4, env=env)], prompt_idx=tag * 1000 + i)
