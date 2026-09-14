@@ -52,6 +52,45 @@ async def test_downloads_last_n_windows():
 
 
 @pytest.mark.asyncio
+async def test_projects_fields_before_retaining_archive_history():
+    payload = gzip.compress(json.dumps({
+        "window_start": 100,
+        "window_status": "completed",
+        "rewards_by_hotkey": {"hk": 0.5},
+        "batch": [{"completion_text": "large payload" * 1000}],
+    }).encode())
+
+    async def fake_get_object(Bucket, Key):
+        class _Body:
+            async def read(self):
+                return payload
+
+            def close(self):
+                pass
+
+        return {"Body": _Body()}
+
+    mock_client = AsyncMock()
+    mock_client.get_object = fake_get_object
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_client
+    mock_ctx.__aexit__.return_value = None
+
+    with patch("reliquary.infrastructure.storage.get_s3_client", return_value=mock_ctx):
+        result = await list_recent_datasets(
+            current_window=101,
+            n=1,
+            fields=("window_start", "window_status", "rewards_by_hotkey"),
+        )
+
+    assert result == [{
+        "window_start": 100,
+        "window_status": "completed",
+        "rewards_by_hotkey": {"hk": 0.5},
+    }]
+
+
+@pytest.mark.asyncio
 async def test_skips_missing_windows():
     """A window that doesn't exist (NoSuchKey) is skipped with a warning."""
     from botocore.exceptions import ClientError
