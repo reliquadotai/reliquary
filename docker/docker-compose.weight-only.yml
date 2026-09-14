@@ -3,6 +3,7 @@
 services:
   reliquary-weight-only:
     image: ghcr.io/reliquadotai/reliquary-validator:latest
+    pull_policy: always
     container_name: reliquary-weight-only
     restart: unless-stopped
     env_file: .env

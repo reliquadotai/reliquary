@@ -3,6 +3,7 @@
 services:
   reliquary-trainer:
     image: ghcr.io/reliquadotai/reliquary-validator:latest
+    pull_policy: always
     container_name: reliquary-trainer
     restart: unless-stopped
     stop_grace_period: 60s

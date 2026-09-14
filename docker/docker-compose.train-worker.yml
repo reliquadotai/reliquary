@@ -5,6 +5,7 @@
 services:
   reliquary-train-worker:
     image: ${TRAIN_WORKER_IMAGE:-ghcr.io/reliquadotai/reliquary-validator:latest}
+    pull_policy: always
     container_name: reliquary-train-worker
     restart: unless-stopped
     stop_grace_period: 60s
