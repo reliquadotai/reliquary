@@ -68,6 +68,36 @@ def test_no_module_still_reads_the_removed_constant():
     assert hits == "", f"TASK_EMISSION_SHARE still referenced:\n{hits}"
 
 
+def test_the_production_service_is_handed_the_per_environment_caps():
+    """The window pool is per-environment only if the call site says so.
+
+    Task 4 gave ValidationService an ``env_caps`` parameter and the assembler
+    a per-environment pool; neither does anything unless the production
+    construction actually passes it. This asserts the wire, not the plumbing.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path("reliquary/cli/main.py").read_text()
+    tree = ast.parse(source)
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ValidationService"
+    ]
+
+    assert calls, "no ValidationService construction found in cli/main.py"
+    for call in calls:
+        passed = {kw.arg for kw in call.keywords}
+        assert "env_caps" in passed, (
+            "the production ValidationService call must pass env_caps, or the "
+            "per-environment window pool is dead code"
+        )
+        assert "emission_cap" in passed
+        assert "price_params" in passed
+
+
 def test_no_registry_at_all_starts_the_legacy_task_at_the_full_pool():
     """The fallback that keeps `default` running the day this ships: a
     wholly absent registry (today's reality for every validator) is not a

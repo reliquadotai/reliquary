@@ -1141,6 +1141,7 @@ def validate(
                 ),
                 emission_cap=task_config.emission_cap,
                 price_params=task_config.price_params,
+                env_caps=task_config.env_caps,
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,
             )

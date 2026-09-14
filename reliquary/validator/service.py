@@ -4319,7 +4319,9 @@ class ValidationService:
             self._set_state(WindowState.READY)
 
     def _advance_price_shadow(
-        self, price_signal: dict[str, Any] | None
+        self,
+        price_signal: dict[str, Any] | None,
+        window_status: str = "completed",
     ) -> dict[str, Any] | None:
         """What the armed controller WOULD have paid, having paid none of it.
 
@@ -4332,6 +4334,14 @@ class ValidationService:
         A restart therefore resets the walk to ``start``, which costs a shadow
         run nothing -- but arming this will need the state seeded from the last
         archive, or a restart would silently hand miners back the full pool.
+
+        ``window_status`` defaults to "completed" for every existing caller.
+        ``_archive_window`` passes its own real status instead: a hardcoded
+        "completed" here made ``outcomes_by_environment_from_archive``'s
+        timed-out branch (which zeroes the per-environment denominator, so a
+        window that never filled cannot read as a fast fill) unreachable from
+        production. The status is read once and used for both the scalar
+        walk and the per-environment one below, on the same record.
         """
         if price_signal is None:
             return None
@@ -4348,7 +4358,7 @@ class ValidationService:
         price_params = self._price_params or PRODUCTION_PRICE_PARAMS
 
         outcome = outcome_from_archive(
-            {"window_status": "completed", **price_signal}
+            {"window_status": window_status, **price_signal}
         )
         if outcome is None:
             return None
@@ -4363,13 +4373,69 @@ class ValidationService:
         history.append(outcome)
         decision = advance(state, list(history), price_params)
         self._price_shadow_state = decision.state
-        return {
+        shadow = {
             "price": decision.price,
             "last_good": decision.last_good,
             "r": decision.r,
             "r_smoothed": decision.r_smoothed,
             "regime": decision.regime,
             "applied": False,
+        }
+        by_environment = self._advance_price_shadow_by_environment(
+            {"window_status": window_status, **price_signal}, price_params
+        )
+        if by_environment:
+            shadow["by_environment"] = by_environment
+        return shadow
+
+    def _advance_price_shadow_by_environment(
+        self, record: dict[str, Any], price_params
+    ) -> dict[str, dict[str, Any]] | None:
+        """Each environment's own shadow walk, on the same shared rule.
+
+        Absent for an archive written before the per-environment map existed,
+        so a reader can tell "no split" from "every environment at start".
+        """
+        from reliquary.validator.emission_price import (
+            PriceState,
+            advance_by_environment,
+            outcomes_by_environment_from_archive,
+        )
+
+        outcomes = outcomes_by_environment_from_archive(record)
+        if not outcomes:
+            return None
+        history = getattr(self, "_price_shadow_outcomes_by_environment", None)
+        if history is None:
+            history = {}
+            self._price_shadow_outcomes_by_environment = history
+        states = getattr(self, "_price_shadow_states_by_environment", None)
+        if states is None:
+            states = {}
+            self._price_shadow_states_by_environment = states
+        for environment, outcome in outcomes.items():
+            trail = history.get(environment)
+            if trail is None:
+                trail = collections.deque(maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
+                history[environment] = trail
+            trail.append(outcome)
+        decisions = advance_by_environment(
+            states,
+            {environment: list(trail) for environment, trail in history.items()},
+            price_params,
+        )
+        for environment, environment_decision in decisions.items():
+            states[environment] = environment_decision.state
+        return {
+            environment: {
+                "price": environment_decision.price,
+                "last_good": environment_decision.last_good,
+                "r": environment_decision.r,
+                "r_smoothed": environment_decision.r_smoothed,
+                "regime": environment_decision.regime,
+                "applied": False,
+            }
+            for environment, environment_decision in decisions.items()
         }
 
     @staticmethod
@@ -4991,7 +5057,7 @@ class ValidationService:
         price_signal = _window_price_signal(
             first_batcher, batcher_dict, _price_target_for
         )
-        price_shadow = self._advance_price_shadow(price_signal)
+        price_shadow = self._advance_price_shadow(price_signal, window_status=window_status)
         archive = {
             "archive_schema_version": 2,
             "window_status": window_status,

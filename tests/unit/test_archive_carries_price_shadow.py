@@ -150,3 +150,77 @@ async def test_an_unmeasurable_window_publishes_no_shadow():
     archives = await _archive_all(_service(), [(_FakeBatcher(), submission)])
 
     assert "emission_price_shadow" not in archives[0]
+
+
+def test_the_shadow_publishes_a_price_per_environment():
+    """Each environment's walk reaches the archive, not just the window's."""
+    service = _service()          # follow this file's own existing helper
+    signal = {
+        "window_open_round": 0,
+        "window_close_round": 1000,
+        "collect_ready_round": 800,
+        "collect_ready_round_by_environment": {"math": 800, "code": 200},
+    }
+
+    shadow = service._advance_price_shadow(signal)
+
+    assert shadow["applied"] is False
+    by_environment = shadow["by_environment"]
+    assert set(by_environment) == {"math", "code"}
+    for entry in by_environment.values():
+        assert entry["applied"] is False
+        assert set(entry) >= {"price", "last_good", "r", "r_smoothed", "regime", "applied"}
+
+
+def test_an_environment_keeps_its_own_shadow_walk_across_windows():
+    """Two windows, and the cheap environment's price must not track the dear one's."""
+    service = _service()
+    for _ in range(3):
+        shadow = service._advance_price_shadow({
+            "window_open_round": 0,
+            "window_close_round": 1000,
+            "collect_ready_round": 900,
+            "collect_ready_round_by_environment": {"math": 900, "code": 100},
+        })
+
+    assert shadow["by_environment"]["math"]["price"] != (
+        shadow["by_environment"]["code"]["price"]
+    )
+
+
+def test_a_record_without_the_map_still_produces_the_window_shadow():
+    """Archives written before the map existed must keep working unchanged."""
+    service = _service()
+
+    shadow = service._advance_price_shadow({
+        "window_open_round": 0,
+        "window_close_round": 1000,
+        "collect_ready_round": 800,
+    })
+
+    assert shadow["applied"] is False
+    assert "by_environment" not in shadow
+
+
+def test_a_timed_out_window_does_not_price_lagging_proofs_as_a_fast_fill():
+    """A timed-out window's fast admission must not read as a cheap fill.
+
+    ``outcomes_by_environment_from_archive`` zeroes the denominator for a
+    timed-out record so a window that never finished proving reads as
+    unmeasurable rather than fast. That branch only fires if the real
+    ``window_status`` reaches it instead of a hardcoded "completed".
+    """
+    signal = {
+        "window_open_round": 0,
+        "window_close_round": 2400,
+        "collect_ready_round": 110,
+        "collect_ready_round_by_environment": {"math": 110, "code": 110},
+    }
+
+    completed = _service()._advance_price_shadow(signal, window_status="completed")
+    timed_out = _service()._advance_price_shadow(signal, window_status="timed_out")
+
+    assert completed["by_environment"]["math"]["regime"] == "descend"
+    assert completed["by_environment"]["math"]["price"] < 1.0
+    assert timed_out["by_environment"]["math"]["regime"] != "descend"
+    assert timed_out["by_environment"]["math"]["price"] == 1.0
