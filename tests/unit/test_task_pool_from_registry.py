@@ -205,10 +205,12 @@ def test_recovery_defaults_a_pre_upgrade_journal_to_the_whole_pool(
 
 
 def test_activating_a_window_journals_the_pool_it_opened_with(tmp_path, monkeypatch):
-    """The leg no other test covers: ValidationService must hand its own
-    emission cap to recovery.begin(). Dropping that keyword is silent -- the
-    journal simply falls back to 1.0 and a recovered window pays the whole
-    pool instead of this task's share."""
+    """The leg no other test covers: ValidationService must hand this
+    window's own pool to recovery.begin(). Dropping that keyword is silent --
+    the journal simply falls back to 1.0 and a recovered window pays the whole
+    pool instead of this task's share. The value comes from the assembler
+    rather than from `_emission_cap`, so the journal holds exactly the number
+    the archive will report; here the two are the same 0.37."""
     import types
 
     import reliquary.validator.service as service_mod
@@ -223,7 +225,8 @@ def test_activating_a_window_journals_the_pool_it_opened_with(tmp_path, monkeypa
     service = types.SimpleNamespace(
         _active_batchers={"math": batcher}, _candidate_window_n=42,
         _set_window_preparation_stage=lambda stage: None,
-        _candidate_fill_closed_assembler=types.SimpleNamespace(window_start=42),
+        _candidate_fill_closed_assembler=types.SimpleNamespace(
+            window_start=42, window_pool=0.37),
         _fill_closed_assembler=None, _fill_closed_assemblers={},
         _fill_closed_recovery_store=store,
         _checkpoint_store=types.SimpleNamespace(
@@ -308,6 +311,106 @@ def test_a_three_environment_window_at_a_fractional_cap_still_finishes(tmp_path)
         tombstone_fn=lambda key, data: None,
         window_pool=0.9,
     )
+    archive = {
+        "window_start": 42,
+        "window_status": "completed",
+        "payment_policy": assembler.payment_policy,
+        "selection_policy": FILL_CLOSED_SELECTION_POLICY,
+        "picks_target": assembler.picks_target,
+        "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        "window_pool": assembler.window_pool,
+    }
+    enqueued = {}
+
+    store.finish(42, archive, types.SimpleNamespace(
+        enqueue=lambda window, body: enqueued.update({window: body})))
+
+    assert enqueued == {42: archive}
+    assert not store.windows()
+
+
+def _activate_with_a_real_assembler(tmp_path, monkeypatch, *, env_caps, emission_cap):
+    """Drive the real `_activate_window` with the real assembler.
+
+    The per-environment caps are what `task_config` builds, so this exercises
+    the production pairing: a MAP reaches the assembler while the journal is
+    written beside it.
+    """
+    import reliquary.validator.service as service_mod
+    from reliquary.constants import B_BATCH
+    from reliquary.validator.fill_closed_batch_assembler import (
+        FillClosedBatchAssembler,
+    )
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+    from reliquary.validator.service import ValidationService
+
+    monkeypatch.setattr(service_mod, "FILL_CLOSED_ENABLED", True)
+    store = FillClosedRecoveryStore(tmp_path)
+    environments = list(env_caps)
+    assembler = FillClosedBatchAssembler(
+        window_start=42,
+        env_order=environments,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool=env_caps,
+    )
+    batcher = types.SimpleNamespace(
+        window_start=42, mark_window_opened=lambda: None,
+        bind_event_loop=lambda loop: None, current_checkpoint_hash="a" * 40,
+    )
+    service = types.SimpleNamespace(
+        _active_batchers={env: batcher for env in environments},
+        _candidate_window_n=42,
+        _set_window_preparation_stage=lambda stage: None,
+        _candidate_fill_closed_assembler=assembler,
+        _fill_closed_assembler=None, _fill_closed_assemblers={},
+        _fill_closed_recovery_store=store,
+        _checkpoint_store=types.SimpleNamespace(
+            current_manifest=lambda: types.SimpleNamespace(
+                revision="a" * 40, checkpoint_n=7)),
+        env_mix=[(env, B_BATCH) for env in environments],
+        _emission_cap=emission_cap,
+        _env_caps=dict(env_caps),
+        _window_n=None, _candidate_activation_nonce=None,
+        _window_preparation_stage=None,
+        server=types.SimpleNamespace(
+            set_active_batchers=lambda batchers: None,
+            clear_window_preparation_failure=lambda: None),
+        _publish_window_preparation_state=lambda: None,
+        _set_state=lambda state: None,
+    )
+
+    ValidationService._activate_window(service)
+    return store, assembler
+
+
+@pytest.mark.parametrize("cap,split", [
+    # No env_split: task_config spreads the cap evenly. Three shares of 0.9
+    # re-sum to 0.8999999999999999.
+    (0.9, {"math": 1 / 3, "code": 1 / 3, "logic": 1 / 3}),
+    # An explicit --env-split breaks it at TWO environments:
+    # 0.9 * 0.6 + 0.9 * 0.4 == 0.9000000000000001.
+    (0.9, {"math": 0.6, "code": 0.4}),
+])
+def test_the_journalled_pool_is_the_number_the_archive_reports(
+    tmp_path, monkeypatch, cap, split,
+):
+    """`finish()` compares the two with exact float equality, so they must be
+    ONE computation, not two that are meant to agree. Journalling
+    `_emission_cap` while the assembler reports the sum of the per-environment
+    caps is two, and they silently disagree for most (cap, split) pairs."""
+    from reliquary.constants import (
+        FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        FILL_CLOSED_SELECTION_POLICY,
+    )
+
+    env_caps = {env: cap * share for env, share in split.items()}
+    store, assembler = _activate_with_a_real_assembler(
+        tmp_path, monkeypatch, env_caps=env_caps, emission_cap=cap,
+    )
+
+    assert store.load(42)["window_pool"] == assembler.window_pool
+
     archive = {
         "window_start": 42,
         "window_status": "completed",

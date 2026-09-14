@@ -579,3 +579,72 @@ def test_a_zero_breaker_length_disables_the_breaker():
 
     assert decisions["math"].regime == "snap"
     assert decisions["math"].price > 0.5
+
+
+def test_the_breaker_names_a_market_shortage_as_its_cause(caplog):
+    """The regime collapses the two shapes; the log line must not. No
+    arrivals at all is the market not being there."""
+    import logging
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    with caplog.at_level(logging.CRITICAL):
+        advance_by_environment(states, {"math": dry}, PRODUCTION_PRICE_PARAMS)
+
+    assert "MARKET is not supplying" in caplog.text
+    assert "proof plane" not in caplog.text
+
+
+def test_the_breaker_names_our_own_proof_plane_as_its_cause(caplog):
+    """Arrivals reached target and still nothing was proven: that is us, not
+    the market, and the operator's first look should go elsewhere."""
+    import logging
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    timed_out = [
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+    ] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    with caplog.at_level(logging.CRITICAL):
+        advance_by_environment(states, {"math": timed_out}, PRODUCTION_PRICE_PARAMS)
+
+    assert "proof plane cannot keep up" in caplog.text
+    assert "MARKET is not supplying" not in caplog.text
+
+
+def test_the_breaker_says_so_when_the_two_causes_are_mixed(caplog):
+    import logging
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    mixed = [
+        EnvironmentOutcome("math", 0, 1000, None, 500.0),
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True),
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True),
+    ]
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    with caplog.at_level(logging.CRITICAL):
+        advance_by_environment(states, {"math": mixed}, PRODUCTION_PRICE_PARAMS)
+
+    assert "mixed -- 1 window(s) short on arrivals, 2" in caplog.text

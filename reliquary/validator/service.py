@@ -2640,7 +2640,12 @@ class ValidationService:
                     checkpoint_n=checkpoint.checkpoint_n,
                     revision=revision,
                     targets=dict(self.env_mix),
-                    window_pool=self._emission_cap,
+                    # The assembler's own declared total, not ``_emission_cap``
+                    # re-derived: ``finish()`` compares this against the number
+                    # the archive reports with exact float equality, and a map
+                    # of per-environment caps does not always re-sum to the cap
+                    # it came from.
+                    window_pool=candidate_assembler.window_pool,
                 )
             self._fill_closed_assembler = candidate_assembler
             self._fill_closed_assemblers[candidate_window] = candidate_assembler

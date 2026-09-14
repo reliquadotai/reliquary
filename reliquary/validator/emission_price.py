@@ -301,17 +301,37 @@ def advance_by_environment(
         if breaker_length and len(trailing) >= breaker_length and all(
             outcome.timed_out or not outcome.filled for outcome in trailing
         ):
+            # The regime is the same either way -- go look -- but the two
+            # causes are not: no arrivals means the market is not there, while
+            # arrivals that never became proofs means we cannot keep up.
+            starved = sum(1 for outcome in trailing if not outcome.filled)
+            unproven = len(trailing) - starved
+            if not unproven:
+                cause = (
+                    "no admissible candidate ever reached its target: the "
+                    "MARKET is not supplying this environment"
+                )
+            elif not starved:
+                cause = (
+                    "arrivals reached its target but never became proofs: "
+                    "OUR proof plane cannot keep up with the supply"
+                )
+            else:
+                cause = (
+                    f"mixed -- {starved} window(s) short on arrivals, "
+                    f"{unproven} whose arrivals never became proofs"
+                )
             # This is real subnet-halting news -- fill-closed cannot proceed
             # without this environment -- even though the frozen number is,
             # today, only ever a SHADOW price (this function's one production
             # caller is Phase 1's unapplied walk): say so explicitly, so the
             # critical does not read as money moving.
             logger.critical(
-                "environment %s has not filled for %d consecutive windows; "
-                "freezing its SHADOW price (applied: False) at %.4f -- "
-                "treat the environment itself as broken on our side until "
-                "shown otherwise",
-                environment, params.breaker_timeouts, state.price,
+                "environment %s produced no trained batch for %d consecutive "
+                "windows (%s); freezing its SHADOW price (applied: False) at "
+                "%.4f -- treat the environment itself as broken on our side "
+                "until shown otherwise",
+                environment, breaker_length, cause, state.price,
             )
             decisions[environment] = PriceDecision(
                 price=state.price,
