@@ -1321,8 +1321,9 @@ CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
 # half their score in ~25 windows.
 EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 
-# A hotkey below this share of the pool is not paid at all, and the freed mass
-# is burned rather than shared out among the miners above it.
+# A hotkey below this share of the miner total is ramped down and what it loses
+# is shared out among the miners above it: the floor decides who is paid, never
+# how much burns.
 _MIN_INCENTIVE_SHARE_RAW = _os.environ.get("RELIQUARY_MIN_INCENTIVE_SHARE", "0.02")
 try:
     MIN_INCENTIVE_SHARE = float(_MIN_INCENTIVE_SHARE_RAW)

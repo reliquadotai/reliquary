@@ -821,27 +821,22 @@ async def test_burn_fails_closed_when_owner_has_no_uid():
 
 
 # --- Minimum incentive floor: applied in submit_once, at the submission
-# boundary — after _replay_ema's own per-task cap clamp and global backstop,
-# never inside the EMA arithmetic itself. A hotkey below MIN_INCENTIVE_SHARE
-# of the pool is dropped entirely; the freed mass is left for the existing
-# burn conservation in _submit_weights, never reassigned to survivors. ---
+# boundary, after _replay_ema. A hotkey below MIN_INCENTIVE_SHARE of the miner
+# total is ramped down and its mass is shared out among the rest, so the floor
+# decides who is paid and never how much burns. ---
 
 @pytest.mark.asyncio
-async def test_submit_once_drops_hotkey_below_floor_keeps_hotkey_above():
-    """The floor lives at the submission boundary in submit_once, not
-    inside _replay_ema's pure EMA arithmetic. Covers all three ramp
-    regimes in one pass: clearly below MIN_INCENTIVE_RAMP_START (dropped
-    outright), inside the ramp band (paid a partial fraction), and at/above
-    MIN_INCENTIVE_SHARE (paid in full)."""
+async def test_submit_once_applies_the_floor_to_shares():
+    """Shares 0.98 / 0.015 / 0.005 of the miner total cover all three regimes:
+    the smallest is dropped, the middle one sits at the ramp's midpoint and
+    keeps half its share, and the freed mass goes to the survivors."""
     from reliquary.validator.weight_only import WeightOnlyValidator
     import reliquary.validator.weight_only as wov_mod
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
-        _archive(1, [], rewards_by_hotkey={
-            "hk_big": 1.0, "hk_mid": 0.5, "hk_small": 0.1,
-        }),
+        _archive(1, [], rewards_by_hotkey={"hk_big": 0.98, "hk_mid": 0.015, "hk_small": 0.005}),
     ])
     submitted_weights = {}
 
@@ -859,28 +854,24 @@ async def test_submit_once_drops_hotkey_below_floor_keeps_hotkey_above():
     finally:
         _restore(originals)
 
-    # Single window: ema[hk] = EMA_ALPHA * reward exactly.
-    # hk_big: EMA_ALPHA*1.0 ≈ 0.02740 -- at/above the threshold, paid in full.
-    assert submitted_weights["hk_big"] == wov_mod.EMA_ALPHA
-    # hk_mid: EMA_ALPHA*0.5 ≈ 0.01370 -- inside the ramp, paid a fraction of it.
-    v_mid = wov_mod.EMA_ALPHA * 0.5
-    expected_mid = v_mid * (v_mid - 0.01) / (0.02 - 0.01)
-    assert submitted_weights["hk_mid"] == pytest.approx(expected_mid)
-    # hk_small: EMA_ALPHA*0.1 ≈ 0.00274 -- clearly below the ramp start,
-    # dropped outright.
+    # Single window: the miner total is EMA_ALPHA, and the survivors keep it all.
+    total = wov_mod.EMA_ALPHA
     assert "hk_small" not in submitted_weights
+    assert submitted_weights["hk_mid"] == pytest.approx(total * 0.0075 / 0.9875)
+    assert submitted_weights["hk_big"] == pytest.approx(total * 0.98 / 0.9875)
+    assert sum(submitted_weights.values()) == pytest.approx(total)
 
 
 @pytest.mark.asyncio
-async def test_submit_once_keeps_hotkey_exactly_on_the_floor():
-    """The comparison is `>=`, not `>`."""
+async def test_submit_once_keeps_a_hotkey_exactly_on_the_floor_in_full():
+    """The comparison is `>=` on the share, not `>`."""
     from reliquary.validator.weight_only import WeightOnlyValidator
     import reliquary.validator.weight_only as wov_mod
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
-        _archive(1, [], rewards_by_hotkey={"hk_edge": 1.0}),
+        _archive(1, [], rewards_by_hotkey={"hk_a": 0.5, "hk_b": 0.5}),
     ])
     submitted_weights = {}
 
@@ -890,32 +881,30 @@ async def test_submit_once_keeps_hotkey_exactly_on_the_floor():
     wov._submit_weights = _capture_submit
 
     try:
-        # Single window: ema[hk] = EMA_ALPHA * 1.0 == EMA_ALPHA exactly, so
-        # pinning the floor to that same value lands precisely on the
-        # boundary.
-        with patch.object(wov_mod, "MIN_INCENTIVE_SHARE", wov_mod.EMA_ALPHA):
+        # Both hotkeys hold exactly half the miner total.
+        with (
+            patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", 0.25),
+            patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.5),
+        ):
             await wov.submit_once()
     finally:
         _restore(originals)
 
-    assert submitted_weights["hk_edge"] == wov_mod.EMA_ALPHA
+    assert set(submitted_weights) == {"hk_a", "hk_b"}
+    assert submitted_weights["hk_a"] == submitted_weights["hk_b"]
+    assert submitted_weights["hk_a"] == pytest.approx(wov_mod.EMA_ALPHA / 2)
 
 
 @pytest.mark.asyncio
-async def test_submit_once_burns_freed_mass_without_redistributing():
-    """The property that matters most, unchanged by the ramp: every
-    surviving hotkey's value is EXACTLY what it would have been with no
-    floor at all, and the difference is left unallocated -- burned, never
-    redistributed. If the floor were ever implemented as a renormalisation,
-    hk_big's on-chain weight would rise to absorb hk_small's reduction; here
-    it must not move at all. Under the ramp the freed mass is the SUM OF
-    PARTIAL REDUCTIONS rather than whole shares, so the numbers differ from
-    the old cliff test this replaces -- the invariant does not."""
+async def test_submit_once_shares_the_freed_mass_and_leaves_the_burn_unchanged():
+    """The property that matters most: the floor must never change how much
+    burns. Ramping hk_mid down raises hk_big by exactly what hk_mid loses, and
+    the burn uid receives the same weight with or without the floor."""
     from reliquary.validator.weight_only import WeightOnlyValidator
     import reliquary.validator.weight_only as wov_mod
 
     fake_meta = MagicMock(
-        hotkeys=["owner", "hk_big", "hk_small"], uids=[0, 10, 20],
+        hotkeys=["owner", "hk_big", "hk_mid"], uids=[0, 10, 20],
         owner_hotkey="owner",
     )
 
@@ -923,7 +912,7 @@ async def test_submit_once_burns_freed_mass_without_redistributing():
         wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
         originals, _ = _patch_chain_and_storage(blocks_until=200)
         wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
-            _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_small": 0.5}),
+            _archive(1, [], rewards_by_hotkey={"hk_big": 0.985, "hk_mid": 0.015}),
         ])
         captured = {}
 
@@ -950,30 +939,17 @@ async def test_submit_once_burns_freed_mass_without_redistributing():
         return captured
 
     without_floor = await _run_once(0.0, 0.0)
-    with_ramp = await _run_once(0.01, 0.02)
+    with_floor = await _run_once(0.01, 0.02)
 
-    # hk_small's share (EMA_ALPHA*0.5 ≈ 0.01370) sits INSIDE the ramp band
-    # [0.01, 0.02), so it is now paid a partial amount rather than dropped
-    # outright -- that is the numeric change from the old cliff test.
-    v_small = wov_mod.EMA_ALPHA * 0.5
-    expected_paid_small = v_small * (v_small - 0.01) / (0.02 - 0.01)
-
-    # hk_big (uid 10): byte-identical — not rescaled up to absorb any of
-    # hk_small's reduction.
-    assert with_ramp[10] == without_floor[10]
-    # hk_small (uid 20): paid exactly the ramped fraction, not renormalised
-    # to something else.
-    assert with_ramp[20] == pytest.approx(expected_paid_small)
-    # The exact shortfall -- not a whole share, only the ramped-down
-    # difference -- lands on the burn uid (the subnet owner, uid 0 in this
-    # fake metagraph) and nowhere else. This is the assertion that fails
-    # loudly if anyone ever renormalises the survivors instead of burning
-    # the difference.
-    assert with_ramp[0] == pytest.approx(
-        without_floor[0] + (without_floor[20] - with_ramp[20])
+    # hk_mid holds 1.5% of the miner total, the ramp's midpoint: it keeps half.
+    assert with_floor[20] < without_floor[20]
+    assert with_floor[10] > without_floor[10]
+    assert with_floor[20] / with_floor[10] == pytest.approx(0.0075 / 0.985)
+    assert with_floor[10] + with_floor[20] == pytest.approx(
+        without_floor[10] + without_floor[20]
     )
-    assert sum(with_ramp.values()) == pytest.approx(1.0)
-    assert sum(without_floor.values()) == pytest.approx(1.0)
+    assert with_floor[0] == pytest.approx(without_floor[0])
+    assert sum(with_floor.values()) == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
@@ -1006,9 +982,8 @@ async def test_submit_once_floor_disabled_drops_nothing():
 # MIN_INCENTIVE_RAMP_START to full payment at MIN_INCENTIVE_SHARE. A cliff
 # alone gives an infinite marginal return to crossing it, which pays miners
 # to merge hotkeys -- concentration is exactly what the floor should not
-# reward. Pure-function coverage of the ramp math itself, then submit_once
-# coverage that it is actually wired in and that the freed mass still
-# burns rather than being redistributed. ---
+# reward. Pure-function coverage of the ramp and of the redistribution, then
+# submit_once coverage that both are actually wired in. ---
 
 def test_ramped_incentive_above_threshold_is_paid_in_full():
     """Byte-identical to no floor at all: no arithmetic is even attempted."""
@@ -1060,36 +1035,78 @@ def test_ramped_incentive_start_equals_threshold_reproduces_the_cliff():
     assert above == 0.025
 
 
-@pytest.mark.asyncio
-async def test_submit_once_pays_a_ramped_share_between_start_and_threshold():
-    """The ramp must actually be wired into submit_once, not just correct in
-    isolation. v = EMA_ALPHA sits at the exact midpoint of [0, 2*EMA_ALPHA],
-    so it must be paid exactly half."""
+def test_min_incentive_share_redistributes_among_eligible_hotkeys():
+    import math
     from reliquary.validator.weight_only import WeightOnlyValidator
-    import reliquary.validator.weight_only as wov_mod
 
-    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-    originals, _ = _patch_chain_and_storage(blocks_until=200)
-    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
-        _archive(1, [], rewards_by_hotkey={"hk_mid": 1.0}),
-    ])
-    submitted_weights = {}
+    weights = {"hk_big": 0.98, "hk_mid": 0.015, "hk_small": 0.005}
+    paid = WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    )
 
-    async def _capture_submit(_subtensor, miner_weights):
-        submitted_weights.update(miner_weights)
-        return True
-    wov._submit_weights = _capture_submit
+    assert "hk_small" not in paid
+    assert paid["hk_mid"] == pytest.approx(0.0075 / 0.9875)
+    assert paid["hk_big"] == pytest.approx(0.98 / 0.9875)
+    assert math.fsum(paid.values()) == pytest.approx(math.fsum(weights.values()))
 
-    try:
-        with (
-            patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", 0.0),
-            patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 2 * wov_mod.EMA_ALPHA),
-        ):
-            await wov.submit_once()
-    finally:
-        _restore(originals)
 
-    assert submitted_weights["hk_mid"] == pytest.approx(wov_mod.EMA_ALPHA / 2)
+def test_min_incentive_share_reads_shares_so_a_lower_price_filters_nobody_new():
+    """A floor on absolute weight would drop every miner once the price fell
+    far enough; on shares, scaling every weight scales every payment alike."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    weights = {"hk_big": 0.98, "hk_mid": 0.015, "hk_small": 0.005}
+    full = WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    )
+    priced = WeightOnlyValidator._apply_min_incentive_share(
+        {hk: v * 0.05 for hk, v in weights.items()}, start=0.01, threshold=0.02
+    )
+
+    assert set(priced) == set(full)
+    for hk, value in full.items():
+        assert priced[hk] == pytest.approx(value * 0.05)
+
+
+def test_min_incentive_share_leaves_weights_untouched_when_nobody_is_below_it():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    weights = {"hk_a": 0.3, "hk_b": 0.25, "hk_c": 0.2}
+
+    assert WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    ) == weights
+
+
+def test_min_incentive_share_pays_unfiltered_weights_when_everyone_is_below_it():
+    """A filter that removes every hotkey switches payment off rather than
+    filtering: 200 equal miners at 0.5% each all sit below the ramp."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    weights = {f"hk{i}": 0.005 for i in range(200)}
+
+    assert WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    ) == weights
+
+
+def test_min_incentive_share_never_pays_more_than_the_miner_total():
+    """Sum of weights <= 1 is a hard chain invariant, so rescaling must never
+    overshoot the total it started from, not even by one ULP."""
+    import math
+    import random
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    rng = random.Random(81)
+    for _ in range(2000):
+        raw = [rng.random() ** 3 for _ in range(rng.randint(2, 90))]
+        price = rng.choice([1.0, 0.654, 0.43, 0.05])
+        norm = math.fsum(raw)
+        weights = {f"hk{i}": price * r / norm for i, r in enumerate(raw)}
+        paid = WeightOnlyValidator._apply_min_incentive_share(
+            weights, start=0.01, threshold=0.02
+        )
+        assert math.fsum(paid.values()) <= math.fsum(weights.values())
 
 
 @pytest.mark.asyncio
@@ -1131,7 +1148,7 @@ async def test_submit_once_start_equals_threshold_reproduces_the_old_cliff_end_t
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
-        _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_small": 0.5}),
+        _archive(1, [], rewards_by_hotkey={"hk_big": 0.985, "hk_small": 0.015}),
     ])
     submitted_weights = {}
 
@@ -1149,71 +1166,8 @@ async def test_submit_once_start_equals_threshold_reproduces_the_old_cliff_end_t
     finally:
         _restore(originals)
 
-    assert submitted_weights["hk_big"] == wov_mod.EMA_ALPHA
     assert "hk_small" not in submitted_weights
-
-
-@pytest.mark.asyncio
-async def test_submit_once_ramp_burns_the_freed_mass_without_redistributing():
-    """The property that matters most, mirrored from the cliff's own burn
-    test: ramping hk_mid DOWN must never raise hk_big's on-chain weight to
-    absorb the difference. hk_big must be byte-identical across both runs,
-    and the freed mass (v_mid - paid_mid) must land on the burn uid."""
-    from reliquary.validator.weight_only import WeightOnlyValidator
-    import reliquary.validator.weight_only as wov_mod
-
-    fake_meta = MagicMock(
-        hotkeys=["owner", "hk_big", "hk_mid"], uids=[0, 10, 20],
-        owner_hotkey="owner",
-    )
-
-    async def _run_once(ramp_start, share):
-        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-        originals, _ = _patch_chain_and_storage(blocks_until=200)
-        wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
-            _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_mid": 0.1}),
-        ])
-        captured = {}
-
-        async def _capture_set_weights(_subtensor, _wallet, _netuid, uids, weights):
-            captured.update(zip(uids, weights))
-            return True
-
-        try:
-            with (
-                patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", ramp_start),
-                patch.object(wov_mod, "MIN_INCENTIVE_SHARE", share),
-                patch(
-                    "reliquary.validator.weight_only.chain.get_metagraph",
-                    new=AsyncMock(return_value=fake_meta),
-                ),
-                patch(
-                    "reliquary.validator.weight_only.chain.set_weights",
-                    new=_capture_set_weights,
-                ),
-            ):
-                await wov.submit_once()
-        finally:
-            _restore(originals)
-        return captured
-
-    # threshold = EMA_ALPHA/2 puts hk_big (v=EMA_ALPHA) safely above it, and
-    # hk_mid (v=0.1*EMA_ALPHA) inside the ramp from a start of 0.
-    without_floor = await _run_once(0.0, 0.0)
-    with_ramp = await _run_once(0.0, wov_mod.EMA_ALPHA / 2)
-
-    # hk_big (uid 10): untouched -- not rescaled up to absorb hk_mid's cut.
-    assert with_ramp[10] == without_floor[10]
-    # hk_mid (uid 20): ramped down, but still present (it clears the ramp
-    # start), so strictly less than its unfloored share, not absent.
-    assert 0.0 < with_ramp[20] < without_floor[20]
-    # The exact shortfall lands on the burn uid (the subnet owner, uid 0 in
-    # this fake metagraph) -- never spread across hk_big.
-    assert with_ramp[0] == pytest.approx(
-        without_floor[0] + (without_floor[20] - with_ramp[20])
-    )
-    assert sum(with_ramp.values()) == pytest.approx(1.0)
-    assert sum(without_floor.values()) == pytest.approx(1.0)
+    assert submitted_weights["hk_big"] == pytest.approx(wov_mod.EMA_ALPHA)
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -241,26 +242,14 @@ class WeightOnlyValidator:
         )
         ema = self._replay_ema(archives, caps=self._caps_by_task(declared))
         miner_weights = dict(ema)
-        # A hotkey below MIN_INCENTIVE_SHARE of the pool is paid a ramped-down
-        # share rather than its full one, down to nothing at all below
-        # MIN_INCENTIVE_RAMP_START. Applied here, at the submission boundary —
-        # after _replay_ema's own per-task cap clamp and global >1.0 backstop —
-        # rather than inside the EMA arithmetic itself. Ramping down (never
-        # rescaling anyone up) is what keeps the freed mass unallocated:
-        # _submit_weights' burn_weight = max(0, 1 - registered_total) absorbs
-        # it instead of it being shared out among the miners that clear the
-        # floor. The ramp only softens WHERE that mass starts getting freed —
-        # a hard cliff at MIN_INCENTIVE_SHARE alone gives an infinite marginal
-        # return to crossing it, which pays miners to merge hotkeys.
+        # Applied after _replay_ema's per-task caps: the floor decides who is
+        # paid, and the miner total it preserves is what decides what burns.
         if MIN_INCENTIVE_SHARE > 0.0:
-            ramped = {}
-            for hk, v in miner_weights.items():
-                paid = self._ramped_incentive(
-                    v, start=MIN_INCENTIVE_RAMP_START, threshold=MIN_INCENTIVE_SHARE
-                )
-                if paid > 0.0:
-                    ramped[hk] = paid
-            miner_weights = ramped
+            miner_weights = self._apply_min_incentive_share(
+                miner_weights,
+                start=MIN_INCENTIVE_RAMP_START,
+                threshold=MIN_INCENTIVE_SHARE,
+            )
 
         subtensor = await chain.get_subtensor()
         try:
@@ -322,6 +311,49 @@ class WeightOnlyValidator:
         if start >= threshold or value < start:
             return 0.0
         return value * (value - start) / (threshold - start)
+
+    @staticmethod
+    def _apply_min_incentive_share(
+        weights: Mapping[str, float], *, start: float, threshold: float
+    ) -> dict[str, float]:
+        """Ramp down hotkeys holding too small a share, and share their mass out.
+
+        The floor reads each hotkey's share of the miner total, not its absolute
+        weight, so a falling price never drops everyone under it; and the total is
+        preserved, so only the price and the caps decide what burns.
+        """
+        total = math.fsum(weights.values())
+        if total <= 0.0:
+            return dict(weights)
+        shares = {hotkey: value / total for hotkey, value in weights.items()}
+        kept = {
+            hotkey: WeightOnlyValidator._ramped_incentive(
+                share, start=start, threshold=threshold
+            )
+            for hotkey, share in shares.items()
+        }
+        if all(kept[hotkey] == share for hotkey, share in shares.items()):
+            return dict(weights)
+        kept = {hotkey: share for hotkey, share in kept.items() if share > 0.0}
+        kept_total = math.fsum(kept.values())
+        if kept_total <= 0.0:
+            # Filtering out every hotkey would switch payment off, not favour anyone.
+            logger.warning(
+                "Every hotkey holds less than %.4f of the miner total; "
+                "paying the unfiltered weights",
+                start,
+            )
+            return dict(weights)
+        paid = {hotkey: total * share / kept_total for hotkey, share in kept.items()}
+        # Rescaling can overshoot the total by a few ULPs; take them back from
+        # the largest payment so the vector never sums past where it started.
+        overshoot = math.fsum(paid.values()) - total
+        if overshoot > 0.0:
+            largest = max(paid, key=paid.__getitem__)
+            paid[largest] -= overshoot
+            while math.fsum(paid.values()) > total:
+                paid[largest] = math.nextafter(paid[largest], 0.0)
+        return paid
 
     @staticmethod
     def _caps_by_task(declared: Mapping[str, Any]) -> dict[str, float]:
