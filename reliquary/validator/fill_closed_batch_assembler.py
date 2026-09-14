@@ -113,11 +113,16 @@ class FillClosedBatchAssembler:
                 # is an instruction, not an accident: a zero share pays
                 # nobody, and the whole declared total burns.
                 self._pool_by_env = {e: 0.0 for e in self._env_order}
+            # The DECLARED total, never a re-derived sum of the per-environment
+            # pools: ``window_pool`` is the policy value the recovery journal
+            # compares the archive against with exact float equality, and a
+            # zeroed running subset must still declare the total it burned.
+            self._window_pool = declared_total
         else:
             total = float(window_pool)
             share = total / len(self._env_order) if self._env_order else 0.0
             self._pool_by_env = {e: share for e in self._env_order}
-        self._window_pool = sum(self._pool_by_env.values())
+            self._window_pool = total
         self._rewards_by_hotkey: dict[str, float] = {}
         # R24: every group this window actually PAID, in payment order, per
         # environment, each paired with the batch index it was paid in

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -275,6 +276,54 @@ def test_begin_refuses_an_out_of_range_pool(tmp_path, monkeypatch, bad):
 
     with pytest.raises(ValueError, match="pool"):
         store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1}, window_pool=bad)
+
+
+def test_a_three_environment_window_at_a_fractional_cap_still_finishes(tmp_path):
+    """The end-to-end consequence of re-deriving the window pool.
+
+    ``finish()`` compares the archive's pool against the journalled one with
+    exact float equality, and three shares of 0.9 re-sum to
+    0.8999999999999999. The mismatch raised, the caller aborted the window,
+    and fill-closed recovery replayed the correct archive away at an even
+    split -- for 14 of the 100 two-decimal caps.
+    """
+    from reliquary.constants import (
+        B_BATCH,
+        FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        FILL_CLOSED_SELECTION_POLICY,
+    )
+    from reliquary.validator.fill_closed_batch_assembler import (
+        FillClosedBatchAssembler,
+    )
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    environments = ["math", "code", "logic"]
+    store = FillClosedRecoveryStore(tmp_path)
+    store.begin(42, checkpoint_n=7, revision="a" * 40,
+                targets={env: B_BATCH for env in environments}, window_pool=0.9)
+    assembler = FillClosedBatchAssembler(
+        window_start=42,
+        env_order=environments,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool=0.9,
+    )
+    archive = {
+        "window_start": 42,
+        "window_status": "completed",
+        "payment_policy": assembler.payment_policy,
+        "selection_policy": FILL_CLOSED_SELECTION_POLICY,
+        "picks_target": assembler.picks_target,
+        "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        "window_pool": assembler.window_pool,
+    }
+    enqueued = {}
+
+    store.finish(42, archive, types.SimpleNamespace(
+        enqueue=lambda window, body: enqueued.update({window: body})))
+
+    assert enqueued == {42: archive}
+    assert not store.windows()
 
 
 def test_a_zero_share_pays_nobody():

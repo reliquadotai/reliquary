@@ -111,7 +111,11 @@ def test_a_zero_declared_share_pays_the_running_environment_nothing(monkeypatch)
         window_pool={"math": 0.0, "code": 0.0, "logic": 1.0},
     )
 
-    assert assembler.window_pool == pytest.approx(0.0)
+    # The DECLARED total is still what the window reports -- the recovery
+    # journal records the declared total, so reporting the zeroed sum here
+    # would make a crash replay the window at the FULL pool, the inverse of
+    # what the zero-share rule intends. Nobody is paid either way.
+    assert assembler.window_pool == 1.0
     assert assembler.pool_for("math") == pytest.approx(0.0)
     assert assembler.pool_for("code") == pytest.approx(0.0)
 
@@ -135,6 +139,36 @@ def test_a_zero_share_environment_still_renormalises_once_a_paid_one_runs():
     assert assembler.window_pool == pytest.approx(1.0)
     assert assembler.pool_for("code") == pytest.approx(0.0)
     assert assembler.pool_for("logic") == pytest.approx(1.0)
+
+
+def test_a_scalar_pool_is_reported_exactly_not_re_derived():
+    """``window_pool`` is compared against the recovery journal's declared
+    value with exact float equality, so it must be the number handed in, not
+    a sum of the per-environment shares: ``sum([0.9 / 3] * 3)`` is
+    ``0.8999999999999999``, which fails that comparison and sends the whole
+    window down the abort/replay path."""
+    assembler = _assembler(
+        env_order=["math", "code", "logic"], window_pool=0.9
+    )
+
+    assert assembler.window_pool == 0.9
+    assert sum(assembler.pool_for(e) for e in ("math", "code", "logic")) != 0.9
+
+
+def test_a_declared_map_reports_its_own_declared_total_exactly():
+    """Whole mix and narrowed mix alike: the renormalised shares are a
+    payment detail, the declared total is the policy value the archive
+    carries, and re-adding the shares loses the last bit."""
+    declared = {"math": 0.5, "code": 0.3, "logic": 0.1}
+
+    assert _assembler(
+        env_order=["math", "code", "logic"], window_pool=declared
+    ).window_pool == 0.9
+
+    narrowed = _assembler(env_order=["math", "code"], window_pool=declared)
+
+    assert narrowed.window_pool == 0.9
+    assert narrowed.pool_for("math") + narrowed.pool_for("code") != 0.9
 
 
 def _chunk(tag: int, env: str) -> list:
