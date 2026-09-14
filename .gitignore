@@ -27,3 +27,6 @@ reliquary-infra/inventory/known_hosts
 
 # Session scratch — one-off investigation workspaces, never committed
 .r2_analysis/
+
+# Agent working notes; plans and specs live under docs/superpowers/.
+/.superpowers/
