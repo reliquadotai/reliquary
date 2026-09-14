@@ -607,10 +607,9 @@ def price_signal_fields(
 PRODUCTION_PRICE_PARAMS = PriceParams(
     # Today's pool, so the first armed window changes nothing.
     start=1.0,
-    # -1% per step. Quicknet is 3 s, so one step per ~50 minutes: roughly
-    # -25%/day, putting a descent to 0.05 about ten days out. Slow enough to
-    # watch, fast enough to matter.
-    decay=0.99,
+    # -2% per ~50 minutes of window time: about a week from 1.0 to 0.05 at a
+    # 17-minute cycle, still ~5x slower than the ~12 h miners take to feel a price.
+    decay=0.98,
     rounds_per_step=1000,
     # Collection close to the incompressible time is the target, not a signal.
     deadband=0.80,

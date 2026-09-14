@@ -210,7 +210,7 @@ Le prix est **affiché à l'avance**, et le prix qui s'applique à une fenêtre 
 | Paramètre | Valeur | Lecture |
 |---|---|---|
 | `start` | 1.0 | le pool actuel : armer ne change rien à la première fenêtre |
-| `decay` / `rounds_per_step` | 0.99 / 1000 | −1 % toutes les ~50 min, soit ~−25 %/jour |
+| `decay` / `rounds_per_step` | 0.98 / 1000 | −2 % toutes les ~50 min de fenêtre, ~5× plus lent que le délai de boucle (~12 h) |
 | `deadband` | 0.80 | |
 | `snap` | 1.20 | |
 | `floor` | 0.05 | garde de liveness, pas une opinion économique |
@@ -219,7 +219,7 @@ Le prix est **affiché à l'avance**, et le prix qui s'applique à une fenêtre 
 
 **Aucune valeur n'est arrêtée.** La fenêtre de médiane et le plancher de liveness se *dérivent* du délai de boucle et doivent être recalculés s'il change. `decay`, la bande morte, le snap et le plancher se calibrent sur la courbe observée en shadow, avant tout armement.
 
-Ordres de grandeur avec ces valeurs : 1,0 → 0,5 en ~2 jours, → 0,1 en ~7 jours, → 0,05 en ~10 jours. Avec la bande morte et la médiane, compter 12 à 15 jours.
+Ordres de grandeur avec ces valeurs et le cycle mesuré le 14/09 (16,8 min, dont ~12 dans la fenêtre) : 1,0 → 0,5 en ~1,6 jour, → 0,1 en ~5,5 jours, → 0,05 en ~7 jours, au plus vite. `decay` était 0.99 (~14 jours) ; 0.98 est la valeur la plus rapide qui reste ~5× plus lente que le délai de boucle, dominé par l'EMA (~10 h).
 
 ---
 
@@ -465,7 +465,7 @@ Le **registre signé** (§10) : tâches, digests de contrat, paramètres d'incit
     "components": { "validator": "…", "trainer": "…" },
     "incentive": {
       "mechanism": "fill-rate-controller/v1",    // référence à du code déjà livré
-      "params": { "start": 1.0, "decay": 0.99, "rounds_per_step": 1000,
+      "params": { "start": 1.0, "decay": 0.98, "rounds_per_step": 1000,
                   "deadband": 0.80, "snap": 1.20, "floor": 0.05, "median_rounds": 4800 }
     }
   }]
