@@ -109,11 +109,10 @@ class FillClosedBatchAssembler:
                 scale = declared_total / restricted_total
                 self._pool_by_env = {e: v * scale for e, v in restricted.items()}
             else:
-                # Every running environment was declared a zero share: there
-                # is no proportion to preserve, so split the declared total
-                # evenly rather than paying nothing to a mix that is running.
-                share = declared_total / len(self._env_order) if self._env_order else 0.0
-                self._pool_by_env = {e: share for e in self._env_order}
+                # Every running environment was declared a zero share. That
+                # is an instruction, not an accident: a zero share pays
+                # nobody, and the whole declared total burns.
+                self._pool_by_env = {e: 0.0 for e in self._env_order}
         else:
             total = float(window_pool)
             share = total / len(self._env_order) if self._env_order else 0.0

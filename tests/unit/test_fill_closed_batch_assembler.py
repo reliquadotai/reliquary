@@ -93,6 +93,50 @@ def test_two_of_three_running_split_the_declared_total_in_proportion():
     assert assembler.pool_for("code") == pytest.approx(0.3 / 0.9)
 
 
+def test_a_zero_declared_share_pays_the_running_environment_nothing(monkeypatch):
+    """A declared share of 0.0 is the operator's instruction, not a gap to
+    fill by renormalising: when every RUNNING environment was declared
+    zero, the pool is zero, and the non-running environment's declared
+    share simply burns rather than being handed to environments the
+    operator explicitly zeroed out."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    window = 42
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=["math", "code"],
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool={"math": 0.0, "code": 0.0, "logic": 1.0},
+    )
+
+    assert assembler.window_pool == pytest.approx(0.0)
+    assert assembler.pool_for("math") == pytest.approx(0.0)
+    assert assembler.pool_for("code") == pytest.approx(0.0)
+
+    for env in ("math", "code"):
+        groups = _chunk(0, env)
+        for group in groups:
+            group.eos_tokens = 10
+        assembler.accept(env, groups, window, "rev")
+
+    assert sum(assembler.reward_map().values()) == 0.0
+
+
+def test_a_zero_share_environment_still_renormalises_once_a_paid_one_runs():
+    """The same declared map as above, but the running mix now includes the
+    non-zero environment: the declared total must still reach it, in full."""
+    assembler = _assembler(
+        env_order=["code", "logic"],
+        window_pool={"math": 0.0, "code": 0.0, "logic": 1.0},
+    )
+
+    assert assembler.window_pool == pytest.approx(1.0)
+    assert assembler.pool_for("code") == pytest.approx(0.0)
+    assert assembler.pool_for("logic") == pytest.approx(1.0)
+
+
 def _chunk(tag: int, env: str) -> list:
     return [
         _group([_roll(1.0, 4, env=env)], prompt_idx=tag * 1000 + i)
