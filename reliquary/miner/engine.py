@@ -155,7 +155,7 @@ def _warn_transformers_mismatch(local_runtime, validator_runtime) -> None:
     if local and remote and local != remote:
         logger.warning(
             "Transformers runtime differs: miner=%s validator_proof_worker=%s. "
-            "Follow the operator's qualified runtime release; a version difference "
+            "Follow the operator's current runtime release; a version difference "
             "may affect numerical agreement but does not establish a proof failure.",
             local, remote,
         )
