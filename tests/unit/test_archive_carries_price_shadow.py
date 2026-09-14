@@ -224,3 +224,20 @@ def test_a_timed_out_window_does_not_price_lagging_proofs_as_a_fast_fill():
     assert completed["by_environment"]["math"]["price"] < 1.0
     assert timed_out["by_environment"]["math"]["regime"] != "descend"
     assert timed_out["by_environment"]["math"]["price"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_every_priced_window_publishes_the_block_miners_read():
+    """/tasks must show the decision the archive carries, not a separate one."""
+    service = _service()
+
+    archives = await _archive_all(
+        service,
+        [_oversupplied_batcher(open_round=1000), _oversupplied_batcher(open_round=3000)],
+    )
+
+    view = service.server._price_view
+    shadow = archives[-1]["emission_price_shadow"]
+    assert view["value"] == shadow["price"]
+    assert view["regime"] == shadow["regime"]
+    assert view["applied"] is False

@@ -145,3 +145,20 @@ def test_load_declared_tasks_returns_empty_for_invalid_json(tmp_path):
     directory.write_text("{ not json")
 
     assert _load_declared_tasks(str(directory)) == []
+
+
+def test_the_price_block_is_empty_until_a_window_has_been_priced():
+    body = TestClient(ValidatorServer().app).get("/tasks").json()
+
+    assert body["tasks"][0]["price"] is None
+
+
+def test_the_price_block_is_served_as_the_service_published_it():
+    server = ValidatorServer()
+    server._price_view = {"applied": False, "value": 0.654, "regime": "descend"}
+
+    body = TestClient(server.app).get("/tasks").json()
+
+    assert body["tasks"][0]["price"] == {
+        "applied": False, "value": 0.654, "regime": "descend",
+    }

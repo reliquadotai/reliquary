@@ -1253,6 +1253,8 @@ class ValidatorServer:
         # What this task may pay per window, for the /tasks discovery listing.
         # 1.0 is the legacy single-task pool.
         self._emission_cap = float(emission_cap)
+        # The price block /tasks shows miners; the service publishes it each window.
+        self._price_view: dict | None = None
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
         self._runtime_fingerprint = collect_runtime_fingerprint()
@@ -5945,6 +5947,7 @@ class ValidatorServer:
                 "profile_id": PROTOCOL_PROFILE_ID,
                 "model": {"model_id": PROTOCOL_MODEL_ID, "model_revision": PROTOCOL_MODEL_REVISION},
                 "emission_share": self._emission_cap,
+                "price": self._price_view,
                 "url": None,
                 "window": {
                     "window_n": batcher.window_start if batcher is not None else None,

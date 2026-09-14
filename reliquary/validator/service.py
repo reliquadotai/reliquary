@@ -4495,7 +4495,38 @@ class ValidationService:
             by_environment = None
         if by_environment:
             shadow["by_environment"] = by_environment
+        self._publish_price_view(shadow, price_params)
         return shadow
+
+    def _publish_price_view(self, shadow: dict[str, Any], price_params) -> None:
+        """Hand the server the price block ``GET /tasks`` shows miners.
+
+        A failure only hides the block; it must never cost the window its archive.
+        """
+        server = getattr(self, "server", None)
+        if server is None:
+            return
+        try:
+            from reliquary.infrastructure import drand
+            from reliquary.validator.price_view import price_view
+
+            assembler = getattr(self, "_fill_closed_assembler", None)
+            server._price_view = price_view(
+                shadow=shadow,
+                outcomes=list(getattr(self, "_price_shadow_outcomes", None) or ()),
+                params=price_params,
+                window_pool=(
+                    assembler.window_pool if assembler is not None else self._emission_cap
+                ),
+                places_per_window=(
+                    assembler.picks_target * B_BATCH * len(self.env_mix)
+                    if assembler is not None else None
+                ),
+                # Quicknet's 3 s period until the chain info has been fetched.
+                round_seconds=float(drand._DRAND_PERIOD or 3),
+            )
+        except Exception:
+            logger.warning("price block for /tasks could not be built", exc_info=True)
 
     def _advance_price_shadow_by_environment(
         self, record: dict[str, Any], price_params
