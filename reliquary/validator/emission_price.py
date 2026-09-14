@@ -212,7 +212,10 @@ def advance(
     else:
         regime = "hold"
     price = min(max(price, params.floor), params.cap)
-    if outcome.filled:
+    # A timed-out window assembled no batch, so it is not evidence that this
+    # price works no matter what its admission clock says. ``WindowOutcome``
+    # carries no such flag, which is how the scalar walk stays unchanged.
+    if outcome.filled and not getattr(outcome, "timed_out", False):
         # Only a window that actually filled proves a price works. It joins
         # the rolling window rather than replacing ``last_good`` outright, so
         # the minimum -- not the latest fill -- is what the next snap reads.
@@ -242,6 +245,11 @@ class EnvironmentOutcome:
     close_round: int
     ready_round: int | None
     incompressible_rounds: float
+    # Whether the WINDOW timed out: ``filled`` reads the ADMISSION clock while
+    # a timeout is decided on PROVEN groups, so the two disagree in the
+    # dominant shape (arrivals reached target, proofs did not). Last and
+    # defaulted, so every existing construction keeps working.
+    timed_out: bool = False
 
     @property
     def elapsed_rounds(self) -> int:
@@ -281,9 +289,17 @@ def advance_by_environment(
             environment,
             PriceState(price=params.start, last_good=params.start, recent_fill_prices=()),
         )
-        trailing = list(recent)[-params.breaker_timeouts :]
-        if len(trailing) >= params.breaker_timeouts and all(
-            not outcome.filled for outcome in trailing
+        # A breaker length of 0 disables the breaker. Without the guard,
+        # ``[-0:]`` is the WHOLE list and ``all`` over an empty trailing run is
+        # vacuously true, so 0 froze on the first window instead.
+        breaker_length = max(int(params.breaker_timeouts), 0)
+        trailing = list(recent)[-breaker_length:] if breaker_length else []
+        # A timed-out window counts against the breaker even when its
+        # admission clock reached target: the environment produced no trained
+        # batch, which is the halting shape the breaker exists for -- and the
+        # dominant one.
+        if breaker_length and len(trailing) >= breaker_length and all(
+            outcome.timed_out or not outcome.filled for outcome in trailing
         ):
             # This is real subnet-halting news -- fill-closed cannot proceed
             # without this environment -- even though the frozen number is,
@@ -375,12 +391,14 @@ def outcome_from_archive(record: Mapping[str, Any]) -> WindowOutcome | None:
         # own existing "no denominator" rule instead of a second special
         # case. ``filled`` is untouched -- it still reads off
         # ``collect_ready_round`` below, so a window that reached its ready
-        # round is still a HOLD in ``advance`` (it still joins
-        # ``recent_fill_prices``), not silence; only the ratio this window
-        # would otherwise report is what gets suppressed, because it is not
-        # a real measurement of anything. This is the one place the rule
-        # lives -- ``outcomes_by_environment_from_archive`` reads it back off
-        # this same ``WindowOutcome`` rather than repeating it.
+        # round is still a HOLD in ``advance``, not silence; only the ratio
+        # this window would otherwise report is what gets suppressed, because
+        # it is not a real measurement of anything. This is the one place the
+        # rule lives -- ``outcomes_by_environment_from_archive`` reads it back
+        # off this same ``WindowOutcome`` rather than repeating it. The
+        # per-environment walk carries the timeout separately, as
+        # ``EnvironmentOutcome.timed_out``, so the breaker can count it and
+        # ``recent_fill_prices`` can refuse it.
         incompressible = 0.0
     return WindowOutcome(
         open_round=open_round,
@@ -415,6 +433,7 @@ def outcomes_by_environment_from_archive(
     # ``outcome_from_archive`` already zeroes ``incompressible_rounds`` for a
     # "timed_out" record (one owner for that rule); every environment reads
     # the same scalar back rather than re-deriving it here.
+    timed_out = record.get("window_status") == "timed_out"
     outcomes: dict[str, EnvironmentOutcome] = {}
     for environment, ready in by_environment.items():
         if not isinstance(environment, str):
@@ -447,6 +466,7 @@ def outcomes_by_environment_from_archive(
             close_round=scalar.close_round,
             ready_round=resolved,
             incompressible_rounds=scalar.incompressible_rounds,
+            timed_out=timed_out,
         )
     return outcomes
 

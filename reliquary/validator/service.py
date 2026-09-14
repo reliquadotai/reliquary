@@ -420,7 +420,9 @@ def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
-# The three values an archive's/a seal call's "window_status" ever takes.
+# The three values an archive's/a seal call's "window_status" takes on THIS
+# path. A fourth, "recovered_partial", exists but is never written here: only
+# fill_closed_recovery.py writes it, for a window replayed from its journal.
 # Named here, once, so a typo like "timedout" fails an import or an
 # equality check loudly instead of silently degrading to whichever branch
 # every comparison's ``else`` happens to fall through to (pay the forced
@@ -5822,6 +5824,19 @@ class ValidationService:
                 "external_port": self.external_port,
             },
         )
+        from reliquary.constants import PIPELINED_WINDOWS
+
+        if PIPELINED_WINDOWS:
+            # ``window_status`` is not threaded through the ``_gpu_backlog``
+            # stash tuple, so this mode archives a timed-out window as
+            # "completed". The real fix is to thread ``window_status`` through
+            # the backlog; until then this only refuses to fail silently.
+            logger.critical(
+                "RELIQUARY_PIPELINED_WINDOWS is ON: per-window price signals "
+                "are NOT correct in this mode -- a timed-out window is "
+                "archived as \"completed\", and its admission-derived ready "
+                "round then walks the emission price as a real fast fill"
+            )
 
     async def _pause_for_control_drain(self) -> bool:
         """Finish the owed pipeline half, then wait closed while uploads drain."""

@@ -259,6 +259,30 @@ def test_an_env_split_naming_an_undeclared_environment_is_refused(monkeypatch):
     assert state["entries"] == {}
 
 
+def test_a_partial_env_split_is_refused_at_write_time(monkeypatch):
+    """A split that names only some of the profile's environments passes the
+    sum rule and lands in the shared registry, and every validator on the task
+    then exits 4 at its next restart -- `resolve_task_config` only checks
+    coverage on READ. It has to be refused before the write."""
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    state = {"entries": {}, "etag": None}
+    _fake_store(monkeypatch, state)
+
+    result = CliRunner().invoke(app, [
+        "tasks", "create", "--task-id", "default",
+        "--profile-id", "qwen3-4b-base-dapo-fill-closed-v6", "--cap", "0.6",
+        "--env-split", "openmathinstruct=1.0",
+    ])
+
+    assert result.exit_code == 1, result.output
+    assert "opencodeinstruct" in result.output
+    assert "every profile environment" in result.output
+    assert state["entries"] == {}
+
+
 def test_an_env_split_not_summing_to_one_is_refused(monkeypatch):
     from typer.testing import CliRunner
 

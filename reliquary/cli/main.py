@@ -112,6 +112,16 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
                 f"{profile.profile_id!r} does not declare; it has "
                 f"{sorted(declared)}"
             )
+        # A partial split is refused at WRITE time too, not only on read: the
+        # registry is shared, so an entry that omits an environment exits
+        # every validator on the task with code 4 at its next restart.
+        uncovered = declared - named
+        if uncovered:
+            raise ValueError(
+                f"task {task_id!r} declares env_split but it does not cover "
+                f"{sorted(uncovered)}, which profile {profile.profile_id!r} "
+                f"also declares; env_split must name every profile environment"
+            )
     params = asdict(PRODUCTION_PRICE_PARAMS)
     params.update(overrides)
     params["cap"] = float(cap)

@@ -471,3 +471,111 @@ def test_two_dry_windows_still_snap():
 
     assert decisions["math"].regime == "snap"
     assert decisions["math"].price > 0.5
+
+
+def test_a_timed_out_environment_trips_the_breaker_even_when_arrivals_were_full():
+    """The dominant timeout shape: admission reached target, proofs did not.
+
+    ``filled`` reads the admission clock, so before ``timed_out`` existed a
+    run of timed-out windows read as ordinary holds and the breaker -- the
+    guard against a structurally dry environment halting the subnet -- never
+    fired and never logged.
+    """
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    timed_out = [
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+    ] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(
+        states, {"math": timed_out}, PRODUCTION_PRICE_PARAMS
+    )
+
+    assert decisions["math"].regime == "frozen"
+    assert decisions["math"].price == 0.5
+
+
+def test_two_timed_out_windows_do_not_trip_the_breaker():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    timed_out = [
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+    ] * 2
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(
+        states, {"math": timed_out}, PRODUCTION_PRICE_PARAMS
+    )
+
+    assert decisions["math"].regime != "frozen"
+
+
+def test_a_timed_out_window_is_not_evidence_that_the_price_works():
+    """It assembled no batch, so it must not extend the rolling minimum
+    ``last_good`` -- and so must not lower the floor the next snap climbs
+    from."""
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance,
+    )
+
+    state = PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))
+    outcome = EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+
+    decision = advance(state, [outcome], PRODUCTION_PRICE_PARAMS)
+
+    assert decision.recent_fill_prices == (0.5,)
+    assert decision.last_good == 0.5
+
+
+def test_a_filled_window_still_extends_the_rolling_minimum():
+    """The control for the test above: the flag is what suppresses it, not
+    the per-environment shape."""
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance,
+    )
+
+    state = PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))
+    outcome = EnvironmentOutcome("math", 0, 1000, 100, 500.0)
+
+    decision = advance(state, [outcome], PRODUCTION_PRICE_PARAMS)
+
+    assert len(decision.recent_fill_prices) == 2
+
+
+def test_a_zero_breaker_length_disables_the_breaker():
+    """``[-0:]`` is the whole list, so a breaker of 0 froze on the first
+    unfilled window instead of standing down."""
+    import dataclasses
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    params = dataclasses.replace(PRODUCTION_PRICE_PARAMS, breaker_timeouts=0)
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 5
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(states, {"math": dry}, params)
+
+    assert decisions["math"].regime == "snap"
+    assert decisions["math"].price > 0.5
