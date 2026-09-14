@@ -530,7 +530,7 @@ class FillClosedBatchAssembler:
                 for environment, groups in self._paid_groups.items()
             }
 
-    def close(self) -> None:
+    def close(self, *, pay_partial_remainder: bool = True) -> None:
         """Called once by the service when this window closes (R16),
         after every batcher has handed its last chunk to ``accept``. A
         window's final cycle rarely lands exactly on B_BATCH for every
@@ -540,13 +540,25 @@ class FillClosedBatchAssembler:
         marker.
 
         If every environment contributed at least one group to the
-        current cycle, that partial cycle is emitted as one final batch
-        -- a short DAPO minibatch is still a valid optimizer step, and
-        the seal path already trains on partial windows -- through the
-        SAME quarantine gate (R14) a full batch clears. Otherwise (some
-        environment contributed nothing at all) a tombstone is written
-        under the next batch's key instead, so the trainer's cursor still
+        current cycle, ``pay_partial_remainder`` (default True) emits
+        that partial cycle as one final batch -- a short DAPO minibatch
+        is still a valid optimizer step, and the seal path already
+        trains on partial windows -- through the SAME quarantine gate
+        (R14) a full batch clears. Otherwise (some environment
+        contributed nothing at all, OR the caller passed
+        ``pay_partial_remainder=False``) a tombstone is written under
+        the next batch's key instead, so the trainer's cursor still
         advances.
+
+        ``pay_partial_remainder=False`` is for a window that timed out:
+        the fixed per-batch pool divides across ``picks_target`` batches
+        regardless of how many groups land in one, so forcing a
+        half-empty cycle through would give its groups a larger share
+        than a full batch's, and would hand the (possibly still-forming,
+        never health-gated) trainer a partial, biased minibatch. Every
+        EARLIER cycle in this same window already cleared the normal
+        full-batch path in ``accept()`` and keeps its payment; only the
+        trailing remainder is affected.
 
         Idempotent: a second call, or one racing a final in-flight
         ``accept``, is a no-op -- ``_closed`` is set under the same lock
@@ -597,7 +609,10 @@ class FillClosedBatchAssembler:
                 )
                 if not still_outstanding:
                     break
-                if self._accumulator.has_groups_for_all_targets:
+                if (
+                    pay_partial_remainder
+                    and self._accumulator.has_groups_for_all_targets
+                ):
                     self._commit_write_locked(
                         self._prepare_payload_locked(allow_partial=True)
                     )

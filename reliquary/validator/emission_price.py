@@ -368,6 +368,14 @@ def outcomes_by_environment_from_archive(
     scalar = outcome_from_archive(record)
     if scalar is None:
         return None
+    # A timed-out window trained on nothing -- no batch was assembled, so
+    # there is no denominator any ratio could mean. ``filled`` (from
+    # ``ready``, below) already carries the shortage; forcing the
+    # incompressible time to 0 routes every environment's ratio through
+    # ``EnvironmentOutcome.ratio``'s own existing "no denominator" rule
+    # instead of adding a second special case here.
+    timed_out = record.get("window_status") == "timed_out"
+    incompressible = 0.0 if timed_out else scalar.incompressible_rounds
     outcomes: dict[str, EnvironmentOutcome] = {}
     for environment, ready in by_environment.items():
         if not isinstance(environment, str):
@@ -399,7 +407,7 @@ def outcomes_by_environment_from_archive(
             open_round=scalar.open_round,
             close_round=scalar.close_round,
             ready_round=resolved,
-            incompressible_rounds=scalar.incompressible_rounds,
+            incompressible_rounds=incompressible,
         )
     return outcomes
 
