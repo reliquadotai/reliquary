@@ -550,15 +550,29 @@ class FillClosedBatchAssembler:
         the next batch's key instead, so the trainer's cursor still
         advances.
 
-        ``pay_partial_remainder=False`` is for a window that timed out:
-        the fixed per-batch pool divides across ``picks_target`` batches
-        regardless of how many groups land in one, so forcing a
-        half-empty cycle through would give its groups a larger share
-        than a full batch's, and would hand the (possibly still-forming,
-        never health-gated) trainer a partial, biased minibatch. Every
-        EARLIER cycle in this same window already cleared the normal
-        full-batch path in ``accept()`` and keeps its payment; only the
-        trailing remainder is affected.
+        ``pay_partial_remainder=False`` is for a window that timed out. The
+        spec requires a timed-out window to pay only fully assembled
+        batches, and this is what enforces that: it does NOT protect
+        against overpayment -- ``FIXED_GROUP_PAYMENT_POLICY`` already pays a
+        fixed ``pool / slots`` share regardless of how many of ``slots`` are
+        filled (unfilled slots already burn instead of being redistributed,
+        for any batch, timed out or not), so a lone group in a short cycle
+        is paid exactly what a group in a full cycle is paid -- never more.
+        What this flag actually does is BURN that accrued pay: every group
+        in the forced final partial cycle -- fully admitted, proven and
+        graded work -- is tombstoned and paid nothing, on the spec's
+        authority, not because paying it would have been wrong on its own
+        terms. Every EARLIER cycle in this same window already cleared the
+        normal full-batch path in ``accept()`` (already durably enqueued to
+        the trainer, independent of whether this window later times out)
+        and keeps its payment; only the trailing remainder is affected. That
+        remainder is also the one UNBALANCED object a timed-out window could
+        otherwise hand the trainer -- every completed cycle already holds
+        exactly ``B_BATCH`` groups per environment by construction
+        (``BalancedTrainingAccumulator``), so tombstoning the remainder
+        instead of committing it keeps a timed-out window's trained data
+        balanced, which is the one piece of this that is a real property of
+        the data rather than a policy choice.
 
         Idempotent: a second call, or one racing a final in-flight
         ``accept``, is a no-op -- ``_closed`` is set under the same lock

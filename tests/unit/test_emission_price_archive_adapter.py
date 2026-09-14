@@ -106,6 +106,25 @@ def test_measured_stages_take_precedence_over_the_span():
     assert outcome.ratio == 0.5    # 25 rounds against max(50, 20), not against 100
 
 
+def test_a_timed_out_window_yields_no_ratio_even_when_admission_filled():
+    """``collect_ready_round`` is built from ADMITTED candidates while a
+    timeout is decided on PROVEN groups -- admission runs well ahead of
+    proof capacity (to ``2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV``), so
+    arrivals-full/proofs-short is the DOMINANT timeout shape, not the
+    exception: a timed-out window routinely still carries a ready round
+    that would otherwise compute a real, fast-looking ratio. No batch was
+    assembled, so that ratio would report collection speed for a window
+    that never trained -- it must read as None. The same record as
+    "completed" is the control: it must still produce the ratio."""
+    timed_out = outcome_from_archive(_instrumented(window_status="timed_out"))
+    completed = outcome_from_archive(_instrumented(window_status="completed"))
+
+    assert timed_out is not None
+    assert timed_out.ratio is None
+    assert completed is not None
+    assert completed.ratio == 0.25
+
+
 def test_a_bad_entry_costs_only_its_own_environment():
     """A hand-repaired archive with a typo in one environment must not take
     down every environment's price signal -- that isolation is the point of

@@ -357,6 +357,25 @@ def outcome_from_archive(record: Mapping[str, Any]) -> WindowOutcome | None:
     # raise-on-slow regime -- shortage is a window that never filled), and real
     # stage timings sharpen it without a schema change.
     incompressible = measured if measured > 0 else float(close_round - open_round)
+    if record.get("window_status") == "timed_out":
+        # ``collect_ready_round`` is built from ADMITTED candidates, while a
+        # timeout is decided on PROVEN groups -- admission runs well ahead of
+        # proof capacity (to ``2 * FILL_CLOSED_TARGET_GROUPS_PER_ENV``), so a
+        # timed-out window routinely still shows a ready round despite
+        # training on nothing: arrivals-full/proofs-short is the dominant
+        # timeout shape, not the exception. No batch was assembled, so no
+        # ``ratio`` this ``incompressible_rounds`` could produce would mean
+        # anything; forcing it to 0 sends ``ratio`` through ``WindowOutcome``'s
+        # own existing "no denominator" rule instead of a second special
+        # case. ``filled`` is untouched -- it still reads off
+        # ``collect_ready_round`` below, so a window that reached its ready
+        # round is still a HOLD in ``advance`` (it still joins
+        # ``recent_fill_prices``), not silence; only the ratio this window
+        # would otherwise report is what gets suppressed, because it is not
+        # a real measurement of anything. This is the one place the rule
+        # lives -- ``outcomes_by_environment_from_archive`` reads it back off
+        # this same ``WindowOutcome`` rather than repeating it.
+        incompressible = 0.0
     return WindowOutcome(
         open_round=open_round,
         close_round=close_round,
@@ -387,14 +406,9 @@ def outcomes_by_environment_from_archive(
     scalar = outcome_from_archive(record)
     if scalar is None:
         return None
-    # A timed-out window trained on nothing -- no batch was assembled, so
-    # there is no denominator any ratio could mean. ``filled`` (from
-    # ``ready``, below) already carries the shortage; forcing the
-    # incompressible time to 0 routes every environment's ratio through
-    # ``EnvironmentOutcome.ratio``'s own existing "no denominator" rule
-    # instead of adding a second special case here.
-    timed_out = record.get("window_status") == "timed_out"
-    incompressible = 0.0 if timed_out else scalar.incompressible_rounds
+    # ``outcome_from_archive`` already zeroes ``incompressible_rounds`` for a
+    # "timed_out" record (one owner for that rule); every environment reads
+    # the same scalar back rather than re-deriving it here.
     outcomes: dict[str, EnvironmentOutcome] = {}
     for environment, ready in by_environment.items():
         if not isinstance(environment, str):
@@ -426,7 +440,7 @@ def outcomes_by_environment_from_archive(
             open_round=scalar.open_round,
             close_round=scalar.close_round,
             ready_round=resolved,
-            incompressible_rounds=incompressible,
+            incompressible_rounds=scalar.incompressible_rounds,
         )
     return outcomes
 

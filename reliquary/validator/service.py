@@ -420,6 +420,19 @@ def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
+# The three values an archive's/a seal call's "window_status" ever takes.
+# Named here, once, so a typo like "timedout" fails an import or an
+# equality check loudly instead of silently degrading to whichever branch
+# every comparison's ``else`` happens to fall through to (pay the forced
+# remainder, write the training payload, archive "completed"). The
+# archive FIELD stays named "window_status" and these three literal
+# strings are unchanged -- readers (weight-only nodes, the emission-price
+# adapter, older archives already on disk) depend on the exact spelling.
+WINDOW_STATUS_COMPLETED = "completed"
+WINDOW_STATUS_TIMED_OUT = "timed_out"
+WINDOW_STATUS_ABORTED = "aborted"
+
+
 def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
     """Return a filtered view of archives containing only entries for ``env_name``.
 
@@ -430,7 +443,7 @@ def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
     """
     out = []
     for archive in archives:
-        if archive.get("window_status", "completed") == "aborted":
+        if archive.get("window_status", WINDOW_STATUS_COMPLETED) == WINDOW_STATUS_ABORTED:
             continue
         # Determine the archive's env(s). New shape has "environments" list;
         # old shape has "environment" singular. Both may be present together.
@@ -3552,18 +3565,25 @@ class ValidationService:
         verify_task=None,
         late_drops: dict | None = None,
         server_reject_counts: dict | None = None,
-        window_status: str = "completed",
+        window_status: str = WINDOW_STATUS_COMPLETED,
     ) -> None:
         """TRAINING + PUBLISHING + READY phases for one sealed window.
 
         ``window_status="timed_out"`` (the global collection deadline fired
-        rather than every batcher reaching its own target) skips writing
-        this window's training payload/accumulation -- the batch is
-        partial and would bias the update -- while still archiving and
-        paying whatever was already accrued. See ``_archive_window`` and
-        ``FillClosedBatchAssembler.close``.
+        rather than every batcher reaching its own target) still archives
+        and pays whatever was already accrued, but skips this window's
+        LEGACY training-payload write and its contribution to
+        ``self._training_accumulator`` below. That is a real suppression
+        only off ``FILL_CLOSED_ENABLED``: under it, ``window_batches`` here
+        is already empty (v6's seal path selects nothing -- every real
+        payload was written incrementally, per complete cycle, by
+        ``FillClosedBatchAssembler`` during collection, well before a
+        timeout is even known) and the actual enforcement for a timed-out
+        fill-closed window is ``FillClosedBatchAssembler.close``'s own
+        ``pay_partial_remainder=False``, called separately at seal time. See
+        ``_archive_window``.
         """
-        timed_out = window_status == "timed_out"
+        timed_out = window_status == WINDOW_STATUS_TIMED_OUT
         # Pipelined mode passes the SEALED window's batchers explicitly while
         # self._active_batchers already points at the next, collecting window.
         # owns_routing gates every mutation of the live routing state: the GPU
@@ -3891,16 +3911,20 @@ class ValidationService:
         else:
             checkpoint_revision = next(iter(checkpoint_revisions))
             if timed_out:
-                # The global collection deadline fired: everything held
-                # here was fully admitted, proven and graded, there was
-                # simply not enough of it. Training on a partial batch
-                # would bias the update, so this window tombstones its
-                # training payload instead of enqueuing one -- the
-                # trainer's journal cursor still advances, and it is
-                # still paid (see the reward map built in
-                # ``_archive_window``/the fill-closed assembler's own
-                # accrual, which a timed-out window never lets close()
-                # top up with its forced final partial batch).
+                # This is the LEGACY training-payload write. Under
+                # FILL_CLOSED_ENABLED, ``window_batches`` here is already
+                # empty (v6 pays and trains nothing at seal time -- see
+                # ``_archive_window``), so ``_write_training_tombstone``
+                # redirects to ``_write_fill_closed_window_tombstones``,
+                # which finds nothing left to write: the assembler's own
+                # ``close(pay_partial_remainder=False)`` already padded
+                # this window's journal range to its ceiling. The genuine
+                # suppression here is off that flag: without it, a real,
+                # non-empty ``window_batches`` would otherwise be enqueued
+                # as this window's training payload despite being
+                # partial. Rewards are unaffected either way -- they are
+                # read from the archive/assembler accrual, not from this
+                # write.
                 self._write_training_tombstone(
                     window_n, "window_timeout", "WindowTimeout",
                 )
@@ -4473,7 +4497,7 @@ class ValidationService:
 
     async def _archive_window(
         self, batchers, sealed, late_drops=None, server_reject_counts=None,
-        window_status: str = "completed",
+        window_status: str = WINDOW_STATUS_COMPLETED,
     ) -> None:
         """Assemble and enqueue the per-window archive payload.
 
@@ -4797,7 +4821,9 @@ class ValidationService:
                 self._close_and_commit_fill_closed_paid_side_effects(
                     batcher_dict,
                     fill_closed_assembler,
-                    pay_partial_remainder=window_status != "timed_out",
+                    pay_partial_remainder=(
+                        window_status != WINDOW_STATUS_TIMED_OUT
+                    ),
                 )
             )
 
@@ -6100,7 +6126,8 @@ class ValidationService:
                     # window still seals and archives normally except that it
                     # trains on nothing and is tagged for the price signal.
                     window_status = (
-                        "timed_out" if seal_reason == "timeout" else "completed"
+                        WINDOW_STATUS_TIMED_OUT if seal_reason == "timeout"
+                        else WINDOW_STATUS_COMPLETED
                     )
                     if FILL_CLOSED_ENABLED:
                         # Reserve the complete range first so a local disk
@@ -6116,7 +6143,7 @@ class ValidationService:
                             self._active_batchers,
                             self._fill_closed_assembler,
                             pay_partial_remainder=(
-                                window_status != "timed_out"
+                                window_status != WINDOW_STATUS_TIMED_OUT
                             ),
                         )
                         self._arm_fill_closed_rotation_gate()

@@ -18,8 +18,18 @@ REGISTRY_VERSION = 1
 MECHANISM_RL_DISCOVERED_PRICE = "rl-discovered-price"
 KNOWN_MECHANISMS = frozenset({MECHANISM_RL_DISCOVERED_PRICE})
 
-# Every field PriceParams needs. A missing one is refused rather than defaulted:
-# a half-specified controller is not a controller.
+# Every field the REGISTRY declares per task. A missing one is refused rather
+# than defaulted: a half-specified controller is not a controller.
+#
+# Deliberately NOT every field ``PriceParams`` has: ``breaker_timeouts`` (how
+# many consecutive unfilled windows before an environment's price stops
+# escalating) is a controller-tuning knob versioned in the image alongside
+# ``PRODUCTION_PRICE_PARAMS``, not a per-task economic declaration, and
+# ``PriceParams`` carries its own default for it. Completing this tuple to
+# match ``PriceParams`` field-for-field would make every registry entry
+# written before ``breaker_timeouts`` existed suddenly "missing price
+# parameters" -- and an invalid registry makes the validator refuse to start
+# and the weight submitter abstain.
 PRICE_PARAM_FIELDS = (
     "start", "decay", "rounds_per_step", "deadband",
     "snap", "floor", "cap", "median_rounds", "last_good_fills",
