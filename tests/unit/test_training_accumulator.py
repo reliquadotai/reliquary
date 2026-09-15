@@ -95,3 +95,13 @@ def test_epoch_finalize_can_consume_a_partial_but_balanced_reservoir():
     assert acc.training_batches(
         ["math", "code"], allow_partial=True
     ) == [math_groups, code_groups]
+
+
+def test_held_groups_include_a_partial_cycle_missing_an_environment():
+    from reliquary.validator.training_accumulator import BalancedTrainingAccumulator
+
+    accumulator = BalancedTrainingAccumulator({"math": 4, "code": 4})
+    accumulator.add_window({"math": ["m1", "m2"]}, window_n=1, checkpoint_revision="rev")
+
+    assert accumulator.held_groups(["math", "code"]) == [["m1", "m2"], []]
+

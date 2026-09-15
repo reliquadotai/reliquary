@@ -3660,7 +3660,7 @@ class ValidationService:
         ``FillClosedBatchAssembler`` during collection, well before a
         timeout is even known) and the actual enforcement for a timed-out
         fill-closed window is ``FillClosedBatchAssembler.close``'s own
-        ``pay_partial_remainder=False``, called separately at seal time. See
+        ``train_partial_remainder=False``, called separately at seal time. See
         ``_archive_window``.
         """
         timed_out = window_status == WINDOW_STATUS_TIMED_OUT
@@ -3997,7 +3997,7 @@ class ValidationService:
                 # ``_archive_window``), so ``_write_training_tombstone``
                 # redirects to ``_write_fill_closed_window_tombstones``,
                 # which finds nothing left to write: the assembler's own
-                # ``close(pay_partial_remainder=False)`` already padded
+                # ``close(train_partial_remainder=False)`` already padded
                 # this window's journal range to its ceiling. The genuine
                 # suppression here is off that flag: without it, a real,
                 # non-empty ``window_batches`` would otherwise be enqueued
@@ -4680,23 +4680,22 @@ class ValidationService:
         batchers: dict,
         assembler,
         *,
-        pay_partial_remainder: bool = True,
+        train_partial_remainder: bool = True,
     ) -> dict[str, list[tuple[int, Any]]]:
         """Close one v6 journal and cool exactly the groups it paid.
 
-        ``pay_partial_remainder=False`` (a timed-out window) keeps every
-        complete batch this window already paid during ``accept()`` but
-        refuses to force the trailing partial cycle through as one more
-        -- see ``FillClosedBatchAssembler.close``. Called bare on the
+        ``train_partial_remainder=False`` (a timed-out window) still pays the
+        trailing partial cycle but keeps it away from the trainer -- see
+        ``FillClosedBatchAssembler.close``. Called bare on the
         (default, far more common) True path so a test double's
         ``close`` -- mocked as a zero-argument callable, matching every
         production assembler's call before this parameter existed --
         keeps working unmodified.
         """
-        if pay_partial_remainder:
+        if train_partial_remainder:
             assembler.close()
         else:
-            assembler.close(pay_partial_remainder=False)
+            assembler.close(train_partial_remainder=False)
         paid = assembler.paid_groups()
         if set(paid) != set(batchers):
             raise RuntimeError("fill-closed paid environments do not match")
@@ -4718,10 +4717,9 @@ class ValidationService:
         (every batcher sealed on the global deadline rather than on its
         own target) passes "timed_out" instead, so the archive -- and
         ``outcomes_by_environment_from_archive`` reading it back -- can
-        tell the two apart. It also gates whether the fill-closed
-        assembler is allowed to pay the forced final partial batch (see
-        ``pay_partial_remainder`` below): a timed-out window pays every
-        batch it already completed and burns the rest.
+        tell the two apart. It also keeps a timed-out window's final partial
+        batch away from the trainer (see ``train_partial_remainder`` below);
+        every accepted group is paid either way.
 
         ``batchers`` is either:
           * a dict {env_name: GrpoWindowBatcher} (multi-env, called from
@@ -5026,15 +5024,15 @@ class ValidationService:
                 )
             # Idempotent (R16): if the main loop already closed this
             # assembler (see the seal-time call in the window loop), this
-            # is a no-op read of the same paid set. ``pay_partial_
+            # is a no-op read of the same paid set. ``train_partial_
             # remainder=False`` only matters the first time close() runs
             # -- a timed-out window must not force its last partial cycle
-            # through as a paid, trained batch.
+            # through as a trained batch; it is still paid.
             fill_closed_batches = (
                 self._close_and_commit_fill_closed_paid_side_effects(
                     batcher_dict,
                     fill_closed_assembler,
-                    pay_partial_remainder=(
+                    train_partial_remainder=(
                         window_status != WINDOW_STATUS_TIMED_OUT
                     ),
                 )
@@ -6386,7 +6384,7 @@ class ValidationService:
                         self._close_and_commit_fill_closed_paid_side_effects(
                             self._active_batchers,
                             self._fill_closed_assembler,
-                            pay_partial_remainder=(
+                            train_partial_remainder=(
                                 window_status != WINDOW_STATUS_TIMED_OUT
                             ),
                         )

@@ -81,69 +81,48 @@ def _assembler(window: int) -> FillClosedBatchAssembler:
     )
 
 
-def test_a_timed_out_windows_partial_remainder_is_unpaid():
-    """``close(pay_partial_remainder=False)`` -- what the service now calls
-    for a timed-out window -- must not let the trailing, incomplete cycle
-    through as one more paid batch: the fixed per-batch pool would split
-    over fewer participants than a full batch, handing them a larger
-    share for less proof. Every EARLIER, complete cycle keeps exactly
-    what ``accept()`` already paid it, as if the window had completed."""
+
+def test_a_timed_out_windows_partial_remainder_is_paid_but_not_trained():
+    """Every accepted group is paid, even when the window times out. What a
+    timed-out window must not do is hand its unbalanced trailing cycle to the
+    trainer, so ``close(train_partial_remainder=False)`` pays that cycle and
+    tombstones it instead of enqueueing it."""
     window = 42
     math_hotkeys = [f"math-{i}" for i in range(B_BATCH)]
     code_hotkeys = [f"code-{i}" for i in range(B_BATCH)]
-
-    # Reference: a window that only ever sees this one complete cycle,
-    # closed normally (no timeout).
-    reference = _assembler(window)
-    reference.accept(
-        "openmathinstruct",
-        _full_cycle(math_hotkeys, "openmathinstruct"),
-        window, "rev",
+    enqueued: list[int] = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: enqueued.append(key),
+        tombstone_fn=lambda key, data: None,
     )
-    reference.accept(
-        "opencodeinstruct",
-        _full_cycle(code_hotkeys, "opencodeinstruct"),
-        window, "rev",
-    )
-    reference.close()
-    expected = reference.reward_map()
-    assert expected  # the reference cycle really did get paid
-
-    # Under test: the SAME complete cycle, plus a trailing partial
-    # remainder (one straggler group per environment) that never reaches
-    # B_BATCH -- exactly what a global collection deadline leaves behind.
-    assembler = _assembler(window)
     assembler.accept(
-        "openmathinstruct",
-        _full_cycle(math_hotkeys, "openmathinstruct"),
+        "openmathinstruct", _full_cycle(math_hotkeys, "openmathinstruct"), window, "rev",
+    )
+    assembler.accept(
+        "opencodeinstruct", _full_cycle(code_hotkeys, "opencodeinstruct"), window, "rev",
+    )
+    assembler.accept(
+        "openmathinstruct", [_paid_group("math-straggler", 999, "openmathinstruct")],
         window, "rev",
     )
     assembler.accept(
-        "opencodeinstruct",
-        _full_cycle(code_hotkeys, "opencodeinstruct"),
+        "opencodeinstruct", [_paid_group("code-straggler", 999, "opencodeinstruct")],
         window, "rev",
     )
-    assembler.accept(
-        "openmathinstruct",
-        [_paid_group("math-straggler", 999, "openmathinstruct")],
-        window, "rev",
-    )
-    assembler.accept(
-        "opencodeinstruct",
-        [_paid_group("code-straggler", 999, "opencodeinstruct")],
-        window, "rev",
-    )
-    # Both environments hold a group in the final cycle, so a normal
-    # close() would force it through as a paid partial batch -- confirm
-    # the scenario actually exercises that branch.
+    # Both environments hold a group in the final cycle, so a normal close()
+    # would train on it: confirm the scenario exercises that branch.
     assert assembler._accumulator.has_groups_for_all_targets
+    trained_before_close = list(enqueued)
 
-    assembler.close(pay_partial_remainder=False)
+    assembler.close(train_partial_remainder=False)
 
     paid = assembler.reward_map()
-    assert paid == expected
-    assert "math-straggler" not in paid
-    assert "code-straggler" not in paid
-    paid_groups = assembler.paid_groups()
-    assert len(paid_groups["openmathinstruct"]) == B_BATCH
-    assert len(paid_groups["opencodeinstruct"]) == B_BATCH
+    assert paid["math-straggler"] == paid["math-0"]
+    assert paid["code-straggler"] == paid["code-0"]
+    assert enqueued == trained_before_close
+    assert len(assembler.paid_groups()["openmathinstruct"]) == B_BATCH + 1
+    assert len(assembler.paid_groups()["opencodeinstruct"]) == B_BATCH + 1
+
+

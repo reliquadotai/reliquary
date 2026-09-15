@@ -389,17 +389,20 @@ class FillClosedBatchAssembler:
             True,
         )
 
-    def _prepare_incomplete_remainder_tombstone_locked(self) -> _PreparedWrite:
-        """R16: the ``close()`` path when at least one environment
-        contributed nothing to the final, partial cycle. There is no
-        batch to assess -- quarantine (R14) judges assembled batches, and
-        no batch was assembled -- so this writes a plain tombstone under
-        the next batch index, distinct from the R14 quarantine tombstone,
-        purely so the trainer's journal cursor still advances instead of
-        stalling on a window whose remainder never became a payload.
+    def _prepare_paid_remainder_tombstone_locked(self) -> _PreparedWrite:
+        """R16: the ``close()`` path for a final cycle the trainer must not see.
+
+        The cycle is unbalanced (an environment contributed nothing) or its window
+        timed out, so it is written as a tombstone; its groups ride along so they
+        are paid, and so the journal keeps the accounting recovery pays from.
         """
+        if self.next_batch_index >= self.picks_target:
+            raise RuntimeError("fill-closed payload exceeds the window pick target")
         key = encoded_window_journal_key(
             self.window_start, self.next_batch_index
+        )
+        window_batches = dict(
+            zip(self._env_order, self._accumulator.held_groups(self._env_order))
         )
         data = encode_tombstone(
             window_start=self.window_start,
@@ -407,20 +410,13 @@ class FillClosedBatchAssembler:
             failure_type="IncompleteRemainder",
         )
         log_message = (
-            "FillClosedBatchAssembler: window %d batch %d tombstoned at "
-            "close (journal key %d, incomplete remainder %s)" % (
+            "FillClosedBatchAssembler: window %d batch %d tombstoned and paid at "
+            "close (journal key %d, remainder %s)" % (
                 self.window_start, self.next_batch_index, key,
                 self._accumulator.snapshot()["counts"],
             )
         )
-        return _PreparedWrite(
-            key,
-            data,
-            True,
-            log_message,
-            None,
-            True,
-        )
+        return _PreparedWrite(key, data, True, log_message, window_batches, True)
 
     def _commit_write_locked(self, entry: _PreparedWrite) -> None:
         """Durably enqueue ``entry`` and only then commit accounting state."""
@@ -558,7 +554,7 @@ class FillClosedBatchAssembler:
                 for environment, groups in self._paid_groups.items()
             }
 
-    def close(self, *, pay_partial_remainder: bool = True) -> None:
+    def close(self, *, train_partial_remainder: bool = True) -> None:
         """Called once by the service when this window closes (R16),
         after every batcher has handed its last chunk to ``accept``. A
         window's final cycle rarely lands exactly on B_BATCH for every
@@ -567,40 +563,15 @@ class FillClosedBatchAssembler:
         WARNING) -- proven, paid rollouts were silently dropped with no
         marker.
 
-        If every environment contributed at least one group to the
-        current cycle, ``pay_partial_remainder`` (default True) emits
-        that partial cycle as one final batch -- a short DAPO minibatch
-        is still a valid optimizer step, and the seal path already
-        trains on partial windows -- through the SAME quarantine gate
-        (R14) a full batch clears. Otherwise (some environment
-        contributed nothing at all, OR the caller passed
-        ``pay_partial_remainder=False``) a tombstone is written under
-        the next batch's key instead, so the trainer's cursor still
-        advances.
-
-        ``pay_partial_remainder=False`` is for a window that timed out. The
-        spec requires a timed-out window to pay only fully assembled
-        batches, and this is what enforces that: it does NOT protect
-        against overpayment -- ``FIXED_GROUP_PAYMENT_POLICY`` already pays a
-        fixed ``pool / slots`` share regardless of how many of ``slots`` are
-        filled (unfilled slots already burn instead of being redistributed,
-        for any batch, timed out or not), so a lone group in a short cycle
-        is paid exactly what a group in a full cycle is paid -- never more.
-        What this flag actually does is BURN that accrued pay: every group
-        in the forced final partial cycle -- fully admitted, proven and
-        graded work -- is tombstoned and paid nothing, on the spec's
-        authority, not because paying it would have been wrong on its own
-        terms. Every EARLIER cycle in this same window already cleared the
-        normal full-batch path in ``accept()`` (already durably enqueued to
-        the trainer, independent of whether this window later times out)
-        and keeps its payment; only the trailing remainder is affected. That
-        remainder is also the one UNBALANCED object a timed-out window could
-        otherwise hand the trainer -- every completed cycle already holds
-        exactly ``B_BATCH`` groups per environment by construction
-        (``BalancedTrainingAccumulator``), so tombstoning the remainder
-        instead of committing it keeps a timed-out window's trained data
-        balanced, which is the one piece of this that is a real property of
-        the data rather than a policy choice.
+        Every accepted group in the window's final, partial cycle is paid. If
+        every environment contributed to that cycle and ``train_partial_remainder``
+        is True (the default), it is emitted as one final payload -- a short DAPO
+        minibatch is still a valid optimizer step -- through the same quarantine
+        gate (R14) a full batch clears. Otherwise, because an environment
+        contributed nothing or the window timed out, it is written as a tombstone
+        that still carries its groups: the trainer's cursor advances without
+        training on an unbalanced cycle, and the journal keeps the accounting
+        recovery pays from.
 
         Idempotent: a second call, or one racing a final in-flight
         ``accept``, is a no-op -- ``_closed`` is set under the same lock
@@ -652,7 +623,7 @@ class FillClosedBatchAssembler:
                 if not still_outstanding:
                     break
                 if (
-                    pay_partial_remainder
+                    train_partial_remainder
                     and self._accumulator.has_groups_for_all_targets
                 ):
                     self._commit_write_locked(
@@ -660,7 +631,7 @@ class FillClosedBatchAssembler:
                     )
                 else:
                     self._commit_write_locked(
-                        self._prepare_incomplete_remainder_tombstone_locked()
+                        self._prepare_paid_remainder_tombstone_locked()
                     )
                 # Loop again: the forced write above just reset the
                 # accumulator, freeing every environment's capacity --
