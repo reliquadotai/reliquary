@@ -36,6 +36,63 @@ def test_the_window_seals_at_the_nth_pick(monkeypatch):
     assert batcher.poll_deadline() is True
 
 
+_CHAIN = {"genesis_time": 1_000_000.0, "period": 3.0}
+
+
+def test_the_nth_pick_close_stamps_the_round_the_window_closed_at(monkeypatch):
+    """The price signal's close bound: v6 has no seal trigger round, so the close records its own."""
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.infrastructure.chain import compute_current_drand_round
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+    wall = [_CHAIN["genesis_time"] + 3000.0]
+    batcher = _make_batcher(wall_clock_fn=lambda: wall[0], drand_chain_info=dict(_CHAIN))
+    batcher.fill_state = batcher_module.FillState(
+        budgets={"openmathinstruct": 1, "opencodeinstruct": 1}, picks_target=1
+    )
+    batcher.mark_window_opened()
+    batcher.fill_state.record_proven("openmathinstruct")
+    batcher.fill_state.record_proven("opencodeinstruct")
+    batcher.fill_state.record_pick("openmathinstruct")
+    assert batcher.poll_deadline() is False
+    assert getattr(batcher, "window_close_drand_round", None) is None
+
+    batcher.fill_state.record_pick("opencodeinstruct")
+    wall[0] += 600.0
+
+    assert batcher.poll_deadline() is True
+    assert getattr(batcher, "window_close_drand_round", None) == compute_current_drand_round(
+        wall[0], _CHAIN["genesis_time"], _CHAIN["period"]
+    )
+
+
+def test_the_backstop_close_stamps_the_round_the_window_closed_at(monkeypatch):
+    """A window that never fills still closes at a known round, so its shortage can be priced."""
+    import reliquary.validator.batcher as batcher_module
+    from reliquary.infrastructure.chain import compute_current_drand_round
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_MAX_SECONDS", 100.0)
+
+    now, wall = [10.0], [_CHAIN["genesis_time"] + 3000.0]
+    batcher = _make_batcher(
+        time_fn=lambda: now[0], wall_clock_fn=lambda: wall[0], drand_chain_info=dict(_CHAIN)
+    )
+    batcher.fill_state = batcher_module.FillState(
+        budgets={"openmathinstruct": 1}, picks_target=1
+    )
+    batcher.mark_window_opened()
+    assert batcher.poll_deadline() is False
+    assert getattr(batcher, "window_close_drand_round", None) is None
+
+    now[0] += 100.0
+    wall[0] += 100.0
+
+    assert batcher.poll_deadline() is True
+    assert getattr(batcher, "window_close_drand_round", None) == compute_current_drand_round(
+        wall[0], _CHAIN["genesis_time"], _CHAIN["period"]
+    )
+
+
 def test_two_env_batchers_share_one_fill_state_for_is_closed(monkeypatch):
     """R10: the service builds one ``GrpoWindowBatcher`` per environment,
     but ``FillState`` is shared and ``is_closed()`` is window-wide (R35:

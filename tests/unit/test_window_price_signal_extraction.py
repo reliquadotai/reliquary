@@ -29,11 +29,13 @@ class _Batcher:
         *,
         open_round: int | None = None,
         seal_round: int | None = None,
+        close_round: int | None = None,
     ) -> None:
         if submissions_per_prompt is not None:
             self._submissions_per_prompt = submissions_per_prompt
         self.window_open_drand_round = open_round
         self._seal_trigger_round = seal_round
+        self.window_close_drand_round = close_round
 
 
 def _target_for(_env_name, _batcher) -> int:
@@ -86,3 +88,91 @@ def test_one_environment_short_still_reports_the_shortage():
 
     assert signal is not None
     assert signal["collect_ready_round"] is None
+
+
+def test_a_fill_closed_window_reads_its_close_from_the_round_it_closed_at():
+    """A v6 window never sets a seal trigger round; its close bound is the round it closed at."""
+    batcher = _Batcher(
+        {7: [_Pending(1010)], 9: [_Pending(1020)]},
+        open_round=1000,
+        close_round=1100,
+    )
+
+    signal = _window_price_signal(batcher, {"math": batcher}, _target_for)
+
+    assert signal == {
+        "window_open_round": 1000,
+        "window_close_round": 1100,
+        "collect_ready_round": 1020,
+        "collect_ready_round_by_environment": {"math": 1020},
+    }
+
+
+def test_a_real_v6_window_carries_a_complete_signal_after_its_last_pick(monkeypatch):
+    """Auction admission, prove-on-arrival and the Nth-pick close on one real batcher."""
+    from reliquary.infrastructure.chain import compute_current_drand_round
+    from reliquary.validator import batcher as module
+    from reliquary.validator.proof_scheduler import GlobalProofScheduler
+    from tests.unit.test_grpo_window_batcher import (
+        _execute_scheduler_payload,
+        _make_batcher,
+        _request,
+    )
+    from tests.unit.test_proof_scheduler import _wait_until
+
+    for name, value in (
+        ("FILL_CLOSED_ENABLED", True),
+        ("FILL_CLOSED_BOUNDED_PROOFS", True),
+        ("FILL_CLOSED_PROOF_DISPATCH_SECONDS", 60.0),
+        ("FILL_CLOSED_MAX_SECONDS", 100.0),
+        ("B_BATCH", 1),
+    ):
+        monkeypatch.setattr(module, name, value)
+    chain = {"genesis_time": 1_000_000.0, "period": 3.0}
+    now, wall = [10.0], [chain["genesis_time"] + 3000.0]
+    scheduler = GlobalProofScheduler(
+        devices=("gpu-0",),
+        environments=("openmathinstruct", "opencodeinstruct", "reliquary_logic_v2"),
+        proof_callable=_execute_scheduler_payload,
+        checkpoint_revision="",
+        clock=lambda: now[0],
+    )
+    try:
+        batcher = _make_batcher(
+            proof_scheduler=scheduler,
+            time_fn=lambda: now[0],
+            wall_clock_fn=lambda: wall[0],
+            drand_chain_info=dict(chain),
+        )
+        batcher.fill_state = module.FillState(
+            budgets={"openmathinstruct": 4}, picks_target=1
+        )
+        batcher._emit_training_batch_fn = lambda *_args: None
+        batcher.mark_window_opened()
+        open_round = batcher.window_open_drand_round
+        assert isinstance(open_round, int)
+        with scheduler._condition:
+            for offset, prompt in ((2, 21), (5, 22)):
+                request = _request(prompt_idx=prompt, hotkey=str(prompt)).model_copy(
+                    update={"drand_round": open_round + offset}
+                )
+                assert batcher.accept_submission(request).accepted
+        _wait_until(batcher._open_proof_plan_handle.done, timeout=5)
+        assert batcher.can_pick() and batcher.pick_training_batch()
+        wall[0] += 60.0
+        assert batcher.poll_deadline() is True
+        signal = _window_price_signal(
+            batcher, {"openmathinstruct": batcher}, lambda _env, _batcher: 2
+        )
+    finally:
+        assert scheduler.close()
+
+    close_round = compute_current_drand_round(
+        wall[0], chain["genesis_time"], chain["period"]
+    )
+    assert signal == {
+        "window_open_round": open_round,
+        "window_close_round": close_round,
+        "collect_ready_round": open_round + 5,
+        "collect_ready_round_by_environment": {"openmathinstruct": open_round + 5},
+    }
