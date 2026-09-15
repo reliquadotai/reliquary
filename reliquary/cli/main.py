@@ -43,6 +43,193 @@ logger = logging.getLogger(__name__)
 _grader_proc: "subprocess.Popen | None" = None
 
 
+# Startup registry read: how hard we try before refusing to boot. 3 sleeps of
+# 2/4/8s bound the delay at 14s -- far below the time the model load below
+# takes anyway, and far above an R2 503 that clears on its own.
+REGISTRY_READ_ATTEMPTS = 4
+REGISTRY_READ_BACKOFF_SECONDS = 2.0
+
+
+async def read_task_registry_with_retry(
+    read_registry,
+    *,
+    attempts: int = REGISTRY_READ_ATTEMPTS,
+    backoff_seconds: float = REGISTRY_READ_BACKOFF_SECONDS,
+):
+    """Read the registry, retrying a RAISING client a bounded number of times.
+
+    Refusing to start is correct when we cannot learn what we may pay, but a
+    transient R2 error during an ordinary restart is not that, and the V1
+    controller runs ``restart: no`` -- an unretried 503 leaves the validator
+    down until a human notices. An ABSENT registry is not an error: it returns
+    ``({}, None)`` and is handed straight back, never retried.
+    """
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await read_registry()
+        except Exception as exc:
+            last = exc
+            if attempt >= attempts:
+                break
+            delay = backoff_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "task registry read failed (attempt %d/%d): %s; retrying in %.1fs",
+                attempt, attempts, exc, delay,
+            )
+            await asyncio.sleep(delay)
+    assert last is not None
+    raise last
+
+
+def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
+    """One registry entry: shipped controller defaults, then explicit overrides."""
+    from dataclasses import asdict
+
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_id import normalise_task_id
+    from reliquary.shared.task_registry import (
+        MECHANISM_RL_DISCOVERED_PRICE,
+        TaskEntry,
+    )
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    # The entry's id IS the registry key. Normalise it here, at the one place
+    # an operator's typing becomes an entry, so a stray space can never key a
+    # task under something `resolve_task_config` will not find; a value that
+    # is not a usable id at all still raises.
+    task_id = normalise_task_id(task_id)
+    profile = resolve_protocol_profile(profile_id)
+    if env_split is not None:
+        # Fail fast here; `resolve_task_config` is the runtime authority.
+        declared = set(profile.environments)
+        named = set(env_split)
+        unknown = named - declared
+        if unknown:
+            raise ValueError(
+                f"env_split names {sorted(unknown)}, which profile "
+                f"{profile.profile_id!r} does not declare; it has "
+                f"{sorted(declared)}"
+            )
+        # A partial split is refused at WRITE time too, not only on read: the
+        # registry is shared, so an entry that omits an environment exits
+        # every validator on the task with code 4 at its next restart.
+        uncovered = declared - named
+        if uncovered:
+            raise ValueError(
+                f"task {task_id!r} declares env_split but it does not cover "
+                f"{sorted(uncovered)}, which profile {profile.profile_id!r} "
+                f"also declares; env_split must name every profile environment"
+            )
+    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params.update(overrides)
+    params["cap"] = float(cap)
+    return TaskEntry(
+        task_id=task_id,
+        profile_id=profile.profile_id,
+        profile_sha256=canonical_sha256(profile.to_generation_contract()),
+        mechanism=MECHANISM_RL_DISCOVERED_PRICE,
+        params=params,
+        status="active",
+        retired_at=None,
+        env_split=env_split,
+    )
+
+
+tasks_app = typer.Typer(name="tasks", help="Declare and retire subnet tasks")
+app.add_typer(tasks_app)
+
+
+def _parse_env_split_option(value: str | None) -> dict[str, float] | None:
+    """``"math=0.6,code=0.4"`` -> ``{"math": 0.6, "code": 0.4}``, or None."""
+    if value is None:
+        return None
+    shares: dict[str, float] = {}
+    for chunk in value.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(
+                f"--env-split entries must be name=share, got {chunk!r}"
+            )
+        name, _, raw_share = chunk.partition("=")
+        name = name.strip()
+        try:
+            shares[name] = float(raw_share.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"--env-split share for {name!r} is not a number: {raw_share!r}"
+            ) from exc
+    if not shares:
+        raise ValueError("--env-split must name at least one environment")
+    return shares
+
+
+@tasks_app.command("create")
+def tasks_create(
+    task_id: str = typer.Option(..., "--task-id"),
+    profile_id: str = typer.Option(..., "--profile-id"),
+    cap: float = typer.Option(..., "--cap", help="Most of the pool this task may pay"),
+    start: float = typer.Option(None, "--start"),
+    decay: float = typer.Option(None, "--decay"),
+    env_split: str = typer.Option(
+        None,
+        "--env-split",
+        help="How the cap divides between environments, e.g. math=0.6,code=0.4",
+    ),
+) -> None:
+    from reliquary.infrastructure.task_registry_store import create_task
+    from reliquary.shared.task_registry import RegistryError
+
+    overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
+    try:
+        entry = build_task_entry(
+            task_id=task_id,
+            profile_id=profile_id,
+            cap=cap,
+            overrides=overrides,
+            env_split=_parse_env_split_option(env_split),
+        )
+        asyncio.run(create_task(entry))
+    except (RegistryError, ValueError) as exc:
+        # Declaring the first task is the one CLI command that can stop the
+        # whole fleet: both legacy fallbacks are armed by an EMPTY registry,
+        # so a first entry that is not `default` un-arms them for a task
+        # nobody declared. Refuse here rather than weaken the fallbacks.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"declared task {entry.task_id} on {entry.profile_id} with cap {cap}"
+    )
+
+
+@tasks_app.command("list")
+def tasks_list() -> None:
+    from reliquary.infrastructure.task_registry_store import read_registry
+    from reliquary.shared.task_registry import total_cap
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    for task_id, entry in sorted(entries.items()):
+        typer.echo(
+            f"{task_id:24s} {entry.status:8s} cap={entry.params['cap']:.3f} "
+            f"{entry.profile_id}"
+        )
+    typer.echo(f"total declared cap: {total_cap(entries):.4f} / 1.0")
+
+
+@tasks_app.command("retire")
+def tasks_retire(
+    task_id: str = typer.Option(..., "--task-id"),
+    retired_at: int = typer.Option(..., "--retired-at", help="drand round"),
+) -> None:
+    from reliquary.infrastructure.task_registry_store import retire_task_entry
+
+    asyncio.run(retire_task_entry(task_id, retired_at))
+    typer.echo(
+        f"retired {task_id}; its cap stays reserved until its EMA tail decays"
+    )
 
 @app.command("watch-verdicts")
 def watch_verdicts(
@@ -671,6 +858,70 @@ def validate(
         subtensor = await get_subtensor()
 
         if train:
+            from reliquary.constants import (
+                PROTOCOL_GENERATION_CONTRACT,
+                PROTOCOL_PROFILE_ID,
+                TASK_ID,
+            )
+            from reliquary.infrastructure.task_registry_store import read_registry
+            from reliquary.validator.task_config import (
+                TaskConfigError,
+                legacy_registry_fallback,
+                legacy_task_config,
+                resolve_task_config,
+            )
+
+            try:
+                # `_run` is itself the coroutine `_run_validator_event_loop`
+                # drives with `asyncio.run`, so a loop is already running here;
+                # the registry read is awaited in place rather than started
+                # with a second, nested `asyncio.run`. Done before any GPU or
+                # model work below so an undeclared task fails fast.
+                #
+                # An R2 outage must still refuse (we cannot tell what we may
+                # pay), which is why the read stays inside this try -- but a
+                # registry that reads back wholly EMPTY, for the legacy
+                # "default" task only, is not that: it is every validator
+                # running today, before anyone has ever written one. Falling
+                # back there is what keeps this branch from taking `default`
+                # down the day it ships.
+                registry_entries, _ = await read_task_registry_with_retry(
+                    read_registry
+                )
+                if legacy_registry_fallback(registry_entries, [TASK_ID]):
+                    logger.warning(
+                        "No task registry in R2; starting the legacy task at "
+                        "the full pool. Declare it with `reliquary tasks "
+                        "create --task-id default --profile-id %s --cap 1.0` "
+                        "and this fallback stops being used.",
+                        PROTOCOL_PROFILE_ID,
+                    )
+                    task_config = legacy_task_config()
+                else:
+                    task_config = resolve_task_config(
+                        registry_entries,
+                        TASK_ID,
+                        profile_id=PROTOCOL_PROFILE_ID,
+                        generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                    )
+            except TaskConfigError as exc:
+                # Unlike a missing GPU lease, this is not an environment
+                # fault we can run through: we would not know what we are
+                # allowed to pay. 3 is the device lease, 2 is click.
+                logger.critical(
+                    "%s; declare it with `reliquary tasks create` before "
+                    "starting this validator",
+                    exc,
+                )
+                raise typer.Exit(code=4) from exc
+            except Exception as exc:
+                logger.critical(
+                    "task registry could not be read (%s); refusing to start "
+                    "rather than pay under unknown rules",
+                    exc,
+                )
+                raise typer.Exit(code=4) from exc
+
             import torch
             from reliquary.constants import ATTN_IMPLEMENTATION
             from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
@@ -706,6 +957,11 @@ def validate(
                 remote_pool = RemoteProofPool.from_environment(repo_id=hf_repo_id)
                 remote_pool.start()
             if proof_mode == "remote":
+                # No device lease here: every slot below is a card on the
+                # executor host, reached over HTTPS, and this controller holds
+                # no local CUDA context at all. Cards are leased where they are
+                # actually bound -- in the local-proof branch below, which also
+                # covers shadow mode because its local pool is authoritative.
                 proof_worker_pool = remote_pool
                 proof_slots = remote_pool.dispatch_devices
                 proof_models = remote_pool.proxies()
@@ -741,6 +997,32 @@ def validate(
                 proof_device_identities = _configured_proof_device_identities(
                     torch
                 )
+                if proof_device_identities:
+                    from reliquary.constants import TASK_ID
+                    from reliquary.validator.device_lease import (
+                        DeviceLeaseError,
+                        acquire_device_leases,
+                        default_lease_directory,
+                    )
+
+                    try:
+                        acquire_device_leases(
+                            [identity.device_uuid for identity in proof_device_identities],
+                            task_id=TASK_ID,
+                            directory=default_lease_directory(),
+                        )
+                    except DeviceLeaseError as exc:
+                        # A raw traceback under `restart: unless-stopped` is a
+                        # crash loop that says nothing. Name the card, the
+                        # holder and the remedy once, then exit on a code of
+                        # our own (1 is the fatal proof plane, 2 is click's
+                        # usage error).
+                        logger.critical(
+                            "%s; stop that task or point this one at free cards "
+                            "with RELIQUARY_PROOF_DEVICES before starting it again",
+                            exc,
+                        )
+                        raise typer.Exit(code=3) from exc
                 proof_devices = tuple(
                     identity.device_id for identity in proof_device_identities
                 )
@@ -920,6 +1202,9 @@ def validate(
                 proof_capacity_qualification=(
                     proof_capacity_qualification
                 ),
+                emission_cap=task_config.emission_cap,
+                price_params=task_config.price_params,
+                env_caps=task_config.env_caps,
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,
             )

@@ -13,6 +13,7 @@ from reliquary.environment.grader import (
     GRADER_POOL_SIZE as GRADER_POOL_SIZE,
     GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
 )
+from reliquary.shared.task_id import normalise_task_id
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
@@ -971,6 +972,10 @@ TRAINING_RUN_ID = (
     _os.environ.get("RELIQUARY_TRAINING_RUN_ID", "default").strip() or "default"
 )
 
+# Which task this process serves. "default" keeps the legacy archive paths, so
+# the running task is untouched by the existence of any other.
+TASK_ID = normalise_task_id(_os.environ.get("RELIQUARY_TASK_ID"))
+
 # How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
 # checkpoint-publish cadence. Publishing can stall (training starvation, HF
 # publish failures) while windows keep advancing, which would let the snapshot
@@ -1315,6 +1320,52 @@ CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
 # gives a ~25-window half-life — a miner that stops contributing loses
 # half their score in ~25 windows.
 EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
+
+# A hotkey below this share of the miner total is ramped down and what it loses
+# is shared out among the miners above it: the floor decides who is paid, never
+# how much burns.
+_MIN_INCENTIVE_SHARE_RAW = _os.environ.get("RELIQUARY_MIN_INCENTIVE_SHARE", "0.02")
+try:
+    MIN_INCENTIVE_SHARE = float(_MIN_INCENTIVE_SHARE_RAW)
+except ValueError as _exc:
+    raise ValueError(
+        f"RELIQUARY_MIN_INCENTIVE_SHARE={_MIN_INCENTIVE_SHARE_RAW!r} is not a number"
+    ) from _exc
+if not 0.0 <= MIN_INCENTIVE_SHARE < 1.0 or MIN_INCENTIVE_SHARE != MIN_INCENTIVE_SHARE:
+    raise ValueError("RELIQUARY_MIN_INCENTIVE_SHARE must be in [0.0, 1.0)")
+
+# Below this share, a hotkey is paid nothing at all; between here and
+# MIN_INCENTIVE_SHARE it is paid a linearly ramping fraction of its share
+# rather than falling off a cliff at the floor. A 2%-or-nothing cliff gives an
+# infinite marginal return to crossing it, which pays miners to merge
+# hotkeys — concentration is exactly what a floor meant to protect against
+# should not reward. `start == MIN_INCENTIVE_SHARE` degenerates to today's
+# cliff exactly.
+_MIN_INCENTIVE_RAMP_START_RAW = _os.environ.get(
+    "RELIQUARY_MIN_INCENTIVE_RAMP_START", "0.01"
+)
+try:
+    MIN_INCENTIVE_RAMP_START = float(_MIN_INCENTIVE_RAMP_START_RAW)
+except ValueError as _exc:
+    raise ValueError(
+        f"RELIQUARY_MIN_INCENTIVE_RAMP_START={_MIN_INCENTIVE_RAMP_START_RAW!r} "
+        "is not a number"
+    ) from _exc
+if (
+    not 0.0 <= MIN_INCENTIVE_RAMP_START <= MIN_INCENTIVE_SHARE
+    or MIN_INCENTIVE_RAMP_START != MIN_INCENTIVE_RAMP_START
+):
+    raise ValueError(
+        "RELIQUARY_MIN_INCENTIVE_RAMP_START="
+        f"{MIN_INCENTIVE_RAMP_START} must be between 0.0 and "
+        f"MIN_INCENTIVE_SHARE={MIN_INCENTIVE_SHARE}"
+    )
+
+# Whether each window's pool follows the discovered emission price. Armed by
+# default; "0" is the kill switch, and the price is then only published.
+EMISSION_PRICE_ARMED = _os.environ.get(
+    "RELIQUARY_EMISSION_PRICE_ARMED", "1"
+).strip().lower() in ("1", "true", "yes", "on")
 
 # ────────────────  GRPO TRAINING (v2.1)  ────────────────
 

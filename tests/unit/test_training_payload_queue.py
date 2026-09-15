@@ -13,6 +13,7 @@ from reliquary.infrastructure.training_payload_queue import (
     payload_key,
     step_cursor_key,
     tombstone_key,
+    training_prefix,
 )
 
 
@@ -33,6 +34,61 @@ def test_keys():
     assert tombstone_key(30100) == (
         "reliquary/training/window-30100.tombstone.json"
     )
+
+
+def test_a_named_task_keys_under_its_own_training_prefix(monkeypatch):
+    """Window numbers are block-derived, so two tasks agree on them: without
+    this prefix a second task's payload lands on the key default's trainer
+    pulls, and default trains its live model on another task's rollouts."""
+    monkeypatch.setenv("RELIQUARY_TASK_ID", "logic-probe")
+
+    assert training_prefix() == "reliquary/tasks/logic-probe/training"
+    assert payload_key(30100) == (
+        "reliquary/tasks/logic-probe/training/window-30100.npz"
+    )
+    assert tombstone_key(30100) == (
+        "reliquary/tasks/logic-probe/training/window-30100.tombstone.json"
+    )
+    assert step_cursor_key() == (
+        "reliquary/tasks/logic-probe/training/step-cursor.json"
+    )
+
+
+def test_default_is_spelled_the_same_as_unset(monkeypatch):
+    monkeypatch.setenv("RELIQUARY_TASK_ID", "default")
+
+    assert payload_key(30100) == "reliquary/training/window-30100.npz"
+    assert step_cursor_key() == "reliquary/training/step-cursor.json"
+
+
+def test_an_explicit_task_beats_the_environment(monkeypatch):
+    monkeypatch.setenv("RELIQUARY_TASK_ID", "logic-probe")
+
+    assert payload_key(7, "other") == (
+        "reliquary/tasks/other/training/window-7.npz"
+    )
+    assert tombstone_key(7, "default") == (
+        "reliquary/training/window-7.tombstone.json"
+    )
+
+
+def test_a_named_task_drains_to_its_own_prefix(tmp_path, monkeypatch):
+    """The local-filename -> R2-key reverse mapping must move with the
+    forward one, or the drain writes into default's prefix anyway."""
+    monkeypatch.setenv("RELIQUARY_TASK_ID", "logic-probe")
+    q = TrainingPayloadQueue(queue_dir=str(tmp_path))
+    q.enqueue_payload(30100, b"abc")
+    q.enqueue_tombstone(30101, b"{}")
+    q.write_step_cursor(30142)
+
+    uploaded = {}
+    asyncio.run(q.drain_once(upload_fn=lambda k, d: uploaded.update({k: d})))
+
+    assert set(uploaded) == {
+        "reliquary/tasks/logic-probe/training/window-30100.npz",
+        "reliquary/tasks/logic-probe/training/window-30101.tombstone.json",
+        "reliquary/tasks/logic-probe/training/step-cursor.json",
+    }
 
 
 def test_encoded_journal_key_is_the_raw_window_with_the_gate_off(
@@ -413,6 +469,17 @@ def test_step_cursor_invalid_write_is_atomic(tmp_path, journal_key):
 
 def test_step_cursor_key_naming():
     assert step_cursor_key() == "reliquary/training/step-cursor.json"
+
+
+def test_a_named_task_has_its_own_step_cursor(monkeypatch):
+    """One cursor per task: sharing it would have each task's trainer pace
+    on the other's consumption."""
+    monkeypatch.setenv("RELIQUARY_TASK_ID", "logic-probe")
+
+    assert step_cursor_key() == (
+        "reliquary/tasks/logic-probe/training/step-cursor.json"
+    )
+    assert step_cursor_key("default") == "reliquary/training/step-cursor.json"
 
 
 def test_step_cursor_uploads_via_same_transport_and_stays_local(tmp_path):

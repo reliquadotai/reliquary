@@ -11,6 +11,7 @@ import os
 from botocore.exceptions import ClientError
 
 from reliquary.infrastructure.storage import (
+    dataset_object_key,
     get_s3_client,
     upload_window_dataset,
 )
@@ -90,7 +91,9 @@ async def _object_exists(key: str) -> bool:
 
 async def _run(args: argparse.Namespace) -> None:
     archive = _tombstone(args)
-    key = f"reliquary/dataset/window-{args.window}.json.gz"
+    # The same key upload_window_dataset writes, so the guard cannot inspect
+    # one task's object while the write lands under another's.
+    key = dataset_object_key(args.window)
     if not args.execute:
         print(json.dumps(archive, indent=2, sort_keys=True))
         print("dry-run: pass --execute to upload")

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -155,9 +155,20 @@ def test_cli_remote_boot_never_resolves_cuda_or_loads_local_weights(monkeypatch)
     import reliquary.validator.remote_proof as remote
     import reliquary.validator.service as service_module
     import reliquary.validator.weight_only as weights
+    import reliquary.infrastructure.task_registry_store as task_registry_store
     import bittensor
 
     monkeypatch.setenv("RELIQUARY_PROOF_EXECUTOR_MODE", "remote")
+    # `validate --train` reads the task registry from R2 at boot and refuses
+    # to start if it cannot. This test has no R2 credentials and is not about
+    # the registry, so mock the read the same way
+    # test_weight_only_validator.py's `_patch_chain_and_storage` does for the
+    # same read: an absent registry (the shape a real bucket with no registry
+    # object yet returns) makes the startup path fall back to the legacy
+    # "default" task and proceed, without retrying.
+    monkeypatch.setattr(
+        task_registry_store, "read_registry", AsyncMock(return_value=({}, None))
+    )
     monkeypatch.setattr(constants, "DETACHED_TRAINER", True)
     monkeypatch.setattr(constants, "KL_BASE_MODEL", "")
     monkeypatch.setattr(cli, "_resolve_cli_environment_mix", lambda _v: [("fake", 1)])

@@ -18,9 +18,11 @@ from reliquary.constants import (
     FILL_CLOSED_PICKS_PER_WINDOW,
     FILL_CLOSED_SELECTION_POLICY,
     LEGACY_FILL_CLOSED_SELECTION_POLICY,
+    TASK_ID,
 )
 from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.task_registry import _SUM_TOLERANCE
 from reliquary.shared.training_payload import (
     active_training_identity,
     encode_tombstone,
@@ -35,6 +37,18 @@ from reliquary.validator.token_rewards import (
     split_environment_pool,
     split_fixed_environment_pool,
 )
+
+
+def _valid_window_pool(value: object) -> bool:
+    # The upper bound matches what ``validate_registry`` already accepts on the
+    # way in: a guard stricter than the validator that admitted the value is a
+    # guard that rejects its own valid inputs.
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0.0 <= value <= 1.0 + _SUM_TOLERANCE
+    )
+
 
 def accounting_rows(batches: dict | None, *, batch_index: int) -> list[dict]:
     rows = []
@@ -126,6 +140,8 @@ class FillClosedRecoveryStore:
                 raise ValueError("invalid active window pool")
         elif picks > FILL_CLOSED_EMISSIONS_PER_WINDOW:
             raise ValueError("invalid active window pick target")
+        if "window_pool" in value and not _valid_window_pool(value["window_pool"]):
+            raise ValueError("invalid active window pool")
         return value
 
     def windows(self) -> list[int]:
@@ -147,6 +163,8 @@ class FillClosedRecoveryStore:
     ) -> None:
         if self._path(window).exists():
             raise RuntimeError("active window requires recovery before reuse")
+        if not _valid_window_pool(window_pool):
+            raise ValueError("invalid active window pool")
         if any(target != B_BATCH for target in targets.values()):
             raise ValueError("active window batch target mismatch")
         write_json(self._path(window), {
@@ -291,6 +309,8 @@ class FillClosedRecoveryStore:
         archive = {
             "archive_schema_version": 2, "window_start": window,
             "window_status": "recovered_partial" if rows else "aborted",
+            "task_id": TASK_ID,
+            "task_emission_share": float(record.get("window_pool", 1.0)),
             "failure_stage": "active_window_recovery", "failure_type": "interrupted_window",
             "environments": environments, "environment": environments[0],
             "batch_targets": record["batch_targets"], "batch": rows,

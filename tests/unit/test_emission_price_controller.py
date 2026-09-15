@@ -1,0 +1,650 @@
+"""The emission price controller, replayed from window outcomes.
+
+The controller answers one question per window: is collection on the cycle's
+critical path? When it is not, the subnet is paying for speed it cannot
+consume, and the price walks down; the unpaid share burns.
+
+Every constant is expressed in BLOCKS, never in windows. ``EMA_ALPHA`` is the
+cautionary tale: calibrated for ~5-minute windows, it silently became a ~28-hour
+time constant when fill-closed made windows ten times longer. Nobody chose that.
+A controller counted in windows would recalibrate itself the same way the next
+time the cadence moves -- and the cadence is expected to move.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from reliquary.validator.emission_price import (
+    PriceParams,
+    PriceState,
+    WindowOutcome,
+    advance,
+    replay,
+)
+
+
+def _params(**overrides) -> PriceParams:
+    """Parameters chosen for legibility in tests, not for production."""
+    base = dict(
+        start=1.0,
+        decay=0.5,          # a big step so arithmetic stays readable
+        rounds_per_step=100,
+        deadband=0.80,
+        snap=1.20,
+        floor=0.01,
+        cap=1.0,
+        median_rounds=1_000_000,   # effectively "all history" unless overridden
+        last_good_fills=1_000_000,  # effectively "all fills" unless overridden
+    )
+    base.update(overrides)
+    return PriceParams(**base)
+
+
+_INCOMPRESSIBLE = 100
+
+
+def _window(open_round: int, span: int, *, r: float | None) -> WindowOutcome:
+    """A window whose collection landed at ratio ``r``; ``r=None`` never filled."""
+    ready = None if r is None else open_round + round(r * _INCOMPRESSIBLE)
+    return WindowOutcome(
+        open_round=open_round,
+        close_round=open_round + span,
+        collect_ready_round=ready,
+        incompressible_rounds=_INCOMPRESSIBLE,
+    )
+
+
+def _masked(open_round: int, span: int) -> WindowOutcome:
+    """Collection finished well inside the incompressible time.
+
+    ``r`` lands at 0.1, far below any sane deadband, so this is the unambiguous
+    "we are paying for speed we cannot use" case.
+    """
+    return _window(open_round, span, r=0.1)
+
+
+def test_oversupply_walks_the_price_down_geometrically():
+    params = _params()
+
+    # One window covering exactly two decay steps.
+    decision = replay([_masked(0, 200)], params)
+
+    assert decision.price == 0.25
+    assert decision.regime == "descend"
+
+
+def test_price_depends_on_blocks_elapsed_not_on_window_count():
+    """The property that keeps a cadence change from recalibrating the controller.
+
+    Four short windows and one long window covering the same 400 blocks must
+    leave the price at the same place. Without this, halving the window
+    duration would double the controller's speed -- exactly the way EMA_ALPHA
+    drifted when fill-closed lengthened windows.
+    """
+    params = _params()
+
+    one_long = replay([_masked(0, 400)], params)
+    four_short = replay(
+        [_masked(0, 100), _masked(100, 100), _masked(200, 100), _masked(300, 100)],
+        params,
+    )
+
+    assert one_long.price == four_short.price
+    assert one_long.price == 0.0625  # 0.5 ** 4
+
+
+def test_deadband_holds_the_price():
+    """Collection close to the incompressible time is the target, not a signal.
+
+    Without this the controller twitches every window around r=1, which is the
+    main oscillation source once supply is elastic and every miner reads the
+    same public price at the same moment.
+    """
+    params = _params(deadband=0.80)
+
+    decision = replay([_window(0, 200, r=0.9)], params)
+
+    assert decision.price == 1.0
+    assert decision.regime == "hold"
+
+
+def test_shortage_snaps_the_price_up_immediately():
+    """A fill-closed window that never gathers its target stops the trainer.
+
+    There is no graceful degradation to ride out, so recovery does not walk --
+    it jumps. This is what lets the descent be fast in the first place.
+    """
+    params = _params(snap=1.20)
+
+    # Two decay steps down (price 0.25, all filled), then one window that did not.
+    decision = replay([_masked(0, 200), _window(200, 100, r=None)], params)
+
+    assert decision.price == pytest.approx(0.30)
+    assert decision.regime == "snap"
+
+
+def test_repeated_shortage_keeps_escalating():
+    """Liveness: one snap that fails to restore supply must not be a dead end.
+
+    A snap pinned to the last good price would park there forever with the
+    trainer stopped.
+    """
+    params = _params(snap=1.20)
+
+    once = replay([_masked(0, 200), _window(200, 100, r=None)], params)
+    twice = replay(
+        [_masked(0, 200), _window(200, 100, r=None), _window(300, 100, r=None)],
+        params,
+    )
+
+    assert twice.price > once.price
+    assert twice.price == pytest.approx(0.36)
+
+
+def test_a_window_that_never_filled_does_not_become_the_good_price():
+    """``last_good`` is the lowest price at which a window actually filled."""
+    params = _params(snap=1.20)
+
+    decision = replay([_masked(0, 200), _window(200, 100, r=None)], params)
+
+    assert decision.last_good == pytest.approx(0.25)
+
+
+def test_price_never_falls_below_the_floor():
+    """The floor is a liveness guard, not an economic opinion."""
+    params = _params(floor=0.10)
+
+    decision = replay([_masked(0, 1000)], params)   # ten decay steps
+
+    assert decision.price == 0.10
+
+
+def test_snap_never_exceeds_the_cap():
+    params = _params(cap=1.0, snap=1.20)
+
+    decision = replay([_window(0, 100, r=None)], params)
+
+    assert decision.price == 1.0
+
+
+def test_one_noisy_window_does_not_move_the_price():
+    """Descending must be earned: a single fast window is not evidence.
+
+    Fill time is polluted by things that have nothing to do with supply -- the
+    precommit stall that forces STALE_ROUND (12.5 s = 4 drand rounds), network
+    latency, beacon jitter. Spending less on one sample of that would be noise
+    trading.
+    """
+    params = _params(deadband=0.80)
+
+    decision = replay(
+        [_window(0, 100, r=0.9), _window(100, 100, r=0.9), _window(200, 100, r=0.1)],
+        params,
+    )
+
+    assert decision.price == 1.0
+    assert decision.regime == "hold"
+
+
+def test_smoothing_never_delays_the_snap():
+    """The evidence bar is asymmetric because the cost of being wrong is.
+
+    Paying less must be confirmed by the smoothed signal; restoring liveness is
+    not up for confirmation and fires on the instantaneous one.
+    """
+    params = _params(deadband=0.80, cap=2.0, snap=1.20)
+
+    decision = replay(
+        [_window(0, 100, r=0.9), _window(100, 100, r=0.9), _window(200, 100, r=None)],
+        params,
+    )
+
+    assert decision.regime == "snap"
+    assert decision.price == pytest.approx(1.20)
+
+
+def test_the_smoothing_window_is_counted_in_blocks():
+    """Same history, two lookbacks, two answers -- so the lookback is real.
+
+    A lookback counted in windows would silently shrink the moment the cadence
+    changes, which is precisely how EMA_ALPHA drifted to ~28 hours.
+    """
+    history = [
+        _window(0, 100, r=0.1),
+        _window(100, 100, r=0.1),
+        _window(200, 100, r=0.9),
+        _window(300, 100, r=0.9),
+    ]
+
+    long_lookback = replay(history, _params(median_rounds=1000))
+    short_lookback = replay(history, _params(median_rounds=150))
+
+    assert long_lookback.regime == "descend"
+    assert short_lookback.regime == "hold"
+
+
+def test_one_step_needs_only_the_previous_state_and_the_lookback():
+    """A reader must not need the archive chain back to genesis.
+
+    ``_replay_ema`` reads a BOUNDED slice of archives (216). If reproducing the
+    price required folding every window since the run began, a weight-only node
+    would land on a different number than the validator that wrote it -- and
+    the two would submit different weight vectors. So each archive carries its
+    own state, and the next step consumes only that plus the smoothing
+    lookback.
+    """
+    params = _params(median_rounds=250)
+    history = [_masked(0, 100), _masked(100, 100), _masked(200, 100), _masked(300, 100)]
+
+    whole_chain = replay(history, params)
+
+    previous = replay(history[:-1], params)
+    # close_round > 400 - 250 keeps the last three windows, the decided one included.
+    one_step = advance(previous.state, history[-3:], params)
+
+    assert one_step.price == whole_chain.price
+    assert one_step.last_good == whole_chain.last_good
+    assert one_step.regime == whole_chain.regime
+
+
+def test_state_survives_a_round_trip_through_plain_values():
+    """The state crosses an archive, so it must be ordinary JSON scalars."""
+    params = _params()
+    decision = replay([_masked(0, 200)], params)
+
+    revived = PriceState(price=float(decision.price), last_good=float(decision.last_good))
+
+    assert advance(revived, [_masked(200, 100)], params).price == pytest.approx(
+        replay([_masked(0, 300)], params).price
+    )
+
+
+def test_missing_stage_telemetry_is_not_a_shortage():
+    """A window that filled but was not measured carries no ratio, not bad news.
+
+    Collapsing "we did not record the stage durations" into "the window never
+    filled" would snap the price UP every time instrumentation hiccups --
+    exactly backwards, and self-reinforcing since the snap is the one regime
+    that needs no confirmation.
+    """
+    params = _params(cap=2.0)
+    unmeasured = WindowOutcome(
+        open_round=0,
+        close_round=100,
+        collect_ready_round=10,      # it DID fill
+        incompressible_rounds=0,     # but nothing was measured
+    )
+
+    decision = replay([unmeasured], params)
+
+    assert decision.regime == "hold"
+    assert decision.price == 1.0
+
+
+def test_an_unmeasured_window_does_not_enter_the_median():
+    """It carries no information, so it must not dilute the ones that do."""
+    params = _params(deadband=0.80)
+    unmeasured = WindowOutcome(
+        open_round=100,
+        close_round=200,
+        collect_ready_round=110,
+        incompressible_rounds=0,
+    )
+
+    decision = replay([_masked(0, 100), unmeasured, _masked(200, 100)], params)
+
+    # The median is over [0.1, 0.1], not over [0.1, <nothing>, 0.1] read as noise.
+    assert decision.regime == "descend"
+    assert decision.r_smoothed == pytest.approx(0.1)
+
+
+def test_a_fill_at_a_raised_price_does_not_raise_last_good():
+    """A snap that succeeds must not lift the floor the NEXT snap escalates
+    from -- that is the ratchet the rolling minimum exists to break.
+
+    Without it, every incident would raise `last_good` the moment the market
+    recovers at the raised price, and a run of incidents would walk the snap
+    floor toward the cap even though a lower price is known to work.
+    """
+    params = _params(snap=1.20, deadband=0.80)
+
+    decision = replay(
+        [
+            _masked(0, 200),              # fills at 0.25
+            _window(200, 100, r=None),    # snap to 0.30
+            _window(300, 100, r=0.9),     # fills AT the raised price, 0.30
+        ],
+        params,
+    )
+
+    assert decision.price == pytest.approx(0.30)
+    assert decision.last_good == pytest.approx(0.25)
+
+
+def test_last_good_is_a_rolling_minimum_not_a_permanent_one():
+    """Over enough filling windows the floor DOES follow the market up -- it
+    just cannot be raised by any SINGLE expensive fill."""
+    params = _params(snap=1.20, deadband=0.80, cap=2.0, last_good_fills=2)
+
+    decision = replay(
+        [
+            _window(0, 100, r=0.9),      # fills at 1.0
+            _window(100, 100, r=None),   # snap to 1.2
+            _window(200, 100, r=0.9),    # fills at 1.2
+            _window(300, 100, r=None),   # snap to 1.44
+            _window(400, 100, r=0.9),    # fills at 1.44
+        ],
+        params,
+    )
+
+    # Three fills happened, at 1.0, 1.2 and 1.44; with a lookback of 2 only
+    # the last two count, so the floor followed the market up to 1.2 -- but
+    # never all the way to today's price, 1.44.
+    assert decision.last_good == pytest.approx(1.2)
+
+
+def test_replay_equals_the_incremental_fold_with_the_new_field():
+    """`replay()` must land on the identical state -- price, last_good, AND
+    the new rolling-fill tuple -- as folding `advance()` one window at a time.
+
+    This is the property that lets a weight-only node replay an archive and a
+    validator's live walk agree: neither may depend on anything `advance()`
+    does not receive as an explicit argument.
+    """
+    params = _params(snap=1.20, deadband=0.80, cap=2.0, last_good_fills=3)
+    history = [
+        _window(0, 100, r=0.9),
+        _window(100, 100, r=None),
+        _window(200, 100, r=0.9),
+        _window(300, 100, r=None),
+        _window(400, 100, r=0.9),
+        _window(500, 100, r=0.9),
+    ]
+
+    folded = replay(history, params)
+
+    state = PriceState(price=params.start, last_good=params.start)
+    for index in range(len(history)):
+        decision = advance(state, history[: index + 1], params)
+        state = decision.state
+
+    assert state.price == pytest.approx(folded.price)
+    assert state.last_good == pytest.approx(folded.last_good)
+    assert state.recent_fill_prices == folded.state.recent_fill_prices
+
+
+def test_a_state_without_the_recent_fills_tuple_still_loads():
+    """An archive written before this shipped carries no tuple: reviving a
+    `PriceState` from its two plain scalars must not crash, and a snap must
+    still escalate from the carried `last_good`, not from an empty window."""
+    params = _params(snap=1.20)
+    legacy_state = PriceState(price=0.30, last_good=0.25)
+
+    decision = advance(legacy_state, [_window(1000, 100, r=None)], params)
+
+    assert decision.regime == "snap"
+    assert decision.price == pytest.approx(max(0.30, 0.25) * 1.20)
+    assert decision.last_good == pytest.approx(0.25)
+
+
+def test_a_starving_environment_does_not_raise_the_other_ones_price():
+    """The defect this work exists to fix: today one starving env snaps the
+    price for every env, because the window's readiness is the slowest env's."""
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    states = {
+        "math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,)),
+        "code": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,)),
+    }
+    recent = {
+        # math never reached its target; code reached it comfortably early.
+        "math": [EnvironmentOutcome("math", 0, 1000, None, 500.0)],
+        "code": [EnvironmentOutcome("code", 0, 1000, 100, 500.0)],
+    }
+
+    decisions = advance_by_environment(states, recent, PRODUCTION_PRICE_PARAMS)
+
+    assert decisions["math"].regime == "snap"
+    assert decisions["math"].price > 0.5
+    assert decisions["code"].regime != "snap"
+    assert decisions["code"].price <= 0.5
+
+
+def test_each_environment_keeps_its_own_walk():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    states = {
+        "math": PriceState(price=0.8, last_good=0.8, recent_fill_prices=(0.8,)),
+        "code": PriceState(price=0.2, last_good=0.2, recent_fill_prices=(0.2,)),
+    }
+    recent = {
+        "math": [EnvironmentOutcome("math", 0, 1000, 900, 500.0)],
+        "code": [EnvironmentOutcome("code", 0, 1000, 900, 500.0)],
+    }
+
+    decisions = advance_by_environment(states, recent, PRODUCTION_PRICE_PARAMS)
+
+    # Same outcome shape, different starting prices: the walks do not merge.
+    assert decisions["math"].price != decisions["code"].price
+
+
+def test_a_chronically_dry_environment_stops_escalating():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(states, {"math": dry}, PRODUCTION_PRICE_PARAMS)
+
+    assert decisions["math"].regime == "frozen"
+    assert decisions["math"].price == 0.5
+
+
+def test_two_dry_windows_still_snap():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 2
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(states, {"math": dry}, PRODUCTION_PRICE_PARAMS)
+
+    assert decisions["math"].regime == "snap"
+    assert decisions["math"].price > 0.5
+
+
+def test_a_timed_out_environment_trips_the_breaker_even_when_arrivals_were_full():
+    """The dominant timeout shape: admission reached target, proofs did not.
+
+    ``filled`` reads the admission clock, so before ``timed_out`` existed a
+    run of timed-out windows read as ordinary holds and the breaker -- the
+    guard against a structurally dry environment halting the subnet -- never
+    fired and never logged.
+    """
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    timed_out = [
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+    ] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(
+        states, {"math": timed_out}, PRODUCTION_PRICE_PARAMS
+    )
+
+    assert decisions["math"].regime == "frozen"
+    assert decisions["math"].price == 0.5
+
+
+def test_two_timed_out_windows_do_not_trip_the_breaker():
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    timed_out = [
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+    ] * 2
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(
+        states, {"math": timed_out}, PRODUCTION_PRICE_PARAMS
+    )
+
+    assert decisions["math"].regime != "frozen"
+
+
+def test_a_timed_out_window_is_not_evidence_that_the_price_works():
+    """It assembled no batch, so it must not extend the rolling minimum
+    ``last_good`` -- and so must not lower the floor the next snap climbs
+    from."""
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance,
+    )
+
+    state = PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))
+    outcome = EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+
+    decision = advance(state, [outcome], PRODUCTION_PRICE_PARAMS)
+
+    assert decision.recent_fill_prices == (0.5,)
+    assert decision.last_good == 0.5
+
+
+def test_a_filled_window_still_extends_the_rolling_minimum():
+    """The control for the test above: the flag is what suppresses it, not
+    the per-environment shape."""
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance,
+    )
+
+    state = PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))
+    outcome = EnvironmentOutcome("math", 0, 1000, 100, 500.0)
+
+    decision = advance(state, [outcome], PRODUCTION_PRICE_PARAMS)
+
+    assert len(decision.recent_fill_prices) == 2
+
+
+def test_a_zero_breaker_length_disables_the_breaker():
+    """``[-0:]`` is the whole list, so a breaker of 0 froze on the first
+    unfilled window instead of standing down."""
+    import dataclasses
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    params = dataclasses.replace(PRODUCTION_PRICE_PARAMS, breaker_timeouts=0)
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 5
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    decisions = advance_by_environment(states, {"math": dry}, params)
+
+    assert decisions["math"].regime == "snap"
+    assert decisions["math"].price > 0.5
+
+
+def test_the_breaker_names_a_market_shortage_as_its_cause(caplog):
+    """The regime collapses the two shapes; the log line must not. No
+    arrivals at all is the market not being there."""
+    import logging
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    dry = [EnvironmentOutcome("math", 0, 1000, None, 500.0)] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    with caplog.at_level(logging.CRITICAL):
+        advance_by_environment(states, {"math": dry}, PRODUCTION_PRICE_PARAMS)
+
+    assert "MARKET is not supplying" in caplog.text
+    assert "proof plane" not in caplog.text
+
+
+def test_the_breaker_names_our_own_proof_plane_as_its_cause(caplog):
+    """Arrivals reached target and still nothing was proven: that is us, not
+    the market, and the operator's first look should go elsewhere."""
+    import logging
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    timed_out = [
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True)
+    ] * 3
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    with caplog.at_level(logging.CRITICAL):
+        advance_by_environment(states, {"math": timed_out}, PRODUCTION_PRICE_PARAMS)
+
+    assert "proof plane cannot keep up" in caplog.text
+    assert "MARKET is not supplying" not in caplog.text
+
+
+def test_the_breaker_says_so_when_the_two_causes_are_mixed(caplog):
+    import logging
+
+    from reliquary.validator.emission_price import (
+        PRODUCTION_PRICE_PARAMS,
+        EnvironmentOutcome,
+        PriceState,
+        advance_by_environment,
+    )
+
+    mixed = [
+        EnvironmentOutcome("math", 0, 1000, None, 500.0),
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True),
+        EnvironmentOutcome("math", 0, 1000, 100, 0.0, timed_out=True),
+    ]
+    states = {"math": PriceState(price=0.5, last_good=0.5, recent_fill_prices=(0.5,))}
+
+    with caplog.at_level(logging.CRITICAL):
+        advance_by_environment(states, {"math": mixed}, PRODUCTION_PRICE_PARAMS)
+
+    assert "mixed -- 1 window(s) short on arrivals, 2" in caplog.text

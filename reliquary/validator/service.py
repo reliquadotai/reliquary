@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import functools
 import gzip
 import hashlib
@@ -23,6 +24,7 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
+    TASK_ID,
     TRAINING_RUN_ID,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
@@ -173,6 +175,75 @@ def _bind_public_window_randomness(
     digest.update(len(encoded_randomness).to_bytes(4, "big"))
     digest.update(encoded_randomness)
     return digest.hexdigest()
+
+
+def _price_signal_int(value: Any) -> int | None:
+    """An honest int, or nothing. Mocks and floats are nothing."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    return None
+
+
+# How many windows of outcomes the shadow keeps in memory. Only the trailing
+# ``median_rounds`` matter to the controller, which filters what it is handed;
+# this is the bound that keeps the deque from growing.
+_PRICE_SHADOW_HISTORY_WINDOWS = 64
+# What the price walk reads back from an archive at startup; nothing else is loaded.
+_PRICE_ARCHIVE_FIELDS = (
+    "window_start", "window_status", "window_open_round", "window_close_round",
+    "collect_ready_round", "collect_ready_round_by_environment",
+    "training_rounds", "validation_rounds", "emission_price_shadow",
+)
+
+
+def _window_price_signal(first_batcher, batcher_dict, target_for):
+    """The window's price signal for the archive, or None if unmeasurable.
+
+    Everything it needs already exists at seal: ``window_open_drand_round`` is
+    stamped from the real beacon, ``_seal_trigger_round`` from the seal, and
+    ``_submissions_per_prompt`` retains every admitted candidate for the
+    window's life -- appended to, never pruned. Nothing new is recorded in the
+    admission path.
+
+    Returning None rather than a partial record matters: a record carrying the
+    window bounds but no readiness reads downstream as a SHORTAGE, the one
+    regime that snaps the price up without confirmation. The archive tests
+    drive this with ``MagicMock`` batchers, whose every attribute answers with
+    another Mock, so "no real per-prompt index" has to read as silence.
+    """
+    from reliquary.validator.emission_price import price_signal_fields
+
+    arrivals: dict[str, dict[int, list[int]]] = {}
+    targets: dict[str, int] = {}
+    for env_name, env_batcher in batcher_dict.items():
+        index = getattr(env_batcher, "_submissions_per_prompt", None)
+        if not isinstance(index, dict):
+            return None
+        arrivals[str(env_name)] = {
+            int(prompt_idx): [
+                round_
+                for round_ in (
+                    _price_signal_int(getattr(pending, "drand_round", None))
+                    for pending in pendings
+                )
+                if round_ is not None
+            ]
+            for prompt_idx, pendings in index.items()
+        }
+        target = _price_signal_int(target_for(env_name, env_batcher))
+        if target is None:
+            return None
+        targets[str(env_name)] = target
+    return price_signal_fields(
+        open_round=_price_signal_int(
+            getattr(first_batcher, "window_open_drand_round", None)
+        ),
+        close_round=_price_signal_int(
+            getattr(first_batcher, "_seal_trigger_round", None)
+        ),
+        arrivals_by_environment=arrivals,
+        targets_by_environment=targets,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -355,6 +426,21 @@ def _write_gzip_json_atomic(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
+# The three values an archive's/a seal call's "window_status" takes on THIS
+# path. A fourth, "recovered_partial", exists but is never written here: only
+# fill_closed_recovery.py writes it, for a window replayed from its journal.
+# Named here, once, so a typo like "timedout" fails an import or an
+# equality check loudly instead of silently degrading to whichever branch
+# every comparison's ``else`` happens to fall through to (pay the forced
+# remainder, write the training payload, archive "completed"). The
+# archive FIELD stays named "window_status" and these three literal
+# strings are unchanged -- readers (weight-only nodes, the emission-price
+# adapter, older archives already on disk) depend on the exact spelling.
+WINDOW_STATUS_COMPLETED = "completed"
+WINDOW_STATUS_TIMED_OUT = "timed_out"
+WINDOW_STATUS_ABORTED = "aborted"
+
+
 def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
     """Return a filtered view of archives containing only entries for ``env_name``.
 
@@ -365,7 +451,7 @@ def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
     """
     out = []
     for archive in archives:
-        if archive.get("window_status", "completed") == "aborted":
+        if archive.get("window_status", WINDOW_STATUS_COMPLETED) == WINDOW_STATUS_ABORTED:
             continue
         # Determine the archive's env(s). New shape has "environments" list;
         # old shape has "environment" singular. Both may be present together.
@@ -668,6 +754,17 @@ class ValidationService:
         proof_devices: tuple[str, ...] | None = None,
         proof_models: dict[str, Any] | None = None,
         proof_capacity_qualification: dict[str, Any] | None = None,
+        # 1.0 is the legacy single-task pool, not a safe default for a new
+        # task: the env var this replaced had a fail-safe of 0.0 for anything
+        # other than "default". Every non-default construction must pass
+        # this explicitly, from the registry (see resolve_task_config /
+        # TaskConfig.emission_cap).
+        emission_cap: float = 1.0,
+        # Per-environment share of ``emission_cap`` (TaskConfig.env_caps).
+        # None/empty means "no split declared" -- the assembler then divides
+        # ``emission_cap`` evenly, exactly as it always has.
+        env_caps: dict[str, float] | None = None,
+        price_params: Any | None = None,
         proof_worker_pool: Any = None,
         signer_client: Any | None = None,
     ) -> None:
@@ -794,6 +891,13 @@ class ValidationService:
         self.proof_capacity_qualification = dict(
             proof_capacity_qualification or {}
         )
+        # What this task may pay per window. 1.0 is the legacy single-task pool.
+        self._emission_cap = float(emission_cap)
+        # Each environment's own share of ``self._emission_cap``, or empty
+        # when no split was declared -- see the FillClosedBatchAssembler
+        # construction below, which falls back to the scalar in that case.
+        self._env_caps: dict[str, float] = dict(env_caps or {})
+        self._price_params = price_params
         from reliquary.validator.proof_measurements import ProofMeasurements
         self._proof_measurements = ProofMeasurements.from_environment(proof_worker_pool)
         self.proof_scheduler: GlobalProofScheduler | None = None
@@ -899,6 +1003,7 @@ class ValidationService:
                 validator_hotkey=validator_hotkey,
             ),
             no_reveal_namespace=f"no-reveal-v1:{prompt_mismatch_namespace}",
+            emission_cap=self._emission_cap,
         )
         self.server.set_late_drop_callback(self.record_late_drop)
         self.server.configure_prompt_source_health(
@@ -2404,7 +2509,10 @@ class ValidationService:
                 # splits it per environment and per batch itself -- it is
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
-                window_pool=1.0,
+                # Each environment's cap, scaled by its own price when armed.
+                window_pool=self._window_pool_for(
+                    [name for name, _ in self.env_mix]
+                ),
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
@@ -2539,6 +2647,12 @@ class ValidationService:
                     checkpoint_n=checkpoint.checkpoint_n,
                     revision=revision,
                     targets=dict(self.env_mix),
+                    # The assembler's own declared total, not ``_emission_cap``
+                    # re-derived: ``finish()`` compares this against the number
+                    # the archive reports with exact float equality, and a map
+                    # of per-environment caps does not always re-sum to the cap
+                    # it came from.
+                    window_pool=candidate_assembler.window_pool,
                 )
             self._fill_closed_assembler = candidate_assembler
             self._fill_closed_assemblers[candidate_window] = candidate_assembler
@@ -3531,8 +3645,25 @@ class ValidationService:
         verify_task=None,
         late_drops: dict | None = None,
         server_reject_counts: dict | None = None,
+        window_status: str = WINDOW_STATUS_COMPLETED,
     ) -> None:
-        """TRAINING + PUBLISHING + READY phases for one sealed window."""
+        """TRAINING + PUBLISHING + READY phases for one sealed window.
+
+        ``window_status="timed_out"`` (the global collection deadline fired
+        rather than every batcher reaching its own target) still archives
+        and pays whatever was already accrued, but skips this window's
+        LEGACY training-payload write and its contribution to
+        ``self._training_accumulator`` below. That is a real suppression
+        only off ``FILL_CLOSED_ENABLED``: under it, ``window_batches`` here
+        is already empty (v6's seal path selects nothing -- every real
+        payload was written incrementally, per complete cycle, by
+        ``FillClosedBatchAssembler`` during collection, well before a
+        timeout is even known) and the actual enforcement for a timed-out
+        fill-closed window is ``FillClosedBatchAssembler.close``'s own
+        ``pay_partial_remainder=False``, called separately at seal time. See
+        ``_archive_window``.
+        """
+        timed_out = window_status == WINDOW_STATUS_TIMED_OUT
         # Pipelined mode passes the SEALED window's batchers explicitly while
         # self._active_batchers already points at the next, collecting window.
         # owns_routing gates every mutation of the live routing state: the GPU
@@ -3859,20 +3990,45 @@ class ValidationService:
             )
         else:
             checkpoint_revision = next(iter(checkpoint_revisions))
-            # Off the event loop: the encode walks every token of the
-            # window (np.savez_compressed included) — seconds of CPU that
-            # would otherwise freeze /state and the drain workers.
-            await asyncio.to_thread(
-                self._write_training_payload,
-                window_batches, window_n, checkpoint_revision,
-                _quarantine_archive,
-            )
+            if timed_out:
+                # This is the LEGACY training-payload write. Under
+                # FILL_CLOSED_ENABLED, ``window_batches`` here is already
+                # empty (v6 pays and trains nothing at seal time -- see
+                # ``_archive_window``), so ``_write_training_tombstone``
+                # redirects to ``_write_fill_closed_window_tombstones``,
+                # which finds nothing left to write: the assembler's own
+                # ``close(pay_partial_remainder=False)`` already padded
+                # this window's journal range to its ceiling. The genuine
+                # suppression here is off that flag: without it, a real,
+                # non-empty ``window_batches`` would otherwise be enqueued
+                # as this window's training payload despite being
+                # partial. Rewards are unaffected either way -- they are
+                # read from the archive/assembler accrual, not from this
+                # write.
+                self._write_training_tombstone(
+                    window_n, "window_timeout", "WindowTimeout",
+                )
+            else:
+                # Off the event loop: the encode walks every token of the
+                # window (np.savez_compressed included) — seconds of CPU
+                # that would otherwise freeze /state and the drain workers.
+                await asyncio.to_thread(
+                    self._write_training_payload,
+                    window_batches, window_n, checkpoint_revision,
+                    _quarantine_archive,
+                )
             accumulator_update = self._training_accumulator.add_window(
-                {} if window_quarantine.quarantined else window_batches,
+                {} if (timed_out or window_quarantine.quarantined) else window_batches,
                 window_n=window_n,
                 checkpoint_revision=checkpoint_revision,
             )
-            if window_quarantine.quarantined:
+            if timed_out:
+                accumulator_update["blocked_reason"] = "window_timeout"
+                accumulator_update["not_accumulated"] = {
+                    name: len(window_batches.get(name, ()))
+                    for name in per_env_targets
+                }
+            elif window_quarantine.quarantined:
                 accumulator_update["blocked_reason"] = "window_quarantine"
                 accumulator_update["not_accumulated"] = {
                     name: len(window_batches.get(name, ()))
@@ -4249,6 +4405,7 @@ class ValidationService:
                 sealed,
                 late_drops=late_drops,
                 server_reject_counts=server_reject_counts,
+                window_status=window_status,
             )
         except Exception as exc:
             logger.exception("window archive failed")
@@ -4265,13 +4422,281 @@ class ValidationService:
         if owns_routing:
             self._set_state(WindowState.READY)
 
+    def _advance_price_shadow(
+        self,
+        price_signal: dict[str, Any] | None,
+        window_status: str = "completed",
+    ) -> dict[str, Any] | None:
+        """Advance the price walk after a window and publish the decision.
+
+        When armed, the next window's pool reads this walk (``_window_pool_for``),
+        and a restart resumes it from the archives (``_restore_price_walk``).
+
+        ``window_status`` defaults to "completed" for every existing caller.
+        ``_archive_window`` passes its own real status instead: a hardcoded
+        "completed" here made a timed-out window's admission-based ratio read
+        as a real, fast fill on both walks below -- ``outcome_from_archive``
+        zeroes the incompressible denominator for a "timed_out" record (the
+        scalar walk's own read), and ``outcomes_by_environment_from_archive``
+        reads that same zeroed value back for each environment. The status is
+        read once here and used for both, on the same record.
+        """
+        if price_signal is None:
+            return None
+        from reliquary.constants import EMISSION_PRICE_ARMED
+        from reliquary.validator.emission_price import (
+            PRODUCTION_PRICE_PARAMS,
+            PriceState,
+            advance,
+            outcome_from_archive,
+        )
+
+        # This task's own declared parameters, if the registry gave us any;
+        # PRODUCTION_PRICE_PARAMS is the fallback for a task that hasn't
+        # (or, today, for the whole legacy fleet -- see legacy_task_config).
+        price_params = self._price_params or PRODUCTION_PRICE_PARAMS
+
+        outcome = outcome_from_archive(
+            {"window_status": window_status, **price_signal}
+        )
+        if outcome is None:
+            return None
+        history = getattr(self, "_price_shadow_outcomes", None)
+        if history is None:
+            history = collections.deque(maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
+            self._price_shadow_outcomes = history
+        state = getattr(self, "_price_shadow_state", None) or PriceState(
+            price=price_params.start,
+            last_good=price_params.start,
+        )
+        history.append(outcome)
+        decision = advance(state, list(history), price_params)
+        self._price_shadow_state = decision.state
+        shadow = {
+            "price": decision.price,
+            "last_good": decision.last_good,
+            "r": decision.r,
+            "r_smoothed": decision.r_smoothed,
+            "regime": decision.regime,
+            "applied": EMISSION_PRICE_ARMED,
+        }
+        # A shadow number is explicitly ``applied: False``, but this method's
+        # only caller (``_archive_window``) is wrapped by a handler that
+        # tombstones the whole window on any exception -- a bug in the
+        # per-environment walk must not be able to cost a window its pay.
+        try:
+            by_environment = self._advance_price_shadow_by_environment(
+                {"window_status": window_status, **price_signal}, price_params
+            )
+        except Exception:
+            logger.warning(
+                "per-environment shadow price walk failed; publishing the "
+                "window's own shadow only", exc_info=True,
+            )
+            by_environment = None
+        if by_environment:
+            shadow["by_environment"] = by_environment
+        self._publish_price_view(shadow, price_params)
+        return shadow
+
+    def _window_pool_for(self, env_order: list[str]):
+        """What each environment of a new window may pay: its cap, scaled by its price.
+
+        Returns the declared pool object itself while every price is at its cap, so
+        an unpriced window is identical to one built before the price was armed.
+        """
+        from reliquary.constants import EMISSION_PRICE_ARMED
+        from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+        declared = self._env_caps or self._emission_cap
+        if not EMISSION_PRICE_ARMED or not env_order:
+            return declared
+        if isinstance(declared, dict) and any(env not in declared for env in env_order):
+            return declared
+        params = self._price_params or PRODUCTION_PRICE_PARAMS
+        window_state = getattr(self, "_price_shadow_state", None)
+        states = getattr(self, "_price_shadow_states_by_environment", None) or {}
+        factors = {}
+        for environment in env_order:
+            state = states.get(environment) or window_state
+            price = state.price if state is not None else params.start
+            factors[environment] = (
+                min(1.0, max(0.0, price / params.cap)) if params.cap > 0 else 0.0
+            )
+        if all(factor == 1.0 for factor in factors.values()):
+            return declared
+        if isinstance(declared, dict):
+            # A narrowed mix keeps the task's whole cap, in declared proportions.
+            running = math.fsum(float(declared[env]) for env in env_order)
+            scale = (
+                math.fsum(float(value) for value in declared.values()) / running
+                if running > 0 else 0.0
+            )
+            base = {env: float(declared[env]) * scale for env in env_order}
+        else:
+            base = {env: float(declared) / len(env_order) for env in env_order}
+        return {env: base[env] * factors[env] for env in env_order}
+
+    def _seed_price_walk(self, walk) -> None:
+        """Install a walk rebuilt from the archives as this process's own."""
+        self._price_shadow_outcomes = collections.deque(
+            walk.history, maxlen=_PRICE_SHADOW_HISTORY_WINDOWS
+        )
+        self._price_shadow_state = walk.state
+        self._price_shadow_outcomes_by_environment = {
+            environment: collections.deque(trail, maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
+            for environment, trail in walk.history_by_environment.items()
+        }
+        self._price_shadow_states_by_environment = dict(walk.states_by_environment)
+
+    async def _restore_price_walk(self) -> None:
+        """Resume the price walk from the archives, so a restart never resets the price.
+
+        While armed, an unreadable history refuses startup: starting over would hand
+        miners back the starting pool.
+        """
+        from reliquary.constants import EMISSION_PRICE_ARMED, TASK_ID
+        from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS, restore_walk
+
+        end_window = int(getattr(self, "_window_n", 0) or 0)
+        if end_window <= 0:
+            return
+        params = self._price_params or PRODUCTION_PRICE_PARAMS
+        try:
+            archives = await self._load_archive_range(
+                start_window=max(0, end_window - _PRICE_SHADOW_HISTORY_WINDOWS + 1),
+                end_window=end_window,
+                require_all=False,
+                task_id=TASK_ID,
+                fields=_PRICE_ARCHIVE_FIELDS,
+            )
+        except Exception:
+            if EMISSION_PRICE_ARMED:
+                logger.exception(
+                    "Price history unreadable; refusing startup rather than "
+                    "paying the starting price"
+                )
+                raise
+            logger.exception("Price history unreadable; the published price starts over")
+            return
+        walk = restore_walk(archives, params)
+        self._seed_price_walk(walk)
+        if walk.latest_shadow is not None:
+            self._publish_price_view(walk.latest_shadow, params)
+        logger.info(
+            "Price walk restored from %d archived windows: price=%s armed=%s",
+            len(archives),
+            None if walk.state is None else walk.state.price,
+            EMISSION_PRICE_ARMED,
+        )
+
+    def _publish_price_view(self, shadow: dict[str, Any], price_params) -> None:
+        """Hand the server the price block ``GET /tasks`` shows miners.
+
+        A failure only hides the block; it must never cost the window its archive.
+        """
+        server = getattr(self, "server", None)
+        if server is None:
+            return
+        try:
+            from reliquary.infrastructure import drand
+            from reliquary.validator.price_view import price_view
+
+            assembler = getattr(self, "_fill_closed_assembler", None)
+            server._price_view = price_view(
+                shadow=shadow,
+                outcomes=list(getattr(self, "_price_shadow_outcomes", None) or ()),
+                params=price_params,
+                window_pool=(
+                    assembler.window_pool if assembler is not None else self._emission_cap
+                ),
+                places_per_window=(
+                    assembler.picks_target * B_BATCH * len(self.env_mix)
+                    if assembler is not None else None
+                ),
+                # Quicknet's 3 s period until the chain info has been fetched.
+                round_seconds=float(drand._DRAND_PERIOD or 3),
+            )
+        except Exception:
+            logger.warning("price block for /tasks could not be built", exc_info=True)
+
+    def _advance_price_shadow_by_environment(
+        self, record: dict[str, Any], price_params
+    ) -> dict[str, dict[str, Any]] | None:
+        """Each environment's own shadow walk, on the same shared rule.
+
+        Absent for an archive written before the per-environment map existed,
+        so a reader can tell "no split" from "every environment at start".
+        """
+        from reliquary.constants import EMISSION_PRICE_ARMED
+        from reliquary.validator.emission_price import (
+            advance_by_environment,
+            outcomes_by_environment_from_archive,
+        )
+
+        outcomes = outcomes_by_environment_from_archive(record)
+        if not outcomes:
+            return None
+        history = getattr(self, "_price_shadow_outcomes_by_environment", None)
+        if history is None:
+            history = {}
+            self._price_shadow_outcomes_by_environment = history
+        states = getattr(self, "_price_shadow_states_by_environment", None)
+        if states is None:
+            states = {}
+            self._price_shadow_states_by_environment = states
+        for environment, outcome in outcomes.items():
+            trail = history.get(environment)
+            if trail is None:
+                trail = collections.deque(maxlen=_PRICE_SHADOW_HISTORY_WINDOWS)
+                history[environment] = trail
+            trail.append(outcome)
+        # Only THIS window's environments, not every environment ever seen:
+        # ``history`` outlives windows, so an environment absent this window
+        # would otherwise be re-advanced on its last stale outcome forever,
+        # published as if live, and never reach Task 6's breaker (its trail
+        # would never grow past one, so the "consecutive" count never ticks).
+        decisions = advance_by_environment(
+            states,
+            {environment: list(history[environment]) for environment in outcomes},
+            price_params,
+        )
+        for environment, environment_decision in decisions.items():
+            states[environment] = environment_decision.state
+        return {
+            environment: {
+                "price": environment_decision.price,
+                "last_good": environment_decision.last_good,
+                "r": environment_decision.r,
+                "r_smoothed": environment_decision.r_smoothed,
+                "regime": environment_decision.regime,
+                "applied": EMISSION_PRICE_ARMED,
+            }
+            for environment, environment_decision in decisions.items()
+        }
+
     @staticmethod
     def _close_and_commit_fill_closed_paid_side_effects(
         batchers: dict,
         assembler,
+        *,
+        pay_partial_remainder: bool = True,
     ) -> dict[str, list[tuple[int, Any]]]:
-        """Close one v6 journal and cool exactly the groups it paid."""
-        assembler.close()
+        """Close one v6 journal and cool exactly the groups it paid.
+
+        ``pay_partial_remainder=False`` (a timed-out window) keeps every
+        complete batch this window already paid during ``accept()`` but
+        refuses to force the trailing partial cycle through as one more
+        -- see ``FillClosedBatchAssembler.close``. Called bare on the
+        (default, far more common) True path so a test double's
+        ``close`` -- mocked as a zero-argument callable, matching every
+        production assembler's call before this parameter existed --
+        keeps working unmodified.
+        """
+        if pay_partial_remainder:
+            assembler.close()
+        else:
+            assembler.close(pay_partial_remainder=False)
         paid = assembler.paid_groups()
         if set(paid) != set(batchers):
             raise RuntimeError("fill-closed paid environments do not match")
@@ -4285,8 +4710,18 @@ class ValidationService:
 
     async def _archive_window(
         self, batchers, sealed, late_drops=None, server_reject_counts=None,
+        window_status: str = WINDOW_STATUS_COMPLETED,
     ) -> None:
         """Assemble and enqueue the per-window archive payload.
+
+        ``window_status`` is normally "completed"; a timed-out window
+        (every batcher sealed on the global deadline rather than on its
+        own target) passes "timed_out" instead, so the archive -- and
+        ``outcomes_by_environment_from_archive`` reading it back -- can
+        tell the two apart. It also gates whether the fill-closed
+        assembler is allowed to pay the forced final partial batch (see
+        ``pay_partial_remainder`` below): a timed-out window pays every
+        batch it already completed and burns the rest.
 
         ``batchers`` is either:
           * a dict {env_name: GrpoWindowBatcher} (multi-env, called from
@@ -4340,6 +4775,21 @@ class ValidationService:
             return int(
                 getattr(self, "env_targets", {}).get(env_name, B_BATCH)
             )
+
+        def _price_target_for(env_name: str, batcher) -> int:
+            """Groups the window must HOLD to close, not the training batch.
+
+            Under fill-closed a window closes on
+            FILL_CLOSED_TARGET_GROUPS_PER_ENV proven groups.
+            ``_archive_batch_target`` is the per-emission training batch
+            (B_BATCH), sixteen times smaller, and would call the window ready
+            long before it was.
+            """
+            if FILL_CLOSED_ENABLED:
+                from reliquary.constants import FILL_CLOSED_TARGET_GROUPS_PER_ENV
+
+                return int(FILL_CLOSED_TARGET_GROUPS_PER_ENV)
+            return _archive_batch_target(env_name, batcher)
 
         def _environment_manifest_digest(env_name: str) -> str | None:
             from reliquary.environment.registry import get_environment_spec
@@ -4574,13 +5024,19 @@ class ValidationService:
                 raise RuntimeError(
                     f"window {archived_window}: v6 archive has no assembler"
                 )
-            # Idempotent (R16). ``close()`` forces out the last partial
-            # remainder, then the assembler's paid set becomes the sole
-            # authority for cooldown and dedup side effects.
+            # Idempotent (R16): if the main loop already closed this
+            # assembler (see the seal-time call in the window loop), this
+            # is a no-op read of the same paid set. ``pay_partial_
+            # remainder=False`` only matters the first time close() runs
+            # -- a timed-out window must not force its last partial cycle
+            # through as a paid, trained batch.
             fill_closed_batches = (
                 self._close_and_commit_fill_closed_paid_side_effects(
                     batcher_dict,
                     fill_closed_assembler,
+                    pay_partial_remainder=(
+                        window_status != WINDOW_STATUS_TIMED_OUT
+                    ),
                 )
             )
 
@@ -4834,9 +5290,18 @@ class ValidationService:
             env_name: _difficulty_auction_payload(env_batcher)
             for env_name, env_batcher in batcher_dict.items()
         }
+        # Absent when the window could not be measured: window bounds without a
+        # readiness read downstream as a SHORTAGE, which snaps the price up
+        # without confirmation. See ``_window_price_signal``.
+        price_signal = _window_price_signal(
+            first_batcher, batcher_dict, _price_target_for
+        )
+        price_shadow = self._advance_price_shadow(price_signal, window_status=window_status)
         archive = {
             "archive_schema_version": 2,
-            "window_status": "completed",
+            "window_status": window_status,
+            "task_id": TASK_ID,
+            "task_emission_share": self._emission_cap,
             "window_start": first_batcher.window_start,
             **({
                 "selection_policy": FILL_CLOSED_SELECTION_POLICY,
@@ -4861,6 +5326,8 @@ class ValidationService:
             "randomness": first_batcher.randomness,
             "environment": env_names_list[0],   # legacy singular, kept for compat
             "environments": env_names_list,      # multi-env canonical field
+            **(price_signal or {}),
+            **({"emission_price_shadow": price_shadow} if price_shadow else {}),
             "batch_targets": {
                 env_name: _archive_batch_target(env_name, env_batcher)
                 for env_name, env_batcher in batcher_dict.items()
@@ -5327,6 +5794,8 @@ class ValidationService:
         archive = {
             "archive_schema_version": 2,
             "window_status": "aborted",
+            "task_id": TASK_ID,
+            "task_emission_share": self._emission_cap,
             "window_start": int(first_batcher.window_start),
             **({
                 "selection_policy": FILL_CLOSED_SELECTION_POLICY,
@@ -5557,6 +6026,19 @@ class ValidationService:
                 "external_port": self.external_port,
             },
         )
+        from reliquary.constants import PIPELINED_WINDOWS
+
+        if PIPELINED_WINDOWS:
+            # ``window_status`` is not threaded through the ``_gpu_backlog``
+            # stash tuple, so this mode archives a timed-out window as
+            # "completed". The real fix is to thread ``window_status`` through
+            # the backlog; until then this only refuses to fail silently.
+            logger.critical(
+                "RELIQUARY_PIPELINED_WINDOWS is ON: per-window price signals "
+                "are NOT correct in this mode -- a timed-out window is "
+                "archived as \"completed\", and its admission-derived ready "
+                "round then walks the emission price as a real fast fill"
+            )
 
     async def _pause_for_control_drain(self) -> bool:
         """Finish the owed pipeline half, then wait closed while uploads drain."""
@@ -5662,6 +6144,7 @@ class ValidationService:
         await startup_step("prompt_cooldown", self._rebuild_cooldown_from_history())
         await startup_step("content_cooldown", self._restore_content_cooldown())
         await startup_step("hash_history", self._rebuild_hashes_from_history())
+        await startup_step("emission_price", self._restore_price_walk())
         self._log_startup_config_banner()
 
         # Start the background archive-upload worker. It scans the queue
@@ -5878,6 +6361,18 @@ class ValidationService:
                             "Window %d sealed by liveness breaker: %s",
                             self._window_n, seal_reason,
                         )
+                    # A global collection deadline is a market signal, not a
+                    # crash: every group collected before it fired was fully
+                    # admitted, proven and graded -- there simply was not
+                    # enough of it. `_enqueue_aborted_window`'s tombstone (no
+                    # rewards, no training data) exists for an INDETERMINATE
+                    # state, a crash mid-window, not this one. A timed-out
+                    # window still seals and archives normally except that it
+                    # trains on nothing and is tagged for the price signal.
+                    window_status = (
+                        WINDOW_STATUS_TIMED_OUT if seal_reason == "timeout"
+                        else WINDOW_STATUS_COMPLETED
+                    )
                     if FILL_CLOSED_ENABLED:
                         # Reserve the complete range first so a local disk
                         # failure during close leaves a durable closed barrier,
@@ -5891,6 +6386,9 @@ class ValidationService:
                         self._close_and_commit_fill_closed_paid_side_effects(
                             self._active_batchers,
                             self._fill_closed_assembler,
+                            pay_partial_remainder=(
+                                window_status != WINDOW_STATUS_TIMED_OUT
+                            ),
                         )
                         self._arm_fill_closed_rotation_gate()
 
@@ -5939,7 +6437,9 @@ class ValidationService:
                         self._set_state(WindowState.READY)
                     else:
                         self._window_iteration_stage = "seal_train_archive"
-                        await self._train_and_publish()
+                        await self._train_and_publish(
+                            window_status=window_status,
+                        )
 
                     # Persist the cooldown on a fixed window cadence, independent
                     # of the publish cadence (which can stall): keeps the snapshot
@@ -6471,6 +6971,8 @@ class ValidationService:
         start_window: int,
         end_window: int,
         require_all: bool,
+        task_id: str | None = None,
+        fields: tuple[str, ...] | None = None,
     ) -> list[dict]:
         """Merge remote and locally queued archives without identity gaps."""
         if end_window < start_window:
@@ -6482,6 +6984,8 @@ class ValidationService:
                 current_window=end_window + 1,
                 n=len(expected),
                 strict=True,
+                **({"task_id": task_id} if task_id is not None else {}),
+                **({"fields": fields} if fields is not None else {}),
             )
         except Exception as exc:
             remote_error = exc
@@ -6496,6 +7000,11 @@ class ValidationService:
             if archive_queue is not None
             else {}
         )
+        if fields is not None:
+            local = {
+                window: {field: archive[field] for field in fields if field in archive}
+                for window, archive in local.items()
+            }
         merged: dict[int, dict] = {}
         for archive in remote:
             window_start = archive.get("window_start")

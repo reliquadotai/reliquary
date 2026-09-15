@@ -1,0 +1,528 @@
+"""What a window pays comes from the registry, and `default` is unchanged."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import types
+
+import pytest
+
+from reliquary.environment.abi import canonical_sha256
+from reliquary.shared.task_registry import MECHANISM_RL_DISCOVERED_PRICE, TaskEntry
+from reliquary.validator.task_config import resolve_task_config
+
+PARAMS = {
+    "start": 1.0, "decay": 0.99, "rounds_per_step": 1000,
+    "deadband": 0.80, "snap": 1.20, "floor": 0.05, "cap": 1.0,
+    "median_rounds": 4800, "last_good_fills": 50,
+}
+
+
+def test_the_emission_share_env_var_is_gone():
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")}
+    clean["RELIQUARY_TASK_EMISSION_SHARE"] = "0.25"
+    completed = subprocess.run(
+        [sys.executable, "-c",
+         "import reliquary.constants as c; print(hasattr(c, 'TASK_EMISSION_SHARE'))"],
+        capture_output=True, text=True, env=clean,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "False"
+
+
+def test_the_legacy_task_still_pays_the_whole_pool():
+    from reliquary.constants import PROTOCOL_GENERATION_CONTRACT, PROTOCOL_PROFILE_ID
+
+    entry = TaskEntry(
+        task_id="default",
+        profile_id=PROTOCOL_PROFILE_ID,
+        profile_sha256=canonical_sha256(PROTOCOL_GENERATION_CONTRACT),
+        mechanism=MECHANISM_RL_DISCOVERED_PRICE,
+        params=dict(PARAMS),
+        status="active",
+        retired_at=None,
+    )
+
+    config = resolve_task_config(
+        {"default": entry}, "default",
+        profile_id=PROTOCOL_PROFILE_ID,
+        generation_contract=PROTOCOL_GENERATION_CONTRACT,
+    )
+
+    assert config.emission_cap == 1.0
+
+
+def test_no_module_still_reads_the_removed_constant():
+    """The env-var path is gone, not merely unused."""
+    import pathlib
+    import subprocess
+
+    root = pathlib.Path(__file__).resolve().parents[2] / "reliquary"
+    hits = subprocess.run(
+        ["grep", "-rn", "TASK_EMISSION_SHARE", str(root)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert hits == "", f"TASK_EMISSION_SHARE still referenced:\n{hits}"
+
+
+def test_the_production_service_is_handed_the_per_environment_caps():
+    """The window pool is per-environment only if the call site says so.
+
+    Task 4 gave ValidationService an ``env_caps`` parameter and the assembler
+    a per-environment pool; neither does anything unless the production
+    construction actually passes it. This asserts the wire, not the plumbing.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    source = (root / "reliquary" / "cli" / "main.py").read_text()
+    tree = ast.parse(source)
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ValidationService"
+    ]
+
+    assert calls, "no ValidationService construction found in cli/main.py"
+    for call in calls:
+        by_arg = {kw.arg: kw.value for kw in call.keywords}
+        passed = set(by_arg)
+        assert "env_caps" in passed, (
+            "the production ValidationService call must pass env_caps, or the "
+            "per-environment window pool is dead code"
+        )
+        assert "emission_cap" in passed
+        assert "price_params" in passed
+        env_caps_value = by_arg["env_caps"]
+        assert (
+            isinstance(env_caps_value, ast.Attribute)
+            and env_caps_value.attr == "env_caps"
+        ), (
+            "env_caps must be passed as a task_config.env_caps attribute read, "
+            "not a literal -- env_caps={} would pass the 'in passed' check "
+            "above while leaving self._env_caps empty, the exact dead-code "
+            "state this test exists to catch"
+        )
+
+
+def test_no_registry_at_all_starts_the_legacy_task_at_the_full_pool():
+    """The fallback that keeps `default` running the day this ships: a
+    wholly absent registry (today's reality for every validator) is not a
+    refusal, only a present-but-wrong one is."""
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+    from reliquary.validator.task_config import legacy_task_config
+
+    config = legacy_task_config()
+
+    assert config.task_id == "default"
+    assert config.entry is None
+    assert config.emission_cap == 1.0
+    assert config.price_params == PRODUCTION_PRICE_PARAMS
+
+
+# --- Crash-recovery payment coverage, restored from the deleted
+# test_task_emission_share.py and adapted to the registry: `window_pool` is
+# now a value threaded from the registry through ValidationService and
+# FillClosedRecoveryStore.begin(), rather than a process-global constant, so
+# these exercise the pool argument directly instead of the env var. ---
+
+def _recovery_scaffold(tmp_path, monkeypatch, picks=16):
+    """A 16-slot, two-environment window ready to be crash-recovered."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.infrastructure.archive_queue import ArchiveQueue
+    from reliquary.infrastructure.training_payload_queue import TrainingPayloadQueue
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+    from reliquary.validator.fill_closed_rotation import FillClosedRotationStore
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
+    monkeypatch.setattr(recovery_module, "B_BATCH", 16)
+    monkeypatch.setattr(recovery_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
+    monkeypatch.setattr(recovery_module, "FILL_CLOSED_PICKS_PER_WINDOW", picks)
+    return (
+        FillClosedRecoveryStore(tmp_path),
+        TrainingPayloadQueue(str(tmp_path / "payloads")),
+        ArchiveQueue(str(tmp_path / "archives")),
+        FillClosedRotationStore(tmp_path),
+    )
+
+
+def _recover_one_paid_batch(store, queue, archives, rotation):
+    """One paid batch for `alice` in both environments, then recovery."""
+    rows = [{"env_name": env, "batch_index": 0, "hotkey": "alice",
+             "prompt_idx": 1, "eos_tokens": 16, "claimed_checkpoint_hash": "a" * 40}
+            for env in ("math", "code")]
+    queue.enqueue_committed_tombstone(42 * 16, b"training-quarantine", accounting=rows)
+    store.recover(42, queue=queue, archives=archives, rotation=rotation)
+    return archives.pending_archives(start_window=42, end_window=42)[42]
+
+
+def test_recovery_pays_from_the_journalled_pool(tmp_path, monkeypatch):
+    """Recovery divides the pool the window OPENED with -- not a default --
+    by environment and by pick, then by the fixed payment slots."""
+    store, queue, archives, rotation = _recovery_scaffold(tmp_path, monkeypatch)
+    store.begin(42, checkpoint_n=7, revision="a" * 40,
+                targets={"math": 16, "code": 16}, window_pool=0.5)
+
+    archive = _recover_one_paid_batch(store, queue, archives, rotation)
+
+    assert archive["window_pool"] == 0.5
+    # 0.5 / 2 environments / 16 picks, then one of 16 fixed slots, in each of
+    # the two environments alice was paid in.
+    assert archive["rewards_by_hotkey"] == {"alice": 2 * (0.5 / 2 / 16) / 16}
+
+
+def test_recovery_defaults_a_pre_upgrade_journal_to_the_whole_pool(
+    tmp_path, monkeypatch,
+):
+    """A schema_version 1 journal predates `window_pool` entirely; recovery
+    must read it back as the whole pool rather than paying nothing."""
+    from reliquary.shared.training_payload import active_training_identity
+    from reliquary.validator.control import write_json
+
+    store, queue, archives, rotation = _recovery_scaffold(tmp_path, monkeypatch)
+    write_json(store._path(42), {
+        "schema_version": 1, "window_start": 42,
+        "identity": active_training_identity(), "parent_checkpoint_n": 7,
+        "parent_revision": "a" * 40, "environments": ["math", "code"],
+        "batch_targets": {"math": 16, "code": 16}, "archive": None,
+        "picks_target": 16,
+    })
+
+    archive = _recover_one_paid_batch(store, queue, archives, rotation)
+
+    assert archive["window_pool"] == 1.0
+    # Pre-upgrade journals also predate the fixed-slot policy, so the whole
+    # environment pool goes to the only paid hotkey: 1.0 / 2 / 16, twice.
+    assert archive["rewards_by_hotkey"] == {"alice": 2 * (1.0 / 2 / 16)}
+
+
+def test_activating_a_window_journals_the_pool_it_opened_with(tmp_path, monkeypatch):
+    """The leg no other test covers: ValidationService must hand this
+    window's own pool to recovery.begin(). Dropping that keyword is silent --
+    the journal simply falls back to 1.0 and a recovered window pays the whole
+    pool instead of this task's share. The value comes from the assembler
+    rather than from `_emission_cap`, so the journal holds exactly the number
+    the archive will report -- the two are set apart here so that reading the
+    wrong one is a failure and not a coincidence."""
+    import types
+
+    import reliquary.validator.service as service_mod
+    from reliquary.validator.service import ValidationService
+
+    store, _queue, _archives, _rotation = _recovery_scaffold(tmp_path, monkeypatch)
+    monkeypatch.setattr(service_mod, "FILL_CLOSED_ENABLED", True)
+    batcher = types.SimpleNamespace(
+        window_start=42, mark_window_opened=lambda: None,
+        bind_event_loop=lambda loop: None, current_checkpoint_hash="a" * 40,
+    )
+    service = types.SimpleNamespace(
+        _active_batchers={"math": batcher}, _candidate_window_n=42,
+        _set_window_preparation_stage=lambda stage: None,
+        # Deliberately DIFFERENT from _emission_cap below: if the journal
+        # took the cap instead of the assembler's pool, this test must fail.
+        _candidate_fill_closed_assembler=types.SimpleNamespace(
+            window_start=42, window_pool=0.37),
+        _fill_closed_assembler=None, _fill_closed_assemblers={},
+        _fill_closed_recovery_store=store,
+        _checkpoint_store=types.SimpleNamespace(
+            current_manifest=lambda: types.SimpleNamespace(
+                revision="a" * 40, checkpoint_n=7)),
+        env_mix=[("math", 16), ("code", 16)], _emission_cap=0.21,
+        _window_n=None, _candidate_activation_nonce=None,
+        _window_preparation_stage=None,
+        server=types.SimpleNamespace(
+            set_active_batchers=lambda batchers: None,
+            clear_window_preparation_failure=lambda: None),
+        _publish_window_preparation_state=lambda: None,
+        _set_state=lambda state: None,
+    )
+
+    ValidationService._activate_window(service)
+
+    assert store.load(42)["window_pool"] == 0.37
+
+
+def test_recovery_pays_nobody_for_a_journalled_zero_share(tmp_path, monkeypatch):
+    store, queue, archives, rotation = _recovery_scaffold(tmp_path, monkeypatch)
+    store.begin(42, checkpoint_n=7, revision="a" * 40,
+                targets={"math": 16, "code": 16}, window_pool=0.0)
+
+    archive = _recover_one_paid_batch(store, queue, archives, rotation)
+
+    assert archive["window_pool"] == 0.0
+    assert sum(archive["rewards_by_hotkey"].values()) == 0.0
+
+
+def test_begin_round_trips_the_declared_pool(tmp_path, monkeypatch):
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    monkeypatch.setattr(recovery_module, "B_BATCH", 1)
+    store = FillClosedRecoveryStore(tmp_path)
+    store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1}, window_pool=0.5)
+
+    assert store.load(1)["window_pool"] == 0.5
+
+
+@pytest.mark.parametrize("bad", [1.5, -0.1, True])
+def test_begin_refuses_an_out_of_range_pool(tmp_path, monkeypatch, bad):
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    monkeypatch.setattr(recovery_module, "B_BATCH", 1)
+    store = FillClosedRecoveryStore(tmp_path)
+
+    with pytest.raises(ValueError, match="pool"):
+        store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1}, window_pool=bad)
+
+
+def test_begin_accepts_a_pool_one_ulp_above_the_pool_it_totals(tmp_path, monkeypatch):
+    """The journalled pool is now a SUM of per-environment caps, so it can land
+    a hair above 1.0 where `_emission_cap` never could. The guard has to accept
+    what `validate_registry` already accepted on the way in, or the window
+    never opens and the archive stream is an unbroken run of `aborted`."""
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    monkeypatch.setattr(recovery_module, "B_BATCH", 1)
+    store = FillClosedRecoveryStore(tmp_path)
+    import math
+
+    overshoot = math.nextafter(1.0, 2.0)
+
+    assert overshoot > 1.0
+
+    store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1},
+                window_pool=overshoot)
+
+    assert store.load(1)["window_pool"] == overshoot
+
+
+def test_begin_still_refuses_a_pool_meaningfully_above_the_whole_pool(
+    tmp_path, monkeypatch,
+):
+    """The widened bound is one rounding step, not a licence to overpay."""
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    monkeypatch.setattr(recovery_module, "B_BATCH", 1)
+    store = FillClosedRecoveryStore(tmp_path)
+
+    with pytest.raises(ValueError, match="pool"):
+        store.begin(1, checkpoint_n=1, revision="a" * 40, targets={"math": 1},
+                    window_pool=1.001)
+
+
+def test_a_three_environment_window_at_a_fractional_cap_still_finishes(tmp_path):
+    """The end-to-end consequence of re-deriving the window pool.
+
+    ``finish()`` compares the archive's pool against the journalled one with
+    exact float equality, and three shares of 0.9 re-sum to
+    0.8999999999999999. The mismatch raised, the caller aborted the window,
+    and fill-closed recovery replayed the correct archive away at an even
+    split -- for 14 of the 100 two-decimal caps.
+    """
+    from reliquary.constants import (
+        B_BATCH,
+        FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        FILL_CLOSED_SELECTION_POLICY,
+    )
+    from reliquary.validator.fill_closed_batch_assembler import (
+        FillClosedBatchAssembler,
+    )
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    environments = ["math", "code", "logic"]
+    store = FillClosedRecoveryStore(tmp_path)
+    store.begin(42, checkpoint_n=7, revision="a" * 40,
+                targets={env: B_BATCH for env in environments}, window_pool=0.9)
+    assembler = FillClosedBatchAssembler(
+        window_start=42,
+        env_order=environments,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool=0.9,
+    )
+    archive = {
+        "window_start": 42,
+        "window_status": "completed",
+        "payment_policy": assembler.payment_policy,
+        "selection_policy": FILL_CLOSED_SELECTION_POLICY,
+        "picks_target": assembler.picks_target,
+        "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        "window_pool": assembler.window_pool,
+    }
+    enqueued = {}
+
+    store.finish(42, archive, types.SimpleNamespace(
+        enqueue=lambda window, body: enqueued.update({window: body})))
+
+    assert enqueued == {42: archive}
+    assert not store.windows()
+
+
+def _activate_with_a_real_assembler(tmp_path, monkeypatch, *, env_caps, emission_cap):
+    """Drive the real `_activate_window` with the real assembler.
+
+    The per-environment caps are what `task_config` builds, so this exercises
+    the production pairing: a MAP reaches the assembler while the journal is
+    written beside it.
+    """
+    import reliquary.validator.service as service_mod
+    from reliquary.constants import B_BATCH
+    from reliquary.validator.fill_closed_batch_assembler import (
+        FillClosedBatchAssembler,
+    )
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+    from reliquary.validator.service import ValidationService
+
+    monkeypatch.setattr(service_mod, "FILL_CLOSED_ENABLED", True)
+    store = FillClosedRecoveryStore(tmp_path)
+    environments = list(env_caps)
+    assembler = FillClosedBatchAssembler(
+        window_start=42,
+        env_order=environments,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        # Spelled exactly as `_build_window_batchers` spells it, so this
+        # exercises the production MAP path rather than a map handed in
+        # ready-made -- every other prepare/activate test runs the scalar
+        # path at 1.0, where every implementation agrees.
+        window_pool=dict(env_caps) or emission_cap,
+    )
+    batcher = types.SimpleNamespace(
+        window_start=42, mark_window_opened=lambda: None,
+        bind_event_loop=lambda loop: None, current_checkpoint_hash="a" * 40,
+    )
+    service = types.SimpleNamespace(
+        _active_batchers={env: batcher for env in environments},
+        _candidate_window_n=42,
+        _set_window_preparation_stage=lambda stage: None,
+        _candidate_fill_closed_assembler=assembler,
+        _fill_closed_assembler=None, _fill_closed_assemblers={},
+        _fill_closed_recovery_store=store,
+        _checkpoint_store=types.SimpleNamespace(
+            current_manifest=lambda: types.SimpleNamespace(
+                revision="a" * 40, checkpoint_n=7)),
+        env_mix=[(env, B_BATCH) for env in environments],
+        _emission_cap=emission_cap,
+        _env_caps=dict(env_caps),
+        _window_n=None, _candidate_activation_nonce=None,
+        _window_preparation_stage=None,
+        server=types.SimpleNamespace(
+            set_active_batchers=lambda batchers: None,
+            clear_window_preparation_failure=lambda: None),
+        _publish_window_preparation_state=lambda: None,
+        _set_state=lambda state: None,
+    )
+
+    ValidationService._activate_window(service)
+    return store, assembler
+
+
+@pytest.mark.parametrize("cap,split", [
+    # No env_split: task_config spreads the cap evenly. Three shares of 0.9
+    # re-sum to 0.8999999999999999.
+    (0.9, {"math": 1 / 3, "code": 1 / 3, "logic": 1 / 3}),
+    # An explicit --env-split breaks it at TWO environments:
+    # 0.9 * 0.6 + 0.9 * 0.4 == 0.9000000000000001.
+    (0.9, {"math": 0.6, "code": 0.4}),
+    # At cap 1.0 the naive sum lands one ULP ABOVE the pool, which the
+    # recovery journal's own 0.0..1.0 guard then refuses outright:
+    # 0.33 + 0.56 + 0.11 == 1.0000000000000002. `validate_registry` and
+    # `resolve_task_config` both accept this split at their 1e-9 tolerance,
+    # so nothing upstream stops it reaching `begin()`.
+    (1.0, {"math": 0.33, "code": 0.56, "logic": 0.11}),
+    # The same one-ULP overshoot from a plain even split, which needs no
+    # --env-split at all -- it fires at 9, 11, 18, 20 and 21 environments.
+    (1.0, {f"env{n}": 1 / 9 for n in range(9)}),
+])
+def test_the_journalled_pool_is_the_number_the_archive_reports(
+    tmp_path, monkeypatch, cap, split,
+):
+    """`finish()` compares the two with exact float equality, so they must be
+    ONE computation, not two that are meant to agree. Journalling
+    `_emission_cap` while the assembler reports the sum of the per-environment
+    caps is two, and they silently disagree for most (cap, split) pairs."""
+    from reliquary.constants import (
+        FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        FILL_CLOSED_SELECTION_POLICY,
+    )
+
+    env_caps = {env: cap * share for env, share in split.items()}
+    store, assembler = _activate_with_a_real_assembler(
+        tmp_path, monkeypatch, env_caps=env_caps, emission_cap=cap,
+    )
+
+    assert store.load(42)["window_pool"] == assembler.window_pool
+
+    archive = {
+        "window_start": 42,
+        "window_status": "completed",
+        "payment_policy": assembler.payment_policy,
+        "selection_policy": FILL_CLOSED_SELECTION_POLICY,
+        "picks_target": assembler.picks_target,
+        "journal_slots": FILL_CLOSED_EMISSIONS_PER_WINDOW,
+        "window_pool": assembler.window_pool,
+    }
+    enqueued = {}
+
+    store.finish(42, archive, types.SimpleNamespace(
+        enqueue=lambda window, body: enqueued.update({window: body})))
+
+    assert enqueued == {42: archive}
+    assert not store.windows()
+
+
+def test_a_zero_share_pays_nobody():
+    from reliquary.validator.token_rewards import AcceptedGroup, split_environment_pool
+
+    groups = [AcceptedGroup(hotkey="hk", operator_id="hk", eos_tokens=10)]
+
+    assert split_environment_pool(groups, pool=0.0) == {"hk": 0.0}
+
+
+def test_recovered_archive_carries_the_pool_the_window_actually_opened_with(
+    tmp_path, monkeypatch,
+):
+    """The one test that would fail if fill_closed_recovery.py's archive
+    construction hardcoded 1.0 (or misspelt the key) instead of reading back
+    what begin() journalled: everything else in this file exercises the
+    payout math or the store in isolation, not the archived field itself."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+    import reliquary.validator.fill_closed_recovery as recovery_module
+    from reliquary.infrastructure.archive_queue import ArchiveQueue
+    from reliquary.infrastructure.training_payload_queue import TrainingPayloadQueue
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+    from reliquary.validator.fill_closed_rotation import FillClosedRotationStore
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
+    monkeypatch.setattr(recovery_module, "B_BATCH", 16)
+    monkeypatch.setattr(recovery_module, "FILL_CLOSED_EMISSIONS_PER_WINDOW", 16)
+    monkeypatch.setattr(recovery_module, "FILL_CLOSED_PICKS_PER_WINDOW", 16)
+
+    store = FillClosedRecoveryStore(tmp_path)
+    store.begin(42, checkpoint_n=7, revision="a" * 40,
+                targets={"math": 16, "code": 16}, window_pool=0.4)
+    queue = TrainingPayloadQueue(str(tmp_path / "payloads"))
+    archives = ArchiveQueue(str(tmp_path / "archives"))
+    rotation = FillClosedRotationStore(tmp_path)
+
+    rows = [{"env_name": env, "batch_index": 0, "hotkey": "alice",
+             "prompt_idx": 1, "eos_tokens": 16, "claimed_checkpoint_hash": "a" * 40}
+            for env in ("math", "code")]
+    queue.enqueue_committed_tombstone(672, b"training-quarantine", accounting=rows)
+
+    store.recover(42, queue=queue, archives=archives, rotation=rotation)
+    archive = archives.pending_archives(start_window=42, end_window=42)[42]
+
+    assert archive["task_emission_share"] == 0.4

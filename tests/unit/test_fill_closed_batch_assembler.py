@@ -7,6 +7,8 @@ two environments can arrive in any interleaving. The assembler must pair them
 up correctly regardless of arrival order, write exactly one payload per
 completed cycle, and never skip or duplicate a cycle's chunk.
 """
+import pytest
+
 from reliquary.constants import B_BATCH
 from reliquary.infrastructure.training_payload_queue import (
     encoded_window_journal_key,
@@ -23,6 +25,185 @@ from reliquary.validator.fill_closed_batch_assembler import (
 from tests.unit.test_training_payload_codec import _group, _roll
 
 ENV_ORDER = ["openmathinstruct", "opencodeinstruct"]
+
+
+def _assembler(
+    *,
+    env_order: list,
+    window_pool=1.0,
+    window_start: int = 42,
+) -> FillClosedBatchAssembler:
+    """Builds an assembler the same way every other test in this file does
+    inline (there is no shared fixture here -- see e.g. the constructions
+    at :61 and :122): a no-op ``enqueue_fn``/``tombstone_fn`` pair, varying
+    only what these pool tests need, ``env_order`` and ``window_pool``.
+    """
+    return FillClosedBatchAssembler(
+        window_start=window_start,
+        env_order=env_order,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool=window_pool,
+    )
+
+
+def test_a_scalar_pool_still_divides_evenly():
+    """The identity case: today's behaviour, byte for byte."""
+    assembler = _assembler(env_order=["math", "code"], window_pool=1.0)
+
+    assert assembler.pool_for("math") == assembler.pool_for("code")
+    assert assembler.pool_for("math") + assembler.pool_for("code") == pytest.approx(1.0)
+
+
+def test_a_per_environment_pool_is_used_as_given():
+    assembler = _assembler(
+        env_order=["math", "code"], window_pool={"math": 0.6, "code": 0.4}
+    )
+
+    assert assembler.pool_for("math") == pytest.approx(0.6)
+    assert assembler.pool_for("code") == pytest.approx(0.4)
+
+
+def test_an_environment_missing_from_the_map_is_refused():
+    with pytest.raises(ValueError, match="code"):
+        _assembler(env_order=["math", "code"], window_pool={"math": 1.0})
+
+
+def test_a_running_mix_narrower_than_the_map_still_pays_the_declared_total():
+    """A profile can declare more environments than are actually running
+    (e.g. a launch that trims ``RELIQUARY_ENVIRONMENTS`` to one); the
+    environments not running must not have their share burned."""
+    assembler = _assembler(
+        env_order=["math"],
+        window_pool={"math": 1 / 3, "code": 1 / 3, "logic": 1 / 3},
+    )
+
+    assert assembler.window_pool == pytest.approx(1.0)
+    assert assembler.pool_for("math") == pytest.approx(1.0)
+
+
+def test_two_of_three_running_split_the_declared_total_in_proportion():
+    assembler = _assembler(
+        env_order=["math", "code"],
+        window_pool={"math": 0.6, "code": 0.3, "logic": 0.1},
+    )
+
+    assert assembler.window_pool == pytest.approx(1.0)
+    assert assembler.pool_for("math") == pytest.approx(0.6 / 0.9)
+    assert assembler.pool_for("code") == pytest.approx(0.3 / 0.9)
+
+
+def test_a_zero_declared_share_pays_the_running_environment_nothing(monkeypatch):
+    """A declared share of 0.0 is the operator's instruction, not a gap to
+    fill by renormalising: when every RUNNING environment was declared
+    zero, the pool is zero, and the non-running environment's declared
+    share simply burns rather than being handed to environments the
+    operator explicitly zeroed out."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    window = 42
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=["math", "code"],
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        window_pool={"math": 0.0, "code": 0.0, "logic": 1.0},
+    )
+
+    # The DECLARED total is still what the window reports -- the recovery
+    # journal records the declared total, so reporting the zeroed sum here
+    # would make a crash replay the window at the FULL pool, the inverse of
+    # what the zero-share rule intends. Nobody is paid either way.
+    assert assembler.window_pool == 1.0
+    assert assembler.pool_for("math") == pytest.approx(0.0)
+    assert assembler.pool_for("code") == pytest.approx(0.0)
+
+    for env in ("math", "code"):
+        groups = _chunk(0, env)
+        for group in groups:
+            group.eos_tokens = 10
+        assembler.accept(env, groups, window, "rev")
+
+    assert sum(assembler.reward_map().values()) == 0.0
+
+
+def test_a_zero_share_environment_still_renormalises_once_a_paid_one_runs():
+    """The same declared map as above, but the running mix now includes the
+    non-zero environment: the declared total must still reach it, in full."""
+    assembler = _assembler(
+        env_order=["code", "logic"],
+        window_pool={"math": 0.0, "code": 0.0, "logic": 1.0},
+    )
+
+    assert assembler.window_pool == pytest.approx(1.0)
+    assert assembler.pool_for("code") == pytest.approx(0.0)
+    assert assembler.pool_for("logic") == pytest.approx(1.0)
+
+
+def test_a_scalar_pool_is_reported_exactly_not_re_derived():
+    """``window_pool`` is compared against the recovery journal's declared
+    value with exact float equality, so it must be the number handed in, not
+    a sum of the per-environment shares: ``sum([0.9 / 3] * 3)`` is
+    ``0.8999999999999999``, which fails that comparison and sends the whole
+    window down the abort/replay path."""
+    assembler = _assembler(
+        env_order=["math", "code", "logic"], window_pool=0.9
+    )
+
+    assert assembler.window_pool == 0.9
+    assert sum(assembler.pool_for(e) for e in ("math", "code", "logic")) != 0.9
+
+
+def test_a_declared_map_reports_its_own_declared_total_exactly():
+    """Whole mix and narrowed mix alike: the renormalised shares are a
+    payment detail, the declared total is the policy value the archive
+    carries, and re-adding the shares loses the last bit."""
+    declared = {"math": 0.5, "code": 0.3, "logic": 0.1}
+
+    assert _assembler(
+        env_order=["math", "code", "logic"], window_pool=declared
+    ).window_pool == 0.9
+
+    narrowed = _assembler(env_order=["math", "code"], window_pool=declared)
+
+    assert narrowed.window_pool == 0.9
+    assert narrowed.pool_for("math") + narrowed.pool_for("code") != 0.9
+
+
+def test_a_declared_map_totalling_the_whole_pool_does_not_overshoot_it():
+    """A naive left-fold of shares meant to total 1.0 can land one ULP ABOVE
+    it -- `0.33 + 0.56 + 0.11 == 1.0000000000000002`, and likewise a plain even
+    split over 9, 11, 18, 20 or 21 environments. The recovery journal then
+    refuses the pool outright and no window ever opens."""
+    import functools
+    import math
+    import operator
+
+    for declared in (
+        {"math": 0.33, "code": 0.56, "logic": 0.11},
+        {f"env{n}": 1 / 9 for n in range(9)},
+    ):
+        # Built-in sum() compensates from Python 3.12, so fold explicitly.
+        naive = functools.reduce(operator.add, declared.values())
+        assert naive > 1.0, "a plain left fold must overshoot"
+
+        assembler = _assembler(
+            env_order=list(declared), window_pool=declared
+        )
+
+        assert assembler.window_pool == 1.0
+        assert assembler.window_pool == math.fsum(declared.values())
+
+
+def test_a_full_mix_rescales_by_exactly_one():
+    """The docstring's claim, held to the letter: with every declared
+    environment running, no share may move at all."""
+    declared = {"math": 0.33, "code": 0.56, "logic": 0.11}
+
+    assembler = _assembler(env_order=list(declared), window_pool=declared)
+
+    assert [assembler.pool_for(e) for e in declared] == list(declared.values())
 
 
 def _chunk(tag: int, env: str) -> list:

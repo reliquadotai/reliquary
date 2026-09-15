@@ -31,7 +31,9 @@ write created paid journal holes on disk failure.
 from __future__ import annotations
 
 import logging
+import math
 import threading
+from collections.abc import Mapping
 from typing import Any, Callable, NamedTuple, Sequence
 
 from reliquary.constants import B_BATCH, FILL_CLOSED_EMISSIONS_PER_WINDOW, FILL_CLOSED_PICKS_PER_WINDOW
@@ -74,7 +76,7 @@ class FillClosedBatchAssembler:
         env_order: Sequence[str],
         enqueue_fn: Callable[[int, bytes], None],
         tombstone_fn: Callable[[int, bytes], None],
-        window_pool: float = 1.0,
+        window_pool: float | Mapping[str, float] = 1.0,
         commit_fn: Callable[[int, bytes, bool, dict | None], None] | None = None,
     ) -> None:
         self.window_start = int(window_start)
@@ -85,7 +87,47 @@ class FillClosedBatchAssembler:
         self._commit_fn = commit_fn
         # This window's whole emission budget. Payment is computed here, the
         # only place a v6 window's assembled batches are known.
-        self._window_pool = float(window_pool)
+        # A scalar keeps today's even split; a map gives each environment its
+        # own pool. Both shapes are accepted so a scalar caller is unchanged.
+        if isinstance(window_pool, Mapping):
+            missing = [e for e in self._env_order if e not in window_pool]
+            if missing:
+                raise ValueError(
+                    f"window_pool is missing environments: {', '.join(missing)}"
+                )
+            # ``window_pool`` is keyed by the PROFILE's declared environments;
+            # ``env_order`` is the RUNNING mix, which can be a strict subset
+            # (e.g. a launch that trims ``RELIQUARY_ENVIRONMENTS`` to one).
+            # Restricting to ``env_order`` without rescaling would silently
+            # burn every declared environment's share that is not running,
+            # instead of paying it to the ones that are -- so the running
+            # subset is rescaled to still sum to the DECLARED total, in the
+            # declared proportions. A full mix rescales by exactly 1.0.
+            # ``fsum``, not ``sum``: these floats are meant to total a declared
+            # value, and the last-bit drift of a naive left-fold both lands
+            # outside the recovery journal's 0.0..1.0 guard and makes a full
+            # mix rescale by something other than exactly 1.0.
+            declared_total = math.fsum(float(v) for v in window_pool.values())
+            restricted = {e: float(window_pool[e]) for e in self._env_order}
+            restricted_total = math.fsum(restricted.values())
+            if restricted_total > 0:
+                scale = declared_total / restricted_total
+                self._pool_by_env = {e: v * scale for e, v in restricted.items()}
+            else:
+                # Every running environment was declared a zero share. That
+                # is an instruction, not an accident: a zero share pays
+                # nobody, and the whole declared total burns.
+                self._pool_by_env = {e: 0.0 for e in self._env_order}
+            # The DECLARED total, never a re-derived sum of the per-environment
+            # pools: ``window_pool`` is the policy value the recovery journal
+            # compares the archive against with exact float equality, and a
+            # zeroed running subset must still declare the total it burned.
+            self._window_pool = declared_total
+        else:
+            total = float(window_pool)
+            share = total / len(self._env_order) if self._env_order else 0.0
+            self._pool_by_env = {e: share for e in self._env_order}
+            self._window_pool = total
         self._rewards_by_hotkey: dict[str, float] = {}
         # R24: every group this window actually PAID, in payment order, per
         # environment, each paired with the batch index it was paid in
@@ -427,10 +469,13 @@ class FillClosedBatchAssembler:
 
         Two divisors, both deliberate:
 
-        * ``len(self._env_order)`` -- each environment keeps its own pool,
-          exactly as the seal path's ``pool_per_env`` does. Pooling the
-          environments together would let a long-completion environment
-          take a short one's emission through raw token mass alone.
+        * ``self.pool_for(environment)`` -- each environment keeps its own
+          pool, exactly as the seal path's ``pool_per_env`` does. Pooling
+          the environments together would let a long-completion environment
+          take a short one's emission through raw token mass alone. A
+          scalar ``window_pool`` still splits this evenly across
+          environments (see ``__init__``); a per-environment map instead
+          gives each environment exactly its own declared pool.
         * ``picks_target`` -- a v6 window emits up to that many batches
           where the seal path emitted exactly
           one, so one window's pool is spread evenly over its batches.
@@ -444,12 +489,8 @@ class FillClosedBatchAssembler:
         """
         if not self._env_order:
             return
-        batch_pool_per_env = (
-            self._window_pool
-            / len(self._env_order)
-            / self.picks_target
-        )
         for environment, env_batch in window_batches.items():
+            batch_pool_per_env = self.pool_for(environment) / self.picks_target
             self._paid_groups.setdefault(environment, []).extend(
                 (int(batch_index), group) for group in env_batch
             )
@@ -496,6 +537,9 @@ class FillClosedBatchAssembler:
     def window_pool(self) -> float:
         return self._window_pool
 
+    def pool_for(self, environment: str) -> float:
+        return self._pool_by_env[environment]
+
     def paid_groups(self) -> dict[str, list[tuple[int, Any]]]:
         """The groups this window's reward map was computed over (R24),
         each as ``(batch_index, group)`` (R28).
@@ -514,7 +558,7 @@ class FillClosedBatchAssembler:
                 for environment, groups in self._paid_groups.items()
             }
 
-    def close(self) -> None:
+    def close(self, *, pay_partial_remainder: bool = True) -> None:
         """Called once by the service when this window closes (R16),
         after every batcher has handed its last chunk to ``accept``. A
         window's final cycle rarely lands exactly on B_BATCH for every
@@ -524,13 +568,39 @@ class FillClosedBatchAssembler:
         marker.
 
         If every environment contributed at least one group to the
-        current cycle, that partial cycle is emitted as one final batch
-        -- a short DAPO minibatch is still a valid optimizer step, and
-        the seal path already trains on partial windows -- through the
-        SAME quarantine gate (R14) a full batch clears. Otherwise (some
-        environment contributed nothing at all) a tombstone is written
-        under the next batch's key instead, so the trainer's cursor still
+        current cycle, ``pay_partial_remainder`` (default True) emits
+        that partial cycle as one final batch -- a short DAPO minibatch
+        is still a valid optimizer step, and the seal path already
+        trains on partial windows -- through the SAME quarantine gate
+        (R14) a full batch clears. Otherwise (some environment
+        contributed nothing at all, OR the caller passed
+        ``pay_partial_remainder=False``) a tombstone is written under
+        the next batch's key instead, so the trainer's cursor still
         advances.
+
+        ``pay_partial_remainder=False`` is for a window that timed out. The
+        spec requires a timed-out window to pay only fully assembled
+        batches, and this is what enforces that: it does NOT protect
+        against overpayment -- ``FIXED_GROUP_PAYMENT_POLICY`` already pays a
+        fixed ``pool / slots`` share regardless of how many of ``slots`` are
+        filled (unfilled slots already burn instead of being redistributed,
+        for any batch, timed out or not), so a lone group in a short cycle
+        is paid exactly what a group in a full cycle is paid -- never more.
+        What this flag actually does is BURN that accrued pay: every group
+        in the forced final partial cycle -- fully admitted, proven and
+        graded work -- is tombstoned and paid nothing, on the spec's
+        authority, not because paying it would have been wrong on its own
+        terms. Every EARLIER cycle in this same window already cleared the
+        normal full-batch path in ``accept()`` (already durably enqueued to
+        the trainer, independent of whether this window later times out)
+        and keeps its payment; only the trailing remainder is affected. That
+        remainder is also the one UNBALANCED object a timed-out window could
+        otherwise hand the trainer -- every completed cycle already holds
+        exactly ``B_BATCH`` groups per environment by construction
+        (``BalancedTrainingAccumulator``), so tombstoning the remainder
+        instead of committing it keeps a timed-out window's trained data
+        balanced, which is the one piece of this that is a real property of
+        the data rather than a policy choice.
 
         Idempotent: a second call, or one racing a final in-flight
         ``accept``, is a no-op -- ``_closed`` is set under the same lock
@@ -581,7 +651,10 @@ class FillClosedBatchAssembler:
                 )
                 if not still_outstanding:
                     break
-                if self._accumulator.has_groups_for_all_targets:
+                if (
+                    pay_partial_remainder
+                    and self._accumulator.has_groups_for_all_targets
+                ):
                     self._commit_write_locked(
                         self._prepare_payload_locked(allow_partial=True)
                     )

@@ -21,6 +21,7 @@ import gzip
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from aiobotocore.session import get_session
@@ -28,8 +29,50 @@ from aiobotocore.session import get_session
 from botocore.config import Config
 
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.task_id import TASK_ID_RE as _TASK_ID_RE, normalise_task_id
 
 logger = logging.getLogger(__name__)
+
+
+def _task_id(task_id: str | None) -> str:
+    """The task whose archives we are addressing. Env-read like the R2 config."""
+    resolved = task_id if task_id is not None else os.getenv("RELIQUARY_TASK_ID")
+    return normalise_task_id(resolved)
+
+
+def dataset_prefix(task_id: str | None = None) -> str:
+    """Where a task's window archives live. ``default`` keeps the legacy flat path."""
+    resolved = _task_id(task_id)
+    if resolved == "default":
+        return "reliquary/dataset/window-"
+    return f"reliquary/tasks/{resolved}/dataset/window-"
+
+
+def dataset_object_key(window_start: int, task_id: str | None = None) -> str:
+    return f"{dataset_prefix(task_id)}{int(window_start)}.json.gz"
+
+
+async def list_task_ids(*, strict: bool = False, **client_kwargs) -> list[str]:
+    """Every task with an archive namespace, ``default`` always included."""
+    from botocore.exceptions import ClientError
+
+    bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+    tasks = {"default"}
+    async with get_s3_client(**client_kwargs) as client:
+        paginator = client.get_paginator("list_objects_v2")
+        try:
+            async for page in paginator.paginate(
+                Bucket=bucket, Prefix="reliquary/tasks/", Delimiter="/"
+            ):
+                for entry in page.get("CommonPrefixes", []) or []:
+                    candidate = entry.get("Prefix", "")[len("reliquary/tasks/"):].strip("/")
+                    if _TASK_ID_RE.match(candidate):
+                        tasks.add(candidate)
+        except ClientError:
+            if strict:
+                raise
+            logger.exception("list_task_ids failed")
+    return sorted(tasks)
 
 
 def get_s3_client(
@@ -202,7 +245,7 @@ async def upload_window_dataset(
     and a brief failure is non-fatal (they're called from less
     time-sensitive code paths).
     """
-    key = f"reliquary/dataset/window-{window_start}.json.gz"
+    key = dataset_object_key(window_start)
     payload = json.dumps(data, separators=(",", ":")).encode()
     compressed = gzip.compress(payload)
 
@@ -232,6 +275,7 @@ async def list_recent_datasets(
     n: int,
     *,
     strict: bool = False,
+    task_id: str | None = None,
     fields: tuple[str, ...] | None = None,
     **client_kwargs,
 ) -> list[dict]:
@@ -251,7 +295,7 @@ async def list_recent_datasets(
 
     start = max(0, current_window - n)
     keys = [
-        (w, f"reliquary/dataset/window-{w}.json.gz")
+        (w, dataset_object_key(w, task_id))
         for w in range(start, current_window)
     ]
 
@@ -311,6 +355,7 @@ async def list_recent_datasets(
 async def list_all_window_keys(
     *,
     strict: bool = False,
+    task_id: str | None = None,
     **client_kwargs,
 ) -> list[int]:
     """Paginate the flat dataset prefix and return all window_n ints present.
@@ -318,12 +363,11 @@ async def list_all_window_keys(
     Used by validators at startup to derive ``window_n`` without local state.
     Returns a sorted ascending list, empty if no archives exist.
     """
-    import re
     from botocore.exceptions import ClientError
 
     bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
-    prefix = "reliquary/dataset/window-"
-    pattern = re.compile(r"reliquary/dataset/window-(\d+)\.json\.gz$")
+    prefix = dataset_prefix(task_id)
+    pattern = re.compile(re.escape(prefix) + r"(\d+)\.json\.gz$")
 
     windows: list[int] = []
     async with get_s3_client(**client_kwargs) as client:

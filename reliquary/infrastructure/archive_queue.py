@@ -69,6 +69,22 @@ def _default_queue_dir() -> str:
     return os.path.join(state_dir, "pending_archives")
 
 
+def upload_key(window_n: int, task_id: str | None = None) -> str:
+    """The R2 key this queue uploads to; shared with ``storage`` so they cannot drift."""
+    from reliquary.infrastructure.storage import dataset_object_key
+
+    return dataset_object_key(window_n, task_id)
+
+
+def _payload_task_id(archive: dict) -> str | None:
+    """The task that computed this payload; ``None`` (ambient) for files
+    queued before archives carried a task id."""
+    stamped = archive.get("task_id")
+    if isinstance(stamped, str) and stamped.strip():
+        return stamped
+    return None
+
+
 class ArchiveQueue:
     """Persistent retry queue for ``upload_window_dataset`` payloads."""
 
@@ -298,9 +314,12 @@ class ArchiveQueue:
             return False
 
         try:
-            self._read_pending_archive(path, window_n)
+            archive = self._read_pending_archive(path, window_n)
+            # The payload's own task, never the draining process's: a restart
+            # under another RELIQUARY_TASK_ID must not redirect a queued file.
+            key = upload_key(window_n, _payload_task_id(archive))
             body = path.read_bytes()
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             logger.error("ArchiveQueue: failed to read %s: %s", path, e)
             return False
 
@@ -316,7 +335,6 @@ class ArchiveQueue:
         )
         region = os.getenv("R2_REGION", "us-east-1")
         bucket = os.getenv("R2_BUCKET_ID", "reliquary")
-        key = f"reliquary/dataset/window-{window_n}.json.gz"
 
         try:
             await asyncio.to_thread(

@@ -273,6 +273,7 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
     captured["chain_mocks"] = chain_mocks
     captured["weight_wait"] = AsyncMock(return_value=0)
     storage_mocks = {
+        "list_task_ids": AsyncMock(return_value=["default"]),
         "list_all_window_keys": AsyncMock(return_value=[1, 2, 3]),
         "list_recent_datasets": AsyncMock(return_value=[
             _archive(1, ["alice"]),
@@ -280,16 +281,23 @@ def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
             _archive(3, ["bob"]),
         ]),
     }
+    # `read_registry` talks to R2; these tests exercise the epoch/lead-window
+    # state machine, not the registry, so declare "default" the way a real
+    # registry would once one exists.
+    read_registry_mock = AsyncMock(return_value=({"default": object()}, "etag"))
     originals = {
         "weight_wait": signer_backend.weights_submission_wait_blocks,
         "chain": {k: getattr(wov_mod.chain, k) for k in chain_mocks},
         "storage": {k: getattr(wov_mod.storage, k) for k in storage_mocks},
+        "read_registry": wov_mod.read_registry,
     }
     signer_backend.weights_submission_wait_blocks = captured["weight_wait"]
     for k, v in chain_mocks.items():
         setattr(wov_mod.chain, k, v)
     for k, v in storage_mocks.items():
         setattr(wov_mod.storage, k, v)
+    wov_mod.read_registry = read_registry_mock
+    captured["read_registry"] = read_registry_mock
     return originals, captured
 
 
@@ -301,6 +309,7 @@ def _restore(originals):
         setattr(wov_mod.chain, k, v)
     for k, v in originals["storage"].items():
         setattr(wov_mod.storage, k, v)
+    wov_mod.read_registry = originals["read_registry"]
 
 
 async def _wire_submit_counter(wov, captured, *, result=True):
@@ -809,3 +818,527 @@ async def test_burn_fails_closed_when_owner_has_no_uid():
                 await wov._submit_weights(MagicMock(), {"alice": 0.4})
 
     assert captured == {}
+
+
+# --- Minimum incentive floor: applied in submit_once, at the submission
+# boundary, after _replay_ema. A hotkey below MIN_INCENTIVE_SHARE of the miner
+# total is ramped down and its mass is shared out among the rest, so the floor
+# decides who is paid and never how much burns. ---
+
+@pytest.mark.asyncio
+async def test_submit_once_applies_the_floor_to_shares():
+    """Shares 0.98 / 0.015 / 0.005 of the miner total cover all three regimes:
+    the smallest is dropped, the middle one sits at the ramp's midpoint and
+    keeps half its share, and the freed mass goes to the survivors."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_big": 0.98, "hk_mid": 0.015, "hk_small": 0.005}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        with (
+            patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", 0.01),
+            patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.02),
+        ):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    # Single window: the miner total is EMA_ALPHA, and the survivors keep it all.
+    total = wov_mod.EMA_ALPHA
+    assert "hk_small" not in submitted_weights
+    assert submitted_weights["hk_mid"] == pytest.approx(total * 0.0075 / 0.9875)
+    assert submitted_weights["hk_big"] == pytest.approx(total * 0.98 / 0.9875)
+    assert sum(submitted_weights.values()) == pytest.approx(total)
+
+
+@pytest.mark.asyncio
+async def test_submit_once_keeps_a_hotkey_exactly_on_the_floor_in_full():
+    """The comparison is `>=` on the share, not `>`."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_a": 0.5, "hk_b": 0.5}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        # Both hotkeys hold exactly half the miner total.
+        with (
+            patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", 0.25),
+            patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.5),
+        ):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert set(submitted_weights) == {"hk_a", "hk_b"}
+    assert submitted_weights["hk_a"] == submitted_weights["hk_b"]
+    assert submitted_weights["hk_a"] == pytest.approx(wov_mod.EMA_ALPHA / 2)
+
+
+@pytest.mark.asyncio
+async def test_submit_once_shares_the_freed_mass_and_leaves_the_burn_unchanged():
+    """The property that matters most: the floor must never change how much
+    burns. Ramping hk_mid down raises hk_big by exactly what hk_mid loses, and
+    the burn uid receives the same weight with or without the floor."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    fake_meta = MagicMock(
+        hotkeys=["owner", "hk_big", "hk_mid"], uids=[0, 10, 20],
+        owner_hotkey="owner",
+    )
+
+    async def _run_once(ramp_start, min_share):
+        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+        originals, _ = _patch_chain_and_storage(blocks_until=200)
+        wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+            _archive(1, [], rewards_by_hotkey={"hk_big": 0.985, "hk_mid": 0.015}),
+        ])
+        captured = {}
+
+        async def _capture_set_weights(_subtensor, _wallet, _netuid, uids, weights):
+            captured.update(zip(uids, weights))
+            return True
+
+        try:
+            with (
+                patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", ramp_start),
+                patch.object(wov_mod, "MIN_INCENTIVE_SHARE", min_share),
+                patch(
+                    "reliquary.validator.weight_only.chain.get_metagraph",
+                    new=AsyncMock(return_value=fake_meta),
+                ),
+                patch(
+                    "reliquary.validator.weight_only.chain.set_weights",
+                    new=_capture_set_weights,
+                ),
+            ):
+                await wov.submit_once()
+        finally:
+            _restore(originals)
+        return captured
+
+    without_floor = await _run_once(0.0, 0.0)
+    with_floor = await _run_once(0.01, 0.02)
+
+    # hk_mid holds 1.5% of the miner total, the ramp's midpoint: it keeps half.
+    assert with_floor[20] < without_floor[20]
+    assert with_floor[10] > without_floor[10]
+    assert with_floor[20] / with_floor[10] == pytest.approx(0.0075 / 0.985)
+    assert with_floor[10] + with_floor[20] == pytest.approx(
+        without_floor[10] + without_floor[20]
+    )
+    assert with_floor[0] == pytest.approx(without_floor[0])
+    assert sum(with_floor.values()) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_submit_once_floor_disabled_drops_nothing():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_tiny": 0.01}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        with patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.0):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert set(submitted_weights) == {"hk_big", "hk_tiny"}
+
+
+# --- The floor is a ramp, not a cliff: linear from zero at
+# MIN_INCENTIVE_RAMP_START to full payment at MIN_INCENTIVE_SHARE. A cliff
+# alone gives an infinite marginal return to crossing it, which pays miners
+# to merge hotkeys -- concentration is exactly what the floor should not
+# reward. Pure-function coverage of the ramp and of the redistribution, then
+# submit_once coverage that both are actually wired in. ---
+
+def test_ramped_incentive_above_threshold_is_paid_in_full():
+    """Byte-identical to no floor at all: no arithmetic is even attempted."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    value = 0.033333333333
+    assert (
+        WeightOnlyValidator._ramped_incentive(value, start=0.01, threshold=0.02)
+        == value
+    )
+
+
+def test_ramped_incentive_at_the_threshold_itself_is_paid_in_full():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    assert (
+        WeightOnlyValidator._ramped_incentive(0.02, start=0.01, threshold=0.02)
+        == 0.02
+    )
+
+
+def test_ramped_incentive_at_the_midpoint_is_paid_half_its_share():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    paid = WeightOnlyValidator._ramped_incentive(0.015, start=0.01, threshold=0.02)
+
+    assert paid == pytest.approx(0.0075)  # half of 0.015
+
+
+def test_ramped_incentive_below_the_ramp_start_is_zero():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    assert WeightOnlyValidator._ramped_incentive(0.009, start=0.01, threshold=0.02) == 0.0
+    # The boundary itself pays zero too: the ramp is continuous from 0.
+    assert WeightOnlyValidator._ramped_incentive(0.01, start=0.01, threshold=0.02) == 0.0
+
+
+def test_ramped_incentive_start_equals_threshold_reproduces_the_cliff():
+    """The division must be guarded: a zero-width ramp is today's cliff, not
+    a crash."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    below = WeightOnlyValidator._ramped_incentive(0.019, start=0.02, threshold=0.02)
+    at = WeightOnlyValidator._ramped_incentive(0.02, start=0.02, threshold=0.02)
+    above = WeightOnlyValidator._ramped_incentive(0.025, start=0.02, threshold=0.02)
+
+    assert below == 0.0
+    assert at == 0.02
+    assert above == 0.025
+
+
+def test_min_incentive_share_redistributes_among_eligible_hotkeys():
+    import math
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    weights = {"hk_big": 0.98, "hk_mid": 0.015, "hk_small": 0.005}
+    paid = WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    )
+
+    assert "hk_small" not in paid
+    assert paid["hk_mid"] == pytest.approx(0.0075 / 0.9875)
+    assert paid["hk_big"] == pytest.approx(0.98 / 0.9875)
+    assert math.fsum(paid.values()) == pytest.approx(math.fsum(weights.values()))
+
+
+def test_min_incentive_share_reads_shares_so_a_lower_price_filters_nobody_new():
+    """A floor on absolute weight would drop every miner once the price fell
+    far enough; on shares, scaling every weight scales every payment alike."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    weights = {"hk_big": 0.98, "hk_mid": 0.015, "hk_small": 0.005}
+    full = WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    )
+    priced = WeightOnlyValidator._apply_min_incentive_share(
+        {hk: v * 0.05 for hk, v in weights.items()}, start=0.01, threshold=0.02
+    )
+
+    assert set(priced) == set(full)
+    for hk, value in full.items():
+        assert priced[hk] == pytest.approx(value * 0.05)
+
+
+def test_min_incentive_share_leaves_weights_untouched_when_nobody_is_below_it():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    weights = {"hk_a": 0.3, "hk_b": 0.25, "hk_c": 0.2}
+
+    assert WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    ) == weights
+
+
+def test_min_incentive_share_pays_unfiltered_weights_when_everyone_is_below_it():
+    """A filter that removes every hotkey switches payment off rather than
+    filtering: 200 equal miners at 0.5% each all sit below the ramp."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    weights = {f"hk{i}": 0.005 for i in range(200)}
+
+    assert WeightOnlyValidator._apply_min_incentive_share(
+        weights, start=0.01, threshold=0.02
+    ) == weights
+
+
+def test_min_incentive_share_never_pays_more_than_the_miner_total():
+    """Sum of weights <= 1 is a hard chain invariant, so rescaling must never
+    overshoot the total it started from, not even by one ULP."""
+    import math
+    import random
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    rng = random.Random(81)
+    for _ in range(2000):
+        raw = [rng.random() ** 3 for _ in range(rng.randint(2, 90))]
+        price = rng.choice([1.0, 0.654, 0.43, 0.05])
+        norm = math.fsum(raw)
+        weights = {f"hk{i}": price * r / norm for i, r in enumerate(raw)}
+        paid = WeightOnlyValidator._apply_min_incentive_share(
+            weights, start=0.01, threshold=0.02
+        )
+        assert math.fsum(paid.values()) <= math.fsum(weights.values())
+
+
+@pytest.mark.asyncio
+async def test_submit_once_kill_switch_ignores_a_nonzero_ramp_start():
+    """MIN_INCENTIVE_SHARE == 0 disables the floor entirely -- the kill
+    switch -- no matter what MIN_INCENTIVE_RAMP_START is set to."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_tiny": 0.01}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        with (
+            patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.0),
+            patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", 0.005),
+        ):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert set(submitted_weights) == {"hk_big", "hk_tiny"}
+
+
+@pytest.mark.asyncio
+async def test_submit_once_start_equals_threshold_reproduces_the_old_cliff_end_to_end():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    import reliquary.validator.weight_only as wov_mod
+
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
+        _archive(1, [], rewards_by_hotkey={"hk_big": 0.985, "hk_small": 0.015}),
+    ])
+    submitted_weights = {}
+
+    async def _capture_submit(_subtensor, miner_weights):
+        submitted_weights.update(miner_weights)
+        return True
+    wov._submit_weights = _capture_submit
+
+    try:
+        with (
+            patch.object(wov_mod, "MIN_INCENTIVE_SHARE", 0.02),
+            patch.object(wov_mod, "MIN_INCENTIVE_RAMP_START", 0.02),
+        ):
+            await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert "hk_small" not in submitted_weights
+    assert submitted_weights["hk_big"] == pytest.approx(wov_mod.EMA_ALPHA)
+
+
+@pytest.mark.asyncio
+async def test_submit_once_abstains_when_a_task_is_undeclared():
+    """An undeclared task's archives must not move the vector: paying it
+    would be paying under rules nobody agreed to. Pure-function coverage of
+    the rule itself lives in test_weight_reader_multi_task.py; this pins
+    what submit_once actually does with it."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    captured["read_registry"].return_value = ({"some-other-task": object()}, "etag")
+    await _wire_submit_counter(wov, captured)
+    try:
+        result = await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert result is False
+    assert captured["submit_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_once_pays_the_legacy_task_with_no_registry_at_all():
+    """Before any registry object has ever been written, R2 returns
+    NoSuchKey and read_registry reports ({}, None). The lone legacy
+    "default" task predates the registry and must still get paid every
+    epoch, not abstained on forever until an operator declares it."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    captured["read_registry"].return_value = ({}, None)
+    await _wire_submit_counter(wov, captured)
+    try:
+        result = await wov.submit_once()
+    finally:
+        _restore(originals)
+
+    assert result is True
+    assert captured["submit_calls"] == 1
+
+
+# --- FIX 1: one horizon across every task. Anchoring the archive slice to
+# each task's OWN last window hands a task that stopped producing its final
+# 216 windows forever, so its EMA is recomputed at full strength and
+# retirement never decays anything. ---
+
+def _patch_task_archives(windows_by_task, rewards_per_window=1.0):
+    """Emulate the real windowing: each task lists its own window keys, and
+    `list_recent_datasets` serves only the requested [current-n, current) slice.
+    Returns the dict recording what horizon each task was asked for."""
+    import reliquary.validator.weight_only as wov_mod
+
+    asked: dict[str, tuple[int, int]] = {}
+
+    async def _list_task_ids(strict=False, **kw):
+        return sorted(windows_by_task)
+
+    async def _list_all_window_keys(*, task_id=None, strict=False, **kw):
+        return list(windows_by_task[task_id])
+
+    async def _list_recent(current_window, n, *, task_id=None, **kw):
+        asked[task_id] = (current_window, n)
+        low = max(0, current_window - n)
+        return [
+            {"window_start": w, "task_id": task_id,
+             "rewards_by_hotkey": {f"hk-{task_id}": rewards_per_window}}
+            for w in windows_by_task[task_id]
+            if low <= w < current_window
+        ]
+
+    wov_mod.storage.list_task_ids = _list_task_ids
+    wov_mod.storage.list_all_window_keys = _list_all_window_keys
+    wov_mod.storage.list_recent_datasets = _list_recent
+    return asked
+
+
+def _capture_weights(wov, captured):
+    async def _fake_submit(subtensor, miner_weights):
+        captured["submit_calls"] += 1
+        captured["weights"] = dict(miner_weights)
+        return True
+    wov._submit_weights = _fake_submit
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_stopped_producing_decays_out_of_the_horizon():
+    """`retired-task` last archived at window 10; `default` is at 5010. The
+    retired task must not be handed its own last 216 windows forever."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    asked = _patch_task_archives({
+        "default": list(range(5000, 5011)),
+        "retired-task": list(range(1, 11)),
+    })
+    captured["read_registry"].return_value = (
+        {"default": object(), "retired-task": object()}, "etag",
+    )
+    _capture_weights(wov, captured)
+    try:
+        assert await wov.submit_once() is True
+    finally:
+        _restore(originals)
+
+    # One horizon, taken across every task, not each task's own maximum.
+    assert asked["default"][0] == 5011
+    assert asked["retired-task"][0] == 5011
+    assert "hk-default" in captured["weights"]
+    assert "hk-retired-task" not in captured["weights"]
+
+
+@pytest.mark.asyncio
+async def test_one_task_alone_still_anchors_on_its_own_last_window():
+    """`default` alone: the global maximum IS its own maximum, so the slice
+    read is byte-for-byte the one it read before."""
+    from reliquary.validator.weight_only import (
+        ROLLING_WINDOWS_HISTORY,
+        WeightOnlyValidator,
+    )
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    asked = _patch_task_archives({"default": list(range(45000, 45642))})
+    _capture_weights(wov, captured)
+    try:
+        assert await wov.submit_once() is True
+    finally:
+        _restore(originals)
+
+    assert asked == {"default": (45642, ROLLING_WINDOWS_HISTORY * 3)}
+
+
+# --- FIX 2: the declared cap binds where money is assigned. ---
+
+@pytest.mark.asyncio
+async def test_a_task_over_its_declared_cap_does_not_dilute_default():
+    """A box on a stale image archives a full pool for a task declared at cap
+    0.0. Without the per-task clamp the combined total reaches ~2.0 and the
+    global backstop rescales EVERYONE, halving `default`'s miners."""
+    from reliquary.shared.task_registry import MECHANISM_RL_DISCOVERED_PRICE, TaskEntry
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    def _entry(task_id, cap):
+        return TaskEntry(
+            task_id=task_id, profile_id="p", profile_sha256="a" * 64,
+            mechanism=MECHANISM_RL_DISCOVERED_PRICE,
+            params={"start": 1.0, "decay": 0.99, "rounds_per_step": 1000,
+                    "deadband": 0.8, "snap": 1.2, "floor": 0.05, "cap": cap,
+                    "median_rounds": 4800, "last_good_fills": 50},
+            status="active", retired_at=None,
+        )
+
+    windows = list(range(4800, 5011))
+
+    async def _run(tasks, declared):
+        wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+        originals, captured = _patch_chain_and_storage(blocks_until=200)
+        _patch_task_archives({t: list(windows) for t in tasks})
+        captured["read_registry"].return_value = (declared, "etag")
+        _capture_weights(wov, captured)
+        try:
+            assert await wov.submit_once() is True
+        finally:
+            _restore(originals)
+        return captured["weights"]
+
+    alone = await _run(["default"], {"default": _entry("default", 1.0)})
+    beside = await _run(
+        ["default", "stale"],
+        {"default": _entry("default", 1.0), "stale": _entry("stale", 0.0)},
+    )
+
+    assert beside["hk-default"] == alone["hk-default"]
+    assert "hk-stale" not in beside

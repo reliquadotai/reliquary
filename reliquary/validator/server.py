@@ -974,6 +974,49 @@ def _proof_free_submission_reject(
     return None, None
 
 
+def _load_declared_tasks(directory_path: str) -> list[dict]:
+    """Peer tasks an operator declared in a file. Never raises: a bad file means no peers."""
+    try:
+        with open(directory_path, "rb") as handle:
+            declared = json.loads(handle.read())
+    except (OSError, ValueError):
+        logger.warning("task directory %s unreadable", directory_path, exc_info=True)
+        return []
+    from reliquary.constants import TASK_ID
+
+    if not isinstance(declared, list):
+        return []
+    peers: list[dict] = []
+    for entry in declared:
+        if not isinstance(entry, dict):
+            continue
+        task_id, url = entry.get("task_id"), entry.get("url")
+        if not isinstance(task_id, str) or not isinstance(url, str):
+            continue
+        # Our own id is already listed first; a duplicate entry with another
+        # URL would make a miner selecting by id pick arbitrarily.
+        if task_id == TASK_ID:
+            continue
+        profile_id = entry.get("profile_id")
+        model = entry.get("model")
+        emission_share = entry.get("emission_share")
+        peers.append({
+            "task_id": task_id,
+            "profile_id": profile_id if isinstance(profile_id, str) else None,
+            "model": model if isinstance(model, dict) else None,
+            "emission_share": (
+                emission_share
+                if isinstance(emission_share, (int, float))
+                and not isinstance(emission_share, bool)
+                and 0.0 <= emission_share <= 1.0
+                else None
+            ),
+            "url": url,
+            "window": None,
+        })
+    return peers
+
+
 class _Health(BaseModel):
     status: str
     active_window: int | None
@@ -1203,9 +1246,15 @@ class ValidatorServer:
         prompt_mismatch_namespace: str = PROTOCOL_PROFILE_ID,
         no_reveal_state_path: str | os.PathLike[str] | None = None,
         no_reveal_namespace: str = PROTOCOL_PROFILE_ID,
+        emission_cap: float = 1.0,
     ) -> None:
         self.host = host
         self.port = port
+        # What this task may pay per window, for the /tasks discovery listing.
+        # 1.0 is the legacy single-task pool.
+        self._emission_cap = float(emission_cap)
+        # The price block /tasks shows miners; the service publishes it each window.
+        self._price_view: dict | None = None
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
         self._runtime_fingerprint = collect_runtime_fingerprint()
@@ -5882,6 +5931,34 @@ class ValidatorServer:
                 "revision": cp.revision,
                 "signature": cp.signature,
             }
+
+        @app.get("/tasks")
+        async def get_tasks():
+            from reliquary.constants import (
+                PROTOCOL_MODEL_ID,
+                PROTOCOL_MODEL_REVISION,
+                TASK_ID,
+            )
+
+            batcher = self.active_batcher
+            state = getattr(self, "_current_state", None)
+            tasks = [{
+                "task_id": TASK_ID,
+                "profile_id": PROTOCOL_PROFILE_ID,
+                "model": {"model_id": PROTOCOL_MODEL_ID, "model_revision": PROTOCOL_MODEL_REVISION},
+                "emission_share": self._emission_cap,
+                "price": self._price_view,
+                "url": None,
+                "window": {
+                    "window_n": batcher.window_start if batcher is not None else None,
+                    "state": getattr(state, "value", None if state is None else str(state)),
+                },
+            }]
+            # Read per request: adding a task must not restart this one.
+            directory_path = os.environ.get("RELIQUARY_TASK_DIRECTORY_PATH", "").strip()
+            if directory_path:
+                tasks.extend(await asyncio.to_thread(_load_declared_tasks, directory_path))
+            return {"tasks": tasks}
 
 
 

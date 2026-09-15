@@ -187,6 +187,8 @@ def _make_test_service(use_drand: bool):
     svc._publish_every = 100
     svc.train_model = None
     svc.verify_model = None
+    # Aborted-window archives record the task's emission share.
+    svc._emission_cap = 1.0
     return svc
 
 
