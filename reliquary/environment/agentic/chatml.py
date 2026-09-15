@@ -230,6 +230,20 @@ def _coerce(value: str, schema: Any) -> Any:
 
     declared = schema.get("type") if isinstance(schema, Mapping) else None
     types = declared if isinstance(declared, list) else [declared]
+    if declared is None:
+        # Untyped parameters are common in upstream tool schemas; the template wrote
+        # objects and lists as JSON, so read those back and leave the rest as text.
+        if value[:1] in ("{", "["):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return value
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        return value
+    if "string" not in types and value in ("None", "null"):
+        # An optional non-string argument left empty: the template writes Python's None.
+        return None
     for kind in types:
         if kind == "null" and value in ("None", "null"):
             return None

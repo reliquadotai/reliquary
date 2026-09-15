@@ -93,6 +93,16 @@ def test_without_a_schema_every_argument_stays_text():
     assert Renderer.parse_action(text, TASK).arguments == {"n": "3", "flag": "False"}
 
 
+def test_untyped_structures_and_empty_optional_numbers_round_trip():
+    # Both shapes occur in EnvScaler's upstream tool schemas.
+    loose = ToolSpec(name="update", description="", parameters={"type": "object", "properties": {
+        "profile": {}, "limit": {"type": "number"}, "label": {}}})
+    task = EpisodeTask(id="loose", prompt="p", tools=(loose,))
+    action = AssistantAction.tool_call("update", profile={"age": 29, "goals": ["10k"]}, limit=None, label="[draft")
+    parsed = Renderer.parse_action(Renderer.action_text(action, reasoning="r"), task)
+    assert parsed.to_wire() == action.to_wire()
+
+
 def test_reasoning_may_quote_call_markup_and_only_the_answer_counts():
     text = "maybe <tool_call>\n<function=get_weather>\n</function>\n</tool_call>? no.\n</think>\n\nIt rains."
     assert Renderer.parse_action(text, TASK).to_wire() == AssistantAction.final("It rains.").to_wire()
