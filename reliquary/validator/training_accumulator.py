@@ -108,6 +108,12 @@ class BalancedTrainingAccumulator:
             "snapshot": self.snapshot(),
         }
 
+    def held_groups(self, env_order: Sequence[str]) -> list[list[Any]]:
+        """Every group held for each environment, whether or not the cycle is complete."""
+        if set(env_order) != set(self.targets) or len(env_order) != len(self.targets):
+            raise ValueError("training environment order does not match accumulator")
+        return [list(self._groups[name][: self.targets[name]]) for name in env_order]
+
     def training_batches(
         self,
         env_order: Sequence[str],

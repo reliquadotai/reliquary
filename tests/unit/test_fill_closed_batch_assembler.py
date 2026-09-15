@@ -579,6 +579,9 @@ def test_close_tombstones_when_one_env_contributed_nothing(monkeypatch):
     decoded = decode_tombstone(data)
     assert decoded["window_start"] == window
     assert assembler.next_batch_index == FILL_CLOSED_EMISSIONS_PER_WINDOW
+    # Tombstoned for the trainer, but every accepted group is still paid.
+    assert len(assembler.paid_groups()["openmathinstruct"]) == 5
+    assert assembler.reward_map()
 
 
 def test_a_second_close_is_a_noop(monkeypatch):
@@ -1052,3 +1055,34 @@ def test_ten_batches_pay_one_pool_and_pad_remaining_durable_slots(monkeypatch):
     assert [key for key, _ in writes] == list(range(42 * 16, 43 * 16))
     assert all(is_tombstone for _, is_tombstone in writes[10:])
     assert abs(sum(assembler.reward_map().values()) - 1) < 1e-9
+
+
+def test_a_paid_remainder_tombstone_carries_its_groups_to_the_journal(monkeypatch):
+    """Recovery pays from journal accounting, so a remainder that is paid but not
+    trained must reach the journal with its groups, or a crash would unpay it."""
+    import reliquary.infrastructure.training_payload_queue as queue_module
+
+    monkeypatch.setattr(queue_module, "FILL_CLOSED_ENABLED", True)
+    window = 42
+    commits = []
+    assembler = FillClosedBatchAssembler(
+        window_start=window,
+        env_order=ENV_ORDER,
+        enqueue_fn=lambda key, data: None,
+        tombstone_fn=lambda key, data: None,
+        commit_fn=lambda key, data, is_tombstone, batches: commits.append(
+            (key, is_tombstone, batches)
+        ),
+    )
+    assembler.accept(
+        "openmathinstruct", _partial_chunk(0, "openmathinstruct", 5), window, "rev",
+    )
+
+    assembler.close()
+
+    key, is_tombstone, batches = commits[0]
+    assert key == encoded_window_journal_key(window, 0)
+    assert is_tombstone is True
+    assert len(batches["openmathinstruct"]) == 5
+    assert batches["opencodeinstruct"] == []
+
