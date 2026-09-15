@@ -200,7 +200,8 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
     """The window's price signal for the archive, or None if unmeasurable.
 
     Everything it needs already exists at seal: ``window_open_drand_round`` is
-    stamped from the real beacon, ``_seal_trigger_round`` from the seal, and
+    stamped from the real beacon, the close from ``_seal_trigger_round`` (or, for a
+    v6 window, ``window_close_drand_round``), and
     ``_submissions_per_prompt`` retains every admitted candidate for the
     window's life -- appended to, never pruned. Nothing new is recorded in the
     admission path.
@@ -234,13 +235,17 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
         if target is None:
             return None
         targets[str(env_name)] = target
+    close_round = _price_signal_int(getattr(first_batcher, "_seal_trigger_round", None))
+    if close_round is None:
+        # v6 windows close on their fill or backstop, never on a seal trigger.
+        close_round = _price_signal_int(
+            getattr(first_batcher, "window_close_drand_round", None)
+        )
     return price_signal_fields(
         open_round=_price_signal_int(
             getattr(first_batcher, "window_open_drand_round", None)
         ),
-        close_round=_price_signal_int(
-            getattr(first_batcher, "_seal_trigger_round", None)
-        ),
+        close_round=close_round,
         arrivals_by_environment=arrivals,
         targets_by_environment=targets,
     )

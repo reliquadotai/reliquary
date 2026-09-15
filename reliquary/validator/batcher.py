@@ -1002,6 +1002,8 @@ class GrpoWindowBatcher:
         self.window_opened_at: float = self._time_fn()
         self.window_opened_wall_ts: float = self._wall_clock()
         self.window_open_drand_round: int | None = None
+        # v6 only: the drand round the window closed at (fill or backstop).
+        self.window_close_drand_round: int | None = None
         self.last_valid_submission_at: float | None = None
         self.last_valid_submission_wall_ts: float | None = None
 
@@ -1490,6 +1492,25 @@ class GrpoWindowBatcher:
             )
         except Exception:
             self.window_open_drand_round = None
+
+    def _stamp_window_close_round(self) -> None:
+        """Record the drand round a v6 window closed at, once.
+
+        v6 never sets ``_seal_trigger_round``, so this is the price signal's close bound.
+        """
+        if self.window_close_drand_round is not None:
+            return
+        try:
+            if self._drand_chain_info is None:
+                from reliquary.infrastructure.drand import get_current_chain
+                self._drand_chain_info = get_current_chain()
+            from reliquary.infrastructure.chain import compute_current_drand_round
+            ci = self._drand_chain_info
+            self.window_close_drand_round = compute_current_drand_round(
+                self._wall_clock(), ci["genesis_time"], ci["period"],
+            )
+        except Exception:
+            self.window_close_drand_round = None
 
     def is_sealed(self) -> bool:
         """True once adaptive close, the ceiling, or a safety valve fired.
@@ -2897,6 +2918,7 @@ class GrpoWindowBatcher:
                 # R35: the close is the Nth PICK, so by construction the
                 # pool can still hold proven groups no pick took. They
                 # burn (R32) -- see ``_burn_unpicked_proven_groups``.
+                self._stamp_window_close_round()
                 self._seal_v6_proof_plan()
                 handle = self._open_proof_plan_handle
                 if handle is not None and not handle.done():
@@ -2909,6 +2931,7 @@ class GrpoWindowBatcher:
                 # Backstop: stalled candidate supply cannot hold a window open.
                 # Everything proven is unpicked here, and burns for the
                 # same reason: nothing that skips the assembler is paid.
+                self._stamp_window_close_round()
                 self._seal_v6_proof_plan()
                 handle = self._open_proof_plan_handle
                 if handle is not None and not handle.done():
