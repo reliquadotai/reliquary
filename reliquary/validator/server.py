@@ -2517,6 +2517,7 @@ class ValidatorServer:
         rewarded: bool | None = None,
         sigma: float | None = None,
         details: dict[str, Any] | None = None,
+        batch_filled_reason: str | None = None,
     ) -> dict[str, Any]:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
@@ -2591,6 +2592,8 @@ class ValidatorServer:
             entry["rewarded"] = rewarded
         if sigma is not None:
             entry["sigma"] = float(sigma)
+        if batch_filled_reason is not None:
+            entry["batch_filled_reason"] = batch_filled_reason
         self._verdict_sequence_by_hotkey[hotkey] += 1
         entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)
@@ -5285,6 +5288,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage="seal",
                     accepted_into_pool=False,
+                    batch_filled_reason="batch_already_sealed",
                 )
                 log_submission_stage(
                     logger,
@@ -5337,6 +5341,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage=reject_stage,
                     accepted_into_pool=False,
+                    batch_filled_reason=extra.get("batch_filled_reason"),
                 )
                 log_submission_stage(
                     logger,
@@ -6594,6 +6599,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage="seal",
                     accepted_into_pool=False,
+                    batch_filled_reason="batch_already_sealed_or_draining",
                 )
                 log_submission_stage(
                     logger,

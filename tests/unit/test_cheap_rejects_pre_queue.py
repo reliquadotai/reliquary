@@ -339,6 +339,26 @@ def test_proof_admission_full_rejected_pre_queue():
     assert verdicts[-1]["reject_stage"] == "proof_admission"
 
 
+def test_cheap_batch_filled_verdict_names_the_exhausted_capacity():
+    """The batcher already names which capacity ran out. That discriminator
+    must reach the miner's verdict, not only the validator's logs — the fixes
+    for a full window, a byte cap and proof-failure debt have nothing in
+    common."""
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    s.set_active_batcher(_ProofAdmissionFullBatcher())
+    s._worker_task = object()
+    payload = _submission_with_completion_tokens(
+        list(range(4, 36)),
+        rewards=_IN_ZONE_REWARDS,
+    )
+    payload["drand_round"] = 123
+
+    _assert_pre_queue_reject(s, payload, RejectReason.BATCH_FILLED)
+    verdict = list(s._verdicts.get("hkA", []))[-1]
+    assert verdict["batch_filled_reason"] == "proof_admission_window_full"
+
+
 def test_non_cap_non_eos_rejected_before_proof_admission():
     """Short completions that never emit EOS cannot pass termination, so they
     must not reserve one of the scarce proof slots first."""

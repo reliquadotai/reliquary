@@ -213,6 +213,24 @@ def test_batch_filled_appears_in_verdicts() -> None:
     assert any(e["reason"] == "batch_filled" for e in v)
 
 
+def test_batch_filled_verdict_carries_its_reason() -> None:
+    """``batch_filled`` covers a dozen unrelated causes — a sealed window, an
+    exhausted grading budget, a full transport queue, proof-failure debt. The
+    validator already separates them in its logs; without the same
+    discriminator on the verdict a miner cannot tell "you were late" from
+    "your hotkey is locked out for the rest of this window"."""
+    server, client = _make_server_open()
+    server.active_batcher._seal_flag.set()
+
+    req = _request(hotkey="hkBF")
+    client.post("/submit", json=req.model_dump(mode="json"))
+
+    v = client.get("/verdicts/hkBF").json()["verdicts"]
+    filled = [e for e in v if e["reason"] == "batch_filled"]
+    assert filled, "expected a batch_filled verdict"
+    assert filled[0]["batch_filled_reason"] == "batch_already_sealed"
+
+
 # --- isolation: one hotkey's verdicts don't leak into another's -----------
 
 
