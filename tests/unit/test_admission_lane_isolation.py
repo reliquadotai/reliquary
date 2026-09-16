@@ -239,18 +239,36 @@ def test_drainers_and_pool_processes_agree_per_environment():
     assert "reliquaryverifiable_v1" not in cpu_lane
 
 
-def test_empty_lane_fallback_stays_on_its_own_lane():
+def test_empty_lane_fallback_keeps_its_own_queue():
     """A profile with no sandbox environment must not park sandbox drainers on
-    the cpu queue: the synthetic name has no registry entry, so its class
-    cannot be recovered from the name."""
+    the cpu queue. The synthetic key has no registry entry, so nothing may
+    recover its class from its name."""
     server = ValidatorServer()
+    # A profile whose mix declares no sandbox environment at all.
+    server._default_queue_environment_by_class.pop("sandbox", None)
 
+    synthetic = server._default_queue_environment("sandbox")
+
+    assert synthetic not in ("openmathinstruct", "opencodeinstruct")
+    assert (
+        server._submission_queue_for_environment(synthetic)
+        is not server._submission_queue_for_environment("openmathinstruct")
+    )
+
+
+def test_undeclared_environment_does_not_get_a_second_full_lane_budget():
+    """Its lane's budget is already spoken for by the environments that own
+    it, so an undeclared one takes the floor, not another whole share."""
+    from reliquary.constants import MATH_ADMISSION_WORKERS
+
+    server = ValidatorServer()
     server.set_admission_environments(["openmathinstruct"])
-    allocation = server.admission_allocation()
 
-    assert list(allocation["cpu"]) == ["openmathinstruct"]
-    assert allocation["sandbox"], "sandbox lane lost its drainers"
-    assert not set(allocation["cpu"]) & set(allocation["sandbox"])
+    assert (
+        server._admission_worker_count("openmathinstruct")
+        == MATH_ADMISSION_WORKERS
+    )
+    assert server._admission_worker_count("reliquarylogic_v1") == 1
 
 
 def test_admission_environments_default_to_the_profile_mix():
@@ -259,8 +277,10 @@ def test_admission_environments_default_to_the_profile_mix():
 
     server = ValidatorServer()
 
+    # Present in the allocation because the profile's mix supplied it — the
+    # undeclared fallback would answer 1, not the lane budget.
     assert (
-        server._admission_worker_count("openmathinstruct")
+        server.admission_allocation()["cpu"]["openmathinstruct"]
         == MATH_ADMISSION_WORKERS
     )
 

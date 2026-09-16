@@ -1396,6 +1396,8 @@ class ValidatorServer:
         self._submit_queues: dict[str, asyncio.Queue] = {}
         self._admission_environments: list[str] = []
         self._default_queue_environment_by_class: dict[str, str] = {}
+        self._synthetic_lane_keys: dict[str, str] = {}
+        self._admission_allocation_cache: dict[str, dict[str, int]] | None = None
         for _environment, _target in ENVIRONMENT_MIX:
             self._default_queue_environment_by_class.setdefault(
                 _admission_resource_class(_environment), _environment,
@@ -2495,15 +2497,17 @@ class ValidatorServer:
         self,
         environment: str,
     ) -> asyncio.Queue:
-        # Only registered environments earn a queue of their own. An unknown
-        # name shares its class's default queue, so it can never mint one —
-        # the dict is bounded by the registry, not by what a caller sends.
-        try:
-            get_environment_spec(environment)
-        except ValueError:
-            environment = self._default_queue_environment(
-                _admission_resource_class(environment)
-            )
+        # Only registered environments — and a class's own synthetic lane key
+        # — earn a queue. Any other name shares its class's default queue, so
+        # it can never mint one: the dict is bounded by the registry, not by
+        # what a caller sends.
+        if environment not in self._synthetic_lane_keys:
+            try:
+                get_environment_spec(environment)
+            except ValueError:
+                environment = self._default_queue_environment(
+                    _admission_resource_class(environment)
+                )
         queue = self._submit_queues.get(environment)
         if queue is None:
             queue = asyncio.Queue(maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH)
@@ -2512,9 +2516,17 @@ class ValidatorServer:
 
     def _default_queue_environment(self, resource_class: str) -> str:
         """Name the environment the legacy per-class queue attribute maps to."""
-        return self._default_queue_environment_by_class.setdefault(
+        name = self._default_queue_environment_by_class.setdefault(
             resource_class, f"__{resource_class}_lane__",
         )
+        try:
+            get_environment_spec(name)
+        except ValueError:
+            # A class with no environment of its own gets a synthetic key.
+            # The registry cannot classify it, so remember its class here
+            # rather than let anyone re-derive it from the name.
+            self._synthetic_lane_keys[name] = resource_class
+        return name
 
     # ``_submit_queue`` / ``_code_submit_queue`` predate per-environment
     # queues, when a resource class held exactly one environment. They remain
@@ -3576,9 +3588,14 @@ class ValidatorServer:
         for lane in self.admission_allocation().values():
             if environment in lane:
                 return lane[environment]
-        if _admission_resource_class(environment) == "sandbox":
-            return CODE_ADMISSION_WORKERS
-        return MATH_ADMISSION_WORKERS
+        # An environment nobody declared and that is not in the profile's mix.
+        # Its lane budget is already spoken for, so it gets the floor rather
+        # than a second full share on top of the environments that own it.
+        logger.warning(
+            "admission pool for undeclared environment %s: sizing to 1",
+            environment,
+        )
+        return 1
 
     def set_admission_environments(
         self,
@@ -3593,6 +3610,7 @@ class ValidatorServer:
         pool already running at the old one.
         """
         self._admission_environments = list(environments)
+        self._admission_allocation_cache = None
 
     def _admission_environment_names(self) -> list[str]:
         if self._admission_environments:
@@ -3606,6 +3624,8 @@ class ValidatorServer:
         carried rather than re-derived from its name — a synthetic fallback
         name has no registry entry and would resolve to the wrong lane.
         """
+        if self._admission_allocation_cache is not None:
+            return self._admission_allocation_cache
         names = self._admission_environment_names()
         sizes = admission_pool_allocation(names)
         lanes: dict[str, dict[str, int]] = {}
@@ -3625,6 +3645,7 @@ class ValidatorServer:
                     self._default_queue_environment(resource_class): lane_total
                 }
             lanes[resource_class] = lane
+        self._admission_allocation_cache = lanes
         return lanes
 
     @staticmethod
@@ -6317,6 +6338,9 @@ class ValidatorServer:
         self._inflight_proofs_by_environment[environment] += 1
         response: BatchSubmissionResponse | None = None
         reject_stage = "admission_worker"
+        # Which capacity ran out, when the answer is BATCH_FILLED. The batcher
+        # names one of eleven; carrying it is the whole point of the field.
+        batch_filled_reason: str | None = None
         request: BatchSubmissionRequest | None = None
         admission_started = False
         identity_reserved = False
@@ -6521,6 +6545,7 @@ class ValidatorServer:
             if not started:
                 batcher.cancel_logical_group_reservation(request)
                 reject_stage = "proof_admission"
+                batch_filled_reason = start_reason
                 response = batcher.reject_prepared_submission(
                     request,
                     RejectReason.BATCH_FILLED,
@@ -6542,6 +6567,9 @@ class ValidatorServer:
             response = batcher.accept_prepared_submission(
                 prepared, telemetry=telemetry
             )
+            if response.reason is RejectReason.BATCH_FILLED:
+                # The one capacity this call refuses on.
+                batch_filled_reason = "auction_seal_snapshot_started"
         except (asyncio.TimeoutError, BrokenProcessPool):
             cancel_identity_on_exit = identity_reserved and not admission_started
             reject_stage = "admission_timeout"
@@ -6629,12 +6657,7 @@ class ValidatorServer:
                 telemetry,
                 response,
                 stage=reject_stage,
-                # Both auction sites that answer BATCH_FILLED do so because
-                # the window already began its seal snapshot.
-                batch_filled_reason=(
-                    "batch_already_sealed_or_draining"
-                    if response.reason is RejectReason.BATCH_FILLED else None
-                ),
+                batch_filled_reason=batch_filled_reason,
             )
             self._admission_active_by_environment[environment] = max(
                 0,
@@ -6718,7 +6741,6 @@ class ValidatorServer:
                     telemetry,
                     reject_stage="worker",
                     reject_reason=RejectReason.WORKER_DROPPED.value,
-                    batch_filled_reason="batch_already_draining",
                     current_valid_count=getattr(batcher, "valid_count", None),
                     trigger_round=getattr(batcher, "_seal_trigger_round", None),
                     accepted_into_pool=False,
