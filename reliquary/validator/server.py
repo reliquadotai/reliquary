@@ -1395,6 +1395,7 @@ class ValidatorServer:
         # environment arrives next, whose own budget is untouched.
         self._submit_queues: dict[str, asyncio.Queue] = {}
         self._admission_pool_sizes: dict[str, int] = {}
+        self._admission_environments: list[str] = []
         self._default_queue_environment_by_class: dict[str, str] = {}
         for _environment, _target in ENVIRONMENT_MIX:
             self._default_queue_environment_by_class.setdefault(
@@ -3582,6 +3583,53 @@ class ValidatorServer:
         self._admission_pool_sizes = admission_pool_allocation(environments)
         return dict(self._admission_pool_sizes)
 
+    def set_admission_environments(
+        self,
+        environments: Sequence[str],
+    ) -> None:
+        """Declare the environments this validator will actually run.
+
+        Pools and their drainers are both sized from this one set. They have
+        to agree: a pool larger than its drainers idles, and drainers larger
+        than their pool only queue up behind it. ``ValidationService`` may be
+        handed a strict subset of the profile's mix, so the profile's own list
+        cannot be that set.
+
+        Pools outlive a window, so this is fixed once rather than per window —
+        a later window that named a different set would shrink the recorded
+        size without rebuilding the pool already running at the old one.
+        """
+        self._admission_environments = list(environments)
+        self.record_admission_pool_sizes(self._admission_environments)
+
+    def _admission_environment_names(self) -> list[str]:
+        if self._admission_environments:
+            return list(self._admission_environments)
+        return [environment for environment, _target in ENVIRONMENT_MIX]
+
+    def drainer_allocation(self) -> dict[str, int]:
+        """Queue drainers per environment, exactly as ``start`` spawns them."""
+        allocation = admission_pool_allocation(
+            self._admission_environment_names()
+        )
+        for resource_class in ("cpu", "sandbox"):
+            if not any(
+                _admission_resource_class(environment) == resource_class
+                for environment in allocation
+            ):
+                fallback = self._default_queue_environment(resource_class)
+                allocation[fallback] = (
+                    CODE_ADMISSION_WORKERS
+                    if resource_class == "sandbox" else MATH_ADMISSION_WORKERS
+                )
+        return allocation
+
+    def admission_drainer_count(self, environment: str) -> int:
+        """Queue drainers for one environment, as ``start`` will spawn them."""
+        return self.drainer_allocation().get(
+            environment, self._admission_worker_count(environment)
+        )
+
     @staticmethod
     def _admission_wall_seconds(environment: str) -> float:
         if _admission_resource_class(environment) == "sandbox":
@@ -3652,8 +3700,10 @@ class ValidatorServer:
         """Prewarm auction workers before a candidate window becomes OPEN."""
         if not self._auction_admission_enabled:
             return
-        # Size the pools against the whole window, before building any of them.
-        self.record_admission_pool_sizes(list(batchers))
+        if not self._admission_pool_sizes:
+            # An embedder that never declared its environments: fall back to
+            # this window's set rather than leave the pools unsized.
+            self.record_admission_pool_sizes(list(batchers))
         for environment, batcher in batchers.items():
             if (
                 not getattr(batcher, "difficulty_auction_enabled", False)
@@ -7027,20 +7077,15 @@ class ValidatorServer:
         # Each environment's queue needs its own drainers: a lane's workers are
         # split across the environments on it, never multiplied by them.
         extra_workers: list[asyncio.Task[Any]] = []
-        for resource_class, lane_total, label in (
-            ("cpu", MATH_ADMISSION_WORKERS, "math"),
-            ("sandbox", CODE_ADMISSION_WORKERS, "code"),
-        ):
-            lane_environments = [
-                environment
-                for environment, _target in ENVIRONMENT_MIX
-                if _admission_resource_class(environment) == resource_class
-            ] or [self._default_queue_environment(resource_class)]
-            allocation = lane_worker_allocation(
-                lane_environments, total=lane_total,
-            )
+        allocation = self.drainer_allocation()
+        for resource_class, label in (("cpu", "math"), ("sandbox", "code")):
             index = 0
-            for environment, worker_count in allocation.items():
+            lane = {
+                environment: count
+                for environment, count in allocation.items()
+                if _admission_resource_class(environment) == resource_class
+            }
+            for environment, worker_count in lane.items():
                 queue = self._submission_queue_for_environment(environment)
                 for _ in range(worker_count):
                     task = asyncio.create_task(

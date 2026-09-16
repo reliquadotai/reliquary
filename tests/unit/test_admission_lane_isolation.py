@@ -219,6 +219,38 @@ def test_recorded_pool_allocation_shrinks_a_crowded_lane():
     assert server._admission_worker_count("openmathinstruct") == 2
 
 
+def test_drainers_and_pool_processes_agree_per_environment():
+    """A pool larger than its drainers idles; drainers larger than their pool
+    queue up behind it. The two allocations must come from one environment
+    set, and `ValidationService` can be given a strict subset of the profile's
+    mix — so the profile's list is not that set."""
+    server = ValidatorServer()
+    running = ["openmathinstruct", "reliquarylogic_v1"]
+
+    server.set_admission_environments(running)
+
+    # `drainer_allocation` is what `start` spawns from; `_admission_worker_count`
+    # is what pool construction reads. Two sources, one number.
+    allocation = server.drainer_allocation()
+    for environment in running:
+        assert allocation[environment] == 4
+        assert server._admission_worker_count(environment) == 4
+    # An environment the validator does not run gets no drainers at all.
+    assert "reliquaryverifiable_v1" not in allocation
+
+
+def test_admission_environments_default_to_the_profile_mix():
+    """An embedder that never declares its environments keeps today's shape."""
+    from reliquary.constants import MATH_ADMISSION_WORKERS
+
+    server = ValidatorServer()
+
+    assert (
+        server.admission_drainer_count("openmathinstruct")
+        == MATH_ADMISSION_WORKERS
+    )
+
+
 def test_full_neighbour_queue_does_not_reject_another_environment():
     """The miner-visible consequence: env B is admitted while env A is full."""
     server = ValidatorServer()
