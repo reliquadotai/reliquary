@@ -3862,6 +3862,7 @@ class ValidatorServer:
         outcome: BatchSubmissionResponse,
         *,
         stage: str,
+        batch_filled_reason: str | None = None,
     ) -> BatchSubmissionResponse:
         if receipt.terminal_recorded:
             return outcome
@@ -3877,6 +3878,7 @@ class ValidatorServer:
             telemetry=telemetry,
             reject_stage=None if outcome.accepted else stage,
             accepted_into_pool=outcome.accepted,
+            batch_filled_reason=batch_filled_reason,
         )
         log_submission_stage(
             logger,
@@ -4145,6 +4147,7 @@ class ValidatorServer:
                 telemetry,
                 outcome,
                 stage="admission_queue",
+                batch_filled_reason="proof_queue_full",
             )
         self._admission_enqueued_at[claimed.receipt_id] = (
             claimed.environment,
@@ -5443,7 +5446,10 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage=reject_stage,
                     accepted_into_pool=False,
-                    batch_filled_reason=extra.get("batch_filled_reason"),
+                    batch_filled_reason=(
+                        extra.get("batch_filled_reason")
+                        if reason is RejectReason.BATCH_FILLED else None
+                    ),
                 )
                 log_submission_stage(
                     logger,
@@ -5730,8 +5736,12 @@ class ValidatorServer:
                 )
                 return _record_response(resp)
 
+            # Route on the batcher's own environment, never on the name the
+            # miner sent: a queue chosen from unvalidated input can be one no
+            # worker drains, stranding the item and its reservation.
             submit_queue = self._submission_queue_for_environment(
-                submission_env_name
+                getattr(getattr(batcher, "env", None), "name", None)
+                or submission_env_name
             )
             telemetry.mark_enqueued(queue_depth=submit_queue.qsize())
             try:
@@ -6736,6 +6746,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage="proof_admission",
                     accepted_into_pool=False,
+                    batch_filled_reason=start_reason,
                 )
                 log_submission_stage(
                     logger,
