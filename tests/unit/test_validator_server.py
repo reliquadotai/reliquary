@@ -1359,6 +1359,7 @@ def test_wire_complete_reveal_is_not_expired_during_application_delay():
 @pytest.mark.parametrize("reason,stage", [
     (RejectReason.BAD_SCHEMA, "body_parse"),
     (RejectReason.WORKER_DROPPED, "admission_worker"),
+    (RejectReason.BATCH_FILLED, "admission_queue"),
 ])
 async def test_exact_body_reveal_survives_preparation_failure(reason, stage):
     from reliquary.protocol.submission import WindowState
@@ -1381,6 +1382,9 @@ async def test_exact_body_reveal_survives_preparation_failure(reason, stage):
         payload_bytes=len(malformed),
         payload_sha256=hashlib.sha256(malformed).hexdigest(),
     )
+    if stage == "admission_queue":
+        server._submit_queue = asyncio.Queue(maxsize=1)
+        server._submit_queue.put_nowait(object())
 
     with TestClient(server.app) as client:
         committed = client.post(
@@ -1396,6 +1400,15 @@ async def test_exact_body_reveal_survives_preparation_failure(reason, stage):
                 "X-Reliquary-Precommit": committed["receipt_id"],
             },
         )
+
+    if stage == "admission_queue":
+        assert submitted.json() == {"accepted": False, "reason": reason.value}
+        assert submitted.headers["X-Reliquary-Reject-Detail"] == "admission_queue_full"
+        assert "Retry-After" not in submitted.headers
+        receipt = server._upload_precommit_receipts[committed["receipt_id"]]
+        assert receipt.terminal is True
+        assert server._no_reveal_circuit.health_snapshot(current_window=500)["no_reveals_total"] == 0
+        return
 
     assert submitted.json() == {
         "accepted": True,
@@ -1488,6 +1501,11 @@ def test_precommit_signature_saturation_fails_before_executor():
     assert response.status_code == 200
     assert response.json()["reason"] == RejectReason.BATCH_FILLED.value
     assert batcher.pending_upload_precommits == 0
+
+    assert response.headers["X-Reliquary-Reject-Detail"] == "precommit_signature_busy"
+    assert response.headers["Retry-After"] == "1"
+    from reliquary.protocol.submission import SubmissionPrecommitResponse
+    SubmissionPrecommitResponse.model_validate(response.json())
 
 
 @pytest.mark.asyncio

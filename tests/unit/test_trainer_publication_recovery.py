@@ -370,7 +370,38 @@ def test_old_publisher_pruning_never_deletes_a_later_mirror(rig):
     )
 
 
-@pytest.mark.parametrize("corruption", [None, "parent", "title", "lfs", "git_blob"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_default_upload_replaces_weight_layout_atomically(monkeypatch, tmp_path, stale):
+    from types import SimpleNamespace
+    import huggingface_hub
+
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            assert kwargs["parent_commit"] == BASE
+            assert kwargs["delete_patterns"] == list(module.WEIGHT_PATTERNS)
+            return SimpleNamespace(oid="1" * 40)
+
+        def list_repo_files(self, repo_id, *, revision):
+            assert revision == "1" * 40
+            return ["model.safetensors", "config.json"] + (
+                ["model-00001-of-00002.safetensors"] if stale else []
+            )
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    call = module._default_hf_upload(
+        folder_path=str(tmp_path), repo_id="org/repo", parent_commit=BASE,
+        commit_message="checkpoint",
+    )
+    if stale:
+        with pytest.raises(module.PublicationConflict):
+            asyncio.run(call)
+    else:
+        assert asyncio.run(call) == "1" * 40
+
+
+@pytest.mark.parametrize("corruption", [None, "parent", "title", "lfs", "git_blob", "weights"])
 def test_default_hf_recovery_verifies_parent_title_and_both_file_hash_modes(
     monkeypatch, corruption
 ):
@@ -381,6 +412,9 @@ def test_default_hf_recovery_verifies_parent_title_and_both_file_hash_modes(
     revision = "1" * 40
 
     class Api:
+        def list_repo_files(self, repo_id, *, revision):
+            return list(files) + (["model.safetensors.index.json"] if corruption == "weights" else [])
+
         def list_repo_commits(self, repo_id, *, revision):
             return [
                 SimpleNamespace(

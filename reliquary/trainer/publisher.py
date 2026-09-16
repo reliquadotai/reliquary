@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 import fcntl
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import logging
@@ -37,6 +38,10 @@ CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
 R2_CHECKPOINT_PREFIX = "reliquary/checkpoints"
 PUBLICATION_RECEIPT = "reliquary_publication.json"
 PENDING_PUBLICATION = "publication.json"
+WEIGHT_PATTERNS = (
+    "model.safetensors", "model.safetensors.index.json", "model-*.safetensors",
+    "pytorch_model.bin", "pytorch_model.bin.index.json", "pytorch_model-*.bin",
+)
 
 
 class PublicationConflict(RuntimeError):
@@ -76,7 +81,25 @@ def _default_hf_head(repo_id: str) -> str:
 async def _default_hf_upload(**kwargs) -> str:
     from huggingface_hub import HfApi
 
-    return (await asyncio.to_thread(HfApi().upload_folder, **kwargs)).oid
+    api = HfApi()
+    # HF combines deletions and additions in one commit, retaining files being
+    # replaced and preserving history and the caller's parent-commit check.
+    revision = (await asyncio.to_thread(
+        api.upload_folder, **kwargs, delete_patterns=list(WEIGHT_PATTERNS)
+    )).oid
+    await asyncio.to_thread(
+        _verify_weight_file_set, api, kwargs["repo_id"], revision,
+        [path.name for path in Path(kwargs["folder_path"]).iterdir() if path.is_file()],
+    )
+    return revision
+
+
+def _verify_weight_file_set(api, repo_id, revision, files) -> None:
+    def weights(names):
+        return {name for name in names if any(fnmatchcase(name, p) for p in WEIGHT_PATTERNS)}
+
+    if weights(api.list_repo_files(repo_id, revision=revision)) != weights(files):
+        raise PublicationConflict("HF publication has an unexpected weight file set")
 
 
 def _default_hf_verify(
@@ -86,6 +109,7 @@ def _default_hf_verify(
     from huggingface_hub import HfApi
 
     api = HfApi()
+    _verify_weight_file_set(api, repo_id, revision, files)
     commits = api.list_repo_commits(repo_id, revision=revision)
     if (
         len(commits) < 2
