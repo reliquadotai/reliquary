@@ -6113,10 +6113,6 @@ class ValidationService:
         self._archive_queue = archive_queue
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
-        # The mix this validator actually runs, which may be a strict subset of
-        # the profile's. Admission pools and their drainers are both sized from
-        # it, so it has to be declared before the workers are spawned.
-        self.server.set_admission_environments(list(self.envs))
         await startup_step("registration", self._refresh_registered_hotkeys(force=True, reason="startup"))
         await self.server.start()
         await startup_step("activation_checkpoint", self._apply_resume_from())

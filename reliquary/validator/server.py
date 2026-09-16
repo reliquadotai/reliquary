@@ -3623,8 +3623,30 @@ class ValidatorServer:
         self._admission_allocation_cache = None
 
     def _admission_environment_names(self) -> list[str]:
+        """The environments this validator runs, most specific source first.
+
+        ``RELIQUARY_ENVIRONMENTS`` is what the CLI resolves its own mix from,
+        and its default names a single environment — so the running set is
+        routinely a strict subset of the profile's. Reading it here rather
+        than having the service push it keeps ``service.py``, which
+        ``transport_hash`` attests, out of this change.
+        """
         if self._admission_environments:
             return list(self._admission_environments)
+        selection = os.environ.get("RELIQUARY_ENVIRONMENTS", "").strip()
+        if selection:
+            # The CLI validates this selection against the signed profile and
+            # fails closed. Here an unregistered name is simply not an
+            # environment whose admission there is anything to size.
+            running = []
+            for name in (part.strip() for part in selection.split(",")):
+                try:
+                    get_environment_spec(name)
+                except ValueError:
+                    continue
+                running.append(name)
+            if running:
+                return running
         return [environment for environment, _target in ENVIRONMENT_MIX]
 
     def admission_allocation(self) -> dict[str, dict[str, int]]:

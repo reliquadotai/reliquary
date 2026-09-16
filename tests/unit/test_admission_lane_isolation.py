@@ -23,7 +23,10 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import MAX_PENDING_PROOF_QUEUE_DEPTH
+from reliquary.constants import (
+    MATH_ADMISSION_WORKERS,
+    MAX_PENDING_PROOF_QUEUE_DEPTH,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionResponse,
     RejectReason,
@@ -352,4 +355,48 @@ def test_sandboxless_profile_keeps_its_sandbox_lane_off_the_cpu_queue(
     assert synthetic == "__sandbox_lane__"
     assert server._submission_queue_for_environment(synthetic) is not (
         server._submission_queue_for_environment(_CPU_ENV_A)
+    )
+
+
+def test_server_follows_the_runtime_environment_selection(monkeypatch):
+    """The validator runs the mix named by RELIQUARY_ENVIRONMENTS, a strict
+    subset of the profile's (its default is a single environment). The server
+    reads that selection itself rather than being told, so the
+    attestation-covered `service.py` does not have to carry it."""
+    import reliquary.validator.server as server_module
+
+    # A profile declaring three cpu environments...
+    monkeypatch.setattr(
+        server_module,
+        "ENVIRONMENT_MIX",
+        [(_CPU_ENV_A, 16), (_CPU_ENV_B, 16), ("reliquaryverifiable_v1", 16)],
+    )
+    # ...of which this validator actually runs two.
+    monkeypatch.setenv("RELIQUARY_ENVIRONMENTS", f"{_CPU_ENV_A},{_CPU_ENV_B}")
+    server = ValidatorServer()
+
+    cpu_lane = server.admission_allocation()["cpu"]
+
+    assert set(cpu_lane) == {_CPU_ENV_A, _CPU_ENV_B}
+    # The budget goes to the two that run, not split three ways.
+    assert cpu_lane[_CPU_ENV_A] == MATH_ADMISSION_WORKERS // 2
+
+
+def test_explicit_declaration_overrides_the_environment_variable(monkeypatch):
+    """An embedder that declares its set explicitly still wins."""
+    monkeypatch.setenv("RELIQUARY_ENVIRONMENTS", _CPU_ENV_A)
+    server = ValidatorServer()
+
+    server.set_admission_environments([_CPU_ENV_A, _CPU_ENV_B])
+
+    assert set(server.admission_allocation()["cpu"]) == {_CPU_ENV_A, _CPU_ENV_B}
+
+
+def test_unset_environment_variable_falls_back_to_the_profile(monkeypatch):
+    """No selection declared anywhere: the profile's mix is the answer."""
+    monkeypatch.delenv("RELIQUARY_ENVIRONMENTS", raising=False)
+    server = ValidatorServer()
+
+    assert server.admission_allocation()["cpu"][_CPU_ENV_A] == (
+        MATH_ADMISSION_WORKERS
     )
