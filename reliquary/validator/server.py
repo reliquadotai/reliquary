@@ -33,6 +33,7 @@ import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -169,6 +170,51 @@ from reliquary.validator.verifier import (
     rewards_std,
     validate_force_span,
 )
+
+
+def lane_worker_allocation(
+    environments: Sequence[str],
+    *,
+    total: int,
+) -> dict[str, int]:
+    """Split a lane's worker budget evenly across its environments.
+
+    Workers are a validator-wide resource, so the lane's total does not grow
+    with the number of environments sharing it. The one exception is the floor
+    of one worker each: a queue nobody drains fills once and stays full, which
+    is a hard failure, while a surplus task parked on an empty queue costs
+    nothing.
+    """
+    names = list(environments)
+    if not names:
+        return {}
+    base, remainder = divmod(max(total, 0), len(names))
+    return {
+        name: max(1, base + (1 if index < remainder else 0))
+        for index, name in enumerate(names)
+    }
+
+
+def admission_pool_allocation(
+    environments: Sequence[str],
+) -> dict[str, int]:
+    """Size every environment's grading pool, bounded per resource class.
+
+    Grading processes each hold a tokenizer, so they are charged against the
+    validator box rather than against the environment that wanted them. A
+    class's budget is therefore split across the environments on it.
+    """
+    sizes: dict[str, int] = {}
+    for resource_class, lane_total in (
+        ("cpu", MATH_ADMISSION_WORKERS),
+        ("sandbox", CODE_ADMISSION_WORKERS),
+    ):
+        lane = [
+            environment for environment in environments
+            if _admission_resource_class(environment) == resource_class
+        ]
+        sizes.update(lane_worker_allocation(lane, total=lane_total))
+    return sizes
 
 
 def _admission_resource_class(environment: str) -> str:
@@ -1342,15 +1388,26 @@ class ValidatorServer:
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
-        self._submit_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
-        )
-        # OpenCode grading may spend the full sandbox timeout while Math
-        # admission remains CPU-cheap. Independent queues and workers prevent
-        # pathological code from head-of-line blocking the Math auction.
-        self._code_submit_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
-        )
+        # One bounded transport queue per environment. Admission capacity is
+        # charged per environment, so the queue that carries admitted work has
+        # to be too: a queue shared by a whole resource class overflows on the
+        # busiest environment's burst and charges the reject to whichever
+        # environment arrives next, whose own budget is untouched.
+        self._submit_queues: dict[str, asyncio.Queue] = {}
+        self._admission_environments: list[str] = []
+        self._default_queue_environment_by_class: dict[str, str] = {}
+        self._synthetic_lane_keys: dict[str, str] = {}
+        self._admission_allocation_cache: dict[str, dict[str, int]] | None = None
+        for _environment, _target in ENVIRONMENT_MIX:
+            self._default_queue_environment_by_class.setdefault(
+                _admission_resource_class(_environment), _environment,
+            )
+        # Mint both lane keys now. A synthetic one is unknown to the registry,
+        # so its class lives only in ``_synthetic_lane_keys`` — resolving it
+        # before that entry exists would put it on the wrong lane, and which
+        # call runs first is not something routing should depend on.
+        for _resource_class in ("cpu", "sandbox"):
+            self._default_queue_environment(_resource_class)
         self._worker_task: asyncio.Task[Any] | None = None
         self._code_worker_task: asyncio.Task[Any] | None = None
         self._extra_worker_tasks: list[asyncio.Task[Any]] = []
@@ -2446,9 +2503,64 @@ class ValidatorServer:
         self,
         environment: str,
     ) -> asyncio.Queue:
-        if _admission_resource_class(environment) == "sandbox":
-            return self._code_submit_queue
-        return self._submit_queue
+        # A queue exists only where drainers do. Anything else — an
+        # unregistered name, or an environment this validator never declared
+        # — shares its class's default queue, which does have them. A queue
+        # nobody drains is worse than a shared one: its items get no verdict
+        # at all and hold their reservation until the window aborts.
+        if environment not in self._synthetic_lane_keys:
+            drained = {
+                name
+                for lane in self.admission_allocation().values()
+                for name in lane
+            }
+            if environment not in drained:
+                environment = self._default_queue_environment(
+                    _admission_resource_class(environment)
+                )
+        queue = self._submit_queues.get(environment)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH)
+            self._submit_queues[environment] = queue
+        return queue
+
+    def _default_queue_environment(self, resource_class: str) -> str:
+        """Name the environment the legacy per-class queue attribute maps to."""
+        name = self._default_queue_environment_by_class.setdefault(
+            resource_class, f"__{resource_class}_lane__",
+        )
+        try:
+            get_environment_spec(name)
+        except ValueError:
+            # A class with no environment of its own gets a synthetic key.
+            # The registry cannot classify it, so remember its class here
+            # rather than let anyone re-derive it from the name.
+            self._synthetic_lane_keys[name] = resource_class
+        return name
+
+    # ``_submit_queue`` / ``_code_submit_queue`` predate per-environment
+    # queues, when a resource class held exactly one environment. They remain
+    # that class's first environment, so a single-environment class behaves
+    # exactly as before.
+    @property
+    def _submit_queue(self) -> asyncio.Queue:
+        return self._submission_queue_for_environment(
+            self._default_queue_environment("cpu")
+        )
+
+    @_submit_queue.setter
+    def _submit_queue(self, queue: asyncio.Queue) -> None:
+        self._submit_queues[self._default_queue_environment("cpu")] = queue
+
+    @property
+    def _code_submit_queue(self) -> asyncio.Queue:
+        return self._submission_queue_for_environment(
+            self._default_queue_environment("sandbox")
+        )
+
+    @_code_submit_queue.setter
+    def _code_submit_queue(self, queue: asyncio.Queue) -> None:
+        self._submit_queues[self._default_queue_environment("sandbox")] = queue
 
     @property
     def proof_verification_inflight(self) -> int:
@@ -2517,6 +2629,7 @@ class ValidatorServer:
         rewarded: bool | None = None,
         sigma: float | None = None,
         details: dict[str, Any] | None = None,
+        batch_filled_reason: str | None = None,
     ) -> dict[str, Any]:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
@@ -2591,6 +2704,8 @@ class ValidatorServer:
             entry["rewarded"] = rewarded
         if sigma is not None:
             entry["sigma"] = float(sigma)
+        if batch_filled_reason is not None:
+            entry["batch_filled_reason"] = batch_filled_reason
         self._verdict_sequence_by_hotkey[hotkey] += 1
         entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)
@@ -3473,11 +3588,97 @@ class ValidatorServer:
             nonce=receipt.nonce,
         )
 
-    @staticmethod
-    def _admission_worker_count(environment: str) -> int:
-        if _admission_resource_class(environment) == "sandbox":
-            return CODE_ADMISSION_WORKERS
-        return MATH_ADMISSION_WORKERS
+    def _admission_worker_count(self, environment: str) -> int:
+        """Processes in one environment's grading pool — its drainer count.
+
+        The two must agree: a pool larger than its drainers idles, and
+        drainers larger than their pool only queue up behind it. Reading both
+        from ``admission_allocation`` is what keeps them equal.
+        """
+        for lane in self.admission_allocation().values():
+            if environment in lane:
+                return lane[environment]
+        # An environment nobody declared and that is not in the profile's mix.
+        # Its lane budget is already spoken for, so it gets the floor rather
+        # than a second full share on top of the environments that own it.
+        logger.warning(
+            "admission pool for undeclared environment %s: sizing to 1",
+            environment,
+        )
+        return 1
+
+    def set_admission_environments(
+        self,
+        environments: Sequence[str],
+    ) -> None:
+        """Declare the environments this validator will actually run.
+
+        ``ValidationService`` may be handed a strict subset of the profile's
+        mix, so the profile's own list is not that set. Declared once and not
+        per window, because pools outlive a window: a later window naming a
+        different set would shrink the recorded size without rebuilding the
+        pool already running at the old one.
+        """
+        self._admission_environments = list(environments)
+        self._admission_allocation_cache = None
+
+    def _admission_environment_names(self) -> list[str]:
+        """The environments this validator runs, most specific source first.
+
+        ``RELIQUARY_ENVIRONMENTS`` is what the CLI resolves its own mix from,
+        and its default names a single environment — so the running set is
+        routinely a strict subset of the profile's. Reading it here rather
+        than having the service push it keeps ``service.py``, which
+        ``transport_hash`` attests, out of this change.
+        """
+        if self._admission_environments:
+            return list(self._admission_environments)
+        selection = os.environ.get("RELIQUARY_ENVIRONMENTS", "").strip()
+        if selection:
+            # The CLI validates this selection against the signed profile and
+            # fails closed. Here an unregistered name is simply not an
+            # environment whose admission there is anything to size.
+            running = []
+            for name in (part.strip() for part in selection.split(",")):
+                try:
+                    get_environment_spec(name)
+                except ValueError:
+                    continue
+                running.append(name)
+            if running:
+                return running
+        return [environment for environment, _target in ENVIRONMENT_MIX]
+
+    def admission_allocation(self) -> dict[str, dict[str, int]]:
+        """Per-resource-class worker counts, as ``start`` spawns them.
+
+        Keyed by class rather than flat, so the lane an entry belongs to is
+        carried rather than re-derived from its name — a synthetic fallback
+        name has no registry entry and would resolve to the wrong lane.
+        """
+        if self._admission_allocation_cache is not None:
+            return self._admission_allocation_cache
+        names = self._admission_environment_names()
+        sizes = admission_pool_allocation(names)
+        lanes: dict[str, dict[str, int]] = {}
+        for resource_class, lane_total in (
+            ("cpu", MATH_ADMISSION_WORKERS),
+            ("sandbox", CODE_ADMISSION_WORKERS),
+        ):
+            lane = {
+                environment: count
+                for environment, count in sizes.items()
+                if _admission_resource_class(environment) == resource_class
+            }
+            if not lane:
+                # No environment on this class: keep one drainer set on the
+                # class's default queue so the legacy attribute stays live.
+                lane = {
+                    self._default_queue_environment(resource_class): lane_total
+                }
+            lanes[resource_class] = lane
+        self._admission_allocation_cache = lanes
+        return lanes
 
     @staticmethod
     def _admission_wall_seconds(environment: str) -> float:
@@ -3757,6 +3958,7 @@ class ValidatorServer:
         outcome: BatchSubmissionResponse,
         *,
         stage: str,
+        batch_filled_reason: str | None = None,
     ) -> BatchSubmissionResponse:
         if receipt.terminal_recorded:
             return outcome
@@ -3772,6 +3974,7 @@ class ValidatorServer:
             telemetry=telemetry,
             reject_stage=None if outcome.accepted else stage,
             accepted_into_pool=outcome.accepted,
+            batch_filled_reason=batch_filled_reason,
         )
         log_submission_stage(
             logger,
@@ -3781,6 +3984,7 @@ class ValidatorServer:
             reject_stage=None if outcome.accepted else stage,
             reject_reason=None if outcome.accepted else outcome.reason.value,
             accepted_into_pool=outcome.accepted,
+            batch_filled_reason=batch_filled_reason,
         )
         return outcome
 
@@ -4040,6 +4244,7 @@ class ValidatorServer:
                 telemetry,
                 outcome,
                 stage="admission_queue",
+                batch_filled_reason="proof_queue_full",
             )
         self._admission_enqueued_at[claimed.receipt_id] = (
             claimed.environment,
@@ -4088,7 +4293,7 @@ class ValidatorServer:
         """Make every unresolved receipt terminal before aborting a window."""
         batcher_ids = {id(batcher) for batcher in batchers}
         stats = {"queued": 0, "inflight": 0, "expired": 0}
-        for queue in (self._submit_queue, self._code_submit_queue):
+        for queue in list(self._submit_queues.values()):
             retained: list[Any] = []
             while True:
                 try:
@@ -5285,6 +5490,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage="seal",
                     accepted_into_pool=False,
+                    batch_filled_reason="batch_already_sealed",
                 )
                 log_submission_stage(
                     logger,
@@ -5337,6 +5543,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage=reject_stage,
                     accepted_into_pool=False,
+                    batch_filled_reason=extra.get("batch_filled_reason"),
                 )
                 log_submission_stage(
                     logger,
@@ -5435,13 +5642,11 @@ class ValidatorServer:
                 return _cheap_reject(
                     RejectReason.PROMPT_IN_COOLDOWN,
                     reject_stage="cooldown",
-                    batch_filled_reason="prompt_in_cooldown",
                 )
             if batcher.prompt_submission_count(request.prompt_idx) >= MAX_SUBMISSIONS_PER_PROMPT:
                 return _cheap_reject(
                     RejectReason.PROMPT_FULL,
                     reject_stage="prompt_capacity",
-                    batch_filled_reason="prompt_duplicate_or_full",
                 )
 
             # Materialize the exact prompt before reserving proof work. This
@@ -5623,8 +5828,12 @@ class ValidatorServer:
                 )
                 return _record_response(resp)
 
+            # Route on the batcher's own environment, never on the name the
+            # miner sent: a queue chosen from unvalidated input can be one no
+            # worker drains, stranding the item and its reservation.
             submit_queue = self._submission_queue_for_environment(
-                submission_env_name
+                getattr(getattr(batcher, "env", None), "name", None)
+                or submission_env_name
             )
             telemetry.mark_enqueued(queue_depth=submit_queue.qsize())
             try:
@@ -6161,6 +6370,9 @@ class ValidatorServer:
         self._inflight_proofs_by_environment[environment] += 1
         response: BatchSubmissionResponse | None = None
         reject_stage = "admission_worker"
+        # Which capacity ran out, when the answer is BATCH_FILLED. The batcher
+        # names one of eleven; carrying it is the whole point of the field.
+        batch_filled_reason: str | None = None
         request: BatchSubmissionRequest | None = None
         admission_started = False
         identity_reserved = False
@@ -6365,6 +6577,7 @@ class ValidatorServer:
             if not started:
                 batcher.cancel_logical_group_reservation(request)
                 reject_stage = "proof_admission"
+                batch_filled_reason = start_reason
                 response = batcher.reject_prepared_submission(
                     request,
                     RejectReason.BATCH_FILLED,
@@ -6386,6 +6599,9 @@ class ValidatorServer:
             response = batcher.accept_prepared_submission(
                 prepared, telemetry=telemetry
             )
+            if response.reason is RejectReason.BATCH_FILLED:
+                # The one capacity this call refuses on.
+                batch_filled_reason = "auction_seal_snapshot_started"
         except (asyncio.TimeoutError, BrokenProcessPool):
             cancel_identity_on_exit = identity_reserved and not admission_started
             reject_stage = "admission_timeout"
@@ -6473,6 +6689,7 @@ class ValidatorServer:
                 telemetry,
                 response,
                 stage=reject_stage,
+                batch_filled_reason=batch_filled_reason,
             )
             self._admission_active_by_environment[environment] = max(
                 0,
@@ -6556,7 +6773,6 @@ class ValidatorServer:
                     telemetry,
                     reject_stage="worker",
                     reject_reason=RejectReason.WORKER_DROPPED.value,
-                    batch_filled_reason="batch_already_draining",
                     current_valid_count=getattr(batcher, "valid_count", None),
                     trigger_round=getattr(batcher, "_seal_trigger_round", None),
                     accepted_into_pool=False,
@@ -6594,6 +6810,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage="seal",
                     accepted_into_pool=False,
+                    batch_filled_reason="batch_already_sealed_or_draining",
                 )
                 log_submission_stage(
                     logger,
@@ -6628,6 +6845,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage="proof_admission",
                     accepted_into_pool=False,
+                    batch_filled_reason=start_reason,
                 )
                 log_submission_stage(
                     logger,
@@ -6905,30 +7123,27 @@ class ValidatorServer:
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
-        self._worker_task = asyncio.create_task(
-            self._submit_worker(self._submit_queue),
-            name="math_admission_worker_0",
-        )
-        self._code_worker_task = asyncio.create_task(
-            self._submit_worker(self._code_submit_queue),
-            name="code_admission_worker_0",
-        )
-        self._extra_worker_tasks = [
-            *(
-                asyncio.create_task(
-                    self._submit_worker(self._submit_queue),
-                    name=f"math_admission_worker_{index}",
-                )
-                for index in range(1, MATH_ADMISSION_WORKERS)
-            ),
-            *(
-                asyncio.create_task(
-                    self._submit_worker(self._code_submit_queue),
-                    name=f"code_admission_worker_{index}",
-                )
-                for index in range(1, CODE_ADMISSION_WORKERS)
-            ),
-        ]
+        # Each environment's queue needs its own drainers: a lane's workers are
+        # split across the environments on it, never multiplied by them.
+        extra_workers: list[asyncio.Task[Any]] = []
+        allocation = self.admission_allocation()
+        for resource_class, label in (("cpu", "math"), ("sandbox", "code")):
+            index = 0
+            for environment, worker_count in allocation[resource_class].items():
+                queue = self._submission_queue_for_environment(environment)
+                for _ in range(worker_count):
+                    task = asyncio.create_task(
+                        self._submit_worker(queue),
+                        name=f"{label}_admission_worker_{index}_{environment}",
+                    )
+                    if index == 0 and resource_class == "cpu":
+                        self._worker_task = task
+                    elif index == 0:
+                        self._code_worker_task = task
+                    else:
+                        extra_workers.append(task)
+                    index += 1
+        self._extra_worker_tasks = extra_workers
         self._event_loop_monitor_task = asyncio.create_task(
             self._monitor_event_loop_lag(), name="validator_event_loop_monitor"
         )

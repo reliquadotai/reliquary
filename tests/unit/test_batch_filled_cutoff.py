@@ -362,3 +362,65 @@ async def test_worker_seal_check_after_batcher_swap_check():
 
 def test_batch_filled_reject_reason_exists():
     assert RejectReason.BATCH_FILLED.value == "batch_filled"
+
+
+# ---- the reason survives the async worker path ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_proof_admission_reject_names_its_reason(monkeypatch):
+    """Production runs the async worker, not the synchronous /submit path.
+
+    A hotkey locked out by proof-failure debt is refused here, and the
+    validator logs *why*. Without the same discriminator on the verdict, the
+    miner sees a bare ``batch_filled`` and cannot tell a lockout from being
+    late — while a retry, the only move a late miner has, is exactly the wrong
+    move for a lockout.
+    """
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _fake_batcher_marked_sealed(window_start=500)
+
+    def _refuse(self, request):
+        return False, "proof_failure_debt_hotkey"
+
+    # ``_start_proof_admission`` resolves the method on the class, and this is
+    # the real GrpoWindowBatcher — monkeypatch restores it, a bare setattr
+    # would leave production bounds disabled for the rest of the session.
+    monkeypatch.setattr(GrpoWindowBatcher, "start_proof_admission", _refuse)
+    s.set_active_batcher(batcher)
+
+    rollouts = [
+        RolloutSubmission(
+            tokens=list(range(36)), reward=1.0,
+            commit={
+                "tokens": list(range(36)),
+                "rollout": {"prompt_length": 4, "completion_length": 32},
+            },
+            env_name="openmathinstruct",
+        ) for _ in range(8)
+    ]
+    req = BatchSubmissionRequest(
+        miner_hotkey="hkDebt", prompt_idx=7, window_start=500,
+        merkle_root="00" * 32, rollouts=rollouts,
+        checkpoint_hash="sha256:test", protocol_version=2,
+    )
+    await s._submit_queue.put((req, batcher))
+
+    worker = asyncio.create_task(s._submit_worker())
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if s._verdicts.get("hkDebt"):
+                break
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+    verdicts = list(s._verdicts.get("hkDebt", []))
+    assert verdicts, "worker recorded no verdict"
+    assert verdicts[-1]["reason"] == RejectReason.BATCH_FILLED.value
+    assert verdicts[-1]["batch_filled_reason"] == "proof_failure_debt_hotkey"

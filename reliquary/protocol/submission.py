@@ -581,6 +581,10 @@ class Verdict(BaseModel):
     rewarded: bool | None = None
     reject_stage: str | None = None
     reject_reason: str | None = None
+    # Which capacity ran out. ``batch_filled`` alone cannot distinguish "the
+    # window sealed before you" from "your hotkey owes proof-failure debt" —
+    # opposite miner-side fixes.
+    batch_filled_reason: str | None = None
     payload_bytes: int | None = None
     body_read_ms: float | None = None
     body_parse_ms: float | None = None
