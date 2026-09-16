@@ -33,6 +33,7 @@ import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -169,6 +170,29 @@ from reliquary.validator.verifier import (
     rewards_std,
     validate_force_span,
 )
+
+
+def lane_worker_allocation(
+    environments: Sequence[str],
+    *,
+    total: int,
+) -> dict[str, int]:
+    """Split a lane's worker budget evenly across its environments.
+
+    Workers are a validator-wide resource, so the lane's total does not grow
+    with the number of environments sharing it. The one exception is the floor
+    of one worker each: a queue nobody drains fills once and stays full, which
+    is a hard failure, while a surplus task parked on an empty queue costs
+    nothing.
+    """
+    names = list(environments)
+    if not names:
+        return {}
+    base, remainder = divmod(max(total, 0), len(names))
+    return {
+        name: max(1, base + (1 if index < remainder else 0))
+        for index, name in enumerate(names)
+    }
 
 
 def _admission_resource_class(environment: str) -> str:
@@ -1342,15 +1366,17 @@ class ValidatorServer:
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
-        self._submit_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
-        )
-        # OpenCode grading may spend the full sandbox timeout while Math
-        # admission remains CPU-cheap. Independent queues and workers prevent
-        # pathological code from head-of-line blocking the Math auction.
-        self._code_submit_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH,
-        )
+        # One bounded transport queue per environment. Admission capacity is
+        # charged per environment, so the queue that carries admitted work has
+        # to be too: a queue shared by a whole resource class overflows on the
+        # busiest environment's burst and charges the reject to whichever
+        # environment arrives next, whose own budget is untouched.
+        self._submit_queues: dict[str, asyncio.Queue] = {}
+        self._default_queue_environment_by_class: dict[str, str] = {}
+        for _environment, _target in ENVIRONMENT_MIX:
+            self._default_queue_environment_by_class.setdefault(
+                _admission_resource_class(_environment), _environment,
+            )
         self._worker_task: asyncio.Task[Any] | None = None
         self._code_worker_task: asyncio.Task[Any] | None = None
         self._extra_worker_tasks: list[asyncio.Task[Any]] = []
@@ -2446,9 +2472,50 @@ class ValidatorServer:
         self,
         environment: str,
     ) -> asyncio.Queue:
-        if _admission_resource_class(environment) == "sandbox":
-            return self._code_submit_queue
-        return self._submit_queue
+        # Only registered environments earn a queue of their own. An unknown
+        # name shares its class's default queue, so it can never mint one —
+        # the dict is bounded by the registry, not by what a caller sends.
+        try:
+            get_environment_spec(environment)
+        except ValueError:
+            environment = self._default_queue_environment(
+                _admission_resource_class(environment)
+            )
+        queue = self._submit_queues.get(environment)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=MAX_PENDING_PROOF_QUEUE_DEPTH)
+            self._submit_queues[environment] = queue
+        return queue
+
+    def _default_queue_environment(self, resource_class: str) -> str:
+        """Name the environment the legacy per-class queue attribute maps to."""
+        return self._default_queue_environment_by_class.setdefault(
+            resource_class, f"__{resource_class}_lane__",
+        )
+
+    # ``_submit_queue`` / ``_code_submit_queue`` predate per-environment
+    # queues, when a resource class held exactly one environment. They remain
+    # that class's first environment, so a single-environment class behaves
+    # exactly as before.
+    @property
+    def _submit_queue(self) -> asyncio.Queue:
+        return self._submission_queue_for_environment(
+            self._default_queue_environment("cpu")
+        )
+
+    @_submit_queue.setter
+    def _submit_queue(self, queue: asyncio.Queue) -> None:
+        self._submit_queues[self._default_queue_environment("cpu")] = queue
+
+    @property
+    def _code_submit_queue(self) -> asyncio.Queue:
+        return self._submission_queue_for_environment(
+            self._default_queue_environment("sandbox")
+        )
+
+    @_code_submit_queue.setter
+    def _code_submit_queue(self, queue: asyncio.Queue) -> None:
+        self._submit_queues[self._default_queue_environment("sandbox")] = queue
 
     @property
     def proof_verification_inflight(self) -> int:
@@ -4091,7 +4158,7 @@ class ValidatorServer:
         """Make every unresolved receipt terminal before aborting a window."""
         batcher_ids = {id(batcher) for batcher in batchers}
         stats = {"queued": 0, "inflight": 0, "expired": 0}
-        for queue in (self._submit_queue, self._code_submit_queue):
+        for queue in list(self._submit_queues.values()):
             retained: list[Any] = []
             while True:
                 try:
@@ -6911,30 +6978,37 @@ class ValidatorServer:
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
-        self._worker_task = asyncio.create_task(
-            self._submit_worker(self._submit_queue),
-            name="math_admission_worker_0",
-        )
-        self._code_worker_task = asyncio.create_task(
-            self._submit_worker(self._code_submit_queue),
-            name="code_admission_worker_0",
-        )
-        self._extra_worker_tasks = [
-            *(
-                asyncio.create_task(
-                    self._submit_worker(self._submit_queue),
-                    name=f"math_admission_worker_{index}",
-                )
-                for index in range(1, MATH_ADMISSION_WORKERS)
-            ),
-            *(
-                asyncio.create_task(
-                    self._submit_worker(self._code_submit_queue),
-                    name=f"code_admission_worker_{index}",
-                )
-                for index in range(1, CODE_ADMISSION_WORKERS)
-            ),
-        ]
+        # Each environment's queue needs its own drainers: a lane's workers are
+        # split across the environments on it, never multiplied by them.
+        extra_workers: list[asyncio.Task[Any]] = []
+        for resource_class, lane_total, label in (
+            ("cpu", MATH_ADMISSION_WORKERS, "math"),
+            ("sandbox", CODE_ADMISSION_WORKERS, "code"),
+        ):
+            lane_environments = [
+                environment
+                for environment, _target in ENVIRONMENT_MIX
+                if _admission_resource_class(environment) == resource_class
+            ] or [self._default_queue_environment(resource_class)]
+            allocation = lane_worker_allocation(
+                lane_environments, total=lane_total,
+            )
+            index = 0
+            for environment, worker_count in allocation.items():
+                queue = self._submission_queue_for_environment(environment)
+                for _ in range(worker_count):
+                    task = asyncio.create_task(
+                        self._submit_worker(queue),
+                        name=f"{label}_admission_worker_{index}_{environment}",
+                    )
+                    if index == 0 and resource_class == "cpu":
+                        self._worker_task = task
+                    elif index == 0:
+                        self._code_worker_task = task
+                    else:
+                        extra_workers.append(task)
+                    index += 1
+        self._extra_worker_tasks = extra_workers
         self._event_loop_monitor_task = asyncio.create_task(
             self._monitor_event_loop_lag(), name="validator_event_loop_monitor"
         )
