@@ -195,6 +195,28 @@ def lane_worker_allocation(
     }
 
 
+def admission_pool_allocation(
+    environments: Sequence[str],
+) -> dict[str, int]:
+    """Size every environment's grading pool, bounded per resource class.
+
+    Grading processes each hold a tokenizer, so they are charged against the
+    validator box rather than against the environment that wanted them. A
+    class's budget is therefore split across the environments on it.
+    """
+    sizes: dict[str, int] = {}
+    for resource_class, lane_total in (
+        ("cpu", MATH_ADMISSION_WORKERS),
+        ("sandbox", CODE_ADMISSION_WORKERS),
+    ):
+        lane = [
+            environment for environment in environments
+            if _admission_resource_class(environment) == resource_class
+        ]
+        sizes.update(lane_worker_allocation(lane, total=lane_total))
+    return sizes
+
+
 def _admission_resource_class(environment: str) -> str:
     """Return the registered class; local test environments use the CPU lane."""
 
@@ -1372,6 +1394,7 @@ class ValidatorServer:
         # busiest environment's burst and charges the reject to whichever
         # environment arrives next, whose own budget is untouched.
         self._submit_queues: dict[str, asyncio.Queue] = {}
+        self._admission_pool_sizes: dict[str, int] = {}
         self._default_queue_environment_by_class: dict[str, str] = {}
         for _environment, _target in ENVIRONMENT_MIX:
             self._default_queue_environment_by_class.setdefault(
@@ -3543,11 +3566,21 @@ class ValidatorServer:
             nonce=receipt.nonce,
         )
 
-    @staticmethod
-    def _admission_worker_count(environment: str) -> int:
+    def _admission_worker_count(self, environment: str) -> int:
+        recorded = self._admission_pool_sizes.get(environment)
+        if recorded is not None:
+            return recorded
         if _admission_resource_class(environment) == "sandbox":
             return CODE_ADMISSION_WORKERS
         return MATH_ADMISSION_WORKERS
+
+    def record_admission_pool_sizes(
+        self,
+        environments: Sequence[str],
+    ) -> dict[str, int]:
+        """Fix the pool sizes for the environments a window will run."""
+        self._admission_pool_sizes = admission_pool_allocation(environments)
+        return dict(self._admission_pool_sizes)
 
     @staticmethod
     def _admission_wall_seconds(environment: str) -> float:
@@ -3619,6 +3652,8 @@ class ValidatorServer:
         """Prewarm auction workers before a candidate window becomes OPEN."""
         if not self._auction_admission_enabled:
             return
+        # Size the pools against the whole window, before building any of them.
+        self.record_admission_pool_sizes(list(batchers))
         for environment, batcher in batchers.items():
             if (
                 not getattr(batcher, "difficulty_auction_enabled", False)

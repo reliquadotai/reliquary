@@ -164,6 +164,61 @@ def test_more_environments_than_workers_still_drains_each():
     assert allocation == {"a": 1, "b": 1, "c": 1, "d": 1}
 
 
+def test_admission_pools_do_not_multiply_with_environment_count():
+    """Grading processes are the box's memory, not the lane's. Five CPU
+    environments must share the CPU pool budget, not take it each."""
+    from reliquary.constants import CODE_ADMISSION_WORKERS, MATH_ADMISSION_WORKERS
+    from reliquary.validator.server import admission_pool_allocation
+
+    sizes = admission_pool_allocation([
+        "openmathinstruct",
+        "reliquarylogic_v1",
+        "reliquaryverifiable_v1",
+        "reliquary_stateful_tools_v1",
+        "reliquary_retrieval_tools_v1",
+        "opencodeinstruct",
+        "reliquary_workspace_tools_v1",
+    ])
+
+    cpu_total = sum(
+        size for env, size in sizes.items()
+        if env not in ("opencodeinstruct", "reliquary_workspace_tools_v1")
+    )
+    sandbox_total = sum(
+        sizes[env]
+        for env in ("opencodeinstruct", "reliquary_workspace_tools_v1")
+    )
+    assert cpu_total == MATH_ADMISSION_WORKERS
+    assert sandbox_total == CODE_ADMISSION_WORKERS
+    assert min(sizes.values()) >= 1
+
+
+def test_single_environment_lane_keeps_its_whole_pool():
+    """The shape production runs today must not change."""
+    from reliquary.constants import MATH_ADMISSION_WORKERS
+    from reliquary.validator.server import admission_pool_allocation
+
+    sizes = admission_pool_allocation(["openmathinstruct"])
+
+    assert sizes == {"openmathinstruct": MATH_ADMISSION_WORKERS}
+
+
+def test_recorded_pool_allocation_shrinks_a_crowded_lane():
+    """The sizing the window recorded is what pool construction then uses."""
+    server = ValidatorServer()
+    lane = [
+        "openmathinstruct",
+        "reliquarylogic_v1",
+        "reliquaryverifiable_v1",
+        "reliquary_stateful_tools_v1",
+    ]
+
+    server.record_admission_pool_sizes(lane)
+
+    assert sum(server._admission_worker_count(env) for env in lane) == 8
+    assert server._admission_worker_count("openmathinstruct") == 2
+
+
 def test_full_neighbour_queue_does_not_reject_another_environment():
     """The miner-visible consequence: env B is admitted while env A is full."""
     server = ValidatorServer()
