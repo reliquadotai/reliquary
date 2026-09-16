@@ -1402,6 +1402,12 @@ class ValidatorServer:
             self._default_queue_environment_by_class.setdefault(
                 _admission_resource_class(_environment), _environment,
             )
+        # Mint both lane keys now. A synthetic one is unknown to the registry,
+        # so its class lives only in ``_synthetic_lane_keys`` — resolving it
+        # before that entry exists would put it on the wrong lane, and which
+        # call runs first is not something routing should depend on.
+        for _resource_class in ("cpu", "sandbox"):
+            self._default_queue_environment(_resource_class)
         self._worker_task: asyncio.Task[Any] | None = None
         self._code_worker_task: asyncio.Task[Any] | None = None
         self._extra_worker_tasks: list[asyncio.Task[Any]] = []
@@ -2497,14 +2503,18 @@ class ValidatorServer:
         self,
         environment: str,
     ) -> asyncio.Queue:
-        # Only registered environments — and a class's own synthetic lane key
-        # — earn a queue. Any other name shares its class's default queue, so
-        # it can never mint one: the dict is bounded by the registry, not by
-        # what a caller sends.
+        # A queue exists only where drainers do. Anything else — an
+        # unregistered name, or an environment this validator never declared
+        # — shares its class's default queue, which does have them. A queue
+        # nobody drains is worse than a shared one: its items get no verdict
+        # at all and hold their reservation until the window aborts.
         if environment not in self._synthetic_lane_keys:
-            try:
-                get_environment_spec(environment)
-            except ValueError:
+            drained = {
+                name
+                for lane in self.admission_allocation().values()
+                for name in lane
+            }
+            if environment not in drained:
                 environment = self._default_queue_environment(
                     _admission_resource_class(environment)
                 )

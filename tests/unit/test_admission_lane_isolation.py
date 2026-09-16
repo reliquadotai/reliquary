@@ -95,6 +95,7 @@ def _submission(env_name: str, *, hotkey: str = "hkA") -> dict:
 def test_cpu_environments_do_not_share_one_transport_queue():
     """Saturating one CPU environment's queue must leave the other's empty."""
     server = ValidatorServer()
+    server.set_admission_environments([_CPU_ENV_A, _CPU_ENV_B, _SANDBOX_ENV])
 
     queue_a = server._submission_queue_for_environment(_CPU_ENV_A)
     queue_b = server._submission_queue_for_environment(_CPU_ENV_B)
@@ -289,6 +290,8 @@ def test_full_neighbour_queue_does_not_reject_another_environment():
     """The miner-visible consequence: env B is admitted while env A is full."""
     server = ValidatorServer()
     server.set_current_state(WindowState.OPEN)
+    # As the service does: the environments it runs are the ones it declares.
+    server.set_admission_environments([_CPU_ENV_A, _CPU_ENV_B])
     server.set_active_batchers({
         _CPU_ENV_A: _batcher(_CPU_ENV_A),
         _CPU_ENV_B: _batcher(_CPU_ENV_B),
@@ -306,3 +309,47 @@ def test_full_neighbour_queue_does_not_reject_another_environment():
     body = response.json()
     assert body["reason"] != RejectReason.BATCH_FILLED.value, body
     assert body["accepted"] is True, body
+
+
+def test_no_queue_exists_without_a_drainer():
+    """A queue nobody drains is worse than a shared one: its items get no
+    verdict at all and hold their proof-admission reservation until the window
+    aborts. An environment outside the allocation has no drainers, so it must
+    not get a queue of its own."""
+    server = ValidatorServer()
+    server.set_admission_environments([_CPU_ENV_A])
+
+    drained = {
+        environment
+        for lane in server.admission_allocation().values()
+        for environment in lane
+    }
+    assert _CPU_ENV_B not in drained
+
+    assert (
+        server._submission_queue_for_environment(_CPU_ENV_B)
+        is server._submission_queue_for_environment(_CPU_ENV_A)
+    )
+
+
+def test_sandboxless_profile_keeps_its_sandbox_lane_off_the_cpu_queue(
+    monkeypatch,
+):
+    """End state under a profile that declares no sandbox environment: the
+    sandbox lane falls back to a synthetic key, and that key still resolves to
+    a queue of its own. Two mechanisms defend this — the key is minted at
+    construction and the allocation carries its class — so reverting either
+    one alone leaves this green; `test_empty_lane_fallback_keeps_its_own_queue`
+    is what pins the routing guard itself."""
+    import reliquary.validator.server as server_module
+
+    monkeypatch.setattr(
+        server_module, "ENVIRONMENT_MIX", [(_CPU_ENV_A, 16)],
+    )
+    server = ValidatorServer()
+
+    synthetic = server._default_queue_environment("sandbox")
+    assert synthetic == "__sandbox_lane__"
+    assert server._submission_queue_for_environment(synthetic) is not (
+        server._submission_queue_for_environment(_CPU_ENV_A)
+    )
