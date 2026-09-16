@@ -21,6 +21,8 @@ def test_core_compose_uses_docker_private_pid_default(path):
     # "private" is invalid. These roles must keep the isolated, omitted default.
     for name, service in yaml.safe_load(path.read_text())["services"].items():
         assert service.get("pid", "") == "", f"{path.name}:{name}: omit pid for isolation"
+        if path.name == "docker-compose.signer.yml":
+            assert service["mem_limit"] == "${RELIQUARY_SIGNER_MEMORY_LIMIT:-2g}"
 
 
 @pytest.mark.parametrize("role", ("cpu-executor", "signer"))

@@ -269,20 +269,11 @@ async def _default_upload(
     Returns the commit revision SHA (strong hash of the repo state).
     Runs in a thread — HfApi is sync.
     """
-    import asyncio
-    from huggingface_hub import HfApi
+    from reliquary.trainer.publisher import _default_hf_upload
 
-    def _sync_upload():
-        api = HfApi()
-        commit_info = api.upload_folder(
-            folder_path=folder_path,
-            repo_id=repo_id,
-            commit_message=commit_message,
-        )
-        # CommitInfo.oid holds the commit SHA
-        return commit_info.oid
-
-    return await asyncio.to_thread(_sync_upload)
+    return await _default_hf_upload(
+        folder_path=folder_path, repo_id=repo_id, commit_message=commit_message,
+    )
 
 
 def _default_save_hf_format(model: Any, tokenizer: Any, path: Path) -> None:

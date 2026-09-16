@@ -4032,6 +4032,9 @@ class ValidatorServer:
                 accepted=False, reason=RejectReason.BATCH_FILLED
             )
             self._complete_upload_receipt(claimed, outcome)
+            # The receipt is terminal: retrying this reveal returns its cached
+            # verdict, so do not advertise a Retry-After for the same body.
+            response.headers["X-Reliquary-Reject-Detail"] = "admission_queue_full"
             return self._record_raw_terminal(
                 claimed,
                 telemetry,
@@ -4276,7 +4279,14 @@ class ValidatorServer:
                 getattr(http_request.state, "body_completed_at", time.time())
             )
 
-            def reject(reason: RejectReason) -> SubmissionPrecommitResponse:
+            def reject(
+                reason: RejectReason, *, detail: str | None = None,
+                retry_after: int | None = None,
+            ) -> SubmissionPrecommitResponse:
+                if detail is not None:
+                    response.headers["X-Reliquary-Reject-Detail"] = detail
+                if retry_after is not None:
+                    response.headers["Retry-After"] = str(retry_after)
                 logger.warning(
                     "upload_precommit_rejected window=%d env=%s prompt=%d "
                     "hotkey=%s reason=%s payload_bytes=%d",
@@ -4338,7 +4348,10 @@ class ValidatorServer:
                 self._precommit_signature_pool is not None
                 and self._precommit_signature_inflight >= MAX_PENDING_PROOF_QUEUE_DEPTH
             ):
-                return reject(RejectReason.BATCH_FILLED)
+                return reject(
+                    RejectReason.BATCH_FILLED,
+                    detail="precommit_signature_busy", retry_after=1,
+                )
             self._precommit_signature_inflight += 1
             try:
                 signature_call = functools.partial(
@@ -4600,7 +4613,7 @@ class ValidatorServer:
                     reason = RejectReason.HASH_DUPLICATE
                 else:
                     reason = RejectReason.BATCH_FILLED
-                return reject(reason)
+                return reject(reason, detail=register_reason)
 
             remaining = max(
                 0.0,
@@ -5621,6 +5634,7 @@ class ValidatorServer:
                 self._cancel_logical_group_reservation(batcher, request)
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(hk, "proof_queue_full")
+                response.headers["X-Reliquary-Reject-Detail"] = "admission_queue_full"
                 return _cheap_reject(
                     RejectReason.BATCH_FILLED,
                     reject_stage="proof_admission",
