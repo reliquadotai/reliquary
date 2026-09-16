@@ -1394,7 +1394,6 @@ class ValidatorServer:
         # busiest environment's burst and charges the reject to whichever
         # environment arrives next, whose own budget is untouched.
         self._submit_queues: dict[str, asyncio.Queue] = {}
-        self._admission_pool_sizes: dict[str, int] = {}
         self._admission_environments: list[str] = []
         self._default_queue_environment_by_class: dict[str, str] = {}
         for _environment, _target in ENVIRONMENT_MIX:
@@ -3568,20 +3567,18 @@ class ValidatorServer:
         )
 
     def _admission_worker_count(self, environment: str) -> int:
-        recorded = self._admission_pool_sizes.get(environment)
-        if recorded is not None:
-            return recorded
+        """Processes in one environment's grading pool — its drainer count.
+
+        The two must agree: a pool larger than its drainers idles, and
+        drainers larger than their pool only queue up behind it. Reading both
+        from ``admission_allocation`` is what keeps them equal.
+        """
+        for lane in self.admission_allocation().values():
+            if environment in lane:
+                return lane[environment]
         if _admission_resource_class(environment) == "sandbox":
             return CODE_ADMISSION_WORKERS
         return MATH_ADMISSION_WORKERS
-
-    def record_admission_pool_sizes(
-        self,
-        environments: Sequence[str],
-    ) -> dict[str, int]:
-        """Fix the pool sizes for the environments a window will run."""
-        self._admission_pool_sizes = admission_pool_allocation(environments)
-        return dict(self._admission_pool_sizes)
 
     def set_admission_environments(
         self,
@@ -3589,46 +3586,46 @@ class ValidatorServer:
     ) -> None:
         """Declare the environments this validator will actually run.
 
-        Pools and their drainers are both sized from this one set. They have
-        to agree: a pool larger than its drainers idles, and drainers larger
-        than their pool only queue up behind it. ``ValidationService`` may be
-        handed a strict subset of the profile's mix, so the profile's own list
-        cannot be that set.
-
-        Pools outlive a window, so this is fixed once rather than per window —
-        a later window that named a different set would shrink the recorded
-        size without rebuilding the pool already running at the old one.
+        ``ValidationService`` may be handed a strict subset of the profile's
+        mix, so the profile's own list is not that set. Declared once and not
+        per window, because pools outlive a window: a later window naming a
+        different set would shrink the recorded size without rebuilding the
+        pool already running at the old one.
         """
         self._admission_environments = list(environments)
-        self.record_admission_pool_sizes(self._admission_environments)
 
     def _admission_environment_names(self) -> list[str]:
         if self._admission_environments:
             return list(self._admission_environments)
         return [environment for environment, _target in ENVIRONMENT_MIX]
 
-    def drainer_allocation(self) -> dict[str, int]:
-        """Queue drainers per environment, exactly as ``start`` spawns them."""
-        allocation = admission_pool_allocation(
-            self._admission_environment_names()
-        )
-        for resource_class in ("cpu", "sandbox"):
-            if not any(
-                _admission_resource_class(environment) == resource_class
-                for environment in allocation
-            ):
-                fallback = self._default_queue_environment(resource_class)
-                allocation[fallback] = (
-                    CODE_ADMISSION_WORKERS
-                    if resource_class == "sandbox" else MATH_ADMISSION_WORKERS
-                )
-        return allocation
+    def admission_allocation(self) -> dict[str, dict[str, int]]:
+        """Per-resource-class worker counts, as ``start`` spawns them.
 
-    def admission_drainer_count(self, environment: str) -> int:
-        """Queue drainers for one environment, as ``start`` will spawn them."""
-        return self.drainer_allocation().get(
-            environment, self._admission_worker_count(environment)
-        )
+        Keyed by class rather than flat, so the lane an entry belongs to is
+        carried rather than re-derived from its name — a synthetic fallback
+        name has no registry entry and would resolve to the wrong lane.
+        """
+        names = self._admission_environment_names()
+        sizes = admission_pool_allocation(names)
+        lanes: dict[str, dict[str, int]] = {}
+        for resource_class, lane_total in (
+            ("cpu", MATH_ADMISSION_WORKERS),
+            ("sandbox", CODE_ADMISSION_WORKERS),
+        ):
+            lane = {
+                environment: count
+                for environment, count in sizes.items()
+                if _admission_resource_class(environment) == resource_class
+            }
+            if not lane:
+                # No environment on this class: keep one drainer set on the
+                # class's default queue so the legacy attribute stays live.
+                lane = {
+                    self._default_queue_environment(resource_class): lane_total
+                }
+            lanes[resource_class] = lane
+        return lanes
 
     @staticmethod
     def _admission_wall_seconds(environment: str) -> float:
@@ -3700,10 +3697,6 @@ class ValidatorServer:
         """Prewarm auction workers before a candidate window becomes OPEN."""
         if not self._auction_admission_enabled:
             return
-        if not self._admission_pool_sizes:
-            # An embedder that never declared its environments: fall back to
-            # this window's set rather than leave the pools unsized.
-            self.record_admission_pool_sizes(list(batchers))
         for environment, batcher in batchers.items():
             if (
                 not getattr(batcher, "difficulty_auction_enabled", False)
@@ -3938,6 +3931,7 @@ class ValidatorServer:
             reject_stage=None if outcome.accepted else stage,
             reject_reason=None if outcome.accepted else outcome.reason.value,
             accepted_into_pool=outcome.accepted,
+            batch_filled_reason=batch_filled_reason,
         )
         return outcome
 
@@ -5496,10 +5490,7 @@ class ValidatorServer:
                     telemetry=telemetry,
                     reject_stage=reject_stage,
                     accepted_into_pool=False,
-                    batch_filled_reason=(
-                        extra.get("batch_filled_reason")
-                        if reason is RejectReason.BATCH_FILLED else None
-                    ),
+                    batch_filled_reason=extra.get("batch_filled_reason"),
                 )
                 log_submission_stage(
                     logger,
@@ -5598,13 +5589,11 @@ class ValidatorServer:
                 return _cheap_reject(
                     RejectReason.PROMPT_IN_COOLDOWN,
                     reject_stage="cooldown",
-                    batch_filled_reason="prompt_in_cooldown",
                 )
             if batcher.prompt_submission_count(request.prompt_idx) >= MAX_SUBMISSIONS_PER_PROMPT:
                 return _cheap_reject(
                     RejectReason.PROMPT_FULL,
                     reject_stage="prompt_capacity",
-                    batch_filled_reason="prompt_duplicate_or_full",
                 )
 
             # Materialize the exact prompt before reserving proof work. This
@@ -6640,6 +6629,12 @@ class ValidatorServer:
                 telemetry,
                 response,
                 stage=reject_stage,
+                # Both auction sites that answer BATCH_FILLED do so because
+                # the window already began its seal snapshot.
+                batch_filled_reason=(
+                    "batch_already_sealed_or_draining"
+                    if response.reason is RejectReason.BATCH_FILLED else None
+                ),
             )
             self._admission_active_by_environment[environment] = max(
                 0,
@@ -7077,15 +7072,10 @@ class ValidatorServer:
         # Each environment's queue needs its own drainers: a lane's workers are
         # split across the environments on it, never multiplied by them.
         extra_workers: list[asyncio.Task[Any]] = []
-        allocation = self.drainer_allocation()
+        allocation = self.admission_allocation()
         for resource_class, label in (("cpu", "math"), ("sandbox", "code")):
             index = 0
-            lane = {
-                environment: count
-                for environment, count in allocation.items()
-                if _admission_resource_class(environment) == resource_class
-            }
-            for environment, worker_count in lane.items():
+            for environment, worker_count in allocation[resource_class].items():
                 queue = self._submission_queue_for_environment(environment)
                 for _ in range(worker_count):
                     task = asyncio.create_task(

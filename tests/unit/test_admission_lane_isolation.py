@@ -203,8 +203,8 @@ def test_single_environment_lane_keeps_its_whole_pool():
     assert sizes == {"openmathinstruct": MATH_ADMISSION_WORKERS}
 
 
-def test_recorded_pool_allocation_shrinks_a_crowded_lane():
-    """The sizing the window recorded is what pool construction then uses."""
+def test_declared_environments_shrink_a_crowded_lane():
+    """Four cpu environments share the cpu budget rather than take it each."""
     server = ValidatorServer()
     lane = [
         "openmathinstruct",
@@ -213,7 +213,7 @@ def test_recorded_pool_allocation_shrinks_a_crowded_lane():
         "reliquary_stateful_tools_v1",
     ]
 
-    server.record_admission_pool_sizes(lane)
+    server.set_admission_environments(lane)
 
     assert sum(server._admission_worker_count(env) for env in lane) == 8
     assert server._admission_worker_count("openmathinstruct") == 2
@@ -221,22 +221,36 @@ def test_recorded_pool_allocation_shrinks_a_crowded_lane():
 
 def test_drainers_and_pool_processes_agree_per_environment():
     """A pool larger than its drainers idles; drainers larger than their pool
-    queue up behind it. The two allocations must come from one environment
-    set, and `ValidationService` can be given a strict subset of the profile's
-    mix — so the profile's list is not that set."""
+    queue up behind it. Both read one allocation, and `ValidationService` can
+    be given a strict subset of the profile's mix — so the profile's list is
+    not that set."""
     server = ValidatorServer()
     running = ["openmathinstruct", "reliquarylogic_v1"]
 
     server.set_admission_environments(running)
 
-    # `drainer_allocation` is what `start` spawns from; `_admission_worker_count`
-    # is what pool construction reads. Two sources, one number.
-    allocation = server.drainer_allocation()
+    # `admission_allocation` is what `start` spawns from; `_admission_worker_count`
+    # is what pool construction reads.
+    cpu_lane = server.admission_allocation()["cpu"]
     for environment in running:
-        assert allocation[environment] == 4
+        assert cpu_lane[environment] == 4
         assert server._admission_worker_count(environment) == 4
     # An environment the validator does not run gets no drainers at all.
-    assert "reliquaryverifiable_v1" not in allocation
+    assert "reliquaryverifiable_v1" not in cpu_lane
+
+
+def test_empty_lane_fallback_stays_on_its_own_lane():
+    """A profile with no sandbox environment must not park sandbox drainers on
+    the cpu queue: the synthetic name has no registry entry, so its class
+    cannot be recovered from the name."""
+    server = ValidatorServer()
+
+    server.set_admission_environments(["openmathinstruct"])
+    allocation = server.admission_allocation()
+
+    assert list(allocation["cpu"]) == ["openmathinstruct"]
+    assert allocation["sandbox"], "sandbox lane lost its drainers"
+    assert not set(allocation["cpu"]) & set(allocation["sandbox"])
 
 
 def test_admission_environments_default_to_the_profile_mix():
@@ -246,7 +260,7 @@ def test_admission_environments_default_to_the_profile_mix():
     server = ValidatorServer()
 
     assert (
-        server.admission_drainer_count("openmathinstruct")
+        server._admission_worker_count("openmathinstruct")
         == MATH_ADMISSION_WORKERS
     )
 

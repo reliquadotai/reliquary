@@ -368,7 +368,7 @@ def test_batch_filled_reject_reason_exists():
 
 
 @pytest.mark.asyncio
-async def test_worker_proof_admission_reject_names_its_reason():
+async def test_worker_proof_admission_reject_names_its_reason(monkeypatch):
     """Production runs the async worker, not the synchronous /submit path.
 
     A hotkey locked out by proof-failure debt is refused here, and the
@@ -384,7 +384,10 @@ async def test_worker_proof_admission_reject_names_its_reason():
     def _refuse(self, request):
         return False, "proof_failure_debt_hotkey"
 
-    type(batcher).start_proof_admission = _refuse
+    # ``_start_proof_admission`` resolves the method on the class, and this is
+    # the real GrpoWindowBatcher — monkeypatch restores it, a bare setattr
+    # would leave production bounds disabled for the rest of the session.
+    monkeypatch.setattr(GrpoWindowBatcher, "start_proof_admission", _refuse)
     s.set_active_batcher(batcher)
 
     rollouts = [
@@ -416,7 +419,6 @@ async def test_worker_proof_admission_reject_names_its_reason():
             await worker
         except asyncio.CancelledError:
             pass
-    delattr(type(batcher), "start_proof_admission")
 
     verdicts = list(s._verdicts.get("hkDebt", []))
     assert verdicts, "worker recorded no verdict"
