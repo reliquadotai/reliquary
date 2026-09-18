@@ -33,6 +33,30 @@ from reliquary.environment.agentic.base import EpisodeEnvironment
 AdmissionResourceClass = Literal["cpu", "sandbox"]
 TerminationPolicy = Literal["eos_or_cap", "math_bft"]
 FinalAnswerPolicy = Literal["boxed", "fenced_python", "json"]
+
+# Single-turn contracts qualified to cross the external boundary. The name is
+# not decorative: `verify_external_artifact` refuses a wheel whose artifact
+# declares a different contract from its spec, so this set is exactly what a
+# reviewer has looked at.
+#
+# What a contract is free to choose is how its answer is read — a typed JSON
+# object, the last boxed span, free text put to deterministic verifiers. What
+# none of them may change is the binary lattice, and that is not taste: the
+# reward a wheel returns is checked against `attainable_rewards` at grading
+# time, and with two values that check is total. It is also what keeps the
+# robust-utility enumeration cheap, since an uncertain rollout is priced under
+# every value the lattice allows.
+#
+# Fractional rewards are deliberately still outside. They would need the
+# lattice itself to come from the wheel, and the materials relay to carry it,
+# which is a wider change than a name.
+EXTERNAL_SINGLE_TURN_CONTRACTS = frozenset(
+    {
+        "reliquary/answer-json/v1",
+        "reliquary/boxed-answer/v1",
+        "reliquary/checked-answer/v1",
+    }
+)
 InteractionMode = Literal["single_turn", "episode"]
 
 
@@ -130,14 +154,20 @@ class EnvironmentSpec:
                 raise ValueError(
                     "external environments require a manifest digest"
                 )
-            if self.interaction_mode == "single_turn" and (
-                self.contract_version != "reliquary/answer-json/v1"
-                or self.final_answer_policy != "json"
-                or not self.validator_authoritative_reward
-                or self.reward_lattice_policy != "binary-v1"
-                or self.attainable_rewards != (0.0, 1.0)
-            ):
-                raise ValueError("external single-turn environments require answer-json/v1 binary rewards")
+            if self.interaction_mode == "single_turn":
+                if self.contract_version not in EXTERNAL_SINGLE_TURN_CONTRACTS:
+                    raise ValueError(
+                        "external single-turn contract is not one of "
+                        f"{sorted(EXTERNAL_SINGLE_TURN_CONTRACTS)}"
+                    )
+                if (
+                    not self.validator_authoritative_reward
+                    or self.reward_lattice_policy != "binary-v1"
+                    or self.attainable_rewards != (0.0, 1.0)
+                ):
+                    raise ValueError(
+                        "external single-turn environments require binary rewards"
+                    )
 
     def create(self) -> Environment | EpisodeEnvironment:
         if self.required_data_env_var and not os.environ.get(
@@ -687,6 +717,7 @@ def resolve_environment_mix(
 
 
 __all__ = [
+    "EXTERNAL_SINGLE_TURN_CONTRACTS",
     "ENVIRONMENT_SPECS",
     "EnvironmentSpec",
     "InteractionMode",

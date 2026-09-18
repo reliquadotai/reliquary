@@ -517,7 +517,11 @@ class ExternalAnswerEnvironment:
     """
 
     def __init__(self, backend: Any, spec: EnvironmentSpec) -> None:
-        if spec.contract_version != "reliquary/answer-json/v1":
+        from reliquary.environment.registry import (
+            EXTERNAL_SINGLE_TURN_CONTRACTS,
+        )
+
+        if spec.contract_version not in EXTERNAL_SINGLE_TURN_CONTRACTS:
             raise ValueError("unsupported external single-turn contract")
         for method in ("__len__", "task", "grade"):
             if not callable(getattr(backend, method, None)):
