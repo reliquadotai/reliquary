@@ -133,3 +133,22 @@ def test_each_environment_shows_its_own_price():
         "openmathinstruct": {"value": 0.6, "regime": "descend"},
         "opencodeinstruct": {"value": 0.7, "regime": "hold"},
     }
+
+
+def test_the_fill_target_follows_the_denominator_the_controller_divides_by():
+    """A window that reports its own training span is judged against THAT span,
+    so the target a miner reads has to be the same one -- not the window's
+    duration, which is longer and would advertise a target nobody is held to."""
+    outcomes = [
+        WindowOutcome(
+            open_round=1000 + i * 336,
+            close_round=1000 + i * 336 + 244,
+            collect_ready_round=1000 + i * 336 + 25,
+            incompressible_rounds=200.0,
+        )
+        for i in range(6)
+    ]
+
+    view = _view(_shadow(), outcomes)
+
+    assert view["fill_target_seconds"] == pytest.approx(0.80 * 200 * ROUND_SECONDS)
