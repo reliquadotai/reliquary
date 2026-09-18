@@ -951,6 +951,23 @@ DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
 # 14M-prompt env supplies enough fresh material without needing reuse.
 BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
 
+
+def prompt_cooldown_windows_for_environment(environment: str) -> int:
+    """The cooldown this environment declares, or the global default.
+
+    The default above was sized for a 14M-prompt corpus, where a million
+    windows means "single use for the life of the run". A curated corpus turns
+    that into starvation rather than rotation: at eight prompts per window a
+    2,285-task environment is spent in three days and then serves nothing at
+    all. An environment that knows its corpus is small says so in the profile.
+    """
+
+    profile = ACTIVE_PROTOCOL_PROFILE.environments.get(environment)
+    declared = getattr(profile, "prompt_cooldown_windows", None)
+    if declared is None:
+        return BATCH_PROMPT_COOLDOWN_WINDOWS
+    return int(declared)
+
 # Cooldown is restored at startup from a run-keyed snapshot persisted to R2
 # (see CooldownMap.export_state + service._restore_cooldown), so the FULL
 # cooldown survives a restart without replaying the whole

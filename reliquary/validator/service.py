@@ -21,7 +21,6 @@ from reliquary.constants import (
     AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS,
     AUCTION_EARLY_CLOSE_MIN_SECONDS,
     AUCTION_EARLY_CLOSE_MODE,
-    BATCH_PROMPT_COOLDOWN_WINDOWS,
     COOLDOWN_REBUILD_LOOKBACK,
     COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS,
     TASK_ID,
@@ -104,6 +103,7 @@ from reliquary.constants import (
     WINDOW_COLLECTION_SECONDS,
     WINDOW_TIMEOUT_SECONDS,
     CODE_ADMISSION_WORKERS,
+    prompt_cooldown_windows_for_environment,
 )
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
@@ -947,13 +947,18 @@ class ValidationService:
         self._windows_in_interval: int = 0
         # One CooldownMap per env so prompt-cooldown is independent across
         # environments (a math prompt cooling down doesn't block code prompts).
+        # The horizon is per env too: the maps were always separate, but they
+        # shared one value sized for a 14M-prompt corpus, which a curated one
+        # turns from rotation into starvation.
         self._cooldown_per_env: dict[str, CooldownMap] = {
-            name: CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+            name: CooldownMap(
+                cooldown_windows=prompt_cooldown_windows_for_environment(name)
+            )
             for name in self.envs
         }
         self._content_cooldown_per_env: dict[str, ContentCooldownMap] = {
             name: ContentCooldownMap(
-                cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
+                cooldown_windows=prompt_cooldown_windows_for_environment(name)
             )
             for name in self.envs
         }

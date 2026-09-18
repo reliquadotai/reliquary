@@ -138,10 +138,30 @@ class EnvironmentProfile:
     # Present only for the Episode v1 fork. Historical profiles omit this
     # field and therefore retain their exact generation-contract bytes.
     episode: EpisodeProfile | None = None
+    # How many windows a prompt of THIS environment sits out after it has been
+    # trained on. `None` keeps BATCH_PROMPT_COOLDOWN_WINDOWS, so every
+    # historical profile is unchanged.
+    #
+    # The global default was sized for OpenMathInstruct's 14M prompts, where
+    # one million windows means "single use for the life of any real run". A
+    # curated corpus breaks that: at eight prompts per window, 2,285 tasks are
+    # exhausted in three days and the environment then serves nothing. The
+    # value is declared rather than derived from the corpus at runtime — every
+    # validator has to agree on which prompts are eligible, and a length read
+    # from an installed wheel is not something consensus can rest on.
+    #
+    # The rule the numbers come from: one full pass through the corpus before
+    # any prompt returns, i.e. `min(default, virtual_length // batch_target)`,
+    # computed once here where it can be reviewed.
+    prompt_cooldown_windows: int | None = None
 
     def __post_init__(self) -> None:
         if int(self.max_new_tokens) <= 0:
             raise ValueError("environment max_new_tokens must be positive")
+        if self.prompt_cooldown_windows is not None and (
+            int(self.prompt_cooldown_windows) <= 0
+        ):
+            raise ValueError("environment prompt_cooldown_windows must be positive")
         if self.batch_target is not None and int(self.batch_target) <= 0:
             raise ValueError("environment batch_target must be positive")
         if bool(self.environment_contract_id) != bool(
@@ -243,6 +263,10 @@ class ProtocolProfile:
                 )
             if environment.batch_target is not None:
                 environment_contract["batch_target"] = environment.batch_target
+            if environment.prompt_cooldown_windows is not None:
+                environment_contract["prompt_cooldown_windows"] = (
+                    environment.prompt_cooldown_windows
+                )
             if environment.environment_contract_id is not None:
                 environment_contract["environment_contract_id"] = (
                     environment.environment_contract_id
