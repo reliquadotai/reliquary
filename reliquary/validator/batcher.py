@@ -3719,7 +3719,11 @@ class GrpoWindowBatcher:
         )
         if callable(cases_loader):
             reward_materials = cases_loader(problem)
-            if getattr(self.env, "name", "") == "opencodeinstruct":
+            # `code_cases` is the older, narrower channel; what fills it is the
+            # environment asking for the sandbox, not its name. The name test
+            # this replaces would never have matched a packaged code
+            # environment, which is the same environment under another name.
+            if spec is not None and spec.admission_resource_class == "sandbox":
                 code_cases = list(reward_materials)
         return AdmissionProblemMaterials(
             problem=dict(problem),

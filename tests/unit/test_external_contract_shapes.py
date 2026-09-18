@@ -73,7 +73,7 @@ def test_fractional_rewards_are_still_outside() -> None:
 
 
 def test_a_reward_the_validator_does_not_own_is_refused() -> None:
-    with pytest.raises(ValueError, match="binary rewards"):
+    with pytest.raises(ValueError, match="validator authoritative"):
         _spec(validator_authoritative_reward=False)
 
 

@@ -556,6 +556,48 @@ class ExternalAnswerEnvironment:
                 "environment": self.name, "generator_index": normalized,
                 "metadata": dict(raw["metadata"])}
 
+    def admission_reward_cases(self, problem: dict) -> list[dict[str, Any]]:
+        """Hand this repository the cases a reward is computed from.
+
+        The relay exists so a packaged environment can supply what it knows —
+        the corpus, the task, the cases — while execution stays here, behind
+        the sandbox. A wheel grading its own Python would be running
+        model-written code behind its own rlimits, which its own README says
+        is not a containment boundary.
+
+        Validated like every other crossing: the problem is reconstructed from
+        its index before the backend is asked, so a caller cannot hand in a
+        problem the environment never issued and read back somebody else's
+        cases.
+        """
+        index = problem.get("generator_index")
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+            or problem != self.get_problem(index)
+        ):
+            return []
+        loader = getattr(self._backend, "admission_reward_cases", None)
+        if not callable(loader):
+            raise TypeError(
+                "external environment is missing admission_reward_cases()"
+            )
+        cases = loader(index)
+        if not isinstance(cases, list):
+            raise TypeError("external reward materials must be a list")
+        materials: list[dict[str, Any]] = []
+        for case in cases:
+            if not isinstance(case, Mapping):
+                raise TypeError("each external reward material must be an object")
+            # Canonicalised on the way through: these bytes reach a content
+            # digest, so insertion order must not be able to change identity.
+            canonical_json(dict(case))
+            materials.append(dict(case))
+        if not materials:
+            raise ValueError("external reward materials must not be empty")
+        return materials
+
     def compute_reward(self, problem: dict, completion: str) -> float:
         index = problem.get("generator_index")
         if (not isinstance(index, int) or isinstance(index, bool) or index < 0
@@ -565,8 +607,18 @@ class ExternalAnswerEnvironment:
                       name="external answer reward",
                       required={"reward", "success", "state_digest"})
         reward = _number(raw["reward"], name="external answer reward")
-        if reward not in self._spec.attainable_rewards:
-            raise ValueError("external answer reward is outside its declared lattice")
+        # A materials environment declares no fixed lattice, because the one
+        # that applies is derived here from the case count. Its own grade is
+        # still worth bounding to the unit interval — it is what replay
+        # compares against — but membership is not a question that has an
+        # answer before the cases are known.
+        if self._spec.attainable_rewards:
+            if reward not in self._spec.attainable_rewards:
+                raise ValueError(
+                    "external answer reward is outside its declared lattice"
+                )
+        elif not 0.0 <= reward <= 1.0:
+            raise ValueError("external answer reward is outside [0, 1]")
         if not isinstance(raw["success"], bool) or raw["success"] != (reward == 1.0):
             raise ValueError("external answer success and reward disagree")
         _digest(raw["state_digest"], name="external answer state digest")

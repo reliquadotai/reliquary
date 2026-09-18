@@ -55,9 +55,66 @@ EXTERNAL_SINGLE_TURN_CONTRACTS = frozenset(
         "reliquary/answer-json/v1",
         "reliquary/boxed-answer/v1",
         "reliquary/checked-answer/v1",
+        "reliquary/python-cases/v1",
     }
 )
+
+# The one relay name an external environment may expose for its reward
+# materials. Named rather than free-form: the wrapper has to define it, and a
+# spec that asked for anything else would silently get no materials at all —
+# `getattr` would return None and the lattice would collapse to a single point.
+EXTERNAL_REWARD_MATERIALIZER = "admission_reward_cases"
 InteractionMode = Literal["single_turn", "episode"]
+
+
+def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
+    """An external environment either grades itself or hands over materials.
+
+    **Grades itself.** The wheel returns the reward and this repository checks
+    it against a fixed lattice at grading time. That check is what makes
+    trusting the package bounded, so the lattice has to be binary: two values
+    make membership total, and an uncertain rollout is priced under every value
+    the lattice allows, which stays cheap at two.
+
+    **Hands over materials.** The wheel supplies the cases; this repository
+    executes them and computes the reward, so there is no foreign reward to
+    bound and the lattice is derived here from the case count. It is the shape
+    a code environment needs, and it is the shape that keeps execution inside
+    the sandbox: a package that graded its own Python would be running
+    model-written code behind its own rlimits instead of behind gVisor.
+
+    Nothing else is admitted. A wheel that both graded itself and declared a
+    fractional lattice would be handing back a number this repository has no
+    way to bound.
+    """
+
+    binary = (
+        spec.reward_lattice_policy == "binary-v1"
+        and spec.attainable_rewards == (0.0, 1.0)
+        and spec.reward_materializer_method is None
+    )
+    if binary:
+        return
+    materials = (
+        spec.reward_materializer_method == EXTERNAL_REWARD_MATERIALIZER
+        and not spec.attainable_rewards
+    )
+    if not materials:
+        raise ValueError(
+            "an external single-turn environment must either declare binary "
+            "rewards or hand over reward materials named "
+            f"{EXTERNAL_REWARD_MATERIALIZER!r}"
+        )
+    if spec.scorer_path.endswith(":score_external_answers"):
+        raise ValueError(
+            "an environment that hands over materials must be scored here, "
+            "not by the wheel that supplied them"
+        )
+    if spec.admission_resource_class != "sandbox":
+        raise ValueError(
+            "reward materials are executed, so the environment must ask for "
+            "the sandbox"
+        )
 
 
 def _import_attribute(path: str) -> Any:
@@ -160,14 +217,11 @@ class EnvironmentSpec:
                         "external single-turn contract is not one of "
                         f"{sorted(EXTERNAL_SINGLE_TURN_CONTRACTS)}"
                     )
-                if (
-                    not self.validator_authoritative_reward
-                    or self.reward_lattice_policy != "binary-v1"
-                    or self.attainable_rewards != (0.0, 1.0)
-                ):
+                if not self.validator_authoritative_reward:
                     raise ValueError(
-                        "external single-turn environments require binary rewards"
+                        "an external reward must be validator authoritative"
                     )
+                _validate_external_reward_shape(self)
 
     def create(self) -> Environment | EpisodeEnvironment:
         if self.required_data_env_var and not os.environ.get(
@@ -717,6 +771,7 @@ def resolve_environment_mix(
 
 
 __all__ = [
+    "EXTERNAL_REWARD_MATERIALIZER",
     "EXTERNAL_SINGLE_TURN_CONTRACTS",
     "ENVIRONMENT_SPECS",
     "EnvironmentSpec",
