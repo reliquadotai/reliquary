@@ -970,9 +970,11 @@ def _bft_training_metrics(plan) -> dict[str, float | int]:
 # Per-rollout loss (forward-pass heavy — uses the model)
 # ---------------------------------------------------------------------------
 
-# Row-chunk for selected-logprob streaming. With Qwen3.5 vocab=248320:
-#   chunk × vocab × 4 bytes = 64 × 248320 × 4 ≈ 61 MiB peak fp32 alloc per chunk.
-_LOGPROB_CHUNK = 64
+# Row-chunk for selected-logprob streaming. Each chunk re-reads the whole
+# lm_head weight for however few rows it serves, pinning its arithmetic
+# intensity at 2 × chunk FLOP/byte — under an H100's ~295 ridge the GEMM is
+# bandwidth-bound, which 64 was. 512 clears it and the curve is flat past that.
+_LOGPROB_CHUNK = 512
 
 
 def _logprob_block(logits_slice: torch.Tensor, indices_slice: torch.Tensor) -> torch.Tensor:

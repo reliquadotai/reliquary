@@ -22,6 +22,7 @@ from reliquary.validator.training import (
     TrainingStepSkipped, _rollout_loss, train_step,
     reset_training_state,
     _selected_logprobs, _selected_logprobs_for_tokens,
+    _selected_logprobs_from_hidden,
 )
 
 
@@ -40,14 +41,16 @@ def test_selected_logprobs_matches_log_softmax_gather():
     """
     import torch.nn.functional as F
     torch.manual_seed(0)
-    N, V = 200, 1024  # picks a non-multiple of chunk=64 to exercise the tail
+    # chunk is pinned here, not inherited: N must stay a non-multiple of it so
+    # the tail path runs whatever the production default happens to be.
+    N, V, chunk = 200, 1024, 64
     logits = torch.randn(N, V, dtype=torch.bfloat16, requires_grad=True)
     indices = torch.randint(0, V, (N,))
 
     expected = F.log_softmax(logits.float(), dim=-1).gather(
         1, indices.unsqueeze(1)
     ).squeeze(1)
-    got = _selected_logprobs(logits, indices)
+    got = _selected_logprobs(logits, indices, chunk=chunk)
 
     assert got.shape == expected.shape
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
@@ -59,7 +62,7 @@ def test_selected_logprobs_backward_matches_reference():
     """
     import torch.nn.functional as F
     torch.manual_seed(1)
-    N, V = 130, 512
+    N, V, chunk = 130, 512, 64  # non-multiple of chunk: exercises the tail
     logits_a = torch.randn(N, V, dtype=torch.float32, requires_grad=True)
     logits_b = logits_a.detach().clone().requires_grad_(True)
     indices = torch.randint(0, V, (N,))
@@ -67,9 +70,27 @@ def test_selected_logprobs_backward_matches_reference():
     F.log_softmax(logits_a, dim=-1).gather(
         1, indices.unsqueeze(1)
     ).squeeze(1).sum().backward()
-    _selected_logprobs(logits_b, indices).sum().backward()
+    _selected_logprobs(logits_b, indices, chunk=chunk).sum().backward()
 
     torch.testing.assert_close(logits_a.grad, logits_b.grad, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 64, 512, 4096])
+def test_selected_logprobs_from_hidden_is_chunk_invariant(chunk):
+    """The row-chunk is a performance knob only: every row's logsumexp covers
+    the whole vocabulary, so no chunking can change what a row returns.
+    """
+    torch.manual_seed(2)
+    N, H, V = 130, 8, 64
+    lm_head = torch.nn.Linear(H, V, bias=False)
+    hidden = torch.randn(N, H, requires_grad=True)
+    indices = torch.randint(0, V, (N,))
+
+    reference = _selected_logprobs_from_hidden(hidden, indices, lm_head, chunk=N)
+    got = _selected_logprobs_from_hidden(hidden, indices, lm_head, chunk=chunk)
+
+    assert got.shape == (N,)
+    torch.testing.assert_close(got, reference, rtol=1e-6, atol=1e-6)
 
 
 def test_qwen_like_selected_logprobs_uses_hidden_lm_head_path():
