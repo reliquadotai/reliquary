@@ -30,12 +30,14 @@ class _Batcher:
         open_round: int | None = None,
         seal_round: int | None = None,
         close_round: int | None = None,
+        first_pick_round: int | None = None,
     ) -> None:
         if submissions_per_prompt is not None:
             self._submissions_per_prompt = submissions_per_prompt
         self.window_open_drand_round = open_round
         self._seal_trigger_round = seal_round
         self.window_close_drand_round = close_round
+        self.window_first_pick_drand_round = first_pick_round
 
 
 def _target_for(_env_name, _batcher) -> int:
@@ -175,4 +177,41 @@ def test_a_real_v6_window_carries_a_complete_signal_after_its_last_pick(monkeypa
         "window_close_round": close_round,
         "collect_ready_round": open_round + 5,
         "collect_ready_round_by_environment": {"openmathinstruct": open_round + 5},
+        # The only pick left 60 s before the close, and a round is 3 s.
+        "training_rounds": 20,
     }
+
+
+def test_the_training_span_runs_from_the_earliest_pick_to_the_close():
+    """Environments pick in lockstep but not in the same instant, and the
+    trainer has been busy since the first of them: the earliest pick is where
+    the window's training span starts."""
+    math = _Batcher(
+        {7: [_Pending(1005)], 9: [_Pending(1020)]},
+        open_round=1000,
+        close_round=1100,
+        first_pick_round=1040,
+    )
+    code = _Batcher(
+        {7: [_Pending(1005)], 9: [_Pending(1020)]},
+        open_round=1000,
+        close_round=1100,
+        first_pick_round=1030,
+    )
+
+    signal = _window_price_signal(math, {"math": math, "code": code}, _target_for)
+
+    assert signal["training_rounds"] == 70
+
+
+def test_a_window_no_environment_picked_reports_no_training_span():
+    batcher = _Batcher(
+        {7: [_Pending(1005)], 9: [_Pending(1020)]},
+        open_round=1000,
+        close_round=1100,
+        first_pick_round=None,
+    )
+
+    signal = _window_price_signal(batcher, {"math": batcher}, _target_for)
+
+    assert "training_rounds" not in signal

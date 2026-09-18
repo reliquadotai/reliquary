@@ -118,3 +118,46 @@ def test_the_signal_carries_both_the_scalar_and_the_map():
     # The scalar is the slowest environment, as before; the map is per env.
     assert fields["collect_ready_round"] == 130
     assert fields["collect_ready_round_by_environment"] == {"math": 110, "code": 130}
+
+
+def test_a_window_that_picked_reports_its_training_span():
+    """``r``'s denominator should be the time we spend training a window, not
+    the window's whole duration -- which also contains the collection ``r``
+    measures."""
+    fields = price_signal_fields(
+        open_round=1000,
+        close_round=1100,
+        arrivals_by_environment={"openmathinstruct": {7: [1010], 9: [1020]}},
+        targets_by_environment={"openmathinstruct": 2},
+        first_pick_round=1030,
+    )
+
+    assert fields["training_rounds"] == 70
+
+
+def test_a_window_that_never_picked_reports_no_training_span():
+    """No pick means no training happened, so the archive stays silent and the
+    reader falls back to the window's own span."""
+    fields = price_signal_fields(
+        open_round=1000,
+        close_round=1100,
+        arrivals_by_environment={"openmathinstruct": {7: [1010], 9: [1020]}},
+        targets_by_environment={"openmathinstruct": 2},
+        first_pick_round=None,
+    )
+
+    assert "training_rounds" not in fields
+
+
+def test_a_pick_at_the_close_reports_no_training_span():
+    """A non-positive span is not a measurement; it must not be archived as
+    one, because the reader treats any positive value as authoritative."""
+    fields = price_signal_fields(
+        open_round=1000,
+        close_round=1100,
+        arrivals_by_environment={"openmathinstruct": {7: [1010], 9: [1020]}},
+        targets_by_environment={"openmathinstruct": 2},
+        first_pick_round=1100,
+    )
+
+    assert "training_rounds" not in fields

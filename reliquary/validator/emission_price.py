@@ -401,13 +401,12 @@ def outcome_from_archive(record: Mapping[str, Any]) -> WindowOutcome | None:
         float(record.get("training_rounds") or 0.0),
         float(record.get("validation_rounds") or 0.0),
     )
-    # A fill-closed window closes when the LAST constraint is lifted, so its
-    # span IS max(t_collect, t_stages) -- the denominator r wants, for free,
-    # where per-stage timing does not exist in the window loop at all today.
-    # The ratio it yields is capped at 1 and so cannot report how far past the
-    # stages collection ran; that costs the controller nothing (it has no
-    # raise-on-slow regime -- shortage is a window that never filled), and real
-    # stage timings sharpen it without a schema change.
+    # ``training_rounds`` is the window's first pick to its close: the time the
+    # trainer actually spent consuming it, which is what r wants. The fallback
+    # is the window's whole span, carried by every archive written before that
+    # field existed. That span also contains the collection r measures, so
+    # while arrivals come in a burst it reads LOW and the controller keeps
+    # cutting past a price collection had already matched.
     incompressible = measured if measured > 0 else float(close_round - open_round)
     if record.get("window_status") == "timed_out":
         # ``collect_ready_round`` is built from ADMITTED candidates, while a
@@ -663,13 +662,19 @@ def price_signal_fields(
     close_round: int | None,
     arrivals_by_environment: Mapping[str, Mapping[int, Sequence[int]]] | None,
     targets_by_environment: Mapping[str, int],
+    first_pick_round: int | None = None,
 ) -> dict[str, Any] | None:
-    """The three fields a window contributes to the archive, or None.
+    """The fields a window contributes to the archive, or None.
 
-    They travel together or not at all. A record carrying the window bounds but
-    not the readiness reads as a SHORTAGE -- the one regime that needs no
-    confirmation and snaps the price up -- when all that happened is that the
-    validator could not measure. Silence has to look like silence.
+    The window bounds and the readiness travel together or not at all. A record
+    carrying the bounds but not the readiness reads as a SHORTAGE -- the one
+    regime that needs no confirmation and snaps the price up -- when all that
+    happened is that the validator could not measure. Silence has to look like
+    silence.
+
+    ``training_rounds`` is the exception: it is optional, and its absence means
+    "fall back to the window's span", which is what every archive written
+    before it existed already means.
 
     An explicit ``collect_ready_round: None`` INSIDE a complete record is the
     opposite: measured, and it did not fill. That is real news and it travels.
@@ -680,7 +685,7 @@ def price_signal_fields(
         environment: distinct_prompt_arrival_rounds(arrivals)
         for environment, arrivals in arrivals_by_environment.items()
     }
-    return {
+    fields: dict[str, Any] = {
         "window_open_round": int(open_round),
         "window_close_round": int(close_round),
         "collect_ready_round": window_ready_round(
@@ -691,6 +696,14 @@ def price_signal_fields(
             collapsed, targets_by_environment
         ),
     }
+    # Absent rather than zero when nothing was picked: the reader treats any
+    # positive value as authoritative, and a window that trained nothing has
+    # no training span to report.
+    if first_pick_round is not None:
+        training_rounds = int(close_round) - int(first_pick_round)
+        if training_rounds > 0:
+            fields["training_rounds"] = training_rounds
+    return fields
 
 
 # Versioned in the image on purpose, and deliberately NOT in constants.py: the
