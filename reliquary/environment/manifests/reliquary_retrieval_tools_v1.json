@@ -29,7 +29,7 @@
     "reliquary/environment/agentic/suite.py",
     "reliquary/environment/agentic/types.py"
   ],
-  "implementation_sha256": "cce2e89999e1c9ae79d206f6d6fbec49661897e4d2c18559269376cc09a62bd1",
+  "implementation_sha256": "a499ad21334f43b41e7c15eb0669725538e4fa1256deb914b2d46532cf90f8f6",
   "source": "Reliquary-authored procedural frozen document collections",
   "external_data": false,
   "network_required": false,

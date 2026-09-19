@@ -1282,7 +1282,7 @@ class MiningEngine:
     ) -> list[dict]:
         """Generate M complete canonical episodes, one turn at a time."""
 
-        from reliquary.environment.agentic.renderer import CanonicalEpisodeRenderer
+        from reliquary.environment.agentic.renderers import renderer_for
         from reliquary.environment.agentic.runner import EpisodeRunner
         from reliquary.miner.episode_policy import HFEpisodePolicy
 
@@ -1294,7 +1294,11 @@ class MiningEngine:
             encoded = self.tokenizer.encode(text, add_special_tokens=False)
             return list(getattr(encoded, "ids", encoded))
 
-        renderer = CanonicalEpisodeRenderer(encode)
+        # The environment's declared dialect — the same lookup the validator
+        # uses to re-render this episode, so the two sides cannot disagree about
+        # which renderer produced the transcript it compares byte for byte.
+        renderer_id = str(get_environment_spec(env.name).renderer_id)
+        renderer = renderer_for(renderer_id, encode)
         task = env.get_task(prompt_idx)
         hotkey = self.wallet.hotkey.ss58_address
         generations: list[dict] = []
@@ -1327,6 +1331,7 @@ class MiningEngine:
                 "prompt_length": int(trace.assistant_spans[0][0]),
                 "forced": False,
                 "trace": trace,
+                "renderer_id": renderer_id,
             })
         return generations
 
@@ -1420,7 +1425,9 @@ class MiningEngine:
                 raise RuntimeError("episode trace has no reward report")
             episode = {
                 "schema_version": trace.schema,
-                "renderer_id": "reliquary-jsonl-tools-v1",
+                # What this episode was actually rendered with, recorded when
+                # the renderer was chosen rather than restated here.
+                "renderer_id": generation["renderer_id"],
                 "task_id": trace.task_id,
                 "seed": trace.seed,
                 "actions": [action.to_wire() for action in trace.actions],

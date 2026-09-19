@@ -539,8 +539,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "3725a5ec6186702d3f387c2a8cb174ff"
-            "ce672dc3efe9b877460a8454e775db2e"
+            "0f490881544ba065bf33b974032adbc3"
+            "f844d2c3978bcd6ca8dbb7089baa8f18"
         ),
     ),
     EnvironmentSpec(
@@ -588,8 +588,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "94095ba52ae58895f19b99bc9d605d8"
-            "a3b6cdea55118af1b857ed42d484072c0"
+            "1c53afdf6acc59dd7df0693b7486e47"
+            "de94d79977404841d1368ffb2571c0c7d"
         ),
     ),
     EnvironmentSpec(
@@ -613,8 +613,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "9f888c49e5d1775f0f83314a0177ee5"
-            "562c9e4858b8e4e401af8ef9ff7e0f4a7"
+            "7f0465cff80aefc489e0302d2122272"
+            "8115e0094df33858d6c613fa5423489e2"
         ),
     ),
     # Installed, and deliberately named by no profile. The corpus is
@@ -646,8 +646,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "3634fb5110df0d3e2d04233fa766a4a6"
-            "c8c732bb8c0e3000e0cc78d9263fd273"
+            "0bc5d6beea3e265df051650b98a4b99a"
+            "2789484c5c151677ba2caff41915e8ca"
         ),
         required_data_env_var="RELIQUARY_ENVSCALER_DATA",
     ),
@@ -726,6 +726,23 @@ _SPEC_VALUES = (
         ),
         external_distribution="reliquary-code",
         external_artifact_resource="reliquary_code/artifact.json",
+    ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/episode-json/v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-chatml-tools-v1",
+        environment_manifest_sha256=(
+            "7f8aa92d804028d96f737b2dfc00c471"
+            "a79f84eb364a5eb5e8e49289d0777f54"
+        ),
+        external_distribution="reliquary-telecom-solo",
+        external_artifact_resource="reliquary_telecom_solo/artifact.json",
     ),
 )
 
