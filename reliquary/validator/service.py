@@ -216,6 +216,7 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
 
     arrivals: dict[str, dict[int, list[int]]] = {}
     targets: dict[str, int] = {}
+    first_pick_rounds: list[int] = []
     for env_name, env_batcher in batcher_dict.items():
         index = getattr(env_batcher, "_submissions_per_prompt", None)
         if not isinstance(index, dict):
@@ -235,6 +236,11 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
         if target is None:
             return None
         targets[str(env_name)] = target
+        first_pick = _price_signal_int(
+            getattr(env_batcher, "window_first_pick_drand_round", None)
+        )
+        if first_pick is not None:
+            first_pick_rounds.append(first_pick)
     close_round = _price_signal_int(getattr(first_batcher, "_seal_trigger_round", None))
     if close_round is None:
         # v6 windows close on their fill or backstop, never on a seal trigger.
@@ -248,6 +254,9 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
         close_round=close_round,
         arrivals_by_environment=arrivals,
         targets_by_environment=targets,
+        # The trainer has been working since the FIRST environment picked, so
+        # the earliest pick is where the window's training span starts.
+        first_pick_round=min(first_pick_rounds) if first_pick_rounds else None,
     )
 
 

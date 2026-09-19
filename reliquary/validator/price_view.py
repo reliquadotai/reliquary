@@ -39,7 +39,14 @@ def price_view(
         for outcome in recent
         if outcome.collect_ready_round is not None
     ]
-    elapsed = [outcome.elapsed_rounds for outcome in recent if outcome.elapsed_rounds > 0]
+    # The controller divides by ``incompressible_rounds``, so the target a miner
+    # reads has to be that, not the window's duration -- the two differ as soon
+    # as a window reports its own training span.
+    denominators = [
+        outcome.incompressible_rounds
+        for outcome in recent
+        if outcome.incompressible_rounds > 0
+    ]
     view: dict[str, Any] = {
         "applied": applied,
         "value": value,
@@ -54,8 +61,8 @@ def price_view(
             statistics.median(fills) * round_seconds if fills else None
         ),
         "fill_target_seconds": (
-            params.deadband * statistics.median(elapsed) * round_seconds
-            if elapsed else None
+            params.deadband * statistics.median(denominators) * round_seconds
+            if denominators else None
         ),
         "pay_per_place_share_of_window": (
             window_pool / places_per_window

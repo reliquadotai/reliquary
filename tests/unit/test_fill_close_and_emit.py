@@ -702,3 +702,52 @@ def test_fill_close_also_seals_the_plan_which_finalises_completed(
         assert batcher.fill_state.snapshot()["in_flight"][env] == 0
     finally:
         assert scheduler.close()
+
+
+def _picking_batcher(monkeypatch, wall):
+    from tests.unit.test_pick_by_rate import _capture_picks, _fill_closed_batcher
+    batcher = _fill_closed_batcher(
+        monkeypatch,
+        wall_clock_fn=lambda: wall[0],
+        drand_chain_info=dict(_CHAIN),
+    )
+    _capture_picks(batcher)
+    return batcher
+
+
+def _prove_one_pick(batcher, prefix):
+    from tests.unit.test_pick_by_rate import _prove
+    for i in range(B_BATCH):
+        _prove(batcher, f"{prefix}-{i}", rate=1.0, payload_bytes=1_000)
+
+
+def test_the_first_pick_stamps_the_round_the_training_span_starts_at(monkeypatch):
+    """``r``'s denominator is the window's training span, and the trainer has
+    been busy since the first pick left."""
+    from reliquary.infrastructure.chain import compute_current_drand_round
+
+    wall = [_CHAIN["genesis_time"] + 3000.0]
+    batcher = _picking_batcher(monkeypatch, wall)
+    assert getattr(batcher, "window_first_pick_drand_round", None) is None
+
+    _prove_one_pick(batcher, "first")
+    assert batcher.pick_training_batch() is True
+
+    assert batcher.window_first_pick_drand_round == compute_current_drand_round(
+        wall[0], _CHAIN["genesis_time"], _CHAIN["period"]
+    )
+
+
+def test_a_later_pick_does_not_move_the_training_span_start(monkeypatch):
+    wall = [_CHAIN["genesis_time"] + 3000.0]
+    batcher = _picking_batcher(monkeypatch, wall)
+
+    _prove_one_pick(batcher, "first")
+    assert batcher.pick_training_batch() is True
+    stamped = batcher.window_first_pick_drand_round
+
+    wall[0] += 600.0
+    _prove_one_pick(batcher, "second")
+    assert batcher.pick_training_batch() is True
+
+    assert batcher.window_first_pick_drand_round == stamped

@@ -1004,6 +1004,8 @@ class GrpoWindowBatcher:
         self.window_open_drand_round: int | None = None
         # v6 only: the drand round the window closed at (fill or backstop).
         self.window_close_drand_round: int | None = None
+        # v6 only: the drand round this window's first pick left at.
+        self.window_first_pick_drand_round: int | None = None
         self.last_valid_submission_at: float | None = None
         self.last_valid_submission_wall_ts: float | None = None
 
@@ -1493,6 +1495,20 @@ class GrpoWindowBatcher:
         except Exception:
             self.window_open_drand_round = None
 
+    def _current_drand_round(self) -> int | None:
+        """The round the beacon is on right now, or None if it cannot be read."""
+        try:
+            if self._drand_chain_info is None:
+                from reliquary.infrastructure.drand import get_current_chain
+                self._drand_chain_info = get_current_chain()
+            from reliquary.infrastructure.chain import compute_current_drand_round
+            ci = self._drand_chain_info
+            return compute_current_drand_round(
+                self._wall_clock(), ci["genesis_time"], ci["period"],
+            )
+        except Exception:
+            return None
+
     def _stamp_window_close_round(self) -> None:
         """Record the drand round a v6 window closed at, once.
 
@@ -1500,17 +1516,17 @@ class GrpoWindowBatcher:
         """
         if self.window_close_drand_round is not None:
             return
-        try:
-            if self._drand_chain_info is None:
-                from reliquary.infrastructure.drand import get_current_chain
-                self._drand_chain_info = get_current_chain()
-            from reliquary.infrastructure.chain import compute_current_drand_round
-            ci = self._drand_chain_info
-            self.window_close_drand_round = compute_current_drand_round(
-                self._wall_clock(), ci["genesis_time"], ci["period"],
-            )
-        except Exception:
-            self.window_close_drand_round = None
+        self.window_close_drand_round = self._current_drand_round()
+
+    def _stamp_window_first_pick_round(self) -> None:
+        """Record the drand round this window's first pick left at, once.
+
+        It opens the window's training span, the denominator ``r`` compares
+        collection against.
+        """
+        if self.window_first_pick_drand_round is not None:
+            return
+        self.window_first_pick_drand_round = self._current_drand_round()
 
     def is_sealed(self) -> bool:
         """True once adaptive close, the ceiling, or a safety valve fired.
@@ -2116,6 +2132,9 @@ class GrpoWindowBatcher:
         if claim is None:
             return False
         *chunk, claimed = claim
+        # The pick ordinal is spent from here on even if the callback raises
+        # below, so this is where the window's training span starts.
+        self._stamp_window_first_pick_round()
         if self._emit_training_batch_fn is not None:
             try:
                 self._emit_training_batch_fn(*chunk)
