@@ -727,6 +727,22 @@ _SPEC_VALUES = (
         external_distribution="reliquary-code",
         external_artifact_resource="reliquary_code/artifact.json",
     ),
+    EnvironmentSpec(
+        # Telecom support tickets in tau2-bench's solo mode, graded on the
+        # device and the carrier's records after the last call — nothing the
+        # model writes reaches the score, only what it did. Binary: one failed
+        # predicate takes the whole reward.
+        #
+        # Rendered in ChatML, the dialect the policy was trained to call tools
+        # in. Measured on it, the policy closes its reasoning and emits a call
+        # on every opening turn; rendered in the JSONL dialect it would read
+        # its tools in a format it has never seen.
+        name="reliquary_telecom_solo_v1",
+        factory_path="reliquary_telecom_solo:TelecomSoloEnvironment",
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
         validator_authoritative_reward=True,
         admission_resource_class="cpu",
         termination_policy="eos_or_cap",

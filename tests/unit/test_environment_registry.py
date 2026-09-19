@@ -39,6 +39,7 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         "reliquary_dapo_math_v1",
         "reliquary_instruction_following_v1",
         "reliquary_code_v1",
+        "reliquary_telecom_solo_v1",
     )
     with pytest.raises(TypeError):
         ENVIRONMENT_SPECS["new"] = ENVIRONMENT_SPECS["openmathinstruct"]
