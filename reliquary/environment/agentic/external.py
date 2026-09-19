@@ -7,6 +7,8 @@ import hashlib
 import importlib
 import importlib.metadata
 import importlib.abc
+import importlib.resources.abc
+import io
 import importlib.util
 import sys
 import threading
@@ -440,11 +442,96 @@ _IMPORT_LOCK = threading.RLock()
 _VERIFIED_MODULES: dict[str, tuple[str, Any]] = {}
 
 
+class _SnapshotTraversable(importlib.resources.abc.Traversable):
+    """A read-only package directory backed by verified bytes, not by the disk.
+
+    `importlib.resources.files(__package__)` is how a packaged environment reads
+    its own corpus, and a module this loader executes has no finder behind it
+    to answer — so the lookup fell through to an orphan path and every
+    environment that ships data failed on its first task. The bytes served here
+    are the ones hashed against the artifact, held in memory, so what the
+    environment reads is what was verified: nothing on disk can change between
+    the check and the use. It is the same rule the Python sources already follow.
+    """
+
+    def __init__(self, resources: Mapping[str, bytes], path: str) -> None:
+        self._resources = resources
+        self._path = path.strip("/")
+
+    @property
+    def name(self) -> str:
+        return PurePosixPath(self._path).name
+
+    def joinpath(self, *descendants: Any) -> "_SnapshotTraversable":
+        parts: list[str] = [part for part in self._path.split("/") if part]
+        for descendant in descendants:
+            for part in PurePosixPath(str(descendant)).parts:
+                if part in ("", "."):
+                    continue
+                if part == ".." or part.startswith("/"):
+                    raise ValueError("resource path escapes its package")
+                parts.append(part)
+        return _SnapshotTraversable(self._resources, "/".join(parts))
+
+    def __truediv__(self, child: Any) -> "_SnapshotTraversable":
+        return self.joinpath(child)
+
+    def is_file(self) -> bool:
+        return self._path in self._resources
+
+    def is_dir(self) -> bool:
+        prefix = f"{self._path}/" if self._path else ""
+        return not self.is_file() and any(
+            key.startswith(prefix) for key in self._resources
+        )
+
+    def iterdir(self):
+        prefix = f"{self._path}/" if self._path else ""
+        children = sorted({
+            key[len(prefix):].split("/", 1)[0]
+            for key in self._resources
+            if key.startswith(prefix)
+        })
+        for child in children:
+            yield _SnapshotTraversable(self._resources, prefix + child)
+
+    def open(self, mode: str = "r", *args: Any, **kwargs: Any):
+        if not self.is_file():
+            raise FileNotFoundError(f"no verified resource at {self._path!r}")
+        stream = io.BytesIO(self._resources[self._path])
+        if "b" in mode:
+            return stream
+        return io.TextIOWrapper(stream, *args, **kwargs)
+
+    def read_bytes(self) -> bytes:
+        if not self.is_file():
+            raise FileNotFoundError(f"no verified resource at {self._path!r}")
+        return self._resources[self._path]
+
+
+class _SnapshotResources(importlib.resources.abc.TraversableResources):
+    def __init__(self, resources: Mapping[str, bytes], package_path: str) -> None:
+        self._resources, self._package_path = resources, package_path
+
+    def files(self) -> _SnapshotTraversable:
+        return _SnapshotTraversable(self._resources, self._package_path)
+
+
 class _ArtifactSourceLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """Execute only a snapshot of hash-bound source, never sys.path or pyc code."""
 
-    def __init__(self, package: str, sources: dict, digest: str) -> None:
+    def __init__(
+        self,
+        package: str,
+        sources: dict,
+        digest: str,
+        resources: Mapping[str, bytes] | None = None,
+    ) -> None:
         self.package, self.sources, self.digest = package, sources, digest
+        self.resources: Mapping[str, bytes] = resources or {}
+
+    def get_resource_reader(self, fullname: str) -> _SnapshotResources:
+        return _SnapshotResources(self.resources, fullname.replace(".", "/"))
 
     def find_spec(self, fullname, path=None, target=None):
         if fullname != self.package and not fullname.startswith(self.package + "."):
@@ -479,13 +566,18 @@ def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any
         distribution = importlib.metadata.distribution(spec.external_distribution or "")
         package = PurePosixPath(spec.external_artifact_resource or "").parts[0]
         sources = {}
+        resources: dict[str, bytes] = {}
         for relative, digest in artifact["files"].items():
-            if not relative.endswith(".py"):
-                continue
             path = Path(distribution.locate_file(relative)).resolve()
-            source = path.read_bytes()
-            if _sha256(source) != digest:
+            body = path.read_bytes()
+            if _sha256(body) != digest:
                 raise ValueError(f"external artifact file digest mismatch: {relative}")
+            if not relative.endswith(".py"):
+                # Data is snapshotted from the bytes just hashed, like source:
+                # served from memory, it cannot change after the check.
+                resources[relative] = body
+                continue
+            source = body
             is_package = relative.endswith("/__init__.py")
             module_name = relative[:-12] if is_package else relative[:-3]
             sources[module_name.replace("/", ".")] = (str(path), source, is_package)
@@ -495,7 +587,9 @@ def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any
             if name == package or name.startswith(package + "."):
                 if _VERIFIED_MODULES.get(name) != (spec.environment_manifest_sha256, module):
                     raise ValueError(f"external module was imported without verification: {name}")
-        loader = _ArtifactSourceLoader(package, sources, spec.environment_manifest_sha256)
+        loader = _ArtifactSourceLoader(
+            package, sources, spec.environment_manifest_sha256, resources
+        )
         entrypoint = artifact["entrypoints"]["replay"]
         module_name, _, attribute_name = entrypoint.partition(":")
         sys.meta_path.insert(0, loader)
