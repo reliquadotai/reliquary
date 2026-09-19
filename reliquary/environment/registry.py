@@ -32,7 +32,7 @@ from reliquary.environment.agentic.base import EpisodeEnvironment
 
 AdmissionResourceClass = Literal["cpu", "sandbox"]
 TerminationPolicy = Literal["eos_or_cap", "math_bft"]
-FinalAnswerPolicy = Literal["boxed", "fenced_python", "json"]
+FinalAnswerPolicy = Literal["boxed", "fenced_python", "json", "text"]
 
 # Single-turn contracts qualified to cross the external boundary. The name is
 # not decorative: `verify_external_artifact` refuses a wheel whose artifact
@@ -181,6 +181,12 @@ class EnvironmentSpec:
             "boxed",
             "fenced_python",
             "json",
+            # The whole completion is the answer: nothing to extract, and so
+            # nothing for the boxed-integrity check to inspect. Only `boxed`
+            # switches any behaviour on, so this changes nothing at runtime —
+            # it exists so an environment graded on free text does not have to
+            # declare `json` to get through, which would be untrue.
+            "text",
         ):
             raise ValueError("unknown final-answer policy")
         if self.interaction_mode not in ("single_turn", "episode"):
@@ -644,6 +650,82 @@ _SPEC_VALUES = (
             "c8c732bb8c0e3000e0cc78d9263fd273"
         ),
         required_data_env_var="RELIQUARY_ENVSCALER_DATA",
+    ),
+    EnvironmentSpec(
+        # Competition maths, graded on the last boxed integer. Graded by the
+        # package: the lattice is binary, so the reward it returns is checked
+        # against (0.0, 1.0) at grading time and the check is total. `boxed`
+        # switches on the integrity check that withholds trust from a zero
+        # whose box was cut mid-span.
+        name="reliquary_dapo_math_v1",
+        factory_path="reliquary_dapo_math:DapoMathEnvironment",
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="boxed",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/boxed-answer/v1",
+        environment_manifest_sha256=(
+            "cca437d73e8183a6df4af4780e00e34c"
+            "d26fed03238b18208898b1e2586d2035"
+        ),
+        external_distribution="reliquary-dapo-math",
+        external_artifact_resource="reliquary_dapo_math/artifact.json",
+    ),
+    EnvironmentSpec(
+        # Constraints checked by deterministic verifiers against the whole
+        # completion. Binary — every constraint or nothing — so the package
+        # grades and the reward is bounded. `text` because there is no answer
+        # span to extract, which is also why this environment runs direct: a
+        # reasoning block would be graded as part of the answer.
+        name="reliquary_instruction_following_v1",
+        factory_path=(
+            "reliquary_instruction_following:InstructionFollowingEnvironment"
+        ),
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="text",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/checked-answer/v1",
+        environment_manifest_sha256=(
+            "84b8698446e68e057faea54ea4045cd1"
+            "98c21fb6bd0a7c8fc259a7659c4e483d"
+        ),
+        external_distribution="reliquary-instruction-following",
+        external_artifact_resource=(
+            "reliquary_instruction_following/artifact.json"
+        ),
+    ),
+    EnvironmentSpec(
+        # The package supplies the corpus and the cases; this repository
+        # executes them. Graded here, not by the package, because the package
+        # would run model-written Python behind its own rlimits in the
+        # validator's process — its README says those are not a containment
+        # boundary. The cases cross through `admission_reward_cases` and are
+        # sent to the same grading service `opencodeinstruct` uses, so nothing
+        # about execution moves. The lattice is derived from the case count.
+        name="reliquary_code_v1",
+        factory_path="reliquary_code:CodeEnvironment",
+        scorer_path="reliquary.validator.admission:_score_opencode_adapter",
+        validator_authoritative_reward=True,
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="fenced_python",
+        reward_lattice_policy="fractional-by-case-count-v1",
+        attainable_rewards=(),
+        contract_version="reliquary/python-cases/v1",
+        reward_materializer_method="admission_reward_cases",
+        environment_manifest_sha256=(
+            "71e4f23c614b7f321bbb9f6cf74f98b7"
+            "72137442bdf9960e5b6d9b6387f41216"
+        ),
+        external_distribution="reliquary-code",
+        external_artifact_resource="reliquary_code/artifact.json",
     ),
 )
 

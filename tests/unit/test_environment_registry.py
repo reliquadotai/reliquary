@@ -33,6 +33,12 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         # Registered so a measurement can address it by name; no profile
         # declares it, so no window can draw it.
         "envscaler_tools_v1",
+        # Packaged environments from reliquary-environments, bound by the
+        # artifact digest committed in their source. Inert until a profile
+        # names them: no live profile does.
+        "reliquary_dapo_math_v1",
+        "reliquary_instruction_following_v1",
+        "reliquary_code_v1",
     )
     with pytest.raises(TypeError):
         ENVIRONMENT_SPECS["new"] = ENVIRONMENT_SPECS["openmathinstruct"]
