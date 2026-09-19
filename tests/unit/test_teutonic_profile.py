@@ -156,3 +156,35 @@ def test_the_lookup_reads_the_active_profile(monkeypatch) -> None:
     assert constants.thinking_for_environment("reliquary_instruction_following_v1") is False
     assert constants.thinking_for_environment("reliquary_dapo_math_v1") is True
     assert constants.thinking_for_environment("not-an-environment") is True
+
+
+def _optimizer_knobs(profile_id: str, **overrides: str) -> list:
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")}
+    env["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
+    env.update(overrides)
+    script = (
+        "import json; from reliquary import constants as c; "
+        "print(json.dumps([c.OPTIMIZER_MASTER_WEIGHTS, c.OPTIMIZER_STATE_8BIT]))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True,
+        text=True, env=env,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_teutonic_steps_fp32_masters_with_8bit_moments() -> None:
+    # 8.96B params: 2 weights + 2 gradients + 4 masters + 2 moments = 90 GB.
+    assert _optimizer_knobs(PROFILE.profile_id) == [True, True]
+
+
+def test_the_live_4b_run_keeps_its_optimizer() -> None:
+    assert _optimizer_knobs(
+        "qwen3-4b-base-dapo-reliquary-v1",
+        RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED="1",
+    ) == [False, False]

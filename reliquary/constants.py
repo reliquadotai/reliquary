@@ -1459,16 +1459,23 @@ if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
 # warp() the identity so the trainer's ratio lives in the space the samples came
 # from. Pre-v4 the two spaces differ by a token-dependent factor, so the band is
 # left symmetric there rather than nominally "tuned" against a moving target.
-# Optimizer-state precision. bitsandbytes PagedAdamW8bit saves VRAM, but its
-# quantisation noise is a non-trivial fraction of a 1e-6 update, and DAPO §4.1
-# trains with plain AdamW. v4 therefore defaults to full precision; pre-v4 keeps
-# the 8-bit paged optimizer. Env-overridable in both directions, because whether
-# fp32 optimizer state fits alongside train_model + verify_model is a property
-# of the box, not of the profile.
+# Optimizer precision. A 1e-6 step is under half a bf16 ulp once |w| >= 5.1e-4,
+# so stepping bf16 weights in place drops it whatever the moments' precision:
+# on the v1 trainer 0.01% of those weights moved over 112 checkpoints. v9 steps
+# fp32 master weights instead, against which 8-bit moments track fp32 AdamW
+# (cosine 1.000 on Teutonic-I tensors). Earlier profiles keep their dynamics;
+# both knobs are env-overridable.
+OPTIMIZER_MASTER_WEIGHTS = (
+    _os.environ.get(
+        "RELIQUARY_OPTIMIZER_MASTER_WEIGHTS",
+        "1" if PROTOCOL_VERSION >= 9 else "0",
+    )
+    not in ("0", "false", "False")
+)
 OPTIMIZER_STATE_8BIT = (
     _os.environ.get(
         "RELIQUARY_OPTIMIZER_STATE_8BIT",
-        "0" if PROTOCOL_VERSION >= 4 else "1",
+        "0" if 4 <= PROTOCOL_VERSION < 9 else "1",
     )
     not in ("0", "false", "False")
 )
