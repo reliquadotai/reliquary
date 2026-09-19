@@ -79,6 +79,11 @@ def _multipart_transfer_config():
     )
 
 
+# A remote proof plane adopts by revision from the hub, so the controller only
+# needs the snapshot's metadata; these are the files it can leave in the mirror.
+WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin")
+
+
 class CheckpointIntake:
     def __init__(
         self,
@@ -91,8 +96,10 @@ class CheckpointIntake:
         installed_repo_id: str | None = None,
         validate_fn: Callable[[Path], dict[str, Any]] = _default_validate,
         expected_identity: dict[str, Any] | None = None,
+        fetch_weights: bool = True,
     ) -> None:
         self._r2 = r2_client
+        self._fetch_weights = bool(fetch_weights)
         self._bucket = bucket
         self.staging_dir = Path(staging_dir)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
@@ -282,6 +289,8 @@ class CheckpointIntake:
                     or "\\" in filename
                     or filename in {".", ".."}
                 ):
+                    continue
+                if not self._fetch_weights and filename.endswith(WEIGHT_FILE_SUFFIXES):
                     continue
                 target = (dest / filename).resolve()
                 try:

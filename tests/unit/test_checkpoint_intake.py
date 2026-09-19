@@ -300,3 +300,48 @@ def test_stage_rejects_existing_revision_symlink_outside_root(tmp_path):
 
     assert intake.stage(_manifest()) is False
     assert list(outside.iterdir()) == []
+
+
+def _mirror(revision=REV_7):
+    base = f"reliquary/checkpoints/{revision}"
+    return {
+        f"{base}/model.safetensors": b"weights",
+        f"{base}/model-00001-of-00002.safetensors": b"shard-1",
+        f"{base}/pytorch_model.bin": b"legacy",
+        f"{base}/model.safetensors.index.json": b"{}",
+        f"{base}/config.json": b"{}",
+        f"{base}/reliquary_protocol_profile.json": b"{}",
+    }
+
+
+def test_stage_fetches_weights_by_default(tmp_path):
+    intake = CheckpointIntake(
+        r2_client=_R2(manifest=_manifest(), files=_mirror()), bucket="b",
+        staging_dir=str(tmp_path), validate_fn=lambda p: {"ok": True},
+    )
+
+    assert intake.stage(_manifest()) is True
+    _, path = intake.take_staged()
+    assert (path / "model.safetensors").read_bytes() == b"weights"
+    assert (path / "model-00001-of-00002.safetensors").exists()
+    assert (path / "pytorch_model.bin").exists()
+
+
+def test_stage_leaves_weights_in_the_mirror_when_told_not_to_fetch_them(tmp_path):
+    """A remote proof plane adopts by revision, so the controller stages only
+    the metadata it validates and never pulls the multi-gigabyte weights."""
+    seen = []
+    intake = CheckpointIntake(
+        r2_client=_R2(manifest=_manifest(), files=_mirror()), bucket="b",
+        staging_dir=str(tmp_path), fetch_weights=False,
+        validate_fn=lambda p: seen.append(sorted(f.name for f in p.iterdir())) or {"ok": True},
+    )
+
+    assert intake.stage(_manifest()) is True
+    _, path = intake.take_staged()
+    assert sorted(f.name for f in path.iterdir()) == [
+        "config.json",
+        "model.safetensors.index.json",
+        "reliquary_protocol_profile.json",
+    ]
+    assert seen == [sorted(f.name for f in path.iterdir())]  # validated what was staged
