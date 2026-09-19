@@ -154,6 +154,17 @@ class EnvironmentProfile:
     # any prompt returns, i.e. `min(default, virtual_length // batch_target)`,
     # computed once here where it can be reviewed.
     prompt_cooldown_windows: int | None = None
+    # Whether the chat template opens a reasoning block for this environment.
+    # `None` keeps it open, which is what every historical profile did — the
+    # value was hard-coded `True` in both places that render a prompt.
+    #
+    # It belongs to the environment rather than the run because the cost of
+    # deliberating depends on what the grader reads. An environment graded on
+    # the whole completion — no answer span to extract — checks the reasoning
+    # against constraints written for the answer; measured on instruction
+    # following, closing the block cut the band from 37.5% to 4.2%. One graded
+    # on a world rather than a string pays nothing for it and plans better.
+    thinking: bool | None = None
 
     def __post_init__(self) -> None:
         if int(self.max_new_tokens) <= 0:
@@ -267,6 +278,8 @@ class ProtocolProfile:
                 environment_contract["prompt_cooldown_windows"] = (
                     environment.prompt_cooldown_windows
                 )
+            if environment.thinking is not None:
+                environment_contract["thinking"] = environment.thinking
             if environment.environment_contract_id is not None:
                 environment_contract["environment_contract_id"] = (
                     environment.environment_contract_id
@@ -731,6 +744,114 @@ _PROFILE_VALUES = (
             token_cap=8192,
             bucket_tokens_per_round=50,
         ),
+    ),
+
+    ProtocolProfile(
+        profile_id="teutonic-9b-reliquary-suite-v9-dev1",
+        # Dormant development profile for the Teutonic-I run: four packaged
+        # environments from reliquary-environments, each bound by the digest of
+        # its artifact manifest. Nothing selects it until a task entry names it
+        # and a validator is started with it; the live profile is untouched.
+        #
+        # Every per-environment number below was measured on this policy rather
+        # than carried over from the 4B run — the budgets, the reasoning mode,
+        # and the episode limits all moved when they were.
+        model_id="ReliquaryForge/teutonic-i-graft-sft-cot-v2",
+        model_revision="d5256c5ccc2c06d8f9bf3133b37ab2a5b95a224e",
+        protocol_version=9,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        # An instruct policy trained on the chat template, unlike the base
+        # models every v4+ profile used. Raw completion would hand it a prompt
+        # in a form it never saw.
+        prompt_encoding="chat_template",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquary_dapo_math_v1": EnvironmentProfile(
+                # 32,768, not the 8,192 the siblings need. Measured: band 70.8%
+                # at 24,576 against 81.2% here, dead groups 26.0% against 17.7%.
+                # Competition maths does not fit a budget chosen for answers.
+                max_new_tokens=32768,
+                bft=None,
+                answer_format="boxed",
+                batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/boxed-answer/v1",
+                environment_manifest_sha256=(
+                    "cca437d73e8183a6df4af4780e00e34cd26fed03238b18208898b1e2586d2035"
+                ),
+                # One pass through the 13,931-problem train split at 16 a window.
+                prompt_cooldown_windows=870,
+            ),
+            "reliquary_instruction_following_v1": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="text",
+                batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/checked-answer/v1",
+                environment_manifest_sha256=(
+                    "84b8698446e68e057faea54ea4045cd198c21fb6bd0a7c8fc259a7659c4e483d"
+                ),
+                # One pass through the 29,435-prompt train split.
+                prompt_cooldown_windows=1839,
+                # Direct: every verifier reads the whole completion, so an open
+                # reasoning block is graded against constraints written for the
+                # answer. Measured on this policy, band 4.2% thinking against
+                # 37.5% direct.
+                thinking=False,
+            ),
+            "reliquary_code_v1": EnvironmentProfile(
+                # The longest completion that finished on its own ran to about
+                # 6,600 tokens; raising this measured worse, not better.
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="fenced_python",
+                batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/python-cases/v1",
+                environment_manifest_sha256=(
+                    "71e4f23c614b7f321bbb9f6cf74f98b772137442bdf9960e5b6d9b6387f41216"
+                ),
+                # No cooldown override: 2,481,806 prompts at 16 a window outlast
+                # the global horizon, which is what that horizon was sized for.
+            ),
+            "reliquary_telecom_solo_v1": EnvironmentProfile(
+                # For an episode this is the whole transcript, as `max_episode_tokens`.
+                max_new_tokens=49152,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                batch_target=16,
+                environment_contract_id="reliquary/episode-json/v1",
+                environment_manifest_sha256=(
+                    "7f8aa92d804028d96f737b2dfc00c471a79f84eb364a5eb5e8e49289d0777f54"
+                ),
+                # One pass through the 1,827-ticket train split.
+                prompt_cooldown_windows=114,
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    # The dialect the policy calls tools in. It closes its
+                    # reasoning and emits a call on 32 of 32 opening turns here.
+                    renderer_id="reliquary-chatml-tools-v1",
+                    max_turns=40,
+                    # Per turn. Measured over 11,308 turns: p99 2,001, and a
+                    # higher cap buys three hundredths of a percent.
+                    max_action_tokens=4096,
+                    # Whole transcript: a 10,118-token opening (44 tool schemas
+                    # and the policy), up to 24,324 generated, and tool results
+                    # of about 63 tokens a turn — about 37,000 at worst.
+                    max_episode_tokens=49152,
+                    max_observation_bytes=65536,
+                ),
+            ),
+        },
+        throughput_tiebreak=None,
     ),
 )
 

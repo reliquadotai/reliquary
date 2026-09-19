@@ -337,7 +337,13 @@ def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str
 
         return rendered_episode_prompt(env, prompt_idx)
     problem = env.get_problem(prompt_idx)
-    return render_canonical_prompt(tokenizer, str(problem["prompt"]))
+    from reliquary.constants import thinking_for_environment
+
+    return render_canonical_prompt(
+        tokenizer,
+        str(problem["prompt"]),
+        thinking=thinking_for_environment(str(getattr(env, "name", ""))),
+    )
 
 
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:

@@ -104,6 +104,7 @@ from reliquary.constants import (
     WINDOW_TIMEOUT_SECONDS,
     CODE_ADMISSION_WORKERS,
     prompt_cooldown_windows_for_environment,
+    thinking_for_environment,
 )
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
@@ -603,7 +604,11 @@ def open_grpo_window(
 
             return encode_episode_prompt(tokenizer, env, prompt_idx)
         problem = env.get_problem(prompt_idx)
-        return encode_prompt(tokenizer, problem["prompt"])
+        return encode_prompt(
+            tokenizer,
+            problem["prompt"],
+            thinking=thinking_for_environment(str(getattr(env, "name", ""))),
+        )
 
     return GrpoWindowBatcher(
         window_start=window_start,
@@ -7280,7 +7285,9 @@ class ValidationService:
                     rendered = rendered_episode_prompt(env, int(prompt_idx))
                 else:
                     rendered = render_canonical_prompt(
-                        self.tokenizer, str(problem["prompt"])
+                        self.tokenizer,
+                        str(problem["prompt"]),
+                        thinking=thinking_for_environment(str(env_name)),
                     )
                 digest = prompt_content_sha256(env_name, rendered)
                 prior = content_state.get(digest, -1)

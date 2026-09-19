@@ -871,6 +871,19 @@ def resolve_environment_mix(
             raise ValueError(
                 f"environment {name!r} manifest does not match installed code"
             )
+        # The signed contract names an episode's renderer, and both the miner
+        # and the validator render with the spec's. If the two disagreed, the
+        # contract would describe a dialect the code does not speak, and nothing
+        # else would notice until every replay failed.
+        profile_episode = getattr(environment_profile, "episode", None)
+        if (
+            profile_episode is not None
+            and spec.renderer_id is not None
+            and profile_episode.renderer_id != spec.renderer_id
+        ):
+            raise ValueError(
+                f"environment {name!r} renderer does not match installed code"
+            )
         if spec.external_distribution is not None:
             from reliquary.environment.agentic.external import verify_external_artifact
 

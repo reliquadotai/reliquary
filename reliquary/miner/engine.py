@@ -1165,6 +1165,7 @@ class MiningEngine:
             BFT_FORCE_ANSWER,
             BFT_THINKING_BUDGET,
             max_new_tokens_for_environment,
+            thinking_for_environment,
         )
         from reliquary.miner.forced_seed_sampler import (
             ForcedSeedLogitsProcessor, forced_seed_generate_kwargs,
@@ -1178,7 +1179,17 @@ class MiningEngine:
         )
 
         hotkey = self.wallet.hotkey.ss58_address
-        prompt_tokens = encode_prompt(self.tokenizer, problem["prompt"])
+        # Resolved before the prompt is encoded: whether the template opens a
+        # reasoning block is per environment, and the validator renders this
+        # same prompt with the same lookup.
+        prompt_env_name = env_name
+        if prompt_env_name is None:
+            prompt_env_name = getattr(getattr(self, "env", None), "name", None)
+        prompt_tokens = encode_prompt(
+            self.tokenizer,
+            problem["prompt"],
+            thinking=thinking_for_environment(str(prompt_env_name or "")),
+        )
         prompt_length = len(prompt_tokens)
         eos_ids = resolve_eos_token_ids(self.vllm_model, self.tokenizer)
         pad_token_id = getattr(self.tokenizer, "pad_token_id", None)

@@ -974,6 +974,20 @@ DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
 BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
 
 
+def thinking_for_environment(environment: str) -> bool:
+    """Whether this environment's prompts open a reasoning block.
+
+    Read by both prompt renderers — the one that produces the tokens a miner
+    generates from, and the one that feeds `prompt_content_sha256` — so they
+    cannot disagree. A disagreement between those two is not rejected; it is
+    dropped silently at seal.
+    """
+
+    profile = ACTIVE_PROTOCOL_PROFILE.environments.get(environment)
+    declared = getattr(profile, "thinking", None)
+    return True if declared is None else bool(declared)
+
+
 def prompt_cooldown_windows_for_environment(environment: str) -> int:
     """The cooldown this environment declares, or the global default.
 
