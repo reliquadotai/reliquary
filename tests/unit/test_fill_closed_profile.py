@@ -175,9 +175,16 @@ def test_fill_closed_refuses_incoherent_operator_bounds():
         "from reliquary import constants",
         RELIQUARY_FILL_CLOSED_ADMISSION_BUDGET_PER_ENV="255",
     )
+    # Derived, not a literal: the whole fill schedule hangs off
+    # FILL_CLOSED_MAX_SECONDS, so a hard-coded "too late" stops being too late
+    # the moment that is rescaled — which is how this test last broke.
+    from reliquary.constants import FILL_CLOSED_PROOF_DISPATCH_SECONDS
+
     too_late = _v6_script(
         "from reliquary import constants",
-        RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS="1800",
+        RELIQUARY_FILL_CLOSED_PRECOMMIT_SECONDS=str(
+            int(FILL_CLOSED_PROOF_DISPATCH_SECONDS)
+        ),
     )
 
     assert too_small.returncode != 0
@@ -187,8 +194,13 @@ def test_fill_closed_refuses_incoherent_operator_bounds():
 
 
 def test_strict_fill_closed_deadline_must_fit_the_service_timeout():
+    # Strict service leaves proofs unbounded, so the coherence check asks for
+    # `deadline * 2 < WINDOW_TIMEOUT_SECONDS`. Half the wall is the first value
+    # that must not fit, whatever the wall currently is.
+    from reliquary.constants import WINDOW_TIMEOUT_SECONDS
+
     result = _constants_under(
-        RELIQUARY_FILL_CLOSED_MAX_SECONDS="3600",
+        RELIQUARY_FILL_CLOSED_MAX_SECONDS=str(WINDOW_TIMEOUT_SECONDS // 2),
     )
 
     assert result.returncode != 0

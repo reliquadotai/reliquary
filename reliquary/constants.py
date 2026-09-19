@@ -787,8 +787,30 @@ _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
 
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.
+#
+# 1800 was sized against a 4B policy answering in 8,192 tokens. It did not stay
+# a backstop: production had to cut picks per window from the profile's 16 to 7
+# to fit under it, which buys the deadline with more than half the training
+# signal a window could carry. A bound that is met by shrinking the work is
+# setting the cadence, which is exactly what this is not for.
+#
+# Six hours, because the next policy is larger on every axis at once — roughly
+# twice the parameters, up to four times the token ceiling on maths, and a
+# multi-turn environment whose rollouts are conversations rather than answers.
+# Guessing the product of those and cutting it fine would repeat the mistake.
+#
+# A high value is safe here, and that is not an assumption: a window whose
+# proof-admission queue drains seals immediately on the liveness path (see
+# PROOF_ADMISSION_STALL_POLL_SECONDS), so this only ever extends a window where
+# work is still arriving. What it costs is a genuinely stuck window sealing
+# late; what it buys is never again sealing a healthy one short.
+#
+# It cannot move alone. The coherence check by WINDOW_TIMEOUT_SECONDS requires
+# `this * 2 < that` whenever proofs are unbounded, which is how production
+# runs, so 1800 against 7200 was exactly half the budget rather than a number
+# someone picked. Both move together and the ratio is preserved.
 FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
-    "RELIQUARY_FILL_CLOSED_MAX_SECONDS", "1800"
+    "RELIQUARY_FILL_CLOSED_MAX_SECONDS", "21600"
 ))
 if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
     raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
@@ -1320,7 +1342,18 @@ SUBNET_START_BLOCK = 0
 # Safety-net timeout: a window auto-seals after this many seconds even
 # if fewer than B valid submissions have landed. The unused slots burn.
 # Set generously — this is a backstop, not the cadence.
-WINDOW_TIMEOUT_SECONDS = 7200
+#
+# Raised with FILL_CLOSED_MAX_SECONDS rather than on its own merits: the two
+# are bound by the coherence check below, which in the unbounded proof mode
+# production runs requires `backstop * 2 < this`. The backstop is the number
+# with a reason; this one is three times it, so the invariant holds with room
+# rather than exactly.
+#
+# This is also the binding one operationally. The backstop reads an environment
+# variable, so it can be tuned on a running fleet; this is a literal, so a
+# backstop above half of it cannot start at all. Leaving it low is what made
+# 1800 unraisable without a deploy.
+WINDOW_TIMEOUT_SECONDS = 64800
 if FILL_CLOSED_ENABLED and (
     FILL_CLOSED_MAX_SECONDS * (1 if FILL_CLOSED_BOUNDED_PROOFS else 2)
     >= WINDOW_TIMEOUT_SECONDS
