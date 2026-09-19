@@ -1466,6 +1466,10 @@ class ValidationService:
 
             current = self._checkpoint_store.current_manifest()
             self._checkpoint_intake = CheckpointIntake(
+                # A remote proof plane adopts by revision and the controller is
+                # a CPU proxy, so the weights would be downloaded, never read,
+                # and deleted at install. Anything local (shadow included) keeps them.
+                fetch_weights=not getattr(self, "_network_proof", False),
                 r2_client=default_r2_client(),
                 bucket=_os.getenv("R2_BUCKET_ID", "reliquary"),
                 staging_dir=_os.path.join(
