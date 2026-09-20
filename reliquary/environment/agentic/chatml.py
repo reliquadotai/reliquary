@@ -33,6 +33,11 @@ CHATML_RENDERER_ID = "reliquary-chatml-tools-v1"
 
 IM_START = "<|im_start|>"
 IM_END = "<|im_end|>"
+# What a policy's turn ends on when it stops itself. The template writes the
+# terminator as part of the *next* turn's framing, so a turn that carries its
+# own is complete, not overlong: measured on Teutonic-I, every well-formed call
+# arrived as `</tool_call><|im_end|>` and was refused as text after the call.
+TURN_END = ("<|im_end|>", "<|endoftext|>")
 THINK_OPEN = "<think>\n"
 THINK_CLOSE = "</think>"
 CALL_OPEN = "<tool_call>"
@@ -72,6 +77,20 @@ def _parameter_text(value: Any) -> str:
     if isinstance(value, Mapping) or isinstance(value, (list, tuple)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _without_turn_end(text: str) -> str:
+    """The turn without the terminator the policy stopped on."""
+
+    stripped = text.rstrip()
+    changed = True
+    while changed:
+        changed = False
+        for terminator in TURN_END:
+            if stripped.endswith(terminator):
+                stripped = stripped[: -len(terminator)].rstrip()
+                changed = True
+    return stripped
 
 
 class ChatMLEpisodeRenderer:
@@ -148,6 +167,7 @@ class ChatMLEpisodeRenderer:
         most one function call with nothing after it.
         """
 
+        text = _without_turn_end(text)
         if THINK_CLOSE not in text:
             raise ValueError("turn never closed its reasoning")
         # The template also takes what follows the last closing tag.

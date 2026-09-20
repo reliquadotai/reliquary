@@ -150,3 +150,43 @@ def test_a_malformed_chatml_call_becomes_an_invalid_action_not_a_crash() -> None
         environment, environment.get_task(0), seed=1, policy=_Broken()
     )
     assert trace.actions[0].tool == "__invalid_action__"
+
+
+CALL_TURN = (
+    "looking the customer up\n</think>\n\n<tool_call>\n"
+    "<function=get_customer_by_phone>\n<parameter=phone_number>\n"
+    "555-123-2002\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+def test_a_turn_that_carries_its_own_terminator_still_commits() -> None:
+    # What the policy actually writes: it stops on <|im_end|>, and the decoded
+    # turn keeps it. Measured on Teutonic-I, every well-formed call arrived this
+    # way and was refused as "text after the function call".
+    action = ChatMLEpisodeRenderer.parse_action(CALL_TURN + "<|im_end|>")
+
+    assert action.kind == "tool"
+    assert action.tool == "get_customer_by_phone"
+    assert dict(action.arguments) == {"phone_number": "555-123-2002"}
+
+
+def test_both_terminators_are_consumed() -> None:
+    for tail in ("<|endoftext|>", "<|im_end|>\n", "<|im_end|><|endoftext|>"):
+        action = ChatMLEpisodeRenderer.parse_action(CALL_TURN + tail)
+        assert action.tool == "get_customer_by_phone"
+
+
+def test_a_final_answer_keeps_its_text_when_the_terminator_goes() -> None:
+    action = ChatMLEpisodeRenderer.parse_action(
+        "thinking\n</think>\n\nthe line is suspended<|im_end|>"
+    )
+
+    assert action.kind == "final"
+    assert action.content == "the line is suspended"
+
+
+def test_real_text_after_the_call_is_still_refused() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        ChatMLEpisodeRenderer.parse_action(CALL_TURN + "\nand then I will check<|im_end|>")
