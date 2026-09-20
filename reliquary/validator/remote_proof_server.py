@@ -14,11 +14,13 @@ import time
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from starlette.middleware.gzip import GZipMiddleware
 
 from reliquary.validator.proof_worker import ProofWorkerUnavailable
 from reliquary.validator.remote_proof_protocol import (
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, AdoptionRequest, CheckpointBinding,
     MAX_PROOF_PIPELINE_DEPTH, ProofHealth, ProofRequest, ProofResponse, ProofValues, SlotState,
+    GZIP_LEVEL, GZIP_MIN_BYTES, InflateRequest,
     canonical_bytes, digest, transport_hash, ProofBatchRequest, ProofBatchResponse,
     MAX_BATCH_REQUEST_BYTES, MAX_BATCH_RESPONSE_BYTES,
 )
@@ -413,6 +415,13 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
         value = await read(request, ProofBatchRequest, MAX_BATCH_REQUEST_BYTES)
         return await prove_values(value.items, batch=True)
 
+    # Responses: httpx already advertises gzip and decodes transparently, so the
+    # client needs nothing for that direction. Requests: starlette decodes no
+    # Content-Encoding at all, hence InflateRequest. Added last so it wraps
+    # everything and the body is plain before any other layer reads it.
+    app.add_middleware(GZipMiddleware, minimum_size=GZIP_MIN_BYTES,
+                       compresslevel=GZIP_LEVEL)
+    app.add_middleware(InflateRequest, limit=MAX_BATCH_REQUEST_BYTES)
     return app
 
 

@@ -1480,6 +1480,25 @@ OPTIMIZER_STATE_8BIT = (
     not in ("0", "false", "False")
 )
 
+# Which engine the miner generates single-turn rollouts on. transformers is the
+# reference; "vllm" runs the same forced draw through a vLLM logits processor,
+# measured level on seed agreement (0.964-0.980 per group against 0.970-0.974)
+# and worth ~12x the throughput, since a transformers decode step costs ~31 ms
+# whatever the batch. The proof always stays on the transformers copy.
+MINER_GENERATION_BACKEND = _os.environ.get(
+    "RELIQUARY_MINER_GENERATION_BACKEND", "transformers"
+).strip().lower()
+if MINER_GENERATION_BACKEND not in ("transformers", "vllm"):
+    raise ValueError(
+        "RELIQUARY_MINER_GENERATION_BACKEND must be 'transformers' or 'vllm'"
+    )
+# Concurrent rollouts the vLLM engine keeps in flight. 256 measured 6,050 tok/s
+# on an H200; the ceiling is the KV cache, which vLLM pages.
+MINER_VLLM_MAX_NUM_SEQS = int(
+    _os.environ.get("RELIQUARY_MINER_VLLM_MAX_NUM_SEQS", "256")
+)
+
+
 PPO_CLIP_EPSILON_LOW = 0.2
 PPO_CLIP_EPSILON_HIGH = 0.28 if PROTOCOL_VERSION >= 4 else 0.2
 

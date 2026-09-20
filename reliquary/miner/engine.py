@@ -501,7 +501,11 @@ class MiningEngine:
         validator_url_override: str | None = None,
         checkpoint_identity_store: MinerCheckpointIdentityStore | None = None,
         initial_checkpoint_identity: ActivatedCheckpoint | None = None,
+        generator: Any | None = None,
     ) -> None:
+        # When set, single-turn rollouts come from this engine instead of
+        # ``vllm_model.generate``; the proof still runs on ``hf_model``.
+        self.generator = generator
         self.vllm_model = vllm_model
         self.hf_model = hf_model
         self.tokenizer = tokenizer
@@ -1097,6 +1101,9 @@ class MiningEngine:
             self.vllm_model = new_gen
             del old_hf
             del old_gen
+            generator = getattr(self, "generator", None)
+            if generator is not None:
+                generator.reload(local_path)
             self._loaded_checkpoint_path = local_path
             logger.info("Checkpoint %s loaded into both models", local_path)
             return self.hf_model
@@ -1137,6 +1144,9 @@ class MiningEngine:
         except Exception:
             pass
 
+        generator = getattr(self, "generator", None)
+        if generator is not None:
+            generator.reload(local_path)
         self._loaded_checkpoint_path = local_path
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
@@ -1215,6 +1225,26 @@ class MiningEngine:
                 )
             except ValueError:
                 bft_applicable = False
+
+        generator = getattr(self, "generator", None)
+        if generator is not None and not bft_applicable:
+            completions = generator.generate(
+                prompt_tokens,
+                randomness=randomness,
+                prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash,
+                rollouts=M_ROLLOUTS,
+                max_new_tokens=environment_cap,
+                eos_ids=sorted(eos_ids),
+            )
+            return [
+                {
+                    "tokens": prompt_tokens + list(completion),
+                    "prompt_length": prompt_length,
+                    "forced": False,
+                }
+                for completion in completions
+            ]
 
         with torch.no_grad():
             input_tensor = torch.tensor(
