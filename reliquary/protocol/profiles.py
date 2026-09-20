@@ -836,9 +836,12 @@ _PROFILE_VALUES = (
                 prompt_cooldown_windows=114,
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
-                    # The dialect the policy calls tools in. It closes its
-                    # reasoning and emits a call on 32 of 32 opening turns here.
-                    renderer_id="reliquary-chatml-tools-v1",
+                    # The dialect the policy was fine-tuned in. ChatML was tried
+                    # and measured on H200 20-09: it requires every turn to close
+                    # its reasoning before the call, which this policy does not,
+                    # so 38 of 38 turns parsed as invalid actions against 23 valid
+                    # calls over 16 distinct tools here.
+                    renderer_id="reliquary-jsonl-tools-v1",
                     max_turns=40,
                     # Per turn. Measured over 11,308 turns: p99 2,001, and a
                     # higher cap buys three hundredths of a percent.

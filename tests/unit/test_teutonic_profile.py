@@ -5,6 +5,7 @@ tests pin what the numbers are for, so a later edit that moves one has to say
 why rather than pass silently.
 """
 
+from reliquary.environment.registry import get_environment_spec
 from reliquary.protocol.profiles import PROFILES
 
 PROFILE = PROFILES["teutonic-9b-reliquary-suite-v9-dev1"]
@@ -47,10 +48,14 @@ def test_the_measured_budgets() -> None:
     assert envs["reliquary_code_v1"].max_new_tokens == 8192
 
 
-def test_telecom_is_an_episode_rendered_in_chatml() -> None:
+def test_telecom_is_an_episode_in_the_dialect_the_policy_was_tuned_in() -> None:
+    # Measured on H200 20-09 over the same tasks and seeds: ChatML parsed 38 of
+    # 38 turns as invalid actions, this dialect 23 valid calls over 16 tools.
     episode = PROFILE.environments["reliquary_telecom_solo_v1"].episode
     assert episode is not None
-    assert episode.renderer_id == "reliquary-chatml-tools-v1"
+    assert episode.renderer_id == "reliquary-jsonl-tools-v1"
+    spec_renderer = get_environment_spec("reliquary_telecom_solo_v1").renderer_id
+    assert episode.renderer_id == str(spec_renderer)
     assert episode.max_turns == 40
     assert episode.max_action_tokens == 4096
     # The whole transcript: a 10,118-token opening, up to 24,324 generated and
