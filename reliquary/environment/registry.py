@@ -752,7 +752,7 @@ _SPEC_VALUES = (
         contract_version="reliquary/episode-json/v1",
         interaction_mode="episode",
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
-        renderer_id="reliquary-jsonl-tools-v1",
+        renderer_id="reliquary-chatml-tools-v1",
         environment_manifest_sha256=(
             "7f8aa92d804028d96f737b2dfc00c471"
             "a79f84eb364a5eb5e8e49289d0777f54"

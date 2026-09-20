@@ -836,12 +836,13 @@ _PROFILE_VALUES = (
                 prompt_cooldown_windows=114,
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
-                    # The dialect the policy was fine-tuned in. ChatML was tried
-                    # and measured on H200 20-09: it requires every turn to close
-                    # its reasoning before the call, which this policy does not,
-                    # so 38 of 38 turns parsed as invalid actions against 23 valid
-                    # calls over 16 distinct tools here.
-                    renderer_id="reliquary-jsonl-tools-v1",
+                    # The policy's own template. Measured on H200 20-09 over 64
+                    # episodes each: this dialect lands a valid call in 61 of 61,
+                    # a median of 15 distinct tools and no invalid action, and
+                    # solves 2 tickets outright; the JSONL dialect, whose framing
+                    # this policy never saw, leaves 45 of 64 without a single
+                    # valid call and none solved.
+                    renderer_id="reliquary-chatml-tools-v1",
                     max_turns=40,
                     # Per turn. Measured over 11,308 turns: p99 2,001, and a
                     # higher cap buys three hundredths of a percent.

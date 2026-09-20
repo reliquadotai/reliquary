@@ -49,11 +49,12 @@ def test_the_measured_budgets() -> None:
 
 
 def test_telecom_is_an_episode_in_the_dialect_the_policy_was_tuned_in() -> None:
-    # Measured on H200 20-09 over the same tasks and seeds: ChatML parsed 38 of
-    # 38 turns as invalid actions, this dialect 23 valid calls over 16 tools.
+    # Measured on H200 20-09, 64 episodes per dialect: this one lands a valid
+    # call in 61 of 61 with a median of 15 tools and solves 2 tickets; the JSONL
+    # dialect leaves 45 of 64 without a single valid call and solves none.
     episode = PROFILE.environments["reliquary_telecom_solo_v1"].episode
     assert episode is not None
-    assert episode.renderer_id == "reliquary-jsonl-tools-v1"
+    assert episode.renderer_id == "reliquary-chatml-tools-v1"
     spec_renderer = get_environment_spec("reliquary_telecom_solo_v1").renderer_id
     assert episode.renderer_id == str(spec_renderer)
     assert episode.max_turns == 40
