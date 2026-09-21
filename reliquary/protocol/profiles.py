@@ -847,7 +847,7 @@ _PROFILE_VALUES = (
                 batch_target=4,
                 environment_contract_id="reliquary/episode-json/v1",
                 environment_manifest_sha256=(
-                    "7f8aa92d804028d96f737b2dfc00c471a79f84eb364a5eb5e8e49289d0777f54"
+                    "74d0e7569247eabc3d4fb2d909773f2b1f1d8430a4ce4f4fd09c6ad6e6794b05"
                 ),
                 # One pass through the tickets this policy can use, ~240 of
                 # them, at four a window — not the 456 windows the corpus-wide
