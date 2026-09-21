@@ -774,7 +774,14 @@ _PROFILE_VALUES = (
                 max_new_tokens=32768,
                 bft=None,
                 answer_format="boxed",
-                batch_target=16,
+                # Half the siblings' prompt count, because a group here costs
+                # what ten of theirs cost: 493k tokens against 48k, measured on
+                # an H200 over a group of 16 at this budget. At 16 prompts this
+                # environment alone is three quarters of the window's tokens,
+                # for a band measured in protocol at 25% (3 groups of 12), so
+                # the window would buy maths in code's and instruction
+                # following's place.
+                batch_target=8,
                 prompt_template=PromptTemplateProfile(
                     "reliquary-external-prompt-v1", "$problem",
                 ),
@@ -782,8 +789,8 @@ _PROFILE_VALUES = (
                 environment_manifest_sha256=(
                     "cca437d73e8183a6df4af4780e00e34cd26fed03238b18208898b1e2586d2035"
                 ),
-                # One pass through the 13,931-problem train split at 16 a window.
-                prompt_cooldown_windows=870,
+                # One pass through the 13,931-problem train split at 8 a window.
+                prompt_cooldown_windows=1741,
             ),
             "reliquary_instruction_following_v1": EnvironmentProfile(
                 max_new_tokens=8192,
@@ -827,13 +834,31 @@ _PROFILE_VALUES = (
                 max_new_tokens=49152,
                 bft=None,
                 answer_format="episode_json_action_v1",
-                batch_target=16,
+                # What this corpus supplies, not what it declares. Measured on
+                # an H200 21-09 at 8 rollouts a task: `service_issue` solves
+                # 54.7% of the time (47 tasks) and `mobile_data_issue` 9.8%
+                # (254), while `mms_issue` — 1,984 of the 2,285 — solves 0.9%.
+                # A group drawn there is sixteen zeroes: the sigma gate refuses
+                # it and nothing is paid for it, so miners draw from the other
+                # two and the usable corpus is ~240 tickets, not 1,827. Four
+                # prompts a window is what that pool sustains. It goes back up
+                # when the policy makes `mms_issue` solvable, which is a
+                # property of the policy rather than of the environment.
+                batch_target=4,
                 environment_contract_id="reliquary/episode-json/v1",
                 environment_manifest_sha256=(
                     "7f8aa92d804028d96f737b2dfc00c471a79f84eb364a5eb5e8e49289d0777f54"
                 ),
-                # One pass through the 1,827-ticket train split.
-                prompt_cooldown_windows=114,
+                # One pass through the tickets this policy can use, ~240 of
+                # them, at four a window — not the 456 windows the corpus-wide
+                # rule gives. Sized on the declared 1,827, the usable pool is
+                # spent in sixty windows and the environment then serves
+                # nothing for four hundred more, because every ticket still
+                # eligible is one no group passes the gate on. This is the one
+                # place that rule is deliberately relaxed, and it is a smaller
+                # relaxation than it reads as: a ticket returns every sixty
+                # windows instead of the environment going dark.
+                prompt_cooldown_windows=60,
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
                     # The policy's own template. Measured on H200 20-09 over 64

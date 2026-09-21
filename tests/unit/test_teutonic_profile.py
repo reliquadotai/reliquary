@@ -69,17 +69,26 @@ def test_telecom_is_an_episode_in_the_dialect_the_policy_was_tuned_in() -> None:
 
 
 def test_small_corpora_rotate_instead_of_running_dry() -> None:
-    """One pass through each train split at 16 a window. The global horizon —
-    a million windows — would exhaust telecom's 1,827 tickets in days and then
-    serve nothing."""
+    """One pass through each train split at that split's prompt count. The
+    global horizon — a million windows — would exhaust telecom's tickets in
+    days and then serve nothing."""
     envs = PROFILE.environments
-    assert envs["reliquary_telecom_solo_v1"].prompt_cooldown_windows == 1827 // 16
-    assert envs["reliquary_dapo_math_v1"].prompt_cooldown_windows == 13931 // 16
+    assert envs["reliquary_dapo_math_v1"].prompt_cooldown_windows == 13931 // 8
     assert (
         envs["reliquary_instruction_following_v1"].prompt_cooldown_windows
         == 29435 // 16
     )
     assert envs["reliquary_code_v1"].prompt_cooldown_windows is None
+
+
+def test_telecom_rotates_on_the_tickets_this_policy_can_use() -> None:
+    """Measured 21-09: `mms_issue` is 1,984 of 2,285 tasks and solves 0.9%, so
+    a group drawn there is sixteen zeroes the gate refuses. Sizing the rotation
+    on the declared corpus spends the ~240 usable tickets in sixty windows and
+    then serves nothing for four hundred more."""
+    telecom = PROFILE.environments["reliquary_telecom_solo_v1"]
+    assert telecom.batch_target == 4
+    assert telecom.prompt_cooldown_windows == 240 // telecom.batch_target
 
 
 def test_each_profile_entry_binds_the_spec_it_names() -> None:
