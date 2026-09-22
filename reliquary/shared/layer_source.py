@@ -181,3 +181,46 @@ class Prefetching(LayerSource):
         self._pending.clear()
         self._pool.shutdown(cancel_futures=True)
         self._source.close()
+
+
+def _pinned_like(tensor: torch.Tensor) -> torch.Tensor:
+    """Page-locked host memory shaped like ``tensor``. Needs a CUDA context to allocate."""
+    return torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+
+
+class PinnedLayers(LayerSource):
+    """Hands out each layer from page-locked host memory.
+
+    A copy to the device reads host memory the driver may have to fault in and walk page by page;
+    out of page-locked memory it is a single DMA. The layer is staged into a slab that is
+    allocated once and reused, so the pinning itself is paid at the first layer and never again.
+
+    Two slabs, because the reader runs a layer ahead: while the device is being handed layer *i*
+    the thread behind is already filling *i+1*, and they must not be the same memory. The copy to
+    the device is synchronous, so a slab is free again as soon as its layer has been loaded — an
+    overlapping copy would need an event here, and there is none to wait on.
+    """
+
+    def __init__(self, source: LayerSource, slots: int = 2) -> None:
+        if slots < 2:
+            raise ValueError("a layer is staged while the next one is read; that takes two slabs")
+        self._source = source
+        self.n_layers = source.n_layers
+        self._slabs: list[dict[str, torch.Tensor]] = [{} for _ in range(slots)]
+
+    def state(self, index: int) -> Mapping[str, torch.Tensor]:
+        state = self._source.state(index)
+        slab = self._slabs[index % len(self._slabs)]
+        staged = {}
+        for name, tensor in state.items():
+            held = slab.get(name)
+            if held is None or held.shape != tensor.shape or held.dtype != tensor.dtype:
+                held = _pinned_like(tensor)
+                slab[name] = held
+            held.copy_(tensor)
+            staged[name] = held
+        return staged
+
+    def close(self) -> None:
+        self._slabs = [{} for _ in self._slabs]
+        self._source.close()

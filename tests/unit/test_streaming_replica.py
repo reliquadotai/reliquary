@@ -107,3 +107,55 @@ def test_a_padded_batch_is_refused_until_it_is_supported(tmp_path):
     mask[0, :3] = 0
     with pytest.raises(NotImplementedError, match="attention mask"):
         forward_single_layer(replica, tokens, mask, -1)
+
+
+def test_a_layer_is_staged_in_page_locked_memory_only_for_a_device_that_has_a_bus(tmp_path):
+    """Pinning costs host memory and buys nothing when the layer never crosses a bus."""
+    from reliquary.shared.layer_source import PinnedLayers
+    from reliquary.shared.streaming_forward import _staged
+
+    class _Source:
+        n_layers = 1
+
+        def state(self, index):
+            return {}
+
+        def close(self):
+            pass
+
+    assert not isinstance(_staged(_Source(), "cpu", prefetch=False), PinnedLayers)
+    if torch.cuda.is_available():  # pragma: no cover - CI has no card
+        assert isinstance(_staged(_Source(), "cuda", prefetch=False), PinnedLayers)
+
+
+def test_staging_alternates_slabs_so_the_reader_ahead_never_overwrites_the_layer_in_use(monkeypatch):
+    """The thread reading layer i+1 must not be filling the memory layer i is being loaded from."""
+    import reliquary.shared.layer_source as layer_source
+
+    monkeypatch.setattr(
+        layer_source, "_pinned_like", lambda t: torch.empty(t.shape, dtype=t.dtype),
+    )
+
+    class _Source:
+        n_layers = 4
+
+        def state(self, index):
+            return {"w": torch.full((2, 2), float(index))}
+
+        def close(self):
+            pass
+
+    staged = layer_source.PinnedLayers(_Source())
+    held = [staged.state(index)["w"] for index in range(4)]
+
+    assert held[0].data_ptr() != held[1].data_ptr(), "consecutive layers land in different slabs"
+    assert held[0].data_ptr() == held[2].data_ptr(), "and the slab comes back round"
+    assert torch.equal(held[1], torch.full((2, 2), 3.0)), "a slab holds the last layer staged in it"
+    assert torch.equal(staged.state(0)["w"], torch.zeros(2, 2)), "what is handed out is the layer"
+
+
+def test_a_single_slab_is_refused(monkeypatch):
+    from reliquary.shared.layer_source import PinnedLayers
+
+    with pytest.raises(ValueError, match="two slabs"):
+        PinnedLayers(object(), slots=1)

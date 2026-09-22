@@ -22,7 +22,13 @@ from typing import Any
 import torch
 
 from reliquary.shared.fused_layers import is_fused_store
-from reliquary.shared.layer_source import CheckpointLayers, HostLayers, LayerSource, Prefetching
+from reliquary.shared.layer_source import (
+    CheckpointLayers,
+    HostLayers,
+    LayerSource,
+    PinnedLayers,
+    Prefetching,
+)
 
 
 @dataclass(frozen=True)
@@ -103,9 +109,7 @@ class StreamedReplica:
         if fused_dir is None and is_fused_store(path):
             # A store is its own fused copy: it was written to be read this way.
             fused_dir = path
-        source: LayerSource = CheckpointLayers(path, fused_dir=fused_dir)
-        if prefetch:
-            source = Prefetching(source)
+        source = _staged(CheckpointLayers(path, fused_dir=fused_dir), device, prefetch)
         return cls(skeleton, source, device=device)
 
     @classmethod
@@ -113,9 +117,7 @@ class StreamedReplica:
         cls, model: Any, *, device: str | torch.device = "cpu", prefetch: bool = False
     ) -> "StreamedReplica":
         """Build a replica over a model already in host memory."""
-        source: LayerSource = HostLayers(model)
-        if prefetch:
-            source = Prefetching(source)
+        source = _staged(HostLayers(model), device, prefetch)
         return cls(model, source, device=device)
 
     @property
@@ -167,6 +169,17 @@ class StreamedReplica:
 
     def close(self) -> None:
         self._source.close()
+
+
+def _staged(source: LayerSource, device: str | torch.device, prefetch: bool) -> LayerSource:
+    """Wrap a source in what the device it feeds is worth paying for.
+
+    Page-locking costs host memory and buys nothing when the layer is not crossing a bus, so it is
+    only put in front of a device that has one.
+    """
+    if torch.device(device).type == "cuda":
+        source = PinnedLayers(source)
+    return Prefetching(source) if prefetch else source
 
 
 def _load_fixed_parts(skeleton: Any, path: Path) -> None:
