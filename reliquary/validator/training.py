@@ -137,7 +137,7 @@ _UNPAD_CACHE_INSTALLED = _install_unpad_sync_cache()
 # Module-global state — persists across train_step calls for the same model
 # ---------------------------------------------------------------------------
 
-_optimizer: Optional[torch.optim.Optimizer] = None
+_optimizer: Optional["torch.optim.Optimizer | _MasterWeightOptimizer"] = None
 _scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
 _optimizer_model_id: Optional[int] = None
 
@@ -221,6 +221,77 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     )
 
 
+def _use_master_weights(params) -> bool:
+    """Whether to step fp32 copies: the profile asks for it and some parameter
+    is stored below fp32. Lazy import so tests can monkeypatch the flag."""
+    from reliquary.constants import OPTIMIZER_MASTER_WEIGHTS
+
+    return OPTIMIZER_MASTER_WEIGHTS and any(
+        parameter.dtype in (torch.bfloat16, torch.float16) for parameter in params
+    )
+
+
+# Parameters whose gradients are widened to fp32 per inner step: 1 GiB of
+# transient, instead of 4 bytes per parameter for the whole model at once.
+_MASTER_STEP_CHUNK_NUMEL = 1 << 28
+
+
+class _MasterWeightOptimizer:
+    """The inner optimizer steps fp32 masters; the model keeps its bf16 weights.
+
+    Forward and backward are unchanged, so the model always holds exactly the
+    weights that get published. Each step widens the gradient onto the master,
+    steps there and writes the rounded master back, so updates smaller than a
+    bf16 ulp accumulate instead of rounding away. A restart rebuilds the
+    masters from the published bf16 weights.
+    """
+
+    def __init__(self, params, build) -> None:
+        self.params = list(params)
+        self.masters = [
+            torch.nn.Parameter(parameter.detach().to(torch.float32, copy=True))
+            for parameter in self.params
+        ]
+        self.inner = build(self.masters)
+
+    @property
+    def param_groups(self):
+        return self.inner.param_groups
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for parameter in self.params:
+            if parameter.grad is None:
+                continue
+            if set_to_none:
+                parameter.grad = None
+            else:
+                parameter.grad.detach_()
+                parameter.grad.zero_()
+
+    @torch.no_grad()
+    def step(self) -> None:
+        # The inner optimizer skips parameters without a gradient, so stepping
+        # one chunk at a time still updates every parameter exactly once.
+        pending, numel = [], 0
+        for parameter, master in zip(self.params, self.masters):
+            if parameter.grad is None:
+                continue
+            master.grad = parameter.grad.to(torch.float32)
+            pending.append((parameter, master))
+            numel += parameter.numel()
+            if numel >= _MASTER_STEP_CHUNK_NUMEL:
+                self._step_chunk(pending)
+                pending, numel = [], 0
+        if pending:
+            self._step_chunk(pending)
+
+    def _step_chunk(self, pending) -> None:
+        self.inner.step()
+        for parameter, master in pending:
+            parameter.copy_(master)
+            master.grad = None
+
+
 def _lazy_init(model, global_step_hint: int | None = None) -> bool:
     """Create optimizer + scheduler on first call for a given model. No-op
     on subsequent calls with the same model. The reference model used for
@@ -241,7 +312,14 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         logger.warning("_lazy_init: model.parameters() is empty; skipping init")
         return False
 
-    _optimizer = _build_optimizer(params)
+    if _use_master_weights(params):
+        _optimizer = _MasterWeightOptimizer(params, _build_optimizer)
+        logger.info(
+            "fp32 master weights for %d parameters",
+            sum(parameter.numel() for parameter in params),
+        )
+    else:
+        _optimizer = _build_optimizer(params)
 
     hint = max(0, int(global_step_hint or 0))
     rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 else 0
@@ -263,7 +341,11 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
             base *= min(1.0, (step - hint + 1) / (rewarmup + 1))
         return base
 
-    _scheduler = torch.optim.lr_scheduler.LambdaLR(_optimizer, _lr_lambda)
+    scheduled = (
+        _optimizer.inner if isinstance(_optimizer, _MasterWeightOptimizer)
+        else _optimizer
+    )
+    _scheduler = torch.optim.lr_scheduler.LambdaLR(scheduled, _lr_lambda)
     if hint > 0:
         # Restored position: ``hint`` is the EXACT scheduler step count the
         # published checkpoint carried in its profile (never derived from

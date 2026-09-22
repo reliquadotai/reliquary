@@ -501,7 +501,11 @@ class MiningEngine:
         validator_url_override: str | None = None,
         checkpoint_identity_store: MinerCheckpointIdentityStore | None = None,
         initial_checkpoint_identity: ActivatedCheckpoint | None = None,
+        generator: Any | None = None,
     ) -> None:
+        # When set, single-turn rollouts come from this engine instead of
+        # ``vllm_model.generate``; the proof still runs on ``hf_model``.
+        self.generator = generator
         self.vllm_model = vllm_model
         self.hf_model = hf_model
         self.tokenizer = tokenizer
@@ -1097,6 +1101,9 @@ class MiningEngine:
             self.vllm_model = new_gen
             del old_hf
             del old_gen
+            generator = getattr(self, "generator", None)
+            if generator is not None:
+                generator.reload(local_path)
             self._loaded_checkpoint_path = local_path
             logger.info("Checkpoint %s loaded into both models", local_path)
             return self.hf_model
@@ -1137,6 +1144,9 @@ class MiningEngine:
         except Exception:
             pass
 
+        generator = getattr(self, "generator", None)
+        if generator is not None:
+            generator.reload(local_path)
         self._loaded_checkpoint_path = local_path
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
@@ -1165,6 +1175,7 @@ class MiningEngine:
             BFT_FORCE_ANSWER,
             BFT_THINKING_BUDGET,
             max_new_tokens_for_environment,
+            thinking_for_environment,
         )
         from reliquary.miner.forced_seed_sampler import (
             ForcedSeedLogitsProcessor, forced_seed_generate_kwargs,
@@ -1178,7 +1189,17 @@ class MiningEngine:
         )
 
         hotkey = self.wallet.hotkey.ss58_address
-        prompt_tokens = encode_prompt(self.tokenizer, problem["prompt"])
+        # Resolved before the prompt is encoded: whether the template opens a
+        # reasoning block is per environment, and the validator renders this
+        # same prompt with the same lookup.
+        prompt_env_name = env_name
+        if prompt_env_name is None:
+            prompt_env_name = getattr(getattr(self, "env", None), "name", None)
+        prompt_tokens = encode_prompt(
+            self.tokenizer,
+            problem["prompt"],
+            thinking=thinking_for_environment(str(prompt_env_name or "")),
+        )
         prompt_length = len(prompt_tokens)
         eos_ids = resolve_eos_token_ids(self.vllm_model, self.tokenizer)
         pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
@@ -1204,6 +1225,26 @@ class MiningEngine:
                 )
             except ValueError:
                 bft_applicable = False
+
+        generator = getattr(self, "generator", None)
+        if generator is not None and not bft_applicable:
+            completions = generator.generate(
+                prompt_tokens,
+                randomness=randomness,
+                prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash,
+                rollouts=M_ROLLOUTS,
+                max_new_tokens=environment_cap,
+                eos_ids=sorted(eos_ids),
+            )
+            return [
+                {
+                    "tokens": prompt_tokens + list(completion),
+                    "prompt_length": prompt_length,
+                    "forced": False,
+                }
+                for completion in completions
+            ]
 
         with torch.no_grad():
             input_tensor = torch.tensor(
@@ -1282,7 +1323,7 @@ class MiningEngine:
     ) -> list[dict]:
         """Generate M complete canonical episodes, one turn at a time."""
 
-        from reliquary.environment.agentic.renderer import CanonicalEpisodeRenderer
+        from reliquary.environment.agentic.renderers import renderer_for
         from reliquary.environment.agentic.runner import EpisodeRunner
         from reliquary.miner.episode_policy import HFEpisodePolicy
 
@@ -1294,7 +1335,11 @@ class MiningEngine:
             encoded = self.tokenizer.encode(text, add_special_tokens=False)
             return list(getattr(encoded, "ids", encoded))
 
-        renderer = CanonicalEpisodeRenderer(encode)
+        # The environment's declared dialect — the same lookup the validator
+        # uses to re-render this episode, so the two sides cannot disagree about
+        # which renderer produced the transcript it compares byte for byte.
+        renderer_id = str(get_environment_spec(env.name).renderer_id)
+        renderer = renderer_for(renderer_id, encode)
         task = env.get_task(prompt_idx)
         hotkey = self.wallet.hotkey.ss58_address
         generations: list[dict] = []
@@ -1327,6 +1372,7 @@ class MiningEngine:
                 "prompt_length": int(trace.assistant_spans[0][0]),
                 "forced": False,
                 "trace": trace,
+                "renderer_id": renderer_id,
             })
         return generations
 
@@ -1420,7 +1466,9 @@ class MiningEngine:
                 raise RuntimeError("episode trace has no reward report")
             episode = {
                 "schema_version": trace.schema,
-                "renderer_id": "reliquary-jsonl-tools-v1",
+                # What this episode was actually rendered with, recorded when
+                # the renderer was chosen rather than restated here.
+                "renderer_id": generation["renderer_id"],
                 "task_id": trace.task_id,
                 "seed": trace.seed,
                 "actions": [action.to_wire() for action in trace.actions],

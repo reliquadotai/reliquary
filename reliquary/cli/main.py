@@ -23,6 +23,8 @@ from reliquary.constants import (
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
+    MINER_GENERATION_BACKEND,
+    MINER_VLLM_MAX_NUM_SEQS,
     PROOF_SLOTS_PER_DEVICE,
     PROTOCOL_MODEL_ID,
     PROTOCOL_MODEL_REVISION,
@@ -925,6 +927,22 @@ def mine(
             checkpoint_identity_store.commit(initial_checkpoint_identity)
 
         envs = load_environments(env_names)
+        generator = None
+        if MINER_GENERATION_BACKEND == "vllm":
+            from reliquary.miner.vllm_generation import VLLMRolloutGenerator
+
+            # vLLM owns cuda:0, where the transformers generation copy also
+            # sits; on a single-device box that copy is only read for its eos
+            # ids and device, so the two coexist at a lower utilisation.
+            generator = VLLMRolloutGenerator(
+                initial_path,
+                revision=base_load_kwargs.get("revision"),
+                max_num_seqs=MINER_VLLM_MAX_NUM_SEQS,
+                gpu_memory_utilization=(
+                    0.85 if proof_device != "cuda:0" else 0.6
+                ),
+            )
+
         engine = MiningEngine(
             vllm_model,
             hf_model,
@@ -932,6 +950,7 @@ def mine(
             wallet,
             envs=envs,
             mix=mix,
+            generator=generator,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
             checkpoint_identity_store=checkpoint_identity_store,

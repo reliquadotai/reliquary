@@ -99,7 +99,15 @@ class EpisodeRunner:
                     turn=turn,
                 )
                 try:
-                    action = AssistantAction.from_json(generated.text)
+                    # The renderer reads its own dialect: a JSON object for the
+                    # canonical one, a `<tool_call>` block for ChatML. Without a
+                    # renderer — replaying structured wire actions — the text is
+                    # the JSON form those actions serialise to.
+                    action = (
+                        self.renderer.parse_action(generated.text, task)
+                        if self.renderer is not None
+                        else AssistantAction.from_json(generated.text)
+                    )
                 except (RecursionError, TypeError, ValueError):
                     raw_bytes = generated.text.encode(
                         "utf-8", errors="backslashreplace"

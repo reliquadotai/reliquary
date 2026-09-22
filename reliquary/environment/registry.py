@@ -32,8 +32,89 @@ from reliquary.environment.agentic.base import EpisodeEnvironment
 
 AdmissionResourceClass = Literal["cpu", "sandbox"]
 TerminationPolicy = Literal["eos_or_cap", "math_bft"]
-FinalAnswerPolicy = Literal["boxed", "fenced_python", "json"]
+FinalAnswerPolicy = Literal["boxed", "fenced_python", "json", "text"]
+
+# Single-turn contracts qualified to cross the external boundary. The name is
+# not decorative: `verify_external_artifact` refuses a wheel whose artifact
+# declares a different contract from its spec, so this set is exactly what a
+# reviewer has looked at.
+#
+# What a contract is free to choose is how its answer is read — a typed JSON
+# object, the last boxed span, free text put to deterministic verifiers. What
+# none of them may change is the binary lattice, and that is not taste: the
+# reward a wheel returns is checked against `attainable_rewards` at grading
+# time, and with two values that check is total. It is also what keeps the
+# robust-utility enumeration cheap, since an uncertain rollout is priced under
+# every value the lattice allows.
+#
+# Fractional rewards are deliberately still outside. They would need the
+# lattice itself to come from the wheel, and the materials relay to carry it,
+# which is a wider change than a name.
+EXTERNAL_SINGLE_TURN_CONTRACTS = frozenset(
+    {
+        "reliquary/answer-json/v1",
+        "reliquary/boxed-answer/v1",
+        "reliquary/checked-answer/v1",
+        "reliquary/python-cases/v1",
+    }
+)
+
+# The one relay name an external environment may expose for its reward
+# materials. Named rather than free-form: the wrapper has to define it, and a
+# spec that asked for anything else would silently get no materials at all —
+# `getattr` would return None and the lattice would collapse to a single point.
+EXTERNAL_REWARD_MATERIALIZER = "admission_reward_cases"
 InteractionMode = Literal["single_turn", "episode"]
+
+
+def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
+    """An external environment either grades itself or hands over materials.
+
+    **Grades itself.** The wheel returns the reward and this repository checks
+    it against a fixed lattice at grading time. That check is what makes
+    trusting the package bounded, so the lattice has to be binary: two values
+    make membership total, and an uncertain rollout is priced under every value
+    the lattice allows, which stays cheap at two.
+
+    **Hands over materials.** The wheel supplies the cases; this repository
+    executes them and computes the reward, so there is no foreign reward to
+    bound and the lattice is derived here from the case count. It is the shape
+    a code environment needs, and it is the shape that keeps execution inside
+    the sandbox: a package that graded its own Python would be running
+    model-written code behind its own rlimits instead of behind gVisor.
+
+    Nothing else is admitted. A wheel that both graded itself and declared a
+    fractional lattice would be handing back a number this repository has no
+    way to bound.
+    """
+
+    binary = (
+        spec.reward_lattice_policy == "binary-v1"
+        and spec.attainable_rewards == (0.0, 1.0)
+        and spec.reward_materializer_method is None
+    )
+    if binary:
+        return
+    materials = (
+        spec.reward_materializer_method == EXTERNAL_REWARD_MATERIALIZER
+        and not spec.attainable_rewards
+    )
+    if not materials:
+        raise ValueError(
+            "an external single-turn environment must either declare binary "
+            "rewards or hand over reward materials named "
+            f"{EXTERNAL_REWARD_MATERIALIZER!r}"
+        )
+    if spec.scorer_path.endswith(":score_external_answers"):
+        raise ValueError(
+            "an environment that hands over materials must be scored here, "
+            "not by the wheel that supplied them"
+        )
+    if spec.admission_resource_class != "sandbox":
+        raise ValueError(
+            "reward materials are executed, so the environment must ask for "
+            "the sandbox"
+        )
 
 
 def _import_attribute(path: str) -> Any:
@@ -100,6 +181,12 @@ class EnvironmentSpec:
             "boxed",
             "fenced_python",
             "json",
+            # The whole completion is the answer: nothing to extract, and so
+            # nothing for the boxed-integrity check to inspect. Only `boxed`
+            # switches any behaviour on, so this changes nothing at runtime —
+            # it exists so an environment graded on free text does not have to
+            # declare `json` to get through, which would be untrue.
+            "text",
         ):
             raise ValueError("unknown final-answer policy")
         if self.interaction_mode not in ("single_turn", "episode"):
@@ -130,14 +217,17 @@ class EnvironmentSpec:
                 raise ValueError(
                     "external environments require a manifest digest"
                 )
-            if self.interaction_mode == "single_turn" and (
-                self.contract_version != "reliquary/answer-json/v1"
-                or self.final_answer_policy != "json"
-                or not self.validator_authoritative_reward
-                or self.reward_lattice_policy != "binary-v1"
-                or self.attainable_rewards != (0.0, 1.0)
-            ):
-                raise ValueError("external single-turn environments require answer-json/v1 binary rewards")
+            if self.interaction_mode == "single_turn":
+                if self.contract_version not in EXTERNAL_SINGLE_TURN_CONTRACTS:
+                    raise ValueError(
+                        "external single-turn contract is not one of "
+                        f"{sorted(EXTERNAL_SINGLE_TURN_CONTRACTS)}"
+                    )
+                if not self.validator_authoritative_reward:
+                    raise ValueError(
+                        "an external reward must be validator authoritative"
+                    )
+                _validate_external_reward_shape(self)
 
     def create(self) -> Environment | EpisodeEnvironment:
         if self.required_data_env_var and not os.environ.get(
@@ -449,8 +539,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "3725a5ec6186702d3f387c2a8cb174ff"
-            "ce672dc3efe9b877460a8454e775db2e"
+            "0f490881544ba065bf33b974032adbc3"
+            "f844d2c3978bcd6ca8dbb7089baa8f18"
         ),
     ),
     EnvironmentSpec(
@@ -498,8 +588,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "94095ba52ae58895f19b99bc9d605d8"
-            "a3b6cdea55118af1b857ed42d484072c0"
+            "1c53afdf6acc59dd7df0693b7486e47"
+            "de94d79977404841d1368ffb2571c0c7d"
         ),
     ),
     EnvironmentSpec(
@@ -523,8 +613,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "9f888c49e5d1775f0f83314a0177ee5"
-            "562c9e4858b8e4e401af8ef9ff7e0f4a7"
+            "7f0465cff80aefc489e0302d2122272"
+            "8115e0094df33858d6c613fa5423489e2"
         ),
     ),
     # Installed, and deliberately named by no profile. The corpus is
@@ -556,10 +646,119 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-jsonl-tools-v1",
         environment_manifest_sha256=(
-            "3634fb5110df0d3e2d04233fa766a4a6"
-            "c8c732bb8c0e3000e0cc78d9263fd273"
+            "0bc5d6beea3e265df051650b98a4b99a"
+            "2789484c5c151677ba2caff41915e8ca"
         ),
         required_data_env_var="RELIQUARY_ENVSCALER_DATA",
+    ),
+    EnvironmentSpec(
+        # Competition maths, graded on the last boxed integer. Graded by the
+        # package: the lattice is binary, so the reward it returns is checked
+        # against (0.0, 1.0) at grading time and the check is total. `boxed`
+        # switches on the integrity check that withholds trust from a zero
+        # whose box was cut mid-span.
+        name="reliquary_dapo_math_v1",
+        factory_path="reliquary_dapo_math:DapoMathEnvironment",
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="boxed",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/boxed-answer/v1",
+        environment_manifest_sha256=(
+            "cca437d73e8183a6df4af4780e00e34c"
+            "d26fed03238b18208898b1e2586d2035"
+        ),
+        external_distribution="reliquary-dapo-math",
+        external_artifact_resource="reliquary_dapo_math/artifact.json",
+    ),
+    EnvironmentSpec(
+        # Constraints checked by deterministic verifiers against the whole
+        # completion. Binary — every constraint or nothing — so the package
+        # grades and the reward is bounded. `text` because there is no answer
+        # span to extract, which is also why this environment runs direct: a
+        # reasoning block would be graded as part of the answer.
+        name="reliquary_instruction_following_v1",
+        factory_path=(
+            "reliquary_instruction_following:InstructionFollowingEnvironment"
+        ),
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="text",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/checked-answer/v1",
+        environment_manifest_sha256=(
+            "84b8698446e68e057faea54ea4045cd1"
+            "98c21fb6bd0a7c8fc259a7659c4e483d"
+        ),
+        external_distribution="reliquary-instruction-following",
+        external_artifact_resource=(
+            "reliquary_instruction_following/artifact.json"
+        ),
+    ),
+    EnvironmentSpec(
+        # The package supplies the corpus and the cases; this repository
+        # executes them. Graded here, not by the package, because the package
+        # would run model-written Python behind its own rlimits in the
+        # validator's process — its README says those are not a containment
+        # boundary. The cases cross through `admission_reward_cases` and are
+        # sent to the same grading service `opencodeinstruct` uses, so nothing
+        # about execution moves. The lattice is derived from the case count.
+        name="reliquary_code_v1",
+        factory_path="reliquary_code:CodeEnvironment",
+        scorer_path="reliquary.validator.admission:_score_opencode_adapter",
+        validator_authoritative_reward=True,
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="fenced_python",
+        reward_lattice_policy="fractional-by-case-count-v1",
+        attainable_rewards=(),
+        contract_version="reliquary/python-cases/v1",
+        reward_materializer_method="admission_reward_cases",
+        environment_manifest_sha256=(
+            "71e4f23c614b7f321bbb9f6cf74f98b7"
+            "72137442bdf9960e5b6d9b6387f41216"
+        ),
+        external_distribution="reliquary-code",
+        external_artifact_resource="reliquary_code/artifact.json",
+    ),
+    EnvironmentSpec(
+        # Telecom support tickets in tau2-bench's solo mode, graded on the
+        # device and the carrier's records after the last call — nothing the
+        # model writes reaches the score, only what it did. Binary: one failed
+        # predicate takes the whole reward.
+        #
+        # Rendered in ChatML, the dialect the policy was trained to call tools
+        # in. Measured on it, the policy closes its reasoning and emits a call
+        # on every opening turn; rendered in the JSONL dialect it would read
+        # its tools in a format it has never seen.
+        name="reliquary_telecom_solo_v1",
+        factory_path="reliquary_telecom_solo:TelecomSoloEnvironment",
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/episode-json/v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-chatml-tools-v1",
+        environment_manifest_sha256=(
+            "74d0e7569247eabc3d4fb2d909773f2b"
+            "1f1d8430a4ce4f4fd09c6ad6e6794b05"
+        ),
+        external_distribution="reliquary-telecom-solo",
+        external_artifact_resource="reliquary_telecom_solo/artifact.json",
     ),
 )
 
@@ -672,6 +871,19 @@ def resolve_environment_mix(
             raise ValueError(
                 f"environment {name!r} manifest does not match installed code"
             )
+        # The signed contract names an episode's renderer, and both the miner
+        # and the validator render with the spec's. If the two disagreed, the
+        # contract would describe a dialect the code does not speak, and nothing
+        # else would notice until every replay failed.
+        profile_episode = getattr(environment_profile, "episode", None)
+        if (
+            profile_episode is not None
+            and spec.renderer_id is not None
+            and profile_episode.renderer_id != spec.renderer_id
+        ):
+            raise ValueError(
+                f"environment {name!r} renderer does not match installed code"
+            )
         if spec.external_distribution is not None:
             from reliquary.environment.agentic.external import verify_external_artifact
 
@@ -687,6 +899,8 @@ def resolve_environment_mix(
 
 
 __all__ = [
+    "EXTERNAL_REWARD_MATERIALIZER",
+    "EXTERNAL_SINGLE_TURN_CONTRACTS",
     "ENVIRONMENT_SPECS",
     "EnvironmentSpec",
     "InteractionMode",

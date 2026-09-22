@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from reliquary.environment.agentic.types import AssistantAction, GeneratedAction
+from reliquary.environment.agentic.types import (
+    MAX_ACTION_BYTES,
+    AssistantAction,
+    GeneratedAction,
+)
 
 
 class JsonActionStoppingCriteria:
@@ -29,6 +33,31 @@ class JsonActionStoppingCriteria:
             except (RecursionError, TypeError, ValueError):
                 verdicts.append(False)
         return torch.tensor(verdicts, device=input_ids.device, dtype=torch.bool)
+
+
+def _within_action_bytes(tokenizer, generated: list[int]) -> tuple[list[int], str]:
+    """The longest prefix of a turn that fits the action byte budget.
+
+    A turn that overruns it used to raise out of the policy — past the runner's
+    own handling — so one rambling turn ended the miner's episode with a
+    traceback instead of an invalid action worth zero. The cut is on tokens, so
+    the validator replaying the trace reads exactly the same turn.
+    """
+
+    def decode(count: int) -> str:
+        return tokenizer.decode(generated[:count], skip_special_tokens=False)
+
+    text = decode(len(generated))
+    if len(text.encode("utf-8")) <= MAX_ACTION_BYTES:
+        return generated, text
+    low, high = 1, len(generated)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(decode(middle).encode("utf-8")) <= MAX_ACTION_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    return generated[:low], decode(low)
 
 
 class HFEpisodePolicy:
@@ -107,8 +136,9 @@ class HFEpisodePolicy:
         generated = output[0, len(context):].tolist()
         if not generated:
             raise RuntimeError("episode policy produced no action tokens")
+        generated, text = _within_action_bytes(self.tokenizer, generated)
         self.sampled_offset += len(generated)
         return GeneratedAction(
-            text=self.tokenizer.decode(generated, skip_special_tokens=False),
+            text=text,
             tokens=tuple(int(token) for token in generated),
         )

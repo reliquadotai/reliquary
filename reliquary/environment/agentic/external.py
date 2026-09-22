@@ -7,6 +7,8 @@ import hashlib
 import importlib
 import importlib.metadata
 import importlib.abc
+import importlib.resources.abc
+import io
 import importlib.util
 import sys
 import threading
@@ -440,11 +442,96 @@ _IMPORT_LOCK = threading.RLock()
 _VERIFIED_MODULES: dict[str, tuple[str, Any]] = {}
 
 
+class _SnapshotTraversable(importlib.resources.abc.Traversable):
+    """A read-only package directory backed by verified bytes, not by the disk.
+
+    `importlib.resources.files(__package__)` is how a packaged environment reads
+    its own corpus, and a module this loader executes has no finder behind it
+    to answer — so the lookup fell through to an orphan path and every
+    environment that ships data failed on its first task. The bytes served here
+    are the ones hashed against the artifact, held in memory, so what the
+    environment reads is what was verified: nothing on disk can change between
+    the check and the use. It is the same rule the Python sources already follow.
+    """
+
+    def __init__(self, resources: Mapping[str, bytes], path: str) -> None:
+        self._resources = resources
+        self._path = path.strip("/")
+
+    @property
+    def name(self) -> str:
+        return PurePosixPath(self._path).name
+
+    def joinpath(self, *descendants: Any) -> "_SnapshotTraversable":
+        parts: list[str] = [part for part in self._path.split("/") if part]
+        for descendant in descendants:
+            for part in PurePosixPath(str(descendant)).parts:
+                if part in ("", "."):
+                    continue
+                if part == ".." or part.startswith("/"):
+                    raise ValueError("resource path escapes its package")
+                parts.append(part)
+        return _SnapshotTraversable(self._resources, "/".join(parts))
+
+    def __truediv__(self, child: Any) -> "_SnapshotTraversable":
+        return self.joinpath(child)
+
+    def is_file(self) -> bool:
+        return self._path in self._resources
+
+    def is_dir(self) -> bool:
+        prefix = f"{self._path}/" if self._path else ""
+        return not self.is_file() and any(
+            key.startswith(prefix) for key in self._resources
+        )
+
+    def iterdir(self):
+        prefix = f"{self._path}/" if self._path else ""
+        children = sorted({
+            key[len(prefix):].split("/", 1)[0]
+            for key in self._resources
+            if key.startswith(prefix)
+        })
+        for child in children:
+            yield _SnapshotTraversable(self._resources, prefix + child)
+
+    def open(self, mode: str = "r", *args: Any, **kwargs: Any):
+        if not self.is_file():
+            raise FileNotFoundError(f"no verified resource at {self._path!r}")
+        stream = io.BytesIO(self._resources[self._path])
+        if "b" in mode:
+            return stream
+        return io.TextIOWrapper(stream, *args, **kwargs)
+
+    def read_bytes(self) -> bytes:
+        if not self.is_file():
+            raise FileNotFoundError(f"no verified resource at {self._path!r}")
+        return self._resources[self._path]
+
+
+class _SnapshotResources(importlib.resources.abc.TraversableResources):
+    def __init__(self, resources: Mapping[str, bytes], package_path: str) -> None:
+        self._resources, self._package_path = resources, package_path
+
+    def files(self) -> _SnapshotTraversable:
+        return _SnapshotTraversable(self._resources, self._package_path)
+
+
 class _ArtifactSourceLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """Execute only a snapshot of hash-bound source, never sys.path or pyc code."""
 
-    def __init__(self, package: str, sources: dict, digest: str) -> None:
+    def __init__(
+        self,
+        package: str,
+        sources: dict,
+        digest: str,
+        resources: Mapping[str, bytes] | None = None,
+    ) -> None:
         self.package, self.sources, self.digest = package, sources, digest
+        self.resources: Mapping[str, bytes] = resources or {}
+
+    def get_resource_reader(self, fullname: str) -> _SnapshotResources:
+        return _SnapshotResources(self.resources, fullname.replace(".", "/"))
 
     def find_spec(self, fullname, path=None, target=None):
         if fullname != self.package and not fullname.startswith(self.package + "."):
@@ -479,13 +566,18 @@ def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any
         distribution = importlib.metadata.distribution(spec.external_distribution or "")
         package = PurePosixPath(spec.external_artifact_resource or "").parts[0]
         sources = {}
+        resources: dict[str, bytes] = {}
         for relative, digest in artifact["files"].items():
-            if not relative.endswith(".py"):
-                continue
             path = Path(distribution.locate_file(relative)).resolve()
-            source = path.read_bytes()
-            if _sha256(source) != digest:
+            body = path.read_bytes()
+            if _sha256(body) != digest:
                 raise ValueError(f"external artifact file digest mismatch: {relative}")
+            if not relative.endswith(".py"):
+                # Data is snapshotted from the bytes just hashed, like source:
+                # served from memory, it cannot change after the check.
+                resources[relative] = body
+                continue
+            source = body
             is_package = relative.endswith("/__init__.py")
             module_name = relative[:-12] if is_package else relative[:-3]
             sources[module_name.replace("/", ".")] = (str(path), source, is_package)
@@ -495,7 +587,9 @@ def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any
             if name == package or name.startswith(package + "."):
                 if _VERIFIED_MODULES.get(name) != (spec.environment_manifest_sha256, module):
                     raise ValueError(f"external module was imported without verification: {name}")
-        loader = _ArtifactSourceLoader(package, sources, spec.environment_manifest_sha256)
+        loader = _ArtifactSourceLoader(
+            package, sources, spec.environment_manifest_sha256, resources
+        )
         entrypoint = artifact["entrypoints"]["replay"]
         module_name, _, attribute_name = entrypoint.partition(":")
         sys.meta_path.insert(0, loader)
@@ -517,7 +611,11 @@ class ExternalAnswerEnvironment:
     """
 
     def __init__(self, backend: Any, spec: EnvironmentSpec) -> None:
-        if spec.contract_version != "reliquary/answer-json/v1":
+        from reliquary.environment.registry import (
+            EXTERNAL_SINGLE_TURN_CONTRACTS,
+        )
+
+        if spec.contract_version not in EXTERNAL_SINGLE_TURN_CONTRACTS:
             raise ValueError("unsupported external single-turn contract")
         for method in ("__len__", "task", "grade"):
             if not callable(getattr(backend, method, None)):
@@ -552,6 +650,48 @@ class ExternalAnswerEnvironment:
                 "environment": self.name, "generator_index": normalized,
                 "metadata": dict(raw["metadata"])}
 
+    def admission_reward_cases(self, problem: dict) -> list[dict[str, Any]]:
+        """Hand this repository the cases a reward is computed from.
+
+        The relay exists so a packaged environment can supply what it knows —
+        the corpus, the task, the cases — while execution stays here, behind
+        the sandbox. A wheel grading its own Python would be running
+        model-written code behind its own rlimits, which its own README says
+        is not a containment boundary.
+
+        Validated like every other crossing: the problem is reconstructed from
+        its index before the backend is asked, so a caller cannot hand in a
+        problem the environment never issued and read back somebody else's
+        cases.
+        """
+        index = problem.get("generator_index")
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+            or problem != self.get_problem(index)
+        ):
+            return []
+        loader = getattr(self._backend, "admission_reward_cases", None)
+        if not callable(loader):
+            raise TypeError(
+                "external environment is missing admission_reward_cases()"
+            )
+        cases = loader(index)
+        if not isinstance(cases, list):
+            raise TypeError("external reward materials must be a list")
+        materials: list[dict[str, Any]] = []
+        for case in cases:
+            if not isinstance(case, Mapping):
+                raise TypeError("each external reward material must be an object")
+            # Canonicalised on the way through: these bytes reach a content
+            # digest, so insertion order must not be able to change identity.
+            canonical_json(dict(case))
+            materials.append(dict(case))
+        if not materials:
+            raise ValueError("external reward materials must not be empty")
+        return materials
+
     def compute_reward(self, problem: dict, completion: str) -> float:
         index = problem.get("generator_index")
         if (not isinstance(index, int) or isinstance(index, bool) or index < 0
@@ -561,8 +701,18 @@ class ExternalAnswerEnvironment:
                       name="external answer reward",
                       required={"reward", "success", "state_digest"})
         reward = _number(raw["reward"], name="external answer reward")
-        if reward not in self._spec.attainable_rewards:
-            raise ValueError("external answer reward is outside its declared lattice")
+        # A materials environment declares no fixed lattice, because the one
+        # that applies is derived here from the case count. Its own grade is
+        # still worth bounding to the unit interval — it is what replay
+        # compares against — but membership is not a question that has an
+        # answer before the cases are known.
+        if self._spec.attainable_rewards:
+            if reward not in self._spec.attainable_rewards:
+                raise ValueError(
+                    "external answer reward is outside its declared lattice"
+                )
+        elif not 0.0 <= reward <= 1.0:
+            raise ValueError("external answer reward is outside [0, 1]")
         if not isinstance(raw["success"], bool) or raw["success"] != (reward == 1.0):
             raise ValueError("external answer success and reward disagree")
         _digest(raw["state_digest"], name="external answer state digest")

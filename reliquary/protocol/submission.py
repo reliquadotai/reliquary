@@ -678,7 +678,10 @@ class EpisodeMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["reliquary/episode/v1"]
-    renderer_id: Literal["reliquary-jsonl-tools-v1"]
+    # Every renderer an environment may declare. The validator re-renders with
+    # the environment's own id and compares byte for byte, so accepting an id
+    # here does not let a miner pick its dialect — a mismatch still fails.
+    renderer_id: Literal["reliquary-jsonl-tools-v1", "reliquary-chatml-tools-v1"]
     task_id: str = Field(..., min_length=1, max_length=128)
     seed: int = Field(..., ge=0)
     actions: list[dict[str, Any]] = Field(..., min_length=1, max_length=64)

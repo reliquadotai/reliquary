@@ -30,7 +30,7 @@
     "reliquary/environment/agentic/suite.py",
     "reliquary/environment/agentic/types.py"
   ],
-  "implementation_sha256": "f5a8dec80222894cc0e916e9e5556a9e1be4a8e5c0f991cd886af9616be98322",
+  "implementation_sha256": "bba398942fe29c524eba0ed9e023eff8b960564a28791c4e6eb26ad81f6bc3b1",
   "source": "Reliquary-authored procedural file-repair workspaces",
   "external_data": false,
   "network_required": false,

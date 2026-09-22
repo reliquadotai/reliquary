@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import gzip
 import json
 from pathlib import Path
 import socket
@@ -19,7 +20,8 @@ from reliquary.validator.proof_capacity import compute_proof_path_hash
 from reliquary.validator.proof_worker import ProofWorkerUnavailable
 from reliquary.validator.remote_proof import RemoteProofPool
 from reliquary.validator.remote_proof_protocol import (
-    AdoptionRequest, CheckpointBinding, ProofInput, ProofRequest, ProofValues, digest,
+    AdoptionRequest, CheckpointBinding, ProofInput, ProofRequest, ProofResponse,
+    ProofValues, digest,
 )
 from reliquary.validator.remote_proof_server import create_proof_app
 from reliquary.validator.verifier import ProofResult
@@ -102,6 +104,10 @@ def endpoint(pki, backend, *, tamper=None, timeout=2., pipeline_depth=1):
             if request.url.path != "/v1/prove" or response.status_code != 200:
                 return response
             body = b"".join([part async for part in response.body_iterator])
+            # This hook is registered after create_proof_app, so it sits OUTSIDE
+            # the response compression and sees the encoded body.
+            if response.headers.get("content-encoding") == "gzip":
+                body = gzip.decompress(body)
             value = json.loads(body)
             tamper(value)
             return Response(json.dumps(value), media_type="application/json")
@@ -840,3 +846,24 @@ def test_the_controller_takes_its_pipeline_depth_from_configuration(pki, monkeyp
         assert pool.pipeline_depth == 3
     finally:
         pool.close()
+
+
+def test_a_large_request_crosses_the_link_compressed_and_parses_intact(pki):
+    backend = CPUProofBackend()
+    with endpoint(pki, backend, timeout=10.) as client:
+        # The bulk of a real request is the rollout metadata, so grow that and
+        # leave the proof coverage the canned kernel result expects.
+        big = ProofInput(tokens=[1, 2, 3], commitments=[{"sketch": 0}] * 3,
+                         rollout={"prompt_length": 1, "completion_length": 2,
+                                  "token_logprobs": [-0.5] * 20000},
+                         randomness="ab" * 32, seed_u_values=[.1, .2])
+        raw = client._request("POST", "/v1/prove", request_for(
+            client, job_id="big-job", payload=big,
+            content_sha256=digest(big.model_dump()),
+            expires_at_ms=int((time.time() + 10) * 1000)), timeout=10)
+        assert ProofResponse.read(raw).job_id == "big-job"
+        stats = client._rpc_stats
+        # *_bytes stay canonical so every bound and digest keeps its meaning;
+        # *_wire_bytes are what the link actually carried.
+        assert stats["request_bytes"] > 4 * stats["request_wire_bytes"] > 0
+        assert stats["response_wire_bytes"] > 0
