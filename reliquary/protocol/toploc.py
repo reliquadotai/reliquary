@@ -126,3 +126,84 @@ class ChunkProof:
 
     def values_at(self, xs: Sequence[int]) -> list[int]:
         return evaluate(self.coeffs, [int(x) % self.modulus for x in xs])
+
+
+# The reference's value when no exponent agrees, so no mantissa can be compared.
+NO_MANTISSA = float(2**64)
+
+_BF16_EXP_MASK = 0x7F80
+_BF16_MANT_MASK = 0x007F
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkResult:
+    """Three error measures: acceptance is always at or below a threshold."""
+
+    exp_mismatches: int
+    mant_err_mean: float
+    mant_err_median: float
+
+
+def compare_bf16_bits(
+    proof_bits: Sequence[int], verifier_bits: Sequence[int]
+) -> ChunkResult:
+    """The per-chunk comparison of ``verify_proofs`` in poly.cpp."""
+    if len(proof_bits) != len(verifier_bits):
+        raise ValueError("proof and verifier value counts differ")
+    mismatches = 0
+    errors: list[int] = []
+    for proof, verifier in zip(proof_bits, verifier_bits):
+        if (proof & _BF16_EXP_MASK) != (verifier & _BF16_EXP_MASK):
+            mismatches += 1
+        else:
+            errors.append(abs((proof & _BF16_MANT_MASK) - (verifier & _BF16_MANT_MASK)))
+    if not errors:
+        return ChunkResult(mismatches, NO_MANTISSA, NO_MANTISSA)
+    errors.sort()
+    return ChunkResult(
+        mismatches, sum(errors) / len(errors), float(errors[len(errors) // 2])
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ToplocThresholds:
+    exp_mismatch: int
+    mant_mean: float
+    mant_median: float
+    min_allowed_failures: int = 0
+    ratio_allowed_failures: float = 0.0
+
+
+def sequence_verdict(
+    results: Sequence[ChunkResult], thresholds: ToplocThresholds
+) -> tuple[bool, str | None]:
+    """toploc-validator's validate_stage_results @ 55c1a23, except that an empty
+    sequence fails closed instead of passing."""
+    if not results:
+        return False, "no_chunks"
+    t = thresholds
+    if t.min_allowed_failures > 0 or t.ratio_allowed_failures > 0:
+        allowance = max(t.min_allowed_failures, t.ratio_allowed_failures * len(results))
+        kept: list[ChunkResult] = []
+        forgiven: list[ChunkResult] = []
+        for result in results:
+            if result.exp_mismatches <= t.exp_mismatch:
+                kept.append(result)
+            else:
+                forgiven.append(result)
+                allowance -= 1
+        if allowance < 0:
+            return False, "too_many_exp_mismatches"
+        if any(r.mant_err_mean > t.mant_mean for r in forgiven):
+            return False, "mant_err_mean"
+        if any(r.mant_err_median > t.mant_median for r in forgiven):
+            return False, "mant_err_median"
+        results = kept
+    for result in results:
+        if result.exp_mismatches > t.exp_mismatch:
+            return False, "exp_mismatch"
+        if result.mant_err_mean > t.mant_mean:
+            return False, "mant_err_mean"
+        if result.mant_err_median > t.mant_median:
+            return False, "mant_err_median"
+    return True, None
