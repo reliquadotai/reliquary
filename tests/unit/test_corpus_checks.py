@@ -10,7 +10,9 @@ from reliquary.corpus.checks import (
 )
 from reliquary.corpus.job import Sampling
 
-SAMPLING = Sampling(temperature=1.0, top_p=1.0, top_k=0, max_new_tokens=100, n=2)
+SAMPLING = Sampling(
+    temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=1, max_new_tokens=100, n=2
+)
 
 
 def test_the_declared_number_of_completions_is_required():

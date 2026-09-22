@@ -21,7 +21,7 @@ PROMPT_ORDERS = frozenset({PROMPT_ORDER_MINER_WALK, PROMPT_ORDER_FREE})
 JOB_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
-_SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "max_new_tokens", "n")
+_SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_new_tokens", "max_new_tokens", "n")
 _FILTER_FIELDS = ("grader_id", "threshold")
 _JOB_FIELDS = (
     "schema",
@@ -51,6 +51,7 @@ class Sampling:
     temperature: float
     top_p: float
     top_k: int
+    min_new_tokens: int
     max_new_tokens: int
     n: int
 
@@ -102,6 +103,7 @@ class JobSpec:
                 "temperature": self.sampling.temperature,
                 "top_p": self.sampling.top_p,
                 "top_k": self.sampling.top_k,
+                "min_new_tokens": self.sampling.min_new_tokens,
                 "max_new_tokens": self.sampling.max_new_tokens,
                 "n": self.sampling.n,
             },
@@ -157,11 +159,19 @@ def _parse_sampling(raw: Any) -> Sampling:
     top_k = raw["top_k"]
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
         raise JobError(f"sampling.top_k must be a non-negative whole number, got {top_k!r}")
+    max_new_tokens = _positive_int(raw, "max_new_tokens")
+    # The floor is what a cursor step costs: a job that wants no floor sets 1.
+    min_new_tokens = _positive_int(raw, "min_new_tokens")
+    if min_new_tokens > max_new_tokens:
+        raise JobError(
+            f"sampling.min_new_tokens {min_new_tokens} exceeds max_new_tokens {max_new_tokens}"
+        )
     return Sampling(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        max_new_tokens=_positive_int(raw, "max_new_tokens"),
+        min_new_tokens=min_new_tokens,
+        max_new_tokens=max_new_tokens,
         n=_positive_int(raw, "n"),
     )
 

@@ -26,6 +26,7 @@ def _raw(**overrides):
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": 0,
+            "min_new_tokens": 1,
             "max_new_tokens": 4096,
             "n": 2,
         },
@@ -56,8 +57,28 @@ def test_contract_is_json_native_and_stable():
     contract = parse_job(_raw()).to_contract()
     assert contract["schema"] == JOB_SCHEMA
     assert contract["sampling"]["n"] == 2
+    assert contract["sampling"]["min_new_tokens"] == 1
     assert contract["filter"] is None
     assert contract == parse_job(_raw()).to_contract()
+
+
+def test_a_floor_on_new_tokens_is_carried():
+    # The floor prices a cursor step: a probe pays n * min_new_tokens tokens.
+    job = parse_job(_raw(sampling={
+        "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+        "min_new_tokens": 64, "max_new_tokens": 4096, "n": 2,
+    }))
+    assert job.sampling.min_new_tokens == 64
+    assert job.to_contract()["sampling"]["min_new_tokens"] == 64
+
+
+def test_a_floor_above_the_ceiling_names_both_values():
+    with pytest.raises(JobError) as excinfo:
+        parse_job(_raw(sampling={
+            "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+            "min_new_tokens": 9, "max_new_tokens": 8, "n": 1,
+        }))
+    assert "9" in str(excinfo.value) and "8" in str(excinfo.value)
 
 
 def test_free_prompt_order_is_legal():
@@ -77,12 +98,16 @@ def test_free_prompt_order_is_legal():
         {"slots_per_prompt": 0},
         {"renderer_id": ""},
         {"prompt_order": "whatever"},
-        {"sampling": {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 0.0, "top_k": 0, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.5, "top_k": 0, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 0, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 8, "n": 0}},
+        {"sampling": {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 0.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.5, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 0, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 0}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 0,
+                      "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 9,
+                      "max_new_tokens": 8, "n": 1}},
         {"filter": {"grader_id": "", "threshold": 1.0}},
         {"filter": {"grader_id": "x"}},
         {"deadline_round": -1},

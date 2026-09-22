@@ -22,7 +22,7 @@ def _job(prompt_count, slots_per_prompt):
             "renderer_id": "reliquary/render/v5",
             "sampling": {
                 "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-                "max_new_tokens": 100, "n": 1,
+                "min_new_tokens": 1, "max_new_tokens": 100, "n": 1,
             },
             "slots_per_prompt": slots_per_prompt,
             "filter": None,
