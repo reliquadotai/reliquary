@@ -1,8 +1,10 @@
 """The order in which one miner consumes a job's prompt source.
 
 Each miner walks its own hash order, which disperses collisions that a shared
-heuristic would concentrate, and removes any ability to select the prompts
-whose completions are longest.
+heuristic would concentrate, and takes away any choice of WHICH prompt comes
+next. It does not equalise the cost of skipping one against answering it: a
+miner can always answer at the floor and step on. What closes that residue is
+the audit tier, where junk completions fail token authenticity.
 """
 
 from __future__ import annotations

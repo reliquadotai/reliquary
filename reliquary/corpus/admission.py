@@ -45,7 +45,15 @@ def admit(
     cursors: CursorLedger,
     seen: AbstractSet[str],
 ) -> Verdict:
-    """Decide one submission, consuming a slot and a cursor step when earned."""
+    """Decide one submission, consuming a slot and a cursor step when earned.
+
+    REQUIRED of the caller: ``token_counts``, ``terminations``,
+    ``last_token_ids`` and ``digests`` must be derived by the validator from
+    the submitted token arrays, never copied from what the miner declared.
+    Pass a declared label and ``check_termination`` degenerates back into the
+    label check that was deliberately removed; pass declared digests and the
+    duplicate check is decorative.
+    """
     # The four sequences describe the same completions, so a disagreement in
     # length means some completion would be paid for without ever being checked.
     lengths = {

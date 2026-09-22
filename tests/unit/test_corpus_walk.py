@@ -1,6 +1,7 @@
 """Each miner consumes the prompt source in its own deterministic order, so
 collisions are random rather than correlated by a shared heuristic, and no
-miner can pick the prompts with the longest completions."""
+miner chooses which prompt it answers next. Skipping one is not made as
+expensive as answering it; the audit tier closes that residue."""
 
 import pytest
 
