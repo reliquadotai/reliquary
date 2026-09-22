@@ -80,6 +80,14 @@ def test_an_impossible_completion_is_refused(overrides):
         CorpusCompletion(**_completion(**overrides))
 
 
+def test_the_wire_is_bounded():
+    # Without a ceiling the whole payload is parsed before a check can refuse it.
+    with pytest.raises(ValidationError):
+        CorpusCompletion(**_completion(tokens=[1] * 131073))
+    with pytest.raises(ValidationError):
+        CorpusSubmissionRequest(**_request(completions=[_completion()] * 65))
+
+
 def test_the_response_carries_the_verdict_and_what_is_left():
     response = CorpusSubmissionResponse(
         reason=CorpusRejectReason.ACCEPTED,

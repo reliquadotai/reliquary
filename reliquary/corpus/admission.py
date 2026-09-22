@@ -89,18 +89,21 @@ def admit(
             detail={"prompt_count": job.prompt_count, "got": prompt_index},
         )
 
-    for result in (
-        check_completion_count(len(token_counts), job.sampling),
-        check_token_budget(token_counts, job.sampling),
-        check_termination(
+    # Callables, not results: a junk submission is refused on its first failing
+    # check rather than walked once per check.
+    for check in (
+        lambda: check_completion_count(len(token_counts), job.sampling),
+        lambda: check_token_budget(token_counts, job.sampling),
+        lambda: check_termination(
             terminations,
             token_counts,
             last_token_ids,
             sampling=job.sampling,
             eos_token_id=job.eos_token_id,
         ),
-        check_duplicates(digests, seen),
+        lambda: check_duplicates(digests, seen),
     ):
+        result = check()
         if not result.ok:
             return Verdict(False, result.reason or "", detail=dict(result.detail))
 

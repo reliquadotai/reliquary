@@ -40,7 +40,7 @@ class CorpusRejectReason(str, Enum):
 class CorpusCompletion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tokens: list[int] = Field(min_length=1)
+    tokens: list[int] = Field(min_length=1, max_length=131072)
     text: str
     termination: Literal["eos", "cap"]
 
@@ -60,7 +60,7 @@ class CorpusSubmissionRequest(BaseModel):
     cursor: int = Field(ge=0)
     prompt_index: int = Field(ge=0)
     checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    completions: list[CorpusCompletion] = Field(min_length=1)
+    completions: list[CorpusCompletion] = Field(min_length=1, max_length=64)
     signature: str = Field(min_length=1)
 
 

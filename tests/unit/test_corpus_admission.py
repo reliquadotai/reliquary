@@ -240,6 +240,22 @@ def test_a_one_token_probe_is_refused_under_a_floor():
     assert cursors.expected("5Gx") == 0
 
 
+class _ExplodingSeen:
+    """Membership that must never be consulted once a check has failed."""
+
+    def __contains__(self, item: object) -> bool:
+        raise AssertionError("the duplicate check ran after an earlier one failed")
+
+
+def test_a_failed_check_stops_the_chain():
+    # A million junk completions must not be walked four times to be refused.
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, token_counts=[10, 200], seen=_ExplodingSeen())
+    assert verdict.accepted is False
+    assert verdict.reason == "token_budget_exceeded"
+
+
 def test_two_miners_hold_independent_cursors():
     job = _job()
     slots, cursors = _state(job)
