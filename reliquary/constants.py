@@ -73,6 +73,18 @@ PROTOCOL_GENERATION_CONTRACT = (
     ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
 )
 
+# Model architectures this image can actually run, drawn from the HF configs
+# behind the nine compiled profiles in reliquary/protocol/profiles.py: dense
+# Qwen3 (Qwen/Qwen3-4B-Base, seven profiles) and Qwen3.5's conditional
+# generation class (Qwen/Qwen3.5-2B and -4B, including the default profile;
+# see reliquary/shared/modeling.py's `_is_qwen35_conditional_config`). No
+# profile names an MoE checkpoint, so that architecture is deliberately absent
+# rather than pre-approved on spec. A task contract naming anything else is
+# refused at startup rather than at the first forward pass.
+SUPPORTED_MODEL_ARCHITECTURES = frozenset(
+    {"Qwen3ForCausalLM", "Qwen3_5ForConditionalGeneration"}
+)
+
 # ────────────────  TIMING (CONSENSUS)  ────────────────
 
 # Blocks per window — 5 blocks × 12s ≈ 60s.

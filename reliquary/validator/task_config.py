@@ -68,6 +68,27 @@ def resolve_task_config(
             f"task {task_id!r} pins profile contract {entry.profile_sha256[:12]}… "
             f"but this build computes {digest[:12]}…"
         )
+    if entry.contract is not None:
+        from reliquary.constants import SUPPORTED_MODEL_ARCHITECTURES
+        from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+        # Shape is the registry's job; whether this binary can execute the
+        # contract is ours, and it must fail here rather than mid-window.
+        declared = set(entry.contract.get("environments") or ())
+        missing = sorted(declared - set(ENVIRONMENT_SPECS))
+        if missing:
+            raise TaskConfigError(
+                f"task {task_id!r} names environments this binary does not "
+                f"install: {missing}"
+            )
+        architecture = entry.contract.get("model_architecture")
+        if architecture and architecture not in SUPPORTED_MODEL_ARCHITECTURES:
+            raise TaskConfigError(
+                f"task {task_id!r} names model architecture "
+                f"{architecture!r}, which this image cannot run; it supports "
+                f"{sorted(SUPPORTED_MODEL_ARCHITECTURES)}"
+            )
+
     environments = list(generation_contract.get("environments") or ())
     if entry.env_split is not None:
         unknown = set(entry.env_split) - set(environments)
