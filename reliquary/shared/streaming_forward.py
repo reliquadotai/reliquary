@@ -21,6 +21,7 @@ from typing import Any
 
 import torch
 
+from reliquary.shared.fused_layers import is_fused_store
 from reliquary.shared.layer_source import CheckpointLayers, HostLayers, LayerSource, Prefetching
 
 
@@ -99,6 +100,9 @@ class StreamedReplica:
             extra["dtype"] = dtype
         skeleton = AutoModelForCausalLM.from_config(config, **extra).eval()
         _load_fixed_parts(skeleton, Path(path))
+        if fused_dir is None and is_fused_store(path):
+            # A store is its own fused copy: it was written to be read this way.
+            fused_dir = path
         source: LayerSource = CheckpointLayers(path, fused_dir=fused_dir)
         if prefetch:
             source = Prefetching(source)

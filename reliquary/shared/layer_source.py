@@ -15,6 +15,8 @@ from typing import Any, Mapping
 import torch
 
 LAYER_PREFIX = "model.layers."
+# How a pre-fused store names one layer's file; written by ``fused_layers``, read here.
+LAYER_FILE = "layer{:03d}.safetensors"
 
 
 class LayerSource:
@@ -69,7 +71,7 @@ class CheckpointLayers(LayerSource):
     def fused_file(self, index: int) -> Path | None:
         if self._fused is None:
             return None
-        candidate = self._fused / f"layer{index:03d}.safetensors"
+        candidate = self._fused / LAYER_FILE.format(index)
         return candidate if candidate.exists() else None
 
     def state(self, index: int) -> Mapping[str, torch.Tensor]:
@@ -79,6 +81,10 @@ class CheckpointLayers(LayerSource):
 
             return load_file(str(fused))
         prefix = f"{LAYER_PREFIX}{index}."
+        if not self._names[index]:
+            raise FileNotFoundError(
+                f"{self._path} holds no tensors for layer {index} and no fused copy of it"
+            )
         raw = self._reader.read(self._names[index])
         return fuse_layer_state({k[len(prefix):]: v for k, v in raw.items()})
 

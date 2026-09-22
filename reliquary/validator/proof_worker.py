@@ -585,12 +585,19 @@ def _install_streamed(
     checkpoint_revision: str,
     repo_id: str | None,
 ) -> None:
-    """Point a streamed replica at the checkpoint it must now verify against."""
+    """Point a streamed replica at the checkpoint it must now verify against.
+
+    The staged directory is deleted the moment the swap completes, so the weights are first
+    written into this validator's own store, which is where the traversal then reads them from.
+    Building it costs one pass over the checkpoint and is paid once per revision, by whichever
+    slot rotates first; the slots that follow find it already there.
+    """
     from pathlib import Path
 
     import torch
 
     from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.shared.fused_layers import fused_store_root, install_fused_store
     from reliquary.shared.streaming_forward import StreamedReplica
     from reliquary.validator.proof_capacity import physical_proof_device
 
@@ -600,13 +607,14 @@ def _install_streamed(
             f"{snapshot_dir!r} is not one; the durable repo is not a substitute because the "
             "layers are read from disk on every traversal"
         )
+    store = install_fused_store(snapshot_dir, fused_store_root(), checkpoint_revision)
     previous = context.get("model")
     context["model"] = None
     context["revision"] = None
     if hasattr(previous, "close"):
         previous.close()
     context["model"] = StreamedReplica.from_checkpoint(
-        snapshot_dir,
+        store,
         device=physical_proof_device(context.get("device")),
         dtype=torch.bfloat16,
         prefetch=True,

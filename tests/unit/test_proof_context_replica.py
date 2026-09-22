@@ -59,6 +59,8 @@ def test_both_replicas_verify_a_rollout_the_same_way(tmp_path, monkeypatch):
 
 def test_a_streamed_slot_survives_a_checkpoint_rotation(tmp_path, monkeypatch):
     """A rotation must rebuild the replica, not load a state dict into something that has no layers."""
+    import shutil
+
     import torch
 
     from reliquary.shared.forward import forward_single_layer
@@ -79,5 +81,8 @@ def test_a_streamed_slot_survives_a_checkpoint_rotation(tmp_path, monkeypatch):
     tokens = torch.randint(0, 256, (1, 12), generator=torch.Generator().manual_seed(4))
     resident = AutoModelForCausalLM.from_pretrained(str(second), dtype=torch.bfloat16, attn_implementation="eager").eval()
     hidden, _ = forward_single_layer(resident, tokens, None, -1)
+    # Intake drops the staged copy as soon as the swap completes, and this replica reads its
+    # layers from disk on every pass: it has to be reading the store, not the download.
+    shutil.rmtree(second)
     streamed, _ = forward_single_layer(context["model"], tokens, None, -1)
     assert torch.equal(streamed, hidden), "the rotated replica serves the new checkpoint"
