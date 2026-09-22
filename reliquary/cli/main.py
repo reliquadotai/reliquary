@@ -137,6 +137,78 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
     )
 
 
+def build_contract_task_entry(
+    *,
+    task_id,
+    from_profile,
+    model_id,
+    model_revision,
+    model_architecture,
+    environments,
+    cap,
+    overrides,
+):
+    """One registry entry that CARRIES its contract, seeded from a template.
+
+    The template is a starting point, never the authority: the entry's contract
+    is what the fleet will run, and its digest is computed from that contract.
+    """
+    from dataclasses import asdict
+
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_id import normalise_task_id
+    from reliquary.shared.task_registry import (
+        MECHANISM_RL_DISCOVERED_PRICE,
+        TaskEntry,
+    )
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    task_id = normalise_task_id(task_id)
+    contract = dict(resolve_protocol_profile(from_profile).to_generation_contract())
+
+    # The task id IS the contract's profile id: two tasks seeded from one
+    # template must stay distinguishable to the checks that compare them.
+    contract["profile_id"] = task_id
+    contract["model_id"] = model_id
+    contract["model_revision"] = model_revision
+    # Knowing an arbitrary HF repo's architecture means fetching its config,
+    # which this builder cannot do and stay pure (no network, no filesystem).
+    # The operator states it; whether THIS image can run it is checked at
+    # startup in `resolve_task_config`, against the image's own capability
+    # list, not duplicated here where it could drift out of sync.
+    contract["model_architecture"] = model_architecture
+
+    if environments is not None:
+        if not environments:
+            raise ValueError("a task must declare at least one environment")
+        declared = contract["environments"]
+        unknown = sorted(set(environments) - set(declared))
+        if unknown:
+            raise ValueError(
+                f"template {from_profile!r} does not declare {unknown}; "
+                f"it has {sorted(declared)}"
+            )
+        contract["environments"] = {
+            name: declared[name] for name in sorted(environments)
+        }
+
+    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params.update(overrides)
+    params["cap"] = float(cap)
+    return TaskEntry(
+        task_id=task_id,
+        profile_id=task_id,
+        profile_sha256=canonical_sha256(contract),
+        mechanism=MECHANISM_RL_DISCOVERED_PRICE,
+        params=params,
+        status="active",
+        retired_at=None,
+        env_split=None,
+        contract=contract,
+    )
+
+
 tasks_app = typer.Typer(name="tasks", help="Declare and retire subnet tasks")
 app.add_typer(tasks_app)
 
@@ -170,7 +242,9 @@ def _parse_env_split_option(value: str | None) -> dict[str, float] | None:
 @tasks_app.command("create")
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
-    profile_id: str = typer.Option(..., "--profile-id"),
+    profile_id: str = typer.Option(
+        None, "--profile-id", help="Compiled profile to pin; unused with --model"
+    ),
     cap: float = typer.Option(..., "--cap", help="Most of the pool this task may pay"),
     start: float = typer.Option(None, "--start"),
     decay: float = typer.Option(None, "--decay"),
@@ -179,19 +253,73 @@ def tasks_create(
         "--env-split",
         help="How the cap divides between environments, e.g. math=0.6,code=0.4",
     ),
+    model: str = typer.Option(
+        None, "--model", help="Model id; implies a carried contract"
+    ),
+    model_revision: str = typer.Option(None, "--model-revision"),
+    model_architecture: str = typer.Option(
+        None,
+        "--model-architecture",
+        help="Architecture class the model config declares, e.g. Qwen3ForCausalLM",
+    ),
+    from_profile: str = typer.Option(
+        None, "--from-profile", help="Template to seed the contract from"
+    ),
+    envs: str = typer.Option(
+        None, "--envs", help="Comma-separated subset of the template's environments"
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
 
     overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
     try:
-        entry = build_task_entry(
-            task_id=task_id,
-            profile_id=profile_id,
-            cap=cap,
-            overrides=overrides,
-            env_split=_parse_env_split_option(env_split),
-        )
+        if model is not None:
+            # The builder cannot infer any of these (a template is not a
+            # network call, and architecture needs one) -- so all three are
+            # required together, and each missing one is named, not guessed.
+            missing = [
+                flag
+                for flag, value in (
+                    ("--model-revision", model_revision),
+                    ("--from-profile", from_profile),
+                    ("--model-architecture", model_architecture),
+                )
+                if value is None
+            ]
+            if missing:
+                typer.echo(
+                    f"error: --model requires {', '.join(missing)}", err=True,
+                )
+                raise typer.Exit(code=1)
+            entry = build_contract_task_entry(
+                task_id=task_id,
+                from_profile=from_profile,
+                model_id=model,
+                model_revision=model_revision,
+                model_architecture=model_architecture,
+                environments=(
+                    None
+                    if envs is None
+                    else [e.strip() for e in envs.split(",") if e.strip()]
+                ),
+                cap=cap,
+                overrides=overrides,
+            )
+        else:
+            if profile_id is None:
+                typer.echo(
+                    "error: --profile-id is required unless --model is given",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            entry = build_task_entry(
+                task_id=task_id,
+                profile_id=profile_id,
+                cap=cap,
+                overrides=overrides,
+                env_split=_parse_env_split_option(env_split),
+            )
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -230,6 +358,28 @@ def tasks_retire(
     typer.echo(
         f"retired {task_id}; its cap stays reserved until its EMA tail decays"
     )
+
+
+@tasks_app.command("contract")
+def tasks_contract(task_id: str = typer.Option(..., "--task-id")) -> None:
+    """Print a task's carried contract, for a deployment to mount."""
+    import json
+
+    from reliquary.infrastructure.task_registry_store import read_registry
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    entry = entries.get(task_id)
+    if entry is None:
+        typer.echo(f"error: no task {task_id!r} in the registry", err=True)
+        raise typer.Exit(code=1)
+    if entry.contract is None:
+        typer.echo(
+            f"error: task {task_id!r} is a legacy entry and carries no contract",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(entry.contract, sort_keys=True, separators=(",", ":")))
+
 
 @app.command("watch-verdicts")
 def watch_verdicts(
