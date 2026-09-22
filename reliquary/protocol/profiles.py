@@ -291,6 +291,109 @@ class ProtocolProfile:
         }
 
 
+def _required(contract: Mapping[str, Any], field: str) -> Any:
+    """Refuse a contract missing a field rather than defaulting it: a default
+    here is a silent disagreement between two processes."""
+    if field not in contract:
+        raise ValueError(f"generation contract is missing {field!r}")
+    return contract[field]
+
+
+def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
+    if not isinstance(body, Mapping):
+        raise ValueError(f"environment {name!r} is not an object")
+    if "max_new_tokens" not in body:
+        raise ValueError(f"environment {name!r} is missing 'max_new_tokens'")
+    bft = body.get("bft")
+    template = body.get("prompt_template")
+    episode = body.get("episode")
+    return EnvironmentProfile(
+        max_new_tokens=int(body["max_new_tokens"]),
+        bft=(
+            None
+            if bft is None
+            else BFTProfile(
+                thinking_budget=int(bft["thinking_budget"]),
+                answer_budget=int(bft["answer_budget"]),
+                force_answer=bool(bft["force_answer"]),
+            )
+        ),
+        answer_format=body.get("answer_format"),
+        prompt_template=(
+            None
+            if template is None
+            # 'renderer' and 'sha256' are derived, so they are recomputed rather
+            # than read; the round-trip test is what proves they still agree.
+            else PromptTemplateProfile(
+                template_id=str(template["id"]),
+                template=str(template["template"]),
+            )
+        ),
+        batch_target=body.get("batch_target"),
+        environment_contract_id=body.get("environment_contract_id"),
+        environment_manifest_sha256=body.get("environment_manifest_sha256"),
+        episode=(
+            None
+            if episode is None
+            else EpisodeProfile(
+                schema=str(episode["schema"]),
+                renderer_id=str(episode["renderer_id"]),
+                max_turns=int(episode["max_turns"]),
+                max_action_tokens=int(episode["max_action_tokens"]),
+                max_episode_tokens=int(episode["max_episode_tokens"]),
+                max_observation_bytes=int(episode["max_observation_bytes"]),
+            )
+        ),
+    )
+
+
+def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
+    """Rebuild a profile from what ``to_generation_contract`` produced.
+
+    The exact inverse, and it must stay exact: a task carries this contract, so
+    a field lost in translation is a field the fleet disagrees about silently.
+    """
+    if not isinstance(contract, Mapping):
+        raise ValueError("a generation contract must be an object")
+
+    sampling = _required(contract, "sampling")
+    if not isinstance(sampling, Mapping):
+        raise ValueError("generation contract 'sampling' must be an object")
+    environments = _required(contract, "environments")
+    if not isinstance(environments, Mapping):
+        raise ValueError("generation contract 'environments' must be an object")
+    tiebreak = contract.get("throughput_tiebreak")
+
+    return ProtocolProfile(
+        profile_id=str(_required(contract, "profile_id")),
+        model_id=str(_required(contract, "model_id")),
+        model_revision=str(_required(contract, "model_revision")),
+        protocol_version=int(_required(contract, "protocol_version")),
+        collection_seconds=int(_required(contract, "collection_seconds")),
+        upload_grace_seconds=int(_required(contract, "upload_grace_seconds")),
+        prompt_encoding=str(_required(contract, "prompt_encoding")),
+        sampling=SamplingProfile(
+            rollouts=int(sampling["rollouts"]),
+            temperature=float(sampling["temperature"]),
+            top_p=float(sampling["top_p"]),
+            top_k=int(sampling["top_k"]),
+            do_sample=bool(sampling["do_sample"]),
+        ),
+        environments={
+            name: _environment_from_contract(name, body)
+            for name, body in environments.items()
+        },
+        throughput_tiebreak=(
+            None
+            if tiebreak is None
+            else ThroughputTiebreakProfile(
+                token_cap=int(tiebreak["token_cap"]),
+                bucket_tokens_per_round=int(tiebreak["bucket_tokens_per_round"]),
+            )
+        ),
+    )
+
+
 _SAMPLING = SamplingProfile(
     rollouts=8,
     temperature=0.6,
@@ -790,6 +893,7 @@ __all__ = [
     "PROFILES",
     "ProtocolProfile",
     "SamplingProfile",
+    "profile_from_contract",
     "resolve_protocol_profile",
     "render_active_prompt",
     "to_generation_contract",
