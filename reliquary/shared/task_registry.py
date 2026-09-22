@@ -22,6 +22,9 @@ MECHANISM_CORPUS_GENERATION = "corpus-generation"
 KNOWN_MECHANISMS = frozenset(
     {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION}
 )
+# What a task may pin as the way its rollouts are verified. Declaring one makes every validator
+# run the same path whatever its card; declaring none lets each derive it, which is the default.
+KNOWN_VERIFICATION = frozenset({"resident", "streamed"})
 
 # Every field the REGISTRY declares per task. A missing one is refused rather
 # than defaulted: a half-specified controller is not a controller.
@@ -64,6 +67,9 @@ class TaskEntry:
     # legacy form, where the binary holds the contract and the entry pins its
     # hash in `profile_sha256`.
     contract: Mapping[str, Any] | None = None
+    # Which replica the task's validators verify with, when the task pins one.
+    # None means "not declared": each validator derives it from its own card.
+    verification: str | None = None
 
 
 def _number(value: Any, field: str) -> float:
@@ -102,6 +108,11 @@ def validate_entry(entry: TaskEntry) -> None:
         )
     if entry.mechanism not in KNOWN_MECHANISMS:
         raise RegistryError(f"unknown incentive mechanism {entry.mechanism!r}")
+    if entry.verification is not None and entry.verification not in KNOWN_VERIFICATION:
+        raise RegistryError(
+            f"unknown verification replica {entry.verification!r}; "
+            f"declare one of {', '.join(sorted(KNOWN_VERIFICATION))}, or nothing to derive it"
+        )
     if entry.status not in {"active", "retired"}:
         raise RegistryError(f"unknown status {entry.status!r}")
     missing = [f for f in PRICE_PARAM_FIELDS if f not in entry.params]
@@ -215,6 +226,25 @@ def retire_task(
     return {**entries, task_id: retired}
 
 
+def _verification_of(task_id: str, body: Mapping[str, Any]) -> str | None:
+    """Read the declared replica, refusing a block this reader does not understand."""
+    declared = body.get("verification")
+    if declared is None:
+        return None
+    if not isinstance(declared, Mapping):
+        raise RegistryError(f"task {task_id!r} verification must be an object")
+    unknown = set(declared) - {"replica"}
+    if unknown:
+        raise RegistryError(
+            f"task {task_id!r} verification declares {', '.join(sorted(unknown))}, "
+            "which this validator does not know how to honour"
+        )
+    replica = declared.get("replica")
+    if replica is not None and not isinstance(replica, str):
+        raise RegistryError(f"task {task_id!r} verification replica must be a string")
+    return replica
+
+
 def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
     try:
         document = json.loads(raw)
@@ -245,6 +275,7 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             retired_at=body.get("retired_at"),
             env_split=body.get("env_split"),
             contract=body.get("contract"),
+            verification=_verification_of(task_id, body),
         )
     if strict:
         validate_registry(entries)
@@ -269,7 +300,15 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
             "env_split": (
                 None if entry.env_split is None else dict(entry.env_split)
             ),
+            # Always written, null when undeclared, like `env_split`. `contract`
+            # below is the one field that is omitted instead — see its comment.
+            "verification": (
+                None if entry.verification is None
+                else {"replica": entry.verification}
+            ),
         }
+        # Omitted rather than written as null, so a registry holding only legacy
+        # entries renders exactly as it did before contracts existed.
         if entry.contract is not None:
             body["contract"] = dict(entry.contract)
         return body

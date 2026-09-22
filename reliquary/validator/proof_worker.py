@@ -40,7 +40,9 @@ __all__ = [
     "reload_proof_context",
     "proof_error_type",
     "remote_commitment_verifier",
+    "batch_padding_for",
     "run_commitment_proof",
+    "shadow_traversal",
 ]
 
 
@@ -86,6 +88,15 @@ def remote_commitment_verifier(
     per-rollout proof loop is untouched.
     """
 
+    def _device_of(model: Any) -> str:
+        device_id = getattr(model, "device_id", None)
+        if not isinstance(model, ProofModelProxy) or not device_id:
+            raise ProofWorkerUnavailable(
+                "isolated proof plane requires a ProofModelProxy, got "
+                f"{type(model).__name__}"
+            )
+        return device_id
+
     def verify(
         commit: Any,
         model: Any,
@@ -94,14 +105,17 @@ def remote_commitment_verifier(
         tokenizer: Any = None,
         seed_u_values: Any = None,
     ) -> Any:
-        device_id = getattr(model, "device_id", None)
-        if not isinstance(model, ProofModelProxy) or not device_id:
-            raise ProofWorkerUnavailable(
-                "isolated proof plane requires a ProofModelProxy, got "
-                f"{type(model).__name__}"
-            )
+        device_id = _device_of(model)
         return pool.call(device_id, commit, window_randomness, seed_u_values)
 
+    def warm(inputs: Sequence[Any], model: Any, window_randomness: str) -> int:
+        """Pay one pass for a slice of the request the per-rollout loop is about to prove."""
+        device_id = _device_of(model)
+        commits = [commit for commit, _ in inputs]
+        seeds = [seed for _, seed in inputs]
+        return pool.warm(device_id, commits, window_randomness, seeds)
+
+    verify.warm = warm
     return verify
 
 
@@ -131,6 +145,7 @@ def _worker_main(
     context_factory: str,
     handler: str,
     reload_handler: str | None,
+    warm_handler: str | None,
     factory_kwargs: Mapping[str, Any],
     device: str,
 ) -> None:
@@ -139,6 +154,7 @@ def _worker_main(
         context = _resolve(context_factory)(device=device, **dict(factory_kwargs))
         handler_fn = _resolve(handler)
         reload_fn = _resolve(reload_handler) if reload_handler else None
+        warm_fn = _resolve(warm_handler) if warm_handler else None
     except BaseException as exc:  # noqa: BLE001 - reported, then the child exits
         try:
             connection.send(("start_failed", (type(exc).__name__, str(exc))))
@@ -162,6 +178,10 @@ def _worker_main(
                 if reload_fn is None:
                     raise RuntimeError("worker has no reload handler")
                 payload = reload_fn(context, *args, **kwargs)
+            elif operation == "warm":
+                if warm_fn is None:
+                    raise RuntimeError("worker has no warm handler")
+                payload = warm_fn(context, *args, **kwargs)
             else:
                 payload = handler_fn(context, *args, **kwargs)
         except Exception as exc:  # noqa: BLE001 - relayed, worker stays up
@@ -200,9 +220,11 @@ class ProofWorkerPool:
         context_factory: str,
         handler: str,
         reload_handler: str | None = None,
+        warm_handler: str | None = None,
         factory_kwargs: Mapping[str, Any] | None = None,
         request_timeout_seconds: float | None = None,
         reload_timeout_seconds: float | None = None,
+        warm_timeout_seconds: float | None = None,
         start_timeout_seconds: float = 900.0,
     ) -> None:
         if not devices:
@@ -213,6 +235,7 @@ class ProofWorkerPool:
         self._context_factory = context_factory
         self._handler = handler
         self._reload_handler = reload_handler
+        self._warm_handler = warm_handler
         self._factory_kwargs = dict(factory_kwargs or {})
         self._request_timeout_seconds = (
             None if request_timeout_seconds is None
@@ -221,6 +244,13 @@ class ProofWorkerPool:
         self._reload_timeout_seconds = (
             None if reload_timeout_seconds is None
             else float(reload_timeout_seconds)
+        )
+        # A warm pass drives the model over a whole slice at once, which on a streamed replica is
+        # a full traversal: it is closer to a reload than to a single proof, and the request
+        # timeout would retire a worker that is doing exactly what it was asked.
+        self._warm_timeout_seconds = (
+            self._reload_timeout_seconds if warm_timeout_seconds is None
+            else float(warm_timeout_seconds)
         )
         self._start_timeout_seconds = float(start_timeout_seconds)
         self._revisions: dict[str, str | None] = {}
@@ -324,6 +354,7 @@ class ProofWorkerPool:
                 "context_factory": self._context_factory,
                 "handler": self._handler,
                 "reload_handler": self._reload_handler,
+                "warm_handler": self._warm_handler,
                 "factory_kwargs": self._factory_kwargs,
                 "device": device_id,
             },
@@ -382,10 +413,10 @@ class ProofWorkerPool:
     def _exchange(self, worker, device_id: str, operation: str, args, kwargs) -> Any:
         try:
             worker.connection.send((operation, args, kwargs))
-            timeout = (
-                self._reload_timeout_seconds if operation == "reload"
-                else self._request_timeout_seconds
-            )
+            timeout = {
+                "reload": self._reload_timeout_seconds,
+                "warm": self._warm_timeout_seconds,
+            }.get(operation, self._request_timeout_seconds)
             if timeout is not None and not worker.connection.poll(timeout):
                 self._retire(device_id, worker=worker)
                 raise ProofWorkerUnavailable(
@@ -425,6 +456,27 @@ class ProofWorkerPool:
             (snapshot_dir, checkpoint_revision, repo_id), {},
         )
         self._revisions[device_id] = checkpoint_revision
+
+    def warm(
+        self,
+        device_id: str,
+        commits: Sequence[Any],
+        window_randomness: str,
+        seed_u_values: Sequence[Any] | None = None,
+    ) -> int:
+        """Drive the model once for a slice, so the proofs that follow do not each drive it.
+
+        Returns how many rollouts were warmed. A pool with no warm handler warms none, and the
+        proofs run exactly as they did before.
+        """
+        if not self._warm_handler or not commits:
+            return 0
+        seeds = list(seed_u_values or [None] * len(commits))
+        return int(
+            self._request(
+                device_id, "warm", (list(commits), window_randomness, seeds), {},
+            )
+        )
 
     def revision(self, device_id: str) -> str | None:
         """Revision this worker is certified for, or None when unknown."""
@@ -477,15 +529,146 @@ class ProofWorkerPool:
 # process, never in the validator's interpreter.
 
 
+def batch_padding_for(replica: str | None) -> bool:
+    """Whether this slot's passes may mix lengths.
+
+    A streamed slot has to: a traversal is its whole cost, and rollouts that terminate on their
+    own almost never share a token count, so an unpadded pass carries one rollout. A resident slot
+    does not: its forward is cheap either way, and not padding is how it keeps returning exactly
+    what one-at-a-time verification returned before any of this existed.
+    """
+    from reliquary.constants import PROOF_BATCH_PADDING
+
+    if PROOF_BATCH_PADDING != "auto":
+        return PROOF_BATCH_PADDING == "on"
+    return replica == STREAMED
+
+
+def _warm_key(commit: Any) -> tuple:
+    """What identifies a rollout among the ones a warm pass covered."""
+    return tuple(commit["tokens"])
+
+
+def warm_commitment_batch(
+    context: MutableMapping[str, Any],
+    commits: list[dict],
+    window_randomness: str,
+    seed_u_values: Any = None,
+) -> int:
+    """Pay one traversal of the model for a whole batch, before its proofs arrive one by one.
+
+    The server proves item by item, and rightly so: that loop carries the receipts, the deadlines
+    and the stop at the first failure. Warming leaves it alone and removes the only part that does
+    not belong to an item — the pass over the model, which a streamed replica pays in full every
+    time. Each proof then finds its rows already computed.
+    """
+    from reliquary.validator import verifier as verifier_module
+
+    context["_warm"] = {}
+    if not commits:
+        return 0
+    rows = verifier_module.forward_rows_for_batch(
+        commits, context["model"], pad=batch_padding_for(context.get("replica")),
+    )
+    context["_warm"] = {_warm_key(commit): rows[index] for index, commit in enumerate(commits)}
+    return len(context["_warm"])
+
+
+def shadow_traversal(context: MutableMapping[str, Any], commit: Any) -> bool:
+    """Run the streamed traversal beside the resident forward and report what differs.
+
+    That the two agree to the bit is the oracle this path rests on, and it exists only while the
+    model still fits on a card — which is the window before a model arrives that does not. Running
+    it on a sampled share of live traffic is how it gets exercised against the real checkpoint and
+    real rollouts while it can still be checked at all.
+
+    It never touches a verdict. A miner is accepted or rejected on the same forward as before; a
+    disagreement here is reported and counted, and it is the operator who decides what it means.
+    """
+    import random
+
+    import torch
+
+    from reliquary.constants import LAYER_INDEX, PROOF_SHADOW_FRACTION
+    from reliquary.shared.forward import forward_single_layer
+    from reliquary.shared.streaming_forward import StreamedReplica
+
+    model = context.get("model")
+    if (
+        PROOF_SHADOW_FRACTION <= 0.0
+        or context.get("replica") != RESIDENT
+        or model is None
+        or isinstance(commit, list)
+        or random.random() >= PROOF_SHADOW_FRACTION
+    ):
+        return False
+    report = context.setdefault("shadow", {"checked": 0, "mismatched": 0, "failed": 0})
+    try:
+        shadow = context.get("_shadow_replica")
+        if shadow is None:
+            shadow = StreamedReplica.from_model(model, device=next(model.parameters()).device)
+            context["_shadow_replica"] = shadow
+        tokens = torch.tensor([list(commit["tokens"])], device=next(model.parameters()).device)
+        with torch.no_grad():
+            resident, _ = forward_single_layer(model, tokens, None, LAYER_INDEX)
+            streamed, _ = forward_single_layer(shadow, tokens, None, LAYER_INDEX)
+        report["checked"] += 1
+        if not torch.equal(streamed, resident):
+            difference = float((streamed.float() - resident.float()).abs().max())
+            report["mismatched"] += 1
+            report["max_difference"] = max(report.get("max_difference", 0.0), difference)
+            logger.error(
+                "shadow traversal disagrees with the resident forward on %d tokens "
+                "(max |difference| %.3e); no verdict was changed",
+                tokens.shape[1], difference,
+            )
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - a shadow must never cost a proof
+        report["failed"] += 1
+        logger.exception("shadow traversal failed; the proof itself is unaffected")
+        return False
+
+
 def run_commitment_proof(
     context: MutableMapping[str, Any],
     commit: Any,
     window_randomness: str,
     seed_u_values: Any = None,
 ) -> Any:
-    """Run one GRAIL proof against the weights this worker owns."""
+    """Run a GRAIL proof against the weights this worker owns.
+
+    A list of commits is proved with one pass of the model per group and comes back as a list of
+    results in the same order. That matters for a streamed replica, where a pass costs a full
+    traversal and proving rollouts one at a time would pay it over and over.
+    """
     from reliquary.validator import verifier as verifier_module
 
+    shadow_traversal(context, commit)
+    warm = context.get("_warm")
+    if warm and not isinstance(commit, list):
+        # Spent as it is consumed: a second attempt on the same rollout runs its own pass rather
+        # than reusing rows that belonged to the first.
+        rows = warm.pop(_warm_key(commit), None)
+        if rows is not None:
+            return verifier_module.verify_commitment_proofs(
+                commit,
+                context["model"],
+                window_randomness,
+                tokenizer=context["tokenizer"],
+                seed_u_values=seed_u_values,
+                forward=rows,
+            )
+    if isinstance(commit, list):
+        seeds = seed_u_values if isinstance(seed_u_values, list) else [None] * len(commit)
+        return verifier_module.verify_commitment_proofs_batch(
+            commit,
+            context["model"],
+            window_randomness,
+            tokenizer=context["tokenizer"],
+            seed_u_values=seeds,
+            pad=batch_padding_for(context.get("replica")),
+        )
     return verifier_module.verify_commitment_proofs(
         commit,
         context["model"],
@@ -512,14 +695,60 @@ def describe_proof_context(context: MutableMapping[str, Any]) -> dict[str, Any]:
     )
     return {
         "device_id": device,
+        "replica": context.get("replica", RESIDENT),
         "physical_device": identity.device_id,
         "hardware_class": identity.hardware_class,
         "device_uuid": identity.device_uuid,
         "revision": context.get("revision"),
+        "shadow": dict(context.get("shadow") or {}),
         "runtime": collect_runtime_fingerprint(generation_model=model, proof_model=model),
         "config": model.config.to_dict(),
         "generation_config": model.generation_config.to_dict(),
     }
+
+
+def _install_streamed(
+    context: MutableMapping[str, Any],
+    snapshot_dir: str | None,
+    checkpoint_revision: str,
+    repo_id: str | None,
+) -> None:
+    """Point a streamed replica at the checkpoint it must now verify against.
+
+    The staged directory is deleted the moment the swap completes, so the weights are first
+    written into this validator's own store, which is where the traversal then reads them from.
+    Building it costs one pass over the checkpoint and is paid once per revision, by whichever
+    slot rotates first; the slots that follow find it already there.
+    """
+    from pathlib import Path
+
+    import torch
+
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.shared.fused_layers import fused_store_root, install_fused_store
+    from reliquary.shared.streaming_forward import StreamedReplica
+    from reliquary.validator.proof_capacity import physical_proof_device
+
+    if not (snapshot_dir and Path(snapshot_dir).is_dir()):
+        raise RuntimeError(
+            "a streamed replica reloads from a staged checkpoint directory, and "
+            f"{snapshot_dir!r} is not one; the durable repo is not a substitute because the "
+            "layers are read from disk on every traversal"
+        )
+    store = install_fused_store(snapshot_dir, fused_store_root(), checkpoint_revision)
+    previous = context.get("model")
+    context["model"] = None
+    context["revision"] = None
+    if hasattr(previous, "close"):
+        previous.close()
+    context["model"] = StreamedReplica.from_checkpoint(
+        store,
+        device=physical_proof_device(context.get("device")),
+        dtype=torch.bfloat16,
+        prefetch=True,
+        attn_implementation=ATTN_IMPLEMENTATION,
+    )
+    context["revision"] = checkpoint_revision
 
 
 def reload_proof_context(
@@ -554,6 +783,13 @@ def reload_proof_context(
     if (not snapshot_dir and repo_id and context.get("model") is not None
             and initial_source == (repo_id, checkpoint_revision)):
         context["revision"] = checkpoint_revision
+        return
+
+    if context.get("replica") == STREAMED:
+        # A streamed replica has no layers to load into: its weights live in the checkpoint and
+        # are read one at a time. Rotating it means pointing it at the new directory, which costs
+        # only the fixed parts — the layers are not held in the first place.
+        _install_streamed(context, snapshot_dir, checkpoint_revision, repo_id)
         return
 
     state: dict[str, Any] = {}
@@ -650,11 +886,51 @@ def _install_from_hub(
     context["revision"] = checkpoint_revision
 
 
+from reliquary.shared.replica_strategy import RESIDENT, STREAMED
+
+
+def choose_proof_replica(
+    checkpoint: str, physical_device: str, declared: str | None = None,
+) -> str:
+    """Whether this slot can hold the model, or has to walk it one layer at a time.
+
+    Derived from the checkpoint's size against the card's free memory, so no operator has to know
+    what a model is made of. A task that pins a replica overrides the derivation — that is how a
+    fleet of unequal cards is made to run one path — and ``RELIQUARY_PROOF_REPLICA`` overrides
+    both, for a shadow run or an incident.
+    """
+    import os
+    from pathlib import Path
+
+    import torch
+
+    from reliquary.shared.replica_strategy import RESIDENT, checkpoint_weight_bytes, choose_replica
+
+    override = os.environ.get("RELIQUARY_PROOF_REPLICA") or None
+    if not str(physical_device).startswith("cuda"):
+        # Without a card there is nothing to outgrow, and nothing to refuse a task for.
+        return choose_replica(
+            weights_bytes=0, free_bytes=1, override=override, declared=declared,
+        )
+    try:
+        weights = checkpoint_weight_bytes(Path(checkpoint))
+    except (FileNotFoundError, OSError):
+        # A checkpoint we cannot size is a checkpoint we have always loaded resident.
+        return choose_replica(
+            weights_bytes=0, free_bytes=1, override=override, declared=declared,
+        )
+    free, _total = torch.cuda.mem_get_info(torch.device(physical_device))
+    return choose_replica(
+        weights_bytes=weights, free_bytes=free, override=override, declared=declared,
+    )
+
+
 def build_proof_context(
     *,
     checkpoint: str,
     device: str,
     load_kwargs: Mapping[str, Any] | None = None,
+    replica: str | None = None,
 ) -> dict[str, Any]:
     """Load this worker's bootstrap replica, exactly as the in-process path did.
 
@@ -671,6 +947,8 @@ def build_proof_context(
 
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared import modeling
+    from reliquary.shared.replica_strategy import RESIDENT, STREAMED
+    from reliquary.shared.streaming_forward import StreamedReplica
     from reliquary.validator.proof_capacity import physical_proof_device
 
     kwargs = dict(load_kwargs or {})
@@ -678,18 +956,32 @@ def build_proof_context(
     # ``device`` is a proof SLOT id: several slots can share one card, and
     # torch does not understand the ``cuda:0#1`` form. The slot id stays in the
     # context because that is this worker's identity to the pool and scheduler.
-    model = modeling.load_text_generation_model(
-        checkpoint,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=ATTN_IMPLEMENTATION,
-        **kwargs,
-    ).to(physical_proof_device(device)).eval()
-    for parameter in model.parameters():
-        parameter.requires_grad = False
+    physical = physical_proof_device(device)
+    replica = choose_proof_replica(checkpoint, physical, replica)
+    if replica == STREAMED:
+        # The model outgrew the card: keep one decoder layer on it at a time. What the
+        # verification path reads off a model is unchanged, so nothing downstream moves.
+        model = StreamedReplica.from_checkpoint(
+            checkpoint,
+            device=physical,
+            dtype=torch.bfloat16,
+            prefetch=True,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+    else:
+        model = modeling.load_text_generation_model(
+            checkpoint,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=ATTN_IMPLEMENTATION,
+            **kwargs,
+        ).to(physical).eval()
+        for parameter in model.parameters():
+            parameter.requires_grad = False
     return {
         "model": model,
         "tokenizer": tokenizer,
         "device": device,
+        "replica": replica,
         "revision": None,
         "_initial_source": (checkpoint, kwargs.get("revision")),
     }
@@ -698,6 +990,7 @@ def build_proof_context(
 PROOF_CONTEXT_FACTORY = "reliquary.validator.proof_worker:build_proof_context"
 PROOF_HANDLER = "reliquary.validator.proof_worker:run_commitment_proof"
 PROOF_RELOAD_HANDLER = "reliquary.validator.proof_worker:reload_proof_context"
+PROOF_WARM_HANDLER = "reliquary.validator.proof_worker:warm_commitment_batch"
 
 
 def build_isolated_proof_plane(
@@ -706,6 +999,7 @@ def build_isolated_proof_plane(
     checkpoint: str,
     load_kwargs: Mapping[str, Any] | None = None,
     reference_model: Any = None,
+    replica: str | None = None,
 ) -> tuple["ProofWorkerPool", dict[str, ProofModelProxy]]:
     """Assemble the isolated plane: one worker per proof slot, one proxy each.
 
@@ -723,9 +1017,11 @@ def build_isolated_proof_plane(
         context_factory=PROOF_CONTEXT_FACTORY,
         handler=PROOF_HANDLER,
         reload_handler=PROOF_RELOAD_HANDLER,
+        warm_handler=PROOF_WARM_HANDLER,
         factory_kwargs={
             "checkpoint": checkpoint,
             "load_kwargs": dict(load_kwargs or {}),
+            "replica": replica,
         },
         request_timeout_seconds=PROOF_WORKER_REQUEST_TIMEOUT_SECONDS,
         reload_timeout_seconds=PROOF_WORKER_RELOAD_TIMEOUT_SECONDS,

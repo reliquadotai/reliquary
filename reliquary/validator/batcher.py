@@ -24,6 +24,7 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     CHALLENGE_K,
     M_ROLLOUTS,
+    PROOF_WARM_ROLLOUTS,
     PROTOCOL_THROUGHPUT_TIEBREAK,
     B_BATCH,
     DIFFICULTY_AUCTION_DELTA,
@@ -4759,6 +4760,11 @@ class GrpoWindowBatcher:
 
         _t_prep_done = time.perf_counter()
         remote_batch = getattr(self._verify_commitment, "batch", None)
+        # A warming pass drives the model once for a slice of the request, and the per-rollout
+        # loop below then checks rows that are already computed. The loop itself does not move:
+        # each rollout keeps its own receipt, its own deadline, and a GRAIL failure still stops
+        # the ones behind it.
+        warm_proofs = getattr(self._verify_commitment, "warm", None)
         prefetched_proofs = []
         def seed_uniforms(index, commit):
             positions = policy_token_positions(list(commit.get("tokens") or []), commit.get("rollout") or {})
@@ -4810,6 +4816,25 @@ class GrpoWindowBatcher:
             _t_sketch += time.perf_counter() - _tmark
             seed_u = seed_uniforms(rollout_idx, rollout.commit)
             try:
+                if warm_proofs is not None and rollout_idx % PROOF_WARM_ROLLOUTS == 0:
+                    inputs = [
+                        (r.commit, seed_uniforms(index, r.commit))
+                        for index, r in enumerate(
+                            request.rollouts[rollout_idx:rollout_idx + PROOF_WARM_ROLLOUTS],
+                            rollout_idx,
+                        )
+                    ]
+                    _t_warm0 = time.perf_counter()
+                    try:
+                        warm_proofs(inputs, proof_model, self.randomness)
+                    except Exception:
+                        # A warm pass is an optimisation. Losing it costs each rollout its own
+                        # pass; failing the group over it would cost a miner a window.
+                        logger.warning(
+                            "warming the proof batch failed; proving one rollout at a time",
+                            exc_info=True,
+                        )
+                    _t_proof_total += time.perf_counter() - _t_warm0
                 if remote_batch is not None:
                     if not prefetched_proofs:
                         from reliquary.validator.remote_proof_protocol import MAX_PROOF_BATCH

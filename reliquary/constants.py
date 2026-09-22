@@ -62,6 +62,35 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
+# How many tokens one verification pass puts on the card at once. A pass costs one traversal of
+# the model, which a streamed replica pays in full, so the budget wants to be as large as the card
+# allows: measured at 13.5 GB of device memory for 65k tokens in flight on a 2048-wide model, and
+# a pass of 32 rollouts costs 0.22 s each against 7.6 s for one alone.
+PROOF_BATCH_TOKEN_BUDGET = int(_os.environ.get("RELIQUARY_PROOF_BATCH_TOKENS", "262144"))
+
+# How many of a request's rollouts one warming pass covers. A group is what a miner submits, so
+# warming a group at a time is what makes the pass shared without holding rows for rollouts the
+# loop may never reach. The worker still splits the slice into passes by token budget.
+PROOF_WARM_ROLLOUTS = int(_os.environ.get("RELIQUARY_PROOF_WARM_ROLLOUTS", "16"))
+if PROOF_WARM_ROLLOUTS < 1:
+    raise ValueError("RELIQUARY_PROOF_WARM_ROLLOUTS must be at least 1")
+
+# Whether a pass may hold rollouts of different lengths, padded to the widest and cut back after.
+# "auto" pads for a streamed replica and not for a resident one: rollouts that terminate on their
+# own almost never share a token count, so without padding a streamed slot pays a traversal per
+# rollout and the batching it exists for does not happen; while a resident slot has no throughput
+# problem to solve and keeps returning, to the bit, what one-at-a-time verification always did.
+PROOF_BATCH_PADDING = _os.environ.get("RELIQUARY_PROOF_BATCH_PADDING", "auto").strip().lower()
+if PROOF_BATCH_PADDING not in {"auto", "on", "off"}:
+    raise ValueError("RELIQUARY_PROOF_BATCH_PADDING must be 'auto', 'on' or 'off'")
+
+# Fraction of proofs a resident slot also runs through the streamed traversal, comparing the two
+# and reporting when they differ. The oracle only exists while the model still fits on one card,
+# which is exactly the window before the cutover: 0 outside it, because it doubles the forward.
+PROOF_SHADOW_FRACTION = float(_os.environ.get("RELIQUARY_PROOF_SHADOW_FRACTION", "0"))
+if not 0.0 <= PROOF_SHADOW_FRACTION <= 1.0:
+    raise ValueError("RELIQUARY_PROOF_SHADOW_FRACTION must be between 0 and 1")
+
 PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
 PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
 PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision

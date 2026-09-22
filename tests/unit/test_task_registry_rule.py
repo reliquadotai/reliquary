@@ -360,3 +360,28 @@ def test_a_second_task_is_allowed_once_default_exists():
     require_default_declared_first(
         {"default": _entry("default", 0.7)}, _entry("logic-probe", 0.3)
     )
+
+
+def test_a_task_may_declare_how_its_rollouts_are_verified():
+    """Declaring nothing is the default: each validator derives it from its own card."""
+    entry = replace(_entry("moe", 0.5), verification="streamed")
+    validate_entry(entry)
+
+    parsed = parse_registry(render_registry({"moe": entry}))["moe"]
+
+    assert parsed.verification == "streamed"
+    assert parse_registry(render_registry({"d": _entry("d", 0.5)}))["d"].verification is None
+
+
+def test_a_verification_replica_nobody_implements_is_refused_at_declaration():
+    with pytest.raises(RegistryError, match="unknown verification replica"):
+        validate_entry(replace(_entry("moe", 0.5), verification="quantised"))
+
+
+def test_a_verification_block_this_validator_cannot_honour_stops_it():
+    """A newer controller's field must not be read as 'nothing declared' by an older binary."""
+    document = json.loads(render_registry({"moe": _entry("moe", 0.5)}))
+    document["tasks"]["moe"]["verification"] = {"replica": "streamed", "audit_fraction": 0.1}
+
+    with pytest.raises(RegistryError, match="audit_fraction"):
+        parse_registry(json.dumps(document).encode())

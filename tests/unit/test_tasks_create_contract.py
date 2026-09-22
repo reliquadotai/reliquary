@@ -33,6 +33,31 @@ def test_the_entry_carries_a_contract_whose_digest_is_its_own():
     assert entry.params["cap"] == 0.30
 
 
+def test_a_pinned_verification_sits_beside_the_contract_not_inside_it():
+    # Generating on a large mixture-of-experts model is the case that needs a
+    # pinned replica. It says how validators CHECK the work, not what the work
+    # is, so it must not change the contract or its digest.
+    template = _template()
+    common = dict(
+        task_id="glm-run",
+        from_profile=template,
+        model_id="org/GLM",
+        model_revision="abc123",
+        model_architecture="Qwen3ForCausalLM",
+        environments=None,
+        cap=0.30,
+        overrides={},
+    )
+    plain = build_contract_task_entry(**common)
+    pinned = build_contract_task_entry(**common, verification="streamed")
+
+    assert plain.verification is None
+    assert pinned.verification == "streamed"
+    assert "verification" not in pinned.contract
+    assert pinned.contract == plain.contract
+    assert pinned.profile_sha256 == plain.profile_sha256
+
+
 def test_the_model_is_overridden_and_nothing_else_is():
     template = _template()
     source = PROFILES[template]
