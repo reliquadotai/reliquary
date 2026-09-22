@@ -92,7 +92,13 @@ def admit(
     for result in (
         check_completion_count(len(token_counts), job.sampling),
         check_token_budget(token_counts, job.sampling),
-        check_termination(terminations),
+        check_termination(
+            terminations,
+            token_counts,
+            last_token_ids,
+            sampling=job.sampling,
+            eos_token_id=job.eos_token_id,
+        ),
         check_duplicates(digests, seen),
     ):
         if not result.ok:

@@ -72,15 +72,48 @@ def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> Check
     return OK
 
 
-def check_termination(terminations: Sequence[str]) -> CheckResult:
+def check_termination(
+    terminations: Sequence[str],
+    token_counts: Sequence[int],
+    last_token_ids: Sequence[int],
+    *,
+    sampling: Sampling,
+    eos_token_id: int,
+) -> CheckResult:
     """A completion ends on EOS or on the cap; anything else is a silent
-    truncation we will not pay for."""
+    truncation we will not pay for.
+
+    The label alone is worthless, so each one is checked against the structure
+    it claims: the caller has already made the three sequences agree in length.
+    """
     for position, termination in enumerate(terminations):
         if termination not in TERMINATIONS:
             return CheckResult(
                 ok=False,
                 reason="bad_termination",
                 detail={"position": position, "termination": termination},
+            )
+        if termination == "cap" and token_counts[position] != sampling.max_new_tokens:
+            return CheckResult(
+                ok=False,
+                reason="bad_termination",
+                detail={
+                    "position": position,
+                    "termination": "cap",
+                    "tokens": int(token_counts[position]),
+                    "max_new_tokens": sampling.max_new_tokens,
+                },
+            )
+        if termination == "eos" and last_token_ids[position] != eos_token_id:
+            return CheckResult(
+                ok=False,
+                reason="bad_termination",
+                detail={
+                    "position": position,
+                    "termination": "eos",
+                    "last_token_id": int(last_token_ids[position]),
+                    "eos_token_id": eos_token_id,
+                },
             )
     return OK
 

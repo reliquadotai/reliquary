@@ -22,6 +22,7 @@ def _job(**overrides):
         "prompt_source": "openmathinstruct",
         "prompt_count": 1000,
         "renderer_id": "reliquary/render/v5",
+        "eos_token_id": EOS,
         "sampling": {
             "temperature": 1.0,
             "top_p": 1.0,
@@ -162,6 +163,38 @@ def test_a_cheap_check_failure_is_reported_and_moves_nothing(kwargs, reason):
     verdict = _call(job, slots, cursors, **kwargs)
     assert verdict.accepted is False
     assert verdict.reason == reason
+    assert slots.filled == 0
+    assert cursors.expected("5Gx") == 0
+
+
+def test_a_short_completion_labelled_cap_is_refused():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, terminations=["cap", "cap"])
+    assert verdict.accepted is False
+    assert verdict.reason == "bad_termination"
+    assert verdict.detail == {
+        "position": 0,
+        "termination": "cap",
+        "tokens": 10,
+        "max_new_tokens": 100,
+    }
+    assert slots.filled == 0
+    assert cursors.expected("5Gx") == 0
+
+
+def test_an_eos_label_that_does_not_end_on_eos_is_refused():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, last_token_ids=[EOS, 7])
+    assert verdict.accepted is False
+    assert verdict.reason == "bad_termination"
+    assert verdict.detail == {
+        "position": 1,
+        "termination": "eos",
+        "last_token_id": 7,
+        "eos_token_id": EOS,
+    }
     assert slots.filled == 0
     assert cursors.expected("5Gx") == 0
 

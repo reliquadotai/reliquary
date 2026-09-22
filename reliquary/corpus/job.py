@@ -32,6 +32,7 @@ _JOB_FIELDS = (
     "prompt_source",
     "prompt_count",
     "renderer_id",
+    "eos_token_id",
     "sampling",
     "slots_per_prompt",
     "filter",
@@ -73,6 +74,7 @@ class JobSpec:
     prompt_source: str
     prompt_count: int
     renderer_id: str
+    eos_token_id: int
     sampling: Sampling
     slots_per_prompt: int
     filter: Filter | None
@@ -99,6 +101,7 @@ class JobSpec:
             "prompt_source": self.prompt_source,
             "prompt_count": self.prompt_count,
             "renderer_id": self.renderer_id,
+            "eos_token_id": self.eos_token_id,
             "sampling": {
                 "temperature": self.sampling.temperature,
                 "top_p": self.sampling.top_p,
@@ -132,6 +135,13 @@ def _positive_int(raw: Mapping[str, Any], field: str) -> int:
     value = raw.get(field)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise JobError(f"{field} must be a positive whole number, got {value!r}")
+    return value
+
+
+def _non_negative_int(raw: Mapping[str, Any], field: str) -> int:
+    value = raw.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise JobError(f"{field} must be a non-negative whole number, got {value!r}")
     return value
 
 
@@ -234,6 +244,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         prompt_source=_text(raw, "prompt_source"),
         prompt_count=_positive_int(raw, "prompt_count"),
         renderer_id=_text(raw, "renderer_id"),
+        eos_token_id=_non_negative_int(raw, "eos_token_id"),
         sampling=_parse_sampling(raw["sampling"]),
         slots_per_prompt=_positive_int(raw, "slots_per_prompt"),
         filter=_parse_filter(raw["filter"]),

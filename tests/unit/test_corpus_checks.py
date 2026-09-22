@@ -13,6 +13,7 @@ from reliquary.corpus.job import Sampling
 SAMPLING = Sampling(
     temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=1, max_new_tokens=100, n=2
 )
+EOS = 151645
 
 
 def test_the_declared_number_of_completions_is_required():
@@ -50,12 +51,43 @@ def test_an_empty_completion_is_refused():
     assert result.reason == "token_budget_exceeded"
 
 
+def _termination(terminations, token_counts, last_token_ids):
+    return check_termination(
+        terminations, token_counts, last_token_ids, sampling=SAMPLING, eos_token_id=EOS
+    )
+
+
 def test_termination_must_be_declared_and_known():
-    assert check_termination(["eos", "cap"]).ok is True
-    result = check_termination(["eos", "truncated"])
+    assert _termination(["eos", "cap"], [4, 100], [EOS, 9]).ok is True
+    result = _termination(["eos", "truncated"], [4, 100], [EOS, 9])
     assert result.ok is False
     assert result.reason == "bad_termination"
     assert result.detail == {"position": 1, "termination": "truncated"}
+
+
+def test_a_cap_label_must_have_reached_the_cap():
+    # A label is not evidence: the token count has to agree with it.
+    result = _termination(["cap"], [3], [9])
+    assert result.ok is False
+    assert result.reason == "bad_termination"
+    assert result.detail == {
+        "position": 0,
+        "termination": "cap",
+        "tokens": 3,
+        "max_new_tokens": 100,
+    }
+
+
+def test_an_eos_label_must_end_on_the_eos_token():
+    result = _termination(["eos"], [4], [9])
+    assert result.ok is False
+    assert result.reason == "bad_termination"
+    assert result.detail == {
+        "position": 0,
+        "termination": "eos",
+        "last_token_id": 9,
+        "eos_token_id": EOS,
+    }
 
 
 def test_the_digest_binds_the_prompt_to_the_tokens():

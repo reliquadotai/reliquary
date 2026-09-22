@@ -21,6 +21,7 @@ def _job(prompt_count, slots_per_prompt):
             "prompt_source": "reliquarylogic",
             "prompt_count": prompt_count,
             "renderer_id": "reliquary/render/v5",
+            "eos_token_id": EOS,
             "sampling": {
                 "temperature": 1.0, "top_p": 1.0, "top_k": 0,
                 "min_new_tokens": 1, "max_new_tokens": 100, "n": 1,

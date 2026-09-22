@@ -22,6 +22,7 @@ def _raw(**overrides):
         "prompt_source": "openmathinstruct",
         "prompt_count": 1000,
         "renderer_id": "reliquary/render/v5",
+        "eos_token_id": 151645,
         "sampling": {
             "temperature": 1.0,
             "top_p": 1.0,
@@ -58,6 +59,7 @@ def test_contract_is_json_native_and_stable():
     assert contract["schema"] == JOB_SCHEMA
     assert contract["sampling"]["n"] == 2
     assert contract["sampling"]["min_new_tokens"] == 1
+    assert contract["eos_token_id"] == 151645
     assert contract["filter"] is None
     assert contract == parse_job(_raw()).to_contract()
 
@@ -79,6 +81,13 @@ def test_a_floor_above_the_ceiling_names_both_values():
             "min_new_tokens": 9, "max_new_tokens": 8, "n": 1,
         }))
     assert "9" in str(excinfo.value) and "8" in str(excinfo.value)
+
+
+def test_the_manifest_pins_the_eos_token():
+    # The termination check compares against this, so the job must pin it.
+    job = parse_job(_raw(eos_token_id=0))
+    assert job.eos_token_id == 0
+    assert job.to_contract()["eos_token_id"] == 0
 
 
 def test_free_prompt_order_is_legal():
@@ -111,6 +120,9 @@ def test_free_prompt_order_is_legal():
         {"filter": {"grader_id": "", "threshold": 1.0}},
         {"filter": {"grader_id": "x"}},
         {"deadline_round": -1},
+        {"eos_token_id": -1},
+        {"eos_token_id": "151645"},
+        {"eos_token_id": None},
     ],
 )
 def test_a_broken_manifest_is_refused(overrides):
