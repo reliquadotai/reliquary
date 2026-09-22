@@ -122,3 +122,55 @@ def test_a_task_the_cli_created_boots_and_the_validator_accepts_it(tmp_path):
         ).to_generation_contract(),
     )
     assert config.task_id == "glm-run"
+
+
+def _template_carrying_the_newest_environment_fields():
+    """The profile whose contract exercises the fields added most recently.
+
+    The default profile predates them, so the test above cannot catch a
+    reader that drops one: it is the newest fields that are unread, every
+    time.
+    """
+    for profile_id in sorted(PROFILES):
+        contract = PROFILES[profile_id].to_generation_contract()
+        for body in contract["environments"].values():
+            if body.get("prompt_cooldown_windows") is not None:
+                return profile_id
+    import pytest
+
+    pytest.fail(
+        "no compiled profile exercises 'prompt_cooldown_windows'; "
+        "this test cannot run"
+    )
+
+
+def test_a_task_seeded_from_the_newest_profile_boots(tmp_path):
+    """A generation task on a policy with per-environment cooldown and
+    reasoning settings, created the way an operator creates one.
+
+    This is the case the merge broke: the contract carried two fields the
+    reader did not honour, so the entry was attested and could not start.
+    """
+    from reliquary.cli.main import build_contract_task_entry
+
+    template = _template_carrying_the_newest_environment_fields()
+    entry = build_contract_task_entry(
+        task_id="newest-run",
+        from_profile=template,
+        model_id="org/Policy",
+        model_revision="abc123",
+        model_architecture="Qwen3_5ForConditionalGeneration",
+        environments=None,
+        cap=0.30,
+        overrides={},
+        verification="streamed",
+    )
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps(entry.contract))
+
+    booted = _probe({TASK_CONTRACT_ENV_VAR: str(path)})
+    assert booted["profile_id"] == "newest-run"
+    assert booted["contract_sha256"] == entry.profile_sha256
+    # Pinning the replica must not have moved the digest.
+    assert entry.verification == "streamed"
+    assert "verification" not in entry.contract
