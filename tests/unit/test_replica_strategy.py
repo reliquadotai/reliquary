@@ -1,7 +1,9 @@
-"""Which replica a proof slot builds is derived from the model and the card, not configured.
+"""Which replica a proof slot builds: derived by default, pinned by a task that wants it uniform.
 
-An operator who ticks the wrong box on a task would either waste a card or fail to verify at all,
-so the worker decides for itself and the flag exists only to force a path for a test.
+Left alone, the worker decides from the model and its card, so nobody has to know what a model is
+made of. A task can pin one instead, which is how a fleet of unequal cards is made to run a single
+path — but not a path a card cannot build, which is refused at startup rather than mid-window. A
+single validator can still force one for an incident or a shadow run.
 """
 
 import pytest
@@ -51,3 +53,35 @@ def test_weights_are_measured_from_the_checkpoint(tmp_path):
     expected = sum(p.numel() * p.element_size() for p in model.parameters())
     measured = checkpoint_weight_bytes(tmp_path)
     assert 0.9 * expected <= measured <= 1.2 * expected
+
+
+def test_a_task_that_pins_a_replica_gets_it_on_a_card_that_could_have_held_the_model():
+    """A fleet of unequal cards is made to run one path by the task, not by each operator."""
+    from reliquary.shared.replica_strategy import STREAMED, choose_replica
+
+    assert choose_replica(weights_bytes=1, free_bytes=1_000, declared=STREAMED) == STREAMED
+
+
+def test_a_task_cannot_pin_a_replica_a_card_cannot_build():
+    """Refused at startup, not by running out of memory on some miner's rollout."""
+    from reliquary.shared.replica_strategy import RESIDENT, ReplicaUnavailable, choose_replica
+
+    with pytest.raises(ReplicaUnavailable, match="do not fit"):
+        choose_replica(weights_bytes=900, free_bytes=1_000, declared=RESIDENT)
+
+
+def test_forcing_a_path_on_one_validator_beats_what_the_task_pinned():
+    """The override is for an incident or a shadow run, and forcing means forcing."""
+    from reliquary.shared.replica_strategy import RESIDENT, STREAMED, choose_replica
+
+    assert choose_replica(
+        weights_bytes=900, free_bytes=1_000, override=RESIDENT, declared=STREAMED,
+    ) == RESIDENT
+
+
+def test_a_replica_nobody_implements_is_refused_wherever_it_is_named():
+    from reliquary.shared.replica_strategy import choose_replica
+
+    for field in ("override", "declared"):
+        with pytest.raises(ValueError, match=field):
+            choose_replica(weights_bytes=1, free_bytes=2, **{field: "quantised"})

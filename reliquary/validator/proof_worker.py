@@ -870,12 +870,15 @@ def _install_from_hub(
 from reliquary.shared.replica_strategy import RESIDENT, STREAMED
 
 
-def choose_proof_replica(checkpoint: str, physical_device: str) -> str:
+def choose_proof_replica(
+    checkpoint: str, physical_device: str, declared: str | None = None,
+) -> str:
     """Whether this slot can hold the model, or has to walk it one layer at a time.
 
     Derived from the checkpoint's size against the card's free memory, so no operator has to know
-    what a model is made of. ``RELIQUARY_PROOF_REPLICA`` forces a path for a shadow run or a test;
-    it is not how the choice is made in production.
+    what a model is made of. A task that pins a replica overrides the derivation — that is how a
+    fleet of unequal cards is made to run one path — and ``RELIQUARY_PROOF_REPLICA`` overrides
+    both, for a shadow run or an incident.
     """
     import os
     from pathlib import Path
@@ -886,15 +889,21 @@ def choose_proof_replica(checkpoint: str, physical_device: str) -> str:
 
     override = os.environ.get("RELIQUARY_PROOF_REPLICA") or None
     if not str(physical_device).startswith("cuda"):
-        # Without a card there is nothing to outgrow; only an explicit override streams.
-        return choose_replica(weights_bytes=0, free_bytes=1, override=override)
+        # Without a card there is nothing to outgrow, and nothing to refuse a task for.
+        return choose_replica(
+            weights_bytes=0, free_bytes=1, override=override, declared=declared,
+        )
     try:
         weights = checkpoint_weight_bytes(Path(checkpoint))
     except (FileNotFoundError, OSError):
         # A checkpoint we cannot size is a checkpoint we have always loaded resident.
-        return choose_replica(weights_bytes=0, free_bytes=1, override=override)
+        return choose_replica(
+            weights_bytes=0, free_bytes=1, override=override, declared=declared,
+        )
     free, _total = torch.cuda.mem_get_info(torch.device(physical_device))
-    return choose_replica(weights_bytes=weights, free_bytes=free, override=override)
+    return choose_replica(
+        weights_bytes=weights, free_bytes=free, override=override, declared=declared,
+    )
 
 
 def build_proof_context(
@@ -902,6 +911,7 @@ def build_proof_context(
     checkpoint: str,
     device: str,
     load_kwargs: Mapping[str, Any] | None = None,
+    replica: str | None = None,
 ) -> dict[str, Any]:
     """Load this worker's bootstrap replica, exactly as the in-process path did.
 
@@ -928,7 +938,7 @@ def build_proof_context(
     # torch does not understand the ``cuda:0#1`` form. The slot id stays in the
     # context because that is this worker's identity to the pool and scheduler.
     physical = physical_proof_device(device)
-    replica = choose_proof_replica(checkpoint, physical)
+    replica = choose_proof_replica(checkpoint, physical, replica)
     if replica == STREAMED:
         # The model outgrew the card: keep one decoder layer on it at a time. What the
         # verification path reads off a model is unchanged, so nothing downstream moves.
@@ -970,6 +980,7 @@ def build_isolated_proof_plane(
     checkpoint: str,
     load_kwargs: Mapping[str, Any] | None = None,
     reference_model: Any = None,
+    replica: str | None = None,
 ) -> tuple["ProofWorkerPool", dict[str, ProofModelProxy]]:
     """Assemble the isolated plane: one worker per proof slot, one proxy each.
 
@@ -991,6 +1002,7 @@ def build_isolated_proof_plane(
         factory_kwargs={
             "checkpoint": checkpoint,
             "load_kwargs": dict(load_kwargs or {}),
+            "replica": replica,
         },
         request_timeout_seconds=PROOF_WORKER_REQUEST_TIMEOUT_SECONDS,
         reload_timeout_seconds=PROOF_WORKER_RELOAD_TIMEOUT_SECONDS,

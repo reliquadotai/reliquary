@@ -86,3 +86,29 @@ def test_a_streamed_slot_survives_a_checkpoint_rotation(tmp_path, monkeypatch):
     shutil.rmtree(second)
     streamed, _ = forward_single_layer(context["model"], tokens, None, -1)
     assert torch.equal(streamed, hidden), "the rotated replica serves the new checkpoint"
+
+
+def test_a_slot_builds_the_replica_its_task_pinned(tmp_path, monkeypatch):
+    """The task decides for the fleet; the card would have held this model resident."""
+    from reliquary.shared.streaming_forward import StreamedReplica
+    from reliquary.validator import proof_worker
+
+    monkeypatch.setattr("reliquary.constants.ATTN_IMPLEMENTATION", "eager")
+    context = proof_worker.build_proof_context(
+        checkpoint=str(_tiny_checkpoint(tmp_path)), device="cpu", replica=STREAMED,
+    )
+
+    assert context["replica"] == STREAMED
+    assert isinstance(context["model"], StreamedReplica)
+
+
+def test_forcing_a_path_on_one_slot_beats_what_its_task_pinned(tmp_path, monkeypatch):
+    from reliquary.validator import proof_worker
+
+    monkeypatch.setattr("reliquary.constants.ATTN_IMPLEMENTATION", "eager")
+    monkeypatch.setenv("RELIQUARY_PROOF_REPLICA", "resident")
+    context = proof_worker.build_proof_context(
+        checkpoint=str(_tiny_checkpoint(tmp_path)), device="cpu", replica=STREAMED,
+    )
+
+    assert context["replica"] == RESIDENT

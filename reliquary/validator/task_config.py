@@ -34,6 +34,8 @@ class TaskConfig:
     emission_cap: float
     # Per-environment share of `emission_cap`: `cap * env_split_e`.
     env_caps: dict[str, float]
+    # The replica this task's validators verify with, or None to let each derive it.
+    verification: str | None = None
 
 
 def resolve_task_config(
@@ -106,6 +108,7 @@ def resolve_task_config(
         price_params=params,
         emission_cap=cap,
         env_caps=env_caps,
+        verification=entry.verification,
     )
 
 

@@ -82,7 +82,7 @@ async def read_task_registry_with_retry(
     raise last
 
 
-def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
+def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None):
     """One registry entry: shipped controller defaults, then explicit overrides."""
     from dataclasses import asdict
 
@@ -90,6 +90,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
     from reliquary.protocol.profiles import resolve_protocol_profile
     from reliquary.shared.task_id import normalise_task_id
     from reliquary.shared.task_registry import (
+        KNOWN_VERIFICATION,
         MECHANISM_RL_DISCOVERED_PRICE,
         TaskEntry,
     )
@@ -122,6 +123,11 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
                 f"{sorted(uncovered)}, which profile {profile.profile_id!r} "
                 f"also declares; env_split must name every profile environment"
             )
+    if verification is not None and verification not in KNOWN_VERIFICATION:
+        raise ValueError(
+            f"--verification must be one of {', '.join(sorted(KNOWN_VERIFICATION))}, "
+            f"got {verification!r}; omit it to let each validator derive it from its card"
+        )
     params = asdict(PRODUCTION_PRICE_PARAMS)
     params.update(overrides)
     params["cap"] = float(cap)
@@ -134,6 +140,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
         status="active",
         retired_at=None,
         env_split=env_split,
+        verification=verification,
     )
 
 
@@ -179,6 +186,15 @@ def tasks_create(
         "--env-split",
         help="How the cap divides between environments, e.g. math=0.6,code=0.4",
     ),
+    verification: str = typer.Option(
+        None,
+        "--verification",
+        help=(
+            "Pin how rollouts are verified: 'resident' holds the model on the card, "
+            "'streamed' walks it one layer at a time. Omit to let each validator derive "
+            "it from its own card."
+        ),
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
@@ -191,6 +207,7 @@ def tasks_create(
             cap=cap,
             overrides=overrides,
             env_split=_parse_env_split_option(env_split),
+            verification=verification,
         )
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
@@ -202,6 +219,7 @@ def tasks_create(
         raise typer.Exit(code=1) from exc
     typer.echo(
         f"declared task {entry.task_id} on {entry.profile_id} with cap {cap}"
+        + (f", verified {entry.verification}" if entry.verification else "")
     )
 
 
@@ -1157,6 +1175,7 @@ def validate(
                         checkpoint=checkpoint,
                         load_kwargs=base_load_kwargs,
                         reference_model=model,
+                        replica=task_config.verification,
                     )
                     proof_worker_pool.start()
                     logger.info(

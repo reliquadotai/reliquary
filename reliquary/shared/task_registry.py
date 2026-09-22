@@ -17,6 +17,9 @@ from reliquary.shared.task_id import DEFAULT_TASK_ID, normalise_task_id
 REGISTRY_VERSION = 1
 MECHANISM_RL_DISCOVERED_PRICE = "rl-discovered-price"
 KNOWN_MECHANISMS = frozenset({MECHANISM_RL_DISCOVERED_PRICE})
+# What a task may pin as the way its rollouts are verified. Declaring one makes every validator
+# run the same path whatever its card; declaring none lets each derive it, which is the default.
+KNOWN_VERIFICATION = frozenset({"resident", "streamed"})
 
 # Every field the REGISTRY declares per task. A missing one is refused rather
 # than defaulted: a half-specified controller is not a controller.
@@ -55,6 +58,9 @@ class TaskEntry:
     # How the task's cap divides between its environments, e.g.
     # {"math": 0.6, "code": 0.4}. None means "not declared".
     env_split: Mapping[str, float] | None = None
+    # Which replica the task's validators verify with, when the task pins one.
+    # None means "not declared": each validator derives it from its own card.
+    verification: str | None = None
 
 
 def _number(value: Any, field: str) -> float:
@@ -93,6 +99,11 @@ def validate_entry(entry: TaskEntry) -> None:
         )
     if entry.mechanism not in KNOWN_MECHANISMS:
         raise RegistryError(f"unknown incentive mechanism {entry.mechanism!r}")
+    if entry.verification is not None and entry.verification not in KNOWN_VERIFICATION:
+        raise RegistryError(
+            f"unknown verification replica {entry.verification!r}; "
+            f"declare one of {', '.join(sorted(KNOWN_VERIFICATION))}, or nothing to derive it"
+        )
     if entry.status not in {"active", "retired"}:
         raise RegistryError(f"unknown status {entry.status!r}")
     missing = [f for f in PRICE_PARAM_FIELDS if f not in entry.params]
@@ -202,6 +213,25 @@ def retire_task(
     return {**entries, task_id: retired}
 
 
+def _verification_of(task_id: str, body: Mapping[str, Any]) -> str | None:
+    """Read the declared replica, refusing a block this reader does not understand."""
+    declared = body.get("verification")
+    if declared is None:
+        return None
+    if not isinstance(declared, Mapping):
+        raise RegistryError(f"task {task_id!r} verification must be an object")
+    unknown = set(declared) - {"replica"}
+    if unknown:
+        raise RegistryError(
+            f"task {task_id!r} verification declares {', '.join(sorted(unknown))}, "
+            "which this validator does not know how to honour"
+        )
+    replica = declared.get("replica")
+    if replica is not None and not isinstance(replica, str):
+        raise RegistryError(f"task {task_id!r} verification replica must be a string")
+    return replica
+
+
 def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
     try:
         document = json.loads(raw)
@@ -231,6 +261,7 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             status=str(body.get("status", "active")),
             retired_at=body.get("retired_at"),
             env_split=body.get("env_split"),
+            verification=_verification_of(task_id, body),
         )
     if strict:
         validate_registry(entries)
@@ -256,6 +287,10 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
                 "retired_at": entry.retired_at,
                 "env_split": (
                     None if entry.env_split is None else dict(entry.env_split)
+                ),
+                "verification": (
+                    None if entry.verification is None
+                    else {"replica": entry.verification}
                 ),
             }
             for task_id, entry in sorted(entries.items())

@@ -170,3 +170,14 @@ def test_both_call_sites_use_the_shared_predicate():
         capture_output=True, text=True,
     ).stdout.strip()
     assert hits == "", f"a fallback predicate is still written by hand:\n{hits}"
+
+
+def test_the_declared_verification_replica_reaches_the_task_config():
+    """What the registry pins is what the proof plane is built with."""
+    from reliquary.validator.task_config import legacy_task_config
+
+    config = _resolve({"default": _entry(verification="streamed")})
+
+    assert config.verification == "streamed"
+    assert _resolve({"default": _entry()}).verification is None, "deriving it is the default"
+    assert legacy_task_config().verification is None
