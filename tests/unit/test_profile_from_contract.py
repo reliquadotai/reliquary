@@ -202,3 +202,27 @@ def test_a_missing_nested_key_in_throughput_tiebreak_is_refused():
     contract["throughput_tiebreak"] = tiebreak
     with pytest.raises(ValueError, match="token_cap"):
         profile_from_contract(contract)
+
+
+def test_a_carried_architecture_survives_the_round_trip():
+    # The field the CLI seals into a contract. Dropped here, the digest the
+    # process computes can never match the one the registry attests.
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    contract["model_architecture"] = "Qwen3ForCausalLM"
+    rebuilt = profile_from_contract(contract)
+    assert rebuilt.model_architecture == "Qwen3ForCausalLM"
+    assert rebuilt.to_generation_contract() == contract
+
+
+@pytest.mark.parametrize("profile_id", sorted(PROFILES))
+def test_a_compiled_profile_emits_no_architecture_key(profile_id):
+    # Emitted only when set, so the nine compiled contracts keep the exact
+    # bytes -- and digests -- the fleet already attests.
+    assert "model_architecture" not in PROFILES[profile_id].to_generation_contract()
+
+
+def test_an_architecture_that_is_not_text_is_refused():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    contract["model_architecture"] = 42
+    with pytest.raises(ValueError, match="model_architecture"):
+        profile_from_contract(contract)

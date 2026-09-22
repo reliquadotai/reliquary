@@ -73,6 +73,7 @@ def resolve_task_config(
     if entry.contract is not None:
         from reliquary.constants import SUPPORTED_MODEL_ARCHITECTURES
         from reliquary.environment.registry import ENVIRONMENT_SPECS
+        from reliquary.protocol.profiles import profile_from_contract
 
         # Shape is the registry's job; whether this binary can execute the
         # contract is ours, and it must fail here rather than mid-window.
@@ -83,7 +84,16 @@ def resolve_task_config(
                 f"task {task_id!r} names environments this binary does not "
                 f"install: {missing}"
             )
-        architecture = entry.contract.get("model_architecture")
+        # Read from the REBUILT profile, not from the raw contract: what the
+        # process will actually run is the round trip, so a field only the raw
+        # mapping carries is a field nothing enforces.
+        try:
+            architecture = profile_from_contract(entry.contract).model_architecture
+        except ValueError as exc:
+            raise TaskConfigError(
+                f"task {task_id!r} carries a contract this binary cannot "
+                f"read: {exc}"
+            ) from exc
         if architecture and architecture not in SUPPORTED_MODEL_ARCHITECTURES:
             raise TaskConfigError(
                 f"task {task_id!r} names model architecture "

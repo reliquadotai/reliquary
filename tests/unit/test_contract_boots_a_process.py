@@ -16,7 +16,9 @@ from reliquary.protocol.profiles import (
 PROBE = """
 import json, sys
 from reliquary import constants
+from reliquary.protocol.release_contract import canonical_sha256
 print(json.dumps({
+    "contract_sha256": canonical_sha256(constants.PROTOCOL_GENERATION_CONTRACT),
     "profile_id": constants.PROTOCOL_PROFILE_ID,
     "model_id": constants.PROTOCOL_MODEL_ID,
     "model_revision": constants.PROTOCOL_MODEL_REVISION,
@@ -77,3 +79,46 @@ def test_an_unusable_contract_stops_the_process(tmp_path):
     )
     assert result.returncode != 0
     assert "contract" in result.stderr.lower()
+
+
+def test_a_task_the_cli_created_boots_and_the_validator_accepts_it(tmp_path):
+    """The whole point of the feature, end to end, across the one boundary no
+    other test crosses: the CLI seals an entry, a deployment mounts its
+    contract, the process boots under it, and the validator accepts the pair.
+
+    Every test on either side supplies its own fixture, so a field the CLI
+    writes but the round trip drops passes both sides and fails only here.
+    """
+    from reliquary.cli.main import build_contract_task_entry
+    from reliquary.protocol.profiles import profile_from_contract
+    from reliquary.validator.task_config import resolve_task_config
+
+    entry = build_contract_task_entry(
+        task_id="glm-run",
+        from_profile=DEFAULT_PROFILE_ID,
+        model_id="org/GLM",
+        model_revision="abc123",
+        model_architecture="Qwen3ForCausalLM",
+        environments=None,
+        cap=0.30,
+        overrides={},
+    )
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps(entry.contract))
+
+    booted = _probe({TASK_CONTRACT_ENV_VAR: str(path)})
+    assert booted["profile_id"] == "glm-run"
+    assert booted["model_id"] == "org/GLM"
+    # The digest the booted process computes is the one the registry attests.
+    assert booted["contract_sha256"] == entry.profile_sha256
+
+    # And the startup refusals pass on exactly that round trip.
+    config = resolve_task_config(
+        {"glm-run": entry},
+        "glm-run",
+        profile_id=booted["profile_id"],
+        generation_contract=profile_from_contract(
+            entry.contract
+        ).to_generation_contract(),
+    )
+    assert config.task_id == "glm-run"

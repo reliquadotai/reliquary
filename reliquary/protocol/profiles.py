@@ -207,6 +207,11 @@ class ProtocolProfile:
     sampling: SamplingProfile
     environments: Mapping[str, EnvironmentProfile]
     throughput_tiebreak: ThroughputTiebreakProfile | None = None
+    # The architecture class the model's config declares, stated by whoever
+    # sealed the contract. Compiled profiles omit it, so their contract bytes
+    # are unchanged; a carried contract must name it, because the startup
+    # refusal that checks it against this image's list has nothing else to read.
+    model_architecture: str | None = None
 
     def __post_init__(self) -> None:
         # Copy before wrapping so caller-owned dictionaries cannot mutate a
@@ -264,7 +269,7 @@ class ProtocolProfile:
                 }
             environments[name] = environment_contract
 
-        return {
+        contract: dict[str, Any] = {
             "profile_id": self.profile_id,
             "model_id": self.model_id,
             "model_revision": self.model_revision,
@@ -291,6 +296,12 @@ class ProtocolProfile:
             },
             "environments": environments,
         }
+        # Emitted only when set, like `episode` and `batch_target`: that is what
+        # keeps the compiled profiles' contract bytes, and their digests,
+        # identical to what the fleet already attests.
+        if self.model_architecture is not None:
+            contract["model_architecture"] = self.model_architecture
+        return contract
 
 
 def _required(body: Mapping[str, Any], field: str, *, context: str = "generation contract") -> Any:
@@ -332,6 +343,20 @@ def _coerce_float(value: Any, field: str, *, context: str = "generation contract
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{context} {field!r} is not a float: {exc}") from exc
+
+
+def _coerce_str(value: Any, field: str, *, context: str = "generation contract") -> str | None:
+    """An optional text field is text or absent, never a dict or a number.
+
+    Waving one through is worse than a bad message: the wrong value survives
+    the round trip unchanged, so the digest agrees and a malformed contract
+    becomes a self-consistent, registry-attested task that boots.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{context} {field!r} must be text, got {value!r}")
+    return value
 
 
 def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
@@ -439,6 +464,10 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
             "upload_grace_seconds",
         ),
         prompt_encoding=str(_required(contract, "prompt_encoding")),
+        # Legitimately absent: every compiled profile predates the field.
+        model_architecture=_coerce_str(
+            contract.get("model_architecture"), "model_architecture"
+        ),
         sampling=SamplingProfile(
             rollouts=_coerce_int(
                 _required(sampling_body, "rollouts", context="generation contract 'sampling'"),
