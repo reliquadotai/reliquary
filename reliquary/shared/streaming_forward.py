@@ -66,6 +66,7 @@ class StreamedReplica:
 
     def __init__(self, skeleton: Any, source: LayerSource, device: str | torch.device = "cpu") -> None:
         self.config = skeleton.config
+        self.generation_config = getattr(skeleton, "generation_config", None)
         self.device = torch.device(device)
         self._source = source
         self._skeleton = skeleton
@@ -109,7 +110,11 @@ class StreamedReplica:
         if fused_dir is None and is_fused_store(path):
             # A store is its own fused copy: it was written to be read this way.
             fused_dir = path
-        source = _staged(CheckpointLayers(path, fused_dir=fused_dir), device, prefetch)
+        source = _staged(
+            CheckpointLayers(path, fused_dir=fused_dir),
+            prefetch,
+            pin=torch.device(device).type == "cuda",
+        )
         return cls(skeleton, source, device=device)
 
     @classmethod
@@ -117,7 +122,10 @@ class StreamedReplica:
         cls, model: Any, *, device: str | torch.device = "cpu", prefetch: bool = False
     ) -> "StreamedReplica":
         """Build a replica over a model already in host memory."""
-        source = _staged(HostLayers(model), device, prefetch)
+        held = next(model.parameters()).device.type
+        source = _staged(
+            HostLayers(model), prefetch, pin=held == "cpu" and torch.device(device).type == "cuda",
+        )
         return cls(model, source, device=device)
 
     @property
@@ -171,13 +179,13 @@ class StreamedReplica:
         self._source.close()
 
 
-def _staged(source: LayerSource, device: str | torch.device, prefetch: bool) -> LayerSource:
-    """Wrap a source in what the device it feeds is worth paying for.
+def _staged(source: LayerSource, prefetch: bool, *, pin: bool) -> LayerSource:
+    """Wrap a source in what the traversal it feeds is worth paying for.
 
-    Page-locking costs host memory and buys nothing when the layer is not crossing a bus, so it is
-    only put in front of a device that has one.
+    Page-locking costs host memory and buys nothing unless the layer is actually crossing a bus,
+    which it is not when the weights already sit on the device the traversal runs on.
     """
-    if torch.device(device).type == "cuda":
+    if pin:
         source = PinnedLayers(source)
     return Prefetching(source) if prefetch else source
 

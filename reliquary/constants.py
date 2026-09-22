@@ -68,6 +68,13 @@ ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 # a pass of 32 rollouts costs 0.22 s each against 7.6 s for one alone.
 PROOF_BATCH_TOKEN_BUDGET = int(_os.environ.get("RELIQUARY_PROOF_BATCH_TOKENS", "262144"))
 
+# Fraction of proofs a resident slot also runs through the streamed traversal, comparing the two
+# and reporting when they differ. The oracle only exists while the model still fits on one card,
+# which is exactly the window before the cutover: 0 outside it, because it doubles the forward.
+PROOF_SHADOW_FRACTION = float(_os.environ.get("RELIQUARY_PROOF_SHADOW_FRACTION", "0"))
+if not 0.0 <= PROOF_SHADOW_FRACTION <= 1.0:
+    raise ValueError("RELIQUARY_PROOF_SHADOW_FRACTION must be between 0 and 1")
+
 PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
 PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
 PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision

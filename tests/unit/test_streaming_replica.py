@@ -123,9 +123,8 @@ def test_a_layer_is_staged_in_page_locked_memory_only_for_a_device_that_has_a_bu
         def close(self):
             pass
 
-    assert not isinstance(_staged(_Source(), "cpu", prefetch=False), PinnedLayers)
-    if torch.cuda.is_available():  # pragma: no cover - CI has no card
-        assert isinstance(_staged(_Source(), "cuda", prefetch=False), PinnedLayers)
+    assert not isinstance(_staged(_Source(), prefetch=False, pin=False), PinnedLayers)
+    assert isinstance(_staged(_Source(), prefetch=False, pin=True), PinnedLayers)
 
 
 def test_staging_alternates_slabs_so_the_reader_ahead_never_overwrites_the_layer_in_use(monkeypatch):

@@ -41,6 +41,7 @@ __all__ = [
     "proof_error_type",
     "remote_commitment_verifier",
     "run_commitment_proof",
+    "shadow_traversal",
 ]
 
 
@@ -505,6 +506,62 @@ def warm_commitment_batch(
     return len(context["_warm"])
 
 
+def shadow_traversal(context: MutableMapping[str, Any], commit: Any) -> bool:
+    """Run the streamed traversal beside the resident forward and report what differs.
+
+    That the two agree to the bit is the oracle this path rests on, and it exists only while the
+    model still fits on a card — which is the window before a model arrives that does not. Running
+    it on a sampled share of live traffic is how it gets exercised against the real checkpoint and
+    real rollouts while it can still be checked at all.
+
+    It never touches a verdict. A miner is accepted or rejected on the same forward as before; a
+    disagreement here is reported and counted, and it is the operator who decides what it means.
+    """
+    import random
+
+    import torch
+
+    from reliquary.constants import LAYER_INDEX, PROOF_SHADOW_FRACTION
+    from reliquary.shared.forward import forward_single_layer
+    from reliquary.shared.streaming_forward import StreamedReplica
+
+    model = context.get("model")
+    if (
+        PROOF_SHADOW_FRACTION <= 0.0
+        or context.get("replica") != RESIDENT
+        or model is None
+        or isinstance(commit, list)
+        or random.random() >= PROOF_SHADOW_FRACTION
+    ):
+        return False
+    report = context.setdefault("shadow", {"checked": 0, "mismatched": 0, "failed": 0})
+    try:
+        shadow = context.get("_shadow_replica")
+        if shadow is None:
+            shadow = StreamedReplica.from_model(model, device=next(model.parameters()).device)
+            context["_shadow_replica"] = shadow
+        tokens = torch.tensor([list(commit["tokens"])], device=next(model.parameters()).device)
+        with torch.no_grad():
+            resident, _ = forward_single_layer(model, tokens, None, LAYER_INDEX)
+            streamed, _ = forward_single_layer(shadow, tokens, None, LAYER_INDEX)
+        report["checked"] += 1
+        if not torch.equal(streamed, resident):
+            difference = float((streamed.float() - resident.float()).abs().max())
+            report["mismatched"] += 1
+            report["max_difference"] = max(report.get("max_difference", 0.0), difference)
+            logger.error(
+                "shadow traversal disagrees with the resident forward on %d tokens "
+                "(max |difference| %.3e); no verdict was changed",
+                tokens.shape[1], difference,
+            )
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - a shadow must never cost a proof
+        report["failed"] += 1
+        logger.exception("shadow traversal failed; the proof itself is unaffected")
+        return False
+
+
 def run_commitment_proof(
     context: MutableMapping[str, Any],
     commit: Any,
@@ -519,6 +576,7 @@ def run_commitment_proof(
     """
     from reliquary.validator import verifier as verifier_module
 
+    shadow_traversal(context, commit)
     warm = context.get("_warm")
     if warm and not isinstance(commit, list):
         # Spent as it is consumed: a second attempt on the same rollout runs its own pass rather
@@ -573,6 +631,7 @@ def describe_proof_context(context: MutableMapping[str, Any]) -> dict[str, Any]:
         "hardware_class": identity.hardware_class,
         "device_uuid": identity.device_uuid,
         "revision": context.get("revision"),
+        "shadow": dict(context.get("shadow") or {}),
         "runtime": collect_runtime_fingerprint(generation_model=model, proof_model=model),
         "config": model.config.to_dict(),
         "generation_config": model.generation_config.to_dict(),
