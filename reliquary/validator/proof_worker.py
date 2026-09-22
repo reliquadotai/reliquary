@@ -522,6 +522,42 @@ def describe_proof_context(context: MutableMapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _install_streamed(
+    context: MutableMapping[str, Any],
+    snapshot_dir: str | None,
+    checkpoint_revision: str,
+    repo_id: str | None,
+) -> None:
+    """Point a streamed replica at the checkpoint it must now verify against."""
+    from pathlib import Path
+
+    import torch
+
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.shared.streaming_forward import StreamedReplica
+    from reliquary.validator.proof_capacity import physical_proof_device
+
+    if not (snapshot_dir and Path(snapshot_dir).is_dir()):
+        raise RuntimeError(
+            "a streamed replica reloads from a staged checkpoint directory, and "
+            f"{snapshot_dir!r} is not one; the durable repo is not a substitute because the "
+            "layers are read from disk on every traversal"
+        )
+    previous = context.get("model")
+    context["model"] = None
+    context["revision"] = None
+    if hasattr(previous, "close"):
+        previous.close()
+    context["model"] = StreamedReplica.from_checkpoint(
+        snapshot_dir,
+        device=physical_proof_device(context.get("device")),
+        dtype=torch.bfloat16,
+        prefetch=True,
+        attn_implementation=ATTN_IMPLEMENTATION,
+    )
+    context["revision"] = checkpoint_revision
+
+
 def reload_proof_context(
     context: MutableMapping[str, Any],
     snapshot_dir: str | None,
@@ -554,6 +590,13 @@ def reload_proof_context(
     if (not snapshot_dir and repo_id and context.get("model") is not None
             and initial_source == (repo_id, checkpoint_revision)):
         context["revision"] = checkpoint_revision
+        return
+
+    if context.get("replica") == STREAMED:
+        # A streamed replica has no layers to load into: its weights live in the checkpoint and
+        # are read one at a time. Rotating it means pointing it at the new directory, which costs
+        # only the fixed parts — the layers are not held in the first place.
+        _install_streamed(context, snapshot_dir, checkpoint_revision, repo_id)
         return
 
     state: dict[str, Any] = {}
@@ -648,6 +691,9 @@ def _install_from_hub(
         parameter.requires_grad = False
     context["model"] = model
     context["revision"] = checkpoint_revision
+
+
+from reliquary.shared.replica_strategy import STREAMED
 
 
 def choose_proof_replica(checkpoint: str, physical_device: str) -> str:
