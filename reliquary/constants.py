@@ -68,6 +68,13 @@ ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 # a pass of 32 rollouts costs 0.22 s each against 7.6 s for one alone.
 PROOF_BATCH_TOKEN_BUDGET = int(_os.environ.get("RELIQUARY_PROOF_BATCH_TOKENS", "262144"))
 
+# How many of a request's rollouts one warming pass covers. A group is what a miner submits, so
+# warming a group at a time is what makes the pass shared without holding rows for rollouts the
+# loop may never reach. The worker still splits the slice into passes by token budget.
+PROOF_WARM_ROLLOUTS = int(_os.environ.get("RELIQUARY_PROOF_WARM_ROLLOUTS", "16"))
+if PROOF_WARM_ROLLOUTS < 1:
+    raise ValueError("RELIQUARY_PROOF_WARM_ROLLOUTS must be at least 1")
+
 # Fraction of proofs a resident slot also runs through the streamed traversal, comparing the two
 # and reporting when they differ. The oracle only exists while the model still fits on one card,
 # which is exactly the window before the cutover: 0 outside it, because it doubles the forward.

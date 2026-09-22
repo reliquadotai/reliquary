@@ -87,6 +87,15 @@ def remote_commitment_verifier(
     per-rollout proof loop is untouched.
     """
 
+    def _device_of(model: Any) -> str:
+        device_id = getattr(model, "device_id", None)
+        if not isinstance(model, ProofModelProxy) or not device_id:
+            raise ProofWorkerUnavailable(
+                "isolated proof plane requires a ProofModelProxy, got "
+                f"{type(model).__name__}"
+            )
+        return device_id
+
     def verify(
         commit: Any,
         model: Any,
@@ -95,14 +104,17 @@ def remote_commitment_verifier(
         tokenizer: Any = None,
         seed_u_values: Any = None,
     ) -> Any:
-        device_id = getattr(model, "device_id", None)
-        if not isinstance(model, ProofModelProxy) or not device_id:
-            raise ProofWorkerUnavailable(
-                "isolated proof plane requires a ProofModelProxy, got "
-                f"{type(model).__name__}"
-            )
+        device_id = _device_of(model)
         return pool.call(device_id, commit, window_randomness, seed_u_values)
 
+    def warm(inputs: Sequence[Any], model: Any, window_randomness: str) -> int:
+        """Pay one pass for a slice of the request the per-rollout loop is about to prove."""
+        device_id = _device_of(model)
+        commits = [commit for commit, _ in inputs]
+        seeds = [seed for _, seed in inputs]
+        return pool.warm(device_id, commits, window_randomness, seeds)
+
+    verify.warm = warm
     return verify
 
 
@@ -132,6 +144,7 @@ def _worker_main(
     context_factory: str,
     handler: str,
     reload_handler: str | None,
+    warm_handler: str | None,
     factory_kwargs: Mapping[str, Any],
     device: str,
 ) -> None:
@@ -140,6 +153,7 @@ def _worker_main(
         context = _resolve(context_factory)(device=device, **dict(factory_kwargs))
         handler_fn = _resolve(handler)
         reload_fn = _resolve(reload_handler) if reload_handler else None
+        warm_fn = _resolve(warm_handler) if warm_handler else None
     except BaseException as exc:  # noqa: BLE001 - reported, then the child exits
         try:
             connection.send(("start_failed", (type(exc).__name__, str(exc))))
@@ -163,6 +177,10 @@ def _worker_main(
                 if reload_fn is None:
                     raise RuntimeError("worker has no reload handler")
                 payload = reload_fn(context, *args, **kwargs)
+            elif operation == "warm":
+                if warm_fn is None:
+                    raise RuntimeError("worker has no warm handler")
+                payload = warm_fn(context, *args, **kwargs)
             else:
                 payload = handler_fn(context, *args, **kwargs)
         except Exception as exc:  # noqa: BLE001 - relayed, worker stays up
@@ -201,9 +219,11 @@ class ProofWorkerPool:
         context_factory: str,
         handler: str,
         reload_handler: str | None = None,
+        warm_handler: str | None = None,
         factory_kwargs: Mapping[str, Any] | None = None,
         request_timeout_seconds: float | None = None,
         reload_timeout_seconds: float | None = None,
+        warm_timeout_seconds: float | None = None,
         start_timeout_seconds: float = 900.0,
     ) -> None:
         if not devices:
@@ -214,6 +234,7 @@ class ProofWorkerPool:
         self._context_factory = context_factory
         self._handler = handler
         self._reload_handler = reload_handler
+        self._warm_handler = warm_handler
         self._factory_kwargs = dict(factory_kwargs or {})
         self._request_timeout_seconds = (
             None if request_timeout_seconds is None
@@ -222,6 +243,13 @@ class ProofWorkerPool:
         self._reload_timeout_seconds = (
             None if reload_timeout_seconds is None
             else float(reload_timeout_seconds)
+        )
+        # A warm pass drives the model over a whole slice at once, which on a streamed replica is
+        # a full traversal: it is closer to a reload than to a single proof, and the request
+        # timeout would retire a worker that is doing exactly what it was asked.
+        self._warm_timeout_seconds = (
+            self._reload_timeout_seconds if warm_timeout_seconds is None
+            else float(warm_timeout_seconds)
         )
         self._start_timeout_seconds = float(start_timeout_seconds)
         self._revisions: dict[str, str | None] = {}
@@ -325,6 +353,7 @@ class ProofWorkerPool:
                 "context_factory": self._context_factory,
                 "handler": self._handler,
                 "reload_handler": self._reload_handler,
+                "warm_handler": self._warm_handler,
                 "factory_kwargs": self._factory_kwargs,
                 "device": device_id,
             },
@@ -383,10 +412,10 @@ class ProofWorkerPool:
     def _exchange(self, worker, device_id: str, operation: str, args, kwargs) -> Any:
         try:
             worker.connection.send((operation, args, kwargs))
-            timeout = (
-                self._reload_timeout_seconds if operation == "reload"
-                else self._request_timeout_seconds
-            )
+            timeout = {
+                "reload": self._reload_timeout_seconds,
+                "warm": self._warm_timeout_seconds,
+            }.get(operation, self._request_timeout_seconds)
             if timeout is not None and not worker.connection.poll(timeout):
                 self._retire(device_id, worker=worker)
                 raise ProofWorkerUnavailable(
@@ -426,6 +455,27 @@ class ProofWorkerPool:
             (snapshot_dir, checkpoint_revision, repo_id), {},
         )
         self._revisions[device_id] = checkpoint_revision
+
+    def warm(
+        self,
+        device_id: str,
+        commits: Sequence[Any],
+        window_randomness: str,
+        seed_u_values: Sequence[Any] | None = None,
+    ) -> int:
+        """Drive the model once for a slice, so the proofs that follow do not each drive it.
+
+        Returns how many rollouts were warmed. A pool with no warm handler warms none, and the
+        proofs run exactly as they did before.
+        """
+        if not self._warm_handler or not commits:
+            return 0
+        seeds = list(seed_u_values or [None] * len(commits))
+        return int(
+            self._request(
+                device_id, "warm", (list(commits), window_randomness, seeds), {},
+            )
+        )
 
     def revision(self, device_id: str) -> str | None:
         """Revision this worker is certified for, or None when unknown."""
@@ -911,6 +961,7 @@ def build_proof_context(
 PROOF_CONTEXT_FACTORY = "reliquary.validator.proof_worker:build_proof_context"
 PROOF_HANDLER = "reliquary.validator.proof_worker:run_commitment_proof"
 PROOF_RELOAD_HANDLER = "reliquary.validator.proof_worker:reload_proof_context"
+PROOF_WARM_HANDLER = "reliquary.validator.proof_worker:warm_commitment_batch"
 
 
 def build_isolated_proof_plane(
@@ -936,6 +987,7 @@ def build_isolated_proof_plane(
         context_factory=PROOF_CONTEXT_FACTORY,
         handler=PROOF_HANDLER,
         reload_handler=PROOF_RELOAD_HANDLER,
+        warm_handler=PROOF_WARM_HANDLER,
         factory_kwargs={
             "checkpoint": checkpoint,
             "load_kwargs": dict(load_kwargs or {}),
