@@ -52,7 +52,7 @@ def check_completion_count(count: int, sampling: Sampling) -> CheckResult:
 
 def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> CheckResult:
     for position, tokens in enumerate(token_counts):
-        if tokens <= 0 or tokens > sampling.max_new_tokens:
+        if tokens > sampling.max_new_tokens:
             return CheckResult(
                 ok=False,
                 reason="token_budget_exceeded",
@@ -62,6 +62,9 @@ def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> Check
                     "max_new_tokens": sampling.max_new_tokens,
                 },
             )
+        # The floor catches the empty completion too, because `min_new_tokens`
+        # is always at least 1; calling zero tokens a cap breach would read as
+        # the opposite failure in reject-reason telemetry.
         if tokens < sampling.min_new_tokens:
             return CheckResult(
                 ok=False,

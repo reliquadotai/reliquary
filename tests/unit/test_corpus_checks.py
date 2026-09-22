@@ -45,10 +45,14 @@ def test_a_completion_under_the_floor_is_refused():
     assert result.detail == {"position": 1, "tokens": 7, "min_new_tokens": 8}
 
 
-def test_an_empty_completion_is_refused():
+def test_an_empty_completion_is_an_underrun_not_a_cap_breach():
+    # min_new_tokens is always at least 1, so zero tokens is short of the
+    # floor. Labelling it "exceeded" reads as a cap breach in reject-reason
+    # telemetry, which is the opposite of what happened.
     result = check_token_budget([4, 0], SAMPLING)
     assert result.ok is False
-    assert result.reason == "token_budget_exceeded"
+    assert result.reason == "token_budget_underrun"
+    assert result.detail == {"position": 1, "tokens": 0, "min_new_tokens": 1}
 
 
 def _termination(terminations, token_counts, last_token_ids):
