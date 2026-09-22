@@ -592,6 +592,33 @@ def plan_verification_passes(commits: list[dict], *, token_budget: int) -> list[
     return passes
 
 
+def forward_rows_for_batch(
+    commits: list[dict],
+    model: Any,
+    *,
+    token_budget: int | None = None,
+) -> dict[int, tuple[Any, Any]]:
+    """The rows of a pass, one entry per rollout, keyed by its position in the list.
+
+    Split out so a worker can pay the traversal once for a batch and hand each rollout its rows
+    when the proof for it arrives. Nothing else about how a rollout is proved changes.
+    """
+    from reliquary.constants import LAYER_INDEX, PROOF_BATCH_TOKEN_BUDGET
+
+    budget = PROOF_BATCH_TOKEN_BUDGET if token_budget is None else token_budget
+    device = next(model.parameters()).device
+    materialize = _lm_head_vocab_size(getattr(model, "lm_head", None)) is None
+    rows: dict[int, tuple[Any, Any]] = {}
+    for group in plan_verification_passes(commits, token_budget=budget):
+        tokens = torch.tensor([commits[index]["tokens"] for index in group], device=device)
+        hidden, logits = forward_single_layer_for_batch(
+            model, tokens, None, LAYER_INDEX, materialize_logits=materialize,
+        )
+        for row, index in enumerate(group):
+            rows[index] = (hidden[row], None if logits is None else logits[row])
+    return rows
+
+
 def verify_commitment_proofs_batch(
     commits: list[dict],
     model: Any,
@@ -609,26 +636,20 @@ def verify_commitment_proofs_batch(
     """
     from reliquary.constants import LAYER_INDEX, PROOF_BATCH_TOKEN_BUDGET
 
-    budget = PROOF_BATCH_TOKEN_BUDGET if token_budget is None else token_budget
-    device = next(model.parameters()).device
-    lm_head = getattr(model, "lm_head", None)
-    materialize = _lm_head_vocab_size(lm_head) is None
-    results: list[Any] = [None] * len(commits)
-    for group in plan_verification_passes(commits, token_budget=budget):
-        tokens = torch.tensor([commits[index]["tokens"] for index in group], device=device)
-        hidden, logits = forward_single_layer_for_batch(
-            model, tokens, None, LAYER_INDEX, materialize_logits=materialize,
-        )
-        for row, index in enumerate(group):
-            seeds = None if seed_u_values is None else seed_u_values[index]
-            results[index] = verify_commitment_proofs(
-                commits[index],
+    rows = forward_rows_for_batch(commits, model, token_budget=token_budget)
+    results: list[Any] = []
+    for index, commit in enumerate(commits):
+        seeds = None if seed_u_values is None else seed_u_values[index]
+        results.append(
+            verify_commitment_proofs(
+                commit,
                 model,
                 window_randomness,
                 tokenizer=tokenizer,
                 seed_u_values=seeds,
-                forward=(hidden[row], None if logits is None else logits[row]),
+                forward=rows[index],
             )
+        )
     return results
 
 

@@ -477,15 +477,71 @@ class ProofWorkerPool:
 # process, never in the validator's interpreter.
 
 
+def _warm_key(commit: Any) -> tuple:
+    """What identifies a rollout among the ones a warm pass covered."""
+    return tuple(commit["tokens"])
+
+
+def warm_commitment_batch(
+    context: MutableMapping[str, Any],
+    commits: list[dict],
+    window_randomness: str,
+    seed_u_values: Any = None,
+) -> int:
+    """Pay one traversal of the model for a whole batch, before its proofs arrive one by one.
+
+    The server proves item by item, and rightly so: that loop carries the receipts, the deadlines
+    and the stop at the first failure. Warming leaves it alone and removes the only part that does
+    not belong to an item — the pass over the model, which a streamed replica pays in full every
+    time. Each proof then finds its rows already computed.
+    """
+    from reliquary.validator import verifier as verifier_module
+
+    context["_warm"] = {}
+    if not commits:
+        return 0
+    rows = verifier_module.forward_rows_for_batch(commits, context["model"])
+    context["_warm"] = {_warm_key(commit): rows[index] for index, commit in enumerate(commits)}
+    return len(context["_warm"])
+
+
 def run_commitment_proof(
     context: MutableMapping[str, Any],
     commit: Any,
     window_randomness: str,
     seed_u_values: Any = None,
 ) -> Any:
-    """Run one GRAIL proof against the weights this worker owns."""
+    """Run a GRAIL proof against the weights this worker owns.
+
+    A list of commits is proved with one pass of the model per group and comes back as a list of
+    results in the same order. That matters for a streamed replica, where a pass costs a full
+    traversal and proving rollouts one at a time would pay it over and over.
+    """
     from reliquary.validator import verifier as verifier_module
 
+    warm = context.get("_warm")
+    if warm and not isinstance(commit, list):
+        # Spent as it is consumed: a second attempt on the same rollout runs its own pass rather
+        # than reusing rows that belonged to the first.
+        rows = warm.pop(_warm_key(commit), None)
+        if rows is not None:
+            return verifier_module.verify_commitment_proofs(
+                commit,
+                context["model"],
+                window_randomness,
+                tokenizer=context["tokenizer"],
+                seed_u_values=seed_u_values,
+                forward=rows,
+            )
+    if isinstance(commit, list):
+        seeds = seed_u_values if isinstance(seed_u_values, list) else [None] * len(commit)
+        return verifier_module.verify_commitment_proofs_batch(
+            commit,
+            context["model"],
+            window_randomness,
+            tokenizer=context["tokenizer"],
+            seed_u_values=seeds,
+        )
     return verifier_module.verify_commitment_proofs(
         commit,
         context["model"],
@@ -512,6 +568,7 @@ def describe_proof_context(context: MutableMapping[str, Any]) -> dict[str, Any]:
     )
     return {
         "device_id": device,
+        "replica": context.get("replica", RESIDENT),
         "physical_device": identity.device_id,
         "hardware_class": identity.hardware_class,
         "device_uuid": identity.device_uuid,
@@ -693,7 +750,7 @@ def _install_from_hub(
     context["revision"] = checkpoint_revision
 
 
-from reliquary.shared.replica_strategy import STREAMED
+from reliquary.shared.replica_strategy import RESIDENT, STREAMED
 
 
 def choose_proof_replica(checkpoint: str, physical_device: str) -> str:
@@ -744,7 +801,7 @@ def build_proof_context(
 
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared import modeling
-    from reliquary.shared.replica_strategy import STREAMED
+    from reliquary.shared.replica_strategy import RESIDENT, STREAMED
     from reliquary.shared.streaming_forward import StreamedReplica
     from reliquary.validator.proof_capacity import physical_proof_device
 
