@@ -7,10 +7,10 @@ rubbish before the audit ever draws.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Set as AbstractSet
 from dataclasses import dataclass, field
 import hashlib
-from typing import AbstractSet, Any
+from typing import Any
 
 from reliquary.corpus.job import Sampling
 
