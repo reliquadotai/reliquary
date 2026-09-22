@@ -650,6 +650,33 @@ def _install_from_hub(
     context["revision"] = checkpoint_revision
 
 
+def choose_proof_replica(checkpoint: str, physical_device: str) -> str:
+    """Whether this slot can hold the model, or has to walk it one layer at a time.
+
+    Derived from the checkpoint's size against the card's free memory, so no operator has to know
+    what a model is made of. ``RELIQUARY_PROOF_REPLICA`` forces a path for a shadow run or a test;
+    it is not how the choice is made in production.
+    """
+    import os
+    from pathlib import Path
+
+    import torch
+
+    from reliquary.shared.replica_strategy import RESIDENT, checkpoint_weight_bytes, choose_replica
+
+    override = os.environ.get("RELIQUARY_PROOF_REPLICA") or None
+    if not str(physical_device).startswith("cuda"):
+        # Without a card there is nothing to outgrow; only an explicit override streams.
+        return choose_replica(weights_bytes=0, free_bytes=1, override=override)
+    try:
+        weights = checkpoint_weight_bytes(Path(checkpoint))
+    except (FileNotFoundError, OSError):
+        # A checkpoint we cannot size is a checkpoint we have always loaded resident.
+        return choose_replica(weights_bytes=0, free_bytes=1, override=override)
+    free, _total = torch.cuda.mem_get_info(torch.device(physical_device))
+    return choose_replica(weights_bytes=weights, free_bytes=free, override=override)
+
+
 def build_proof_context(
     *,
     checkpoint: str,
@@ -671,6 +698,8 @@ def build_proof_context(
 
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared import modeling
+    from reliquary.shared.replica_strategy import STREAMED
+    from reliquary.shared.streaming_forward import StreamedReplica
     from reliquary.validator.proof_capacity import physical_proof_device
 
     kwargs = dict(load_kwargs or {})
@@ -678,18 +707,32 @@ def build_proof_context(
     # ``device`` is a proof SLOT id: several slots can share one card, and
     # torch does not understand the ``cuda:0#1`` form. The slot id stays in the
     # context because that is this worker's identity to the pool and scheduler.
-    model = modeling.load_text_generation_model(
-        checkpoint,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=ATTN_IMPLEMENTATION,
-        **kwargs,
-    ).to(physical_proof_device(device)).eval()
-    for parameter in model.parameters():
-        parameter.requires_grad = False
+    physical = physical_proof_device(device)
+    replica = choose_proof_replica(checkpoint, physical)
+    if replica == STREAMED:
+        # The model outgrew the card: keep one decoder layer on it at a time. What the
+        # verification path reads off a model is unchanged, so nothing downstream moves.
+        model = StreamedReplica.from_checkpoint(
+            checkpoint,
+            device=physical,
+            dtype=torch.bfloat16,
+            prefetch=True,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+    else:
+        model = modeling.load_text_generation_model(
+            checkpoint,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=ATTN_IMPLEMENTATION,
+            **kwargs,
+        ).to(physical).eval()
+        for parameter in model.parameters():
+            parameter.requires_grad = False
     return {
         "model": model,
         "tokenizer": tokenizer,
         "device": device,
+        "replica": replica,
         "revision": None,
         "_initial_source": (checkpoint, kwargs.get("revision")),
     }

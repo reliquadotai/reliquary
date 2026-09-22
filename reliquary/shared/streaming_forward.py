@@ -80,15 +80,24 @@ class StreamedReplica:
         dtype: torch.dtype | None = None,
         prefetch: bool = False,
         fused_dir: str | Path | None = None,
+        attn_implementation: str | None = None,
     ) -> "StreamedReplica":
-        """Build a replica whose layers stay on disk until the traversal reaches them."""
+        """Build a replica whose layers stay on disk until the traversal reaches them.
+
+        ``attn_implementation`` must match what a resident replica would use: the hidden states a
+        verifier compares are the ones the kernels produce, so a different kernel here shows up
+        downstream as a miner whose sketch does not match.
+        """
         from transformers import AutoConfig, AutoModelForCausalLM
 
         config = AutoConfig.from_pretrained(path)
-        skeleton = AutoModelForCausalLM.from_config(config)
+        extra = {} if attn_implementation is None else {"attn_implementation": attn_implementation}
+        # Built in the target dtype rather than cast into it: casting the whole model afterwards
+        # would take the rotary tables down with it, which a resident replica keeps in float32,
+        # and the hidden states would part ways in the last bits.
         if dtype is not None:
-            skeleton = skeleton.to(dtype)
-        skeleton = skeleton.eval()
+            extra["dtype"] = dtype
+        skeleton = AutoModelForCausalLM.from_config(config, **extra).eval()
         _load_fixed_parts(skeleton, Path(path))
         source: LayerSource = CheckpointLayers(path, fused_dir=fused_dir)
         if prefetch:
@@ -125,15 +134,26 @@ class StreamedReplica:
                 "streamed replica: a padded attention mask is not supported yet; "
                 "batch rollouts of equal length or pass no mask"
             )
+        from transformers.masking_utils import create_causal_mask
+
         input_ids = input_ids.to(self.device)
         hidden = self.embed_tokens(input_ids)
         positions = torch.arange(input_ids.shape[1], device=self.device).unsqueeze(0)
         cos, sin = self.rotary_emb(hidden, positions)
+        # The model builds this mask itself before it reaches a layer, and an eager attention
+        # given None would read the future. Built here the same way, from the same helper.
+        causal_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=hidden,
+            attention_mask=None,
+            past_key_values=None,
+            position_ids=positions,
+        )
         for index in range(self._source.n_layers):
             self._buffer.load_state_dict(self._source.state(index))
             out = self._buffer(
                 hidden_states=hidden,
-                attention_mask=None,
+                attention_mask=causal_mask,
                 position_ids=positions,
                 use_cache=False,
                 position_embeddings=(cos, sin),
