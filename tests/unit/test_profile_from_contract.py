@@ -69,3 +69,84 @@ def test_an_environment_missing_its_budget_is_refused():
     contract["environments"] = {name: broken}
     with pytest.raises(ValueError):
         profile_from_contract(contract)
+
+
+def test_a_missing_nested_key_in_sampling_is_refused():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    sampling = dict(contract["sampling"])
+    sampling.pop("temperature")
+    contract["sampling"] = sampling
+    with pytest.raises(ValueError, match="temperature"):
+        profile_from_contract(contract)
+
+
+def test_a_null_required_top_level_string_field_is_refused():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    contract["profile_id"] = None
+    with pytest.raises(ValueError, match="null"):
+        profile_from_contract(contract)
+
+
+def test_a_null_required_top_level_int_field_is_refused():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    contract["protocol_version"] = None
+    with pytest.raises(ValueError, match="null"):
+        profile_from_contract(contract)
+
+
+def test_a_bool_as_int_field_is_refused():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    contract["protocol_version"] = True
+    with pytest.raises(ValueError, match="bool"):
+        profile_from_contract(contract)
+
+
+def test_a_missing_nested_key_in_bft_is_refused():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    name = None
+    for env_name, env_body in contract["environments"].items():
+        if env_body.get("bft") is not None:
+            name = env_name
+            break
+    if name is not None:
+        env = dict(contract["environments"][name])
+        bft = dict(env["bft"])
+        bft.pop("thinking_budget")
+        env["bft"] = bft
+        contract["environments"] = {name: env}
+        with pytest.raises(ValueError, match="thinking_budget"):
+            profile_from_contract(contract)
+
+
+def test_a_missing_nested_key_in_episode_is_refused():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    name = None
+    for env_name, env_body in contract["environments"].items():
+        if env_body.get("episode") is not None:
+            name = env_name
+            break
+    if name is not None:
+        env = dict(contract["environments"][name])
+        episode = dict(env["episode"])
+        episode.pop("max_turns")
+        env["episode"] = episode
+        contract["environments"] = {name: env}
+        with pytest.raises(ValueError, match="max_turns"):
+            profile_from_contract(contract)
+
+
+def test_a_profile_with_legitimately_null_optional_fields_rebuilds():
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    # Ensure throughput_tiebreak, bft, answer_format, and prompt_template are
+    # explicitly set to None (not missing). This is legitimate and must work.
+    contract["throughput_tiebreak"] = None
+    name = next(iter(contract["environments"].keys()))
+    env = dict(contract["environments"][name])
+    env["bft"] = None
+    env["answer_format"] = None
+    env["prompt_template"] = None
+    contract["environments"] = {name: env}
+    # Should not raise.
+    rebuilt = profile_from_contract(contract)
+    assert rebuilt is not None
+    assert rebuilt.throughput_tiebreak is None

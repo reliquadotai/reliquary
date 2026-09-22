@@ -291,31 +291,48 @@ class ProtocolProfile:
         }
 
 
-def _required(contract: Mapping[str, Any], field: str) -> Any:
-    """Refuse a contract missing a field rather than defaulting it: a default
-    here is a silent disagreement between two processes."""
-    if field not in contract:
-        raise ValueError(f"generation contract is missing {field!r}")
-    return contract[field]
+def _required(body: Mapping[str, Any], field: str, *, context: str = "generation contract") -> Any:
+    """Refuse a contract missing a field or having a null value: a default here
+    is a silent disagreement between two processes."""
+    if field not in body:
+        raise ValueError(f"{context} is missing {field!r}")
+    value = body[field]
+    if value is None:
+        raise ValueError(f"{context} has a null {field!r}")
+    return value
+
+
+def _coerce_int(value: Any, field: str, *, context: str = "generation contract") -> int:
+    """Coerce to int, rejecting bool values that masquerade as int."""
+    if isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} is a bool, not an int")
+    return int(value)
 
 
 def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
     if not isinstance(body, Mapping):
         raise ValueError(f"environment {name!r} is not an object")
-    if "max_new_tokens" not in body:
-        raise ValueError(f"environment {name!r} is missing 'max_new_tokens'")
-    bft = body.get("bft")
+    max_tokens = _required(body, "max_new_tokens", context=f"environment {name!r}")
+    bft_body = body.get("bft")
     template = body.get("prompt_template")
-    episode = body.get("episode")
+    episode_body = body.get("episode")
     return EnvironmentProfile(
-        max_new_tokens=int(body["max_new_tokens"]),
+        max_new_tokens=_coerce_int(max_tokens, "max_new_tokens", context=f"environment {name!r}"),
         bft=(
             None
-            if bft is None
+            if bft_body is None
             else BFTProfile(
-                thinking_budget=int(bft["thinking_budget"]),
-                answer_budget=int(bft["answer_budget"]),
-                force_answer=bool(bft["force_answer"]),
+                thinking_budget=_coerce_int(
+                    _required(bft_body, "thinking_budget", context=f"environment {name!r} 'bft'"),
+                    "thinking_budget",
+                    context=f"environment {name!r} 'bft'",
+                ),
+                answer_budget=_coerce_int(
+                    _required(bft_body, "answer_budget", context=f"environment {name!r} 'bft'"),
+                    "answer_budget",
+                    context=f"environment {name!r} 'bft'",
+                ),
+                force_answer=bool(_required(bft_body, "force_answer", context=f"environment {name!r} 'bft'")),
             )
         ),
         answer_format=body.get("answer_format"),
@@ -325,8 +342,8 @@ def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
             # 'renderer' and 'sha256' are derived, so they are recomputed rather
             # than read; the round-trip test is what proves they still agree.
             else PromptTemplateProfile(
-                template_id=str(template["id"]),
-                template=str(template["template"]),
+                template_id=str(_required(template, "id", context=f"environment {name!r} 'prompt_template'")),
+                template=str(_required(template, "template", context=f"environment {name!r} 'prompt_template'")),
             )
         ),
         batch_target=body.get("batch_target"),
@@ -334,14 +351,30 @@ def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
         environment_manifest_sha256=body.get("environment_manifest_sha256"),
         episode=(
             None
-            if episode is None
+            if episode_body is None
             else EpisodeProfile(
-                schema=str(episode["schema"]),
-                renderer_id=str(episode["renderer_id"]),
-                max_turns=int(episode["max_turns"]),
-                max_action_tokens=int(episode["max_action_tokens"]),
-                max_episode_tokens=int(episode["max_episode_tokens"]),
-                max_observation_bytes=int(episode["max_observation_bytes"]),
+                schema=str(_required(episode_body, "schema", context=f"environment {name!r} 'episode'")),
+                renderer_id=str(_required(episode_body, "renderer_id", context=f"environment {name!r} 'episode'")),
+                max_turns=_coerce_int(
+                    _required(episode_body, "max_turns", context=f"environment {name!r} 'episode'"),
+                    "max_turns",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_action_tokens=_coerce_int(
+                    _required(episode_body, "max_action_tokens", context=f"environment {name!r} 'episode'"),
+                    "max_action_tokens",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_episode_tokens=_coerce_int(
+                    _required(episode_body, "max_episode_tokens", context=f"environment {name!r} 'episode'"),
+                    "max_episode_tokens",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_observation_bytes=_coerce_int(
+                    _required(episode_body, "max_observation_bytes", context=f"environment {name!r} 'episode'"),
+                    "max_observation_bytes",
+                    context=f"environment {name!r} 'episode'",
+                ),
             )
         ),
     )
@@ -356,8 +389,8 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
     if not isinstance(contract, Mapping):
         raise ValueError("a generation contract must be an object")
 
-    sampling = _required(contract, "sampling")
-    if not isinstance(sampling, Mapping):
+    sampling_body = _required(contract, "sampling")
+    if not isinstance(sampling_body, Mapping):
         raise ValueError("generation contract 'sampling' must be an object")
     environments = _required(contract, "environments")
     if not isinstance(environments, Mapping):
@@ -368,16 +401,33 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
         profile_id=str(_required(contract, "profile_id")),
         model_id=str(_required(contract, "model_id")),
         model_revision=str(_required(contract, "model_revision")),
-        protocol_version=int(_required(contract, "protocol_version")),
-        collection_seconds=int(_required(contract, "collection_seconds")),
-        upload_grace_seconds=int(_required(contract, "upload_grace_seconds")),
+        protocol_version=_coerce_int(
+            _required(contract, "protocol_version"),
+            "protocol_version",
+        ),
+        collection_seconds=_coerce_int(
+            _required(contract, "collection_seconds"),
+            "collection_seconds",
+        ),
+        upload_grace_seconds=_coerce_int(
+            _required(contract, "upload_grace_seconds"),
+            "upload_grace_seconds",
+        ),
         prompt_encoding=str(_required(contract, "prompt_encoding")),
         sampling=SamplingProfile(
-            rollouts=int(sampling["rollouts"]),
-            temperature=float(sampling["temperature"]),
-            top_p=float(sampling["top_p"]),
-            top_k=int(sampling["top_k"]),
-            do_sample=bool(sampling["do_sample"]),
+            rollouts=_coerce_int(
+                _required(sampling_body, "rollouts", context="generation contract 'sampling'"),
+                "rollouts",
+                context="generation contract 'sampling'",
+            ),
+            temperature=float(_required(sampling_body, "temperature", context="generation contract 'sampling'")),
+            top_p=float(_required(sampling_body, "top_p", context="generation contract 'sampling'")),
+            top_k=_coerce_int(
+                _required(sampling_body, "top_k", context="generation contract 'sampling'"),
+                "top_k",
+                context="generation contract 'sampling'",
+            ),
+            do_sample=bool(_required(sampling_body, "do_sample", context="generation contract 'sampling'")),
         ),
         environments={
             name: _environment_from_contract(name, body)
@@ -387,8 +437,16 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
             None
             if tiebreak is None
             else ThroughputTiebreakProfile(
-                token_cap=int(tiebreak["token_cap"]),
-                bucket_tokens_per_round=int(tiebreak["bucket_tokens_per_round"]),
+                token_cap=_coerce_int(
+                    _required(tiebreak, "token_cap", context="generation contract 'throughput_tiebreak'"),
+                    "token_cap",
+                    context="generation contract 'throughput_tiebreak'",
+                ),
+                bucket_tokens_per_round=_coerce_int(
+                    _required(tiebreak, "bucket_tokens_per_round", context="generation contract 'throughput_tiebreak'"),
+                    "bucket_tokens_per_round",
+                    context="generation contract 'throughput_tiebreak'",
+                ),
             )
         ),
     )
