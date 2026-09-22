@@ -8,9 +8,11 @@ currently deployed constants.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from string import Template
 from types import MappingProxyType
 from typing import Any
@@ -289,6 +291,198 @@ class ProtocolProfile:
             },
             "environments": environments,
         }
+
+
+def _required(body: Mapping[str, Any], field: str, *, context: str = "generation contract") -> Any:
+    """Refuse a contract missing a field or having a null value: a default here
+    is a silent disagreement between two processes."""
+    if field not in body:
+        raise ValueError(f"{context} is missing {field!r}")
+    value = body[field]
+    if value is None:
+        raise ValueError(f"{context} has a null {field!r}")
+    return value
+
+
+def _coerce_int(value: Any, field: str, *, context: str = "generation contract") -> int:
+    """Coerce to int, rejecting bool values that masquerade as int.
+
+    ``int(value)`` raises a bare ``TypeError`` for a value like a list; that
+    must become a ``ValueError`` naming the field, like every other rejection
+    in this module, so no caller has to catch a second exception type.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} is a bool, not an int")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} {field!r} is not an int: {exc}") from exc
+
+
+def _coerce_float(value: Any, field: str, *, context: str = "generation contract") -> float:
+    """Coerce to float, rejecting bool values that masquerade as float.
+
+    Same reasoning as ``_coerce_int``: ``float(value)`` raises a bare
+    ``TypeError`` for a value like a list, and that must become a
+    ``ValueError`` naming the field instead.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} is a bool, not a float")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} {field!r} is not a float: {exc}") from exc
+
+
+def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
+    if not isinstance(body, Mapping):
+        raise ValueError(f"environment {name!r} is not an object")
+    max_tokens = _required(body, "max_new_tokens", context=f"environment {name!r}")
+    bft_body = body.get("bft")
+    template = body.get("prompt_template")
+    episode_body = body.get("episode")
+    return EnvironmentProfile(
+        max_new_tokens=_coerce_int(max_tokens, "max_new_tokens", context=f"environment {name!r}"),
+        bft=(
+            None
+            if bft_body is None
+            else BFTProfile(
+                thinking_budget=_coerce_int(
+                    _required(bft_body, "thinking_budget", context=f"environment {name!r} 'bft'"),
+                    "thinking_budget",
+                    context=f"environment {name!r} 'bft'",
+                ),
+                answer_budget=_coerce_int(
+                    _required(bft_body, "answer_budget", context=f"environment {name!r} 'bft'"),
+                    "answer_budget",
+                    context=f"environment {name!r} 'bft'",
+                ),
+                force_answer=bool(_required(bft_body, "force_answer", context=f"environment {name!r} 'bft'")),
+            )
+        ),
+        answer_format=body.get("answer_format"),
+        prompt_template=(
+            None
+            if template is None
+            # 'renderer' and 'sha256' are derived, so they are recomputed rather
+            # than read; the round-trip test is what proves they still agree.
+            else PromptTemplateProfile(
+                template_id=str(_required(template, "id", context=f"environment {name!r} 'prompt_template'")),
+                template=str(_required(template, "template", context=f"environment {name!r} 'prompt_template'")),
+            )
+        ),
+        batch_target=body.get("batch_target"),
+        environment_contract_id=body.get("environment_contract_id"),
+        environment_manifest_sha256=body.get("environment_manifest_sha256"),
+        episode=(
+            None
+            if episode_body is None
+            else EpisodeProfile(
+                schema=str(_required(episode_body, "schema", context=f"environment {name!r} 'episode'")),
+                renderer_id=str(_required(episode_body, "renderer_id", context=f"environment {name!r} 'episode'")),
+                max_turns=_coerce_int(
+                    _required(episode_body, "max_turns", context=f"environment {name!r} 'episode'"),
+                    "max_turns",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_action_tokens=_coerce_int(
+                    _required(episode_body, "max_action_tokens", context=f"environment {name!r} 'episode'"),
+                    "max_action_tokens",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_episode_tokens=_coerce_int(
+                    _required(episode_body, "max_episode_tokens", context=f"environment {name!r} 'episode'"),
+                    "max_episode_tokens",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_observation_bytes=_coerce_int(
+                    _required(episode_body, "max_observation_bytes", context=f"environment {name!r} 'episode'"),
+                    "max_observation_bytes",
+                    context=f"environment {name!r} 'episode'",
+                ),
+            )
+        ),
+    )
+
+
+def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
+    """Rebuild a profile from what ``to_generation_contract`` produced.
+
+    The exact inverse, and it must stay exact: a task carries this contract, so
+    a field lost in translation is a field the fleet disagrees about silently.
+    """
+    if not isinstance(contract, Mapping):
+        raise ValueError("a generation contract must be an object")
+
+    sampling_body = _required(contract, "sampling")
+    if not isinstance(sampling_body, Mapping):
+        raise ValueError("generation contract 'sampling' must be an object")
+    environments = _required(contract, "environments")
+    if not isinstance(environments, Mapping):
+        raise ValueError("generation contract 'environments' must be an object")
+    tiebreak = contract.get("throughput_tiebreak")
+
+    return ProtocolProfile(
+        profile_id=str(_required(contract, "profile_id")),
+        model_id=str(_required(contract, "model_id")),
+        model_revision=str(_required(contract, "model_revision")),
+        protocol_version=_coerce_int(
+            _required(contract, "protocol_version"),
+            "protocol_version",
+        ),
+        collection_seconds=_coerce_int(
+            _required(contract, "collection_seconds"),
+            "collection_seconds",
+        ),
+        upload_grace_seconds=_coerce_int(
+            _required(contract, "upload_grace_seconds"),
+            "upload_grace_seconds",
+        ),
+        prompt_encoding=str(_required(contract, "prompt_encoding")),
+        sampling=SamplingProfile(
+            rollouts=_coerce_int(
+                _required(sampling_body, "rollouts", context="generation contract 'sampling'"),
+                "rollouts",
+                context="generation contract 'sampling'",
+            ),
+            temperature=_coerce_float(
+                _required(sampling_body, "temperature", context="generation contract 'sampling'"),
+                "temperature",
+                context="generation contract 'sampling'",
+            ),
+            top_p=_coerce_float(
+                _required(sampling_body, "top_p", context="generation contract 'sampling'"),
+                "top_p",
+                context="generation contract 'sampling'",
+            ),
+            top_k=_coerce_int(
+                _required(sampling_body, "top_k", context="generation contract 'sampling'"),
+                "top_k",
+                context="generation contract 'sampling'",
+            ),
+            do_sample=bool(_required(sampling_body, "do_sample", context="generation contract 'sampling'")),
+        ),
+        environments={
+            name: _environment_from_contract(name, body)
+            for name, body in environments.items()
+        },
+        throughput_tiebreak=(
+            None
+            if tiebreak is None
+            else ThroughputTiebreakProfile(
+                token_cap=_coerce_int(
+                    _required(tiebreak, "token_cap", context="generation contract 'throughput_tiebreak'"),
+                    "token_cap",
+                    context="generation contract 'throughput_tiebreak'",
+                ),
+                bucket_tokens_per_round=_coerce_int(
+                    _required(tiebreak, "bucket_tokens_per_round", context="generation contract 'throughput_tiebreak'"),
+                    "bucket_tokens_per_round",
+                    context="generation contract 'throughput_tiebreak'",
+                ),
+            )
+        ),
+    )
 
 
 _SAMPLING = SamplingProfile(
@@ -715,14 +909,28 @@ PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
 )
 DEFAULT_PROFILE_ID = "qwen35-2b-auction-v2"
 _PROFILE_ENV_VAR = "RELIQUARY_PROTOCOL_PROFILE"
+TASK_CONTRACT_ENV_VAR = "RELIQUARY_TASK_CONTRACT"
 
 
 def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
-    """Resolve an explicit profile or the environment-selected default.
+    """Resolve an explicit profile, a task's carried contract, or the default.
 
     Empty, misspelled, and otherwise unknown IDs are errors. Falling back after
     an explicit selection would silently put peers on different wire contracts.
+
+    An explicit id wins over the contract file: callers that pass one are
+    naming a template, not asking what this process runs.
     """
+
+    if profile_id is None:
+        contract_path = os.environ.get(TASK_CONTRACT_ENV_VAR)
+        # Absent (None) falls through to the compiled catalogue below; present
+        # but empty is a broken deployment, not an unset one, and must fail
+        # the same way a misspelled path does rather than run the default.
+        if contract_path is not None:
+            if not contract_path:
+                raise ValueError(f"{TASK_CONTRACT_ENV_VAR} is set but empty")
+            return _profile_from_contract_file(contract_path)
 
     selected_id = (
         os.environ.get(_PROFILE_ENV_VAR, DEFAULT_PROFILE_ID)
@@ -736,6 +944,32 @@ def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
         raise ValueError(
             f"unknown protocol profile {selected_id!r}; "
             f"expected one of: {available}"
+        ) from exc
+
+
+def _profile_from_contract_file(path: str) -> ProtocolProfile:
+    """Read the contract this process was given, or refuse to start.
+
+    Every failure here is fatal on purpose: a process that silently fell back
+    to the compiled catalogue would generate under a contract nobody declared.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"cannot read the task contract at {path!r}: {exc}"
+        ) from exc
+    try:
+        contract = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"the task contract at {path!r} is not JSON: {exc}"
+        ) from exc
+    try:
+        return profile_from_contract(contract)
+    except ValueError as exc:
+        raise ValueError(
+            f"the task contract at {path!r} is unusable: {exc}"
         ) from exc
 
 
@@ -790,6 +1024,8 @@ __all__ = [
     "PROFILES",
     "ProtocolProfile",
     "SamplingProfile",
+    "TASK_CONTRACT_ENV_VAR",
+    "profile_from_contract",
     "resolve_protocol_profile",
     "render_active_prompt",
     "to_generation_contract",

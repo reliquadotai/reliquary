@@ -60,6 +60,10 @@ class TaskEntry:
     # How the task's cap divides between its environments, e.g.
     # {"math": 0.6, "code": 0.4}. None means "not declared".
     env_split: Mapping[str, float] | None = None
+    # The generation contract this task runs, carried in full. None means the
+    # legacy form, where the binary holds the contract and the entry pins its
+    # hash in `profile_sha256`.
+    contract: Mapping[str, Any] | None = None
 
 
 def _number(value: Any, field: str) -> float:
@@ -140,6 +144,10 @@ def validate_entry(entry: TaskEntry) -> None:
             raise RegistryError(
                 f"env_split shares total {total:.4f}, which is not 1.0"
             )
+    if entry.contract is not None and not isinstance(entry.contract, Mapping):
+        raise RegistryError(
+            f"task {entry.task_id!r} carries a contract that is not an object"
+        )
 
 
 def total_cap(entries: Mapping[str, TaskEntry]) -> float:
@@ -236,6 +244,7 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             status=str(body.get("status", "active")),
             retired_at=body.get("retired_at"),
             env_split=body.get("env_split"),
+            contract=body.get("contract"),
         )
     if strict:
         validate_registry(entries)
@@ -247,23 +256,28 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
 
 def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
     """Canonical bytes: sorted keys, so two writers produce the same object."""
+    def _body(entry: TaskEntry) -> dict[str, Any]:
+        body = {
+            "profile_id": entry.profile_id,
+            "profile_sha256": entry.profile_sha256,
+            "incentive": {
+                "mechanism": entry.mechanism,
+                "params": dict(entry.params),
+            },
+            "status": entry.status,
+            "retired_at": entry.retired_at,
+            "env_split": (
+                None if entry.env_split is None else dict(entry.env_split)
+            ),
+        }
+        if entry.contract is not None:
+            body["contract"] = dict(entry.contract)
+        return body
+
     document = {
         "registry_version": REGISTRY_VERSION,
         "tasks": {
-            task_id: {
-                "profile_id": entry.profile_id,
-                "profile_sha256": entry.profile_sha256,
-                "incentive": {
-                    "mechanism": entry.mechanism,
-                    "params": dict(entry.params),
-                },
-                "status": entry.status,
-                "retired_at": entry.retired_at,
-                "env_split": (
-                    None if entry.env_split is None else dict(entry.env_split)
-                ),
-            }
-            for task_id, entry in sorted(entries.items())
+            task_id: _body(entry) for task_id, entry in sorted(entries.items())
         },
     }
     # allow_nan=False: the Python default emits bare NaN/Infinity literals that
