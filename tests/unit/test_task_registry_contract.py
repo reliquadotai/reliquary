@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from reliquary.protocol.release_contract import canonical_sha256
 from reliquary.shared.task_registry import (
     RegistryError,
     TaskEntry,
@@ -44,8 +45,13 @@ def _entry(**overrides):
         "params": PARAMS,
         "status": "active",
         "retired_at": None,
+        "contract": None,
     }
     payload.update(overrides)
+    # An honest entry pins the digest of the contract it carries, so tests that
+    # are not about the digest rule do not have to restate it.
+    if payload["contract"] is not None and "profile_sha256" not in overrides:
+        payload["profile_sha256"] = canonical_sha256(payload["contract"])
     return TaskEntry(**payload)
 
 
@@ -94,3 +100,39 @@ def test_both_kinds_of_entry_coexist():
 def test_a_contract_that_is_not_an_object_is_refused(bad):
     with pytest.raises(RegistryError):
         validate_entry(_entry(task_id="glm-run", contract=bad))
+
+
+def test_a_carried_contract_must_digest_to_the_hash_the_entry_pins():
+    # Spec section 5: `profile_sha256` keeps its exact meaning -- the digest of
+    # the generation contract this task runs. An entry that pins one contract
+    # and carries another is attesting work nobody signed for.
+    entry = _entry(task_id="glm-run", contract=CONTRACT, profile_sha256="a" * 64)
+    with pytest.raises(RegistryError) as caught:
+        validate_entry(entry)
+    assert "glm-run" in str(caught.value)
+
+
+def test_a_carried_contract_whose_digest_agrees_is_accepted():
+    entry = _entry(task_id="glm-run", contract=CONTRACT)
+    assert entry.profile_sha256 == canonical_sha256(CONTRACT)
+    validate_entry(entry)
+
+
+def test_a_contract_that_cannot_be_hashed_is_refused():
+    # A non-JSON value never reached R2 as bytes, but it must be refused where
+    # the message can name the task rather than as a bare TypeError.
+    entry = _entry(
+        task_id="glm-run", contract={"profile_id": {1, 2}}, profile_sha256="a" * 64,
+    )
+    with pytest.raises(RegistryError) as caught:
+        validate_entry(entry)
+    assert "glm-run" in str(caught.value)
+
+
+def test_a_parsed_contract_is_the_entrys_own_copy():
+    # Money-adjacent attestation: the entry must own the mapping its digest was
+    # checked against, not share it with whoever handed it over.
+    raw = render_registry({"glm-run": _entry(task_id="glm-run", contract=CONTRACT)})
+    entry = parse_registry(raw)["glm-run"]
+    entry.contract["model_id"] = "someone-elses/model"
+    assert parse_registry(raw)["glm-run"].contract["model_id"] == "org/GLM"

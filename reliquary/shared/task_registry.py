@@ -12,6 +12,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+# Imported from `release_contract`, whose imports are stdlib only, so this
+# module stays free of `reliquary.environment.abi` and the I/O behind it.
+from reliquary.protocol.release_contract import canonical_sha256
 from reliquary.shared.task_id import DEFAULT_TASK_ID, normalise_task_id
 
 REGISTRY_VERSION = 1
@@ -155,10 +158,27 @@ def validate_entry(entry: TaskEntry) -> None:
             raise RegistryError(
                 f"env_split shares total {total:.4f}, which is not 1.0"
             )
-    if entry.contract is not None and not isinstance(entry.contract, Mapping):
-        raise RegistryError(
-            f"task {entry.task_id!r} carries a contract that is not an object"
-        )
+    if entry.contract is not None:
+        if not isinstance(entry.contract, Mapping):
+            raise RegistryError(
+                f"task {entry.task_id!r} carries a contract that is not an object"
+            )
+        # `profile_sha256` means the digest of the contract this task runs, so
+        # an entry pinning one contract and carrying another attests work
+        # nobody signed for. Every startup refusal downstream assumes this.
+        try:
+            digest = canonical_sha256(entry.contract)
+        except (TypeError, ValueError) as exc:
+            raise RegistryError(
+                f"task {entry.task_id!r} carries a contract that cannot be "
+                f"hashed: {exc}"
+            ) from exc
+        if digest != entry.profile_sha256:
+            raise RegistryError(
+                f"task {entry.task_id!r} carries a contract digesting to "
+                f"{digest[:12]}… but pins profile_sha256 "
+                f"{entry.profile_sha256[:12]}…"
+            )
 
 
 def total_cap(entries: Mapping[str, TaskEntry]) -> float:
@@ -265,6 +285,7 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
         params = incentive.get("params")
         if not isinstance(params, dict):
             raise RegistryError(f"task {task_id!r} has no incentive parameters")
+        contract = body.get("contract")
         entries[task_id] = TaskEntry(
             task_id=task_id,
             profile_id=str(body.get("profile_id", "")),
@@ -274,7 +295,11 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             status=str(body.get("status", "active")),
             retired_at=body.get("retired_at"),
             env_split=body.get("env_split"),
-            contract=body.get("contract"),
+            # Copied on ingestion: the entry must own the mapping its digest
+            # was checked against, or validate-then-mutate reopens the gap.
+            contract=(
+                dict(contract) if isinstance(contract, Mapping) else contract
+            ),
             verification=_verification_of(task_id, body),
         )
     if strict:
