@@ -59,6 +59,16 @@ def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> Check
                     "max_new_tokens": sampling.max_new_tokens,
                 },
             )
+        if tokens < sampling.min_new_tokens:
+            return CheckResult(
+                ok=False,
+                reason="token_budget_underrun",
+                detail={
+                    "position": position,
+                    "tokens": int(tokens),
+                    "min_new_tokens": sampling.min_new_tokens,
+                },
+            )
     return OK
 
 

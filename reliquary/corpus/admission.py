@@ -87,8 +87,11 @@ def admit(
             return Verdict(False, result.reason or "", detail=dict(result.detail))
 
     # Past this point the miner really did answer the prompt its walk named,
-    # so the cursor moves whether or not a slot was still free. Skipping a
-    # prompt must never be cheaper than answering it.
+    # so the cursor moves whether or not a slot was still free. This prices a
+    # step at n * min_new_tokens tokens of work rather than making it free; it
+    # does NOT make skipping cost what answering costs, because a miner can
+    # always emit exactly the minimum. What closes the gap is the audit tier:
+    # junk completions fail token authenticity. See the spec's threat model.
     if slots.is_full(prompt_index):
         _advance(job, cursors, hotkey)
         return Verdict(

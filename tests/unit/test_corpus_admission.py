@@ -116,7 +116,7 @@ def test_a_full_prompt_is_refused_but_still_costs_the_cursor():
     assert verdict.accepted is False
     assert verdict.reason == "prompt_full"
     assert verdict.slots_remaining == 0
-    # Skipping a prompt must cost exactly what answering it costs.
+    # A full prompt still costs the step, so a collision is not a free retry.
     assert cursors.expected("5Gx") == 1
 
 
@@ -152,6 +152,21 @@ def test_a_cheap_check_failure_is_reported_and_moves_nothing(kwargs, reason):
     verdict = _call(job, slots, cursors, **kwargs)
     assert verdict.accepted is False
     assert verdict.reason == reason
+    assert slots.filled == 0
+    assert cursors.expected("5Gx") == 0
+
+
+def test_a_one_token_probe_is_refused_under_a_floor():
+    # The cheapest cursor step used to be n completions of one token each.
+    job = _job(sampling={
+        "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+        "min_new_tokens": 64, "max_new_tokens": 100, "n": 2,
+    })
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, token_counts=[1, 1])
+    assert verdict.accepted is False
+    assert verdict.reason == "token_budget_underrun"
+    assert verdict.detail == {"position": 0, "tokens": 1, "min_new_tokens": 64}
     assert slots.filled == 0
     assert cursors.expected("5Gx") == 0
 

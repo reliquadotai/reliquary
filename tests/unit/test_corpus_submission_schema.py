@@ -42,6 +42,7 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
     # reliquary.corpus.checks emits these as plain strings; they must match.
     assert CorpusRejectReason.BAD_COMPLETION_COUNT.value == "bad_completion_count"
     assert CorpusRejectReason.TOKEN_BUDGET_EXCEEDED.value == "token_budget_exceeded"
+    assert CorpusRejectReason.TOKEN_BUDGET_UNDERRUN.value == "token_budget_underrun"
     assert CorpusRejectReason.BAD_TERMINATION.value == "bad_termination"
     assert CorpusRejectReason.HASH_DUPLICATE.value == "hash_duplicate"
 

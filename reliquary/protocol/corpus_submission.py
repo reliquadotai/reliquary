@@ -30,6 +30,7 @@ class CorpusRejectReason(str, Enum):
     PROMPT_FULL = "prompt_full"
     BAD_COMPLETION_COUNT = "bad_completion_count"
     TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
+    TOKEN_BUDGET_UNDERRUN = "token_budget_underrun"
     BAD_TERMINATION = "bad_termination"
     HASH_DUPLICATE = "hash_duplicate"
     DEGENERATE = "degenerate"

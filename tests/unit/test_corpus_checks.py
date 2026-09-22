@@ -32,6 +32,18 @@ def test_a_completion_over_the_budget_is_refused():
     assert result.detail == {"position": 1, "tokens": 101, "max_new_tokens": 100}
 
 
+def test_a_completion_under_the_floor_is_refused():
+    # The floor is what makes stepping the cursor cost tokens.
+    floored = Sampling(
+        temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=8, max_new_tokens=100, n=2
+    )
+    assert check_token_budget([8, 100], floored).ok is True
+    result = check_token_budget([8, 7], floored)
+    assert result.ok is False
+    assert result.reason == "token_budget_underrun"
+    assert result.detail == {"position": 1, "tokens": 7, "min_new_tokens": 8}
+
+
 def test_an_empty_completion_is_refused():
     result = check_token_budget([4, 0], SAMPLING)
     assert result.ok is False
