@@ -184,3 +184,84 @@ def test_a_legacy_task_without_model_still_routes_to_build_task_entry(monkeypatc
     entry = state["entries"]["default"]
     assert entry.contract is None
     assert entry.profile_id == template
+
+
+# --- Passing both `--profile-id` and `--model` looks like it should do
+# something; it must be refused, not silently drop one of them. ---
+
+def test_profile_id_together_with_model_is_refused(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.infrastructure import task_registry_store as store
+
+    state = {"entries": {}, "etag": None}
+
+    async def _read(**kwargs):
+        return dict(state["entries"]), state["etag"]
+
+    async def _write(entries, etag, **kwargs):
+        raise AssertionError("this combination must be refused before any write")
+
+    monkeypatch.setattr(store, "read_registry", _read)
+    monkeypatch.setattr(store, "write_registry", _write)
+
+    template = _template()
+    result = CliRunner().invoke(app, [
+        "tasks", "create", "--task-id", "glm-run",
+        "--profile-id", template,
+        "--model", "org/GLM", "--model-revision", "abc123",
+        "--from-profile", template, "--model-architecture", "Qwen3ForCausalLM",
+        "--cap", "0.3",
+    ])
+
+    assert result.exit_code != 0
+    assert "--profile-id" in result.output
+    assert "--from-profile" in result.output
+    assert state["entries"] == {}
+
+
+# --- `tasks contract` hands a deployment the file it will mount; it must
+# refuse cleanly, and write nothing, when there is nothing usable to hand. ---
+
+def _fake_contract_store(monkeypatch, entries):
+    from reliquary.infrastructure import task_registry_store as store
+
+    async def _read(**kwargs):
+        return dict(entries), '"etag"'
+
+    async def _write(*args, **kwargs):
+        raise AssertionError("tasks contract must never write")
+
+    monkeypatch.setattr(store, "read_registry", _read)
+    monkeypatch.setattr(store, "write_registry", _write)
+
+
+def test_tasks_contract_on_an_unknown_task_is_refused(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    _fake_contract_store(monkeypatch, {})
+
+    result = CliRunner().invoke(app, ["tasks", "contract", "--task-id", "ghost"])
+
+    assert result.exit_code != 0
+    assert "ghost" in result.output
+
+
+def test_tasks_contract_on_a_legacy_entry_is_refused(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app, build_task_entry
+
+    template = _template()
+    legacy = build_task_entry(
+        task_id="default", profile_id=template, cap=1.0, overrides={},
+    )
+    _fake_contract_store(monkeypatch, {"default": legacy})
+
+    result = CliRunner().invoke(app, ["tasks", "contract", "--task-id", "default"])
+
+    assert result.exit_code != 0
+    assert "legacy" in result.output

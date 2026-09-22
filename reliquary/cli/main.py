@@ -181,7 +181,10 @@ def build_contract_task_entry(
 
     if environments is not None:
         if not environments:
-            raise ValueError("a task must declare at least one environment")
+            raise ValueError(
+                "--envs must name at least one environment, or be omitted "
+                "to keep the template's full set"
+            )
         declared = contract["environments"]
         unknown = sorted(set(environments) - set(declared))
         if unknown:
@@ -243,7 +246,7 @@ def _parse_env_split_option(value: str | None) -> dict[str, float] | None:
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
     profile_id: str = typer.Option(
-        None, "--profile-id", help="Compiled profile to pin; unused with --model"
+        None, "--profile-id", help="Compiled profile to pin; refused with --model"
     ),
     cap: float = typer.Option(..., "--cap", help="Most of the pool this task may pay"),
     start: float = typer.Option(None, "--start"),
@@ -275,6 +278,18 @@ def tasks_create(
     overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
     try:
         if model is not None:
+            if profile_id is not None:
+                # An operator who passes an option believes it does
+                # something; silently dropping --profile-id here would be
+                # the same trap this branch keeps finding elsewhere. This
+                # path is new, so nothing can already depend on the
+                # permissive behaviour.
+                typer.echo(
+                    "error: --profile-id has no effect with --model; use "
+                    "--from-profile to select the template",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
             # The builder cannot infer any of these (a template is not a
             # network call, and architecture needs one) -- so all three are
             # required together, and each missing one is named, not guessed.
