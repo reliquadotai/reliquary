@@ -316,33 +316,62 @@ def _required(body: Mapping[str, Any], field: str, *, context: str = "generation
 
 
 def _coerce_int(value: Any, field: str, *, context: str = "generation contract") -> int:
-    """Coerce to int, rejecting bool values that masquerade as int.
+    """A whole number, or a ``ValueError`` naming the field.
 
-    ``int(value)`` raises a bare ``TypeError`` for a value like a list; that
-    must become a ``ValueError`` naming the field, like every other rejection
-    in this module, so no caller has to catch a second exception type.
+    Nothing is converted: ``int(3.7)`` would answer a question nobody asked,
+    and ``protocol_version`` gates wire compatibility. ``bool`` is named
+    separately because it is an ``int`` subclass and would otherwise pass.
     """
     if isinstance(value, bool):
         raise ValueError(f"{context} {field!r} is a bool, not an int")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{context} {field!r} is not an int: {exc}") from exc
+    if not isinstance(value, int):
+        raise ValueError(f"{context} {field!r} is not an int: {value!r}")
+    return value
 
 
 def _coerce_float(value: Any, field: str, *, context: str = "generation contract") -> float:
-    """Coerce to float, rejecting bool values that masquerade as float.
-
-    Same reasoning as ``_coerce_int``: ``float(value)`` raises a bare
-    ``TypeError`` for a value like a list, and that must become a
-    ``ValueError`` naming the field instead.
-    """
+    """A number, or a ``ValueError`` naming the field. A whole number is one."""
     if isinstance(value, bool):
         raise ValueError(f"{context} {field!r} is a bool, not a float")
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{context} {field!r} is not a float: {exc}") from exc
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{context} {field!r} is not a float: {value!r}")
+    return float(value)
+
+
+# Every key each block of a generation contract may carry. `prompt_template`
+# includes the two derived keys the writer emits but the reader recomputes.
+_CONTRACT_FIELDS = (
+    "profile_id", "model_id", "model_revision", "model_architecture",
+    "protocol_version", "prompt_encoding", "throughput_tiebreak",
+    "collection_seconds", "upload_grace_seconds", "sampling", "environments",
+)
+_SAMPLING_FIELDS = ("rollouts", "temperature", "top_p", "top_k", "do_sample")
+_ENVIRONMENT_FIELDS = (
+    "max_new_tokens", "answer_format", "bft", "prompt_template",
+    "batch_target", "environment_contract_id", "environment_manifest_sha256",
+    "episode",
+)
+_BFT_FIELDS = ("thinking_budget", "answer_budget", "force_answer")
+_PROMPT_TEMPLATE_FIELDS = ("id", "renderer", "template", "sha256")
+_EPISODE_FIELDS = (
+    "schema", "renderer_id", "max_turns", "max_action_tokens",
+    "max_episode_tokens", "max_observation_bytes",
+)
+_TIEBREAK_FIELDS = ("token_cap", "bucket_tokens_per_round")
+
+
+def _object(body: Any, known: tuple[str, ...], *, context: str) -> Mapping[str, Any]:
+    """An object whose every key is one this reader honours.
+
+    An ignored key is worse than a rejected one: the rebuild drops it, so the
+    only symptom is a digest mismatch at startup that names nothing.
+    """
+    if not isinstance(body, Mapping):
+        raise ValueError(f"{context} must be an object")
+    unknown = sorted(set(body) - set(known))
+    if unknown:
+        raise ValueError(f"{context} has unknown fields: {unknown}")
+    return body
 
 
 def _coerce_str(value: Any, field: str, *, context: str = "generation contract") -> str | None:
@@ -362,10 +391,23 @@ def _coerce_str(value: Any, field: str, *, context: str = "generation contract")
 def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
     if not isinstance(body, Mapping):
         raise ValueError(f"environment {name!r} is not an object")
+    body = _object(body, _ENVIRONMENT_FIELDS, context=f"environment {name!r}")
     max_tokens = _required(body, "max_new_tokens", context=f"environment {name!r}")
     bft_body = body.get("bft")
+    if bft_body is not None:
+        bft_body = _object(bft_body, _BFT_FIELDS, context=f"environment {name!r} 'bft'")
     template = body.get("prompt_template")
+    if template is not None:
+        template = _object(
+            template,
+            _PROMPT_TEMPLATE_FIELDS,
+            context=f"environment {name!r} 'prompt_template'",
+        )
     episode_body = body.get("episode")
+    if episode_body is not None:
+        episode_body = _object(
+            episode_body, _EPISODE_FIELDS, context=f"environment {name!r} 'episode'"
+        )
     return EnvironmentProfile(
         max_new_tokens=_coerce_int(max_tokens, "max_new_tokens", context=f"environment {name!r}"),
         bft=(
@@ -385,7 +427,9 @@ def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
                 force_answer=bool(_required(bft_body, "force_answer", context=f"environment {name!r} 'bft'")),
             )
         ),
-        answer_format=body.get("answer_format"),
+        answer_format=_coerce_str(
+            body.get("answer_format"), "answer_format", context=f"environment {name!r}"
+        ),
         prompt_template=(
             None
             if template is None
@@ -396,9 +440,26 @@ def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
                 template=str(_required(template, "template", context=f"environment {name!r} 'prompt_template'")),
             )
         ),
-        batch_target=body.get("batch_target"),
-        environment_contract_id=body.get("environment_contract_id"),
-        environment_manifest_sha256=body.get("environment_manifest_sha256"),
+        # All four optional fields go through a named coercion. A value the
+        # bare `.get()` waved through was a round-trip fixed point, so its
+        # digest agreed and the malformed contract booted as an attested task.
+        batch_target=(
+            None
+            if body.get("batch_target") is None
+            else _coerce_int(
+                body["batch_target"], "batch_target", context=f"environment {name!r}"
+            )
+        ),
+        environment_contract_id=_coerce_str(
+            body.get("environment_contract_id"),
+            "environment_contract_id",
+            context=f"environment {name!r}",
+        ),
+        environment_manifest_sha256=_coerce_str(
+            body.get("environment_manifest_sha256"),
+            "environment_manifest_sha256",
+            context=f"environment {name!r}",
+        ),
         episode=(
             None
             if episode_body is None
@@ -438,14 +499,24 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
     """
     if not isinstance(contract, Mapping):
         raise ValueError("a generation contract must be an object")
+    contract = _object(contract, _CONTRACT_FIELDS, context="generation contract")
 
     sampling_body = _required(contract, "sampling")
     if not isinstance(sampling_body, Mapping):
         raise ValueError("generation contract 'sampling' must be an object")
+    sampling_body = _object(
+        sampling_body, _SAMPLING_FIELDS, context="generation contract 'sampling'"
+    )
     environments = _required(contract, "environments")
     if not isinstance(environments, Mapping):
         raise ValueError("generation contract 'environments' must be an object")
     tiebreak = contract.get("throughput_tiebreak")
+    if tiebreak is not None:
+        tiebreak = _object(
+            tiebreak,
+            _TIEBREAK_FIELDS,
+            context="generation contract 'throughput_tiebreak'",
+        )
 
     return ProtocolProfile(
         profile_id=str(_required(contract, "profile_id")),
