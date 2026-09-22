@@ -62,6 +62,12 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
+# How many tokens one verification pass puts on the card at once. A pass costs one traversal of
+# the model, which a streamed replica pays in full, so the budget wants to be as large as the card
+# allows: measured at 13.5 GB of device memory for 65k tokens in flight on a 2048-wide model, and
+# a pass of 32 rollouts costs 0.22 s each against 7.6 s for one alone.
+PROOF_BATCH_TOKEN_BUDGET = int(_os.environ.get("RELIQUARY_PROOF_BATCH_TOKENS", "262144"))
+
 PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
 PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
 PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision
