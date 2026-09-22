@@ -119,9 +119,15 @@ class ChunkProof:
         modulus = int.from_bytes(data[0:2], "big")
         if modulus == 0:
             raise ValueError("a zero modulus is the reference's null proof")
+        if modulus > MOD_N:
+            raise ValueError(f"modulus {modulus} is above the field")
         coeffs = tuple(
             int.from_bytes(data[i : i + 2], "big") for i in range(2, len(data), 2)
         )
+        # An honest builder only emits reduced coefficients; refusing the rest
+        # removes a byte-level way to write the same proof twice.
+        if any(c >= MOD_N for c in coeffs):
+            raise ValueError("a coefficient is outside the field")
         return cls(modulus, coeffs)
 
     def values_at(self, xs: Sequence[int]) -> list[int]:

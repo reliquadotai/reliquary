@@ -112,3 +112,15 @@ def test_a_128_point_proof_is_258_bytes():
 @pytest.mark.parametrize("tokens,expected", [(1, 1), (32, 1), (33, 2), (70, 3), (64, 2)])
 def test_expected_chunks(tokens, expected):
     assert expected_chunks(tokens, 32) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"\xff\xda\x00\x01",      # modulus above the field
+        b"\xff\xd9\xff\xd9",      # coefficient equal to the field prime
+    ],
+)
+def test_values_no_honest_builder_emits_are_refused(raw):
+    with pytest.raises(ValueError):
+        ChunkProof.from_bytes(raw)

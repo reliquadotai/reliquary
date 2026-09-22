@@ -62,7 +62,12 @@ def verify_chunk_proofs(
     for flat, raw in zip(flats, proofs):
         indices, bits = _top(flat, topk)
         try:
-            proof_bits = ChunkProof.from_bytes(raw).values_at(indices)
+            proof = ChunkProof.from_bytes(raw)
+            # Exactly topk coefficients, as an honest builder emits: checked
+            # before Horner, whose cost grows with every forged coefficient.
+            if len(proof.coeffs) != topk:
+                raise ValueError(f"{len(proof.coeffs)} coefficients, expected {topk}")
+            proof_bits = proof.values_at(indices)
         except ValueError:
             results.append(ChunkResult(topk, NO_MANTISSA, NO_MANTISSA))
             continue

@@ -57,3 +57,14 @@ def test_a_wrong_number_of_proofs_is_refused():
 def test_a_chunk_smaller_than_topk_is_refused():
     with pytest.raises(ValueError):
         build_chunk_proofs(_hidden(rows=1, width=64), **KW)
+
+
+def test_a_proof_with_the_wrong_number_of_coefficients_fails_closed():
+    # An honest proof has exactly topk coefficients; anything else is refused
+    # before Horner, which would otherwise run once per forged coefficient.
+    hidden = _hidden()
+    proofs = build_chunk_proofs(hidden, **KW)
+    proofs[0] = proofs[0] + b"\x00\x01" * 1000
+    results = verify_chunk_proofs(hidden, proofs, **KW)
+    assert results[0].exp_mismatches == 128
+    assert results[0].mant_err_mean == NO_MANTISSA
