@@ -5746,8 +5746,12 @@ class ValidationService:
                 assembler,
             )
             recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
-            recovery.recover(window_start, queue=self._training_payload_queue_ref(),
-                             archives=get_archive_queue(), rotation=self._fill_closed_rotation_store)
+            archive = recovery.recover(
+                window_start, queue=self._training_payload_queue_ref(),
+                archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
+            )
+            # Keep the hash recovery cache contiguous; a gap stalls it for good.
+            self._cache_archived_hashes(archive)
             self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
             getattr(self, "_fill_closed_assemblers", {}).pop(window_start, None)
             current = getattr(self, "_fill_closed_assembler", None)

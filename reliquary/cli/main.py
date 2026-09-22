@@ -5,6 +5,7 @@ import atexit
 import logging
 import math
 import os
+import resource
 import shutil
 import socket as _socket
 import subprocess
@@ -872,6 +873,19 @@ def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
     )
 
 
+def _raise_open_file_limit() -> None:
+    """Lift the soft RLIMIT_NOFILE to the hard cap; Docker's 1024 default
+    starved the controller of sockets (EMFILE) on 2026-09-22."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 1_048_576 if hard == resource.RLIM_INFINITY else hard
+        if soft != resource.RLIM_INFINITY and soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            logger.info("Raised open file limit %d -> %d", soft, target)
+    except (OSError, ValueError):
+        logger.warning("Could not raise the open file limit", exc_info=True)
+
+
 def _run_validator_event_loop(coroutine) -> None:
     """Run the validator and hard-exit after an unrecoverable proof fault.
 
@@ -882,6 +896,7 @@ def _run_validator_event_loop(coroutine) -> None:
     supervisor an actual child exit and lets Docker apply its restart policy.
     """
 
+    _raise_open_file_limit()
     try:
         asyncio.run(coroutine)
     except FatalProofPlaneError:

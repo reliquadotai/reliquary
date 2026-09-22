@@ -206,7 +206,7 @@ class FillClosedRecoveryStore:
         finally:
             os.close(fd)
 
-    def finish(self, window: int, archive: dict, archive_queue: Any) -> None:
+    def finish(self, window: int, archive: dict, archive_queue: Any) -> dict:
         record = self.load(window)
         if record["schema_version"] == 2 and (
             archive.get("payment_policy") != record["payment_policy"]
@@ -223,12 +223,13 @@ class FillClosedRecoveryStore:
         archive_queue.enqueue(window, archive)
         self._path(window).unlink()
         self._sync(self.directory)
+        return archive
 
-    def recover(self, window: int, *, queue: Any, archives: Any, rotation: Any) -> None:
+    def recover(self, window: int, *, queue: Any, archives: Any, rotation: Any) -> dict:
+        """Archive an interrupted window and return the archive it enqueued."""
         record = self.load(window)
         if record["archive"] is not None:
-            self.finish(window, record["archive"], archives)
-            return
+            return self.finish(window, record["archive"], archives)
         rows, rewards, payload_count = [], {}, 0
         environments = record["environments"]
         payment_policy = record.get(
@@ -325,4 +326,4 @@ class FillClosedRecoveryStore:
             "runners_up": [], "rejected": [], "reject_summary": {},
             "training_quarantine": {"quarantined": False, "reasons": [], "metrics": {}},
         }
-        self.finish(window, archive, archives)
+        return self.finish(window, archive, archives)

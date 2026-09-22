@@ -247,8 +247,9 @@ def test_quarantined_training_still_preserves_miner_payment_after_crash(tmp_path
              "prompt_idx": 1, "eos_tokens": 16, "claimed_checkpoint_hash": "a" * 40}
             for env in ("math", "code")]
     queue.enqueue_committed_tombstone(672, b"training-quarantine", accounting=rows)
-    store.recover(42, queue=queue, archives=archives, rotation=rotation)
+    returned = store.recover(42, queue=queue, archives=archives, rotation=rotation)
     archive = archives.pending_archives(start_window=42, end_window=42)[42]
+    assert returned == archive
     assert archive["rewards_by_hotkey"] == {"alice": 1 / 256}
     assert archive["durable_payload_count"] == 0
     assert not rotation.load().requires_successor
@@ -380,7 +381,9 @@ def test_live_accounting_commit_and_abort_release_stale_assembler(tmp_path, monk
 
     monkeypatch.setattr(store, "quarantine_uncommitted", quarantine)
     monkeypatch.setattr(store, "recover", recover)
+    cached = []
     svc = SimpleNamespace(_active_batchers={"math": batcher},
+        _cache_archived_hashes=cached.append,
         _archive_enqueued_windows=set(), _fill_closed_recovery_store=store,
         _training_payload_queue_ref=lambda: queue, _fill_closed_rotation_store=rotation,
         _fill_closed_assemblers={42: assembler}, _fill_closed_assembler=assembler,
@@ -393,6 +396,9 @@ def test_live_accounting_commit_and_abort_release_stale_assembler(tmp_path, monk
         "close", "paid", ("prepare", [group]), "commit", "quarantine", "recover",
     ]
     assert receipt_path.read_bytes() == original
+    # A recovered window must advance the hash recovery cache like a sealed
+    # one, or the cache stalls and the next restart replays the full horizon.
+    assert cached == [archives.pending_archives(start_window=42, end_window=42)[42]]
     assert archives.pending_archives(start_window=42, end_window=42)[42][
         "batch"
     ] == [
