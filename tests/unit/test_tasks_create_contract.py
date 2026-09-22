@@ -290,3 +290,38 @@ def test_tasks_contract_on_a_legacy_entry_is_refused(monkeypatch):
 
     assert result.exit_code != 0
     assert "legacy" in result.output
+
+
+def test_env_split_together_with_model_is_refused(monkeypatch):
+    # The contract path builds `env_split=None` and says nothing, which is the
+    # identical trap already closed for `--profile-id`.
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.infrastructure import task_registry_store as store
+
+    state = {"entries": {}, "etag": None}
+
+    async def _read(**kwargs):
+        return dict(state["entries"]), state["etag"]
+
+    async def _write(entries, etag, **kwargs):
+        raise AssertionError("this combination must be refused before any write")
+
+    monkeypatch.setattr(store, "read_registry", _read)
+    monkeypatch.setattr(store, "write_registry", _write)
+
+    template = _template()
+    names = sorted(PROFILES[template].environments)[:2]
+    result = CliRunner().invoke(app, [
+        "tasks", "create", "--task-id", "glm-run",
+        "--model", "org/GLM", "--model-revision", "abc123",
+        "--from-profile", template, "--model-architecture", "Qwen3ForCausalLM",
+        "--env-split", f"{names[0]}=0.6,{names[1]}=0.4",
+        "--cap", "0.3",
+    ])
+
+    assert result.exit_code != 0
+    assert "--env-split" in result.output
+    assert "--model" in result.output
+    assert state["entries"] == {}

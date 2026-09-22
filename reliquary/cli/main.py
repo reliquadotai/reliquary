@@ -313,6 +313,17 @@ def tasks_create(
                     err=True,
                 )
                 raise typer.Exit(code=1)
+            if env_split is not None:
+                # Same trap as --profile-id: the contract path builds
+                # env_split=None, so the shares an operator typed would be
+                # dropped without a word.
+                typer.echo(
+                    "error: --env-split has no effect with --model; a carried "
+                    "contract declares its own environment set, selected with "
+                    "--envs",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
             # The builder cannot infer any of these (a template is not a
             # network call, and architecture needs one) -- so all three are
             # required together, and each missing one is named, not guessed.
