@@ -90,6 +90,19 @@ def test_an_eos_label_must_end_on_the_eos_token():
     }
 
 
+def test_a_passing_check_never_shares_its_detail():
+    # One OK singleton would hand every caller the same mutable dict, and this
+    # package exists to be replayed.
+    first = check_completion_count(2, SAMPLING)
+    second = check_completion_count(2, SAMPLING)
+    assert first.detail is not second.detail
+    first.detail["poison"] = True
+    assert second.detail == {}
+    assert check_duplicates([], seen=frozenset()).detail == {}
+    assert check_token_budget([4], SAMPLING).detail == {}
+    assert _termination(["eos"], [4], [EOS]).detail == {}
+
+
 def test_the_digest_binds_the_prompt_to_the_tokens():
     assert completion_digest(3, [1, 2, 3]) == completion_digest(3, [1, 2, 3])
     assert completion_digest(3, [1, 2, 3]) != completion_digest(4, [1, 2, 3])

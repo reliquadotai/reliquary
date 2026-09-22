@@ -24,7 +24,10 @@ class CheckResult:
     detail: dict[str, Any] = field(default_factory=dict)
 
 
-OK = CheckResult(ok=True)
+def _ok() -> CheckResult:
+    """A fresh result every time: ``CheckResult`` is frozen but its default
+    detail dict is not, so one shared OK would carry a caller's edit forward."""
+    return CheckResult(ok=True)
 
 
 def completion_digest(prompt_index: int, tokens: Sequence[int]) -> str:
@@ -44,7 +47,7 @@ def check_completion_count(count: int, sampling: Sampling) -> CheckResult:
             reason="bad_completion_count",
             detail={"expected": sampling.n, "got": count},
         )
-    return OK
+    return _ok()
 
 
 def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> CheckResult:
@@ -69,7 +72,7 @@ def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> Check
                     "min_new_tokens": sampling.min_new_tokens,
                 },
             )
-    return OK
+    return _ok()
 
 
 def check_termination(
@@ -115,7 +118,7 @@ def check_termination(
                     "eos_token_id": eos_token_id,
                 },
             )
-    return OK
+    return _ok()
 
 
 def check_duplicates(digests: Sequence[str], seen: AbstractSet[str]) -> CheckResult:
@@ -129,4 +132,4 @@ def check_duplicates(digests: Sequence[str], seen: AbstractSet[str]) -> CheckRes
                 detail={"position": position, "digest": digest},
             )
         within.add(digest)
-    return OK
+    return _ok()
