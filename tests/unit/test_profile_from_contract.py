@@ -114,6 +114,28 @@ def test_a_bool_as_int_field_is_refused():
         profile_from_contract(contract)
 
 
+def test_a_list_as_int_field_is_refused():
+    # int() raises a bare TypeError for a list; that must become a ValueError
+    # naming the field, like every other rejection in this module.
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    contract["protocol_version"] = [1, 2]
+    with pytest.raises(ValueError, match="protocol_version") as caught:
+        profile_from_contract(contract)
+    assert not isinstance(caught.value, TypeError)
+
+
+def test_a_list_as_float_field_is_refused():
+    # Same failure mode as the int case, for the other coercion that can
+    # raise a bare TypeError: float().
+    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
+    sampling = dict(contract["sampling"])
+    sampling["temperature"] = [1, 2]
+    contract["sampling"] = sampling
+    with pytest.raises(ValueError, match="temperature") as caught:
+        profile_from_contract(contract)
+    assert not isinstance(caught.value, TypeError)
+
+
 def test_a_missing_nested_key_in_bft_is_refused():
     contract, name = _profile_contract_with("bft")
     env = dict(contract["environments"][name])

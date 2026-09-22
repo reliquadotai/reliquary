@@ -305,10 +305,33 @@ def _required(body: Mapping[str, Any], field: str, *, context: str = "generation
 
 
 def _coerce_int(value: Any, field: str, *, context: str = "generation contract") -> int:
-    """Coerce to int, rejecting bool values that masquerade as int."""
+    """Coerce to int, rejecting bool values that masquerade as int.
+
+    ``int(value)`` raises a bare ``TypeError`` for a value like a list; that
+    must become a ``ValueError`` naming the field, like every other rejection
+    in this module, so no caller has to catch a second exception type.
+    """
     if isinstance(value, bool):
         raise ValueError(f"{context} {field!r} is a bool, not an int")
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} {field!r} is not an int: {exc}") from exc
+
+
+def _coerce_float(value: Any, field: str, *, context: str = "generation contract") -> float:
+    """Coerce to float, rejecting bool values that masquerade as float.
+
+    Same reasoning as ``_coerce_int``: ``float(value)`` raises a bare
+    ``TypeError`` for a value like a list, and that must become a
+    ``ValueError`` naming the field instead.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} is a bool, not a float")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} {field!r} is not a float: {exc}") from exc
 
 
 def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
@@ -422,8 +445,16 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
                 "rollouts",
                 context="generation contract 'sampling'",
             ),
-            temperature=float(_required(sampling_body, "temperature", context="generation contract 'sampling'")),
-            top_p=float(_required(sampling_body, "top_p", context="generation contract 'sampling'")),
+            temperature=_coerce_float(
+                _required(sampling_body, "temperature", context="generation contract 'sampling'"),
+                "temperature",
+                context="generation contract 'sampling'",
+            ),
+            top_p=_coerce_float(
+                _required(sampling_body, "top_p", context="generation contract 'sampling'"),
+                "top_p",
+                context="generation contract 'sampling'",
+            ),
             top_k=_coerce_int(
                 _required(sampling_body, "top_k", context="generation contract 'sampling'"),
                 "top_k",
@@ -893,7 +924,12 @@ def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
 
     if profile_id is None:
         contract_path = os.environ.get(TASK_CONTRACT_ENV_VAR)
-        if contract_path:
+        # Absent (None) falls through to the compiled catalogue below; present
+        # but empty is a broken deployment, not an unset one, and must fail
+        # the same way a misspelled path does rather than run the default.
+        if contract_path is not None:
+            if not contract_path:
+                raise ValueError(f"{TASK_CONTRACT_ENV_VAR} is set but empty")
             return _profile_from_contract_file(contract_path)
 
     selected_id = (

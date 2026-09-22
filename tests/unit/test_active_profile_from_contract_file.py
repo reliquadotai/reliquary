@@ -49,7 +49,19 @@ def test_an_unreadable_contract_file_is_a_loud_failure(tmp_path, monkeypatch):
     path = tmp_path / "contract.json"
     path.write_text("{not json")
     monkeypatch.setenv(TASK_CONTRACT_ENV_VAR, str(path))
-    with pytest.raises(ValueError):
+    # json.JSONDecodeError is itself a ValueError, so pytest.raises(ValueError)
+    # alone would pass even if the wrap-and-name-the-path logic were deleted;
+    # the path must actually show up in the message.
+    with pytest.raises(ValueError) as caught:
+        resolve_protocol_profile()
+    assert str(path) in str(caught.value)
+
+
+def test_an_empty_contract_path_is_a_loud_failure(monkeypatch):
+    # Present but empty (a common broken-shell-templating outcome) must fail
+    # like a misspelled path, not be treated as unset and fall back silently.
+    monkeypatch.setenv(TASK_CONTRACT_ENV_VAR, "")
+    with pytest.raises(ValueError, match=TASK_CONTRACT_ENV_VAR):
         resolve_protocol_profile()
 
 
