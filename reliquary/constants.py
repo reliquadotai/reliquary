@@ -492,6 +492,15 @@ MAX_PENDING_PROOF_QUEUE_DEPTH = 64
 # bounded CPU parallelism; four Code group workers each fan sixteen rollouts through
 # the shared capacity-bounded remote executor client. These are validator-runtime capacities, not miner
 # wire constants.
+#
+# These budget a whole RESOURCE CLASS and are split across the environments
+# running on it — they are not per-environment counts. They were per-environment
+# until per-environment admission queues landed, so a deployment carrying an
+# explicit value has to multiply it by the number of environments on that class
+# to keep the capacity it had: two CPU environments at four processes each is
+# RELIQUARY_MATH_ADMISSION_WORKERS=8, not 4. Grading concurrency is what drains
+# the admission queue, so halving it silently is the one way per-environment
+# queues cost throughput instead of adding it. See `admission_pool_allocation`.
 MATH_ADMISSION_WORKERS = int(
     _os.environ.get("RELIQUARY_MATH_ADMISSION_WORKERS", "8")
 )
