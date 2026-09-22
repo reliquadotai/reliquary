@@ -359,3 +359,58 @@ def test_an_environment_manifest_sha256_that_is_not_text_is_refused():
     assert "environment_manifest_sha256" in str(caught.value)
     assert name in str(caught.value)
     assert not isinstance(caught.value, TypeError)
+
+
+# --- `prompt_cooldown_windows` and `thinking` arrived with the Teutonic
+# profile. The contract emitted them before this reader honoured them, so a
+# task carrying that profile was attested and could not boot. ---
+
+def test_prompt_cooldown_windows_survives_the_round_trip():
+    contract, name = _profile_contract_with("prompt_cooldown_windows")
+    expected = contract["environments"][name]["prompt_cooldown_windows"]
+    rebuilt = profile_from_contract(contract)
+    assert rebuilt.environments[name].prompt_cooldown_windows == expected
+
+
+def test_thinking_survives_the_round_trip():
+    # The only compiled profile that sets it sets it False, so an assertion
+    # against None would pass on a reader that dropped the field entirely.
+    contract, name = _profile_contract_with("thinking")
+    expected = contract["environments"][name]["thinking"]
+    assert isinstance(expected, bool)
+    rebuilt = profile_from_contract(contract)
+    assert rebuilt.environments[name].thinking is expected
+
+
+def test_a_non_integer_prompt_cooldown_windows_is_refused():
+    contract, name = _profile_contract_with("prompt_cooldown_windows")
+    env = dict(contract["environments"][name])
+    env["prompt_cooldown_windows"] = 2.5
+    contract["environments"] = {name: env}
+    with pytest.raises(ValueError) as caught:
+        profile_from_contract(contract)
+    assert "prompt_cooldown_windows" in str(caught.value)
+    assert not isinstance(caught.value, TypeError)
+
+
+def test_a_truthy_stand_in_for_thinking_is_refused():
+    # `bool(1)` would be re-emitted as `true`, so the contract would no longer
+    # hash to what it arrived as: a fixed point broken with nothing named.
+    contract, name = _profile_contract_with("thinking")
+    env = dict(contract["environments"][name])
+    env["thinking"] = 1
+    contract["environments"] = {name: env}
+    with pytest.raises(ValueError) as caught:
+        profile_from_contract(contract)
+    assert "thinking" in str(caught.value)
+
+
+def test_a_truthy_stand_in_for_force_answer_is_refused():
+    # Same trap, one field over: `bool()` accepted anything here.
+    contract, name = _profile_contract_with("bft")
+    env = dict(contract["environments"][name])
+    env["bft"] = {**env["bft"], "force_answer": 1}
+    contract["environments"] = {name: env}
+    with pytest.raises(ValueError) as caught:
+        profile_from_contract(contract)
+    assert "force_answer" in str(caught.value)

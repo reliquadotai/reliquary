@@ -386,7 +386,7 @@ _SAMPLING_FIELDS = ("rollouts", "temperature", "top_p", "top_k", "do_sample")
 _ENVIRONMENT_FIELDS = (
     "max_new_tokens", "answer_format", "bft", "prompt_template",
     "batch_target", "environment_contract_id", "environment_manifest_sha256",
-    "episode",
+    "episode", "prompt_cooldown_windows", "thinking",
 )
 _BFT_FIELDS = ("thinking_budget", "answer_budget", "force_answer")
 _PROMPT_TEMPLATE_FIELDS = ("id", "renderer", "template", "sha256")
@@ -422,6 +422,17 @@ def _coerce_str(value: Any, field: str, *, context: str = "generation contract")
         return None
     if not isinstance(value, str):
         raise ValueError(f"{context} {field!r} must be text, got {value!r}")
+    return value
+
+
+def _coerce_bool(value: Any, field: str, *, context: str = "generation contract") -> bool:
+    """A flag is a JSON boolean, never a truthy stand-in.
+
+    ``bool(1)`` would be re-emitted as ``true``, so the contract would no
+    longer hash to what it arrived as and startup would fail naming nothing.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} must be true or false, got {value!r}")
     return value
 
 
@@ -461,7 +472,11 @@ def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
                     "answer_budget",
                     context=f"environment {name!r} 'bft'",
                 ),
-                force_answer=bool(_required(bft_body, "force_answer", context=f"environment {name!r} 'bft'")),
+                force_answer=_coerce_bool(
+                    _required(bft_body, "force_answer", context=f"environment {name!r} 'bft'"),
+                    "force_answer",
+                    context=f"environment {name!r} 'bft'",
+                ),
             )
         ),
         answer_format=_coerce_str(
@@ -496,6 +511,22 @@ def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
             body.get("environment_manifest_sha256"),
             "environment_manifest_sha256",
             context=f"environment {name!r}",
+        ),
+        prompt_cooldown_windows=(
+            None
+            if body.get("prompt_cooldown_windows") is None
+            else _coerce_int(
+                body["prompt_cooldown_windows"],
+                "prompt_cooldown_windows",
+                context=f"environment {name!r}",
+            )
+        ),
+        thinking=(
+            None
+            if body.get("thinking") is None
+            else _coerce_bool(
+                body["thinking"], "thinking", context=f"environment {name!r}"
+            )
         ),
         episode=(
             None
