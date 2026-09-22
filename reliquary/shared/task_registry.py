@@ -16,7 +16,12 @@ from reliquary.shared.task_id import DEFAULT_TASK_ID, normalise_task_id
 
 REGISTRY_VERSION = 1
 MECHANISM_RL_DISCOVERED_PRICE = "rl-discovered-price"
-KNOWN_MECHANISMS = frozenset({MECHANISM_RL_DISCOVERED_PRICE})
+# Corpus generation on a frozen checkpoint: paid per verified token, with the
+# price pinned by declaring floor == cap.
+MECHANISM_CORPUS_GENERATION = "corpus-generation"
+KNOWN_MECHANISMS = frozenset(
+    {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION}
+)
 
 # Every field the REGISTRY declares per task. A missing one is refused rather
 # than defaulted: a half-specified controller is not a controller.
