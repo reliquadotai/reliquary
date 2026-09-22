@@ -75,6 +75,15 @@ PROOF_WARM_ROLLOUTS = int(_os.environ.get("RELIQUARY_PROOF_WARM_ROLLOUTS", "16")
 if PROOF_WARM_ROLLOUTS < 1:
     raise ValueError("RELIQUARY_PROOF_WARM_ROLLOUTS must be at least 1")
 
+# Whether a pass may hold rollouts of different lengths, padded to the widest and cut back after.
+# "auto" pads for a streamed replica and not for a resident one: rollouts that terminate on their
+# own almost never share a token count, so without padding a streamed slot pays a traversal per
+# rollout and the batching it exists for does not happen; while a resident slot has no throughput
+# problem to solve and keeps returning, to the bit, what one-at-a-time verification always did.
+PROOF_BATCH_PADDING = _os.environ.get("RELIQUARY_PROOF_BATCH_PADDING", "auto").strip().lower()
+if PROOF_BATCH_PADDING not in {"auto", "on", "off"}:
+    raise ValueError("RELIQUARY_PROOF_BATCH_PADDING must be 'auto', 'on' or 'off'")
+
 # Fraction of proofs a resident slot also runs through the streamed traversal, comparing the two
 # and reporting when they differ. The oracle only exists while the model still fits on one card,
 # which is exactly the window before the cutover: 0 outside it, because it doubles the forward.

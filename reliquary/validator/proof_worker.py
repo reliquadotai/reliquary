@@ -40,6 +40,7 @@ __all__ = [
     "reload_proof_context",
     "proof_error_type",
     "remote_commitment_verifier",
+    "batch_padding_for",
     "run_commitment_proof",
     "shadow_traversal",
 ]
@@ -528,6 +529,21 @@ class ProofWorkerPool:
 # process, never in the validator's interpreter.
 
 
+def batch_padding_for(replica: str | None) -> bool:
+    """Whether this slot's passes may mix lengths.
+
+    A streamed slot has to: a traversal is its whole cost, and rollouts that terminate on their
+    own almost never share a token count, so an unpadded pass carries one rollout. A resident slot
+    does not: its forward is cheap either way, and not padding is how it keeps returning exactly
+    what one-at-a-time verification returned before any of this existed.
+    """
+    from reliquary.constants import PROOF_BATCH_PADDING
+
+    if PROOF_BATCH_PADDING != "auto":
+        return PROOF_BATCH_PADDING == "on"
+    return replica == STREAMED
+
+
 def _warm_key(commit: Any) -> tuple:
     """What identifies a rollout among the ones a warm pass covered."""
     return tuple(commit["tokens"])
@@ -551,7 +567,9 @@ def warm_commitment_batch(
     context["_warm"] = {}
     if not commits:
         return 0
-    rows = verifier_module.forward_rows_for_batch(commits, context["model"])
+    rows = verifier_module.forward_rows_for_batch(
+        commits, context["model"], pad=batch_padding_for(context.get("replica")),
+    )
     context["_warm"] = {_warm_key(commit): rows[index] for index, commit in enumerate(commits)}
     return len(context["_warm"])
 
@@ -649,6 +667,7 @@ def run_commitment_proof(
             window_randomness,
             tokenizer=context["tokenizer"],
             seed_u_values=seeds,
+            pad=batch_padding_for(context.get("replica")),
         )
     return verifier_module.verify_commitment_proofs(
         commit,

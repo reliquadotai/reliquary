@@ -572,23 +572,47 @@ def forward_single_layer_for_batch(model: Any, tokens: torch.Tensor, mask: Any, 
         return forward_single_layer(model, tokens, mask, layer_index, **kwargs)
 
 
-def plan_verification_passes(commits: list[dict], *, token_budget: int) -> list[list[int]]:
+def plan_verification_passes(
+    commits: list[dict], *, token_budget: int, pad: bool = False,
+) -> list[list[int]]:
     """Group rollouts into the passes that will verify them.
 
-    Same length travels together and different lengths do not: padding a short rollout up to a
-    long one moves the hidden states a hair, and every gate downstream is calibrated against the
-    numbers an unpadded pass produces. Grouping only exact matches keeps the verdicts identical to
-    what one-at-a-time verification returns, which is the property that lets this be turned on
-    without recalibrating anything. A budget bounds what one pass puts on the card.
+    Without padding, only rollouts of the same token count travel together, and the verdicts are
+    the ones one-at-a-time verification returns, to the bit. That is the safe grouping, and on
+    real traffic it is barely a grouping at all: completions that terminate on their own almost
+    never share a length, measured at 1.02 rollouts per pass over 384 real groups of sixteen.
+
+    With padding, rollouts of nearby length share a pass and each row is cut back to its own
+    tokens afterwards. Nothing a row reads comes from the padding: attention here is causal, so a
+    position never sees a later one, and the tokens after a rollout's end are later ones. What the
+    padding can still move is the arithmetic — a wider batch tiles and reduces differently — and
+    that is a property of the kernel, not of this code.
+
+    Sorted by length so a pass pads as little as possible, and budgeted on the padded width, which
+    is what actually lands on the card.
     """
-    by_length: dict[int, list[int]] = {}
-    for index, commit in enumerate(commits):
-        by_length.setdefault(len(commit["tokens"]), []).append(index)
-    passes: list[list[int]] = []
-    for length, members in sorted(by_length.items()):
-        per_pass = max(1, token_budget // max(1, length))
-        for start in range(0, len(members), per_pass):
-            passes.append(members[start : start + per_pass])
+    order = sorted(range(len(commits)), key=lambda index: len(commits[index]["tokens"]))
+    if not pad:
+        by_length: dict[int, list[int]] = {}
+        for index in order:
+            by_length.setdefault(len(commits[index]["tokens"]), []).append(index)
+        passes = []
+        for length, members in sorted(by_length.items()):
+            per_pass = max(1, token_budget // max(1, length))
+            for start in range(0, len(members), per_pass):
+                passes.append(members[start : start + per_pass])
+        return passes
+    passes, current, widest = [], [], 0
+    for index in order:
+        length = len(commits[index]["tokens"])
+        width = max(widest, length)
+        if current and width * (len(current) + 1) > token_budget:
+            passes.append(current)
+            current, widest, width = [], 0, length
+        current.append(index)
+        widest = width
+    if current:
+        passes.append(current)
     return passes
 
 
@@ -597,11 +621,13 @@ def forward_rows_for_batch(
     model: Any,
     *,
     token_budget: int | None = None,
+    pad: bool = False,
 ) -> dict[int, tuple[Any, Any]]:
     """The rows of a pass, one entry per rollout, keyed by its position in the list.
 
     Split out so a worker can pay the traversal once for a batch and hand each rollout its rows
-    when the proof for it arrives. Nothing else about how a rollout is proved changes.
+    when the proof for it arrives. Each rollout is handed exactly its own tokens' rows: what sat
+    beside it in the pass, and what was padded after it, are cut away here.
     """
     from reliquary.constants import LAYER_INDEX, PROOF_BATCH_TOKEN_BUDGET
 
@@ -609,13 +635,26 @@ def forward_rows_for_batch(
     device = next(model.parameters()).device
     materialize = _lm_head_vocab_size(getattr(model, "lm_head", None)) is None
     rows: dict[int, tuple[Any, Any]] = {}
-    for group in plan_verification_passes(commits, token_budget=budget):
-        tokens = torch.tensor([commits[index]["tokens"] for index in group], device=device)
+    for group in plan_verification_passes(commits, token_budget=budget, pad=pad):
+        lengths = [len(commits[index]["tokens"]) for index in group]
+        width = max(lengths)
+        # Padded with zeros rather than a token of the rollout's own: a causal position never
+        # reads what comes after it, so what the padding is cannot reach a row, but what it is
+        # must not depend on the rollout either, or two validators would pad differently.
+        batch = torch.zeros((len(group), width), dtype=torch.long, device=device)
+        for row, index in enumerate(group):
+            batch[row, : lengths[row]] = torch.tensor(
+                commits[index]["tokens"], dtype=torch.long, device=device,
+            )
         hidden, logits = forward_single_layer_for_batch(
-            model, tokens, None, LAYER_INDEX, materialize_logits=materialize,
+            model, batch, None, LAYER_INDEX, materialize_logits=materialize,
         )
         for row, index in enumerate(group):
-            rows[index] = (hidden[row], None if logits is None else logits[row])
+            end = lengths[row]
+            rows[index] = (
+                hidden[row, :end],
+                None if logits is None else logits[row, :end],
+            )
     return rows
 
 
@@ -627,6 +666,7 @@ def verify_commitment_proofs_batch(
     tokenizer: Any = None,
     seed_u_values: list[list[float] | None] | None = None,
     token_budget: int | None = None,
+    pad: bool = False,
 ) -> list[ProofResult]:
     """Verify several rollouts with one traversal of the model per pass.
 
@@ -636,7 +676,7 @@ def verify_commitment_proofs_batch(
     """
     from reliquary.constants import LAYER_INDEX, PROOF_BATCH_TOKEN_BUDGET
 
-    rows = forward_rows_for_batch(commits, model, token_budget=token_budget)
+    rows = forward_rows_for_batch(commits, model, token_budget=token_budget, pad=pad)
     results: list[Any] = []
     for index, commit in enumerate(commits):
         seeds = None if seed_u_values is None else seed_u_values[index]
