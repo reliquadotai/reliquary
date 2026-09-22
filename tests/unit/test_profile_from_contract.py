@@ -16,6 +16,19 @@ def _any_profile_id():
     return sorted(PROFILES)[0]
 
 
+def _profile_contract_with(field):
+    """A contract and the environment in it that actually exercises an
+    optional structure. Searching all profiles rather than the first is the
+    point: a test that silently finds nothing is a test that asserts nothing.
+    """
+    for profile_id in sorted(PROFILES):
+        contract = PROFILES[profile_id].to_generation_contract()
+        for name, body in contract["environments"].items():
+            if body.get(field) is not None:
+                return contract, name
+    pytest.fail(f"no compiled profile exercises {field!r}; this test cannot run")
+
+
 @pytest.mark.parametrize("profile_id", sorted(PROFILES))
 def test_every_compiled_profile_survives_a_round_trip(profile_id):
     profile = PROFILES[profile_id]
@@ -102,37 +115,25 @@ def test_a_bool_as_int_field_is_refused():
 
 
 def test_a_missing_nested_key_in_bft_is_refused():
-    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
-    name = None
-    for env_name, env_body in contract["environments"].items():
-        if env_body.get("bft") is not None:
-            name = env_name
-            break
-    if name is not None:
-        env = dict(contract["environments"][name])
-        bft = dict(env["bft"])
-        bft.pop("thinking_budget")
-        env["bft"] = bft
-        contract["environments"] = {name: env}
-        with pytest.raises(ValueError, match="thinking_budget"):
-            profile_from_contract(contract)
+    contract, name = _profile_contract_with("bft")
+    env = dict(contract["environments"][name])
+    bft = dict(env["bft"])
+    bft.pop("thinking_budget")
+    env["bft"] = bft
+    contract["environments"] = {name: env}
+    with pytest.raises(ValueError, match="thinking_budget"):
+        profile_from_contract(contract)
 
 
 def test_a_missing_nested_key_in_episode_is_refused():
-    contract = dict(PROFILES[_any_profile_id()].to_generation_contract())
-    name = None
-    for env_name, env_body in contract["environments"].items():
-        if env_body.get("episode") is not None:
-            name = env_name
-            break
-    if name is not None:
-        env = dict(contract["environments"][name])
-        episode = dict(env["episode"])
-        episode.pop("max_turns")
-        env["episode"] = episode
-        contract["environments"] = {name: env}
-        with pytest.raises(ValueError, match="max_turns"):
-            profile_from_contract(contract)
+    contract, name = _profile_contract_with("episode")
+    env = dict(contract["environments"][name])
+    episode = dict(env["episode"])
+    episode.pop("max_turns")
+    env["episode"] = episode
+    contract["environments"] = {name: env}
+    with pytest.raises(ValueError, match="max_turns"):
+        profile_from_contract(contract)
 
 
 def test_a_profile_with_legitimately_null_optional_fields_rebuilds():
@@ -150,3 +151,32 @@ def test_a_profile_with_legitimately_null_optional_fields_rebuilds():
     rebuilt = profile_from_contract(contract)
     assert rebuilt is not None
     assert rebuilt.throughput_tiebreak is None
+
+
+def test_a_missing_nested_key_in_prompt_template_is_refused():
+    contract, name = _profile_contract_with("prompt_template")
+    env = dict(contract["environments"][name])
+    template = dict(env["prompt_template"])
+    template.pop("id")
+    env["prompt_template"] = template
+    contract["environments"] = {name: env}
+    with pytest.raises(ValueError, match="'id'"):
+        profile_from_contract(contract)
+
+
+def test_a_missing_nested_key_in_throughput_tiebreak_is_refused():
+    # throughput_tiebreak is top-level, not per-environment
+    contract = None
+    for profile_id in sorted(PROFILES):
+        c = PROFILES[profile_id].to_generation_contract()
+        if c.get("throughput_tiebreak") is not None:
+            contract = c
+            break
+    if contract is None:
+        pytest.fail("no compiled profile exercises 'throughput_tiebreak'; this test cannot run")
+    contract = dict(contract)
+    tiebreak = dict(contract["throughput_tiebreak"])
+    tiebreak.pop("token_cap")
+    contract["throughput_tiebreak"] = tiebreak
+    with pytest.raises(ValueError, match="token_cap"):
+        profile_from_contract(contract)
