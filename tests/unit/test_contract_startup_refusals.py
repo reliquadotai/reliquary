@@ -18,10 +18,18 @@ def _profile():
     return PROFILES[sorted(PROFILES)[0]]
 
 
+def _contract(profile, **overrides):
+    """What a sealed, contract-carrying task looks like: a template plus the
+    architecture the operator declared. Only compiled profiles omit it."""
+    contract = profile.to_generation_contract()
+    contract["model_architecture"] = "Qwen3ForCausalLM"
+    contract.update(overrides)
+    return contract
+
+
 def _entry(profile, **overrides):
     from reliquary.environment.abi import canonical_sha256
 
-    contract = profile.to_generation_contract()
     payload = {
         "task_id": "glm-run",
         "profile_id": profile.profile_id,
@@ -29,7 +37,7 @@ def _entry(profile, **overrides):
         "params": PARAMS,
         "status": "active",
         "retired_at": None,
-        "contract": contract,
+        "contract": _contract(profile),
     }
     payload.update(overrides)
     # profile_sha256 pins whatever contract this entry actually carries, so a
@@ -44,12 +52,12 @@ def test_a_carried_contract_passes_the_existing_checks_by_construction():
     # The process builds its profile FROM the contract, so profile_id and
     # profile_sha256 agree without any new logic.
     profile = _profile()
-    entry = _entry(profile)
+    contract = _contract(profile)
     config = resolve_task_config(
-        {"glm-run": entry},
+        {"glm-run": _entry(profile, contract=contract)},
         "glm-run",
         profile_id=profile.profile_id,
-        generation_contract=profile.to_generation_contract(),
+        generation_contract=contract,
     )
     assert config.task_id == "glm-run"
 
@@ -60,8 +68,7 @@ def test_a_contract_that_disagrees_with_the_registry_is_refused():
     # which is exactly why this design adds no new verification logic.
     profile = _profile()
     entry = _entry(profile)
-    tampered = profile.to_generation_contract()
-    tampered["model_id"] = "someone-elses/model"
+    tampered = _contract(profile, model_id="someone-elses/model")
     with pytest.raises(TaskConfigError):
         resolve_task_config(
             {"glm-run": entry},
@@ -73,7 +80,7 @@ def test_a_contract_that_disagrees_with_the_registry_is_refused():
 
 def test_an_environment_the_binary_does_not_install_is_refused():
     profile = _profile()
-    contract = profile.to_generation_contract()
+    contract = _contract(profile)
     contract["environments"] = dict(contract["environments"])
     contract["environments"]["not-installed-anywhere"] = {
         "max_new_tokens": 128, "answer_format": None, "bft": None,
@@ -90,8 +97,7 @@ def test_an_environment_the_binary_does_not_install_is_refused():
 
 def test_an_unsupported_model_architecture_is_refused():
     profile = _profile()
-    contract = profile.to_generation_contract()
-    contract["model_architecture"] = "SomethingNobodyShips"
+    contract = _contract(profile, model_architecture="SomethingNobodyShips")
     with pytest.raises(TaskConfigError) as caught:
         resolve_task_config(
             {"glm-run": _entry(profile, contract=contract)},
@@ -102,15 +108,44 @@ def test_an_unsupported_model_architecture_is_refused():
     assert "SomethingNobodyShips" in str(caught.value)
 
 
-def test_a_contract_without_an_architecture_field_is_not_refused():
-    # Historical contracts carry no architecture; refusing them would refuse
-    # every task that exists today.
+def test_a_carried_contract_that_names_no_architecture_is_refused():
+    # Nothing legitimately produces this: `tasks create --model` requires the
+    # flag. Accepting it would leave the architecture refusal unreachable for
+    # exactly the entries it exists to guard.
     profile = _profile()
     contract = profile.to_generation_contract()
     assert "model_architecture" not in contract
-    resolve_task_config(
-        {"glm-run": _entry(profile, contract=contract)},
+    with pytest.raises(TaskConfigError) as caught:
+        resolve_task_config(
+            {"glm-run": _entry(profile, contract=contract)},
+            "glm-run",
+            profile_id=profile.profile_id,
+            generation_contract=contract,
+        )
+    assert "architecture" in str(caught.value)
+
+
+def test_a_legacy_entry_that_carries_no_contract_is_still_accepted():
+    # The historical form: the binary holds the contract, the entry pins its
+    # hash. Refusing these would refuse every task running today.
+    from reliquary.environment.abi import canonical_sha256
+
+    profile = _profile()
+    contract = profile.to_generation_contract()
+    entry = TaskEntry(
+        task_id="glm-run",
+        profile_id=profile.profile_id,
+        profile_sha256=canonical_sha256(contract),
+        mechanism="rl-discovered-price",
+        params=PARAMS,
+        status="active",
+        retired_at=None,
+    )
+    assert entry.contract is None
+    config = resolve_task_config(
+        {"glm-run": entry},
         "glm-run",
         profile_id=profile.profile_id,
         generation_contract=contract,
     )
+    assert config.entry is entry

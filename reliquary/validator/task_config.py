@@ -94,7 +94,17 @@ def resolve_task_config(
                 f"task {task_id!r} carries a contract this binary cannot "
                 f"read: {exc}"
             ) from exc
-        if architecture and architecture not in SUPPORTED_MODEL_ARCHITECTURES:
+        # Contract-LESS entries are the historical form and keep working; a
+        # carried contract without an architecture is a state nothing
+        # produces, and accepting it leaves the check below unreachable for
+        # exactly the entries it guards.
+        if architecture is None:
+            raise TaskConfigError(
+                f"task {task_id!r} carries a contract that names no model "
+                f"architecture; seal one into the contract so this image can "
+                f"refuse a model it cannot run"
+            )
+        if architecture not in SUPPORTED_MODEL_ARCHITECTURES:
             raise TaskConfigError(
                 f"task {task_id!r} names model architecture "
                 f"{architecture!r}, which this image cannot run; it supports "
