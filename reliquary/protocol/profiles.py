@@ -8,9 +8,11 @@ currently deployed constants.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from string import Template
 from types import MappingProxyType
 from typing import Any
@@ -876,14 +878,23 @@ PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
 )
 DEFAULT_PROFILE_ID = "qwen35-2b-auction-v2"
 _PROFILE_ENV_VAR = "RELIQUARY_PROTOCOL_PROFILE"
+TASK_CONTRACT_ENV_VAR = "RELIQUARY_TASK_CONTRACT"
 
 
 def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
-    """Resolve an explicit profile or the environment-selected default.
+    """Resolve an explicit profile, a task's carried contract, or the default.
 
     Empty, misspelled, and otherwise unknown IDs are errors. Falling back after
     an explicit selection would silently put peers on different wire contracts.
+
+    An explicit id wins over the contract file: callers that pass one are
+    naming a template, not asking what this process runs.
     """
+
+    if profile_id is None:
+        contract_path = os.environ.get(TASK_CONTRACT_ENV_VAR)
+        if contract_path:
+            return _profile_from_contract_file(contract_path)
 
     selected_id = (
         os.environ.get(_PROFILE_ENV_VAR, DEFAULT_PROFILE_ID)
@@ -897,6 +908,32 @@ def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
         raise ValueError(
             f"unknown protocol profile {selected_id!r}; "
             f"expected one of: {available}"
+        ) from exc
+
+
+def _profile_from_contract_file(path: str) -> ProtocolProfile:
+    """Read the contract this process was given, or refuse to start.
+
+    Every failure here is fatal on purpose: a process that silently fell back
+    to the compiled catalogue would generate under a contract nobody declared.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"cannot read the task contract at {path!r}: {exc}"
+        ) from exc
+    try:
+        contract = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"the task contract at {path!r} is not JSON: {exc}"
+        ) from exc
+    try:
+        return profile_from_contract(contract)
+    except ValueError as exc:
+        raise ValueError(
+            f"the task contract at {path!r} is unusable: {exc}"
         ) from exc
 
 
@@ -951,6 +988,7 @@ __all__ = [
     "PROFILES",
     "ProtocolProfile",
     "SamplingProfile",
+    "TASK_CONTRACT_ENV_VAR",
     "profile_from_contract",
     "resolve_protocol_profile",
     "render_active_prompt",
