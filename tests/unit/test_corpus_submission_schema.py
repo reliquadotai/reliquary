@@ -45,6 +45,7 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
     assert CorpusRejectReason.TOKEN_BUDGET_UNDERRUN.value == "token_budget_underrun"
     assert CorpusRejectReason.BAD_TERMINATION.value == "bad_termination"
     assert CorpusRejectReason.HASH_DUPLICATE.value == "hash_duplicate"
+    assert CorpusRejectReason.MALFORMED_SUBMISSION.value == "malformed_submission"
 
 
 def test_an_unknown_field_is_refused():

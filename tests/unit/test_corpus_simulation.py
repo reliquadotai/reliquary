@@ -7,6 +7,7 @@ from reliquary.corpus.slots import SlotLedger
 from reliquary.corpus.walk import CursorLedger, walk_index
 
 SHA = "c" * 64
+EOS = 151645
 
 
 def _job(prompt_count, slots_per_prompt):
@@ -51,6 +52,7 @@ def _run(job, hotkeys, attempts_each):
                 checkpoint_sha256=SHA,
                 token_counts=[10],
                 terminations=["eos"],
+                last_token_ids=[EOS],
                 digests=[digest],
                 slots=slots,
                 cursors=cursors,
@@ -95,6 +97,7 @@ def test_grinding_the_cursor_gains_nothing():
             checkpoint_sha256=SHA,
             token_counts=[10],
             terminations=["eos"],
+            last_token_ids=[EOS],
             digests=[f"g{candidate}"],
             slots=slots,
             cursors=cursors,

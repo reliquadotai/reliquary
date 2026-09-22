@@ -9,6 +9,7 @@ from reliquary.corpus.slots import SlotLedger
 from reliquary.corpus.walk import CursorLedger, walk_index
 
 SHA = "a" * 64
+EOS = 151645
 
 
 def _job(**overrides):
@@ -56,6 +57,7 @@ def _call(job, slots, cursors, *, hotkey="5Gx", cursor=None, prompt_index=None, 
         "checkpoint_sha256": SHA,
         "token_counts": [10, 12],
         "terminations": ["eos", "eos"],
+        "last_token_ids": [EOS, EOS],
         "digests": ["d0", "d1"],
         "slots": slots,
         "cursors": cursors,
@@ -140,7 +142,15 @@ def test_the_wrong_checkpoint_is_refused():
 @pytest.mark.parametrize(
     "kwargs,reason",
     [
-        ({"token_counts": [10], "terminations": ["eos"], "digests": ["d0"]}, "bad_completion_count"),
+        (
+            {
+                "token_counts": [10],
+                "terminations": ["eos"],
+                "digests": ["d0"],
+                "last_token_ids": [EOS],
+            },
+            "bad_completion_count",
+        ),
         ({"token_counts": [10, 200]}, "token_budget_exceeded"),
         ({"terminations": ["eos", "nope"]}, "bad_termination"),
         ({"seen": {"d1"}}, "hash_duplicate"),
@@ -152,6 +162,32 @@ def test_a_cheap_check_failure_is_reported_and_moves_nothing(kwargs, reason):
     verdict = _call(job, slots, cursors, **kwargs)
     assert verdict.accepted is False
     assert verdict.reason == reason
+    assert slots.filled == 0
+    assert cursors.expected("5Gx") == 0
+
+
+def test_sequences_that_disagree_in_length_are_refused():
+    # Two token counts against one termination paid for a completion that no
+    # check ever saw.
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(
+        job,
+        slots,
+        cursors,
+        token_counts=[50, 50],
+        terminations=["eos"],
+        digests=["only-one"],
+        last_token_ids=[EOS],
+    )
+    assert verdict.accepted is False
+    assert verdict.reason == "malformed_submission"
+    assert verdict.detail == {
+        "token_counts": 2,
+        "terminations": 1,
+        "digests": 1,
+        "last_token_ids": 1,
+    }
     assert slots.filled == 0
     assert cursors.expected("5Gx") == 0
 

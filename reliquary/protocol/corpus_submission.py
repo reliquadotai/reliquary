@@ -15,13 +15,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class CorpusRejectReason(str, Enum):
     """Canonical verdicts. ``ACCEPTED`` is the one success value.
 
-    The four cheap-check reasons are duplicated as plain strings in
-    ``reliquary.corpus.checks`` so that module stays free of pydantic; the
-    schema test pins them equal.
+    The cheap-check reasons are duplicated as plain strings in
+    ``reliquary.corpus.checks`` and ``reliquary.corpus.admission`` so those
+    modules stay free of pydantic; the schema test pins them equal.
     """
 
     ACCEPTED = "accepted"
     BAD_SIGNATURE = "bad_signature"
+    MALFORMED_SUBMISSION = "malformed_submission"
     JOB_UNKNOWN = "job_unknown"
     JOB_COMPLETE = "job_complete"
     CHECKPOINT_MISMATCH = "checkpoint_mismatch"

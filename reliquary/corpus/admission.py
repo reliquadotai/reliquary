@@ -39,12 +39,24 @@ def admit(
     checkpoint_sha256: str,
     token_counts: Sequence[int],
     terminations: Sequence[str],
+    last_token_ids: Sequence[int],
     digests: Sequence[str],
     slots: SlotLedger,
     cursors: CursorLedger,
     seen: AbstractSet[str],
 ) -> Verdict:
     """Decide one submission, consuming a slot and a cursor step when earned."""
+    # The four sequences describe the same completions, so a disagreement in
+    # length means some completion would be paid for without ever being checked.
+    lengths = {
+        "token_counts": len(token_counts),
+        "terminations": len(terminations),
+        "digests": len(digests),
+        "last_token_ids": len(last_token_ids),
+    }
+    if len(set(lengths.values())) != 1:
+        return Verdict(False, "malformed_submission", detail=lengths)
+
     if slots.is_complete:
         return Verdict(False, "job_complete")
 
