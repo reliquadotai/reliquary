@@ -5,6 +5,9 @@ import pytest
 from pydantic import ValidationError
 
 from reliquary.protocol.corpus_submission import (
+    MAX_COMPLETIONS_PER_SUBMISSION,
+    MAX_COMPLETION_TEXT_CHARS,
+    MAX_COMPLETION_TOKENS,
     CorpusCompletion,
     CorpusRejectReason,
     CorpusSubmissionRequest,
@@ -83,9 +86,15 @@ def test_an_impossible_completion_is_refused(overrides):
 def test_the_wire_is_bounded():
     # Without a ceiling the whole payload is parsed before a check can refuse it.
     with pytest.raises(ValidationError):
-        CorpusCompletion(**_completion(tokens=[1] * 131073))
+        CorpusCompletion(**_completion(tokens=[1] * (MAX_COMPLETION_TOKENS + 1)))
     with pytest.raises(ValidationError):
-        CorpusSubmissionRequest(**_request(completions=[_completion()] * 65))
+        CorpusSubmissionRequest(**_request(
+            completions=[_completion()] * (MAX_COMPLETIONS_PER_SUBMISSION + 1)
+        ))
+    # `text` carries the most bytes of any field, so leaving it unbounded
+    # leaves the whole ceiling decorative.
+    with pytest.raises(ValidationError):
+        CorpusCompletion(**_completion(text="x" * (MAX_COMPLETION_TEXT_CHARS + 1)))
 
 
 def test_the_response_carries_the_verdict_and_what_is_left():

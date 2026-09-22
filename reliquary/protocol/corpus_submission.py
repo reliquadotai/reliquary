@@ -12,6 +12,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+# Ceilings the parser enforces before any check can run. The text bound is the
+# token ceiling at a generous 8 characters per token: `text` carries the most
+# bytes of any field, so leaving it unbounded leaves the others decorative.
+MAX_COMPLETION_TOKENS = 131072
+MAX_COMPLETION_TEXT_CHARS = MAX_COMPLETION_TOKENS * 8
+MAX_COMPLETIONS_PER_SUBMISSION = 64
+
+
 class CorpusRejectReason(str, Enum):
     """Canonical verdicts. ``ACCEPTED`` is the one success value.
 
@@ -40,8 +48,8 @@ class CorpusRejectReason(str, Enum):
 class CorpusCompletion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tokens: list[int] = Field(min_length=1, max_length=131072)
-    text: str
+    tokens: list[int] = Field(min_length=1, max_length=MAX_COMPLETION_TOKENS)
+    text: str = Field(max_length=MAX_COMPLETION_TEXT_CHARS)
     termination: Literal["eos", "cap"]
 
     @field_validator("tokens")
@@ -60,7 +68,9 @@ class CorpusSubmissionRequest(BaseModel):
     cursor: int = Field(ge=0)
     prompt_index: int = Field(ge=0)
     checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    completions: list[CorpusCompletion] = Field(min_length=1, max_length=64)
+    completions: list[CorpusCompletion] = Field(
+        min_length=1, max_length=MAX_COMPLETIONS_PER_SUBMISSION
+    )
     signature: str = Field(min_length=1)
 
 
