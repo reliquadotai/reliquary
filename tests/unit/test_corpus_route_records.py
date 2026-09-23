@@ -115,3 +115,55 @@ def test_an_already_recorded_submission_is_not_announced(seeded_job):
     assert body["accepted"] is True
     assert records.write_calls == 1  # no retry: False is not an exception
     assert accepted == []
+
+
+def test_an_on_accepted_that_raises_still_returns_the_accepted_response(seeded_job):
+    """A subscriber's own bug must not turn a slot and a record that both
+    landed into a bare 500 -- the retry that response would invite is then
+    refused as a duplicate, since the ledger already moved."""
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    records = _Records()
+    calls: list[str] = []
+
+    def _boom(submission_id: str) -> None:
+        calls.append(submission_id)
+        raise RuntimeError("webhook down")
+
+    app = FastAPI()
+    app.include_router(build_corpus_router(
+        job_id="swe-v1", store=seeded_job.store, tokenizer=_Tokenizer(),
+        renderer=seeded_job.renderer, verify_signature=lambda r: True,
+        prompt_job_for=seeded_job.prompt_job_for, records=records,
+        on_accepted=_boom,
+    ))
+    client = TestClient(app)
+    request = _request([7] * 16 + [EOS])
+    response = client.post("/corpus/submit", json=request.model_dump())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is True
+    sid = corpus_submission_id(request)
+    assert calls == [sid]
+    assert sid in records.written
+
+
+def test_a_corrupt_ledger_snapshot_is_named_on_the_cursor_route(seeded_job):
+    """The same translation `submit_corpus` applies to a corrupt snapshot:
+    a bare lookup error would name every miner on the job as the cause."""
+    seeded_job.seed_ledgers({"slots": {"99999999": 1}, "cursors": {}, "seen": []})
+    response = _client(seeded_job, _Records(), []).get("/corpus/cursor/5Hot")
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_ledger_corrupt"
+
+
+def test_a_corrupt_manifest_is_named_on_the_job_route(seeded_job, _r2_client):
+    """The same translation `submit_corpus` applies to a manifest that no
+    longer parses, so `GET /corpus/job` fails the same way a submission does."""
+    _r2_client.objects["reliquary/corpus/jobs/swe-v1.json"] = (
+        b'{"schema": "nope"}',
+        '"tampered"',
+    )
+    response = _client(seeded_job, _Records(), []).get("/corpus/job")
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_job_manifest_corrupt"

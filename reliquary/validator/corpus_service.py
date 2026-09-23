@@ -615,22 +615,30 @@ def build_corpus_router(
             logger.info("corpus record %s already recorded", submission_id[:12])
             return
         if on_accepted is not None:
-            on_accepted(submission_id)
+            # The slot and the record are both already durable: a subscriber's
+            # own bug must not turn that into a bare 500, which would send the
+            # miner a retry that is then refused as a duplicate submission.
+            try:
+                on_accepted(submission_id)
+            except Exception:
+                logger.exception(
+                    "corpus on_accepted callback failed for %s", submission_id[:12]
+                )
 
     @router.get(JOB_PATH)
     async def corpus_job() -> dict:
-        job, _ = await store.read_job(job_id)
+        job = await _read_job_checked()
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
         return job.to_contract()
 
     @router.get(CURSOR_PATH)
     async def corpus_cursor(hotkey: str) -> dict:
-        job, _ = await store.read_job(job_id)
+        job = await _read_job_checked()
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
         snapshot, _ = await store.read_ledgers(job_id)
-        _, cursors, _ = rebuild_ledgers(job, snapshot)
+        _, cursors, _ = _rebuild_ledgers_checked(job, snapshot)
         return {"hotkey": hotkey, "cursor": cursors.expected(hotkey)}
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
@@ -654,22 +662,11 @@ def build_corpus_router(
         if not verified:
             return _refuse(CorpusRejectReason.BAD_SIGNATURE)
 
-        try:
-            job, _ = await store.read_job(job_id)
-        except JobError as exc:
-            # A manifest in the bucket that no longer parses is an operator
-            # fault. `JobError` subclasses `ValueError`, so without this clause
-            # the one below would disguise it as an unknown job — and since it
-            # is caught here rather than left bare, the operator gets a name
-            # instead of "Internal Server Error".
-            logger.error("corpus job %s has an unreadable manifest: %s", job_id, exc)
-            raise HTTPException(
-                status_code=500, detail="corpus_job_manifest_corrupt"
-            ) from exc
-        except ValueError:
-            # The id is not one the store could ever have written, so it names
-            # no job; it must not become a 500 on a hostile request.
-            job = None
+        # `JobError` subclasses `ValueError`, so `_read_job_checked` catches it
+        # first: a manifest in the bucket that no longer parses is an operator
+        # fault, and left uncaught here it would disguise itself as an unknown
+        # job instead of naming the corrupt one.
+        job = await _read_job_checked()
         if job is None:
             return _refuse(
                 CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id}
@@ -723,16 +720,11 @@ def build_corpus_router(
 
         for _ in range(max_write_attempts):
             snapshot, etag = await store.read_ledgers(job_id)
-            try:
-                slots, cursors, seen = rebuild_ledgers(job, snapshot)
-            except LedgerSnapshotError as exc:
-                # The blast radius is every miner on this job, and there is no
-                # circuit breaker: the object stays corrupt until an operator
-                # repairs it, so the refusal has to be named, not a bare 500.
-                logger.error("corpus ledgers for %s are unreadable: %s", job_id, exc)
-                raise HTTPException(
-                    status_code=500, detail="corpus_ledger_corrupt"
-                ) from exc
+            # The blast radius of a corrupt snapshot is every miner on this
+            # job, and there is no circuit breaker: the object stays corrupt
+            # until an operator repairs it, so `_rebuild_ledgers_checked`
+            # names the refusal rather than leaving a bare 500.
+            slots, cursors, seen = _rebuild_ledgers_checked(job, snapshot)
             before = ledger_snapshot(slots, cursors, seen)
 
             verdict = admit(
@@ -776,6 +768,41 @@ def build_corpus_router(
         )
         # Nothing was consumed, so the same work resubmits cleanly.
         raise HTTPException(status_code=503, detail="corpus_ledger_contention")
+
+    async def _read_job_checked() -> JobSpec | None:
+        """The manifest, or the same named 500 ``submit_corpus`` raises on one
+        that no longer parses -- shared so the GET routes, which read the
+        identical object, fail the same way an operator's corrupt manifest.
+        """
+        try:
+            job, _ = await store.read_job(job_id)
+        except JobError as exc:
+            logger.error(
+                "corpus job %s has an unreadable manifest: %s", job_id, exc
+            )
+            raise HTTPException(
+                status_code=500, detail="corpus_job_manifest_corrupt"
+            ) from exc
+        except ValueError:
+            # The id is not one the store could ever have written, so it names
+            # no job; it must not become a 500 on a hostile request.
+            return None
+        return job
+
+    def _rebuild_ledgers_checked(
+        job: JobSpec, snapshot: Any
+    ) -> tuple[SlotLedger, CursorLedger, set[str]]:
+        """``rebuild_ledgers``, translated the same way ``submit_corpus``
+        translates it -- shared with the cursor route, which reads the same
+        snapshot and must not turn a corrupt one into a bare lookup error.
+        """
+        try:
+            return rebuild_ledgers(job, snapshot)
+        except LedgerSnapshotError as exc:
+            logger.error("corpus ledgers for %s are unreadable: %s", job_id, exc)
+            raise HTTPException(
+                status_code=500, detail="corpus_ledger_corrupt"
+            ) from exc
 
     return router
 
