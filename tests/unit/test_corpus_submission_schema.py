@@ -49,6 +49,11 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
     assert CorpusRejectReason.BAD_TERMINATION.value == "bad_termination"
     assert CorpusRejectReason.HASH_DUPLICATE.value == "hash_duplicate"
     assert CorpusRejectReason.MALFORMED_SUBMISSION.value == "malformed_submission"
+    # The service maps a refusal to the wire by its own reason string, so a
+    # divergence here would raise on the response instead of naming the fault.
+    from reliquary.validator.corpus_text import REASON_TEXT_MISMATCH
+
+    assert CorpusRejectReason.TEXT_MISMATCH.value == REASON_TEXT_MISMATCH
 
 
 def test_an_unknown_field_is_refused():

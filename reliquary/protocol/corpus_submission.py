@@ -42,6 +42,10 @@ class CorpusRejectReason(str, Enum):
     TOKEN_BUDGET_UNDERRUN = "token_budget_underrun"
     BAD_TERMINATION = "bad_termination"
     HASH_DUPLICATE = "hash_duplicate"
+    # The validator-side text check (`validator/corpus_text.py`): payment
+    # counts tokens, the corpus is made of text, and a completion whose text
+    # is not its tokens is paid for nothing.
+    TEXT_MISMATCH = "text_does_not_match_tokens"
     DEGENERATE = "degenerate"
 
 
