@@ -77,3 +77,18 @@ def test_a_grail_proof_profile_is_not_audited_here():
 def test_a_prompt_length_outside_the_sequence_is_refused():
     with pytest.raises(ValueError):
         completion_hidden_states(_tiny(0), TOKENS, len(TOKENS))
+
+
+def test_a_token_outside_the_vocabulary_is_refused_before_the_model_runs():
+    # On CUDA an out-of-range embedding index kills the device context.
+    with pytest.raises(ValueError, match="vocabulary"):
+        completion_hidden_states(_tiny(0), [1, 2, 3, 512], 2)
+
+
+def test_a_topk_wider_than_the_model_is_a_validator_error_not_the_miners():
+    import dataclasses
+
+    hidden = completion_hidden_states(_tiny(0), TOKENS, PROMPT_LEN)
+    too_wide = dataclasses.replace(PROOF, topk=129)   # a 1-row chunk has 128 activations
+    with pytest.raises(ValueError, match="configuration"):
+        audit_completion(hidden[:33], ["AAAA"] * 2, too_wide)

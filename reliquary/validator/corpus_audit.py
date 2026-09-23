@@ -31,6 +31,10 @@ def completion_hidden_states(model, tokens: Sequence[int], prompt_len: int) -> t
     """Final hidden state at every position that produced a completion token."""
     if not 0 < prompt_len < len(tokens):
         raise ValueError(f"prompt_len {prompt_len} leaves no completion in {len(tokens)} tokens")
+    vocabulary = model.get_input_embeddings().num_embeddings
+    if min(tokens) < 0 or max(tokens) >= vocabulary:
+        # On CUDA an out-of-range embedding index kills the device context.
+        raise ValueError(f"a token id is outside the vocabulary of {vocabulary}")
     device = next(model.parameters()).device
     ids = torch.tensor([list(tokens)], device=device)
     output = model(input_ids=ids, output_hidden_states=True, use_cache=False)
@@ -42,6 +46,14 @@ def audit_completion(
 ) -> AuditOutcome:
     if proof.scheme != PROOF_SCHEME_TOPLOC:
         raise ValueError(f"the corpus audit verifies toploc, not {proof.scheme!r}")
+    # Raised, not returned as a verdict: these are the validator's own errors,
+    # and a failed audit would void an honest miner's epoch credit.
+    if hidden.dim() != 2:
+        raise ValueError(f"configuration: expected [rows, width] activations, got {tuple(hidden.shape)}")
+    if proof.topk > hidden.shape[1]:
+        raise ValueError(
+            f"configuration: topk {proof.topk} exceeds the model width {hidden.shape[1]}"
+        )
     try:
         raw = [base64.b64decode(p, validate=True) for p in proofs_b64]
     except (binascii.Error, ValueError):
