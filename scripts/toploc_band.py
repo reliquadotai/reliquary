@@ -16,22 +16,10 @@ import platform
 import torch
 
 from reliquary.miner.vllm_hidden_capture import capture_hidden_states, completion_rows
-from reliquary.protocol.toploc import ToplocThresholds, sequence_verdict
+from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+from reliquary.protocol.toploc import sequence_verdict
 from reliquary.protocol.toploc_proof import build_chunk_proofs, verify_chunk_proofs
-
-# Prime Intellect's deployed default (toploc-validator @ 55c1a23, default.toml).
-# Duplicated here until the task contract carries it.
-CHUNK_TOKENS, TOPK = 32, 128
-THRESHOLDS = ToplocThresholds(exp_mismatch=60, mant_mean=40.0, mant_median=40.0)
-
-
-@torch.no_grad()
-def completion_hidden_states(model, tokens, prompt_len):
-    """Final hidden state at every position that produced a completion token."""
-    ids = torch.tensor([list(tokens)], device=next(model.parameters()).device)
-    output = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-    return output.hidden_states[-1][0, prompt_len - 1 : len(tokens) - 1]
-
+from reliquary.validator.corpus_audit import completion_hidden_states
 
 PROMPTS = [
     "Question: Solve for x: 3x + 7 = 22. Show your work.\nAnswer:",
@@ -48,7 +36,7 @@ def parse_args(argv=None):
     parser.add_argument("--rollouts", type=int, default=32)
     parser.add_argument("--max-tokens", type=int, default=256)
     # Spec measurement 5: does a coarser chunk keep the separation at 4x less proof?
-    parser.add_argument("--chunk-tokens", type=int, default=CHUNK_TOKENS)
+    parser.add_argument("--chunk-tokens", type=int, default=PROOF.chunk_tokens)
     parser.add_argument("--out", required=True)
     return parser.parse_args(argv)
 
@@ -71,7 +59,7 @@ def main(argv=None):
         tokens = list(output.prompt_token_ids) + list(output.outputs[0].token_ids)
         prompt_len = len(output.prompt_token_ids)
         rows = completion_rows(capture.for_request(output.request_id), prompt_len, len(tokens))
-        proofs = build_chunk_proofs(rows, chunk_tokens=args.chunk_tokens, topk=TOPK)
+        proofs = build_chunk_proofs(rows, chunk_tokens=args.chunk_tokens, topk=PROOF.topk)
         miners.append((tokens, prompt_len, proofs))
     del llm
     gc.collect()
@@ -82,8 +70,8 @@ def main(argv=None):
     report = []
     for tokens, prompt_len, proofs in miners:
         hidden = completion_hidden_states(verifier, tokens, prompt_len)
-        results = verify_chunk_proofs(hidden, proofs, chunk_tokens=args.chunk_tokens, topk=TOPK)
-        passed, reason = sequence_verdict(results, THRESHOLDS)
+        results = verify_chunk_proofs(hidden, proofs, chunk_tokens=args.chunk_tokens, topk=PROOF.topk)
+        passed, reason = sequence_verdict(results, PROOF.thresholds())
         report.append({"passed": passed, "reason": reason,
                        "chunks": [[r.exp_mismatches, r.mant_err_mean, r.mant_err_median] for r in results]})
     worst = max(c[0] for r in report for c in r["chunks"])
@@ -93,7 +81,7 @@ def main(argv=None):
                    "quantization": args.quantization, "chunk_tokens": args.chunk_tokens,
                    "rollouts": report}, handle)
     print(f"{args.quantization}: {sum(r['passed'] for r in report)}/{len(report)} pass at "
-          f"{THRESHOLDS.exp_mismatch}/{THRESHOLDS.mant_mean:g}/{THRESHOLDS.mant_median:g}; "
+          f"{PROOF.exp_mismatch_threshold}/{PROOF.mant_mean_threshold:g}/{PROOF.mant_median_threshold:g}; "
           f"worst chunk exp mismatches {worst}")
 
 
