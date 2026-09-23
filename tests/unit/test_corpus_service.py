@@ -437,6 +437,73 @@ def test_a_completion_exactly_at_the_cap_without_eos_is_accepted(client):
     assert body["accepted"] is True
 
 
+def test_a_miner_walk_job_advances_the_cursor_it_persists(fake_r2, seeded_job):
+    """Every other fixture in this file is `prompt_order="free"`, where the
+    cursor is never read or written: replace `cursors.snapshot()` with `{}` in
+    `ledger_snapshot` and 104 tests across six files stay green. In production
+    that resets every miner on every request, so a `miner_walk` job serves one
+    prompt per hotkey forever. This is the test that sees it."""
+    from reliquary.corpus.walk import walk_index
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    raw = _manifest()
+    raw["job_id"] = "walk-v1"
+    raw["prompt_order"] = "miner_walk"
+    asyncio.run(job_store.write_job(raw, None, **fake_r2))
+
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id="walk-v1",
+            store=seeded_job.store,
+            tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer,
+            verify_signature=lambda request: True,
+            prompt_job_for=seeded_job.prompt_job_for,
+        )
+    )
+    client = TestClient(app)
+
+    def _post(cursor, prompt_index, filler):
+        tokens = [filler] * 16 + [EOS]
+        request = CorpusSubmissionRequest(
+            job_id="walk-v1",
+            miner_hotkey="5Hot",
+            cursor=cursor,
+            prompt_index=prompt_index,
+            checkpoint_sha256=CHECKPOINT,
+            rendered_prompt=_faithful_prompt(prompt_index),
+            completions=[
+                {
+                    "tokens": tokens,
+                    "text": _text_for(tokens),
+                    "termination": "eos",
+                }
+            ],
+            signature="ok",
+        )
+        return client.post("/corpus/submit", json=request.model_dump()).json()
+
+    first_index = walk_index("walk-v1", "5Hot", 0, 1000)
+    second_index = walk_index("walk-v1", "5Hot", 1, 1000)
+    assert _post(0, first_index, 1)["accepted"] is True
+    # The second submission only parses if the FIRST one's cursor survived the
+    # round trip through the bucket: this is the read half.
+    assert _post(1, second_index, 2)["accepted"] is True
+
+    # And the write half, read back out of the store rather than off the
+    # response, because the response would look identical either way.
+    snapshot, _ = asyncio.run(job_store.read_ledgers("walk-v1", **fake_r2))
+    assert snapshot["cursors"] == {"5Hot": 2}
+
+    # A miner cannot pick its own step back: the cursor is where the ledger
+    # says it is, not where the request says.
+    replayed = _post(0, first_index, 3)
+    assert replayed["accepted"] is False
+    assert replayed["reason"] == "bad_cursor"
+    assert replayed["detail"] == {"expected": 2, "got": 0}
+
+
 def test_the_endpoint_derives_the_digest_from_the_tokens(client):
     """Two submissions with the same tokens must collide as duplicates
     whatever they declare, because the digest is computed here."""
