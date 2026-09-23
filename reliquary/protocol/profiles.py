@@ -195,6 +195,75 @@ class ThroughputTiebreakProfile:
     bucket_tokens_per_round: int
 
 
+PROOF_SCHEME_GRAIL = "grail-v7"
+PROOF_SCHEME_TOPLOC = "toploc-v1"
+_PROOF_SCHEMES = (PROOF_SCHEME_GRAIL, PROOF_SCHEME_TOPLOC)
+_PROOF_MODES = ("enforce", "shadow")
+_TOPLOC_FIELDS = (
+    "chunk_tokens", "topk", "exp_mismatch_threshold", "mant_mean_threshold",
+    "mant_median_threshold", "min_allowed_failures", "ratio_allowed_failures",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProofProfile:
+    """How a task's work is proven. ``shadow`` computes and records, never rejects."""
+
+    scheme: str
+    mode: str
+    chunk_tokens: int | None = None
+    topk: int | None = None
+    exp_mismatch_threshold: int | None = None
+    mant_mean_threshold: float | None = None
+    mant_median_threshold: float | None = None
+    min_allowed_failures: int | None = None
+    ratio_allowed_failures: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.scheme not in _PROOF_SCHEMES:
+            raise ValueError(f"unknown proof scheme {self.scheme!r}")
+        if self.mode not in _PROOF_MODES:
+            raise ValueError(f"unknown proof mode {self.mode!r}")
+        values = [getattr(self, name) for name in _TOPLOC_FIELDS]
+        if self.scheme == PROOF_SCHEME_TOPLOC and any(v is None for v in values):
+            raise ValueError("a toploc proof must state every threshold")
+        if self.scheme == PROOF_SCHEME_GRAIL and any(v is not None for v in values):
+            raise ValueError("a grail proof takes no toploc fields")
+
+    def thresholds(self):
+        from reliquary.protocol.toploc import ToplocThresholds
+
+        if self.scheme != PROOF_SCHEME_TOPLOC:
+            raise ValueError("only a toploc proof has thresholds")
+        return ToplocThresholds(
+            exp_mismatch=self.exp_mismatch_threshold,
+            mant_mean=float(self.mant_mean_threshold),
+            mant_median=float(self.mant_median_threshold),
+            min_allowed_failures=self.min_allowed_failures,
+            ratio_allowed_failures=float(self.ratio_allowed_failures),
+        )
+
+    def to_contract(self) -> dict[str, Any]:
+        body: dict[str, Any] = {"scheme": self.scheme, "mode": self.mode}
+        if self.scheme == PROOF_SCHEME_TOPLOC:
+            body.update({name: getattr(self, name) for name in _TOPLOC_FIELDS})
+        return body
+
+
+# Prime Intellect's deployed default (toploc-validator @ 55c1a23, default.toml).
+TOPLOC_DEPLOYED_DEFAULTS = ProofProfile(
+    scheme=PROOF_SCHEME_TOPLOC,
+    mode="enforce",
+    chunk_tokens=32,
+    topk=128,
+    exp_mismatch_threshold=60,
+    mant_mean_threshold=40.0,
+    mant_median_threshold=40.0,
+    min_allowed_failures=0,
+    ratio_allowed_failures=0.0,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ProtocolProfile:
     profile_id: str
@@ -212,6 +281,9 @@ class ProtocolProfile:
     # are unchanged; a carried contract must name it, because the startup
     # refusal that checks it against this image's list has nothing else to read.
     model_architecture: str | None = None
+    # How the task's work is proven. Empty means GRAIL enforced, as every
+    # compiled profile has always meant, and keeps their contract bytes.
+    proofs: tuple[ProofProfile, ...] = ()
 
     def __post_init__(self) -> None:
         # Copy before wrapping so caller-owned dictionaries cannot mutate a
@@ -221,6 +293,9 @@ class ProtocolProfile:
             "environments",
             MappingProxyType(dict(self.environments)),
         )
+        object.__setattr__(self, "proofs", tuple(self.proofs))
+        if sum(1 for p in self.proofs if p.mode == "enforce") > 1:
+            raise ValueError("a task enforces at most one proof scheme")
 
     def to_generation_contract(self) -> dict[str, Any]:
         """Return a detached contract containing only JSON-native values."""
@@ -301,6 +376,8 @@ class ProtocolProfile:
         # identical to what the fleet already attests.
         if self.model_architecture is not None:
             contract["model_architecture"] = self.model_architecture
+        if self.proofs:
+            contract["proofs"] = [proof.to_contract() for proof in self.proofs]
         return contract
 
 
@@ -344,6 +421,7 @@ _CONTRACT_FIELDS = (
     "profile_id", "model_id", "model_revision", "model_architecture",
     "protocol_version", "prompt_encoding", "throughput_tiebreak",
     "collection_seconds", "upload_grace_seconds", "sampling", "environments",
+    "proofs",
 )
 _SAMPLING_FIELDS = ("rollouts", "temperature", "top_p", "top_k", "do_sample")
 _ENVIRONMENT_FIELDS = (
@@ -358,6 +436,7 @@ _EPISODE_FIELDS = (
     "max_episode_tokens", "max_observation_bytes",
 )
 _TIEBREAK_FIELDS = ("token_cap", "bucket_tokens_per_round")
+_PROOF_FIELDS = ("scheme", "mode", *_TOPLOC_FIELDS)
 
 
 def _object(body: Any, known: tuple[str, ...], *, context: str) -> Mapping[str, Any]:
@@ -491,6 +570,31 @@ def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
     )
 
 
+def _proof_from_contract(index: int, body: Any) -> ProofProfile:
+    context = f"generation contract 'proofs'[{index}]"
+    body = _object(body, _PROOF_FIELDS, context=context)
+
+    def integer(name):
+        value = body.get(name)
+        return None if value is None else _coerce_int(value, name, context=context)
+
+    def real(name):
+        value = body.get(name)
+        return None if value is None else _coerce_float(value, name, context=context)
+
+    return ProofProfile(
+        scheme=str(_required(body, "scheme", context=context)),
+        mode=str(_required(body, "mode", context=context)),
+        chunk_tokens=integer("chunk_tokens"),
+        topk=integer("topk"),
+        exp_mismatch_threshold=integer("exp_mismatch_threshold"),
+        mant_mean_threshold=real("mant_mean_threshold"),
+        mant_median_threshold=real("mant_median_threshold"),
+        min_allowed_failures=integer("min_allowed_failures"),
+        ratio_allowed_failures=real("ratio_allowed_failures"),
+    )
+
+
 def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
     """Rebuild a profile from what ``to_generation_contract`` produced.
 
@@ -518,6 +622,10 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
             context="generation contract 'throughput_tiebreak'",
         )
 
+    proofs_body = contract.get("proofs")
+    if proofs_body is not None and not isinstance(proofs_body, list):
+        raise ValueError("generation contract 'proofs' must be a list")
+
     return ProtocolProfile(
         profile_id=str(_required(contract, "profile_id")),
         model_id=str(_required(contract, "model_id")),
@@ -538,6 +646,9 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
         # Legitimately absent: every compiled profile predates the field.
         model_architecture=_coerce_str(
             contract.get("model_architecture"), "model_architecture"
+        ),
+        proofs=tuple(
+            _proof_from_contract(i, body) for i, body in enumerate(proofs_body or ())
         ),
         sampling=SamplingProfile(
             rollouts=_coerce_int(
@@ -583,6 +694,14 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
             )
         ),
     )
+
+
+def enforced_proof(profile: ProtocolProfile) -> ProofProfile:
+    """The scheme that decides; GRAIL when the contract names none."""
+    for proof in profile.proofs:
+        if proof.mode == "enforce":
+            return proof
+    return ProofProfile(PROOF_SCHEME_GRAIL, "enforce")
 
 
 _SAMPLING = SamplingProfile(
