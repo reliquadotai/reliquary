@@ -22,6 +22,7 @@ from pydantic import (
 )
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
+from reliquary.protocol.toploc_wire import ProofB64, proof_volume_error
 from reliquary.shared.runtime_fingerprint import runtime_profile_hash
 
 
@@ -67,6 +68,8 @@ class RejectReason(str, Enum):
     PROMPT_FULL = "prompt_full"
     PROMPT_OUT_OF_RANGE = "prompt_out_of_range"
     GRAIL_FAIL = "grail_fail"
+    # The task's contract enforces toploc and the rollout's proofs failed it.
+    TOPLOC_FAIL = "toploc_fail"
     HASH_DUPLICATE = "hash_duplicate"
     LOGPROB_MISMATCH = "logprob_mismatch"
     REWARD_MISMATCH = "reward_mismatch"
@@ -740,6 +743,17 @@ class CommitModel(BaseModel):
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo
     rollout: RolloutMetadata
+    # One base64 proof per chunk of the completion, sent only when the task's
+    # contract names toploc. The thresholds are never the miner's to send.
+    toploc_proofs: list[ProofB64] | None = None
+
+    @model_validator(mode="after")
+    def _toploc_proofs_fit(self) -> "CommitModel":
+        if self.toploc_proofs is not None:
+            error = proof_volume_error(self.toploc_proofs, len(self.tokens))
+            if error:
+                raise ValueError(error)
+        return self
 
     @field_validator("commitments")
     @classmethod

@@ -137,6 +137,13 @@ class ProofResult:
     # trusting a miner-supplied flag or permitting an injected close token.
     natural_close_pick_ok: bool | None = None
     natural_close_pick_cdf_miss: float | None = None
+    # TOPLOC, when the task's contract names it; all_passed stays GRAIL's.
+    toploc_checked: bool = False
+    toploc_passed: bool = False
+    toploc_reason: str | None = None
+    toploc_worst_exp: int = 0
+    toploc_worst_mant_mean: float = 0.0
+    toploc_worst_mant_median: float = 0.0
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -885,6 +892,9 @@ def verify_commitment_proofs(
         )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
+    from reliquary.validator.toploc_check import toploc_verdict
+
+    toploc = toploc_verdict(hidden_states, commit, prompt_length)
     if capture_utility:
         (
             hidden_start_f16_b64,
@@ -967,6 +977,12 @@ def verify_commitment_proofs(
         terminal_pick_cdf_miss=terminal_pick_cdf_miss,
         natural_close_pick_ok=natural_close_pick_ok,
         natural_close_pick_cdf_miss=natural_close_pick_cdf_miss,
+        toploc_checked=toploc is not None,
+        toploc_passed=bool(toploc and toploc.passed),
+        toploc_reason=None if toploc is None else toploc.reason,
+        toploc_worst_exp=0 if toploc is None else int(toploc.worst_exp),
+        toploc_worst_mant_mean=0.0 if toploc is None else float(toploc.worst_mant_mean),
+        toploc_worst_mant_median=0.0 if toploc is None else float(toploc.worst_mant_median),
     )
 
 

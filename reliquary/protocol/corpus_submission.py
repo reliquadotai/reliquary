@@ -9,7 +9,16 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from reliquary.protocol.toploc_wire import (
+    MAX_PROOF_B64_CHARS,
+    MAX_PROOF_BYTES,
+    MAX_PROOF_CHARS_PER_TOKEN,
+    PROOF_CHARS_SLACK,
+    ProofB64,
+    proof_volume_error,
+)
 
 
 # Ceilings the parser enforces before any check can run. The text bound is the
@@ -63,6 +72,8 @@ class CorpusRejectReason(str, Enum):
     # free-tier check over `validator/rollout_patterns.py`, and the name is
     # pinned here so the check lands under it rather than inventing a second.
     DEGENERATE = "degenerate"
+    BAD_PROOF_SHAPE = "bad_proof_shape"
+    PROOF_FAIL = "proof_fail"
 
 
 class CorpusCompletion(BaseModel):
@@ -78,6 +89,7 @@ class CorpusCompletion(BaseModel):
 
     tokens: list[int] = Field(min_length=1, max_length=MAX_COMPLETION_TOKENS)
     text: str = Field(max_length=MAX_COMPLETION_TEXT_CHARS)
+    proofs: list[ProofB64] = Field(default_factory=list, max_length=MAX_COMPLETION_TOKENS)
 
     @field_validator("tokens")
     @classmethod
@@ -85,6 +97,13 @@ class CorpusCompletion(BaseModel):
         if any(token < 0 for token in value):
             raise ValueError("token ids must not be negative")
         return value
+
+    @model_validator(mode="after")
+    def _proofs_fit_the_completion(self) -> "CorpusCompletion":
+        error = proof_volume_error(self.proofs, len(self.tokens))
+        if error:
+            raise ValueError(error)
+        return self
 
 
 class CorpusSubmissionRequest(BaseModel):

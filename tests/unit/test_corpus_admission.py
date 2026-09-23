@@ -264,3 +264,27 @@ def test_two_miners_hold_independent_cursors():
     assert cursors.expected("5Hy") == 0
     verdict = _call(job, slots, cursors, hotkey="5Hy", digests=["e0", "e1"])
     assert verdict.accepted is True
+
+
+def test_a_wrong_proof_count_refuses_without_touching_the_ledgers():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, proof_counts=[1, 0], proof_chunk_tokens=32)
+    assert (verdict.accepted, verdict.reason) == (False, "bad_proof_shape")
+    assert cursors.expected("5Gx") == 0
+    assert slots.filled == 0
+
+
+def test_right_proof_counts_are_accepted():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, proof_counts=[1, 1], proof_chunk_tokens=32)
+    assert verdict.accepted is True
+
+
+def test_a_proof_requirement_without_counts_is_malformed():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, proof_chunk_tokens=32)
+    assert (verdict.accepted, verdict.reason) == (False, "malformed_submission")
+    assert slots.filled == 0
