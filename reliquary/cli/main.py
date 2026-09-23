@@ -880,7 +880,13 @@ def corpus_mine(
 
     from reliquary.corpus.encoding import checkpoint_fingerprint
     from reliquary.corpus.job import parse_job
-    from reliquary.miner.corpus_miner import VllmGenerator, mine_steps
+    from reliquary.miner.corpus_miner import (
+        CorpusMinerHalted,
+        CorpusPermanentFailure,
+        CorpusTransientFailure,
+        VllmGenerator,
+        mine_steps,
+    )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
     from reliquary.protocol.signatures import sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
@@ -905,15 +911,49 @@ def corpus_mine(
     wallet = bt.Wallet(**wallet_kwargs)
     http = httpx.Client(base_url=validator_url, timeout=120.0)
 
+    def _error_detail(response: "httpx.Response"):
+        try:
+            return response.json()
+        except ValueError:
+            return response.text[:500]
+
+    def _issue(request_call):
+        """Run one HTTP request, translating its outcome into the two
+        exceptions ``mine_steps`` understands. 503 (ledger contention) and a
+        transport failure (timeout, connection error) are transient -- the
+        caller retries the SAME idempotent request; every other error status,
+        or a body this client cannot parse as JSON, is permanent."""
+        try:
+            response = request_call()
+        except httpx.TransportError as exc:
+            raise CorpusTransientFailure(f"transport error: {exc}") from exc
+        if response.status_code == 503:
+            raise CorpusTransientFailure(f"503 from {response.request.url}")
+        if response.status_code >= 400:
+            raise CorpusPermanentFailure(
+                f"{response.status_code} from {response.request.url}",
+                status=response.status_code,
+                detail=_error_detail(response),
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise CorpusPermanentFailure(
+                f"non-JSON body from {response.request.url}: {exc}",
+                status=response.status_code,
+            ) from exc
+
     class _Client:
         def job(self):
-            return http.get("/corpus/job").raise_for_status().json()
+            response = http.get("/corpus/job")
+            response.raise_for_status()
+            return response.json()
 
         def cursor(self, hk):
-            return int(http.get(f"/corpus/cursor/{hk}").raise_for_status().json()["cursor"])
+            return int(_issue(lambda: http.get(f"/corpus/cursor/{hk}"))["cursor"])
 
         def submit(self, body):
-            return http.post("/corpus/submit", json=body).json()
+            return _issue(lambda: http.post("/corpus/submit", json=body))
 
     client = _Client()
     job = parse_job(client.job())
@@ -929,13 +969,18 @@ def corpus_mine(
 
     renderer = renderer_for_job(job, encode)
     prompts = prompt_job_for_spec(job)
-    counts = mine_steps(
-        job=job, hotkey=wallet.hotkey.ss58_address, client=client,
-        generator=VllmGenerator(directory, job.sampling, proof),
-        tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
-        sign=lambda body: sign_corpus_submission(wallet, body),
-        max_steps=max_steps or None,
-    )
+    try:
+        counts = mine_steps(
+            job=job, hotkey=wallet.hotkey.ss58_address, client=client,
+            generator=VllmGenerator(directory, job.sampling, proof, job.eos_token_id),
+            tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
+            sign=lambda body: sign_corpus_submission(wallet, body),
+            max_steps=max_steps or None,
+        )
+    except CorpusMinerHalted as exc:
+        typer.echo(f"error: {exc}", err=True)
+        typer.echo(dict(exc.counts))
+        raise typer.Exit(code=1) from exc
     typer.echo(counts)
 
 
