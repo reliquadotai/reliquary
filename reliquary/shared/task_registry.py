@@ -73,6 +73,10 @@ class TaskEntry:
     # Which replica the task's validators verify with, when the task pins one.
     # None means "not declared": each validator derives it from its own card.
     verification: str | None = None
+    # The corpus job this task generates for. Beside the contract, never inside
+    # it: the contract says how generation happens, the job says which work to
+    # do, and putting it inside would move every RL contract's digest.
+    job_id: str | None = None
 
 
 def _number(value: Any, field: str) -> float:
@@ -143,6 +147,21 @@ def validate_entry(entry: TaskEntry) -> None:
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
         raise RegistryError(f"floor {floor} exceeds cap {cap}")
+    if entry.mechanism == MECHANISM_CORPUS_GENERATION:
+        # V0 has no price discovery: an unpinned floor would animate advance()
+        # with nothing driving it.
+        if floor != cap:
+            raise RegistryError(
+                f"corpus task {entry.task_id!r} must pin its price: "
+                f"floor {floor} must equal cap {cap}"
+            )
+        if not entry.job_id:
+            raise RegistryError(f"corpus task {entry.task_id!r} names no job")
+    elif entry.job_id is not None:
+        raise RegistryError(
+            f"task {entry.task_id!r} names a job but its mechanism is "
+            f"{entry.mechanism!r}, which does not run one"
+        )
     if entry.env_split is not None:
         if not isinstance(entry.env_split, Mapping) or not entry.env_split:
             raise RegistryError("env_split must be a non-empty object")
@@ -265,6 +284,20 @@ def _verification_of(task_id: str, body: Mapping[str, Any]) -> str | None:
     return replica
 
 
+def _job_id_of(task_id: str, body: Mapping[str, Any]) -> str | None:
+    """Read the declared job, refusing a value that is not a name.
+
+    The id is interpolated into a bucket key by the job store, so a number or
+    an object must be refused here rather than reach that interpolation.
+    """
+    declared = body.get("job_id")
+    if declared is not None and not isinstance(declared, str):
+        raise RegistryError(
+            f"task {task_id!r} job_id must be a string or null, got {declared!r}"
+        )
+    return declared
+
+
 def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
     try:
         document = json.loads(raw)
@@ -301,6 +334,7 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
                 dict(contract) if isinstance(contract, Mapping) else contract
             ),
             verification=_verification_of(task_id, body),
+            job_id=_job_id_of(task_id, body),
         )
     if strict:
         validate_registry(entries)
@@ -331,6 +365,9 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
                 None if entry.verification is None
                 else {"replica": entry.verification}
             ),
+            # Always written, null when undeclared, like `verification`: one
+            # convention for the fields that sit beside the contract.
+            "job_id": entry.job_id,
         }
         # Omitted rather than written as null, so a registry holding only legacy
         # entries renders exactly as it did before contracts existed.

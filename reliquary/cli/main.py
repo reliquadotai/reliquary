@@ -228,6 +228,60 @@ def build_contract_task_entry(
     )
 
 
+def build_corpus_task_entry(
+    *,
+    task_id,
+    job_id,
+    from_profile,
+    model_id,
+    model_revision,
+    model_architecture,
+    prompt_source,
+    cap,
+    overrides,
+    verification=None,
+):
+    """One registry entry for a corpus generation job.
+
+    The contract is built exactly as an RL task's is, narrowed to the single
+    environment the job draws its prompts from, so a validator that boots this
+    task installs precisely what the job reads. ``job_id`` stays OUTSIDE the
+    contract, beside it on the entry: the contract says how generation happens
+    and is compared against what the binary derives at startup, while the job
+    says which work to do.
+    """
+    from dataclasses import replace
+
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+    # A corpus task's price IS its cap, so accepting a floor and then
+    # overwriting it would be the silent drop this CLI refuses elsewhere.
+    if "floor" in overrides and float(overrides["floor"]) != float(cap):
+        raise ValueError(
+            f"a corpus task pins its price at its cap, so floor "
+            f"{overrides['floor']} cannot be declared against cap {cap}"
+        )
+    entry = build_contract_task_entry(
+        task_id=task_id,
+        from_profile=from_profile,
+        model_id=model_id,
+        model_revision=model_revision,
+        model_architecture=model_architecture,
+        environments=[prompt_source],
+        cap=cap,
+        overrides=overrides,
+        verification=verification,
+    )
+    # V0 has no price discovery: floor == cap is what keeps `advance()` still.
+    params = {**entry.params, "floor": entry.params["cap"]}
+    return replace(
+        entry,
+        mechanism=MECHANISM_CORPUS_GENERATION,
+        params=params,
+        job_id=job_id,
+    )
+
+
 tasks_app = typer.Typer(name="tasks", help="Declare and retire subnet tasks")
 app.add_typer(tasks_app)
 
@@ -433,6 +487,278 @@ def tasks_contract(task_id: str = typer.Option(..., "--task-id")) -> None:
         )
         raise typer.Exit(code=1)
     typer.echo(json.dumps(entry.contract, sort_keys=True, separators=(",", ":")))
+
+
+jobs_app = typer.Typer(
+    name="jobs", help="Declare and cancel corpus generation jobs"
+)
+app.add_typer(jobs_app)
+
+
+def build_job_manifest(
+    *,
+    job_id,
+    checkpoint_repo,
+    checkpoint_revision,
+    checkpoint_sha256,
+    prompt_source,
+    prompt_count,
+    renderer_id,
+    eos_token_id,
+    slots_per_prompt,
+    temperature,
+    top_p,
+    top_k,
+    min_new_tokens,
+    max_new_tokens,
+    n,
+    grader_id,
+    threshold,
+    prompt_order,
+    deadline_round,
+):
+    """The manifest as the job store will hold it.
+
+    Field-level refusals stay in `parse_job`, which the store runs before the
+    write; the only rule here is the one `parse_job` cannot see, because it
+    reads a filter that is already built or already absent.
+    """
+    from reliquary.corpus.job import JOB_SCHEMA
+
+    if (grader_id is None) != (threshold is None):
+        raise ValueError(
+            "--grader-id and --threshold go together: a filter needs both, and "
+            "a job that keeps every completion declares neither"
+        )
+    return {
+        "schema": JOB_SCHEMA,
+        "job_id": job_id,
+        "checkpoint_repo": checkpoint_repo,
+        "checkpoint_revision": checkpoint_revision,
+        "checkpoint_sha256": checkpoint_sha256,
+        "prompt_source": prompt_source,
+        "prompt_count": prompt_count,
+        "renderer_id": renderer_id,
+        "eos_token_id": eos_token_id,
+        "sampling": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_new_tokens": min_new_tokens,
+            "max_new_tokens": max_new_tokens,
+            "n": n,
+        },
+        "slots_per_prompt": slots_per_prompt,
+        "filter": (
+            None
+            if grader_id is None
+            else {"grader_id": grader_id, "threshold": threshold}
+        ),
+        "prompt_order": prompt_order,
+        "deadline_round": deadline_round,
+    }
+
+
+@jobs_app.command("create")
+def jobs_create(
+    job_id: str = typer.Option(..., "--job-id", help="Name of the corpus job"),
+    task_id: str = typer.Option(
+        None, "--task-id", help="Registry key; defaults to the job id"
+    ),
+    model: str = typer.Option(
+        ..., "--model", help="Frozen checkpoint repo; also the job's checkpoint"
+    ),
+    model_revision: str = typer.Option(..., "--model-revision"),
+    model_architecture: str = typer.Option(
+        ...,
+        "--model-architecture",
+        help="Architecture class the model config declares, e.g. Qwen3ForCausalLM",
+    ),
+    checkpoint_sha256: str = typer.Option(
+        ..., "--checkpoint-sha256", help="64 lowercase hex characters"
+    ),
+    from_profile: str = typer.Option(
+        ..., "--from-profile", help="Template to seed the contract from"
+    ),
+    prompt_source: str = typer.Option(
+        ...,
+        "--prompt-source",
+        help="The installed environment the job draws prompts from; it becomes "
+        "the contract's single environment",
+    ),
+    prompt_count: int = typer.Option(..., "--prompt-count"),
+    renderer_id: str = typer.Option(..., "--renderer-id"),
+    eos_token_id: int = typer.Option(..., "--eos-token-id"),
+    slots_per_prompt: int = typer.Option(..., "--slots-per-prompt"),
+    max_new_tokens: int = typer.Option(..., "--max-new-tokens"),
+    cap: float = typer.Option(
+        ..., "--cap", help="The task's share of the pool; also its pinned price"
+    ),
+    min_new_tokens: int = typer.Option(1, "--min-new-tokens"),
+    temperature: float = typer.Option(1.0, "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    top_k: int = typer.Option(0, "--top-k"),
+    n: int = typer.Option(1, "--n", help="Completions per submitted slot"),
+    grader_id: str = typer.Option(
+        None, "--grader-id", help="Rejection sampling: what decides membership"
+    ),
+    threshold: float = typer.Option(None, "--threshold"),
+    prompt_order: str = typer.Option("free", "--prompt-order"),
+    deadline_round: int = typer.Option(None, "--deadline-round"),
+    start: float = typer.Option(None, "--start"),
+    decay: float = typer.Option(None, "--decay"),
+    verification: str = typer.Option(
+        None,
+        "--verification",
+        help=(
+            "Pin how rollouts are verified: 'resident' holds the model on the "
+            "card, 'streamed' walks it one layer at a time. Omit to let each "
+            "validator derive it from its own card."
+        ),
+    ),
+) -> None:
+    """Write the job manifest and the registry entry that pays for it."""
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.task_registry_store import create_task
+    from reliquary.shared.task_registry import RegistryError
+
+    overrides = {
+        k: v for k, v in (("start", start), ("decay", decay)) if v is not None
+    }
+    try:
+        manifest = build_job_manifest(
+            job_id=job_id,
+            # The contract's model IS the job's frozen checkpoint. Taking both
+            # from one flag is what makes them unable to disagree: a validator
+            # verifying one model while admitting against another job would
+            # pay for work nobody can reproduce.
+            checkpoint_repo=model,
+            checkpoint_revision=model_revision,
+            checkpoint_sha256=checkpoint_sha256,
+            prompt_source=prompt_source,
+            prompt_count=prompt_count,
+            renderer_id=renderer_id,
+            eos_token_id=eos_token_id,
+            slots_per_prompt=slots_per_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_new_tokens=min_new_tokens,
+            max_new_tokens=max_new_tokens,
+            n=n,
+            grader_id=grader_id,
+            threshold=threshold,
+            prompt_order=prompt_order,
+            deadline_round=deadline_round,
+        )
+        entry = build_corpus_task_entry(
+            task_id=task_id or job_id,
+            job_id=job_id,
+            from_profile=from_profile,
+            model_id=model,
+            model_revision=model_revision,
+            model_architecture=model_architecture,
+            prompt_source=prompt_source,
+            cap=cap,
+            overrides=overrides,
+            verification=verification,
+        )
+    except (RegistryError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        asyncio.run(job_store.write_job(manifest, None))
+    except job_store.CorpusStoreConflict as exc:
+        # Replacing a live job's manifest would change the work under miners
+        # already holding slots against it.
+        typer.echo(
+            f"error: job {job_id!r} already has a manifest; pick another job id",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # The registry write goes last because it is the one that can lose a race
+    # or break the sum rule. A manifest with no entry is a job nobody pays
+    # for, so take it back rather than leave it behind.
+    try:
+        asyncio.run(create_task(entry))
+    except Exception as exc:
+        try:
+            asyncio.run(job_store.delete_job(job_id))
+        except Exception:
+            typer.echo(
+                f"error: the task was not declared AND its manifest could not "
+                f"be removed; delete job {job_id!r} by hand before retrying",
+                err=True,
+            )
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"declared job {job_id} as task {entry.task_id} on {prompt_source} "
+        f"with cap {cap} pinned as its price"
+        + (f", verified {entry.verification}" if entry.verification else "")
+    )
+
+
+@jobs_app.command("list")
+def jobs_list() -> None:
+    """Every job with a manifest, and the task that declares it, if any."""
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.task_registry_store import read_registry
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    declared = {
+        entry.job_id: entry
+        for _, entry in sorted(entries.items(), reverse=True)
+        if entry.job_id
+    }
+    stored = asyncio.run(job_store.list_jobs())
+    for job_id in stored:
+        entry = declared.get(job_id)
+        if entry is None:
+            # An orphan is what a failed rollback leaves; it must be visible.
+            typer.echo(f"{job_id:24s} no task entry")
+        else:
+            typer.echo(
+                f"{job_id:24s} {entry.status:8s} task={entry.task_id} "
+                f"cap={entry.params['cap']:.3f}"
+            )
+    for job_id, entry in sorted(declared.items()):
+        if job_id not in stored:
+            # The mirror image: a task that would refuse its first submission.
+            typer.echo(f"{job_id:24s} declared by {entry.task_id}, NO MANIFEST")
+
+
+@jobs_app.command("cancel")
+def jobs_cancel(
+    job_id: str = typer.Option(..., "--job-id"),
+    retired_at: int = typer.Option(..., "--retired-at", help="drand round"),
+) -> None:
+    """Stop submissions. The manifest stays: settlement still reads it."""
+    from reliquary.infrastructure.task_registry_store import (
+        read_registry,
+        retire_task_entry,
+    )
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    named = [entry for entry in entries.values() if entry.job_id == job_id]
+    if not named:
+        typer.echo(
+            f"error: no task in the registry names job {job_id!r}", err=True
+        )
+        raise typer.Exit(code=1)
+    for entry in named:
+        asyncio.run(retire_task_entry(entry.task_id, retired_at))
+    typer.echo(
+        f"cancelled job {job_id}: retired "
+        + ", ".join(sorted(entry.task_id for entry in named))
+        + "; the manifest stays for settlement"
+    )
 
 
 @app.command("watch-verdicts")

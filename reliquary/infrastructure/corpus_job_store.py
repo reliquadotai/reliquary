@@ -120,6 +120,35 @@ async def write_job(job: Mapping[str, Any], etag: str | None, **client_kwargs) -
     return await _put(_job_key(job_id), body, etag, **client_kwargs)
 
 
+async def delete_job(job_id: str, **client_kwargs) -> None:
+    """Remove a manifest. Unconditional, and safe only for the one caller that
+    needs it: ``write_job`` with no ETag CREATES (``IfNoneMatch: "*"``), so a
+    declaration rolling itself back is deleting an object it just made."""
+    validated = _validated_job_id(job_id)
+    bucket = _bucket(client_kwargs)
+    async with get_s3_client(**client_kwargs) as client:
+        await client.delete_object(Bucket=bucket, Key=_job_key(validated))
+
+
+async def list_jobs(**client_kwargs) -> list[str]:
+    """Every job with a manifest, declared or not — an orphan must be visible."""
+    bucket = _bucket(client_kwargs)
+    job_ids: list[str] = []
+    async with get_s3_client(**client_kwargs) as client:
+        paginator = client.get_paginator("list_objects_v2")
+        async for page in paginator.paginate(Bucket=bucket, Prefix=JOB_KEY_PREFIX):
+            for obj in page.get("Contents", []) or []:
+                name = obj["Key"][len(JOB_KEY_PREFIX):]
+                if not name.endswith(".json"):
+                    continue
+                # The ledgers object lives at `{job_id}/ledgers.json`, whose
+                # stem carries a slash and so cannot match a job id.
+                stem = name[: -len(".json")]
+                if JOB_ID_RE.match(stem):
+                    job_ids.append(stem)
+    return sorted(job_ids)
+
+
 async def read_ledgers(job_id: str, **client_kwargs) -> tuple[dict, str | None]:
     """The slot/cursor ledger snapshot and its ETag. Absent reads as ({}, None)."""
     validated = _validated_job_id(job_id)

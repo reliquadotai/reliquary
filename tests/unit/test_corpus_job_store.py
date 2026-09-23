@@ -74,6 +74,24 @@ class _FakeMultiObjectR2:
         self.objects[Key] = (Body, etag)
         return {"ETag": etag}
 
+    async def delete_object(self, Bucket, Key):
+        self.objects.pop(Key, None)
+        return {}
+
+    def get_paginator(self, name):
+        objects = self.objects
+
+        class _Paginator:
+            def paginate(self, Bucket, Prefix="", **kwargs):
+                keys = sorted(k for k in objects if k.startswith(Prefix))
+
+                async def _pages():
+                    yield {"Contents": [{"Key": key} for key in keys]}
+
+                return _pages()
+
+        return _Paginator()
+
 
 def _client_error(code: str):
     from botocore.exceptions import ClientError
@@ -157,3 +175,31 @@ async def test_a_job_id_that_is_not_a_job_id_is_refused_before_any_write(fake_r2
     # The id becomes a bucket key; a traversal or a wildcard must never reach it.
     with pytest.raises(ValueError):
         await store.write_job({**_manifest(job_id="../../etc/passwd")}, None, **fake_r2)
+
+
+@pytest.mark.asyncio
+async def test_every_stored_job_is_listed_and_its_ledgers_are_not(fake_r2):
+    # The ledgers object lives under the job's own prefix and also ends in
+    # .json; listing it as a job would invent one nobody declared.
+    await store.write_job(_manifest("swe-v1"), None, **fake_r2)
+    await store.write_job(_manifest("math-v2"), None, **fake_r2)
+    await store.write_ledgers("swe-v1", {"slots": {}}, None, **fake_r2)
+
+    assert await store.list_jobs(**fake_r2) == ["math-v2", "swe-v1"]
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_job_is_gone_and_a_second_delete_is_quiet(fake_r2):
+    # `jobs create` rolls itself back with this; a rollback that raised on an
+    # already-absent manifest would hide the failure it is reporting.
+    await store.write_job(_manifest(), None, **fake_r2)
+    await store.delete_job("swe-v1", **fake_r2)
+
+    assert await store.read_job("swe-v1", **fake_r2) == (None, None)
+    await store.delete_job("swe-v1", **fake_r2)
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_job_id_that_is_not_a_job_id_is_refused(fake_r2):
+    with pytest.raises(ValueError):
+        await store.delete_job("../../etc/passwd", **fake_r2)

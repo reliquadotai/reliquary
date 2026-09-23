@@ -33,6 +33,9 @@ def _entry(**overrides):
         "params": params,
         "status": "active",
         "retired_at": None,
+        # A corpus entry names the job it generates for; an entry without one
+        # is a share of the pool with no work attached to it.
+        "job_id": "corpus-math-v1",
     }
     payload.update(overrides)
     return TaskEntry(**payload)
