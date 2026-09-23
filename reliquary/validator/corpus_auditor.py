@@ -42,6 +42,10 @@ class CorpusAuditor:
     def _judge(self, record: dict) -> dict:
         prompt = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
         worst = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
+        if not record["completions"]:
+            # Fail closed like sequence_verdict does for an empty chunk sequence:
+            # no completions must never read as a vacuous pass paid like honest work.
+            return {"passed": False, "reason": "no_completions", **worst}
         passed, reason = True, None
         for completion in record["completions"]:
             hidden = completion_hidden_states(
@@ -84,4 +88,10 @@ class CorpusAuditor:
             self.enqueue(submission_id)
         while True:
             submission_id = await self._queue.get()
-            await self.audit(submission_id)
+            try:
+                await self.audit(submission_id)
+            except Exception:
+                # A store hiccup (e.g. a transient ConnectionError) must not kill the
+                # drain loop: leave the submission pending, pending_ids() picks it up
+                # again at the next start, and we keep draining the rest of the queue.
+                logger.exception("corpus audit of %s crashed the drain loop", submission_id[:12])

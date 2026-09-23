@@ -103,3 +103,44 @@ def test_a_second_audit_of_the_same_submission_changes_nothing():
     first = asyncio.run(auditor.audit(ID))
     asyncio.run(auditor.audit(ID))
     assert records.verdicts[ID] == first
+
+
+def test_no_completions_fails_closed():
+    model = _tiny(0)
+    empty = _record(model)
+    empty["completions"] = []
+    records = _Records({ID: empty})
+    verdict = asyncio.run(_auditor(model, records).audit(ID))
+    assert (verdict["passed"], verdict["reason"]) == (False, "no_completions")
+
+
+def test_run_survives_a_store_exception_and_keeps_draining():
+    model = _tiny(0)
+    bad_id = "c" * 64
+    good_id = "d" * 64
+
+    class _FlakyRecords(_Records):
+        async def read_submission(self, job_id, sid):
+            if sid == bad_id:
+                raise ConnectionError("transient store failure")
+            return await super().read_submission(job_id, sid)
+
+    records = _FlakyRecords({good_id: _record(model)})
+    auditor = _auditor(model, records)
+    auditor.enqueue(bad_id)
+    auditor.enqueue(good_id)
+
+    async def _wait_for_the_good_verdict():
+        task = asyncio.create_task(auditor.run())
+        try:
+            while good_id not in records.verdicts:
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(asyncio.wait_for(_wait_for_the_good_verdict(), timeout=5))
+    assert records.verdicts[good_id]["passed"] is True
