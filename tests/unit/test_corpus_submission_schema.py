@@ -61,6 +61,11 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
 
     assert CorpusRejectReason.PROMPT_NOT_FAITHFUL.value == REASON_PROMPT_MISMATCH
 
+    # Two different operational facts, so two different wire names: a miner
+    # that gets `job_not_served` has the right job and the wrong validator.
+    assert CorpusRejectReason.JOB_NOT_SERVED.value == "job_not_served"
+    assert CorpusRejectReason.JOB_UNKNOWN.value == "job_unknown"
+
 
 def test_a_submission_without_the_prompt_it_conditioned_on_is_refused():
     # Optional would mean bypassable: a miner omitting the field would switch

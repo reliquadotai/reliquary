@@ -136,10 +136,12 @@ class _CountingStore:
     def __init__(self, client_kwargs):
         self._kwargs = client_kwargs
         self.ledger_write_attempts = 0
+        self.job_reads = 0
         self._conflicts_left = 0
         self._competing_snapshot = None
 
     async def read_job(self, job_id):
+        self.job_reads += 1
         return await job_store.read_job(job_id, **self._kwargs)
 
     async def read_ledgers(self, job_id):
@@ -223,6 +225,7 @@ def client(fake_r2, seeded_job):
     app = FastAPI()
     app.include_router(
         build_corpus_router(
+            job_id="swe-v1",
             store=seeded_job.store,
             tokenizer=_Tokenizer(),
             renderer=seeded_job.renderer,
@@ -243,6 +246,7 @@ def _client_over(seeded_job, spec):
     app = FastAPI()
     app.include_router(
         build_corpus_router(
+            job_id="swe-v1",
             store=seeded_job.store,
             tokenizer=_Tokenizer(),
             renderer=seeded_job.renderer,
@@ -250,6 +254,25 @@ def _client_over(seeded_job, spec):
             prompt_job_for=lambda job: prompt_job_for_spec(
                 job, environments={PROMPT_SOURCE: spec}
             ),
+        )
+    )
+    return TestClient(app)
+
+
+def _client_for_job(seeded_job, job_id):
+    """The same router, serving a job id the test chooses. Production takes
+    that id from the registry entry that pays for the job."""
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id=job_id,
+            store=seeded_job.store,
+            tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer,
+            verify_signature=lambda request: True,
+            prompt_job_for=seeded_job.prompt_job_for,
         )
     )
     return TestClient(app)
@@ -377,12 +400,9 @@ def test_the_same_tokens_under_another_prompt_are_not_a_duplicate(client):
     assert _submit(client, tokens=tokens, prompt_index=1).json()["accepted"] is True
 
 
-def test_a_submission_for_an_unknown_job_is_refused_without_touching_the_ledgers(
-    client, seeded_job
-):
-    before = seeded_job.ledger_writes()
-    request = CorpusSubmissionRequest(
-        job_id="ghost",
+def _submission_for(job_id):
+    return CorpusSubmissionRequest(
+        job_id=job_id,
         miner_hotkey="5Hot",
         cursor=0,
         prompt_index=0,
@@ -391,29 +411,71 @@ def test_a_submission_for_an_unknown_job_is_refused_without_touching_the_ledgers
         completions=[{"tokens": [1], "text": "1", "termination": "cap"}],
         signature="ok",
     )
-    body = client.post("/corpus/submit", json=request.model_dump()).json()
+
+
+def test_a_submission_for_another_job_never_reaches_this_validators_store(
+    client, seeded_job
+):
+    """A validator is paid out of ONE task's share, for ONE job. Serving a
+    submission for another job spends this task's slots and this task's
+    bucket writes on work nobody here is paid for, so it is refused before
+    the manifest is even read."""
+    before_reads = seeded_job.store.job_reads
+    before_writes = seeded_job.ledger_writes()
+
+    body = client.post(
+        "/corpus/submit", json=_submission_for("other-job").model_dump()
+    ).json()
+
+    assert body["accepted"] is False
+    assert body["reason"] == "job_not_served"
+    assert body["detail"]["serves"] == "swe-v1"
+    assert seeded_job.store.job_reads == before_reads
+    assert seeded_job.ledger_writes() == before_writes
+
+
+def test_the_job_this_validator_serves_is_still_read(client, seeded_job):
+    """The other direction, so the refusal above cannot be satisfied by a
+    router that refuses every job id it is given."""
+    before_reads = seeded_job.store.job_reads
+
+    body = client.post(
+        "/corpus/submit", json=_submission_for("swe-v1").model_dump()
+    ).json()
+
+    assert body["reason"] != "job_not_served"
+    assert seeded_job.store.job_reads == before_reads + 1
+
+
+def test_a_submission_for_an_unknown_job_is_refused_without_touching_the_ledgers(
+    seeded_job
+):
+    """"Not mine" and "no such job" are different operational facts: this one
+    is a task declaring a job whose manifest is absent from the bucket."""
+    before = seeded_job.ledger_writes()
+    ghost = _client_for_job(seeded_job, "ghost")
+
+    body = ghost.post(
+        "/corpus/submit", json=_submission_for("ghost").model_dump()
+    ).json()
+
     assert body["accepted"] is False
     assert body["reason"] == "job_unknown"
     assert seeded_job.ledger_writes() == before
 
 
-def test_a_job_id_that_could_never_name_a_job_is_refused_not_raised(
-    client, seeded_job
-):
-    """The id becomes a bucket key, so the store refuses it outright; that
-    must read as "no such job", not as a 500 on a hostile request."""
+def test_a_job_id_that_could_never_name_a_job_is_refused_not_raised(seeded_job):
+    """The id becomes a bucket key, so the store refuses it outright. The
+    registry checks only that a corpus entry NAMES a job, not that the name
+    is usable, so a hand-edited entry reaches the store: that must read as
+    "no such job", not as a 500."""
     before = seeded_job.ledger_writes()
-    request = CorpusSubmissionRequest(
-        job_id="../../etc/passwd",
-        miner_hotkey="5Hot",
-        cursor=0,
-        prompt_index=0,
-        checkpoint_sha256=CHECKPOINT,
-        rendered_prompt=_faithful_prompt(0),
-        completions=[{"tokens": [1], "text": "1", "termination": "cap"}],
-        signature="ok",
+    hostile = _client_for_job(seeded_job, "../../etc/passwd")
+
+    response = hostile.post(
+        "/corpus/submit", json=_submission_for("../../etc/passwd").model_dump()
     )
-    response = client.post("/corpus/submit", json=request.model_dump())
+
     assert response.status_code == 200
     assert response.json()["reason"] == "job_unknown"
     assert seeded_job.ledger_writes() == before
@@ -735,6 +797,7 @@ def test_the_router_carries_the_prompt_fidelity_seam(seeded_job):
 
     environments = seeded_job.environments()
     router = build_corpus_router(
+        job_id="swe-v1",
         store=seeded_job.store,
         tokenizer=_Tokenizer(),
         renderer=seeded_job.renderer,

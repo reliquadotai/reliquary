@@ -1363,6 +1363,66 @@ def mine(
     asyncio.run(_run())
 
 
+async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=None):
+    """Bind the corpus submission route to the one job this task declares.
+
+    Everything the route needs is derived from that declaration rather than
+    configured beside it: the job id comes from the registry entry, and the
+    renderer from that job's own manifest, so a validator cannot be serving a
+    renderer -- or a job -- the declaration did not name. Returns False, having
+    done nothing, for any task that is not a corpus one.
+    """
+    from reliquary.environment.agentic.renderers import renderer_for
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+    from reliquary.validator.corpus_service import (
+        refuse_unsigned_corpus_submissions,
+    )
+    from reliquary.validator.task_config import TaskConfigError
+
+    if getattr(entry, "mechanism", None) != MECHANISM_CORPUS_GENERATION:
+        return False
+
+    store = BucketJobStore()
+    job, _ = await store.read_job(str(entry.job_id))
+    if job is None:
+        # The task is declared and would take its share of the pool, so a
+        # missing manifest is a refusal to start, not a route that 404s.
+        raise TaskConfigError(
+            f"task {entry.task_id!r} declares corpus job {entry.job_id!r} but "
+            f"the job store has no manifest for it"
+        )
+
+    def encode(text: str) -> list[int]:
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        return list(getattr(encoded, "ids", encoded))
+
+    if verify_signature is None:
+        verify_signature = refuse_unsigned_corpus_submissions
+        logger.critical(
+            "corpus job %s is mounted but this binary has no corpus signature "
+            "binding, so EVERY submission is refused as bad_signature until "
+            "one lands in protocol/signatures.py",
+            job.job_id,
+        )
+    mounted = server.mount_corpus_router(
+        entry,
+        store=store,
+        tokenizer=tokenizer,
+        renderer=renderer_for(job.renderer_id, encode),
+        verify_signature=verify_signature,
+    )
+    logger.info(
+        "corpus job %s mounted: source %s, renderer %s, checkpoint %s@%s",
+        job.job_id,
+        job.prompt_source,
+        job.renderer_id,
+        job.checkpoint_repo,
+        job.checkpoint_revision,
+    )
+    return mounted
+
+
 @app.command()
 def validate(
     train: bool = typer.Option(
@@ -1819,6 +1879,19 @@ def validate(
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,
             )
+            try:
+                # After the server exists and before it is served, so the
+                # route's one fidelity cache lives on the loop that answers.
+                await mount_corpus_service(
+                    service.server, task_config.entry, tokenizer=tokenizer
+                )
+            except TaskConfigError as exc:
+                logger.critical(
+                    "%s; fix the declaration with `reliquary jobs` before "
+                    "starting this validator",
+                    exc,
+                )
+                raise typer.Exit(code=4) from exc
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking
             # call on the trainer's loop (e.g. /state acquiring a lock the

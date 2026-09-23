@@ -35,6 +35,10 @@ class CorpusRejectReason(str, Enum):
     BAD_SIGNATURE = "bad_signature"
     MALFORMED_SUBMISSION = "malformed_submission"
     JOB_UNKNOWN = "job_unknown"
+    # Distinct from JOB_UNKNOWN on purpose: "this job exists but this
+    # validator is not the one paid for it" and "no such job" send a miner to
+    # two different places.
+    JOB_NOT_SERVED = "job_not_served"
     JOB_COMPLETE = "job_complete"
     CHECKPOINT_MISMATCH = "checkpoint_mismatch"
     BAD_CURSOR = "bad_cursor"

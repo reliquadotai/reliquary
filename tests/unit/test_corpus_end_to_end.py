@@ -18,10 +18,11 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from reliquary.cli.main import app as cli
+from reliquary.cli.main import app as cli, mount_corpus_service
 from reliquary.environment.agentic.renderers import renderer_for
 from reliquary.environment.registry import ENVIRONMENT_SPECS
 from reliquary.infrastructure import corpus_job_store as job_store
@@ -55,19 +56,6 @@ class _DigitTokenizer:
         return "".join(str(i) for i in ids)
 
 
-class _Store:
-    """The real job store, over whatever bucket the fixture installed."""
-
-    async def read_job(self, job_id):
-        return await job_store.read_job(job_id)
-
-    async def read_ledgers(self, job_id):
-        return await job_store.read_ledgers(job_id)
-
-    async def write_ledgers(self, job_id, snapshot, etag):
-        return await job_store.write_ledgers(job_id, snapshot, etag)
-
-
 def _declared_args():
     """`jobs create` for a job whose prompts a validator can really render."""
     source = _prompt_source(_template())
@@ -88,16 +76,31 @@ def _renderer(job):
     return renderer_for(job.renderer_id, lambda text: [])
 
 
-def _mount(entry, job):
+def _mount(entry, *, verify_signature=lambda request: True):
+    """The production startup path: the store, the job id and the renderer are
+    all derived from the declaration, not supplied by the test.
+
+    `verify_signature` is injected because the production default refuses
+    everything -- `protocol/signatures.py` carries no corpus binding yet -- and
+    a test of the rest of the wiring has to get past it. One test below pins
+    that default.
+    """
     server = ValidatorServer()
-    mounted = server.mount_corpus_router(
-        entry,
-        store=_Store(),
-        tokenizer=_DigitTokenizer(),
-        renderer=_renderer(job),
-        verify_signature=lambda request: True,
+    mounted = asyncio.run(
+        mount_corpus_service(
+            server,
+            entry,
+            tokenizer=_DigitTokenizer(),
+            verify_signature=verify_signature,
+        )
     )
     return server, mounted
+
+
+def _mount_on(server, entry):
+    return asyncio.run(
+        mount_corpus_service(server, entry, tokenizer=_DigitTokenizer())
+    )
 
 
 def _rendered_prompt(job, prompt_index):
@@ -107,10 +110,10 @@ def _rendered_prompt(job, prompt_index):
     return _renderer(job).initial_text(environment.get_task(prompt_index))
 
 
-def _submit(client, job, *, prompt_index, filler, rendered_for=None):
+def _submit(client, job, *, prompt_index, filler, rendered_for=None, job_id=None):
     tokens = [filler] * 16 + [EOS]
     request = CorpusSubmissionRequest(
-        job_id=job.job_id,
+        job_id=job.job_id if job_id is None else job_id,
         miner_hotkey="5Hot",
         cursor=0,
         prompt_index=prompt_index,
@@ -149,7 +152,7 @@ def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
     assert job is not None, "the CLI wrote no manifest for the task it declared"
     assert job.slots_per_prompt == SLOTS_PER_PROMPT
 
-    server, mounted = _mount(entry, job)
+    server, mounted = _mount(entry)
     assert mounted is True
 
     with TestClient(server.app) as client:
@@ -179,6 +182,12 @@ def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
         assert astray["accepted"] is False
         assert astray["reason"] == "prompt_not_faithful"
 
+        # The job id the route serves comes from the registry entry, so work
+        # declared under another task's cap is refused here, by name.
+        foreign = _submit(client, job, prompt_index=2, filler=7, job_id="other-job")
+        assert foreign["accepted"] is False
+        assert foreign["reason"] == "job_not_served"
+
     # What the endpoint derived has to have reached the bucket, or the next
     # validator to read these ledgers sells the same slots again.
     raw, _ = bucket.objects[f"reliquary/corpus/jobs/{job.job_id}/ledgers.json"]
@@ -187,20 +196,50 @@ def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
     assert len(ledgers["seen"]) == SLOTS_PER_PROMPT + 1
 
 
+def test_the_startup_path_mounts_nothing_it_cannot_authenticate(bucket, registry):
+    """`protocol/signatures.py` carries no corpus binding, so the route is
+    wired with a verifier that refuses everything. The endpoint exists and
+    nothing can be admitted through it -- not a stub that accepts."""
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
+    entry = registry["entries"][TASK_ID]
+    job, _ = asyncio.run(job_store.read_job(entry.job_id))
+
+    server, mounted = _mount(entry, verify_signature=None)
+    assert mounted is True
+
+    with TestClient(server.app) as client:
+        body = _submit(client, job, prompt_index=0, filler=1)
+
+    assert body["accepted"] is False
+    assert body["reason"] == "bad_signature"
+
+
+def test_a_declared_job_with_no_manifest_refuses_to_start(bucket, registry):
+    """The task is declared and would take its share of the pool, so a job the
+    store cannot produce is a startup refusal -- not a route that 404s while
+    the task keeps its cap."""
+    from reliquary.validator.task_config import TaskConfigError
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
+    entry = registry["entries"][TASK_ID]
+    bucket.objects.pop(f"reliquary/corpus/jobs/{entry.job_id}.json")
+
+    with pytest.raises(TaskConfigError) as caught:
+        _mount(entry)
+
+    assert entry.job_id in str(caught.value)
+
+
 def test_a_validator_on_an_rl_task_exposes_no_corpus_route(bucket, registry):
     """The mount is gated on the resolved task, so an RL validator serves no
     route that sells slots nobody declared -- and neither does the legacy
     fallback, whose task config carries no registry entry at all."""
     server = ValidatorServer()
-    arguments = {
-        "store": _Store(),
-        "tokenizer": _DigitTokenizer(),
-        "renderer": renderer_for("reliquary-jsonl-tools-v1", lambda text: []),
-        "verify_signature": lambda request: True,
-    }
 
-    assert server.mount_corpus_router(_rl_entry("default", 1.0), **arguments) is False
-    assert server.mount_corpus_router(None, **arguments) is False
+    assert _mount_on(server, _rl_entry("default", 1.0)) is False
+    assert _mount_on(server, None) is False
 
     assert [
         path
@@ -209,3 +248,23 @@ def test_a_validator_on_an_rl_task_exposes_no_corpus_route(bucket, registry):
     ] == []
     with TestClient(server.app) as client:
         assert client.post("/corpus/submit", json={}).status_code == 404
+
+
+def test_the_server_gate_does_not_depend_on_the_startup_path(bucket, registry):
+    """The mechanism gate lives on the mount itself, so a second caller cannot
+    open the route by skipping the CLI's half of it."""
+    server = ValidatorServer()
+    arguments = {
+        "store": None,
+        "tokenizer": _DigitTokenizer(),
+        "renderer": renderer_for("reliquary-jsonl-tools-v1", lambda text: []),
+        "verify_signature": lambda request: True,
+    }
+
+    assert server.mount_corpus_router(_rl_entry("default", 1.0), **arguments) is False
+    assert server.mount_corpus_router(None, **arguments) is False
+    assert [
+        path
+        for path in (getattr(route, "path", "") for route in server.app.routes)
+        if "corpus" in path
+    ] == []

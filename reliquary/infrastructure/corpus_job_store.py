@@ -166,3 +166,28 @@ async def write_ledgers(
     validated = _validated_job_id(job_id)
     body = _encode(dict(snapshot))
     return await _put(_ledgers_key(validated), body, etag, **client_kwargs)
+
+
+class BucketJobStore:
+    """The three calls the submission endpoint makes, bound to one bucket.
+
+    The endpoint takes an object rather than this module so that a test can
+    hand it a fake; binding the client kwargs once, here, is what keeps
+    storage configuration out of the request path.
+    """
+
+    __slots__ = ("_client_kwargs",)
+
+    def __init__(self, **client_kwargs: Any) -> None:
+        self._client_kwargs = client_kwargs
+
+    async def read_job(self, job_id: str) -> tuple[JobSpec | None, str | None]:
+        return await read_job(job_id, **self._client_kwargs)
+
+    async def read_ledgers(self, job_id: str) -> tuple[dict, str | None]:
+        return await read_ledgers(job_id, **self._client_kwargs)
+
+    async def write_ledgers(
+        self, job_id: str, snapshot: Mapping[str, Any], etag: str | None
+    ) -> str | None:
+        return await write_ledgers(job_id, snapshot, etag, **self._client_kwargs)

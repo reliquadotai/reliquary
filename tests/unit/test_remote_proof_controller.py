@@ -189,6 +189,10 @@ def test_cli_remote_boot_never_resolves_cuda_or_loads_local_weights(monkeypatch)
     monkeypatch.setattr(remote.RemoteProofPool, "from_environment", lambda **kw: pool)
     seen = []
     class Service:
+        # The real service builds one; startup offers it to the corpus mount,
+        # which declines because this task's mechanism is not corpus.
+        server = None
+
         def __init__(self, wallet, model, tokenizer, **kwargs):
             assert isinstance(model, ProofModelProxy)
             assert kwargs["proof_worker_pool"] is pool

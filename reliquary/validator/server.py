@@ -6381,6 +6381,9 @@ class ValidatorServer:
 
         self.app.include_router(
             build_corpus_router(
+                # The one job this task pays for; a submission naming any
+                # other is refused before the store is touched.
+                job_id=str(entry.job_id),
                 store=store,
                 tokenizer=tokenizer,
                 renderer=renderer,

@@ -318,6 +318,20 @@ def ledger_snapshot(
 # --------------------------------------------------------------------------
 
 
+def refuse_unsigned_corpus_submissions(request: CorpusSubmissionRequest) -> bool:
+    """Refuse every submission, because nothing can yet verify one.
+
+    ``protocol/signatures.py`` binds a GRPO window envelope -- window, merkle
+    root, drand round -- and carries no binding over a corpus submission's job,
+    cursor or tokens; no miner signs one either. Until that binding exists this
+    is what the mount wires in, so the route is reachable and unusable rather
+    than open. Not a placeholder to be quietly replaced by ``True``: replacing
+    it means writing the binding.
+    """
+    del request
+    return False
+
+
 def _refuse(
     reason: CorpusRejectReason, detail: Mapping[str, Any] | None = None
 ) -> CorpusSubmissionResponse:
@@ -349,6 +363,7 @@ def _respond(verdict: Verdict) -> CorpusSubmissionResponse:
 
 def build_corpus_router(
     *,
+    job_id: str,
     store: CorpusJobStore,
     tokenizer: Tokenizer,
     renderer: Renderer,
@@ -356,7 +371,13 @@ def build_corpus_router(
     prompt_job_for=prompt_job_for_spec,
     max_write_attempts: int = DEFAULT_WRITE_ATTEMPTS,
 ) -> APIRouter:
-    """The corpus submission endpoint, over an already-bound job store."""
+    """The corpus submission endpoint, over an already-bound job store.
+
+    ``job_id`` is the job this validator is paid to serve — the one its task
+    entry names. It is not a default: a router that would serve whatever job a
+    submission names spends this task's bucket writes, and eventually this
+    task's share, on work declared under somebody else's cap.
+    """
 
     router = APIRouter()
     prompt_fidelity = PromptFidelity(renderer=renderer, prompt_job_for=prompt_job_for)
@@ -367,6 +388,14 @@ def build_corpus_router(
     async def submit_corpus(
         request: CorpusSubmissionRequest,
     ) -> CorpusSubmissionResponse:
+        # First, and before the store is touched at all: another job's work is
+        # not this validator's to admit, record or eventually pay for.
+        if request.job_id != job_id:
+            return _refuse(
+                CorpusRejectReason.JOB_NOT_SERVED,
+                {"job_id": request.job_id, "serves": job_id},
+            )
+
         # Before anything reads or writes: an unsigned submission must not
         # reach the ledgers, or a spoofed hotkey consumes another miner's work.
         if not verify_signature(request):
@@ -504,5 +533,6 @@ __all__ = [
     "ledger_snapshot",
     "prompt_job_for_spec",
     "rebuild_ledgers",
+    "refuse_unsigned_corpus_submissions",
     "resolve_prompt_source",
 ]
