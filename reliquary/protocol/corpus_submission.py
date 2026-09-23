@@ -7,7 +7,7 @@ Named ``corpus`` rather than ``batch``: ``BatchSubmissionRequest`` in
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -63,11 +63,18 @@ class CorpusRejectReason(str, Enum):
 
 
 class CorpusCompletion(BaseModel):
+    """Tokens and their text, and nothing the miner says ABOUT them.
+
+    There is no ``termination`` field: the validator derives that label from
+    the tokens (``check_termination``) and ``admit`` has no parameter it could
+    travel through, so a required enum here could only refuse an honest miner
+    that spells its own label ``"stop"`` or ``"length"``.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     tokens: list[int] = Field(min_length=1, max_length=MAX_COMPLETION_TOKENS)
     text: str = Field(max_length=MAX_COMPLETION_TEXT_CHARS)
-    termination: Literal["eos", "cap"]
 
     @field_validator("tokens")
     @classmethod

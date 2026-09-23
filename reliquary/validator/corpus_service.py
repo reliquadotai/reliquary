@@ -5,9 +5,10 @@ This module is where the validator's own view of a submission is built.
 module's obligation: ``token_counts``, ``last_token_ids`` and ``digests`` are
 all derived here from the submitted token arrays. Nothing the miner *declares*
 about its completions is forwarded — forward a digest and the duplicate check
-becomes decoration. ``CorpusCompletion.termination`` is carried on the wire and
-deliberately never read: the label the miner puts on its own work is a claim,
-and ``check_termination`` derives the truth from the tokens instead.
+becomes decoration. The wire carries no termination label either: the miner's
+word about how its own completion ended is a claim, ``check_termination``
+derives the truth from the tokens, and a field nothing reads could only refuse
+a miner that spells its label differently.
 
 Its own module rather than a handler inside ``server.py``: the corpus path
 shares no state with the RL window machinery, and mounting is a separate,

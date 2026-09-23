@@ -812,7 +812,13 @@ def jobs_cancel(
     job_id: str = typer.Option(..., "--job-id"),
     retired_at: int = typer.Option(..., "--retired-at", help="drand round"),
 ) -> None:
-    """Stop submissions. The manifest stays: settlement still reads it."""
+    """Retire the task entry. It is a BOOT gate, not a stop.
+
+    `resolve_task_config` refuses a retired entry at startup and `admit()`
+    never reads `status`, so a validator already serving this job keeps
+    admitting submissions until it restarts. The manifest stays either way:
+    settlement still reads it.
+    """
     from reliquary.infrastructure.task_registry_store import (
         read_registry,
         retire_task_entry,
@@ -828,9 +834,11 @@ def jobs_cancel(
     for entry in named:
         asyncio.run(retire_task_entry(entry.task_id, retired_at))
     typer.echo(
-        f"cancelled job {job_id}: retired "
+        f"retired "
         + ", ".join(sorted(entry.task_id for entry in named))
-        + "; the manifest stays for settlement"
+        + f" for job {job_id}. This stops validators that START from now on; "
+        "one already running keeps admitting submissions until it restarts. "
+        "The manifest stays for settlement."
     )
 
 

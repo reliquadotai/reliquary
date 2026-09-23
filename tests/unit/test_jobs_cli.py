@@ -387,7 +387,7 @@ def test_jobs_create_refuses_a_prompt_count_the_source_cannot_fill(
 
 
 def test_jobs_cancel_retires_the_entry_and_leaves_the_manifest(bucket, registry):
-    """Submissions stop; the manifest stays readable for settlement."""
+    """The entry is retired and the manifest stays readable for settlement."""
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     assert CliRunner().invoke(app, _create_args()).exit_code == 0
 
@@ -399,6 +399,24 @@ def test_jobs_cancel_retires_the_entry_and_leaves_the_manifest(bucket, registry)
     assert registry["entries"]["corpus-run"].status == "retired"
     assert registry["entries"]["corpus-run"].retired_at == 5000000
     assert _manifest_keys(bucket) == ["reliquary/corpus/jobs/swe-v1.json"]
+
+
+def test_jobs_cancel_says_it_is_a_boot_gate_and_not_a_stop(bucket, registry):
+    """`status` is checked by `resolve_task_config` at startup and `admit()`
+    never reads it, so a validator already serving this job keeps admitting.
+    The operator acts on this sentence, so it has to be the true one."""
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(app, _create_args()).exit_code == 0
+
+    result = CliRunner().invoke(
+        app, ["jobs", "cancel", "--job-id", "swe-v1", "--retired-at", "5000000"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "already running" in result.output
+    assert "restarts" in result.output
+    # The word the old output used, which an operator reads as "it has stopped".
+    assert "cancelled" not in result.output.lower()
 
 
 def test_jobs_cancel_on_a_job_nothing_declares_is_refused(bucket, registry):

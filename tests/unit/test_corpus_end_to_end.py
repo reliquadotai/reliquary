@@ -126,7 +126,6 @@ def _submit(client, job, *, prompt_index, filler, rendered_for=None, job_id=None
                 # The trailing terminator leaves no trace in the text (T3-a).
                 "tokens": tokens,
                 "text": "".join(str(token) for token in tokens[:-1]),
-                "termination": "eos",
             }
         ],
         signature="ok",

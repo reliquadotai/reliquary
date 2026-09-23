@@ -17,7 +17,7 @@ from reliquary.protocol.corpus_submission import (
 
 
 def _completion(**overrides):
-    payload = {"tokens": [1, 2, 3], "text": "hello", "termination": "eos"}
+    payload = {"tokens": [1, 2, 3], "text": "hello"}
     payload.update(overrides)
     return payload
 
@@ -39,8 +39,16 @@ def _request(**overrides):
 
 def test_a_well_formed_submission_parses():
     request = CorpusSubmissionRequest(**_request())
-    assert request.completions[0].termination == "eos"
+    assert request.completions[0].tokens == [1, 2, 3]
     assert request.cursor == 0
+
+
+def test_a_completion_may_not_declare_how_it_terminated():
+    """`check_termination` derives that label from the tokens and `admit` has
+    no parameter it could travel through, so the field read nothing and could
+    only 422 an honest miner whose own word is "stop" or "length"."""
+    with pytest.raises(ValidationError):
+        CorpusCompletion(**_completion(termination="eos"))
 
 
 def test_the_checks_agree_with_the_pure_module_on_reason_names():
@@ -121,7 +129,7 @@ def test_an_impossible_submission_is_refused(overrides):
 
 @pytest.mark.parametrize(
     "overrides",
-    [{"tokens": []}, {"termination": "truncated"}, {"tokens": [-1]}],
+    [{"tokens": []}, {"tokens": [-1]}],
 )
 def test_an_impossible_completion_is_refused(overrides):
     with pytest.raises(ValidationError):

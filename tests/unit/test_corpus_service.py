@@ -295,7 +295,6 @@ def _submit(
     *,
     tokens,
     text=None,
-    termination="eos",
     prompt_index=0,
     cursor=0,
     signature="ok",
@@ -315,7 +314,6 @@ def _submit(
             {
                 "tokens": tokens,
                 "text": _text_for(tokens) if text is None else text,
-                "termination": termination,
             }
         ],
         signature=signature,
@@ -330,20 +328,17 @@ def test_a_well_formed_submission_is_accepted_and_consumes_a_slot(client):
 
 
 def test_the_endpoint_derives_the_termination_from_the_tokens(client):
-    """A completion labelled "eos" that neither ends on the terminator nor
-    reached the cap is a silent truncation, and is refused however it is
-    labelled — the endpoint never passes the label on."""
-    body = _submit(client, tokens=[7] * 16 + [99], termination="eos").json()
+    """A completion that neither ends on the terminator nor reached the cap is
+    a silent truncation. The wire carries no label to compare it against: the
+    only source of one is `tokens[-1]`, here and in `check_termination`.
+
+    Its counterpart -- a cap LABEL on an eos-ending completion, accepted --
+    went with the field it depended on: the label is now unrepresentable on
+    the wire rather than merely unread, so the case it discriminated cannot be
+    built. `test_a_completion_may_not_declare_how_it_terminated` pins that."""
+    body = _submit(client, tokens=[7] * 16 + [99]).json()
     assert body["accepted"] is False
     assert "termination" in body["reason"]
-
-
-def test_a_cap_label_on_an_eos_ending_completion_is_also_derived_away(client):
-    """The other direction, so the test above cannot be passed by hardcoding
-    "cap": a completion that really did end on EOS is accepted however it is
-    labelled. `admit()` has no parameter the label could travel through."""
-    body = _submit(client, tokens=[7] * 16 + [EOS], termination="cap").json()
-    assert body["accepted"] is True
 
 
 def test_a_completion_below_the_floor_is_refused(client, seeded_job):
@@ -404,7 +399,7 @@ def test_the_empty_completion_is_refused_at_the_lowest_floor_a_job_may_declare(
             prompt_index=0,
             checkpoint_sha256=CHECKPOINT,
             rendered_prompt=_faithful_prompt(0),
-            completions=[{"tokens": tokens, "text": text, "termination": "eos"}],
+            completions=[{"tokens": tokens, "text": text}],
             signature="ok",
         )
         return client.post("/corpus/submit", json=request.model_dump()).json()
@@ -477,7 +472,6 @@ def test_a_miner_walk_job_advances_the_cursor_it_persists(fake_r2, seeded_job):
                 {
                     "tokens": tokens,
                     "text": _text_for(tokens),
-                    "termination": "eos",
                 }
             ],
             signature="ok",
@@ -530,7 +524,7 @@ def _submission_for(job_id):
         prompt_index=0,
         checkpoint_sha256=CHECKPOINT,
         rendered_prompt=_faithful_prompt(0),
-        completions=[{"tokens": [1], "text": "1", "termination": "cap"}],
+        completions=[{"tokens": [1], "text": "1"}],
         signature="ok",
     )
 
