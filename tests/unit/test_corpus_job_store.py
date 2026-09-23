@@ -189,17 +189,42 @@ async def test_every_stored_job_is_listed_and_its_ledgers_are_not(fake_r2):
 
 
 @pytest.mark.asyncio
-async def test_a_deleted_job_is_gone_and_a_second_delete_is_quiet(fake_r2):
-    # `jobs create` rolls itself back with this; a rollback that raised on an
-    # already-absent manifest would hide the failure it is reporting.
+async def test_a_deleted_job_is_gone(fake_r2):
+    # `jobs create` rolls itself back with this. Deliberately NOT asserting
+    # that a second delete is quiet: S3 DeleteObject is idempotent, so that
+    # would be a property of the backend, and the fake would prove it whatever
+    # this module did.
     await store.write_job(_manifest(), None, **fake_r2)
     await store.delete_job("swe-v1", **fake_r2)
 
     assert await store.read_job("swe-v1", **fake_r2) == (None, None)
-    await store.delete_job("swe-v1", **fake_r2)
 
 
 @pytest.mark.asyncio
-async def test_deleting_a_job_id_that_is_not_a_job_id_is_refused(fake_r2):
-    with pytest.raises(ValueError):
-        await store.delete_job("../../etc/passwd", **fake_r2)
+@pytest.mark.parametrize("job_id", ["../../etc/passwd", "swe-v1\n", "*"])
+async def test_deleting_a_job_id_that_is_not_a_job_id_is_refused(fake_r2, job_id):
+    with pytest.raises(ValueError, match="unusable job id"):
+        await store.delete_job(job_id, **fake_r2)
+
+
+@pytest.mark.asyncio
+async def test_a_job_id_carrying_a_newline_never_becomes_a_key(fake_r2):
+    """The store has no `strip` of its own, so the id's anchor is the only
+    thing between a registry value and an object key with a newline in it."""
+    with pytest.raises(ValueError, match="unusable job id"):
+        await store.write_job(_manifest(job_id="swe-v1\n"), None, **fake_r2)
+    with pytest.raises(ValueError, match="unusable job id"):
+        await store.read_job("swe-v1\n", **fake_r2)
+
+
+@pytest.mark.asyncio
+async def test_a_stored_key_carrying_a_newline_is_not_listed_as_a_job(
+    fake_r2, seed_object
+):
+    # A key some other writer put there must not come back as a job id that
+    # `read_job` would then refuse -- or `jobs list` shows a job nobody can
+    # open.
+    await store.write_job(_manifest("swe-v1"), None, **fake_r2)
+    seed_object("reliquary/corpus/jobs/evil\n.json", b"{}")
+
+    assert await store.list_jobs(**fake_r2) == ["swe-v1"]

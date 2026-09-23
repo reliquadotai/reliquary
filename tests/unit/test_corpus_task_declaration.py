@@ -67,11 +67,19 @@ def rl_entry():
 
 
 def test_a_corpus_entry_pins_its_price_and_names_its_job(corpus_entry):
+    from dataclasses import replace
+
     entry = corpus_entry()
     assert entry.mechanism == MECHANISM_CORPUS_GENERATION
-    assert entry.params["floor"] == entry.params["cap"]
-    assert entry.job_id
     validate_entry(entry)
+
+    # The assertions above only restate the fixture, so they would hold with
+    # the rule reverted. Perturbing each half is what proves the accepted
+    # shape is the one the rule requires, not merely one it tolerates.
+    with pytest.raises(RegistryError):
+        validate_entry(replace(entry, params={**entry.params, "floor": 0.01}))
+    with pytest.raises(RegistryError):
+        validate_entry(replace(entry, job_id=None))
 
 
 def test_a_corpus_entry_whose_price_is_not_pinned_is_refused(corpus_entry):
@@ -101,7 +109,7 @@ def test_an_rl_entry_is_not_subjected_to_the_corpus_rules(rl_entry):
 
 def test_a_job_id_on_an_rl_entry_is_refused(rl_entry):
     entry = rl_entry(job_id="swe-v1")
-    with pytest.raises(RegistryError):
+    with pytest.raises(RegistryError, match="does not run one"):
         validate_entry(entry)
 
 
@@ -120,9 +128,13 @@ def test_the_named_job_survives_a_render_and_parse_round_trip(corpus_entry):
 def test_a_legacy_entry_reads_back_naming_no_job(rl_entry):
     from reliquary.shared.task_registry import parse_registry, render_registry
 
-    parsed = parse_registry(render_registry({"default": rl_entry()}))
+    raw = render_registry({"default": rl_entry()})
 
-    assert parsed["default"].job_id is None
+    # Against the BYTES, not the parsed object: `job_id is None` is also the
+    # dataclass default, so it would hold if `render_registry` stopped writing
+    # the key at all. The key is written, and written as null.
+    assert b'"job_id":null' in raw
+    assert parse_registry(raw)["default"].job_id is None
 
 
 def test_a_job_id_that_is_not_a_name_is_refused_on_the_wire(corpus_entry):
@@ -137,6 +149,84 @@ def test_a_job_id_that_is_not_a_name_is_refused_on_the_wire(corpus_entry):
 
     with pytest.raises(RegistryError, match="job_id"):
         parse_registry(json.dumps(document).encode())
+
+
+# --- One job is paid for by one task. Two tasks naming it would each pay
+# their own share for the SAME submissions, so this belongs beside the sum of
+# caps in `validate_registry`, not in `validate_entry`. ---
+
+
+def test_two_active_tasks_may_not_name_the_same_job(corpus_entry):
+    from dataclasses import replace
+
+    from reliquary.shared.task_registry import validate_registry
+
+    first = corpus_entry()
+    second = replace(first, task_id="corpus-run-2", profile_id="corpus-run-2")
+
+    with pytest.raises(RegistryError, match="both name job"):
+        validate_registry({"corpus-run": first, "corpus-run-2": second})
+
+
+def test_two_tasks_naming_DIFFERENT_jobs_are_fine(corpus_entry):
+    from dataclasses import replace
+
+    from reliquary.shared.task_registry import validate_registry
+
+    first = corpus_entry()
+    second = replace(
+        first, task_id="corpus-run-2", profile_id="corpus-run-2", job_id="math-v2"
+    )
+
+    validate_registry({"corpus-run": first, "corpus-run-2": second})
+
+
+def test_a_retired_task_does_not_hold_its_job_against_a_new_one(corpus_entry):
+    """The boundary of the chosen rule: a cancelled job must be re-declarable.
+    A retired task accepts no submission, so it cannot double-pay for one."""
+    from dataclasses import replace
+
+    from reliquary.shared.task_registry import validate_registry
+
+    retired = replace(corpus_entry(), status="retired", retired_at=5_000_000)
+    fresh = replace(
+        corpus_entry(), task_id="corpus-run-2", profile_id="corpus-run-2"
+    )
+
+    validate_registry({"corpus-run": retired, "corpus-run-2": fresh})
+
+
+def test_the_uniqueness_rule_is_not_an_entry_rule(corpus_entry):
+    """`validate_entry` sees one entry and cannot know about the other, so a
+    corpus entry on its own must still validate."""
+    validate_entry(corpus_entry())
+
+
+# --- Declaring the first corpus task makes the registry unreadable to any
+# validator whose binary predates the mechanism: they refuse the WHOLE
+# registry and will not start. ---
+
+
+def test_declaring_a_corpus_task_is_refused_unless_it_is_acknowledged(
+    corpus_entry,
+):
+    from reliquary.shared.task_registry import require_fleet_knows_corpus_generation
+
+    with pytest.raises(RegistryError, match="corpus-generation"):
+        require_fleet_knows_corpus_generation(corpus_entry(), acknowledged=False)
+
+
+def test_an_acknowledged_corpus_task_is_allowed(corpus_entry):
+    from reliquary.shared.task_registry import require_fleet_knows_corpus_generation
+
+    require_fleet_knows_corpus_generation(corpus_entry(), acknowledged=True)
+
+
+def test_an_rl_task_needs_no_acknowledgement(rl_entry):
+    # The hazard is the unknown MECHANISM, so it exists for corpus tasks only.
+    from reliquary.shared.task_registry import require_fleet_knows_corpus_generation
+
+    require_fleet_knows_corpus_generation(rl_entry(), acknowledged=False)
 
 
 # --- `build_corpus_task_entry`: the operator-facing constructor. ---

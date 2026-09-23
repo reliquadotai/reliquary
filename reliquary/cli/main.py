@@ -616,11 +616,27 @@ def jobs_create(
             "validator derive it from its own card."
         ),
     ),
+    fleet_knows_corpus_generation: bool = typer.Option(
+        False,
+        "--fleet-knows-corpus-generation",
+        help=(
+            "Required. Confirms that every validator already runs a binary "
+            "that knows the 'corpus-generation' mechanism; one corpus entry "
+            "makes the whole registry unreadable to any that does not, and "
+            "those validators refuse to start."
+        ),
+    ),
 ) -> None:
     """Write the job manifest and the registry entry that pays for it."""
     from reliquary.infrastructure import corpus_job_store as job_store
-    from reliquary.infrastructure.task_registry_store import create_task
-    from reliquary.shared.task_registry import RegistryError
+    from reliquary.infrastructure.task_registry_store import (
+        RegistryConflict,
+        create_task,
+    )
+    from reliquary.shared.task_registry import (
+        RegistryError,
+        require_fleet_knows_corpus_generation,
+    )
 
     overrides = {
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
@@ -667,6 +683,18 @@ def jobs_create(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
+    # Before either write, so a refusal leaves nothing behind. The guard is in
+    # `task_registry` and does not know this CLI, so the flag is named here.
+    try:
+        require_fleet_knows_corpus_generation(
+            entry, acknowledged=fleet_knows_corpus_generation
+        )
+    except RegistryError as exc:
+        typer.echo(
+            f"error: {exc} Pass --fleet-knows-corpus-generation.", err=True
+        )
+        raise typer.Exit(code=1) from exc
+
     try:
         asyncio.run(job_store.write_job(manifest, None))
     except job_store.CorpusStoreConflict as exc:
@@ -682,11 +710,13 @@ def jobs_create(
         raise typer.Exit(code=1) from exc
 
     # The registry write goes last because it is the one that can lose a race
-    # or break the sum rule. A manifest with no entry is a job nobody pays
-    # for, so take it back rather than leave it behind.
+    # or break the sum rule.
     try:
         asyncio.run(create_task(entry))
-    except Exception as exc:
+    except (RegistryError, RegistryConflict) as exc:
+        # These two refuse INSTEAD of putting: a rule rejected the entry, or
+        # every attempt lost its compare-and-swap. Nothing landed, so the
+        # manifest is a job nobody pays for and is safe to take back.
         try:
             asyncio.run(job_store.delete_job(job_id))
         except Exception:
@@ -696,6 +726,19 @@ def jobs_create(
                 err=True,
             )
         typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        # Transport, timeout, anything else: the put MAY have landed. Deleting
+        # the manifest now is the worst outcome available -- a declared task
+        # holding a cap share and refusing every submission it is paid for --
+        # so leave it and make the operator look.
+        typer.echo(f"error: {exc}", err=True)
+        typer.echo(
+            f"error: the registry write for job {job_id!r} did not confirm, so "
+            f"its manifest is LEFT IN PLACE. Run `reliquary jobs list` to see "
+            f"whether the task landed before retrying.",
+            err=True,
+        )
         raise typer.Exit(code=1) from exc
 
     typer.echo(

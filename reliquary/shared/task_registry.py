@@ -215,6 +215,23 @@ def validate_registry(entries: Mapping[str, TaskEntry]) -> None:
             f"declared caps total {total:.4f}, above the single available pool "
             f"of 1.0; retire a task or lower a cap first"
         )
+    # The other money invariant, and it lives here for the same reason: one
+    # entry cannot see it. Two tasks naming one job would each pay their own
+    # share for the SAME submissions.
+    #
+    # Retired entries are excluded: they accept no submission, so they cannot
+    # double-pay for one, and counting them would make a cancelled job
+    # undeclarable forever. Their cap stays guarded by the sum above.
+    claimed: dict[str, str] = {}
+    for task_id, entry in sorted(entries.items()):
+        if not entry.job_id or entry.status != "active":
+            continue
+        if entry.job_id in claimed:
+            raise RegistryError(
+                f"tasks {claimed[entry.job_id]!r} and {task_id!r} both name "
+                f"job {entry.job_id!r}; one job is paid for by one task"
+            )
+        claimed[entry.job_id] = task_id
 
 
 def add_task(
@@ -247,6 +264,31 @@ def require_default_declared_first(
         f"refusing to declare {entry.task_id!r} while {DEFAULT_TASK_ID!r} is "
         f"absent from the registry: that would stop every validator running "
         f"today. Declare {DEFAULT_TASK_ID!r} first, then add this task."
+    )
+
+
+def require_fleet_knows_corpus_generation(
+    entry: TaskEntry, *, acknowledged: bool
+) -> None:
+    """Refuse to make the registry unreadable to validators that predate the
+    corpus mechanism.
+
+    ``validate_registry`` runs ``validate_entry`` over EVERY entry, and a
+    binary whose ``KNOWN_MECHANISMS`` lacks ``corpus-generation`` refuses the
+    whole registry -- so the first corpus entry stops every validator still on
+    an older image, not just the corpus task. No CLI can read the fleet's
+    version, so the operator states it. Deliberately NOT part of ``add_task``,
+    for the same reason as ``require_default_declared_first``: this is a
+    deployment precondition of a live subnet, not an invariant of the object.
+    """
+    if entry.mechanism != MECHANISM_CORPUS_GENERATION or acknowledged:
+        return
+    raise RegistryError(
+        f"refusing to declare {entry.task_id!r}: a {MECHANISM_CORPUS_GENERATION!r} "
+        f"entry makes the WHOLE registry unreadable to any validator whose "
+        f"binary does not know that mechanism, and those validators refuse to "
+        f"start. Confirm every validator already runs a binary that knows it, "
+        f"then declare the task again with the acknowledgement flag."
     )
 
 

@@ -133,3 +133,20 @@ def test_a_broken_manifest_is_refused(overrides):
 def test_an_unknown_field_is_refused():
     with pytest.raises(JobError):
         parse_job(_raw(surprise=1))
+
+
+@pytest.mark.parametrize("job_id", ["math-v1\n", "math-v1\nrm -rf", "\nmath-v1"])
+def test_a_job_id_carrying_a_newline_is_not_a_job_id(job_id):
+    """`$` matches before a trailing newline, and this id is interpolated into
+    an object key by the job store, which has no `strip` of its own."""
+    from reliquary.corpus.job import JOB_ID_RE
+
+    assert JOB_ID_RE.match(job_id) is None
+
+
+def test_a_checkpoint_digest_carrying_a_newline_is_not_a_digest():
+    """Same anchor, same reason: a digest that compares equal with a newline
+    attached is a digest two readers can disagree about."""
+    from reliquary.corpus.job import _SHA256_RE
+
+    assert _SHA256_RE.match("a" * 64 + "\n") is None

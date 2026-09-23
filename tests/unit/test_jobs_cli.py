@@ -146,6 +146,9 @@ def registry(monkeypatch):
     return state
 
 
+ACK = "--fleet-knows-corpus-generation"
+
+
 def _create_args(**overrides) -> list[str]:
     template = _template()
     options = {
@@ -165,7 +168,7 @@ def _create_args(**overrides) -> list[str]:
         "--cap": "0.30",
     }
     options.update(overrides)
-    argv = ["jobs", "create"]
+    argv = ["jobs", "create", ACK]
     for flag, value in options.items():
         argv += [flag, value]
     return argv
@@ -216,6 +219,24 @@ def test_the_manifest_carries_what_the_operator_declared(bucket, registry):
     assert manifest["filter"] is None
 
 
+def test_the_manifest_and_the_contract_name_one_checkpoint(bucket, registry):
+    """A validator verifying one model while admitting against another job
+    would pay for work nobody can reproduce. One flag feeds both, so they
+    cannot disagree -- name that here, or nothing does."""
+    import json
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(app, _create_args()).exit_code == 0
+
+    body, _ = bucket.objects["reliquary/corpus/jobs/swe-v1.json"]
+    manifest = json.loads(body)
+    contract = registry["entries"]["corpus-run"].contract
+
+    assert manifest["checkpoint_repo"] == contract["model_id"]
+    assert manifest["checkpoint_revision"] == contract["model_revision"]
+    assert manifest["prompt_source"] in contract["environments"]
+
+
 def test_jobs_create_rolls_back_the_manifest_when_the_entry_write_fails(
     bucket, registry
 ):
@@ -235,6 +256,46 @@ def test_jobs_create_rolls_back_the_manifest_when_the_entry_write_fails(
     assert bucket.deleted == ["reliquary/corpus/jobs/swe-v1.json"]
     assert _manifest_keys(bucket) == []
     assert set(registry["entries"]) == {"default"}
+
+
+def test_jobs_create_refuses_without_the_fleet_acknowledgement(bucket, registry):
+    """One corpus entry makes the WHOLE registry unreadable to a validator
+    whose binary predates the mechanism, so the hazard is a deliberate act."""
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    argv = [token for token in _create_args() if token != ACK]
+
+    result = CliRunner().invoke(app, argv)
+
+    assert result.exit_code != 0
+    assert ACK in result.output
+    # Nothing at all: the refusal happens before either write.
+    assert _manifest_keys(bucket) == []
+    assert bucket.deleted == []
+    assert set(registry["entries"]) == {"default"}
+
+
+def test_an_ambiguous_registry_failure_leaves_the_manifest(
+    bucket, registry, monkeypatch
+):
+    """A transport error on a put that actually landed would otherwise leave a
+    declared task holding a cap share with its manifest deleted, refusing
+    every submission it is paid for."""
+    from reliquary.infrastructure import task_registry_store as store
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+
+    async def _write(entries, etag, **kwargs):
+        raise OSError("connection reset by peer")
+
+    monkeypatch.setattr(store, "write_registry", _write)
+
+    result = CliRunner().invoke(app, _create_args())
+
+    assert result.exit_code != 0
+    assert bucket.deleted == []
+    assert _manifest_keys(bucket) == ["reliquary/corpus/jobs/swe-v1.json"]
+    assert "swe-v1" in result.output
+    assert "jobs list" in result.output
 
 
 def test_jobs_create_refuses_a_job_that_already_has_a_manifest(bucket, registry):
@@ -291,6 +352,21 @@ def test_jobs_list_shows_a_job_with_no_entry(bucket, registry):
     assert result.exit_code == 0, result.output
     assert "swe-v1" in result.output
     assert "no task entry" in result.output
+
+
+def test_jobs_list_shows_a_task_whose_manifest_is_gone(bucket, registry):
+    """The mirror of the orphan: this task holds a cap share and would refuse
+    every submission, which is exactly what an ambiguous rollback can leave."""
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(app, _create_args()).exit_code == 0
+    bucket.objects.pop("reliquary/corpus/jobs/swe-v1.json")
+
+    result = CliRunner().invoke(app, ["jobs", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "swe-v1" in result.output
+    assert "NO MANIFEST" in result.output
+    assert "corpus-run" in result.output
 
 
 def test_jobs_list_names_the_task_that_declares_a_job(bucket, registry):

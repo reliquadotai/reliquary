@@ -18,8 +18,10 @@ PROMPT_ORDER_MINER_WALK = "miner_walk"
 PROMPT_ORDER_FREE = "free"
 PROMPT_ORDERS = frozenset({PROMPT_ORDER_MINER_WALK, PROMPT_ORDER_FREE})
 
-JOB_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# `\Z`, not `$`: `$` also matches before a trailing newline, and a job id is
+# interpolated into an object key by the job store, which has no strip of its own.
+JOB_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9-]{0,62}\Z")
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 _SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_new_tokens", "max_new_tokens", "n")
 _FILTER_FIELDS = ("grader_id", "threshold")
