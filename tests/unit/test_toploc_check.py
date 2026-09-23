@@ -50,3 +50,26 @@ def test_miscounted_proofs_fail_on_shape():
     hidden = _hidden(0)
     proofs = completion_proofs_b64(hidden, 12, 82, **KW)[:-1]
     assert toploc_verdict(hidden, _commit(proofs), 12).reason == "bad_proof_shape"
+
+
+def test_a_shadow_configuration_error_is_recorded_not_raised():
+    # topk wider than the model: the validator's own mistake. In shadow it must
+    # not take the GRAIL proof down with it.
+    import dataclasses
+
+    spec = dataclasses.replace(PROOF, mode="shadow", topk=257).to_contract()
+    hidden = _hidden(0)
+    verdict = toploc_verdict(hidden, _commit(completion_proofs_b64(hidden, 12, 82, **KW), spec=spec), 12)
+    assert verdict.passed is False
+    assert verdict.reason == "error:ValueError"
+
+
+def test_an_enforced_configuration_error_stays_loud():
+    import dataclasses
+
+    import pytest
+
+    spec = dataclasses.replace(PROOF, topk=257).to_contract()
+    hidden = _hidden(0)
+    with pytest.raises(ValueError, match="configuration"):
+        toploc_verdict(hidden, _commit(completion_proofs_b64(hidden, 12, 82, **KW), spec=spec), 12)

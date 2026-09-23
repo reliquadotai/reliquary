@@ -32,12 +32,19 @@ def toploc_verdict(
     spec = commit.get("toploc_spec")
     if spec is None:
         return None
-    proof = ProofProfile(**spec)
-    proofs = commit.get("toploc_proofs")
-    if proofs is None:
-        return ToplocVerdict(False, "missing", 0, 0.0, 0.0)
-    rows = hidden[prompt_length - 1 : hidden.shape[0] - 1] if prompt_length > 0 else hidden[:0]
-    outcome = audit_completion(rows, proofs, proof)
+    try:
+        proof = ProofProfile(**spec)
+        proofs = commit.get("toploc_proofs")
+        if proofs is None:
+            return ToplocVerdict(False, "missing", 0, 0.0, 0.0)
+        rows = hidden[prompt_length - 1 : hidden.shape[0] - 1] if prompt_length > 0 else hidden[:0]
+        outcome = audit_completion(rows, proofs, proof)
+    except Exception as exc:
+        # The validator's own error. Enforced, it must stay loud rather than
+        # fail an honest miner; in shadow it must not cost the GRAIL proof.
+        if spec.get("mode") != "shadow":
+            raise
+        return ToplocVerdict(False, f"error:{type(exc).__name__}", 0, 0.0, 0.0)
     results = outcome.results
     return ToplocVerdict(
         outcome.passed,
