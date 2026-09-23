@@ -58,6 +58,14 @@ class HiddenStateCapture:
             raise KeyError(f"{len(matches)} captured requests match {request_id!r}")
         return torch.cat(self._rows[matches[0]], 0)
 
+    def pop(self, request_id: str) -> torch.Tensor:
+        """Like ``for_request``, but forgets the rows: a long-lived miner process
+        must not keep every completion's activations resident forever."""
+        matches = [r for r in self._rows if r == request_id or r.startswith(request_id + "-")]
+        if len(matches) != 1:
+            raise KeyError(f"{len(matches)} captured requests match {request_id!r}")
+        return torch.cat(self._rows.pop(matches[0]), 0)
+
 
 def _check_engine_mode() -> None:
     if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") != "0":

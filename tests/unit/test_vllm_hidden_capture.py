@@ -86,3 +86,16 @@ def test_an_unsupported_engine_mode_is_refused(monkeypatch, variable, value):
     with pytest.raises(RuntimeError):
         with capture_hidden_states(_FakeRunner):
             pass
+
+
+def test_pop_returns_and_forgets_the_request(monkeypatch):
+    _env(monkeypatch)
+    runner = _FakeRunner([(["0-x", "1-y"], torch.tensor([[1.0], [2.0], [3.0]]))])
+    with capture_hidden_states(_FakeRunner) as capture:
+        runner.execute_model(SimpleNamespace(num_scheduled_tokens={"0-x": 2, "1-y": 1}))
+        popped = capture.pop("0")
+        assert popped.flatten().tolist() == [1.0, 2.0]
+        with pytest.raises(KeyError):
+            capture.pop("0")
+        # The other request is untouched by popping the first.
+        assert capture.for_request("1").flatten().tolist() == [3.0]

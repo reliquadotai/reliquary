@@ -861,6 +861,84 @@ def jobs_cancel(
     )
 
 
+corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
+app.add_typer(corpus_app)
+
+
+@corpus_app.command("mine")
+def corpus_mine(
+    validator_url: str = typer.Option(..., "--validator-url"),
+    wallet_name: str = typer.Option("default"),
+    hotkey: str = typer.Option("default"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", "")),
+    max_steps: int = typer.Option(0, help="0 = until the job completes"),
+) -> None:
+    """Generate for the corpus job the validator serves, and submit it."""
+    import bittensor as bt
+    import httpx
+    from huggingface_hub import snapshot_download
+
+    from reliquary.corpus.encoding import checkpoint_fingerprint
+    from reliquary.corpus.job import parse_job
+    from reliquary.miner.corpus_miner import VllmGenerator, mine_steps
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
+    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.shared.modeling import load_tokenizer
+    from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
+
+    # Every corpus completion is proved from its own decode activations, so a
+    # process whose active contract carries no toploc entry has nothing to
+    # submit with: refuse to start rather than generate work it can't sign.
+    proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+    if proof is None:
+        typer.echo(
+            "error: the active protocol profile "
+            f"{ACTIVE_PROTOCOL_PROFILE.profile_id!r} declares no toploc proof; "
+            "corpus mining has no way to prove a completion under it",
+            err=True,
+        )
+        raise typer.Exit(code=4)
+
+    wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+    if wallet_path:
+        wallet_kwargs["path"] = wallet_path
+    wallet = bt.Wallet(**wallet_kwargs)
+    http = httpx.Client(base_url=validator_url, timeout=120.0)
+
+    class _Client:
+        def job(self):
+            return http.get("/corpus/job").raise_for_status().json()
+
+        def cursor(self, hk):
+            return int(http.get(f"/corpus/cursor/{hk}").raise_for_status().json()["cursor"])
+
+        def submit(self, body):
+            return http.post("/corpus/submit", json=body).json()
+
+    client = _Client()
+    job = parse_job(client.job())
+    directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
+    if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
+        typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
+        raise typer.Exit(code=4)
+    tokenizer = load_tokenizer(directory)
+
+    def encode(text):
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        return list(getattr(encoded, "ids", encoded))
+
+    renderer = renderer_for_job(job, encode)
+    prompts = prompt_job_for_spec(job)
+    counts = mine_steps(
+        job=job, hotkey=wallet.hotkey.ss58_address, client=client,
+        generator=VllmGenerator(directory, job.sampling, proof),
+        tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
+        sign=lambda body: sign_corpus_submission(wallet, body),
+        max_steps=max_steps or None,
+    )
+    typer.echo(counts)
+
+
 @app.command("watch-verdicts")
 def watch_verdicts(
     hotkey: str = typer.Option(..., help="Public miner SS58 address; no wallet or private key required"),
