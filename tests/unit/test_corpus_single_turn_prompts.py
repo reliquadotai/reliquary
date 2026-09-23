@@ -442,11 +442,16 @@ def test_the_fidelity_seam_serves_a_single_turn_job():
 # --------------------------------------------------------------------------
 
 
-def test_a_manifest_whose_renderer_disagrees_with_the_contract_is_refused():
+def test_a_manifest_whose_renderer_disagrees_with_the_contract_is_refused(monkeypatch):
     """`jobs create` already refuses a source this binary cannot render; a
     renderer the job's own contract does not declare is the same failure, one
     field over, and it must not reach the bucket."""
     from reliquary.cli.main import build_job_manifest
+    from tests.unit.test_jobs_cli import stub_source_rows
+
+    # Declaration counts the source's rows; the rule under test reads the
+    # PROFILE, so stubbing the dataset read leaves it untouched.
+    stub_source_rows(monkeypatch, "openmathinstruct", 1000)
 
     def _manifest(**overrides):
         arguments = {
@@ -489,15 +494,18 @@ def test_a_manifest_whose_renderer_disagrees_with_the_contract_is_refused():
 CONTRACT_PROFILE = "qwen3-4b-base-dapo-reliquary-v1"
 
 
-def _declare_math_job(registry):
+def _declare_math_job(registry, monkeypatch):
     """A corpus job on an installed MATH source, through the real CLI."""
     from typer.testing import CliRunner
 
     from reliquary.cli.main import app as cli
     from reliquary.infrastructure import corpus_job_store as job_store
 
-    from tests.unit.test_jobs_cli import _create_args, _rl_entry
+    from tests.unit.test_jobs_cli import _create_args, _rl_entry, stub_source_rows
 
+    # Declaration counts the source's rows, so the dataset read is stubbed:
+    # the mount below still resolves the real spec's mode and the real profile.
+    stub_source_rows(monkeypatch, "openmathinstruct", 1000)
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     result = CliRunner().invoke(
         cli,
@@ -545,7 +553,7 @@ def test_a_math_job_declares_and_mounts_end_to_end(bucket, registry, monkeypatch
     `RELIQUARY_TASK_CONTRACT` does to a validator serving this task."""
     from reliquary.protocol import profiles
 
-    entry = _declare_math_job(registry)
+    entry = _declare_math_job(registry, monkeypatch)
     monkeypatch.setattr(
         profiles, "ACTIVE_PROTOCOL_PROFILE", profiles.PROFILES[CONTRACT_PROFILE]
     )
@@ -567,7 +575,7 @@ def test_a_validator_rendering_these_prompts_differently_refuses_to_serve(
     would look exactly like a fleet of dishonest miners."""
     from reliquary.protocol import profiles
 
-    entry = _declare_math_job(registry)
+    entry = _declare_math_job(registry, monkeypatch)
     monkeypatch.setattr(
         profiles,
         "ACTIVE_PROTOCOL_PROFILE",

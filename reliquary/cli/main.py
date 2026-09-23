@@ -519,29 +519,24 @@ def build_job_manifest(
     deadline_round,
     from_profile=None,
 ):
-    """The manifest as the job store will hold it.
+    """The manifest as the job store will hold it, refused unless every
+    submission it will ever be paid for could be admitted.
 
-    Field-level refusals stay in `parse_job`, which the store runs before the
-    write; the only rule here is the one `parse_job` cannot see, because it
-    reads a filter that is already built or already absent.
+    Field-level refusals live in `parse_job`, which this runs itself rather
+    than leaving to the store: the rule below needs a parsed job, and a
+    manifest that only fails at the store is one the source check never saw.
+    The filter pairing is the one rule `parse_job` cannot see, because by then
+    the filter is either built or absent.
     """
-    from reliquary.corpus.job import JOB_SCHEMA
-    from reliquary.validator.corpus_service import resolve_prompt_source
+    from reliquary.corpus.job import JOB_SCHEMA, parse_job
+    from reliquary.validator.corpus_service import prompt_job_for_spec
 
     if (grader_id is None) != (threshold is None):
         raise ValueError(
             "--grader-id and --threshold go together: a filter needs both, and "
             "a job that keeps every completion declares neither"
         )
-    # A source whose rows the validator cannot render fails prompt fidelity on
-    # every submission the job is ever paid for, so it is refused here rather
-    # than once per submission forever. The profile checked against is the
-    # template the TASK is seeded from, not whichever one this CLI process
-    # happens to run: it is the one the fleet will render these prompts with.
-    resolve_prompt_source(
-        prompt_source, renderer_id=renderer_id, profile=from_profile
-    )
-    return {
+    manifest = {
         "schema": JOB_SCHEMA,
         "job_id": job_id,
         "checkpoint_repo": checkpoint_repo,
@@ -568,6 +563,15 @@ def build_job_manifest(
         "prompt_order": prompt_order,
         "deadline_round": deadline_round,
     }
+    # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
+    # both are refusals the operator would otherwise meet one submission at a
+    # time: an unrenderable source fails fidelity forever, and a prompt_count
+    # above the source's length is a 500 on the first submission and every one
+    # after it. The profile checked against is the template the TASK is seeded
+    # from, not whichever one this CLI process happens to run: it is the one
+    # the fleet will render these prompts with.
+    prompt_job_for_spec(parse_job(manifest), profile=from_profile)
+    return manifest
 
 
 @jobs_app.command("create")
@@ -597,7 +601,13 @@ def jobs_create(
         help="The installed environment the job draws prompts from; it becomes "
         "the contract's single environment",
     ),
-    prompt_count: int = typer.Option(..., "--prompt-count"),
+    prompt_count: int = typer.Option(
+        ...,
+        "--prompt-count",
+        help="Rows of the source this job owns; checked against the source's "
+        "own length, which BUILDS it -- a dataset-backed source must be "
+        "readable from here to declare a job over it",
+    ),
     renderer_id: str = typer.Option(..., "--renderer-id"),
     eos_token_id: int = typer.Option(..., "--eos-token-id"),
     slots_per_prompt: int = typer.Option(..., "--slots-per-prompt"),

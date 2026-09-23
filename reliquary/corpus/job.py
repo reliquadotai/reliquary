@@ -14,6 +14,13 @@ from typing import Any
 
 JOB_SCHEMA = "reliquary/corpus-job/v1"
 
+# The wire's own bounds, duplicated here the way the reject reasons are, so this
+# module stays free of pydantic like the rest of the pure layer; the schema test
+# pins them equal. A job declared above either one sells slots that no valid
+# request can fill, so it is refused at declaration rather than once per 422.
+MAX_COMPLETION_TOKENS = 131072
+MAX_COMPLETIONS_PER_SUBMISSION = 64
+
 PROMPT_ORDER_MINER_WALK = "miner_walk"
 PROMPT_ORDER_FREE = "free"
 PROMPT_ORDERS = frozenset({PROMPT_ORDER_MINER_WALK, PROMPT_ORDER_FREE})
@@ -172,11 +179,23 @@ def _parse_sampling(raw: Any) -> Sampling:
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
         raise JobError(f"sampling.top_k must be a non-negative whole number, got {top_k!r}")
     max_new_tokens = _positive_int(raw, "max_new_tokens")
-    # The floor is what a cursor step costs: a job that wants no floor sets 1.
+    if max_new_tokens > MAX_COMPLETION_TOKENS:
+        raise JobError(
+            f"sampling.max_new_tokens {max_new_tokens} is above the wire's "
+            f"{MAX_COMPLETION_TOKENS}, so a completion at this job's cap could "
+            "never be submitted"
+        )
     min_new_tokens = _positive_int(raw, "min_new_tokens")
     if min_new_tokens > max_new_tokens:
         raise JobError(
             f"sampling.min_new_tokens {min_new_tokens} exceeds max_new_tokens {max_new_tokens}"
+        )
+    n = _positive_int(raw, "n")
+    if n > MAX_COMPLETIONS_PER_SUBMISSION:
+        raise JobError(
+            f"sampling.n {n} is above the wire's "
+            f"{MAX_COMPLETIONS_PER_SUBMISSION} completions per submission, so "
+            "every submission this job asks for would be refused unparsed"
         )
     return Sampling(
         temperature=temperature,
@@ -184,7 +203,7 @@ def _parse_sampling(raw: Any) -> Sampling:
         top_k=top_k,
         min_new_tokens=min_new_tokens,
         max_new_tokens=max_new_tokens,
-        n=_positive_int(raw, "n"),
+        n=n,
     )
 
 

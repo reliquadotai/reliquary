@@ -327,6 +327,65 @@ def test_jobs_create_refuses_a_job_that_already_has_a_manifest(bucket, registry)
     assert set(registry["entries"]) == {"default", "corpus-run"}
 
 
+class _RowsOnlySpec:
+    """The real spec with only its build replaced, so a test can choose the
+    source's row count. `jobs create` BUILDS the source to count its rows, and
+    a unit test must not read a dataset to declare a job."""
+
+    def __init__(self, spec, rows: int):
+        self._spec = spec
+        self._rows = rows
+
+    def __getattr__(self, name):
+        return getattr(self._spec, name)
+
+    def create(self):
+        rows = self._rows
+
+        class _Environment:
+            def __len__(self):
+                return rows
+
+        return _Environment()
+
+
+def stub_source_rows(monkeypatch, source: str, rows: int) -> None:
+    """Give one installed source a row count without reading its dataset."""
+    from reliquary.validator import corpus_service
+
+    specs = corpus_service.ENVIRONMENT_SPECS
+    monkeypatch.setattr(
+        corpus_service,
+        "ENVIRONMENT_SPECS",
+        {**specs, source: _RowsOnlySpec(specs[source], rows)},
+    )
+
+
+def test_jobs_create_refuses_a_prompt_count_the_source_cannot_fill(
+    bucket, registry, monkeypatch
+):
+    """A job claiming more rows than its source has does not fail at
+    declaration unless this check runs: `prompt_job_for_spec` first raises on
+    the FIRST submission, as a 500, for every miner, forever."""
+    stub_source_rows(monkeypatch, _prompt_source(_template()), 10)
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+
+    result = CliRunner().invoke(app, _create_args(**{"--prompt-count": "1000"}))
+
+    assert result.exit_code != 0
+    # Both numbers, or the operator cannot tell which way the gap runs.
+    assert "1000" in result.output and "10" in result.output
+    # Nothing landed: the refusal precedes both writes.
+    assert _manifest_keys(bucket) == []
+    assert set(registry["entries"]) == {"default"}
+
+    # The other side of the same bound, so the test above cannot be satisfied
+    # by refusing every declaration.
+    assert CliRunner().invoke(
+        app, _create_args(**{"--prompt-count": "10"})
+    ).exit_code == 0
+
+
 def test_jobs_cancel_retires_the_entry_and_leaves_the_manifest(bucket, registry):
     """Submissions stop; the manifest stays readable for settlement."""
     registry["entries"] = {"default": _rl_entry("default", 0.5)}

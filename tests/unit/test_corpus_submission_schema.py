@@ -72,6 +72,17 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
     assert CorpusRejectReason.BAD_SIGNATURE.value == "bad_signature"
 
 
+def test_the_manifest_parser_carries_the_same_ceilings_as_the_wire():
+    """`reliquary.corpus.job` stays free of pydantic like its siblings, so it
+    duplicates these two numbers rather than importing them. A job declared
+    above either one refuses every submission as a bare 422, so a drift here
+    is a job that can only refuse."""
+    from reliquary.corpus import job as corpus_job
+
+    assert corpus_job.MAX_COMPLETIONS_PER_SUBMISSION == MAX_COMPLETIONS_PER_SUBMISSION
+    assert corpus_job.MAX_COMPLETION_TOKENS == MAX_COMPLETION_TOKENS
+
+
 def test_a_submission_without_the_prompt_it_conditioned_on_is_refused():
     # Optional would mean bypassable: a miner omitting the field would switch
     # prompt fidelity off for itself.

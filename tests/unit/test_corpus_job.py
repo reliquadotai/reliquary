@@ -150,3 +150,42 @@ def test_a_checkpoint_digest_carrying_a_newline_is_not_a_digest():
     from reliquary.corpus.job import _SHA256_RE
 
     assert _SHA256_RE.match("a" * 64 + "\n") is None
+
+
+def test_a_job_asking_for_more_completions_than_the_wire_carries_is_refused():
+    """`n` completions arrive in ONE request, so a job declaring more than the
+    wire's list bound sells slots no submission can ever fill: a bare pydantic
+    422, forever, with no reject reason to count."""
+    from reliquary.corpus.job import MAX_COMPLETIONS_PER_SUBMISSION
+
+    over = MAX_COMPLETIONS_PER_SUBMISSION + 1
+    with pytest.raises(JobError) as excinfo:
+        parse_job(_raw(sampling={
+            "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+            "min_new_tokens": 1, "max_new_tokens": 8, "n": over,
+        }))
+    assert str(over) in str(excinfo.value)
+    # The boundary itself stays declarable, or the refusal is only a smaller cap.
+    assert parse_job(_raw(sampling={
+        "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+        "min_new_tokens": 1, "max_new_tokens": 8,
+        "n": MAX_COMPLETIONS_PER_SUBMISSION,
+    })).sampling.n == MAX_COMPLETIONS_PER_SUBMISSION
+
+
+def test_a_job_whose_token_cap_exceeds_the_wire_is_refused():
+    """A completion at the job's own cap must be submissible. Above the wire's
+    token bound it cannot be, so the job can only ever refuse."""
+    from reliquary.corpus.job import MAX_COMPLETION_TOKENS
+
+    over = MAX_COMPLETION_TOKENS + 1
+    with pytest.raises(JobError) as excinfo:
+        parse_job(_raw(sampling={
+            "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+            "min_new_tokens": 1, "max_new_tokens": over, "n": 1,
+        }))
+    assert str(over) in str(excinfo.value)
+    assert parse_job(_raw(sampling={
+        "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+        "min_new_tokens": 1, "max_new_tokens": MAX_COMPLETION_TOKENS, "n": 1,
+    })).sampling.max_new_tokens == MAX_COMPLETION_TOKENS

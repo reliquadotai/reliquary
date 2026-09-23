@@ -331,7 +331,15 @@ def test_a_manifest_on_a_renderable_source_is_built():
     assert _manifest()["prompt_source"] == "reliquary_stateful_tools_v1"
 
 
-def test_a_single_turn_source_is_declarable_only_against_the_contract_that_renders_it():
+def test_a_single_turn_source_is_declarable_only_against_the_contract_that_renders_it(
+    monkeypatch,
+):
+    # Declaration counts the source's rows, and this one is dataset-backed:
+    # stubbed so the test stays a unit test, which leaves the rule below --
+    # read off the PROFILE, not the environment -- exactly as it was.
+    from tests.unit.test_jobs_cli import stub_source_rows
+
+    stub_source_rows(monkeypatch, "openmathinstruct", 1000)
     # Single-turn environments render their own prompts, through the profile's
     # prompt template rather than through a renderer the manifest picks. So the
     # manifest may only NAME that template: a job declared against a profile
