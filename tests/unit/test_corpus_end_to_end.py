@@ -80,10 +80,10 @@ def _mount(entry, *, verify_signature=lambda request: True):
     """The production startup path: the store, the job id and the renderer are
     all derived from the declaration, not supplied by the test.
 
-    `verify_signature` is injected because the production default refuses
-    everything -- `protocol/signatures.py` carries no corpus binding yet -- and
-    a test of the rest of the wiring has to get past it. One test below pins
-    that default.
+    `verify_signature` is injected because the production default is the real
+    `verify_corpus_signature`, which fails closed on a fake hotkey like the
+    ones these tests submit -- a test of the rest of the wiring has to get
+    past it. One test below pins that default.
     """
     server = ValidatorServer()
     mounted = asyncio.run(
@@ -195,15 +195,25 @@ def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
     assert len(ledgers["seen"]) == SLOTS_PER_PROMPT + 1
 
 
-def test_the_startup_path_mounts_nothing_it_cannot_authenticate(bucket, registry):
-    """`protocol/signatures.py` carries no corpus binding, so the route is
-    wired with a verifier that refuses everything. The endpoint exists and
-    nothing can be admitted through it -- not a stub that accepts. The reason
-    says this validator cannot verify, not that the miner signed badly."""
+def test_the_startup_path_binds_the_real_corpus_verifier(
+    bucket, registry, monkeypatch
+):
+    """A caller that leaves `verify_signature` unset gets the real
+    `verify_corpus_signature`, not a stub -- proven by swapping that name for
+    one that accepts and watching the swap reach the mounted route."""
+    import reliquary.protocol.signatures as signatures
+
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
     entry = registry["entries"][TASK_ID]
     job, _ = asyncio.run(job_store.read_job(entry.job_id))
+
+    calls = []
+    monkeypatch.setattr(
+        signatures,
+        "verify_corpus_signature",
+        lambda request: calls.append(request) or True,
+    )
 
     server, mounted = _mount(entry, verify_signature=None)
     assert mounted is True
@@ -211,8 +221,8 @@ def test_the_startup_path_mounts_nothing_it_cannot_authenticate(bucket, registry
     with TestClient(server.app) as client:
         body = _submit(client, job, prompt_index=0, filler=1)
 
-    assert body["accepted"] is False
-    assert body["reason"] == "signature_unverifiable"
+    assert len(calls) == 1
+    assert body["accepted"] is True
 
 
 def test_a_declared_job_with_no_manifest_refuses_to_start(bucket, registry):

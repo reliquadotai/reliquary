@@ -1411,10 +1411,7 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
     """
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
-    from reliquary.validator.corpus_service import (
-        refuse_unsigned_corpus_submissions,
-        renderer_for_job,
-    )
+    from reliquary.validator.corpus_service import renderer_for_job
     from reliquary.validator.task_config import TaskConfigError
 
     if entry is None:
@@ -1446,13 +1443,9 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         return list(getattr(encoded, "ids", encoded))
 
     if verify_signature is None:
-        verify_signature = refuse_unsigned_corpus_submissions
-        logger.critical(
-            "corpus job %s is mounted but this binary has no corpus signature "
-            "binding, so EVERY submission is refused as signature_unverifiable "
-            "until one lands in protocol/signatures.py",
-            job.job_id,
-        )
+        from reliquary.protocol.signatures import verify_corpus_signature
+
+        verify_signature = verify_corpus_signature
     mounted = server.mount_corpus_router(
         entry,
         store=store,
