@@ -21,6 +21,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 import logging
+import time
 from typing import Any, Protocol
 
 from fastapi import APIRouter, HTTPException
@@ -47,6 +48,15 @@ from reliquary.validator.corpus_text import (
 logger = logging.getLogger(__name__)
 
 SUBMIT_PATH = "/corpus/submit"
+JOB_PATH = "/corpus/job"
+CURSOR_PATH = "/corpus/cursor/{hotkey}"
+
+# The record's own schema tag, so a reader of the bucket can tell what shape
+# to expect before it parses the rest of the document.
+RECORD_SCHEMA = "reliquary/corpus-submission-record/v1"
+# Mirrors `DEFAULT_WRITE_ATTEMPTS` below: a handful of rounds against a
+# transient bucket fault, not a queue a miner's request should block behind.
+RECORD_WRITE_ATTEMPTS = 3
 
 # Validators at different versions share one ledger object, and this repo ships
 # `:latest` behind Watchtower, so an older reader that IGNORED a field it did
@@ -542,6 +552,9 @@ def build_corpus_router(
     verify_signature,
     prompt_job_for=prompt_job_for_spec,
     max_write_attempts: int = DEFAULT_WRITE_ATTEMPTS,
+    records=None,
+    on_accepted=None,
+    proof_chunk_tokens: int | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -555,6 +568,70 @@ def build_corpus_router(
     prompt_fidelity = PromptFidelity(renderer=renderer, prompt_job_for=prompt_job_for)
     # Also exposed, so the mount can reach the check without the handler.
     router.prompt_fidelity = prompt_fidelity
+
+    async def _record_accepted(request: CorpusSubmissionRequest, served: str) -> None:
+        # After the ledger write, never before: a record without its slot would
+        # be paid for work the ledgers say never happened.
+        if records is None:
+            return
+        from reliquary.protocol.signatures import corpus_submission_id
+
+        submission_id = corpus_submission_id(request)
+        record = {
+            "schema": RECORD_SCHEMA,
+            "submission_id": submission_id,
+            "job_id": served,
+            "hotkey": request.miner_hotkey,
+            "cursor": request.cursor,
+            "prompt_index": request.prompt_index,
+            "rendered_prompt": request.rendered_prompt,
+            "received_at": time.time(),
+            "token_count": sum(len(c.tokens) for c in request.completions),
+            "completions": [c.model_dump() for c in request.completions],
+        }
+        written = False
+        for attempt in range(RECORD_WRITE_ATTEMPTS):
+            try:
+                written = await records.write_submission(served, submission_id, record)
+                break
+            except Exception:
+                logger.warning(
+                    "corpus record %s write attempt %d failed",
+                    submission_id[:12],
+                    attempt + 1,
+                )
+        else:
+            # The slot is consumed and the tokens go unpaid: the one loss this
+            # design accepts rather than paying for a record it cannot keep.
+            logger.critical(
+                "corpus record %s could not be written; its tokens go unpaid",
+                submission_id[:12],
+            )
+            return
+        if not written:
+            # Create-only store: False means this id already exists, almost
+            # always a resend of the same signed submission whose record is
+            # already queued -- not a fault, and not a second announcement.
+            logger.info("corpus record %s already recorded", submission_id[:12])
+            return
+        if on_accepted is not None:
+            on_accepted(submission_id)
+
+    @router.get(JOB_PATH)
+    async def corpus_job() -> dict:
+        job, _ = await store.read_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="corpus_job_unknown")
+        return job.to_contract()
+
+    @router.get(CURSOR_PATH)
+    async def corpus_cursor(hotkey: str) -> dict:
+        job, _ = await store.read_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="corpus_job_unknown")
+        snapshot, _ = await store.read_ledgers(job_id)
+        _, cursors, _ = rebuild_ledgers(job, snapshot)
+        return {"hotkey": hotkey, "cursor": cursors.expected(hotkey)}
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(
@@ -670,6 +747,8 @@ def build_corpus_router(
                 slots=slots,
                 cursors=cursors,
                 seen=seen,
+                proof_counts=[len(c.proofs) for c in request.completions],
+                proof_chunk_tokens=proof_chunk_tokens,
             )
             if verdict.accepted:
                 # `admit` reads `seen`, it does not grow it: recording what was
@@ -685,6 +764,8 @@ def build_corpus_router(
                 await store.write_ledgers(job_id, after, etag)
             except CorpusStoreConflict:
                 continue
+            if verdict.accepted:
+                await _record_accepted(request, job_id)
             return _respond(verdict)
 
         logger.warning(
@@ -700,13 +781,16 @@ def build_corpus_router(
 
 
 __all__ = [
+    "CURSOR_PATH",
     "CorpusPromptSourceError",
     "CorpusSignatureUnavailable",
     "EnvironmentPromptJob",
+    "JOB_PATH",
     "LEDGER_SCHEMA",
     "MAX_RESOLVED_PROMPT_SOURCES",
     "LedgerSnapshotError",
     "PromptFidelity",
+    "RECORD_SCHEMA",
     "SUBMIT_PATH",
     "SingleTurnPromptJob",
     "SingleTurnPromptRenderer",

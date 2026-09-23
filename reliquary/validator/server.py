@@ -6361,6 +6361,9 @@ class ValidatorServer:
         tokenizer: Any,
         renderer: Any,
         verify_signature: Callable[[Any], bool],
+        records: Any = None,
+        on_accepted: Callable[[str], None] | None = None,
+        proof_chunk_tokens: int | None = None,
     ) -> bool:
         """Serve corpus submissions, and only for a task that declares them.
 
@@ -6394,6 +6397,9 @@ class ValidatorServer:
                 tokenizer=tokenizer,
                 renderer=renderer,
                 verify_signature=verify_signature,
+                records=records,
+                on_accepted=on_accepted,
+                proof_chunk_tokens=proof_chunk_tokens,
             )
         )
         return True
