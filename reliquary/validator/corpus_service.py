@@ -16,6 +16,8 @@ reversible step.
 
 from __future__ import annotations
 
+import asyncio
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 import logging
 from typing import Any, Protocol
@@ -58,6 +60,11 @@ LEDGER_FIELDS = frozenset({"schema", "slots", "cursors", "seen"})
 # plenty; past that the miner is better served by a retryable failure than by
 # a request that never returns.
 DEFAULT_WRITE_ATTEMPTS = 4
+
+# Each resolved source holds a built environment, and a validator serves only a
+# handful of live jobs at once, so the cache is bounded rather than growing with
+# every job this process has ever seen.
+MAX_RESOLVED_PROMPT_SOURCES = 8
 
 
 class LedgerSnapshotError(Exception):
@@ -162,8 +169,19 @@ def prompt_job_for_spec(
     callers hold the result for the life of the job rather than per request.
     """
     spec = resolve_prompt_source(job.prompt_source, environments=environments)
-    environment = spec.create()
-    rows = len(environment)
+    try:
+        environment = spec.create()
+        rows = len(environment)
+    except CorpusPromptSourceError:
+        raise
+    except Exception as exc:
+        # A missing corpus directory or a broken wheel would otherwise reach
+        # the handler as a bare 500, which is the anonymous failure the named
+        # ledger and manifest errors already removed.
+        raise CorpusPromptSourceError(
+            f"prompt source {job.prompt_source!r} could not be built for job "
+            f"{job.job_id!r}: {type(exc).__name__}: {exc}"
+        ) from exc
     if rows < job.prompt_count:
         raise CorpusPromptSourceError(
             f"job {job.job_id!r} claims {job.prompt_count} prompts but "
@@ -179,30 +197,55 @@ class PromptFidelity:
     needs: the job's renderer and the environment its prompt source names.
     """
 
-    __slots__ = ("_renderer", "_prompt_job_for", "_jobs")
+    __slots__ = ("_renderer", "_prompt_job_for", "_jobs", "_max_jobs", "_lock")
 
-    def __init__(self, *, renderer: Renderer, prompt_job_for) -> None:
+    def __init__(
+        self,
+        *,
+        renderer: Renderer,
+        prompt_job_for,
+        max_jobs: int = MAX_RESOLVED_PROMPT_SOURCES,
+    ) -> None:
         self._renderer = renderer
         self._prompt_job_for = prompt_job_for
-        self._jobs: dict[str, Any] = {}
+        self._jobs: OrderedDict[str, Any] = OrderedDict()
+        self._max_jobs = max_jobs
+        self._lock = asyncio.Lock()
 
-    def __call__(
+    async def __call__(
         self, rendered: str, *, job: JobSpec, prompt_index: int
     ) -> CheckResult:
+        prompts = await self._prompt_job(job)
+        # The comparison itself is a render and a string equality, so it stays
+        # on the loop; only the build behind it does not.
         return check_prompt_fidelity(
             rendered,
-            job=self._prompt_job(job),
+            job=prompts,
             prompt_index=prompt_index,
             renderer=self._renderer,
         )
 
-    def _prompt_job(self, job: JobSpec):
-        # Resolving a source builds its environment, so it is done once per
-        # job rather than once per submission.
+    async def _prompt_job(self, job: JobSpec):
         cached = self._jobs.get(job.job_id)
-        if cached is None:
-            cached = self._prompt_job_for(job)
+        if cached is not None:
+            self._jobs.move_to_end(job.job_id)
+            return cached
+        # Resolving a source BUILDS its environment, and a dataset-backed one
+        # reads from disk: doing that on the loop would stall every other
+        # request this validator is serving, which is how `/state` froze once.
+        async with self._lock:
+            # Re-checked under the lock, so two first submissions for one job
+            # build it once rather than racing.
+            cached = self._jobs.get(job.job_id)
+            if cached is not None:
+                self._jobs.move_to_end(job.job_id)
+                return cached
+            cached = await asyncio.to_thread(self._prompt_job_for, job)
             self._jobs[job.job_id] = cached
+            while len(self._jobs) > self._max_jobs:
+                # Eviction costs one rebuild and never correctness: resolution
+                # is a pure function of the manifest.
+                self._jobs.popitem(last=False)
         return cached
 
 
@@ -359,7 +402,7 @@ def build_corpus_router(
                 {"prompt_count": job.prompt_count, "got": request.prompt_index},
             )
         try:
-            fidelity = prompt_fidelity(
+            fidelity = await prompt_fidelity(
                 request.rendered_prompt, job=job, prompt_index=request.prompt_index
             )
         except CorpusPromptSourceError as exc:
@@ -453,6 +496,7 @@ __all__ = [
     "CorpusPromptSourceError",
     "EnvironmentPromptJob",
     "LEDGER_SCHEMA",
+    "MAX_RESOLVED_PROMPT_SOURCES",
     "LedgerSnapshotError",
     "PromptFidelity",
     "SUBMIT_PATH",

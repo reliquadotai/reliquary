@@ -95,6 +95,40 @@ class _Spec:
         return self._environment
 
 
+class _BlockingSpec:
+    """A source whose build costs real time, the way a dataset-backed one does.
+
+    It records whether it was built with an event loop running in its own
+    thread, which is exactly the question: on the loop, or off it."""
+
+    interaction_mode = "episode"
+
+    def __init__(self, environment):
+        self._environment = environment
+        self.built_on_the_event_loop = None
+
+    def create(self):
+        import time
+
+        try:
+            asyncio.get_running_loop()
+            self.built_on_the_event_loop = True
+        except RuntimeError:
+            self.built_on_the_event_loop = False
+        time.sleep(0.05)
+        return self._environment
+
+
+class _UnbuildableSpec:
+    """A source that is installed and episode-mode but cannot be built — a
+    missing corpus directory, a broken wheel."""
+
+    interaction_mode = "episode"
+
+    def create(self):
+        raise RuntimeError("corpus shard is missing")
+
+
 class _CountingStore:
     """The real store bound to the fake bucket, counting ledger writes and
     able to lose a compare-and-swap race on demand."""
@@ -194,6 +228,28 @@ def client(fake_r2, seeded_job):
             renderer=seeded_job.renderer,
             verify_signature=lambda request: request.signature != "bad",
             prompt_job_for=seeded_job.prompt_job_for,
+        )
+    )
+    return TestClient(app)
+
+
+def _client_over(seeded_job, spec):
+    """The same router, over a prompt source the test supplies."""
+    from reliquary.validator.corpus_service import (
+        build_corpus_router,
+        prompt_job_for_spec,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            store=seeded_job.store,
+            tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer,
+            verify_signature=lambda request: True,
+            prompt_job_for=lambda job: prompt_job_for_spec(
+                job, environments={PROMPT_SOURCE: spec}
+            ),
         )
     )
     return TestClient(app)
@@ -565,6 +621,74 @@ def test_ledgers_written_under_another_schema_are_refused(client, seeded_job):
     assert response.json()["detail"] == "corpus_ledger_corrupt"
 
 
+def test_the_prompt_source_is_never_built_on_the_event_loop(seeded_job):
+    """Building a dataset-backed source reads from disk. Inside the handler
+    that stalls every other request this validator is serving, which is the
+    shape that froze `/state` once already."""
+    spec = _BlockingSpec(seeded_job.environment)
+    client = _client_over(seeded_job, spec)
+
+    assert _submit(client, tokens=[7] * 16 + [EOS]).json()["accepted"] is True
+    assert spec.built_on_the_event_loop is False
+
+
+def test_a_prompt_source_that_cannot_be_built_is_named_not_anonymous(seeded_job):
+    client = _client_over(seeded_job, _UnbuildableSpec())
+
+    response = _submit(client, tokens=[7] * 16 + [EOS])
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_prompt_source_unusable"
+
+
+def test_a_build_failure_carries_what_broke(seeded_job):
+    from reliquary.validator.corpus_service import (
+        CorpusPromptSourceError,
+        prompt_job_for_spec,
+    )
+
+    with pytest.raises(CorpusPromptSourceError, match="corpus shard is missing"):
+        prompt_job_for_spec(
+            seeded_job.job, environments={PROMPT_SOURCE: _UnbuildableSpec()}
+        )
+
+
+def test_only_a_bounded_number_of_prompt_sources_is_held(seeded_job):
+    """Each resolved source holds a built environment, so a cache keyed by job
+    id grows with every job this process has ever served."""
+    from reliquary.validator.corpus_service import (
+        MAX_RESOLVED_PROMPT_SOURCES,
+        PromptFidelity,
+        prompt_job_for_spec,
+    )
+
+    assert MAX_RESOLVED_PROMPT_SOURCES < 1000
+    built = []
+
+    def resolve(job):
+        built.append(job.job_id)
+        return prompt_job_for_spec(job, environments=seeded_job.environments())
+
+    fidelity = PromptFidelity(
+        renderer=seeded_job.renderer, prompt_job_for=resolve, max_jobs=2
+    )
+    jobs = [parse_job({**seeded_job.raw, "job_id": f"job-{i}"}) for i in range(3)]
+
+    async def visit(job):
+        return await fidelity(_faithful_prompt(0), job=job, prompt_index=0)
+
+    async def run():
+        for job in jobs:
+            assert (await visit(job)).ok
+        # The third arrival evicted the first, so it costs one rebuild.
+        assert (await visit(jobs[0])).ok
+        # The most recent two are still held.
+        assert (await visit(jobs[2])).ok
+
+    asyncio.run(run())
+
+    assert built == ["job-0", "job-1", "job-2", "job-0"]
+
+
 def test_the_prompt_source_resolves_to_the_job_s_own_rows(seeded_job):
     """The adapter `check_prompt_fidelity` needs: a JobSpec names a prompt
     source, and the environment behind that name supplies the rows."""
@@ -619,7 +743,18 @@ def test_the_router_carries_the_prompt_fidelity_seam(seeded_job):
     )
     job = seeded_job.job
 
-    assert router.prompt_fidelity("<prompt row-3>", job=job, prompt_index=3).ok
-    refused = router.prompt_fidelity("<prompt row-4>", job=job, prompt_index=3)
+    async def run():
+        # One loop for both, because the seam holds an asyncio.Lock and a
+        # second `asyncio.run` would hand it a different loop.
+        faithful = await router.prompt_fidelity(
+            "<prompt row-3>", job=job, prompt_index=3
+        )
+        refused = await router.prompt_fidelity(
+            "<prompt row-4>", job=job, prompt_index=3
+        )
+        return faithful, refused
+
+    faithful, refused = asyncio.run(run())
+    assert faithful.ok
     assert not refused.ok
     assert refused.reason == "prompt_not_faithful"
