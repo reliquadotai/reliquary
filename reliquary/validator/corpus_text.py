@@ -49,24 +49,36 @@ class PromptJob(Protocol):
     def task_for(self, prompt_index: int) -> EpisodeTask: ...
 
 
+# Adapting a real ``JobSpec`` (which names ``prompt_source`` but carries no
+# prompt text) plus the environment that name resolves to, into something
+# satisfying ``PromptJob``, is the calling endpoint's job, not this module's.
+
+
 def check_text_matches_tokens(
-    tokens: Sequence[int], text: str, *, tokenizer: Tokenizer
+    tokens: Sequence[int], text: str, *, tokenizer: Tokenizer, eos_token_id: int
 ) -> CheckResult:
     """Refuse a completion whose ``text`` is not what its ``tokens`` decode to.
 
-    Compared EXACTLY: no stripping, no whitespace normalisation, no
-    casefolding. A miner able to add characters the tokens do not contain
-    could inject arbitrary content into the corpus, which is the product
-    being sold, so relaxing this comparison would reopen the gap it exists
-    to close. ``skip_special_tokens`` and ``clean_up_tokenization_spaces``
-    are pinned to keep the tokenizer's own decode as literal as possible;
-    without them some tokenizers rewrite whitespace by default, which would
-    fail an honest submission for a reason that has nothing to do with the
-    text it sent.
+    Compared EXACTLY, with one narrow exception: the LAST token may be
+    dropped before decoding, and only if it equals ``eos_token_id``. Ordinary
+    generation (``skip_special_tokens=True``) never returns the terminator's
+    text at all, so requiring a miner to spell out ``<|endoftext|>`` would
+    reject the honest default at scale, and the corpus should not carry a
+    "stop" token embedded in its training text anyway. Nothing else is
+    stripped: the same id earlier in the array, or a different trailing
+    special token, must still appear in ``text``, or a miner is paid for
+    tokens that leave no trace in the product. Only the stripped spelling is
+    legal — accepting both forms would give one completion two valid
+    digests for the same work. ``skip_special_tokens`` and
+    ``clean_up_tokenization_spaces`` are pinned to keep the tokenizer's own
+    decode as literal as possible; without them some tokenizers rewrite
+    whitespace by default, which would fail an honest submission for a
+    reason that has nothing to do with the text it sent.
     """
 
+    body = tokens[:-1] if tokens and tokens[-1] == eos_token_id else tokens
     decoded = tokenizer.decode(
-        tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        body, skip_special_tokens=False, clean_up_tokenization_spaces=False
     )
     if decoded != text:
         return CheckResult(
