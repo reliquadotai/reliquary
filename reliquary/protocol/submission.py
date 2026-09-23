@@ -68,6 +68,8 @@ class RejectReason(str, Enum):
     PROMPT_FULL = "prompt_full"
     PROMPT_OUT_OF_RANGE = "prompt_out_of_range"
     GRAIL_FAIL = "grail_fail"
+    # The task's contract enforces toploc and the rollout's proofs failed it.
+    TOPLOC_FAIL = "toploc_fail"
     HASH_DUPLICATE = "hash_duplicate"
     LOGPROB_MISMATCH = "logprob_mismatch"
     REWARD_MISMATCH = "reward_mismatch"
