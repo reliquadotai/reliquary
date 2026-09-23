@@ -10,9 +10,11 @@ from reliquary.protocol.toploc import (
     MOD_N,
     ChunkProof,
     evaluate,
+    evaluate_batch,
     expected_chunks,
     injective_modulus,
     newton_coefficients,
+    newton_coefficients_batch,
 )
 
 
@@ -124,3 +126,28 @@ def test_expected_chunks(tokens, expected):
 def test_values_no_honest_builder_emits_are_refused(raw):
     with pytest.raises(ValueError):
         ChunkProof.from_bytes(raw)
+
+
+def test_batched_newton_matches_one_chunk_at_a_time():
+    rng = random.Random(11)
+    xs = [rng.sample(range(MOD_N), 128) for _ in range(5)]
+    ys = [[rng.randrange(1 << 16) for _ in range(128)] for _ in range(5)]
+    batched = newton_coefficients_batch(xs, ys)
+    assert [list(map(int, row)) for row in batched] == [
+        newton_coefficients(x, y) for x, y in zip(xs, ys)
+    ]
+
+
+def test_batched_newton_refuses_a_collision_in_any_chunk():
+    with pytest.raises(ValueError, match="collide"):
+        newton_coefficients_batch([[1, 2, 3], [4, 5, 4 + MOD_N]], [[0, 0, 0], [0, 0, 0]])
+
+
+def test_batched_evaluation_matches_one_chunk_at_a_time():
+    rng = random.Random(12)
+    coeffs = [[rng.randrange(MOD_N) for _ in range(128)] for _ in range(5)]
+    xs = [[rng.randrange(MOD_N) for _ in range(128)] for _ in range(5)]
+    batched = evaluate_batch(coeffs, xs)
+    assert [list(map(int, row)) for row in batched] == [
+        evaluate(c, x) for c, x in zip(coeffs, xs)
+    ]

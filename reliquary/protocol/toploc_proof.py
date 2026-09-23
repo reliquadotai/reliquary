@@ -9,7 +9,7 @@ a proof's bf16 bits would be meaningless.
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -18,34 +18,44 @@ from reliquary.protocol.toploc import (
     ChunkProof,
     ChunkResult,
     compare_bf16_bits,
+    evaluate_batch,
+    injective_modulus,
+    newton_coefficients_batch,
 )
 
 
-def _chunks(hidden: torch.Tensor, chunk_tokens: int) -> Iterator[torch.Tensor]:
+def _chunk_tops(
+    hidden: torch.Tensor, chunk_tokens: int, topk: int
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Each chunk's top-k indices by magnitude and the bf16 bits there."""
     if hidden.dim() != 2 or hidden.shape[0] == 0:
         raise ValueError(f"expected [rows, width] activations, got {tuple(hidden.shape)}")
     hidden = hidden.to(torch.bfloat16)
+    # One abs over the whole tensor: per chunk it cost ~60x more on CPU.
+    magnitude = hidden.abs()
+    all_indices, all_bits = [], []
     for start in range(0, hidden.shape[0], chunk_tokens):
-        yield hidden[start : start + chunk_tokens].reshape(-1)
-
-
-def _top(flat: torch.Tensor, topk: int) -> tuple[list[int], list[int]]:
-    if flat.numel() < topk:
-        raise ValueError(f"a chunk of {flat.numel()} activations cannot yield top-{topk}")
-    indices = flat.abs().topk(topk).indices
-    values = flat[indices].detach().to("cpu").contiguous()
-    bits = (values.view(torch.int16).to(torch.int32) & 0xFFFF).tolist()
-    return indices.to("cpu").tolist(), bits
+        flat = hidden[start : start + chunk_tokens].reshape(-1)
+        if flat.numel() < topk:
+            raise ValueError(f"a chunk of {flat.numel()} activations cannot yield top-{topk}")
+        indices = magnitude[start : start + chunk_tokens].reshape(-1).topk(topk).indices
+        values = flat[indices].detach().to("cpu").contiguous()
+        all_bits.append((values.view(torch.int16).to(torch.int32) & 0xFFFF).tolist())
+        all_indices.append(indices.to("cpu").tolist())
+    return all_indices, all_bits
 
 
 def build_chunk_proofs(
     hidden: torch.Tensor, *, chunk_tokens: int, topk: int
 ) -> list[bytes]:
-    proofs = []
-    for flat in _chunks(hidden, chunk_tokens):
-        indices, bits = _top(flat, topk)
-        proofs.append(ChunkProof.from_points(indices, bits).to_bytes())
-    return proofs
+    all_indices, all_bits = _chunk_tops(hidden, chunk_tokens, topk)
+    moduli = [injective_modulus(indices) for indices in all_indices]
+    reduced = [[i % m for i in indices] for indices, m in zip(all_indices, moduli)]
+    coeffs = newton_coefficients_batch(reduced, all_bits)
+    return [
+        ChunkProof(m, tuple(int(c) for c in row)).to_bytes()
+        for m, row in zip(moduli, coeffs)
+    ]
 
 
 def verify_chunk_proofs(
@@ -56,24 +66,35 @@ def verify_chunk_proofs(
     topk: int,
 ) -> list[ChunkResult]:
     """One result per chunk; an unreadable proof is a failing result, not an error."""
-    flats = list(_chunks(hidden, chunk_tokens))
-    if len(flats) != len(proofs):
-        raise ValueError(f"{len(proofs)} proofs for {len(flats)} chunks")
-    results = []
-    for flat, raw in zip(flats, proofs):
-        indices, bits = _top(flat, topk)
+    all_indices, all_bits = _chunk_tops(hidden, chunk_tokens, topk)
+    if len(all_indices) != len(proofs):
+        raise ValueError(f"{len(proofs)} proofs for {len(all_indices)} chunks")
+    parsed: dict[int, ChunkProof] = {}
+    for chunk, raw in enumerate(proofs):
         try:
             proof = ChunkProof.from_bytes(raw)
-            # Exactly topk coefficients, as an honest builder emits: checked
-            # before Horner, whose cost grows with every forged coefficient.
-            if len(proof.coeffs) != topk:
-                raise ValueError(f"{len(proof.coeffs)} coefficients, expected {topk}")
-            proof_bits = proof.values_at(indices)
         except ValueError:
-            results.append(ChunkResult(topk, NO_MANTISSA, NO_MANTISSA))
             continue
-        results.append(compare_bf16_bits(proof_bits, bits))
-    return results
+        # Exactly topk coefficients, as an honest builder emits: checked
+        # before Horner, whose cost grows with every forged coefficient.
+        if len(proof.coeffs) == topk:
+            parsed[chunk] = proof
+    readable = sorted(parsed)
+    values = (
+        evaluate_batch(
+            [parsed[c].coeffs for c in readable],
+            [[i % parsed[c].modulus for i in all_indices[c]] for c in readable],
+        )
+        if readable
+        else []
+    )
+    proof_bits = {c: [int(v) for v in row] for c, row in zip(readable, values)}
+    return [
+        compare_bf16_bits(proof_bits[c], all_bits[c])
+        if c in proof_bits
+        else ChunkResult(topk, NO_MANTISSA, NO_MANTISSA)
+        for c in range(len(proofs))
+    ]
 
 
 def completion_proofs_b64(

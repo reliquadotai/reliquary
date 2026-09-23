@@ -61,41 +61,56 @@ def newton_coefficients(xs: Sequence[int], ys: Sequence[int]) -> list[int]:
         raise ValueError("xs and ys must have the same length")
     if len(xs) == 0:
         raise ValueError("at least one point is required")
+    return [int(c) for c in newton_coefficients_batch([xs], [ys])[0]]
+
+
+def newton_coefficients_batch(xs, ys) -> np.ndarray:
+    """``newton_coefficients`` for every row at once: [chunks, points] in and
+    out, so a sequence's chunks cost one pass instead of one per chunk."""
     x = np.asarray(xs, dtype=np.int64)
     dd = np.asarray(ys, dtype=np.int64) % MOD_N
-    n = len(x)
+    if x.ndim != 2 or x.shape != dd.shape or x.shape[1] == 0:
+        raise ValueError("expected equal [chunks, points] arrays with points >= 1")
+    n = x.shape[1]
     for k in range(1, n):
-        denominator = (x[k:] - x[: n - k]) % MOD_N
+        denominator = (x[:, k:] - x[:, : n - k]) % MOD_N
         if (denominator == 0).any():
             raise ValueError("points collide in the field")
         # The right-hand side reads the previous pass before it is overwritten,
         # which is what the reference's descending loop achieves in place.
-        dd[k:] = ((dd[k:] - dd[k - 1 : n - 1]) % MOD_N * _INVERSES[denominator]) % MOD_N
+        dd[:, k:] = ((dd[:, k:] - dd[:, k - 1 : n - 1]) % MOD_N * _INVERSES[denominator]) % MOD_N
 
-    coeffs = np.zeros(n, dtype=np.int64)
-    factor = np.zeros(n, dtype=np.int64)
-    factor[0] = 1
+    coeffs = np.zeros_like(dd)
+    factor = np.zeros_like(dd)
+    factor[:, 0] = 1
     for i in range(n):
-        coeffs[: i + 1] = (coeffs[: i + 1] + dd[i] * factor[: i + 1]) % MOD_N
+        coeffs[:, : i + 1] = (coeffs[:, : i + 1] + dd[:, i : i + 1] * factor[:, : i + 1]) % MOD_N
         if i + 1 < n:
-            minus_xi = int((-x[i]) % MOD_N)
+            minus_xi = (-x[:, i : i + 1]) % MOD_N
             shifted = np.zeros_like(factor)
-            shifted[0] = (factor[0] * minus_xi) % MOD_N
-            shifted[1 : i + 2] = (factor[0 : i + 1] + factor[1 : i + 2] * minus_xi) % MOD_N
+            shifted[:, :1] = (factor[:, :1] * minus_xi) % MOD_N
+            shifted[:, 1 : i + 2] = (factor[:, : i + 1] + factor[:, 1 : i + 2] * minus_xi) % MOD_N
             factor = shifted
-    return [int(c) for c in coeffs]
+    return coeffs
 
 
 def evaluate(coeffs: Sequence[int], xs: Sequence[int]) -> list[int]:
     """Horner's method at every x, mod MOD_N, as ``evaluate_polynomials`` does."""
     if len(coeffs) == 0:
         raise ValueError("a polynomial needs at least one coefficient")
+    return [int(v) for v in evaluate_batch([coeffs], [xs])[0]]
+
+
+def evaluate_batch(coeffs, xs) -> np.ndarray:
+    """``evaluate`` for every row at once: row r of ``coeffs`` at row r of ``xs``."""
     c = np.asarray(coeffs, dtype=np.int64)
     x = np.asarray(xs, dtype=np.int64)
-    result = np.full(x.shape, c[-1], dtype=np.int64)
-    for coefficient in c[-2::-1]:
-        result = (result * x + coefficient) % MOD_N
-    return [int(v) for v in result % MOD_N]
+    if c.ndim != 2 or c.shape[1] == 0 or x.ndim != 2 or x.shape[0] != c.shape[0]:
+        raise ValueError("expected [polys, coeffs] and [polys, points] arrays")
+    result = np.repeat(c[:, -1:], x.shape[1], axis=1)
+    for j in range(c.shape[1] - 2, -1, -1):
+        result = (result * x + c[:, j : j + 1]) % MOD_N
+    return result % MOD_N
 
 
 @dataclass(frozen=True, slots=True)
