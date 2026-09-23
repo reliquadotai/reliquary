@@ -317,6 +317,9 @@ class ProtocolProfile:
         object.__setattr__(self, "proofs", tuple(self.proofs))
         if sum(1 for p in self.proofs if p.mode == "enforce") > 1:
             raise ValueError("a task enforces at most one proof scheme")
+        schemes = [p.scheme for p in self.proofs]
+        if len(schemes) != len(set(schemes)):
+            raise ValueError("a task names each proof scheme once")
 
     def to_generation_contract(self) -> dict[str, Any]:
         """Return a detached contract containing only JSON-native values."""
@@ -723,6 +726,27 @@ def enforced_proof(profile: ProtocolProfile) -> ProofProfile:
         if proof.mode == "enforce":
             return proof
     return ProofProfile(PROOF_SCHEME_GRAIL, "enforce")
+
+
+def toploc_proof(profile: ProtocolProfile) -> ProofProfile | None:
+    """The contract's toploc entry, whatever its mode."""
+    for proof in profile.proofs:
+        if proof.scheme == PROOF_SCHEME_TOPLOC:
+            return proof
+    return None
+
+
+def proof_rejection(
+    profile: ProtocolProfile, *, grail_passed: bool, toploc_passed: bool | None
+) -> str | None:
+    """Which enforced scheme refuses the rollout, if any; a shadow scheme never does.
+
+    ``toploc_passed`` is None when no toploc verdict exists, which refuses under
+    toploc enforcement: missing proofs are not a pass.
+    """
+    if enforced_proof(profile).scheme == PROOF_SCHEME_TOPLOC:
+        return None if toploc_passed is True else "toploc_fail"
+    return None if grail_passed else "grail_fail"
 
 
 _SAMPLING = SamplingProfile(
