@@ -311,8 +311,15 @@ def _corpus_entry_this_binary_can_resolve(job_id):
     )
 
 
-def _seed_manifest(job_id):
-    """The job the entry above names, written through the real store."""
+def _seed_manifest(job_id, *, renderer_id=None):
+    """The job the entry above names, written through the real store.
+
+    `renderer_id` defaults to the source's own declared one; a caller may
+    pass another name -- `build_job_manifest` does not check that an episode
+    job's `renderer_id` names a real renderer (only `renderer_for_job` does,
+    at startup), so this can seed a manifest that parses and declares
+    cleanly but cannot actually be rendered.
+    """
     from reliquary.cli.main import build_job_manifest
 
     source = _prompt_source(_template())
@@ -323,7 +330,7 @@ def _seed_manifest(job_id):
         checkpoint_sha256=CHECKPOINT,
         prompt_source=source,
         prompt_count=64,
-        renderer_id=ENVIRONMENT_SPECS[source].renderer_id,
+        renderer_id=ENVIRONMENT_SPECS[source].renderer_id if renderer_id is None else renderer_id,
         eos_token_id=EOS,
         slots_per_prompt=SLOTS_PER_PROMPT,
         temperature=1.0,
@@ -487,6 +494,57 @@ def test_a_corpus_renderer_that_cannot_build_exits_four_before_any_download(
         )
 
     monkeypatch.setattr(corpus_service, "renderer_for_job", _unrenderable)
+
+    # None of these may be reached: the renderer refusal must come first.
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download", lambda *a, **kw: pytest.fail("downloaded")
+    )
+    monkeypatch.setattr(
+        encoding, "checkpoint_fingerprint", lambda *a, **kw: pytest.fail("fingerprinted")
+    )
+    monkeypatch.setattr(modeling, "load_tokenizer", lambda *a, **kw: pytest.fail("tokenized"))
+    monkeypatch.setattr(
+        modeling, "load_text_generation_model", lambda *a, **kw: pytest.fail("loaded")
+    )
+
+    result = CliRunner().invoke(cli_module.app, ["validate"])
+
+    assert result.exit_code == 4, (result.output, result.exception)
+
+
+def test_a_corpus_job_naming_an_unknown_renderer_exits_four_before_any_download(
+    monkeypatch, bucket, registry
+):
+    """The test above stubs `renderer_for_job` itself to raise
+    `CorpusPromptSourceError`; it cannot prove the OTHER way a job's declared
+    renderer is unbuildable. `jobs create` never checks that an episode job's
+    `renderer_id` names a real renderer -- `build_job_manifest` only resolves
+    the prompt SOURCE, and an episode source's own renderer is unchecked
+    there (`resolve_prompt_source`'s docstring: "there is no second
+    authority to disagree with"). Only `renderer_for` checks the name, at
+    startup, and it raises a plain `ValueError`, not `CorpusPromptSourceError`
+    -- so this seeds a manifest with a name no renderer answers to and drives
+    the real `renderer_for_job` -> `renderer_for` chain, the only way to prove
+    that `ValueError` is caught too."""
+    from types import SimpleNamespace
+
+    import bittensor
+    import huggingface_hub
+    import reliquary.cli.main as cli_module
+    import reliquary.corpus.encoding as encoding
+    import reliquary.infrastructure.chain as chain
+    import reliquary.shared.modeling as modeling
+
+    _seed_manifest("swe-v1", renderer_id="no-such-renderer")
+    entry = _corpus_entry_this_binary_can_resolve("swe-v1")
+    registry["entries"] = {entry.task_id: entry}
+
+    monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
+
+    async def subtensor():
+        return SimpleNamespace()
+
+    monkeypatch.setattr(chain, "get_subtensor", subtensor)
 
     # None of these may be reached: the renderer refusal must come first.
     monkeypatch.setattr(

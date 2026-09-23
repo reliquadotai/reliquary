@@ -67,7 +67,7 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
     from reliquary.protocol.signatures import verify_corpus_signature
     from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
-    from reliquary.validator.corpus_service import CorpusPromptSourceError, renderer_for_job
+    from reliquary.validator.corpus_service import renderer_for_job
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
     store = BucketJobStore()
@@ -88,8 +88,16 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
 
     try:
         renderer = renderer_for_job(job, encode)
-    except CorpusPromptSourceError as exc:
-        raise RuntimeError(str(exc)) from exc
+    except ValueError as exc:
+        # `CorpusPromptSourceError` (an unbuildable/mismatched prompt source)
+        # is a `ValueError` subclass; an episode job's `renderer_id` naming no
+        # known renderer raises the same plain `ValueError` from `renderer_for`
+        # -- `jobs create` never checks that name either. One clause covers
+        # both: both are the job declaring a rendering this binary cannot do.
+        raise RuntimeError(
+            f"job {job.job_id!r} declares renderer {job.renderer_id!r} for "
+            f"prompt source {job.prompt_source!r}, which cannot be built: {exc}"
+        ) from exc
 
     directory = Path(snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision))
     refusal = startup_refusal(entry, job, ACTIVE_PROTOCOL_PROFILE, checkpoint_fingerprint(directory))
