@@ -12,6 +12,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from reliquary.protocol.toploc_wire import ProofB64
 from reliquary.shared.checkpoint_identity import canonical_checkpoint_identity
 from reliquary.shared.strict_json import strict_json_loads
 
@@ -103,6 +104,10 @@ class ProofInput(WireModel):
     rollout: dict[str, JsonValue]
     randomness: Annotated[str, Field(min_length=2, max_length=256, pattern=r"^(?:0x)?[0-9a-fA-F]+$")]
     seed_u_values: Annotated[list[Probability], Field(max_length=MAX_TOKENS)] | None
+    # Sent only when the task's contract names toploc; the spec is the
+    # validator's, from its contract, never the miner's.
+    toploc_proofs: Annotated[list[ProofB64], Field(max_length=MAX_TOKENS)] | None = None
+    toploc_spec: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def aligned(self):
@@ -111,9 +116,14 @@ class ProofInput(WireModel):
         return self
 
     def commit(self) -> dict:
-        return {"tokens": self.tokens,
-                "commitments": [x.model_dump() for x in self.commitments],
-                "rollout": self.rollout}
+        commit = {"tokens": self.tokens,
+                  "commitments": [x.model_dump() for x in self.commitments],
+                  "rollout": self.rollout}
+        if self.toploc_proofs is not None:
+            commit["toploc_proofs"] = list(self.toploc_proofs)
+        if self.toploc_spec is not None:
+            commit["toploc_spec"] = dict(self.toploc_spec)
+        return commit
 
 
 class ProofRequest(WireModel):
@@ -171,6 +181,12 @@ class ProofValues(WireModel):
     terminal_pick_cdf_miss: Probability | None
     natural_close_pick_ok: bool | None
     natural_close_pick_cdf_miss: Probability | None
+    toploc_checked: bool = False
+    toploc_passed: bool = False
+    toploc_reason: Annotated[str, Field(max_length=64)] | None = None
+    toploc_worst_exp: Count = 0
+    toploc_worst_mant_mean: Annotated[float, Field(ge=0)] = 0.0
+    toploc_worst_mant_median: Annotated[float, Field(ge=0)] = 0.0
 
     @model_validator(mode="after")
     def aligned(self):

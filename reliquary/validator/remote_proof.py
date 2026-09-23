@@ -410,7 +410,8 @@ class RemoteProofPool:
             for commit, seed_u_values in inputs:
                 payload = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
                                      rollout=commit.get("rollout") or {}, randomness=randomness,
-                                     seed_u_values=seed_u_values)
+                                     seed_u_values=seed_u_values,
+                                     toploc_proofs=commit.get("toploc_proofs"), toploc_spec=commit.get("toploc_spec"))
                 requests.append(ProofRequest(job_id=uuid.uuid4().hex, attempt=0,
                     worker_id=self.worker_id, session_id=self.health.session_id,
                     device_id=slot, runtime_hash=self.runtime_fingerprint["profile_hash"],
@@ -519,7 +520,8 @@ class ShadowProofPool:
                 # Freeze bytes before the admission thread annotates the rollout.
                 frozen = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
                                     rollout=commit.get("rollout") or {}, randomness=randomness,
-                                    seed_u_values=seed_u_values).model_copy(deep=True)
+                                    seed_u_values=seed_u_values,
+                                    toploc_proofs=commit.get("toploc_proofs"), toploc_spec=commit.get("toploc_spec")).model_copy(deep=True)
 
                 def compare():
                     try:
