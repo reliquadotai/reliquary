@@ -8,6 +8,7 @@ a proof's bf16 bits would be meaningless.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator, Sequence
 
 import torch
@@ -73,3 +74,23 @@ def verify_chunk_proofs(
             continue
         results.append(compare_bf16_bits(proof_bits, bits))
     return results
+
+
+def completion_proofs_b64(
+    hidden: torch.Tensor,
+    prompt_length: int,
+    total_length: int,
+    *,
+    chunk_tokens: int,
+    topk: int,
+) -> list[str]:
+    """Wire-ready proofs over the rows of a full-sequence forward that produced
+    the completion: positions prompt_length - 1 .. total_length - 2."""
+    if not 0 < prompt_length < total_length or hidden.shape[0] < total_length - 1:
+        raise ValueError(
+            f"no completion rows for prompt {prompt_length} in {total_length} tokens "
+            f"over {hidden.shape[0]} rows"
+        )
+    rows = hidden[prompt_length - 1 : total_length - 1]
+    proofs = build_chunk_proofs(rows, chunk_tokens=chunk_tokens, topk=topk)
+    return [base64.b64encode(proof).decode() for proof in proofs]

@@ -33,7 +33,9 @@ from reliquary.miner.checkpoint_identity import (
 from reliquary.protocol.profiles import (
     ACTIVE_PROTOCOL_PROFILE,
     to_generation_contract,
+    toploc_proof,
 )
+from reliquary.protocol.toploc_proof import completion_proofs_b64
 from reliquary.environment.registry import get_environment_spec
 from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.infrastructure import chain
@@ -1448,7 +1450,7 @@ class MiningEngine:
             )
             proof_version = GRAIL_PROOF_VERSION
 
-        return {
+        commit = {
             "tokens": all_tokens,
             "commitments": commitments,
             "proof_version": proof_version,
@@ -1457,3 +1459,11 @@ class MiningEngine:
             "beacon": {"randomness": randomness},
             "rollout": rollout_metadata,
         }
+        # The same final hidden states GRAIL just used: no extra forward.
+        toploc = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+        if toploc is not None:
+            commit["toploc_proofs"] = completion_proofs_b64(
+                hidden_states, prompt_length, len(all_tokens),
+                chunk_tokens=toploc.chunk_tokens, topk=toploc.topk,
+            )
+        return commit

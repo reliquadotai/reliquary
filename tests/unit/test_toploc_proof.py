@@ -1,11 +1,17 @@
 """Proofs over real tensors. Rows are the hidden states that produced the
 completion tokens; chunks of 32 rows, the last one possibly short."""
 
+import base64 as _b64
+
 import pytest
 import torch
 
 from reliquary.protocol.toploc import NO_MANTISSA
-from reliquary.protocol.toploc_proof import build_chunk_proofs, verify_chunk_proofs
+from reliquary.protocol.toploc_proof import (
+    build_chunk_proofs,
+    completion_proofs_b64,
+    verify_chunk_proofs,
+)
 
 KW = {"chunk_tokens": 32, "topk": 128}
 
@@ -68,3 +74,20 @@ def test_a_proof_with_the_wrong_number_of_coefficients_fails_closed():
     results = verify_chunk_proofs(hidden, proofs, **KW)
     assert results[0].exp_mismatches == 128
     assert results[0].mant_err_mean == NO_MANTISSA
+
+
+
+
+
+def test_completion_proofs_cover_exactly_the_completion_rows():
+    full = _hidden(rows=12 + 70, seed=3)        # 12 prompt tokens, 70 completion tokens
+    proofs = completion_proofs_b64(full, 12, 82, **KW)
+    assert len(proofs) == 3
+    rows = full[11:81]
+    assert [_b64.b64decode(p) for p in proofs] == build_chunk_proofs(rows, **KW)
+
+
+@pytest.mark.parametrize("prompt_length,total", [(0, 10), (10, 10), (5, 99)])
+def test_completion_proofs_refuse_impossible_bounds(prompt_length, total):
+    with pytest.raises(ValueError):
+        completion_proofs_b64(_hidden(rows=10), prompt_length, total, **KW)
