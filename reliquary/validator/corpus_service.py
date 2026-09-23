@@ -51,9 +51,11 @@ SUBMIT_PATH = "/corpus/submit"
 # Validators at different versions share one ledger object, and this repo ships
 # `:latest` behind Watchtower, so an older reader that IGNORED a field it did
 # not know would DELETE it on its next read-modify-write — silent loss on the
-# money object. So an unknown field is refused. `schema` is what lets a field be
-# added later without hard-failing every older validator on that job, and it can
-# only be introduced before a real job exists.
+# money object. So an unknown field is refused. `schema` does NOT buy
+# compatibility: `LEDGER_FIELDS` and `rebuild_ledgers` still hard-fail an older
+# reader on any new field. What it buys is a NAMED failure — "ledgers under
+# schema X, not Y" instead of a field list — and it can only be introduced
+# before a real job exists.
 LEDGER_SCHEMA = "reliquary/corpus-ledgers/v1"
 LEDGER_FIELDS = frozenset({"schema", "slots", "cursors", "seen"})
 
@@ -597,8 +599,10 @@ def build_corpus_router(
             )
 
         # The fidelity check indexes the prompt source, so a miner-controlled
-        # index is bounded before it can raise on the operator's behalf. This
-        # is the same rule `admit` applies, reached earlier.
+        # index is bounded before it can raise on the operator's behalf. On a
+        # `free` job this is the bound `admit` applies, reached earlier; on
+        # `miner_walk` `admit` compares against `walk_index` instead, which is
+        # a stricter rule inside this one.
         if request.prompt_index >= job.prompt_count:
             return _refuse(
                 CorpusRejectReason.PROMPT_MISMATCH,

@@ -350,15 +350,10 @@ def test_a_server_that_declines_the_mount_is_not_walked_past(bucket, registry):
     assert entry.job_id in str(caught.value)
 
 
-def test_the_validator_startup_path_serves_the_route(monkeypatch, bucket):
-    """`mount_corpus_service` can be perfect and the validator still serve
-    nothing: the call site has to pass the resolved ENTRY and the real server,
-    and a mistake there is silent -- its only evidence is a missing log line.
-
-    So this boots `validate --train` onto a corpus task with the RL machinery
-    mocked the way `test_remote_proof_controller` mocks it, and asks the
-    server that startup actually built whether the route is on it.
-    """
+def _boot_validate_on_a_corpus_task(monkeypatch):
+    """Run `validate` on a declared corpus task with the RL machinery mocked
+    the way `test_remote_proof_controller` mocks it: no CUDA, no model, no
+    chain, no HF. Returns the CLI result and the servers startup built."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -432,11 +427,49 @@ def test_the_validator_startup_path_serves_the_route(monkeypatch, bucket):
     monkeypatch.setattr(weights, "WeightOnlyValidator", WeightSetter)
 
     result = CliRunner().invoke(cli_module.app, ["validate", "--resume-from", f"sha:{REV}"])
+    return result, servers
+
+
+def test_the_validator_startup_path_serves_the_route(monkeypatch, bucket):
+    """`mount_corpus_service` can be perfect and the validator still serve
+    nothing: the call site has to pass the resolved ENTRY and the real server,
+    and a mistake there is silent -- its only evidence is a missing log line.
+
+    So this boots `validate --train` onto a corpus task and asks the server
+    that startup actually built whether the route is on it.
+    """
+    result, servers = _boot_validate_on_a_corpus_task(monkeypatch)
 
     assert result.exit_code == 0, (result.output, result.exception)
     assert len(servers) == 1
     paths = [getattr(route, "path", "") for route in servers[0].app.routes]
     assert "/corpus/submit" in paths
+
+
+def test_a_renderer_startup_cannot_build_exits_four_rather_than_traceback(
+    monkeypatch, bucket
+):
+    """`renderer_for_job` raises `CorpusPromptSourceError`, and the call site
+    caught only `TaskConfigError`. A renderer that disagrees with this
+    validator's own profile is exactly the failure an operator has to be told
+    about, and it arrived as a bare traceback instead of the CRITICAL line and
+    the exit code every other startup refusal uses."""
+    from reliquary.validator import corpus_service
+
+    def _refuse(job, encode, **kwargs):
+        raise corpus_service.CorpusPromptSourceError(
+            f"prompt source {job.prompt_source!r} renders through another template"
+        )
+
+    monkeypatch.setattr(corpus_service, "renderer_for_job", _refuse)
+
+    result, servers = _boot_validate_on_a_corpus_task(monkeypatch)
+
+    assert result.exit_code == 4, (result.output, result.exception)
+    # And nothing was served: a validator holding this task's share must not
+    # come up with the route half-mounted.
+    paths = [getattr(route, "path", "") for server in servers for route in server.app.routes]
+    assert "/corpus/submit" not in paths
 
 
 def test_the_mount_refuses_the_task_config_wrapper(bucket, registry):

@@ -59,7 +59,13 @@ class CursorLedger:
         for hotkey, cursor in snapshot.items():
             if not isinstance(hotkey, str) or not hotkey:
                 raise ValueError(f"unusable hotkey {hotkey!r} in cursor snapshot")
-            position = int(cursor)
+            # Not `int(cursor)`: that turns 1.5 into 1 and hands a miner a step
+            # it never took. A cursor this binary cannot read exactly is named.
+            if isinstance(cursor, bool) or not isinstance(cursor, int):
+                raise ValueError(
+                    f"cursor for {hotkey} is not a whole number: {cursor!r}"
+                )
+            position = cursor
             if position < 0:
                 raise ValueError(f"cursor for {hotkey} is negative: {position}")
             ledger._cursors[hotkey] = position

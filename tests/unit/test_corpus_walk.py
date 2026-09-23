@@ -72,3 +72,12 @@ def test_the_cursor_round_trips_through_a_snapshot():
 def test_a_broken_cursor_snapshot_is_refused(snapshot):
     with pytest.raises(ValueError):
         CursorLedger.from_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("cursor", [1.5, 2.0, True, "2"])
+def test_a_cursor_that_is_not_a_whole_number_is_refused_not_rounded(cursor):
+    """`int()` would silently turn 1.5 into 1 and hand that miner a step it
+    never took. A cursor is a position in a money ledger, so a snapshot this
+    binary cannot read exactly is named rather than coerced."""
+    with pytest.raises(ValueError):
+        CursorLedger.from_snapshot({"5Gx": cursor})

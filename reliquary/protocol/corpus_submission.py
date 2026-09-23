@@ -59,6 +59,9 @@ class CorpusRejectReason(str, Enum):
     # The prompt the miner says it conditioned on is not the source row the
     # job assigned to that slot, rendered by the job's own renderer.
     PROMPT_NOT_FAITHFUL = "prompt_not_faithful"
+    # RESERVED, no producer yet: spec §7 lists degeneracy/repetition as a
+    # free-tier check over `validator/rollout_patterns.py`, and the name is
+    # pinned here so the check lands under it rather than inventing a second.
     DEGENERATE = "degenerate"
 
 

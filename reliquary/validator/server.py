@@ -6369,9 +6369,10 @@ class ValidatorServer:
         what opens it is the same declaration that pays for it. An RL task, or
         the legacy fallback that has no entry at all, mounts nothing.
 
-        Called once at startup, before the loop this app is served on: the
-        router's fidelity seam holds an ``asyncio.Lock`` and a cache of built
-        prompt sources, so one process must hold exactly one of them.
+        Called once at startup, awaited ON the loop this app is then served
+        on: the router's fidelity seam holds an ``asyncio.Lock`` and a cache
+        of built prompt sources, so one process must hold exactly one of them,
+        on one loop.
 
         The supported caller is ``cli.main.mount_corpus_service``, which
         derives the renderer from the job's own manifest; a caller that

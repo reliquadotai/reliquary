@@ -1938,13 +1938,18 @@ def validate(
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,
             )
+            from reliquary.validator.corpus_service import CorpusPromptSourceError
+
             try:
                 # After the server exists and before it is served, so the
                 # route's one fidelity cache lives on the loop that answers.
                 await mount_corpus_service(
                     service.server, task_config.entry, tokenizer=tokenizer
                 )
-            except TaskConfigError as exc:
+            # `CorpusPromptSourceError` beside it, not under it: a renderer
+            # this validator's own profile does not declare is a declaration
+            # to fix, and on `TaskConfigError` alone it left as a traceback.
+            except (TaskConfigError, CorpusPromptSourceError) as exc:
                 logger.critical(
                     "%s; fix the declaration with `reliquary jobs` before "
                     "starting this validator",
