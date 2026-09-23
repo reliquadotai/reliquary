@@ -517,6 +517,7 @@ def build_job_manifest(
     threshold,
     prompt_order,
     deadline_round,
+    from_profile=None,
 ):
     """The manifest as the job store will hold it.
 
@@ -534,8 +535,12 @@ def build_job_manifest(
         )
     # A source whose rows the validator cannot render fails prompt fidelity on
     # every submission the job is ever paid for, so it is refused here rather
-    # than once per submission forever.
-    resolve_prompt_source(prompt_source)
+    # than once per submission forever. The profile checked against is the
+    # template the TASK is seeded from, not whichever one this CLI process
+    # happens to run: it is the one the fleet will render these prompts with.
+    resolve_prompt_source(
+        prompt_source, renderer_id=renderer_id, profile=from_profile
+    )
     return {
         "schema": JOB_SCHEMA,
         "job_id": job_id,
@@ -660,6 +665,9 @@ def jobs_create(
             prompt_source=prompt_source,
             prompt_count=prompt_count,
             renderer_id=renderer_id,
+            # The same template the entry's contract is built from, so the
+            # manifest is checked against the contract this command declares.
+            from_profile=from_profile,
             eos_token_id=eos_token_id,
             slots_per_prompt=slots_per_prompt,
             temperature=temperature,
@@ -1377,11 +1385,11 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
     its share of the pool and exposes no route, with a missing log line as the
     only evidence.
     """
-    from reliquary.environment.agentic.renderers import renderer_for
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
     from reliquary.validator.corpus_service import (
         refuse_unsigned_corpus_submissions,
+        renderer_for_job,
     )
     from reliquary.validator.task_config import TaskConfigError
 
@@ -1425,7 +1433,11 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         entry,
         store=store,
         tokenizer=tokenizer,
-        renderer=renderer_for(job.renderer_id, encode),
+        # The job's own source decides the renderer: this validator's active
+        # profile is its task contract, so a manifest naming a rendering that
+        # contract does not declare refuses the mount rather than serving
+        # prompts nobody declared.
+        renderer=renderer_for_job(job, encode),
         verify_signature=verify_signature,
     )
     if not mounted:

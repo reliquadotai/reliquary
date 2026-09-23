@@ -130,17 +130,111 @@ class EnvironmentPromptJob:
         self._environment = environment
 
     def task_for(self, prompt_index: int) -> EpisodeTask:
-        position = int(prompt_index)
-        if position < 0 or position >= self._job.prompt_count:
+        return self._environment.get_task(_owned_position(self._job, prompt_index))
+
+
+class SingleTurnPromptJob:
+    """The same shape over a single-turn environment, whose rows answer
+    ``get_problem`` and come back already rendered.
+
+    Both jobs satisfy one ``PromptJob``, so ``check_prompt_fidelity`` never
+    learns which mode it is serving: the difference between an episode prompt
+    and a single-turn one is entirely here and in the renderer beside it.
+    """
+
+    __slots__ = ("_job", "_environment")
+
+    def __init__(self, job: JobSpec, environment: Any) -> None:
+        self._job = job
+        self._environment = environment
+
+    def task_for(self, prompt_index: int) -> EpisodeTask:
+        # `get_problem` WRAPS its index with modulo, so an out-of-range index
+        # returns a valid prompt for a row this job does not own rather than
+        # raising. Bounding before the call is what makes that impossible.
+        position = _owned_position(self._job, prompt_index)
+        problem = self._environment.get_problem(position)
+        prompt = problem.get("prompt") if isinstance(problem, Mapping) else None
+        if not isinstance(prompt, str) or not prompt:
             raise CorpusPromptSourceError(
-                f"job {self._job.job_id!r} has {self._job.prompt_count} prompts; "
-                f"{position} is outside it"
+                f"prompt source {self._job.prompt_source!r} returned no prompt "
+                f"text for row {position}"
             )
-        return self._environment.get_task(position)
+        # The row's identity here is its index: fidelity compares the prompt
+        # text, and carrying the environment's own id would only add a way for
+        # a source to hand back something `EpisodeTask` refuses.
+        return EpisodeTask(
+            id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=()
+        )
+
+
+class SingleTurnPromptRenderer:
+    """The renderer half of the single-turn path: the prompt is already
+    rendered when the environment hands it over, so this hands it back.
+
+    It exists so both modes present the same two pieces — a task and a
+    renderer — to one check, rather than the check growing a branch.
+    """
+
+    @staticmethod
+    def initial_text(task: EpisodeTask) -> str:
+        return task.prompt
+
+
+def _owned_position(job: JobSpec, prompt_index: int) -> int:
+    """The index, or a refusal naming the job's own bound."""
+    position = int(prompt_index)
+    if position < 0 or position >= job.prompt_count:
+        raise CorpusPromptSourceError(
+            f"job {job.job_id!r} has {job.prompt_count} prompts; "
+            f"{position} is outside it"
+        )
+    return position
+
+
+def _declared_prompt_template_id(prompt_source: str, profile: Any | None) -> str:
+    """The id of the prompt template a profile renders this environment with.
+
+    ``None`` means the active profile, which under task isolation IS the corpus
+    task's contract. A profile id is accepted too, so `jobs create` can ask
+    about the contract it is declaring rather than the one its own process
+    happens to run.
+    """
+    from reliquary.protocol import profiles
+
+    if profile is None:
+        resolved = profiles.ACTIVE_PROTOCOL_PROFILE
+    elif isinstance(profile, str):
+        resolved = profiles.resolve_protocol_profile(profile)
+    else:
+        resolved = profile
+    profile_id = getattr(resolved, "profile_id", "?")
+    try:
+        environment_profile = resolved.environments[prompt_source]
+    except KeyError:
+        raise CorpusPromptSourceError(
+            f"profile {profile_id!r} declares no environment {prompt_source!r}, "
+            "so it says nothing about how that source's prompts are rendered"
+        ) from None
+    template = getattr(environment_profile, "prompt_template", None)
+    if template is None:
+        # Legacy profiles leave the prompt to environment-local concatenation,
+        # which has no id: there would be nothing for the manifest to name and
+        # nothing to check it against.
+        raise CorpusPromptSourceError(
+            f"profile {profile_id!r} declares no prompt template for "
+            f"{prompt_source!r}, so its prompts have no rendering rule a "
+            "manifest could pin"
+        )
+    return template.template_id
 
 
 def resolve_prompt_source(
-    prompt_source: str, *, environments: Mapping[str, Any] | None = None
+    prompt_source: str,
+    *,
+    environments: Mapping[str, Any] | None = None,
+    renderer_id: str | None = None,
+    profile: Any | None = None,
 ) -> Any:
     """The environment spec a prompt source names, or a named refusal.
 
@@ -148,6 +242,16 @@ def resolve_prompt_source(
     job whose source cannot be rendered refuses every submission it is ever
     paid for, and the operator should learn that at declaration rather than
     from a reject-reason counter.
+
+    ``renderer_id`` is the manifest's, and for a single-turn source it is
+    checked rather than trusted. Which of the two is authoritative has one
+    answer: the PROFILE is, because the environment renders its own rows
+    through it (`get_problem` -> `render_active_prompt`) and the manifest has
+    no say in that. So the manifest may only NAME that rendering, and a
+    manifest that names another one is refused here -- at declaration against
+    the contract being declared, and again wherever the job is served, against
+    the profile that validator actually runs. Two sources of truth for what the
+    miner was asked cannot be left to agree by construction.
     """
     specs = ENVIRONMENT_SPECS if environments is None else environments
     try:
@@ -157,27 +261,76 @@ def resolve_prompt_source(
             f"prompt source {prompt_source!r} is not an installed environment"
         ) from None
     mode = getattr(spec, "interaction_mode", None)
-    if mode != "episode":
-        # A single-turn environment answers `get_problem`, not `get_task`, and
-        # renders through `encode_prompt` rather than an episode renderer;
-        # that is a second fidelity path, and it does not exist yet.
+    if mode == "episode":
+        # An episode job's renderer IS its manifest's: both sides build it from
+        # `renderer_id` and render through it, so there is no second authority
+        # to disagree with.
+        return spec
+    if mode != "single_turn":
         raise CorpusPromptSourceError(
-            f"prompt source {prompt_source!r} is {mode!r}; prompt fidelity "
-            "needs an episode environment, whose rows render through "
-            "`initial_text`"
+            f"prompt source {prompt_source!r} is {mode!r}, which is neither an "
+            "episode environment nor a single-turn one"
+        )
+    if renderer_id is None:
+        raise CorpusPromptSourceError(
+            f"prompt source {prompt_source!r} is single-turn, so resolving it "
+            "needs the job's renderer_id: without it the profile's rendering "
+            "would go unchecked, which is the disagreement this refuses"
+        )
+    declared = _declared_prompt_template_id(prompt_source, profile)
+    if renderer_id != declared:
+        raise CorpusPromptSourceError(
+            f"prompt source {prompt_source!r} renders through prompt template "
+            f"{declared!r}, but the job declares renderer {renderer_id!r}; a "
+            "job whose renderer is not the one its prompts are rendered with "
+            "fails fidelity on every submission it is ever paid for"
         )
     return spec
 
 
+def renderer_for_job(
+    job: JobSpec,
+    encode,
+    *,
+    environments: Mapping[str, Any] | None = None,
+    profile: Any | None = None,
+) -> Any:
+    """The renderer this job's prompts are compared through.
+
+    The mode decides it, not the caller: an episode job renders through the
+    renderer its manifest names, while a single-turn job's rows arrive already
+    rendered and the only faithful renderer is the one that changes nothing.
+    """
+    from reliquary.environment.agentic.renderers import renderer_for
+
+    spec = resolve_prompt_source(
+        job.prompt_source,
+        environments=environments,
+        renderer_id=job.renderer_id,
+        profile=profile,
+    )
+    if getattr(spec, "interaction_mode", None) == "episode":
+        return renderer_for(job.renderer_id, encode)
+    return SingleTurnPromptRenderer()
+
+
 def prompt_job_for_spec(
-    job: JobSpec, *, environments: Mapping[str, Any] | None = None
-) -> EnvironmentPromptJob:
+    job: JobSpec,
+    *,
+    environments: Mapping[str, Any] | None = None,
+    profile: Any | None = None,
+) -> EnvironmentPromptJob | SingleTurnPromptJob:
     """Resolve a job's prompt source to the rows a fidelity check needs.
 
     Builds the environment, which for a real source reads a dataset — so
     callers hold the result for the life of the job rather than per request.
     """
-    spec = resolve_prompt_source(job.prompt_source, environments=environments)
+    spec = resolve_prompt_source(
+        job.prompt_source,
+        environments=environments,
+        renderer_id=job.renderer_id,
+        profile=profile,
+    )
     try:
         environment = spec.create()
         rows = len(environment)
@@ -196,7 +349,9 @@ def prompt_job_for_spec(
             f"job {job.job_id!r} claims {job.prompt_count} prompts but "
             f"{job.prompt_source!r} has {rows}"
         )
-    return EnvironmentPromptJob(job, environment)
+    if getattr(spec, "interaction_mode", None) == "episode":
+        return EnvironmentPromptJob(job, environment)
+    return SingleTurnPromptJob(job, environment)
 
 
 class PromptFidelity:
@@ -548,10 +703,13 @@ __all__ = [
     "LedgerSnapshotError",
     "PromptFidelity",
     "SUBMIT_PATH",
+    "SingleTurnPromptJob",
+    "SingleTurnPromptRenderer",
     "build_corpus_router",
     "ledger_snapshot",
     "prompt_job_for_spec",
     "rebuild_ledgers",
     "refuse_unsigned_corpus_submissions",
+    "renderer_for_job",
     "resolve_prompt_source",
 ]

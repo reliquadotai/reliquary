@@ -331,12 +331,22 @@ def test_a_manifest_on_a_renderable_source_is_built():
     assert _manifest()["prompt_source"] == "reliquary_stateful_tools_v1"
 
 
-def test_a_prompt_source_the_validator_cannot_render_is_refused_at_declaration():
-    # Single-turn environments render through `encode_prompt`, not through an
-    # episode renderer, so prompt fidelity has no path for them: every
-    # submission to such a job would be refused, forever.
+def test_a_single_turn_source_is_declarable_only_against_the_contract_that_renders_it():
+    # Single-turn environments render their own prompts, through the profile's
+    # prompt template rather than through a renderer the manifest picks. So the
+    # manifest may only NAME that template: a job declared against a profile
+    # that pins none, or under some other renderer, would be compared against a
+    # prompt nobody was ever asked.
     with pytest.raises(ValueError, match="openmathinstruct"):
         _manifest(prompt_source="openmathinstruct")
+
+    declared = _manifest(
+        prompt_source="openmathinstruct",
+        renderer_id="openmathinstruct-step-by-step-v1",
+        from_profile="qwen3-4b-base-dapo-reliquary-v1",
+    )
+
+    assert declared["prompt_source"] == "openmathinstruct"
 
 
 def test_a_prompt_source_that_is_not_installed_is_refused_at_declaration():
