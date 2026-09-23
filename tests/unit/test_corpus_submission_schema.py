@@ -131,3 +131,21 @@ def test_a_proof_must_be_bounded_base64(bad):
 def test_the_proof_reasons_have_their_names():
     assert CorpusRejectReason.BAD_PROOF_SHAPE.value == "bad_proof_shape"
     assert CorpusRejectReason.PROOF_FAIL.value == "proof_fail"
+
+
+def test_a_completion_cannot_carry_more_proofs_than_tokens():
+    with pytest.raises(ValidationError):
+        CorpusCompletion(**_completion(tokens=[1, 2], proofs=["/9kAAQ=="] * 3))
+
+
+def test_proof_bytes_are_bounded_by_the_completions_own_length():
+    # 344 base64 characters is one honest 128-point proof. Three tokens cannot
+    # need two of them, whatever the chunking.
+    proof = "A" * 344
+    with pytest.raises(ValidationError):
+        CorpusCompletion(**_completion(tokens=[1, 2, 3], proofs=[proof, proof]))
+
+
+@pytest.mark.parametrize("tokens,proofs", [(1, 1), (32, 1), (70, 3)])
+def test_honest_proof_volumes_fit(tokens, proofs):
+    CorpusCompletion(**_completion(tokens=list(range(1, tokens + 1)), proofs=["A" * 344] * proofs))

@@ -9,7 +9,14 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 
 # Ceilings the parser enforces before any check can run. The text bound is the
@@ -22,6 +29,12 @@ MAX_COMPLETIONS_PER_SUBMISSION = 64
 # sensibly ask for, and one proof per token is the finest chunking possible.
 MAX_PROOF_BYTES = 2 + 2 * 1024
 MAX_PROOF_B64_CHARS = 4 * ((MAX_PROOF_BYTES + 2) // 3)
+# One honest 128-point proof is 344 base64 characters; at the finest deployed
+# chunking (32 tokens) that is under 11 characters per token. A completion's
+# proofs are bounded by its own length, plus one chunk of rounding. A contract
+# with finer chunks or a larger topk must raise these.
+MAX_PROOF_CHARS_PER_TOKEN = 11
+PROOF_CHARS_SLACK = 344
 ProofB64 = Annotated[
     str,
     StringConstraints(pattern=r"^[A-Za-z0-9+/]*={0,2}$", max_length=MAX_PROOF_B64_CHARS),
@@ -69,6 +82,15 @@ class CorpusCompletion(BaseModel):
         if any(token < 0 for token in value):
             raise ValueError("token ids must not be negative")
         return value
+
+    @model_validator(mode="after")
+    def _proofs_fit_the_completion(self) -> "CorpusCompletion":
+        if len(self.proofs) > len(self.tokens):
+            raise ValueError("a completion carries more proofs than tokens")
+        budget = len(self.tokens) * MAX_PROOF_CHARS_PER_TOKEN + PROOF_CHARS_SLACK
+        if sum(len(proof) for proof in self.proofs) > budget:
+            raise ValueError(f"proofs exceed {budget} characters for this completion")
+        return self
 
 
 class CorpusSubmissionRequest(BaseModel):
