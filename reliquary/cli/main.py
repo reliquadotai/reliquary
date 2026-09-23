@@ -807,6 +807,65 @@ def jobs_list() -> None:
             typer.echo(f"{job_id:24s} declared by {entry.task_id}, NO MANIFEST")
 
 
+def _job_grader(job):
+    """The grader `--apply-filter` scores every completion with: the job's own
+    prompt source, at its own filter's threshold. Episode-mode sources cannot
+    grade a single completion text this way (there is no single-turn
+    `get_problem`/`compute_reward` for them), so this refuses instead of
+    grading wrongly."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.validator.corpus_service import _owned_position
+
+    if job.filter is None:
+        raise typer.BadParameter(f"job {job.job_id!r} has no filter to apply")
+    spec = ENVIRONMENT_SPECS[job.prompt_source]
+    if spec.interaction_mode == "episode":
+        raise typer.BadParameter(
+            f"prompt source {job.prompt_source!r} is episode-mode; "
+            "--apply-filter cannot grade a single completion text against it"
+        )
+    environment = spec.create()
+    threshold = job.filter.threshold
+
+    def grade(prompt_index: int, text: str) -> tuple[bool, float]:
+        problem = environment.get_problem(_owned_position(job, prompt_index))
+        reward = environment.compute_reward(problem, text)
+        return reward >= threshold, reward
+
+    return grade
+
+
+@jobs_app.command("export")
+def jobs_export(
+    job_id: str = typer.Argument(...),
+    out: str = typer.Option(..., "--out"),
+    apply_filter: bool = typer.Option(False, "--apply-filter"),
+    only_accepted: bool = typer.Option(False, "--only-accepted"),
+) -> None:
+    """Write the verified completions of a job as JSON lines."""
+    import json
+
+    from reliquary.corpus.export import export_rows
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+
+    async def _run() -> int:
+        job, _ = await job_store.read_job(job_id)
+        if job is None:
+            raise typer.BadParameter(f"no job {job_id!r}")
+        grade = _job_grader(job) if apply_filter else None
+        written = 0
+        with open(out, "w", encoding="utf-8") as handle:
+            async for row in export_rows(job=job, records=BucketRecordStore(), grade=grade):
+                if only_accepted and not row.get("accepted", True):
+                    continue
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                written += 1
+        return written
+
+    typer.echo(f"{asyncio.run(_run())} rows written to {out}")
+
+
 @jobs_app.command("fingerprint")
 def jobs_fingerprint(
     checkpoint: str = typer.Argument(..., help="HF repo id or local directory"),
