@@ -83,3 +83,25 @@ def test_a_bool_threshold_is_refused_on_read():
     contract["proofs"][0]["exp_mismatch_threshold"] = True
     with pytest.raises(ValueError):
         profile_from_contract(contract)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("chunk_tokens", 0),
+        ("chunk_tokens", -4),
+        ("topk", 0),
+        ("topk", -1),
+        ("exp_mismatch_threshold", -1),
+        ("mant_mean_threshold", -0.5),
+        ("mant_median_threshold", float("nan")),
+        ("mant_mean_threshold", float("inf")),
+        ("min_allowed_failures", -3),
+        ("ratio_allowed_failures", 5.0),
+        ("ratio_allowed_failures", -0.1),
+        ("topk", True),
+    ],
+)
+def test_a_toploc_value_that_would_fail_every_honest_miner_is_refused(field, value):
+    with pytest.raises(ValueError):
+        dataclasses.replace(TOPLOC_DEPLOYED_DEFAULTS, **{field: value})

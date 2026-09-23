@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -229,6 +230,26 @@ class ProofProfile:
             raise ValueError("a toploc proof must state every threshold")
         if self.scheme == PROOF_SCHEME_GRAIL and any(v is not None for v in values):
             raise ValueError("a grail proof takes no toploc fields")
+        if self.scheme == PROOF_SCHEME_TOPLOC:
+            self._check_toploc_ranges()
+
+    def _check_toploc_ranges(self) -> None:
+        """A value outside these ranges boots a task every honest miner fails."""
+        for name in ("chunk_tokens", "topk", "exp_mismatch_threshold", "min_allowed_failures"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a whole number, got {value!r}")
+        for name in ("mant_mean_threshold", "mant_median_threshold", "ratio_allowed_failures"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number, got {value!r}")
+        if self.chunk_tokens < 1 or self.topk < 1:
+            raise ValueError("chunk_tokens and topk must be at least 1")
+        if min(self.exp_mismatch_threshold, self.mant_mean_threshold,
+               self.mant_median_threshold, self.min_allowed_failures) < 0:
+            raise ValueError("thresholds must not be negative")
+        if not 0.0 <= self.ratio_allowed_failures <= 1.0:
+            raise ValueError("ratio_allowed_failures must be within [0, 1]")
 
     def thresholds(self):
         from reliquary.protocol.toploc import ToplocThresholds
