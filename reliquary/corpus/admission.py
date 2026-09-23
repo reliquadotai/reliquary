@@ -12,7 +12,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from reliquary.corpus.checks import (
+    CheckResult,
     check_completion_count,
+    check_proof_shape,
     check_duplicates,
     check_termination,
     check_token_budget,
@@ -44,6 +46,8 @@ def admit(
     slots: SlotLedger,
     cursors: CursorLedger,
     seen: AbstractSet[str],
+    proof_counts: Sequence[int] | None = None,
+    proof_chunk_tokens: int | None = None,
 ) -> Verdict:
     """Decide one submission, consuming a slot and a cursor step when earned.
 
@@ -52,7 +56,8 @@ def admit(
     the submitted token arrays, never copied from what the miner declared.
     Pass a declared label and ``check_termination`` degenerates back into the
     label check that was deliberately removed; pass declared digests and the
-    duplicate check is decorative.
+    duplicate check is decorative. ``proof_counts`` must likewise be the
+    lengths of the received proof lists, counted by the validator.
     """
     # The four sequences describe the same completions, so a disagreement in
     # length means some completion would be paid for without ever being checked.
@@ -64,6 +69,9 @@ def admit(
     }
     if len(set(lengths.values())) != 1:
         return Verdict(False, "malformed_submission", detail=lengths)
+
+    if proof_chunk_tokens is not None and proof_counts is None:
+        return Verdict(False, "malformed_submission", detail={"proof_counts": None})
 
     if slots.is_complete:
         return Verdict(False, "job_complete")
@@ -110,6 +118,11 @@ def admit(
             eos_token_id=job.eos_token_id,
         ),
         lambda: check_duplicates(digests, seen),
+        lambda: (
+            check_proof_shape(token_counts, proof_counts, proof_chunk_tokens)
+            if proof_chunk_tokens is not None
+            else CheckResult(ok=True)
+        ),
     ):
         result = check()
         if not result.ok:

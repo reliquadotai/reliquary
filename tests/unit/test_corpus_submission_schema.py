@@ -114,3 +114,20 @@ def test_the_response_carries_the_verdict_and_what_is_left():
         detail={"prompt_index": 42},
     )
     assert refused.accepted is False
+
+
+def test_a_completion_carries_base64_proofs():
+    completion = CorpusCompletion(**_completion(proofs=["/9kAAQ=="]))
+    assert completion.proofs == ["/9kAAQ=="]
+    assert CorpusCompletion(**_completion()).proofs == []
+
+
+@pytest.mark.parametrize("bad", ["not base64!", "A" * 5000])
+def test_a_proof_must_be_bounded_base64(bad):
+    with pytest.raises(ValidationError):
+        CorpusCompletion(**_completion(proofs=[bad]))
+
+
+def test_the_proof_reasons_have_their_names():
+    assert CorpusRejectReason.BAD_PROOF_SHAPE.value == "bad_proof_shape"
+    assert CorpusRejectReason.PROOF_FAIL.value == "proof_fail"

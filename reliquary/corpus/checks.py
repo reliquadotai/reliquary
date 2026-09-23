@@ -13,6 +13,7 @@ import hashlib
 from typing import Any
 
 from reliquary.corpus.job import Sampling
+from reliquary.protocol.toploc import expected_chunks
 
 TERMINATIONS = frozenset({"eos", "cap"})
 
@@ -135,4 +136,25 @@ def check_duplicates(digests: Sequence[str], seen: AbstractSet[str]) -> CheckRes
                 detail={"position": position, "digest": digest},
             )
         within.add(digest)
+    return _ok()
+
+
+def check_proof_shape(
+    token_counts: Sequence[int], proof_counts: Sequence[int], chunk_tokens: int
+) -> CheckResult:
+    """One proof per chunk of every completion, counted before any GPU work."""
+    if len(token_counts) != len(proof_counts):
+        return CheckResult(
+            ok=False,
+            reason="bad_proof_shape",
+            detail={"completions": len(token_counts), "proof_lists": len(proof_counts)},
+        )
+    for position, (tokens, proofs) in enumerate(zip(token_counts, proof_counts)):
+        expected = expected_chunks(tokens, chunk_tokens)
+        if proofs != expected:
+            return CheckResult(
+                ok=False,
+                reason="bad_proof_shape",
+                detail={"completion": position, "expected": expected, "got": proofs},
+            )
     return _ok()

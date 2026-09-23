@@ -131,3 +131,20 @@ def test_a_submission_that_repeats_itself_is_refused():
     assert result.ok is False
     assert result.reason == "hash_duplicate"
     assert result.detail == {"position": 1, "digest": same}
+
+
+from reliquary.corpus.checks import check_proof_shape
+
+
+def test_one_proof_per_chunk_passes():
+    assert check_proof_shape([32, 33, 70], [1, 2, 3], 32).ok
+
+
+def test_a_missing_proof_is_bad_shape():
+    result = check_proof_shape([33], [1], 32)
+    assert (result.ok, result.reason) == (False, "bad_proof_shape")
+    assert result.detail == {"completion": 0, "expected": 2, "got": 1}
+
+
+def test_counts_must_describe_the_same_completions():
+    assert check_proof_shape([10, 10], [1], 32).reason == "bad_proof_shape"

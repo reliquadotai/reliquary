@@ -7,9 +7,9 @@ Named ``corpus`` rather than ``batch``: ``BatchSubmissionRequest`` in
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 
 # Ceilings the parser enforces before any check can run. The text bound is the
@@ -18,6 +18,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MAX_COMPLETION_TOKENS = 131072
 MAX_COMPLETION_TEXT_CHARS = MAX_COMPLETION_TOKENS * 8
 MAX_COMPLETIONS_PER_SUBMISSION = 64
+# A chunk proof is 2 + 2 * topk bytes; 1024 covers any topk a contract could
+# sensibly ask for, and one proof per token is the finest chunking possible.
+MAX_PROOF_BYTES = 2 + 2 * 1024
+MAX_PROOF_B64_CHARS = 4 * ((MAX_PROOF_BYTES + 2) // 3)
+ProofB64 = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9+/]*={0,2}$", max_length=MAX_PROOF_B64_CHARS),
+]
 
 
 class CorpusRejectReason(str, Enum):
@@ -43,6 +51,8 @@ class CorpusRejectReason(str, Enum):
     BAD_TERMINATION = "bad_termination"
     HASH_DUPLICATE = "hash_duplicate"
     DEGENERATE = "degenerate"
+    BAD_PROOF_SHAPE = "bad_proof_shape"
+    PROOF_FAIL = "proof_fail"
 
 
 class CorpusCompletion(BaseModel):
@@ -51,6 +61,7 @@ class CorpusCompletion(BaseModel):
     tokens: list[int] = Field(min_length=1, max_length=MAX_COMPLETION_TOKENS)
     text: str = Field(max_length=MAX_COMPLETION_TEXT_CHARS)
     termination: Literal["eos", "cap"]
+    proofs: list[ProofB64] = Field(default_factory=list, max_length=MAX_COMPLETION_TOKENS)
 
     @field_validator("tokens")
     @classmethod
