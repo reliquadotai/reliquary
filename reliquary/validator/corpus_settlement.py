@@ -84,7 +84,8 @@ class CorpusSettler:
 
         now = self._clock()
         other_max = await self._archives.other_max(self._task_id)
-        if other_max != state["other_max_seen"]:
+        clock_changed = other_max != state["other_max_seen"]
+        if clock_changed:
             state["other_max_seen"], state["other_max_seen_at"] = other_max, now
 
         settled = set(state["settled"])
@@ -92,13 +93,29 @@ class CorpusSettler:
         window = choose_window(last_window=state["last_window"], other_max=other_max,
                                other_max_seen_at=state["other_max_seen_at"], now=now,
                                stall_seconds=self._stall)
-        if not new_ids or window is None:
+
+        if new_ids and window is not None:
+            verdicts = [await self._records.read_verdict(self._job_id, sid) for sid in new_ids]
+            rewards = rewards_for(verdicts, self._cap)
+            if rewards:
+                state["pending"] = {"window": window, "ids": new_ids, "rewards": rewards}
+                etag = await self._records.write_settlement(self._job_id, state, etag)
+                return await self._finish(state, etag)
+            # Every verdict this period failed (spec §7): no archive, the
+            # index does not move, but these ids must not be reconsidered
+            # forever, so mark them settled in this same CAS write.
+            state["settled"] = sorted(settled | set(new_ids))
+            await self._records.write_settlement(self._job_id, state, etag)
             return None
-        verdicts = [await self._records.read_verdict(self._job_id, sid) for sid in new_ids]
-        rewards = rewards_for(verdicts, self._cap)
-        state["pending"] = {"window": window, "ids": new_ids, "rewards": rewards}
-        etag = await self._records.write_settlement(self._job_id, state, etag)
-        return await self._finish(state, etag)
+
+        if clock_changed:
+            # Nothing settles this call, but other_max genuinely moved: CAS
+            # it in now. Otherwise the next call finds the persisted
+            # other_max_seen still stale, "changes" again, and keeps
+            # resetting the stall clock to "now" forever — the corpus is
+            # never paid again once the other task goes idle (§7b rule 3).
+            await self._records.write_settlement(self._job_id, state, etag)
+        return None
 
 
 class R2Archives:

@@ -135,6 +135,43 @@ def test_rl_weights_are_identical_with_and_without_the_corpus_task():
     assert both["C1"] > 0
 
 
+def test_the_stall_clock_persists_so_the_corpus_advances_after_one_more_rl_seal():
+    # Reproduces the wedge: other_max_seen/_at must be CAS-written even on a
+    # call that settles nothing, or every later call sees "other_max changed
+    # just now" forever and the corpus never advances again.
+    records = _Records({"1" * 64: _v("A", 10)})
+    archives = _Archives(46000)
+    assert asyncio.run(_settler(records, archives, now=0).settle_once()) == 46000
+    records.verdicts["2" * 64] = _v("A", 10)
+    # RL is already stalled 200s past t=0 with stall_seconds=100: advance alone.
+    assert asyncio.run(_settler(records, archives, now=200).settle_once()) == 46001
+    records.verdicts["3" * 64] = _v("A", 10)
+    archives.other = 46001  # RL seals once more, then stops forever
+    # other_max just changed (from the settler's point of view): too soon to
+    # call it a stall.
+    assert asyncio.run(_settler(records, archives, now=300).settle_once()) is None
+    # STALL has now elapsed since the settler first observed other_max=46001
+    # (at t=300): it must advance, not stay wedged on None forever.
+    assert asyncio.run(_settler(records, archives, now=1000).settle_once()) == 46002
+    assert archives.written[46002]["rewards_by_hotkey"] == pytest.approx({"A": 0.1})
+
+
+def test_an_all_failed_period_writes_no_archive_but_marks_ids_settled():
+    records = _Records({"1" * 64: _v("C", 9, ok=False)})
+    archives = _Archives(46000)
+    assert asyncio.run(_settler(records, archives).settle_once()) is None
+    assert archives.written == {}
+    assert records.state["settled"] == ["1" * 64]
+    assert records.state["last_window"] is None
+    assert records.state["pending"] is None
+
+    records.verdicts["2" * 64] = _v("A", 10)
+    assert asyncio.run(_settler(records, archives).settle_once()) == 46000
+    assert archives.written[46000]["rewards_by_hotkey"] == pytest.approx({"A": 0.1})
+    assert sorted(records.state["settled"]) == ["1" * 64, "2" * 64]
+    assert records.state["last_window"] == 46000
+
+
 def test_r2archives_other_max_excludes_its_own_task_and_is_none_when_no_other_task_has_windows():
     async def fake_list_task_ids(*, strict=False, **kw):
         return ["corpus-math", "default"]
