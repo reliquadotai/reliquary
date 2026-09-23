@@ -524,12 +524,17 @@ def build_job_manifest(
     reads a filter that is already built or already absent.
     """
     from reliquary.corpus.job import JOB_SCHEMA
+    from reliquary.validator.corpus_service import resolve_prompt_source
 
     if (grader_id is None) != (threshold is None):
         raise ValueError(
             "--grader-id and --threshold go together: a filter needs both, and "
             "a job that keeps every completion declares neither"
         )
+    # A source whose rows the validator cannot render fails prompt fidelity on
+    # every submission the job is ever paid for, so it is refused here rather
+    # than once per submission forever.
+    resolve_prompt_source(prompt_source)
     return {
         "schema": JOB_SCHEMA,
         "job_id": job_id,

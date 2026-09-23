@@ -76,19 +76,33 @@ def _client_error(code: str):
     return ClientError({"Error": {"Code": code}}, "PutObject")
 
 
+def _episode_sources(profile_id: str) -> list[str]:
+    """The profile's environments a corpus job may actually draw from.
+
+    `jobs create` refuses a prompt source prompt fidelity cannot render, and
+    only an episode environment renders through `initial_text`.
+    """
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.protocol.profiles import PROFILES
+
+    return sorted(
+        name
+        for name in PROFILES[profile_id].environments
+        if getattr(ENVIRONMENT_SPECS.get(name), "interaction_mode", None) == "episode"
+    )
+
+
 def _template() -> str:
     from reliquary.protocol.profiles import PROFILES
 
     for profile_id in sorted(PROFILES):
-        if len(PROFILES[profile_id].environments) >= 2:
+        if len(PROFILES[profile_id].environments) >= 2 and _episode_sources(profile_id):
             return profile_id
-    pytest.skip("no compiled profile declares two environments")
+    pytest.skip("no compiled profile declares two environments with a renderable one")
 
 
 def _prompt_source(template: str) -> str:
-    from reliquary.protocol.profiles import PROFILES
-
-    return sorted(PROFILES[template].environments)[0]
+    return _episode_sources(template)[0]
 
 
 def _rl_entry(task_id: str, cap: float):

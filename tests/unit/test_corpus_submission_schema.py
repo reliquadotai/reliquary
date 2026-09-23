@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from reliquary.protocol.corpus_submission import (
     MAX_COMPLETIONS_PER_SUBMISSION,
+    MAX_RENDERED_PROMPT_CHARS,
     MAX_COMPLETION_TEXT_CHARS,
     MAX_COMPLETION_TOKENS,
     CorpusCompletion,
@@ -28,6 +29,7 @@ def _request(**overrides):
         "cursor": 0,
         "prompt_index": 42,
         "checkpoint_sha256": "a" * 64,
+        "rendered_prompt": "<prompt row-42>",
         "completions": [_completion()],
         "signature": "de" * 32,
     }
@@ -55,6 +57,19 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
 
     assert CorpusRejectReason.TEXT_MISMATCH.value == REASON_TEXT_MISMATCH
 
+    from reliquary.validator.corpus_text import REASON_PROMPT_MISMATCH
+
+    assert CorpusRejectReason.PROMPT_NOT_FAITHFUL.value == REASON_PROMPT_MISMATCH
+
+
+def test_a_submission_without_the_prompt_it_conditioned_on_is_refused():
+    # Optional would mean bypassable: a miner omitting the field would switch
+    # prompt fidelity off for itself.
+    payload = _request()
+    payload.pop("rendered_prompt")
+    with pytest.raises(ValidationError):
+        CorpusSubmissionRequest(**payload)
+
 
 def test_an_unknown_field_is_refused():
     with pytest.raises(ValidationError):
@@ -72,6 +87,10 @@ def test_an_unknown_field_is_refused():
         {"checkpoint_sha256": "a" * 63},
         {"job_id": ""},
         {"miner_hotkey": ""},
+        # Prompt fidelity is a free-tier check, so the prompt it checks is not
+        # a field a miner may leave out or leave empty.
+        {"rendered_prompt": ""},
+        {"rendered_prompt": "x" * (MAX_RENDERED_PROMPT_CHARS + 1)},
     ],
 )
 def test_an_impossible_submission_is_refused(overrides):

@@ -22,6 +22,9 @@ from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
 
 EOS = 151645
 CHECKPOINT = "a" * 64
+# A real installed environment the fidelity adapter genuinely serves: episode
+# mode, procedural rows, no dataset and no network.
+PROMPT_SOURCE = "reliquary_stateful_tools_v1"
 
 
 def _manifest():
@@ -31,7 +34,7 @@ def _manifest():
         "checkpoint_repo": "org/Frozen",
         "checkpoint_revision": "abc123",
         "checkpoint_sha256": CHECKPOINT,
-        "prompt_source": "openmathinstruct",
+        "prompt_source": PROMPT_SOURCE,
         "prompt_count": 1000,
         "renderer_id": "reliquary-jsonl-tools-v1",
         "eos_token_id": EOS,
@@ -67,7 +70,7 @@ class _Renderer:
 class _Environment:
     """The prompt source, indexable without a dataset download."""
 
-    name = "openmathinstruct"
+    name = PROMPT_SOURCE
 
     def __init__(self, rows: int = 1000):
         self._rows = rows
@@ -128,6 +131,7 @@ class _SeededJob:
         self.renderer = renderer
         self.environment = environment
         self.raw = raw
+        self.prompt_job_calls = 0
 
     @property
     def job(self):
@@ -146,7 +150,14 @@ class _SeededJob:
         )
 
     def environments(self, environment=None):
-        return {"openmathinstruct": _Spec(environment or self.environment)}
+        return {PROMPT_SOURCE: _Spec(environment or self.environment)}
+
+    def prompt_job_for(self, job):
+        """The endpoint's seam, counting how often a job's source is resolved."""
+        from reliquary.validator.corpus_service import prompt_job_for_spec
+
+        self.prompt_job_calls += 1
+        return prompt_job_for_spec(job, environments=self.environments())
 
 
 @pytest.fixture
@@ -182,9 +193,15 @@ def client(fake_r2, seeded_job):
             tokenizer=_Tokenizer(),
             renderer=seeded_job.renderer,
             verify_signature=lambda request: request.signature != "bad",
+            prompt_job_for=seeded_job.prompt_job_for,
         )
     )
     return TestClient(app)
+
+
+def _faithful_prompt(prompt_index):
+    """What the job's own renderer makes of that slot's source row."""
+    return f"<prompt row-{prompt_index}>"
 
 
 def _text_for(tokens):
@@ -203,6 +220,7 @@ def _submit(
     prompt_index=0,
     cursor=0,
     signature="ok",
+    rendered_prompt=None,
 ):
     """Build through the wire model so the schema is exercised, not bypassed."""
     request = CorpusSubmissionRequest(
@@ -211,6 +229,9 @@ def _submit(
         cursor=cursor,
         prompt_index=prompt_index,
         checkpoint_sha256=CHECKPOINT,
+        rendered_prompt=(
+            _faithful_prompt(prompt_index) if rendered_prompt is None else rendered_prompt
+        ),
         completions=[
             {
                 "tokens": tokens,
@@ -230,9 +251,9 @@ def test_a_well_formed_submission_is_accepted_and_consumes_a_slot(client):
 
 
 def test_the_endpoint_derives_the_termination_from_the_tokens(client):
-    """A completion labelled "eos" whose last token is NOT the manifest's
-    eos_token_id must be refused. If the endpoint forwarded the declared
-    label, this passes and the check becomes decoration."""
+    """A completion labelled "eos" that neither ends on the terminator nor
+    reached the cap is a silent truncation, and is refused however it is
+    labelled — the endpoint never passes the label on."""
     body = _submit(client, tokens=[7] * 16 + [99], termination="eos").json()
     assert body["accepted"] is False
     assert "termination" in body["reason"]
@@ -241,8 +262,44 @@ def test_the_endpoint_derives_the_termination_from_the_tokens(client):
 def test_a_cap_label_on_an_eos_ending_completion_is_also_derived_away(client):
     """The other direction, so the test above cannot be passed by hardcoding
     "cap": a completion that really did end on EOS is accepted however it is
-    labelled, because the label never reaches the check."""
+    labelled. `admit()` has no parameter the label could travel through."""
     body = _submit(client, tokens=[7] * 16 + [EOS], termination="cap").json()
+    assert body["accepted"] is True
+
+
+def test_a_completion_below_the_floor_is_refused(client, seeded_job):
+    """`token_counts` is derived too, and nothing else in this file crosses
+    either budget bound: pin it to `min_new_tokens` and every other test here
+    stays green while a one-token completion gets paid."""
+    before = seeded_job.ledger_writes()
+    body = _submit(client, tokens=[7] * 8 + [EOS]).json()
+    assert body["accepted"] is False
+    assert body["reason"] == "token_budget_underrun"
+    assert body["detail"]["tokens"] == 9
+    assert seeded_job.ledger_writes() == before
+
+
+def test_the_cheapest_possible_completion_is_refused(client):
+    # One EOS token and empty text: what a pinned token count would buy.
+    body = _submit(client, tokens=[EOS], text="").json()
+    assert body["accepted"] is False
+    assert body["reason"] == "token_budget_underrun"
+    assert body["detail"]["tokens"] == 1
+
+
+def test_a_completion_over_the_budget_is_refused(client, seeded_job):
+    before = seeded_job.ledger_writes()
+    body = _submit(client, tokens=[7] * 4097).json()
+    assert body["accepted"] is False
+    assert body["reason"] == "token_budget_exceeded"
+    assert body["detail"]["tokens"] == 4097
+    assert seeded_job.ledger_writes() == before
+
+
+def test_a_completion_exactly_at_the_cap_without_eos_is_accepted(client):
+    # The other side of the same bound, so the test above cannot be satisfied
+    # by refusing everything long.
+    body = _submit(client, tokens=[7] * 4096).json()
     assert body["accepted"] is True
 
 
@@ -274,6 +331,7 @@ def test_a_submission_for_an_unknown_job_is_refused_without_touching_the_ledgers
         cursor=0,
         prompt_index=0,
         checkpoint_sha256=CHECKPOINT,
+        rendered_prompt=_faithful_prompt(0),
         completions=[{"tokens": [1], "text": "1", "termination": "cap"}],
         signature="ok",
     )
@@ -295,6 +353,7 @@ def test_a_job_id_that_could_never_name_a_job_is_refused_not_raised(
         cursor=0,
         prompt_index=0,
         checkpoint_sha256=CHECKPOINT,
+        rendered_prompt=_faithful_prompt(0),
         completions=[{"tokens": [1], "text": "1", "termination": "cap"}],
         signature="ok",
     )
@@ -384,34 +443,126 @@ def test_a_corrupt_ledger_snapshot_is_named_rather_than_a_bare_lookup_error(
     client, seeded_job
 ):
     """The store moves ledger snapshots as raw dicts and has no job in scope
-    to check them against, so this layer is the only one that can."""
-    from reliquary.validator.corpus_service import LedgerSnapshotError
+    to check them against, so this layer is the only one that can. It answers
+    with a name: a bare "Internal Server Error" is indistinguishable from a
+    bug, and the blast radius is every miner on the job."""
+    from reliquary.validator.corpus_service import LedgerSnapshotError, rebuild_ledgers
 
     seeded_job.seed_ledgers({"slots": {"99999999": 1}, "cursors": {}, "seen": []})
+    response = _submit(client, tokens=[7] * 16 + [EOS])
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_ledger_corrupt"
+
     with pytest.raises(LedgerSnapshotError) as caught:
-        _submit(client, tokens=[7] * 16 + [EOS])
+        rebuild_ledgers(seeded_job.job, {"slots": {"99999999": 1}})
     assert "swe-v1" in str(caught.value)
 
 
 def test_a_ledger_snapshot_with_a_field_this_binary_cannot_read_is_refused(
     client, seeded_job
 ):
-    # Slots we do not fully understand are slots we could sell twice.
-    from reliquary.validator.corpus_service import LedgerSnapshotError
-
+    # An older reader that ignored it would delete it on its next write.
     seeded_job.seed_ledgers({"slots": {}, "cursors": {}, "seen": [], "reserved": {}})
-    with pytest.raises(LedgerSnapshotError):
-        _submit(client, tokens=[7] * 16 + [EOS])
+    response = _submit(client, tokens=[7] * 16 + [EOS])
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_ledger_corrupt"
 
 
 def test_a_ledger_snapshot_carrying_a_digest_that_is_not_one_is_refused(
     client, seeded_job
 ):
-    from reliquary.validator.corpus_service import LedgerSnapshotError
-
     seeded_job.seed_ledgers({"slots": {}, "cursors": {}, "seen": [17]})
-    with pytest.raises(LedgerSnapshotError):
-        _submit(client, tokens=[7] * 16 + [EOS])
+    response = _submit(client, tokens=[7] * 16 + [EOS])
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_ledger_corrupt"
+
+
+def test_a_prompt_the_job_never_assigned_is_refused(client, seeded_job):
+    """Spec §7's prompt fidelity, now that the wire carries the prompt: a
+    miner answering an easier question than its slot names is not paid."""
+    before = seeded_job.ledger_writes()
+    body = _submit(
+        client,
+        tokens=[7] * 16 + [EOS],
+        rendered_prompt=_faithful_prompt(0) + "\nHint: the answer is 42.",
+    ).json()
+    assert body["accepted"] is False
+    assert body["reason"] == "prompt_not_faithful"
+    assert seeded_job.ledger_writes() == before
+
+
+def test_a_prompt_rendered_for_another_slot_is_refused(client):
+    body = _submit(
+        client, tokens=[7] * 16 + [EOS], prompt_index=3,
+        rendered_prompt=_faithful_prompt(4),
+    ).json()
+    assert body["accepted"] is False
+    assert body["reason"] == "prompt_not_faithful"
+
+
+def test_a_prompt_index_past_the_source_cannot_raise_out_of_the_adapter(client):
+    """The fidelity check indexes the prompt source with a number the miner
+    chose, so it has to be bounded before it reaches the environment."""
+    response = _submit(client, tokens=[7] * 16 + [EOS], prompt_index=5000)
+    assert response.status_code == 200
+    assert response.json()["reason"] == "prompt_mismatch"
+
+
+def test_the_prompt_source_is_resolved_once_per_job_not_once_per_request(
+    client, seeded_job
+):
+    # Resolving a real source builds its environment; doing it per submission
+    # would put a dataset load on the request path.
+    for index in range(3):
+        assert _submit(
+            client, tokens=[index] * 16 + [EOS], prompt_index=index
+        ).json()["accepted"] is True
+    assert seeded_job.prompt_job_calls == 1
+
+
+def test_a_refusal_that_moves_nothing_costs_no_ledger_write(client, seeded_job):
+    """A miner spraying junk must not bill a bucket write per attempt."""
+    before = seeded_job.ledger_writes()
+    for _ in range(5):
+        assert _submit(client, tokens=[7] * 16 + [99]).json()["accepted"] is False
+    assert seeded_job.ledger_writes() == before
+
+
+def test_a_manifest_that_no_longer_parses_is_named_not_called_unknown(
+    client, seeded_job, _r2_client
+):
+    """`JobError` subclasses `ValueError`, so dropping its clause would
+    disguise an operator's corrupt manifest as a miner's unknown job."""
+    _r2_client.objects["reliquary/corpus/jobs/swe-v1.json"] = (
+        b'{"schema": "nope"}',
+        '"tampered"',
+    )
+    response = _submit(client, tokens=[7] * 16 + [EOS])
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_job_manifest_corrupt"
+
+
+def test_the_ledger_object_carries_the_schema_it_was_written_under(
+    client, seeded_job, _r2_client
+):
+    """Independently-operated validators share this object; without a marker,
+    a later field could only be added by breaking every older reader."""
+    import json
+
+    from reliquary.validator.corpus_service import LEDGER_SCHEMA
+
+    assert _submit(client, tokens=[7] * 16 + [EOS]).json()["accepted"] is True
+    body, _ = _r2_client.objects["reliquary/corpus/jobs/swe-v1/ledgers.json"]
+    assert json.loads(body)["schema"] == LEDGER_SCHEMA
+
+
+def test_ledgers_written_under_another_schema_are_refused(client, seeded_job):
+    seeded_job.seed_ledgers(
+        {"schema": "reliquary/corpus-ledgers/v2", "slots": {}, "cursors": {}, "seen": []}
+    )
+    response = _submit(client, tokens=[7] * 16 + [EOS])
+    assert response.status_code == 500
+    assert response.json()["detail"] == "corpus_ledger_corrupt"
 
 
 def test_the_prompt_source_resolves_to_the_job_s_own_rows(seeded_job):
@@ -434,7 +585,7 @@ def test_a_prompt_source_that_is_not_an_installed_environment_is_named(seeded_jo
 
     with pytest.raises(CorpusPromptSourceError) as caught:
         prompt_job_for_spec(seeded_job.job, environments={})
-    assert "openmathinstruct" in str(caught.value)
+    assert PROMPT_SOURCE in str(caught.value)
 
 
 def test_a_prompt_source_shorter_than_the_manifest_claims_is_refused(seeded_job):

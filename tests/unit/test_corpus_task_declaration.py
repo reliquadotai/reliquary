@@ -297,3 +297,48 @@ def test_an_explicit_floor_that_contradicts_the_pin_is_refused():
     # keeps closing; the price of a corpus task is the cap, by construction.
     with pytest.raises(ValueError, match="floor"):
         _build(overrides={"floor": 0.05})
+
+
+def _manifest(**overrides):
+    from reliquary.cli.main import build_job_manifest
+
+    kwargs = dict(
+        job_id="swe-v1",
+        checkpoint_repo="org/Frozen",
+        checkpoint_revision="abc123",
+        checkpoint_sha256="a" * 64,
+        prompt_source="reliquary_stateful_tools_v1",
+        prompt_count=1000,
+        renderer_id="reliquary-jsonl-tools-v1",
+        eos_token_id=151645,
+        slots_per_prompt=8,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        min_new_tokens=16,
+        max_new_tokens=4096,
+        n=1,
+        grader_id=None,
+        threshold=None,
+        prompt_order="free",
+        deadline_round=None,
+    )
+    kwargs.update(overrides)
+    return build_job_manifest(**kwargs)
+
+
+def test_a_manifest_on_a_renderable_source_is_built():
+    assert _manifest()["prompt_source"] == "reliquary_stateful_tools_v1"
+
+
+def test_a_prompt_source_the_validator_cannot_render_is_refused_at_declaration():
+    # Single-turn environments render through `encode_prompt`, not through an
+    # episode renderer, so prompt fidelity has no path for them: every
+    # submission to such a job would be refused, forever.
+    with pytest.raises(ValueError, match="openmathinstruct"):
+        _manifest(prompt_source="openmathinstruct")
+
+
+def test_a_prompt_source_that_is_not_installed_is_refused_at_declaration():
+    with pytest.raises(ValueError, match="not-an-environment"):
+        _manifest(prompt_source="not-an-environment")

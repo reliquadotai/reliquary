@@ -38,7 +38,6 @@ def admit(
     prompt_index: int,
     checkpoint_sha256: str,
     token_counts: Sequence[int],
-    terminations: Sequence[str],
     last_token_ids: Sequence[int],
     digests: Sequence[str],
     slots: SlotLedger,
@@ -47,18 +46,21 @@ def admit(
 ) -> Verdict:
     """Decide one submission, consuming a slot and a cursor step when earned.
 
-    REQUIRED of the caller: ``token_counts``, ``terminations``,
-    ``last_token_ids`` and ``digests`` must be derived by the validator from
-    the submitted token arrays, never copied from what the miner declared.
-    Pass a declared label and ``check_termination`` degenerates back into the
-    label check that was deliberately removed; pass declared digests and the
-    duplicate check is decorative.
+    REQUIRED of the caller: ``token_counts``, ``last_token_ids`` and
+    ``digests`` must be derived by the validator from the submitted token
+    arrays, never copied from what the miner declared. Pass declared digests
+    and the duplicate check is decorative.
+
+    These are facts about the tokens, never a label ABOUT them: there is no
+    ``terminations`` parameter, so "the caller forwarded the miner's declared
+    termination" is unrepresentable rather than merely tested for.
+    ``check_termination`` derives the label from ``last_token_ids`` and the
+    job's ``eos_token_id``.
     """
-    # The four sequences describe the same completions, so a disagreement in
+    # The three sequences describe the same completions, so a disagreement in
     # length means some completion would be paid for without ever being checked.
     lengths = {
         "token_counts": len(token_counts),
-        "terminations": len(terminations),
         "digests": len(digests),
         "last_token_ids": len(last_token_ids),
     }
@@ -103,7 +105,6 @@ def admit(
         lambda: check_completion_count(len(token_counts), job.sampling),
         lambda: check_token_budget(token_counts, job.sampling),
         lambda: check_termination(
-            terminations,
             token_counts,
             last_token_ids,
             sampling=job.sampling,

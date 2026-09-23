@@ -2,12 +2,12 @@
 
 This module is where the validator's own view of a submission is built.
 ``admit()`` decides, but it decides on numbers, and those numbers are this
-module's obligation: ``token_counts``, ``terminations``, ``last_token_ids``
-and ``digests`` are all derived here from the submitted token arrays. Nothing
-the miner *declares* about its completions is forwarded — forward the
-termination label and ``check_termination`` collapses back into the label
-check that was deliberately removed, forward a digest and the duplicate check
-becomes decoration.
+module's obligation: ``token_counts``, ``last_token_ids`` and ``digests`` are
+all derived here from the submitted token arrays. Nothing the miner *declares*
+about its completions is forwarded — forward a digest and the duplicate check
+becomes decoration. ``CorpusCompletion.termination`` is carried on the wire and
+deliberately never read: the label the miner puts on its own work is a claim,
+and ``check_termination`` derives the truth from the tokens instead.
 
 Its own module rather than a handler inside ``server.py``: the corpus path
 shares no state with the RL window machinery, and mounting is a separate,
@@ -45,10 +45,14 @@ logger = logging.getLogger(__name__)
 
 SUBMIT_PATH = "/corpus/submit"
 
-# The ledger object's whole vocabulary. An unknown field is refused rather
-# than ignored: a snapshot this binary cannot fully read may describe slots it
-# is about to sell a second time.
-LEDGER_FIELDS = frozenset({"slots", "cursors", "seen"})
+# Validators at different versions share one ledger object, and this repo ships
+# `:latest` behind Watchtower, so an older reader that IGNORED a field it did
+# not know would DELETE it on its next read-modify-write — silent loss on the
+# money object. So an unknown field is refused. `schema` is what lets a field be
+# added later without hard-failing every older validator on that job, and it can
+# only be introduced before a real job exists.
+LEDGER_SCHEMA = "reliquary/corpus-ledgers/v1"
+LEDGER_FIELDS = frozenset({"schema", "slots", "cursors", "seen"})
 
 # Contention is a two-writer race, not a queue, so a handful of rounds is
 # plenty; past that the miner is better served by a retryable failure than by
@@ -65,8 +69,12 @@ class LedgerSnapshotError(Exception):
     """
 
 
-class CorpusPromptSourceError(Exception):
-    """The job's ``prompt_source`` cannot be resolved to the rows it claims."""
+class CorpusPromptSourceError(ValueError):
+    """The job's ``prompt_source`` cannot be resolved to the rows it claims.
+
+    A ``ValueError`` so that `jobs create`, which already refuses a manifest on
+    ``ValueError``, rejects such a source at declaration.
+    """
 
 
 class CorpusJobStore(Protocol):
@@ -115,6 +123,36 @@ class EnvironmentPromptJob:
         return self._environment.get_task(position)
 
 
+def resolve_prompt_source(
+    prompt_source: str, *, environments: Mapping[str, Any] | None = None
+) -> Any:
+    """The environment spec a prompt source names, or a named refusal.
+
+    Separate from building it, because `jobs create` applies the same rule: a
+    job whose source cannot be rendered refuses every submission it is ever
+    paid for, and the operator should learn that at declaration rather than
+    from a reject-reason counter.
+    """
+    specs = ENVIRONMENT_SPECS if environments is None else environments
+    try:
+        spec = specs[prompt_source]
+    except KeyError:
+        raise CorpusPromptSourceError(
+            f"prompt source {prompt_source!r} is not an installed environment"
+        ) from None
+    mode = getattr(spec, "interaction_mode", None)
+    if mode != "episode":
+        # A single-turn environment answers `get_problem`, not `get_task`, and
+        # renders through `encode_prompt` rather than an episode renderer;
+        # that is a second fidelity path, and it does not exist yet.
+        raise CorpusPromptSourceError(
+            f"prompt source {prompt_source!r} is {mode!r}; prompt fidelity "
+            "needs an episode environment, whose rows render through "
+            "`initial_text`"
+        )
+    return spec
+
+
 def prompt_job_for_spec(
     job: JobSpec, *, environments: Mapping[str, Any] | None = None
 ) -> EnvironmentPromptJob:
@@ -123,21 +161,7 @@ def prompt_job_for_spec(
     Builds the environment, which for a real source reads a dataset — so
     callers hold the result for the life of the job rather than per request.
     """
-    specs = ENVIRONMENT_SPECS if environments is None else environments
-    try:
-        spec = specs[job.prompt_source]
-    except KeyError:
-        raise CorpusPromptSourceError(
-            f"job {job.job_id!r} names prompt source {job.prompt_source!r}, "
-            "which is not an installed environment"
-        ) from None
-    if getattr(spec, "interaction_mode", None) != "episode":
-        # A single-turn environment answers `get_problem`, not `get_task`, and
-        # its prompt is rendered by `encode_prompt` rather than by an episode
-        # renderer; that is a second fidelity path, not this one.
-        raise CorpusPromptSourceError(
-            f"prompt source {job.prompt_source!r} is not an episode environment"
-        )
+    spec = resolve_prompt_source(job.prompt_source, environments=environments)
     environment = spec.create()
     rows = len(environment)
     if rows < job.prompt_count:
@@ -151,10 +175,8 @@ def prompt_job_for_spec(
 class PromptFidelity:
     """Spec §7's prompt-fidelity check, bound to a job's renderer and source.
 
-    NOT called by the submission handler: ``CorpusSubmissionRequest`` carries
-    completions only, so there is no rendered prompt to compare the job's own
-    rendering against. It is bound here because this is the only place holding
-    both halves the check needs, and it is exercised directly by its tests.
+    Bound here because this is the only place that holds both halves the check
+    needs: the job's renderer and the environment its prompt source names.
     """
 
     __slots__ = ("_renderer", "_prompt_job_for", "_jobs")
@@ -207,6 +229,14 @@ def rebuild_ledgers(
         raise LedgerSnapshotError(
             f"job {job.job_id!r} has ledger fields this binary cannot read: {unknown}"
         )
+    # Absent on the empty read that precedes a job's first write, and on any
+    # object written before the marker existed.
+    schema = snapshot.get("schema", LEDGER_SCHEMA)
+    if schema != LEDGER_SCHEMA:
+        raise LedgerSnapshotError(
+            f"job {job.job_id!r} has ledgers under schema {schema!r}, "
+            f"not {LEDGER_SCHEMA!r}"
+        )
     try:
         slots = SlotLedger.from_snapshot(
             job.prompt_count, job.slots_per_prompt, snapshot.get("slots") or {}
@@ -233,6 +263,7 @@ def ledger_snapshot(
     here rather than by the encoder, so a snapshot compares equal to the one
     that comes back out of the bucket."""
     return {
+        "schema": LEDGER_SCHEMA,
         "slots": {str(index): count for index, count in slots.snapshot().items()},
         "cursors": cursors.snapshot(),
         "seen": sorted(seen),
@@ -285,11 +316,9 @@ def build_corpus_router(
     """The corpus submission endpoint, over an already-bound job store."""
 
     router = APIRouter()
-    # The fidelity seam, bound where both the renderer and the prompt source
-    # are in scope. See `PromptFidelity` for why the handler cannot call it.
-    router.prompt_fidelity = PromptFidelity(
-        renderer=renderer, prompt_job_for=prompt_job_for
-    )
+    prompt_fidelity = PromptFidelity(renderer=renderer, prompt_job_for=prompt_job_for)
+    # Also exposed, so the mount can reach the check without the handler.
+    router.prompt_fidelity = prompt_fidelity
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(
@@ -302,10 +331,16 @@ def build_corpus_router(
 
         try:
             job, _ = await store.read_job(request.job_id)
-        except JobError:
+        except JobError as exc:
             # A manifest in the bucket that no longer parses is an operator
-            # fault, and calling it "unknown job" would hide it.
-            raise
+            # fault. `JobError` subclasses `ValueError`, so without this clause
+            # the one below would disguise it as an unknown job — and since it
+            # is caught here rather than left bare, the operator gets a name
+            # instead of "Internal Server Error".
+            logger.error("corpus job %s has an unreadable manifest: %s", request.job_id, exc)
+            raise HTTPException(
+                status_code=500, detail="corpus_job_manifest_corrupt"
+            ) from exc
         except ValueError:
             # The id is not one the store could ever have written, so it names
             # no job; it must not become a 500 on a hostile request.
@@ -315,13 +350,36 @@ def build_corpus_router(
                 CorpusRejectReason.JOB_UNKNOWN, {"job_id": request.job_id}
             )
 
+        # The fidelity check indexes the prompt source, so a miner-controlled
+        # index is bounded before it can raise on the operator's behalf. This
+        # is the same rule `admit` applies, reached earlier.
+        if request.prompt_index >= job.prompt_count:
+            return _refuse(
+                CorpusRejectReason.PROMPT_MISMATCH,
+                {"prompt_count": job.prompt_count, "got": request.prompt_index},
+            )
+        try:
+            fidelity = prompt_fidelity(
+                request.rendered_prompt, job=job, prompt_index=request.prompt_index
+            )
+        except CorpusPromptSourceError as exc:
+            # The manifest names a source this binary cannot serve, so every
+            # submission to this job fails identically. `jobs create` refuses
+            # such a source, so reaching here means this validator does not
+            # have the environments the declaring operator had.
+            logger.error(
+                "corpus job %s has an unusable prompt source: %s", request.job_id, exc
+            )
+            raise HTTPException(
+                status_code=500, detail="corpus_prompt_source_unusable"
+            ) from exc
+        if not fidelity.ok:
+            return _refuse(CorpusRejectReason(fidelity.reason), fidelity.detail)
+
         # Derived here, from the tokens alone. See this module's docstring.
         arrays = [completion.tokens for completion in request.completions]
         token_counts = [len(tokens) for tokens in arrays]
         last_token_ids = [tokens[-1] for tokens in arrays]
-        terminations = [
-            "eos" if tokens[-1] == job.eos_token_id else "cap" for tokens in arrays
-        ]
         digests = [
             completion_digest(request.prompt_index, tokens) for tokens in arrays
         ]
@@ -338,7 +396,16 @@ def build_corpus_router(
 
         for _ in range(max_write_attempts):
             snapshot, etag = await store.read_ledgers(request.job_id)
-            slots, cursors, seen = rebuild_ledgers(job, snapshot)
+            try:
+                slots, cursors, seen = rebuild_ledgers(job, snapshot)
+            except LedgerSnapshotError as exc:
+                # The blast radius is every miner on this job, and there is no
+                # circuit breaker: the object stays corrupt until an operator
+                # repairs it, so the refusal has to be named, not a bare 500.
+                logger.error("corpus ledgers for %s are unreadable: %s", request.job_id, exc)
+                raise HTTPException(
+                    status_code=500, detail="corpus_ledger_corrupt"
+                ) from exc
             before = ledger_snapshot(slots, cursors, seen)
 
             verdict = admit(
@@ -348,7 +415,6 @@ def build_corpus_router(
                 prompt_index=request.prompt_index,
                 checkpoint_sha256=request.checkpoint_sha256,
                 token_counts=token_counts,
-                terminations=terminations,
                 last_token_ids=last_token_ids,
                 digests=digests,
                 slots=slots,
@@ -386,6 +452,7 @@ def build_corpus_router(
 __all__ = [
     "CorpusPromptSourceError",
     "EnvironmentPromptJob",
+    "LEDGER_SCHEMA",
     "LedgerSnapshotError",
     "PromptFidelity",
     "SUBMIT_PATH",
@@ -393,4 +460,5 @@ __all__ = [
     "ledger_snapshot",
     "prompt_job_for_spec",
     "rebuild_ledgers",
+    "resolve_prompt_source",
 ]

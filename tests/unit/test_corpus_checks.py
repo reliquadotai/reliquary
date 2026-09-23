@@ -55,23 +55,21 @@ def test_an_empty_completion_is_an_underrun_not_a_cap_breach():
     assert result.detail == {"position": 1, "tokens": 0, "min_new_tokens": 1}
 
 
-def _termination(terminations, token_counts, last_token_ids):
+def _termination(token_counts, last_token_ids):
     return check_termination(
-        terminations, token_counts, last_token_ids, sampling=SAMPLING, eos_token_id=EOS
+        token_counts, last_token_ids, sampling=SAMPLING, eos_token_id=EOS
     )
 
 
-def test_termination_must_be_declared_and_known():
-    assert _termination(["eos", "cap"], [4, 100], [EOS, 9]).ok is True
-    result = _termination(["eos", "truncated"], [4, 100], [EOS, 9])
-    assert result.ok is False
-    assert result.reason == "bad_termination"
-    assert result.detail == {"position": 1, "termination": "truncated"}
+def test_a_completion_ends_on_the_terminator_or_on_the_cap():
+    # Ending on EOS is free of the budget; ending anywhere else is only honest
+    # if the completion ran out of room.
+    assert _termination([4, 100], [EOS, 9]).ok is True
 
 
-def test_a_cap_label_must_have_reached_the_cap():
-    # A label is not evidence: the token count has to agree with it.
-    result = _termination(["cap"], [3], [9])
+def test_a_completion_that_stopped_early_without_the_terminator_is_refused():
+    # The silent truncation: 3 tokens, no EOS, and 97 of its budget unspent.
+    result = _termination([3], [9])
     assert result.ok is False
     assert result.reason == "bad_termination"
     assert result.detail == {
@@ -79,19 +77,16 @@ def test_a_cap_label_must_have_reached_the_cap():
         "termination": "cap",
         "tokens": 3,
         "max_new_tokens": 100,
-    }
-
-
-def test_an_eos_label_must_end_on_the_eos_token():
-    result = _termination(["eos"], [4], [9])
-    assert result.ok is False
-    assert result.reason == "bad_termination"
-    assert result.detail == {
-        "position": 0,
-        "termination": "eos",
         "last_token_id": 9,
-        "eos_token_id": EOS,
     }
+
+
+def test_the_check_takes_no_label_at_all():
+    # The point of this signature: a caller CANNOT hand over what the miner
+    # said its completion did, only what its tokens show.
+    import inspect
+
+    assert "terminations" not in inspect.signature(check_termination).parameters
 
 
 def test_a_passing_check_never_shares_its_detail():
@@ -104,7 +99,7 @@ def test_a_passing_check_never_shares_its_detail():
     assert second.detail == {}
     assert check_duplicates([], seen=frozenset()).detail == {}
     assert check_token_budget([4], SAMPLING).detail == {}
-    assert _termination(["eos"], [4], [EOS]).detail == {}
+    assert _termination([4], [EOS]).detail == {}
 
 
 def test_the_digest_binds_the_prompt_to_the_tokens():

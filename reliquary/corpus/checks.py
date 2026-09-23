@@ -14,8 +14,6 @@ from typing import Any
 
 from reliquary.corpus.job import Sampling
 
-TERMINATIONS = frozenset({"eos", "cap"})
-
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
@@ -79,7 +77,6 @@ def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> Check
 
 
 def check_termination(
-    terminations: Sequence[str],
     token_counts: Sequence[int],
     last_token_ids: Sequence[int],
     *,
@@ -89,17 +86,18 @@ def check_termination(
     """A completion ends on EOS or on the cap; anything else is a silent
     truncation we will not pay for.
 
-    The label alone is worthless, so each one is checked against the structure
-    it claims: the caller has already made the three sequences agree in length.
+    The label is DERIVED here, not taken. This check used to accept a
+    ``terminations`` sequence and test each label against the structure it
+    claimed, which made the miner's own word an input — and any caller
+    deriving the label and the last token id from the same array turned the
+    EOS case into a tautology no test could ever discriminate. What is left is
+    the one rule that carries evidence: a completion that did not stop on the
+    terminator must have run out of budget.
     """
-    for position, termination in enumerate(terminations):
-        if termination not in TERMINATIONS:
-            return CheckResult(
-                ok=False,
-                reason="bad_termination",
-                detail={"position": position, "termination": termination},
-            )
-        if termination == "cap" and token_counts[position] != sampling.max_new_tokens:
+    for position, last_token_id in enumerate(last_token_ids):
+        if last_token_id == eos_token_id:
+            continue
+        if token_counts[position] != sampling.max_new_tokens:
             return CheckResult(
                 ok=False,
                 reason="bad_termination",
@@ -108,17 +106,7 @@ def check_termination(
                     "termination": "cap",
                     "tokens": int(token_counts[position]),
                     "max_new_tokens": sampling.max_new_tokens,
-                },
-            )
-        if termination == "eos" and last_token_ids[position] != eos_token_id:
-            return CheckResult(
-                ok=False,
-                reason="bad_termination",
-                detail={
-                    "position": position,
-                    "termination": "eos",
-                    "last_token_id": int(last_token_ids[position]),
-                    "eos_token_id": eos_token_id,
+                    "last_token_id": int(last_token_id),
                 },
             )
     return _ok()

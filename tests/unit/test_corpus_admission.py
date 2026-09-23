@@ -57,7 +57,6 @@ def _call(job, slots, cursors, *, hotkey="5Gx", cursor=None, prompt_index=None, 
         "prompt_index": prompt_index,
         "checkpoint_sha256": SHA,
         "token_counts": [10, 12],
-        "terminations": ["eos", "eos"],
         "last_token_ids": [EOS, EOS],
         "digests": ["d0", "d1"],
         "slots": slots,
@@ -146,14 +145,13 @@ def test_the_wrong_checkpoint_is_refused():
         (
             {
                 "token_counts": [10],
-                "terminations": ["eos"],
                 "digests": ["d0"],
                 "last_token_ids": [EOS],
             },
             "bad_completion_count",
         ),
         ({"token_counts": [10, 200]}, "token_budget_exceeded"),
-        ({"terminations": ["eos", "nope"]}, "bad_termination"),
+        ({"last_token_ids": [EOS, 7]}, "bad_termination"),
         ({"seen": {"d1"}}, "hash_duplicate"),
     ],
 )
@@ -167,23 +165,9 @@ def test_a_cheap_check_failure_is_reported_and_moves_nothing(kwargs, reason):
     assert cursors.expected("5Gx") == 0
 
 
-def test_a_short_completion_labelled_cap_is_refused():
-    job = _job()
-    slots, cursors = _state(job)
-    verdict = _call(job, slots, cursors, terminations=["cap", "cap"])
-    assert verdict.accepted is False
-    assert verdict.reason == "bad_termination"
-    assert verdict.detail == {
-        "position": 0,
-        "termination": "cap",
-        "tokens": 10,
-        "max_new_tokens": 100,
-    }
-    assert slots.filled == 0
-    assert cursors.expected("5Gx") == 0
-
-
-def test_an_eos_label_that_does_not_end_on_eos_is_refused():
+def test_a_completion_that_stopped_short_of_both_endings_is_refused():
+    # 12 tokens, no terminator, and 88 of its budget unspent: a truncation
+    # dressed up as a completion. No label was ever supplied to dress it.
     job = _job()
     slots, cursors = _state(job)
     verdict = _call(job, slots, cursors, last_token_ids=[EOS, 7])
@@ -191,17 +175,35 @@ def test_an_eos_label_that_does_not_end_on_eos_is_refused():
     assert verdict.reason == "bad_termination"
     assert verdict.detail == {
         "position": 1,
-        "termination": "eos",
+        "termination": "cap",
+        "tokens": 12,
+        "max_new_tokens": 100,
         "last_token_id": 7,
-        "eos_token_id": EOS,
     }
     assert slots.filled == 0
     assert cursors.expected("5Gx") == 0
 
 
+def test_admit_cannot_be_told_what_the_miner_said_its_completions_did():
+    # The forwarded-label bug is not tested for, it is unrepresentable: there
+    # is no parameter to forward it through.
+    import inspect
+
+    assert "terminations" not in inspect.signature(admit).parameters
+
+
+def test_a_completion_that_really_reached_the_cap_is_accepted_without_eos():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(
+        job, slots, cursors, token_counts=[100, 100], last_token_ids=[7, 9]
+    )
+    assert verdict.accepted is True
+
+
 def test_sequences_that_disagree_in_length_are_refused():
-    # Two token counts against one termination paid for a completion that no
-    # check ever saw.
+    # Two token counts against one digest paid for a completion that no check
+    # ever saw.
     job = _job()
     slots, cursors = _state(job)
     verdict = _call(
@@ -209,7 +211,6 @@ def test_sequences_that_disagree_in_length_are_refused():
         slots,
         cursors,
         token_counts=[50, 50],
-        terminations=["eos"],
         digests=["only-one"],
         last_token_ids=[EOS],
     )
@@ -217,7 +218,6 @@ def test_sequences_that_disagree_in_length_are_refused():
     assert verdict.reason == "malformed_submission"
     assert verdict.detail == {
         "token_counts": 2,
-        "terminations": 1,
         "digests": 1,
         "last_token_ids": 1,
     }

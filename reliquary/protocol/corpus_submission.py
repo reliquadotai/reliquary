@@ -18,6 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MAX_COMPLETION_TOKENS = 131072
 MAX_COMPLETION_TEXT_CHARS = MAX_COMPLETION_TOKENS * 8
 MAX_COMPLETIONS_PER_SUBMISSION = 64
+# The prompt the miner conditioned on. Same ceiling as one completion's text:
+# a prompt longer than a full generation would not fit the context either.
+MAX_RENDERED_PROMPT_CHARS = MAX_COMPLETION_TEXT_CHARS
 
 
 class CorpusRejectReason(str, Enum):
@@ -46,6 +49,9 @@ class CorpusRejectReason(str, Enum):
     # counts tokens, the corpus is made of text, and a completion whose text
     # is not its tokens is paid for nothing.
     TEXT_MISMATCH = "text_does_not_match_tokens"
+    # The prompt the miner says it conditioned on is not the source row the
+    # job assigned to that slot, rendered by the job's own renderer.
+    PROMPT_NOT_FAITHFUL = "prompt_not_faithful"
     DEGENERATE = "degenerate"
 
 
@@ -72,6 +78,9 @@ class CorpusSubmissionRequest(BaseModel):
     cursor: int = Field(ge=0)
     prompt_index: int = Field(ge=0)
     checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Required, not optional: prompt fidelity is a free-tier check, and a field
+    # a miner may omit is a check a miner may switch off.
+    rendered_prompt: str = Field(min_length=1, max_length=MAX_RENDERED_PROMPT_CHARS)
     completions: list[CorpusCompletion] = Field(
         min_length=1, max_length=MAX_COMPLETIONS_PER_SUBMISSION
     )
