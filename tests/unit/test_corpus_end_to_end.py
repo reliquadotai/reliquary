@@ -320,7 +320,7 @@ def _seed_manifest(job_id):
         temperature=1.0,
         top_p=1.0,
         top_k=0,
-        min_new_tokens=1,
+        min_new_tokens=2,
         max_new_tokens=4096,
         n=1,
         grader_id=None,

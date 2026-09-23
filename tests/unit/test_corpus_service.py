@@ -366,6 +366,61 @@ def test_the_cheapest_possible_completion_is_refused(client):
     assert body["detail"]["tokens"] == 1
 
 
+def test_the_empty_completion_is_refused_at_the_lowest_floor_a_job_may_declare(
+    fake_r2, seeded_job
+):
+    """The boundary the CLI's own default used to sit on. Every fixture in
+    this file declares a floor of 16, so nothing here approaches the floor a
+    job may actually choose: at `min_new_tokens=1`, `tokens=[eos]` with
+    `text=""` clears the budget, the termination check and the text check, and
+    is paid a slot for an empty corpus row. The parser now refuses a floor of
+    1, so this is the cheapest job that exists -- and it still refuses."""
+    from reliquary.corpus.job import MIN_NEW_TOKENS_FLOOR
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    raw = _manifest()
+    raw["job_id"] = "floor-v1"
+    raw["sampling"] = {**raw["sampling"], "min_new_tokens": MIN_NEW_TOKENS_FLOOR}
+    asyncio.run(job_store.write_job(raw, None, **fake_r2))
+
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id="floor-v1",
+            store=seeded_job.store,
+            tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer,
+            verify_signature=lambda request: True,
+            prompt_job_for=seeded_job.prompt_job_for,
+        )
+    )
+    client = TestClient(app)
+
+    def _post(tokens, text):
+        request = CorpusSubmissionRequest(
+            job_id="floor-v1",
+            miner_hotkey="5Hot",
+            cursor=0,
+            prompt_index=0,
+            checkpoint_sha256=CHECKPOINT,
+            rendered_prompt=_faithful_prompt(0),
+            completions=[{"tokens": tokens, "text": text, "termination": "eos"}],
+            signature="ok",
+        )
+        return client.post("/corpus/submit", json=request.model_dump()).json()
+
+    before = seeded_job.ledger_writes()
+    empty = _post([EOS], "")
+    assert empty["accepted"] is False
+    assert empty["reason"] == "token_budget_underrun"
+    # Nothing moved: an accepted empty completion burns its slot permanently.
+    assert seeded_job.ledger_writes() == before
+
+    # One token of content at the same floor is accepted, so the refusal above
+    # is the floor doing its job rather than this job refusing everything.
+    assert _post([7, EOS], "7")["accepted"] is True
+
+
 def test_a_completion_over_the_budget_is_refused(client, seeded_job):
     before = seeded_job.ledger_writes()
     body = _submit(client, tokens=[7] * 4097).json()

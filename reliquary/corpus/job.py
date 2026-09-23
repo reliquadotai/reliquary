@@ -21,6 +21,12 @@ JOB_SCHEMA = "reliquary/corpus-job/v1"
 MAX_COMPLETION_TOKENS = 131072
 MAX_COMPLETIONS_PER_SUBMISSION = 64
 
+# The terminator counts toward the token budget, so a floor of 1 is a floor of
+# nothing: a completion of just the eos id has empty text, clears every check,
+# and is paid a slot for a corpus row with nothing in it. Two is the smallest
+# floor that leaves one token behind.
+MIN_NEW_TOKENS_FLOOR = 2
+
 PROMPT_ORDER_MINER_WALK = "miner_walk"
 PROMPT_ORDER_FREE = "free"
 PROMPT_ORDERS = frozenset({PROMPT_ORDER_MINER_WALK, PROMPT_ORDER_FREE})
@@ -186,6 +192,12 @@ def _parse_sampling(raw: Any) -> Sampling:
             "never be submitted"
         )
     min_new_tokens = _positive_int(raw, "min_new_tokens")
+    if min_new_tokens < MIN_NEW_TOKENS_FLOOR:
+        raise JobError(
+            f"sampling.min_new_tokens must be at least {MIN_NEW_TOKENS_FLOOR}, "
+            f"got {min_new_tokens}: the terminator counts toward the budget, so "
+            "a lower floor pays a slot for a completion with no text in it"
+        )
     if min_new_tokens > max_new_tokens:
         raise JobError(
             f"sampling.min_new_tokens {min_new_tokens} exceeds max_new_tokens {max_new_tokens}"

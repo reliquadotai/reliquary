@@ -27,7 +27,7 @@ def _job(**overrides):
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": 0,
-            "min_new_tokens": 1,
+            "min_new_tokens": 2,
             "max_new_tokens": 100,
             "n": 2,
         },

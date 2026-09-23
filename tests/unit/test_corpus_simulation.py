@@ -24,7 +24,7 @@ def _job(prompt_count, slots_per_prompt):
             "eos_token_id": EOS,
             "sampling": {
                 "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-                "min_new_tokens": 1, "max_new_tokens": 100, "n": 1,
+                "min_new_tokens": 2, "max_new_tokens": 100, "n": 1,
             },
             "slots_per_prompt": slots_per_prompt,
             "filter": None,

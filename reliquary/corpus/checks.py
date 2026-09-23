@@ -60,9 +60,9 @@ def check_token_budget(token_counts: Sequence[int], sampling: Sampling) -> Check
                     "max_new_tokens": sampling.max_new_tokens,
                 },
             )
-        # The floor catches the empty completion too, because `min_new_tokens`
-        # is always at least 1; calling zero tokens a cap breach would read as
-        # the opposite failure in reject-reason telemetry.
+        # The floor catches the completion that is only its terminator, because
+        # `parse_job` refuses a floor below 2; calling a short completion a cap
+        # breach would read as the opposite failure in reject-reason telemetry.
         if tokens < sampling.min_new_tokens:
             return CheckResult(
                 ok=False,

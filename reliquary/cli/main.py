@@ -615,7 +615,13 @@ def jobs_create(
     cap: float = typer.Option(
         ..., "--cap", help="The task's share of the pool; also its pinned price"
     ),
-    min_new_tokens: int = typer.Option(1, "--min-new-tokens"),
+    min_new_tokens: int = typer.Option(
+        2,
+        "--min-new-tokens",
+        help="Tokens a completion must reach, terminator included; 2 is the "
+        "lowest a job may declare, because 1 would pay for a completion whose "
+        "only token is the terminator",
+    ),
     temperature: float = typer.Option(1.0, "--temperature"),
     top_p: float = typer.Option(1.0, "--top-p"),
     top_k: int = typer.Option(0, "--top-k"),

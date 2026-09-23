@@ -27,7 +27,7 @@ def _raw(**overrides):
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": 0,
-            "min_new_tokens": 1,
+            "min_new_tokens": 2,
             "max_new_tokens": 4096,
             "n": 2,
         },
@@ -58,7 +58,7 @@ def test_contract_is_json_native_and_stable():
     contract = parse_job(_raw()).to_contract()
     assert contract["schema"] == JOB_SCHEMA
     assert contract["sampling"]["n"] == 2
-    assert contract["sampling"]["min_new_tokens"] == 1
+    assert contract["sampling"]["min_new_tokens"] == 2
     assert contract["eos_token_id"] == 151645
     assert contract["filter"] is None
     assert contract == parse_job(_raw()).to_contract()
@@ -72,6 +72,31 @@ def test_a_floor_on_new_tokens_is_carried():
     }))
     assert job.sampling.min_new_tokens == 64
     assert job.to_contract()["sampling"]["min_new_tokens"] == 64
+
+
+def test_a_floor_of_one_token_is_refused():
+    """The terminator counts toward the budget, so a floor of 1 is a floor of
+    nothing: `tokens=[eos]` with `text=""` clears the budget, the termination
+    check and the text check, and is paid a slot for an empty corpus row.
+
+    Refused in the parser rather than only in the CLI, because a floor is a
+    money field and every caller that writes a manifest has to meet the rule.
+    """
+    from reliquary.corpus.job import MIN_NEW_TOKENS_FLOOR
+
+    with pytest.raises(JobError) as excinfo:
+        parse_job(_raw(sampling={
+            "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+            "min_new_tokens": 1, "max_new_tokens": 4096, "n": 1,
+        }))
+    assert "min_new_tokens" in str(excinfo.value)
+    # The lowest floor that leaves a token behind stays declarable, or the
+    # refusal is just a bigger floor nobody chose.
+    assert MIN_NEW_TOKENS_FLOOR == 2
+    assert parse_job(_raw(sampling={
+        "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+        "min_new_tokens": MIN_NEW_TOKENS_FLOOR, "max_new_tokens": 4096, "n": 1,
+    })).sampling.min_new_tokens == MIN_NEW_TOKENS_FLOOR
 
 
 def test_a_floor_above_the_ceiling_names_both_values():
@@ -107,12 +132,12 @@ def test_free_prompt_order_is_legal():
         {"slots_per_prompt": 0},
         {"renderer_id": ""},
         {"prompt_order": "whatever"},
-        {"sampling": {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 0.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.5, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "min_new_tokens": 1, "max_new_tokens": 8, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 0, "n": 1}},
-        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 1, "max_new_tokens": 8, "n": 0}},
+        {"sampling": {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 2, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 0.0, "top_k": 0, "min_new_tokens": 2, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.5, "top_k": 0, "min_new_tokens": 2, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "min_new_tokens": 2, "max_new_tokens": 8, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 2, "max_new_tokens": 0, "n": 1}},
+        {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 2, "max_new_tokens": 8, "n": 0}},
         {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 0,
                       "max_new_tokens": 8, "n": 1}},
         {"sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 9,
@@ -162,13 +187,13 @@ def test_a_job_asking_for_more_completions_than_the_wire_carries_is_refused():
     with pytest.raises(JobError) as excinfo:
         parse_job(_raw(sampling={
             "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-            "min_new_tokens": 1, "max_new_tokens": 8, "n": over,
+            "min_new_tokens": 2, "max_new_tokens": 8, "n": over,
         }))
     assert str(over) in str(excinfo.value)
     # The boundary itself stays declarable, or the refusal is only a smaller cap.
     assert parse_job(_raw(sampling={
         "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-        "min_new_tokens": 1, "max_new_tokens": 8,
+        "min_new_tokens": 2, "max_new_tokens": 8,
         "n": MAX_COMPLETIONS_PER_SUBMISSION,
     })).sampling.n == MAX_COMPLETIONS_PER_SUBMISSION
 
@@ -182,10 +207,10 @@ def test_a_job_whose_token_cap_exceeds_the_wire_is_refused():
     with pytest.raises(JobError) as excinfo:
         parse_job(_raw(sampling={
             "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-            "min_new_tokens": 1, "max_new_tokens": over, "n": 1,
+            "min_new_tokens": 2, "max_new_tokens": over, "n": 1,
         }))
     assert str(over) in str(excinfo.value)
     assert parse_job(_raw(sampling={
         "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-        "min_new_tokens": 1, "max_new_tokens": MAX_COMPLETION_TOKENS, "n": 1,
+        "min_new_tokens": 2, "max_new_tokens": MAX_COMPLETION_TOKENS, "n": 1,
     })).sampling.max_new_tokens == MAX_COMPLETION_TOKENS
