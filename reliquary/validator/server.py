@@ -6353,6 +6353,42 @@ class ValidatorServer:
         app.add_middleware(HttpMetricsMiddleware, metrics=self.http_metrics)
         return app
 
+    def mount_corpus_router(
+        self,
+        entry: Any,
+        *,
+        store: Any,
+        tokenizer: Any,
+        renderer: Any,
+        verify_signature: Callable[[Any], bool],
+    ) -> bool:
+        """Serve corpus submissions, and only for a task that declares them.
+
+        Gated on the resolved registry entry rather than on a flag or an
+        environment variable: the route sells slots and is paid per token, so
+        what opens it is the same declaration that pays for it. An RL task, or
+        the legacy fallback that has no entry at all, mounts nothing.
+
+        Called once at startup, before the loop this app is served on: the
+        router's fidelity seam holds an ``asyncio.Lock`` and a cache of built
+        prompt sources, so one process must hold exactly one of them.
+        """
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+        if getattr(entry, "mechanism", None) != MECHANISM_CORPUS_GENERATION:
+            return False
+        from reliquary.validator.corpus_service import build_corpus_router
+
+        self.app.include_router(
+            build_corpus_router(
+                store=store,
+                tokenizer=tokenizer,
+                renderer=renderer,
+                verify_signature=verify_signature,
+            )
+        )
+        return True
+
     async def _process_auction_submission(
         self,
         item: _QueuedAuctionSubmission,
