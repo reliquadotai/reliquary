@@ -50,6 +50,31 @@ def test_the_filter_annotates_every_row():
     assert [(r["completion"], r["accepted"], r["score"]) for r in rows] == [("yes", True, 1.0), ("no", False, 0.0)]
 
 
+def test_a_passed_verdict_with_no_record_is_skipped_with_a_warning(caplog):
+    """R2 is not transactional: a verdict can be visible before its submission
+    object is. Exporting pays nothing, so skipping that row is safe -- the
+    alternative is a bare crash that blanks the whole run over one bad row."""
+    import logging
+
+    class _RecordsWithAGap(_Records):
+        async def read_submission(self, job_id, sid):
+            if sid == "1" * 64:
+                return None
+            return await super().read_submission(job_id, sid)
+
+    records = _RecordsWithAGap()
+    records.verdicts = {"1" * 64: {"passed": True}, "2" * 64: {"passed": True}}
+
+    async def go():
+        with caplog.at_level(logging.WARNING, logger="reliquary.corpus.export"):
+            return [row async for row in export_rows(job=_Job(), records=records)]
+
+    rows = asyncio.run(go())
+
+    assert [(r["prompt"], r["completion"]) for r in rows] == [("q4", "x")]
+    assert any("1" * 12 in message for message in caplog.messages)
+
+
 # --- `jobs export`: the CLI wiring around `export_rows`. A fake job store, a
 # fake record store, and a fake environment spec so the filter path never
 # touches a real bucket or a real dataset. ---
@@ -264,3 +289,33 @@ def test_jobs_export_refuses_an_unknown_job(jobs, records, tmp_path):
     assert result.exit_code != 0
     assert "ghost" in result.output
     assert not out.exists()
+
+
+def test_jobs_export_mid_stream_failure_leaves_no_file_or_temp_file_behind(
+    jobs, records, tmp_path
+):
+    """A truncated, valid-looking dataset at `--out` is worse than no file at
+    all: a downstream trainer cannot tell it apart from a completed export."""
+    jobs["math-v1"] = _job_spec()
+    records.subs = {
+        "1" * 64: {"hotkey": "A", "prompt_index": 3, "rendered_prompt": "q3",
+                   "completions": [{"text": "yes", "tokens": [1]}]},
+        "2" * 64: {"hotkey": "B", "prompt_index": 4, "rendered_prompt": "q4",
+                   "completions": [{"text": "x", "tokens": [3]}]},
+    }
+    records.verdicts = {"1" * 64: {"passed": True}, "2" * 64: {"passed": True}}
+    real_read_submission = records.read_submission
+
+    async def _raising(job_id, sid):
+        if sid == "2" * 64:
+            raise RuntimeError("record store exploded mid-stream")
+        return await real_read_submission(job_id, sid)
+
+    records.read_submission = _raising
+    out = tmp_path / "dataset.jsonl"
+
+    result = CliRunner().invoke(app, ["jobs", "export", "math-v1", "--out", str(out)])
+
+    assert result.exit_code != 0
+    assert not out.exists()
+    assert list(tmp_path.iterdir()) == []

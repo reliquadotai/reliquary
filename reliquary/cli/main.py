@@ -842,7 +842,13 @@ def jobs_export(
     apply_filter: bool = typer.Option(False, "--apply-filter"),
     only_accepted: bool = typer.Option(False, "--only-accepted"),
 ) -> None:
-    """Write the verified completions of a job as JSON lines."""
+    """Write the verified completions of a job as JSON lines.
+
+    Written to a temporary file beside `--out` and swapped in with
+    `os.replace` only once the export completes, so a mid-stream failure (the
+    record store, the grader) never leaves a truncated, valid-looking dataset
+    in its place -- and any pre-existing `--out` is untouched until then.
+    """
     import json
 
     from reliquary.corpus.export import export_rows
@@ -854,13 +860,24 @@ def jobs_export(
         if job is None:
             raise typer.BadParameter(f"no job {job_id!r}")
         grade = _job_grader(job) if apply_filter else None
+        temporary = f"{out}.{os.getpid()}.tmp"
         written = 0
-        with open(out, "w", encoding="utf-8") as handle:
-            async for row in export_rows(job=job, records=BucketRecordStore(), grade=grade):
-                if only_accepted and not row.get("accepted", True):
-                    continue
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-                written += 1
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                async for row in export_rows(
+                    job=job, records=BucketRecordStore(), grade=grade
+                ):
+                    if only_accepted and not row.get("accepted", True):
+                        continue
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    written += 1
+            os.replace(temporary, out)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
         return written
 
     typer.echo(f"{asyncio.run(_run())} rows written to {out}")
