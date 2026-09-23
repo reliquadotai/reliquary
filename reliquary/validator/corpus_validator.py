@@ -67,19 +67,37 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
     from reliquary.protocol.signatures import verify_corpus_signature
     from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
-    from reliquary.validator.corpus_service import renderer_for_job
+    from reliquary.validator.corpus_service import CorpusPromptSourceError, renderer_for_job
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
     store = BucketJobStore()
     job, _ = await store.read_job(str(entry.job_id))
     if job is None:
         raise RuntimeError(f"task {entry.task_id!r} declares job {entry.job_id!r} but it has no manifest")
+
+    # A tokenizer isn't loaded yet, but the renderer only calls `encode` once
+    # a submission arrives -- by then `tokenizer_box` is populated. Resolving
+    # the prompt source here, before any download or model load, makes a bad
+    # `prompt_source`/`renderer_id` declaration a refusal that costs seconds,
+    # not a checkpoint download and a GPU load.
+    tokenizer_box: dict = {}
+
+    def encode(text: str) -> list[int]:
+        encoded = tokenizer_box["tokenizer"].encode(text, add_special_tokens=False)
+        return list(getattr(encoded, "ids", encoded))
+
+    try:
+        renderer = renderer_for_job(job, encode)
+    except CorpusPromptSourceError as exc:
+        raise RuntimeError(str(exc)) from exc
+
     directory = Path(snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision))
     refusal = startup_refusal(entry, job, ACTIVE_PROTOCOL_PROFILE, checkpoint_fingerprint(directory))
     if refusal:
         raise RuntimeError(refusal)
 
     tokenizer = load_tokenizer(str(directory))
+    tokenizer_box["tokenizer"] = tokenizer
     model = load_text_generation_model(
         str(directory), torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
     ).to("cuda").eval()
@@ -88,12 +106,8 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
     auditor = CorpusAuditor(job_id=job.job_id, records=records, model=model,
                             tokenizer=tokenizer, proof=proof)
 
-    def encode(text: str) -> list[int]:
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        return list(getattr(encoded, "ids", encoded))
-
     app = build_corpus_app(entry=entry, job=job, store=store, records=records, tokenizer=tokenizer,
-                           renderer=renderer_for_job(job, encode),
+                           renderer=renderer,
                            verify_signature=verify_corpus_signature, auditor=auditor,
                            proof_chunk_tokens=proof.chunk_tokens)
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in

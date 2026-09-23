@@ -448,6 +448,63 @@ def test_a_corpus_startup_refusal_exits_four_rather_than_a_traceback(
     assert len(calls) == 1
 
 
+def test_a_corpus_renderer_that_cannot_build_exits_four_before_any_download(
+    monkeypatch, bucket, registry
+):
+    """The test above replaces `run_corpus_validator` outright, which proves
+    the CLI's `except RuntimeError` but not that `run_corpus_validator`
+    itself converts a renderer failure into one -- that gap is what let
+    `CorpusPromptSourceError` escape as a bare traceback (exit 1) instead of
+    exit 4. This drives the REAL `run_corpus_validator`, with only its
+    download and model-load calls stubbed to fail the test if reached: the
+    renderer is resolved before any of them (a controller ruling -- this
+    refusal must cost seconds, not a checkpoint download and a GPU load), so
+    none should fire."""
+    from types import SimpleNamespace
+
+    import bittensor
+    import huggingface_hub
+    import reliquary.cli.main as cli_module
+    import reliquary.corpus.encoding as encoding
+    import reliquary.infrastructure.chain as chain
+    import reliquary.shared.modeling as modeling
+    from reliquary.validator import corpus_service
+
+    _seed_manifest("swe-v1")
+    entry = _corpus_entry_this_binary_can_resolve("swe-v1")
+    registry["entries"] = {entry.task_id: entry}
+
+    monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
+
+    async def subtensor():
+        return SimpleNamespace()
+
+    monkeypatch.setattr(chain, "get_subtensor", subtensor)
+
+    def _unrenderable(job, encode, **kwargs):
+        raise corpus_service.CorpusPromptSourceError(
+            f"prompt source {job.prompt_source!r} renders through another template"
+        )
+
+    monkeypatch.setattr(corpus_service, "renderer_for_job", _unrenderable)
+
+    # None of these may be reached: the renderer refusal must come first.
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download", lambda *a, **kw: pytest.fail("downloaded")
+    )
+    monkeypatch.setattr(
+        encoding, "checkpoint_fingerprint", lambda *a, **kw: pytest.fail("fingerprinted")
+    )
+    monkeypatch.setattr(modeling, "load_tokenizer", lambda *a, **kw: pytest.fail("tokenized"))
+    monkeypatch.setattr(
+        modeling, "load_text_generation_model", lambda *a, **kw: pytest.fail("loaded")
+    )
+
+    result = CliRunner().invoke(cli_module.app, ["validate"])
+
+    assert result.exit_code == 4, (result.output, result.exception)
+
+
 def test_the_mount_refuses_the_task_config_wrapper(bucket, registry):
     """The call site's own failure mode: `TaskConfig` has no `.mechanism`, so
     a mount gated on `getattr(entry, "mechanism", None)` would decline a
