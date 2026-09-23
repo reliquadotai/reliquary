@@ -104,7 +104,15 @@ async def read_job(job_id: str, **client_kwargs) -> tuple[JobSpec | None, str | 
         raw = json.loads(body)
     except ValueError as exc:
         raise JobError(f"stored job {job_id!r} is not JSON: {exc}") from exc
-    return parse_job(raw), etag
+    parsed = parse_job(raw)
+    if parsed.job_id != validated:
+        # The key IS the job's identity: the ledgers hang off it and the
+        # registry entry names it. A manifest declaring another id would be
+        # served here while judging submissions as that other job.
+        raise JobError(
+            f"job stored at {validated!r} declares itself {parsed.job_id!r}"
+        )
+    return parsed, etag
 
 
 async def write_job(job: Mapping[str, Any], etag: str | None, **client_kwargs) -> str | None:

@@ -33,6 +33,9 @@ class CorpusRejectReason(str, Enum):
 
     ACCEPTED = "accepted"
     BAD_SIGNATURE = "bad_signature"
+    # Not the miner's fault: this validator has no way to check a signature at
+    # all, and saying "bad_signature" would send it debugging its own keys.
+    SIGNATURE_UNVERIFIABLE = "signature_unverifiable"
     MALFORMED_SUBMISSION = "malformed_submission"
     JOB_UNKNOWN = "job_unknown"
     # Distinct from JOB_UNKNOWN on purpose: "this job exists but this

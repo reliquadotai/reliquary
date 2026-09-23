@@ -1371,6 +1371,11 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
     renderer from that job's own manifest, so a validator cannot be serving a
     renderer -- or a job -- the declaration did not name. Returns False, having
     done nothing, for any task that is not a corpus one.
+
+    False is reserved for exactly that case. A corpus task that cannot be
+    served RAISES, because the alternative is a validator that boots, holds
+    its share of the pool and exposes no route, with a missing log line as the
+    only evidence.
     """
     from reliquary.environment.agentic.renderers import renderer_for
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
@@ -1380,7 +1385,18 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
     )
     from reliquary.validator.task_config import TaskConfigError
 
-    if getattr(entry, "mechanism", None) != MECHANISM_CORPUS_GENERATION:
+    if entry is None:
+        # The legacy fallback resolves no registry entry at all.
+        return False
+    mechanism = getattr(entry, "mechanism", None)
+    if mechanism is None:
+        # `TaskConfig` is not a `TaskEntry`, and passing the wrapper would
+        # read as "not a corpus task" and mount nothing at all.
+        raise TaskConfigError(
+            f"the corpus mount takes the registry entry, not "
+            f"{type(entry).__name__}"
+        )
+    if mechanism != MECHANISM_CORPUS_GENERATION:
         return False
 
     store = BucketJobStore()
@@ -1401,8 +1417,8 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         verify_signature = refuse_unsigned_corpus_submissions
         logger.critical(
             "corpus job %s is mounted but this binary has no corpus signature "
-            "binding, so EVERY submission is refused as bad_signature until "
-            "one lands in protocol/signatures.py",
+            "binding, so EVERY submission is refused as signature_unverifiable "
+            "until one lands in protocol/signatures.py",
             job.job_id,
         )
     mounted = server.mount_corpus_router(
@@ -1412,6 +1428,13 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         renderer=renderer_for(job.renderer_id, encode),
         verify_signature=verify_signature,
     )
+    if not mounted:
+        # The server applies the same rule to the same entry, so a refusal
+        # here means the two disagree -- never something to walk past.
+        raise TaskConfigError(
+            f"task {entry.task_id!r} declares corpus job {job.job_id!r} but "
+            f"the server refused to mount its route"
+        )
     logger.info(
         "corpus job %s mounted: source %s, renderer %s, checkpoint %s@%s",
         job.job_id,

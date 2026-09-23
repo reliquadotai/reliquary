@@ -76,6 +76,15 @@ class LedgerSnapshotError(Exception):
     """
 
 
+class CorpusSignatureUnavailable(Exception):
+    """This validator cannot check any corpus signature, whatever it carries.
+
+    Raised by a verifier instead of returning False, because the two are
+    different facts: False says the miner's signature did not check out, and
+    this says nothing about the miner at all.
+    """
+
+
 class CorpusPromptSourceError(ValueError):
     """The job's ``prompt_source`` cannot be resolved to the rows it claims.
 
@@ -327,9 +336,14 @@ def refuse_unsigned_corpus_submissions(request: CorpusSubmissionRequest) -> bool
     is what the mount wires in, so the route is reachable and unusable rather
     than open. Not a placeholder to be quietly replaced by ``True``: replacing
     it means writing the binding.
+
+    Raises rather than returning False so the miner is told this validator
+    cannot verify, not that its signature was wrong.
     """
     del request
-    return False
+    raise CorpusSignatureUnavailable(
+        "this binary carries no corpus signature binding"
+    )
 
 
 def _refuse(
@@ -398,18 +412,22 @@ def build_corpus_router(
 
         # Before anything reads or writes: an unsigned submission must not
         # reach the ledgers, or a spoofed hotkey consumes another miner's work.
-        if not verify_signature(request):
+        try:
+            verified = verify_signature(request)
+        except CorpusSignatureUnavailable:
+            return _refuse(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
+        if not verified:
             return _refuse(CorpusRejectReason.BAD_SIGNATURE)
 
         try:
-            job, _ = await store.read_job(request.job_id)
+            job, _ = await store.read_job(job_id)
         except JobError as exc:
             # A manifest in the bucket that no longer parses is an operator
             # fault. `JobError` subclasses `ValueError`, so without this clause
             # the one below would disguise it as an unknown job — and since it
             # is caught here rather than left bare, the operator gets a name
             # instead of "Internal Server Error".
-            logger.error("corpus job %s has an unreadable manifest: %s", request.job_id, exc)
+            logger.error("corpus job %s has an unreadable manifest: %s", job_id, exc)
             raise HTTPException(
                 status_code=500, detail="corpus_job_manifest_corrupt"
             ) from exc
@@ -419,7 +437,7 @@ def build_corpus_router(
             job = None
         if job is None:
             return _refuse(
-                CorpusRejectReason.JOB_UNKNOWN, {"job_id": request.job_id}
+                CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id}
             )
 
         # The fidelity check indexes the prompt source, so a miner-controlled
@@ -440,7 +458,7 @@ def build_corpus_router(
             # such a source, so reaching here means this validator does not
             # have the environments the declaring operator had.
             logger.error(
-                "corpus job %s has an unusable prompt source: %s", request.job_id, exc
+                "corpus job %s has an unusable prompt source: %s", job_id, exc
             )
             raise HTTPException(
                 status_code=500, detail="corpus_prompt_source_unusable"
@@ -467,14 +485,14 @@ def build_corpus_router(
                 return _refuse(CorpusRejectReason(text.reason), text.detail)
 
         for _ in range(max_write_attempts):
-            snapshot, etag = await store.read_ledgers(request.job_id)
+            snapshot, etag = await store.read_ledgers(job_id)
             try:
                 slots, cursors, seen = rebuild_ledgers(job, snapshot)
             except LedgerSnapshotError as exc:
                 # The blast radius is every miner on this job, and there is no
                 # circuit breaker: the object stays corrupt until an operator
                 # repairs it, so the refusal has to be named, not a bare 500.
-                logger.error("corpus ledgers for %s are unreadable: %s", request.job_id, exc)
+                logger.error("corpus ledgers for %s are unreadable: %s", job_id, exc)
                 raise HTTPException(
                     status_code=500, detail="corpus_ledger_corrupt"
                 ) from exc
@@ -504,14 +522,14 @@ def build_corpus_router(
                 # spraying junk cannot bill us a bucket write per attempt.
                 return _respond(verdict)
             try:
-                await store.write_ledgers(request.job_id, after, etag)
+                await store.write_ledgers(job_id, after, etag)
             except CorpusStoreConflict:
                 continue
             return _respond(verdict)
 
         logger.warning(
             "corpus ledgers for %s stayed contended over %d attempts (miner %s)",
-            request.job_id,
+            job_id,
             max_write_attempts,
             request.miner_hotkey[:12],
         )
@@ -523,6 +541,7 @@ def build_corpus_router(
 
 __all__ = [
     "CorpusPromptSourceError",
+    "CorpusSignatureUnavailable",
     "EnvironmentPromptJob",
     "LEDGER_SCHEMA",
     "MAX_RESOLVED_PROMPT_SOURCES",

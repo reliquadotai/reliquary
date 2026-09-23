@@ -66,6 +66,11 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
     assert CorpusRejectReason.JOB_NOT_SERVED.value == "job_not_served"
     assert CorpusRejectReason.JOB_UNKNOWN.value == "job_unknown"
 
+    # "your signature is wrong" and "I cannot check signatures" are likewise
+    # two facts, and only one of them is the miner's to act on.
+    assert CorpusRejectReason.SIGNATURE_UNVERIFIABLE.value == "signature_unverifiable"
+    assert CorpusRejectReason.BAD_SIGNATURE.value == "bad_signature"
+
 
 def test_a_submission_without_the_prompt_it_conditioned_on_is_refused():
     # Optional would mean bypassable: a miner omitting the field would switch

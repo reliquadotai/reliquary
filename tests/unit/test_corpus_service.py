@@ -434,6 +434,22 @@ def test_a_submission_for_another_job_never_reaches_this_validators_store(
     assert seeded_job.ledger_writes() == before_writes
 
 
+def test_the_store_is_keyed_off_the_served_job_not_the_request(client, seeded_job):
+    """The guard makes the two equal, so this cannot be observed through the
+    wire: it is asserted on the calls themselves, because the property is that
+    a request field never reaches a bucket key -- not that it happens to hold
+    the right value today."""
+    import inspect
+
+    from reliquary.validator import corpus_service
+
+    source = inspect.getsource(corpus_service.build_corpus_router)
+    body = source[source.index("async def submit_corpus") :]
+    for call in ("store.read_job(", "store.read_ledgers(", "store.write_ledgers("):
+        argument = body[body.index(call) + len(call) :].lstrip()
+        assert argument.startswith("job_id"), f"{call} is keyed off {argument[:40]!r}"
+
+
 def test_the_job_this_validator_serves_is_still_read(client, seeded_job):
     """The other direction, so the refusal above cannot be satisfied by a
     router that refuses every job id it is given."""
@@ -445,6 +461,45 @@ def test_the_job_this_validator_serves_is_still_read(client, seeded_job):
 
     assert body["reason"] != "job_not_served"
     assert seeded_job.store.job_reads == before_reads + 1
+
+
+def test_a_validator_that_cannot_verify_says_so_instead_of_bad_signature(
+    seeded_job, fake_r2
+):
+    """`bad_signature` tells a miner its signature was wrong. When this binary
+    carries no corpus binding at all, the miner's signature was never the
+    problem, and a miner debugging against the wrong reason burns real time."""
+    from reliquary.validator.corpus_service import (
+        build_corpus_router,
+        refuse_unsigned_corpus_submissions,
+    )
+
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id="swe-v1",
+            store=seeded_job.store,
+            tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer,
+            verify_signature=refuse_unsigned_corpus_submissions,
+            prompt_job_for=seeded_job.prompt_job_for,
+        )
+    )
+    unverifiable = TestClient(app)
+
+    body = unverifiable.post(
+        "/corpus/submit", json=_submission_for("swe-v1").model_dump()
+    ).json()
+
+    assert body["accepted"] is False
+    assert body["reason"] == "signature_unverifiable"
+
+
+def test_a_signature_that_does_not_verify_is_still_a_bad_signature(client):
+    """The other direction: a verifier that CAN verify and refuses must not be
+    reported as this validator's own failure."""
+    body = _submit(client, tokens=[7] * 16 + [EOS], signature="bad").json()
+    assert body["reason"] == "bad_signature"
 
 
 def test_a_submission_for_an_unknown_job_is_refused_without_touching_the_ledgers(

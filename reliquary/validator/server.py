@@ -6372,6 +6372,11 @@ class ValidatorServer:
         Called once at startup, before the loop this app is served on: the
         router's fidelity seam holds an ``asyncio.Lock`` and a cache of built
         prompt sources, so one process must hold exactly one of them.
+
+        The supported caller is ``cli.main.mount_corpus_service``, which
+        derives the renderer from the job's own manifest; a caller that
+        supplies its own renderer can hand this one a dialect the job never
+        declared, and nothing here can tell.
         """
         from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
 

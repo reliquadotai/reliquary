@@ -199,7 +199,8 @@ def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
 def test_the_startup_path_mounts_nothing_it_cannot_authenticate(bucket, registry):
     """`protocol/signatures.py` carries no corpus binding, so the route is
     wired with a verifier that refuses everything. The endpoint exists and
-    nothing can be admitted through it -- not a stub that accepts."""
+    nothing can be admitted through it -- not a stub that accepts. The reason
+    says this validator cannot verify, not that the miner signed badly."""
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
     entry = registry["entries"][TASK_ID]
@@ -212,7 +213,7 @@ def test_the_startup_path_mounts_nothing_it_cannot_authenticate(bucket, registry
         body = _submit(client, job, prompt_index=0, filler=1)
 
     assert body["accepted"] is False
-    assert body["reason"] == "bad_signature"
+    assert body["reason"] == "signature_unverifiable"
 
 
 def test_a_declared_job_with_no_manifest_refuses_to_start(bucket, registry):
@@ -268,3 +269,196 @@ def test_the_server_gate_does_not_depend_on_the_startup_path(bucket, registry):
         for path in (getattr(route, "path", "") for route in server.app.routes)
         if "corpus" in path
     ] == []
+
+
+def _corpus_entry_this_binary_can_resolve(job_id):
+    """A registry entry `resolve_task_config` accepts: this process's own task
+    id, profile and contract digest, declaring a corpus job."""
+    from dataclasses import asdict
+
+    from reliquary.constants import (
+        PROTOCOL_GENERATION_CONTRACT,
+        PROTOCOL_PROFILE_ID,
+        TASK_ID as PROCESS_TASK_ID,
+    )
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.shared.task_registry import (
+        MECHANISM_CORPUS_GENERATION,
+        TaskEntry,
+    )
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params["cap"] = params["floor"] = 0.3
+    return TaskEntry(
+        task_id=PROCESS_TASK_ID,
+        profile_id=PROTOCOL_PROFILE_ID,
+        profile_sha256=canonical_sha256(PROTOCOL_GENERATION_CONTRACT),
+        mechanism=MECHANISM_CORPUS_GENERATION,
+        params=params,
+        status="active",
+        retired_at=None,
+        job_id=job_id,
+    )
+
+
+def _seed_manifest(job_id):
+    """The job the entry above names, written through the real store."""
+    from reliquary.cli.main import build_job_manifest
+
+    source = _prompt_source(_template())
+    manifest = build_job_manifest(
+        job_id=job_id,
+        checkpoint_repo="org/Frozen",
+        checkpoint_revision="abc123",
+        checkpoint_sha256=CHECKPOINT,
+        prompt_source=source,
+        prompt_count=64,
+        renderer_id=ENVIRONMENT_SPECS[source].renderer_id,
+        eos_token_id=EOS,
+        slots_per_prompt=SLOTS_PER_PROMPT,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        min_new_tokens=1,
+        max_new_tokens=4096,
+        n=1,
+        grader_id=None,
+        threshold=None,
+        prompt_order="free",
+        deadline_round=None,
+    )
+    asyncio.run(job_store.write_job(manifest, None))
+
+
+def test_a_server_that_declines_the_mount_is_not_walked_past(bucket, registry):
+    """Server and helper apply the same rule to the same entry, so a refusal
+    means they disagree -- which must stop the process, not leave a corpus
+    task running with no route."""
+    from reliquary.validator.task_config import TaskConfigError
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
+    entry = registry["entries"][TASK_ID]
+
+    class _DecliningServer:
+        def mount_corpus_router(self, entry, **kwargs):
+            return False
+
+    with pytest.raises(TaskConfigError) as caught:
+        _mount_on(_DecliningServer(), entry)
+
+    assert entry.job_id in str(caught.value)
+
+
+def test_the_validator_startup_path_serves_the_route(monkeypatch, bucket):
+    """`mount_corpus_service` can be perfect and the validator still serve
+    nothing: the call site has to pass the resolved ENTRY and the real server,
+    and a mistake there is silent -- its only evidence is a missing log line.
+
+    So this boots `validate --train` onto a corpus task with the RL machinery
+    mocked the way `test_remote_proof_controller` mocks it, and asks the
+    server that startup actually built whether the route is on it.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import bittensor
+    import reliquary.cli.main as cli_module
+    import reliquary.constants as constants
+    import reliquary.infrastructure.chain as chain
+    import reliquary.infrastructure.task_registry_store as task_registry_store
+    import reliquary.shared.modeling as modeling
+    import reliquary.validator.remote_proof as remote
+    import reliquary.validator.service as service_module
+    import reliquary.validator.weight_only as weights
+    from reliquary.validator.proof_worker import ProofModelProxy
+
+    from tests.unit.test_remote_proof_controller import REV, MetadataPool
+
+    _seed_manifest("swe-v1")
+    entry = _corpus_entry_this_binary_can_resolve("swe-v1")
+    monkeypatch.setattr(
+        task_registry_store,
+        "read_registry",
+        AsyncMock(return_value=({entry.task_id: entry}, None)),
+    )
+
+    # Everything below this line is the RL boot, mocked off the box: no CUDA,
+    # no model, no chain, no HF.
+    monkeypatch.setenv("RELIQUARY_PROOF_EXECUTOR_MODE", "remote")
+    monkeypatch.setattr(constants, "DETACHED_TRAINER", True)
+    monkeypatch.setattr(constants, "KL_BASE_MODEL", "")
+    monkeypatch.setattr(
+        cli_module, "_resolve_cli_environment_mix", lambda _v: [("fake", 1)]
+    )
+    monkeypatch.setattr(cli_module, "_v3_activation_checkpoint_revision", lambda *a: REV)
+    monkeypatch.setattr(modeling, "load_tokenizer", lambda *a, **kw: SimpleNamespace())
+    monkeypatch.setattr(
+        modeling, "load_text_generation_model", lambda *a, **kw: pytest.fail("loaded")
+    )
+    monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
+
+    async def subtensor():
+        return SimpleNamespace()
+
+    monkeypatch.setattr(chain, "get_subtensor", subtensor)
+    pool = MetadataPool()
+    pool.start = lambda: None
+    pool.dispatch_devices = ("cuda:0",)
+    pool.proxies = lambda: {device: ProofModelProxy(device) for device in pool.dispatch_devices}
+    pool.qualify = lambda revision: {"revision": revision}
+    monkeypatch.setattr(remote.RemoteProofPool, "from_environment", lambda **kw: pool)
+
+    servers = []
+
+    class Service:
+        def __init__(self, wallet, model, tokenizer, **kwargs):
+            # The real service builds one; what this test is about is what
+            # startup then does with it.
+            self.server = ValidatorServer()
+            servers.append(self.server)
+
+        async def run(self, subtensor):
+            pass
+
+    class WeightSetter:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self):
+            pass
+
+    monkeypatch.setattr(service_module, "ValidationService", Service)
+    monkeypatch.setattr(weights, "WeightOnlyValidator", WeightSetter)
+
+    result = CliRunner().invoke(cli_module.app, ["validate", "--resume-from", f"sha:{REV}"])
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert len(servers) == 1
+    paths = [getattr(route, "path", "") for route in servers[0].app.routes]
+    assert "/corpus/submit" in paths
+
+
+def test_the_mount_refuses_the_task_config_wrapper(bucket, registry):
+    """The call site's own failure mode: `TaskConfig` has no `.mechanism`, so
+    a mount gated on `getattr(entry, "mechanism", None)` would decline a
+    declared corpus task in silence and the validator would boot, hold its
+    share of the pool and serve nothing."""
+    from reliquary.validator.task_config import TaskConfig, TaskConfigError
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
+    entry = registry["entries"][TASK_ID]
+    config = TaskConfig(
+        task_id=entry.task_id,
+        entry=entry,
+        price_params=None,
+        emission_cap=0.3,
+        env_caps={},
+    )
+
+    with pytest.raises(TaskConfigError) as caught:
+        _mount_on(ValidatorServer(), config)
+
+    assert "TaskConfig" in str(caught.value)

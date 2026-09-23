@@ -154,6 +154,25 @@ async def test_a_stored_manifest_that_is_not_a_job_is_refused_on_read(fake_r2, s
 
 
 @pytest.mark.asyncio
+async def test_a_manifest_filed_under_another_job_is_refused_on_read(
+    fake_r2, seed_object
+):
+    """The key is the job's identity everywhere else -- the ledgers hang off
+    it, the registry entry names it, the endpoint serves it. A manifest that
+    parses but declares a different id would be served under the key while
+    every check inside it judged submissions against the other job."""
+    import json
+
+    seed_object(
+        "reliquary/corpus/jobs/swe-v1.json",
+        json.dumps(_manifest(job_id="other-job")).encode(),
+    )
+    with pytest.raises(JobError) as caught:
+        await store.read_job("swe-v1", **fake_r2)
+    assert "other-job" in str(caught.value)
+
+
+@pytest.mark.asyncio
 async def test_a_stale_etag_conflicts_rather_than_overwriting(fake_r2):
     first = await store.write_job(_manifest(), None, **fake_r2)
     await store.write_job({**_manifest(), "prompt_count": 2000}, first, **fake_r2)
