@@ -807,6 +807,25 @@ def jobs_list() -> None:
             typer.echo(f"{job_id:24s} declared by {entry.task_id}, NO MANIFEST")
 
 
+@jobs_app.command("fingerprint")
+def jobs_fingerprint(
+    checkpoint: str = typer.Argument(..., help="HF repo id or local directory"),
+    revision: str = typer.Option("", "--revision", help="HF revision (repo ids only)"),
+) -> None:
+    """Print the value `jobs create --checkpoint-sha256` expects for a checkpoint."""
+    from pathlib import Path
+
+    from reliquary.corpus.encoding import checkpoint_fingerprint
+
+    directory = Path(checkpoint)
+    if not directory.is_dir():
+        from huggingface_hub import snapshot_download
+
+        directory = Path(snapshot_download(checkpoint, revision=revision or None,
+                                           allow_patterns=["*.safetensors"]))
+    typer.echo(checkpoint_fingerprint(directory))
+
+
 @jobs_app.command("cancel")
 def jobs_cancel(
     job_id: str = typer.Option(..., "--job-id"),
