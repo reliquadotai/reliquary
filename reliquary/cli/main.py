@@ -1547,6 +1547,10 @@ def validate(
         ),
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
+    set_weights: bool = typer.Option(
+        False, "--set-weights/--no-set-weights",
+        help="Corpus tasks only: also set weights from this process. Off by default: the RL validator's setter already pays every task.",
+    ),
 ):
     """Run Reliquary validator (trainer mode by default; --no-train for weight-only)."""
     setup_logging(log_level)
@@ -1662,6 +1666,26 @@ def validate(
                     exc,
                 )
                 raise typer.Exit(code=4) from exc
+
+            from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+            if getattr(task_config.entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION:
+                # A corpus task runs one process on one card with no RL
+                # machinery at all: branch before any of it -- model load,
+                # proof plane, batching -- is even imported.
+                from reliquary.validator.corpus_validator import run_corpus_validator
+
+                try:
+                    await run_corpus_validator(
+                        entry=task_config.entry, wallet=wallet, netuid=netuid,
+                        signer_client=signer_client, http_host=http_host,
+                        http_port=http_port, cap=task_config.emission_cap,
+                        set_weights=set_weights,
+                    )
+                except RuntimeError as exc:
+                    logger.critical("%s; fix the declaration before starting this validator", exc)
+                    raise typer.Exit(code=4) from exc
+                return
 
             import torch
             from reliquary.constants import ATTN_IMPLEMENTATION

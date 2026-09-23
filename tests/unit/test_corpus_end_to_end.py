@@ -360,126 +360,92 @@ def test_a_server_that_declines_the_mount_is_not_walked_past(bucket, registry):
     assert entry.job_id in str(caught.value)
 
 
-def _boot_validate_on_a_corpus_task(monkeypatch):
-    """Run `validate` on a declared corpus task with the RL machinery mocked
-    the way `test_remote_proof_controller` mocks it: no CUDA, no model, no
-    chain, no HF. Returns the CLI result and the servers startup built."""
+def _boot_validate_dispatching_to_corpus_validator(monkeypatch, *, side_effect=None):
+    """Run `validate` on a declared corpus task, with `run_corpus_validator`
+    itself replaced.
+
+    Task 8 moved a corpus task off the RL boot entirely (spec G2): `validate`
+    now branches to `run_corpus_validator` before any RL machinery -- model,
+    chain, proof plane -- is even imported, so there is no longer a
+    `ValidatorServer` this path builds for a test to inspect.
+    `run_corpus_validator` itself needs a GPU and R2 (covered in
+    `test_corpus_validator.py`, and end to end on real hardware in Task 11);
+    what only a full CLI boot can prove is the dispatch itself -- the
+    resolved entry and cap reach it, and RL loading is never touched.
+    """
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
     import bittensor
     import reliquary.cli.main as cli_module
-    import reliquary.constants as constants
     import reliquary.infrastructure.chain as chain
-    import reliquary.infrastructure.task_registry_store as task_registry_store
     import reliquary.shared.modeling as modeling
-    import reliquary.validator.remote_proof as remote
-    import reliquary.validator.service as service_module
-    import reliquary.validator.weight_only as weights
-    from reliquary.validator.proof_worker import ProofModelProxy
+    import reliquary.validator.corpus_validator as corpus_validator
 
-    from tests.unit.test_remote_proof_controller import REV, MetadataPool
-
-    _seed_manifest("swe-v1")
-    entry = _corpus_entry_this_binary_can_resolve("swe-v1")
-    monkeypatch.setattr(
-        task_registry_store,
-        "read_registry",
-        AsyncMock(return_value=({entry.task_id: entry}, None)),
-    )
-
-    # Everything below this line is the RL boot, mocked off the box: no CUDA,
-    # no model, no chain, no HF.
-    monkeypatch.setenv("RELIQUARY_PROOF_EXECUTOR_MODE", "remote")
-    monkeypatch.setattr(constants, "DETACHED_TRAINER", True)
-    monkeypatch.setattr(constants, "KL_BASE_MODEL", "")
-    monkeypatch.setattr(
-        cli_module, "_resolve_cli_environment_mix", lambda _v: [("fake", 1)]
-    )
-    monkeypatch.setattr(cli_module, "_v3_activation_checkpoint_revision", lambda *a: REV)
-    monkeypatch.setattr(modeling, "load_tokenizer", lambda *a, **kw: SimpleNamespace())
-    monkeypatch.setattr(
-        modeling, "load_text_generation_model", lambda *a, **kw: pytest.fail("loaded")
-    )
     monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
 
     async def subtensor():
         return SimpleNamespace()
 
     monkeypatch.setattr(chain, "get_subtensor", subtensor)
-    pool = MetadataPool()
-    pool.start = lambda: None
-    pool.dispatch_devices = ("cuda:0",)
-    pool.proxies = lambda: {device: ProofModelProxy(device) for device in pool.dispatch_devices}
-    pool.qualify = lambda revision: {"revision": revision}
-    monkeypatch.setattr(remote.RemoteProofPool, "from_environment", lambda **kw: pool)
+    # The one direct evidence the RL boot was skipped: it must never load.
+    monkeypatch.setattr(
+        modeling, "load_text_generation_model", lambda *a, **kw: pytest.fail("loaded")
+    )
 
-    servers = []
+    calls = []
 
-    class Service:
-        def __init__(self, wallet, model, tokenizer, **kwargs):
-            # The real service builds one; what this test is about is what
-            # startup then does with it.
-            self.server = ValidatorServer()
-            servers.append(self.server)
+    async def fake_run_corpus_validator(**kwargs):
+        calls.append(kwargs)
+        if side_effect is not None:
+            await side_effect(**kwargs)
 
-        async def run(self, subtensor):
-            pass
+    monkeypatch.setattr(corpus_validator, "run_corpus_validator", fake_run_corpus_validator)
 
-    class WeightSetter:
-        def __init__(self, **kwargs):
-            pass
-
-        async def run(self):
-            pass
-
-    monkeypatch.setattr(service_module, "ValidationService", Service)
-    monkeypatch.setattr(weights, "WeightOnlyValidator", WeightSetter)
-
-    result = CliRunner().invoke(cli_module.app, ["validate", "--resume-from", f"sha:{REV}"])
-    return result, servers
+    result = CliRunner().invoke(cli_module.app, ["validate"])
+    return result, calls
 
 
-def test_the_validator_startup_path_serves_the_route(monkeypatch, bucket):
-    """`mount_corpus_service` can be perfect and the validator still serve
-    nothing: the call site has to pass the resolved ENTRY and the real server,
-    and a mistake there is silent -- its only evidence is a missing log line.
-
-    So this boots `validate --train` onto a corpus task and asks the server
-    that startup actually built whether the route is on it.
+def test_the_validator_startup_path_dispatches_to_run_corpus_validator(
+    monkeypatch, registry
+):
+    """`validate` on a corpus task has to reach `run_corpus_validator` with
+    the REGISTRY's resolved entry and cap, not fall through to the RL
+    service Task 8 supersedes for this mechanism -- a mistake there is
+    silent, its only evidence a validator that boots holding this task's
+    share and serving nothing.
     """
-    result, servers = _boot_validate_on_a_corpus_task(monkeypatch)
+    entry = _corpus_entry_this_binary_can_resolve("swe-v1")
+    registry["entries"] = {entry.task_id: entry}
+
+    result, calls = _boot_validate_dispatching_to_corpus_validator(monkeypatch)
 
     assert result.exit_code == 0, (result.output, result.exception)
-    assert len(servers) == 1
-    paths = [getattr(route, "path", "") for route in servers[0].app.routes]
-    assert "/corpus/submit" in paths
+    assert len(calls) == 1
+    assert calls[0]["entry"].job_id == "swe-v1"
+    assert calls[0]["cap"] == pytest.approx(0.3)
+    assert calls[0]["set_weights"] is False
 
 
-def test_a_renderer_startup_cannot_build_exits_four_rather_than_traceback(
-    monkeypatch, bucket
+def test_a_corpus_startup_refusal_exits_four_rather_than_a_traceback(
+    monkeypatch, registry
 ):
-    """`renderer_for_job` raises `CorpusPromptSourceError`, and the call site
-    caught only `TaskConfigError`. A renderer that disagrees with this
-    validator's own profile is exactly the failure an operator has to be told
-    about, and it arrived as a bare traceback instead of the CRITICAL line and
-    the exit code every other startup refusal uses."""
-    from reliquary.validator import corpus_service
+    """`run_corpus_validator` raises `RuntimeError` for every named startup
+    refusal (an unenforced contract, a checkpoint mismatch, a missing
+    manifest). The CLI's own `except RuntimeError` is what turns that into
+    the CRITICAL line and exit code 4 every other startup refusal uses,
+    not a bare traceback."""
+    entry = _corpus_entry_this_binary_can_resolve("swe-v1")
+    registry["entries"] = {entry.task_id: entry}
 
-    def _refuse(job, encode, **kwargs):
-        raise corpus_service.CorpusPromptSourceError(
-            f"prompt source {job.prompt_source!r} renders through another template"
-        )
+    async def _refuse(**kwargs):
+        raise RuntimeError("the task contract's toploc proof is not enforce")
 
-    monkeypatch.setattr(corpus_service, "renderer_for_job", _refuse)
-
-    result, servers = _boot_validate_on_a_corpus_task(monkeypatch)
+    result, calls = _boot_validate_dispatching_to_corpus_validator(
+        monkeypatch, side_effect=_refuse
+    )
 
     assert result.exit_code == 4, (result.output, result.exception)
-    # And nothing was served: a validator holding this task's share must not
-    # come up with the route half-mounted.
-    paths = [getattr(route, "path", "") for server in servers for route in server.app.routes]
-    assert "/corpus/submit" not in paths
+    assert len(calls) == 1
 
 
 def test_the_mount_refuses_the_task_config_wrapper(bucket, registry):
