@@ -46,6 +46,10 @@ PRICE_PARAM_FIELDS = (
     "snap", "floor", "cap", "median_rounds", "last_good_fills",
 )
 
+# Optional per-task minimum-incentive floor: a hotkey's share is measured within
+# its own task, and absent keys fall back to the protocol-wide floor.
+INCENTIVE_FLOOR_FIELDS = ("min_incentive_share", "min_incentive_ramp_start")
+
 # Float addition of exact decimals is not exact; 1.0 must not fail by 1e-16.
 _SUM_TOLERANCE = 1e-9
 
@@ -98,6 +102,22 @@ def _number(value: Any, field: str) -> float:
     return number
 
 
+def _validate_incentive_floor(params: Mapping[str, Any]) -> None:
+    share = params.get("min_incentive_share")
+    start = params.get("min_incentive_ramp_start")
+    for field, value in (("min_incentive_share", share), ("min_incentive_ramp_start", start)):
+        if value is not None and not 0.0 <= _number(value, field) < 1.0:
+            raise RegistryError(f"{field} must be in [0.0, 1.0), got {value}")
+    if start is not None and share is None:
+        # A ramp start with no share of its own would silently borrow the
+        # protocol's, which is not what the declaration says.
+        raise RegistryError("min_incentive_ramp_start needs min_incentive_share")
+    if start is not None and float(start) > float(share):
+        raise RegistryError(
+            f"min_incentive_ramp_start {start} exceeds min_incentive_share {share}"
+        )
+
+
 def validate_entry(entry: TaskEntry) -> None:
     """Everything checkable about one entry without reading the image or R2."""
     try:
@@ -141,6 +161,7 @@ def validate_entry(entry: TaskEntry) -> None:
         raise RegistryError(
             f"retired_at must be an integer round or null, got {entry.retired_at!r}"
         )
+    _validate_incentive_floor(entry.params)
     cap = _number(entry.params["cap"], "cap")
     if not 0.0 <= cap <= 1.0:
         raise RegistryError(f"cap must be between 0.0 and 1.0, got {cap}")
@@ -312,6 +333,7 @@ def set_cap(
     task_id: str,
     cap: float,
     floor: float | None = None,
+    min_incentive_share: float | None = None,
 ) -> dict[str, TaskEntry]:
     """Change one live entry's cap (and optionally floor), nothing else.
 
@@ -331,6 +353,10 @@ def set_cap(
         params["floor"] = float(floor)
     elif entry.mechanism == MECHANISM_CORPUS_GENERATION:
         params["floor"] = float(cap)
+    if min_incentive_share is not None:
+        params["min_incentive_share"] = float(min_incentive_share)
+        if float(params.get("min_incentive_ramp_start", 0.0)) > float(min_incentive_share):
+            params["min_incentive_ramp_start"] = float(min_incentive_share)
     updated = {**entries, task_id: replace(entry, params=params)}
     validate_registry(updated)
     return updated

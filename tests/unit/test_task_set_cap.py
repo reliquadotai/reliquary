@@ -130,7 +130,7 @@ def test_the_cli_sets_the_cap(monkeypatch):
 
     calls = []
 
-    async def _set(task_id, cap, *, floor=None):
+    async def _set(task_id, cap, *, floor=None, min_incentive_share=None):
         calls.append((task_id, cap, floor))
 
     monkeypatch.setattr(store, "set_task_cap", _set)
@@ -145,7 +145,7 @@ def test_the_cli_names_a_refusal_and_exits_non_zero(monkeypatch):
 
     from reliquary.cli.main import app
 
-    async def _set(task_id, cap, *, floor=None):
+    async def _set(task_id, cap, *, floor=None, min_incentive_share=None):
         raise RegistryError("task 'nope' is not in the registry")
 
     monkeypatch.setattr(store, "set_task_cap", _set)

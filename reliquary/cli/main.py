@@ -241,6 +241,7 @@ def build_corpus_task_entry(
     cap,
     overrides,
     verification=None,
+    min_incentive_share=0.0,
 ):
     """One registry entry for a corpus generation job.
 
@@ -276,6 +277,12 @@ def build_corpus_task_entry(
     )
     # V0 has no price discovery: floor == cap is what keeps `advance()` still.
     params = {**entry.params, "floor": entry.params["cap"]}
+    # Every verified token is paid: a floor cut here would drop small miners'
+    # work, so a corpus task starts with none unless the operator names one.
+    params["min_incentive_share"] = float(min_incentive_share)
+    params["min_incentive_ramp_start"] = min(
+        float(params.get("min_incentive_ramp_start", 0.0)), float(min_incentive_share)
+    )
     contract = _with_enforced_toploc(entry.contract)
     return replace(
         entry,
@@ -485,13 +492,19 @@ def tasks_set_cap(
         None, "--floor",
         help="New price floor; omitted, an RL task keeps its floor and a corpus task's follows the cap",
     ),
+    min_incentive_share: float = typer.Option(
+        None, "--min-incentive-share",
+        help="Minimum share of THIS task a hotkey needs to be paid; 0 pays everyone",
+    ),
 ) -> None:
     """Change a live task's cap; its contract and digest are untouched."""
     from reliquary.infrastructure import task_registry_store as store
     from reliquary.shared.task_registry import RegistryError
 
     try:
-        asyncio.run(store.set_task_cap(task_id, cap, floor=floor))
+        asyncio.run(store.set_task_cap(
+            task_id, cap, floor=floor, min_incentive_share=min_incentive_share
+        ))
     except (RegistryError, store.RegistryConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -661,6 +674,11 @@ def jobs_create(
     cap: float = typer.Option(
         ..., "--cap", help="The task's share of the pool; also its pinned price"
     ),
+    min_incentive_share: float = typer.Option(
+        0.0,
+        "--min-incentive-share",
+        help="Minimum share of this task a hotkey needs to be paid; 0 pays every verified token",
+    ),
     min_new_tokens: int = typer.Option(
         2,
         "--min-new-tokens",
@@ -766,6 +784,7 @@ def jobs_create(
             cap=cap,
             overrides=overrides,
             verification=verification,
+            min_incentive_share=min_incentive_share,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)

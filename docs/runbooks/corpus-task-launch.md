@@ -163,6 +163,12 @@ reliquary jobs create \
   defaults); the corpus validator refuses a contract without one.
 - `--grader-id/--threshold` only annotate the export; the filter never decides
   payment.
+- The minimum-incentive floor is per task: a hotkey's share is measured within
+  its task and what the floor cuts is redistributed within that task only. A
+  corpus task is declared with `--min-incentive-share 0` by default, so every
+  verified token is paid; raise it later with
+  `reliquary tasks set-cap --task-id corpus-<name> --cap <cap> --min-incentive-share <x>`.
+  Tasks that declare no floor (the RL task) keep the protocol's 1% -> 2% ramp.
 
 Check both halves landed:
 
