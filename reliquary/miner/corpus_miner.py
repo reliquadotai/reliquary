@@ -236,11 +236,8 @@ class VllmGenerator:
             # bad_termination. `ignore_eos=True` turns off that model-config
             # default so only `stop_token_ids` below can end generation --
             # `min_tokens` above still masks it until the floor is reached.
-            # NOT verified against the installed vLLM API (no GPU on this
-            # machine): whether vLLM keeps the stop token itself in the
-            # output `token_ids` when `stop_token_ids` fires needs confirming
-            # on the H100 box in Task 11; `completion_text`'s "drop a
-            # trailing eos" branch assumes it does.
+            # Checked on vLLM 0.30 (H100, 2026-09-24): the stop token is kept
+            # at the end of `token_ids`, which `completion_text` relies on.
             stop_token_ids=[eos_token_id], ignore_eos=True,
         )
         self._proof = proof
