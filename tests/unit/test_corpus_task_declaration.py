@@ -360,3 +360,23 @@ def test_a_single_turn_source_is_declarable_only_against_the_contract_that_rende
 def test_a_prompt_source_that_is_not_installed_is_refused_at_declaration():
     with pytest.raises(ValueError, match="not-an-environment"):
         _manifest(prompt_source="not-an-environment")
+
+
+def test_the_carried_contract_enforces_toploc_so_the_corpus_validator_can_boot():
+    # No compiled template carries a proof, and the corpus validator refuses a
+    # contract without an enforced toploc one: without this, `jobs create`
+    # declares a task no validator will ever serve.
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.protocol.profiles import (
+        PROOF_SCHEME_TOPLOC,
+        TOPLOC_DEPLOYED_DEFAULTS,
+        profile_from_contract,
+    )
+
+    entry = _build()
+    proofs = profile_from_contract(entry.contract).proofs
+
+    toploc = [p for p in proofs if p.scheme == PROOF_SCHEME_TOPLOC]
+    assert toploc == [TOPLOC_DEPLOYED_DEFAULTS]
+    assert entry.profile_sha256 == canonical_sha256(entry.contract)
+    validate_entry(entry)

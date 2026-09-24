@@ -253,6 +253,7 @@ def build_corpus_task_entry(
     """
     from dataclasses import replace
 
+    from reliquary.environment.abi import canonical_sha256
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
 
     # A corpus task's price IS its cap, so accepting a floor and then
@@ -275,12 +276,32 @@ def build_corpus_task_entry(
     )
     # V0 has no price discovery: floor == cap is what keeps `advance()` still.
     params = {**entry.params, "floor": entry.params["cap"]}
+    contract = _with_enforced_toploc(entry.contract)
     return replace(
         entry,
         mechanism=MECHANISM_CORPUS_GENERATION,
         params=params,
         job_id=job_id,
+        contract=contract,
+        profile_sha256=canonical_sha256(contract),
     )
+
+
+def _with_enforced_toploc(contract):
+    """A corpus task is paid only on audited work, and the corpus validator
+    refuses a contract without an enforced toploc proof. No compiled template
+    carries one, so the template's own toploc entry is enforced if it has one,
+    and Prime Intellect's deployed defaults are added otherwise."""
+    from reliquary.protocol.profiles import PROOF_SCHEME_TOPLOC, TOPLOC_DEPLOYED_DEFAULTS
+
+    proofs = [dict(p) for p in contract.get("proofs") or ()]
+    toploc = [p for p in proofs if p.get("scheme") == PROOF_SCHEME_TOPLOC]
+    if toploc:
+        for proof in toploc:
+            proof["mode"] = "enforce"
+    else:
+        proofs.append(TOPLOC_DEPLOYED_DEFAULTS.to_contract())
+    return {**contract, "proofs": proofs}
 
 
 tasks_app = typer.Typer(name="tasks", help="Declare and retire subnet tasks")
