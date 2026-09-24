@@ -201,3 +201,36 @@ def test_consecutive_validator_side_errors_stop_the_auditor_loudly():
     with pytest.raises(CorpusAuditorHalted):
         asyncio.run(asyncio.wait_for(auditor.run(), timeout=10))
     assert records.verdicts == {}
+
+
+# --- re-review: an out-of-vocabulary id is the miner's fault, not ours ---
+
+
+def test_out_of_vocab_records_fail_and_never_halt_the_auditor():
+    from reliquary.validator.corpus_auditor import MAX_CONSECUTIVE_VALIDATOR_ERRORS
+
+    model = _tiny(0)
+    vocabulary = model.get_input_embeddings().num_embeddings
+    bad = _record(model)
+    bad["completions"][0]["tokens"] = list(range(100, 169)) + [vocabulary]
+    ids = [f"{i:064x}" for i in range(MAX_CONSECUTIVE_VALIDATOR_ERRORS + 2)]
+    records = _Records({sid: bad for sid in ids})
+    auditor = _auditor(model, records)
+
+    async def _drain():
+        task = asyncio.create_task(auditor.run())
+        try:
+            while len(records.verdicts) < len(ids):
+                assert not task.done(), task
+                await asyncio.sleep(0.01)
+            assert not task.done()
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(asyncio.wait_for(_drain(), timeout=20))
+    assert all(v["passed"] is False and v["reason"] == "token_out_of_vocab"
+               for v in records.verdicts.values())

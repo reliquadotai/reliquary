@@ -202,3 +202,9 @@ def test_proof_bytes_are_bounded_by_the_completions_own_length():
 @pytest.mark.parametrize("tokens,proofs", [(1, 1), (32, 1), (70, 3)])
 def test_honest_proof_volumes_fit(tokens, proofs):
     CorpusCompletion(**_completion(tokens=list(range(1, tokens + 1)), proofs=["A" * 344] * proofs))
+
+
+def test_the_out_of_vocab_reason_is_one_name_everywhere():
+    from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
+
+    assert CorpusRejectReason.TOKEN_OUT_OF_VOCAB.value == REASON_TOKEN_OUT_OF_VOCAB == "token_out_of_vocab"

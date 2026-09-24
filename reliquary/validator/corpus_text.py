@@ -24,6 +24,9 @@ from reliquary.environment.agentic.types import EpisodeTask
 
 REASON_TEXT_MISMATCH = "text_does_not_match_tokens"
 REASON_PROMPT_MISMATCH = "prompt_not_faithful"
+# A tokenizer drops unknown ids on decode, so the text check cannot see them;
+# the vocabulary bound is checked separately, by the route and by the auditor.
+REASON_TOKEN_OUT_OF_VOCAB = "token_out_of_vocab"
 
 
 def _ok() -> CheckResult:

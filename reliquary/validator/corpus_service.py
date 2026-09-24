@@ -565,6 +565,7 @@ def build_corpus_router(
     records=None,
     on_accepted=None,
     proof_chunk_tokens: int | None = None,
+    vocab_size: int | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -724,6 +725,17 @@ def build_corpus_router(
         digests = [
             completion_digest(request.prompt_index, tokens) for tokens in arrays
         ]
+
+        if vocab_size is not None:
+            # Before the text check, which cannot see these (decode drops
+            # unknown ids), and before any write: the auditor's prefill would
+            # otherwise be the first thing to trip on them.
+            for index, tokens in enumerate(arrays):
+                if max(tokens) >= vocab_size:
+                    return _refuse(
+                        CorpusRejectReason.TOKEN_OUT_OF_VOCAB,
+                        {"completion": index, "vocab_size": vocab_size},
+                    )
 
         for completion in request.completions:
             text = check_text_matches_tokens(

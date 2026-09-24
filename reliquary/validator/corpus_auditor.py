@@ -16,6 +16,7 @@ import torch
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.protocol.profiles import ProofProfile
 from reliquary.validator.corpus_audit import audit_completion, completion_hidden_states
+from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,13 @@ class CorpusAuditor:
             # Fail closed like sequence_verdict does for an empty chunk sequence:
             # no completions must never read as a vacuous pass paid like honest work.
             return {"passed": False, "reason": "no_completions", **worst}
+        # The miner's fault, not ours: checked before the prefill so it becomes a
+        # failed verdict instead of a validator-side error that halts the auditor.
+        vocabulary = self._model.get_input_embeddings().num_embeddings
+        for completion in record["completions"]:
+            tokens = completion["tokens"]
+            if tokens and (min(tokens) < 0 or max(tokens) >= vocabulary):
+                return {"passed": False, "reason": REASON_TOKEN_OUT_OF_VOCAB, **worst}
         passed, reason = True, None
         for completion in record["completions"]:
             hidden = completion_hidden_states(

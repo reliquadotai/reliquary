@@ -1058,3 +1058,32 @@ def test_a_store_outage_on_job_is_a_503(seeded_job):
     response = client.get("/corpus/job")
     assert response.status_code == 503
     assert response.json()["detail"] == "corpus_store_unavailable"
+
+
+# --- re-review: an out-of-vocabulary id is refused at the door ---
+
+
+def _vocab_client(seeded_job, vocab_size):
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id="swe-v1", store=seeded_job.store, tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer, verify_signature=lambda request: True,
+            prompt_job_for=seeded_job.prompt_job_for, vocab_size=vocab_size,
+        )
+    )
+    return TestClient(app)
+
+
+def test_a_token_id_outside_the_models_vocabulary_is_refused_before_any_write(seeded_job):
+    # A tokenizer silently drops unknown ids on decode, so the text check
+    # cannot catch this; only the vocabulary bound can.
+    vocab = EOS + 1
+    client = _vocab_client(seeded_job, vocab_size=vocab)
+    body = _submit(client, tokens=[7] * 15 + [vocab, EOS]).json()
+    assert body["accepted"] is False
+    assert body["reason"] == "token_out_of_vocab"
+    assert seeded_job.ledger_writes() == 0
+    assert _submit(client, tokens=[7] * 15 + [vocab - 1, EOS]).json()["accepted"] is True

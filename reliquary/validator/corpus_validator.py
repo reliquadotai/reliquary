@@ -37,7 +37,8 @@ def startup_refusal(entry, job, profile, local_fingerprint: str) -> str | None:
 
 
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
-                     auditor, proof_chunk_tokens, prompt_job_for=None) -> FastAPI:
+                     auditor, proof_chunk_tokens, prompt_job_for=None,
+                     vocab_size=None) -> FastAPI:
     from reliquary.validator.corpus_service import build_corpus_router, prompt_job_for_spec
 
     app = FastAPI()
@@ -45,6 +46,7 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
         job_id=str(entry.job_id), store=store, tokenizer=tokenizer, renderer=renderer,
         verify_signature=verify_signature, prompt_job_for=prompt_job_for or prompt_job_for_spec,
         records=records, on_accepted=auditor.enqueue, proof_chunk_tokens=proof_chunk_tokens,
+        vocab_size=vocab_size,
     ))
     return app
 
@@ -117,7 +119,8 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
     app = build_corpus_app(entry=entry, job=job, store=store, records=records, tokenizer=tokenizer,
                            renderer=renderer,
                            verify_signature=verify_corpus_signature, auditor=auditor,
-                           proof_chunk_tokens=proof.chunk_tokens)
+                           proof_chunk_tokens=proof.chunk_tokens,
+                           vocab_size=model.get_input_embeddings().num_embeddings)
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in
     # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
     settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
