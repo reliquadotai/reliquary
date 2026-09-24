@@ -89,7 +89,9 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
         return list(getattr(encoded, "ids", encoded))
 
     try:
-        renderer = renderer_for_job(job, encode)
+        renderer = renderer_for_job(
+            job, encode, tokenizer=lambda: tokenizer_box["tokenizer"]
+        )
     except ValueError as exc:
         # `CorpusPromptSourceError` (an unbuildable/mismatched prompt source)
         # is a `ValueError` subclass; an episode job's `renderer_id` naming no

@@ -294,7 +294,7 @@ def run_miner(args) -> None:
         encoded = tokenizer.encode(text, add_special_tokens=False)
         return list(getattr(encoded, "ids", encoded))
 
-    renderer = renderer_for_job(job, encode)
+    renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
     prompts = prompt_job_for_spec(job)
     keypair = bt.Keypair.create_from_mnemonic(os.environ["CORPUS_E2E_MNEMONIC"])
     signer = SimpleNamespace(hotkey=keypair)
@@ -452,7 +452,7 @@ def orchestrate(args) -> int:
         sha256 = checkpoint_fingerprint(honest_dir)
         eos = load_tokenizer(str(honest_dir)).eos_token_id
         contract = declare_task(state, args, task_id=task_id, job_id=job_id, revision=honest_revision)
-        renderer_id = contract["environments"][args.prompt_source]["prompt_template"]["id"]
+        renderer_id = args.renderer or contract["environments"][args.prompt_source]["prompt_template"]["id"]
         manifest = asyncio.run(declare_job(
             state, args, job_id=job_id, revision=honest_revision, sha256=sha256, eos=eos,
             renderer_id=renderer_id, contract=contract,
@@ -573,6 +573,8 @@ def main() -> int:
         p.add_argument("--base-profile", default="qwen3-4b-reliquary-logic-v8-dev1")
         p.add_argument("--model-architecture", default="Qwen3ForCausalLM")
         p.add_argument("--prompt-source", default="reliquarylogic_v1")
+        p.add_argument("--renderer", default=None,
+                       help="e.g. chat-template-thinking-v1; omit for the contract's own template")
         p.add_argument("--prompt-count", type=int, default=200)
         p.add_argument("--slots-per-prompt", type=int, default=4)
         p.add_argument("--n", type=int, default=4)

@@ -144,6 +144,12 @@ reliquary jobs create \
   --fleet-knows-corpus-generation
 ```
 
+- For a chat model, pass `--renderer-id chat-template-thinking-v1` (or
+  `chat-template-v1` without thinking): each row the contract renders is
+  wrapped as one user turn of the checkpoint's own chat template, pinned by
+  `--model-revision`. Without it the model receives the raw row, which is only
+  right for a base model. `--eos-token-id` is then the template's turn end
+  (e.g. `<|im_end|>`).
 - `--from-profile` must declare `<source>` with a prompt template;
   `<renderer-id>` is that template's id (the contract's
   `environments.<source>.prompt_template.id`). A mismatch is refused here.

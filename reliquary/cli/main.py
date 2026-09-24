@@ -1125,7 +1125,7 @@ def corpus_mine(
         encoded = tokenizer.encode(text, add_special_tokens=False)
         return list(getattr(encoded, "ids", encoded))
 
-    renderer = renderer_for_job(job, encode)
+    renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
     prompts = prompt_job_for_spec(job)
     try:
         counts = mine_steps(
@@ -1755,7 +1755,7 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         # profile is its task contract, so a manifest naming a rendering that
         # contract does not declare refuses the mount rather than serving
         # prompts nobody declared.
-        renderer=renderer_for_job(job, encode),
+        renderer=renderer_for_job(job, encode, tokenizer=tokenizer),
         verify_signature=verify_signature,
     )
     if not mounted:

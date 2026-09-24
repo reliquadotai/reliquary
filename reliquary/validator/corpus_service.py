@@ -191,6 +191,38 @@ class SingleTurnPromptJob:
         )
 
 
+# Renderer ids that wrap a single-turn row in the checkpoint's own chat
+# template; the value is whether the template's thinking mode is on.
+CHAT_TEMPLATE_RENDERERS = {
+    "chat-template-v1": False,
+    "chat-template-thinking-v1": True,
+}
+
+
+class ChatTemplatePromptRenderer:
+    """The row as one user turn of the model's chat template, generation prompt
+    appended. Miner and validator hold the same tokenizer (the job's revision),
+    so both render the same text; ``tokenizer`` may be a zero-argument callable
+    when the renderer is built before the tokenizer is loaded."""
+
+    __slots__ = ("_tokenizer", "_thinking")
+
+    def __init__(self, tokenizer: Any, *, thinking: bool) -> None:
+        self._tokenizer = tokenizer
+        self._thinking = thinking
+
+    def initial_text(self, task: EpisodeTask) -> str:
+        tokenizer = self._tokenizer() if callable(self._tokenizer) and not hasattr(
+            self._tokenizer, "apply_chat_template"
+        ) else self._tokenizer
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": task.prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self._thinking,
+        )
+
+
 class SingleTurnPromptRenderer:
     """The renderer half of the single-turn path: the prompt is already
     rendered when the environment hands it over, so this hands it back.
@@ -301,6 +333,11 @@ def resolve_prompt_source(
             "would go unchecked, which is the disagreement this refuses"
         )
     declared = _declared_prompt_template_id(prompt_source, profile)
+    if renderer_id in CHAT_TEMPLATE_RENDERERS:
+        # The model's own template wraps the row the contract rendered, so the
+        # contract must still render it; the template itself is pinned by the
+        # checkpoint revision, not by the contract.
+        return spec
     if renderer_id != declared:
         raise CorpusPromptSourceError(
             f"prompt source {prompt_source!r} renders through prompt template "
@@ -317,6 +354,7 @@ def renderer_for_job(
     *,
     environments: Mapping[str, Any] | None = None,
     profile: Any | None = None,
+    tokenizer: Any | None = None,
 ) -> Any:
     """The renderer this job's prompts are compared through.
 
@@ -334,6 +372,15 @@ def renderer_for_job(
     )
     if getattr(spec, "interaction_mode", None) == "episode":
         return renderer_for(job.renderer_id, encode)
+    if job.renderer_id in CHAT_TEMPLATE_RENDERERS:
+        if tokenizer is None:
+            raise CorpusPromptSourceError(
+                f"job {job.job_id!r} renders through the model's chat template, "
+                "so building its renderer needs the checkpoint's tokenizer"
+            )
+        return ChatTemplatePromptRenderer(
+            tokenizer, thinking=CHAT_TEMPLATE_RENDERERS[job.renderer_id]
+        )
     return SingleTurnPromptRenderer()
 
 
@@ -850,6 +897,8 @@ __all__ = [
     "SUBMIT_PATH",
     "SingleTurnPromptJob",
     "SingleTurnPromptRenderer",
+    "ChatTemplatePromptRenderer",
+    "CHAT_TEMPLATE_RENDERERS",
     "build_corpus_router",
     "ledger_snapshot",
     "prompt_job_for_spec",
