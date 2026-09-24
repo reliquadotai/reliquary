@@ -585,3 +585,53 @@ def test_the_mount_refuses_the_task_config_wrapper(bucket, registry):
         _mount_on(ValidatorServer(), config)
 
     assert "TaskConfig" in str(caught.value)
+
+
+def test_a_corpus_contract_for_another_source_boots_without_the_rl_environment_mix(
+    monkeypatch, registry, tmp_path
+):
+    """Final review, finding 2: `--environments` defaults to openmathinstruct,
+    which a corpus contract for another source does not declare. The corpus
+    branch must be taken before the RL mix is resolved (or the code grader
+    started), or `validate` refuses a correctly declared corpus task."""
+    from dataclasses import replace
+    import json as _json
+
+    import reliquary.cli.main as cli_module
+    import reliquary.constants as constants
+    from reliquary.cli.main import build_corpus_task_entry
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR, resolve_protocol_profile
+
+    entry = build_corpus_task_entry(
+        task_id=constants.TASK_ID, job_id="logic-v1",
+        from_profile="qwen3-4b-base-dapo-reliquary-v1", model_id="Qwen/Qwen3-4B-Base",
+        model_revision="main", model_architecture="Qwen3ForCausalLM",
+        prompt_source="reliquary_logic_v2", cap=0.1, overrides={},
+    )
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(_json.dumps(entry.contract))
+    monkeypatch.setenv(TASK_CONTRACT_ENV_VAR, str(contract_path))
+    # What importing under RELIQUARY_TASK_CONTRACT gives the process.
+    profile = resolve_protocol_profile()
+    assert "openmathinstruct" not in profile.environments
+    monkeypatch.setattr(cli_module, "ACTIVE_PROTOCOL_PROFILE", profile)
+    monkeypatch.setattr(constants, "PROTOCOL_PROFILE_ID", profile.profile_id)
+    monkeypatch.setattr(constants, "PROTOCOL_GENERATION_CONTRACT", profile.to_generation_contract())
+    registry["entries"] = {entry.task_id: replace(entry, profile_id=profile.profile_id)}
+
+    mix_calls = []
+    real_mix = cli_module._resolve_cli_environment_mix
+
+    def spy_mix(value):
+        mix_calls.append(value)
+        return real_mix(value)
+
+    monkeypatch.setattr(cli_module, "_resolve_cli_environment_mix", spy_mix)
+    monkeypatch.setattr(cli_module, "_ensure_grader_running",
+                        lambda *a, **kw: pytest.fail("grader started"))
+
+    result, calls = _boot_validate_dispatching_to_corpus_validator(monkeypatch)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert len(calls) == 1 and calls[0]["entry"].job_id == "logic-v1"
+    assert mix_calls == []

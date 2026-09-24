@@ -1805,14 +1805,13 @@ def validate(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    mix = _resolve_cli_environment_mix(environments) if train else []
-    env_names = [name for name, _target in mix]
-    if train and "opencodeinstruct" in env_names:
-        _ensure_grader_running()
+    # The RL environment mix (and the code grader) is resolved inside `_run`,
+    # after the corpus branch: `--environments` defaults to an RL source a
+    # corpus task's contract need not declare.
     if train:
         logger.info(
-            "Starting Reliquary validator [trainer] (network=%s, netuid=%d, envs=%s, http=%s:%d)",
-            network, netuid, env_names, http_host, http_port,
+            "Starting Reliquary validator [trainer] (network=%s, netuid=%d, http=%s:%d)",
+            network, netuid, http_host, http_port,
         )
     else:
         logger.info(
@@ -1932,6 +1931,12 @@ def validate(
                     logger.critical("%s; fix the declaration before starting this validator", exc)
                     raise typer.Exit(code=4) from exc
                 return
+
+            mix = _resolve_cli_environment_mix(environments)
+            env_names = [name for name, _target in mix]
+            if "opencodeinstruct" in env_names:
+                _ensure_grader_running()
+            logger.info("RL environments: %s", env_names)
 
             import torch
             from reliquary.constants import ATTN_IMPLEMENTATION
