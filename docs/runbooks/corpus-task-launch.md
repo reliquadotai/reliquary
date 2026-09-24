@@ -43,8 +43,15 @@ of the fleet (trainer and weight-only) has been redeployed on this binary.
 
 ### 1.2 The TOPLOC band is measured on the job's checkpoint (BLOCKING)
 
-The honest band and the vLLM decode capture were measured on Qwen3-4B only
-(worst honest `exp_mismatch` 9 against a threshold of 60 on the rehearsal).
+The honest band and the vLLM decode capture were measured on one checkpoint
+only, Qwen3-4B-Base (906bfd4b), on one H100:
+
+- 2026-09-22 bench: honest miner and verifier both Qwen3-4B-Base; the sibling
+  Qwen3-4B generating was caught, fp8 Qwen3-4B-Base was not refused by 60/40/40.
+- 2026-09-24 rehearsal (section 0): job checkpoint Qwen3-4B-Base, worst honest
+  `exp_mismatch` 9 against a threshold of 60; the dishonest miner generated
+  with Qwen3-4B and failed at 111-126.
+
 Before a job on any other checkpoint, and in particular before a Teutonic job,
 measure it on the test H100, honest and fp8:
 
@@ -61,8 +68,8 @@ Go only if every honest chunk passes the thresholds the contract will carry
 (`jobs create` writes Prime Intellect's deployed 60/40/40 unless the template
 carries its own toploc entry). If the capture hook does not fit the checkpoint's
 architecture (Teutonic is a hybrid), stop: that is fixed in the miner first.
-Note that 60/40/40 does not refuse fp8 on Qwen3-4B; a job on it pays a miner
-running fp8.
+Note that 60/40/40 does not refuse fp8 on Qwen3-4B-Base; a job on it pays a
+miner running fp8.
 
 ### 1.3 Room in the pool for the new task
 
@@ -75,6 +82,21 @@ reliquary tasks list
 The caps must sum to at most 1.0, and a retired task keeps its cap reserved
 until its EMA tail decays. Then:
 
+- **`default` is present** (the usual case): lower its cap with `tasks set-cap`.
+  It changes only the entry's params, under compare-and-swap, and re-checks the
+  whole registry (sum of caps, floor <= cap); the contract and its digest are
+  untouched, so the task's startup checks still match. It refuses a retired or
+  unknown task, and an RL floor above the new cap (pass `--floor` then).
+
+  ```bash
+  reliquary tasks set-cap --task-id default --cap 0.9
+  reliquary tasks list    # default active, cap=0.900; total declared cap 0.9000
+  ```
+
+  The weight setter re-reads the registry on every replay, so the lowered clamp
+  applies to payment without a restart; an RL validator already running keeps
+  the cap it resolved at startup for its own reporting until it restarts.
+
 - **`default` is absent** (the fleet runs on the legacy fallback): declare it
   first, at the lowered cap, on the profile the RL validators run today.
   Declaring any other task first un-arms the legacy fallback and stops every
@@ -84,11 +106,6 @@ until its EMA tail decays. Then:
   reliquary tasks create --task-id default --profile-id <rl-profile-id> --cap 0.9
   reliquary tasks list    # default active, cap=0.900
   ```
-
-- **`default` is present at a cap that leaves no room**: stop. This binary has
-  no command that lowers an existing entry's cap (`tasks create` refuses an
-  existing id, and retiring keeps the cap reserved). Lowering it needs a
-  registry change of its own before this runbook can continue.
 
 Lowering the RL cap is the one change the RL task sees, deliberately. Nothing
 else about RL payment may move: the corpus settler never writes an archive index
