@@ -992,3 +992,69 @@ def test_the_router_carries_the_prompt_fidelity_seam(seeded_job):
     assert faithful.ok
     assert not refused.ok
     assert refused.reason == "prompt_not_faithful"
+
+
+# --- final review, finding 3: a store outage is transient, not a permanent 500 ---
+
+
+def _transport_errors():
+    from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
+
+    return [
+        ClientError({"Error": {"Code": "InternalError"}}, "GetObject"),
+        EndpointConnectionError(endpoint_url="https://bucket.invalid"),
+        ReadTimeoutError(endpoint_url="https://bucket.invalid"),
+        ConnectionResetError("reset by peer"),
+    ]
+
+
+def _outage_client(seeded_job):
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id="swe-v1",
+            store=seeded_job.store,
+            tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer,
+            verify_signature=lambda request: True,
+            prompt_job_for=seeded_job.prompt_job_for,
+        )
+    )
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _break(store, method, exc):
+    async def _raise(*args, **kwargs):
+        raise exc
+
+    setattr(store, method, _raise)
+
+
+@pytest.mark.parametrize("method", ["read_job", "read_ledgers", "write_ledgers"])
+@pytest.mark.parametrize("error", range(4))
+def test_a_store_outage_on_submit_is_a_503_the_miner_retries(seeded_job, method, error):
+    client = _outage_client(seeded_job)
+    _break(seeded_job.store, method, _transport_errors()[error])
+    response = _submit(client, tokens=[7] * 16 + [EOS])
+    assert response.status_code == 503
+    assert response.json()["detail"] == "corpus_store_unavailable"
+
+
+@pytest.mark.parametrize("method", ["read_job", "read_ledgers"])
+@pytest.mark.parametrize("error", range(4))
+def test_a_store_outage_on_cursor_is_a_503_the_miner_retries(seeded_job, method, error):
+    client = _outage_client(seeded_job)
+    _break(seeded_job.store, method, _transport_errors()[error])
+    response = client.get("/corpus/cursor/5Hot")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "corpus_store_unavailable"
+
+
+def test_a_store_outage_on_job_is_a_503(seeded_job):
+    client = _outage_client(seeded_job)
+    _break(seeded_job.store, "read_job", _transport_errors()[1])
+    response = client.get("/corpus/job")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "corpus_store_unavailable"

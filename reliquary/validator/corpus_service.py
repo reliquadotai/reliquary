@@ -79,6 +79,16 @@ DEFAULT_WRITE_ATTEMPTS = 4
 # every job this process has ever seen.
 MAX_RESOLVED_PROMPT_SOURCES = 8
 
+try:
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # pragma: no cover - botocore ships with the store
+    BotoCoreError = ClientError = OSError
+
+# A bucket that cannot be reached right now (throttled, 5xx, reset, timeout).
+# Answered 503 so a miner retries instead of halting on a permanent 500; the
+# corrupt manifest/ledger cases keep their named 500s.
+_STORE_TRANSPORT_ERRORS = (ClientError, BotoCoreError, OSError, asyncio.TimeoutError)
+
 
 class LedgerSnapshotError(Exception):
     """The stored ledgers do not describe this job.
@@ -566,6 +576,13 @@ def build_corpus_router(
 
     router = APIRouter()
     prompt_fidelity = PromptFidelity(renderer=renderer, prompt_job_for=prompt_job_for)
+
+    async def _from_store(call, what: str):
+        try:
+            return await call
+        except _STORE_TRANSPORT_ERRORS as exc:
+            logger.warning("corpus store %s for job %s failed: %r", what, job_id, exc)
+            raise HTTPException(status_code=503, detail="corpus_store_unavailable") from exc
     # Also exposed, so the mount can reach the check without the handler.
     router.prompt_fidelity = prompt_fidelity
 
@@ -637,7 +654,7 @@ def build_corpus_router(
         job = await _read_job_checked()
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
-        snapshot, _ = await store.read_ledgers(job_id)
+        snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger read")
         _, cursors, _ = _rebuild_ledgers_checked(job, snapshot)
         return {"hotkey": hotkey, "cursor": cursors.expected(hotkey)}
 
@@ -719,7 +736,7 @@ def build_corpus_router(
                 return _refuse(CorpusRejectReason(text.reason), text.detail)
 
         for _ in range(max_write_attempts):
-            snapshot, etag = await store.read_ledgers(job_id)
+            snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
             # The blast radius of a corrupt snapshot is every miner on this
             # job, and there is no circuit breaker: the object stays corrupt
             # until an operator repairs it, so `_rebuild_ledgers_checked`
@@ -753,7 +770,7 @@ def build_corpus_router(
                 # spraying junk cannot bill us a bucket write per attempt.
                 return _respond(verdict)
             try:
-                await store.write_ledgers(job_id, after, etag)
+                await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
             except CorpusStoreConflict:
                 continue
             if verdict.accepted:
@@ -775,7 +792,7 @@ def build_corpus_router(
         identical object, fail the same way an operator's corrupt manifest.
         """
         try:
-            job, _ = await store.read_job(job_id)
+            job, _ = await _from_store(store.read_job(job_id), "manifest read")
         except JobError as exc:
             logger.error(
                 "corpus job %s has an unreadable manifest: %s", job_id, exc

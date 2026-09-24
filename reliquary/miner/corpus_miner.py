@@ -4,8 +4,8 @@ sign, submit.
 
 The loop is written against three small seams (generator, client, signer) so
 it is tested without a GPU; ``VllmGenerator`` is the real generator. A
-``CorpusClient`` may raise ``CorpusTransientFailure`` (503 ledger contention,
-a timeout, a transport error) -- the signed body is idempotent, so the loop
+``CorpusClient`` may raise ``CorpusTransientFailure`` (502/503/504, a
+timeout, a transport error) -- the signed body is idempotent, so the loop
 retries the identical submission rather than paying for a fresh generation --
 or ``CorpusPermanentFailure`` (any other HTTP error, or a body this client
 cannot make sense of); a run of ``max_consecutive_failures`` of the latter
@@ -37,6 +37,11 @@ _TRANSIENT_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 # tolerates on one call before giving up on it entirely.
 _MAX_CONSECUTIVE_FAILURES = 5
 
+# Statuses that say "not now" rather than "never": ledger contention or a store
+# outage (503), and a proxy in front of the validator timing out or losing it
+# (502/504). A short outage must not count toward the permanent-failure halt.
+TRANSIENT_STATUSES = frozenset({502, 503, 504})
+
 
 class CorpusTransientFailure(Exception):
     """Ledger contention (HTTP 503) or a transport-level failure (timeout,
@@ -65,6 +70,42 @@ class CorpusMinerHalted(Exception):
     def __init__(self, message: str, *, counts: dict[str, int]) -> None:
         super().__init__(message)
         self.counts = dict(counts)
+
+
+def _error_detail(response):
+    try:
+        return response.json()
+    except ValueError:
+        return response.text[:500]
+
+
+def issue_corpus_request(request_call):
+    """Run one httpx request against the corpus validator, translating its
+    outcome into the two exceptions ``mine_steps`` understands. A status in
+    ``TRANSIENT_STATUSES`` and a transport failure (timeout, connection error)
+    are transient -- the caller retries the SAME idempotent request; every other
+    error status, or a body this client cannot parse as JSON, is permanent."""
+    import httpx
+
+    try:
+        response = request_call()
+    except httpx.TransportError as exc:
+        raise CorpusTransientFailure(f"transport error: {exc}") from exc
+    if response.status_code in TRANSIENT_STATUSES:
+        raise CorpusTransientFailure(f"{response.status_code} from {response.request.url}")
+    if response.status_code >= 400:
+        raise CorpusPermanentFailure(
+            f"{response.status_code} from {response.request.url}",
+            status=response.status_code,
+            detail=_error_detail(response),
+        )
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise CorpusPermanentFailure(
+            f"non-JSON body from {response.request.url}: {exc}",
+            status=response.status_code,
+        ) from exc
 
 
 @dataclass(frozen=True)

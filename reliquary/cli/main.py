@@ -1004,9 +1004,8 @@ def corpus_mine(
     from reliquary.corpus.job import parse_job
     from reliquary.miner.corpus_miner import (
         CorpusMinerHalted,
-        CorpusPermanentFailure,
-        CorpusTransientFailure,
         VllmGenerator,
+        issue_corpus_request as _issue,
         mine_steps,
     )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
@@ -1032,38 +1031,6 @@ def corpus_mine(
         wallet_kwargs["path"] = wallet_path
     wallet = bt.Wallet(**wallet_kwargs)
     http = httpx.Client(base_url=validator_url, timeout=120.0)
-
-    def _error_detail(response: "httpx.Response"):
-        try:
-            return response.json()
-        except ValueError:
-            return response.text[:500]
-
-    def _issue(request_call):
-        """Run one HTTP request, translating its outcome into the two
-        exceptions ``mine_steps`` understands. 503 (ledger contention) and a
-        transport failure (timeout, connection error) are transient -- the
-        caller retries the SAME idempotent request; every other error status,
-        or a body this client cannot parse as JSON, is permanent."""
-        try:
-            response = request_call()
-        except httpx.TransportError as exc:
-            raise CorpusTransientFailure(f"transport error: {exc}") from exc
-        if response.status_code == 503:
-            raise CorpusTransientFailure(f"503 from {response.request.url}")
-        if response.status_code >= 400:
-            raise CorpusPermanentFailure(
-                f"{response.status_code} from {response.request.url}",
-                status=response.status_code,
-                detail=_error_detail(response),
-            )
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise CorpusPermanentFailure(
-                f"non-JSON body from {response.request.url}: {exc}",
-                status=response.status_code,
-            ) from exc
 
     class _Client:
         def job(self):

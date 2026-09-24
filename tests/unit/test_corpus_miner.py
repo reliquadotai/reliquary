@@ -280,3 +280,43 @@ def test_the_vllm_generator_leaves_the_memory_share_to_vllm_unless_told(monkeypa
 
     assert "gpu_memory_utilization" not in default._llm.kwargs
     assert shared._llm.kwargs["gpu_memory_utilization"] == 0.5
+
+
+# --- final review, finding 3: gateway statuses are transient too ---
+
+
+def _response(status, body=b'{"ok": true}'):
+    import httpx
+
+    return httpx.Response(status, content=body,
+                          request=httpx.Request("POST", "http://validator/corpus/submit"))
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_a_gateway_or_unavailable_status_is_transient(status):
+    from reliquary.miner.corpus_miner import issue_corpus_request
+
+    with pytest.raises(CorpusTransientFailure):
+        issue_corpus_request(lambda: _response(status, b"{}"))
+
+
+@pytest.mark.parametrize("status", [400, 404, 422, 500])
+def test_other_error_statuses_stay_permanent(status):
+    from reliquary.miner.corpus_miner import issue_corpus_request
+
+    with pytest.raises(CorpusPermanentFailure) as caught:
+        issue_corpus_request(lambda: _response(status, b'{"detail": "x"}'))
+    assert caught.value.status == status
+
+
+def test_a_transport_error_is_transient_and_a_body_is_returned():
+    import httpx
+
+    from reliquary.miner.corpus_miner import issue_corpus_request
+
+    def _fail():
+        raise httpx.ConnectError("refused")
+
+    with pytest.raises(CorpusTransientFailure):
+        issue_corpus_request(_fail)
+    assert issue_corpus_request(lambda: _response(200)) == {"ok": True}
