@@ -193,3 +193,79 @@ def test_r2archives_other_max_excludes_its_own_task_and_is_none_when_no_other_ta
     with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=fake_list_task_ids_alone)), \
          patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=fake_list_all_window_keys_alone)):
         assert asyncio.run(R2Archives().other_max("corpus-math")) is None
+
+
+# --- final review, finding 1: stall mode advances at the RL cadence, not the settle cadence ---
+
+
+class _FailingArchives(_Archives):
+    """Crashes on the archive write itself, so a pending entry is left with no archive."""
+
+    def __init__(self, other_max):
+        super().__init__(other_max)
+        self.fail = False
+
+    async def write(self, task_id, window, data):
+        if self.fail:
+            raise OSError("crash before the archive landed")
+        await super().write(task_id, window, data)
+
+
+def test_stall_mode_advances_at_most_once_per_rl_window_not_once_per_settle_call():
+    # RL sealed 46000 long ago and the corpus already joined it; then ten
+    # settle calls 60 s apart, each with a fresh verdict, as the loop makes.
+    records = _Records({"0" * 64: _v("A", 10)})
+    archives = _Archives(46000)
+    assert asyncio.run(_settler(records, archives, now=0).settle_once()) == 46000
+    start = 10 * STALL
+    for i in range(10):
+        records.verdicts[f"{i + 1:064d}"] = _v("A", 10)
+        asyncio.run(_settler(records, archives, now=start + 60 * i).settle_once())
+    assert max(archives.written) - 46000 <= 1
+
+
+def test_stall_mode_advances_again_once_an_rl_window_of_wall_time_has_passed():
+    from reliquary.validator.corpus_settlement import RL_WINDOW_SECONDS
+
+    records = _Records({"0" * 64: _v("A", 10)})
+    archives = _Archives(46000)
+    asyncio.run(_settler(records, archives, now=0).settle_once())
+    start = 10 * STALL
+    records.verdicts["1" * 64] = _v("A", 10)
+    assert asyncio.run(_settler(records, archives, now=start).settle_once()) == 46001
+    records.verdicts["2" * 64] = _v("A", 10)
+    assert asyncio.run(_settler(records, archives, now=start + RL_WINDOW_SECONDS - 1).settle_once()) is None
+    assert asyncio.run(_settler(records, archives, now=start + RL_WINDOW_SECONDS).settle_once()) == 46002
+
+
+def test_a_pending_stall_entry_finished_after_rl_revived_does_not_lead_the_horizon():
+    from reliquary.validator.corpus_settlement import RL_WINDOW_SECONDS
+
+    records = _Records({"0" * 64: _v("A", 10)})
+    archives = _FailingArchives(46000)
+    asyncio.run(_settler(records, archives, now=0).settle_once())
+    # Stall: the corpus advances alone to 46002, one RL window apart.
+    t = 10 * STALL
+    for sid in ("1", "2"):
+        records.verdicts[sid * 64] = _v("A", 10)
+        asyncio.run(_settler(records, archives, now=t).settle_once())
+        t += RL_WINDOW_SECONDS
+    assert records.state["last_window"] == 46002
+    # The next stall settlement crashes after its pending write, before any archive.
+    records.verdicts["3" * 64] = _v("B", 10)
+    archives.fail = True
+    with pytest.raises(OSError):
+        asyncio.run(_settler(records, archives, now=t).settle_once())
+    assert records.state["pending"]["window"] == 46003
+    archives.fail = False
+    # RL revives and seals 46001: finishing the pending entry now would write
+    # 46003 above a live task's horizon.
+    archives.other = 46001
+    assert asyncio.run(_settler(records, archives, now=t + 10).settle_once()) is None
+    assert 46003 not in archives.written
+    assert records.state["pending"]["window"] == 46003
+    # Once RL reaches the pending window, it is finished there, once.
+    archives.other = 46003
+    assert asyncio.run(_settler(records, archives, now=t + 20).settle_once()) == 46003
+    assert archives.written[46003]["rewards_by_hotkey"] == pytest.approx({"B": 0.1})
+    assert "3" * 64 in records.state["settled"] and records.state["pending"] is None

@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 SETTLEMENT_SCHEMA = "reliquary/corpus-settlement/v1"
 
+# Wall time of one RL window: the V1 cycle measured on 2026-09-13 (proof
+# ~11.3 min + rotation ~4.6 min). Alone, the corpus advances at most this often,
+# so the shared replay horizon never moves faster than RL itself moved it.
+RL_WINDOW_SECONDS = 16 * 60
+
 
 def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
     tokens: dict[str, int] = {}
@@ -28,27 +33,36 @@ def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
     return {hotkey: cap * count / total for hotkey, count in tokens.items()}
 
 
-def choose_window(*, last_window, other_max, other_max_seen_at, now, stall_seconds):
-    if other_max is None:
-        return 0 if last_window is None else last_window + 1
-    if last_window is None or other_max > last_window:
+def _stalled(other_max_seen_at, now, stall_seconds) -> bool:
+    return other_max_seen_at is not None and now - other_max_seen_at > stall_seconds
+
+
+def choose_window(*, last_window, other_max, other_max_seen_at, now, stall_seconds,
+                  last_advanced_at=None, advance_every_seconds=0.0):
+    if other_max is not None and (last_window is None or other_max > last_window):
         return other_max
-    if other_max_seen_at is not None and now - other_max_seen_at > stall_seconds:
-        # Every other task is idle: advancing alone decays it the way a
-        # retired task already decays.
-        return last_window + 1
-    return None
+    if other_max is None and last_window is None:
+        return 0
+    if other_max is not None and not _stalled(other_max_seen_at, now, stall_seconds):
+        return None
+    # Every other task is idle (or none exists): advancing alone decays it the
+    # way a retired task already decays, but no faster than RL itself would.
+    if last_advanced_at is not None and now - last_advanced_at < advance_every_seconds:
+        return None
+    return last_window + 1
 
 
 class CorpusSettler:
     def __init__(self, *, task_id, job_id, cap, records, archives,
-                 stall_seconds: float = 3 * 16 * 60, clock=time.time) -> None:
+                 stall_seconds: float = 3 * RL_WINDOW_SECONDS,
+                 advance_every_seconds: float = RL_WINDOW_SECONDS, clock=time.time) -> None:
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
         self._records = records
         self._archives = archives
         self._stall = stall_seconds
+        self._advance_every = advance_every_seconds
         self._clock = clock
 
     def _archive(self, window: int, rewards: Mapping[str, float]) -> dict:
@@ -72,33 +86,54 @@ class CorpusSettler:
             "settled": sorted(set(state.get("settled") or []) | set(pending["ids"])),
             "pending": None,
         }
+        if pending.get("alone"):
+            final["advanced_at"] = pending.get("at")
         await self._records.write_settlement(self._job_id, final, etag)
         return pending["window"]
 
     async def settle_once(self) -> int | None:
         state, etag = await self._records.read_settlement(self._job_id)
         state = {"schema": SETTLEMENT_SCHEMA, "last_window": None, "settled": [],
-                 "other_max_seen": None, "other_max_seen_at": None, "pending": None, **state}
-        if state["pending"]:
-            return await self._finish(state, etag)
+                 "other_max_seen": None, "other_max_seen_at": None, "advanced_at": None,
+                 "pending": None, **state}
 
         now = self._clock()
         other_max = await self._archives.other_max(self._task_id)
         clock_changed = other_max != state["other_max_seen"]
         if clock_changed:
+            # Another task sealed: a new stall, if one comes, starts its own
+            # RL-cadence spacing from scratch.
             state["other_max_seen"], state["other_max_seen_at"] = other_max, now
+            state["advanced_at"] = None
+
+        if state["pending"]:
+            window = state["pending"]["window"]
+            live = other_max is not None and not _stalled(state["other_max_seen_at"], now, self._stall)
+            if live and window > other_max:
+                # Chosen alone during a stall and interrupted; the other task
+                # has since revived. Re-targeting the ids to another index could
+                # pay them twice if the archive already landed, so hold them
+                # until the live task reaches this window (the next corpus index
+                # would have waited for exactly that anyway).
+                if clock_changed:
+                    await self._records.write_settlement(self._job_id, state, etag)
+                return None
+            return await self._finish(state, etag)
 
         settled = set(state["settled"])
         new_ids = [sid for sid in await self._records.list_verdict_ids(self._job_id) if sid not in settled]
         window = choose_window(last_window=state["last_window"], other_max=other_max,
                                other_max_seen_at=state["other_max_seen_at"], now=now,
-                               stall_seconds=self._stall)
+                               stall_seconds=self._stall, last_advanced_at=state["advanced_at"],
+                               advance_every_seconds=self._advance_every)
 
         if new_ids and window is not None:
             verdicts = [await self._records.read_verdict(self._job_id, sid) for sid in new_ids]
             rewards = rewards_for(verdicts, self._cap)
             if rewards:
-                state["pending"] = {"window": window, "ids": new_ids, "rewards": rewards}
+                alone = other_max is None or window > other_max
+                state["pending"] = {"window": window, "ids": new_ids, "rewards": rewards,
+                                    "alone": alone, "at": now}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
                 return await self._finish(state, etag)
             # Every verdict this period failed (spec §7): no archive, the
