@@ -477,6 +477,27 @@ def tasks_list() -> None:
     typer.echo(f"total declared cap: {total_cap(entries):.4f} / 1.0")
 
 
+@tasks_app.command("set-cap")
+def tasks_set_cap(
+    task_id: str = typer.Option(..., "--task-id"),
+    cap: float = typer.Option(..., "--cap", help="The task's new share of the pool"),
+    floor: float = typer.Option(
+        None, "--floor",
+        help="New price floor; omitted, an RL task keeps its floor and a corpus task's follows the cap",
+    ),
+) -> None:
+    """Change a live task's cap; its contract and digest are untouched."""
+    from reliquary.infrastructure import task_registry_store as store
+    from reliquary.shared.task_registry import RegistryError
+
+    try:
+        asyncio.run(store.set_task_cap(task_id, cap, floor=floor))
+    except (RegistryError, store.RegistryConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"task {task_id} now has cap {cap}" + (f" and floor {floor}" if floor is not None else ""))
+
+
 @tasks_app.command("retire")
 def tasks_retire(
     task_id: str = typer.Option(..., "--task-id"),

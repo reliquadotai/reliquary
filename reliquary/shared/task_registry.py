@@ -307,6 +307,35 @@ def retire_task(
     return {**entries, task_id: retired}
 
 
+def set_cap(
+    entries: Mapping[str, TaskEntry],
+    task_id: str,
+    cap: float,
+    floor: float | None = None,
+) -> dict[str, TaskEntry]:
+    """Change one live entry's cap (and optionally floor), nothing else.
+
+    The contract and its digest stay as they are: a cap is what the task may
+    pay, not how it generates. A corpus task's price follows its cap unless a
+    floor is named, and a named floor that breaks the pin is refused below.
+    """
+    if task_id not in entries:
+        raise RegistryError(f"task {task_id!r} is not in the registry")
+    entry = entries[task_id]
+    if entry.status != "active":
+        # A retired cap is reserved while its EMA decays; changing it would
+        # hand out budget that is still being paid.
+        raise RegistryError(f"task {task_id!r} is {entry.status}; its cap cannot change")
+    params = {**entry.params, "cap": float(cap)}
+    if floor is not None:
+        params["floor"] = float(floor)
+    elif entry.mechanism == MECHANISM_CORPUS_GENERATION:
+        params["floor"] = float(cap)
+    updated = {**entries, task_id: replace(entry, params=params)}
+    validate_registry(updated)
+    return updated
+
+
 def _verification_of(task_id: str, body: Mapping[str, Any]) -> str | None:
     """Read the declared replica, refusing a block this reader does not understand."""
     declared = body.get("verification")
