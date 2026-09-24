@@ -144,3 +144,60 @@ def test_run_survives_a_store_exception_and_keeps_draining():
 
     asyncio.run(asyncio.wait_for(_wait_for_the_good_verdict(), timeout=5))
     assert records.verdicts[good_id]["passed"] is True
+
+
+# --- final review, finding 4: retry what failed, and stop loudly on a broken validator ---
+
+
+def test_a_submission_whose_read_failed_is_audited_on_the_next_rescan():
+    model = _tiny(0)
+    flaky_id = "c" * 64
+
+    class _OnceFlakyRecords(_Records):
+        failed = False
+
+        async def read_submission(self, job_id, sid):
+            if sid == flaky_id and not self.failed:
+                self.failed = True
+                raise ConnectionError("transient store failure")
+            return await super().read_submission(job_id, sid)
+
+    records = _OnceFlakyRecords({flaky_id: _record(model)})
+    auditor = CorpusAuditor(job_id="math-v1", records=records, model=model,
+                            tokenizer=_Tokenizer(), proof=PROOF, rescan_every_seconds=0.05)
+
+    async def _wait():
+        task = asyncio.create_task(auditor.run())
+        try:
+            while flaky_id not in records.verdicts:
+                assert not task.done(), task
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(asyncio.wait_for(_wait(), timeout=10))
+    assert records.failed and records.verdicts[flaky_id]["passed"] is True
+
+
+def test_consecutive_validator_side_errors_stop_the_auditor_loudly():
+    from dataclasses import replace
+
+    from reliquary.validator.corpus_auditor import (
+        MAX_CONSECUTIVE_VALIDATOR_ERRORS,
+        CorpusAuditorHalted,
+    )
+
+    model = _tiny(0)
+    record = _record(model)
+    records = _Records({f"{i:064x}": record for i in range(MAX_CONSECUTIVE_VALIDATOR_ERRORS + 1)})
+    wide = replace(PROOF, topk=1024)  # a configuration error on every audit
+    auditor = CorpusAuditor(job_id="math-v1", records=records, model=model,
+                            tokenizer=_Tokenizer(), proof=wide, rescan_every_seconds=0.05)
+
+    with pytest.raises(CorpusAuditorHalted):
+        asyncio.run(asyncio.wait_for(auditor.run(), timeout=10))
+    assert records.verdicts == {}
