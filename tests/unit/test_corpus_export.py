@@ -172,6 +172,14 @@ def records(monkeypatch):
 def env_specs(monkeypatch):
     from reliquary.environment import registry
 
+    # `corpus_service` binds its own `ENVIRONMENT_SPECS` name at MODULE import
+    # time (`from ... import ENVIRONMENT_SPECS`). Importing it here, before the
+    # patch below, makes sure that binding captures the real catalog rather
+    # than -- if this were this process's first import of `corpus_service`,
+    # e.g. triggered lazily by `jobs export` itself -- freezing onto our fake
+    # one for the rest of the test session, past this fixture's teardown.
+    import reliquary.validator.corpus_service  # noqa: F401
+
     specs = {"fake-env": _FakeSpec(), "fake-episode-env": _FakeEpisodeSpec()}
     monkeypatch.setattr(registry, "ENVIRONMENT_SPECS", specs)
     return specs
