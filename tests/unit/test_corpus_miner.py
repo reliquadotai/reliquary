@@ -222,12 +222,7 @@ def test_a_generation_failure_drops_the_step_and_continues():
     assert client.cursor_reads == 2, "one initial read, one resync after the dropped step"
 
 
-def test_the_vllm_generator_stops_only_on_the_jobs_eos(monkeypatch):
-    """SamplingParams must stop on the job's eos, not whatever the checkpoint's
-    own generation_config lists: vLLM stopping on a DIFFERENT terminator would
-    get an honest completion judged (and refused, ``bad_termination``) against
-    an eos it never produced."""
-
+def _install_fake_vllm(monkeypatch):
     class _FakeSamplingParams:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -254,6 +249,15 @@ def test_the_vllm_generator_stops_only_on_the_jobs_eos(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.v1.worker", ModuleType("vllm.v1.worker"))
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", fake_gpu_model_runner_module)
 
+
+def test_the_vllm_generator_stops_only_on_the_jobs_eos(monkeypatch):
+    """SamplingParams must stop on the job's eos, not whatever the checkpoint's
+    own generation_config lists: vLLM stopping on a DIFFERENT terminator would
+    get an honest completion judged (and refused, ``bad_termination``) against
+    an eos it never produced."""
+
+    _install_fake_vllm(monkeypatch)
+
     sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=64)
     proof = SimpleNamespace(chunk_tokens=32, topk=8)
     generator = VllmGenerator("/fake/checkpoint", sampling, proof, EOS)
@@ -262,3 +266,17 @@ def test_the_vllm_generator_stops_only_on_the_jobs_eos(monkeypatch):
     assert generator._params.ignore_eos is True
     assert generator._params.min_tokens == 2
     assert generator._params.max_tokens == 64
+
+
+def test_the_vllm_generator_leaves_the_memory_share_to_vllm_unless_told(monkeypatch):
+    """A validator sharing the card needs vLLM to take less than its default
+    share; unset, vLLM keeps its own default rather than one we guessed."""
+    _install_fake_vllm(monkeypatch)
+    sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=64)
+    proof = SimpleNamespace(chunk_tokens=32, topk=8)
+
+    default = VllmGenerator("/fake/checkpoint", sampling, proof, EOS)
+    shared = VllmGenerator("/fake/checkpoint", sampling, proof, EOS, gpu_memory_utilization=0.5)
+
+    assert "gpu_memory_utilization" not in default._llm.kwargs
+    assert shared._llm.kwargs["gpu_memory_utilization"] == 0.5

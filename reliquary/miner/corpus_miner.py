@@ -209,7 +209,8 @@ class VllmGenerator:
     recomputed and would be missing from the capture.
     """
 
-    def __init__(self, checkpoint_dir: str, sampling, proof, eos_token_id: int) -> None:
+    def __init__(self, checkpoint_dir: str, sampling, proof, eos_token_id: int,
+                 gpu_memory_utilization: float | None = None) -> None:
         import os
 
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -220,7 +221,10 @@ class VllmGenerator:
 
         self._capture_cm = capture_hidden_states()
         self._capture = self._capture_cm.__enter__()
-        self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False)
+        # Only passed when set: a miner alone on its card keeps vLLM's own
+        # default, one sharing it (e.g. with a validator) asks for less.
+        memory = {} if gpu_memory_utilization is None else {"gpu_memory_utilization": gpu_memory_utilization}
+        self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False, **memory)
         self._params = SamplingParams(
             n=1, temperature=sampling.temperature, top_p=sampling.top_p,
             top_k=sampling.top_k if sampling.top_k > 0 else -1,

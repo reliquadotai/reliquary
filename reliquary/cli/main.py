@@ -948,6 +948,10 @@ def corpus_mine(
     hotkey: str = typer.Option("default"),
     wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", "")),
     max_steps: int = typer.Option(0, help="0 = until the job completes"),
+    gpu_memory_utilization: float = typer.Option(
+        None, "--gpu-memory-utilization",
+        help="Share of the card vLLM may take; omit for vLLM's own default",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
     import bittensor as bt
@@ -1048,7 +1052,8 @@ def corpus_mine(
     try:
         counts = mine_steps(
             job=job, hotkey=wallet.hotkey.ss58_address, client=client,
-            generator=VllmGenerator(directory, job.sampling, proof, job.eos_token_id),
+            generator=VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
+                                    gpu_memory_utilization=gpu_memory_utilization),
             tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
             sign=lambda body: sign_corpus_submission(wallet, body),
             max_steps=max_steps or None,
