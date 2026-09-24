@@ -561,9 +561,9 @@ def test_a_math_job_declares_and_mounts_end_to_end(bucket, registry, monkeypatch
     server, mounted = _mount(entry)
 
     assert mounted is True
-    assert "/corpus/submit" in [
-        getattr(route, "path", "") for route in server.app.routes
-    ]
+    # The OpenAPI paths, not `app.routes`: FastAPI >= 0.141 keeps an included
+    # router's routes out of `app.routes`.
+    assert "/corpus/submit" in server.app.openapi()["paths"]
 
 
 def test_a_validator_rendering_these_prompts_differently_refuses_to_serve(

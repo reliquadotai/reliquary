@@ -251,11 +251,9 @@ def test_a_validator_on_an_rl_task_exposes_no_corpus_route(bucket, registry):
     assert _mount_on(server, _rl_entry("default", 1.0)) is False
     assert _mount_on(server, None) is False
 
-    assert [
-        path
-        for path in (getattr(route, "path", "") for route in server.app.routes)
-        if "corpus" in path
-    ] == []
+    # The OpenAPI paths, not `app.routes`: FastAPI >= 0.141 keeps an included
+    # router's routes out of `app.routes`, where this check would always pass.
+    assert [path for path in server.app.openapi()["paths"] if "corpus" in path] == []
     with TestClient(server.app) as client:
         assert client.post("/corpus/submit", json={}).status_code == 404
 
@@ -273,11 +271,9 @@ def test_the_server_gate_does_not_depend_on_the_startup_path(bucket, registry):
 
     assert server.mount_corpus_router(_rl_entry("default", 1.0), **arguments) is False
     assert server.mount_corpus_router(None, **arguments) is False
-    assert [
-        path
-        for path in (getattr(route, "path", "") for route in server.app.routes)
-        if "corpus" in path
-    ] == []
+    # The OpenAPI paths, not `app.routes`: FastAPI >= 0.141 keeps an included
+    # router's routes out of `app.routes`, where this check would always pass.
+    assert [path for path in server.app.openapi()["paths"] if "corpus" in path] == []
 
 
 def _corpus_entry_this_binary_can_resolve(job_id):

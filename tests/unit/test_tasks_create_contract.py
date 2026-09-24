@@ -1,6 +1,8 @@
 """`tasks create` can seed a contract from a compiled profile and override the
 model and the environment set — the two things an operator actually chooses."""
 
+from dataclasses import asdict
+
 import pytest
 
 from reliquary.cli.main import build_contract_task_entry
@@ -70,7 +72,9 @@ def test_the_model_is_overridden_and_nothing_else_is():
     rebuilt = profile_from_contract(entry.contract)
     assert rebuilt.model_id == "org/GLM"
     assert rebuilt.model_revision == "abc123"
-    assert rebuilt.sampling == source.sampling
+    # By value: another test reloads `profiles`, which makes the two
+    # SamplingProfile objects instances of two copies of one class.
+    assert asdict(rebuilt.sampling) == asdict(source.sampling)
     assert set(rebuilt.environments) == set(source.environments)
 
 
