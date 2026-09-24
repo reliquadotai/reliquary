@@ -653,7 +653,11 @@ def jobs_create(
     renderer_id: str = typer.Option(..., "--renderer-id"),
     eos_token_id: int = typer.Option(..., "--eos-token-id"),
     slots_per_prompt: int = typer.Option(..., "--slots-per-prompt"),
-    max_new_tokens: int = typer.Option(..., "--max-new-tokens"),
+    max_new_tokens: int = typer.Option(
+        None,
+        "--max-new-tokens",
+        help="Omit to take the budget the template gives this prompt source",
+    ),
     cap: float = typer.Option(
         ..., "--cap", help="The task's share of the pool; also its pinned price"
     ),
@@ -711,6 +715,18 @@ def jobs_create(
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
     }
     try:
+        if max_new_tokens is None:
+            # The template budgets each environment for its model, and the RL
+            # task on the same source generates to that length already.
+            from reliquary.protocol.profiles import resolve_protocol_profile
+
+            environments = resolve_protocol_profile(from_profile).environments
+            if prompt_source not in environments:
+                raise ValueError(
+                    f"template {from_profile!r} does not declare {prompt_source!r}; "
+                    "pass --max-new-tokens"
+                )
+            max_new_tokens = environments[prompt_source].max_new_tokens
         manifest = build_job_manifest(
             job_id=job_id,
             # The contract's model IS the job's frozen checkpoint. Taking both

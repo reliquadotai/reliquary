@@ -137,7 +137,7 @@ reliquary jobs create \
   --prompt-source <source> --prompt-count 200 \
   --renderer-id <renderer-id> --eos-token-id <eos-id> \
   --slots-per-prompt 4 --n 4 \
-  --min-new-tokens 16 --max-new-tokens 512 \
+  --min-new-tokens 16 \
   --prompt-order miner_walk \
   --grader-id <source> --threshold 1.0 \
   --cap 0.1 \
@@ -151,6 +151,11 @@ reliquary jobs create \
   source: a dataset-backed one must be readable from this machine.
 - `--eos-token-id` is the id the miner's vLLM stops on and the route judges
   termination against (151643 for Qwen3-4B-Base).
+- `--max-new-tokens` is omitted on purpose: the job then takes the budget the
+  template gives the source (32768 for DAPO maths on the Teutonic profile), the
+  length the RL task already generates to. A short cap cuts every reasoning
+  completion before its answer: in the 512-token rehearsal the filter kept 3 of
+  80. Pass it only to override the template.
 - `--min-new-tokens` at least 16. Never 1: the terminator counts, and 1 pays a
   slot for an empty completion (the parser refuses below 2).
 - The price is pinned: `floor == cap`, paid per verified token. The carried

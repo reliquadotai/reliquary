@@ -184,7 +184,11 @@ async def declare_job(state: Path, args, *, job_id: str, revision: str, sha256: 
         prompt_count=args.prompt_count, renderer_id=renderer_id, eos_token_id=eos,
         slots_per_prompt=args.slots_per_prompt, temperature=sampling["temperature"],
         top_p=sampling["top_p"], top_k=sampling["top_k"], min_new_tokens=args.min_new_tokens,
-        max_new_tokens=args.max_new_tokens, n=args.n,
+        # A rehearsal may pass a short cap to run fast; a real job takes the
+        # template's budget for the source, as `jobs create` does by default.
+        max_new_tokens=(args.max_new_tokens or
+                        contract["environments"][args.prompt_source]["max_new_tokens"]),
+        n=args.n,
         grader_id=args.prompt_source, threshold=1.0,
         prompt_order="miner_walk", deadline_round=None,
         from_profile=profile_from_contract(contract),
@@ -573,7 +577,8 @@ def main() -> int:
         p.add_argument("--slots-per-prompt", type=int, default=4)
         p.add_argument("--n", type=int, default=4)
         p.add_argument("--min-new-tokens", type=int, default=16)
-        p.add_argument("--max-new-tokens", type=int, default=512)
+        p.add_argument("--max-new-tokens", type=int, default=None,
+                       help="omit for the template's budget; a short value only speeds a rehearsal")
         p.add_argument("--honest-steps", type=int, default=20)
         p.add_argument("--dishonest-steps", type=int, default=5)
         p.add_argument("--cap", type=float, default=0.1)

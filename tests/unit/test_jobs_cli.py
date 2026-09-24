@@ -523,3 +523,27 @@ def test_jobs_status_is_not_drained_while_a_settlement_is_pending(monkeypatch):
                                         "pending": {"window": 46001, "ids": ids}})
     result = _status(monkeypatch, records)
     assert "pending=46001" in result.output and "drained: no" in result.output
+
+
+def test_without_a_declared_budget_the_job_takes_the_templates_own(bucket, registry):
+    """The template already budgets each environment for this model (Teutonic's
+    DAPO maths is 32k); a job that silently generated shorter would stop every
+    completion at the cap and fail the filter on nearly all of them."""
+    import json
+
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    argv = _create_args()
+    at = argv.index("--max-new-tokens")
+    del argv[at : at + 2]
+
+    result = CliRunner().invoke(app, argv)
+
+    assert result.exit_code == 0, result.output
+    body, _ = bucket.objects["reliquary/corpus/jobs/swe-v1.json"]
+    template = _template()
+    budget = resolve_protocol_profile(template).environments[
+        _prompt_source(template)
+    ].max_new_tokens
+    assert json.loads(body)["sampling"]["max_new_tokens"] == budget
