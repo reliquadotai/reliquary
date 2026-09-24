@@ -469,3 +469,57 @@ def test_jobs_list_names_the_task_that_declares_a_job(bucket, registry):
     assert result.exit_code == 0, result.output
     assert "corpus-run" in result.output
     assert "no task entry" not in result.output
+
+
+# --- final review, finding 5: the drain check the stop procedure runs ---
+
+
+class _StatusRecords:
+    def __init__(self, submissions, verdicts, state):
+        self.submissions, self.verdicts, self.state = submissions, verdicts, state
+
+    async def list_submission_ids(self, job_id):
+        return sorted(self.submissions)
+
+    async def list_verdict_ids(self, job_id):
+        return sorted(self.verdicts)
+
+    async def read_settlement(self, job_id):
+        return dict(self.state), '"e"'
+
+
+def _status(monkeypatch, records):
+    from reliquary.infrastructure import corpus_record_store
+
+    monkeypatch.setattr(corpus_record_store, "BucketRecordStore", lambda **kw: records)
+    return CliRunner().invoke(app, ["jobs", "status", "swe-v1"])
+
+
+def test_jobs_status_reports_an_undrained_job(monkeypatch):
+    ids = [c * 64 for c in "123"]
+    records = _StatusRecords(ids, ids[:2], {"settled": ids[:1], "last_window": 46000,
+                                            "pending": None, "advanced_at": None})
+    result = _status(monkeypatch, records)
+    assert result.exit_code == 0, result.output
+    assert "submissions=3" in result.output and "verdicts=2" in result.output
+    assert "unaudited=1" in result.output and "unsettled=1" in result.output
+    assert "last_window=46000" in result.output
+    assert "drained: no" in result.output
+
+
+def test_jobs_status_reports_a_drained_job(monkeypatch):
+    ids = [c * 64 for c in "12"]
+    records = _StatusRecords(ids, ids, {"settled": ids, "last_window": 46001, "pending": None})
+    result = _status(monkeypatch, records)
+    assert result.exit_code == 0, result.output
+    assert "unaudited=0" in result.output and "unsettled=0" in result.output
+    assert "pending=none" in result.output
+    assert "drained: yes" in result.output
+
+
+def test_jobs_status_is_not_drained_while_a_settlement_is_pending(monkeypatch):
+    ids = ["1" * 64]
+    records = _StatusRecords(ids, ids, {"settled": [], "last_window": 46000,
+                                        "pending": {"window": 46001, "ids": ids}})
+    result = _status(monkeypatch, records)
+    assert "pending=46001" in result.output and "drained: no" in result.output

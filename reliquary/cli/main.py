@@ -925,6 +925,40 @@ def jobs_export(
     typer.echo(f"{asyncio.run(_run())} rows written to {out}")
 
 
+@jobs_app.command("status")
+def jobs_status(job_id: str = typer.Argument(...)) -> None:
+    """How far a job is from drained: accepted, audited and settled counts.
+
+    Read-only. The stop procedure waits for `drained: yes` before
+    `jobs cancel`: retiring the task is a boot gate, so anything not yet
+    audited or settled when the corpus validator stops is never paid.
+    """
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+
+    async def _read():
+        records = BucketRecordStore()
+        submissions = set(await records.list_submission_ids(job_id))
+        verdicts = set(await records.list_verdict_ids(job_id))
+        state, _ = await records.read_settlement(job_id)
+        return submissions, verdicts, state or {}
+
+    submissions, verdicts, state = asyncio.run(_read())
+    settled = verdicts & set(state.get("settled") or ())
+    pending = state.get("pending")
+    pending_window = pending["window"] if pending else None
+    last_window = state.get("last_window")
+    unaudited = len(submissions - verdicts)
+    unsettled = len(verdicts - settled)
+    typer.echo(
+        f"{job_id}: submissions={len(submissions)} verdicts={len(verdicts)} "
+        f"unaudited={unaudited} settled={len(settled)} unsettled={unsettled} "
+        f"pending={'none' if pending_window is None else pending_window} "
+        f"last_window={'none' if last_window is None else last_window}"
+    )
+    drained = unaudited == 0 and unsettled == 0 and pending is None
+    typer.echo(f"drained: {'yes' if drained else 'no'}")
+
+
 @jobs_app.command("fingerprint")
 def jobs_fingerprint(
     checkpoint: str = typer.Argument(..., help="HF repo id or local directory"),
