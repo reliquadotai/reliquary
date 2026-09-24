@@ -506,6 +506,9 @@ def test_a_corpus_renderer_that_cannot_build_exits_four_before_any_download(
     monkeypatch.setattr(
         modeling, "load_text_generation_model", lambda *a, **kw: pytest.fail("loaded")
     )
+    monkeypatch.setattr(
+        modeling, "load_text_only_model", lambda *a, **kw: pytest.fail("loaded")
+    )
 
     result = CliRunner().invoke(cli_module.app, ["validate"])
 
@@ -556,6 +559,9 @@ def test_a_corpus_job_naming_an_unknown_renderer_exits_four_before_any_download(
     monkeypatch.setattr(modeling, "load_tokenizer", lambda *a, **kw: pytest.fail("tokenized"))
     monkeypatch.setattr(
         modeling, "load_text_generation_model", lambda *a, **kw: pytest.fail("loaded")
+    )
+    monkeypatch.setattr(
+        modeling, "load_text_only_model", lambda *a, **kw: pytest.fail("loaded")
     )
 
     result = CliRunner().invoke(cli_module.app, ["validate"])

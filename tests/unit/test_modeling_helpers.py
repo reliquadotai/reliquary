@@ -120,3 +120,37 @@ def test_model_loader_normalizes_torch_dtype_for_transformers_5(monkeypatch):
     assert seen["config_kwargs"] == {"cache_dir": "/tmp/hf"}
     assert seen["model_kwargs"]["dtype"] == "bf16"
     assert "torch_dtype" not in seen["model_kwargs"]
+
+
+def test_a_text_only_load_takes_the_language_model_of_a_multimodal_checkpoint(monkeypatch):
+    """The corpus audit proves text; a multimodal checkpoint whose vision config
+    this transformers cannot read (Qwen3.8) must still load its language model."""
+    import types
+
+    import transformers
+
+    from reliquary.shared import modeling
+
+    text_config = object()
+    composite = types.SimpleNamespace(text_config=text_config)
+    calls = {}
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained",
+                        classmethod(lambda cls, *a, **k: composite))
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained",
+                        classmethod(lambda cls, source, **k: calls.setdefault("kw", (source, k))))
+    modeling.load_text_only_model("/ckpt", torch_dtype="bf16")
+    source, kwargs = calls["kw"]
+    assert source == "/ckpt" and kwargs["config"] is text_config and kwargs["dtype"] == "bf16"
+
+
+def test_a_text_only_load_of_a_text_checkpoint_is_the_usual_load(monkeypatch):
+    import types
+
+    import transformers
+
+    from reliquary.shared import modeling
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained",
+                        classmethod(lambda cls, *a, **k: types.SimpleNamespace()))
+    monkeypatch.setattr(modeling, "load_text_generation_model", lambda source, **k: ("usual", source))
+    assert modeling.load_text_only_model("/ckpt") == ("usual", "/ckpt")

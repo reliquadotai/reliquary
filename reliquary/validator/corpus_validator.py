@@ -67,7 +67,7 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
     from reliquary.protocol.signatures import verify_corpus_signature
-    from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
+    from reliquary.shared.modeling import load_text_only_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_service import renderer_for_job
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
@@ -110,7 +110,7 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
 
     tokenizer = load_tokenizer(str(directory))
     tokenizer_box["tokenizer"] = tokenizer
-    model = load_text_generation_model(
+    model = load_text_only_model(
         str(directory), torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
     ).to("cuda").eval()
     proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)

@@ -38,17 +38,37 @@ def parse_args(argv=None):
     # Spec measurement 5: does a coarser chunk keep the separation at 4x less proof?
     parser.add_argument("--chunk-tokens", type=int, default=PROOF.chunk_tokens)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5,
+                        help="vLLM's share of the card; a model over ~40 GB needs more")
+    parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument("--phase", choices=["both", "generate", "verify"], default="both",
+                        help="a model that fills the card needs generate and verify in two processes")
+    parser.add_argument("--work", default=None, help="file the generate phase writes for verify")
+    parser.add_argument("--text-only", action="store_true",
+                        help="turn off image/video inputs of a multimodal checkpoint")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.phase == "verify":
+        import base64
+        with open(args.work) as handle:
+            miners = [(t, n, [base64.b64decode(p) for p in proofs])
+                      for t, n, proofs in json.load(handle)]
+        _verify(args, miners)
+        return
     from vllm import LLM, SamplingParams
-    from transformers import AutoModelForCausalLM
 
-    llm = LLM(model=args.model, dtype="bfloat16", seed=1234, max_model_len=2048,
-              gpu_memory_utilization=0.5, enable_prefix_caching=False,
-              quantization=None if args.quantization == "none" else args.quantization)
+    extra = {}
+    if args.max_num_seqs:
+        extra["max_num_seqs"] = args.max_num_seqs
+    if args.text_only:
+        extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+    llm = LLM(model=args.model, dtype="bfloat16", seed=1234,
+              max_model_len=max(2048, args.max_tokens + 512),
+              gpu_memory_utilization=args.gpu_memory_utilization, enable_prefix_caching=False,
+              quantization=None if args.quantization == "none" else args.quantization, **extra)
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(args.rollouts)]
     params = [SamplingParams(temperature=1.0, top_p=1.0, max_tokens=args.max_tokens, seed=1000 + i)
               for i in range(args.rollouts)]
@@ -61,12 +81,27 @@ def main(argv=None):
         rows = completion_rows(capture.for_request(output.request_id), prompt_len, len(tokens))
         proofs = build_chunk_proofs(rows, chunk_tokens=args.chunk_tokens, topk=PROOF.topk)
         miners.append((tokens, prompt_len, proofs))
+    if args.phase == "generate":
+        import base64
+        with open(args.work, "w") as handle:
+            json.dump([[t, n, [base64.b64encode(p).decode() for p in proofs]]
+                       for t, n, proofs in miners], handle)
+        return
     del llm
     gc.collect()
     torch.cuda.empty_cache()
+    _verify(args, miners)
 
-    verifier = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, attn_implementation="sdpa").to("cuda").eval()
+
+def _verify(args, miners):
+
+    # The loader the corpus auditor uses, so a checkpoint it cannot load fails here.
+    from huggingface_hub import snapshot_download
+    from reliquary.shared.modeling import load_text_only_model
+
+    verifier = load_text_only_model(
+        snapshot_download(args.model), torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+    ).to("cuda").eval()
     report = []
     for tokens, prompt_len, proofs in miners:
         hidden = completion_hidden_states(verifier, tokens, prompt_len)
