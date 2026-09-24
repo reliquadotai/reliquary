@@ -269,3 +269,23 @@ def test_a_pending_stall_entry_finished_after_rl_revived_does_not_lead_the_horiz
     assert asyncio.run(_settler(records, archives, now=t + 20).settle_once()) == 46003
     assert archives.written[46003]["rewards_by_hotkey"] == pytest.approx({"B": 0.1})
     assert "3" * 64 in records.state["settled"] and records.state["pending"] is None
+
+
+def test_a_delayed_finish_spaces_the_next_lone_advance_from_the_finish_time():
+    from reliquary.validator.corpus_settlement import RL_WINDOW_SECONDS
+
+    records = _Records({"0" * 64: _v("A", 10)})
+    archives = _FailingArchives(46000)
+    asyncio.run(_settler(records, archives, now=0).settle_once())
+    t = 10 * STALL
+    records.verdicts["1" * 64] = _v("A", 10)
+    archives.fail = True  # the lone advance to 46001 crashes before its archive
+    with pytest.raises(OSError):
+        asyncio.run(_settler(records, archives, now=t).settle_once())
+    archives.fail = False
+    # Finished two RL windows later, still in the same stall.
+    late = t + 2 * RL_WINDOW_SECONDS
+    assert asyncio.run(_settler(records, archives, now=late).settle_once()) == 46001
+    records.verdicts["2" * 64] = _v("A", 10)
+    assert asyncio.run(_settler(records, archives, now=late + 60).settle_once()) is None
+    assert max(archives.written) == 46001

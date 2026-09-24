@@ -75,7 +75,7 @@ class CorpusSettler:
             "job_id": self._job_id,
         }
 
-    async def _finish(self, state: dict, etag) -> int:
+    async def _finish(self, state: dict, etag, now: float) -> int:
         pending = state["pending"]
         # Idempotent: the same window and the same rewards, however often a
         # crash makes this run again.
@@ -87,7 +87,9 @@ class CorpusSettler:
             "pending": None,
         }
         if pending.get("alone"):
-            final["advanced_at"] = pending.get("at")
+            # The finish time, not the choice time: a finish delayed by a crash
+            # or a hold must still be one RL window from the next lone advance.
+            final["advanced_at"] = now
         await self._records.write_settlement(self._job_id, final, etag)
         return pending["window"]
 
@@ -118,7 +120,7 @@ class CorpusSettler:
                 if clock_changed:
                     await self._records.write_settlement(self._job_id, state, etag)
                 return None
-            return await self._finish(state, etag)
+            return await self._finish(state, etag, now)
 
         settled = set(state["settled"])
         new_ids = [sid for sid in await self._records.list_verdict_ids(self._job_id) if sid not in settled]
@@ -135,7 +137,7 @@ class CorpusSettler:
                 state["pending"] = {"window": window, "ids": new_ids, "rewards": rewards,
                                     "alone": alone, "at": now}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
-                return await self._finish(state, etag)
+                return await self._finish(state, etag, now)
             # Every verdict this period failed (spec §7): no archive, the
             # index does not move, but these ids must not be reconsidered
             # forever, so mark them settled in this same CAS write.
