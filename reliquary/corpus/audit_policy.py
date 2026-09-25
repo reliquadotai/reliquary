@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
+import math
 
 AUDIT_PARAM_KEYS = {
     "audit_q": "q", "audit_probation_submissions": "probation_submissions",
@@ -14,6 +15,7 @@ AUDIT_PARAM_KEYS = {
     "audit_ban_window_seconds": "ban_window_seconds", "audit_ban_seconds": "ban_seconds",
 }
 _INTS = {"probation_submissions", "ban_after_failures"}
+_HEX_DIGITS = set("0123456789abcdef")
 MANT_HISTORY = 200
 
 
@@ -24,13 +26,16 @@ class AuditParams:
     hold_seconds: float = 4320.0
     suspect_seconds: float = 86400.0
     ban_after_failures: int = 3
-    ban_window_seconds: float = 86400.0
+    ban_window_seconds: float = 604800.0
     ban_seconds: float = 604800.0
 
     @classmethod
     def from_params(cls, params: Mapping) -> "AuditParams":
         validate_audit_params(params)
         return cls(**{attr: params[key] for key, attr in AUDIT_PARAM_KEYS.items() if key in params})
+
+
+_DEFAULTS = AuditParams()
 
 
 def validate_audit_params(params: Mapping) -> None:
@@ -40,17 +45,28 @@ def validate_audit_params(params: Mapping) -> None:
         value = params[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{key} must be a number, got {value!r}")
+        # json.loads happily parses NaN/Infinity; unchecked they disable a
+        # hold/ban/window (NaN comparisons are always false) or end a ban
+        # instantly (now < nan is false).
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite, got {value!r}")
         if attr in _INTS and (not float(value).is_integer() or value < 1):
             raise ValueError(f"{key} must be a whole number >= 1, got {value}")
         if attr == "q" and not 0.0 < value <= 1.0:
             raise ValueError(f"audit_q must be in (0, 1], got {value}")
         if attr.endswith("seconds") and value < 0:
             raise ValueError(f"{key} must not be negative, got {value}")
+    # A zero hold with q < 1 pays an unaudited "sampled" submission the
+    # instant it is not drawn, defeating the backward audit on a later
+    # confirmed failure (§7.4); harmless at q = 1, which never takes that path.
+    q = params.get("audit_q", _DEFAULTS.q)
+    hold = params.get("audit_hold_seconds", _DEFAULTS.hold_seconds)
+    if q < 1.0 and hold == 0:
+        raise ValueError("audit_hold_seconds must not be 0 when audit_q < 1")
 
 
 @dataclass
 class MinerState:
-    state: str = "probation"
     audited_passed: int = 0
     confirmed_failures: list = field(default_factory=list)
     suspect_until: float | None = None
@@ -65,22 +81,30 @@ class MinerState:
         return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
 
 
-def effective_state(m: MinerState, now: float, params: AuditParams | None = None) -> str:
-    probation = (params or AuditParams()).probation_submissions
+def effective_state(m: MinerState, now: float, params: AuditParams) -> str:
+    # The only authority on state; nothing persists a "state" string, so no
+    # stale copy can disagree with what `now` and these fields say (§5).
     if m.banned_until is not None:
         return "banned" if now < m.banned_until else "probation"
     if m.suspect_until is not None and now < m.suspect_until:
         return "suspect"
-    return "sampled" if m.audited_passed >= probation else "probation"
+    return "sampled" if m.audited_passed >= params.probation_submissions else "probation"
+
+
+def _require_hex64(value: str, label: str) -> bytes:
+    if not isinstance(value, str) or len(value) != 64 or not set(value) <= _HEX_DIGITS:
+        raise ValueError(f"{label} must be exactly 64 lowercase hex characters, got {value!r}")
+    return bytes.fromhex(value)
 
 
 def drawn(randomness_hex: str, submission_id: str, q: float) -> bool:
-    digest = hashlib.sha256(bytes.fromhex(randomness_hex) + bytes.fromhex(submission_id)).digest()
+    digest = hashlib.sha256(_require_hex64(randomness_hex, "randomness_hex") +
+                            _require_hex64(submission_id, "submission_id")).digest()
     return int.from_bytes(digest, "big") < int(q * 2**256)
 
 
 def decision(m, *, params, now, received_at, recent_submissions, randomness_hex,
-             submission_id: str = "") -> str:
+             submission_id: str) -> str:
     state = effective_state(m, now, params)
     if state == "banned":
         return "void_banned"
@@ -102,8 +126,12 @@ def after_pass(m: MinerState, params: AuditParams, mant_mean: float) -> MinerSta
 
 
 def after_confirmed_failure(m: MinerState, params: AuditParams, now: float) -> MinerState:
+    # Any confirmed failure resets audited_passed: probation (and the ban
+    # that follows suspect) is left only with no confirmed failure (§5), so
+    # a hotkey coming out of suspect always starts a fresh probation count.
     failures = [t for t in m.confirmed_failures if now - t <= params.ban_window_seconds] + [now]
     if len(failures) >= params.ban_after_failures:
         return replace(m, confirmed_failures=failures, suspect_until=None,
                        banned_until=now + params.ban_seconds, audited_passed=0)
-    return replace(m, confirmed_failures=failures, suspect_until=now + params.suspect_seconds)
+    return replace(m, confirmed_failures=failures, suspect_until=now + params.suspect_seconds,
+                   audited_passed=0)

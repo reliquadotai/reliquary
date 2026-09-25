@@ -10,6 +10,7 @@ from reliquary.corpus.audit_policy import (
 P = AuditParams(q=0.1, probation_submissions=3, hold_seconds=100, suspect_seconds=50,
                 ban_after_failures=2, ban_window_seconds=1000, ban_seconds=500)
 R = "ab" * 32
+SID = "cd" * 32  # has hex letters, so SID.upper() below is a genuinely different (invalid) string
 
 
 def test_defaults_are_v0():
@@ -19,6 +20,9 @@ def test_defaults_are_v0():
 @pytest.mark.parametrize("bad", [
     {"audit_q": 0.0}, {"audit_q": 1.5}, {"audit_probation_submissions": 0},
     {"audit_hold_seconds": -1}, {"audit_ban_after_failures": 0}, {"audit_q": "0.1"},
+    {"audit_hold_seconds": float("nan")}, {"audit_suspect_seconds": float("nan")},
+    {"audit_ban_seconds": float("inf")}, {"audit_ban_window_seconds": float("inf")},
+    {"audit_q": 0.5, "audit_hold_seconds": 0},
 ])
 def test_nonsense_parameters_are_refused(bad):
     with pytest.raises(ValueError):
@@ -28,7 +32,8 @@ def test_nonsense_parameters_are_refused(bad):
 def test_a_new_hotkey_is_audited_until_its_probation_passes():
     m = MinerState()
     for _ in range(3):
-        assert decision(m, params=P, now=0, received_at=0, recent_submissions=50, randomness_hex=R) == "audit"
+        assert decision(m, params=P, now=0, received_at=0, recent_submissions=50,
+                        randomness_hex=R, submission_id=SID) == "audit"
         m = after_pass(m, P, 1.0)
     assert effective_state(m, 0, P) == "sampled"
 
@@ -41,7 +46,7 @@ def test_the_draw_is_deterministic_and_close_to_q():
 
 
 def _sampled():
-    return MinerState(state="sampled", audited_passed=3)
+    return MinerState(audited_passed=3)
 
 
 def test_a_sampled_miner_waits_then_passes_unaudited_unless_drawn():
@@ -83,3 +88,63 @@ def test_a_ban_ends_into_a_fresh_probation():
 def test_state_round_trips():
     m = after_pass(_sampled(), P, 2.5)
     assert MinerState.from_dict(m.to_dict()) == m
+
+
+# --- Fix round 1: reviewer findings, ruled by the controller, spec §5/§8 amended ---
+
+
+def test_the_default_escalation_reaches_a_ban_across_suspect_cycles():
+    """Reviewer's reproduction: with the *defaults* (ban_window_seconds now
+    604800, strictly longer than suspect_seconds), three failures spaced one
+    suspect period apart must still fall inside the same ban window and ban,
+    not loop as suspect forever."""
+    D = AuditParams()
+    m = after_confirmed_failure(MinerState(), D, now=0)
+    assert effective_state(m, 86401, D) == "probation"
+    m = after_confirmed_failure(m, D, now=86401)
+    m = after_confirmed_failure(m, D, now=172802)
+    assert effective_state(m, 172802, D) == "banned"
+
+
+def test_a_confirmed_failure_resets_probation_progress_not_just_on_ban():
+    """§5: probation is left only with no confirmed failure, so a hotkey deep
+    into probation that fails and later leaves `suspect` must land back in
+    `probation` (fresh audits), not jump straight to `sampled` on its old
+    audited_passed count."""
+    D = AuditParams()
+    m = after_confirmed_failure(MinerState(audited_passed=100), D, now=0)
+    assert effective_state(m, 100, D) == "suspect"
+    assert effective_state(m, D.suspect_seconds, D) == "probation"
+
+
+def test_miner_state_has_no_persisted_state_field():
+    assert "state" not in MinerState.__dataclass_fields__
+
+
+def test_from_dict_ignores_a_stale_state_key():
+    d = MinerState(audited_passed=5).to_dict()
+    d["state"] = "sampled"  # an old persisted dict; must not resurrect the field
+    assert MinerState.from_dict(d) == MinerState(audited_passed=5)
+
+
+@pytest.mark.parametrize("bad", ["", "x" * 64, R.upper(), R[:-1], R + "00", " " * 64])
+def test_malformed_randomness_hex_is_refused(bad):
+    with pytest.raises(ValueError):
+        drawn(bad, SID, 0.5)
+
+
+@pytest.mark.parametrize("bad", ["", "x" * 64, SID.upper(), SID[:-1], SID + "00", " " * 64])
+def test_malformed_submission_id_is_refused(bad):
+    with pytest.raises(ValueError):
+        drawn(R, bad, 0.5)
+
+
+def test_decision_requires_submission_id():
+    with pytest.raises(TypeError):
+        decision(_sampled(), params=P, now=10, received_at=0, recent_submissions=50,
+                 randomness_hex=R)
+
+
+def test_effective_state_requires_params():
+    with pytest.raises(TypeError):
+        effective_state(MinerState(), 0)
