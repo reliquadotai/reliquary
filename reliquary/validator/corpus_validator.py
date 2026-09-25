@@ -94,6 +94,51 @@ def make_round_at(genesis_time: float, period: float):
     return round_at
 
 
+class LazyRoundAt:
+    """``round_at``, resolved on first use rather than once at process
+    startup: an ``/info`` fetch that fails while this validator boots must
+    not turn sampling off for the rest of its life (fix round 1, finding 2).
+
+    A successful resolution is cached forever -- a chain's genesis time and
+    period never change once published. A failed one is retried at most once
+    every ``retry_seconds``, never on every call (the drand relays are not
+    free). While unresolved, calling this raises instead of returning an int;
+    ``CorpusAuditor`` catches that and audits the submission, exactly as it
+    does a missing beacon (never guesses a round from nothing).
+    """
+
+    def __init__(self, *, retry_seconds: float = 60.0, clock=time.time) -> None:
+        self._retry_seconds = retry_seconds
+        self._clock = clock
+        self._resolved = None
+        self._last_attempt: float | None = None
+
+    def __call__(self, t: float) -> int:
+        if self._resolved is None:
+            self._resolve()
+        return self._resolved(t)
+
+    def _resolve(self) -> None:
+        now = self._clock()
+        if self._last_attempt is not None and now - self._last_attempt < self._retry_seconds:
+            raise RuntimeError(
+                "drand chain genesis/period not resolved yet; retry throttled"
+            )
+        self._last_attempt = now
+        from reliquary.infrastructure import drand
+
+        chain = drand.get_current_chain()
+        genesis_time, period = chain.get("genesis_time"), chain.get("period")
+        if genesis_time is None or period is None:
+            logger.warning(
+                "drand chain genesis/period not yet known (genesis_time=%r period=%r); "
+                "auditing every sampled submission until they resolve",
+                genesis_time, period,
+            )
+            raise RuntimeError("drand chain genesis/period not yet known")
+        self._resolved = make_round_at(genesis_time, period)
+
+
 def build_corpus_audit_wiring(*, entry, job, records):
     """This task's audit parameters, per-hotkey state, ban check, and drand
     draw -- everything ``run_corpus_validator`` hands the auditor and the
@@ -102,13 +147,13 @@ def build_corpus_audit_wiring(*, entry, job, records):
 
     ``entry.params`` may carry no ``audit_*`` keys at all:
     ``AuditParams.from_params`` then defaults to ``q = 1.0``, V0's full audit.
-    A ``beacon``/``round_at`` pair that cannot be resolved (the drand chain's
-    genesis time is not yet known to this process) comes back as
-    ``(None, None)``: the auditor then audits every submission instead of
-    guessing a draw (fail safe, spec §6).
+    ``beacon`` and ``round_at`` are always real callables, never ``None``:
+    resolving the drand chain's genesis time and period is ``round_at``'s own
+    job now (``LazyRoundAt``), deferred to first use and retried on its own
+    schedule, so a chain that is not yet known when this process starts still
+    turns sampling on later without a restart.
     """
     from reliquary.corpus.audit_policy import AuditParams, effective_state
-    from reliquary.infrastructure import drand
     from reliquary.validator.corpus_miner_states import MinerStates
 
     params = AuditParams.from_params(entry.params)
@@ -118,19 +163,7 @@ def build_corpus_audit_wiring(*, entry, job, records):
         state = await miner_states.get(hotkey)
         return effective_state(state, time.time(), params) == "banned"
 
-    chain = drand.get_current_chain()
-    genesis_time, period = chain.get("genesis_time"), chain.get("period")
-    if genesis_time is None or period is None:
-        logger.warning(
-            "corpus task %s: drand chain parameters not yet known "
-            "(genesis_time=%r period=%r); auditing every submission until they resolve",
-            entry.task_id, genesis_time, period,
-        )
-        beacon, round_at = None, None
-    else:
-        beacon, round_at = drand_beacon, make_round_at(genesis_time, period)
-
-    return params, miner_states, is_banned, beacon, round_at
+    return params, miner_states, is_banned, drand_beacon, LazyRoundAt()
 
 
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
@@ -254,6 +287,7 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
 
 
 __all__ = [
+    "LazyRoundAt",
     "build_corpus_app",
     "build_corpus_audit_wiring",
     "drand_beacon",

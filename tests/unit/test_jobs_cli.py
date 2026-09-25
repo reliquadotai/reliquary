@@ -210,6 +210,33 @@ def test_jobs_create_writes_the_manifest_and_the_entry(bucket, registry):
     assert list(entry.contract["environments"]) == [_prompt_source(_template())]
 
 
+def test_jobs_create_carries_every_audit_parameter(bucket, registry):
+    """`jobs create` is the only place a hotkey's suspect/ban parameters can be
+    set at declaration; a flag dropped here can only be fixed later with
+    `tasks set-cap`, after the task is already live."""
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+
+    result = CliRunner().invoke(app, _create_args(**{
+        "--audit-q": "0.2",
+        "--audit-probation-submissions": "50",
+        "--audit-hold-seconds": "1000",
+        "--audit-suspect-seconds": "999",
+        "--audit-ban-after-failures": "5",
+        "--audit-ban-window-seconds": "12345",
+        "--audit-ban-seconds": "6789",
+    }))
+
+    assert result.exit_code == 0, result.output
+    params = registry["entries"]["corpus-run"].params
+    assert params["audit_q"] == 0.2
+    assert params["audit_probation_submissions"] == 50
+    assert params["audit_hold_seconds"] == 1000
+    assert params["audit_suspect_seconds"] == 999
+    assert params["audit_ban_after_failures"] == 5
+    assert params["audit_ban_window_seconds"] == 12345
+    assert params["audit_ban_seconds"] == 6789
+
+
 def test_the_manifest_carries_what_the_operator_declared(bucket, registry):
     """The manifest is what the miner generates against; a field dropped here
     is a fleet generating to the wrong sampling."""

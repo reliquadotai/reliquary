@@ -140,6 +140,67 @@ def test_the_cli_sets_the_cap(monkeypatch):
     assert calls == [("default", 0.9, None)]
 
 
+def test_the_cli_forwards_every_audit_flag(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    calls = []
+
+    async def _set(task_id, cap, *, floor=None, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(store, "set_task_cap", _set)
+    result = CliRunner().invoke(app, [
+        "tasks", "set-cap", "--task-id", "default", "--cap", "0.9",
+        "--audit-q", "0.3",
+        "--audit-probation-submissions", "40",
+        "--audit-hold-seconds", "500",
+        "--audit-suspect-seconds", "111",
+        "--audit-ban-after-failures", "2",
+        "--audit-ban-window-seconds", "222",
+        "--audit-ban-seconds", "333",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [{
+        "min_incentive_share": None,
+        "audit_q": 0.3,
+        "audit_probation_submissions": 40,
+        "audit_hold_seconds": 500.0,
+        "audit_suspect_seconds": 111.0,
+        "audit_ban_after_failures": 2,
+        "audit_ban_window_seconds": 222.0,
+        "audit_ban_seconds": 333.0,
+    }]
+
+
+def test_the_cli_omits_audit_flags_not_passed(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    calls = []
+
+    async def _set(task_id, cap, *, floor=None, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(store, "set_task_cap", _set)
+    result = CliRunner().invoke(app, ["tasks", "set-cap", "--task-id", "default", "--cap", "0.9"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [{
+        "min_incentive_share": None,
+        "audit_q": None,
+        "audit_probation_submissions": None,
+        "audit_hold_seconds": None,
+        "audit_suspect_seconds": None,
+        "audit_ban_after_failures": None,
+        "audit_ban_window_seconds": None,
+        "audit_ban_seconds": None,
+    }]
+
+
 def test_the_cli_names_a_refusal_and_exits_non_zero(monkeypatch):
     from typer.testing import CliRunner
 

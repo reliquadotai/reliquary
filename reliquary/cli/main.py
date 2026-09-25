@@ -507,6 +507,30 @@ def tasks_set_cap(
         None, "--audit-q",
         help="Sampled fraction of audits once a hotkey is out of probation; 1.0 audits everything",
     ),
+    audit_probation_submissions: int = typer.Option(
+        None, "--audit-probation-submissions",
+        help="Audited passes a new hotkey needs, with no confirmed failure, before sampling starts",
+    ),
+    audit_hold_seconds: float = typer.Option(
+        None, "--audit-hold-seconds",
+        help="Hold before an unaudited (sampled and not drawn) submission is payable",
+    ),
+    audit_suspect_seconds: float = typer.Option(
+        None, "--audit-suspect-seconds",
+        help="How long a hotkey with one confirmed failure is audited at 100%",
+    ),
+    audit_ban_after_failures: int = typer.Option(
+        None, "--audit-ban-after-failures",
+        help="Confirmed failures inside the ban window that ban the hotkey",
+    ),
+    audit_ban_window_seconds: float = typer.Option(
+        None, "--audit-ban-window-seconds",
+        help="The window confirmed failures are counted in for a ban",
+    ),
+    audit_ban_seconds: float = typer.Option(
+        None, "--audit-ban-seconds",
+        help="How long a ban lasts",
+    ),
 ) -> None:
     """Change a live task's cap; its contract and digest are untouched."""
     from reliquary.infrastructure import task_registry_store as store
@@ -514,7 +538,13 @@ def tasks_set_cap(
 
     try:
         asyncio.run(store.set_task_cap(
-            task_id, cap, floor=floor, min_incentive_share=min_incentive_share, audit_q=audit_q
+            task_id, cap, floor=floor, min_incentive_share=min_incentive_share, audit_q=audit_q,
+            audit_probation_submissions=audit_probation_submissions,
+            audit_hold_seconds=audit_hold_seconds,
+            audit_suspect_seconds=audit_suspect_seconds,
+            audit_ban_after_failures=audit_ban_after_failures,
+            audit_ban_window_seconds=audit_ban_window_seconds,
+            audit_ban_seconds=audit_ban_seconds,
         ))
     except (RegistryError, store.RegistryConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -705,6 +735,26 @@ def jobs_create(
         "--audit-hold-seconds",
         help="Hold before an unaudited (sampled and not drawn) submission is payable",
     ),
+    audit_suspect_seconds: int = typer.Option(
+        86400,
+        "--audit-suspect-seconds",
+        help="How long a hotkey with one confirmed failure is audited at 100%",
+    ),
+    audit_ban_after_failures: int = typer.Option(
+        3,
+        "--audit-ban-after-failures",
+        help="Confirmed failures inside the ban window that ban the hotkey",
+    ),
+    audit_ban_window_seconds: int = typer.Option(
+        604800,
+        "--audit-ban-window-seconds",
+        help="The window confirmed failures are counted in for a ban",
+    ),
+    audit_ban_seconds: int = typer.Option(
+        604800,
+        "--audit-ban-seconds",
+        help="How long a ban lasts",
+    ),
     min_new_tokens: int = typer.Option(
         2,
         "--min-new-tokens",
@@ -815,6 +865,10 @@ def jobs_create(
                 "audit_q": audit_q,
                 "audit_probation_submissions": audit_probation_submissions,
                 "audit_hold_seconds": audit_hold_seconds,
+                "audit_suspect_seconds": audit_suspect_seconds,
+                "audit_ban_after_failures": audit_ban_after_failures,
+                "audit_ban_window_seconds": audit_ban_window_seconds,
+                "audit_ban_seconds": audit_ban_seconds,
             },
         )
     except (RegistryError, ValueError) as exc:

@@ -340,12 +340,22 @@ def set_cap(
     floor: float | None = None,
     min_incentive_share: float | None = None,
     audit_q: float | None = None,
+    audit_probation_submissions: int | None = None,
+    audit_hold_seconds: float | None = None,
+    audit_suspect_seconds: float | None = None,
+    audit_ban_after_failures: int | None = None,
+    audit_ban_window_seconds: float | None = None,
+    audit_ban_seconds: float | None = None,
 ) -> dict[str, TaskEntry]:
     """Change one live entry's cap (and optionally floor), nothing else.
 
     The contract and its digest stay as they are: a cap is what the task may
     pay, not how it generates. A corpus task's price follows its cap unless a
     floor is named, and a named floor that breaks the pin is refused below.
+
+    Every ``audit_*`` argument is optional and independent: an omitted one
+    (``None``) leaves that entry's existing value untouched, so an operator
+    can raise the ban window without also having to restate the hold.
     """
     if task_id not in entries:
         raise RegistryError(f"task {task_id!r} is not in the registry")
@@ -365,6 +375,18 @@ def set_cap(
             params["min_incentive_ramp_start"] = float(min_incentive_share)
     if audit_q is not None:
         params["audit_q"] = float(audit_q)
+    if audit_probation_submissions is not None:
+        params["audit_probation_submissions"] = int(audit_probation_submissions)
+    if audit_hold_seconds is not None:
+        params["audit_hold_seconds"] = float(audit_hold_seconds)
+    if audit_suspect_seconds is not None:
+        params["audit_suspect_seconds"] = float(audit_suspect_seconds)
+    if audit_ban_after_failures is not None:
+        params["audit_ban_after_failures"] = int(audit_ban_after_failures)
+    if audit_ban_window_seconds is not None:
+        params["audit_ban_window_seconds"] = float(audit_ban_window_seconds)
+    if audit_ban_seconds is not None:
+        params["audit_ban_seconds"] = float(audit_ban_seconds)
     updated = {**entries, task_id: replace(entry, params=params)}
     validate_registry(updated)
     return updated

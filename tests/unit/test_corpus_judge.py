@@ -89,11 +89,11 @@ def _rec(seed, received_at=T0, hotkey=HK):
     return {**_RECORDS[seed], "hotkey": hotkey, "received_at": received_at}
 
 
-def _judge(records, states, clock, *, params=None, beacon=None):
+def _judge(records, states, clock, *, params=None, beacon=None, round_at=_round_at):
     return CorpusAuditor(
         job_id="math-v1", records=records, model=_model(0), tokenizer=_Tokenizer(), proof=PROOF,
         params=params or AuditParams(q=Q, hold_seconds=HOLD, ban_after_failures=10),
-        miner_states=states, beacon=beacon, round_at=_round_at, clock=clock,
+        miner_states=states, beacon=beacon, round_at=round_at, clock=clock,
     )
 
 
@@ -235,6 +235,26 @@ def test_no_beacon_audits(beacon):
     asyncio.run(auditor.judge_many(ids))
     assert set(records.verdicts) == set(ids)
     assert all(v["audited"] is True and "draw" not in v for v in records.verdicts.values())
+
+
+def test_a_raising_round_at_audits():
+    """The drand chain's genesis/period may not be resolved yet: `round_at`
+    then raises instead of returning an int, and the auditor treats that
+    exactly like a missing beacon -- audit, never guess a round from
+    nothing (fix round 1, finding 2)."""
+    ids = _ids(False, 2)
+    records = _Records({sid: _rec(0) for sid in ids})
+    states = _States({HK: SAMPLED})
+    beacon = _Beacon()
+
+    def _unresolved(t):
+        raise RuntimeError("drand chain genesis/period not resolved yet")
+
+    auditor = _judge(records, states, _Clock(T0 + 10), beacon=beacon, round_at=_unresolved)
+    asyncio.run(auditor.judge_many(ids))
+    assert set(records.verdicts) == set(ids)
+    assert all(v["audited"] is True and "draw" not in v for v in records.verdicts.values())
+    assert beacon.calls == []
 
 
 def test_an_unaudited_pass_is_never_written_before_the_hold_ends():
@@ -380,6 +400,38 @@ def test_the_draw_uses_the_first_round_published_after_receipt():
     for sid in ids:
         draw = records.verdicts[sid]["draw"]
         assert draw["round"] == 3334 and _published(draw["round"]) > received
+
+
+def test_a_failed_beacon_round_is_not_refetched_within_the_negative_cache_window():
+    """A round the beacon just failed on is not refetched for
+    NEGATIVE_BEACON_CACHE_SECONDS: every sampled submission whose draw lands
+    on that round would otherwise repeat the same failing network call
+    (fix round 1, finding 4)."""
+    first = _ids(False, 2)
+    records = _Records({sid: _rec(0, received_at=_published(41)) for sid in first})
+    beacon = _Beacon(ConnectionError("drand down"))
+    clock = _Clock(_published(42) + 2.5)
+    auditor = _judge(records, _States({HK: SAMPLED}), clock, beacon=beacon)
+
+    asyncio.run(auditor.judge_many(first))
+    assert beacon.calls == [42]
+    assert all(v["audited"] is True for v in records.verdicts.values())
+
+    # A second submission drawing the same round, well inside the negative
+    # cache window: no second fetch, still fully audited (fail safe).
+    second = _ids(False, 2, start=2000)
+    records.submissions.update({sid: _rec(0, received_at=_published(41)) for sid in second})
+    clock.now += 5.0
+    asyncio.run(auditor.judge_many(second))
+    assert beacon.calls == [42]
+    assert all(v["audited"] is True for v in records.verdicts.values())
+
+    # Past the negative-cache window: retried.
+    third = _ids(False, 2, start=4000)
+    records.submissions.update({sid: _rec(0, received_at=_published(41)) for sid in third})
+    clock.now += 30.0
+    asyncio.run(auditor.judge_many(third))
+    assert beacon.calls == [42, 42]
 
 
 def test_a_held_record_is_audited_when_a_failure_lands_in_the_same_pass():

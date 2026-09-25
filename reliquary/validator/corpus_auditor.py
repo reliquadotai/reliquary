@@ -46,6 +46,10 @@ RUN_BATCH_IDS = 16
 # Propagation slack after the draw round's publication before it is fetched:
 # asking too early reads as "no beacon", which audits (safe, but wastes the sampling).
 BEACON_GRACE_SECONDS = 2.0
+# How long a round that just failed to fetch is left unfetched before the next
+# attempt: every sampled submission whose draw lands on a bad round would
+# otherwise refetch it once per judging pass.
+NEGATIVE_BEACON_CACHE_SECONDS = 30.0
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _WORST_ZERO = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
 _BANNED_VOID = {"passed": False, "audited": False, "reason": "banned"}
@@ -89,6 +93,9 @@ class CorpusAuditor:
         # ones are not re-read, so `recent` can only undercount (more audits).
         self._seeded = False
         self._randomness: dict[int, str] = {}
+        # Round -> when its fetch last failed; a negative cache, so a bad
+        # round is retried at most once every NEGATIVE_BEACON_CACHE_SECONDS.
+        self._failed_rounds: dict[int, float] = {}
 
     def enqueue(self, submission_id: str) -> None:
         if submission_id in self._queued:
@@ -359,19 +366,29 @@ class CorpusAuditor:
 
     async def _randomness_for(self, round_number: int) -> str | None:
         """The drand randomness of a round, lowercased, or None (fetch error,
-        malformed): the caller then audits."""
+        malformed): the caller then audits. A round that just failed is not
+        refetched for NEGATIVE_BEACON_CACHE_SECONDS -- every sampled
+        submission whose draw lands on that round would otherwise repeat the
+        same failing network call, one per judging pass."""
         randomness = self._randomness.get(round_number)
-        if randomness is None:
-            try:
-                value = await asyncio.to_thread(self._beacon, round_number)
-            except Exception:
-                logger.warning("drand round %d unavailable; auditing", round_number, exc_info=True)
-                value = None
-            if isinstance(value, str) and _HEX64.fullmatch(value.lower()):
-                randomness = self._randomness[round_number] = value.lower()
-            elif value is not None:
+        if randomness is not None:
+            return randomness
+        failed_at = self._failed_rounds.get(round_number)
+        if failed_at is not None and self._clock() - failed_at < NEGATIVE_BEACON_CACHE_SECONDS:
+            return None
+        try:
+            value = await asyncio.to_thread(self._beacon, round_number)
+        except Exception:
+            logger.warning("drand round %d unavailable; auditing", round_number, exc_info=True)
+            value = None
+        if isinstance(value, str) and _HEX64.fullmatch(value.lower()):
+            randomness = self._randomness[round_number] = value.lower()
+            self._failed_rounds.pop(round_number, None)
+        else:
+            if value is not None:
                 logger.error("drand round %d gave malformed randomness %r; auditing",
                              round_number, value)
+            self._failed_rounds[round_number] = self._clock()
         return randomness
 
     async def _judge_once(self, submission_ids: list[str]) -> set[str]:
@@ -403,13 +420,27 @@ class CorpusAuditor:
                         and self._round_at is not None):
                     # round_at(t) is the first round published strictly after t:
                     # the miner signed before its randomness existed (spec §6).
-                    round_number = int(self._round_at(received_at))
-                    if int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number:
-                        continue  # its round is not out yet: wait, the rescan comes back
-                    randomness = await self._randomness_for(round_number)
-                    if randomness is not None:
-                        draw = {"round": round_number, "q": self._params.q,
-                                "drawn": drawn(randomness, submission_id, self._params.q)}
+                    # It may raise -- the drand chain's genesis/period can still
+                    # be unresolved (a lazy `round_at` retries on its own
+                    # schedule) -- caught here rather than propagated, so an
+                    # unresolved chain audits this submission (randomness stays
+                    # None below, decision() then reads that as "audit") instead
+                    # of crashing the whole batch out of the drain loop.
+                    try:
+                        round_number = int(self._round_at(received_at))
+                        round_not_out_yet = int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number
+                    except Exception:
+                        logger.warning(
+                            "round_at unavailable for %s; auditing", submission_id[:12],
+                            exc_info=True,
+                        )
+                    else:
+                        if round_not_out_yet:
+                            continue  # its round is not out yet: wait, the rescan comes back
+                        randomness = await self._randomness_for(round_number)
+                        if randomness is not None:
+                            draw = {"round": round_number, "q": self._params.q,
+                                    "drawn": drawn(randomness, submission_id, self._params.q)}
             choice = decision(state, params=self._params, now=now, received_at=received_at,
                               recent_submissions=recent, randomness_hex=randomness,
                               submission_id=submission_id)

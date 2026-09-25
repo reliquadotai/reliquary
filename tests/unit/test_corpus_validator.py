@@ -130,21 +130,94 @@ def test_wiring_resolves_beacon_and_round_at_when_the_chain_is_known(
     assert round_at(1_600_000_000.0) == 2
 
 
-def test_wiring_audits_everything_when_the_drand_chain_is_unknown(
-    seeded_job, wired_records, monkeypatch, caplog
-):
+def test_wiring_never_touches_the_chain_at_build_time(seeded_job, wired_records, monkeypatch):
+    """Resolution is lazy (fix round 1, finding 2): an `/info` fetch that
+    fails while this process boots must not decide sampling for the rest of
+    its life, so building the wiring must not itself resolve the chain --
+    only `round_at`'s first actual use does."""
     from reliquary.infrastructure import drand
 
-    monkeypatch.setattr(drand, "get_current_chain", lambda: {"genesis_time": None, "period": 3.0})
+    calls = []
+    monkeypatch.setattr(
+        drand, "get_current_chain",
+        lambda: (calls.append(1), {"genesis_time": None, "period": 3.0})[1],
+    )
     entry = _entry(params={})
 
-    with caplog.at_level("WARNING", logger="reliquary.validator.corpus_validator"):
-        _, _, _, beacon, round_at = build_corpus_audit_wiring(
-            entry=entry, job=seeded_job.job, records=wired_records
-        )
+    params, miner_states, is_banned, beacon, round_at = build_corpus_audit_wiring(
+        entry=entry, job=seeded_job.job, records=wired_records
+    )
 
-    assert beacon is None and round_at is None
-    assert "drand" in caplog.text.lower()
+    assert calls == []
+    assert beacon is drand_beacon
+    assert round_at is not None and callable(round_at)
+
+
+def test_lazy_round_at_raises_until_the_chain_resolves(monkeypatch):
+    """Chain unknown at start: `round_at` raises rather than guessing a round
+    (the auditor then audits, per test_a_raising_round_at_audits in
+    test_corpus_judge.py). Chain resolves later: the SAME object starts
+    returning real rounds -- no restart, nobody rebuilds it."""
+    from reliquary.infrastructure import drand
+    from reliquary.validator.corpus_validator import LazyRoundAt
+
+    chain = {"genesis_time": None, "period": 3.0}
+    monkeypatch.setattr(drand, "get_current_chain", lambda: dict(chain))
+
+    # retry_seconds=0: this test is about resolution succeeding once the
+    # chain is known, not about the throttle (covered separately below).
+    round_at = LazyRoundAt(retry_seconds=0.0)
+    with pytest.raises(Exception):
+        round_at(0.0)
+
+    chain["genesis_time"] = 1_600_000_000.0
+    assert round_at(1_600_000_000.0) == 2
+
+
+def test_lazy_round_at_throttles_retries_to_once_per_window(monkeypatch):
+    from reliquary.infrastructure import drand
+    from reliquary.validator.corpus_validator import LazyRoundAt
+
+    calls = []
+    monkeypatch.setattr(
+        drand, "get_current_chain",
+        lambda: (calls.append(1), {"genesis_time": None, "period": 3.0})[1],
+    )
+
+    now = [1000.0]
+    round_at = LazyRoundAt(retry_seconds=60.0, clock=lambda: now[0])
+
+    with pytest.raises(Exception):
+        round_at(0.0)
+    assert len(calls) == 1
+
+    # Still inside the retry window: not retried.
+    now[0] += 10.0
+    with pytest.raises(Exception):
+        round_at(0.0)
+    assert len(calls) == 1
+
+    # Past the retry window: retried.
+    now[0] += 60.0
+    with pytest.raises(Exception):
+        round_at(0.0)
+    assert len(calls) == 2
+
+
+def test_lazy_round_at_caches_a_resolved_chain_forever(monkeypatch):
+    from reliquary.infrastructure import drand
+    from reliquary.validator.corpus_validator import LazyRoundAt
+
+    calls = []
+    monkeypatch.setattr(
+        drand, "get_current_chain",
+        lambda: (calls.append(1), {"genesis_time": 1_600_000_000.0, "period": 3.0})[1],
+    )
+
+    round_at = LazyRoundAt()
+    assert round_at(1_600_000_000.0) == 2
+    assert round_at(1_600_000_003.0) == 3
+    assert len(calls) == 1
 
 
 def test_is_banned_reflects_a_banned_hotkey(seeded_job, wired_records, fixed_drand_chain):

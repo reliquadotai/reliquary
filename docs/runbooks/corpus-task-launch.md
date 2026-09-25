@@ -189,12 +189,20 @@ V0's rule is audit everything, and `audit_q = 1.0` (the default) still gives
 exactly that. The partial-audit design (spec
 `2026-09-25-corpus-partial-audit-design.md`) can instead sample a fraction of
 one hotkey's submissions once it has proven itself, at the cost of a short
-hold before an unaudited one is paid. `jobs create` accepts `--audit-q`,
-`--audit-probation-submissions` and `--audit-hold-seconds`; `tasks set-cap`
-can change `--audit-q` on a live task. The remaining three
-(`audit_suspect_seconds`, `audit_ban_after_failures`,
-`audit_ban_window_seconds`, `audit_ban_seconds`) have no CLI flag yet and
-always run at the defaults below.
+hold before an unaudited one is paid. `jobs create` accepts every `audit_*`
+flag below at declaration (`--audit-q`, `--audit-probation-submissions`,
+`--audit-hold-seconds`, `--audit-suspect-seconds`,
+`--audit-ban-after-failures`, `--audit-ban-window-seconds`,
+`--audit-ban-seconds`); `tasks set-cap` accepts the same seven flags to
+change them on a live task, each independently -- an omitted flag leaves that
+one parameter as it was, only the ones passed change.
+
+**A `tasks set-cap` audit change only takes effect on the corpus validator's
+next restart.** The process reads `entry.params` into `AuditParams` once, at
+startup (`build_corpus_audit_wiring`); it does not re-read the registry while
+running. Changing `--audit-q` (or any other `audit_*` flag) on a live task is
+safe to run at any time, but nothing about that task's audit behaviour
+changes until the corpus validator is restarted against the updated entry.
 
 | param | default | meaning |
 |---|---|---|
@@ -234,10 +242,22 @@ What each state means for a miner:
 **A hold delays payment, it never skips it.** A `sampled` submission that is
 not drawn is payable only once `audit_hold_seconds` has passed since it was
 received; until then `reliquary jobs status <job>` shows it as accepted but
-unsettled, the same as one still waiting on a batched audit pass. If the
-validator cannot resolve the drand chain's genesis time at startup, it falls
-back to auditing every submission (fail safe) until that resolves, logging a
-warning; this never applies at `audit_q = 1.0`, which never needs a draw.
+unsettled, the same as one still waiting on a batched audit pass. Resolving
+the drand chain's genesis time and period is lazy: if it is not yet known
+when a submission's draw is due, that submission is audited (fail safe)
+instead of guessing a round, and the next one retries resolution (at most
+once a minute) -- the validator does not need restarting once the chain
+becomes reachable, sampling turns on by itself. This never applies at
+`audit_q = 1.0`, which never needs a draw.
+
+**Sampling needs the `quicknet` chain.** `DRAND_CHAIN` (env var, default
+`quicknet`) selects which drand chain the corpus validator draws against.
+`verify_beacon_signature` cross-checks every beacon against
+`bittensor_drand`'s own fetch, which is hardcoded to `quicknet`; run this
+validator against `DRAND_CHAIN=default` (or any other chain) and every
+signature check fails, so every draw is treated as unavailable and every
+`sampled` submission is audited -- correct (fail safe), but silently gives
+`audit_q = 1.0`'s cost with none of its savings. Leave `DRAND_CHAIN` unset.
 
 ## 3. Start the corpus validator
 
