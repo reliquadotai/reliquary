@@ -139,13 +139,14 @@ async def set_task_cap(
     *,
     floor: float | None = None,
     min_incentive_share: float | None = None,
+    audit_q: float | None = None,
     attempts: int = 5,
     **client_kwargs,
 ) -> None:
     """Re-applied against the winner of a lost race, so the new cap is checked
     against the registry that is actually there, not the one first read."""
     await _mutate(
-        lambda e: set_cap(e, task_id, cap, floor, min_incentive_share),
+        lambda e: set_cap(e, task_id, cap, floor, min_incentive_share, audit_q),
         attempts=attempts,
         **client_kwargs,
     )

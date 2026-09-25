@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time as _time
+from collections.abc import Mapping
 from pathlib import Path
 
 import typer
@@ -242,6 +243,7 @@ def build_corpus_task_entry(
     overrides,
     verification=None,
     min_incentive_share=0.0,
+    audit_params: Mapping | None = None,
 ):
     """One registry entry for a corpus generation job.
 
@@ -283,6 +285,11 @@ def build_corpus_task_entry(
     params["min_incentive_ramp_start"] = min(
         float(params.get("min_incentive_ramp_start", 0.0)), float(min_incentive_share)
     )
+    # Absent keys mean V0 (full audit); the caller (`jobs create`) is the one
+    # that writes q/probation/hold defaults, so this builder itself declares
+    # none unless told to.
+    if audit_params:
+        params.update(audit_params)
     contract = _with_enforced_toploc(entry.contract)
     return replace(
         entry,
@@ -496,6 +503,10 @@ def tasks_set_cap(
         None, "--min-incentive-share",
         help="Minimum share of THIS task a hotkey needs to be paid; 0 pays everyone",
     ),
+    audit_q: float = typer.Option(
+        None, "--audit-q",
+        help="Sampled fraction of audits once a hotkey is out of probation; 1.0 audits everything",
+    ),
 ) -> None:
     """Change a live task's cap; its contract and digest are untouched."""
     from reliquary.infrastructure import task_registry_store as store
@@ -503,7 +514,7 @@ def tasks_set_cap(
 
     try:
         asyncio.run(store.set_task_cap(
-            task_id, cap, floor=floor, min_incentive_share=min_incentive_share
+            task_id, cap, floor=floor, min_incentive_share=min_incentive_share, audit_q=audit_q
         ))
     except (RegistryError, store.RegistryConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -679,6 +690,21 @@ def jobs_create(
         "--min-incentive-share",
         help="Minimum share of this task a hotkey needs to be paid; 0 pays every verified token",
     ),
+    audit_q: float = typer.Option(
+        1.0,
+        "--audit-q",
+        help="Sampled fraction of audits once a hotkey is out of probation; 1.0 (default) audits everything",
+    ),
+    audit_probation_submissions: int = typer.Option(
+        100,
+        "--audit-probation-submissions",
+        help="Audited passes a new hotkey needs, with no confirmed failure, before sampling starts",
+    ),
+    audit_hold_seconds: int = typer.Option(
+        4320,
+        "--audit-hold-seconds",
+        help="Hold before an unaudited (sampled and not drawn) submission is payable",
+    ),
     min_new_tokens: int = typer.Option(
         2,
         "--min-new-tokens",
@@ -785,6 +811,11 @@ def jobs_create(
             overrides=overrides,
             verification=verification,
             min_incentive_share=min_incentive_share,
+            audit_params={
+                "audit_q": audit_q,
+                "audit_probation_submissions": audit_probation_submissions,
+                "audit_hold_seconds": audit_hold_seconds,
+            },
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)

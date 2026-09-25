@@ -14,6 +14,7 @@ from typing import Any
 
 # Imported from `release_contract`, whose imports are stdlib only, so this
 # module stays free of `reliquary.environment.abi` and the I/O behind it.
+from reliquary.corpus.audit_policy import validate_audit_params
 from reliquary.protocol.release_contract import canonical_sha256
 from reliquary.shared.task_id import DEFAULT_TASK_ID, normalise_task_id
 
@@ -162,6 +163,10 @@ def validate_entry(entry: TaskEntry) -> None:
             f"retired_at must be an integer round or null, got {entry.retired_at!r}"
         )
     _validate_incentive_floor(entry.params)
+    try:
+        validate_audit_params(entry.params)
+    except ValueError as exc:
+        raise RegistryError(str(exc)) from exc
     cap = _number(entry.params["cap"], "cap")
     if not 0.0 <= cap <= 1.0:
         raise RegistryError(f"cap must be between 0.0 and 1.0, got {cap}")
@@ -334,6 +339,7 @@ def set_cap(
     cap: float,
     floor: float | None = None,
     min_incentive_share: float | None = None,
+    audit_q: float | None = None,
 ) -> dict[str, TaskEntry]:
     """Change one live entry's cap (and optionally floor), nothing else.
 
@@ -357,6 +363,8 @@ def set_cap(
         params["min_incentive_share"] = float(min_incentive_share)
         if float(params.get("min_incentive_ramp_start", 0.0)) > float(min_incentive_share):
             params["min_incentive_ramp_start"] = float(min_incentive_share)
+    if audit_q is not None:
+        params["audit_q"] = float(audit_q)
     updated = {**entries, task_id: replace(entry, params=params)}
     validate_registry(updated)
     return updated
