@@ -79,6 +79,10 @@ def test_the_checks_agree_with_the_pure_module_on_reason_names():
     assert CorpusRejectReason.SIGNATURE_UNVERIFIABLE.value == "signature_unverifiable"
     assert CorpusRejectReason.BAD_SIGNATURE.value == "bad_signature"
 
+    from reliquary.corpus.checks import REASON_MINER_BANNED
+
+    assert CorpusRejectReason.MINER_BANNED.value == REASON_MINER_BANNED == "miner_banned"
+
 
 def test_the_manifest_parser_carries_the_same_ceilings_as_the_wire():
     """`reliquary.corpus.job` stays free of pydantic like its siblings, so it

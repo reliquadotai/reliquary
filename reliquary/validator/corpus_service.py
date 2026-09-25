@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 import logging
 import time
 from typing import Any, Protocol
@@ -613,6 +613,7 @@ def build_corpus_router(
     on_accepted=None,
     proof_chunk_tokens: int | None = None,
     vocab_size: int | None = None,
+    is_banned: Callable[[str], Awaitable[bool]] | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -620,6 +621,9 @@ def build_corpus_router(
     entry names. It is not a default: a router that would serve whatever job a
     submission names spends this task's bucket writes, and eventually this
     task's share, on work declared under somebody else's cap.
+
+    ``is_banned`` is optional: a caller with no ban state to consult (a test,
+    or a validator not yet wired to one) leaves every hotkey admitted.
     """
 
     router = APIRouter()
@@ -726,6 +730,11 @@ def build_corpus_router(
             return _refuse(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
         if not verified:
             return _refuse(CorpusRejectReason.BAD_SIGNATURE)
+
+        # Right after the signature check and before anything is read or
+        # written: an unsigned request must not be able to probe ban status.
+        if is_banned is not None and await is_banned(request.miner_hotkey):
+            return _refuse(CorpusRejectReason.MINER_BANNED)
 
         # `JobError` subclasses `ValueError`, so `_read_job_checked` catches it
         # first: a manifest in the bucket that no longer parses is an operator

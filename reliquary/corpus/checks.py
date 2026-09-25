@@ -29,6 +29,12 @@ def _ok() -> CheckResult:
     return CheckResult(ok=True)
 
 
+# No check function produces this: the ban lookup needs the validator's own
+# miner state and is applied by the route itself. The string lives here so it
+# has one name, the way ``corpus_text.py`` names its own reasons.
+REASON_MINER_BANNED = "miner_banned"
+
+
 def completion_digest(prompt_index: int, tokens: Sequence[int]) -> str:
     """Bind the tokens to the prompt they answer, so the same text under two
     prompts is two different completions."""
