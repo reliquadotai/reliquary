@@ -10,6 +10,7 @@ of being charged to a miner for our fault.
 from __future__ import annotations
 
 import asyncio
+import bisect
 from dataclasses import replace
 import logging
 import re
@@ -24,6 +25,7 @@ from reliquary.corpus.audit_policy import (
     after_confirmed_failure,
     after_pass,
     decision,
+    drawn,
     effective_state,
 )
 from reliquary.corpus.encoding import prompt_token_ids
@@ -41,11 +43,8 @@ MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 AUDIT_BATCH_TOKENS = 131072
 # `run()` drains the queue into groups no larger than this before auditing.
 RUN_BATCH_IDS = 16
-# The draw uses the drand round current this long after receipt, so the miner
-# signed before that round's randomness existed (spec §6).
-DRAW_MARGIN_SECONDS = 3.0
-# Propagation slack before a round that should exist is fetched: asking too
-# early reads as "no beacon", which audits (safe, but wastes the sampling).
+# Propagation slack after the draw round's publication before it is fetched:
+# asking too early reads as "no beacon", which audits (safe, but wastes the sampling).
 BEACON_GRACE_SECONDS = 2.0
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _WORST_ZERO = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
@@ -83,6 +82,12 @@ class CorpusAuditor:
         # Records are immutable: (hotkey, received_at, token_count) read once,
         # so a rescan every minute does not re-read every record from the store.
         self._meta: dict[str, tuple[str, float, int]] = {}
+        # Per hotkey, the sorted arrival times still inside the hold window;
+        # `recent_submissions` is counted from here, never from a job listing.
+        self._arrivals: dict[str, list[float]] = {}
+        # Pending records are read once per process to seed `_arrivals`; judged
+        # ones are not re-read, so `recent` can only undercount (more audits).
+        self._seeded = False
         self._randomness: dict[int, str] = {}
 
     def enqueue(self, submission_id: str) -> None:
@@ -187,12 +192,18 @@ class CorpusAuditor:
             received = record.get("received_at")
             # An older record carries no arrival time: its hold counts from when
             # we first saw it, never as already over.
+            received_at = float(received) if received is not None else self._clock()
             self._meta[submission_id] = (
-                record["hotkey"],
-                float(received) if received is not None else self._clock(),
-                int(record["token_count"]),
+                record["hotkey"], received_at, int(record["token_count"]),
             )
+            bisect.insort(self._arrivals.setdefault(record["hotkey"], []), received_at)
         return record
+
+    def _recent(self, hotkey: str, now: float) -> int:
+        arrivals = self._arrivals.get(hotkey, [])
+        # Older than the hold window: never counted again, as `now` only grows.
+        del arrivals[:bisect.bisect_left(arrivals, now - self._params.hold_seconds)]
+        return bisect.bisect_right(arrivals, now)
 
     async def _audit_outcomes(self, records: list[dict]) -> list[dict | str]:
         """One outcome per record; a string is a validator-side error message."""
@@ -317,10 +328,21 @@ class CorpusAuditor:
                     states[hotkey] = await self._state(hotkey, now)
                 if effective_state(states[hotkey], now, self._params) == "banned":
                     outcome = dict(_BANNED_VOID)
+            if not outcome["passed"] and outcome["audited"]:
+                failed_hotkeys.add(hotkey)
+                if self._miner_states is not None:
+                    # Escalate before the verdict exists: a crash in between then
+                    # re-audits the record, and the retry counts nothing twice
+                    # (idempotent by submission id), instead of leaving a caught
+                    # cheater unsuspected while its held records are paid.
+                    states[hotkey] = await self._miner_states.update(
+                        hotkey, lambda m, now=now, sid=submission_id:
+                        after_confirmed_failure(m, self._params, now, sid)
+                    )
             verdict = self._verdict(submission_id, hotkey, record["token_count"], outcome,
                                     draws.get(submission_id) if outcome["audited"] else None)
             results[k], written = await self._write(submission_id, verdict)
-            # Only the call that wrote a verdict moves the state: a repeat audit
+            # Only the call that wrote a passing verdict counts it: a repeat audit
             # (stale queue entry, restart) must never count twice.
             if not written or self._miner_states is None or not outcome["audited"]:
                 continue
@@ -333,19 +355,11 @@ class CorpusAuditor:
                     return after_pass(m, self._params, mant_mean)
 
                 states[hotkey] = await self._miner_states.update(hotkey, count_pass)
-            else:
-                failed_hotkeys.add(hotkey)
-                states[hotkey] = await self._miner_states.update(
-                    hotkey, lambda m, now=now: after_confirmed_failure(m, self._params, now)
-                )
         return results, failed_hotkeys
 
-    async def _draw(self, received_at: float) -> tuple[str | None, dict | None]:
-        """The drand randomness for this record's round, lowercased, or None
-        (no beacon, fetch error, malformed): the caller then audits."""
-        if self._beacon is None or self._round_at is None:
-            return None, None
-        round_number = int(self._round_at(received_at + DRAW_MARGIN_SECONDS))
+    async def _randomness_for(self, round_number: int) -> str | None:
+        """The drand randomness of a round, lowercased, or None (fetch error,
+        malformed): the caller then audits."""
         randomness = self._randomness.get(round_number)
         if randomness is None:
             try:
@@ -358,9 +372,7 @@ class CorpusAuditor:
             elif value is not None:
                 logger.error("drand round %d gave malformed randomness %r; auditing",
                              round_number, value)
-        if randomness is None:
-            return None, None
-        return randomness, {"round": round_number, "q": self._params.q}
+        return randomness
 
     async def _judge_once(self, submission_ids: list[str]) -> set[str]:
         now = self._clock()
@@ -375,27 +387,29 @@ class CorpusAuditor:
         for hotkey in {self._meta[sid][0] for sid in known}:
             states[hotkey] = await self._state(hotkey, now)
 
-        all_known = False
         audit_ids, draws, unaudited, voided = [], {}, [], []
         for submission_id in known:
             hotkey, received_at, _ = self._meta[submission_id]
             state = states[hotkey]
             randomness, draw, recent = None, None, 0
             if self._params.q < 1.0 and effective_state(state, now, self._params) == "sampled":
-                if not all_known:
-                    # Judged records count too: read every record of the job once.
-                    for sid in await self._records.list_submission_ids(self._job_id):
+                if not self._seeded:
+                    for sid in await self.pending_ids():
                         if sid not in self._meta:
                             await self._read(sid)
-                    all_known = True
-                recent = sum(
-                    1 for hk, t, _ in self._meta.values()
-                    if hk == hotkey and now - self._params.hold_seconds <= t <= now
-                )
-                if recent >= 1.0 / self._params.q:
-                    if now < received_at + DRAW_MARGIN_SECONDS + BEACON_GRACE_SECONDS:
+                    self._seeded = True
+                recent = self._recent(hotkey, now)
+                if (recent >= 1.0 / self._params.q and self._beacon is not None
+                        and self._round_at is not None):
+                    # round_at(t) is the first round published strictly after t:
+                    # the miner signed before its randomness existed (spec §6).
+                    round_number = int(self._round_at(received_at))
+                    if int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number:
                         continue  # its round is not out yet: wait, the rescan comes back
-                    randomness, draw = await self._draw(received_at)
+                    randomness = await self._randomness_for(round_number)
+                    if randomness is not None:
+                        draw = {"round": round_number, "q": self._params.q,
+                                "drawn": drawn(randomness, submission_id, self._params.q)}
             choice = decision(state, params=self._params, now=now, received_at=received_at,
                               recent_submissions=recent, randomness_hex=randomness,
                               submission_id=submission_id)

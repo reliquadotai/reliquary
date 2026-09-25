@@ -133,6 +133,10 @@ def test_a_non_dict_document_raises_naming_the_job(r2):
         {"mant_mean_history": {"x": 1}},
         {"suspect_until": "soon"},
         {"banned_until": float("inf")},
+        {"failure_ids": "d" * 64},
+        {"failure_ids": ["D" * 64]},
+        {"failure_ids": ["d" * 63]},
+        {"failure_ids": [7]},
     ],
 )
 def test_a_malformed_entry_raises_naming_job_and_hotkey(r2, entry):
@@ -169,9 +173,11 @@ def test_a_well_formed_entry_still_reads(r2):
                 "suspect_until": None,
                 "banned_until": None,
                 "mant_mean_history": [0.5],
+                "failure_ids": ["d" * 64],
             }
         },
     )
     m = asyncio.run(MinerStates(BucketRecordStore(), "job-x").get("A"))
     assert m.audited_passed == 3
     assert m.confirmed_failures == [1.0, 2.0]
+    assert m.failure_ids == ["d" * 64]

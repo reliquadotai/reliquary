@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import math
+import re
 
 from reliquary.corpus.audit_policy import MinerState
 from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
@@ -16,6 +17,7 @@ from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
 _NONNEGATIVE_INT_FIELDS = ("audited_passed",)
 _FINITE_NUMBER_LIST_FIELDS = ("confirmed_failures", "mant_mean_history")
 _FINITE_NUMBER_OR_NONE_FIELDS = ("suspect_until", "banned_until")
+_SUBMISSION_ID = re.compile(r"[0-9a-f]{64}")
 
 
 def _is_finite_number(value: object) -> bool:
@@ -67,6 +69,15 @@ def _validate_entry(entry: object, job_id: str, hotkey: str) -> Mapping:
             raise ValueError(
                 f"{field} for hotkey {hotkey!r} in job {job_id!r} must be a finite number or null, "
                 f"got {value!r}"
+            )
+    if "failure_ids" in entry:
+        value = entry["failure_ids"]
+        if not isinstance(value, list) or not all(
+            isinstance(v, str) and _SUBMISSION_ID.fullmatch(v) for v in value
+        ):
+            raise ValueError(
+                f"failure_ids for hotkey {hotkey!r} in job {job_id!r} must be a list of "
+                f"64-lowercase-hex submission ids, got {value!r}"
             )
     return entry
 

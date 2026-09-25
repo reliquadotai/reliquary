@@ -54,6 +54,15 @@ class _Beacon:
         return self.value
 
 
+def _round_at(t):
+    # Contract: the first drand round published strictly after t (3 s chain, round r at 3r).
+    return int(t // 3) + 1
+
+
+def _published(round_number):
+    return 3.0 * round_number
+
+
 def _ids(want_drawn, n, start=0):
     found, i = [], start
     while len(found) < n:
@@ -84,7 +93,7 @@ def _judge(records, states, clock, *, params=None, beacon=None):
     return CorpusAuditor(
         job_id="math-v1", records=records, model=_model(0), tokenizer=_Tokenizer(), proof=PROOF,
         params=params or AuditParams(q=Q, hold_seconds=HOLD, ban_after_failures=10),
-        miner_states=states, beacon=beacon, round_at=lambda t: int(t) // 3, clock=clock,
+        miner_states=states, beacon=beacon, round_at=_round_at, clock=clock,
     )
 
 
@@ -119,7 +128,7 @@ def test_a_sampled_miners_undrawn_record_waits_then_passes_unaudited():
         v = records.verdicts[sid]
         assert (v["passed"], v["audited"], v["reason"]) == (True, False, None)
         assert v["worst_exp"] == 0 and v["worst_mant_mean"] == 0.0
-        assert v["draw"] == {"round": int(T0 + 3) // 3, "q": Q}
+        assert v["draw"] == {"round": _round_at(T0), "q": Q, "drawn": False}
     assert states.states[HK] == SAMPLED
 
 
@@ -133,7 +142,7 @@ def test_a_drawn_record_is_audited_immediately():
     assert set(records.verdicts) == {hit}
     v = records.verdicts[hit]
     assert (v["passed"], v["audited"]) == (True, True)
-    assert v["draw"] == {"round": int(T0 + 3) // 3, "q": Q}
+    assert v["draw"] == {"round": _round_at(T0), "q": Q, "drawn": True}
     assert states.states[HK].audited_passed == 101
 
 
@@ -270,3 +279,117 @@ def test_a_restart_mid_hold_neither_loses_nor_doubles_a_verdict():
     assert records.verdicts[hit] == audited[hit]
     assert all(records.verdicts[sid]["audited"] is False for sid in held)
     assert states.states[HK].audited_passed == 101
+
+
+# --- Fix round 1: escalation before the verdict, listing cost, draw round, same-pass guard ---
+
+
+class _CrashingStates(_States):
+    """The first update fails: before applying it, or after (a crash between the
+    committed state and the verdict write)."""
+
+    def __init__(self, initial, applied):
+        super().__init__(initial)
+        self.applied = applied
+        self.crashed = False
+
+    async def update(self, hotkey, change, attempts=5):
+        if not self.crashed:
+            self.crashed = True
+            if self.applied:
+                await super().update(hotkey, change, attempts)
+            raise ConnectionError("store down")
+        return await super().update(hotkey, change, attempts)
+
+
+@pytest.mark.parametrize("applied", [False, True])
+def test_a_crash_around_the_escalation_still_ends_suspect_counted_once(applied):
+    sid = _ids(False, 1)[0]
+    records = _Records({sid: _rec(1)})
+    states = _CrashingStates({HK: SAMPLED}, applied)
+    clock = _Clock(T0 + 10)
+    params = AuditParams(ban_after_failures=10)
+    with pytest.raises(ConnectionError):
+        asyncio.run(_judge(records, states, clock, params=params).judge_many([sid]))
+
+    restarted = _judge(records, states, clock, params=params)
+
+    async def _again():
+        await restarted.judge_many(await restarted.pending_ids())
+
+    asyncio.run(_again())
+    v = records.verdicts[sid]
+    assert (v["passed"], v["audited"]) == (False, True)
+    state = states.states[HK]
+    assert state.suspect_until == T0 + 10 + params.suspect_seconds
+    assert len(state.confirmed_failures) == 1 and state.failure_ids == [sid]
+
+
+class _CountingRecords(_Records):
+    def __init__(self, submissions):
+        super().__init__(submissions)
+        self.listings = 0
+        self.reads = {}
+
+    async def list_submission_ids(self, job_id):
+        self.listings += 1
+        return await super().list_submission_ids(job_id)
+
+    async def read_submission(self, job_id, sid):
+        self.reads[sid] = self.reads.get(sid, 0) + 1
+        return await super().read_submission(job_id, sid)
+
+
+def test_judging_many_batches_lists_the_job_at_most_once():
+    ids = _ids(False, 6)
+    records = _CountingRecords({sid: _rec(0) for sid in ids})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    for batch in (ids[:2], ids[2:4], ids[4:]):
+        asyncio.run(auditor.judge_many(batch))
+    assert records.verdicts == {}
+    assert records.listings <= 1
+    assert records.reads == {sid: 1 for sid in ids}
+
+
+def test_a_restart_reads_only_pending_records():
+    judged = _ids(False, 3)
+    pending = _ids(False, 2, start=500)
+    records = _CountingRecords({sid: _rec(0) for sid in [*judged, *pending]})
+    for sid in judged:
+        records.verdicts[sid] = {"passed": True}
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor.judge_many(pending))
+    assert set(records.reads) == set(pending)
+
+
+def test_the_draw_uses_the_first_round_published_after_receipt():
+    received = _published(3333)  # round 3333 comes out at the very instant of receipt
+    ids = _ids(False, 2)
+    records = _Records({sid: _rec(0, received_at=received) for sid in ids})
+    beacon = _Beacon()
+    clock = _Clock(received + 1)
+    auditor = _judge(records, _States({HK: SAMPLED}), clock, beacon=beacon)
+    asyncio.run(auditor.judge_many(ids))
+    # Round 3334 is not out yet: nothing is fetched, nothing decided.
+    assert beacon.calls == [] and records.verdicts == {}
+    clock.now = _published(3334) + 2.5
+    asyncio.run(auditor.judge_many(ids))
+    assert beacon.calls == [3334]
+    clock.now = received + HOLD
+    asyncio.run(auditor.judge_many(ids))
+    for sid in ids:
+        draw = records.verdicts[sid]["draw"]
+        assert draw["round"] == 3334 and _published(draw["round"]) > received
+
+
+def test_a_held_record_is_audited_when_a_failure_lands_in_the_same_pass():
+    held = _ids(False, 1)[0]
+    hit = _ids(True, 1)[0]
+    now = T0 + HOLD
+    records = _Records({held: _rec(1), hit: _rec(1, received_at=now - 10)})
+    states = _States({HK: SAMPLED})
+    auditor = _judge(records, states, _Clock(now), beacon=_Beacon())
+    asyncio.run(auditor.judge_many([held, hit]))
+    assert records.verdicts[hit]["passed"] is False
+    v = records.verdicts[held]
+    assert (v["passed"], v["audited"]) == (False, True)

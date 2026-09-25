@@ -17,6 +17,9 @@ AUDIT_PARAM_KEYS = {
 _INTS = {"probation_submissions", "ban_after_failures"}
 _HEX_DIGITS = set("0123456789abcdef")
 MANT_HISTORY = 200
+# Submissions whose confirmed failure is already counted; bounded, and far
+# longer than one judging pass's retries need.
+FAILURE_IDS = 256
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,7 @@ class MinerState:
     suspect_until: float | None = None
     banned_until: float | None = None
     mant_mean_history: list = field(default_factory=list)
+    failure_ids: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,13 +129,19 @@ def after_pass(m: MinerState, params: AuditParams, mant_mean: float) -> MinerSta
     return replace(m, audited_passed=m.audited_passed + 1, mant_mean_history=history)
 
 
-def after_confirmed_failure(m: MinerState, params: AuditParams, now: float) -> MinerState:
+def after_confirmed_failure(m: MinerState, params: AuditParams, now: float,
+                            submission_id: str) -> MinerState:
     # Any confirmed failure resets audited_passed: probation (and the ban
     # that follows suspect) is left only with no confirmed failure (§5), so
     # a hotkey coming out of suspect always starts a fresh probation count.
+    # Idempotent per submission: the state is written before the verdict, so a
+    # retry after a crash between the two must not count the failure twice.
+    if submission_id in m.failure_ids:
+        return m
+    ids = (list(m.failure_ids) + [submission_id])[-FAILURE_IDS:]
     failures = [t for t in m.confirmed_failures if now - t <= params.ban_window_seconds] + [now]
     if len(failures) >= params.ban_after_failures:
         return replace(m, confirmed_failures=failures, suspect_until=None,
-                       banned_until=now + params.ban_seconds, audited_passed=0)
+                       banned_until=now + params.ban_seconds, audited_passed=0, failure_ids=ids)
     return replace(m, confirmed_failures=failures, suspect_until=now + params.suspect_seconds,
-                   audited_passed=0)
+                   audited_passed=0, failure_ids=ids)

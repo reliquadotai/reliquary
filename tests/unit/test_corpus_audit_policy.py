@@ -70,18 +70,19 @@ def test_a_slow_hotkey_is_audited_in_full():
 
 
 def test_a_confirmed_failure_makes_it_suspect_then_a_second_bans():
-    m = after_confirmed_failure(_sampled(), P, now=0)
+    m = after_confirmed_failure(_sampled(), P, now=0, submission_id="1" * 64)
     assert effective_state(m, 10, P) == "suspect"
     assert decision(m, params=P, now=10, received_at=0, recent_submissions=50,
                     randomness_hex=R, submission_id="c" * 64) == "audit"
-    m = after_confirmed_failure(m, P, now=20)
+    m = after_confirmed_failure(m, P, now=20, submission_id="2" * 64)
     assert effective_state(m, 30, P) == "banned"
     assert decision(m, params=P, now=30, received_at=25, recent_submissions=50,
                     randomness_hex=R, submission_id="c" * 64) == "void_banned"
 
 
 def test_a_ban_ends_into_a_fresh_probation():
-    m = after_confirmed_failure(after_confirmed_failure(_sampled(), P, now=0), P, now=1)
+    m = after_confirmed_failure(after_confirmed_failure(_sampled(), P, now=0, submission_id="3" * 64),
+                                P, now=1, submission_id="8" * 64)
     assert effective_state(m, 1 + 500 + 1, P) == "probation"
 
 
@@ -99,10 +100,10 @@ def test_the_default_escalation_reaches_a_ban_across_suspect_cycles():
     suspect period apart must still fall inside the same ban window and ban,
     not loop as suspect forever."""
     D = AuditParams()
-    m = after_confirmed_failure(MinerState(), D, now=0)
+    m = after_confirmed_failure(MinerState(), D, now=0, submission_id="4" * 64)
     assert effective_state(m, 86401, D) == "probation"
-    m = after_confirmed_failure(m, D, now=86401)
-    m = after_confirmed_failure(m, D, now=172802)
+    m = after_confirmed_failure(m, D, now=86401, submission_id="5" * 64)
+    m = after_confirmed_failure(m, D, now=172802, submission_id="6" * 64)
     assert effective_state(m, 172802, D) == "banned"
 
 
@@ -112,7 +113,7 @@ def test_a_confirmed_failure_resets_probation_progress_not_just_on_ban():
     `probation` (fresh audits), not jump straight to `sampled` on its old
     audited_passed count."""
     D = AuditParams()
-    m = after_confirmed_failure(MinerState(audited_passed=100), D, now=0)
+    m = after_confirmed_failure(MinerState(audited_passed=100), D, now=0, submission_id="7" * 64)
     assert effective_state(m, 100, D) == "suspect"
     assert effective_state(m, D.suspect_seconds, D) == "probation"
 
@@ -148,3 +149,22 @@ def test_decision_requires_submission_id():
 def test_effective_state_requires_params():
     with pytest.raises(TypeError):
         effective_state(MinerState(), 0)
+
+
+# --- Task 5 fix round 1: the escalation is written before the verdict, idempotently ---
+
+
+def test_a_confirmed_failure_counts_once_per_submission():
+    sid = "d" * 64
+    once = after_confirmed_failure(_sampled(), P, now=0, submission_id=sid)
+    assert once.failure_ids == [sid]
+    assert after_confirmed_failure(once, P, now=5, submission_id=sid) == once
+
+
+def test_failure_ids_are_bounded():
+    from reliquary.corpus.audit_policy import FAILURE_IDS
+
+    m = MinerState(failure_ids=[f"{i:064x}" for i in range(FAILURE_IDS)])
+    m = after_confirmed_failure(m, AuditParams(ban_after_failures=10**6), now=0,
+                                submission_id="e" * 64)
+    assert len(m.failure_ids) == FAILURE_IDS == 256 and m.failure_ids[-1] == "e" * 64
