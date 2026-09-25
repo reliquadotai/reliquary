@@ -282,6 +282,22 @@ def test_the_vllm_generator_leaves_the_memory_share_to_vllm_unless_told(monkeypa
     assert shared._llm.kwargs["gpu_memory_utilization"] == 0.5
 
 
+def test_two_vllm_generators_do_not_share_a_sampling_seed(monkeypatch):
+    """vLLM seeds every engine with 0 by default, so two miners sampling the
+    same prompt at the same step drew byte-identical completions and the second
+    was refused `hash_duplicate` (rehearsal 2026-09-25): each process seeds its
+    own engine at random."""
+    _install_fake_vllm(monkeypatch)
+    sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=64)
+    proof = SimpleNamespace(chunk_tokens=32, topk=8)
+
+    seeds = {VllmGenerator("/fake/checkpoint", sampling, proof, EOS)._llm.kwargs.get("seed")
+             for _ in range(4)}
+
+    assert None not in seeds and 0 not in seeds
+    assert len(seeds) == 4
+
+
 # --- final review, finding 3: gateway statuses are transient too ---
 
 

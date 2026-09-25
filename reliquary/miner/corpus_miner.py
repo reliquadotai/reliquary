@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import logging
+import secrets
 import time
 from typing import Protocol
 
@@ -265,7 +266,12 @@ class VllmGenerator:
         # Only passed when set: a miner alone on its card keeps vLLM's own
         # default, one sharing it (e.g. with a validator) asks for less.
         memory = {} if gpu_memory_utilization is None else {"gpu_memory_utilization": gpu_memory_utilization}
-        self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False, **memory)
+        # vLLM seeds every engine with 0: two miners sampling one prompt at the
+        # same step would submit identical completions, the second refused
+        # hash_duplicate. The audit never depends on the seed.
+        seed = secrets.randbelow(2**31 - 1) + 1
+        self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False,
+                        seed=seed, **memory)
         self._params = SamplingParams(
             n=1, temperature=sampling.temperature, top_p=sampling.top_p,
             top_k=sampling.top_k if sampling.top_k > 0 else -1,
