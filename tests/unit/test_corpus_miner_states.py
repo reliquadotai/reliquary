@@ -22,13 +22,16 @@ def r2(monkeypatch):
     return client
 
 
-def test_an_update_survives_a_concurrent_writer(r2):
+def test_an_update_preserves_other_hotkeys_entries(r2):
+    # Three sequential updates (A, then B, then A again): this does not put a
+    # writer between another update's own read and write, so it proves the
+    # merge is scoped to one hotkey, not the CAS retry itself — that race is
+    # covered by test_a_conflict_is_re_read_and_the_change_reapplied below.
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
     from reliquary.validator.corpus_miner_states import MinerStates
 
     states = MinerStates(BucketRecordStore(), "job-x")
     asyncio.run(states.update("A", lambda m: replace(m, banned_until=99.0)))
-    # A second writer lands between our read and write: the ban must survive.
     other = MinerStates(BucketRecordStore(), "job-x")
     asyncio.run(other.update("B", lambda m: replace(m, audited_passed=1)))
     asyncio.run(states.update("A", lambda m: replace(m, audited_passed=5)))
@@ -95,3 +98,80 @@ def test_attempts_exhausted_raises_conflict(r2):
     with pytest.raises(CorpusStoreConflict):
         asyncio.run(states.update("A", lambda m: replace(m, audited_passed=1), attempts=2))
     assert store.write_attempts == 2
+
+
+def _seed_miners(r2, job_id, document):
+    # Writes straight into the fake bucket, bypassing the store's own
+    # validated write path — the only way to plant a hand-edited/corrupt
+    # miners.json for these tests.
+    import json
+
+    from reliquary.infrastructure.corpus_record_store import _miners_key
+
+    r2.objects[_miners_key(job_id)] = (json.dumps(document).encode(), '"seed"')
+
+
+def test_a_non_dict_document_raises_naming_the_job(r2):
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    _seed_miners(r2, "job-x", ["not", "an", "object"])
+    with pytest.raises(ValueError, match="job-x"):
+        asyncio.run(MinerStates(BucketRecordStore(), "job-x").get("A"))
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "banned",
+        [1, 2, 3],
+        {"audited_passed": "five"},
+        {"audited_passed": -1},
+        {"audited_passed": True},
+        {"confirmed_failures": "nope"},
+        {"confirmed_failures": [1, float("nan")]},
+        {"mant_mean_history": {"x": 1}},
+        {"suspect_until": "soon"},
+        {"banned_until": float("inf")},
+    ],
+)
+def test_a_malformed_entry_raises_naming_job_and_hotkey(r2, entry):
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    _seed_miners(r2, "job-x", {"A": entry})
+    with pytest.raises(ValueError) as caught:
+        asyncio.run(MinerStates(BucketRecordStore(), "job-x").get("A"))
+    assert "job-x" in str(caught.value)
+    assert "A" in str(caught.value)
+
+
+def test_update_also_validates_the_entry_it_reads(r2):
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    _seed_miners(r2, "job-x", {"A": "banned"})
+    with pytest.raises(ValueError, match="job-x"):
+        asyncio.run(MinerStates(BucketRecordStore(), "job-x").update("A", lambda m: m))
+
+
+def test_a_well_formed_entry_still_reads(r2):
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    _seed_miners(
+        r2,
+        "job-x",
+        {
+            "A": {
+                "audited_passed": 3,
+                "confirmed_failures": [1.0, 2.0],
+                "suspect_until": None,
+                "banned_until": None,
+                "mant_mean_history": [0.5],
+            }
+        },
+    )
+    m = asyncio.run(MinerStates(BucketRecordStore(), "job-x").get("A"))
+    assert m.audited_passed == 3
+    assert m.confirmed_failures == [1.0, 2.0]
