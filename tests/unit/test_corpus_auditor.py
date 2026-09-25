@@ -234,3 +234,26 @@ def test_out_of_vocab_records_fail_and_never_halt_the_auditor():
     asyncio.run(asyncio.wait_for(_drain(), timeout=20))
     assert all(v["passed"] is False and v["reason"] == "token_out_of_vocab"
                for v in records.verdicts.values())
+
+
+# --- batched audit: one bad record must not stall the rest of its batch ---
+
+
+def test_a_batch_with_one_validator_error_still_judges_the_others(monkeypatch):
+    model = _tiny(0)
+    good, bad = "a" * 64, "b" * 64
+    records = _Records({good: _record(model), bad: _record(model)})
+    auditor = _auditor(model, records)
+    real = auditor._judge_many
+
+    def flaky(batch):
+        if any(r is records.submissions[bad] for r in batch) and len(batch) > 1:
+            raise RuntimeError("batch OOM")
+        if any(r is records.submissions[bad] for r in batch):
+            raise RuntimeError("still failing alone")
+        return real(batch)
+
+    monkeypatch.setattr(auditor, "_judge_many", flaky)
+    asyncio.run(auditor.audit_many([good, bad]))
+    assert records.verdicts[good]["passed"] is True
+    assert bad not in records.verdicts

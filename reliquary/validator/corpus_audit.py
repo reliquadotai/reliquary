@@ -26,19 +26,39 @@ class AuditOutcome:
     results: tuple[ChunkResult, ...] = ()
 
 
+def _decoder(model):
+    # The base model returns only the last (normed) hidden state; asking the LM
+    # head model for all of them costs ~20 GB at 32k tokens on a 27B model.
+    return model.model if hasattr(model, "model") else model.get_decoder()
+
+
 @torch.no_grad()
 def completion_hidden_states(model, tokens: Sequence[int], prompt_len: int) -> torch.Tensor:
     """Final hidden state at every position that produced a completion token."""
-    if not 0 < prompt_len < len(tokens):
-        raise ValueError(f"prompt_len {prompt_len} leaves no completion in {len(tokens)} tokens")
+    return batch_completion_hidden_states(model, [(list(tokens), prompt_len)])[0]
+
+
+@torch.no_grad()
+def batch_completion_hidden_states(
+    model, sequences: Sequence[tuple[Sequence[int], int]]
+) -> list[torch.Tensor]:
+    """The same rows for several sequences, right-padded into one forward pass."""
     vocabulary = model.get_input_embeddings().num_embeddings
-    if min(tokens) < 0 or max(tokens) >= vocabulary:
-        # On CUDA an out-of-range embedding index kills the device context.
-        raise ValueError(f"a token id is outside the vocabulary of {vocabulary}")
+    for tokens, prompt_len in sequences:
+        if not 0 < prompt_len < len(tokens):
+            raise ValueError(f"prompt_len {prompt_len} leaves no completion in {len(tokens)} tokens")
+        if min(tokens) < 0 or max(tokens) >= vocabulary:
+            # On CUDA an out-of-range embedding index kills the device context.
+            raise ValueError(f"a token id is outside the vocabulary of {vocabulary}")
     device = next(model.parameters()).device
-    ids = torch.tensor([list(tokens)], device=device)
-    output = model(input_ids=ids, output_hidden_states=True, use_cache=False)
-    return output.hidden_states[-1][0, prompt_len - 1 : len(tokens) - 1]
+    width = max(len(tokens) for tokens, _ in sequences)
+    ids = torch.zeros((len(sequences), width), dtype=torch.long, device=device)
+    mask = torch.zeros_like(ids)
+    for row, (tokens, _) in enumerate(sequences):
+        ids[row, : len(tokens)] = torch.tensor(tokens, device=device)
+        mask[row, : len(tokens)] = 1
+    hidden = _decoder(model)(input_ids=ids, attention_mask=mask, use_cache=False).last_hidden_state
+    return [hidden[row, n - 1 : len(tokens) - 1] for row, (tokens, n) in enumerate(sequences)]
 
 
 def audit_completion(
