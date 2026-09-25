@@ -733,8 +733,21 @@ def build_corpus_router(
 
         # Right after the signature check and before anything is read or
         # written: an unsigned request must not be able to probe ban status.
-        if is_banned is not None and await is_banned(request.miner_hotkey):
-            return _refuse(CorpusRejectReason.MINER_BANNED)
+        if is_banned is not None:
+            try:
+                banned = await is_banned(request.miner_hotkey)
+            except Exception as exc:
+                # Same response `_from_store` gives a bucket transport error:
+                # the miners document is unreachable, not that this hotkey
+                # was cleared to submit.
+                logger.warning(
+                    "corpus ban check for %s failed: %r", request.miner_hotkey[:12], exc
+                )
+                raise HTTPException(
+                    status_code=503, detail="corpus_store_unavailable"
+                ) from exc
+            if banned:
+                return _refuse(CorpusRejectReason.MINER_BANNED)
 
         # `JobError` subclasses `ValueError`, so `_read_job_checked` catches it
         # first: a manifest in the bucket that no longer parses is an operator

@@ -183,14 +183,71 @@ reliquary jobs list     # <job>  active  task=corpus-<name> cap=0.100
 reliquary tasks contract --task-id corpus-<name> > corpus-<name>.contract.json
 ```
 
+### 2.1 Partial audit parameters (`audit_*`)
+
+V0's rule is audit everything, and `audit_q = 1.0` (the default) still gives
+exactly that. The partial-audit design (spec
+`2026-09-25-corpus-partial-audit-design.md`) can instead sample a fraction of
+one hotkey's submissions once it has proven itself, at the cost of a short
+hold before an unaudited one is paid. `jobs create` accepts `--audit-q`,
+`--audit-probation-submissions` and `--audit-hold-seconds`; `tasks set-cap`
+can change `--audit-q` on a live task. The remaining three
+(`audit_suspect_seconds`, `audit_ban_after_failures`,
+`audit_ban_window_seconds`, `audit_ban_seconds`) have no CLI flag yet and
+always run at the defaults below.
+
+| param | default | meaning |
+|---|---|---|
+| `audit_q` | 1.0 | fraction of a `sampled` hotkey's submissions the GPU audits; 1.0 audits everything (V0) |
+| `audit_probation_submissions` | 100 | audited passes, no confirmed failure, before a hotkey leaves `probation` |
+| `audit_hold_seconds` | 4320 (72 min, ≈ one epoch) | how long an unaudited submission waits before it is paid |
+| `audit_suspect_seconds` | 86400 (24 h) | how long a hotkey with one confirmed failure is audited at 100 % |
+| `audit_ban_after_failures` | 3 | confirmed failures inside the ban window that ban the hotkey |
+| `audit_ban_window_seconds` | 604800 (7 d) | the window those failures are counted in |
+| `audit_ban_seconds` | 604800 (7 d) | how long the ban lasts |
+
+What each state means for a miner:
+
+- **`probation`** — every accepted submission of this hotkey is audited on
+  the GPU. Applies to a brand-new hotkey and to one just re-registered after a
+  ban (probation is never skipped on re-registration); it lasts until
+  `audit_probation_submissions` submissions have passed audit with no
+  confirmed failure in between.
+- **`sampled`** — only a fraction `audit_q` of submissions is drawn for audit.
+  The draw is keyed on a drand beacon published strictly after the submission
+  was received, so a miner cannot choose which of its own submissions gets
+  checked; a hotkey submitting fewer than `1 / audit_q` per hold is still
+  audited at 100 % (too small a sample to be worth drawing). A submission that
+  is not drawn still waits out `audit_hold_seconds` before it is paid,
+  unaudited (verdict `passed: true, audited: false`).
+- **`suspect`** — one confirmed failure (a failure that survives a second,
+  separate re-audit) puts the hotkey back to 100 % audit for
+  `audit_suspect_seconds`, and every one of its records still in hold at that
+  moment is audited backwards, so a cheater caught late is not paid for what
+  it already sent before being caught.
+- **`banned`** — `audit_ban_after_failures` confirmed failures inside
+  `audit_ban_window_seconds` ban the hotkey for `audit_ban_seconds`: the route
+  refuses its submissions outright (reject reason `miner_banned`), and every
+  one of its records still without a verdict is voided, never paid. A ban ends
+  into a fresh `probation` — not straight back to `sampled`.
+
+**A hold delays payment, it never skips it.** A `sampled` submission that is
+not drawn is payable only once `audit_hold_seconds` has passed since it was
+received; until then `reliquary jobs status <job>` shows it as accepted but
+unsettled, the same as one still waiting on a batched audit pass. If the
+validator cannot resolve the drand chain's genesis time at startup, it falls
+back to auditing every submission (fail safe) until that resolves, logging a
+warning; this never applies at `audit_q = 1.0`, which never needs a draw.
+
 ## 3. Start the corpus validator
 
 One process on one H100 (the GRAIL validator's card is fine: nothing else of
 the RL service runs in it). It loads the job's checkpoint in bf16, refuses to
 start if the contract's model is not the job's checkpoint or the fingerprint
 differs, serves `GET /corpus/job`, `GET /corpus/cursor/{hotkey}` and
-`POST /corpus/submit`, audits every accepted submission (q = 1) and settles
-every 60 s.
+`POST /corpus/submit`, audits accepted submissions per the job's `audit_*`
+parameters (§2.1 — `audit_q = 1.0`, the default, audits every one, as in V0)
+and settles every 60 s.
 
 ```bash
 export RELIQUARY_TASK_ID=corpus-<name>

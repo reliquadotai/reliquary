@@ -85,6 +85,23 @@ def test_is_banned_none_changes_nothing(seeded_job):
     assert body["accepted"] is True
 
 
+async def _raising_ban(hotkey):
+    raise RuntimeError("miners.json unreadable")
+
+
+def test_is_banned_raising_gives_503_and_writes_nothing(seeded_job):
+    before_reads = seeded_job.store.job_reads
+    before_writes = seeded_job.ledger_writes()
+    client = _client(seeded_job, is_banned=_raising_ban)
+
+    response = _submit(client, tokens=[7] * 16 + [EOS], hotkey="5Hot")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "corpus_store_unavailable"
+    assert seeded_job.store.job_reads == before_reads
+    assert seeded_job.ledger_writes() == before_writes
+
+
 def test_a_bad_signature_is_refused_before_the_ban_check_runs(seeded_job):
     """The ban check sits after the signature check, so an unsigned request
     cannot use it to probe whether a hotkey is banned."""
