@@ -105,6 +105,25 @@ async def write_settlement(job_id, state, etag, **client_kwargs) -> str | None:
     return await _put(_settlement_key(job_id), _encode(dict(state)), etag, **client_kwargs)
 
 
+def _miners_key(job_id: str) -> str:
+    return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/miners.json"
+
+
+async def read_miners(job_id, **client_kwargs) -> tuple[dict, str | None]:
+    """Every hotkey's audit state for this job, whole-document. Absent reads
+    as ({}, None): a hotkey with no entry is handled by the caller (§5,
+    "unknown is probation"), not by this store."""
+    body, etag = await _get(_miners_key(job_id), **client_kwargs)
+    return ({}, None) if body is None else (json.loads(body), etag)
+
+
+async def write_miners(job_id, state, etag, **client_kwargs) -> str | None:
+    """Compare-and-swap of the whole miners document, like the settlement
+    state: two auditors racing on different hotkeys must not let one
+    overwrite the other's write."""
+    return await _put(_miners_key(job_id), _encode(dict(state)), etag, **client_kwargs)
+
+
 class BucketRecordStore:
     """The record calls bound to one bucket, so tests can hand the services a fake."""
 
@@ -136,3 +155,9 @@ class BucketRecordStore:
 
     async def write_settlement(self, job_id, state, etag):
         return await write_settlement(job_id, state, etag, **self._kw)
+
+    async def read_miners(self, job_id):
+        return await read_miners(job_id, **self._kw)
+
+    async def write_miners(self, job_id, state, etag):
+        return await write_miners(job_id, state, etag, **self._kw)
