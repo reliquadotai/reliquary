@@ -1,18 +1,31 @@
-"""Re-run the job's model over every accepted submission and record a verdict.
+"""Judge every accepted submission: audit it with the job's model, wait out its
+hold, or pass it unaudited, and record a verdict.
 
-V0 audits everything (q = 1): a submission is paid only once a passing verdict
-exists for it. A validator-side error writes no verdict, so the submission stays
-pending instead of being charged to a miner for our fault.
+With `audit_q = 1` (the default) every record is audited on arrival, as in V0.
+A submission is paid only once a passing verdict exists for it. A
+validator-side error writes no verdict, so the submission stays pending instead
+of being charged to a miner for our fault.
 """
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
+import re
 import time
+from collections.abc import Callable
 
 import torch
 
+from reliquary.corpus.audit_policy import (
+    AuditParams,
+    MinerState,
+    after_confirmed_failure,
+    after_pass,
+    decision,
+    effective_state,
+)
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.protocol.profiles import ProofProfile
 from reliquary.validator.corpus_audit import audit_completion, batch_completion_hidden_states
@@ -28,6 +41,15 @@ MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 AUDIT_BATCH_TOKENS = 131072
 # `run()` drains the queue into groups no larger than this before auditing.
 RUN_BATCH_IDS = 16
+# The draw uses the drand round current this long after receipt, so the miner
+# signed before that round's randomness existed (spec §6).
+DRAW_MARGIN_SECONDS = 3.0
+# Propagation slack before a round that should exist is fetched: asking too
+# early reads as "no beacon", which audits (safe, but wastes the sampling).
+BEACON_GRACE_SECONDS = 2.0
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_WORST_ZERO = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
+_BANNED_VOID = {"passed": False, "audited": False, "reason": "banned"}
 
 
 class CorpusAuditorHalted(Exception):
@@ -37,7 +59,11 @@ class CorpusAuditorHalted(Exception):
 class CorpusAuditor:
     def __init__(self, *, job_id: str, records, model, tokenizer, proof: ProofProfile,
                  rescan_every_seconds: float = RESCAN_SECONDS,
-                 max_validator_errors: int = MAX_CONSECUTIVE_VALIDATOR_ERRORS) -> None:
+                 max_validator_errors: int = MAX_CONSECUTIVE_VALIDATOR_ERRORS,
+                 params: AuditParams = AuditParams(), miner_states=None,
+                 beacon: Callable[[int], str | None] | None = None,
+                 round_at: Callable[[float], int] | None = None,
+                 clock: Callable[[], float] = time.time) -> None:
         self._job_id = job_id
         self._records = records
         self._model = model
@@ -49,6 +75,15 @@ class CorpusAuditor:
         self._rescan_every = rescan_every_seconds
         self._max_validator_errors = max_validator_errors
         self._validator_errors = 0
+        self._params = params
+        self._miner_states = miner_states
+        self._beacon = beacon
+        self._round_at = round_at
+        self._clock = clock
+        # Records are immutable: (hotkey, received_at, token_count) read once,
+        # so a rescan every minute does not re-read every record from the store.
+        self._meta: dict[str, tuple[str, float, int]] = {}
+        self._randomness: dict[int, str] = {}
 
     def enqueue(self, submission_id: str) -> None:
         if submission_id in self._queued:
@@ -64,7 +99,7 @@ class CorpusAuditor:
     def _judge_many(self, records: list[dict]) -> list[dict]:
         """Judge several records at once: every completion of every record that
         needs the GPU is packed, sorted by length, into shared forward passes."""
-        worst_zero = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
+        worst_zero = _WORST_ZERO
         results: list[dict | None] = [None] * len(records)
         prompts: list[list[int] | None] = [None] * len(records)
         vocabulary = self._model.get_input_embeddings().num_embeddings
@@ -138,24 +173,29 @@ class CorpusAuditor:
             results[i] = {"passed": passed, "reason": reason, **worst}
         return results
 
-    async def audit_many(self, submission_ids: list[str]) -> list[dict | None]:
-        ids: list[str] = []
-        records: list[dict] = []
-        for submission_id in submission_ids:
-            try:
-                record = await self._records.read_submission(self._job_id, submission_id)
-            except Exception:
-                # Isolated per id: one bad read must not stall the rest of the batch.
-                logger.exception("corpus read of %s failed; leaving it pending", submission_id[:12])
-                continue
-            if record is None:
-                logger.error("corpus submission %s has no record", submission_id[:12])
-                continue
-            ids.append(submission_id)
-            records.append(record)
-        if not records:
-            return []
+    async def _read(self, submission_id: str) -> dict | None:
+        try:
+            record = await self._records.read_submission(self._job_id, submission_id)
+        except Exception:
+            # Isolated per id: one bad read must not stall the rest of the batch.
+            logger.exception("corpus read of %s failed; leaving it pending", submission_id[:12])
+            return None
+        if record is None:
+            logger.error("corpus submission %s has no record", submission_id[:12])
+            return None
+        if submission_id not in self._meta:
+            received = record.get("received_at")
+            # An older record carries no arrival time: its hold counts from when
+            # we first saw it, never as already over.
+            self._meta[submission_id] = (
+                record["hotkey"],
+                float(received) if received is not None else self._clock(),
+                int(record["token_count"]),
+            )
+        return record
 
+    async def _audit_outcomes(self, records: list[dict]) -> list[dict | str]:
+        """One outcome per record; a string is a validator-side error message."""
         batch_failed, batch_error = False, ""
         try:
             judged: list = await asyncio.to_thread(self._judge_many, records)
@@ -188,30 +228,220 @@ class CorpusAuditor:
                     # outlive this line, into the next record's retry.
                     judged.append(str(solo_exc))
                     del solo_exc
+        return judged
 
-        results: list[dict | None] = []
-        for submission_id, record, outcome in zip(ids, records, judged):
-            if not isinstance(outcome, dict):
+    def _verdict(self, submission_id: str, hotkey: str, token_count: int, outcome: dict,
+                 draw: dict | None) -> dict:
+        verdict = {
+            "schema": VERDICT_SCHEMA,
+            "submission_id": submission_id,
+            "hotkey": hotkey,
+            "token_count": int(token_count),
+            "audited_at": self._clock(),
+            **outcome,
+        }
+        if draw is not None:
+            verdict["draw"] = draw
+        return verdict
+
+    async def _write(self, submission_id: str, verdict: dict) -> tuple[dict, bool]:
+        """Create-only: the verdict that stands, and whether this call wrote it."""
+        if await self._records.write_verdict(self._job_id, submission_id, verdict):
+            return verdict, True
+        return await self._records.read_verdict(self._job_id, submission_id), False
+
+    async def _state(self, hotkey: str, now: float) -> MinerState:
+        if self._miner_states is None:
+            return MinerState()
+        state = await self._miner_states.get(hotkey)
+        if state.banned_until is not None and now >= state.banned_until:
+            # Persist the end of a ban as a fresh probation (§7.3), so passes
+            # counted before or during the ban never shorten it.
+            def end_ban(m: MinerState) -> MinerState:
+                if m.banned_until is not None and now >= m.banned_until:
+                    return replace(m, banned_until=None, audited_passed=0)
+                return m
+
+            state = await self._miner_states.update(hotkey, end_ban)
+        return state
+
+    async def audit_many(self, submission_ids: list[str],
+                         draws: dict[str, dict] | None = None) -> list[dict | None]:
+        ids: list[str] = []
+        records: list[dict] = []
+        for submission_id in submission_ids:
+            record = await self._read(submission_id)
+            if record is not None:
+                ids.append(submission_id)
+                records.append(record)
+        if not records:
+            return []
+        results, _ = await self._audit_records(ids, records, draws or {})
+        return results
+
+    async def _audit_records(self, ids: list[str], records: list[dict],
+                             draws: dict[str, dict]) -> tuple[list[dict | None], set[str]]:
+        """Audit, re-audit each failure alone, write the verdicts and move each
+        hotkey's state. Returns the verdicts and the hotkeys with a confirmed failure."""
+        outcomes = await self._audit_outcomes(records)
+        for k, outcome in enumerate(outcomes):
+            if isinstance(outcome, dict) and not outcome["passed"]:
+                # §7.2: only a failure that a second, separate audit repeats counts.
+                outcomes[k] = (await self._audit_outcomes([records[k]]))[0]
+
+        for submission_id, outcome in zip(ids, outcomes):
+            if isinstance(outcome, dict):
+                self._validator_errors = 0
+            else:
                 # Ours, not the miner's: leave it pending for the next rescan.
                 self._validator_errors += 1
                 logger.error(
                     "corpus audit of %s failed on the validator: %s", submission_id[:12], outcome
                 )
-                results.append(None)
+
+        results: list[dict | None] = [None] * len(ids)
+        failed_hotkeys: set[str] = set()
+        states: dict[str, MinerState] = {}
+        # Failures first: a ban they cause must void this batch's passes of that hotkey.
+        order = sorted(
+            (k for k, outcome in enumerate(outcomes) if isinstance(outcome, dict)),
+            key=lambda k: outcomes[k]["passed"],
+        )
+        for k in order:
+            submission_id, record, outcome = ids[k], records[k], outcomes[k]
+            hotkey = record["hotkey"]
+            now = self._clock()
+            outcome = {**outcome, "audited": True}
+            if outcome["passed"]:
+                if hotkey not in states:
+                    states[hotkey] = await self._state(hotkey, now)
+                if effective_state(states[hotkey], now, self._params) == "banned":
+                    outcome = dict(_BANNED_VOID)
+            verdict = self._verdict(submission_id, hotkey, record["token_count"], outcome,
+                                    draws.get(submission_id) if outcome["audited"] else None)
+            results[k], written = await self._write(submission_id, verdict)
+            # Only the call that wrote a verdict moves the state: a repeat audit
+            # (stale queue entry, restart) must never count twice.
+            if not written or self._miner_states is None or not outcome["audited"]:
                 continue
-            self._validator_errors = 0
-            verdict = {
-                "schema": VERDICT_SCHEMA,
-                "submission_id": submission_id,
-                "hotkey": record["hotkey"],
-                "token_count": int(record["token_count"]),
-                "audited_at": time.time(),
-                **outcome,
-            }
-            if not await self._records.write_verdict(self._job_id, submission_id, verdict):
-                verdict = await self._records.read_verdict(self._job_id, submission_id)
-            results.append(verdict)
-        return results
+            if outcome["passed"]:
+                mant_mean = outcome["worst_mant_mean"]
+
+                def count_pass(m: MinerState, now=now, mant_mean=mant_mean) -> MinerState:
+                    if effective_state(m, now, self._params) == "banned":
+                        return m
+                    return after_pass(m, self._params, mant_mean)
+
+                states[hotkey] = await self._miner_states.update(hotkey, count_pass)
+            else:
+                failed_hotkeys.add(hotkey)
+                states[hotkey] = await self._miner_states.update(
+                    hotkey, lambda m, now=now: after_confirmed_failure(m, self._params, now)
+                )
+        return results, failed_hotkeys
+
+    async def _draw(self, received_at: float) -> tuple[str | None, dict | None]:
+        """The drand randomness for this record's round, lowercased, or None
+        (no beacon, fetch error, malformed): the caller then audits."""
+        if self._beacon is None or self._round_at is None:
+            return None, None
+        round_number = int(self._round_at(received_at + DRAW_MARGIN_SECONDS))
+        randomness = self._randomness.get(round_number)
+        if randomness is None:
+            try:
+                value = await asyncio.to_thread(self._beacon, round_number)
+            except Exception:
+                logger.warning("drand round %d unavailable; auditing", round_number, exc_info=True)
+                value = None
+            if isinstance(value, str) and _HEX64.fullmatch(value.lower()):
+                randomness = self._randomness[round_number] = value.lower()
+            elif value is not None:
+                logger.error("drand round %d gave malformed randomness %r; auditing",
+                             round_number, value)
+        if randomness is None:
+            return None, None
+        return randomness, {"round": round_number, "q": self._params.q}
+
+    async def _judge_once(self, submission_ids: list[str]) -> set[str]:
+        now = self._clock()
+        read: dict[str, dict] = {}
+        for submission_id in submission_ids:
+            if submission_id not in self._meta:
+                record = await self._read(submission_id)
+                if record is not None:
+                    read[submission_id] = record
+        known = [sid for sid in dict.fromkeys(submission_ids) if sid in self._meta]
+        states = {}
+        for hotkey in {self._meta[sid][0] for sid in known}:
+            states[hotkey] = await self._state(hotkey, now)
+
+        all_known = False
+        audit_ids, draws, unaudited, voided = [], {}, [], []
+        for submission_id in known:
+            hotkey, received_at, _ = self._meta[submission_id]
+            state = states[hotkey]
+            randomness, draw, recent = None, None, 0
+            if self._params.q < 1.0 and effective_state(state, now, self._params) == "sampled":
+                if not all_known:
+                    # Judged records count too: read every record of the job once.
+                    for sid in await self._records.list_submission_ids(self._job_id):
+                        if sid not in self._meta:
+                            await self._read(sid)
+                    all_known = True
+                recent = sum(
+                    1 for hk, t, _ in self._meta.values()
+                    if hk == hotkey and now - self._params.hold_seconds <= t <= now
+                )
+                if recent >= 1.0 / self._params.q:
+                    if now < received_at + DRAW_MARGIN_SECONDS + BEACON_GRACE_SECONDS:
+                        continue  # its round is not out yet: wait, the rescan comes back
+                    randomness, draw = await self._draw(received_at)
+            choice = decision(state, params=self._params, now=now, received_at=received_at,
+                              recent_submissions=recent, randomness_hex=randomness,
+                              submission_id=submission_id)
+            if choice == "audit":
+                audit_ids.append(submission_id)
+                if draw is not None:
+                    draws[submission_id] = draw
+            elif choice == "pass_unaudited":
+                unaudited.append((submission_id, draw))
+            elif choice == "void_banned":
+                voided.append(submission_id)
+
+        failed: set[str] = set()
+        if audit_ids:
+            records = [read.get(sid) or await self._read(sid) for sid in audit_ids]
+            pairs = [(sid, r) for sid, r in zip(audit_ids, records) if r is not None]
+            if pairs:
+                _, failed = await self._audit_records(
+                    [sid for sid, _ in pairs], [r for _, r in pairs], draws)
+        for submission_id, draw in unaudited:
+            hotkey, _, token_count = self._meta[submission_id]
+            if hotkey in failed:
+                continue  # now suspect: the backward audit decides it
+            await self._write(submission_id, self._verdict(
+                submission_id, hotkey, token_count,
+                {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}, draw))
+        for submission_id in voided:
+            hotkey, _, token_count = self._meta[submission_id]
+            await self._write(submission_id, self._verdict(
+                submission_id, hotkey, token_count, dict(_BANNED_VOID), None))
+        return failed
+
+    async def judge_many(self, submission_ids: list[str]) -> None:
+        """Decide each record: audit now, wait out its hold, pass it unaudited, or
+        void it for a ban; then audit backwards after every confirmed failure."""
+        failed = await self._judge_once(list(submission_ids))
+        # At q = 1 every held record is already being audited on arrival.
+        while failed and self._params.q < 1.0:
+            # §7.2: every record of a hotkey just found cheating that has no
+            # verdict yet is audited (it is suspect now) before it can be paid.
+            pending = await self.pending_ids()
+            for sid in pending:
+                if sid not in self._meta:
+                    await self._read(sid)
+            held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed]
+            failed = await self._judge_once(held)
 
     async def audit(self, submission_id: str) -> dict | None:
         results = await self.audit_many([submission_id])
@@ -241,7 +471,7 @@ class CorpusAuditor:
                     except asyncio.QueueEmpty:
                         break
                 try:
-                    await self.audit_many(batch)
+                    await self.judge_many(batch)
                 except Exception:
                     # A store hiccup (e.g. a transient ConnectionError) must not kill
                     # the drain loop: the submissions stay pending and the next
