@@ -118,6 +118,9 @@ class CorpusAuditor:
             for (i, c_idx), hidden in zip(sub_batch, hidden_states):
                 completion = records[i]["completions"][c_idx]
                 outcomes[i, c_idx] = audit_completion(hidden, completion["proofs"], self._proof)
+            # Drop this sub-batch's padded activations before the next one is
+            # computed: two final-hidden-state tensors must never be live at once.
+            del hidden_states, sequences, hidden
 
         for i, record in enumerate(records):
             if results[i] is not None:
@@ -153,25 +156,42 @@ class CorpusAuditor:
         if not records:
             return []
 
+        batch_failed, batch_error = False, ""
         try:
             judged: list = await asyncio.to_thread(self._judge_many, records)
         except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+            # Record only the message here, then leave the block: `exc` and its
+            # traceback pin every frame that was live when the batch failed
+            # (including this batch's hidden states), and the retries below
+            # must not run while any of that memory is still referenced.
+            batch_failed, batch_error = True, str(exc)
+            del exc
+
+        if batch_failed:
             # Ours, not the miner's: one record's fault must not stall the rest
             # of the batch, so retry each alone before giving up on any of them.
             logger.error(
                 "corpus audit batch of %d failed on the validator: %s; retrying one by one",
-                len(records), exc,
+                len(records), batch_error,
             )
+            if torch.cuda.is_available():
+                # The failed batch's activations are unreachable now; hand that
+                # memory back before the smaller retries ask for their own.
+                torch.cuda.empty_cache()
             judged = []
             for record in records:
                 try:
                     judged.append((await asyncio.to_thread(self._judge_many, [record]))[0])
                 except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as solo_exc:
-                    judged.append(solo_exc)
+                    # A message, not the exception object: so this record's
+                    # traceback (and whatever activations it pins) cannot
+                    # outlive this line, into the next record's retry.
+                    judged.append(str(solo_exc))
+                    del solo_exc
 
         results: list[dict | None] = []
         for submission_id, record, outcome in zip(ids, records, judged):
-            if isinstance(outcome, Exception):
+            if not isinstance(outcome, dict):
                 # Ours, not the miner's: leave it pending for the next rescan.
                 self._validator_errors += 1
                 logger.error(

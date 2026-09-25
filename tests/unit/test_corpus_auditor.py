@@ -2,6 +2,9 @@
 
 import asyncio
 import base64
+import gc
+import sys
+import weakref
 
 import pytest
 import torch
@@ -257,3 +260,53 @@ def test_a_batch_with_one_validator_error_still_judges_the_others(monkeypatch):
     asyncio.run(auditor.audit_many([good, bad]))
     assert records.verdicts[good]["passed"] is True
     assert bad not in records.verdicts
+
+
+def test_the_solo_retries_run_after_the_failed_batchs_exception_is_forgotten(monkeypatch):
+    # A batch-level exception's traceback pins every frame (and tensor) live
+    # when it was raised; asyncio.to_thread runs the judged call itself in a
+    # worker thread with its own, always-clear exc_info, so the only place
+    # that can observe "are we still inside the failed batch's except block"
+    # is the coroutine's own thread, right as it hands work to that thread.
+    model = _tiny(0)
+    good, bad = "a" * 64, "b" * 64
+    records = _Records({good: _record(model), bad: _record(model)})
+    auditor = _auditor(model, records)
+    real_judge_many = auditor._judge_many
+    real_to_thread = asyncio.to_thread
+    dispatch_exc_info = []
+    solo_exc_ref = []
+
+    class _SimulatedOOM(RuntimeError):
+        pass  # a plain RuntimeError instance cannot take a weakref
+
+    def flaky(batch):
+        if any(r is records.submissions[bad] for r in batch) and len(batch) > 1:
+            raise _SimulatedOOM("batch OOM")
+        if any(r is records.submissions[bad] for r in batch):
+            exc = _SimulatedOOM("still failing alone")
+            solo_exc_ref.append(weakref.ref(exc))
+            raise exc
+        return real_judge_many(batch)
+
+    async def spying_to_thread(func, *args, **kwargs):
+        dispatch_exc_info.append(sys.exc_info())
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", spying_to_thread)
+    monkeypatch.setattr(auditor, "_judge_many", flaky)
+
+    asyncio.run(auditor.audit_many([good, bad]))
+
+    # Dispatch 0 is the whole-batch call (nothing has failed yet); 1 and 2 are
+    # the two solo retries, which must run with no exception live in the
+    # caller (the failed batch's traceback, and whatever it pinned, forgotten
+    # before either retry starts).
+    assert len(dispatch_exc_info) == 3
+    assert dispatch_exc_info[1:] == [(None, None, None), (None, None, None)]
+
+    gc.collect()
+    # audit_many must not keep the failing record's own exception (and its
+    # traceback) referenced anywhere once it has recorded the failure as a
+    # plain message.
+    assert solo_exc_ref and solo_exc_ref[0]() is None
