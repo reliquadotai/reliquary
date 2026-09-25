@@ -1856,6 +1856,7 @@ def validate(
         )
 
     async def _run():
+        nonlocal resume_from
         from reliquary.infrastructure.chain import get_subtensor
 
         signer_client = None
@@ -2020,7 +2021,13 @@ def validate(
                 model = next(iter(proof_models.values()))
                 from reliquary.validator.observed_proof_rollout import (
                     authorize_observed_live, observed_live_requested,
+                    observed_restart_checkpoint,
                 )
+                if observed_live_requested():
+                    recovered_checkpoint = observed_restart_checkpoint(remote_pool)
+                    if recovered_checkpoint is not None:
+                        activation_checkpoint_revision = recovered_checkpoint.revision
+                        resume_from = f"sha:{activation_checkpoint_revision}"
                 proof_capacity_qualification = (
                     authorize_observed_live(remote_pool, activation_checkpoint_revision)
                     if observed_live_requested()
