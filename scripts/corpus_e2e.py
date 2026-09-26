@@ -8,6 +8,12 @@ bucket ``reliquary`` is refused.
 
     R2_BUCKET_ID=reliquary-corpus-e2e python scripts/corpus_e2e.py --start-minio
 
+With ``--audit-q/--audit-probation/--audit-hold-seconds`` the task samples its
+audits, and ``--late-cheater-steps K`` adds a hotkey that mines honestly through
+probation, then K steps with the dishonest model: it must turn suspect at its
+first failed audit, every record it still has in hold must be audited, and none
+of its switched records may be paid.
+
 Prints one JSON summary on stdout and exits non-zero if any check fails.
 """
 
@@ -163,7 +169,7 @@ def declare_task(state: Path, args, *, task_id: str, job_id: str, revision: str)
         task_id=task_id, job_id=job_id, from_profile=args.base_profile,
         model_id=args.honest_model, model_revision=revision,
         model_architecture=args.model_architecture, prompt_source=args.prompt_source,
-        cap=args.cap, overrides={},
+        cap=args.cap, overrides={}, audit_params=audit_params_from_args(args),
     )
     validate_entry(entry)
     (state / "contract.json").write_text(json.dumps(entry.contract, sort_keys=True))
@@ -206,8 +212,10 @@ def run_validator(args) -> None:
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
     from reliquary.validator.corpus_validator import run_corpus_validator
 
+    # The audit parameters live in the entry's params, as the registry would carry them.
+    params = json.loads(Path(args.entry).read_text())["params"]
     entry = SimpleNamespace(task_id=args.task_id, job_id=args.job_id,
-                            mechanism=MECHANISM_CORPUS_GENERATION)
+                            mechanism=MECHANISM_CORPUS_GENERATION, params=params)
     # Settlement is driven by the orchestrator once every verdict is in, so the
     # archive it checks is the only one written.
     asyncio.run(run_corpus_validator(
@@ -308,11 +316,24 @@ def run_miner(args) -> None:
     )
     load_seconds = time.perf_counter() - load_started
     started = time.perf_counter()
-    counts = mine_steps(
-        job=job, hotkey=keypair.ss58_address, client=client, generator=generator,
-        tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
-        sign=lambda body: sign_corpus_submission(signer, body), max_steps=args.steps,
-    )
+    def mine(steps):
+        return mine_steps(
+            job=job, hotkey=keypair.ss58_address, client=client, generator=generator,
+            tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
+            sign=lambda body: sign_corpus_submission(signer, body), max_steps=steps,
+        )
+
+    if args.until_accepted:
+        # Probation counts accepted submissions: keep stepping until exactly
+        # that many landed, whatever the route refused on the way.
+        counts: dict = {}
+        for _ in range(3 * args.until_accepted):
+            if counts.get("accepted", 0) >= args.until_accepted:
+                break
+            for reason, count in mine(1).items():
+                counts[reason] = counts.get(reason, 0) + count
+    else:
+        counts = mine(args.steps)
     elapsed = time.perf_counter() - started
     Path(args.out).write_text(json.dumps({
         "hotkey": keypair.ss58_address, "model": str(generate_directory), "counts": counts,
@@ -362,7 +383,7 @@ def _stop(process: subprocess.Popen | None) -> None:
 
 
 def _run_miner_process(state: Path, env: dict, args, role: str, mnemonic: str, steps: int,
-                       model: str | None, revision: str | None) -> dict:
+                       model: str | None, revision: str | None, *, until_accepted: bool = False) -> dict:
     out = state / f"miner-{role}.json"
     # The mnemonic goes through the environment, not argv, which any process can list.
     env = {**env, "CORPUS_E2E_MNEMONIC": mnemonic}
@@ -371,6 +392,8 @@ def _run_miner_process(state: Path, env: dict, args, role: str, mnemonic: str, s
             "--gpu-memory-utilization", str(args.gpu_memory_utilization)]
     if model:
         argv += ["--model", model, "--revision", revision]
+    if until_accepted:
+        argv += ["--until-accepted", str(steps)]
     process = _spawn(state, env, f"miner-{role}", argv)
     code = process.wait(timeout=args.miner_timeout)
     if code != 0 or not out.exists():
@@ -409,25 +432,189 @@ def _toploc_summary(verdicts: list[dict]) -> dict:
     }
 
 
+# A record audited this soon after its arrival was audited on arrival; any later
+# one waited for its beacon round, a rescan or a backward audit.
+ON_ARRIVAL_SECONDS = 30.0
+
+
 def _audit_throughput(subs: list[dict], verdicts: list[dict]) -> dict:
     # The auditor drains a FIFO queue, so each verdict's busy time is from the
-    # later of its arrival and the previous verdict to its own verdict.
+    # later of its arrival and the previous verdict to its own verdict. Only
+    # records audited on arrival are counted: a drawn one, or one audited
+    # later, waited (for a beacon round or a rescan) and that wait is not
+    # audit time; an unaudited or voided record cost no GPU. Every verdict
+    # still marks when the auditor was last busy.
     pairs = sorted(zip(subs, verdicts), key=lambda p: p[1]["audited_at"])
-    busy, previous, tokens = 0.0, None, 0
+    busy, previous, tokens, counted, later = 0.0, None, 0, 0, 0
     for sub, verdict in pairs:
         start = sub["received_at"] if previous is None else max(previous, sub["received_at"])
-        busy += max(0.0, verdict["audited_at"] - start)
         previous = verdict["audited_at"]
+        if not verdict.get("audited", True):
+            continue
+        # A drawn record first waited for its beacon round and a rescan.
+        if verdict.get("draw") or verdict["audited_at"] - sub["received_at"] > ON_ARRIVAL_SECONDS:
+            later += 1
+            continue
+        busy += max(0.0, verdict["audited_at"] - start)
         tokens += int(sub["token_count"])
-    return {"audited_submissions": len(pairs), "completion_tokens": tokens,
-            "busy_seconds": round(busy, 1),
+        counted += 1
+    return {"audited_submissions": counted, "audited_later_not_counted": later,
+            "completion_tokens": tokens, "busy_seconds": round(busy, 1),
             "completion_tokens_per_second": round(tokens / max(busy, 1e-9), 1)}
+
+
+AUDIT_FLAGS = (
+    ("audit_q", "audit_q"),
+    ("audit_probation", "audit_probation_submissions"),
+    ("audit_hold_seconds", "audit_hold_seconds"),
+    ("audit_suspect_seconds", "audit_suspect_seconds"),
+    ("audit_ban_after_failures", "audit_ban_after_failures"),
+)
+
+
+def audit_params_from_args(args) -> dict:
+    """The task's `audit_*` params, as `jobs create` would declare them; none
+    given means V0 (every submission audited)."""
+    return {key: getattr(args, attr) for attr, key in AUDIT_FLAGS
+            if getattr(args, attr, None) is not None}
+
+
+def submission_rows(subs: list[dict], verdicts: list[dict], *, role_of: dict[str, str],
+                    switch_at: float | None, settled: set[str]) -> list[dict]:
+    """One row per accepted submission, in arrival order. The late cheater's
+    rows are `pre_switch` or `switched` by arrival against the moment its
+    honest process ended; `paid` is a passing verdict the settlement consumed."""
+    rows = []
+    for sub, verdict in sorted(zip(subs, verdicts), key=lambda p: p[0]["received_at"]):
+        role = role_of.get(sub["hotkey"], "unknown")
+        phase = None
+        if role == "late":
+            phase = "switched" if switch_at is not None and sub["received_at"] >= switch_at else "pre_switch"
+        sid = verdict["submission_id"]
+        rows.append({
+            "submission_id": sid, "role": role, "phase": phase,
+            "received_at": sub["received_at"], "audited_at": verdict["audited_at"],
+            "token_count": int(sub["token_count"]),
+            "audited": bool(verdict.get("audited", True)), "draw": verdict.get("draw"),
+            "passed": bool(verdict["passed"]), "reason": verdict.get("reason"),
+            "worst_exp": verdict.get("worst_exp"),
+            "paid": bool(verdict["passed"]) and sid in settled,
+        })
+    return rows
+
+
+def _caught_by(first: dict, rows: list[dict], *, q: float, hold: float,
+               probation: int | None = None) -> str:
+    """Why the late cheater's first failed record was audited at all."""
+    if first["phase"] != "switched":
+        return "pre_switch"
+    if first["draw"] and first["draw"].get("drawn"):
+        return "draw"
+    passes = sum(1 for r in rows if r["role"] == "late" and r["audited"] and r["passed"]
+                 and r["audited_at"] < first["audited_at"])
+    if probation is not None and passes < probation:
+        return "probation"
+    # Not drawn yet audited while sampled: the hotkey was below 1/q per hold
+    # (spec §7.4), or the beacon could not be fetched (audit, fail safe).
+    t = first["audited_at"]
+    recent = sum(1 for r in rows if r["role"] == "late" and t - hold < r["received_at"] <= t)
+    return "slow_hotkey" if recent < 1.0 / q else "no_beacon"
+
+
+def partial_audit_checks(rows: list[dict], miner_states: dict[str, dict], *,
+                         q: float, hold: float, probation: int | None = None) -> tuple[dict, dict]:
+    """(report, checks) for a run with an honest miner, a late cheater that is
+    honest through probation then switches model, and optionally an immediate
+    cheater. `miner_states` maps a role to its miners.json fields plus
+    `effective_state` at the end of the run."""
+    def of(role, phase=None):
+        return [r for r in rows if r["role"] == role and (phase is None or r["phase"] == phase)]
+
+    checks: dict[str, bool] = {}
+    honest, pre, post = of("honest"), of("late", "pre_switch"), of("late", "switched")
+    checks["honest_all_passed_and_paid"] = bool(honest) and all(r["passed"] and r["paid"] for r in honest)
+    checks["sampling_exercised"] = any(r["passed"] and not r["audited"] for r in honest)
+    checks["late_pre_switch_all_paid"] = bool(pre) and all(r["passed"] and r["paid"] for r in pre)
+    checks["late_post_switch_none_paid"] = bool(post) and not any(r["passed"] or r["paid"] for r in post)
+
+    failed = sorted((r for r in of("late") if r["audited"] and not r["passed"]),
+                    key=lambda r: r["audited_at"])
+    first = failed[0] if failed else None
+    checks["late_caught"] = first is not None
+    report: dict = {"detection": None}
+    state = miner_states.get("late") or {}
+    if first is None:
+        checks["late_suspect_at_first_failure"] = False
+        checks["late_held_records_all_audited"] = False
+        checks["late_no_pass_after_detection"] = False
+    else:
+        t = first["audited_at"]
+        failures = state.get("confirmed_failures") or []
+        # The state is written before the verdict, so its first confirmed
+        # failure is no later than the first failed verdict.
+        checks["late_suspect_at_first_failure"] = (
+            state.get("effective_state") in ("suspect", "banned") and bool(failures)
+            and min(failures) <= t)
+        held = [r for r in of("late") if r["received_at"] <= t < r["audited_at"]]
+        checks["late_held_records_all_audited"] = all(r["audited"] for r in held)
+        checks["late_no_pass_after_detection"] = not any(
+            r["passed"] for r in of("late") if r["audited_at"] >= t)
+        report["detection"] = {
+            "submission_id": first["submission_id"], "audited_at": t, "draw": first["draw"],
+            "caught_by": _caught_by(first, rows, q=q, hold=hold, probation=probation),
+            "post_switch_before_detection": sum(1 for r in post if r["received_at"] < first["received_at"]),
+            "held_at_detection": len(held),
+            "held_at_detection_audited": sum(r["audited"] for r in held),
+        }
+    immediate = of("dishonest")
+    if immediate:
+        checks["immediate_cheater_none_paid"] = not any(r["passed"] or r["paid"] for r in immediate)
+    report["by_role"] = {
+        f"{role}{'/' + phase if phase else ''}": {
+            "submissions": len(rs), "audited": sum(r["audited"] for r in rs),
+            "drawn": sum(bool(r["draw"] and r["draw"].get("drawn")) for r in rs),
+            "passed_unaudited": sum(r["passed"] and not r["audited"] for r in rs),
+            "passed": sum(r["passed"] for r in rs), "paid": sum(r["paid"] for r in rs),
+            "voided_banned": sum(r["reason"] == "banned" for r in rs),
+        }
+        for role, phase, rs in (("honest", None, honest), ("late", "pre_switch", pre),
+                                ("late", "switched", post), ("dishonest", None, immediate))
+        if rs
+    }
+    return report, checks
+
+
+async def _read_miner_states(job_id: str, params: dict, role_of: dict[str, str]) -> dict:
+    from reliquary.corpus.audit_policy import AuditParams, MinerState, effective_state
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+
+    document, _ = await BucketRecordStore().read_miners(job_id)
+    audit = AuditParams.from_params(params)
+    now = time.time()
+    states = {}
+    for hotkey, fields in (document or {}).items():
+        state = MinerState.from_dict(fields)
+        states[role_of.get(hotkey, hotkey)] = {
+            "hotkey": hotkey, "effective_state": effective_state(state, now, audit),
+            **{k: v for k, v in state.to_dict().items() if k != "mant_mean_history"},
+            "mant_mean_history_len": len(state.mant_mean_history),
+        }
+    return states
+
+
+def _route_ok(counts: dict, steps: int, *, may_be_banned: bool) -> bool:
+    # A cheater may be banned mid-run; the route then refuses it, nothing else.
+    allowed = {"accepted", "miner_banned"} if may_be_banned else {"accepted"}
+    return set(counts) <= allowed and sum(counts.values()) == steps
 
 
 def orchestrate(args) -> int:
     _refuse_production_bucket()
     _refuse_busy_card(args.allow_busy_gpu)
-    summary: dict = {"ok": False, "checks": {}}
+    audit_params = audit_params_from_args(args)
+    if args.late_cheater_steps and not args.audit_probation:
+        raise SystemExit("--late-cheater-steps needs --audit-probation: it mines honestly that many times")
+    summary: dict = {"ok": False, "checks": {}, "audit_params": audit_params}
     checks = summary["checks"]
     stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
     job_id, task_id = f"e2e-{stamp}", f"corpus-e2e-{stamp}"
@@ -452,6 +639,7 @@ def orchestrate(args) -> int:
         sha256 = checkpoint_fingerprint(honest_dir)
         eos = load_tokenizer(str(honest_dir)).eos_token_id
         contract = declare_task(state, args, task_id=task_id, job_id=job_id, revision=honest_revision)
+        params = json.loads((state / "entry.json").read_text())["params"]
         renderer_id = args.renderer or contract["environments"][args.prompt_source]["prompt_template"]["id"]
         manifest = asyncio.run(declare_job(
             state, args, job_id=job_id, revision=honest_revision, sha256=sha256, eos=eos,
@@ -468,49 +656,89 @@ def orchestrate(args) -> int:
         env = _child_env(state, task_id)
         validator = _spawn(state, env, "validator", [
             "validator", "--task-id", task_id, "--job-id", job_id,
-            "--port", str(args.port), "--cap", str(args.cap)])
+            "--port", str(args.port), "--cap", str(args.cap), "--entry", str(state / "entry.json")])
         started = time.time()
         _wait_http(f"http://127.0.0.1:{args.port}/corpus/job", validator, args.validator_timeout)
         summary["validator_start_seconds"] = round(time.time() - started, 1)
 
         import bittensor as bt
 
-        mnemonics = {role: bt.Keypair.generate_mnemonic() for role in ("honest", "dishonest")}
-        honest = _run_miner_process(state, env, args, "honest", mnemonics["honest"],
-                                    args.honest_steps, None, None)
-        dishonest = _run_miner_process(state, env, args, "dishonest", mnemonics["dishonest"],
-                                       args.dishonest_steps, args.dishonest_model, dishonest_revision)
-        summary["miners"] = {"honest": honest, "dishonest": dishonest}
-        accepted = honest["counts"].get("accepted", 0) + dishonest["counts"].get("accepted", 0)
-        checks["honest_all_accepted_by_route"] = honest["counts"] == {"accepted": args.honest_steps}
-        checks["dishonest_all_accepted_by_route"] = dishonest["counts"] == {"accepted": args.dishonest_steps}
+        mnemonics = {role: bt.Keypair.generate_mnemonic() for role in ("honest", "late", "dishonest")}
+        miners, route = {}, {}
+        miners["honest"] = _run_miner_process(state, env, args, "honest", mnemonics["honest"],
+                                              args.honest_steps, None, None)
+        route["honest"] = _route_ok(miners["honest"]["counts"], args.honest_steps, may_be_banned=False)
+        switch_at = None
+        if args.late_cheater_steps:
+            # One hotkey, two processes: honest through probation, then the
+            # other model under the same mnemonic, from where its cursor stands.
+            miners["late_pre_switch"] = _run_miner_process(
+                state, env, args, "late-pre-switch", mnemonics["late"], args.audit_probation, None, None,
+                until_accepted=True)
+            switch_at = time.time()
+            miners["late_switched"] = _run_miner_process(
+                state, env, args, "late-switched", mnemonics["late"], args.late_cheater_steps,
+                args.dishonest_model, dishonest_revision)
+            # Exactly `probation` accepted, so the switch lands right as it ends.
+            route["late_pre_switch"] = (
+                miners["late_pre_switch"]["counts"].get("accepted") == args.audit_probation)
+            route["late_switched"] = _route_ok(miners["late_switched"]["counts"],
+                                               args.late_cheater_steps, may_be_banned=True)
+        if args.dishonest_steps:
+            miners["dishonest"] = _run_miner_process(
+                state, env, args, "dishonest", mnemonics["dishonest"], args.dishonest_steps,
+                args.dishonest_model, dishonest_revision)
+            route["dishonest"] = _route_ok(miners["dishonest"]["counts"], args.dishonest_steps,
+                                           may_be_banned=True)
+        summary["miners"] = miners
+        summary["switch_at"] = switch_at
+        for name, ok in route.items():
+            checks[f"route_{name}"] = ok
+        accepted = sum(m["counts"].get("accepted", 0) for m in miners.values())
+        role_of = {m["hotkey"]: name.split("_")[0] for name, m in miners.items()}
 
         subs, verdicts = asyncio.run(_wait_verdicts(job_id, accepted, args.audit_timeout, validator))
-        by_role = {"honest": [], "dishonest": []}
-        role_of = {honest["hotkey"]: "honest", dishonest["hotkey"]: "dishonest"}
-        for verdict in verdicts:
-            by_role[role_of[verdict["hotkey"]]].append(verdict)
-        summary["verdicts"] = {
-            role: {"passed": sum(bool(v["passed"]) for v in vs),
-                   "failed": sum(not v["passed"] for v in vs), "toploc": _toploc_summary(vs)}
-            for role, vs in by_role.items()
-        }
         summary["audit_throughput"] = _audit_throughput(subs, verdicts)
-        checks["honest_verdicts_all_pass"] = (
-            len(by_role["honest"]) == args.honest_steps and all(v["passed"] for v in by_role["honest"]))
-        checks["dishonest_verdicts_all_fail"] = (
-            len(by_role["dishonest"]) == args.dishonest_steps
-            and not any(v["passed"] for v in by_role["dishonest"]))
+        summary["verdicts"] = {}
+        for role in sorted(set(role_of.values())):
+            vs = [v for v in verdicts if role_of.get(v["hotkey"]) == role]
+            audited = [v for v in vs if v.get("audited", True)]
+            summary["verdicts"][role] = {
+                "passed": sum(bool(v["passed"]) for v in vs),
+                "failed": sum(not v["passed"] for v in vs), "toploc": _toploc_summary(audited)}
 
         summary["archive"] = asyncio.run(_settle_and_read(task_id, job_id, args.cap))
+        settled = set(summary["archive"].pop("settled_ids", []))
+        rows = submission_rows(subs, verdicts, role_of=role_of, switch_at=switch_at, settled=settled)
+        summary["submissions"] = rows
+        summary["miner_states"] = asyncio.run(_read_miner_states(job_id, params, role_of))
+        report, audit_checks = partial_audit_checks(
+            rows, summary["miner_states"], q=float(params.get("audit_q", 1.0)),
+            hold=float(params.get("audit_hold_seconds", 4320.0)),
+            probation=int(params.get("audit_probation_submissions", 100)))
+        summary["partial_audit"] = report
+        if not args.late_cheater_steps:
+            # No late cheater to judge: keep the checks that still apply.
+            audit_checks = {k: v for k, v in audit_checks.items()
+                            if k in ("honest_all_passed_and_paid", "immediate_cheater_none_paid")
+                            or (k == "sampling_exercised" and params.get("audit_q", 1.0) < 1.0)}
+        checks.update(audit_checks)
+
         rewards = summary["archive"].get("rewards_by_hotkey") or {}
-        checks["archive_pays_only_honest"] = set(rewards) == {honest["hotkey"]}
+        paid_tokens: dict[str, int] = {}
+        for r in rows:
+            if r["paid"]:
+                hotkey = next(h for h, role in role_of.items() if role == r["role"])
+                paid_tokens[hotkey] = paid_tokens.get(hotkey, 0) + r["token_count"]
+        total = sum(paid_tokens.values())
+        checks["archive_pays_paid_records_by_tokens"] = set(rewards) == set(paid_tokens) and all(
+            abs(rewards[h] - args.cap * t / total) < 1e-9 for h, t in paid_tokens.items())
         checks["archive_sums_to_cap"] = abs(sum(rewards.values()) - args.cap) < 1e-9
         checks["second_settlement_is_a_noop"] = summary["archive"]["second_settle"] is None
 
         summary["export"] = _export(state, env, job_id)
-        checks["export_rows"] = summary["export"]["rows"] == args.honest_steps * args.n
-        checks["export_only_honest"] = summary["export"]["hotkeys"] == [honest["hotkey"]]
+        checks["export_rows"] = summary["export"]["rows"] == sum(r["paid"] for r in rows) * args.n
+        checks["export_only_paid_hotkeys"] = summary["export"]["hotkeys"] == sorted(paid_tokens)
         summary["ok"] = all(checks.values())
     except Exception as exc:
         logger.exception("the end-to-end run failed")
@@ -529,17 +757,19 @@ async def _settle_and_read(task_id: str, job_id: str, cap: float) -> dict:
     from reliquary.infrastructure.storage import dataset_object_key, download_json
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
+    records = BucketRecordStore()
     settler = CorpusSettler(task_id=task_id, job_id=job_id, cap=cap,
-                            records=BucketRecordStore(), archives=R2Archives())
+                            records=records, archives=R2Archives())
     window = await settler.settle_once()
     if window is None:
-        return {"window": None, "second_settle": None}
+        return {"window": None, "second_settle": None, "settled_ids": []}
     key = dataset_object_key(window, task_id)
     archive = await download_json(key, strict=True)
     return {"window": window, "key": key, "rewards_by_hotkey": archive["rewards_by_hotkey"],
             "sum": sum(archive["rewards_by_hotkey"].values()),
             "window_status": archive.get("window_status"),
-            "second_settle": await settler.settle_once()}
+            "second_settle": await settler.settle_once(),
+            "settled_ids": (await records.read_settlement(job_id))[0].get("settled") or []}
 
 
 def _export(state: Path, env: dict, job_id: str) -> dict:
@@ -589,12 +819,21 @@ def main() -> int:
         p.add_argument("--validator-timeout", type=float, default=900)
         p.add_argument("--miner-timeout", type=float, default=3600)
         p.add_argument("--audit-timeout", type=float, default=1800)
+        # Partial audit (spec 2026-09-25); none given keeps V0's full audit.
+        p.add_argument("--audit-q", type=float, default=None)
+        p.add_argument("--audit-probation", type=int, default=None)
+        p.add_argument("--audit-hold-seconds", type=float, default=None)
+        p.add_argument("--audit-suspect-seconds", type=float, default=None)
+        p.add_argument("--audit-ban-after-failures", type=int, default=None)
+        p.add_argument("--late-cheater-steps", type=int, default=0,
+                       help="a hotkey honest for --audit-probation steps, then this many with the dishonest model")
 
     v = sub.add_parser("validator")
     v.add_argument("--task-id", required=True)
     v.add_argument("--job-id", required=True)
     v.add_argument("--port", type=int, required=True)
     v.add_argument("--cap", type=float, required=True)
+    v.add_argument("--entry", required=True)
 
     m = sub.add_parser("miner")
     m.add_argument("--validator-url", required=True)
@@ -603,6 +842,7 @@ def main() -> int:
     m.add_argument("--model", default=None)
     m.add_argument("--revision", default=None)
     m.add_argument("--gpu-memory-utilization", type=float, default=None)
+    m.add_argument("--until-accepted", type=int, default=None)
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,

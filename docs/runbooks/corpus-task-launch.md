@@ -32,6 +32,39 @@ record and settlement stores are wrong without both. Expected: every honest
 verdict passes, every dishonest one fails `exp_mismatch`, the archive pays only
 the honest hotkey and sums to the cap, and the export has `steps x n` rows.
 
+**Partial audit rehearsal.** The same script rehearses sampling (§2.1) with a
+hotkey that mines honestly through probation and then switches model:
+
+```bash
+R2_BUCKET_ID=reliquary-corpus-e2e \
+  setsid nohup python scripts/corpus_e2e.py --start-minio --state-dir /opt/corpus-e2e \
+    --honest-model <repo> --honest-revision <rev> --base-profile <template-profile-id> \
+    --model-architecture <arch> --dishonest-model <other-repo> --dishonest-revision <rev> \
+    --prompt-source <source> --max-new-tokens 512 \
+    --honest-steps 20 --dishonest-steps 5 --late-cheater-steps 30 \
+    --audit-q 0.2 --audit-probation 5 --audit-hold-seconds 300 > e2e.json 2> e2e.log </dev/null &
+```
+
+The late cheater's honest phase runs until exactly `--audit-probation`
+submissions are accepted, then a second process under the same mnemonic mines
+with the dishonest model. The hold must cover the dishonest process's model load
+(else the hotkey falls under `1/q` per hold and is audited at 100 %, the slow
+path, not the draw) and 30 switched steps make "never drawn" about 0.1 %.
+`summary.json` lists every submission (audited, draw, passed, reason, paid), each
+hotkey's `miners.json` fields with its `effective_state`, `partial_audit.detection`
+(`caught_by`: `draw`, `slow_hotkey`, `probation` or `no_beacon`) and explicit
+checks. The validator needs network to drand and `bittensor_drand` installed, or
+every draw audits and `sampling_exercised` fails. 2026-09-25, test H100, Teutonic
+(`teutonic-i-graft-sft-cot-v2@d5256c5`) against Qwen3.5-4B, DAPO, 512 tokens,
+n = 4: every check passed. The honest miner had 20 of 20 paid, 6 of them passed
+unaudited after their hold. The late cheater had 5 of 5 pre-switch paid; its
+first switched submission was drawn and failed (`exp_mismatch` 128), the 5
+records it still had in hold were audited backwards and failed, the ban (3
+confirmed failures) voided 1 more and refused 23, and 0 of its 7 switched
+records were paid. Audit on arrival: 1.1k completion tokens/s including
+re-audits, and 1.3k for passes alone (one record of 2048 tokens at a time, with a
+vLLM miner on the same card, including store round trips).
+
 The rehearsal runs against MinIO, not R2. The job, record and settlement stores
 rely on conditional puts (`If-None-Match: *` to create, `If-Match: <etag>` to
 replace), and MinIO passing says nothing about R2. Before launch, spot-check both
