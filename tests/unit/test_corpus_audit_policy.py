@@ -43,7 +43,7 @@ def test_a_new_hotkey_is_audited_until_its_probation_passes():
     for _ in range(3):
         assert decision(m, params=P, now=0, received_at=0, recent_submissions=50,
                         randomness_hex=R, submission_id=SID) == "audit"
-        m = after_pass(m, P, 1.0)
+        m = after_pass(m, P, 1.0, f"{len(m.pass_ids):064x}")
     assert effective_state(m, 0, P) == "sampled"
 
 
@@ -96,7 +96,7 @@ def test_a_ban_ends_into_a_fresh_probation():
 
 
 def test_state_round_trips():
-    m = after_pass(_sampled(), P, 2.5)
+    m = after_pass(_sampled(), P, 2.5, SID)
     assert MinerState.from_dict(m.to_dict()) == m
 
 
@@ -177,3 +177,13 @@ def test_failure_ids_are_bounded():
     m = after_confirmed_failure(m, AuditParams(ban_after_failures=10**6), now=0,
                                 submission_id="e" * 64)
     assert len(m.failure_ids) == FAILURE_IDS == 256 and m.failure_ids[-1] == "e" * 64
+
+
+def test_a_pass_is_counted_once_per_submission_and_the_ids_stay_bounded():
+    from reliquary.corpus.audit_policy import PASS_IDS
+
+    m = after_pass(_sampled(), P, 2.5, SID)
+    assert after_pass(m, P, 9.0, SID) == m
+    for i in range(PASS_IDS + 5):
+        m = after_pass(m, P, 1.0, f"{i:064x}")
+    assert len(m.pass_ids) == PASS_IDS and m.audited_passed == 3 + 1 + PASS_IDS + 5

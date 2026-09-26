@@ -21,6 +21,10 @@ MANT_HISTORY = 200
 # Submissions whose confirmed failure is already counted; bounded, and far
 # longer than one judging pass's retries need.
 FAILURE_IDS = 256
+# Submissions whose audited pass is already counted: a write that landed but
+# whose response was lost is retried, and must not count them twice. The
+# auditor writes at most this many passes per hotkey per write.
+PASS_IDS = 32
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,7 @@ class MinerState:
     banned_until: float | None = None
     mant_mean_history: list = field(default_factory=list)
     failure_ids: list = field(default_factory=list)
+    pass_ids: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -129,9 +134,14 @@ def decision(m, *, params, now, received_at, recent_submissions, randomness_hex,
     return "pass_unaudited" if now >= received_at + params.hold_seconds else "wait"
 
 
-def after_pass(m: MinerState, params: AuditParams, mant_mean: float) -> MinerState:
+def after_pass(m: MinerState, params: AuditParams, mant_mean: float,
+               submission_id: str) -> MinerState:
+    if submission_id in m.pass_ids:
+        return m
     history = (list(m.mant_mean_history) + [float(mant_mean)])[-MANT_HISTORY:]
-    return replace(m, audited_passed=m.audited_passed + 1, mant_mean_history=history)
+    ids = (list(m.pass_ids) + [submission_id])[-PASS_IDS:]
+    return replace(m, audited_passed=m.audited_passed + 1, mant_mean_history=history,
+                   pass_ids=ids)
 
 
 def after_confirmed_failure(m: MinerState, params: AuditParams, now: float,

@@ -20,6 +20,7 @@ from collections.abc import Callable
 import torch
 
 from reliquary.corpus.audit_policy import (
+    PASS_IDS,
     AuditParams,
     MinerState,
     after_confirmed_failure,
@@ -388,20 +389,25 @@ class CorpusAuditor:
             # Only the call that wrote a passing verdict counts it: a repeat audit
             # (stale queue entry, restart) must never count twice.
             if written and outcome["passed"] and outcome["audited"]:
-                passes.setdefault(hotkey, []).append(outcome["worst_mant_mean"])
+                passes.setdefault(hotkey, []).append((submission_id, outcome["worst_mant_mean"]))
 
-        if passes and self._miner_states is not None:
-            def count(means: list[float]) -> Callable[[MinerState], MinerState]:
-                def change(m: MinerState) -> MinerState:
-                    for mant_mean in means:
-                        if effective_state(m, now, self._params) == "banned":
-                            return m
-                        m = after_pass(m, self._params, mant_mean)
-                    return m
-                return change
+        def count(batch: list[tuple[str, float]]) -> Callable[[MinerState], MinerState]:
+            def change(m: MinerState) -> MinerState:
+                for sid, mant_mean in batch:
+                    if effective_state(m, now, self._params) == "banned":
+                        return m
+                    m = after_pass(m, self._params, mant_mean, sid)
+                return m
+            return change
 
+        # At most PASS_IDS per hotkey per write: a retry of a write that landed
+        # finds every one of its ids still in pass_ids and counts none twice.
+        while passes and self._miner_states is not None:
+            chunk = {hotkey: batch[:PASS_IDS] for hotkey, batch in passes.items()}
+            passes = {hotkey: batch[PASS_IDS:] for hotkey, batch in passes.items()
+                      if batch[PASS_IDS:]}
             await self._miner_states.update_many(
-                {hotkey: count(means) for hotkey, means in passes.items()})
+                {hotkey: count(batch) for hotkey, batch in chunk.items()})
         return results, failed_hotkeys
 
     async def _randomness_for(self, round_number: int) -> str | None:

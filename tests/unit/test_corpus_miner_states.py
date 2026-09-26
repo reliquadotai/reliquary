@@ -147,6 +147,8 @@ def test_a_non_dict_document_raises_naming_the_job(r2):
         {"failure_ids": ["D" * 64]},
         {"failure_ids": ["d" * 63]},
         {"failure_ids": [7]},
+        {"pass_ids": "d" * 64},
+        {"pass_ids": ["d" * 63]},
     ],
 )
 def test_a_malformed_entry_raises_naming_job_and_hotkey(r2, entry):

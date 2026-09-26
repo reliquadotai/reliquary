@@ -694,3 +694,44 @@ def test_a_failed_seeding_read_after_a_restart_holds_unaudited_passes_back():
     asyncio.run(auditor.judge_many([x]))  # Y reads now: drawn, audited, caught
     assert records.verdicts[y]["passed"] is False
     assert (records.verdicts[x]["passed"], records.verdicts[x]["audited"]) == (False, True)
+
+
+class _LostResponseRecords(_MinersRecords):
+    """The first miners.json write commits, then its response is lost."""
+
+    async def write_miners(self, job_id, state, etag):
+        etag = await super().write_miners(job_id, state, etag)
+        if self.miner_writes == 1:
+            raise ConnectionError("connection reset after the PUT landed")
+        return etag
+
+
+def test_a_landed_write_whose_response_was_lost_counts_each_pass_once():
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    async def _no_sleep(seconds):
+        pass
+
+    ids = _ids(False, 3)
+    records = _LostResponseRecords({sid: _rec(0) for sid in ids})
+    states = MinerStates(records, "math-v1", sleep=_no_sleep)
+    auditor = _judge(records, states, _Clock(T0 + 1), params=AuditParams())
+    asyncio.run(auditor.judge_many(ids))
+    assert records.miner_writes == 2
+    state = asyncio.run(states.get(HK))
+    assert state.audited_passed == 3 and len(state.mant_mean_history) == 3
+
+
+def test_passes_beyond_the_remembered_ids_are_written_in_chunks(monkeypatch):
+    import reliquary.corpus.audit_policy as policy
+    import reliquary.validator.corpus_auditor as auditor_module
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    monkeypatch.setattr(policy, "PASS_IDS", 2)
+    monkeypatch.setattr(auditor_module, "PASS_IDS", 2)
+    ids = _ids(False, 3)
+    records = _MinersRecords({sid: _rec(0) for sid in ids})
+    states = MinerStates(records, "math-v1")
+    asyncio.run(_judge(records, states, _Clock(T0 + 1), params=AuditParams()).judge_many(ids))
+    assert records.miner_writes == 2
+    assert asyncio.run(states.get(HK)).audited_passed == 3

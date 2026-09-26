@@ -85,13 +85,15 @@ def _validate_entry(entry: object, job_id: str, hotkey: str) -> Mapping:
                 f"{field} for hotkey {hotkey!r} in job {job_id!r} must be a finite number or null, "
                 f"got {value!r}"
             )
-    if "failure_ids" in entry:
-        value = entry["failure_ids"]
+    for field in ("failure_ids", "pass_ids"):
+        if field not in entry:
+            continue
+        value = entry[field]
         if not isinstance(value, list) or not all(
             isinstance(v, str) and _SUBMISSION_ID.fullmatch(v) for v in value
         ):
             raise ValueError(
-                f"failure_ids for hotkey {hotkey!r} in job {job_id!r} must be a list of "
+                f"{field} for hotkey {hotkey!r} in job {job_id!r} must be a list of "
                 f"64-lowercase-hex submission ids, got {value!r}"
             )
     return entry
