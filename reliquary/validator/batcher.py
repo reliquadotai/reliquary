@@ -19,11 +19,13 @@ from typing import Any, Callable
 
 from pydantic import ValidationError
 
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, proof_rejection, toploc_proof
 from reliquary.constants import (
     BOOTSTRAP_SIGMA_MIN,
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     CHALLENGE_K,
     M_ROLLOUTS,
+    PROOF_WARM_ROLLOUTS,
     PROTOCOL_THROUGHPUT_TIEBREAK,
     B_BATCH,
     DIFFICULTY_AUCTION_DELTA,
@@ -337,7 +339,13 @@ def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str
 
         return rendered_episode_prompt(env, prompt_idx)
     problem = env.get_problem(prompt_idx)
-    return render_canonical_prompt(tokenizer, str(problem["prompt"]))
+    from reliquary.constants import thinking_for_environment
+
+    return render_canonical_prompt(
+        tokenizer,
+        str(problem["prompt"]),
+        thinking=thinking_for_environment(str(getattr(env, "name", ""))),
+    )
 
 
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
@@ -477,6 +485,20 @@ def _forced_seed_rollout_reject(per_rollout, enforce: bool) -> bool:
                 and (n_match / n_stoch) < FORCED_SEED_ROLLOUT_FLOOR):
             return True
     return False
+
+
+def _active_profile():
+    """The contract this process runs; a function so tests can swap it."""
+    return ACTIVE_PROTOCOL_PROFILE
+
+
+def _with_toploc_spec(commit: dict, profile) -> dict:
+    """A copy carrying the validator's own toploc thresholds, when its contract
+    names toploc; the miner's commit is never mutated."""
+    toploc = toploc_proof(profile)
+    if toploc is None:
+        return commit
+    return {**commit, "toploc_spec": toploc.to_contract()}
 
 
 def _is_missing_kwarg_typeerror(exc: TypeError, kwarg: str) -> bool:
@@ -3719,7 +3741,11 @@ class GrpoWindowBatcher:
         )
         if callable(cases_loader):
             reward_materials = cases_loader(problem)
-            if getattr(self.env, "name", "") == "opencodeinstruct":
+            # `code_cases` is the older, narrower channel; what fills it is the
+            # environment asking for the sandbox, not its name. The name test
+            # this replaces would never have matched a packaged code
+            # environment, which is the same environment under another name.
+            if spec is not None and spec.admission_resource_class == "sandbox":
                 code_cases = list(reward_materials)
         return AdmissionProblemMaterials(
             problem=dict(problem),
@@ -4759,12 +4785,18 @@ class GrpoWindowBatcher:
 
         _t_prep_done = time.perf_counter()
         remote_batch = getattr(self._verify_commitment, "batch", None)
+        # A warming pass drives the model once for a slice of the request, and the per-rollout
+        # loop below then checks rows that are already computed. The loop itself does not move:
+        # each rollout keeps its own receipt, its own deadline, and a GRAIL failure still stops
+        # the ones behind it.
+        warm_proofs = getattr(self._verify_commitment, "warm", None)
         prefetched_proofs = []
         def seed_uniforms(index, commit):
             positions = policy_token_positions(list(commit.get("tokens") or []), commit.get("rollout") or {})
             return [u_at(self.randomness, request.prompt_idx, request.checkpoint_hash, index, j)
                     for j in range(len(positions))]
 
+        profile = _active_profile()
         for rollout_idx, rollout in enumerate(request.rollouts):
             # Never carry a validator-derived carve across re-validation of the
             # same Pydantic object. The private value is set only after the
@@ -4809,11 +4841,31 @@ class GrpoWindowBatcher:
             )
             _t_sketch += time.perf_counter() - _tmark
             seed_u = seed_uniforms(rollout_idx, rollout.commit)
+            verify_commit = _with_toploc_spec(rollout.commit, profile)
             try:
+                if warm_proofs is not None and rollout_idx % PROOF_WARM_ROLLOUTS == 0:
+                    inputs = [
+                        (_with_toploc_spec(r.commit, profile), seed_uniforms(index, r.commit))
+                        for index, r in enumerate(
+                            request.rollouts[rollout_idx:rollout_idx + PROOF_WARM_ROLLOUTS],
+                            rollout_idx,
+                        )
+                    ]
+                    _t_warm0 = time.perf_counter()
+                    try:
+                        warm_proofs(inputs, proof_model, self.randomness)
+                    except Exception:
+                        # A warm pass is an optimisation. Losing it costs each rollout its own
+                        # pass; failing the group over it would cost a miner a window.
+                        logger.warning(
+                            "warming the proof batch failed; proving one rollout at a time",
+                            exc_info=True,
+                        )
+                    _t_proof_total += time.perf_counter() - _t_warm0
                 if remote_batch is not None:
                     if not prefetched_proofs:
                         from reliquary.validator.remote_proof_protocol import MAX_PROOF_BATCH
-                        inputs = [(r.commit, seed_uniforms(index, r.commit)) for index, r in
+                        inputs = [(_with_toploc_spec(r.commit, profile), seed_uniforms(index, r.commit)) for index, r in
                                   enumerate(request.rollouts[rollout_idx:rollout_idx + MAX_PROOF_BATCH], rollout_idx)]
                         _t_proof0 = time.perf_counter()
                         prefetched_proofs = remote_batch(inputs, proof_model, self.randomness)
@@ -4821,7 +4873,7 @@ class GrpoWindowBatcher:
                     proof = prefetched_proofs.pop(0)
                 else:
                     proof = self._verify_commitment(
-                        rollout.commit,
+                        verify_commit,
                         proof_model,
                         self.randomness,
                         tokenizer=self.tokenizer,
@@ -4839,18 +4891,18 @@ class GrpoWindowBatcher:
                 if _is_missing_kwarg_typeerror(exc, "seed_u_values"):
                     try:
                         proof = self._verify_commitment(
-                            rollout.commit, proof_model, self.randomness,
+                            verify_commit, proof_model, self.randomness,
                             tokenizer=self.tokenizer,
                         )
                     except TypeError as exc2:
                         if not _is_missing_kwarg_typeerror(exc2, "tokenizer"):
                             raise
                         proof = self._verify_commitment(
-                            rollout.commit, proof_model, self.randomness,
+                            verify_commit, proof_model, self.randomness,
                         )
                 elif _is_missing_kwarg_typeerror(exc, "tokenizer"):
                     proof = self._verify_commitment(
-                        rollout.commit, proof_model, self.randomness,
+                        verify_commit, proof_model, self.randomness,
                     )
                 else:
                     raise
@@ -4924,11 +4976,26 @@ class GrpoWindowBatcher:
                 "validated_force_span_length": 0,
                 **rollout_token_metrics,
                 **rollout_sketch_metrics,
+                "toploc_checked": bool(getattr(proof, "toploc_checked", False)),
+                "toploc_passed": bool(getattr(proof, "toploc_passed", False)),
+                "toploc_reason": getattr(proof, "toploc_reason", None),
+                "toploc_worst_exp": int(getattr(proof, "toploc_worst_exp", 0)),
+                "toploc_worst_mant_mean": float(getattr(proof, "toploc_worst_mant_mean", 0.0)),
+                "toploc_worst_mant_median": float(getattr(proof, "toploc_worst_mant_median", 0.0)),
             }
             seed_cdf_per_rollout.append(seed_cdf_entry)
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
-            if not proof.all_passed:
+            rejection = proof_rejection(
+                profile,
+                grail_passed=bool(proof.all_passed),
+                toploc_passed=(
+                    bool(getattr(proof, "toploc_passed", False))
+                    if getattr(proof, "toploc_checked", False)
+                    else None
+                ),
+            )
+            if rejection == "grail_fail":
                 logger.warning(
                     "grail_fail diag hotkey=%s prompt=%d sketch_diff_max=%d "
                     "passed=%d/%d",
@@ -4940,6 +5007,14 @@ class GrpoWindowBatcher:
                     "grail",
                     sketch_diff_max=proof.sketch_diff_max,
                 )
+            if rejection == "toploc_fail":
+                logger.warning(
+                    "toploc_fail hotkey=%s prompt=%d reason=%s worst_exp=%d",
+                    request.miner_hotkey, request.prompt_idx,
+                    getattr(proof, "toploc_reason", None),
+                    int(getattr(proof, "toploc_worst_exp", 0)),
+                )
+                return reject(RejectReason.TOPLOC_FAIL, "toploc")
 
             # Termination check: rollout must end with EOS at p(EOS) >= threshold
             # or hit the protocol cap. Cap hits without a natural EOS are counted

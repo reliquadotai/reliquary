@@ -34,7 +34,9 @@ def prompt_content_sha256(environment: str, rendered_prompt: str) -> str:
     )
 
 
-def render_canonical_prompt(tokenizer: Any, prompt: str) -> str:
+def render_canonical_prompt(
+    tokenizer: Any, prompt: str, *, thinking: bool = True
+) -> str:
     """Render a trusted user prompt exactly as admission will tokenize it."""
     # Mirror of encode_prompt's guard. Both must switch on the same constant:
     # this render feeds prompt_content_sha256 while encode_prompt feeds the
@@ -57,12 +59,30 @@ def render_canonical_prompt(tokenizer: Any, prompt: str) -> str:
             "tokenize": False,
         }
         if "enable_thinking" in chat_template:
-            kwargs["enable_thinking"] = True
+            kwargs["enable_thinking"] = bool(thinking)
         rendered = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             **kwargs,
         )
     return rendered
+
+
+def _cases_carry_the_target(environment: str) -> bool:
+    """Whether this environment's answer material is its cases, not its text.
+
+    Asked of the registry rather than compared to a name: a packaged code
+    environment is the same environment under a different one, and hashing its
+    `ground_truth` instead of its cases would quietly change what the digest
+    means for it. Unknown names fall back to the text path, which is what every
+    environment without cases already does.
+    """
+    from reliquary.environment.registry import get_environment_spec
+
+    try:
+        spec = get_environment_spec(environment)
+    except (KeyError, ValueError):
+        return False
+    return spec.admission_resource_class == "sandbox"
 
 
 def target_content_sha256(
@@ -77,7 +97,7 @@ def target_content_sha256(
     structured grader cases so dictionary insertion order cannot change the
     identity.
     """
-    if environment == "opencodeinstruct" and code_cases is not None:
+    if _cases_carry_the_target(environment) and code_cases is not None:
         payload = json.dumps(
             code_cases,
             sort_keys=True,

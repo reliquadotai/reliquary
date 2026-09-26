@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import logging
 import os
+import gzip
 import ssl
 import threading
 import time
@@ -22,6 +23,7 @@ from reliquary.validator.remote_proof_protocol import (
     MAX_PROOF_PIPELINE_DEPTH,
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, AdoptionRequest, CheckpointBinding,
     ProofHealth, ProofInput, ProofRequest, ProofResponse, ProofValues,
+    GZIP_LEVEL, GZIP_MIN_BYTES,
     RemoteProofMeasurement, canonical_bytes, digest, transport_hash,
     ProofBatchRequest, ProofBatchResponse, MAX_PROOF_BATCH,
     MAX_BATCH_REQUEST_BYTES, MAX_BATCH_RESPONSE_BYTES,
@@ -82,8 +84,12 @@ class RemoteProofPool:
         self._health_probe = None
         self._measurements = threading.local()
         self._rpc_lock = threading.Lock()
+        # *_bytes stay the canonical (decompressed) sizes so every existing
+        # bound and ratio keeps its meaning; *_wire_bytes are what the link
+        # actually carried, which is what says whether compression paid.
         self._rpc_stats = dict(calls=0, reconnects=0, seconds=0.0,
                                request_bytes=0, response_bytes=0, rollouts=0,
+                               request_wire_bytes=0, response_wire_bytes=0,
                                in_flight=0, max_in_flight=0, failures=0)
 
     @contextmanager
@@ -132,11 +138,18 @@ class RemoteProofPool:
         raw = None if body is None else canonical_bytes(body.model_dump())
         if raw is not None and len(raw) > request_limit:
             raise ProofWorkerUnavailable("proof request exceeds transport bound")
+        # The bound above is on the canonical body, so compression can only
+        # shrink what crosses the link and never widens what the worker admits.
+        headers = {"content-type": "application/json"}
+        wire = raw
+        if raw is not None and len(raw) >= GZIP_MIN_BYTES:
+            wire = gzip.compress(raw, GZIP_LEVEL)
+            headers["content-encoding"] = "gzip"
         retry = retry or method == "GET"  # A stale keep-alive must not fence a healthy worker.
         for attempt in range(2 if retry else 1):
             try:
-                with self._client.stream(method, path, content=raw,
-                        headers={"content-type": "application/json"}, timeout=timeout,
+                with self._client.stream(method, path, content=wire,
+                        headers=headers, timeout=timeout,
                         extensions={"trace": trace}) as response:
                     response.raise_for_status()
                     result = bytearray()
@@ -151,8 +164,13 @@ class RemoteProofPool:
                             self._rpc_stats["seconds"] += time.perf_counter() - started
                             self._rpc_stats["request_bytes"] += len(raw or b"")
                             self._rpc_stats["response_bytes"] += len(result)
-                    logger.info("proof_rpc path=%s request_bytes=%d response_bytes=%d elapsed_ms=%.3f reconnects=%d retry=%d",
-                                path, len(raw or b""), len(result), (time.perf_counter() - started) * 1000, reconnects, attempt)
+                            self._rpc_stats["request_wire_bytes"] += len(wire or b"")
+                            self._rpc_stats["response_wire_bytes"] += (
+                                response.num_bytes_downloaded)
+                    logger.info("proof_rpc path=%s request_bytes=%d response_bytes=%d request_wire_bytes=%d response_wire_bytes=%d elapsed_ms=%.3f reconnects=%d retry=%d",
+                                path, len(raw or b""), len(result), len(wire or b""),
+                                response.num_bytes_downloaded,
+                                (time.perf_counter() - started) * 1000, reconnects, attempt)
                     return bytes(result)
             except httpx.TransportError as exc:
                 if retry and attempt == 0:
@@ -410,7 +428,8 @@ class RemoteProofPool:
             for commit, seed_u_values in inputs:
                 payload = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
                                      rollout=commit.get("rollout") or {}, randomness=randomness,
-                                     seed_u_values=seed_u_values)
+                                     seed_u_values=seed_u_values,
+                                     toploc_proofs=commit.get("toploc_proofs"), toploc_spec=commit.get("toploc_spec"))
                 requests.append(ProofRequest(job_id=uuid.uuid4().hex, attempt=0,
                     worker_id=self.worker_id, session_id=self.health.session_id,
                     device_id=slot, runtime_hash=self.runtime_fingerprint["profile_hash"],
@@ -519,7 +538,8 @@ class ShadowProofPool:
                 # Freeze bytes before the admission thread annotates the rollout.
                 frozen = ProofInput(tokens=commit["tokens"], commitments=commit["commitments"],
                                     rollout=commit.get("rollout") or {}, randomness=randomness,
-                                    seed_u_values=seed_u_values).model_copy(deep=True)
+                                    seed_u_values=seed_u_values,
+                                    toploc_proofs=commit.get("toploc_proofs"), toploc_spec=commit.get("toploc_spec")).model_copy(deep=True)
 
                 def compare():
                     try:

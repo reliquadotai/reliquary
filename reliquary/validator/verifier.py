@@ -137,6 +137,13 @@ class ProofResult:
     # trusting a miner-supplied flag or permitting an injected close token.
     natural_close_pick_ok: bool | None = None
     natural_close_pick_cdf_miss: float | None = None
+    # TOPLOC, when the task's contract names it; all_passed stays GRAIL's.
+    toploc_checked: bool = False
+    toploc_passed: bool = False
+    toploc_reason: str | None = None
+    toploc_worst_exp: int = 0
+    toploc_worst_mant_mean: float = 0.0
+    toploc_worst_mant_median: float = 0.0
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -564,6 +571,135 @@ def proof_challenge_indices(
     )
 
 
+def forward_single_layer_for_batch(model: Any, tokens: torch.Tensor, mask: Any, layer_index: int, **kwargs: Any):
+    """One pass for several rollouts at once. Named apart so a test can watch it run."""
+    from reliquary.shared.forward import forward_single_layer
+
+    with torch.no_grad():
+        return forward_single_layer(model, tokens, mask, layer_index, **kwargs)
+
+
+def plan_verification_passes(
+    commits: list[dict], *, token_budget: int, pad: bool = False,
+) -> list[list[int]]:
+    """Group rollouts into the passes that will verify them.
+
+    Without padding, only rollouts of the same token count travel together, and the verdicts are
+    the ones one-at-a-time verification returns, to the bit. That is the safe grouping, and on
+    real traffic it is barely a grouping at all: completions that terminate on their own almost
+    never share a length, measured at 1.02 rollouts per pass over 384 real groups of sixteen.
+
+    With padding, rollouts of nearby length share a pass and each row is cut back to its own
+    tokens afterwards. Nothing a row reads comes from the padding: attention here is causal, so a
+    position never sees a later one, and the tokens after a rollout's end are later ones. What the
+    padding can still move is the arithmetic — a wider batch tiles and reduces differently — and
+    that is a property of the kernel, not of this code.
+
+    Sorted by length so a pass pads as little as possible, and budgeted on the padded width, which
+    is what actually lands on the card.
+    """
+    order = sorted(range(len(commits)), key=lambda index: len(commits[index]["tokens"]))
+    if not pad:
+        by_length: dict[int, list[int]] = {}
+        for index in order:
+            by_length.setdefault(len(commits[index]["tokens"]), []).append(index)
+        passes = []
+        for length, members in sorted(by_length.items()):
+            per_pass = max(1, token_budget // max(1, length))
+            for start in range(0, len(members), per_pass):
+                passes.append(members[start : start + per_pass])
+        return passes
+    passes, current, widest = [], [], 0
+    for index in order:
+        length = len(commits[index]["tokens"])
+        width = max(widest, length)
+        if current and width * (len(current) + 1) > token_budget:
+            passes.append(current)
+            current, widest, width = [], 0, length
+        current.append(index)
+        widest = width
+    if current:
+        passes.append(current)
+    return passes
+
+
+def forward_rows_for_batch(
+    commits: list[dict],
+    model: Any,
+    *,
+    token_budget: int | None = None,
+    pad: bool = False,
+) -> dict[int, tuple[Any, Any]]:
+    """The rows of a pass, one entry per rollout, keyed by its position in the list.
+
+    Split out so a worker can pay the traversal once for a batch and hand each rollout its rows
+    when the proof for it arrives. Each rollout is handed exactly its own tokens' rows: what sat
+    beside it in the pass, and what was padded after it, are cut away here.
+    """
+    from reliquary.constants import LAYER_INDEX, PROOF_BATCH_TOKEN_BUDGET
+
+    budget = PROOF_BATCH_TOKEN_BUDGET if token_budget is None else token_budget
+    device = next(model.parameters()).device
+    materialize = _lm_head_vocab_size(getattr(model, "lm_head", None)) is None
+    rows: dict[int, tuple[Any, Any]] = {}
+    for group in plan_verification_passes(commits, token_budget=budget, pad=pad):
+        lengths = [len(commits[index]["tokens"]) for index in group]
+        width = max(lengths)
+        # Padded with zeros rather than a token of the rollout's own: a causal position never
+        # reads what comes after it, so what the padding is cannot reach a row, but what it is
+        # must not depend on the rollout either, or two validators would pad differently.
+        batch = torch.zeros((len(group), width), dtype=torch.long, device=device)
+        for row, index in enumerate(group):
+            batch[row, : lengths[row]] = torch.tensor(
+                commits[index]["tokens"], dtype=torch.long, device=device,
+            )
+        hidden, logits = forward_single_layer_for_batch(
+            model, batch, None, LAYER_INDEX, materialize_logits=materialize,
+        )
+        for row, index in enumerate(group):
+            end = lengths[row]
+            rows[index] = (
+                hidden[row, :end],
+                None if logits is None else logits[row, :end],
+            )
+    return rows
+
+
+def verify_commitment_proofs_batch(
+    commits: list[dict],
+    model: Any,
+    window_randomness: str,
+    *,
+    tokenizer: Any = None,
+    seed_u_values: list[list[float] | None] | None = None,
+    token_budget: int | None = None,
+    pad: bool = False,
+) -> list[ProofResult]:
+    """Verify several rollouts with one traversal of the model per pass.
+
+    A resident replica barely notices; a streamed one pays a full traversal for every forward, so
+    verifying one rollout at a time would pay it over and over. Measured on an H100 with
+    Qwen3-30B-A3B: 7.6 s for a single rollout against 0.22 s each at thirty-two.
+    """
+    from reliquary.constants import LAYER_INDEX, PROOF_BATCH_TOKEN_BUDGET
+
+    rows = forward_rows_for_batch(commits, model, token_budget=token_budget, pad=pad)
+    results: list[Any] = []
+    for index, commit in enumerate(commits):
+        seeds = None if seed_u_values is None else seed_u_values[index]
+        results.append(
+            verify_commitment_proofs(
+                commit,
+                model,
+                window_randomness,
+                tokenizer=tokenizer,
+                seed_u_values=seeds,
+                forward=rows[index],
+            )
+        )
+    return results
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
@@ -571,6 +707,7 @@ def verify_commitment_proofs(
     *,
     tokenizer: Any = None,
     seed_u_values: list[float] | None = None,
+    forward: tuple[Any, Any] | None = None,
 ) -> ProofResult:
     """Hard check: verify GRAIL sketch commitments against the model
     forward pass, AND precompute the sparse values the behavioural
@@ -628,23 +765,30 @@ def verify_commitment_proofs(
     expected_challenges = min(CHALLENGE_K, challenge_domain_size)
 
     device = next(model.parameters()).device
-    input_ids = torch.tensor([tokens], device=device)
     lm_head = getattr(model, "lm_head", None)
     # Row-wise projection needs a separable head whose width we can read
     # without projecting; anything else keeps the old materialised block.
     vocab_size = _lm_head_vocab_size(lm_head)
     can_project_rows = vocab_size is not None
-    with torch.no_grad():
-        hidden_states_gpu, logits_batch = forward_single_layer(
-            model, input_ids, None, LAYER_INDEX,
-            materialize_logits=not can_project_rows,
-        )
+    if forward is not None:
+        # This rollout's rows out of a pass that ran for several of them: one traversal of the
+        # model serves the whole batch, which is what makes a streamed replica affordable.
+        hidden_states_gpu, logits_batch = forward
+    else:
+        input_ids = torch.tensor([tokens], device=device)
+        with torch.no_grad():
+            hidden_rows, logits_rows = forward_single_layer(
+                model, input_ids, None, LAYER_INDEX,
+                materialize_logits=not can_project_rows,
+            )
+        hidden_states_gpu = hidden_rows[0]
+        logits_batch = None if logits_rows is None else logits_rows[0]
 
-    hidden_states_gpu = hidden_states_gpu[0]  # [seq_len, hidden_dim]
+    # [seq_len, hidden_dim]
     if logits_batch is None:
         logits_gpu: Any = _LazyLogitRows(hidden_states_gpu, lm_head, vocab_size)
     else:
-        logits_gpu = logits_batch[0]  # [seq_len, vocab_size], kept on GPU
+        logits_gpu = logits_batch  # [seq_len, vocab_size], kept on GPU
 
     p_stop = _gpu_p_stop(
         logits_gpu, seq_len, _eos_set_from_model(model, tokenizer), device,
@@ -748,6 +892,9 @@ def verify_commitment_proofs(
         )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
+    from reliquary.validator.toploc_check import toploc_verdict
+
+    toploc = toploc_verdict(hidden_states, commit, prompt_length)
     if capture_utility:
         (
             hidden_start_f16_b64,
@@ -830,6 +977,12 @@ def verify_commitment_proofs(
         terminal_pick_cdf_miss=terminal_pick_cdf_miss,
         natural_close_pick_ok=natural_close_pick_ok,
         natural_close_pick_cdf_miss=natural_close_pick_cdf_miss,
+        toploc_checked=toploc is not None,
+        toploc_passed=bool(toploc and toploc.passed),
+        toploc_reason=None if toploc is None else toploc.reason,
+        toploc_worst_exp=0 if toploc is None else int(toploc.worst_exp),
+        toploc_worst_mant_mean=0.0 if toploc is None else float(toploc.worst_mant_mean),
+        toploc_worst_mant_median=0.0 if toploc is None else float(toploc.worst_mant_median),
     )
 
 

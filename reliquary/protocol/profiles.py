@@ -8,9 +8,12 @@ currently deployed constants.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from string import Template
 from types import MappingProxyType
 from typing import Any
@@ -138,10 +141,41 @@ class EnvironmentProfile:
     # Present only for the Episode v1 fork. Historical profiles omit this
     # field and therefore retain their exact generation-contract bytes.
     episode: EpisodeProfile | None = None
+    # How many windows a prompt of THIS environment sits out after it has been
+    # trained on. `None` keeps BATCH_PROMPT_COOLDOWN_WINDOWS, so every
+    # historical profile is unchanged.
+    #
+    # The global default was sized for OpenMathInstruct's 14M prompts, where
+    # one million windows means "single use for the life of any real run". A
+    # curated corpus breaks that: at eight prompts per window, 2,285 tasks are
+    # exhausted in three days and the environment then serves nothing. The
+    # value is declared rather than derived from the corpus at runtime — every
+    # validator has to agree on which prompts are eligible, and a length read
+    # from an installed wheel is not something consensus can rest on.
+    #
+    # The rule the numbers come from: one full pass through the corpus before
+    # any prompt returns, i.e. `min(default, virtual_length // batch_target)`,
+    # computed once here where it can be reviewed.
+    prompt_cooldown_windows: int | None = None
+    # Whether the chat template opens a reasoning block for this environment.
+    # `None` keeps it open, which is what every historical profile did — the
+    # value was hard-coded `True` in both places that render a prompt.
+    #
+    # It belongs to the environment rather than the run because the cost of
+    # deliberating depends on what the grader reads. An environment graded on
+    # the whole completion — no answer span to extract — checks the reasoning
+    # against constraints written for the answer; measured on instruction
+    # following, closing the block cut the band from 37.5% to 4.2%. One graded
+    # on a world rather than a string pays nothing for it and plans better.
+    thinking: bool | None = None
 
     def __post_init__(self) -> None:
         if int(self.max_new_tokens) <= 0:
             raise ValueError("environment max_new_tokens must be positive")
+        if self.prompt_cooldown_windows is not None and (
+            int(self.prompt_cooldown_windows) <= 0
+        ):
+            raise ValueError("environment prompt_cooldown_windows must be positive")
         if self.batch_target is not None and int(self.batch_target) <= 0:
             raise ValueError("environment batch_target must be positive")
         if bool(self.environment_contract_id) != bool(
@@ -193,6 +227,95 @@ class ThroughputTiebreakProfile:
     bucket_tokens_per_round: int
 
 
+PROOF_SCHEME_GRAIL = "grail-v7"
+PROOF_SCHEME_TOPLOC = "toploc-v1"
+_PROOF_SCHEMES = (PROOF_SCHEME_GRAIL, PROOF_SCHEME_TOPLOC)
+_PROOF_MODES = ("enforce", "shadow")
+_TOPLOC_FIELDS = (
+    "chunk_tokens", "topk", "exp_mismatch_threshold", "mant_mean_threshold",
+    "mant_median_threshold", "min_allowed_failures", "ratio_allowed_failures",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProofProfile:
+    """How a task's work is proven. ``shadow`` computes and records, never rejects."""
+
+    scheme: str
+    mode: str
+    chunk_tokens: int | None = None
+    topk: int | None = None
+    exp_mismatch_threshold: int | None = None
+    mant_mean_threshold: float | None = None
+    mant_median_threshold: float | None = None
+    min_allowed_failures: int | None = None
+    ratio_allowed_failures: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.scheme not in _PROOF_SCHEMES:
+            raise ValueError(f"unknown proof scheme {self.scheme!r}")
+        if self.mode not in _PROOF_MODES:
+            raise ValueError(f"unknown proof mode {self.mode!r}")
+        values = [getattr(self, name) for name in _TOPLOC_FIELDS]
+        if self.scheme == PROOF_SCHEME_TOPLOC and any(v is None for v in values):
+            raise ValueError("a toploc proof must state every threshold")
+        if self.scheme == PROOF_SCHEME_GRAIL and any(v is not None for v in values):
+            raise ValueError("a grail proof takes no toploc fields")
+        if self.scheme == PROOF_SCHEME_TOPLOC:
+            self._check_toploc_ranges()
+
+    def _check_toploc_ranges(self) -> None:
+        """A value outside these ranges boots a task every honest miner fails."""
+        for name in ("chunk_tokens", "topk", "exp_mismatch_threshold", "min_allowed_failures"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be a whole number, got {value!r}")
+        for name in ("mant_mean_threshold", "mant_median_threshold", "ratio_allowed_failures"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number, got {value!r}")
+        if self.chunk_tokens < 1 or self.topk < 1:
+            raise ValueError("chunk_tokens and topk must be at least 1")
+        if min(self.exp_mismatch_threshold, self.mant_mean_threshold,
+               self.mant_median_threshold, self.min_allowed_failures) < 0:
+            raise ValueError("thresholds must not be negative")
+        if not 0.0 <= self.ratio_allowed_failures <= 1.0:
+            raise ValueError("ratio_allowed_failures must be within [0, 1]")
+
+    def thresholds(self):
+        from reliquary.protocol.toploc import ToplocThresholds
+
+        if self.scheme != PROOF_SCHEME_TOPLOC:
+            raise ValueError("only a toploc proof has thresholds")
+        return ToplocThresholds(
+            exp_mismatch=self.exp_mismatch_threshold,
+            mant_mean=float(self.mant_mean_threshold),
+            mant_median=float(self.mant_median_threshold),
+            min_allowed_failures=self.min_allowed_failures,
+            ratio_allowed_failures=float(self.ratio_allowed_failures),
+        )
+
+    def to_contract(self) -> dict[str, Any]:
+        body: dict[str, Any] = {"scheme": self.scheme, "mode": self.mode}
+        if self.scheme == PROOF_SCHEME_TOPLOC:
+            body.update({name: getattr(self, name) for name in _TOPLOC_FIELDS})
+        return body
+
+
+# Prime Intellect's deployed default (toploc-validator @ 55c1a23, default.toml).
+TOPLOC_DEPLOYED_DEFAULTS = ProofProfile(
+    scheme=PROOF_SCHEME_TOPLOC,
+    mode="enforce",
+    chunk_tokens=32,
+    topk=128,
+    exp_mismatch_threshold=60,
+    mant_mean_threshold=40.0,
+    mant_median_threshold=40.0,
+    min_allowed_failures=0,
+    ratio_allowed_failures=0.0,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ProtocolProfile:
     profile_id: str
@@ -205,6 +328,14 @@ class ProtocolProfile:
     sampling: SamplingProfile
     environments: Mapping[str, EnvironmentProfile]
     throughput_tiebreak: ThroughputTiebreakProfile | None = None
+    # The architecture class the model's config declares, stated by whoever
+    # sealed the contract. Compiled profiles omit it, so their contract bytes
+    # are unchanged; a carried contract must name it, because the startup
+    # refusal that checks it against this image's list has nothing else to read.
+    model_architecture: str | None = None
+    # How the task's work is proven. Empty means GRAIL enforced, as every
+    # compiled profile has always meant, and keeps their contract bytes.
+    proofs: tuple[ProofProfile, ...] = ()
 
     def __post_init__(self) -> None:
         # Copy before wrapping so caller-owned dictionaries cannot mutate a
@@ -214,6 +345,12 @@ class ProtocolProfile:
             "environments",
             MappingProxyType(dict(self.environments)),
         )
+        object.__setattr__(self, "proofs", tuple(self.proofs))
+        if sum(1 for p in self.proofs if p.mode == "enforce") > 1:
+            raise ValueError("a task enforces at most one proof scheme")
+        schemes = [p.scheme for p in self.proofs]
+        if len(schemes) != len(set(schemes)):
+            raise ValueError("a task names each proof scheme once")
 
     def to_generation_contract(self) -> dict[str, Any]:
         """Return a detached contract containing only JSON-native values."""
@@ -243,6 +380,12 @@ class ProtocolProfile:
                 )
             if environment.batch_target is not None:
                 environment_contract["batch_target"] = environment.batch_target
+            if environment.prompt_cooldown_windows is not None:
+                environment_contract["prompt_cooldown_windows"] = (
+                    environment.prompt_cooldown_windows
+                )
+            if environment.thinking is not None:
+                environment_contract["thinking"] = environment.thinking
             if environment.environment_contract_id is not None:
                 environment_contract["environment_contract_id"] = (
                     environment.environment_contract_id
@@ -262,7 +405,7 @@ class ProtocolProfile:
                 }
             environments[name] = environment_contract
 
-        return {
+        contract: dict[str, Any] = {
             "profile_id": self.profile_id,
             "model_id": self.model_id,
             "model_revision": self.model_revision,
@@ -289,6 +432,389 @@ class ProtocolProfile:
             },
             "environments": environments,
         }
+        # Emitted only when set, like `episode` and `batch_target`: that is what
+        # keeps the compiled profiles' contract bytes, and their digests,
+        # identical to what the fleet already attests.
+        if self.model_architecture is not None:
+            contract["model_architecture"] = self.model_architecture
+        if self.proofs:
+            contract["proofs"] = [proof.to_contract() for proof in self.proofs]
+        return contract
+
+
+def _required(body: Mapping[str, Any], field: str, *, context: str = "generation contract") -> Any:
+    """Refuse a contract missing a field or having a null value: a default here
+    is a silent disagreement between two processes."""
+    if field not in body:
+        raise ValueError(f"{context} is missing {field!r}")
+    value = body[field]
+    if value is None:
+        raise ValueError(f"{context} has a null {field!r}")
+    return value
+
+
+def _coerce_int(value: Any, field: str, *, context: str = "generation contract") -> int:
+    """A whole number, or a ``ValueError`` naming the field.
+
+    Nothing is converted: ``int(3.7)`` would answer a question nobody asked,
+    and ``protocol_version`` gates wire compatibility. ``bool`` is named
+    separately because it is an ``int`` subclass and would otherwise pass.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} is a bool, not an int")
+    if not isinstance(value, int):
+        raise ValueError(f"{context} {field!r} is not an int: {value!r}")
+    return value
+
+
+def _coerce_float(value: Any, field: str, *, context: str = "generation contract") -> float:
+    """A number, or a ``ValueError`` naming the field. A whole number is one."""
+    if isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} is a bool, not a float")
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{context} {field!r} is not a float: {value!r}")
+    return float(value)
+
+
+# Every key each block of a generation contract may carry. `prompt_template`
+# includes the two derived keys the writer emits but the reader recomputes.
+_CONTRACT_FIELDS = (
+    "profile_id", "model_id", "model_revision", "model_architecture",
+    "protocol_version", "prompt_encoding", "throughput_tiebreak",
+    "collection_seconds", "upload_grace_seconds", "sampling", "environments",
+    "proofs",
+)
+_SAMPLING_FIELDS = ("rollouts", "temperature", "top_p", "top_k", "do_sample")
+_ENVIRONMENT_FIELDS = (
+    "max_new_tokens", "answer_format", "bft", "prompt_template",
+    "batch_target", "environment_contract_id", "environment_manifest_sha256",
+    "episode", "prompt_cooldown_windows", "thinking",
+)
+_BFT_FIELDS = ("thinking_budget", "answer_budget", "force_answer")
+_PROMPT_TEMPLATE_FIELDS = ("id", "renderer", "template", "sha256")
+_EPISODE_FIELDS = (
+    "schema", "renderer_id", "max_turns", "max_action_tokens",
+    "max_episode_tokens", "max_observation_bytes",
+)
+_TIEBREAK_FIELDS = ("token_cap", "bucket_tokens_per_round")
+_PROOF_FIELDS = ("scheme", "mode", *_TOPLOC_FIELDS)
+
+
+def _object(body: Any, known: tuple[str, ...], *, context: str) -> Mapping[str, Any]:
+    """An object whose every key is one this reader honours.
+
+    An ignored key is worse than a rejected one: the rebuild drops it, so the
+    only symptom is a digest mismatch at startup that names nothing.
+    """
+    if not isinstance(body, Mapping):
+        raise ValueError(f"{context} must be an object")
+    unknown = sorted(set(body) - set(known))
+    if unknown:
+        raise ValueError(f"{context} has unknown fields: {unknown}")
+    return body
+
+
+def _coerce_str(value: Any, field: str, *, context: str = "generation contract") -> str | None:
+    """An optional text field is text or absent, never a dict or a number.
+
+    Waving one through is worse than a bad message: the wrong value survives
+    the round trip unchanged, so the digest agrees and a malformed contract
+    becomes a self-consistent, registry-attested task that boots.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{context} {field!r} must be text, got {value!r}")
+    return value
+
+
+def _coerce_bool(value: Any, field: str, *, context: str = "generation contract") -> bool:
+    """A flag is a JSON boolean, never a truthy stand-in.
+
+    ``bool(1)`` would be re-emitted as ``true``, so the contract would no
+    longer hash to what it arrived as and startup would fail naming nothing.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{context} {field!r} must be true or false, got {value!r}")
+    return value
+
+
+def _environment_from_contract(name: str, body: Any) -> EnvironmentProfile:
+    if not isinstance(body, Mapping):
+        raise ValueError(f"environment {name!r} is not an object")
+    body = _object(body, _ENVIRONMENT_FIELDS, context=f"environment {name!r}")
+    max_tokens = _required(body, "max_new_tokens", context=f"environment {name!r}")
+    bft_body = body.get("bft")
+    if bft_body is not None:
+        bft_body = _object(bft_body, _BFT_FIELDS, context=f"environment {name!r} 'bft'")
+    template = body.get("prompt_template")
+    if template is not None:
+        template = _object(
+            template,
+            _PROMPT_TEMPLATE_FIELDS,
+            context=f"environment {name!r} 'prompt_template'",
+        )
+    episode_body = body.get("episode")
+    if episode_body is not None:
+        episode_body = _object(
+            episode_body, _EPISODE_FIELDS, context=f"environment {name!r} 'episode'"
+        )
+    return EnvironmentProfile(
+        max_new_tokens=_coerce_int(max_tokens, "max_new_tokens", context=f"environment {name!r}"),
+        bft=(
+            None
+            if bft_body is None
+            else BFTProfile(
+                thinking_budget=_coerce_int(
+                    _required(bft_body, "thinking_budget", context=f"environment {name!r} 'bft'"),
+                    "thinking_budget",
+                    context=f"environment {name!r} 'bft'",
+                ),
+                answer_budget=_coerce_int(
+                    _required(bft_body, "answer_budget", context=f"environment {name!r} 'bft'"),
+                    "answer_budget",
+                    context=f"environment {name!r} 'bft'",
+                ),
+                force_answer=_coerce_bool(
+                    _required(bft_body, "force_answer", context=f"environment {name!r} 'bft'"),
+                    "force_answer",
+                    context=f"environment {name!r} 'bft'",
+                ),
+            )
+        ),
+        answer_format=_coerce_str(
+            body.get("answer_format"), "answer_format", context=f"environment {name!r}"
+        ),
+        prompt_template=(
+            None
+            if template is None
+            # 'renderer' and 'sha256' are derived, so they are recomputed rather
+            # than read; the round-trip test is what proves they still agree.
+            else PromptTemplateProfile(
+                template_id=str(_required(template, "id", context=f"environment {name!r} 'prompt_template'")),
+                template=str(_required(template, "template", context=f"environment {name!r} 'prompt_template'")),
+            )
+        ),
+        # All four optional fields go through a named coercion. A value the
+        # bare `.get()` waved through was a round-trip fixed point, so its
+        # digest agreed and the malformed contract booted as an attested task.
+        batch_target=(
+            None
+            if body.get("batch_target") is None
+            else _coerce_int(
+                body["batch_target"], "batch_target", context=f"environment {name!r}"
+            )
+        ),
+        environment_contract_id=_coerce_str(
+            body.get("environment_contract_id"),
+            "environment_contract_id",
+            context=f"environment {name!r}",
+        ),
+        environment_manifest_sha256=_coerce_str(
+            body.get("environment_manifest_sha256"),
+            "environment_manifest_sha256",
+            context=f"environment {name!r}",
+        ),
+        prompt_cooldown_windows=(
+            None
+            if body.get("prompt_cooldown_windows") is None
+            else _coerce_int(
+                body["prompt_cooldown_windows"],
+                "prompt_cooldown_windows",
+                context=f"environment {name!r}",
+            )
+        ),
+        thinking=(
+            None
+            if body.get("thinking") is None
+            else _coerce_bool(
+                body["thinking"], "thinking", context=f"environment {name!r}"
+            )
+        ),
+        episode=(
+            None
+            if episode_body is None
+            else EpisodeProfile(
+                schema=str(_required(episode_body, "schema", context=f"environment {name!r} 'episode'")),
+                renderer_id=str(_required(episode_body, "renderer_id", context=f"environment {name!r} 'episode'")),
+                max_turns=_coerce_int(
+                    _required(episode_body, "max_turns", context=f"environment {name!r} 'episode'"),
+                    "max_turns",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_action_tokens=_coerce_int(
+                    _required(episode_body, "max_action_tokens", context=f"environment {name!r} 'episode'"),
+                    "max_action_tokens",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_episode_tokens=_coerce_int(
+                    _required(episode_body, "max_episode_tokens", context=f"environment {name!r} 'episode'"),
+                    "max_episode_tokens",
+                    context=f"environment {name!r} 'episode'",
+                ),
+                max_observation_bytes=_coerce_int(
+                    _required(episode_body, "max_observation_bytes", context=f"environment {name!r} 'episode'"),
+                    "max_observation_bytes",
+                    context=f"environment {name!r} 'episode'",
+                ),
+            )
+        ),
+    )
+
+
+def _proof_from_contract(index: int, body: Any) -> ProofProfile:
+    context = f"generation contract 'proofs'[{index}]"
+    body = _object(body, _PROOF_FIELDS, context=context)
+
+    def integer(name):
+        value = body.get(name)
+        return None if value is None else _coerce_int(value, name, context=context)
+
+    def real(name):
+        value = body.get(name)
+        return None if value is None else _coerce_float(value, name, context=context)
+
+    return ProofProfile(
+        scheme=str(_required(body, "scheme", context=context)),
+        mode=str(_required(body, "mode", context=context)),
+        chunk_tokens=integer("chunk_tokens"),
+        topk=integer("topk"),
+        exp_mismatch_threshold=integer("exp_mismatch_threshold"),
+        mant_mean_threshold=real("mant_mean_threshold"),
+        mant_median_threshold=real("mant_median_threshold"),
+        min_allowed_failures=integer("min_allowed_failures"),
+        ratio_allowed_failures=real("ratio_allowed_failures"),
+    )
+
+
+def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
+    """Rebuild a profile from what ``to_generation_contract`` produced.
+
+    The exact inverse, and it must stay exact: a task carries this contract, so
+    a field lost in translation is a field the fleet disagrees about silently.
+    """
+    if not isinstance(contract, Mapping):
+        raise ValueError("a generation contract must be an object")
+    contract = _object(contract, _CONTRACT_FIELDS, context="generation contract")
+
+    sampling_body = _required(contract, "sampling")
+    if not isinstance(sampling_body, Mapping):
+        raise ValueError("generation contract 'sampling' must be an object")
+    sampling_body = _object(
+        sampling_body, _SAMPLING_FIELDS, context="generation contract 'sampling'"
+    )
+    environments = _required(contract, "environments")
+    if not isinstance(environments, Mapping):
+        raise ValueError("generation contract 'environments' must be an object")
+    tiebreak = contract.get("throughput_tiebreak")
+    if tiebreak is not None:
+        tiebreak = _object(
+            tiebreak,
+            _TIEBREAK_FIELDS,
+            context="generation contract 'throughput_tiebreak'",
+        )
+
+    proofs_body = contract.get("proofs")
+    if proofs_body is not None and not isinstance(proofs_body, list):
+        raise ValueError("generation contract 'proofs' must be a list")
+
+    return ProtocolProfile(
+        profile_id=str(_required(contract, "profile_id")),
+        model_id=str(_required(contract, "model_id")),
+        model_revision=str(_required(contract, "model_revision")),
+        protocol_version=_coerce_int(
+            _required(contract, "protocol_version"),
+            "protocol_version",
+        ),
+        collection_seconds=_coerce_int(
+            _required(contract, "collection_seconds"),
+            "collection_seconds",
+        ),
+        upload_grace_seconds=_coerce_int(
+            _required(contract, "upload_grace_seconds"),
+            "upload_grace_seconds",
+        ),
+        prompt_encoding=str(_required(contract, "prompt_encoding")),
+        # Legitimately absent: every compiled profile predates the field.
+        model_architecture=_coerce_str(
+            contract.get("model_architecture"), "model_architecture"
+        ),
+        proofs=tuple(
+            _proof_from_contract(i, body) for i, body in enumerate(proofs_body or ())
+        ),
+        sampling=SamplingProfile(
+            rollouts=_coerce_int(
+                _required(sampling_body, "rollouts", context="generation contract 'sampling'"),
+                "rollouts",
+                context="generation contract 'sampling'",
+            ),
+            temperature=_coerce_float(
+                _required(sampling_body, "temperature", context="generation contract 'sampling'"),
+                "temperature",
+                context="generation contract 'sampling'",
+            ),
+            top_p=_coerce_float(
+                _required(sampling_body, "top_p", context="generation contract 'sampling'"),
+                "top_p",
+                context="generation contract 'sampling'",
+            ),
+            top_k=_coerce_int(
+                _required(sampling_body, "top_k", context="generation contract 'sampling'"),
+                "top_k",
+                context="generation contract 'sampling'",
+            ),
+            do_sample=bool(_required(sampling_body, "do_sample", context="generation contract 'sampling'")),
+        ),
+        environments={
+            name: _environment_from_contract(name, body)
+            for name, body in environments.items()
+        },
+        throughput_tiebreak=(
+            None
+            if tiebreak is None
+            else ThroughputTiebreakProfile(
+                token_cap=_coerce_int(
+                    _required(tiebreak, "token_cap", context="generation contract 'throughput_tiebreak'"),
+                    "token_cap",
+                    context="generation contract 'throughput_tiebreak'",
+                ),
+                bucket_tokens_per_round=_coerce_int(
+                    _required(tiebreak, "bucket_tokens_per_round", context="generation contract 'throughput_tiebreak'"),
+                    "bucket_tokens_per_round",
+                    context="generation contract 'throughput_tiebreak'",
+                ),
+            )
+        ),
+    )
+
+
+def enforced_proof(profile: ProtocolProfile) -> ProofProfile:
+    """The scheme that decides; GRAIL when the contract names none."""
+    for proof in profile.proofs:
+        if proof.mode == "enforce":
+            return proof
+    return ProofProfile(PROOF_SCHEME_GRAIL, "enforce")
+
+
+def toploc_proof(profile: ProtocolProfile) -> ProofProfile | None:
+    """The contract's toploc entry, whatever its mode."""
+    for proof in profile.proofs:
+        if proof.scheme == PROOF_SCHEME_TOPLOC:
+            return proof
+    return None
+
+
+def proof_rejection(
+    profile: ProtocolProfile, *, grail_passed: bool, toploc_passed: bool | None
+) -> str | None:
+    """Which enforced scheme refuses the rollout, if any; a shadow scheme never does.
+
+    ``toploc_passed`` is None when no toploc verdict exists, which refuses under
+    toploc enforcement: missing proofs are not a pass.
+    """
+    if enforced_proof(profile).scheme == PROOF_SCHEME_TOPLOC:
+        return None if toploc_passed is True else "toploc_fail"
+    return None if grail_passed else "grail_fail"
 
 
 _SAMPLING = SamplingProfile(
@@ -616,8 +1142,8 @@ _PROFILE_VALUES = (
                 batch_target=16,
                 environment_contract_id="reliquary-stateful-tools-v1",
                 environment_manifest_sha256=(
-                    "3725a5ec6186702d3f387c2a8cb174ff"
-                    "ce672dc3efe9b877460a8454e775db2e"
+                    "0f490881544ba065bf33b974032adbc3"
+                    "f844d2c3978bcd6ca8dbb7089baa8f18"
                 ),
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
@@ -635,8 +1161,8 @@ _PROFILE_VALUES = (
                 batch_target=16,
                 environment_contract_id="reliquary-retrieval-tools-v1",
                 environment_manifest_sha256=(
-                    "94095ba52ae58895f19b99bc9d605d8"
-                    "a3b6cdea55118af1b857ed42d484072c0"
+                    "1c53afdf6acc59dd7df0693b7486e47"
+                    "de94d79977404841d1368ffb2571c0c7d"
                 ),
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
@@ -654,8 +1180,8 @@ _PROFILE_VALUES = (
                 batch_target=16,
                 environment_contract_id="reliquary-workspace-tools-v1",
                 environment_manifest_sha256=(
-                    "9f888c49e5d1775f0f83314a0177ee5"
-                    "562c9e4858b8e4e401af8ef9ff7e0f4a7"
+                    "7f0465cff80aefc489e0302d2122272"
+                    "8115e0094df33858d6c613fa5423489e2"
                 ),
                 episode=EpisodeProfile(
                     schema="reliquary/episode/v1",
@@ -708,6 +1234,143 @@ _PROFILE_VALUES = (
             bucket_tokens_per_round=50,
         ),
     ),
+
+    ProtocolProfile(
+        profile_id="teutonic-9b-reliquary-suite-v9-dev1",
+        # Dormant development profile for the Teutonic-I run: four packaged
+        # environments from reliquary-environments, each bound by the digest of
+        # its artifact manifest. Nothing selects it until a task entry names it
+        # and a validator is started with it; the live profile is untouched.
+        #
+        # Every per-environment number below was measured on this policy rather
+        # than carried over from the 4B run — the budgets, the reasoning mode,
+        # and the episode limits all moved when they were.
+        model_id="ReliquaryForge/teutonic-i-graft-sft-cot-v2",
+        model_revision="d5256c5ccc2c06d8f9bf3133b37ab2a5b95a224e",
+        protocol_version=9,
+        collection_seconds=100,
+        upload_grace_seconds=33,
+        # An instruct policy trained on the chat template, unlike the base
+        # models every v4+ profile used. Raw completion would hand it a prompt
+        # in a form it never saw.
+        prompt_encoding="chat_template",
+        sampling=_SAMPLING_DAPO,
+        environments={
+            "reliquary_dapo_math_v1": EnvironmentProfile(
+                # 32,768, not the 8,192 the siblings need. Measured: band 70.8%
+                # at 24,576 against 81.2% here, dead groups 26.0% against 17.7%.
+                # Competition maths does not fit a budget chosen for answers.
+                max_new_tokens=32768,
+                bft=None,
+                answer_format="boxed",
+                # Half the siblings' prompt count, because a group here costs
+                # what ten of theirs cost: 493k tokens against 48k, measured on
+                # an H200 over a group of 16 at this budget. At 16 prompts this
+                # environment alone is three quarters of the window's tokens,
+                # for a band measured in protocol at 25% (3 groups of 12), so
+                # the window would buy maths in code's and instruction
+                # following's place.
+                batch_target=8,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/boxed-answer/v1",
+                environment_manifest_sha256=(
+                    "cca437d73e8183a6df4af4780e00e34cd26fed03238b18208898b1e2586d2035"
+                ),
+                # One pass through the 13,931-problem train split at 8 a window.
+                prompt_cooldown_windows=1741,
+            ),
+            "reliquary_instruction_following_v1": EnvironmentProfile(
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="text",
+                batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/checked-answer/v1",
+                environment_manifest_sha256=(
+                    "84b8698446e68e057faea54ea4045cd198c21fb6bd0a7c8fc259a7659c4e483d"
+                ),
+                # One pass through the 29,435-prompt train split.
+                prompt_cooldown_windows=1839,
+                # Direct: every verifier reads the whole completion, so an open
+                # reasoning block is graded against constraints written for the
+                # answer. Measured on this policy, band 4.2% thinking against
+                # 37.5% direct.
+                thinking=False,
+            ),
+            "reliquary_code_v1": EnvironmentProfile(
+                # The longest completion that finished on its own ran to about
+                # 6,600 tokens; raising this measured worse, not better.
+                max_new_tokens=8192,
+                bft=None,
+                answer_format="fenced_python",
+                batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/python-cases/v1",
+                environment_manifest_sha256=(
+                    "71e4f23c614b7f321bbb9f6cf74f98b772137442bdf9960e5b6d9b6387f41216"
+                ),
+                # No cooldown override: 2,481,806 prompts at 16 a window outlast
+                # the global horizon, which is what that horizon was sized for.
+            ),
+            "reliquary_telecom_solo_v1": EnvironmentProfile(
+                # For an episode this is the whole transcript, as `max_episode_tokens`.
+                max_new_tokens=49152,
+                bft=None,
+                answer_format="episode_json_action_v1",
+                # What this corpus supplies, not what it declares. Measured on
+                # an H200 21-09 at 8 rollouts a task: `service_issue` solves
+                # 54.7% of the time (47 tasks) and `mobile_data_issue` 9.8%
+                # (254), while `mms_issue` — 1,984 of the 2,285 — solves 0.9%.
+                # A group drawn there is sixteen zeroes: the sigma gate refuses
+                # it and nothing is paid for it, so miners draw from the other
+                # two and the usable corpus is ~240 tickets, not 1,827. Four
+                # prompts a window is what that pool sustains. It goes back up
+                # when the policy makes `mms_issue` solvable, which is a
+                # property of the policy rather than of the environment.
+                batch_target=4,
+                environment_contract_id="reliquary/episode-json/v1",
+                environment_manifest_sha256=(
+                    "74d0e7569247eabc3d4fb2d909773f2b1f1d8430a4ce4f4fd09c6ad6e6794b05"
+                ),
+                # One pass through the tickets this policy can use, ~240 of
+                # them, at four a window — not the 456 windows the corpus-wide
+                # rule gives. Sized on the declared 1,827, the usable pool is
+                # spent in sixty windows and the environment then serves
+                # nothing for four hundred more, because every ticket still
+                # eligible is one no group passes the gate on. This is the one
+                # place that rule is deliberately relaxed, and it is a smaller
+                # relaxation than it reads as: a ticket returns every sixty
+                # windows instead of the environment going dark.
+                prompt_cooldown_windows=60,
+                episode=EpisodeProfile(
+                    schema="reliquary/episode/v1",
+                    # The policy's own template. Measured on H200 20-09 over 64
+                    # episodes each: this dialect lands a valid call in 61 of 61,
+                    # a median of 15 distinct tools and no invalid action, and
+                    # solves 2 tickets outright; the JSONL dialect, whose framing
+                    # this policy never saw, leaves 45 of 64 without a single
+                    # valid call and none solved.
+                    renderer_id="reliquary-chatml-tools-v1",
+                    max_turns=40,
+                    # Per turn. Measured over 11,308 turns: p99 2,001, and a
+                    # higher cap buys three hundredths of a percent.
+                    max_action_tokens=4096,
+                    # Whole transcript: a 10,118-token opening (44 tool schemas
+                    # and the policy), up to 24,324 generated, and tool results
+                    # of about 63 tokens a turn — about 37,000 at worst.
+                    max_episode_tokens=49152,
+                    max_observation_bytes=65536,
+                ),
+            ),
+        },
+        throughput_tiebreak=None,
+    ),
 )
 
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
@@ -715,14 +1378,28 @@ PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
 )
 DEFAULT_PROFILE_ID = "qwen35-2b-auction-v2"
 _PROFILE_ENV_VAR = "RELIQUARY_PROTOCOL_PROFILE"
+TASK_CONTRACT_ENV_VAR = "RELIQUARY_TASK_CONTRACT"
 
 
 def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
-    """Resolve an explicit profile or the environment-selected default.
+    """Resolve an explicit profile, a task's carried contract, or the default.
 
     Empty, misspelled, and otherwise unknown IDs are errors. Falling back after
     an explicit selection would silently put peers on different wire contracts.
+
+    An explicit id wins over the contract file: callers that pass one are
+    naming a template, not asking what this process runs.
     """
+
+    if profile_id is None:
+        contract_path = os.environ.get(TASK_CONTRACT_ENV_VAR)
+        # Absent (None) falls through to the compiled catalogue below; present
+        # but empty is a broken deployment, not an unset one, and must fail
+        # the same way a misspelled path does rather than run the default.
+        if contract_path is not None:
+            if not contract_path:
+                raise ValueError(f"{TASK_CONTRACT_ENV_VAR} is set but empty")
+            return _profile_from_contract_file(contract_path)
 
     selected_id = (
         os.environ.get(_PROFILE_ENV_VAR, DEFAULT_PROFILE_ID)
@@ -736,6 +1413,32 @@ def resolve_protocol_profile(profile_id: str | None = None) -> ProtocolProfile:
         raise ValueError(
             f"unknown protocol profile {selected_id!r}; "
             f"expected one of: {available}"
+        ) from exc
+
+
+def _profile_from_contract_file(path: str) -> ProtocolProfile:
+    """Read the contract this process was given, or refuse to start.
+
+    Every failure here is fatal on purpose: a process that silently fell back
+    to the compiled catalogue would generate under a contract nobody declared.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"cannot read the task contract at {path!r}: {exc}"
+        ) from exc
+    try:
+        contract = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"the task contract at {path!r} is not JSON: {exc}"
+        ) from exc
+    try:
+        return profile_from_contract(contract)
+    except ValueError as exc:
+        raise ValueError(
+            f"the task contract at {path!r} is unusable: {exc}"
         ) from exc
 
 
@@ -790,6 +1493,8 @@ __all__ = [
     "PROFILES",
     "ProtocolProfile",
     "SamplingProfile",
+    "TASK_CONTRACT_ENV_VAR",
+    "profile_from_contract",
     "resolve_protocol_profile",
     "render_active_prompt",
     "to_generation_contract",

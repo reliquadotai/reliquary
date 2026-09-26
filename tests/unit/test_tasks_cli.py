@@ -208,6 +208,19 @@ def test_declaring_default_then_a_second_task_both_succeed(monkeypatch):
     assert set(state["entries"]) == {"default", "logic-probe"}
 
 
+# --- `--profile-id` became optional so `--model` could reach its own
+# routing, but the legacy path still needs ONE of the two to pick a task. ---
+
+def test_neither_profile_id_nor_model_is_refused_by_the_cli():
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    result = CliRunner().invoke(app, ["tasks", "create", "--task-id", "x", "--cap", "0.3"])
+    assert result.exit_code == 1
+    assert "--profile-id" in result.output
+
+
 # --- --env-split: a name the profile does not declare is a refusal, not a
 # fallback -- that is what puts a real budget decision on the wrong path. ---
 
@@ -364,3 +377,27 @@ def test_an_absent_registry_is_not_an_error_and_is_never_retried():
 
     assert (entries, etag) == ({}, None)
     assert calls["n"] == 1
+
+
+def test_a_task_can_be_declared_with_the_replica_its_validators_verify_with():
+    from reliquary.cli.main import build_task_entry
+
+    entry = build_task_entry(
+        task_id="moe", profile_id="qwen3-4b-base-dapo-fill-closed-v6", cap=0.5, overrides={}, verification="streamed",
+    )
+
+    assert entry.verification == "streamed"
+    assert build_task_entry(
+        task_id="moe", profile_id="qwen3-4b-base-dapo-fill-closed-v6", cap=0.5, overrides={},
+    ).verification is None, "declaring nothing leaves each validator to derive it"
+
+
+def test_declaring_a_replica_nobody_implements_is_refused_before_it_reaches_the_registry():
+    import pytest as _pytest
+
+    from reliquary.cli.main import build_task_entry
+
+    with _pytest.raises(ValueError, match="--verification"):
+        build_task_entry(
+            task_id="moe", profile_id="qwen3-4b-base-dapo-fill-closed-v6", cap=0.5, overrides={}, verification="moe",
+        )

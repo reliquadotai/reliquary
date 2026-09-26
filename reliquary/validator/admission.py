@@ -996,6 +996,10 @@ def score_and_finalize_submission(
                             encode=encode_piece,
                             max_episode_tokens=max_episode_tokens,
                             max_observation_bytes=max_observation_bytes,
+                            # The dialect the environment declares, which is
+                            # the one the miner rendered with: the transcript
+                            # below is compared byte for byte.
+                            renderer_id=str(environment_spec.renderer_id),
                         )
                         reward = trace.reward
                         if reward is None:

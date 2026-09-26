@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 
 from reliquary.environment.agentic.base import EpisodeEnvironment
-from reliquary.environment.agentic.renderer import CanonicalEpisodeRenderer
+from reliquary.environment.agentic.renderer import EPISODE_RENDERER_ID
+from reliquary.environment.agentic.renderers import renderer_for
 from reliquary.environment.agentic.runner import EpisodeRunner, ScriptedPolicy
 from reliquary.environment.agentic.types import (
     AssistantAction,
@@ -69,15 +70,21 @@ def replay_tokenized_episode(
     encode: Callable[[str], list[int]],
     max_episode_tokens: int | None = None,
     max_observation_bytes: int = 64 * 1024,
+    renderer_id: str = EPISODE_RENDERER_ID,
 ) -> EpisodeTrace:
-    """Replay while reconstructing the exact canonical flattened transcript."""
+    """Replay while reconstructing the exact canonical flattened transcript.
+
+    `renderer_id` must be the one the miner rendered with: the transcript is
+    compared byte for byte, so a different dialect fails every replay. The
+    default keeps every existing caller on the renderer it always used.
+    """
 
     generated = []
     for start, end in assistant_spans:
         piece = list(tokens[int(start):int(end)])
         generated.append(GeneratedAction(text=decode(piece), tokens=tuple(piece)))
     return EpisodeRunner(
-        renderer=CanonicalEpisodeRenderer(encode),
+        renderer=renderer_for(renderer_id, encode),
         max_episode_tokens=max_episode_tokens,
         max_observation_bytes=max_observation_bytes,
     ).run(

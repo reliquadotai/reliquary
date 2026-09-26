@@ -86,3 +86,30 @@ def test_fatal_proof_error_hard_exits_despite_blocking_shutdown_thread():
     assert completed.stderr.index(
         "simulated-service-cleanup-completed"
     ) < completed.stderr.index("forcing process exit for supervisor restart")
+
+
+def test_validator_event_loop_raises_soft_open_file_limit_to_hard(monkeypatch):
+    # A 1024 soft limit killed the V1 controller (EMFILE) on 2026-09-22.
+    import reliquary.cli.main as cli
+
+    calls = []
+    monkeypatch.setattr(cli.resource, "getrlimit", lambda _kind: (1024, 524288))
+    monkeypatch.setattr(cli.resource, "setrlimit", lambda kind, limits: calls.append((kind, limits)))
+
+    async def ok() -> None:
+        return None
+
+    cli._run_validator_event_loop(ok())
+    assert calls == [(cli.resource.RLIMIT_NOFILE, (524288, 524288))]
+
+
+def test_open_file_limit_raise_is_best_effort(monkeypatch):
+    import reliquary.cli.main as cli
+
+    monkeypatch.setattr(cli.resource, "getrlimit", lambda _kind: (1024, cli.resource.RLIM_INFINITY))
+
+    def refuse(_kind, _limits):
+        raise ValueError("not permitted")
+
+    monkeypatch.setattr(cli.resource, "setrlimit", refuse)
+    cli._raise_open_file_limit()  # must not raise

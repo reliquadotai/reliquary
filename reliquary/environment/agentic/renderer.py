@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from collections.abc import Callable
 
 from reliquary.environment.agentic.types import (
@@ -51,6 +53,19 @@ class CanonicalEpisodeRenderer:
     def final_suffix(action: AssistantAction) -> str:
         del action
         return "\n<|reliquary_end|>\n"
+
+    @staticmethod
+    def parse_action(text: str, task: Any = None) -> AssistantAction:
+        """The action a JSONL turn commits to.
+
+        Owned by the renderer, because which text is an action depends on the
+        dialect it was written in: this one reads a JSON object, the ChatML
+        renderer reads a `<tool_call>` block. `task` is accepted for the common
+        signature and not needed here.
+        """
+
+        del task
+        return AssistantAction.from_json(text)
 
     def encode_initial(self, task: EpisodeTask) -> list[int]:
         return list(self._encode(self.initial_text(task)))

@@ -34,6 +34,8 @@ class TaskConfig:
     emission_cap: float
     # Per-environment share of `emission_cap`: `cap * env_split_e`.
     env_caps: dict[str, float]
+    # The replica this task's validators verify with, or None to let each derive it.
+    verification: str | None = None
 
 
 def resolve_task_config(
@@ -68,6 +70,47 @@ def resolve_task_config(
             f"task {task_id!r} pins profile contract {entry.profile_sha256[:12]}… "
             f"but this build computes {digest[:12]}…"
         )
+    if entry.contract is not None:
+        from reliquary.constants import SUPPORTED_MODEL_ARCHITECTURES
+        from reliquary.environment.registry import ENVIRONMENT_SPECS
+        from reliquary.protocol.profiles import profile_from_contract
+
+        # Shape is the registry's job; whether this binary can execute the
+        # contract is ours, and it must fail here rather than mid-window.
+        declared = set(entry.contract.get("environments") or ())
+        missing = sorted(declared - set(ENVIRONMENT_SPECS))
+        if missing:
+            raise TaskConfigError(
+                f"task {task_id!r} names environments this binary does not "
+                f"install: {missing}"
+            )
+        # Read from the REBUILT profile, not from the raw contract: what the
+        # process will actually run is the round trip, so a field only the raw
+        # mapping carries is a field nothing enforces.
+        try:
+            architecture = profile_from_contract(entry.contract).model_architecture
+        except ValueError as exc:
+            raise TaskConfigError(
+                f"task {task_id!r} carries a contract this binary cannot "
+                f"read: {exc}"
+            ) from exc
+        # Contract-LESS entries are the historical form and keep working; a
+        # carried contract without an architecture is a state nothing
+        # produces, and accepting it leaves the check below unreachable for
+        # exactly the entries it guards.
+        if architecture is None:
+            raise TaskConfigError(
+                f"task {task_id!r} carries a contract that names no model "
+                f"architecture; seal one into the contract so this image can "
+                f"refuse a model it cannot run"
+            )
+        if architecture not in SUPPORTED_MODEL_ARCHITECTURES:
+            raise TaskConfigError(
+                f"task {task_id!r} names model architecture "
+                f"{architecture!r}, which this image cannot run; it supports "
+                f"{sorted(SUPPORTED_MODEL_ARCHITECTURES)}"
+            )
+
     environments = list(generation_contract.get("environments") or ())
     if entry.env_split is not None:
         unknown = set(entry.env_split) - set(environments)
@@ -106,6 +149,7 @@ def resolve_task_config(
         price_params=params,
         emission_cap=cap,
         env_caps=env_caps,
+        verification=entry.verification,
     )
 
 

@@ -31,7 +31,9 @@ def hash_tokens(tokens: list[int]) -> bytes:
     return hashlib.sha256(tokens_bytes).digest()
 
 
-def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
+def encode_prompt(
+    tokenizer: Any, prompt_text: str, *, thinking: bool = True
+) -> list[int]:
     """Canonical prompt → token encoder shared by miner and validator.
 
     Instruct/thinking models (Qwen3.5, etc.) ship a chat template
@@ -70,9 +72,10 @@ def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
             "return_dict": False,
         }
         if "enable_thinking" in chat_template:
-            # Enable thinking: the raised token cap gives the CoT room to close
-            # </think> and emit \boxed{} before truncating.
-            kwargs["enable_thinking"] = True
+            # Per environment, through `thinking_for_environment`: open by
+            # default, closed where the grader would read the reasoning as
+            # part of the answer.
+            kwargs["enable_thinking"] = bool(thinking)
         encoded = tokenizer.apply_chat_template(messages, **kwargs)
         if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
             encoded = encoded["input_ids"]

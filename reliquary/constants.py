@@ -62,6 +62,35 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 
+# How many tokens one verification pass puts on the card at once. A pass costs one traversal of
+# the model, which a streamed replica pays in full, so the budget wants to be as large as the card
+# allows: measured at 13.5 GB of device memory for 65k tokens in flight on a 2048-wide model, and
+# a pass of 32 rollouts costs 0.22 s each against 7.6 s for one alone.
+PROOF_BATCH_TOKEN_BUDGET = int(_os.environ.get("RELIQUARY_PROOF_BATCH_TOKENS", "262144"))
+
+# How many of a request's rollouts one warming pass covers. A group is what a miner submits, so
+# warming a group at a time is what makes the pass shared without holding rows for rollouts the
+# loop may never reach. The worker still splits the slice into passes by token budget.
+PROOF_WARM_ROLLOUTS = int(_os.environ.get("RELIQUARY_PROOF_WARM_ROLLOUTS", "16"))
+if PROOF_WARM_ROLLOUTS < 1:
+    raise ValueError("RELIQUARY_PROOF_WARM_ROLLOUTS must be at least 1")
+
+# Whether a pass may hold rollouts of different lengths, padded to the widest and cut back after.
+# "auto" pads for a streamed replica and not for a resident one: rollouts that terminate on their
+# own almost never share a token count, so without padding a streamed slot pays a traversal per
+# rollout and the batching it exists for does not happen; while a resident slot has no throughput
+# problem to solve and keeps returning, to the bit, what one-at-a-time verification always did.
+PROOF_BATCH_PADDING = _os.environ.get("RELIQUARY_PROOF_BATCH_PADDING", "auto").strip().lower()
+if PROOF_BATCH_PADDING not in {"auto", "on", "off"}:
+    raise ValueError("RELIQUARY_PROOF_BATCH_PADDING must be 'auto', 'on' or 'off'")
+
+# Fraction of proofs a resident slot also runs through the streamed traversal, comparing the two
+# and reporting when they differ. The oracle only exists while the model still fits on one card,
+# which is exactly the window before the cutover: 0 outside it, because it doubles the forward.
+PROOF_SHADOW_FRACTION = float(_os.environ.get("RELIQUARY_PROOF_SHADOW_FRACTION", "0"))
+if not 0.0 <= PROOF_SHADOW_FRACTION <= 1.0:
+    raise ValueError("RELIQUARY_PROOF_SHADOW_FRACTION must be between 0 and 1")
+
 PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
 PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
 PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision
@@ -71,6 +100,18 @@ PROTOCOL_VERSION = ACTIVE_PROTOCOL_PROFILE.protocol_version
 PROTOCOL_THROUGHPUT_TIEBREAK = ACTIVE_PROTOCOL_PROFILE.throughput_tiebreak
 PROTOCOL_GENERATION_CONTRACT = (
     ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
+)
+
+# Model architectures this image can actually run, drawn from the HF configs
+# behind the nine compiled profiles in reliquary/protocol/profiles.py: dense
+# Qwen3 (Qwen/Qwen3-4B-Base, seven profiles) and Qwen3.5's conditional
+# generation class (Qwen/Qwen3.5-2B and -4B, including the default profile;
+# see reliquary/shared/modeling.py's `_is_qwen35_conditional_config`). No
+# profile names an MoE checkpoint, so that architecture is deliberately absent
+# rather than pre-approved on spec. A task contract naming anything else is
+# refused at startup rather than at the first forward pass.
+SUPPORTED_MODEL_ARCHITECTURES = frozenset(
+    {"Qwen3ForCausalLM", "Qwen3_5ForConditionalGeneration"}
 )
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
@@ -787,8 +828,30 @@ _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
 
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.
+#
+# 1800 was sized against a 4B policy answering in 8,192 tokens. It did not stay
+# a backstop: production had to cut picks per window from the profile's 16 to 7
+# to fit under it, which buys the deadline with more than half the training
+# signal a window could carry. A bound that is met by shrinking the work is
+# setting the cadence, which is exactly what this is not for.
+#
+# Six hours, because the next policy is larger on every axis at once — roughly
+# twice the parameters, up to four times the token ceiling on maths, and a
+# multi-turn environment whose rollouts are conversations rather than answers.
+# Guessing the product of those and cutting it fine would repeat the mistake.
+#
+# A high value is safe here, and that is not an assumption: a window whose
+# proof-admission queue drains seals immediately on the liveness path (see
+# PROOF_ADMISSION_STALL_POLL_SECONDS), so this only ever extends a window where
+# work is still arriving. What it costs is a genuinely stuck window sealing
+# late; what it buys is never again sealing a healthy one short.
+#
+# It cannot move alone. The coherence check by WINDOW_TIMEOUT_SECONDS requires
+# `this * 2 < that` whenever proofs are unbounded, which is how production
+# runs, so 1800 against 7200 was exactly half the budget rather than a number
+# someone picked. Both move together and the ratio is preserved.
 FILL_CLOSED_MAX_SECONDS = float(_os.environ.get(
-    "RELIQUARY_FILL_CLOSED_MAX_SECONDS", "1800"
+    "RELIQUARY_FILL_CLOSED_MAX_SECONDS", "21600"
 ))
 if not _math.isfinite(FILL_CLOSED_MAX_SECONDS) or FILL_CLOSED_MAX_SECONDS <= 0:
     raise ValueError("RELIQUARY_FILL_CLOSED_MAX_SECONDS must be positive")
@@ -950,6 +1013,37 @@ DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
 # realistic training run (1M windows ≈ 700 days at 5 blocks × 12s). The
 # 14M-prompt env supplies enough fresh material without needing reuse.
 BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
+
+
+def thinking_for_environment(environment: str) -> bool:
+    """Whether this environment's prompts open a reasoning block.
+
+    Read by both prompt renderers — the one that produces the tokens a miner
+    generates from, and the one that feeds `prompt_content_sha256` — so they
+    cannot disagree. A disagreement between those two is not rejected; it is
+    dropped silently at seal.
+    """
+
+    profile = ACTIVE_PROTOCOL_PROFILE.environments.get(environment)
+    declared = getattr(profile, "thinking", None)
+    return True if declared is None else bool(declared)
+
+
+def prompt_cooldown_windows_for_environment(environment: str) -> int:
+    """The cooldown this environment declares, or the global default.
+
+    The default above was sized for a 14M-prompt corpus, where a million
+    windows means "single use for the life of the run". A curated corpus turns
+    that into starvation rather than rotation: at eight prompts per window a
+    2,285-task environment is spent in three days and then serves nothing at
+    all. An environment that knows its corpus is small says so in the profile.
+    """
+
+    profile = ACTIVE_PROTOCOL_PROFILE.environments.get(environment)
+    declared = getattr(profile, "prompt_cooldown_windows", None)
+    if declared is None:
+        return BATCH_PROMPT_COOLDOWN_WINDOWS
+    return int(declared)
 
 # Cooldown is restored at startup from a run-keyed snapshot persisted to R2
 # (see CooldownMap.export_state + service._restore_cooldown), so the FULL
@@ -1303,7 +1397,18 @@ SUBNET_START_BLOCK = 0
 # Safety-net timeout: a window auto-seals after this many seconds even
 # if fewer than B valid submissions have landed. The unused slots burn.
 # Set generously — this is a backstop, not the cadence.
-WINDOW_TIMEOUT_SECONDS = 7200
+#
+# Raised with FILL_CLOSED_MAX_SECONDS rather than on its own merits: the two
+# are bound by the coherence check below, which in the unbounded proof mode
+# production runs requires `backstop * 2 < this`. The backstop is the number
+# with a reason; this one is three times it, so the invariant holds with room
+# rather than exactly.
+#
+# This is also the binding one operationally. The backstop reads an environment
+# variable, so it can be tuned on a running fleet; this is a literal, so a
+# backstop above half of it cannot start at all. Leaving it low is what made
+# 1800 unraisable without a deploy.
+WINDOW_TIMEOUT_SECONDS = 64800
 if FILL_CLOSED_ENABLED and (
     FILL_CLOSED_MAX_SECONDS * (1 if FILL_CLOSED_BOUNDED_PROOFS else 2)
     >= WINDOW_TIMEOUT_SECONDS
@@ -1395,19 +1500,45 @@ if not _math.isfinite(LEARNING_RATE) or not 0.0 < LEARNING_RATE <= 1e-3:
 # warp() the identity so the trainer's ratio lives in the space the samples came
 # from. Pre-v4 the two spaces differ by a token-dependent factor, so the band is
 # left symmetric there rather than nominally "tuned" against a moving target.
-# Optimizer-state precision. bitsandbytes PagedAdamW8bit saves VRAM, but its
-# quantisation noise is a non-trivial fraction of a 1e-6 update, and DAPO §4.1
-# trains with plain AdamW. v4 therefore defaults to full precision; pre-v4 keeps
-# the 8-bit paged optimizer. Env-overridable in both directions, because whether
-# fp32 optimizer state fits alongside train_model + verify_model is a property
-# of the box, not of the profile.
-OPTIMIZER_STATE_8BIT = (
+# Optimizer precision. A 1e-6 step is under half a bf16 ulp once |w| >= 5.1e-4,
+# so stepping bf16 weights in place drops it whatever the moments' precision:
+# on the v1 trainer 0.01% of those weights moved over 112 checkpoints. v9 steps
+# fp32 master weights instead, against which 8-bit moments track fp32 AdamW
+# (cosine 1.000 on Teutonic-I tensors). Earlier profiles keep their dynamics;
+# both knobs are env-overridable.
+OPTIMIZER_MASTER_WEIGHTS = (
     _os.environ.get(
-        "RELIQUARY_OPTIMIZER_STATE_8BIT",
-        "0" if PROTOCOL_VERSION >= 4 else "1",
+        "RELIQUARY_OPTIMIZER_MASTER_WEIGHTS",
+        "1" if PROTOCOL_VERSION >= 9 else "0",
     )
     not in ("0", "false", "False")
 )
+OPTIMIZER_STATE_8BIT = (
+    _os.environ.get(
+        "RELIQUARY_OPTIMIZER_STATE_8BIT",
+        "0" if 4 <= PROTOCOL_VERSION < 9 else "1",
+    )
+    not in ("0", "false", "False")
+)
+
+# Which engine the miner generates single-turn rollouts on. transformers is the
+# reference; "vllm" runs the same forced draw through a vLLM logits processor,
+# measured level on seed agreement (0.964-0.980 per group against 0.970-0.974)
+# and worth ~12x the throughput, since a transformers decode step costs ~31 ms
+# whatever the batch. The proof always stays on the transformers copy.
+MINER_GENERATION_BACKEND = _os.environ.get(
+    "RELIQUARY_MINER_GENERATION_BACKEND", "transformers"
+).strip().lower()
+if MINER_GENERATION_BACKEND not in ("transformers", "vllm"):
+    raise ValueError(
+        "RELIQUARY_MINER_GENERATION_BACKEND must be 'transformers' or 'vllm'"
+    )
+# Concurrent rollouts the vLLM engine keeps in flight. 256 measured 6,050 tok/s
+# on an H200; the ceiling is the KV cache, which vLLM pages.
+MINER_VLLM_MAX_NUM_SEQS = int(
+    _os.environ.get("RELIQUARY_MINER_VLLM_MAX_NUM_SEQS", "256")
+)
+
 
 PPO_CLIP_EPSILON_LOW = 0.2
 PPO_CLIP_EPSILON_HIGH = 0.28 if PROTOCOL_VERSION >= 4 else 0.2

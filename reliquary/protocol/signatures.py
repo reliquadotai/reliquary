@@ -482,3 +482,79 @@ def verify_precommit_signature(
     except Exception as exc:
         logger.debug("precommit signature verify failed: %s", exc)
         return False
+
+
+CORPUS_DOMAIN = b"reliquary/corpus-submission/v1"
+
+
+def _corpus_fields(request) -> dict:
+    return request.model_dump() if hasattr(request, "model_dump") else dict(request)
+
+
+def build_corpus_binding(request) -> bytes:
+    """Digest of every field a corpus submission is admitted and paid on.
+
+    The same length-prefixed layout as the envelope binding. Completions are
+    bound in order, each as the digests of its tokens, text and proofs, so the
+    binding stays small however long the completions are.
+    """
+    body = _corpus_fields(request)
+
+    def _len_bytes(b: bytes) -> bytes:
+        return len(b).to_bytes(4, "big")
+
+    def _sha(b: bytes) -> bytes:
+        return hashlib.sha256(b).digest()
+
+    parts = [
+        str(body["job_id"]).encode("utf-8"),
+        str(body["miner_hotkey"]).encode("utf-8"),
+        int(body["cursor"]).to_bytes(8, "big", signed=False),
+        int(body["prompt_index"]).to_bytes(8, "big", signed=False),
+        str(body["checkpoint_sha256"]).encode("utf-8"),
+        _sha(str(body["rendered_prompt"]).encode("utf-8")),
+    ]
+    for completion in body["completions"]:
+        tokens = b"".join(int(t).to_bytes(4, "big", signed=False) for t in completion["tokens"])
+        proofs = b"".join(
+            _len_bytes(p.encode("ascii")) + p.encode("ascii")
+            for p in completion.get("proofs") or []
+        )
+        parts += [_sha(tokens), _sha(str(completion["text"]).encode("utf-8")), _sha(proofs)]
+    h = hashlib.sha256()
+    h.update(CORPUS_DOMAIN)
+    for part in parts:
+        h.update(_len_bytes(part))
+        h.update(part)
+    return h.digest()
+
+
+def corpus_submission_id(request) -> str:
+    """The submission's storage key: its signed binding, so a resend is the same object."""
+    return build_corpus_binding(request).hex()
+
+
+def sign_corpus_submission(wallet, request) -> str:
+    if bt is None:
+        raise ImportError("bittensor is required for sign_corpus_submission")
+    return wallet.hotkey.sign(build_corpus_binding(request)).hex()  # type: ignore[union-attr]
+
+
+def verify_corpus_signature(request) -> bool:
+    """False on any failure; fail-closed without bittensor, like the envelope."""
+    if bt is None:
+        logger.debug("verify_corpus_signature: bittensor unavailable")
+        return False
+    body = _corpus_fields(request)
+    try:
+        sig_bytes = bytes.fromhex(str(body.get("signature") or ""))
+    except ValueError:
+        return False
+    if not sig_bytes:
+        return False
+    try:
+        keypair = bt.Keypair(ss58_address=str(body["miner_hotkey"]))  # type: ignore[union-attr]
+        return bool(keypair.verify(data=build_corpus_binding(request), signature=sig_bytes))
+    except Exception as e:
+        logger.debug("corpus signature verify failed: %s", e)
+        return False

@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zlib
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from reliquary.protocol.toploc_wire import ProofB64
 from reliquary.shared.checkpoint_identity import canonical_checkpoint_identity
 from reliquary.shared.strict_json import strict_json_loads
 
@@ -47,6 +49,75 @@ def canonical_bytes(value: object) -> bytes:
 
 def digest(value: object) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+# The proof RPC is a latency path, so the marginal ratio above level 1 is not
+# worth its CPU: measured on real batches, level 1 gives -57% for 6.5 ms where
+# level 6 gives -60% for 25 ms.
+GZIP_LEVEL = 1
+# Below this a compressed body is not smaller than the plain one.
+GZIP_MIN_BYTES = 1024
+
+
+async def _refuse(send, status: int, detail: str) -> None:
+    await send({"type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body",
+                "body": b'{"detail":"%s"}' % detail.encode("ascii")})
+
+
+class InflateRequest:
+    """Decode ``Content-Encoding: gzip`` on request bodies.
+
+    The bound is applied to the DECOMPRESSED size, so ``MAX_*_REQUEST_BYTES``
+    keeps the meaning it has without compression and a compressed body cannot
+    make the worker allocate more than a plain one.
+
+    Pure ASGI on purpose: the endpoints consume ``request.stream()``, and a
+    BaseHTTPMiddleware that rewrites its own Request object leaves them reading
+    the still-compressed channel.
+    """
+
+    def __init__(self, app, limit: int):
+        self.app = app
+        self.limit = limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not any(
+            k == b"content-encoding" and v.lower() == b"gzip"
+            for k, v in scope["headers"]
+        ):
+            return await self.app(scope, receive, send)
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        body = bytearray()
+        more = True
+        try:
+            while more:
+                message = await receive()
+                if message["type"] != "http.request":
+                    break
+                body.extend(decoder.decompress(
+                    message.get("body", b""), self.limit - len(body) + 1))
+                if len(body) > self.limit:
+                    return await _refuse(send, 413, "request too large")
+                more = message.get("more_body", False)
+        except zlib.error:
+            return await _refuse(send, 400, "malformed gzip body")
+        if not decoder.eof:
+            return await _refuse(send, 400, "truncated gzip body")
+        payload, delivered = bytes(body), False
+
+        async def inflated_receive():
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.disconnect"}
+            delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        headers = [(k, v) for k, v in scope["headers"]
+                   if k not in (b"content-encoding", b"content-length")]
+        headers.append((b"content-length", str(len(payload)).encode("ascii")))
+        await self.app({**scope, "headers": headers}, inflated_receive, send)
 
 
 def transport_hash() -> str:
@@ -103,6 +174,10 @@ class ProofInput(WireModel):
     rollout: dict[str, JsonValue]
     randomness: Annotated[str, Field(min_length=2, max_length=256, pattern=r"^(?:0x)?[0-9a-fA-F]+$")]
     seed_u_values: Annotated[list[Probability], Field(max_length=MAX_TOKENS)] | None
+    # Sent only when the task's contract names toploc; the spec is the
+    # validator's, from its contract, never the miner's.
+    toploc_proofs: Annotated[list[ProofB64], Field(max_length=MAX_TOKENS)] | None = None
+    toploc_spec: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def aligned(self):
@@ -111,9 +186,14 @@ class ProofInput(WireModel):
         return self
 
     def commit(self) -> dict:
-        return {"tokens": self.tokens,
-                "commitments": [x.model_dump() for x in self.commitments],
-                "rollout": self.rollout}
+        commit = {"tokens": self.tokens,
+                  "commitments": [x.model_dump() for x in self.commitments],
+                  "rollout": self.rollout}
+        if self.toploc_proofs is not None:
+            commit["toploc_proofs"] = list(self.toploc_proofs)
+        if self.toploc_spec is not None:
+            commit["toploc_spec"] = dict(self.toploc_spec)
+        return commit
 
 
 class ProofRequest(WireModel):
@@ -171,6 +251,12 @@ class ProofValues(WireModel):
     terminal_pick_cdf_miss: Probability | None
     natural_close_pick_ok: bool | None
     natural_close_pick_cdf_miss: Probability | None
+    toploc_checked: bool = False
+    toploc_passed: bool = False
+    toploc_reason: Annotated[str, Field(max_length=64)] | None = None
+    toploc_worst_exp: Count = 0
+    toploc_worst_mant_mean: Annotated[float, Field(ge=0)] = 0.0
+    toploc_worst_mant_median: Annotated[float, Field(ge=0)] = 0.0
 
     @model_validator(mode="after")
     def aligned(self):

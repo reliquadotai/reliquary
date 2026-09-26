@@ -22,6 +22,32 @@ def observed_live_requested() -> bool:
     return mode == "observed_live"
 
 
+def observed_restart_checkpoint(pool):
+    """Resume only an adopted checkpoint recorded by this controller on disk."""
+    if os.environ.get("RELIQUARY_PROOF_RESUME_ADOPTED_CHECKPOINT", "0") != "1":
+        return None
+    from reliquary.validator.fill_closed_rotation import FillClosedRotationStore
+    from reliquary.validator.fill_closed_recovery import FillClosedRecoveryStore
+
+    state_dir = os.environ.get("RELIQUARY_STATE_DIR", "")
+    checkpoint = pool.health.checkpoint if pool.health is not None else None
+    if not observed_live_requested() or not state_dir or checkpoint is None:
+        raise ValueError("observed restart requires an adopted checkpoint and durable state")
+    binding = (checkpoint.checkpoint_n, checkpoint.revision)
+    gate = FillClosedRotationStore(state_dir).load()
+    if gate is not None and (
+        binding == (gate.parent_checkpoint_n, gate.parent_revision)
+        or (gate.requires_successor and gate.adoption_covers(checkpoint))
+    ):
+        return checkpoint
+    recovery = FillClosedRecoveryStore(state_dir)
+    for window in recovery.windows():
+        record = recovery.load(window)
+        if binding == (record["parent_checkpoint_n"], record["parent_revision"]):
+            return checkpoint
+    raise ValueError("observed restart checkpoint is absent from durable controller state")
+
+
 def _read_pinned(path, sha):
     if not isinstance(path, str) or not Path(path).is_absolute():
         raise ValueError("observed rollout evidence needs an absolute path")
@@ -135,13 +161,27 @@ def authorize_observed_live(pool, activation_revision):
         "device_uuid": slot.device_uuid, "hardware_class": slot.hardware_class,
         "environments": environments,
     }
+    evidence_checkpoint = health.checkpoint
+    pinned_identity = identity
+    if observed_restart_checkpoint(pool) is not None:
+        from reliquary.validator.remote_proof_protocol import CheckpointBinding
+        anchor = manifest.get("identity", {})
+        evidence_checkpoint = CheckpointBinding(**{
+            **health.checkpoint.model_dump(),
+            "checkpoint_n": anchor.get("checkpoint_n"),
+            "revision": anchor.get("checkpoint_revision"),
+        })
+        if health.checkpoint.checkpoint_n < evidence_checkpoint.checkpoint_n:
+            raise ValueError("observed restart cannot regress the evidence checkpoint")
+        pinned_identity = {**identity, "checkpoint_n": evidence_checkpoint.checkpoint_n,
+                           "checkpoint_revision": evidence_checkpoint.revision}
     if (not re.fullmatch(r"[0-9a-f]{40}", identity["controller_software_revision"] or "")
-            or manifest.get("identity") != identity):
+            or manifest.get("identity") != pinned_identity):
         raise ValueError("observed rollout controller/worker/runtime/checkpoint identity mismatch")
     evidence = manifest.get("evidence", {})
     natural = evidence.get("natural_attempts", {})
     summary = _natural_summary(_read_pinned(natural.get("path"), natural.get("sha256")),
-        health.checkpoint.model_dump(), environments)
+        evidence_checkpoint.model_dump(), environments)
     historical = evidence.get("historical_stress", {})
     if (historical.get("qualified_for_current_runtime") is not False
             or not re.fullmatch(r"[0-9a-f]{40}", historical.get("software_revision", ""))):
@@ -150,13 +190,14 @@ def authorize_observed_live(pool, activation_revision):
         _read_pinned(historical.get("path"), historical.get("sha256")).splitlines() if line.strip()]
     if not stress or any(
             row.get("software_revision") != historical["software_revision"]
-            or row.get("checkpoint_revision") != activation_revision
+            or row.get("checkpoint_revision") != evidence_checkpoint.revision
             or row.get("device_uuid") != slot.device_uuid
             or row.get("environment") not in environments for row in stress):
         raise ValueError("historical stress source/checkpoint/GPU evidence mismatch")
     return {"mode": "observed_live", "qualified": False,
         "operator_authorized": True, "authorization_sha256": sha,
         "identity": identity, "budget": budget, "benchmark_evidence": evidence,
+        "evidence_checkpoint": evidence_checkpoint.model_dump(),
         "natural_observations": summary,
         "historical_stress_observations": {"groups": len(stress),
             "source_revision": historical["software_revision"], "qualified_for_current_runtime": False},

@@ -5,12 +5,14 @@ import atexit
 import logging
 import math
 import os
+import resource
 import shutil
 import socket as _socket
 import subprocess
 import sys
 import threading
 import time as _time
+from collections.abc import Mapping
 from pathlib import Path
 
 import typer
@@ -23,6 +25,8 @@ from reliquary.constants import (
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
+    MINER_GENERATION_BACKEND,
+    MINER_VLLM_MAX_NUM_SEQS,
     PROOF_SLOTS_PER_DEVICE,
     PROTOCOL_MODEL_ID,
     PROTOCOL_MODEL_REVISION,
@@ -82,7 +86,7 @@ async def read_task_registry_with_retry(
     raise last
 
 
-def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
+def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None):
     """One registry entry: shipped controller defaults, then explicit overrides."""
     from dataclasses import asdict
 
@@ -90,6 +94,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
     from reliquary.protocol.profiles import resolve_protocol_profile
     from reliquary.shared.task_id import normalise_task_id
     from reliquary.shared.task_registry import (
+        KNOWN_VERIFICATION,
         MECHANISM_RL_DISCOVERED_PRICE,
         TaskEntry,
     )
@@ -122,6 +127,11 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
                 f"{sorted(uncovered)}, which profile {profile.profile_id!r} "
                 f"also declares; env_split must name every profile environment"
             )
+    if verification is not None and verification not in KNOWN_VERIFICATION:
+        raise ValueError(
+            f"--verification must be one of {', '.join(sorted(KNOWN_VERIFICATION))}, "
+            f"got {verification!r}; omit it to let each validator derive it from its card"
+        )
     params = asdict(PRODUCTION_PRICE_PARAMS)
     params.update(overrides)
     params["cap"] = float(cap)
@@ -134,7 +144,178 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None):
         status="active",
         retired_at=None,
         env_split=env_split,
+        verification=verification,
     )
+
+
+def build_contract_task_entry(
+    *,
+    task_id,
+    from_profile,
+    model_id,
+    model_revision,
+    model_architecture,
+    environments,
+    cap,
+    overrides,
+    verification=None,
+):
+    """One registry entry that CARRIES its contract, seeded from a template.
+
+    The template is a starting point, never the authority: the entry's contract
+    is what the fleet will run, and its digest is computed from that contract.
+
+    ``verification`` stays OUTSIDE the contract, beside it on the entry: it says
+    how validators check the work, not what the work is, so it must not change
+    the contract's digest. A task generating on a large mixture-of-experts model
+    is the case that needs it.
+    """
+    from dataclasses import asdict
+
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_id import normalise_task_id
+    from reliquary.shared.task_registry import (
+        MECHANISM_RL_DISCOVERED_PRICE,
+        TaskEntry,
+    )
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    task_id = normalise_task_id(task_id)
+    contract = dict(resolve_protocol_profile(from_profile).to_generation_contract())
+
+    # The task id IS the contract's profile id: two tasks seeded from one
+    # template must stay distinguishable to the checks that compare them.
+    contract["profile_id"] = task_id
+    contract["model_id"] = model_id
+    contract["model_revision"] = model_revision
+    # Knowing an arbitrary HF repo's architecture means fetching its config,
+    # which this builder cannot do and stay pure (no network, no filesystem).
+    # The operator states it; whether THIS image can run it is checked at
+    # startup in `resolve_task_config`, against the image's own capability
+    # list, not duplicated here where it could drift out of sync.
+    contract["model_architecture"] = model_architecture
+
+    if environments is not None:
+        if not environments:
+            raise ValueError(
+                "--envs must name at least one environment, or be omitted "
+                "to keep the template's full set"
+            )
+        declared = contract["environments"]
+        unknown = sorted(set(environments) - set(declared))
+        if unknown:
+            raise ValueError(
+                f"template {from_profile!r} does not declare {unknown}; "
+                f"it has {sorted(declared)}"
+            )
+        contract["environments"] = {
+            name: declared[name] for name in sorted(environments)
+        }
+
+    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params.update(overrides)
+    params["cap"] = float(cap)
+    return TaskEntry(
+        task_id=task_id,
+        profile_id=task_id,
+        profile_sha256=canonical_sha256(contract),
+        mechanism=MECHANISM_RL_DISCOVERED_PRICE,
+        params=params,
+        status="active",
+        retired_at=None,
+        env_split=None,
+        contract=contract,
+        verification=verification,
+    )
+
+
+def build_corpus_task_entry(
+    *,
+    task_id,
+    job_id,
+    from_profile,
+    model_id,
+    model_revision,
+    model_architecture,
+    prompt_source,
+    cap,
+    overrides,
+    verification=None,
+    min_incentive_share=0.0,
+    audit_params: Mapping | None = None,
+):
+    """One registry entry for a corpus generation job.
+
+    The contract is built exactly as an RL task's is, narrowed to the single
+    environment the job draws its prompts from, so a validator that boots this
+    task installs precisely what the job reads. ``job_id`` stays OUTSIDE the
+    contract, beside it on the entry: the contract says how generation happens
+    and is compared against what the binary derives at startup, while the job
+    says which work to do.
+    """
+    from dataclasses import replace
+
+    from reliquary.environment.abi import canonical_sha256
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+    # A corpus task's price IS its cap, so accepting a floor and then
+    # overwriting it would be the silent drop this CLI refuses elsewhere.
+    if "floor" in overrides and float(overrides["floor"]) != float(cap):
+        raise ValueError(
+            f"a corpus task pins its price at its cap, so floor "
+            f"{overrides['floor']} cannot be declared against cap {cap}"
+        )
+    entry = build_contract_task_entry(
+        task_id=task_id,
+        from_profile=from_profile,
+        model_id=model_id,
+        model_revision=model_revision,
+        model_architecture=model_architecture,
+        environments=[prompt_source],
+        cap=cap,
+        overrides=overrides,
+        verification=verification,
+    )
+    # V0 has no price discovery: floor == cap is what keeps `advance()` still.
+    params = {**entry.params, "floor": entry.params["cap"]}
+    # Every verified token is paid: a floor cut here would drop small miners'
+    # work, so a corpus task starts with none unless the operator names one.
+    params["min_incentive_share"] = float(min_incentive_share)
+    params["min_incentive_ramp_start"] = min(
+        float(params.get("min_incentive_ramp_start", 0.0)), float(min_incentive_share)
+    )
+    # Absent keys mean V0 (full audit); the caller (`jobs create`) is the one
+    # that writes q/probation/hold defaults, so this builder itself declares
+    # none unless told to.
+    if audit_params:
+        params.update(audit_params)
+    contract = _with_enforced_toploc(entry.contract)
+    return replace(
+        entry,
+        mechanism=MECHANISM_CORPUS_GENERATION,
+        params=params,
+        job_id=job_id,
+        contract=contract,
+        profile_sha256=canonical_sha256(contract),
+    )
+
+
+def _with_enforced_toploc(contract):
+    """A corpus task is paid only on audited work, and the corpus validator
+    refuses a contract without an enforced toploc proof. No compiled template
+    carries one, so the template's own toploc entry is enforced if it has one,
+    and Prime Intellect's deployed defaults are added otherwise."""
+    from reliquary.protocol.profiles import PROOF_SCHEME_TOPLOC, TOPLOC_DEPLOYED_DEFAULTS
+
+    proofs = [dict(p) for p in contract.get("proofs") or ()]
+    toploc = [p for p in proofs if p.get("scheme") == PROOF_SCHEME_TOPLOC]
+    if toploc:
+        for proof in toploc:
+            proof["mode"] = "enforce"
+    else:
+        proofs.append(TOPLOC_DEPLOYED_DEFAULTS.to_contract())
+    return {**contract, "proofs": proofs}
 
 
 tasks_app = typer.Typer(name="tasks", help="Declare and retire subnet tasks")
@@ -170,7 +351,9 @@ def _parse_env_split_option(value: str | None) -> dict[str, float] | None:
 @tasks_app.command("create")
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
-    profile_id: str = typer.Option(..., "--profile-id"),
+    profile_id: str = typer.Option(
+        None, "--profile-id", help="Compiled profile to pin; refused with --model"
+    ),
     cap: float = typer.Option(..., "--cap", help="Most of the pool this task may pay"),
     start: float = typer.Option(None, "--start"),
     decay: float = typer.Option(None, "--decay"),
@@ -179,19 +362,107 @@ def tasks_create(
         "--env-split",
         help="How the cap divides between environments, e.g. math=0.6,code=0.4",
     ),
+    model: str = typer.Option(
+        None, "--model", help="Model id; implies a carried contract"
+    ),
+    model_revision: str = typer.Option(None, "--model-revision"),
+    model_architecture: str = typer.Option(
+        None,
+        "--model-architecture",
+        help="Architecture class the model config declares, e.g. Qwen3ForCausalLM",
+    ),
+    from_profile: str = typer.Option(
+        None, "--from-profile", help="Template to seed the contract from"
+    ),
+    envs: str = typer.Option(
+        None, "--envs", help="Comma-separated subset of the template's environments"
+    ),
+    verification: str = typer.Option(
+        None,
+        "--verification",
+        help=(
+            "Pin how rollouts are verified: 'resident' holds the model on the card, "
+            "'streamed' walks it one layer at a time. Omit to let each validator derive "
+            "it from its own card."
+        ),
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
 
     overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
     try:
-        entry = build_task_entry(
-            task_id=task_id,
-            profile_id=profile_id,
-            cap=cap,
-            overrides=overrides,
-            env_split=_parse_env_split_option(env_split),
-        )
+        if model is not None:
+            if profile_id is not None:
+                # An operator who passes an option believes it does
+                # something; silently dropping --profile-id here would be
+                # the same trap this branch keeps finding elsewhere. This
+                # path is new, so nothing can already depend on the
+                # permissive behaviour.
+                typer.echo(
+                    "error: --profile-id has no effect with --model; use "
+                    "--from-profile to select the template",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            if env_split is not None:
+                # Same trap as --profile-id: the contract path builds
+                # env_split=None, so the shares an operator typed would be
+                # dropped without a word.
+                typer.echo(
+                    "error: --env-split has no effect with --model; a carried "
+                    "contract declares its own environment set, selected with "
+                    "--envs",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            # The builder cannot infer any of these (a template is not a
+            # network call, and architecture needs one) -- so all three are
+            # required together, and each missing one is named, not guessed.
+            missing = [
+                flag
+                for flag, value in (
+                    ("--model-revision", model_revision),
+                    ("--from-profile", from_profile),
+                    ("--model-architecture", model_architecture),
+                )
+                if value is None
+            ]
+            if missing:
+                typer.echo(
+                    f"error: --model requires {', '.join(missing)}", err=True,
+                )
+                raise typer.Exit(code=1)
+            entry = build_contract_task_entry(
+                task_id=task_id,
+                from_profile=from_profile,
+                model_id=model,
+                model_revision=model_revision,
+                model_architecture=model_architecture,
+                environments=(
+                    None
+                    if envs is None
+                    else [e.strip() for e in envs.split(",") if e.strip()]
+                ),
+                cap=cap,
+                overrides=overrides,
+                verification=verification,
+            )
+        else:
+            if profile_id is None:
+                typer.echo(
+                    "error: --profile-id is required unless --model is given",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            entry = build_task_entry(
+                task_id=task_id,
+                profile_id=profile_id,
+                cap=cap,
+                overrides=overrides,
+                env_split=_parse_env_split_option(env_split),
+                verification=verification,
+            )
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -202,6 +473,7 @@ def tasks_create(
         raise typer.Exit(code=1) from exc
     typer.echo(
         f"declared task {entry.task_id} on {entry.profile_id} with cap {cap}"
+        + (f", verified {entry.verification}" if entry.verification else "")
     )
 
 
@@ -219,6 +491,67 @@ def tasks_list() -> None:
     typer.echo(f"total declared cap: {total_cap(entries):.4f} / 1.0")
 
 
+@tasks_app.command("set-cap")
+def tasks_set_cap(
+    task_id: str = typer.Option(..., "--task-id"),
+    cap: float = typer.Option(..., "--cap", help="The task's new share of the pool"),
+    floor: float = typer.Option(
+        None, "--floor",
+        help="New price floor; omitted, an RL task keeps its floor and a corpus task's follows the cap",
+    ),
+    min_incentive_share: float = typer.Option(
+        None, "--min-incentive-share",
+        help="Minimum share of THIS task a hotkey needs to be paid; 0 pays everyone",
+    ),
+    audit_q: float = typer.Option(
+        None, "--audit-q",
+        help="Sampled fraction of audits once a hotkey is out of probation; 1.0 audits everything",
+    ),
+    audit_probation_submissions: int = typer.Option(
+        None, "--audit-probation-submissions",
+        help="Audited passes a new hotkey needs, with no confirmed failure, before sampling starts",
+    ),
+    audit_hold_seconds: float = typer.Option(
+        None, "--audit-hold-seconds",
+        help="Hold before an unaudited (sampled and not drawn) submission is payable",
+    ),
+    audit_suspect_seconds: float = typer.Option(
+        None, "--audit-suspect-seconds",
+        help="How long a hotkey with one confirmed failure is audited at 100%",
+    ),
+    audit_ban_after_failures: int = typer.Option(
+        None, "--audit-ban-after-failures",
+        help="Confirmed failures inside the ban window that ban the hotkey",
+    ),
+    audit_ban_window_seconds: float = typer.Option(
+        None, "--audit-ban-window-seconds",
+        help="The window confirmed failures are counted in for a ban",
+    ),
+    audit_ban_seconds: float = typer.Option(
+        None, "--audit-ban-seconds",
+        help="How long a ban lasts",
+    ),
+) -> None:
+    """Change a live task's cap; its contract and digest are untouched."""
+    from reliquary.infrastructure import task_registry_store as store
+    from reliquary.shared.task_registry import RegistryError
+
+    try:
+        asyncio.run(store.set_task_cap(
+            task_id, cap, floor=floor, min_incentive_share=min_incentive_share, audit_q=audit_q,
+            audit_probation_submissions=audit_probation_submissions,
+            audit_hold_seconds=audit_hold_seconds,
+            audit_suspect_seconds=audit_suspect_seconds,
+            audit_ban_after_failures=audit_ban_after_failures,
+            audit_ban_window_seconds=audit_ban_window_seconds,
+            audit_ban_seconds=audit_ban_seconds,
+        ))
+    except (RegistryError, store.RegistryConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"task {task_id} now has cap {cap}" + (f" and floor {floor}" if floor is not None else ""))
+
+
 @tasks_app.command("retire")
 def tasks_retire(
     task_id: str = typer.Option(..., "--task-id"),
@@ -230,6 +563,720 @@ def tasks_retire(
     typer.echo(
         f"retired {task_id}; its cap stays reserved until its EMA tail decays"
     )
+
+
+@tasks_app.command("contract")
+def tasks_contract(task_id: str = typer.Option(..., "--task-id")) -> None:
+    """Print a task's carried contract, for a deployment to mount."""
+    import json
+
+    from reliquary.infrastructure.task_registry_store import read_registry
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    entry = entries.get(task_id)
+    if entry is None:
+        typer.echo(f"error: no task {task_id!r} in the registry", err=True)
+        raise typer.Exit(code=1)
+    if entry.contract is None:
+        typer.echo(
+            f"error: task {task_id!r} is a legacy entry and carries no contract",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(entry.contract, sort_keys=True, separators=(",", ":")))
+
+
+jobs_app = typer.Typer(
+    name="jobs", help="Declare and cancel corpus generation jobs"
+)
+app.add_typer(jobs_app)
+
+
+def build_job_manifest(
+    *,
+    job_id,
+    checkpoint_repo,
+    checkpoint_revision,
+    checkpoint_sha256,
+    prompt_source,
+    prompt_count,
+    renderer_id,
+    eos_token_id,
+    slots_per_prompt,
+    temperature,
+    top_p,
+    top_k,
+    min_new_tokens,
+    max_new_tokens,
+    n,
+    grader_id,
+    threshold,
+    prompt_order,
+    deadline_round,
+    from_profile=None,
+):
+    """The manifest as the job store will hold it, refused unless every
+    submission it will ever be paid for could be admitted.
+
+    Field-level refusals live in `parse_job`, which this runs itself rather
+    than leaving to the store: the rule below needs a parsed job, and a
+    manifest that only fails at the store is one the source check never saw.
+    The filter pairing is the one rule `parse_job` cannot see, because by then
+    the filter is either built or absent.
+    """
+    from reliquary.corpus.job import JOB_SCHEMA, parse_job
+    from reliquary.validator.corpus_service import prompt_job_for_spec
+
+    if (grader_id is None) != (threshold is None):
+        raise ValueError(
+            "--grader-id and --threshold go together: a filter needs both, and "
+            "a job that keeps every completion declares neither"
+        )
+    manifest = {
+        "schema": JOB_SCHEMA,
+        "job_id": job_id,
+        "checkpoint_repo": checkpoint_repo,
+        "checkpoint_revision": checkpoint_revision,
+        "checkpoint_sha256": checkpoint_sha256,
+        "prompt_source": prompt_source,
+        "prompt_count": prompt_count,
+        "renderer_id": renderer_id,
+        "eos_token_id": eos_token_id,
+        "sampling": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_new_tokens": min_new_tokens,
+            "max_new_tokens": max_new_tokens,
+            "n": n,
+        },
+        "slots_per_prompt": slots_per_prompt,
+        "filter": (
+            None
+            if grader_id is None
+            else {"grader_id": grader_id, "threshold": threshold}
+        ),
+        "prompt_order": prompt_order,
+        "deadline_round": deadline_round,
+    }
+    # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
+    # both are refusals the operator would otherwise meet one submission at a
+    # time: an unrenderable source fails fidelity forever, and a prompt_count
+    # above the source's length is a 500 on the first submission and every one
+    # after it. The profile checked against is the template the TASK is seeded
+    # from, not whichever one this CLI process happens to run: it is the one
+    # the fleet will render these prompts with.
+    prompt_job_for_spec(parse_job(manifest), profile=from_profile)
+    return manifest
+
+
+@jobs_app.command("create")
+def jobs_create(
+    job_id: str = typer.Option(..., "--job-id", help="Name of the corpus job"),
+    task_id: str = typer.Option(
+        None, "--task-id", help="Registry key; defaults to the job id"
+    ),
+    model: str = typer.Option(
+        ..., "--model", help="Frozen checkpoint repo; also the job's checkpoint"
+    ),
+    model_revision: str = typer.Option(..., "--model-revision"),
+    model_architecture: str = typer.Option(
+        ...,
+        "--model-architecture",
+        help="Architecture class the model config declares, e.g. Qwen3ForCausalLM",
+    ),
+    checkpoint_sha256: str = typer.Option(
+        ..., "--checkpoint-sha256", help="64 lowercase hex characters"
+    ),
+    from_profile: str = typer.Option(
+        ..., "--from-profile", help="Template to seed the contract from"
+    ),
+    prompt_source: str = typer.Option(
+        ...,
+        "--prompt-source",
+        help="The installed environment the job draws prompts from; it becomes "
+        "the contract's single environment",
+    ),
+    prompt_count: int = typer.Option(
+        ...,
+        "--prompt-count",
+        help="Rows of the source this job owns; checked against the source's "
+        "own length, which BUILDS it -- a dataset-backed source must be "
+        "readable from here to declare a job over it",
+    ),
+    renderer_id: str = typer.Option(..., "--renderer-id"),
+    eos_token_id: int = typer.Option(..., "--eos-token-id"),
+    slots_per_prompt: int = typer.Option(..., "--slots-per-prompt"),
+    max_new_tokens: int = typer.Option(
+        None,
+        "--max-new-tokens",
+        help="Omit to take the budget the template gives this prompt source",
+    ),
+    cap: float = typer.Option(
+        ..., "--cap", help="The task's share of the pool; also its pinned price"
+    ),
+    min_incentive_share: float = typer.Option(
+        0.0,
+        "--min-incentive-share",
+        help="Minimum share of this task a hotkey needs to be paid; 0 pays every verified token",
+    ),
+    audit_q: float = typer.Option(
+        1.0,
+        "--audit-q",
+        help="Sampled fraction of audits once a hotkey is out of probation; 1.0 (default) audits everything",
+    ),
+    audit_probation_submissions: int = typer.Option(
+        100,
+        "--audit-probation-submissions",
+        help="Audited passes a new hotkey needs, with no confirmed failure, before sampling starts",
+    ),
+    audit_hold_seconds: int = typer.Option(
+        4320,
+        "--audit-hold-seconds",
+        help="Hold before an unaudited (sampled and not drawn) submission is payable",
+    ),
+    audit_suspect_seconds: int = typer.Option(
+        86400,
+        "--audit-suspect-seconds",
+        help="How long a hotkey with one confirmed failure is audited at 100%",
+    ),
+    audit_ban_after_failures: int = typer.Option(
+        3,
+        "--audit-ban-after-failures",
+        help="Confirmed failures inside the ban window that ban the hotkey",
+    ),
+    audit_ban_window_seconds: int = typer.Option(
+        604800,
+        "--audit-ban-window-seconds",
+        help="The window confirmed failures are counted in for a ban",
+    ),
+    audit_ban_seconds: int = typer.Option(
+        604800,
+        "--audit-ban-seconds",
+        help="How long a ban lasts",
+    ),
+    min_new_tokens: int = typer.Option(
+        2,
+        "--min-new-tokens",
+        help="Tokens a completion must reach, terminator included; 2 is the "
+        "lowest a job may declare, because 1 would pay for a completion whose "
+        "only token is the terminator",
+    ),
+    temperature: float = typer.Option(1.0, "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    top_k: int = typer.Option(0, "--top-k"),
+    n: int = typer.Option(1, "--n", help="Completions per submitted slot"),
+    grader_id: str = typer.Option(
+        None, "--grader-id", help="Rejection sampling: what decides membership"
+    ),
+    threshold: float = typer.Option(None, "--threshold"),
+    prompt_order: str = typer.Option("free", "--prompt-order"),
+    deadline_round: int = typer.Option(None, "--deadline-round"),
+    start: float = typer.Option(None, "--start"),
+    decay: float = typer.Option(None, "--decay"),
+    verification: str = typer.Option(
+        None,
+        "--verification",
+        help=(
+            "Pin how rollouts are verified: 'resident' holds the model on the "
+            "card, 'streamed' walks it one layer at a time. Omit to let each "
+            "validator derive it from its own card."
+        ),
+    ),
+    fleet_knows_corpus_generation: bool = typer.Option(
+        False,
+        "--fleet-knows-corpus-generation",
+        help=(
+            "Required. Confirms that every validator already runs a binary "
+            "that knows the 'corpus-generation' mechanism; one corpus entry "
+            "makes the whole registry unreadable to any that does not, and "
+            "those validators refuse to start."
+        ),
+    ),
+) -> None:
+    """Write the job manifest and the registry entry that pays for it."""
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.task_registry_store import (
+        RegistryConflict,
+        create_task,
+    )
+    from reliquary.shared.task_registry import (
+        RegistryError,
+        require_fleet_knows_corpus_generation,
+    )
+
+    overrides = {
+        k: v for k, v in (("start", start), ("decay", decay)) if v is not None
+    }
+    try:
+        if max_new_tokens is None:
+            # The template budgets each environment for its model, and the RL
+            # task on the same source generates to that length already.
+            from reliquary.protocol.profiles import resolve_protocol_profile
+
+            environments = resolve_protocol_profile(from_profile).environments
+            if prompt_source not in environments:
+                raise ValueError(
+                    f"template {from_profile!r} does not declare {prompt_source!r}; "
+                    "pass --max-new-tokens"
+                )
+            max_new_tokens = environments[prompt_source].max_new_tokens
+        manifest = build_job_manifest(
+            job_id=job_id,
+            # The contract's model IS the job's frozen checkpoint. Taking both
+            # from one flag is what makes them unable to disagree: a validator
+            # verifying one model while admitting against another job would
+            # pay for work nobody can reproduce.
+            checkpoint_repo=model,
+            checkpoint_revision=model_revision,
+            checkpoint_sha256=checkpoint_sha256,
+            prompt_source=prompt_source,
+            prompt_count=prompt_count,
+            renderer_id=renderer_id,
+            # The same template the entry's contract is built from, so the
+            # manifest is checked against the contract this command declares.
+            from_profile=from_profile,
+            eos_token_id=eos_token_id,
+            slots_per_prompt=slots_per_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_new_tokens=min_new_tokens,
+            max_new_tokens=max_new_tokens,
+            n=n,
+            grader_id=grader_id,
+            threshold=threshold,
+            prompt_order=prompt_order,
+            deadline_round=deadline_round,
+        )
+        entry = build_corpus_task_entry(
+            task_id=task_id or job_id,
+            job_id=job_id,
+            from_profile=from_profile,
+            model_id=model,
+            model_revision=model_revision,
+            model_architecture=model_architecture,
+            prompt_source=prompt_source,
+            cap=cap,
+            overrides=overrides,
+            verification=verification,
+            min_incentive_share=min_incentive_share,
+            audit_params={
+                "audit_q": audit_q,
+                "audit_probation_submissions": audit_probation_submissions,
+                "audit_hold_seconds": audit_hold_seconds,
+                "audit_suspect_seconds": audit_suspect_seconds,
+                "audit_ban_after_failures": audit_ban_after_failures,
+                "audit_ban_window_seconds": audit_ban_window_seconds,
+                "audit_ban_seconds": audit_ban_seconds,
+            },
+        )
+    except (RegistryError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Before either write, so a refusal leaves nothing behind. The guard is in
+    # `task_registry` and does not know this CLI, so the flag is named here.
+    try:
+        require_fleet_knows_corpus_generation(
+            entry, acknowledged=fleet_knows_corpus_generation
+        )
+    except RegistryError as exc:
+        typer.echo(
+            f"error: {exc} Pass --fleet-knows-corpus-generation.", err=True
+        )
+        raise typer.Exit(code=1) from exc
+
+    try:
+        asyncio.run(job_store.write_job(manifest, None))
+    except job_store.CorpusStoreConflict as exc:
+        # Replacing a live job's manifest would change the work under miners
+        # already holding slots against it.
+        typer.echo(
+            f"error: job {job_id!r} already has a manifest; pick another job id",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # The registry write goes last because it is the one that can lose a race
+    # or break the sum rule.
+    try:
+        asyncio.run(create_task(entry))
+    except (RegistryError, RegistryConflict) as exc:
+        # These two refuse INSTEAD of putting: a rule rejected the entry, or
+        # every attempt lost its compare-and-swap. Nothing landed, so the
+        # manifest is a job nobody pays for and is safe to take back.
+        try:
+            asyncio.run(job_store.delete_job(job_id))
+        except Exception:
+            typer.echo(
+                f"error: the task was not declared AND its manifest could not "
+                f"be removed; delete job {job_id!r} by hand before retrying",
+                err=True,
+            )
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        # Transport, timeout, anything else: the put MAY have landed. Deleting
+        # the manifest now is the worst outcome available -- a declared task
+        # holding a cap share and refusing every submission it is paid for --
+        # so leave it and make the operator look.
+        typer.echo(f"error: {exc}", err=True)
+        typer.echo(
+            f"error: the registry write for job {job_id!r} did not confirm, so "
+            f"its manifest is LEFT IN PLACE. Run `reliquary jobs list` to see "
+            f"whether the task landed before retrying.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"declared job {job_id} as task {entry.task_id} on {prompt_source} "
+        f"with cap {cap} pinned as its price"
+        + (f", verified {entry.verification}" if entry.verification else "")
+    )
+
+
+@jobs_app.command("list")
+def jobs_list() -> None:
+    """Every job with a manifest, and the task that declares it, if any."""
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.task_registry_store import read_registry
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    declared = {
+        entry.job_id: entry
+        for _, entry in sorted(entries.items(), reverse=True)
+        if entry.job_id
+    }
+    stored = asyncio.run(job_store.list_jobs())
+    for job_id in stored:
+        entry = declared.get(job_id)
+        if entry is None:
+            # An orphan is what a failed rollback leaves; it must be visible.
+            typer.echo(f"{job_id:24s} no task entry")
+        else:
+            typer.echo(
+                f"{job_id:24s} {entry.status:8s} task={entry.task_id} "
+                f"cap={entry.params['cap']:.3f}"
+            )
+    for job_id, entry in sorted(declared.items()):
+        if job_id not in stored:
+            # The mirror image: a task that would refuse its first submission.
+            typer.echo(f"{job_id:24s} declared by {entry.task_id}, NO MANIFEST")
+
+
+def _job_grader(job):
+    """The grader `--apply-filter` scores every completion with: the job's own
+    prompt source, at its own filter's threshold. Episode-mode sources cannot
+    grade a single completion text this way (there is no single-turn
+    `get_problem`/`compute_reward` for them), so this refuses instead of
+    grading wrongly."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.validator.corpus_service import _owned_position
+
+    if job.filter is None:
+        raise typer.BadParameter(f"job {job.job_id!r} has no filter to apply")
+    spec = ENVIRONMENT_SPECS[job.prompt_source]
+    if spec.interaction_mode == "episode":
+        raise typer.BadParameter(
+            f"prompt source {job.prompt_source!r} is episode-mode; "
+            "--apply-filter cannot grade a single completion text against it"
+        )
+    environment = spec.create()
+    threshold = job.filter.threshold
+
+    def grade(prompt_index: int, text: str) -> tuple[bool, float]:
+        problem = environment.get_problem(_owned_position(job, prompt_index))
+        reward = environment.compute_reward(problem, text)
+        return reward >= threshold, reward
+
+    return grade
+
+
+@jobs_app.command("export")
+def jobs_export(
+    job_id: str = typer.Argument(...),
+    out: str = typer.Option(..., "--out"),
+    apply_filter: bool = typer.Option(False, "--apply-filter"),
+    only_accepted: bool = typer.Option(False, "--only-accepted"),
+) -> None:
+    """Write the verified completions of a job as JSON lines.
+
+    Written to a temporary file beside `--out` and swapped in with
+    `os.replace` only once the export completes, so a mid-stream failure (the
+    record store, the grader) never leaves a truncated, valid-looking dataset
+    in its place -- and any pre-existing `--out` is untouched until then.
+    """
+    import json
+
+    from reliquary.corpus.export import export_rows
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+
+    async def _run() -> int:
+        job, _ = await job_store.read_job(job_id)
+        if job is None:
+            raise typer.BadParameter(f"no job {job_id!r}")
+        grade = _job_grader(job) if apply_filter else None
+        temporary = f"{out}.{os.getpid()}.tmp"
+        written = 0
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                async for row in export_rows(
+                    job=job, records=BucketRecordStore(), grade=grade
+                ):
+                    if only_accepted and not row.get("accepted", True):
+                        continue
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    written += 1
+            os.replace(temporary, out)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        return written
+
+    typer.echo(f"{asyncio.run(_run())} rows written to {out}")
+
+
+@jobs_app.command("status")
+def jobs_status(job_id: str = typer.Argument(...)) -> None:
+    """How far a job is from drained: accepted, audited and settled counts.
+
+    Read-only. The stop procedure waits for `drained: yes` before
+    `jobs cancel`: retiring the task is a boot gate, so anything not yet
+    audited or settled when the corpus validator stops is never paid.
+    """
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+
+    async def _read():
+        records = BucketRecordStore()
+        submissions = set(await records.list_submission_ids(job_id))
+        verdicts = set(await records.list_verdict_ids(job_id))
+        state, _ = await records.read_settlement(job_id)
+        return submissions, verdicts, state or {}
+
+    submissions, verdicts, state = asyncio.run(_read())
+    settled = verdicts & set(state.get("settled") or ())
+    pending = state.get("pending")
+    pending_window = pending["window"] if pending else None
+    last_window = state.get("last_window")
+    unaudited = len(submissions - verdicts)
+    unsettled = len(verdicts - settled)
+    typer.echo(
+        f"{job_id}: submissions={len(submissions)} verdicts={len(verdicts)} "
+        f"unaudited={unaudited} settled={len(settled)} unsettled={unsettled} "
+        f"pending={'none' if pending_window is None else pending_window} "
+        f"last_window={'none' if last_window is None else last_window}"
+    )
+    drained = unaudited == 0 and unsettled == 0 and pending is None
+    typer.echo(f"drained: {'yes' if drained else 'no'}")
+
+
+@jobs_app.command("miner-reset")
+def jobs_miner_reset(
+    job_id: str = typer.Option(..., "--job-id"),
+    hotkeys: list[str] = typer.Option(None, "--hotkey", help="Repeatable"),
+    all_hotkeys: bool = typer.Option(False, "--all", help="Every hotkey in the job's miners.json"),
+) -> None:
+    """Clear hotkeys' suspect, ban and confirmed failures in the job's miners.json.
+
+    For a validator-side systematic failure (wrong card or kernel band, wrong
+    checkpoint) that failed honest miners. Only the state is reset: verdicts
+    are write-once, so records already failed or voided `banned` stay unpaid.
+    """
+    from dataclasses import replace
+
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    if bool(hotkeys) == all_hotkeys:
+        typer.echo("error: name hotkeys with --hotkey, or pass --all (not both)", err=True)
+        raise typer.Exit(code=1)
+    states = MinerStates(BucketRecordStore(), job_id)
+
+    def clear(m):
+        return replace(m, suspect_until=None, banned_until=None, confirmed_failures=[])
+
+    async def _run() -> list[str]:
+        stored = await states.hotkeys()
+        unknown = sorted(set(hotkeys or ()) - set(stored))
+        if unknown:
+            # A typo must not read as a reset of a hotkey that was never caught.
+            raise typer.BadParameter(f"no miner state for {', '.join(unknown)} in job {job_id!r}")
+        targets = stored if all_hotkeys else sorted(set(hotkeys))
+        if targets:
+            await states.update_many({hotkey: clear for hotkey in targets})
+        return targets
+
+    try:
+        targets = asyncio.run(_run())
+    except typer.BadParameter as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"reset {len(targets)} hotkey(s) in job {job_id}: {', '.join(targets) or '-'}")
+    typer.echo(
+        "suspect, ban and confirmed failures cleared; audited_passed is kept, so a "
+        "hotkey a failure reset to 0 goes through probation again (audited in full, "
+        "paid normally). Verdicts already written stay: records failed or voided "
+        "'banned' stay unpaid."
+    )
+
+
+@jobs_app.command("fingerprint")
+def jobs_fingerprint(
+    checkpoint: str = typer.Argument(..., help="HF repo id or local directory"),
+    revision: str = typer.Option("", "--revision", help="HF revision (repo ids only)"),
+) -> None:
+    """Print the value `jobs create --checkpoint-sha256` expects for a checkpoint."""
+    from pathlib import Path
+
+    from reliquary.corpus.encoding import checkpoint_fingerprint
+
+    directory = Path(checkpoint)
+    if not directory.is_dir():
+        from huggingface_hub import snapshot_download
+
+        directory = Path(snapshot_download(checkpoint, revision=revision or None,
+                                           allow_patterns=["*.safetensors"]))
+    typer.echo(checkpoint_fingerprint(directory))
+
+
+@jobs_app.command("cancel")
+def jobs_cancel(
+    job_id: str = typer.Option(..., "--job-id"),
+    retired_at: int = typer.Option(..., "--retired-at", help="drand round"),
+) -> None:
+    """Retire the task entry. It is a BOOT gate, not a stop.
+
+    `resolve_task_config` refuses a retired entry at startup and `admit()`
+    never reads `status`, so a validator already serving this job keeps
+    admitting submissions until it restarts. The manifest stays either way:
+    settlement still reads it.
+    """
+    from reliquary.infrastructure.task_registry_store import (
+        read_registry,
+        retire_task_entry,
+    )
+
+    entries, _ = asyncio.run(read_registry(strict=False))
+    named = [entry for entry in entries.values() if entry.job_id == job_id]
+    if not named:
+        typer.echo(
+            f"error: no task in the registry names job {job_id!r}", err=True
+        )
+        raise typer.Exit(code=1)
+    for entry in named:
+        asyncio.run(retire_task_entry(entry.task_id, retired_at))
+    typer.echo(
+        f"retired "
+        + ", ".join(sorted(entry.task_id for entry in named))
+        + f" for job {job_id}. This stops validators that START from now on; "
+        "one already running keeps admitting submissions until it restarts. "
+        "The manifest stays for settlement."
+    )
+
+
+corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
+app.add_typer(corpus_app)
+
+
+@corpus_app.command("mine")
+def corpus_mine(
+    validator_url: str = typer.Option(..., "--validator-url"),
+    wallet_name: str = typer.Option("default"),
+    hotkey: str = typer.Option("default"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", "")),
+    max_steps: int = typer.Option(0, help="0 = until the job completes"),
+    gpu_memory_utilization: float = typer.Option(
+        None, "--gpu-memory-utilization",
+        help="Share of the card vLLM may take; omit for vLLM's own default",
+    ),
+) -> None:
+    """Generate for the corpus job the validator serves, and submit it."""
+    import bittensor as bt
+    import httpx
+    from huggingface_hub import snapshot_download
+
+    from reliquary.corpus.encoding import checkpoint_fingerprint
+    from reliquary.corpus.job import parse_job
+    from reliquary.miner.corpus_miner import (
+        CorpusMinerHalted,
+        VllmGenerator,
+        issue_corpus_request as _issue,
+        mine_steps,
+    )
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
+    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.shared.modeling import load_tokenizer
+    from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
+
+    # Every corpus completion is proved from its own decode activations, so a
+    # process whose active contract carries no toploc entry has nothing to
+    # submit with: refuse to start rather than generate work it can't sign.
+    proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+    if proof is None:
+        typer.echo(
+            "error: the active protocol profile "
+            f"{ACTIVE_PROTOCOL_PROFILE.profile_id!r} declares no toploc proof; "
+            "corpus mining has no way to prove a completion under it",
+            err=True,
+        )
+        raise typer.Exit(code=4)
+
+    wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+    if wallet_path:
+        wallet_kwargs["path"] = wallet_path
+    wallet = bt.Wallet(**wallet_kwargs)
+    http = httpx.Client(base_url=validator_url, timeout=120.0)
+
+    class _Client:
+        def job(self):
+            response = http.get("/corpus/job")
+            response.raise_for_status()
+            return response.json()
+
+        def cursor(self, hk):
+            return int(_issue(lambda: http.get(f"/corpus/cursor/{hk}"))["cursor"])
+
+        def submit(self, body):
+            return _issue(lambda: http.post("/corpus/submit", json=body))
+
+    client = _Client()
+    job = parse_job(client.job())
+    directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
+    if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
+        typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
+        raise typer.Exit(code=4)
+    tokenizer = load_tokenizer(directory)
+
+    def encode(text):
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        return list(getattr(encoded, "ids", encoded))
+
+    renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
+    prompts = prompt_job_for_spec(job)
+    try:
+        counts = mine_steps(
+            job=job, hotkey=wallet.hotkey.ss58_address, client=client,
+            generator=VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
+                                    gpu_memory_utilization=gpu_memory_utilization),
+            tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
+            sign=lambda body: sign_corpus_submission(wallet, body),
+            max_steps=max_steps or None,
+        )
+    except CorpusMinerHalted as exc:
+        typer.echo(f"error: {exc}", err=True)
+        typer.echo(dict(exc.counts))
+        raise typer.Exit(code=1) from exc
+    typer.echo(counts)
+
 
 @app.command("watch-verdicts")
 def watch_verdicts(
@@ -294,6 +1341,19 @@ def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
     )
 
 
+def _raise_open_file_limit() -> None:
+    """Lift the soft RLIMIT_NOFILE to the hard cap; Docker's 1024 default
+    starved the controller of sockets (EMFILE) on 2026-09-22."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 1_048_576 if hard == resource.RLIM_INFINITY else hard
+        if soft != resource.RLIM_INFINITY and soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            logger.info("Raised open file limit %d -> %d", soft, target)
+    except (OSError, ValueError):
+        logger.warning("Could not raise the open file limit", exc_info=True)
+
+
 def _run_validator_event_loop(coroutine) -> None:
     """Run the validator and hard-exit after an unrecoverable proof fault.
 
@@ -304,6 +1364,7 @@ def _run_validator_event_loop(coroutine) -> None:
     supervisor an actual child exit and lets Docker apply its restart policy.
     """
 
+    _raise_open_file_limit()
     try:
         asyncio.run(coroutine)
     except FatalProofPlaneError:
@@ -723,6 +1784,22 @@ def mine(
             checkpoint_identity_store.commit(initial_checkpoint_identity)
 
         envs = load_environments(env_names)
+        generator = None
+        if MINER_GENERATION_BACKEND == "vllm":
+            from reliquary.miner.vllm_generation import VLLMRolloutGenerator
+
+            # vLLM owns cuda:0, where the transformers generation copy also
+            # sits; on a single-device box that copy is only read for its eos
+            # ids and device, so the two coexist at a lower utilisation.
+            generator = VLLMRolloutGenerator(
+                initial_path,
+                revision=base_load_kwargs.get("revision"),
+                max_num_seqs=MINER_VLLM_MAX_NUM_SEQS,
+                gpu_memory_utilization=(
+                    0.85 if proof_device != "cuda:0" else 0.6
+                ),
+            )
+
         engine = MiningEngine(
             vllm_model,
             hf_model,
@@ -730,6 +1807,7 @@ def mine(
             wallet,
             envs=envs,
             mix=mix,
+            generator=generator,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
             checkpoint_identity_store=checkpoint_identity_store,
@@ -751,6 +1829,86 @@ def mine(
             raise
 
     asyncio.run(_run())
+
+
+async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=None):
+    """Bind the corpus submission route to the one job this task declares.
+
+    Everything the route needs is derived from that declaration rather than
+    configured beside it: the job id comes from the registry entry, and the
+    renderer from that job's own manifest, so a validator cannot be serving a
+    renderer -- or a job -- the declaration did not name. Returns False, having
+    done nothing, for any task that is not a corpus one.
+
+    False is reserved for exactly that case. A corpus task that cannot be
+    served RAISES, because the alternative is a validator that boots, holds
+    its share of the pool and exposes no route, with a missing log line as the
+    only evidence.
+    """
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+    from reliquary.validator.corpus_service import renderer_for_job
+    from reliquary.validator.task_config import TaskConfigError
+
+    if entry is None:
+        # The legacy fallback resolves no registry entry at all.
+        return False
+    mechanism = getattr(entry, "mechanism", None)
+    if mechanism is None:
+        # `TaskConfig` is not a `TaskEntry`, and passing the wrapper would
+        # read as "not a corpus task" and mount nothing at all.
+        raise TaskConfigError(
+            f"the corpus mount takes the registry entry, not "
+            f"{type(entry).__name__}"
+        )
+    if mechanism != MECHANISM_CORPUS_GENERATION:
+        return False
+
+    store = BucketJobStore()
+    job, _ = await store.read_job(str(entry.job_id))
+    if job is None:
+        # The task is declared and would take its share of the pool, so a
+        # missing manifest is a refusal to start, not a route that 404s.
+        raise TaskConfigError(
+            f"task {entry.task_id!r} declares corpus job {entry.job_id!r} but "
+            f"the job store has no manifest for it"
+        )
+
+    def encode(text: str) -> list[int]:
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        return list(getattr(encoded, "ids", encoded))
+
+    if verify_signature is None:
+        from reliquary.protocol.signatures import verify_corpus_signature
+
+        verify_signature = verify_corpus_signature
+    mounted = server.mount_corpus_router(
+        entry,
+        store=store,
+        tokenizer=tokenizer,
+        # The job's own source decides the renderer: this validator's active
+        # profile is its task contract, so a manifest naming a rendering that
+        # contract does not declare refuses the mount rather than serving
+        # prompts nobody declared.
+        renderer=renderer_for_job(job, encode, tokenizer=tokenizer),
+        verify_signature=verify_signature,
+    )
+    if not mounted:
+        # The server applies the same rule to the same entry, so a refusal
+        # here means the two disagree -- never something to walk past.
+        raise TaskConfigError(
+            f"task {entry.task_id!r} declares corpus job {job.job_id!r} but "
+            f"the server refused to mount its route"
+        )
+    logger.info(
+        "corpus job %s mounted: source %s, renderer %s, checkpoint %s@%s",
+        job.job_id,
+        job.prompt_source,
+        job.renderer_id,
+        job.checkpoint_repo,
+        job.checkpoint_revision,
+    )
+    return mounted
 
 
 @app.command()
@@ -806,6 +1964,10 @@ def validate(
         ),
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
+    set_weights: bool = typer.Option(
+        False, "--set-weights/--no-set-weights",
+        help="Corpus tasks only: also set weights from this process. Off by default: the RL validator's setter already pays every task.",
+    ),
 ):
     """Run Reliquary validator (trainer mode by default; --no-train for weight-only)."""
     setup_logging(log_level)
@@ -814,14 +1976,13 @@ def validate(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    mix = _resolve_cli_environment_mix(environments) if train else []
-    env_names = [name for name, _target in mix]
-    if train and "opencodeinstruct" in env_names:
-        _ensure_grader_running()
+    # The RL environment mix (and the code grader) is resolved inside `_run`,
+    # after the corpus branch: `--environments` defaults to an RL source a
+    # corpus task's contract need not declare.
     if train:
         logger.info(
-            "Starting Reliquary validator [trainer] (network=%s, netuid=%d, envs=%s, http=%s:%d)",
-            network, netuid, env_names, http_host, http_port,
+            "Starting Reliquary validator [trainer] (network=%s, netuid=%d, http=%s:%d)",
+            network, netuid, http_host, http_port,
         )
     else:
         logger.info(
@@ -830,6 +1991,7 @@ def validate(
         )
 
     async def _run():
+        nonlocal resume_from
         from reliquary.infrastructure.chain import get_subtensor
 
         signer_client = None
@@ -922,6 +2084,32 @@ def validate(
                 )
                 raise typer.Exit(code=4) from exc
 
+            from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+            if getattr(task_config.entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION:
+                # A corpus task runs one process on one card with no RL
+                # machinery at all: branch before any of it -- model load,
+                # proof plane, batching -- is even imported.
+                from reliquary.validator.corpus_validator import run_corpus_validator
+
+                try:
+                    await run_corpus_validator(
+                        entry=task_config.entry, wallet=wallet, netuid=netuid,
+                        signer_client=signer_client, http_host=http_host,
+                        http_port=http_port, cap=task_config.emission_cap,
+                        set_weights=set_weights,
+                    )
+                except RuntimeError as exc:
+                    logger.critical("%s; fix the declaration before starting this validator", exc)
+                    raise typer.Exit(code=4) from exc
+                return
+
+            mix = _resolve_cli_environment_mix(environments)
+            env_names = [name for name, _target in mix]
+            if "opencodeinstruct" in env_names:
+                _ensure_grader_running()
+            logger.info("RL environments: %s", env_names)
+
             import torch
             from reliquary.constants import ATTN_IMPLEMENTATION
             from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
@@ -968,7 +2156,13 @@ def validate(
                 model = next(iter(proof_models.values()))
                 from reliquary.validator.observed_proof_rollout import (
                     authorize_observed_live, observed_live_requested,
+                    observed_restart_checkpoint,
                 )
+                if observed_live_requested():
+                    recovered_checkpoint = observed_restart_checkpoint(remote_pool)
+                    if recovered_checkpoint is not None:
+                        activation_checkpoint_revision = recovered_checkpoint.revision
+                        resume_from = f"sha:{activation_checkpoint_revision}"
                 proof_capacity_qualification = (
                     authorize_observed_live(remote_pool, activation_checkpoint_revision)
                     if observed_live_requested()
@@ -1157,6 +2351,7 @@ def validate(
                         checkpoint=checkpoint,
                         load_kwargs=base_load_kwargs,
                         reference_model=model,
+                        replica=task_config.verification,
                     )
                     proof_worker_pool.start()
                     logger.info(
@@ -1208,6 +2403,24 @@ def validate(
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,
             )
+            from reliquary.validator.corpus_service import CorpusPromptSourceError
+
+            try:
+                # After the server exists and before it is served, so the
+                # route's one fidelity cache lives on the loop that answers.
+                await mount_corpus_service(
+                    service.server, task_config.entry, tokenizer=tokenizer
+                )
+            # `CorpusPromptSourceError` beside it, not under it: a renderer
+            # this validator's own profile does not declare is a declaration
+            # to fix, and on `TaskConfigError` alone it left as a traceback.
+            except (TaskConfigError, CorpusPromptSourceError) as exc:
+                logger.critical(
+                    "%s; fix the declaration with `reliquary jobs` before "
+                    "starting this validator",
+                    exc,
+                )
+                raise typer.Exit(code=4) from exc
             # Run the weight setter in a dedicated OS thread with its own
             # event loop. asyncio is single-threaded, so any sync blocking
             # call on the trainer's loop (e.g. /state acquiring a lock the

@@ -67,6 +67,25 @@ def auto_model_class_for_config(config: Any):
     return AutoModelForCausalLM
 
 
+def load_text_only_model(source: str, **kwargs):
+    """The language model alone, for a caller that only ever proves text.
+
+    A multimodal checkpoint loads its text config into a causal LM, which skips
+    the vision tower entirely: less memory, and a checkpoint whose vision config
+    this transformers cannot read (Qwen3.8) still loads. Text checkpoints load
+    as usual. Not for GRAIL, whose hidden states stay on the full model.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    if "torch_dtype" in kwargs and "dtype" not in kwargs:
+        kwargs["dtype"] = kwargs.pop("torch_dtype")
+    config = AutoConfig.from_pretrained(source, **_config_kwargs(kwargs))
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return load_text_generation_model(source, **kwargs)
+    return AutoModelForCausalLM.from_pretrained(source, config=text_config, **kwargs)
+
+
 def load_text_generation_model(source: str, **kwargs):
     """Load the model class used for text-only generation/training/proofs.
 

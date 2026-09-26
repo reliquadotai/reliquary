@@ -1,0 +1,137 @@
+"""Pydantic v2 models for the miner->validator corpus generation protocol.
+
+Named ``corpus`` rather than ``batch``: ``BatchSubmissionRequest`` in
+``submission.py`` is the GRPO training batch, and the two must not be confused.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from reliquary.protocol.toploc_wire import (
+    MAX_PROOF_B64_CHARS,
+    MAX_PROOF_BYTES,
+    MAX_PROOF_CHARS_PER_TOKEN,
+    PROOF_CHARS_SLACK,
+    ProofB64,
+    proof_volume_error,
+)
+
+
+# Ceilings the parser enforces before any check can run. The text bound is the
+# token ceiling at a generous 8 characters per token: `text` carries the most
+# bytes of any field, so leaving it unbounded leaves the others decorative.
+MAX_COMPLETION_TOKENS = 131072
+MAX_COMPLETION_TEXT_CHARS = MAX_COMPLETION_TOKENS * 8
+MAX_COMPLETIONS_PER_SUBMISSION = 64
+# The prompt the miner conditioned on. Same ceiling as one completion's text:
+# a prompt longer than a full generation would not fit the context either.
+MAX_RENDERED_PROMPT_CHARS = MAX_COMPLETION_TEXT_CHARS
+
+
+class CorpusRejectReason(str, Enum):
+    """Canonical verdicts. ``ACCEPTED`` is the one success value.
+
+    The cheap-check reasons are duplicated as plain strings in
+    ``reliquary.corpus.checks`` and ``reliquary.corpus.admission`` so those
+    modules stay free of pydantic; the schema test pins them equal.
+    """
+
+    ACCEPTED = "accepted"
+    BAD_SIGNATURE = "bad_signature"
+    # Not the miner's fault: this validator has no way to check a signature at
+    # all, and saying "bad_signature" would send it debugging its own keys.
+    SIGNATURE_UNVERIFIABLE = "signature_unverifiable"
+    # Checked right after the signature, so a spoofed hotkey cannot probe ban
+    # status and a banned one never reaches the ledgers.
+    MINER_BANNED = "miner_banned"
+    MALFORMED_SUBMISSION = "malformed_submission"
+    JOB_UNKNOWN = "job_unknown"
+    # Distinct from JOB_UNKNOWN on purpose: "this job exists but this
+    # validator is not the one paid for it" and "no such job" send a miner to
+    # two different places.
+    JOB_NOT_SERVED = "job_not_served"
+    JOB_COMPLETE = "job_complete"
+    CHECKPOINT_MISMATCH = "checkpoint_mismatch"
+    BAD_CURSOR = "bad_cursor"
+    PROMPT_MISMATCH = "prompt_mismatch"
+    PROMPT_FULL = "prompt_full"
+    BAD_COMPLETION_COUNT = "bad_completion_count"
+    TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
+    TOKEN_BUDGET_UNDERRUN = "token_budget_underrun"
+    BAD_TERMINATION = "bad_termination"
+    HASH_DUPLICATE = "hash_duplicate"
+    # The validator-side text check (`validator/corpus_text.py`): payment
+    # counts tokens, the corpus is made of text, and a completion whose text
+    # is not its tokens is paid for nothing.
+    TEXT_MISMATCH = "text_does_not_match_tokens"
+    # The prompt the miner says it conditioned on is not the source row the
+    # job assigned to that slot, rendered by the job's own renderer.
+    PROMPT_NOT_FAITHFUL = "prompt_not_faithful"
+    # A token id at or above the job model's vocabulary size.
+    TOKEN_OUT_OF_VOCAB = "token_out_of_vocab"
+    # RESERVED, no producer yet: spec §7 lists degeneracy/repetition as a
+    # free-tier check over `validator/rollout_patterns.py`, and the name is
+    # pinned here so the check lands under it rather than inventing a second.
+    DEGENERATE = "degenerate"
+    BAD_PROOF_SHAPE = "bad_proof_shape"
+    PROOF_FAIL = "proof_fail"
+
+
+class CorpusCompletion(BaseModel):
+    """Tokens and their text, and nothing the miner says ABOUT them.
+
+    There is no ``termination`` field: the validator derives that label from
+    the tokens (``check_termination``) and ``admit`` has no parameter it could
+    travel through, so a required enum here could only refuse an honest miner
+    that spells its own label ``"stop"`` or ``"length"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tokens: list[int] = Field(min_length=1, max_length=MAX_COMPLETION_TOKENS)
+    text: str = Field(max_length=MAX_COMPLETION_TEXT_CHARS)
+    proofs: list[ProofB64] = Field(default_factory=list, max_length=MAX_COMPLETION_TOKENS)
+
+    @field_validator("tokens")
+    @classmethod
+    def _token_ids_are_not_negative(cls, value: list[int]) -> list[int]:
+        if any(token < 0 for token in value):
+            raise ValueError("token ids must not be negative")
+        return value
+
+    @model_validator(mode="after")
+    def _proofs_fit_the_completion(self) -> "CorpusCompletion":
+        error = proof_volume_error(self.proofs, len(self.tokens))
+        if error:
+            raise ValueError(error)
+        return self
+
+
+class CorpusSubmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    miner_hotkey: str = Field(min_length=1)
+    cursor: int = Field(ge=0)
+    prompt_index: int = Field(ge=0)
+    checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Required, not optional: prompt fidelity is a free-tier check, and a field
+    # a miner may omit is a check a miner may switch off.
+    rendered_prompt: str = Field(min_length=1, max_length=MAX_RENDERED_PROMPT_CHARS)
+    completions: list[CorpusCompletion] = Field(
+        min_length=1, max_length=MAX_COMPLETIONS_PER_SUBMISSION
+    )
+    signature: str = Field(min_length=1)
+
+
+class CorpusSubmissionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: CorpusRejectReason
+    accepted: bool
+    slots_remaining: int | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)

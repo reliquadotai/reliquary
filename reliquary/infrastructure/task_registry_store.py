@@ -19,6 +19,7 @@ from reliquary.shared.task_registry import (
     render_registry,
     require_default_declared_first,
     retire_task,
+    set_cap,
     validate_registry,
 )
 
@@ -127,6 +128,35 @@ async def retire_task_entry(
 ) -> None:
     await _mutate(
         lambda e: retire_task(e, task_id, retired_at),
+        attempts=attempts,
+        **client_kwargs,
+    )
+
+
+async def set_task_cap(
+    task_id: str,
+    cap: float,
+    *,
+    floor: float | None = None,
+    min_incentive_share: float | None = None,
+    audit_q: float | None = None,
+    audit_probation_submissions: int | None = None,
+    audit_hold_seconds: float | None = None,
+    audit_suspect_seconds: float | None = None,
+    audit_ban_after_failures: int | None = None,
+    audit_ban_window_seconds: float | None = None,
+    audit_ban_seconds: float | None = None,
+    attempts: int = 5,
+    **client_kwargs,
+) -> None:
+    """Re-applied against the winner of a lost race, so the new cap is checked
+    against the registry that is actually there, not the one first read."""
+    await _mutate(
+        lambda e: set_cap(
+            e, task_id, cap, floor, min_incentive_share, audit_q,
+            audit_probation_submissions, audit_hold_seconds, audit_suspect_seconds,
+            audit_ban_after_failures, audit_ban_window_seconds, audit_ban_seconds,
+        ),
         attempts=attempts,
         **client_kwargs,
     )

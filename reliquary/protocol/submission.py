@@ -22,6 +22,7 @@ from pydantic import (
 )
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
+from reliquary.protocol.toploc_wire import ProofB64, proof_volume_error
 from reliquary.shared.runtime_fingerprint import runtime_profile_hash
 
 
@@ -67,6 +68,8 @@ class RejectReason(str, Enum):
     PROMPT_FULL = "prompt_full"
     PROMPT_OUT_OF_RANGE = "prompt_out_of_range"
     GRAIL_FAIL = "grail_fail"
+    # The task's contract enforces toploc and the rollout's proofs failed it.
+    TOPLOC_FAIL = "toploc_fail"
     HASH_DUPLICATE = "hash_duplicate"
     LOGPROB_MISMATCH = "logprob_mismatch"
     REWARD_MISMATCH = "reward_mismatch"
@@ -678,7 +681,10 @@ class EpisodeMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["reliquary/episode/v1"]
-    renderer_id: Literal["reliquary-jsonl-tools-v1"]
+    # Every renderer an environment may declare. The validator re-renders with
+    # the environment's own id and compares byte for byte, so accepting an id
+    # here does not let a miner pick its dialect — a mismatch still fails.
+    renderer_id: Literal["reliquary-jsonl-tools-v1", "reliquary-chatml-tools-v1"]
     task_id: str = Field(..., min_length=1, max_length=128)
     seed: int = Field(..., ge=0)
     actions: list[dict[str, Any]] = Field(..., min_length=1, max_length=64)
@@ -737,6 +743,17 @@ class CommitModel(BaseModel):
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo
     rollout: RolloutMetadata
+    # One base64 proof per chunk of the completion, sent only when the task's
+    # contract names toploc. The thresholds are never the miner's to send.
+    toploc_proofs: list[ProofB64] | None = None
+
+    @model_validator(mode="after")
+    def _toploc_proofs_fit(self) -> "CommitModel":
+        if self.toploc_proofs is not None:
+            error = proof_volume_error(self.toploc_proofs, len(self.tokens))
+            if error:
+                raise ValueError(error)
+        return self
 
     @field_validator("commitments")
     @classmethod

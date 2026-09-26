@@ -242,16 +242,14 @@ class WeightOnlyValidator:
             "Replaying %d archives across %d task(s): %s",
             len(archives), len(by_task), ", ".join(sorted(by_task)),
         )
-        ema = self._replay_ema(archives, caps=self._caps_by_task(declared))
+        # The floor runs inside _replay_ema, per task: a hotkey's share is
+        # measured against its own task, and what it cuts stays in that task.
+        ema = self._replay_ema(
+            archives,
+            caps=self._caps_by_task(declared),
+            floors=self._floors_by_task(declared),
+        )
         miner_weights = dict(ema)
-        # Applied after _replay_ema's per-task caps: the floor decides who is
-        # paid, and the miner total it preserves is what decides what burns.
-        if MIN_INCENTIVE_SHARE > 0.0:
-            miner_weights = self._apply_min_incentive_share(
-                miner_weights,
-                start=MIN_INCENTIVE_RAMP_START,
-                threshold=MIN_INCENTIVE_SHARE,
-            )
 
         subtensor = await chain.get_subtensor()
         try:
@@ -358,6 +356,25 @@ class WeightOnlyValidator:
         return paid
 
     @staticmethod
+    def _floors_by_task(declared: Mapping[str, Any]) -> dict[str, tuple[float, float]]:
+        """Each declared task's (ramp start, share) floor; the protocol's by default.
+
+        A task that names only a share below the protocol's ramp start ramps
+        from zero, so a declared floor is never raised by the default one.
+        """
+        floors: dict[str, tuple[float, float]] = {}
+        for task_id, entry in (declared or {}).items():
+            params = getattr(entry, "params", None)
+            if not isinstance(params, Mapping) or "min_incentive_share" not in params:
+                floors[str(task_id)] = (MIN_INCENTIVE_RAMP_START, MIN_INCENTIVE_SHARE)
+                continue
+            share = float(params["min_incentive_share"])
+            default_start = MIN_INCENTIVE_RAMP_START if MIN_INCENTIVE_RAMP_START <= share else 0.0
+            start = float(params.get("min_incentive_ramp_start", default_start))
+            floors[str(task_id)] = (start, share)
+        return floors
+
+    @staticmethod
     def _caps_by_task(declared: Mapping[str, Any]) -> dict[str, float]:
         """The most each declared task may pay, keyed by task id.
 
@@ -380,7 +397,10 @@ class WeightOnlyValidator:
 
     @staticmethod
     def _replay_ema(
-        archives: list[dict], *, caps: Mapping[str, float] | None = None
+        archives: list[dict],
+        *,
+        caps: Mapping[str, float] | None = None,
+        floors: Mapping[str, tuple[float, float]] | None = None,
     ) -> dict[str, float]:
         """Replay the per-window emission distribution into an EMA.
 
@@ -440,6 +460,14 @@ class WeightOnlyValidator:
             ema = WeightOnlyValidator._clamp_to_cap(
                 task_id, ema, None if caps is None else caps.get(task_id)
             )
+            if floors is not None:
+                start, threshold = floors.get(
+                    task_id, (MIN_INCENTIVE_RAMP_START, MIN_INCENTIVE_SHARE)
+                )
+                if threshold > 0.0:
+                    ema = WeightOnlyValidator._apply_min_incentive_share(
+                        ema, start=start, threshold=threshold
+                    )
             for hk, v in ema.items():
                 combined[hk] = combined.get(hk, 0.0) + v
 
