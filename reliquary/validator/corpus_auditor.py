@@ -418,8 +418,9 @@ class CorpusAuditor:
                 recent = self._recent(hotkey, now)
                 if (recent >= 1.0 / self._params.q and self._beacon is not None
                         and self._round_at is not None):
-                    # round_at(t) is the first round published strictly after t:
-                    # the miner signed before its randomness existed (spec §6).
+                    # round_at(t) is the first round published strictly after t;
+                    # one more round keeps the miner signing before its
+                    # randomness exists even with our clock a period behind (§6).
                     # It may raise -- the drand chain's genesis/period can still
                     # be unresolved (a lazy `round_at` retries on its own
                     # schedule) -- caught here rather than propagated, so an
@@ -427,7 +428,7 @@ class CorpusAuditor:
                     # None below, decision() then reads that as "audit") instead
                     # of crashing the whole batch out of the drain loop.
                     try:
-                        round_number = int(self._round_at(received_at))
+                        round_number = int(self._round_at(received_at)) + 1
                         round_not_out_yet = int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number
                     except Exception:
                         logger.warning(

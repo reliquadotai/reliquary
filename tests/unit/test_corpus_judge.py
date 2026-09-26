@@ -128,7 +128,7 @@ def test_a_sampled_miners_undrawn_record_waits_then_passes_unaudited():
         v = records.verdicts[sid]
         assert (v["passed"], v["audited"], v["reason"]) == (True, False, None)
         assert v["worst_exp"] == 0 and v["worst_mant_mean"] == 0.0
-        assert v["draw"] == {"round": _round_at(T0), "q": Q, "drawn": False}
+        assert v["draw"] == {"round": _round_at(T0) + 1, "q": Q, "drawn": False}
     assert states.states[HK] == SAMPLED
 
 
@@ -142,7 +142,7 @@ def test_a_drawn_record_is_audited_immediately():
     assert set(records.verdicts) == {hit}
     v = records.verdicts[hit]
     assert (v["passed"], v["audited"]) == (True, True)
-    assert v["draw"] == {"round": _round_at(T0), "q": Q, "drawn": True}
+    assert v["draw"] == {"round": _round_at(T0) + 1, "q": Q, "drawn": True}
     assert states.states[HK].audited_passed == 101
 
 
@@ -382,24 +382,27 @@ def test_a_restart_reads_only_pending_records():
     assert set(records.reads) == set(pending)
 
 
-def test_the_draw_uses_the_first_round_published_after_receipt():
-    received = _published(3333)  # round 3333 comes out at the very instant of receipt
+@pytest.mark.parametrize("offset", [0.0, 0.5, 2.9])
+def test_the_draw_round_is_one_round_past_the_first_published_after_receipt(offset):
+    # One extra round: a validator clock up to one period behind real time
+    # still draws on a round published after the miner really sent.
+    received = _published(3333) + offset
     ids = _ids(False, 2)
     records = _Records({sid: _rec(0, received_at=received) for sid in ids})
     beacon = _Beacon()
-    clock = _Clock(received + 1)
+    clock = _Clock(_published(3334) + 2.5)
     auditor = _judge(records, _States({HK: SAMPLED}), clock, beacon=beacon)
     asyncio.run(auditor.judge_many(ids))
-    # Round 3334 is not out yet: nothing is fetched, nothing decided.
+    # Round 3335 is not out yet: nothing is fetched, nothing decided.
     assert beacon.calls == [] and records.verdicts == {}
-    clock.now = _published(3334) + 2.5
+    clock.now = _published(3335) + 2.5
     asyncio.run(auditor.judge_many(ids))
-    assert beacon.calls == [3334]
+    assert beacon.calls == [3335]
     clock.now = received + HOLD
     asyncio.run(auditor.judge_many(ids))
     for sid in ids:
         draw = records.verdicts[sid]["draw"]
-        assert draw["round"] == 3334 and _published(draw["round"]) > received
+        assert draw["round"] == 3335 and _published(draw["round"]) > received + 3.0
 
 
 def test_a_failed_beacon_round_is_not_refetched_within_the_negative_cache_window():
@@ -410,11 +413,11 @@ def test_a_failed_beacon_round_is_not_refetched_within_the_negative_cache_window
     first = _ids(False, 2)
     records = _Records({sid: _rec(0, received_at=_published(41)) for sid in first})
     beacon = _Beacon(ConnectionError("drand down"))
-    clock = _Clock(_published(42) + 2.5)
+    clock = _Clock(_published(43) + 2.5)
     auditor = _judge(records, _States({HK: SAMPLED}), clock, beacon=beacon)
 
     asyncio.run(auditor.judge_many(first))
-    assert beacon.calls == [42]
+    assert beacon.calls == [43]
     assert all(v["audited"] is True for v in records.verdicts.values())
 
     # A second submission drawing the same round, well inside the negative
@@ -423,7 +426,7 @@ def test_a_failed_beacon_round_is_not_refetched_within_the_negative_cache_window
     records.submissions.update({sid: _rec(0, received_at=_published(41)) for sid in second})
     clock.now += 5.0
     asyncio.run(auditor.judge_many(second))
-    assert beacon.calls == [42]
+    assert beacon.calls == [43]
     assert all(v["audited"] is True for v in records.verdicts.values())
 
     # Past the negative-cache window: retried.
@@ -431,7 +434,7 @@ def test_a_failed_beacon_round_is_not_refetched_within_the_negative_cache_window
     records.submissions.update({sid: _rec(0, received_at=_published(41)) for sid in third})
     clock.now += 30.0
     asyncio.run(auditor.judge_many(third))
-    assert beacon.calls == [42, 42]
+    assert beacon.calls == [43, 43]
 
 
 def test_a_held_record_is_audited_when_a_failure_lands_in_the_same_pass():
