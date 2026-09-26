@@ -17,7 +17,7 @@ from tests.unit.test_corpus_service import (  # noqa: F401
 )
 
 
-def _router(seeded_job, job_id, accepted=None):
+def _router(seeded_job, job_id):
     from reliquary.validator.corpus_service import build_corpus_router
 
     return build_corpus_router(
