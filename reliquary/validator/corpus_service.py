@@ -56,6 +56,10 @@ logger = logging.getLogger(__name__)
 SUBMIT_PATH = "/corpus/submit"
 JOB_PATH = "/corpus/job"
 CURSOR_PATH = "/corpus/cursor/{hotkey}"
+# Job-scoped reads, for a validator serving several jobs on one model.
+JOBS_PATH = "/corpus/jobs"
+JOB_SCOPED_PATH = "/corpus/jobs/{job_id}/job"
+CURSOR_SCOPED_PATH = "/corpus/jobs/{job_id}/cursor/{hotkey}"
 
 # The record's own schema tag, so a reader of the bucket can tell what shape
 # to expect before it parses the rest of the document.
@@ -1440,15 +1444,81 @@ def build_corpus_router(
         except LedgerSnapshotError as exc:
             raise _ledger_corrupt(exc) from exc
 
+    # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
+    # this job without a second copy of any of them.
+    router.corpus_job = corpus_job
+    router.corpus_cursor = corpus_cursor
+    router.submit_corpus = submit_corpus
+    return router
+
+
+def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
+    """The job-scoped reads over one ``build_corpus_router`` per served job.
+
+    With several jobs it also owns the legacy paths: submit dispatches on the
+    request's ``job_id``, and the legacy reads answer 409 rather than pick one.
+    With one job those stay on that job's own router, unchanged.
+    """
+    from fastapi.responses import JSONResponse
+
+    served = sorted(routers)
+    router = APIRouter()
+
+    def _served(job_id: str) -> APIRouter:
+        try:
+            return routers[job_id]
+        except KeyError:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served") from None
+
+    @router.get(JOBS_PATH)
+    async def corpus_jobs() -> dict:
+        return {"jobs": served}
+
+    @router.get(JOB_SCOPED_PATH)
+    async def corpus_job_scoped(job_id: str) -> dict:
+        return await _served(job_id).corpus_job()
+
+    @router.get(CURSOR_SCOPED_PATH)
+    async def corpus_cursor_scoped(job_id: str, hotkey: str) -> dict:
+        return await _served(job_id).corpus_cursor(hotkey)
+
+    if len(routers) == 1:
+        return router
+
+    def _several() -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": "several_jobs_served", "jobs": served})
+
+    @router.get(JOB_PATH)
+    async def corpus_job_legacy():
+        return _several()
+
+    @router.get(CURSOR_PATH)
+    async def corpus_cursor_legacy(hotkey: str):
+        return _several()
+
+    @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
+    async def submit_corpus(request: CorpusSubmissionRequest) -> CorpusSubmissionResponse:
+        # As a single job's route does: refused before any store is touched.
+        target = routers.get(request.job_id)
+        if target is None:
+            return _refuse(
+                CorpusRejectReason.JOB_NOT_SERVED,
+                {"job_id": request.job_id, "serves": served},
+            )
+        return await target.submit_corpus(request)
+
     return router
 
 
 __all__ = [
     "CURSOR_PATH",
+    "CURSOR_SCOPED_PATH",
     "CorpusPromptSourceError",
     "CorpusSignatureUnavailable",
     "EnvironmentPromptJob",
+    "JOBS_PATH",
     "JOB_PATH",
+    "JOB_SCOPED_PATH",
     "LEDGER_SCHEMA",
     "LEDGER_SCHEMA_V1",
     "LEDGER_SCHEMA_V2",
@@ -1467,6 +1537,7 @@ __all__ = [
     "SingleTurnPromptRenderer",
     "ChatTemplatePromptRenderer",
     "CHAT_TEMPLATE_RENDERERS",
+    "build_corpus_jobs_router",
     "build_corpus_router",
     "downgrade_ledgers_v1",
     "ensure_ledgers_v2",
