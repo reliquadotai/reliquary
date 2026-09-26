@@ -347,3 +347,33 @@ def test_a_transport_error_is_transient_and_a_body_is_returned():
     with pytest.raises(CorpusTransientFailure):
         issue_corpus_request(_fail)
     assert issue_corpus_request(lambda: _response(200)) == {"ok": True}
+
+
+def test_the_vllm_generator_sizes_its_context_to_the_job(monkeypatch):
+    """vLLM otherwise reserves the checkpoint's own maximum length (262,144 on
+    Qwen3.8-27B), whose KV cache does not fit one H100 next to the weights."""
+    from reliquary.miner.corpus_miner import MAX_NUM_SEQS, PROMPT_ALLOWANCE_TOKENS
+
+    _install_fake_vllm(monkeypatch)
+    sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=32768)
+    proof = SimpleNamespace(chunk_tokens=32, topk=8)
+    generator = VllmGenerator("/fake/checkpoint", sampling, proof, EOS)
+    assert generator._llm.kwargs["max_model_len"] == 32768 + PROMPT_ALLOWANCE_TOKENS
+    # vLLM's default of 1,024 concurrent sequences exceeds a hybrid model's
+    # Mamba cache on one H100 (320 on Qwen3.8-27B); a step runs only n of them.
+    assert generator._llm.kwargs["max_num_seqs"] == MAX_NUM_SEQS
+
+
+def test_a_vision_checkpoint_is_served_text_only(monkeypatch, tmp_path):
+    """The job's prompts are text: a multimodal checkpoint must not reserve its
+    vision encoder's profiling memory."""
+    import json
+
+    _install_fake_vllm(monkeypatch)
+    sampling = SimpleNamespace(temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=64)
+    proof = SimpleNamespace(chunk_tokens=32, topk=8)
+    (tmp_path / "config.json").write_text(json.dumps({"vision_config": {"depth": 27}}))
+    vision = VllmGenerator(str(tmp_path), sampling, proof, EOS)
+    text = VllmGenerator("/fake/checkpoint", sampling, proof, EOS)
+    assert vision._llm.kwargs["limit_mm_per_prompt"] == {"image": 0, "video": 0}
+    assert "limit_mm_per_prompt" not in text._llm.kwargs
