@@ -41,6 +41,10 @@ class _States:
         self.states[hotkey] = change(self.states.get(hotkey, MinerState()))
         return self.states[hotkey]
 
+    async def update_many(self, changes, attempts=5):
+        return {hotkey: await self.update(hotkey, change, attempts)
+                for hotkey, change in changes.items()}
+
 
 class _Beacon:
     def __init__(self, value=RAND):
@@ -472,3 +476,56 @@ def test_a_record_with_a_known_verdict_is_not_audited_again(monkeypatch):
     asyncio.run(auditor.judge_many(held))
     asyncio.run(auditor.judge_many([hit, *held]))
     assert audited == []
+
+
+class _MinersRecords(_Records):
+    """A records fake that also holds miners.json, counting its writes."""
+
+    def __init__(self, submissions):
+        super().__init__(submissions)
+        self.miners, self.etag, self.miner_writes = {}, None, 0
+
+    async def read_miners(self, job_id):
+        return dict(self.miners), self.etag
+
+    async def write_miners(self, job_id, state, etag):
+        self.miner_writes += 1
+        assert etag == self.etag
+        self.miners, self.etag = dict(state), f'"{self.miner_writes}"'
+        return self.etag
+
+
+def test_a_batch_of_passes_writes_the_miner_state_once():
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    ids = _ids(False, 4)
+    records = _MinersRecords({sid: _rec(0) for sid in ids})
+    states = MinerStates(records, "math-v1")
+    auditor = _judge(records, states, _Clock(T0 + 1), params=AuditParams())
+    asyncio.run(auditor.judge_many(ids))
+    assert all(v["passed"] is True for v in records.verdicts.values())
+    assert records.miner_writes == 1
+    assert asyncio.run(states.get(HK)).audited_passed == 4
+
+
+def test_a_batch_of_failures_escalates_in_one_write_before_the_verdicts():
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    ids = _ids(False, 3)
+    records = _MinersRecords({sid: _rec(1) for sid in ids})
+    states = MinerStates(records, "math-v1")
+    seen = []
+    write_verdict = records.write_verdict
+
+    async def _write_verdict(job_id, sid, verdict):
+        seen.append(dict(records.miners.get(HK, {})))
+        return await write_verdict(job_id, sid, verdict)
+
+    records.write_verdict = _write_verdict
+    params = AuditParams(ban_after_failures=10)
+    auditor = _judge(records, states, _Clock(T0 + 1), params=params)
+    asyncio.run(auditor.judge_many(ids))
+    assert all(v["passed"] is False for v in records.verdicts.values())
+    assert records.miner_writes == 1
+    # Every failure's escalation was durable before any failed verdict existed.
+    assert all(sorted(entry["failure_ids"]) == sorted(ids) for entry in seen)

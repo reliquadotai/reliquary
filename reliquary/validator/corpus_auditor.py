@@ -324,50 +324,61 @@ class CorpusAuditor:
                 )
 
         results: list[dict | None] = [None] * len(ids)
-        failed_hotkeys: set[str] = set()
+        judged = [k for k, outcome in enumerate(outcomes) if isinstance(outcome, dict)]
+        now = self._clock()
+        failures: dict[str, list[str]] = {}
+        for k in judged:
+            if not outcomes[k]["passed"]:
+                failures.setdefault(records[k]["hotkey"], []).append(ids[k])
+        failed_hotkeys = set(failures)
         states: dict[str, MinerState] = {}
+        if failures and self._miner_states is not None:
+            # Escalate before the verdicts exist: a crash in between then
+            # re-audits the records, and the retry counts nothing twice
+            # (idempotent by submission id), instead of leaving a caught
+            # cheater unsuspected while its held records are paid. One write
+            # for the whole batch: miners.json is one key, rate-limited.
+            def escalate(sids: list[str]) -> Callable[[MinerState], MinerState]:
+                def change(m: MinerState) -> MinerState:
+                    for sid in sids:
+                        m = after_confirmed_failure(m, self._params, now, sid)
+                    return m
+                return change
+
+            states.update(await self._miner_states.update_many(
+                {hotkey: escalate(sids) for hotkey, sids in failures.items()}))
+
         # Failures first: a ban they cause must void this batch's passes of that hotkey.
-        order = sorted(
-            (k for k, outcome in enumerate(outcomes) if isinstance(outcome, dict)),
-            key=lambda k: outcomes[k]["passed"],
-        )
-        for k in order:
-            submission_id, record, outcome = ids[k], records[k], outcomes[k]
+        passes: dict[str, list[float]] = {}
+        for k in sorted(judged, key=lambda k: outcomes[k]["passed"]):
+            submission_id, record = ids[k], records[k]
             hotkey = record["hotkey"]
-            now = self._clock()
-            outcome = {**outcome, "audited": True}
+            outcome = {**outcomes[k], "audited": True}
             if outcome["passed"]:
                 if hotkey not in states:
                     states[hotkey] = await self._state(hotkey, now)
                 if effective_state(states[hotkey], now, self._params) == "banned":
                     outcome = dict(_BANNED_VOID)
-            if not outcome["passed"] and outcome["audited"]:
-                failed_hotkeys.add(hotkey)
-                if self._miner_states is not None:
-                    # Escalate before the verdict exists: a crash in between then
-                    # re-audits the record, and the retry counts nothing twice
-                    # (idempotent by submission id), instead of leaving a caught
-                    # cheater unsuspected while its held records are paid.
-                    states[hotkey] = await self._miner_states.update(
-                        hotkey, lambda m, now=now, sid=submission_id:
-                        after_confirmed_failure(m, self._params, now, sid)
-                    )
             verdict = self._verdict(submission_id, hotkey, record["token_count"], outcome,
                                     draws.get(submission_id) if outcome["audited"] else None)
             results[k], written = await self._write(submission_id, verdict)
             # Only the call that wrote a passing verdict counts it: a repeat audit
             # (stale queue entry, restart) must never count twice.
-            if not written or self._miner_states is None or not outcome["audited"]:
-                continue
-            if outcome["passed"]:
-                mant_mean = outcome["worst_mant_mean"]
+            if written and outcome["passed"] and outcome["audited"]:
+                passes.setdefault(hotkey, []).append(outcome["worst_mant_mean"])
 
-                def count_pass(m: MinerState, now=now, mant_mean=mant_mean) -> MinerState:
-                    if effective_state(m, now, self._params) == "banned":
-                        return m
-                    return after_pass(m, self._params, mant_mean)
+        if passes and self._miner_states is not None:
+            def count(means: list[float]) -> Callable[[MinerState], MinerState]:
+                def change(m: MinerState) -> MinerState:
+                    for mant_mean in means:
+                        if effective_state(m, now, self._params) == "banned":
+                            return m
+                        m = after_pass(m, self._params, mant_mean)
+                    return m
+                return change
 
-                states[hotkey] = await self._miner_states.update(hotkey, count_pass)
+            await self._miner_states.update_many(
+                {hotkey: count(means) for hotkey, means in passes.items()})
         return results, failed_hotkeys
 
     async def _randomness_for(self, round_number: int) -> str | None:

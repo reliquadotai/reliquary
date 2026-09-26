@@ -4,12 +4,27 @@ stale document over a concurrent writer's (Task 4, spec §5)."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping
+import logging
 import math
 import re
 
 from reliquary.corpus.audit_policy import MinerState
 from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+
+try:
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # pragma: no cover - botocore ships with the store
+    BotoCoreError = ClientError = OSError
+
+logger = logging.getLogger(__name__)
+
+# Throttled (R2 allows about one write per second to a key), 5xx, reset or
+# timeout: the same transport errors the corpus route answers 503 for.
+_TRANSIENT_ERRORS = (ClientError, BotoCoreError, OSError, asyncio.TimeoutError)
+_BACKOFF_SECONDS = 0.5
+_MAX_BACKOFF_SECONDS = 8.0
 
 # Bounds for the fields a stored entry may carry, keyed by the MinerState
 # field name; checked only when the field is present, so a fresh/default
@@ -85,40 +100,64 @@ def _validate_entry(entry: object, job_id: str, hotkey: str) -> Mapping:
 class MinerStates:
     """The per-job miners document, addressed one hotkey at a time."""
 
-    __slots__ = ("_records", "_job_id")
+    __slots__ = ("_records", "_job_id", "_sleep")
 
-    def __init__(self, records, job_id: str) -> None:
+    def __init__(self, records, job_id: str, *, sleep=asyncio.sleep) -> None:
         self._records = records
         self._job_id = job_id
+        self._sleep = sleep
 
-    async def _read_entry(self, hotkey: str) -> tuple[MinerState, Mapping, str | None]:
+    async def _read_document(self) -> tuple[Mapping, str | None]:
         document, etag = await self._records.read_miners(self._job_id)
-        document = _validate_document(document, self._job_id)
-        entry = _validate_entry(document.get(hotkey, {}), self._job_id, hotkey)
-        return MinerState.from_dict(entry), document, etag
+        return _validate_document(document, self._job_id), etag
+
+    def _entry(self, document: Mapping, hotkey: str) -> MinerState:
+        return MinerState.from_dict(_validate_entry(document.get(hotkey, {}), self._job_id, hotkey))
 
     async def get(self, hotkey: str) -> MinerState:
-        state, _, _ = await self._read_entry(hotkey)
-        return state
+        document, _ = await self._read_document()
+        return self._entry(document, hotkey)
+
+    async def hotkeys(self) -> list[str]:
+        document, _ = await self._read_document()
+        return sorted(document)
 
     async def update(
-        self, hotkey: str, change: Callable[[MinerState], MinerState], attempts: int = 5
+        self, hotkey: str, change: Callable[[MinerState], MinerState], attempts: int = 6
     ) -> MinerState:
-        """Apply ``change`` to ``hotkey``'s current state and write it back.
-        On a conflict, re-read the whole document (another hotkey's write may
-        have landed) and re-apply ``change`` to the fresh state, so a ban set
-        by an earlier update is never clobbered by a write built from a stale
-        read."""
-        for _ in range(attempts):
-            current, document, etag = await self._read_entry(hotkey)
-            updated = change(current)
+        return (await self.update_many({hotkey: change}, attempts))[hotkey]
+
+    async def update_many(
+        self, changes: Mapping[str, Callable[[MinerState], MinerState]], attempts: int = 6
+    ) -> dict[str, MinerState]:
+        """Apply each hotkey's ``change`` to its current state and write them
+        all back in one compare-and-swap. On a conflict, re-read the whole
+        document (another writer may have landed) and re-apply every change
+        to the fresh state, so a ban set by an earlier update is never
+        clobbered by a write built from a stale read. A transport error
+        (throttling above all) backs off and retries, within ``attempts``."""
+        for attempt in range(attempts):
             try:
+                document, etag = await self._read_document()
+                updated = {hotkey: change(self._entry(document, hotkey))
+                           for hotkey, change in changes.items()}
                 await self._records.write_miners(
-                    self._job_id, {**document, hotkey: updated.to_dict()}, etag
+                    self._job_id,
+                    {**document, **{hotkey: state.to_dict() for hotkey, state in updated.items()}},
+                    etag,
                 )
             except CorpusStoreConflict:
                 continue
+            except _TRANSIENT_ERRORS:
+                if attempt + 1 >= attempts:
+                    raise
+                delay = min(_MAX_BACKOFF_SECONDS, _BACKOFF_SECONDS * 2**attempt)
+                logger.warning("miners.json of job %s unavailable; retrying in %.1f s",
+                               self._job_id, delay, exc_info=True)
+                await self._sleep(delay)
+                continue
             return updated
         raise CorpusStoreConflict(
-            f"could not update hotkey {hotkey!r} in job {self._job_id!r} after {attempts} attempts"
+            f"could not update hotkeys {sorted(changes)!r} in job {self._job_id!r} "
+            f"after {attempts} attempts"
         )

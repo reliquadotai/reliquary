@@ -191,3 +191,70 @@ def test_a_well_formed_entry_still_reads(r2):
     assert m.audited_passed == 3
     assert m.confirmed_failures == [1.0, 2.0]
     assert m.failure_ids == ["d" * 64]
+
+
+class _ThrottledMinersStore(_FlakyMinersStore):
+    """R2 answers a burst of writes to one key with a throttling error, which
+    is a transport error, not a conflict."""
+
+    def __init__(self, inner, *, throttle_first_n):
+        super().__init__(inner)
+        self._throttle_first_n = throttle_first_n
+
+    async def write_miners(self, job_id, state, etag):
+        from botocore.exceptions import ClientError
+
+        self.write_attempts += 1
+        if self.write_attempts <= self._throttle_first_n:
+            raise ClientError({"Error": {"Code": "SlowDown", "Message": "reduce your rate"}},
+                              "PutObject")
+        return await self._inner.write_miners(job_id, state, etag)
+
+
+def test_a_throttled_write_is_retried_after_a_backoff(r2):
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    store = _ThrottledMinersStore(BucketRecordStore(), throttle_first_n=2)
+    slept = []
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+
+    states = MinerStates(store, "job-x", sleep=_sleep)
+    result = asyncio.run(states.update("A", lambda m: replace(m, audited_passed=m.audited_passed + 1)))
+    assert store.write_attempts == 3 and len(slept) == 2 and all(s > 0 for s in slept)
+    assert result.audited_passed == 1
+    assert asyncio.run(states.get("A")).audited_passed == 1
+
+
+def test_throttling_that_never_ends_raises_after_bounded_attempts(r2):
+    from botocore.exceptions import ClientError
+
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    store = _ThrottledMinersStore(BucketRecordStore(), throttle_first_n=100)
+
+    async def _sleep(seconds):
+        pass
+
+    states = MinerStates(store, "job-x", sleep=_sleep)
+    with pytest.raises(ClientError):
+        asyncio.run(states.update("A", lambda m: replace(m, audited_passed=1), attempts=3))
+    assert store.write_attempts == 3
+
+
+def test_update_many_writes_every_hotkey_in_one_write(r2):
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    store = _FlakyMinersStore(BucketRecordStore())
+    states = MinerStates(store, "job-x")
+    out = asyncio.run(states.update_many({
+        "A": lambda m: replace(m, audited_passed=2),
+        "B": lambda m: replace(m, banned_until=5.0),
+    }))
+    assert store.write_attempts == 1
+    assert out["A"].audited_passed == 2 and out["B"].banned_until == 5.0
+    assert asyncio.run(states.get("B")).banned_until == 5.0
