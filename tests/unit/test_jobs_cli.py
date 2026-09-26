@@ -574,3 +574,61 @@ def test_without_a_declared_budget_the_job_takes_the_templates_own(bucket, regis
         _prompt_source(template)
     ].max_new_tokens
     assert json.loads(body)["sampling"]["max_new_tokens"] == budget
+
+
+class _MinersRecords:
+    def __init__(self, miners):
+        self.miners, self.etag, self.writes = miners, '"0"', 0
+
+    async def read_miners(self, job_id):
+        return dict(self.miners), self.etag
+
+    async def write_miners(self, job_id, state, etag):
+        assert etag == self.etag
+        self.writes += 1
+        self.miners, self.etag = dict(state), f'"{self.writes}"'
+        return self.etag
+
+
+def _caught(**extra):
+    return {"audited_passed": 0, "confirmed_failures": [1.0, 2.0], "suspect_until": None,
+            "banned_until": 4_102_444_800.0, "mant_mean_history": [0.5],
+            "failure_ids": ["a" * 64, "b" * 64], **extra}
+
+
+def _reset(monkeypatch, records, *args):
+    from reliquary.infrastructure import corpus_record_store
+
+    monkeypatch.setattr(corpus_record_store, "BucketRecordStore", lambda **kw: records)
+    return CliRunner().invoke(app, ["jobs", "miner-reset", "--job-id", "swe-v1", *args])
+
+
+def test_miner_reset_clears_one_hotkeys_suspect_ban_and_failures(monkeypatch):
+    records = _MinersRecords({"5A": _caught(), "5B": _caught(suspect_until=4_102_444_800.0)})
+    result = _reset(monkeypatch, records, "--hotkey", "5A")
+    assert result.exit_code == 0, result.output
+    a = records.miners["5A"]
+    assert (a["banned_until"], a["suspect_until"], a["confirmed_failures"]) == (None, None, [])
+    assert a["mant_mean_history"] == [0.5] and a["failure_ids"] == ["a" * 64, "b" * 64]
+    assert records.miners["5B"] == _caught(suspect_until=4_102_444_800.0)
+    assert records.writes == 1
+    # Verdicts are write-once: what was already voided or failed stays unpaid.
+    assert "stay" in result.output and "banned" in result.output
+
+
+def test_miner_reset_all_clears_every_hotkey_in_one_write(monkeypatch):
+    records = _MinersRecords({"5A": _caught(), "5B": _caught(suspect_until=4_102_444_800.0)})
+    result = _reset(monkeypatch, records, "--all")
+    assert result.exit_code == 0, result.output
+    for entry in records.miners.values():
+        assert (entry["banned_until"], entry["suspect_until"], entry["confirmed_failures"]) == (
+            None, None, [])
+    assert records.writes == 1
+
+
+@pytest.mark.parametrize("args", [[], ["--all", "--hotkey", "5A"], ["--hotkey", "5Typo"]])
+def test_miner_reset_refuses_an_ambiguous_or_unknown_target(monkeypatch, args):
+    records = _MinersRecords({"5A": _caught()})
+    result = _reset(monkeypatch, records, *args)
+    assert result.exit_code == 1
+    assert records.writes == 0 and records.miners["5A"] == _caught()

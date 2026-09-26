@@ -1079,6 +1079,56 @@ def jobs_status(job_id: str = typer.Argument(...)) -> None:
     typer.echo(f"drained: {'yes' if drained else 'no'}")
 
 
+@jobs_app.command("miner-reset")
+def jobs_miner_reset(
+    job_id: str = typer.Option(..., "--job-id"),
+    hotkeys: list[str] = typer.Option(None, "--hotkey", help="Repeatable"),
+    all_hotkeys: bool = typer.Option(False, "--all", help="Every hotkey in the job's miners.json"),
+) -> None:
+    """Clear hotkeys' suspect, ban and confirmed failures in the job's miners.json.
+
+    For a validator-side systematic failure (wrong card or kernel band, wrong
+    checkpoint) that failed honest miners. Only the state is reset: verdicts
+    are write-once, so records already failed or voided `banned` stay unpaid.
+    """
+    from dataclasses import replace
+
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator.corpus_miner_states import MinerStates
+
+    if bool(hotkeys) == all_hotkeys:
+        typer.echo("error: name hotkeys with --hotkey, or pass --all (not both)", err=True)
+        raise typer.Exit(code=1)
+    states = MinerStates(BucketRecordStore(), job_id)
+
+    def clear(m):
+        return replace(m, suspect_until=None, banned_until=None, confirmed_failures=[])
+
+    async def _run() -> list[str]:
+        stored = await states.hotkeys()
+        unknown = sorted(set(hotkeys or ()) - set(stored))
+        if unknown:
+            # A typo must not read as a reset of a hotkey that was never caught.
+            raise typer.BadParameter(f"no miner state for {', '.join(unknown)} in job {job_id!r}")
+        targets = stored if all_hotkeys else sorted(set(hotkeys))
+        if targets:
+            await states.update_many({hotkey: clear for hotkey in targets})
+        return targets
+
+    try:
+        targets = asyncio.run(_run())
+    except typer.BadParameter as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"reset {len(targets)} hotkey(s) in job {job_id}: {', '.join(targets) or '-'}")
+    typer.echo(
+        "suspect, ban and confirmed failures cleared; audited_passed is kept, so a "
+        "hotkey a failure reset to 0 goes through probation again (audited in full, "
+        "paid normally). Verdicts already written stay: records failed or voided "
+        "'banned' stay unpaid."
+    )
+
+
 @jobs_app.command("fingerprint")
 def jobs_fingerprint(
     checkpoint: str = typer.Argument(..., help="HF repo id or local directory"),

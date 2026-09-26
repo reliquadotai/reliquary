@@ -255,8 +255,8 @@ What each state means for a miner:
   `audit_probation_submissions` submissions have passed audit with no
   confirmed failure in between.
 - **`sampled`** — only a fraction `audit_q` of submissions is drawn for audit.
-  The draw is keyed on a drand beacon published strictly after the submission
-  was received, so a miner cannot choose which of its own submissions gets
+  The draw is keyed on the drand round after the first one published once the
+  submission was received (one round of margin against clock lag), so a miner cannot choose which of its own submissions gets
   checked; a hotkey submitting fewer than `1 / audit_q` per hold is still
   audited at 100 % (too small a sample to be worth drawing). A submission that
   is not drawn still waits out `audit_hold_seconds` before it is paid,
@@ -372,6 +372,25 @@ reliquary corpus mine --validator-url http://<validator-ip>:<port> \
   cap.
 - **Refusals**: validator logs `corpus submission refused` reasons; a
   dishonest checkpoint shows up as verdicts failing `exp_mismatch`.
+- **Queue lag**: every rescan (once a minute) logs `corpus audit queue lag: N
+  pending, oldest received S s ago`. An undrawn record waits one hold by
+  design; a warning past the hold means the card is not keeping up.
+- **Many hotkeys failing at once** is a validator-side systematic failure, not
+  a fleet of cheaters: wrong card or kernel band, wrong checkpoint. Suspect and
+  bans apply at every `audit_q`, 1.0 included, so honest miners get banned.
+  Stop the corpus validator, fix the cause, then reset the hotkeys it caught:
+
+  ```bash
+  reliquary jobs miner-reset --job-id <job> --hotkey <hotkey> [--hotkey ...]
+  reliquary jobs miner-reset --job-id <job> --all   # every hotkey in miners.json
+  ```
+
+  It clears `suspect_until`, `banned_until` and the confirmed failures in
+  `miners.json` (compare-and-swap, safe while the route runs). Verdicts are
+  write-once: records already failed, or voided `banned` while the ban held,
+  stay unpaid; the reset only stops further loss. A hotkey whose count a
+  failure reset to 0 goes through probation again (audited in full, paid
+  normally). Then restart the corpus validator.
 
 ## 6. Deliver
 
