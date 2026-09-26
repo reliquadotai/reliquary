@@ -33,6 +33,8 @@ def _ok() -> CheckResult:
 # miner state and is applied by the route itself. The string lives here so it
 # has one name, the way ``corpus_text.py`` names its own reasons.
 REASON_MINER_BANNED = "miner_banned"
+# Applied by the route from the subnet's registrations, like the ban.
+REASON_HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
 
 
 def completion_digest(prompt_index: int, tokens: Sequence[int]) -> str:

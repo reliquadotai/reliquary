@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 # Reasons after which the cursor on the validator is the truth, not ours.
 _RESYNC = frozenset({"prompt_full", "bad_cursor", "prompt_mismatch"})
+# Refusals no retry can change: generating on would only burn the card.
+_HALT = frozenset({"hotkey_not_registered", "miner_banned"})
 
 # Backoff delays for a retried request, in seconds; the last value repeats.
 # Bounded so a long outage does not turn into an ever-growing sleep.
@@ -233,6 +235,9 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         counts[reason] += 1
         if reason == "job_complete":
             break
+        if reason in _HALT:
+            raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}",
+                                    counts=dict(counts))
         if answer.get("accepted"):
             cursor += 1
         elif reason in _RESYNC:

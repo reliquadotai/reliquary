@@ -93,6 +93,17 @@ def test_a_complete_job_stops_the_miner():
     assert counts == {"job_complete": 1} and len(client.submitted) == 1
 
 
+@pytest.mark.parametrize("reason", ["hotkey_not_registered", "miner_banned"])
+def test_a_refusal_no_retry_can_change_stops_the_miner(reason):
+    """Generating on would burn the card for nothing: stop and say why."""
+    client = _Client([reason, "accepted"])
+    with pytest.raises(CorpusMinerHalted, match=reason):
+        mine_steps(job=_job(), hotkey="5Hot", client=client, generator=_Generator(),
+                   tokenizer=_Tokenizer(), render=lambda i: f"q{i}", sign=lambda b: "sig",
+                   max_steps=5)
+    assert len(client.submitted) == 1
+
+
 def test_miner_and_auditor_tokenize_the_prompt_identically():
     generator = _Generator()
     mine_steps(job=_job(), hotkey="5Hot", client=_Client(["accepted"]), generator=generator,

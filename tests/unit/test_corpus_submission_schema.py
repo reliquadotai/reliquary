@@ -212,3 +212,11 @@ def test_the_out_of_vocab_reason_is_one_name_everywhere():
     from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
 
     assert CorpusRejectReason.TOKEN_OUT_OF_VOCAB.value == REASON_TOKEN_OUT_OF_VOCAB == "token_out_of_vocab"
+
+
+def test_the_not_registered_reason_is_the_same_string_on_both_sides():
+    from reliquary.corpus.checks import REASON_HOTKEY_NOT_REGISTERED
+    from reliquary.protocol.corpus_submission import CorpusRejectReason
+
+    assert (CorpusRejectReason.HOTKEY_NOT_REGISTERED.value
+            == REASON_HOTKEY_NOT_REGISTERED == "hotkey_not_registered")
