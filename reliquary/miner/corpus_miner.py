@@ -248,6 +248,23 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     return dict(counts)
 
 
+# Room for the rendered prompt beside the job's completion budget.
+PROMPT_ALLOWANCE_TOKENS = 8192
+# A step runs n sequences; vLLM's default 1,024 overruns a hybrid model's Mamba cache.
+MAX_NUM_SEQS = 256
+
+
+def _has_vision_encoder(checkpoint_dir: str) -> bool:
+    import json
+    from pathlib import Path
+
+    try:
+        config = json.loads((Path(checkpoint_dir) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(config, dict) and "vision_config" in config
+
+
 class VllmGenerator:
     """vLLM in-process on the V1 runner, capturing decode activations for proofs.
 
@@ -275,8 +292,15 @@ class VllmGenerator:
         # same step would submit identical completions, the second refused
         # hash_duplicate. The audit never depends on the seed.
         seed = secrets.randbelow(2**31 - 1) + 1
+        # vLLM otherwise reserves the checkpoint's own maximum length, whose KV
+        # cache need not fit the card; the job never asks for more than this.
+        extra = {"max_model_len": sampling.max_new_tokens + PROMPT_ALLOWANCE_TOKENS,
+                 "max_num_seqs": MAX_NUM_SEQS}
+        if _has_vision_encoder(checkpoint_dir):
+            # The job's prompts are text: skip the vision encoder's profiling.
+            extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False,
-                        seed=seed, **memory)
+                        seed=seed, **memory, **extra)
         self._params = SamplingParams(
             n=1, temperature=sampling.temperature, top_p=sampling.top_p,
             top_k=sampling.top_k if sampling.top_k > 0 else -1,
