@@ -757,3 +757,16 @@ def test_an_unaudited_pass_waits_the_routes_write_slack_past_the_hold():
     clock.now = T0 + HOLD + ACCEPT_SLACK_SECONDS
     asyncio.run(auditor.judge_many([x]))
     assert (records.verdicts[x]["passed"], records.verdicts[x]["audited"]) == (True, False)
+
+
+def test_an_unreadable_record_holding_passes_back_is_logged(caplog):
+    x = _ids(False, 1)[0]
+    y = _ids(True, 1)[0]
+    records = _FlakyReads({x: _rec(0), y: _rec(0, received_at=T0 + 10), **_steady()})
+    records.fail[y] = 2
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + HOLD + 1), beacon=_Beacon())
+    with caplog.at_level("ERROR", logger="reliquary.validator.corpus_auditor"):
+        asyncio.run(auditor.judge_many([x]))
+    assert records.verdicts == {}
+    assert any("1 pending corpus record(s) unreadable" in r.getMessage()
+               and "every unaudited pass waits" in r.getMessage() for r in caplog.records)

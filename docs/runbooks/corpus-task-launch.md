@@ -256,11 +256,13 @@ What each state means for a miner:
   confirmed failure in between.
 - **`sampled`** — only a fraction `audit_q` of submissions is drawn for audit.
   The draw is keyed on the drand round after the first one published once the
-  submission was received (one round of margin against clock lag), so a miner cannot choose which of its own submissions gets
-  checked; a hotkey submitting fewer than `1 / audit_q` per hold is still
+  submission was received (one round of margin against clock lag), so a
+  miner cannot choose which of its own submissions gets checked; a hotkey submitting fewer than `1 / audit_q` per hold is still
   audited at 100 % (too small a sample to be worth drawing). A submission that
-  is not drawn still waits out `audit_hold_seconds` before it is paid,
-  unaudited (verdict `passed: true, audited: false`).
+  is not drawn still waits out `audit_hold_seconds` (plus 420 s for the
+  route's record write) before it is paid, unaudited (verdict `passed: true,
+  audited: false`), and longer while a sibling of the same hotkey received
+  inside its hold is not judged yet (see "A hold delays payment").
 - **`suspect`** — one confirmed failure (a failure that survives a second,
   separate re-audit) puts the hotkey back to 100 % audit for
   `audit_suspect_seconds`, and every one of its records still in hold at that
@@ -273,8 +275,15 @@ What each state means for a miner:
   into a fresh `probation` — not straight back to `sampled`.
 
 **A hold delays payment, it never skips it.** A `sampled` submission that is
-not drawn is payable only once `audit_hold_seconds` has passed since it was
-received; until then `reliquary jobs status <job>` shows it as accepted but
+not drawn is payable only once `audit_hold_seconds` plus 420 s (the route's
+worst-case record write) has passed since it was received, and every record
+of that hotkey received inside its hold has been judged or is known undrawn:
+a drawn one still queued is audited first, so a failure there catches it.
+While any pending record cannot be read, **every** unaudited pass of the job
+waits (its hotkey is unknown), and the corpus validator logs `N pending corpus
+record(s) unreadable (e.g. <id>); every unaudited pass waits until they read or
+get a verdict` each pass; audited records are still judged and paid. A record
+that stays unreadable must be fixed in the store. Until then `reliquary jobs status <job>` shows it as accepted but
 unsettled, the same as one still waiting on a batched audit pass. Resolving
 the drand chain's genesis time and period is lazy: if it is not yet known
 when a submission's draw is due, that submission is audited (fail safe)

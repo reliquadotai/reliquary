@@ -567,7 +567,8 @@ class CorpusAuditor:
             if hotkey in failed:
                 continue  # now suspect: the backward audit decides it
             # Wait while a sibling that could still catch this record is
-            # undecided or could not be audited this pass.
+            # undecided or hit a validator error this pass, or while any
+            # pending record is unreadable (its hotkey could be this one).
             if unreadable or hotkey in errored or any(
                     t <= received_at + self._params.hold_seconds
                     for t in undecided.get(hotkey, ())):
