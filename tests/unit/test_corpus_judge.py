@@ -93,11 +93,14 @@ def _rec(seed, received_at=T0, hotkey=HK):
     return {**_RECORDS[seed], "hotkey": hotkey, "received_at": received_at}
 
 
-def _judge(records, states, clock, *, params=None, beacon=None, round_at=_round_at):
+def _judge(records, states, clock, *, params=None, beacon=None, round_at=_round_at,
+           **kwargs):
+    # No payable slack unless a test asks for it: these tests pin the hold itself.
+    kwargs.setdefault("accept_slack_seconds", 0.0)
     return CorpusAuditor(
         job_id="math-v1", records=records, model=_model(0), tokenizer=_Tokenizer(), proof=PROOF,
         params=params or AuditParams(q=Q, hold_seconds=HOLD, ban_after_failures=10),
-        miner_states=states, beacon=beacon, round_at=round_at, clock=clock,
+        miner_states=states, beacon=beacon, round_at=round_at, clock=clock, **kwargs,
     )
 
 
@@ -735,3 +738,22 @@ def test_passes_beyond_the_remembered_ids_are_written_in_chunks(monkeypatch):
     asyncio.run(_judge(records, states, _Clock(T0 + 1), params=AuditParams()).judge_many(ids))
     assert records.miner_writes == 2
     assert asyncio.run(states.get(HK)).audited_passed == 3
+
+
+def test_an_unaudited_pass_waits_the_routes_write_slack_past_the_hold():
+    # The route stamps received_at before its record write (and retries): a
+    # sibling received inside X's hold may be invisible until that write ends.
+    from reliquary.validator.corpus_auditor import ACCEPT_SLACK_SECONDS
+
+    x = _ids(False, 1)[0]
+    records = _Records({x: _rec(0), **_steady()})
+    clock = _Clock(T0 + HOLD + ACCEPT_SLACK_SECONDS - 1e-3)
+    auditor = CorpusAuditor(
+        job_id="math-v1", records=records, model=_model(0), tokenizer=_Tokenizer(), proof=PROOF,
+        params=AuditParams(q=Q, hold_seconds=HOLD, ban_after_failures=10),
+        miner_states=_States({HK: SAMPLED}), beacon=_Beacon(), round_at=_round_at, clock=clock)
+    asyncio.run(auditor.judge_many([x]))
+    assert records.verdicts == {}
+    clock.now = T0 + HOLD + ACCEPT_SLACK_SECONDS
+    asyncio.run(auditor.judge_many([x]))
+    assert (records.verdicts[x]["passed"], records.verdicts[x]["audited"]) == (True, False)

@@ -118,7 +118,7 @@ def drawn(randomness_hex: str, submission_id: str, q: float) -> bool:
 
 
 def decision(m, *, params, now, received_at, recent_submissions, randomness_hex,
-             submission_id: str) -> str:
+             submission_id: str, slack_seconds: float = 0.0) -> str:
     state = effective_state(m, now, params)
     if state == "banned":
         return "void_banned"
@@ -131,7 +131,9 @@ def decision(m, *, params, now, received_at, recent_submissions, randomness_hex,
         return "audit"
     if drawn(randomness_hex, submission_id, params.q):
         return "audit"
-    return "pass_unaudited" if now >= received_at + params.hold_seconds else "wait"
+    # The slack covers a sibling received inside the hold whose record is still being written.
+    payable_at = received_at + params.hold_seconds + slack_seconds
+    return "pass_unaudited" if now >= payable_at else "wait"
 
 
 def after_pass(m: MinerState, params: AuditParams, mant_mean: float,

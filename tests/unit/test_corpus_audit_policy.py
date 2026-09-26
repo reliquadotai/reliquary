@@ -187,3 +187,11 @@ def test_a_pass_is_counted_once_per_submission_and_the_ids_stay_bounded():
     for i in range(PASS_IDS + 5):
         m = after_pass(m, P, 1.0, f"{i:064x}")
     assert len(m.pass_ids) == PASS_IDS and m.audited_passed == 3 + 1 + PASS_IDS + 5
+
+
+def test_the_slack_moves_the_end_of_the_hold():
+    kw = dict(params=P, received_at=0, recent_submissions=50, submission_id=SID)
+    rand = next(f"{i:064x}" for i in range(1000) if not drawn(f"{i:064x}", SID, P.q))
+    assert decision(_sampled(), now=100, randomness_hex=rand, **kw) == "pass_unaudited"
+    assert decision(_sampled(), now=100, randomness_hex=rand, slack_seconds=5, **kw) == "wait"
+    assert decision(_sampled(), now=105, randomness_hex=rand, slack_seconds=5, **kw) == "pass_unaudited"

@@ -51,6 +51,11 @@ BEACON_GRACE_SECONDS = 2.0
 # attempt: every sampled submission whose draw lands on a bad round would
 # otherwise refetch it once per judging pass.
 NEGATIVE_BEACON_CACHE_SECONDS = 30.0
+# The route stamps received_at before its record write, which it tries
+# RECORD_WRITE_ATTEMPTS (3) times, each up to 3 botocore attempts of 15 s
+# connect + 30 s read: 405 s. An unaudited pass waits this long past the hold,
+# so every sibling received inside that hold is visible before it is paid.
+ACCEPT_SLACK_SECONDS = 420.0
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _WORST_ZERO = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
 _BANNED_VOID = {"passed": False, "audited": False, "reason": "banned"}
@@ -67,7 +72,8 @@ class CorpusAuditor:
                  params: AuditParams = AuditParams(), miner_states=None,
                  beacon: Callable[[int], str | None] | None = None,
                  round_at: Callable[[float], int] | None = None,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 accept_slack_seconds: float = ACCEPT_SLACK_SECONDS) -> None:
         self._job_id = job_id
         self._records = records
         self._model = model
@@ -84,6 +90,7 @@ class CorpusAuditor:
         self._beacon = beacon
         self._round_at = round_at
         self._clock = clock
+        self._accept_slack = accept_slack_seconds
         # Records are immutable: (hotkey, received_at, token_count) read once,
         # so a rescan every minute does not re-read every record from the store.
         self._meta: dict[str, tuple[str, float, int]] = {}
@@ -478,7 +485,7 @@ class CorpusAuditor:
                                 "drawn": drawn(randomness, submission_id, self._params.q)}
         choice = decision(state, params=self._params, now=now, received_at=received_at,
                           recent_submissions=recent, randomness_hex=randomness,
-                          submission_id=submission_id)
+                          submission_id=submission_id, slack_seconds=self._accept_slack)
         return choice, draw
 
     async def _judge_once(self, submission_ids: list[str]) -> set[str]:
