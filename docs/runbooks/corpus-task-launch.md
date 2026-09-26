@@ -410,6 +410,74 @@ reliquary corpus ledgers migrate --job <job>    # <job>: migrated | v2 | absent
 A code rollback without step 2 is an outage of the corpus route, not a loss;
 running step 2 at any later point restores service.
 
+### 3.2 Several jobs on one validator (one card, one model load)
+
+A job has one prompt source. To generate, say, maths and code from the same
+teacher at once, declare two jobs and serve both from ONE validator process:
+the model is loaded once and both jobs' audits share the card, one forward pass
+at a time (a FIFO lock: a job with a backlog waits at most one pass before the
+other job's records are audited).
+
+1. **Declare two jobs on the same checkpoint** (§2), each under its own task:
+   same `--model`, `--model-revision`, `--checkpoint-sha256` and
+   `--from-profile`; distinct `--job-id` and `--task-id`; one `--prompt-source`
+   each. Each task keeps its own cap, and all caps together (the RL task's
+   included) must still sum to at most 1.0 (§1.3):
+
+   ```bash
+   reliquary jobs create --job-id <math-job> --task-id corpus-math \
+     --prompt-source reliquary_dapo_math_v1 --cap 0.05 ...   # rest as in §2
+   reliquary jobs create --job-id <code-job> --task-id corpus-code \
+     --prompt-source reliquary_code_v1 --cap 0.05 ...
+   reliquary tasks list   # e.g. default 0.9 + corpus-math 0.05 + corpus-code 0.05 <= 1.0
+   ```
+
+2. **One merged contract.** Each task carries its template narrowed to its own
+   source; the process runs their union. `tasks contract` with several ids
+   prints it, and refuses tasks whose contracts differ in anything but their
+   environments (model, proofs, sampling):
+
+   ```bash
+   reliquary tasks contract --task-id corpus-math --task-id corpus-code > corpus-math-code.contract.json
+   ```
+
+3. **Start one validator with both ids:**
+
+   ```bash
+   export RELIQUARY_TASK_ID=corpus-math,corpus-code
+   export RELIQUARY_TASK_CONTRACT=$PWD/corpus-math-code.contract.json
+   reliquary validate --wallet-name <wallet> --hotkey <hotkey> \
+     --http-host 0.0.0.0 --http-port <port> --no-set-weights
+   ```
+
+   It refuses to start (exit 4, before any download) if an id is not an active
+   `corpus-generation` task (never mix in an RL task), if a task's contract is
+   not the merged contract narrowed to its source, if the jobs name different
+   checkpoints (repo, revision or sha256), if their toploc proofs differ, or if
+   two tasks name the same job. `RELIQUARY_TASK_ID` is also the list of archive
+   prefixes the settler may write under.
+
+What stays per job: the prompt source and renderer, the records and verdicts
+under `reliquary/corpus/jobs/<job>/`, the `audit_*` parameters of that task's
+entry, `miners.json` (a hotkey banned on one job is not banned on the other),
+and settlement: each task's archives under its own prefix, paid from its own
+cap. Shared: the loaded model, the card, and the subnet-registration snapshot.
+
+HTTP: `POST /corpus/submit` is unchanged and routes on the submission's
+`job_id` (a job this validator does not serve is refused `job_not_served`, its
+detail listing the served ids). `GET /corpus/jobs` lists the served jobs;
+`GET /corpus/jobs/<job>/job` and `GET /corpus/jobs/<job>/cursor/<hotkey>`
+answer for one of them (404 `corpus_job_not_served` otherwise). With several
+jobs, the legacy `GET /corpus/job` and `GET /corpus/cursor/<hotkey>` answer
+409 `{"detail": "several_jobs_served", "jobs": [...]}`; with one job they are
+unchanged (and the job-scoped routes work too).
+
+Rehearse it first (§0) with `--second-prompt-source <source>`: one validator
+serves both jobs, one honest miner per job, and one hotkey mines the first job
+with the dishonest model then the second honestly. Pass: each archive pays
+only its own miners and sums to its own cap (`--second-cap`, default `--cap`),
+and that hotkey is failed and banned on the first job only.
+
 ## 4. Miners
 
 On each miner:
@@ -433,6 +501,12 @@ reliquary corpus mine --validator-url http://<validator-ip>:<port> \
 - `--max-steps N` stops after N submissions; 0 runs until `job_complete`.
 - The miner downloads the job's checkpoint and refuses to start if its
   fingerprint differs from the manifest.
+- `--job-id <job>` against a validator serving several jobs (§3.2): the miner
+  then reads that job's `/corpus/jobs/<job>/...` routes. Without it, such a
+  validator's 409 stops the miner with the list of jobs to choose from. One
+  process mines one job: a miner who wants both runs two processes (two cards,
+  or `--gpu-memory-utilization` to share one), with the merged contract file
+  or its job's task contract.
 
 ## 5. Watch
 
