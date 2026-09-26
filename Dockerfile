@@ -59,8 +59,9 @@ RUN printf '%s\n' "${RELIQUARY_BUILD_REVISION}" \
 RUN pip install boto3
 
 # wandb for trainer telemetry (lazy-imported in reliquary.validator.telemetry).
-# No-op at runtime if WANDB_API_KEY is unset.
-RUN pip install wandb
+# No-op at runtime if WANDB_API_KEY is unset. OpenTelemetry is held at the
+# Logic runtime lock's 1.44.0, or `pip check` fails when that lock installs.
+RUN pip install wandb "opentelemetry-api==1.44.0" "opentelemetry-sdk==1.44.0"
 
 # Explicit candidate variant only. Hash-check before install, then verify the
 # installed artifact/import/reward. A local release candidate can be supplied
