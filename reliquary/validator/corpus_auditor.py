@@ -87,8 +87,12 @@ class CorpusAuditor:
                  beacon: Callable[[int], str | None] | None = None,
                  round_at: Callable[[float], int] | None = None,
                  clock: Callable[[], float] = time.time,
-                 accept_slack_seconds: float = ACCEPT_SLACK_SECONDS) -> None:
+                 accept_slack_seconds: float = ACCEPT_SLACK_SECONDS,
+                 gpu_lock: asyncio.Lock | None = None) -> None:
         self._job_id = job_id
+        # Shared by every job's auditor on one loaded model: one forward pass
+        # at a time, and asyncio.Lock wakes waiters FIFO so no job starves.
+        self._gpu_lock = gpu_lock if gpu_lock is not None else contextlib.nullcontext()
         self._records = records
         self._model = model
         self._tokenizer = tokenizer
@@ -310,11 +314,15 @@ class CorpusAuditor:
         del arrivals[:bisect.bisect_left(arrivals, now - self._params.hold_seconds)]
         return bisect.bisect_right(arrivals, now)
 
+    async def _forward(self, records: list[dict]) -> list[dict]:
+        async with self._gpu_lock:
+            return await asyncio.to_thread(self._judge_many, records)
+
     async def _audit_outcomes(self, records: list[dict]) -> list[dict | str]:
         """One outcome per record; a string is a validator-side error message."""
         batch_failed, batch_error = False, ""
         try:
-            judged: list = await asyncio.to_thread(self._judge_many, records)
+            judged: list = await self._forward(records)
         except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as exc:
             # Record only the message here, then leave the block: `exc` and its
             # traceback pin every frame that was live when the batch failed
@@ -337,7 +345,7 @@ class CorpusAuditor:
             judged = []
             for record in records:
                 try:
-                    judged.append((await asyncio.to_thread(self._judge_many, [record]))[0])
+                    judged.append((await self._forward([record]))[0])
                 except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as solo_exc:
                     # A message, not the exception object: so this record's
                     # traceback (and whatever activations it pins) cannot
