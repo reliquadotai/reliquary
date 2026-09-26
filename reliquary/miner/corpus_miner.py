@@ -111,6 +111,52 @@ def issue_corpus_request(request_call):
         ) from exc
 
 
+class CorpusJobSelectionError(Exception):
+    """The validator serves several jobs and this miner named none, or named
+    one it does not serve: pass ``--job-id`` with one of the listed jobs."""
+
+
+class HttpCorpusClient:
+    """The ``CorpusClient`` over HTTP: the legacy paths, or with ``job_id``
+    that job's own paths on a validator serving several jobs."""
+
+    def __init__(self, http, *, job_id: str | None = None) -> None:
+        self._http = http
+        self._job_id = job_id
+
+    def _served(self) -> list:
+        try:
+            return list(self._http.get("/corpus/jobs").json()["jobs"])
+        except Exception:
+            return []
+
+    def job(self) -> dict:
+        if self._job_id is None:
+            response = self._http.get("/corpus/job")
+            if response.status_code == 409:
+                jobs = (_error_detail(response) or {}).get("jobs") or self._served()
+                raise CorpusJobSelectionError(
+                    f"the validator serves several jobs {jobs}; pass --job-id with the "
+                    "one to mine (run one miner process per job)"
+                )
+        else:
+            response = self._http.get(f"/corpus/jobs/{self._job_id}/job")
+            if response.status_code == 404:
+                raise CorpusJobSelectionError(
+                    f"the validator does not serve job {self._job_id!r}; it serves {self._served()}"
+                )
+        response.raise_for_status()
+        return response.json()
+
+    def cursor(self, hotkey: str) -> int:
+        path = (f"/corpus/cursor/{hotkey}" if self._job_id is None
+                else f"/corpus/jobs/{self._job_id}/cursor/{hotkey}")
+        return int(issue_corpus_request(lambda: self._http.get(path))["cursor"])
+
+    def submit(self, body: dict) -> dict:
+        return issue_corpus_request(lambda: self._http.post("/corpus/submit", json=body))
+
+
 @dataclass(frozen=True)
 class Generation:
     tokens: list[int]

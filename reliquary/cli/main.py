@@ -1307,6 +1307,10 @@ def corpus_mine(
         None, "--gpu-memory-utilization",
         help="Share of the card vLLM may take; omit for vLLM's own default",
     ),
+    job_id: str = typer.Option(
+        None, "--job-id",
+        help="The job to mine on a validator serving several; one process mines one job",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
@@ -1320,9 +1324,10 @@ def corpus_mine(
     from reliquary.corpus.encoding import checkpoint_fingerprint
     from reliquary.corpus.job import parse_job
     from reliquary.miner.corpus_miner import (
+        CorpusJobSelectionError,
         CorpusMinerHalted,
+        HttpCorpusClient,
         VllmGenerator,
-        issue_corpus_request as _issue,
         mine_steps,
     )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
@@ -1348,21 +1353,12 @@ def corpus_mine(
         wallet_kwargs["path"] = wallet_path
     wallet = bt.Wallet(**wallet_kwargs)
     http = httpx.Client(base_url=validator_url, timeout=120.0)
-
-    class _Client:
-        def job(self):
-            response = http.get("/corpus/job")
-            response.raise_for_status()
-            return response.json()
-
-        def cursor(self, hk):
-            return int(_issue(lambda: http.get(f"/corpus/cursor/{hk}"))["cursor"])
-
-        def submit(self, body):
-            return _issue(lambda: http.post("/corpus/submit", json=body))
-
-    client = _Client()
-    job = parse_job(client.job())
+    client = HttpCorpusClient(http, job_id=job_id)
+    try:
+        job = parse_job(client.job())
+    except CorpusJobSelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
     if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
         typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
