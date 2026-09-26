@@ -221,7 +221,7 @@ def run_validator(args) -> None:
     asyncio.run(run_corpus_validator(
         entry=entry, wallet=None, netuid=0, signer_client=None,
         http_host="127.0.0.1", http_port=args.port, cap=args.cap,
-        set_weights=False, settle_every_seconds=1e9,
+        set_weights=False, settle_every_seconds=1e9, registration_gate=False,
     ))
 
 

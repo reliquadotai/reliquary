@@ -614,6 +614,7 @@ def build_corpus_router(
     proof_chunk_tokens: int | None = None,
     vocab_size: int | None = None,
     is_banned: Callable[[str], Awaitable[bool]] | None = None,
+    registration: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -624,6 +625,8 @@ def build_corpus_router(
 
     ``is_banned`` is optional: a caller with no ban state to consult (a test,
     or a validator not yet wired to one) leaves every hotkey admitted.
+    ``registration`` likewise: it answers None for a hotkey registered on the
+    subnet, else ``corpus_registration.NOT_REGISTERED`` or ``UNAVAILABLE``.
     """
 
     router = APIRouter()
@@ -730,6 +733,17 @@ def build_corpus_router(
             return _refuse(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
         if not verified:
             return _refuse(CorpusRejectReason.BAD_SIGNATURE)
+
+        # An unregistered hotkey is never paid; refuse it before it costs a
+        # store read or an audit. Unknown registrations are retried, not refused.
+        if registration is not None:
+            from reliquary.validator.corpus_registration import NOT_REGISTERED
+
+            reason = await registration(request.miner_hotkey)
+            if reason == NOT_REGISTERED:
+                return _refuse(CorpusRejectReason.HOTKEY_NOT_REGISTERED)
+            if reason is not None:
+                raise HTTPException(status_code=503, detail="corpus_registration_unavailable")
 
         # Right after the signature check and before anything is read or
         # written: an unsigned request must not be able to probe ban status.

@@ -326,9 +326,13 @@ reliquary validate --wallet-name <wallet> --hotkey <hotkey> \
 - The validator needs the R2 credentials of the production bucket and access
   to `<repo>` on the Hub.
 
-**There are no seats: the task is open to every miner.** Nothing in the code
-counts or lists hotkeys; a submission is admitted on its signature and the CPU
-checks, and every new hotkey is fully audited through its probation. Audit
+**There are no seats: the task is open to every miner registered on the
+subnet.** Nothing in the code counts or lists hotkeys; a submission is admitted
+on its signature, the hotkey's registration and the CPU checks, and every new
+hotkey is fully audited through its probation. An unregistered hotkey is refused
+`hotkey_not_registered` (it could never be paid) and its miner stops; the
+validator reads the subnet's registrations every 10 minutes, and while it has
+no fresh snapshot it answers 503, which miners retry. Audit
 throughput only sets how fast payment follows: when the fleet generates faster
 than the card audits, verdicts lag and payment is delayed, nothing is lost.
 Watch the backlog and the queue lag (section 5); a second card is the answer

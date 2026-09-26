@@ -346,3 +346,35 @@ def test_drand_beacon_lowercases_randomness_on_success(monkeypatch):
 
     assert drand_beacon(42) == "ab" * 32
     assert calls == [("x", 42, "ab" * 32, "cd" * 48)]
+
+
+def test_the_app_refuses_an_unregistered_hotkey(seeded_job):
+    from reliquary.validator.corpus_registration import RegisteredHotkeys
+
+    async def load():
+        return {"5Registered"}
+
+    registered = RegisteredHotkeys(load=load)
+    asyncio.run(registered.refresh())
+    auditor = SimpleNamespace(enqueue=lambda sid: None)
+    app = build_corpus_app(entry=_entry(), job=seeded_job.job, store=seeded_job.store,
+                           records=None, tokenizer=_Tokenizer(), renderer=seeded_job.renderer,
+                           verify_signature=lambda r: True, auditor=auditor,
+                           proof_chunk_tokens=None, prompt_job_for=seeded_job.prompt_job_for,
+                           registration=registered.reason)
+
+    body = TestClient(app).post(
+        "/corpus/submit",
+        json={
+            "job_id": "swe-v1",
+            "miner_hotkey": "5Stranger",
+            "cursor": 0,
+            "prompt_index": 0,
+            "checkpoint_sha256": "a" * 64,
+            "rendered_prompt": _faithful_prompt(0),
+            "completions": [{"tokens": [7] * 16 + [EOS], "text": _text_for([7] * 16 + [EOS])}],
+            "signature": "ok",
+        },
+    ).json()
+
+    assert body["reason"] == "hotkey_not_registered"

@@ -48,6 +48,8 @@ class CorpusRejectReason(str, Enum):
     # Checked right after the signature, so a spoofed hotkey cannot probe ban
     # status and a banned one never reaches the ledgers.
     MINER_BANNED = "miner_banned"
+    # An unregistered hotkey is never paid, so its work would only spend audit GPU.
+    HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
     MALFORMED_SUBMISSION = "malformed_submission"
     JOB_UNKNOWN = "job_unknown"
     # Distinct from JOB_UNKNOWN on purpose: "this job exists but this

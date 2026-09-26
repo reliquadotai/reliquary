@@ -168,7 +168,7 @@ def build_corpus_audit_wiring(*, entry, job, records):
 
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
                      auditor, proof_chunk_tokens, prompt_job_for=None,
-                     vocab_size=None, is_banned=None) -> FastAPI:
+                     vocab_size=None, is_banned=None, registration=None) -> FastAPI:
     from reliquary.validator.corpus_service import build_corpus_router, prompt_job_for_spec
 
     app = FastAPI()
@@ -176,14 +176,15 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
         job_id=str(entry.job_id), store=store, tokenizer=tokenizer, renderer=renderer,
         verify_signature=verify_signature, prompt_job_for=prompt_job_for or prompt_job_for_spec,
         records=records, on_accepted=auditor.enqueue, proof_chunk_tokens=proof_chunk_tokens,
-        vocab_size=vocab_size, is_banned=is_banned,
+        vocab_size=vocab_size, is_banned=is_banned, registration=registration,
     ))
     return app
 
 
 async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_host, http_port,
                                cap: float, set_weights: bool,
-                               settle_every_seconds: float = 60.0) -> None:
+                               settle_every_seconds: float = 60.0,
+                               registration_gate: bool = True) -> None:
     import threading
     from pathlib import Path
 
@@ -233,6 +234,17 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
             f"prompt source {job.prompt_source!r}, which cannot be built: {exc}"
         ) from exc
 
+    # Only the rehearsal turns the gate off: its local keys are not on the chain.
+    registered = None
+    if registration_gate:
+        from reliquary.validator.corpus_registration import (
+            RegisteredHotkeys, load_registered_hotkeys,
+        )
+
+        registered = RegisteredHotkeys(load=lambda: load_registered_hotkeys(netuid))
+        if not await registered.refresh():
+            logger.warning("subnet registrations unknown at start; miners get 503 until they load")
+
     directory = Path(snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision))
     refusal = startup_refusal(entry, job, ACTIVE_PROTOCOL_PROFILE, checkpoint_fingerprint(directory))
     if refusal:
@@ -257,7 +269,8 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
                            verify_signature=verify_corpus_signature, auditor=auditor,
                            proof_chunk_tokens=proof.chunk_tokens,
                            vocab_size=model.get_input_embeddings().num_embeddings,
-                           is_banned=is_banned)
+                           is_banned=is_banned,
+                           registration=registered.reason if registered is not None else None)
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in
     # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
     settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
@@ -283,7 +296,8 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
         ).start()
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
-    await asyncio.gather(server.serve(), auditor.run(), settle_forever())
+    background = [registered.refresh_forever()] if registered is not None else []
+    await asyncio.gather(server.serve(), auditor.run(), settle_forever(), *background)
 
 
 __all__ = [
