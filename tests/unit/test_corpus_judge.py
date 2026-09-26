@@ -647,3 +647,50 @@ def test_the_rescan_logs_the_queue_lag(caplog):
     with caplog.at_level("INFO", logger="reliquary.validator.corpus_auditor"):
         asyncio.run(_one_rescan())
     assert any("queue lag" in r.getMessage() and "400" in r.getMessage() for r in caplog.records)
+
+
+class _FlakyReads(_Records):
+    """Each id in `fail` raises once on read, like a transient store error."""
+
+    def __init__(self, submissions):
+        super().__init__(submissions)
+        self.fail = {}
+
+    async def read_submission(self, job_id, sid):
+        if self.fail.get(sid):
+            self.fail[sid] -= 1
+            raise OSError("transient")
+        return await super().read_submission(job_id, sid)
+
+
+def test_a_drawn_sibling_whose_read_failed_once_is_not_forgotten():
+    x, x2 = _ids(False, 2)
+    y = _ids(True, 1)[0]
+    records = _FlakyReads({x: _rec(1), x2: _rec(1), **_steady(1)})
+    clock = _Clock(T0 + 10)
+    auditor = _judge(records, _States({HK: SAMPLED}), clock, beacon=_Beacon())
+    asyncio.run(auditor.judge_many([x]))
+    assert records.verdicts == {}
+    records.submissions[y] = _rec(1, received_at=T0 + 10)
+    records.fail[y] = 1
+    clock.now = T0 + HOLD + 1
+    # The rescan queued Y into an earlier batch; its read failed and run()
+    # dropped it from the queue.
+    asyncio.run(auditor.judge_many([y]))
+    auditor._queued.discard(y)
+    asyncio.run(auditor.judge_many([x]))
+    assert records.verdicts[y]["passed"] is False
+    assert (records.verdicts[x]["passed"], records.verdicts[x]["audited"]) == (False, True)
+
+
+def test_a_failed_seeding_read_after_a_restart_holds_unaudited_passes_back():
+    x = _ids(False, 1)[0]
+    y = _ids(True, 1)[0]
+    records = _FlakyReads({x: _rec(1), y: _rec(1, received_at=T0 + 10), **_steady(1)})
+    records.fail[y] = 2
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + HOLD + 1), beacon=_Beacon())
+    asyncio.run(auditor.judge_many([x]))  # the seed's read of Y fails, and its re-read
+    assert records.verdicts == {}
+    asyncio.run(auditor.judge_many([x]))  # Y reads now: drawn, audited, caught
+    assert records.verdicts[y]["passed"] is False
+    assert (records.verdicts[x]["passed"], records.verdicts[x]["audited"]) == (False, True)

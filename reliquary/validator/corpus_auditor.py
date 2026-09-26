@@ -101,6 +101,9 @@ class CorpusAuditor:
         # Per hotkey, the ids read but not judged yet: the siblings an unaudited
         # pass must wait for (queue lag can exceed the hold).
         self._unjudged: dict[str, set[str]] = {}
+        # Pending ids whose read failed, until one succeeds or a verdict stands:
+        # their hotkey is unknown, so every unaudited pass waits for them.
+        self._unreadable: set[str] = set()
 
     def enqueue(self, submission_id: str) -> None:
         if submission_id in self._queued:
@@ -117,6 +120,7 @@ class CorpusAuditor:
 
     def _mark_judged(self, submission_id: str) -> None:
         self._judged.add(submission_id)
+        self._unreadable.discard(submission_id)
         if submission_id in self._meta:
             self._unjudged.get(self._meta[submission_id][0], set()).discard(submission_id)
 
@@ -208,10 +212,13 @@ class CorpusAuditor:
         except Exception:
             # Isolated per id: one bad read must not stall the rest of the batch.
             logger.exception("corpus read of %s failed; leaving it pending", submission_id[:12])
+            self._unreadable.add(submission_id)
             return None
         if record is None:
             logger.error("corpus submission %s has no record", submission_id[:12])
+            self._unreadable.add(submission_id)
             return None
+        self._unreadable.discard(submission_id)
         if submission_id not in self._meta:
             received = record.get("received_at")
             # An older record carries no arrival time: its hold counts from when
@@ -473,14 +480,11 @@ class CorpusAuditor:
         # The backward audit and the rescan bring a caught hotkey's records back.
         submission_ids = [sid for sid in submission_ids if sid not in self._judged]
         read: dict[str, dict] = {}
-        unreadable = False
         for submission_id in submission_ids:
             if submission_id not in self._meta:
                 record = await self._read(submission_id)
                 if record is not None:
                     read[submission_id] = record
-                else:
-                    unreadable = True
         known = [sid for sid in dict.fromkeys(submission_ids) if sid in self._meta]
         states = {}
         for hotkey in {self._meta[sid][0] for sid in known}:
@@ -508,10 +512,9 @@ class CorpusAuditor:
             # hold may still sit in the queue. Decide every such sibling now and
             # audit the drawn ones in this pass, so a failure among them reaches
             # X through the same-pass guard below instead of after X is paid.
-            for sid in list(self._queued):
+            for sid in sorted(self._queued | self._unreadable):
                 if sid not in self._meta and sid not in self._judged:
-                    if await self._read(sid) is None:
-                        unreadable = True
+                    await self._read(sid)
             hold_end: dict[str, float] = {}
             for submission_id, _ in unaudited:
                 hotkey, received_at, _ = self._meta[submission_id]
@@ -540,8 +543,12 @@ class CorpusAuditor:
                 results, failed = await self._audit_records(
                     [sid for sid, _ in pairs], [r for _, r in pairs], draws)
                 errored |= {r["hotkey"] for (_, r), result in zip(pairs, results) if result is None}
+        unreadable = bool(self._unreadable)
         if unaudited and unreadable:
-            logger.error("corpus records unreadable; holding every unaudited pass back this pass")
+            logger.error(
+                "%d pending corpus record(s) unreadable (e.g. %s); every unaudited pass "
+                "waits until they read or get a verdict",
+                len(self._unreadable), min(self._unreadable)[:12])
         for submission_id, draw in unaudited:
             hotkey, received_at, token_count = self._meta[submission_id]
             if hotkey in failed:
