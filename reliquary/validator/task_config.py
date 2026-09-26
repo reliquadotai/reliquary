@@ -193,3 +193,85 @@ def legacy_task_config() -> TaskConfig:
         emission_cap=cap,
         env_caps=env_caps,
     )
+
+
+def merge_corpus_contracts(contracts: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """One contract a process can run for several corpus tasks at once.
+
+    Each corpus contract is its template narrowed to one environment, so the
+    merge is the union of the environments; every other field (model, proofs,
+    sampling, ...) must already agree, or one process cannot serve them all.
+    """
+    items = list(contracts.items())
+    first_task, first = items[0]
+    environments: dict[str, Any] = {}
+    owner: dict[str, str] = {}
+    for task_id, contract in items:
+        for key in sorted(set(first) | set(contract)):
+            if key != "environments" and first.get(key) != contract.get(key):
+                raise ValueError(
+                    f"tasks {first_task!r} and {task_id!r} carry different {key!r}; "
+                    "one process can only serve contracts that differ in their environments"
+                )
+        for name, body in (contract.get("environments") or {}).items():
+            if name in environments and environments[name] != body:
+                raise ValueError(
+                    f"tasks {owner[name]!r} and {task_id!r} declare environment {name!r} differently"
+                )
+            environments.setdefault(name, body)
+            owner.setdefault(name, task_id)
+    return {**first, "environments": environments}
+
+
+def resolve_corpus_task_configs(
+    entries: Mapping[str, TaskEntry],
+    task_ids: Iterable[str],
+    *,
+    profile_id: str,
+    generation_contract: Any,
+) -> list[TaskConfig]:
+    """Each corpus task one process serves, in ``task_ids`` order, or a refusal.
+
+    Every entry is resolved against its own carried contract, and that contract
+    must be exactly this process's contract narrowed to its environments: the
+    process renders and proves with ONE contract, the merge of all of them.
+    """
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+    task_ids = tuple(task_ids)
+    configs = []
+    for task_id in task_ids:
+        entry = entries.get(task_id)
+        if entry is not None and getattr(entry, "mechanism", None) != MECHANISM_CORPUS_GENERATION:
+            raise TaskConfigError(
+                f"task {task_id!r} is {entry.mechanism!r}, not a corpus-generation task; "
+                "only a corpus validator serves several task ids"
+            )
+        if entry is not None and entry.contract is None:
+            raise TaskConfigError(
+                f"task {task_id!r} carries no contract; a corpus validator serving several "
+                "tasks needs each one's contract to check it against the one it runs"
+            )
+        contract = entry.contract if entry is not None else generation_contract
+        config = resolve_task_config(
+            entries, task_id, profile_id=profile_id, generation_contract=contract
+        )
+        narrowed = {
+            **generation_contract,
+            "environments": {
+                name: (generation_contract.get("environments") or {}).get(name)
+                for name in (contract.get("environments") or {})
+            },
+        }
+        if canonical_sha256(narrowed) != canonical_sha256(contract):
+            differing = sorted(
+                key for key in set(narrowed) | set(contract)
+                if narrowed.get(key) != contract.get(key)
+            )
+            raise TaskConfigError(
+                f"task {task_id!r}'s contract differs from the one this process runs in "
+                f"{differing}; start it with RELIQUARY_TASK_CONTRACT from `reliquary tasks "
+                f"contract --task-id {' --task-id '.join(task_ids)}`"
+            )
+        configs.append(config)
+    return configs

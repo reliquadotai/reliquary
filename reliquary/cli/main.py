@@ -566,24 +566,41 @@ def tasks_retire(
 
 
 @tasks_app.command("contract")
-def tasks_contract(task_id: str = typer.Option(..., "--task-id")) -> None:
+def tasks_contract(
+    task_ids: list[str] = typer.Option(
+        ..., "--task-id",
+        help="Repeat for corpus tasks one validator serves together: prints their merged contract",
+    ),
+) -> None:
     """Print a task's carried contract, for a deployment to mount."""
     import json
 
     from reliquary.infrastructure.task_registry_store import read_registry
+    from reliquary.validator.task_config import merge_corpus_contracts
 
     entries, _ = asyncio.run(read_registry(strict=False))
-    entry = entries.get(task_id)
-    if entry is None:
-        typer.echo(f"error: no task {task_id!r} in the registry", err=True)
-        raise typer.Exit(code=1)
-    if entry.contract is None:
-        typer.echo(
-            f"error: task {task_id!r} is a legacy entry and carries no contract",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-    typer.echo(json.dumps(entry.contract, sort_keys=True, separators=(",", ":")))
+    contracts = {}
+    for task_id in task_ids:
+        entry = entries.get(task_id)
+        if entry is None:
+            typer.echo(f"error: no task {task_id!r} in the registry", err=True)
+            raise typer.Exit(code=1)
+        if entry.contract is None:
+            typer.echo(
+                f"error: task {task_id!r} is a legacy entry and carries no contract",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        contracts[task_id] = entry.contract
+    if len(contracts) == 1:
+        contract = next(iter(contracts.values()))
+    else:
+        try:
+            contract = merge_corpus_contracts(contracts)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(contract, sort_keys=True, separators=(",", ":")))
 
 
 jobs_app = typer.Typer(
@@ -2126,14 +2143,58 @@ def validate(
                 PROTOCOL_GENERATION_CONTRACT,
                 PROTOCOL_PROFILE_ID,
                 TASK_ID,
+                TASK_IDS,
             )
             from reliquary.infrastructure.task_registry_store import read_registry
             from reliquary.validator.task_config import (
                 TaskConfigError,
                 legacy_registry_fallback,
                 legacy_task_config,
+                resolve_corpus_task_configs,
                 resolve_task_config,
             )
+
+            if len(TASK_IDS) > 1:
+                # Several ids: one corpus validator, one loaded model, one job
+                # per id. Anything else among them refuses, like any other
+                # undeclared task, before the GPU is touched.
+                try:
+                    registry_entries, _ = await read_task_registry_with_retry(
+                        read_registry
+                    )
+                    corpus_configs = resolve_corpus_task_configs(
+                        registry_entries,
+                        TASK_IDS,
+                        profile_id=PROTOCOL_PROFILE_ID,
+                        generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                    )
+                except TaskConfigError as exc:
+                    logger.critical(
+                        "%s; declare them with `reliquary jobs create` before "
+                        "starting this validator",
+                        exc,
+                    )
+                    raise typer.Exit(code=4) from exc
+                except Exception as exc:
+                    logger.critical(
+                        "task registry could not be read (%s); refusing to start "
+                        "rather than pay under unknown rules",
+                        exc,
+                    )
+                    raise typer.Exit(code=4) from exc
+                from reliquary.validator.corpus_validator import run_corpus_validator
+
+                try:
+                    await run_corpus_validator(
+                        jobs=[(c.entry, c.emission_cap) for c in corpus_configs],
+                        wallet=wallet, netuid=netuid, signer_client=signer_client,
+                        http_host=http_host, http_port=http_port,
+                        set_weights=set_weights,
+                    )
+                except RuntimeError as exc:
+                    logger.critical("%s; fix the declaration before starting this validator", exc)
+                    raise typer.Exit(code=4) from exc
+                return
 
             try:
                 # `_run` is itself the coroutine `_run_validator_event_loop`
