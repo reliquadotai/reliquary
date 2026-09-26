@@ -14,3 +14,19 @@ def normalise_task_id(value: str | None) -> str:
     if not TASK_ID_RE.match(resolved):
         raise ValueError(f"unusable task id {resolved!r}")
     return resolved
+
+
+def parse_task_ids(value: str | None) -> tuple[str, ...]:
+    """A comma-separated list of task ids, in order; one id is the usual case.
+
+    Several ids are only meaningful to a corpus validator serving several jobs
+    on one loaded model; a duplicate or empty member is a typo, not a request.
+    """
+    if value is None or "," not in value:
+        return (normalise_task_id(value),)
+    ids = tuple(member.strip() for member in value.split(","))
+    if any(not member for member in ids):
+        raise ValueError(f"task id list {value!r} has an empty member")
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"task id list {value!r} names a task twice")
+    return tuple(normalise_task_id(member) for member in ids)
