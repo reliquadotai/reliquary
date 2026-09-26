@@ -15,6 +15,7 @@ AUDIT_PARAM_KEYS = {
     "audit_ban_window_seconds": "ban_window_seconds", "audit_ban_seconds": "ban_seconds",
 }
 _INTS = {"probation_submissions", "ban_after_failures"}
+_POSITIVE_SECONDS = {"suspect_seconds", "ban_seconds", "ban_window_seconds"}
 _HEX_DIGITS = set("0123456789abcdef")
 MANT_HISTORY = 200
 # Submissions whose confirmed failure is already counted; bounded, and far
@@ -59,6 +60,10 @@ def validate_audit_params(params: Mapping) -> None:
             raise ValueError(f"audit_q must be in (0, 1], got {value}")
         if attr.endswith("seconds") and value < 0:
             raise ValueError(f"{key} must not be negative, got {value}")
+        # Zero makes suspect or a ban end the instant it starts, or a failure
+        # leave the ban window before the next one is counted.
+        if attr in _POSITIVE_SECONDS and value == 0:
+            raise ValueError(f"{key} must be > 0, got {value}")
     # A zero hold with q < 1 pays an unaudited "sampled" submission the
     # instant it is not drawn, defeating the backward audit on a later
     # confirmed failure (§7.4); harmless at q = 1, which never takes that path.

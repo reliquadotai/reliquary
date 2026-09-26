@@ -29,6 +29,15 @@ def test_nonsense_parameters_are_refused(bad):
         validate_audit_params(bad)
 
 
+@pytest.mark.parametrize("key", [
+    "audit_suspect_seconds", "audit_ban_seconds", "audit_ban_window_seconds",
+])
+def test_a_zero_suspect_ban_or_window_length_is_refused(key):
+    # Zero turns suspect or a ban into a no-op, or never counts a failure towards a ban.
+    with pytest.raises(ValueError, match=key):
+        validate_audit_params({key: 0})
+
+
 def test_a_new_hotkey_is_audited_until_its_probation_passes():
     m = MinerState()
     for _ in range(3):
