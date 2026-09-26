@@ -54,10 +54,12 @@ class _FlakyMinersStore:
     without touching the underlying object (``__slots__`` forbids patching it
     directly)."""
 
-    def __init__(self, inner, *, fail_first_n=0, always_fail=False):
+    def __init__(self, inner, *, fail_first_n=0, always_fail=False, concurrent=None):
         self._inner = inner
         self._fail_first_n = fail_first_n
         self._always_fail = always_fail
+        # (hotkey, fields) a concurrent writer lands before each lost race.
+        self._concurrent = concurrent
         self.write_attempts = 0
 
     async def read_miners(self, job_id):
@@ -68,8 +70,12 @@ class _FlakyMinersStore:
 
         self.write_attempts += 1
         if self._always_fail or self.write_attempts <= self._fail_first_n:
-            # Simulate a concurrent writer winning the race: the underlying
-            # store is untouched by this call.
+            # A concurrent writer wins the race; this call's write is dropped.
+            if self._concurrent is not None:
+                hotkey, fields = self._concurrent
+                document, current = await self._inner.read_miners(job_id)
+                entry = {**document.get(hotkey, {}), **fields}
+                await self._inner.write_miners(job_id, {**document, hotkey: entry}, current)
             raise CorpusStoreConflict("stale etag")
         return await self._inner.write_miners(job_id, state, etag)
 
@@ -78,14 +84,18 @@ def test_a_conflict_is_re_read_and_the_change_reapplied(r2):
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
     from reliquary.validator.corpus_miner_states import MinerStates
 
-    store = _FlakyMinersStore(BucketRecordStore(), fail_first_n=1)
+    # The race is lost to a writer banning the same hotkey: the retry must
+    # re-read it, or a write built from the stale read would lift the ban.
+    store = _FlakyMinersStore(BucketRecordStore(), fail_first_n=1,
+                              concurrent=("A", {"banned_until": 99.0}))
     states = MinerStates(store, "job-x")
 
     result = asyncio.run(states.update("A", lambda m: replace(m, audited_passed=m.audited_passed + 1)))
 
     assert store.write_attempts == 2
-    assert result.audited_passed == 1
-    assert asyncio.run(states.get("A")).audited_passed == 1
+    assert result.audited_passed == 1 and result.banned_until == 99.0
+    stored = asyncio.run(states.get("A"))
+    assert stored.audited_passed == 1 and stored.banned_until == 99.0
 
 
 def test_attempts_exhausted_raises_conflict(r2):
