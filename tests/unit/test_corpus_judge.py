@@ -448,3 +448,27 @@ def test_a_held_record_is_audited_when_a_failure_lands_in_the_same_pass():
     assert records.verdicts[hit]["passed"] is False
     v = records.verdicts[held]
     assert (v["passed"], v["audited"]) == (False, True)
+
+
+# --- Final review fixes ---
+
+
+def test_a_record_with_a_known_verdict_is_not_audited_again(monkeypatch):
+    # The backward audit judges the caught hotkey's held records; their queue
+    # entries and the rescan bring them back and must cost no second audit.
+    hit = _ids(True, 1)[0]
+    held = _ids(False, 3)
+    records = _Records({sid: _rec(1) for sid in [hit, *held]})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor.judge_many([hit]))
+    assert set(records.verdicts) == {hit, *held}
+    real, audited = auditor._judge_many, []
+
+    def counting(batch):
+        audited.extend(batch)
+        return real(batch)
+
+    monkeypatch.setattr(auditor, "_judge_many", counting)
+    asyncio.run(auditor.judge_many(held))
+    asyncio.run(auditor.judge_many([hit, *held]))
+    assert audited == []

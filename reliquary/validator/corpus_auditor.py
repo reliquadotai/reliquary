@@ -96,6 +96,8 @@ class CorpusAuditor:
         # Round -> when its fetch last failed; a negative cache, so a bad
         # round is retried at most once every NEGATIVE_BEACON_CACHE_SECONDS.
         self._failed_rounds: dict[int, float] = {}
+        # Ids whose verdict stands (written, found, or listed): never judged again.
+        self._judged: set[str] = set()
 
     def enqueue(self, submission_id: str) -> None:
         if submission_id in self._queued:
@@ -106,6 +108,7 @@ class CorpusAuditor:
     async def pending_ids(self) -> list[str]:
         submitted = await self._records.list_submission_ids(self._job_id)
         judged = set(await self._records.list_verdict_ids(self._job_id))
+        self._judged |= judged
         return [sid for sid in submitted if sid not in judged]
 
     def _judge_many(self, records: list[dict]) -> list[dict]:
@@ -265,8 +268,11 @@ class CorpusAuditor:
     async def _write(self, submission_id: str, verdict: dict) -> tuple[dict, bool]:
         """Create-only: the verdict that stands, and whether this call wrote it."""
         if await self._records.write_verdict(self._job_id, submission_id, verdict):
+            self._judged.add(submission_id)
             return verdict, True
-        return await self._records.read_verdict(self._job_id, submission_id), False
+        standing = await self._records.read_verdict(self._job_id, submission_id)
+        self._judged.add(submission_id)
+        return standing, False
 
     async def _state(self, hotkey: str, now: float) -> MinerState:
         if self._miner_states is None:
@@ -393,6 +399,8 @@ class CorpusAuditor:
 
     async def _judge_once(self, submission_ids: list[str]) -> set[str]:
         now = self._clock()
+        # The backward audit and the rescan bring a caught hotkey's records back.
+        submission_ids = [sid for sid in submission_ids if sid not in self._judged]
         read: dict[str, dict] = {}
         for submission_id in submission_ids:
             if submission_id not in self._meta:
