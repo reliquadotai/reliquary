@@ -104,6 +104,12 @@ def _judge(records, states, clock, *, params=None, beacon=None, round_at=_round_
 SAMPLED = MinerState(audited_passed=100)
 
 
+def _steady(seed=0):
+    # Undrawn records mid-hold: they keep the hotkey above 1/q per hold at
+    # X's hold end (no slow-hotkey audit), and wait themselves.
+    return {sid: _rec(seed, received_at=T0 + 500) for sid in _ids(False, 2, start=5000)}
+
+
 def test_q_one_is_v0():
     ids = _ids(False, 3)
     records = _Records({sid: _rec(0) for sid in ids})
@@ -263,7 +269,7 @@ def test_a_raising_round_at_audits():
 
 def test_an_unaudited_pass_is_never_written_before_the_hold_ends():
     ids = _ids(False, 2)
-    records = _Records({sid: _rec(0) for sid in ids})
+    records = _Records({**{sid: _rec(0) for sid in ids}, **_steady()})
     states = _States({HK: SAMPLED})
     clock = _Clock(T0 + HOLD - 1e-6)
     auditor = _judge(records, states, clock, beacon=_Beacon())
@@ -275,6 +281,10 @@ def test_an_unaudited_pass_is_never_written_before_the_hold_ends():
     asyncio.run(auditor.judge_many([old, *ids]))
     assert old not in records.verdicts
     clock.now = T0 + HOLD
+    asyncio.run(auditor.judge_many([old, *ids]))
+    # `old` arrived inside their hold and its draw round is not out: they wait for it.
+    assert records.verdicts == {}
+    clock.now = T0 + HOLD + 10
     asyncio.run(auditor.judge_many([old, *ids]))
     assert set(records.verdicts) == set(ids)
 
@@ -529,3 +539,111 @@ def test_a_batch_of_failures_escalates_in_one_write_before_the_verdicts():
     assert records.miner_writes == 1
     # Every failure's escalation was durable before any failed verdict existed.
     assert all(sorted(entry["failure_ids"]) == sorted(ids) for entry in seen)
+
+
+# Queue lag longer than the hold: a drawn sibling still in the queue must be
+# judged before an undrawn record of the same hotkey is passed unaudited.
+
+
+@pytest.mark.parametrize("via_queue", [False, True])
+def test_a_drawn_sibling_behind_in_the_queue_is_judged_before_an_unaudited_pass(via_queue):
+    x, x2 = _ids(False, 2)
+    y = _ids(True, 1)[0]
+    records = _Records({x: _rec(1), x2: _rec(1), **_steady(1)})
+    states = _States({HK: SAMPLED})
+    clock = _Clock(T0 + 10)
+    auditor = _judge(records, states, clock, beacon=_Beacon())
+    if via_queue:
+        # Seed the auditor's pending view before Y exists: Y is then known
+        # only through the queue, as in production.
+        asyncio.run(auditor.judge_many([x]))
+        assert records.verdicts == {}
+    records.submissions[y] = _rec(1, received_at=T0 + 10)
+    auditor.enqueue(y)  # accepted by the route; the drain loop has not reached it
+    clock.now = T0 + HOLD + 1
+    asyncio.run(auditor.judge_many([x]))
+    assert records.verdicts[y]["passed"] is False
+    v = records.verdicts[x]
+    assert (v["passed"], v["audited"]) == (False, True)
+    asyncio.run(auditor.judge_many([y, x2]))
+    assert all(v["audited"] is True for v in records.verdicts.values())
+
+
+def test_an_honest_drawn_sibling_behind_in_the_queue_lets_the_record_pass():
+    x = _ids(False, 1)[0]
+    y = _ids(True, 1)[0]
+    records = _Records({x: _rec(0), y: _rec(0, received_at=T0 + 10), **_steady()})
+    states = _States({HK: SAMPLED})
+    auditor = _judge(records, states, _Clock(T0 + HOLD + 1), beacon=_Beacon())
+    auditor.enqueue(y)
+    asyncio.run(auditor.judge_many([x]))
+    assert (records.verdicts[y]["passed"], records.verdicts[y]["audited"]) == (True, True)
+    assert records.verdicts[x]["passed"] is True
+
+
+def test_an_undecidable_sibling_inside_the_hold_makes_the_record_wait():
+    x = _ids(False, 1)[0]
+    y = _ids(False, 1, start=1000)[0]
+    # Received just before X's hold ends: its draw round is not out yet.
+    records = _Records({x: _rec(0), y: _rec(0, received_at=T0 + HOLD - 1), **_steady()})
+    states = _States({HK: SAMPLED})
+    clock = _Clock(T0 + HOLD + 1)
+    auditor = _judge(records, states, clock, beacon=_Beacon())
+    auditor.enqueue(y)
+    asyncio.run(auditor.judge_many([x]))
+    assert records.verdicts == {}
+    clock.now = T0 + HOLD + 10  # Y's round is out: undrawn, it no longer holds X back
+    asyncio.run(auditor.judge_many([x]))
+    assert (records.verdicts[x]["passed"], records.verdicts[x]["audited"]) == (True, False)
+    assert y not in records.verdicts
+
+
+def test_a_sibling_hitting_a_validator_error_makes_the_record_wait(monkeypatch):
+    x = _ids(False, 1)[0]
+    y = _ids(True, 1)[0]
+    records = _Records({x: _rec(0), y: _rec(0, received_at=T0 + 10), **_steady()})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + HOLD + 1), beacon=_Beacon())
+
+    def broken(batch):
+        raise RuntimeError("CUDA error: an illegal memory access")
+
+    monkeypatch.setattr(auditor, "_judge_many", broken)
+    auditor.enqueue(y)
+    asyncio.run(auditor.judge_many([x]))
+    assert records.verdicts == {}
+
+
+def test_a_steady_honest_miner_is_still_paid_unaudited_at_hold_end():
+    # Siblings undrawn or arrived after X's hold ended (their round not out
+    # yet) must not hold X back: a steady miner always has one of those.
+    x = _ids(False, 1)[0]
+    fresh = _ids(False, 1, start=3000)[0]
+    now = T0 + HOLD + 1
+    steady = _steady()
+    records = _Records({x: _rec(0), **steady, fresh: _rec(0, received_at=now - 0.5)})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(now), beacon=_Beacon())
+    for sid in [*steady, fresh]:
+        auditor.enqueue(sid)
+    asyncio.run(auditor.judge_many([x]))
+    assert set(records.verdicts) == {x}
+    assert (records.verdicts[x]["passed"], records.verdicts[x]["audited"]) == (True, False)
+
+
+def test_the_rescan_logs_the_queue_lag(caplog):
+    ids = _ids(False, 2)
+    records = _Records({ids[0]: _rec(0), ids[1]: _rec(0, received_at=T0 + 300)})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 400), beacon=_Beacon())
+    for sid in ids:
+        asyncio.run(auditor._read(sid))
+    assert auditor.queue_lag(ids) == 400.0
+    assert auditor.queue_lag([]) is None
+
+    async def _one_rescan():
+        auditor._rescan_every = 0.0
+        task = asyncio.create_task(auditor._rescan_forever())
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+    with caplog.at_level("INFO", logger="reliquary.validator.corpus_auditor"):
+        asyncio.run(_one_rescan())
+    assert any("queue lag" in r.getMessage() and "400" in r.getMessage() for r in caplog.records)

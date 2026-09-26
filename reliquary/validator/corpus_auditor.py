@@ -98,6 +98,9 @@ class CorpusAuditor:
         self._failed_rounds: dict[int, float] = {}
         # Ids whose verdict stands (written, found, or listed): never judged again.
         self._judged: set[str] = set()
+        # Per hotkey, the ids read but not judged yet: the siblings an unaudited
+        # pass must wait for (queue lag can exceed the hold).
+        self._unjudged: dict[str, set[str]] = {}
 
     def enqueue(self, submission_id: str) -> None:
         if submission_id in self._queued:
@@ -108,8 +111,19 @@ class CorpusAuditor:
     async def pending_ids(self) -> list[str]:
         submitted = await self._records.list_submission_ids(self._job_id)
         judged = set(await self._records.list_verdict_ids(self._job_id))
-        self._judged |= judged
+        for sid in judged - self._judged:
+            self._mark_judged(sid)
         return [sid for sid in submitted if sid not in judged]
+
+    def _mark_judged(self, submission_id: str) -> None:
+        self._judged.add(submission_id)
+        if submission_id in self._meta:
+            self._unjudged.get(self._meta[submission_id][0], set()).discard(submission_id)
+
+    def queue_lag(self, pending: list[str]) -> float | None:
+        """Seconds since the oldest pending record we have read was received."""
+        times = [self._meta[sid][1] for sid in pending if sid in self._meta]
+        return self._clock() - min(times) if times else None
 
     def _judge_many(self, records: list[dict]) -> list[dict]:
         """Judge several records at once: every completion of every record that
@@ -207,6 +221,8 @@ class CorpusAuditor:
                 record["hotkey"], received_at, int(record["token_count"]),
             )
             bisect.insort(self._arrivals.setdefault(record["hotkey"], []), received_at)
+            if submission_id not in self._judged:
+                self._unjudged.setdefault(record["hotkey"], set()).add(submission_id)
         return record
 
     def _recent(self, hotkey: str, now: float) -> int:
@@ -268,10 +284,10 @@ class CorpusAuditor:
     async def _write(self, submission_id: str, verdict: dict) -> tuple[dict, bool]:
         """Create-only: the verdict that stands, and whether this call wrote it."""
         if await self._records.write_verdict(self._job_id, submission_id, verdict):
-            self._judged.add(submission_id)
+            self._mark_judged(submission_id)
             return verdict, True
         standing = await self._records.read_verdict(self._job_id, submission_id)
-        self._judged.add(submission_id)
+        self._mark_judged(submission_id)
         return standing, False
 
     async def _state(self, hotkey: str, now: float) -> MinerState:
@@ -408,62 +424,74 @@ class CorpusAuditor:
             self._failed_rounds[round_number] = self._clock()
         return randomness
 
+    async def _decide(self, submission_id: str, now: float,
+                      state: MinerState) -> tuple[str, dict | None]:
+        """decision() for one known record, with its draw; "undecidable" while
+        its draw round is not out yet (the rescan comes back for it)."""
+        hotkey, received_at, _ = self._meta[submission_id]
+        randomness, draw, recent = None, None, 0
+        if self._params.q < 1.0 and effective_state(state, now, self._params) == "sampled":
+            if not self._seeded:
+                for sid in await self.pending_ids():
+                    if sid not in self._meta:
+                        await self._read(sid)
+                self._seeded = True
+            recent = self._recent(hotkey, now)
+            if (recent >= 1.0 / self._params.q and self._beacon is not None
+                    and self._round_at is not None):
+                # round_at(t) is the first round published strictly after t;
+                # one more round keeps the miner signing before its
+                # randomness exists even with our clock a period behind (§6).
+                # It may raise -- the drand chain's genesis/period can still
+                # be unresolved (a lazy `round_at` retries on its own
+                # schedule) -- caught here rather than propagated, so an
+                # unresolved chain audits this submission (randomness stays
+                # None below, decision() then reads that as "audit") instead
+                # of crashing the whole batch out of the drain loop.
+                try:
+                    round_number = int(self._round_at(received_at)) + 1
+                    round_not_out_yet = int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number
+                except Exception:
+                    logger.warning(
+                        "round_at unavailable for %s; auditing", submission_id[:12],
+                        exc_info=True,
+                    )
+                else:
+                    if round_not_out_yet:
+                        return "undecidable", None
+                    randomness = await self._randomness_for(round_number)
+                    if randomness is not None:
+                        draw = {"round": round_number, "q": self._params.q,
+                                "drawn": drawn(randomness, submission_id, self._params.q)}
+        choice = decision(state, params=self._params, now=now, received_at=received_at,
+                          recent_submissions=recent, randomness_hex=randomness,
+                          submission_id=submission_id)
+        return choice, draw
+
     async def _judge_once(self, submission_ids: list[str]) -> set[str]:
         now = self._clock()
         # The backward audit and the rescan bring a caught hotkey's records back.
         submission_ids = [sid for sid in submission_ids if sid not in self._judged]
         read: dict[str, dict] = {}
+        unreadable = False
         for submission_id in submission_ids:
             if submission_id not in self._meta:
                 record = await self._read(submission_id)
                 if record is not None:
                     read[submission_id] = record
+                else:
+                    unreadable = True
         known = [sid for sid in dict.fromkeys(submission_ids) if sid in self._meta]
         states = {}
         for hotkey in {self._meta[sid][0] for sid in known}:
             states[hotkey] = await self._state(hotkey, now)
 
         audit_ids, draws, unaudited, voided = [], {}, [], []
+        # Per hotkey, arrival times of records whose draw round is not out yet.
+        undecided: dict[str, list[float]] = {}
         for submission_id in known:
             hotkey, received_at, _ = self._meta[submission_id]
-            state = states[hotkey]
-            randomness, draw, recent = None, None, 0
-            if self._params.q < 1.0 and effective_state(state, now, self._params) == "sampled":
-                if not self._seeded:
-                    for sid in await self.pending_ids():
-                        if sid not in self._meta:
-                            await self._read(sid)
-                    self._seeded = True
-                recent = self._recent(hotkey, now)
-                if (recent >= 1.0 / self._params.q and self._beacon is not None
-                        and self._round_at is not None):
-                    # round_at(t) is the first round published strictly after t;
-                    # one more round keeps the miner signing before its
-                    # randomness exists even with our clock a period behind (§6).
-                    # It may raise -- the drand chain's genesis/period can still
-                    # be unresolved (a lazy `round_at` retries on its own
-                    # schedule) -- caught here rather than propagated, so an
-                    # unresolved chain audits this submission (randomness stays
-                    # None below, decision() then reads that as "audit") instead
-                    # of crashing the whole batch out of the drain loop.
-                    try:
-                        round_number = int(self._round_at(received_at)) + 1
-                        round_not_out_yet = int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number
-                    except Exception:
-                        logger.warning(
-                            "round_at unavailable for %s; auditing", submission_id[:12],
-                            exc_info=True,
-                        )
-                    else:
-                        if round_not_out_yet:
-                            continue  # its round is not out yet: wait, the rescan comes back
-                        randomness = await self._randomness_for(round_number)
-                        if randomness is not None:
-                            draw = {"round": round_number, "q": self._params.q,
-                                    "drawn": drawn(randomness, submission_id, self._params.q)}
-            choice = decision(state, params=self._params, now=now, received_at=received_at,
-                              recent_submissions=recent, randomness_hex=randomness,
-                              submission_id=submission_id)
+            choice, draw = await self._decide(submission_id, now, states[hotkey])
             if choice == "audit":
                 audit_ids.append(submission_id)
                 if draw is not None:
@@ -472,18 +500,58 @@ class CorpusAuditor:
                 unaudited.append((submission_id, draw))
             elif choice == "void_banned":
                 voided.append(submission_id)
+            elif choice == "undecidable":
+                undecided.setdefault(hotkey, []).append(received_at)
+
+        if unaudited:
+            # Queue lag can exceed the hold: a drawn sibling received within X's
+            # hold may still sit in the queue. Decide every such sibling now and
+            # audit the drawn ones in this pass, so a failure among them reaches
+            # X through the same-pass guard below instead of after X is paid.
+            for sid in list(self._queued):
+                if sid not in self._meta and sid not in self._judged:
+                    if await self._read(sid) is None:
+                        unreadable = True
+            hold_end: dict[str, float] = {}
+            for submission_id, _ in unaudited:
+                hotkey, received_at, _ = self._meta[submission_id]
+                hold_end[hotkey] = max(hold_end.get(hotkey, 0.0),
+                                       received_at + self._params.hold_seconds)
+            in_pass = set(known)
+            for hotkey, until in hold_end.items():
+                for sid in sorted(self._unjudged.get(hotkey, ())):
+                    if sid in in_pass or self._meta[sid][1] > until:
+                        continue
+                    choice, draw = await self._decide(sid, now, states[hotkey])
+                    if choice == "audit":
+                        audit_ids.append(sid)
+                        if draw is not None:
+                            draws[sid] = draw
+                    elif choice == "undecidable":
+                        undecided.setdefault(hotkey, []).append(self._meta[sid][1])
 
         failed: set[str] = set()
+        errored: set[str] = set()
         if audit_ids:
             records = [read.get(sid) or await self._read(sid) for sid in audit_ids]
             pairs = [(sid, r) for sid, r in zip(audit_ids, records) if r is not None]
+            errored = {self._meta[sid][0] for sid, r in zip(audit_ids, records) if r is None}
             if pairs:
-                _, failed = await self._audit_records(
+                results, failed = await self._audit_records(
                     [sid for sid, _ in pairs], [r for _, r in pairs], draws)
+                errored |= {r["hotkey"] for (_, r), result in zip(pairs, results) if result is None}
+        if unaudited and unreadable:
+            logger.error("corpus records unreadable; holding every unaudited pass back this pass")
         for submission_id, draw in unaudited:
-            hotkey, _, token_count = self._meta[submission_id]
+            hotkey, received_at, token_count = self._meta[submission_id]
             if hotkey in failed:
                 continue  # now suspect: the backward audit decides it
+            # Wait while a sibling that could still catch this record is
+            # undecided or could not be audited this pass.
+            if unreadable or hotkey in errored or any(
+                    t <= received_at + self._params.hold_seconds
+                    for t in undecided.get(hotkey, ())):
+                continue
             await self._write(submission_id, self._verdict(
                 submission_id, hotkey, token_count,
                 {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}, draw))
@@ -518,8 +586,17 @@ class CorpusAuditor:
         while True:
             await asyncio.sleep(self._rescan_every)
             try:
-                for submission_id in await self.pending_ids():
+                pending = await self.pending_ids()
+                for submission_id in pending:
                     self.enqueue(submission_id)
+                lag = self.queue_lag(pending)
+                # An undrawn record waits one hold by design; far beyond that,
+                # the auditor is not keeping up with the traffic.
+                level = (logging.WARNING if lag is not None
+                         and lag > self._params.hold_seconds + 2 * self._rescan_every
+                         else logging.INFO)
+                logger.log(level, "corpus audit queue lag: %d pending, oldest received %s s ago",
+                           len(pending), "-" if lag is None else f"{lag:.0f}")
             except Exception:
                 logger.exception("corpus pending rescan failed; retrying next period")
 
