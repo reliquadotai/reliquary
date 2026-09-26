@@ -8,6 +8,12 @@ bucket ``reliquary`` is refused.
 
     R2_BUCKET_ID=reliquary-corpus-e2e python scripts/corpus_e2e.py --start-minio
 
+With ``--second-prompt-source SRC`` it declares a second task and job on the same
+checkpoint, starts ONE validator process serving both, runs one honest miner per
+job, a dishonest miner on the first job and the same hotkey honestly on the second:
+the dishonest hotkey must be failed and banned on the first job only, and each
+task's archive must pay only its own miners, within its own cap.
+
 With ``--audit-q/--audit-probation/--audit-hold-seconds`` the task samples its
 audits, and ``--late-cheater-steps K`` adds a hotkey that mines honestly through
 probation, then K steps with the dishonest model: it must turn suspect at its
@@ -157,7 +163,8 @@ async def conditional_put_preflight() -> dict:
 # Declaration: the contract and the job
 # --------------------------------------------------------------------------
 
-def declare_task(state: Path, args, *, task_id: str, job_id: str, revision: str) -> dict:
+def declare_task(state: Path, args, *, task_id: str, job_id: str, revision: str,
+                 prompt_source: str | None = None, suffix: str = "") -> dict:
     """The registry entry `jobs create` would write, built by the same code, so
     the contract this run serves under is the one production would carry."""
     from dataclasses import asdict
@@ -168,39 +175,43 @@ def declare_task(state: Path, args, *, task_id: str, job_id: str, revision: str)
     entry = build_corpus_task_entry(
         task_id=task_id, job_id=job_id, from_profile=args.base_profile,
         model_id=args.honest_model, model_revision=revision,
-        model_architecture=args.model_architecture, prompt_source=args.prompt_source,
+        model_architecture=args.model_architecture,
+        prompt_source=prompt_source or args.prompt_source,
         cap=args.cap, overrides={}, audit_params=audit_params_from_args(args),
     )
     validate_entry(entry)
-    (state / "contract.json").write_text(json.dumps(entry.contract, sort_keys=True))
-    (state / "entry.json").write_text(json.dumps(asdict(entry), indent=1, sort_keys=True, default=str))
+    (state / f"contract{suffix}.json").write_text(json.dumps(entry.contract, sort_keys=True))
+    (state / f"entry{suffix}.json").write_text(
+        json.dumps(asdict(entry), indent=1, sort_keys=True, default=str))
     return dict(entry.contract)
 
 
 async def declare_job(state: Path, args, *, job_id: str, revision: str, sha256: str,
-                      eos: int, renderer_id: str, contract: dict) -> dict:
+                      eos: int, renderer_id: str, contract: dict,
+                      prompt_source: str | None = None, suffix: str = "") -> dict:
     from reliquary.cli.main import build_job_manifest
     from reliquary.infrastructure.corpus_job_store import write_job
     from reliquary.protocol.profiles import profile_from_contract
 
     sampling = contract["sampling"]
+    source = prompt_source or args.prompt_source
     manifest = build_job_manifest(
         job_id=job_id, checkpoint_repo=args.honest_model, checkpoint_revision=revision,
-        checkpoint_sha256=sha256, prompt_source=args.prompt_source,
+        checkpoint_sha256=sha256, prompt_source=source,
         prompt_count=args.prompt_count, renderer_id=renderer_id, eos_token_id=eos,
         slots_per_prompt=args.slots_per_prompt, temperature=sampling["temperature"],
         top_p=sampling["top_p"], top_k=sampling["top_k"], min_new_tokens=args.min_new_tokens,
         # A rehearsal may pass a short cap to run fast; a real job takes the
         # template's budget for the source, as `jobs create` does by default.
         max_new_tokens=(args.max_new_tokens or
-                        contract["environments"][args.prompt_source]["max_new_tokens"]),
+                        contract["environments"][source]["max_new_tokens"]),
         n=args.n,
-        grader_id=args.prompt_source, threshold=1.0,
+        grader_id=source, threshold=1.0,
         prompt_order="miner_walk", deadline_round=None,
         from_profile=profile_from_contract(contract),
     )
     await write_job(manifest, None)
-    (state / "job.json").write_text(json.dumps(manifest, indent=1))
+    (state / f"job{suffix}.json").write_text(json.dumps(manifest, indent=1))
     return manifest
 
 
@@ -213,16 +224,24 @@ def run_validator(args) -> None:
     from reliquary.validator.corpus_validator import run_corpus_validator
 
     # The audit parameters live in the entry's params, as the registry would carry them.
-    params = json.loads(Path(args.entry).read_text())["params"]
-    entry = SimpleNamespace(task_id=args.task_id, job_id=args.job_id,
-                            mechanism=MECHANISM_CORPUS_GENERATION, params=params)
+    # Comma lists: one validator process serving several tasks/jobs.
+    task_ids, job_ids = args.task_id.split(","), args.job_id.split(",")
+    caps, entries = args.cap.split(","), args.entry.split(",")
+    jobs = []
+    for task_id, job_id, cap, entry_path in zip(task_ids, job_ids, caps, entries, strict=True):
+        params = json.loads(Path(entry_path).read_text())["params"]
+        entry = SimpleNamespace(task_id=task_id, job_id=job_id,
+                                mechanism=MECHANISM_CORPUS_GENERATION, params=params)
+        jobs.append((entry, float(cap)))
     # Settlement is driven by the orchestrator once every verdict is in, so the
     # archive it checks is the only one written.
-    asyncio.run(run_corpus_validator(
-        entry=entry, wallet=None, netuid=0, signer_client=None,
-        http_host="127.0.0.1", http_port=args.port, cap=args.cap,
-        set_weights=False, settle_every_seconds=1e9, registration_gate=False,
-    ))
+    common = dict(wallet=None, netuid=0, signer_client=None, http_host="127.0.0.1",
+                  http_port=args.port, set_weights=False, settle_every_seconds=1e9,
+                  registration_gate=False)
+    if len(jobs) == 1:
+        asyncio.run(run_corpus_validator(entry=jobs[0][0], cap=jobs[0][1], **common))
+    else:
+        asyncio.run(run_corpus_validator(jobs=jobs, **common))
 
 
 # --------------------------------------------------------------------------
@@ -245,7 +264,7 @@ class _TimedGenerator:
         return generations
 
 
-def _http_client(base_url: str):
+def _http_client(base_url: str, job_id: str | None = None):
     import httpx
 
     from reliquary.miner.corpus_miner import CorpusPermanentFailure, CorpusTransientFailure
@@ -264,12 +283,15 @@ def _http_client(base_url: str):
                                          detail=response.text[:500])
         return response.json()
 
+    # With a job id, that job's scoped paths on a validator serving several.
+    prefix = "/corpus" if job_id is None else f"/corpus/jobs/{job_id}"
+
     class Client:
         def job(self):
-            return issue(lambda: http.get("/corpus/job"))
+            return issue(lambda: http.get(f"{prefix}/job"))
 
         def cursor(self, hotkey):
-            return int(issue(lambda: http.get(f"/corpus/cursor/{hotkey}"))["cursor"])
+            return int(issue(lambda: http.get(f"{prefix}/cursor/{hotkey}"))["cursor"])
 
         def submit(self, body):
             return issue(lambda: http.post("/corpus/submit", json=body))
@@ -288,7 +310,7 @@ def run_miner(args) -> None:
     from reliquary.shared.modeling import load_tokenizer
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
 
-    client = _http_client(args.validator_url)
+    client = _http_client(args.validator_url, args.job_id)
     job = parse_job(client.job())
     job_directory = _snapshot(job.checkpoint_repo, job.checkpoint_revision)
     if checkpoint_fingerprint(job_directory) != job.checkpoint_sha256:
@@ -383,7 +405,8 @@ def _stop(process: subprocess.Popen | None) -> None:
 
 
 def _run_miner_process(state: Path, env: dict, args, role: str, mnemonic: str, steps: int,
-                       model: str | None, revision: str | None, *, until_accepted: bool = False) -> dict:
+                       model: str | None, revision: str | None, *, until_accepted: bool = False,
+                       job_id: str | None = None) -> dict:
     out = state / f"miner-{role}.json"
     # The mnemonic goes through the environment, not argv, which any process can list.
     env = {**env, "CORPUS_E2E_MNEMONIC": mnemonic}
@@ -394,6 +417,8 @@ def _run_miner_process(state: Path, env: dict, args, role: str, mnemonic: str, s
         argv += ["--model", model, "--revision", revision]
     if until_accepted:
         argv += ["--until-accepted", str(steps)]
+    if job_id:
+        argv += ["--job-id", job_id]
     process = _spawn(state, env, f"miner-{role}", argv)
     code = process.wait(timeout=args.miner_timeout)
     if code != 0 or not out.exists():
@@ -609,6 +634,8 @@ def _route_ok(counts: dict, steps: int, *, may_be_banned: bool) -> bool:
 
 
 def orchestrate(args) -> int:
+    if args.second_prompt_source:
+        return orchestrate_two_jobs(args)
     _refuse_production_bucket()
     _refuse_busy_card(args.allow_busy_gpu)
     audit_params = audit_params_from_args(args)
@@ -752,6 +779,157 @@ def orchestrate(args) -> int:
     return 0 if summary["ok"] else 1
 
 
+def two_job_checks(jobs: dict, miners: dict, verdicts: dict, archives: dict,
+                   states: dict) -> dict[str, bool]:
+    """Checks for one validator serving jobs "a" and "b". `miners` maps a role
+    to its miner summary: honest_a, honest_b, dishonest_a (the dishonest model
+    on a) and dishonest_b (the same hotkey, honest on b). `verdicts`,
+    `archives` and `states` are per job key; `states` maps hotkey -> state."""
+    checks: dict[str, bool] = {}
+    cheat = miners["dishonest_a"]["hotkey"]
+    paid_by = {"a": {miners["honest_a"]["hotkey"]},
+               "b": {miners["honest_b"]["hotkey"], miners["dishonest_b"]["hotkey"]}}
+    for key in ("a", "b"):
+        rewards = archives[key].get("rewards_by_hotkey") or {}
+        checks[f"{key}_archive_pays_only_its_own_miners"] = set(rewards) == paid_by[key]
+        checks[f"{key}_archive_sums_to_its_cap"] = abs(sum(rewards.values()) - jobs[key]["cap"]) < 1e-9
+        checks[f"{key}_second_settlement_is_a_noop"] = archives[key]["second_settle"] is None
+    on_a = [v for v in verdicts["a"] if v["hotkey"] == cheat]
+    on_b = [v for v in verdicts["b"] if v["hotkey"] == cheat]
+    checks["dishonest_failed_on_a"] = bool(on_a) and not any(v["passed"] for v in on_a)
+    checks["dishonest_banned_on_a"] = (states["a"].get(cheat) or {}).get("effective_state") == "banned"
+    checks["dishonest_not_banned_on_b"] = (states["b"].get(cheat) or {}).get("effective_state") != "banned"
+    checks["dishonest_passed_on_b"] = bool(on_b) and all(v["passed"] for v in on_b)
+    return checks
+
+
+def orchestrate_two_jobs(args) -> int:
+    """Two tasks and jobs on one checkpoint, one validator process serving both."""
+    _refuse_production_bucket()
+    _refuse_busy_card(args.allow_busy_gpu)
+    if args.late_cheater_steps:
+        raise SystemExit("--late-cheater-steps is a single-job rehearsal")
+    if not args.dishonest_steps:
+        raise SystemExit("--second-prompt-source needs --dishonest-steps: the ban it checks is per job")
+    from reliquary.validator.task_config import merge_corpus_contracts
+
+    audit_params = audit_params_from_args(args)
+    summary: dict = {"ok": False, "checks": {}, "audit_params": audit_params, "mode": "two_jobs"}
+    checks = summary["checks"]
+    stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    jobs = {
+        "a": {"task_id": f"corpus-e2e-{stamp}", "job_id": f"e2e-{stamp}",
+              "prompt_source": args.prompt_source, "renderer": args.renderer, "cap": args.cap},
+        "b": {"task_id": f"corpus-e2e-{stamp}-b", "job_id": f"e2e-{stamp}-b",
+              "prompt_source": args.second_prompt_source, "renderer": args.second_renderer,
+              "cap": args.second_cap if args.second_cap is not None else args.cap},
+    }
+    task_ids = ",".join(j["task_id"] for j in jobs.values())
+    state = Path(args.state_dir) / stamp
+    state.mkdir(parents=True, exist_ok=True)
+    os.environ["RELIQUARY_TASK_ID"] = task_ids
+    validator = None
+    if args.start_minio:
+        start_minio()
+    try:
+        asyncio.run(ensure_bucket())
+        preflight = asyncio.run(conditional_put_preflight())
+        summary["conditional_put"] = preflight
+        if not all(preflight.values()):
+            raise RuntimeError(f"the bucket does not honour conditional PUT: {preflight}")
+
+        from reliquary.corpus.encoding import checkpoint_fingerprint
+        from reliquary.shared.modeling import load_tokenizer
+
+        honest_dir = _snapshot(args.honest_model, args.honest_revision)
+        honest_revision = honest_dir.name
+        sha256 = checkpoint_fingerprint(honest_dir)
+        eos = load_tokenizer(str(honest_dir)).eos_token_id
+        for key, job in jobs.items():
+            job["contract"] = declare_task(state, args, task_id=job["task_id"], job_id=job["job_id"],
+                                           revision=honest_revision,
+                                           prompt_source=job["prompt_source"], suffix=f"-{key}")
+            job["params"] = json.loads((state / f"entry-{key}.json").read_text())["params"]
+        # The one contract the process runs: what `tasks contract --task-id a --task-id b` prints.
+        merged = merge_corpus_contracts({j["task_id"]: j["contract"] for j in jobs.values()})
+        (state / "contract.json").write_text(json.dumps(merged, sort_keys=True))
+        for key, job in jobs.items():
+            source = job["prompt_source"]
+            renderer_id = job["renderer"] or job["contract"]["environments"][source]["prompt_template"]["id"]
+            job["manifest"] = asyncio.run(declare_job(
+                state, args, job_id=job["job_id"], revision=honest_revision, sha256=sha256, eos=eos,
+                renderer_id=renderer_id, contract=job["contract"], prompt_source=source,
+                suffix=f"-{key}"))
+        dishonest_revision = _snapshot(args.dishonest_model, args.dishonest_revision).name
+        summary["jobs"] = {key: {k: j[k] for k in ("task_id", "job_id", "prompt_source", "cap")}
+                           for key, j in jobs.items()}
+        summary.update({"state_dir": str(state), "checkpoint": f"{args.honest_model}@{honest_revision}",
+                        "checkpoint_sha256": sha256, "eos_token_id": eos,
+                        "dishonest_model": f"{args.dishonest_model}@{dishonest_revision}"})
+
+        env = _child_env(state, task_ids)
+        validator = _spawn(state, env, "validator", [
+            "validator", "--task-id", task_ids,
+            "--job-id", ",".join(j["job_id"] for j in jobs.values()),
+            "--port", str(args.port), "--cap", ",".join(str(j["cap"]) for j in jobs.values()),
+            "--entry", ",".join(str(state / f"entry-{key}.json") for key in jobs)])
+        started = time.time()
+        _wait_http(f"http://127.0.0.1:{args.port}/corpus/jobs", validator, args.validator_timeout)
+        summary["validator_start_seconds"] = round(time.time() - started, 1)
+
+        import bittensor as bt
+
+        mnemonics = {role: bt.Keypair.generate_mnemonic() for role in ("honest_a", "honest_b", "dishonest")}
+        runs = (  # role, mnemonic, job, steps, model, revision, may_be_banned
+            ("honest_a", "honest_a", "a", args.honest_steps, None, None, False),
+            ("honest_b", "honest_b", "b", args.honest_steps, None, None, False),
+            ("dishonest_a", "dishonest", "a", args.dishonest_steps, args.dishonest_model,
+             dishonest_revision, True),
+            # The same hotkey, honest, on the other job: its ban there must not follow it.
+            ("dishonest_b", "dishonest", "b", args.dishonest_steps, None, None, False),
+        )
+        miners = {}
+        for role, mnemonic, key, steps, model, revision, may_be_banned in runs:
+            miners[role] = _run_miner_process(state, env, args, role.replace("_", "-"),
+                                              mnemonics[mnemonic], steps, model, revision,
+                                              job_id=jobs[key]["job_id"])
+            miners[role]["job"] = key
+            checks[f"route_{role}"] = _route_ok(miners[role]["counts"], steps,
+                                                may_be_banned=may_be_banned)
+        summary["miners"] = miners
+
+        verdicts, archives, states = {}, {}, {}
+        for key, job in jobs.items():
+            accepted = sum(m["counts"].get("accepted", 0) for m in miners.values() if m["job"] == key)
+            _, verdicts[key] = asyncio.run(_wait_verdicts(job["job_id"], accepted,
+                                                          args.audit_timeout, validator))
+        # Both jobs' verdicts came from the one validator process, still running.
+        checks["one_process_audited_both_jobs"] = validator.poll() is None
+        for key, job in jobs.items():
+            archive = asyncio.run(_settle_and_read(job["task_id"], job["job_id"], job["cap"]))
+            archive.pop("settled_ids", None)
+            archives[key] = archive
+            by_hotkey = asyncio.run(_read_miner_states(job["job_id"], job["params"], {}))
+            states[key] = by_hotkey
+        summary["archives"], summary["miner_states"] = archives, states
+        summary["verdicts"] = {key: {"passed": sum(bool(v["passed"]) for v in vs),
+                                     "failed": sum(not v["passed"] for v in vs),
+                                     "toploc": _toploc_summary([v for v in vs if v.get("audited", True)])}
+                               for key, vs in verdicts.items()}
+        checks.update(two_job_checks(jobs, miners, verdicts, archives, states))
+        summary["ok"] = all(checks.values())
+    except Exception as exc:
+        logger.exception("the two-job end-to-end run failed")
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        _stop(validator)
+        if args.start_minio and not args.keep_minio:
+            stop_minio()
+        (state / "summary.json").write_text(json.dumps(summary, indent=1, sort_keys=True))
+        print(json.dumps(summary, indent=1, sort_keys=True), flush=True)
+    return 0 if summary["ok"] else 1
+
+
 async def _settle_and_read(task_id: str, job_id: str, cap: float) -> dict:
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
     from reliquary.infrastructure.storage import dataset_object_key, download_json
@@ -827,12 +1005,18 @@ def main() -> int:
         p.add_argument("--audit-ban-after-failures", type=int, default=None)
         p.add_argument("--late-cheater-steps", type=int, default=0,
                        help="a hotkey honest for --audit-probation steps, then this many with the dishonest model")
+        p.add_argument("--second-prompt-source", default=None,
+                       help="declare a second task/job on the same checkpoint, served by the same validator")
+        p.add_argument("--second-renderer", default=None,
+                       help="the second job's renderer; omit for its contract's own template")
+        p.add_argument("--second-cap", type=float, default=None, help="omit for --cap")
 
     v = sub.add_parser("validator")
+    # Each a comma list when one process serves several tasks.
     v.add_argument("--task-id", required=True)
     v.add_argument("--job-id", required=True)
     v.add_argument("--port", type=int, required=True)
-    v.add_argument("--cap", type=float, required=True)
+    v.add_argument("--cap", required=True)
     v.add_argument("--entry", required=True)
 
     m = sub.add_parser("miner")
@@ -843,6 +1027,7 @@ def main() -> int:
     m.add_argument("--revision", default=None)
     m.add_argument("--gpu-memory-utilization", type=float, default=None)
     m.add_argument("--until-accepted", type=int, default=None)
+    m.add_argument("--job-id", default=None)
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
