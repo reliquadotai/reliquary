@@ -13,7 +13,7 @@ import math
 import re
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from reliquary.protocol.profiles import PROOF_SCHEME_TOPLOC
 
@@ -168,7 +168,8 @@ def build_corpus_audit_wiring(*, entry, job, records):
 
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
                      auditor, proof_chunk_tokens, prompt_job_for=None,
-                     vocab_size=None, is_banned=None, registration=None) -> FastAPI:
+                     vocab_size=None, is_banned=None, registration=None,
+                     contract=None) -> FastAPI:
     from reliquary.validator.corpus_service import build_corpus_router, prompt_job_for_spec
 
     app = FastAPI()
@@ -178,6 +179,13 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
         records=records, on_accepted=auditor.enqueue, proof_chunk_tokens=proof_chunk_tokens,
         vocab_size=vocab_size, is_banned=is_banned, registration=registration,
     ))
+
+    @app.get("/corpus/contract")
+    async def corpus_contract() -> dict:
+        # Miners have no registry access; this is the contract this process runs.
+        if contract is None:
+            raise HTTPException(status_code=404, detail="corpus_contract_unknown")
+        return contract
 
     from fastapi.exception_handlers import request_validation_exception_handler
     from fastapi.exceptions import RequestValidationError
@@ -282,7 +290,8 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
                            proof_chunk_tokens=proof.chunk_tokens,
                            vocab_size=model.get_input_embeddings().num_embeddings,
                            is_banned=is_banned,
-                           registration=registered.reason if registered is not None else None)
+                           registration=registered.reason if registered is not None else None,
+                           contract=entry.contract)
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in
     # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
     settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,

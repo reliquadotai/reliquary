@@ -265,6 +265,32 @@ def _has_vision_encoder(checkpoint_dir: str) -> bool:
     return isinstance(config, dict) and "vision_config" in config
 
 
+class CorpusContractError(RuntimeError):
+    """The validator served a contract that does not describe this job."""
+
+
+def save_served_contract(contract: dict, job, directory) -> "Path":
+    """Keep the contract the validator serves, once it is known to describe the
+    job's checkpoint and to carry the toploc proof every submission needs."""
+    import json
+    from pathlib import Path
+
+    if (contract.get("model_id") != job.checkpoint_repo
+            or contract.get("model_revision") != job.checkpoint_revision):
+        raise CorpusContractError(
+            f"the served contract describes {contract.get('model_id')!r}@"
+            f"{contract.get('model_revision')!r}, not the job's "
+            f"{job.checkpoint_repo!r}@{job.checkpoint_revision!r}"
+        )
+    if not any(p.get("scheme") == "toploc-v1" for p in contract.get("proofs") or ()):
+        raise CorpusContractError("the served contract carries no toploc proof")
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{job.job_id}.contract.json"
+    path.write_text(json.dumps(contract, sort_keys=True, separators=(",", ":")))
+    return path
+
+
 class VllmGenerator:
     """vLLM in-process on the V1 runner, capturing decode activations for proofs.
 

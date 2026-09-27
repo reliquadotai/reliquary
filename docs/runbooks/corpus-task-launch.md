@@ -348,14 +348,19 @@ they retry.
 
 ## 4. Miners
 
-On each miner, with the same contract file (the miner reads its toploc
-parameters from it and refuses to start without a toploc entry):
+On each miner:
 
 ```bash
-export RELIQUARY_TASK_CONTRACT=$PWD/corpus-<name>.contract.json
 reliquary corpus mine --validator-url http://<validator-ip>:<port> \
   --wallet-name <wallet> --hotkey <hotkey>
 ```
+
+- The miner needs the task's contract (its toploc parameters and prompt
+  templates). Without `RELIQUARY_TASK_CONTRACT` it takes the one the validator
+  serves at `GET /corpus/contract`, checks that it names the job's checkpoint
+  and carries a toploc proof, saves it under `~/.cache/reliquary/corpus/` and
+  restarts itself with it. Setting `RELIQUARY_TASK_CONTRACT` to a file still
+  wins.
 
 - Needs vLLM 0.30 with the decode capture hook; the generator sets
   `VLLM_ENABLE_V1_MULTIPROCESSING=0` and `VLLM_USE_V2_MODEL_RUNNER=0` itself.
