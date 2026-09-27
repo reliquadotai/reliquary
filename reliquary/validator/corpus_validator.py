@@ -178,6 +178,18 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
         records=records, on_accepted=auditor.enqueue, proof_chunk_tokens=proof_chunk_tokens,
         vocab_size=vocab_size, is_banned=is_banned, registration=registration,
     ))
+
+    from fastapi.exception_handlers import request_validation_exception_handler
+    from fastapi.exceptions import RequestValidationError
+
+    @app.exception_handler(RequestValidationError)
+    async def log_malformed(request, exc):
+        # The miner gets the full 422; the log names the fields, never their content.
+        hotkey = exc.body.get("miner_hotkey") if isinstance(exc.body, dict) else None
+        fields = sorted({(".".join(str(p) for p in e.get("loc", ())), e.get("type")) for e in exc.errors()})
+        logger.warning("corpus submission malformed from %s: %s", str(hotkey)[:48], fields[:10])
+        return await request_validation_exception_handler(request, exc)
+
     return app
 
 

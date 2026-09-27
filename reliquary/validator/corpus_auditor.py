@@ -13,6 +13,7 @@ import asyncio
 import bisect
 from dataclasses import replace
 import logging
+import os
 import re
 import time
 from collections.abc import Callable
@@ -41,7 +42,9 @@ VERDICT_SCHEMA = "reliquary/corpus-verdict/v1"
 RESCAN_SECONDS = 60.0
 MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 # Padded size (rows x longest sequence) a sub-batch's forward pass may reach.
-AUDIT_BATCH_TOKENS = 131072
+# What fits depends on the card and checkpoint (131,072 overran an H100 beside
+# Qwen3.8-27B), so the operator may lower it.
+AUDIT_BATCH_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS", "131072"))
 # `run()` drains the queue into groups no larger than this before auditing.
 RUN_BATCH_IDS = 16
 # Propagation slack after the draw round's publication before it is fetched:

@@ -378,3 +378,28 @@ def test_the_app_refuses_an_unregistered_hotkey(seeded_job):
     ).json()
 
     assert body["reason"] == "hotkey_not_registered"
+
+
+def test_a_malformed_submission_is_logged_by_field_not_by_content(seeded_job, monkeypatch):
+    """A 422 tells only the miner what was wrong; the operator needs it too,
+    without the submission's text in the log."""
+    from reliquary.validator import corpus_validator
+
+    lines = []
+    monkeypatch.setattr(corpus_validator.logger, "warning",
+                        lambda message, *args: lines.append(message % args))
+    auditor = SimpleNamespace(enqueue=lambda sid: None)
+    app = build_corpus_app(entry=_entry(), job=seeded_job.job, store=seeded_job.store, records=None,
+                           tokenizer=_Tokenizer(), renderer=seeded_job.renderer,
+                           verify_signature=lambda r: True, auditor=auditor, proof_chunk_tokens=None,
+                           prompt_job_for=seeded_job.prompt_job_for)
+    response = TestClient(app).post("/corpus/submit", json={
+        "job_id": "swe-v1", "miner_hotkey": "5Hot", "cursor": 0, "prompt_index": 0,
+        "checkpoint_sha256": "a" * 64, "rendered_prompt": "secret prompt text",
+        "completions": [{"tokens": [7, EOS], "text": "secret completion", "surprise": 1}],
+        "signature": "ok",
+    })
+    assert response.status_code == 422
+    logged = " ".join(lines)
+    assert "5Hot" in logged and "surprise" in logged and "extra_forbidden" in logged
+    assert "secret" not in logged
