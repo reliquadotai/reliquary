@@ -69,7 +69,10 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
         execs.append((executable, argv, os.environ.get(TASK_CONTRACT_ENV_VAR)))
         raise _Restarted
 
-    monkeypatch.delenv(TASK_CONTRACT_ENV_VAR, raising=False)
+    # setenv first so the monkeypatch restores "absent" afterwards: the command
+    # sets the variable itself, and a leak would reach later tests' subprocesses.
+    monkeypatch.setenv(TASK_CONTRACT_ENV_VAR, "unset-by-this-test")
+    monkeypatch.delenv(TASK_CONTRACT_ENV_VAR)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.setattr("httpx.Client", _Client)
     monkeypatch.setattr(os, "execv", _execv)
@@ -77,3 +80,11 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
     assert isinstance(result.exception, _Restarted), result.output
     (_, _, contract_path), = execs
     assert json.loads(open(contract_path).read()) == CONTRACT
+
+
+def test_the_restart_test_leaves_no_contract_behind():
+    import os
+
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    assert TASK_CONTRACT_ENV_VAR not in os.environ
