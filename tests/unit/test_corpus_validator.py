@@ -403,3 +403,16 @@ def test_a_malformed_submission_is_logged_by_field_not_by_content(seeded_job, mo
     logged = " ".join(lines)
     assert "5Hot" in logged and "surprise" in logged and "extra_forbidden" in logged
     assert "secret" not in logged
+
+
+def test_the_app_serves_the_contract_it_runs(seeded_job):
+    """A miner needs the task's contract to start; it has no registry access,
+    so the validator serves the one it runs."""
+    contract = {"model_id": "org/M", "proofs": [{"scheme": "toploc-v1"}]}
+    auditor = SimpleNamespace(enqueue=lambda sid: None)
+    app = build_corpus_app(entry=_entry(), job=seeded_job.job, store=seeded_job.store, records=None,
+                           tokenizer=_Tokenizer(), renderer=seeded_job.renderer,
+                           verify_signature=lambda r: True, auditor=auditor, proof_chunk_tokens=None,
+                           prompt_job_for=seeded_job.prompt_job_for, contract=contract)
+    response = TestClient(app).get("/corpus/contract")
+    assert response.status_code == 200 and response.json() == contract

@@ -1187,6 +1187,38 @@ corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
 
+def _restart_with_served_contract(validator_url: str) -> None:
+    """Take the task's contract from the validator and restart with it: the
+    active profile is fixed when this process imports it."""
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import httpx
+
+    from reliquary.miner.corpus_miner import CorpusContractError, save_served_contract
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    http = httpx.Client(base_url=validator_url, timeout=60.0)
+    responses = {}
+    for path in ("/corpus/job", "/corpus/contract"):
+        response = http.get(path)
+        response.raise_for_status()
+        responses[path] = response.json()
+    raw = responses["/corpus/job"]
+    job = SimpleNamespace(job_id=raw.get("job_id"), checkpoint_repo=raw.get("checkpoint_repo"),
+                          checkpoint_revision=raw.get("checkpoint_revision"))
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
+    try:
+        path = save_served_contract(responses["/corpus/contract"], job, cache)
+    except CorpusContractError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+    typer.echo(f"using the contract served by {validator_url}: {path}")
+    os.environ[TASK_CONTRACT_ENV_VAR] = str(path)
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+
+
 @corpus_app.command("mine")
 def corpus_mine(
     validator_url: str = typer.Option(..., "--validator-url"),
@@ -1200,6 +1232,10 @@ def corpus_mine(
     ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    if TASK_CONTRACT_ENV_VAR not in os.environ:
+        _restart_with_served_contract(validator_url)
     import bittensor as bt
     import httpx
     from huggingface_hub import snapshot_download
