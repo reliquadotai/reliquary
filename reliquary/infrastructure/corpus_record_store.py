@@ -8,8 +8,8 @@ what decides which verdicts have already been paid.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
-import json
 import re
 from typing import Any
 
@@ -18,6 +18,7 @@ from reliquary.infrastructure.corpus_job_store import (
     CorpusStoreConflict,
     _ClientPool,
     _bucket,
+    _decode,
     _encode,
     _get,
     _put,
@@ -44,7 +45,9 @@ def _key(job_id: str, kind: str, submission_id: str) -> str:
 
 async def _create(key: str, document: Mapping, **client_kwargs) -> bool:
     try:
-        await _put(key, _encode(dict(document)), None, **client_kwargs)
+        # Encoded and decoded off the loop, which the route and auditor share.
+        body = await asyncio.to_thread(_encode, dict(document))
+        await _put(key, body, None, **client_kwargs)
     except CorpusStoreConflict:
         return False
     return True
@@ -52,7 +55,7 @@ async def _create(key: str, document: Mapping, **client_kwargs) -> bool:
 
 async def _read(key: str, **client_kwargs) -> dict | None:
     body, _ = await _get(key, **client_kwargs)
-    return None if body is None else json.loads(body)
+    return None if body is None else await asyncio.to_thread(_decode, body)
 
 
 async def _list_ids(prefix: str, *, pool: _ClientPool | None = None, **client_kwargs) -> list[str]:
@@ -99,11 +102,12 @@ def _settlement_key(job_id: str) -> str:
 
 async def read_settlement(job_id, **client_kwargs) -> tuple[dict, str | None]:
     body, etag = await _get(_settlement_key(job_id), **client_kwargs)
-    return ({}, None) if body is None else (json.loads(body), etag)
+    return ({}, None) if body is None else (await asyncio.to_thread(_decode, body), etag)
 
 
 async def write_settlement(job_id, state, etag, **client_kwargs) -> str | None:
-    return await _put(_settlement_key(job_id), _encode(dict(state)), etag, **client_kwargs)
+    body = await asyncio.to_thread(_encode, dict(state))
+    return await _put(_settlement_key(job_id), body, etag, **client_kwargs)
 
 
 def _miners_key(job_id: str) -> str:
@@ -115,14 +119,15 @@ async def read_miners(job_id, **client_kwargs) -> tuple[dict, str | None]:
     as ({}, None): a hotkey with no entry is handled by the caller (§5,
     "unknown is probation"), not by this store."""
     body, etag = await _get(_miners_key(job_id), **client_kwargs)
-    return ({}, None) if body is None else (json.loads(body), etag)
+    return ({}, None) if body is None else (await asyncio.to_thread(_decode, body), etag)
 
 
 async def write_miners(job_id, state, etag, **client_kwargs) -> str | None:
     """Compare-and-swap of the whole miners document, like the settlement
     state: two auditors racing on different hotkeys must not let one
     overwrite the other's write."""
-    return await _put(_miners_key(job_id), _encode(dict(state)), etag, **client_kwargs)
+    body = await asyncio.to_thread(_encode, dict(state))
+    return await _put(_miners_key(job_id), body, etag, **client_kwargs)
 
 
 class BucketRecordStore:

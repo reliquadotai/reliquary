@@ -164,6 +164,10 @@ def _client(pool: _ClientPool | None, client_kwargs: dict[str, Any]):
     return pool.client() if pool is not None else get_s3_client(**client_kwargs)
 
 
+def _decode(body: bytes) -> Any:
+    return json.loads(body)
+
+
 async def _get(
     key: str, *, pool: _ClientPool | None = None, **client_kwargs
 ) -> tuple[bytes | None, str | None]:
@@ -273,7 +277,8 @@ async def read_ledgers(job_id: str, **client_kwargs) -> tuple[dict, str | None]:
     body, etag = await _get(_ledgers_key(validated), **client_kwargs)
     if body is None:
         return {}, None
-    return json.loads(body), etag
+    # Megabytes once a job is busy: parsed off the loop the route shares.
+    return await asyncio.to_thread(_decode, body), etag
 
 
 async def write_ledgers(
@@ -282,7 +287,7 @@ async def write_ledgers(
     """Conditional put of the ledger snapshot. Raises ``CorpusStoreConflict``
     if a concurrent writer won the race."""
     validated = _validated_job_id(job_id)
-    body = _encode(dict(snapshot))
+    body = await asyncio.to_thread(_encode, dict(snapshot))
     return await _put(_ledgers_key(validated), body, etag, **client_kwargs)
 
 
@@ -294,23 +299,48 @@ class BucketJobStore:
     storage configuration out of the request path.
     """
 
-    __slots__ = ("_client_kwargs", "_pool")
+    __slots__ = ("_client_kwargs", "_pool", "_jobs", "_ledgers")
 
     def __init__(self, **client_kwargs: Any) -> None:
         self._client_kwargs = client_kwargs
         credentials = {k: v for k, v in client_kwargs.items() if k != "bucket_name"}
         # Resolved at build time, not bound here, so a patched `get_s3_client` applies.
         self._pool = _ClientPool(lambda: get_s3_client(**credentials))
+        # A manifest never changes under its id, so a found one is kept.
+        self._jobs: dict[str, tuple[JobSpec, str | None]] = {}
+        # The last ledger snapshot this store read or wrote, with its ETag. Its
+        # only use is the next compare-and-swap, which R2 still judges: a stale
+        # entry costs a conflict, which forgets it, never a lost write.
+        self._ledgers: dict[str, tuple[dict, str]] = {}
 
     async def read_job(self, job_id: str) -> tuple[JobSpec | None, str | None]:
-        return await read_job(job_id, pool=self._pool, **self._client_kwargs)
+        cached = self._jobs.get(job_id)
+        if cached is not None:
+            return cached
+        job, etag = await read_job(job_id, pool=self._pool, **self._client_kwargs)
+        if job is not None:
+            self._jobs[job_id] = (job, etag)
+        return job, etag
 
     async def read_ledgers(self, job_id: str) -> tuple[dict, str | None]:
-        return await read_ledgers(job_id, pool=self._pool, **self._client_kwargs)
+        """The snapshot is shared with the memory: callers must not mutate it."""
+        cached = self._ledgers.get(job_id)
+        if cached is not None:
+            return cached
+        snapshot, etag = await read_ledgers(job_id, pool=self._pool, **self._client_kwargs)
+        if etag is not None:
+            self._ledgers[job_id] = (snapshot, etag)
+        return snapshot, etag
 
     async def write_ledgers(
         self, job_id: str, snapshot: Mapping[str, Any], etag: str | None
     ) -> str | None:
-        return await write_ledgers(
+        # Forgotten before the write: a conflict, or a failure that may or may
+        # not have landed, must send the next read to the bucket.
+        self._ledgers.pop(job_id, None)
+        new_etag = await write_ledgers(
             job_id, snapshot, etag, pool=self._pool, **self._client_kwargs
         )
+        if new_etag is not None:
+            self._ledgers[job_id] = (dict(snapshot), new_etag)
+        return new_etag
