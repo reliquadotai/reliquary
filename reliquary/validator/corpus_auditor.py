@@ -188,15 +188,24 @@ class CorpusAuditor:
             sub_batches.append(current)
 
         outcomes = {}
+        forward_seconds = verify_seconds = 0.0
         for sub_batch in sub_batches:
             sequences = [
                 (prompts[i] + list(records[i]["completions"][c_idx]["tokens"]), len(prompts[i]))
                 for i, c_idx in sub_batch
             ]
+            mark = time.perf_counter()
             hidden_states = batch_completion_hidden_states(self._model, sequences)
+            if hidden_states and hidden_states[0].is_cuda:
+                # Kernels are queued asynchronously: without this the forward's
+                # time would be billed to the first verification that reads it.
+                torch.cuda.synchronize(hidden_states[0].device)
+            forward_seconds += time.perf_counter() - mark
+            mark = time.perf_counter()
             for (i, c_idx), hidden in zip(sub_batch, hidden_states):
                 completion = records[i]["completions"][c_idx]
                 outcomes[i, c_idx] = audit_completion(hidden, completion["proofs"], self._proof)
+            verify_seconds += time.perf_counter() - mark
             # Drop this sub-batch's padded activations before the next one is
             # computed: two final-hidden-state tensors must never be live at once.
             del hidden_states, sequences, hidden
@@ -215,7 +224,23 @@ class CorpusAuditor:
                 if not outcome.passed and passed:
                     passed, reason = False, outcome.reason
             results[i] = {"passed": passed, "reason": reason, **worst}
+        self._log_batch(records, queue, forward_seconds, verify_seconds)
         return results
+
+    def _log_batch(self, records: list[dict], queue: list, forward: float,
+                   verify: float) -> None:
+        """One line per judged batch: what it held, how long its oldest record
+        had waited, and the speed of the GPU forward and the proof check."""
+        completion_tokens = sum(len(records[i]["completions"][c]["tokens"]) for _, i, c in queue)
+        arrivals = [float(r["received_at"]) for r in records if r.get("received_at") is not None]
+        wait = f"{self._clock() - min(arrivals):.1f}s" if arrivals else "-"
+        busy = forward + verify
+        logger.info(
+            "corpus audit batch: records=%d completions=%d completion_tokens=%d "
+            "oldest_wait=%s forward=%.3fs verify=%.3fs tokens_per_s=%.0f",
+            len(records), len(queue), completion_tokens, wait, forward, verify,
+            completion_tokens / busy if busy > 0 else 0.0,
+        )
 
     async def _read(self, submission_id: str) -> dict | None:
         try:
