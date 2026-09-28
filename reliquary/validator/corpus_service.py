@@ -74,6 +74,10 @@ LEDGER_FIELDS = frozenset({"schema", "slots", "cursors", "seen"})
 # a request that never returns.
 DEFAULT_WRITE_ATTEMPTS = 4
 
+# How long a submission waits for its turn on the ledger. One hung PUT can hold
+# the turn for botocore's full ~135 s; past this the miner gets the retryable 503.
+LEDGER_LOCK_TIMEOUT_SECONDS = 30.0
+
 # Each resolved source holds a built environment, and a validator serves only a
 # handful of live jobs at once, so the cache is bounded rather than growing with
 # every job this process has ever seen.
@@ -615,6 +619,7 @@ def build_corpus_router(
     vocab_size: int | None = None,
     is_banned: Callable[[str], Awaitable[bool]] | None = None,
     registration: Callable[[str], Awaitable[str | None]] | None = None,
+    ledger_lock_timeout: float = LEDGER_LOCK_TIMEOUT_SECONDS,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -878,7 +883,16 @@ def build_corpus_router(
         waited = time.perf_counter()
         written: Verdict | None = None
         attempts = 0
-        async with ledger_lock:
+        try:
+            await asyncio.wait_for(ledger_lock.acquire(), ledger_lock_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "corpus ledger turn for %s not granted within %.0f s (miner %s)",
+                job_id, ledger_lock_timeout, request.miner_hotkey[:12],
+            )
+            # Nothing was consumed, so the same work resubmits cleanly.
+            raise HTTPException(status_code=503, detail="corpus_ledger_contention") from None
+        try:
             timing["lock_wait"] = time.perf_counter() - waited
             for attempts in range(1, max_write_attempts + 1):
                 mark = time.perf_counter()
@@ -901,6 +915,8 @@ def build_corpus_router(
                     timing["ledger_write"] += time.perf_counter() - mark
                 written = verdict
                 break
+        finally:
+            ledger_lock.release()
 
         if written is not None:
             # Outside the lock: the record is create-only and keyed by its own

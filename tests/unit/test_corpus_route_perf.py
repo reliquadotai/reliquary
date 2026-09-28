@@ -232,3 +232,45 @@ def test_the_record_store_encodes_and_decodes_off_the_event_loop(monkeypatch):
     asyncio.run(scenario())
     assert len(seen) == 6
     assert not any(loop for _, loop in seen)
+
+
+def test_a_hung_ledger_write_makes_the_next_submission_retryable_not_stuck(
+    fake_r2, seeded_job
+):
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    release = asyncio.Event()
+
+    class _HangingStore(_YieldingStore):
+        async def write_ledgers(self, job_id, snapshot, etag):
+            if not release.is_set():
+                await release.wait()
+            return await super().write_ledgers(job_id, snapshot, etag)
+
+    store = _HangingStore(fake_r2)
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id="swe-v1",
+            store=store,
+            tokenizer=_Tokenizer(),
+            renderer=_Renderer(),
+            verify_signature=lambda request: True,
+            prompt_job_for=seeded_job.prompt_job_for,
+            ledger_lock_timeout=0.05,
+        )
+    )
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://v") as http:
+            first = asyncio.create_task(http.post("/corpus/submit", json=_request("5HotA", 0)))
+            await asyncio.sleep(0.02)
+            second = await http.post("/corpus/submit", json=_request("5HotB", 1))
+            release.set()
+            return (await first), second
+
+    first, second = asyncio.run(scenario())
+    assert second.status_code == 503
+    assert second.json() == {"detail": "corpus_ledger_contention"}
+    assert first.json()["accepted"] is True
