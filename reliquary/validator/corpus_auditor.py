@@ -52,7 +52,9 @@ READ_CONCURRENCY = 16
 # drand rounds fetched at once when a pass needs many (one per sampled record).
 DRAND_CONCURRENCY = 16
 # `run()` drains the queue into groups no larger than this before auditing.
-RUN_BATCH_IDS = 16
+# A pass re-decides the siblings of every unaudited record it pays (about 150 s
+# with ~300 of them on 2026-09-28), so it takes many ids at once to share that.
+RUN_BATCH_IDS = 256
 # Propagation slack after the draw round's publication before it is fetched:
 # asking too early reads as "no beacon", which audits (safe, but wastes the sampling).
 BEACON_GRACE_SECONDS = 2.0
