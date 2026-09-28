@@ -770,3 +770,32 @@ def test_an_unreadable_record_holding_passes_back_is_logged(caplog):
     assert records.verdicts == {}
     assert any("1 pending corpus record(s) unreadable" in r.getMessage()
                and "every unaudited pass waits" in r.getMessage() for r in caplog.records)
+
+
+class _SlowRecords(_Records):
+    """Each read takes a while; counts how many run at once."""
+
+    def __init__(self, submissions):
+        super().__init__(submissions)
+        self.in_flight = 0
+        self.peak = 0
+
+    async def read_submission(self, job_id, sid):
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().read_submission(job_id, sid)
+        finally:
+            self.in_flight -= 1
+
+
+def test_the_startup_seed_reads_pending_records_concurrently():
+    """A restart with thousands of pending records read them one at a time
+    before judging anything (23 minutes on 2026-09-28): they are read together."""
+    pending = _ids(False, 64, start=900)
+    records = _SlowRecords({sid: _rec(0) for sid in pending})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor.judge_many(pending[:1]))
+    assert set(auditor._meta) >= set(pending)
+    assert records.peak > 1

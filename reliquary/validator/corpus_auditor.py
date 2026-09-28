@@ -45,6 +45,8 @@ MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 # What fits depends on the card and checkpoint (131,072 overran an H100 beside
 # Qwen3.8-27B), so the operator may lower it.
 AUDIT_BATCH_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS", "131072"))
+# Store reads in flight at once when many records must be read before judging.
+READ_CONCURRENCY = 16
 # `run()` drains the queue into groups no larger than this before auditing.
 RUN_BATCH_IDS = 16
 # Propagation slack after the draw round's publication before it is fetched:
@@ -268,6 +270,17 @@ class CorpusAuditor:
                 self._unjudged.setdefault(record["hotkey"], set()).add(submission_id)
         return record
 
+    async def _read_all(self, submission_ids) -> dict[str, dict]:
+        """_read for many ids, READ_CONCURRENCY at a time; the readable ones."""
+        gate = asyncio.Semaphore(READ_CONCURRENCY)
+
+        async def one(submission_id):
+            async with gate:
+                return submission_id, await self._read(submission_id)
+
+        pairs = await asyncio.gather(*(one(sid) for sid in dict.fromkeys(submission_ids)))
+        return {sid: record for sid, record in pairs if record is not None}
+
     def _recent(self, hotkey: str, now: float) -> int:
         arrivals = self._arrivals.get(hotkey, [])
         # Older than the hold window: never counted again, as `now` only grows.
@@ -480,9 +493,8 @@ class CorpusAuditor:
         randomness, draw, recent = None, None, 0
         if self._params.q < 1.0 and effective_state(state, now, self._params) == "sampled":
             if not self._seeded:
-                for sid in await self.pending_ids():
-                    if sid not in self._meta:
-                        await self._read(sid)
+                await self._read_all(
+                    [sid for sid in await self.pending_ids() if sid not in self._meta])
                 self._seeded = True
             recent = self._recent(hotkey, now)
             if (recent >= 1.0 / self._params.q and self._beacon is not None
@@ -521,11 +533,8 @@ class CorpusAuditor:
         # The backward audit and the rescan bring a caught hotkey's records back.
         submission_ids = [sid for sid in submission_ids if sid not in self._judged]
         read: dict[str, dict] = {}
-        for submission_id in submission_ids:
-            if submission_id not in self._meta:
-                record = await self._read(submission_id)
-                if record is not None:
-                    read[submission_id] = record
+        read.update(await self._read_all(
+            [sid for sid in submission_ids if sid not in self._meta]))
         known = [sid for sid in dict.fromkeys(submission_ids) if sid in self._meta]
         states = {}
         for hotkey in {self._meta[sid][0] for sid in known}:
@@ -553,9 +562,9 @@ class CorpusAuditor:
             # hold may still sit in the queue. Decide every such sibling now and
             # audit the drawn ones in this pass, so a failure among them reaches
             # X through the same-pass guard below instead of after X is paid.
-            for sid in sorted(self._queued | self._unreadable):
-                if sid not in self._meta and sid not in self._judged:
-                    await self._read(sid)
+            await self._read_all(sorted(
+                sid for sid in self._queued | self._unreadable
+                if sid not in self._meta and sid not in self._judged))
             hold_end: dict[str, float] = {}
             for submission_id, _ in unaudited:
                 hotkey, received_at, _ = self._meta[submission_id]
@@ -619,9 +628,7 @@ class CorpusAuditor:
             # §7.2: every record of a hotkey just found cheating that has no
             # verdict yet is audited (it is suspect now) before it can be paid.
             pending = await self.pending_ids()
-            for sid in pending:
-                if sid not in self._meta:
-                    await self._read(sid)
+            await self._read_all([sid for sid in pending if sid not in self._meta])
             held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed]
             failed = await self._judge_once(held)
 
