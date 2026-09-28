@@ -845,7 +845,9 @@ def build_corpus_router(
             # until an operator repairs it, so `_rebuild_ledgers_checked`
             # names the refusal rather than leaving a bare 500.
             slots, cursors, seen = _rebuild_ledgers_checked(job, snapshot)
-            before = ledger_snapshot(slots, cursors, seen)
+            # The unsorted state `ledger_snapshot` is a function of: comparing
+            # it skips sorting every digest twice for a refusal.
+            before = (slots.snapshot(), cursors.snapshot(), frozenset(seen))
 
             verdict = admit(
                 job,
@@ -867,8 +869,9 @@ def build_corpus_router(
                 # paid for is the caller's half of the duplicate check.
                 seen.update(digests)
 
-            after = ledger_snapshot(slots, cursors, seen)
-            return verdict, (None if after == before else after)
+            if (slots.snapshot(), cursors.snapshot(), seen) == before:
+                return verdict, None
+            return verdict, ledger_snapshot(slots, cursors, seen)
 
         for key in ("ledger_read", "admit", "ledger_write"):
             timing[key] = 0.0
