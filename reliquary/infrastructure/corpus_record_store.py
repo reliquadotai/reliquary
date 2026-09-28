@@ -16,6 +16,7 @@ from typing import Any
 from reliquary.infrastructure.corpus_job_store import (
     JOB_KEY_PREFIX,
     CorpusStoreConflict,
+    _ClientPool,
     _bucket,
     _encode,
     _get,
@@ -54,10 +55,10 @@ async def _read(key: str, **client_kwargs) -> dict | None:
     return None if body is None else json.loads(body)
 
 
-async def _list_ids(prefix: str, **client_kwargs) -> list[str]:
+async def _list_ids(prefix: str, *, pool: _ClientPool | None = None, **client_kwargs) -> list[str]:
     bucket = _bucket(client_kwargs)
     ids: list[str] = []
-    async with get_s3_client(**client_kwargs) as client:
+    async with (pool.client() if pool is not None else get_s3_client(**client_kwargs)) as client:
         paginator = client.get_paginator("list_objects_v2")
         async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []) or []:
@@ -130,7 +131,11 @@ class BucketRecordStore:
     __slots__ = ("_kw",)
 
     def __init__(self, **client_kwargs: Any) -> None:
-        self._kw = client_kwargs
+        credentials = {k: v for k, v in client_kwargs.items() if k != "bucket_name"}
+        # One long-lived client for every call (see `_ClientPool`); resolved
+        # at build time so a patched `get_s3_client` applies.
+        pool = _ClientPool(lambda: get_s3_client(**credentials))
+        self._kw = {**client_kwargs, "pool": pool}
 
     async def write_submission(self, job_id, submission_id, record):
         return await write_submission(job_id, submission_id, record, **self._kw)
