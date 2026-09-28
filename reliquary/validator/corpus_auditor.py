@@ -49,6 +49,8 @@ MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 AUDIT_BATCH_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS", "131072"))
 # Store reads in flight at once when many records must be read before judging.
 READ_CONCURRENCY = 16
+# drand rounds fetched at once when a pass needs many (one per sampled record).
+DRAND_CONCURRENCY = 16
 # `run()` drains the queue into groups no larger than this before auditing.
 RUN_BATCH_IDS = 16
 # Propagation slack after the draw round's publication before it is fetched:
@@ -505,6 +507,32 @@ class CorpusAuditor:
             self._failed_rounds[round_number] = self._clock()
         return randomness
 
+    async def _prefetch_rounds(self, submission_ids, now: float, states: dict) -> None:
+        """Fetch together the drand rounds _decide will ask for one by one; it
+        then reads them from the cache. Any failure is left for _decide."""
+        if self._params.q >= 1.0 or self._beacon is None or self._round_at is None:
+            return
+        rounds = set()
+        for sid in submission_ids:
+            hotkey, received_at, _ = self._meta[sid]
+            if effective_state(states[hotkey], now, self._params) != "sampled":
+                continue
+            try:
+                round_number = int(self._round_at(received_at)) + 1
+                if int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number:
+                    continue  # not out yet: _decide calls it undecidable
+            except Exception:
+                return
+            if round_number not in self._randomness:
+                rounds.add(round_number)
+        gate = asyncio.Semaphore(DRAND_CONCURRENCY)
+
+        async def one(round_number):
+            async with gate:
+                await self._randomness_for(round_number)
+
+        await asyncio.gather(*(one(r) for r in sorted(rounds)))
+
     async def _decide(self, submission_id: str, now: float,
                       state: MinerState) -> tuple[str, dict | None]:
         """decision() for one known record, with its draw; "undecidable" while
@@ -563,6 +591,8 @@ class CorpusAuditor:
         audit_ids, draws, unaudited, voided = [], {}, [], []
         # Per hotkey, arrival times of records whose draw round is not out yet.
         undecided: dict[str, list[float]] = {}
+        with self._timed("decide"):
+            await self._prefetch_rounds(known, now, states)
         for submission_id in known:
             hotkey, received_at, _ = self._meta[submission_id]
             with self._timed("decide"):
@@ -593,10 +623,14 @@ class CorpusAuditor:
                 hold_end[hotkey] = max(hold_end.get(hotkey, 0.0),
                                        received_at + self._params.hold_seconds)
             in_pass = set(known)
-            for hotkey, until in hold_end.items():
-                for sid in sorted(self._unjudged.get(hotkey, ())):
-                    if sid in in_pass or self._meta[sid][1] > until:
-                        continue
+            siblings = {hotkey: [sid for sid in sorted(self._unjudged.get(hotkey, ()))
+                                 if sid not in in_pass and self._meta[sid][1] <= until]
+                        for hotkey, until in hold_end.items()}
+            with self._timed("decide"):
+                await self._prefetch_rounds(
+                    [sid for sids in siblings.values() for sid in sids], now, states)
+            for hotkey, sids in siblings.items():
+                for sid in sids:
                     with self._timed("decide"):
                         choice, draw = await self._decide(sid, now, states[hotkey])
                     self._choices["sibling_" + choice] += 1
