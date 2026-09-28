@@ -799,3 +799,21 @@ def test_the_startup_seed_reads_pending_records_concurrently():
     asyncio.run(auditor.judge_many(pending[:1]))
     assert set(auditor._meta) >= set(pending)
     assert records.peak > 1
+
+
+def test_each_judged_batch_logs_where_its_time_went(monkeypatch):
+    """Minutes passed between GPU batches with the process idle (2026-09-28):
+    each batch now reports its time per phase and what it decided."""
+    from reliquary.validator import corpus_auditor
+
+    lines = []
+    monkeypatch.setattr(corpus_auditor.logger, "info",
+                        lambda message, *args: lines.append(message % args))
+    ids = _ids(False, 3)
+    records = _Records({sid: _rec(0) for sid in ids})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor.judge_many(ids))
+    timing = [line for line in lines if line.startswith("corpus judge pass")]
+    assert timing, lines
+    for phase in ("read=", "state=", "decide=", "drand=", "audit=", "write=", "choices="):
+        assert phase in timing[-1]
