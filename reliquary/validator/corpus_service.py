@@ -631,6 +631,9 @@ def build_corpus_router(
 
     router = APIRouter()
     prompt_fidelity = PromptFidelity(renderer=renderer, prompt_job_for=prompt_job_for)
+    # This process's submissions take turns on the ledger: interleaved, each
+    # would read the same ETag and all but one would lose the compare-and-swap.
+    ledger_lock = asyncio.Lock()
 
     async def _from_store(call, what: str):
         try:
@@ -710,7 +713,7 @@ def build_corpus_router(
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
         snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger read")
-        _, cursors, _ = _rebuild_ledgers_checked(job, snapshot)
+        _, cursors, _ = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
         return {"hotkey": hotkey, "cursor": cursors.expected(hotkey)}
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
@@ -767,11 +770,13 @@ def build_corpus_router(
         # first: a manifest in the bucket that no longer parses is an operator
         # fault, and left uncaught here it would disguise itself as an unknown
         # job instead of naming the corrupt one.
+        started = time.perf_counter()
         job = await _read_job_checked()
         if job is None:
             return _refuse(
                 CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id}
             )
+        timing = {"job_read": time.perf_counter() - started}
 
         # The fidelity check indexes the prompt source, so a miner-controlled
         # index is bounded before it can raise on the operator's behalf. On a
@@ -830,8 +835,11 @@ def build_corpus_router(
             if not text.ok:
                 return _refuse(CorpusRejectReason(text.reason), text.detail)
 
-        for _ in range(max_write_attempts):
-            snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
+        timing["checks"] = time.perf_counter() - started - timing["job_read"]
+
+        def admit_against(snapshot: Any) -> tuple[Verdict, dict[str, Any] | None]:
+            # Pure and CPU-bound over the whole ledger, so it runs in a thread;
+            # the lock keeps two of these from ever working on one snapshot.
             # The blast radius of a corrupt snapshot is every miner on this
             # job, and there is no circuit breaker: the object stays corrupt
             # until an operator repairs it, so `_rebuild_ledgers_checked`
@@ -860,17 +868,52 @@ def build_corpus_router(
                 seen.update(digests)
 
             after = ledger_snapshot(slots, cursors, seen)
-            if after == before:
-                # A refusal that moved nothing costs no write, so a miner
-                # spraying junk cannot bill us a bucket write per attempt.
-                return _respond(verdict)
-            try:
-                await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
-            except CorpusStoreConflict:
-                continue
-            if verdict.accepted:
+            return verdict, (None if after == before else after)
+
+        for key in ("ledger_read", "admit", "ledger_write"):
+            timing[key] = 0.0
+        waited = time.perf_counter()
+        written: Verdict | None = None
+        attempts = 0
+        async with ledger_lock:
+            timing["lock_wait"] = time.perf_counter() - waited
+            for attempts in range(1, max_write_attempts + 1):
+                mark = time.perf_counter()
+                snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
+                timing["ledger_read"] += time.perf_counter() - mark
+
+                mark = time.perf_counter()
+                verdict, after = await asyncio.to_thread(admit_against, snapshot)
+                timing["admit"] += time.perf_counter() - mark
+                if after is None:
+                    # A refusal that moved nothing costs no write, so a miner
+                    # spraying junk cannot bill us a bucket write per attempt.
+                    return _respond(verdict)
+                mark = time.perf_counter()
+                try:
+                    await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
+                except CorpusStoreConflict:
+                    continue
+                finally:
+                    timing["ledger_write"] += time.perf_counter() - mark
+                written = verdict
+                break
+
+        if written is not None:
+            # Outside the lock: the record is create-only and keyed by its own
+            # id, so it needs no turn on the ledger.
+            mark = time.perf_counter()
+            if written.accepted:
                 await _record_accepted(request, job_id)
-            return _respond(verdict)
+                timing["record_write"] = time.perf_counter() - mark
+                timing["total"] = time.perf_counter() - started
+                logger.info(
+                    "corpus submission timing %s: %s attempts=%d",
+                    request.miner_hotkey[:12],
+                    " ".join(f"{k}={v:.3f}" for k, v in timing.items()),
+                    attempts,
+                )
+            return _respond(written)
 
         logger.warning(
             "corpus ledgers for %s stayed contended over %d attempts (miner %s)",
