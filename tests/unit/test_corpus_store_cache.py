@@ -143,3 +143,59 @@ def test_the_ledgers_are_remembered_per_job(bucket):
         return await store.read_ledgers("other-v1")
 
     assert _run(scenario()) == ({}, None)
+
+
+class _GatedR2(_CountingR2):
+    """Holds a GET after it has read its bytes, and a PUT before it lands,
+    until the test releases them: the interleaving a real bucket allows."""
+
+    def __init__(self):
+        super().__init__()
+        self.get_read = asyncio.Event()
+        self.release_get = asyncio.Event()
+        self.put_started = asyncio.Event()
+        self.release_put = asyncio.Event()
+        self.gate = False
+
+    async def get_object(self, Bucket, Key):
+        response = await super().get_object(Bucket, Key)
+        if self.gate:
+            self.get_read.set()
+            await self.release_get.wait()
+        return response
+
+    async def put_object(self, Bucket, Key, Body, **condition):
+        if self.gate:
+            self.put_started.set()
+            await self.release_put.wait()
+        return await super().put_object(Bucket, Key, Body, **condition)
+
+
+def test_a_read_that_raced_a_write_does_not_remember_the_old_ledgers(monkeypatch):
+    client = _GatedR2()
+    monkeypatch.setattr(job_store, "get_s3_client", lambda **kw: client)
+    _run(job_store.write_ledgers("swe-v1", {"slots": {"1": 1}}, None))
+    store = BucketJobStore()
+
+    async def scenario():
+        _, etag = await store.read_ledgers("swe-v1")
+        await store.write_ledgers("swe-v1", {"slots": {"1": 2}}, etag)
+        client.gate = True
+        # The write forgets the memory and waits in flight; a read then misses
+        # and fetches the bytes the write is about to replace.
+        write = asyncio.create_task(store.write_ledgers("swe-v1", {"slots": {"1": 3}}, (await store.read_ledgers("swe-v1"))[1]))
+        await client.put_started.wait()
+        read = asyncio.create_task(store.read_ledgers("swe-v1"))
+        await client.get_read.wait()
+        client.release_put.set()
+        new_etag = await write
+        client.release_get.set()
+        old, _ = await read
+        client.gate = False
+        return old, new_etag, await store.read_ledgers("swe-v1")
+
+    old, new_etag, (latest, latest_etag) = _run(scenario())
+    assert old == {"slots": {"1": 2}}
+    # The late read must not overwrite what the write just remembered.
+    assert latest == {"slots": {"1": 3}}
+    assert latest_etag == new_etag

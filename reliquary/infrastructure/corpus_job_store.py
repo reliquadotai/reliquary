@@ -299,7 +299,7 @@ class BucketJobStore:
     storage configuration out of the request path.
     """
 
-    __slots__ = ("_client_kwargs", "_pool", "_jobs", "_ledgers")
+    __slots__ = ("_client_kwargs", "_pool", "_jobs", "_ledgers", "_generation")
 
     def __init__(self, **client_kwargs: Any) -> None:
         self._client_kwargs = client_kwargs
@@ -312,6 +312,9 @@ class BucketJobStore:
         # only use is the next compare-and-swap, which R2 still judges: a stale
         # entry costs a conflict, which forgets it, never a lost write.
         self._ledgers: dict[str, tuple[dict, str]] = {}
+        # Bumped by every write before its PUT: a read or write that started
+        # under an older generation must not fill the memory with what it saw.
+        self._generation: dict[str, int] = {}
 
     async def read_job(self, job_id: str) -> tuple[JobSpec | None, str | None]:
         cached = self._jobs.get(job_id)
@@ -327,8 +330,10 @@ class BucketJobStore:
         cached = self._ledgers.get(job_id)
         if cached is not None:
             return cached
+        generation = self._generation.get(job_id, 0)
         snapshot, etag = await read_ledgers(job_id, pool=self._pool, **self._client_kwargs)
-        if etag is not None:
+        if (etag is not None and self._generation.get(job_id, 0) == generation
+                and job_id not in self._ledgers):
             self._ledgers[job_id] = (snapshot, etag)
         return snapshot, etag
 
@@ -338,9 +343,10 @@ class BucketJobStore:
         # Forgotten before the write: a conflict, or a failure that may or may
         # not have landed, must send the next read to the bucket.
         self._ledgers.pop(job_id, None)
+        generation = self._generation[job_id] = self._generation.get(job_id, 0) + 1
         new_etag = await write_ledgers(
             job_id, snapshot, etag, pool=self._pool, **self._client_kwargs
         )
-        if new_etag is not None:
+        if new_etag is not None and self._generation[job_id] == generation:
             self._ledgers[job_id] = (dict(snapshot), new_etag)
         return new_etag
