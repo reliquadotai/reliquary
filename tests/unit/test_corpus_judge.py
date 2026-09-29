@@ -652,6 +652,24 @@ def test_the_rescan_logs_the_queue_lag(caplog):
     assert any("queue lag" in r.getMessage() and "400" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("over, level", [(0.0, "INFO"), (1.0, "WARNING")])
+def test_the_queue_lag_warns_only_past_the_hold_plus_the_accept_slack(caplog, over, level):
+    """A healthy undrawn record waits its hold plus the accept slack before it
+    can pass unaudited, so only a lag past both (and two rescans) is a warning."""
+    slack, rescan = 420.0, 60.0
+    received = T0 - (HOLD + slack + 2 * rescan + over)
+    sid = _ids(False, 1)[0]
+    records = _Records({sid: _rec(0, received_at=received)})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0), beacon=_Beacon(),
+                     accept_slack_seconds=slack, rescan_every_seconds=rescan)
+    asyncio.run(auditor._read(sid))
+
+    with caplog.at_level("INFO", logger="reliquary.validator.corpus_auditor"):
+        asyncio.run(auditor._rescan_once(full=False))
+    (record,) = [r for r in caplog.records if "queue lag" in r.getMessage()]
+    assert record.levelname == level
+
+
 class _FlakyReads(_Records):
     """Each id in `fail` raises once on read, like a transient store error."""
 
