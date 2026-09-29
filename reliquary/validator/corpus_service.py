@@ -840,6 +840,8 @@ def build_corpus_router(
     is_banned: Callable[[str], Awaitable[bool]] | None = None,
     registration: Callable[[str], Awaitable[str | None]] | None = None,
     ledger_lock_timeout: float = LEDGER_LOCK_TIMEOUT_SECONDS,
+    seal_threshold: int = SEAL_THRESHOLD,
+    segment_max: int = SEGMENT_MAX,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -859,6 +861,8 @@ def build_corpus_router(
     # This process's submissions take turns on the ledger: interleaved, each
     # would read the same ETag and all but one would lose the compare-and-swap.
     ledger_lock = asyncio.Lock()
+    # The sealed part of the seen set, touched only under `ledger_lock`.
+    seen_index = SeenIndex(store, job_id)
 
     async def _from_store(call, what: str):
         try:
@@ -1062,20 +1066,15 @@ def build_corpus_router(
 
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
-        def admit_against(snapshot: Any) -> tuple[Verdict, dict[str, Any] | None]:
-            # Pure and CPU-bound over the whole ledger, so it runs in a thread;
-            # the lock keeps two of these from ever working on one snapshot.
-            # The blast radius of a corrupt snapshot is every miner on this
-            # job, and there is no circuit breaker: the object stays corrupt
-            # until an operator repairs it, so `_rebuild_ledgers_checked`
-            # names the refusal rather than leaving a bare 500.
-            state = _rebuild_ledgers_checked(job, snapshot)
-            if state.segments:
-                raise HTTPException(status_code=500, detail="corpus_ledger_corrupt")
-            slots, cursors, seen = state.slots, state.cursors, state.pending
-            # The unsorted state `ledger_snapshot` is a function of: comparing
-            # it skips sorting every digest twice for a refusal.
-            before = (slots.snapshot(), cursors.snapshot(), frozenset(seen))
+        def admit_against(
+            state: LedgerState,
+        ) -> tuple[Verdict, tuple[dict[str, Any], list[list[str]]] | None]:
+            # Pure and CPU-bound, so it runs in a thread; the lock keeps two of
+            # these from ever working on one state, and `seen_index` already
+            # holds exactly the segments `state` names.
+            seen_index.check_pending(state.pending)
+            slots, cursors, pending = state.slots, state.cursors, state.pending
+            before = (slots.snapshot(), cursors.snapshot())
 
             verdict = admit(
                 job,
@@ -1088,20 +1087,39 @@ def build_corpus_router(
                 digests=digests,
                 slots=slots,
                 cursors=cursors,
-                seen=seen,
+                seen=SeenView(seen_index, pending),
                 proof_counts=[len(c.proofs) for c in request.completions],
                 proof_chunk_tokens=proof_chunk_tokens,
             )
             if verdict.accepted:
                 # `admit` reads `seen`, it does not grow it: recording what was
                 # paid for is the caller's half of the duplicate check.
-                seen.update(digests)
-
-            if (slots.snapshot(), cursors.snapshot(), seen) == before:
+                pending.update(digests)
+            elif (slots.snapshot(), cursors.snapshot()) == before:
                 return verdict, None
-            return verdict, ledger_snapshot(slots, cursors, seen)
+            chunks: list[list[str]] = []
+            if len(pending) >= seal_threshold:
+                chunks = seal_chunks(pending, segment_max)
+                pending = set()
+            # Everything but the segment list, which the seal completes.
+            return verdict, (ledger_snapshot(slots, cursors, pending, state.segments), chunks)
 
-        for key in ("ledger_read", "admit", "ledger_write"):
+        async def seal(chunks: list[list[str]]) -> list[SegmentRef]:
+            # Written before any ledger names them (I2); a lost ledger write
+            # leaves them orphaned and uncounted (I4), reused by name later.
+            gate = asyncio.Semaphore(SEGMENT_PARALLELISM)
+
+            async def one(chunk: list[str]) -> SegmentRef:
+                async with gate:
+                    segment_id = await _from_store(
+                        store.write_seen_segment(job_id, chunk), "seen segment write"
+                    )
+                seen_index.remember(segment_id, chunk)
+                return SegmentRef(segment_id, len(chunk))
+
+            return list(await asyncio.gather(*(one(chunk) for chunk in chunks)))
+
+        for key in ("ledger_read", "segments", "admit", "ledger_write"):
             timing[key] = 0.0
         waited = time.perf_counter()
         written: Verdict | None = None
@@ -1120,15 +1138,32 @@ def build_corpus_router(
             for attempts in range(1, max_write_attempts + 1):
                 mark = time.perf_counter()
                 snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
+                state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
                 timing["ledger_read"] += time.perf_counter() - mark
 
                 mark = time.perf_counter()
-                verdict, after = await asyncio.to_thread(admit_against, snapshot)
+                await _ensure_seen(state.segments)
+                timing["segments"] += time.perf_counter() - mark
+
+                mark = time.perf_counter()
+                try:
+                    verdict, planned = await asyncio.to_thread(admit_against, state)
+                except LedgerSnapshotError as exc:
+                    raise _ledger_corrupt(exc) from exc
                 timing["admit"] += time.perf_counter() - mark
-                if after is None:
+                if planned is None:
                     # A refusal that moved nothing costs no write, so a miner
                     # spraying junk cannot bill us a bucket write per attempt.
                     return _respond(verdict)
+                after, chunks = planned
+                mark = time.perf_counter()
+                if chunks:
+                    sealed = await seal(chunks)
+                    after["seen_segments"] = [
+                        *after["seen_segments"],
+                        *({"id": ref.id, "count": ref.count} for ref in sealed),
+                    ]
+                timing["segments"] += time.perf_counter() - mark
                 mark = time.perf_counter()
                 try:
                     await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
@@ -1186,6 +1221,20 @@ def build_corpus_router(
             return None
         return job
 
+    def _ledger_corrupt(exc: LedgerSnapshotError) -> HTTPException:
+        # A corrupt ledger or segment refuses every miner on this job until an
+        # operator repairs it, so the refusal is named rather than a bare 500.
+        logger.error("corpus ledgers for %s are unreadable: %s", job_id, exc)
+        return HTTPException(status_code=500, detail="corpus_ledger_corrupt")
+
+    async def _ensure_seen(refs: Sequence[SegmentRef]) -> None:
+        """Load the segments a ledger version names: a missing or altered one
+        is the named 500, a bucket that cannot answer the retryable 503."""
+        try:
+            await _from_store(seen_index.ensure(refs), "seen segment read")
+        except LedgerSnapshotError as exc:
+            raise _ledger_corrupt(exc) from exc
+
     def _rebuild_ledgers_checked(job: JobSpec, snapshot: Any) -> LedgerState:
         """``rebuild_ledgers``, translated the same way ``submit_corpus``
         translates it -- shared with the cursor route, which reads the same
@@ -1194,10 +1243,7 @@ def build_corpus_router(
         try:
             return rebuild_ledgers(job, snapshot)
         except LedgerSnapshotError as exc:
-            logger.error("corpus ledgers for %s are unreadable: %s", job_id, exc)
-            raise HTTPException(
-                status_code=500, detail="corpus_ledger_corrupt"
-            ) from exc
+            raise _ledger_corrupt(exc) from exc
 
     return router
 
