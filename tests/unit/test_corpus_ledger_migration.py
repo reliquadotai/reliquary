@@ -308,3 +308,36 @@ def test_the_first_submit_after_startup_loads_no_segments(seeded_job, _r2_client
 
     assert verdict["accepted"] is True
     assert "segment_get" not in calls
+
+
+def test_a_startup_migration_that_hangs_gives_up_and_the_route_migrates(
+    seeded_job, _r2_client, caplog
+):
+    import logging
+    import time
+
+    from reliquary.validator.corpus_service import migrate_ledgers_at_startup
+    from tests.unit.test_corpus_route_seen import _Store
+
+    raw = {**_manifest(), "job_id": "seen-v1"}
+    asyncio.run(job_store.write_job(raw, None))
+    key = "reliquary/corpus/jobs/seen-v1/ledgers.json"
+    _r2_client.objects[key] = (
+        job_store._encode({"slots": {}, "cursors": {}, "seen": _digests(2000)}), '"v1"'
+    )
+
+    class _Hanging(_Store):
+        async def write_seen_segment(self, job_id, digests):
+            await asyncio.sleep(3600)
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="reliquary.validator.corpus_service"):
+        index = asyncio.run(migrate_ledgers_at_startup(_Hanging(), parse_job(raw), timeout=0.05))
+    assert time.monotonic() - started < 5
+    assert len(index) == 0
+    assert any("timed out" in r.getMessage() for r in caplog.records)
+    assert "seen" in json.loads(_r2_client.objects[key][0])  # still v1
+
+    client = TestClient(_app(seeded_job, BucketJobStore(), seen_index=index))
+    assert _post(client, _body(1))[1]["accepted"] is True
+    assert json.loads(_r2_client.objects[key][0])["schema"] == LEDGER_SCHEMA_V2

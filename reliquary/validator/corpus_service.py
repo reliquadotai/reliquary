@@ -823,7 +823,14 @@ async def ensure_ledgers_v2(
     raise CorpusStoreConflict(f"ledgers of {job.job_id!r} kept changing during migration")
 
 
-async def migrate_ledgers_at_startup(store: Any, job: JobSpec) -> SeenIndex:
+# How long startup waits on the migration and the segment load before serving
+# anyway; the route then migrates inline and loads what the index lacks.
+STARTUP_LEDGER_TIMEOUT_SECONDS = 120.0
+
+
+async def migrate_ledgers_at_startup(
+    store: Any, job: JobSpec, *, timeout: float = STARTUP_LEDGER_TIMEOUT_SECONDS
+) -> SeenIndex:
     """``ensure_ledgers_v2`` before a route serves, then the segments the
     ledger names loaded into the index handed to that route, so its first
     submission does not load them under the ledger lock.
@@ -833,11 +840,23 @@ async def migrate_ledgers_at_startup(store: Any, job: JobSpec) -> SeenIndex:
     answered there by name, so a failure here must not keep the validator down.
     """
     index = SeenIndex(store, job.job_id)
-    try:
+
+    async def prepare() -> str:
         outcome = await ensure_ledgers_v2(store, job)
         snapshot, _ = await store.read_ledgers(job.job_id)
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
         await index.ensure(state.segments)
+        return outcome
+
+    try:
+        outcome = await asyncio.wait_for(prepare(), timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "corpus ledgers for %s: startup preparation timed out after %.0f s; "
+            "the route migrates and loads on its first submission",
+            job.job_id, timeout,
+        )
+        return index
     except Exception:
         logger.exception("corpus ledgers for %s could not be prepared at startup", job.job_id)
         return index
