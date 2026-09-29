@@ -363,8 +363,12 @@ validator's corpus mount) rewrites a v1 ledger at startup, before serving: a
 create-only backup at `reliquary/corpus/jobs/<job>/ledgers.v1-backup.json` (the
 first one is kept), then the seen set sealed into segments of up to 4096, then
 the ledger swapped under its ETag. Expect seconds to tens of seconds for about
-200k digests. If it fails the validator still starts, logs `could not be
-migrated at startup`, and the route migrates on its first write instead.
+200k digests; startup then loads every segment before serving. If either
+fails, or takes over 120 s, the validator still starts (logs `could not be
+prepared at startup` or `startup preparation timed out`) and the route migrates
+on its first write instead. That inline migration writes **no** v1 backup.
+Only the first backup is ever kept, so after a downgrade and a re-migration it
+predates the later v1 state.
 
 **Rollout.** Pin the image for the rollout so Watchtower cannot bounce between
 versions. An older binary refuses a v2 ledger loudly (500
