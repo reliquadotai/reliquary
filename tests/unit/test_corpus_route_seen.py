@@ -605,3 +605,20 @@ def test_v2_verdicts_match_v1_reference_model(seeded_job, _r2_client, order, see
     assert seen_union(_r2_client.objects, JOB) == reference.seen
     assert len(accepted_digests) == len(set(accepted_digests)) == len(reference.seen)
     assert ledger["seen_segments"], "the sequence never sealed; the test proves nothing"
+
+
+def test_a_seal_that_stays_contended_is_retryable_and_writes_no_ledger(seeded_job, _r2_client):
+    _write_job()
+    store = _Store()
+    client = TestClient(_app(seeded_job, store, threshold=2))
+    assert _post(client, _body(1))[1]["accepted"] is True
+    before = _ledger(_r2_client)
+
+    store.faults["segment_put"] = [job_store.CorpusStoreConflict("409 in flight")]
+    assert _post(client, _body(2)) == (503, {"detail": "corpus_store_unavailable"})
+    assert _ledger(_r2_client) == before
+
+    store.faults["segment_put"] = [job_store.CorpusSegmentCorrupt("other bytes")]
+    assert _post(client, _body(2)) == (500, {"detail": "corpus_ledger_corrupt"})
+    assert _ledger(_r2_client) == before
+    assert _post(client, _body(2))[1]["accepted"] is True

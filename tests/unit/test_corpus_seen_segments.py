@@ -114,3 +114,68 @@ def test_the_v1_backup_is_written_once(bucket):
     first, second, kept = asyncio.run(scenario())
     assert (first, second) == (True, False)
     assert kept == {"seen": ["a"]}
+
+
+class _InFlightR2(_CountingR2):
+    """R2's 409 ConditionalRequestConflict: another conditional write to the
+    key is in flight, which says nothing about whether the key exists."""
+
+    def __init__(self, conflicts, lands_after=None):
+        super().__init__()
+        self.conflicts = conflicts
+        self.lands_after = lands_after  # the rival's bytes appear after this many 409s
+        self.puts = 0
+
+    async def put_object(self, Bucket, Key, Body, **condition):
+        self.puts += 1
+        if self.conflicts > 0:
+            self.conflicts -= 1
+            if self.lands_after is not None and self.puts >= self.lands_after:
+                await super().put_object(Bucket, Key, Body)
+            from tests.unit.test_corpus_job_store import _client_error
+
+            raise _client_error("ConditionalRequestConflict")
+        return await super().put_object(Bucket, Key, Body, **condition)
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    monkeypatch.setattr(job_store, "SEGMENT_RETRY_DELAY_SECONDS", 0.0)
+
+
+def _install(monkeypatch, client):
+    monkeypatch.setattr(job_store, "get_s3_client", lambda **kw: client)
+    return client
+
+
+def test_a_409_on_an_absent_segment_is_never_taken_as_written(monkeypatch, no_backoff):
+    client = _install(monkeypatch, _InFlightR2(conflicts=99))
+
+    with pytest.raises(job_store.CorpusStoreConflict):
+        asyncio.run(job_store.write_seen_segment("swe-v1", DIGESTS))
+    assert client.objects == {}
+    assert client.puts == job_store.SEGMENT_WRITE_ATTEMPTS
+
+
+def test_a_409_then_the_rival_lands_reads_back_and_counts(monkeypatch, no_backoff):
+    client = _install(monkeypatch, _InFlightR2(conflicts=1, lands_after=1))
+
+    segment_id = asyncio.run(job_store.write_seen_segment("swe-v1", DIGESTS))
+    assert asyncio.run(job_store.read_seen_segment("swe-v1", segment_id)) == tuple(DIGESTS)
+    assert client.puts == 1
+
+
+def test_a_409_on_an_absent_segment_is_retried_until_it_lands(monkeypatch, no_backoff):
+    client = _install(monkeypatch, _InFlightR2(conflicts=2))
+
+    segment_id = asyncio.run(job_store.write_seen_segment("swe-v1", DIGESTS))
+    assert _segment_key(segment_id) in client.objects
+    assert client.puts == 3
+
+
+def test_an_existing_segment_with_other_bytes_is_corrupt_not_written(bucket, no_backoff):
+    segment_id = hashlib.sha256(job_store._segment_body(DIGESTS)).hexdigest()
+    bucket.objects[_segment_key(segment_id)] = (b"junk", '"x"')
+
+    with pytest.raises(CorpusSegmentCorrupt):
+        asyncio.run(job_store.write_seen_segment("swe-v1", DIGESTS))

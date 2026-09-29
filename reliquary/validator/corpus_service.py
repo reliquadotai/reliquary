@@ -1247,9 +1247,19 @@ def build_corpus_router(
 
             async def one(chunk: list[str]) -> SegmentRef:
                 async with gate:
-                    segment_id = await _from_store(
-                        store.write_seen_segment(job_id, chunk), "seen segment write"
-                    )
+                    try:
+                        segment_id = await _from_store(
+                            store.write_seen_segment(job_id, chunk), "seen segment write"
+                        )
+                    except CorpusStoreConflict as exc:
+                        # A create that stayed contended with the key still
+                        # absent: nothing is named yet, so the miner retries.
+                        logger.warning("corpus seen segment for %s: %s", job_id, exc)
+                        raise HTTPException(
+                            status_code=503, detail="corpus_store_unavailable"
+                        ) from exc
+                    except CorpusSegmentCorrupt as exc:
+                        raise _ledger_corrupt(LedgerSnapshotError(str(exc))) from exc
                 seen_index.remember(segment_id, chunk)
                 return SegmentRef(segment_id, len(chunk))
 

@@ -35,6 +35,10 @@ CLIENT_MAX_AGE_SECONDS = 600.0
 # A sealed segment of the seen-digest set; see ``write_seen_segment``.
 SEEN_SEGMENT_SCHEMA = "reliquary/corpus-seen-segment/v1"
 _SEGMENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+# A create-only segment PUT can meet R2's 409 (another conditional write to the
+# key in flight): it is retried this many times, backing off from this delay.
+SEGMENT_WRITE_ATTEMPTS = 4
+SEGMENT_RETRY_DELAY_SECONDS = 0.2
 
 _ABSENT_CODES = {"NoSuchKey", "404", "NotFound"}
 _CONFLICT_CODES = {"PreconditionFailed", "412", "ConditionalRequestConflict"}
@@ -332,16 +336,26 @@ def _segment_body(digests) -> bytes:
 
 async def write_seen_segment(job_id: str, digests, **client_kwargs) -> str:
     """Create-only put of a sealed segment; returns its id, the sha256 of its
-    bytes. An existing object under that id is the same content, so it counts
-    as written."""
+    bytes. A refused create counts as written only once the segment reads back
+    under its hash: R2's 409 means a write is in flight, not that one landed."""
     validated = _validated_job_id(job_id)
     body = await asyncio.to_thread(_segment_body, digests)
     segment_id = hashlib.sha256(body).hexdigest()
-    try:
-        await _put(_seen_segment_key(validated, segment_id), body, None, **client_kwargs)
-    except CorpusStoreConflict:
-        pass
-    return segment_id
+    key = _seen_segment_key(validated, segment_id)
+    for attempt in range(SEGMENT_WRITE_ATTEMPTS):
+        try:
+            await _put(key, body, None, **client_kwargs)
+            return segment_id
+        except CorpusStoreConflict:
+            pass
+        stored, _ = await _get(key, **client_kwargs)
+        if stored is not None:
+            # Present but not these bytes raises CorpusSegmentCorrupt.
+            await asyncio.to_thread(_decode_segment, segment_id, stored)
+            return segment_id
+        if attempt + 1 < SEGMENT_WRITE_ATTEMPTS:
+            await asyncio.sleep(SEGMENT_RETRY_DELAY_SECONDS * 2 ** attempt)
+    raise CorpusStoreConflict(f"{key} stayed contended and absent")
 
 
 def _decode_segment(segment_id: str, body: bytes) -> tuple[str, ...]:
