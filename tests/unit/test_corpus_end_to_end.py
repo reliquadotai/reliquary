@@ -239,12 +239,26 @@ def test_the_mount_migrates_a_v1_ledger_before_serving(bucket, registry):
         '"v1"',
     )
 
-    _, mounted = _mount(entry)
+    server, mounted = _mount(entry)
 
     assert mounted is True
     ledgers = json.loads(bucket.objects[key][0])
     assert ledgers["schema"] == "reliquary/corpus-ledgers/v2"
     assert seen_union(bucket.objects, entry.job_id) == set(seen)
+
+    # The mount loaded the segments, so the first submission fetches none.
+    fetched = []
+    real_get = bucket.get_object
+
+    async def get_object(Bucket, Key):
+        fetched.append(Key)
+        return await real_get(Bucket=Bucket, Key=Key)
+
+    bucket.get_object = get_object
+    job, _ = asyncio.run(job_store.read_job(entry.job_id))
+    with TestClient(server.app) as client:
+        assert _submit(client, job, prompt_index=2, filler=1)["accepted"] is True
+    assert not [k for k in fetched if "/seen/" in k]
 
 
 def test_a_declared_job_with_no_manifest_refuses_to_start(bucket, registry):

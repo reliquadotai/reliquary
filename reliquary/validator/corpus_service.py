@@ -823,17 +823,29 @@ async def ensure_ledgers_v2(
     raise CorpusStoreConflict(f"ledgers of {job.job_id!r} kept changing during migration")
 
 
-async def migrate_ledgers_at_startup(store: Any, job: JobSpec) -> None:
-    """``ensure_ledgers_v2`` before a route serves, best effort: the route
-    migrates a v1 ledger inline on its first write anyway, and a corrupt or
-    unreachable ledger is answered there by name, so a failure here must not
-    keep the validator down."""
+async def migrate_ledgers_at_startup(store: Any, job: JobSpec) -> SeenIndex:
+    """``ensure_ledgers_v2`` before a route serves, then the segments the
+    ledger names loaded into the index handed to that route, so its first
+    submission does not load them under the ledger lock.
+
+    Best effort: the route migrates a v1 ledger inline on its first write and
+    loads whatever the index lacks, and a corrupt or unreachable ledger is
+    answered there by name, so a failure here must not keep the validator down.
+    """
+    index = SeenIndex(store, job.job_id)
     try:
         outcome = await ensure_ledgers_v2(store, job)
+        snapshot, _ = await store.read_ledgers(job.job_id)
+        state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
+        await index.ensure(state.segments)
     except Exception:
-        logger.exception("corpus ledgers for %s could not be migrated at startup", job.job_id)
-        return
-    logger.info("corpus ledgers for %s at startup: %s", job.job_id, outcome)
+        logger.exception("corpus ledgers for %s could not be prepared at startup", job.job_id)
+        return index
+    logger.info(
+        "corpus ledgers for %s at startup: %s, %d sealed digests loaded",
+        job.job_id, outcome, len(index),
+    )
+    return index
 
 
 async def _loaded(store: Any, job: JobSpec) -> tuple[dict, str | None, LedgerState, SeenIndex]:
@@ -979,6 +991,7 @@ def build_corpus_router(
     ledger_lock_timeout: float = LEDGER_LOCK_TIMEOUT_SECONDS,
     seal_threshold: int = SEAL_THRESHOLD,
     segment_max: int = SEGMENT_MAX,
+    seen_index: SeenIndex | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -998,8 +1011,10 @@ def build_corpus_router(
     # This process's submissions take turns on the ledger: interleaved, each
     # would read the same ETag and all but one would lose the compare-and-swap.
     ledger_lock = asyncio.Lock()
-    # The sealed part of the seen set, touched only under `ledger_lock`.
-    seen_index = SeenIndex(store, job_id)
+    # The sealed part of the seen set, touched only under `ledger_lock`; the
+    # startup path hands in one it has already loaded.
+    if seen_index is None:
+        seen_index = SeenIndex(store, job_id)
 
     async def _from_store(call, what: str):
         try:

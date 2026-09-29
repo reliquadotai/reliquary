@@ -108,7 +108,7 @@ class _Store(BucketJobStore):
 
 
 def _app(seeded_job, store, *, job_id=JOB, records=None, threshold=1024, segment_max=4096,
-         attempts=4):
+         attempts=4, seen_index=None):
     from reliquary.validator.corpus_service import build_corpus_router
 
     app = FastAPI()
@@ -116,7 +116,7 @@ def _app(seeded_job, store, *, job_id=JOB, records=None, threshold=1024, segment
         job_id=job_id, store=store, tokenizer=_Tokenizer(), renderer=_Renderer(),
         verify_signature=lambda request: True, prompt_job_for=seeded_job.prompt_job_for,
         records=records, seal_threshold=threshold, segment_max=segment_max,
-        max_write_attempts=attempts,
+        max_write_attempts=attempts, seen_index=seen_index,
     ))
     return app
 

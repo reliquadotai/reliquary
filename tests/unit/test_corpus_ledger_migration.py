@@ -269,3 +269,42 @@ def test_ledgers_cli_verify_fails_on_a_missing_segment(job, _r2_client):
     result = _cli("verify", "--job", "swe-v1")
     assert result.exit_code != 0
     assert "absent" in result.output
+
+
+def _startup_then_first_submit(seeded_job, store):
+    """The startup path as both entry points run it, then one submission on
+    the router it warmed; returns the store's calls from the submission only."""
+    from reliquary.validator.corpus_service import migrate_ledgers_at_startup
+    import httpx
+
+    job = parse_job({**_manifest(), "job_id": "seen-v1"})
+
+    async def scenario():
+        index = await migrate_ledgers_at_startup(store, job)
+        store.log.clear()
+        app = _app(seeded_job, store, seen_index=index)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://v"
+        ) as http:
+            return (await http.post("/corpus/submit", json=_body(1))).json()
+
+    return asyncio.run(scenario()), store.log
+
+
+@pytest.mark.parametrize("already_v2", [False, True])
+def test_the_first_submit_after_startup_loads_no_segments(seeded_job, _r2_client, already_v2):
+    from tests.unit.test_corpus_route_seen import _Store
+
+    raw = {**_manifest(), "job_id": "seen-v1"}
+    asyncio.run(job_store.write_job(raw, None))
+    _r2_client.objects["reliquary/corpus/jobs/seen-v1/ledgers.json"] = (
+        job_store._encode({"slots": {"5": 8}, "cursors": {}, "seen": _digests(9000)}), '"v1"'
+    )
+    if already_v2:
+        # A restart: the ledger was migrated by an earlier process.
+        assert asyncio.run(ensure_ledgers_v2(BucketJobStore(), parse_job(raw))) == "migrated"
+
+    verdict, calls = _startup_then_first_submit(seeded_job, _Store())
+
+    assert verdict["accepted"] is True
+    assert "segment_get" not in calls

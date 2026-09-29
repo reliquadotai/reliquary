@@ -169,7 +169,7 @@ def build_corpus_audit_wiring(*, entry, job, records):
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
                      auditor, proof_chunk_tokens, prompt_job_for=None,
                      vocab_size=None, is_banned=None, registration=None,
-                     contract=None) -> FastAPI:
+                     contract=None, seen_index=None) -> FastAPI:
     from reliquary.validator.corpus_service import build_corpus_router, prompt_job_for_spec
 
     app = FastAPI()
@@ -178,6 +178,7 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
         verify_signature=verify_signature, prompt_job_for=prompt_job_for or prompt_job_for_spec,
         records=records, on_accepted=auditor.enqueue, proof_chunk_tokens=proof_chunk_tokens,
         vocab_size=vocab_size, is_banned=is_banned, registration=registration,
+        seen_index=seen_index,
     ))
 
     @app.get("/corpus/contract")
@@ -231,7 +232,7 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
     # inside its first submission's ledger turn.
     from reliquary.validator.corpus_service import migrate_ledgers_at_startup
 
-    await migrate_ledgers_at_startup(store, job)
+    seen_index = await migrate_ledgers_at_startup(store, job)
 
     # A tokenizer isn't loaded yet, but the renderer only calls `encode` once
     # a submission arrives -- by then `tokenizer_box` is populated. Resolving
@@ -296,7 +297,7 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
                            vocab_size=model.get_input_embeddings().num_embeddings,
                            is_banned=is_banned,
                            registration=registered.reason if registered is not None else None,
-                           contract=entry.contract)
+                           contract=entry.contract, seen_index=seen_index)
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in
     # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
     settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,

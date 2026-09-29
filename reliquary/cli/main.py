@@ -1973,7 +1973,7 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
     # for sealing a v1 seen set.
     from reliquary.validator.corpus_service import migrate_ledgers_at_startup
 
-    await migrate_ledgers_at_startup(store, job)
+    seen_index = await migrate_ledgers_at_startup(store, job)
 
     def encode(text: str) -> list[int]:
         encoded = tokenizer.encode(text, add_special_tokens=False)
@@ -1993,6 +1993,7 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         # prompts nobody declared.
         renderer=renderer_for_job(job, encode, tokenizer=tokenizer),
         verify_signature=verify_signature,
+        seen_index=seen_index,
     )
     if not mounted:
         # The server applies the same rule to the same entry, so a refusal
