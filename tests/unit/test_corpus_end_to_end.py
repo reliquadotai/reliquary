@@ -28,6 +28,7 @@ from reliquary.environment.registry import ENVIRONMENT_SPECS
 from reliquary.infrastructure import corpus_job_store as job_store
 from reliquary.protocol.corpus_submission import CorpusSubmissionRequest
 from reliquary.validator.server import ValidatorServer
+from tests.unit.test_corpus_ledger_v2 import seen_union
 
 # The CLI's own fake bucket, fake registry and argument builder. A second copy
 # here would drift from the one `jobs create` is actually proved against, and
@@ -192,7 +193,7 @@ def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
     raw, _ = bucket.objects[f"reliquary/corpus/jobs/{job.job_id}/ledgers.json"]
     ledgers = json.loads(raw)
     assert ledgers["slots"] == {"0": SLOTS_PER_PROMPT, "1": 1}
-    assert len(ledgers["seen"]) == SLOTS_PER_PROMPT + 1
+    assert len(seen_union(bucket.objects, job.job_id)) == SLOTS_PER_PROMPT + 1
 
 
 def test_the_startup_path_binds_the_real_corpus_verifier(

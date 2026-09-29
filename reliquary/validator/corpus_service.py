@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
 import logging
+import re
 import time
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from fastapi import APIRouter, HTTPException
 
@@ -33,7 +36,10 @@ from reliquary.corpus.slots import SlotLedger
 from reliquary.corpus.walk import CursorLedger
 from reliquary.environment.agentic.types import EpisodeTask
 from reliquary.environment.registry import ENVIRONMENT_SPECS
-from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+from reliquary.infrastructure.corpus_job_store import (
+    CorpusSegmentCorrupt,
+    CorpusStoreConflict,
+)
 from reliquary.protocol.corpus_submission import (
     CorpusRejectReason,
     CorpusSubmissionRequest,
@@ -61,13 +67,30 @@ RECORD_WRITE_ATTEMPTS = 3
 # Validators at different versions share one ledger object, and this repo ships
 # `:latest` behind Watchtower, so an older reader that IGNORED a field it did
 # not know would DELETE it on its next read-modify-write — silent loss on the
-# money object. So an unknown field is refused. `schema` does NOT buy
-# compatibility: `LEDGER_FIELDS` and `rebuild_ledgers` still hard-fail an older
-# reader on any new field. What it buys is a NAMED failure — "ledgers under
-# schema X, not Y" instead of a field list — and it can only be introduced
-# before a real job exists.
-LEDGER_SCHEMA = "reliquary/corpus-ledgers/v1"
-LEDGER_FIELDS = frozenset({"schema", "slots", "cursors", "seen"})
+# money object. So each schema is read under its own field set and anything
+# else is refused. v2 moved the seen set into sealed segments under NEW field
+# names, never `seen`: a pre-v2 binary refuses a v2 object by its field check
+# (a 500, before any write), so rolling back to a pre-v2 image without
+# `corpus ledgers downgrade` is a corpus outage, not corruption. For v3 and
+# later the schema marker gives the named failure instead.
+LEDGER_SCHEMA_V1 = "reliquary/corpus-ledgers/v1"
+LEDGER_SCHEMA_V2 = "reliquary/corpus-ledgers/v2"
+# The schema this binary writes.
+LEDGER_SCHEMA = LEDGER_SCHEMA_V2
+LEDGER_FIELDS = {
+    LEDGER_SCHEMA_V1: frozenset({"schema", "slots", "cursors", "seen"}),
+    LEDGER_SCHEMA_V2: frozenset(
+        {"schema", "slots", "cursors", "seen_pending", "seen_segments"}
+    ),
+}
+
+# Pending digests are sealed into a segment once this many accumulate, so the
+# ledger rewritten on every submission stays small.
+SEAL_THRESHOLD = 1024
+# The most digests one segment holds (~270 KB), and how many segment GETs or
+# PUTs run at once when many move together (startup, migration).
+SEGMENT_MAX = 4096
+SEGMENT_PARALLELISM = 8
 
 # Contention is a two-writer race, not a queue, so a handful of rounds is
 # plenty; past that the miner is better served by a retryable failure than by
@@ -121,7 +144,7 @@ class CorpusPromptSourceError(ValueError):
 
 
 class CorpusJobStore(Protocol):
-    """The three store calls the endpoint makes, bound to their bucket."""
+    """The store calls the endpoint makes, bound to their bucket."""
 
     async def read_job(self, job_id: str) -> tuple[JobSpec | None, str | None]: ...
 
@@ -130,6 +153,10 @@ class CorpusJobStore(Protocol):
     async def write_ledgers(
         self, job_id: str, snapshot: Mapping[str, Any], etag: str | None
     ) -> str | None: ...
+
+    async def write_seen_segment(self, job_id: str, digests: Sequence[str]) -> str: ...
+
+    async def read_seen_segment(self, job_id: str, segment_id: str) -> tuple[str, ...]: ...
 
 
 class Tokenizer(Protocol):
@@ -492,31 +519,90 @@ class PromptFidelity:
 # --------------------------------------------------------------------------
 
 
-def rebuild_ledgers(
-    job: JobSpec, snapshot: Any
-) -> tuple[SlotLedger, CursorLedger, set[str]]:
+_SEGMENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class SegmentRef(NamedTuple):
+    """A sealed segment as a ledger names it: its content hash and size."""
+
+    id: str
+    count: int
+
+
+@dataclass
+class LedgerState:
+    """One ledger version, parsed. ``pending`` is this state's own copy; the
+    segments' contents live in a ``SeenIndex``."""
+
+    schema: str
+    slots: SlotLedger
+    cursors: CursorLedger
+    pending: set[str]
+    segments: tuple[SegmentRef, ...]
+
+
+def _digest_list(job: JobSpec, field: str, value: Any, *, unique: bool) -> list[str]:
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(digest, str) for digest in value
+    ):
+        raise LedgerSnapshotError(
+            f"job {job.job_id!r} has a {field} list that is not a list of digests"
+        )
+    if unique and len(set(value)) != len(value):
+        raise LedgerSnapshotError(f"job {job.job_id!r} repeats a digest in {field}")
+    return list(value)
+
+
+def _segment_refs(job: JobSpec, value: Any) -> tuple[SegmentRef, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise LedgerSnapshotError(f"job {job.job_id!r} has seen_segments that is not a list")
+    refs = []
+    for item in value:
+        count = item.get("count") if isinstance(item, Mapping) else None
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"id", "count"}
+            or not isinstance(item["id"], str)
+            or not _SEGMENT_ID_RE.match(item["id"])
+            or type(count) is not int
+            or count < 1
+        ):
+            raise LedgerSnapshotError(
+                f"job {job.job_id!r} has a seen segment reference that is not one: {item!r}"
+            )
+        refs.append(SegmentRef(item["id"], count))
+    if len({ref.id for ref in refs}) != len(refs):
+        # The same segment twice would count its digests twice (I3).
+        raise LedgerSnapshotError(f"job {job.job_id!r} names a seen segment twice")
+    return tuple(refs)
+
+
+def rebuild_ledgers(job: JobSpec, snapshot: Any) -> LedgerState:
     """The stored snapshot as live ledgers, or a named refusal.
 
     Rebuilt fresh on every attempt, because ``admit()`` mutates what it is
     given: a write that loses its compare-and-swap must not leave a consumed
-    slot behind in the copy the retry then admits against.
+    slot behind in the copy the retry then admits against. A v1 object reads
+    as all of its seen set pending and no segments.
     """
     if not isinstance(snapshot, Mapping):
         raise LedgerSnapshotError(
             f"job {job.job_id!r} has a ledger object that is not an object"
         )
-    unknown = sorted(set(snapshot) - LEDGER_FIELDS)
-    if unknown:
-        raise LedgerSnapshotError(
-            f"job {job.job_id!r} has ledger fields this binary cannot read: {unknown}"
-        )
     # Absent on the empty read that precedes a job's first write, and on any
     # object written before the marker existed.
-    schema = snapshot.get("schema", LEDGER_SCHEMA)
-    if schema != LEDGER_SCHEMA:
+    schema = snapshot.get("schema", LEDGER_SCHEMA_V1)
+    fields = LEDGER_FIELDS.get(schema) if isinstance(schema, str) else None
+    if fields is None:
         raise LedgerSnapshotError(
             f"job {job.job_id!r} has ledgers under schema {schema!r}, "
-            f"not {LEDGER_SCHEMA!r}"
+            f"not one of {sorted(LEDGER_FIELDS)}"
+        )
+    unknown = sorted(set(snapshot) - fields)
+    if unknown:
+        raise LedgerSnapshotError(
+            f"job {job.job_id!r} has ledger fields this binary cannot read "
+            f"under {schema!r}: {unknown}"
         )
     try:
         slots = SlotLedger.from_snapshot(
@@ -527,28 +613,162 @@ def rebuild_ledgers(
         raise LedgerSnapshotError(
             f"job {job.job_id!r} has an unusable ledger snapshot: {exc}"
         ) from exc
-    seen = snapshot.get("seen") or []
-    if not isinstance(seen, (list, tuple)) or any(
-        not isinstance(digest, str) for digest in seen
-    ):
-        raise LedgerSnapshotError(
-            f"job {job.job_id!r} has a seen-digest list that is not a list of digests"
-        )
-    return slots, cursors, set(seen)
+    if schema == LEDGER_SCHEMA_V1:
+        seen = _digest_list(job, "seen-digest", snapshot.get("seen") or [], unique=False)
+        return LedgerState(schema, slots, cursors, set(seen), ())
+    for field in ("seen_pending", "seen_segments"):
+        if field not in snapshot:
+            # Missing would silently read as a smaller seen set.
+            raise LedgerSnapshotError(f"job {job.job_id!r} has v2 ledgers without {field}")
+    pending = _digest_list(job, "seen_pending", snapshot["seen_pending"], unique=True)
+    return LedgerState(
+        schema, slots, cursors, set(pending), _segment_refs(job, snapshot["seen_segments"])
+    )
 
 
 def ledger_snapshot(
-    slots: SlotLedger, cursors: CursorLedger, seen: set[str]
+    slots: SlotLedger,
+    cursors: CursorLedger,
+    pending: Iterable[str],
+    segments: Sequence[SegmentRef] = (),
 ) -> dict[str, Any]:
-    """The JSON-native form the store persists. Prompt indices are stringified
-    here rather than by the encoder, so a snapshot compares equal to the one
-    that comes back out of the bucket."""
+    """The JSON-native v2 form the store persists. Prompt indices are
+    stringified here rather than by the encoder, so a snapshot compares equal
+    to the one that comes back out of the bucket."""
     return {
-        "schema": LEDGER_SCHEMA,
+        "schema": LEDGER_SCHEMA_V2,
         "slots": {str(index): count for index, count in slots.snapshot().items()},
         "cursors": cursors.snapshot(),
-        "seen": sorted(seen),
+        "seen_pending": sorted(pending),
+        "seen_segments": [{"id": ref.id, "count": ref.count} for ref in segments],
     }
+
+
+def seal_chunks(digests: Iterable[str], segment_max: int = SEGMENT_MAX) -> list[list[str]]:
+    """Sorted, unique chunks of at most ``segment_max`` digests, each one a
+    segment body."""
+    ordered = sorted(set(digests))
+    return [ordered[i:i + segment_max] for i in range(0, len(ordered), segment_max)]
+
+
+class SeenIndex:
+    """The union of the segments one ledger version names, held in memory.
+
+    Segments never change, so their contents are cached forever; the digest
+    map is built only from the references a ledger version actually carries,
+    so an orphan segment (sealed, then its ledger write lost) never counts.
+    Callers serialize ``ensure`` against the reads that follow it.
+    """
+
+    def __init__(
+        self, store: Any, job_id: str, *, parallelism: int = SEGMENT_PARALLELISM
+    ) -> None:
+        self._store = store
+        self._job_id = job_id
+        self._parallelism = parallelism
+        self._contents: dict[str, tuple[str, ...]] = {}
+        self._refs: tuple[SegmentRef, ...] = ()
+        self._owner: dict[str, str] = {}
+
+    def __contains__(self, digest: object) -> bool:
+        return digest in self._owner
+
+    def __len__(self) -> int:
+        return len(self._owner)
+
+    def __iter__(self):
+        return iter(self._owner)
+
+    @property
+    def refs(self) -> tuple[SegmentRef, ...]:
+        return self._refs
+
+    def remember(self, segment_id: str, digests: Sequence[str]) -> None:
+        """Contents this process just sealed, so a later ``ensure`` needs no
+        GET. Not counted until a ledger version names the segment."""
+        self._contents.setdefault(segment_id, tuple(digests))
+
+    def check_pending(self, pending: Iterable[str]) -> None:
+        """I3 between pending and the segments: a digest in both is corrupt."""
+        for digest in pending:
+            if digest in self._owner:
+                raise LedgerSnapshotError(
+                    f"job {self._job_id!r} has digest {digest[:12]} both pending "
+                    f"and in segment {self._owner[digest][:12]}"
+                )
+
+    async def ensure(self, refs: Sequence[SegmentRef]) -> None:
+        """Make the index hold exactly ``refs``. Raises ``LedgerSnapshotError``
+        on a missing, altered, miscounted or overlapping segment (I2, I3),
+        leaving the index as it was; transport errors propagate."""
+        refs = tuple(refs)
+        if refs == self._refs:
+            return
+        extends = refs[: len(self._refs)] == self._refs
+        todo = refs[len(self._refs):] if extends else refs
+        await self._load([ref.id for ref in todo if ref.id not in self._contents])
+        base = self._owner if extends else {}
+        added = await asyncio.to_thread(self._merge, base, todo)
+        if extends:
+            self._owner.update(added)
+        else:
+            self._owner = added
+        self._refs = refs
+
+    async def _load(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        gate = asyncio.Semaphore(self._parallelism)
+
+        async def one(segment_id: str) -> None:
+            async with gate:
+                try:
+                    digests = await self._store.read_seen_segment(self._job_id, segment_id)
+                except CorpusSegmentCorrupt as exc:
+                    raise LedgerSnapshotError(str(exc)) from exc
+            self._contents[segment_id] = tuple(digests)
+
+        await asyncio.gather(*(one(segment_id) for segment_id in ids))
+
+    def _merge(
+        self, base: Mapping[str, str], refs: Sequence[SegmentRef]
+    ) -> dict[str, str]:
+        added: dict[str, str] = {}
+        for ref in refs:
+            digests = self._contents[ref.id]
+            if len(digests) != ref.count:
+                raise LedgerSnapshotError(
+                    f"job {self._job_id!r} seen segment {ref.id[:12]} holds "
+                    f"{len(digests)} digests, its reference says {ref.count}"
+                )
+            for digest in digests:
+                if digest in base or digest in added:
+                    raise LedgerSnapshotError(
+                        f"job {self._job_id!r} has digest {digest[:12]} in two seen segments"
+                    )
+                added[digest] = ref.id
+        return added
+
+
+class SeenView(AbstractSet):
+    """Pending plus the index, as the one set ``admit`` reads. Nothing is
+    copied: ``check_duplicates`` only asks membership."""
+
+    __slots__ = ("_index", "_pending")
+
+    def __init__(self, index: Any, pending: AbstractSet[str]) -> None:
+        self._index = index
+        self._pending = pending
+
+    def __contains__(self, digest: object) -> bool:
+        return digest in self._pending or digest in self._index
+
+    def __len__(self) -> int:
+        return len(self._pending) + len(self._index)
+
+    def __iter__(self):
+        yield from self._pending
+        yield from self._index
 
 
 # --------------------------------------------------------------------------
@@ -718,8 +938,8 @@ def build_corpus_router(
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
         snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger read")
-        _, cursors, _ = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
-        return {"hotkey": hotkey, "cursor": cursors.expected(hotkey)}
+        state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+        return {"hotkey": hotkey, "cursor": state.cursors.expected(hotkey)}
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(
@@ -849,7 +1069,10 @@ def build_corpus_router(
             # job, and there is no circuit breaker: the object stays corrupt
             # until an operator repairs it, so `_rebuild_ledgers_checked`
             # names the refusal rather than leaving a bare 500.
-            slots, cursors, seen = _rebuild_ledgers_checked(job, snapshot)
+            state = _rebuild_ledgers_checked(job, snapshot)
+            if state.segments:
+                raise HTTPException(status_code=500, detail="corpus_ledger_corrupt")
+            slots, cursors, seen = state.slots, state.cursors, state.pending
             # The unsorted state `ledger_snapshot` is a function of: comparing
             # it skips sorting every digest twice for a refusal.
             before = (slots.snapshot(), cursors.snapshot(), frozenset(seen))
@@ -963,9 +1186,7 @@ def build_corpus_router(
             return None
         return job
 
-    def _rebuild_ledgers_checked(
-        job: JobSpec, snapshot: Any
-    ) -> tuple[SlotLedger, CursorLedger, set[str]]:
+    def _rebuild_ledgers_checked(job: JobSpec, snapshot: Any) -> LedgerState:
         """``rebuild_ledgers``, translated the same way ``submit_corpus``
         translates it -- shared with the cursor route, which reads the same
         snapshot and must not turn a corrupt one into a bare lookup error.
@@ -988,11 +1209,19 @@ __all__ = [
     "EnvironmentPromptJob",
     "JOB_PATH",
     "LEDGER_SCHEMA",
+    "LEDGER_SCHEMA_V1",
+    "LEDGER_SCHEMA_V2",
+    "LedgerState",
     "MAX_RESOLVED_PROMPT_SOURCES",
     "LedgerSnapshotError",
     "PromptFidelity",
     "RECORD_SCHEMA",
+    "SEAL_THRESHOLD",
+    "SEGMENT_MAX",
     "SUBMIT_PATH",
+    "SeenIndex",
+    "SeenView",
+    "SegmentRef",
     "SingleTurnPromptJob",
     "SingleTurnPromptRenderer",
     "ChatTemplatePromptRenderer",
@@ -1001,6 +1230,7 @@ __all__ = [
     "ledger_snapshot",
     "prompt_job_for_spec",
     "rebuild_ledgers",
+    "seal_chunks",
     "refuse_unsigned_corpus_submissions",
     "renderer_for_job",
     "resolve_prompt_source",
