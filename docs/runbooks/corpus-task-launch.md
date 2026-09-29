@@ -395,7 +395,10 @@ reliquary corpus ledgers migrate --job <job>    # <job>: migrated | v2 | absent
    on its next accept).
 2. `reliquary corpus ledgers downgrade --job <job>`: it checks every segment,
    then writes v1 (`seen` = pending plus every segment, sorted) under the v2
-   ETag. The segments stay in the bucket; a later v2 start reuses them.
+   ETag. The segments stay in the bucket; a later v2 start reuses them only
+   if the seen set is unchanged (chunks are cut by sorted position, so one new
+   digest renames every chunk after it). Old segments are then orphans:
+   harmless, never counted.
 3. `reliquary corpus ledgers verify --job <job>` must show the v1 schema, the
    same `seen` and no problems.
 4. Deploy the old image, pinned.

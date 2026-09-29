@@ -798,7 +798,8 @@ async def ensure_ledgers_v2(
     """Rewrite a v1 ledger as v2: back it up (create-only, first one kept),
     seal its whole seen set, then swap the ledger under its ETag. Returns
     "absent", "v2" (nothing to do) or "migrated". A conflict re-reads and
-    starts again; segments already sealed are reused by name."""
+    starts again; a chunk whose content is unchanged gets the same name, so
+    its segment is not written twice."""
     for _ in range(LEDGER_REWRITE_ATTEMPTS):
         snapshot, etag = await store.read_ledgers(job.job_id)
         if etag is None:
@@ -1242,7 +1243,8 @@ def build_corpus_router(
 
         async def seal(chunks: list[list[str]]) -> list[SegmentRef]:
             # Written before any ledger names them (I2); a lost ledger write
-            # leaves them orphaned and uncounted (I4), reused by name later.
+            # leaves them orphaned and uncounted (I4); resealing the same
+            # pending set later lands on the same names.
             gate = asyncio.Semaphore(SEGMENT_PARALLELISM)
 
             async def one(chunk: list[str]) -> SegmentRef:
