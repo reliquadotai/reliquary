@@ -651,6 +651,19 @@ def seal_chunks(digests: Iterable[str], segment_max: int = SEGMENT_MAX) -> list[
     return [ordered[i:i + segment_max] for i in range(0, len(ordered), segment_max)]
 
 
+async def _all_or_cancel(awaitables: Iterable[Awaitable[Any]]) -> list[Any]:
+    """``gather``, except that the first failure cancels and awaits the rest,
+    so no segment call outlives the request and no exception goes unretrieved."""
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 class SeenIndex:
     """The union of the segments one ledger version names, held in memory.
 
@@ -728,7 +741,7 @@ class SeenIndex:
                     raise LedgerSnapshotError(str(exc)) from exc
             self._contents[segment_id] = tuple(digests)
 
-        await asyncio.gather(*(one(segment_id) for segment_id in ids))
+        await _all_or_cancel(one(segment_id) for segment_id in ids)
 
     def _merge(
         self, base: Mapping[str, str], refs: Sequence[SegmentRef]
@@ -780,7 +793,7 @@ async def _write_segments(
         async with gate:
             return SegmentRef(await store.write_seen_segment(job_id, chunk), len(chunk))
 
-    return list(await asyncio.gather(*(one(chunk) for chunk in chunks)))
+    return await _all_or_cancel(one(chunk) for chunk in chunks)
 
 
 # Migration and downgrade race at most one other writer; past this many lost
@@ -1299,7 +1312,7 @@ def build_corpus_router(
                 seen_index.remember(segment_id, chunk)
                 return SegmentRef(segment_id, len(chunk))
 
-            return list(await asyncio.gather(*(one(chunk) for chunk in chunks)))
+            return await _all_or_cancel(one(chunk) for chunk in chunks)
 
         for key in ("ledger_read", "segments", "admit", "ledger_write"):
             timing[key] = 0.0

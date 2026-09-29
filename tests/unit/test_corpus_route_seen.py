@@ -622,3 +622,80 @@ def test_a_seal_that_stays_contended_is_retryable_and_writes_no_ledger(seeded_jo
     assert _post(client, _body(2)) == (500, {"detail": "corpus_ledger_corrupt"})
     assert _ledger(_r2_client) == before
     assert _post(client, _body(2))[1]["accepted"] is True
+
+
+class _OneFailsOthersLinger(_Store):
+    """The first segment call fails at once; the others would finish later.
+    Records which of those ever completed, and which were cancelled."""
+
+    def __init__(self):
+        super().__init__()
+        self.completed: list[str] = []
+        self.cancelled = 0
+        self._calls = 0
+
+    async def _slow(self, what):
+        self._calls += 1
+        if self._calls == 1:
+            raise OSError("reset")
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        self.completed.append(what)
+
+    async def write_seen_segment(self, job_id, digests):
+        await self._slow("put")
+        return await BucketJobStore.write_seen_segment(self, job_id, digests)
+
+    async def read_seen_segment(self, job_id, segment_id):
+        await self._slow("get")
+        return await BucketJobStore.read_seen_segment(self, job_id, segment_id)
+
+
+def test_a_failed_seal_cancels_its_sibling_writes(seeded_job, _r2_client):
+    _write_job()
+    store = _OneFailsOthersLinger()
+    app = _app(seeded_job, store, threshold=6, segment_max=1)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://v"
+        ) as http:
+            for fill in range(1, 6):
+                await http.post("/corpus/submit", json=_body(fill))
+            failed = await http.post("/corpus/submit", json=_body(6))
+            await asyncio.sleep(0.1)  # long enough for a surviving write to land
+            return failed
+
+    failed = asyncio.run(scenario())
+    assert failed.status_code == 503
+    assert store.completed == []
+    assert store.cancelled == 5
+    assert _segment_keys(_r2_client.objects) == []
+
+
+def test_a_failed_segment_load_cancels_its_sibling_reads(seeded_job, _r2_client):
+    from reliquary.validator.corpus_service import SeenIndex
+
+    _write_job()
+    client = TestClient(_app(seeded_job, _Store(), threshold=1, segment_max=1))
+    for fill in range(1, 4):
+        assert _post(client, _body(fill))[1]["accepted"] is True
+    refs = _ledger(_r2_client)["seen_segments"]
+    assert len(refs) == 3
+
+    from reliquary.validator.corpus_service import SegmentRef
+
+    store = _OneFailsOthersLinger()
+    index = SeenIndex(store, JOB)
+
+    async def scenario():
+        with pytest.raises(OSError):
+            await index.ensure([SegmentRef(r["id"], r["count"]) for r in refs])
+        await asyncio.sleep(0.1)
+
+    asyncio.run(scenario())
+    assert store.completed == [] and store.cancelled == 2
+    assert len(index) == 0
