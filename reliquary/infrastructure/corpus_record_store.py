@@ -8,15 +8,17 @@ what decides which verdicts have already been paid.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
-import json
 import re
 from typing import Any
 
 from reliquary.infrastructure.corpus_job_store import (
     JOB_KEY_PREFIX,
     CorpusStoreConflict,
+    _ClientPool,
     _bucket,
+    _decode,
     _encode,
     _get,
     _put,
@@ -43,7 +45,9 @@ def _key(job_id: str, kind: str, submission_id: str) -> str:
 
 async def _create(key: str, document: Mapping, **client_kwargs) -> bool:
     try:
-        await _put(key, _encode(dict(document)), None, **client_kwargs)
+        # Encoded and decoded off the loop, which the route and auditor share.
+        body = await asyncio.to_thread(_encode, dict(document))
+        await _put(key, body, None, **client_kwargs)
     except CorpusStoreConflict:
         return False
     return True
@@ -51,13 +55,13 @@ async def _create(key: str, document: Mapping, **client_kwargs) -> bool:
 
 async def _read(key: str, **client_kwargs) -> dict | None:
     body, _ = await _get(key, **client_kwargs)
-    return None if body is None else json.loads(body)
+    return None if body is None else await asyncio.to_thread(_decode, body)
 
 
-async def _list_ids(prefix: str, **client_kwargs) -> list[str]:
+async def _list_ids(prefix: str, *, pool: _ClientPool | None = None, **client_kwargs) -> list[str]:
     bucket = _bucket(client_kwargs)
     ids: list[str] = []
-    async with get_s3_client(**client_kwargs) as client:
+    async with (pool.client() if pool is not None else get_s3_client(**client_kwargs)) as client:
         paginator = client.get_paginator("list_objects_v2")
         async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []) or []:
@@ -98,11 +102,12 @@ def _settlement_key(job_id: str) -> str:
 
 async def read_settlement(job_id, **client_kwargs) -> tuple[dict, str | None]:
     body, etag = await _get(_settlement_key(job_id), **client_kwargs)
-    return ({}, None) if body is None else (json.loads(body), etag)
+    return ({}, None) if body is None else (await asyncio.to_thread(_decode, body), etag)
 
 
 async def write_settlement(job_id, state, etag, **client_kwargs) -> str | None:
-    return await _put(_settlement_key(job_id), _encode(dict(state)), etag, **client_kwargs)
+    body = await asyncio.to_thread(_encode, dict(state))
+    return await _put(_settlement_key(job_id), body, etag, **client_kwargs)
 
 
 def _miners_key(job_id: str) -> str:
@@ -114,14 +119,15 @@ async def read_miners(job_id, **client_kwargs) -> tuple[dict, str | None]:
     as ({}, None): a hotkey with no entry is handled by the caller (§5,
     "unknown is probation"), not by this store."""
     body, etag = await _get(_miners_key(job_id), **client_kwargs)
-    return ({}, None) if body is None else (json.loads(body), etag)
+    return ({}, None) if body is None else (await asyncio.to_thread(_decode, body), etag)
 
 
 async def write_miners(job_id, state, etag, **client_kwargs) -> str | None:
     """Compare-and-swap of the whole miners document, like the settlement
     state: two auditors racing on different hotkeys must not let one
     overwrite the other's write."""
-    return await _put(_miners_key(job_id), _encode(dict(state)), etag, **client_kwargs)
+    body = await asyncio.to_thread(_encode, dict(state))
+    return await _put(_miners_key(job_id), body, etag, **client_kwargs)
 
 
 class BucketRecordStore:
@@ -130,7 +136,11 @@ class BucketRecordStore:
     __slots__ = ("_kw",)
 
     def __init__(self, **client_kwargs: Any) -> None:
-        self._kw = client_kwargs
+        credentials = {k: v for k, v in client_kwargs.items() if k != "bucket_name"}
+        # One long-lived client for every call (see `_ClientPool`); resolved
+        # at build time so a patched `get_s3_client` applies.
+        pool = _ClientPool(lambda: get_s3_client(**credentials))
+        self._kw = {**client_kwargs, "pool": pool}
 
     async def write_submission(self, job_id, submission_id, record):
         return await write_submission(job_id, submission_id, record, **self._kw)

@@ -770,3 +770,92 @@ def test_an_unreadable_record_holding_passes_back_is_logged(caplog):
     assert records.verdicts == {}
     assert any("1 pending corpus record(s) unreadable" in r.getMessage()
                and "every unaudited pass waits" in r.getMessage() for r in caplog.records)
+
+
+class _SlowRecords(_Records):
+    """Each read takes a while; counts how many run at once."""
+
+    def __init__(self, submissions):
+        super().__init__(submissions)
+        self.in_flight = 0
+        self.peak = 0
+
+    async def read_submission(self, job_id, sid):
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().read_submission(job_id, sid)
+        finally:
+            self.in_flight -= 1
+
+
+def test_the_startup_seed_reads_pending_records_concurrently():
+    """A restart with thousands of pending records read them one at a time
+    before judging anything (23 minutes on 2026-09-28): they are read together."""
+    pending = _ids(False, 64, start=900)
+    records = _SlowRecords({sid: _rec(0) for sid in pending})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor.judge_many(pending[:1]))
+    assert set(auditor._meta) >= set(pending)
+    assert records.peak > 1
+
+
+def test_each_judged_batch_logs_where_its_time_went(monkeypatch):
+    """Minutes passed between GPU batches with the process idle (2026-09-28):
+    each batch now reports its time per phase and what it decided."""
+    from reliquary.validator import corpus_auditor
+
+    lines = []
+    monkeypatch.setattr(corpus_auditor.logger, "info",
+                        lambda message, *args: lines.append(message % args))
+    ids = _ids(False, 3)
+    records = _Records({sid: _rec(0) for sid in ids})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor.judge_many(ids))
+    timing = [line for line in lines if line.startswith("corpus judge pass")]
+    assert timing, lines
+    for phase in ("read=", "state=", "decide=", "drand=", "audit=", "write=", "choices="):
+        assert phase in timing[-1]
+
+
+class _SlowBeacon(_Beacon):
+    """A drand fetch that takes a while; counts how many run at once."""
+
+    def __init__(self):
+        super().__init__()
+        import threading
+
+        self._lock = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+
+    def __call__(self, round_number):
+        import time as _time
+
+        with self._lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        try:
+            _time.sleep(0.05)
+            return super().__call__(round_number)
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+def test_the_siblings_drand_rounds_are_fetched_concurrently():
+    """Deciding ~300 siblings fetched one drand round after another took 377 s
+    of a 619 s pass (2026-09-28): the rounds a pass needs are fetched together."""
+    x = _ids(False, 1)[0]
+    siblings = _ids(False, 20, start=7000)
+    records = _Records({x: _rec(0), **{sid: _rec(0, received_at=T0 + 10 + 4 * i)
+                                        for i, sid in enumerate(siblings)}})
+    beacon = _SlowBeacon()
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + HOLD + 1), beacon=beacon)
+    for sid in siblings:
+        auditor.enqueue(sid)
+    asyncio.run(auditor.judge_many([x]))
+    assert len(set(beacon.calls)) >= 20
+    assert beacon.peak > 1
+    assert records.verdicts[x]["passed"] is True

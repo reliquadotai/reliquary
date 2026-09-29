@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import contextlib
+from collections import Counter
 from dataclasses import replace
 import logging
 import os
@@ -45,8 +47,14 @@ MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 # What fits depends on the card and checkpoint (131,072 overran an H100 beside
 # Qwen3.8-27B), so the operator may lower it.
 AUDIT_BATCH_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS", "131072"))
+# Store reads in flight at once when many records must be read before judging.
+READ_CONCURRENCY = 16
+# drand rounds fetched at once when a pass needs many (one per sampled record).
+DRAND_CONCURRENCY = 16
 # `run()` drains the queue into groups no larger than this before auditing.
-RUN_BATCH_IDS = 16
+# A pass re-decides the siblings of every unaudited record it pays (about 150 s
+# with ~300 of them on 2026-09-28), so it takes many ids at once to share that.
+RUN_BATCH_IDS = 256
 # Propagation slack after the draw round's publication before it is fetched:
 # asking too early reads as "no beacon", which audits (safe, but wastes the sampling).
 BEACON_GRACE_SECONDS = 2.0
@@ -115,6 +123,18 @@ class CorpusAuditor:
         # Pending ids whose read failed, until one succeeds or a verdict stands:
         # their hotkey is unknown, so every unaudited pass waits for them.
         self._unreadable: set[str] = set()
+        # Seconds per phase and decisions of the current judge pass, logged
+        # once per pass so an idle GPU shows what it was waiting for.
+        self._phase: Counter = Counter()
+        self._choices: Counter = Counter()
+
+    @contextlib.contextmanager
+    def _timed(self, phase: str):
+        start = time.monotonic()
+        try:
+            yield
+        finally:
+            self._phase[phase] += time.monotonic() - start
 
     def enqueue(self, submission_id: str) -> None:
         if submission_id in self._queued:
@@ -123,8 +143,9 @@ class CorpusAuditor:
         self._queue.put_nowait(submission_id)
 
     async def pending_ids(self) -> list[str]:
-        submitted = await self._records.list_submission_ids(self._job_id)
-        judged = set(await self._records.list_verdict_ids(self._job_id))
+        with self._timed("list"):
+            submitted = await self._records.list_submission_ids(self._job_id)
+            judged = set(await self._records.list_verdict_ids(self._job_id))
         for sid in judged - self._judged:
             self._mark_judged(sid)
         return [sid for sid in submitted if sid not in judged]
@@ -188,15 +209,24 @@ class CorpusAuditor:
             sub_batches.append(current)
 
         outcomes = {}
+        forward_seconds = verify_seconds = 0.0
         for sub_batch in sub_batches:
             sequences = [
                 (prompts[i] + list(records[i]["completions"][c_idx]["tokens"]), len(prompts[i]))
                 for i, c_idx in sub_batch
             ]
+            mark = time.perf_counter()
             hidden_states = batch_completion_hidden_states(self._model, sequences)
+            if hidden_states and hidden_states[0].is_cuda:
+                # Kernels are queued asynchronously: without this the forward's
+                # time would be billed to the first verification that reads it.
+                torch.cuda.synchronize(hidden_states[0].device)
+            forward_seconds += time.perf_counter() - mark
+            mark = time.perf_counter()
             for (i, c_idx), hidden in zip(sub_batch, hidden_states):
                 completion = records[i]["completions"][c_idx]
                 outcomes[i, c_idx] = audit_completion(hidden, completion["proofs"], self._proof)
+            verify_seconds += time.perf_counter() - mark
             # Drop this sub-batch's padded activations before the next one is
             # computed: two final-hidden-state tensors must never be live at once.
             del hidden_states, sequences, hidden
@@ -215,7 +245,23 @@ class CorpusAuditor:
                 if not outcome.passed and passed:
                     passed, reason = False, outcome.reason
             results[i] = {"passed": passed, "reason": reason, **worst}
+        self._log_batch(records, queue, forward_seconds, verify_seconds)
         return results
+
+    def _log_batch(self, records: list[dict], queue: list, forward: float,
+                   verify: float) -> None:
+        """One line per judged batch: what it held, how long its oldest record
+        had waited, and the speed of the GPU forward and the proof check."""
+        completion_tokens = sum(len(records[i]["completions"][c]["tokens"]) for _, i, c in queue)
+        arrivals = [float(r["received_at"]) for r in records if r.get("received_at") is not None]
+        wait = f"{self._clock() - min(arrivals):.1f}s" if arrivals else "-"
+        busy = forward + verify
+        logger.info(
+            "corpus audit batch: records=%d completions=%d completion_tokens=%d "
+            "oldest_wait=%s forward=%.3fs verify=%.3fs tokens_per_s=%.0f",
+            len(records), len(queue), completion_tokens, wait, forward, verify,
+            completion_tokens / busy if busy > 0 else 0.0,
+        )
 
     async def _read(self, submission_id: str) -> dict | None:
         try:
@@ -242,6 +288,18 @@ class CorpusAuditor:
             if submission_id not in self._judged:
                 self._unjudged.setdefault(record["hotkey"], set()).add(submission_id)
         return record
+
+    async def _read_all(self, submission_ids) -> dict[str, dict]:
+        """_read for many ids, READ_CONCURRENCY at a time; the readable ones."""
+        gate = asyncio.Semaphore(READ_CONCURRENCY)
+
+        async def one(submission_id):
+            async with gate:
+                return submission_id, await self._read(submission_id)
+
+        with self._timed("read"):
+            pairs = await asyncio.gather(*(one(sid) for sid in dict.fromkeys(submission_ids)))
+        return {sid: record for sid, record in pairs if record is not None}
 
     def _recent(self, hotkey: str, now: float) -> int:
         arrivals = self._arrivals.get(hotkey, [])
@@ -301,7 +359,9 @@ class CorpusAuditor:
 
     async def _write(self, submission_id: str, verdict: dict) -> tuple[dict, bool]:
         """Create-only: the verdict that stands, and whether this call wrote it."""
-        if await self._records.write_verdict(self._job_id, submission_id, verdict):
+        with self._timed("write"):
+            written = await self._records.write_verdict(self._job_id, submission_id, verdict)
+        if written:
             self._mark_judged(submission_id)
             return verdict, True
         standing = await self._records.read_verdict(self._job_id, submission_id)
@@ -311,7 +371,8 @@ class CorpusAuditor:
     async def _state(self, hotkey: str, now: float) -> MinerState:
         if self._miner_states is None:
             return MinerState()
-        state = await self._miner_states.get(hotkey)
+        with self._timed("state"):
+            state = await self._miner_states.get(hotkey)
         if state.banned_until is not None and now >= state.banned_until:
             # Persist the end of a ban as a fresh probation (§7.3), so passes
             # counted before or during the ban never shorten it.
@@ -433,7 +494,8 @@ class CorpusAuditor:
         if failed_at is not None and self._clock() - failed_at < NEGATIVE_BEACON_CACHE_SECONDS:
             return None
         try:
-            value = await asyncio.to_thread(self._beacon, round_number)
+            with self._timed("drand"):
+                value = await asyncio.to_thread(self._beacon, round_number)
         except Exception:
             logger.warning("drand round %d unavailable; auditing", round_number, exc_info=True)
             value = None
@@ -447,6 +509,32 @@ class CorpusAuditor:
             self._failed_rounds[round_number] = self._clock()
         return randomness
 
+    async def _prefetch_rounds(self, submission_ids, now: float, states: dict) -> None:
+        """Fetch together the drand rounds _decide will ask for one by one; it
+        then reads them from the cache. Any failure is left for _decide."""
+        if self._params.q >= 1.0 or self._beacon is None or self._round_at is None:
+            return
+        rounds = set()
+        for sid in submission_ids:
+            hotkey, received_at, _ = self._meta[sid]
+            if effective_state(states[hotkey], now, self._params) != "sampled":
+                continue
+            try:
+                round_number = int(self._round_at(received_at)) + 1
+                if int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number:
+                    continue  # not out yet: _decide calls it undecidable
+            except Exception:
+                return
+            if round_number not in self._randomness:
+                rounds.add(round_number)
+        gate = asyncio.Semaphore(DRAND_CONCURRENCY)
+
+        async def one(round_number):
+            async with gate:
+                await self._randomness_for(round_number)
+
+        await asyncio.gather(*(one(r) for r in sorted(rounds)))
+
     async def _decide(self, submission_id: str, now: float,
                       state: MinerState) -> tuple[str, dict | None]:
         """decision() for one known record, with its draw; "undecidable" while
@@ -455,9 +543,8 @@ class CorpusAuditor:
         randomness, draw, recent = None, None, 0
         if self._params.q < 1.0 and effective_state(state, now, self._params) == "sampled":
             if not self._seeded:
-                for sid in await self.pending_ids():
-                    if sid not in self._meta:
-                        await self._read(sid)
+                await self._read_all(
+                    [sid for sid in await self.pending_ids() if sid not in self._meta])
                 self._seeded = True
             recent = self._recent(hotkey, now)
             if (recent >= 1.0 / self._params.q and self._beacon is not None
@@ -496,11 +583,8 @@ class CorpusAuditor:
         # The backward audit and the rescan bring a caught hotkey's records back.
         submission_ids = [sid for sid in submission_ids if sid not in self._judged]
         read: dict[str, dict] = {}
-        for submission_id in submission_ids:
-            if submission_id not in self._meta:
-                record = await self._read(submission_id)
-                if record is not None:
-                    read[submission_id] = record
+        read.update(await self._read_all(
+            [sid for sid in submission_ids if sid not in self._meta]))
         known = [sid for sid in dict.fromkeys(submission_ids) if sid in self._meta]
         states = {}
         for hotkey in {self._meta[sid][0] for sid in known}:
@@ -509,9 +593,13 @@ class CorpusAuditor:
         audit_ids, draws, unaudited, voided = [], {}, [], []
         # Per hotkey, arrival times of records whose draw round is not out yet.
         undecided: dict[str, list[float]] = {}
+        with self._timed("decide"):
+            await self._prefetch_rounds(known, now, states)
         for submission_id in known:
             hotkey, received_at, _ = self._meta[submission_id]
-            choice, draw = await self._decide(submission_id, now, states[hotkey])
+            with self._timed("decide"):
+                choice, draw = await self._decide(submission_id, now, states[hotkey])
+            self._choices[choice] += 1
             if choice == "audit":
                 audit_ids.append(submission_id)
                 if draw is not None:
@@ -528,20 +616,26 @@ class CorpusAuditor:
             # hold may still sit in the queue. Decide every such sibling now and
             # audit the drawn ones in this pass, so a failure among them reaches
             # X through the same-pass guard below instead of after X is paid.
-            for sid in sorted(self._queued | self._unreadable):
-                if sid not in self._meta and sid not in self._judged:
-                    await self._read(sid)
+            await self._read_all(sorted(
+                sid for sid in self._queued | self._unreadable
+                if sid not in self._meta and sid not in self._judged))
             hold_end: dict[str, float] = {}
             for submission_id, _ in unaudited:
                 hotkey, received_at, _ = self._meta[submission_id]
                 hold_end[hotkey] = max(hold_end.get(hotkey, 0.0),
                                        received_at + self._params.hold_seconds)
             in_pass = set(known)
-            for hotkey, until in hold_end.items():
-                for sid in sorted(self._unjudged.get(hotkey, ())):
-                    if sid in in_pass or self._meta[sid][1] > until:
-                        continue
-                    choice, draw = await self._decide(sid, now, states[hotkey])
+            siblings = {hotkey: [sid for sid in sorted(self._unjudged.get(hotkey, ()))
+                                 if sid not in in_pass and self._meta[sid][1] <= until]
+                        for hotkey, until in hold_end.items()}
+            with self._timed("decide"):
+                await self._prefetch_rounds(
+                    [sid for sids in siblings.values() for sid in sids], now, states)
+            for hotkey, sids in siblings.items():
+                for sid in sids:
+                    with self._timed("decide"):
+                        choice, draw = await self._decide(sid, now, states[hotkey])
+                    self._choices["sibling_" + choice] += 1
                     if choice == "audit":
                         audit_ids.append(sid)
                         if draw is not None:
@@ -556,8 +650,9 @@ class CorpusAuditor:
             pairs = [(sid, r) for sid, r in zip(audit_ids, records) if r is not None]
             errored = {self._meta[sid][0] for sid, r in zip(audit_ids, records) if r is None}
             if pairs:
-                results, failed = await self._audit_records(
-                    [sid for sid, _ in pairs], [r for _, r in pairs], draws)
+                with self._timed("audit"):
+                    results, failed = await self._audit_records(
+                        [sid for sid, _ in pairs], [r for _, r in pairs], draws)
                 errored |= {r["hotkey"] for (_, r), result in zip(pairs, results) if result is None}
         unreadable = bool(self._unreadable)
         if unaudited and unreadable:
@@ -588,17 +683,27 @@ class CorpusAuditor:
     async def judge_many(self, submission_ids: list[str]) -> None:
         """Decide each record: audit now, wait out its hold, pass it unaudited, or
         void it for a ban; then audit backwards after every confirmed failure."""
-        failed = await self._judge_once(list(submission_ids))
-        # At q = 1 every held record is already being audited on arrival.
-        while failed and self._params.q < 1.0:
-            # §7.2: every record of a hotkey just found cheating that has no
-            # verdict yet is audited (it is suspect now) before it can be paid.
-            pending = await self.pending_ids()
-            for sid in pending:
-                if sid not in self._meta:
-                    await self._read(sid)
-            held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed]
-            failed = await self._judge_once(held)
+        start = time.monotonic()
+        try:
+            failed = await self._judge_once(list(submission_ids))
+            # At q = 1 every held record is already being audited on arrival.
+            while failed and self._params.q < 1.0:
+                # §7.2: every record of a hotkey just found cheating that has no
+                # verdict yet is audited (it is suspect now) before it can be paid.
+                pending = await self.pending_ids()
+                await self._read_all([sid for sid in pending if sid not in self._meta])
+                held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed]
+                failed = await self._judge_once(held)
+        finally:
+            # decide includes drand; audit includes the writes of audited verdicts.
+            logger.info(
+                "corpus judge pass: ids=%d total=%.1fs list=%.1fs read=%.1fs state=%.1fs "
+                "decide=%.1fs drand=%.1fs audit=%.1fs write=%.1fs choices=%s",
+                len(submission_ids), time.monotonic() - start,
+                *(self._phase[p] for p in ("list", "read", "state", "decide", "drand", "audit", "write")),
+                dict(self._choices))
+            self._phase.clear()
+            self._choices.clear()
 
     async def audit(self, submission_id: str) -> dict | None:
         results = await self.audit_many([submission_id])
@@ -630,7 +735,10 @@ class CorpusAuditor:
         rescan = asyncio.create_task(self._rescan_forever())
         try:
             while True:
+                idle = time.monotonic()
                 batch = [await self._queue.get()]
+                if time.monotonic() - idle > 5.0:
+                    logger.info("corpus auditor idle %.1fs waiting for work", time.monotonic() - idle)
                 while len(batch) < RUN_BATCH_IDS:
                     try:
                         batch.append(self._queue.get_nowait())
