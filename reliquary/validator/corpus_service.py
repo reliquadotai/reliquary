@@ -771,6 +771,142 @@ class SeenView(AbstractSet):
         yield from self._index
 
 
+async def _write_segments(
+    store: Any, job_id: str, chunks: Sequence[Sequence[str]], parallelism: int
+) -> list[SegmentRef]:
+    gate = asyncio.Semaphore(parallelism)
+
+    async def one(chunk: Sequence[str]) -> SegmentRef:
+        async with gate:
+            return SegmentRef(await store.write_seen_segment(job_id, chunk), len(chunk))
+
+    return list(await asyncio.gather(*(one(chunk) for chunk in chunks)))
+
+
+# Migration and downgrade race at most one other writer; past this many lost
+# compare-and-swaps something keeps rewriting the ledger and a human should look.
+LEDGER_REWRITE_ATTEMPTS = 8
+
+
+async def ensure_ledgers_v2(
+    store: Any,
+    job: JobSpec,
+    *,
+    segment_max: int = SEGMENT_MAX,
+    parallelism: int = SEGMENT_PARALLELISM,
+) -> str:
+    """Rewrite a v1 ledger as v2: back it up (create-only, first one kept),
+    seal its whole seen set, then swap the ledger under its ETag. Returns
+    "absent", "v2" (nothing to do) or "migrated". A conflict re-reads and
+    starts again; segments already sealed are reused by name."""
+    for _ in range(LEDGER_REWRITE_ATTEMPTS):
+        snapshot, etag = await store.read_ledgers(job.job_id)
+        if etag is None:
+            return "absent"
+        state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
+        if state.schema == LEDGER_SCHEMA_V2:
+            return "v2"
+        await store.write_ledgers_backup(job.job_id, snapshot)
+        chunks = await asyncio.to_thread(seal_chunks, state.pending, segment_max)
+        refs = await _write_segments(store, job.job_id, chunks, parallelism)
+        after = ledger_snapshot(state.slots, state.cursors, (), refs)
+        try:
+            await store.write_ledgers(job.job_id, after, etag)
+        except CorpusStoreConflict:
+            continue
+        logger.info(
+            "corpus ledgers for %s migrated to v2: %d digests in %d segments",
+            job.job_id, len(state.pending), len(refs),
+        )
+        return "migrated"
+    raise CorpusStoreConflict(f"ledgers of {job.job_id!r} kept changing during migration")
+
+
+async def migrate_ledgers_at_startup(store: Any, job: JobSpec) -> None:
+    """``ensure_ledgers_v2`` before a route serves, best effort: the route
+    migrates a v1 ledger inline on its first write anyway, and a corrupt or
+    unreachable ledger is answered there by name, so a failure here must not
+    keep the validator down."""
+    try:
+        outcome = await ensure_ledgers_v2(store, job)
+    except Exception:
+        logger.exception("corpus ledgers for %s could not be migrated at startup", job.job_id)
+        return
+    logger.info("corpus ledgers for %s at startup: %s", job.job_id, outcome)
+
+
+async def _loaded(store: Any, job: JobSpec) -> tuple[dict, str | None, LedgerState, SeenIndex]:
+    """The ledger, parsed, with every segment it names loaded and checked
+    (I2, I3). Raises ``LedgerSnapshotError`` on any violation."""
+    snapshot, etag = await store.read_ledgers(job.job_id)
+    state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
+    index = SeenIndex(store, job.job_id)
+    await index.ensure(state.segments)
+    index.check_pending(state.pending)
+    return snapshot, etag, state, index
+
+
+async def downgrade_ledgers_v1(store: Any, job: JobSpec) -> str:
+    """Rewrite a v2 ledger as v1 with its full seen set, under its ETag, so a
+    pre-v2 image can serve the job again. Run with every validator stopped.
+    Returns "absent", "v1" (nothing to do) or "downgraded"; segments stay in
+    the bucket for a later re-migration."""
+    for _ in range(LEDGER_REWRITE_ATTEMPTS):
+        _, etag, state, index = await _loaded(store, job)
+        if etag is None:
+            return "absent"
+        if state.schema == LEDGER_SCHEMA_V1:
+            return "v1"
+        base = ledger_snapshot(state.slots, state.cursors, ())
+        v1 = {
+            "schema": LEDGER_SCHEMA_V1,
+            "slots": base["slots"],
+            "cursors": base["cursors"],
+            "seen": await asyncio.to_thread(sorted, set(index) | state.pending),
+        }
+        try:
+            await store.write_ledgers(job.job_id, v1, etag)
+        except CorpusStoreConflict:
+            continue
+        return "downgraded"
+    raise CorpusStoreConflict(f"ledgers of {job.job_id!r} kept changing during downgrade")
+
+
+async def verify_ledgers(store: Any, job: JobSpec) -> dict[str, Any]:
+    """Sizes of the stored ledger, after checking every segment it names
+    (I2, I3). ``problems`` names an I1 violation by count: each accepted
+    submission consumed one slot and added ``sampling.n`` digests, so the
+    seen set must hold exactly ``filled * n``."""
+    from reliquary.infrastructure.corpus_job_store import _encode
+
+    snapshot, etag, state, index = await _loaded(store, job)
+    seen = len(index) + len(state.pending)
+    expected = state.slots.filled * job.sampling.n
+    problems = []
+    if seen != expected:
+        problems.append(
+            f"seen holds {seen} digests but {state.slots.filled} filled slots "
+            f"imply {expected}"
+        )
+    reader = getattr(store, "read_ledgers_backup", None)
+    backup = (await reader(job.job_id)) is not None if reader is not None else None
+    return {
+        "job_id": job.job_id,
+        "schema": state.schema if etag is not None else None,
+        "etag": etag,
+        "ledger_bytes": len(await asyncio.to_thread(_encode, dict(snapshot))),
+        "filled": state.slots.filled,
+        "prompts_touched": len(state.slots.snapshot()),
+        "hotkeys": len(state.cursors.snapshot()),
+        "pending": len(state.pending),
+        "segments": len(state.segments),
+        "seen": seen,
+        "expected_seen": expected,
+        "backup": backup,
+        "problems": problems,
+    }
+
+
 # --------------------------------------------------------------------------
 # The endpoint
 # --------------------------------------------------------------------------
@@ -1273,6 +1409,10 @@ __all__ = [
     "ChatTemplatePromptRenderer",
     "CHAT_TEMPLATE_RENDERERS",
     "build_corpus_router",
+    "downgrade_ledgers_v1",
+    "ensure_ledgers_v2",
+    "migrate_ledgers_at_startup",
+    "verify_ledgers",
     "ledger_snapshot",
     "prompt_job_for_spec",
     "rebuild_ledgers",

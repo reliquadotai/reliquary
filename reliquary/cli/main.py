@@ -1219,6 +1219,66 @@ def _restart_with_served_contract(validator_url: str) -> None:
     os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
 
 
+ledgers_app = typer.Typer(
+    name="ledgers", help="Migrate, verify or downgrade a corpus job's ledgers"
+)
+corpus_app.add_typer(ledgers_app)
+
+
+def _run_on_ledgers(job_id: str, action):
+    """Run ``action(store, job)`` against the job's bucket, turning a missing
+    job or a corrupt ledger into a named exit rather than a traceback."""
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.validator.corpus_service import LedgerSnapshotError
+
+    async def _run():
+        store = BucketJobStore()
+        job, _ = await store.read_job(job_id)
+        if job is None:
+            raise typer.BadParameter(f"no job {job_id!r}")
+        return await action(store, job)
+
+    try:
+        return asyncio.run(_run())
+    except LedgerSnapshotError as exc:
+        typer.echo(f"error: ledgers of {job_id!r} are corrupt: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@ledgers_app.command("migrate")
+def ledgers_migrate(job_id: str = typer.Option(..., "--job")) -> None:
+    """Rewrite a v1 ledger as v2 (backup first). Validators also do this at
+    startup; running it by hand is for a rehearsal or a stopped fleet."""
+    from reliquary.validator.corpus_service import ensure_ledgers_v2
+
+    typer.echo(f"{job_id}: {_run_on_ledgers(job_id, ensure_ledgers_v2)}")
+
+
+@ledgers_app.command("verify")
+def ledgers_verify(job_id: str = typer.Option(..., "--job")) -> None:
+    """Load every segment the ledger names, check them, and print sizes.
+    Exits 1 on a missing, altered or overlapping segment, or a seen count the
+    filled slots do not imply."""
+    import json
+
+    from reliquary.validator.corpus_service import verify_ledgers
+
+    report = _run_on_ledgers(job_id, verify_ledgers)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+    if report["problems"]:
+        raise typer.Exit(code=1)
+
+
+@ledgers_app.command("downgrade")
+def ledgers_downgrade(job_id: str = typer.Option(..., "--job")) -> None:
+    """Rewrite a v2 ledger as v1 so a pre-v2 image can serve the job. Stop
+    every validator serving the job first: one still running would migrate it
+    straight back."""
+    from reliquary.validator.corpus_service import downgrade_ledgers_v1
+
+    typer.echo(f"{job_id}: {_run_on_ledgers(job_id, downgrade_ledgers_v1)}")
+
+
 @corpus_app.command("mine")
 def corpus_mine(
     validator_url: str = typer.Option(..., "--validator-url"),
@@ -1909,6 +1969,11 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
             f"task {entry.task_id!r} declares corpus job {entry.job_id!r} but "
             f"the job store has no manifest for it"
         )
+    # Before the route serves, so its first write is not the one that pays
+    # for sealing a v1 seen set.
+    from reliquary.validator.corpus_service import migrate_ledgers_at_startup
+
+    await migrate_ledgers_at_startup(store, job)
 
     def encode(text: str) -> list[int]:
         encoded = tokenizer.encode(text, add_special_tokens=False)

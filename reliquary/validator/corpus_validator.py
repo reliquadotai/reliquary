@@ -227,6 +227,11 @@ async def run_corpus_validator(*, entry, wallet, netuid, signer_client, http_hos
     job, _ = await store.read_job(str(entry.job_id))
     if job is None:
         raise RuntimeError(f"task {entry.task_id!r} declares job {entry.job_id!r} but it has no manifest")
+    # Before anything serves: the route would otherwise seal a v1 seen set
+    # inside its first submission's ledger turn.
+    from reliquary.validator.corpus_service import migrate_ledgers_at_startup
+
+    await migrate_ledgers_at_startup(store, job)
 
     # A tokenizer isn't loaded yet, but the renderer only calls `encode` once
     # a submission arrives -- by then `tokenizer_box` is populated. Resolving
