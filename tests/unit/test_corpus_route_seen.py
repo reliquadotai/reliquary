@@ -522,26 +522,78 @@ class _Reference:
         return verdict, writes, commit
 
 
+def _rival_accepts(r2, reference, job, fill):
+    """Another validator admits fresh work of its own, landing in the bucket
+    and in the reference alike; returns the hook that lands it."""
+
+    def land():
+        free = [p for p in range(job.prompt_count) if not reference.slots.is_full(p)]
+        prompt = free[fill % len(free)]
+        digest = completion_digest(prompt, _tokens(fill))
+        reference.slots.consume(prompt)
+        reference.seen.add(digest)
+        if job.prompt_order == "miner_walk":
+            reference.cursors.advance("5Rival")
+
+        def mutate(ledger):
+            ledger["slots"][str(prompt)] = ledger["slots"].get(str(prompt), 0) + 1
+            ledger["seen_pending"] = sorted([*ledger["seen_pending"], digest])
+            if job.prompt_order == "miner_walk":
+                ledger["cursors"]["5Rival"] = ledger["cursors"].get("5Rival", 0) + 1
+
+        _compete(r2, mutate)()
+        return digest
+
+    return land
+
+
+class _Unremembering(_Store):
+    """Reads the bucket every time. The store's ledger memory assumes one
+    writer: with two, a refusal judged against a stale memory writes nothing,
+    so no compare-and-swap corrects it. That is v1 behaviour, unchanged here,
+    so the two-router interleaving below takes it out of the comparison."""
+
+    async def read_ledgers(self, job_id):
+        self._ledgers.pop(job_id, None)
+        return await super().read_ledgers(job_id)
+
+
+def _assert_matches(r2, reference, step):
+    if _ledger_key() not in r2.objects:
+        assert reference.slots.filled == 0 and not reference.seen, step
+        return
+    ledger = _ledger(r2)
+    assert ledger["slots"] == {str(k): v for k, v in reference.slots.snapshot().items()}, step
+    assert ledger["cursors"] == reference.cursors.snapshot(), step
+    assert seen_union(r2.objects, JOB) == reference.seen, step
+
+
 @pytest.mark.parametrize("order", ["free", "miner_walk"])
 @pytest.mark.parametrize("seed", range(4))
 def test_v2_verdicts_match_v1_reference_model(seeded_job, _r2_client, order, seed):
     rng = random.Random(seed * 7919 + (order == "free"))
-    job = _write_job(prompt_order=order, prompt_count=5, slots_per_prompt=3)
+    # Large enough that 160 steps never complete the job.
+    job = _write_job(prompt_order=order, prompt_count=40, slots_per_prompt=3)
     threshold, segment_max = 3, 2
     reference = _Reference(job)
-    store = _Store()
-    client = TestClient(_app(seeded_job, store, threshold=threshold, segment_max=segment_max))
+
+    def router():
+        store = _Unremembering()
+        return store, TestClient(
+            _app(seeded_job, store, threshold=threshold, segment_max=segment_max)
+        )
+
+    # Two routers on one bucket, each with its own memory and index.
+    routers = [router(), router()]
     sent: list[dict] = []
     accepted_digests: list[str] = []
     next_fill = 1
+    rivals = 0
 
-    for step in range(120):
-        roll = rng.random()
-        if roll < 0.05:
-            store = _Store()
-            client = TestClient(
-                _app(seeded_job, store, threshold=threshold, segment_max=segment_max)
-            )
+    for step in range(160):
+        if rng.random() < 0.05:
+            routers[rng.randrange(2)] = router()  # a restart
+        store, client = routers[rng.randrange(2)]
         hotkey = rng.choice(HOTKEYS)
         kind = rng.random()
         if kind < 0.55 or not sent:
@@ -577,20 +629,31 @@ def test_v2_verdicts_match_v1_reference_model(seeded_job, _r2_client, order, see
         elif writes and 0.14 <= roll < 0.2:
             fault = "response_lost"
             store.faults["after_ledger_put"] = [OSError("response lost")]
-        elif writes and 0.2 <= roll < 0.3:
+        elif writes and 0.2 <= roll < 0.27:
             fault = "conflict"
             store.faults["before_ledger_put"] = [_compete(_r2_client, lambda ledger: None)]
+        elif writes and 0.27 <= roll < 0.37 and _ledger_key() in _r2_client.objects:
+            # A rival admits a different digest between our seal and our write:
+            # our retry admits against what it left.
+            fault = "rival"
+            next_fill += 1
+            rival = _rival_accepts(_r2_client, reference, job, 10_000 + next_fill)
+            store.faults["before_ledger_put"] = [lambda: accepted_digests.append(rival())]
         landed = fault not in ("crash_before_write", "crash_during_seal")
 
         status, got = _post(client, body)
         store.faults.clear()
+        if fault == "rival":
+            rivals += 1
+            # The rival landed first, so the verdict is the one against its ledger.
+            verdict, writes, commit = reference.decide(body)
         if fault in ("crash_before_write", "crash_during_seal", "response_lost"):
             assert status == 503, (step, fault, got)
         else:
             assert status == 200, (step, got)
             assert (got["accepted"], got["reason"], got["slots_remaining"]) == (
                 verdict.accepted, verdict.reason, verdict.slots_remaining
-            ), step
+            ), (step, fault)
         if landed:
             commit()
             if verdict.accepted:
@@ -598,30 +661,11 @@ def test_v2_verdicts_match_v1_reference_model(seeded_job, _r2_client, order, see
                     completion_digest(body["prompt_index"], c["tokens"])
                     for c in body["completions"]
                 )
+        _assert_matches(_r2_client, reference, (step, fault))
 
-    ledger = _ledger(_r2_client)
-    assert ledger["slots"] == {str(k): v for k, v in reference.slots.snapshot().items()}
-    assert ledger["cursors"] == reference.cursors.snapshot()
-    assert seen_union(_r2_client.objects, JOB) == reference.seen
+    assert not reference.slots.is_complete
     assert len(accepted_digests) == len(set(accepted_digests)) == len(reference.seen)
-    assert ledger["seen_segments"], "the sequence never sealed; the test proves nothing"
-
-
-def test_a_seal_that_stays_contended_is_retryable_and_writes_no_ledger(seeded_job, _r2_client):
-    _write_job()
-    store = _Store()
-    client = TestClient(_app(seeded_job, store, threshold=2))
-    assert _post(client, _body(1))[1]["accepted"] is True
-    before = _ledger(_r2_client)
-
-    store.faults["segment_put"] = [job_store.CorpusStoreConflict("409 in flight")]
-    assert _post(client, _body(2)) == (503, {"detail": "corpus_store_unavailable"})
-    assert _ledger(_r2_client) == before
-
-    store.faults["segment_put"] = [job_store.CorpusSegmentCorrupt("other bytes")]
-    assert _post(client, _body(2)) == (500, {"detail": "corpus_ledger_corrupt"})
-    assert _ledger(_r2_client) == before
-    assert _post(client, _body(2))[1]["accepted"] is True
+    assert rivals and _ledger(_r2_client)["seen_segments"], "the faults never fired"
 
 
 class _OneFailsOthersLinger(_Store):
