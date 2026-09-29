@@ -859,3 +859,35 @@ def test_the_siblings_drand_rounds_are_fetched_concurrently():
     assert len(set(beacon.calls)) >= 20
     assert beacon.peak > 1
     assert records.verdicts[x]["passed"] is True
+
+
+def test_a_rescan_requeues_known_pending_records_without_listing_the_store():
+    """Listing ~100k keys every minute took 100-300 s (2026-09-28): the minute
+    rescan requeues what the auditor already knows is pending."""
+    ids = _ids(False, 3)
+    records = _CountingRecords({sid: _rec(0) for sid in ids})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    for sid in ids:
+        asyncio.run(auditor._read(sid))
+    auditor._judged.add(ids[0])
+    asyncio.run(auditor._rescan_once(full=False))
+    assert records.listings == 0
+    assert auditor._queued == set(ids[1:])
+
+
+def test_a_full_rescan_still_lists_the_store():
+    ids = _ids(False, 2)
+    records = _CountingRecords({sid: _rec(0) for sid in ids})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor._rescan_once(full=True))
+    assert records.listings == 1
+    assert auditor._queued == set(ids)
+
+
+def test_an_unreadable_record_is_requeued_by_the_memory_rescan():
+    ids = _ids(False, 1)
+    records = _CountingRecords({sid: _rec(0) for sid in ids})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 10), beacon=_Beacon())
+    auditor._unreadable.add(ids[0])
+    asyncio.run(auditor._rescan_once(full=False))
+    assert auditor._queued == {ids[0]}

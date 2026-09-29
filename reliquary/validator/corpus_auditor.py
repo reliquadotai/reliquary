@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 VERDICT_SCHEMA = "reliquary/corpus-verdict/v1"
 
 RESCAN_SECONDS = 60.0
+# The minute rescan requeues pending records the auditor already knows; the
+# store is listed only this often (100k keys took 100-300 s on 2026-09-28).
+FULL_RESCAN_SECONDS = 1800.0
 MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 # Padded size (rows x longest sequence) a sub-batch's forward pass may reach.
 # What fits depends on the card and checkpoint (131,072 overran an H100 beside
@@ -709,23 +712,35 @@ class CorpusAuditor:
         results = await self.audit_many([submission_id])
         return results[0] if results else None
 
+    def _known_pending(self) -> list[str]:
+        """Pending records this process knows of: read and not judged, or unreadable."""
+        return [sid for sid in (*self._meta, *self._unreadable) if sid not in self._judged]
+
+    async def _rescan_once(self, *, full: bool) -> None:
+        pending = await self.pending_ids() if full else self._known_pending()
+        for submission_id in pending:
+            self.enqueue(submission_id)
+        lag = self.queue_lag(pending)
+        # An undrawn record waits one hold by design; far beyond that,
+        # the auditor is not keeping up with the traffic.
+        level = (logging.WARNING if lag is not None
+                 and lag > self._params.hold_seconds + 2 * self._rescan_every
+                 else logging.INFO)
+        logger.log(level, "corpus audit queue lag: %d pending, oldest received %s s ago",
+                   len(pending), "-" if lag is None else f"{lag:.0f}")
+
     async def _rescan_forever(self) -> None:
-        # The only retry for an id whose audit failed (store read or our own
-        # error): without it, it would wait for the next process start.
+        # The retry for an id whose audit failed or that was waiting out its
+        # hold: from memory every period, from a store listing every
+        # FULL_RESCAN_SECONDS as the net for anything the route did not hand over.
+        last_full = time.monotonic()
         while True:
             await asyncio.sleep(self._rescan_every)
+            full = time.monotonic() - last_full >= FULL_RESCAN_SECONDS
             try:
-                pending = await self.pending_ids()
-                for submission_id in pending:
-                    self.enqueue(submission_id)
-                lag = self.queue_lag(pending)
-                # An undrawn record waits one hold by design; far beyond that,
-                # the auditor is not keeping up with the traffic.
-                level = (logging.WARNING if lag is not None
-                         and lag > self._params.hold_seconds + 2 * self._rescan_every
-                         else logging.INFO)
-                logger.log(level, "corpus audit queue lag: %d pending, oldest received %s s ago",
-                           len(pending), "-" if lag is None else f"{lag:.0f}")
+                await self._rescan_once(full=full)
+                if full:
+                    last_full = time.monotonic()
             except Exception:
                 logger.exception("corpus pending rescan failed; retrying next period")
 
