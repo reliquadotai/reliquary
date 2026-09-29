@@ -72,7 +72,10 @@ on the production bucket with a throwaway key: a create over an existing key and
 a write against a stale ETag must each be refused (412 / `PreconditionFailed`),
 and a write against the current ETag must succeed. Do not launch if either
 refusal is missing: two validators, or a retry, could then double-consume a slot
-or pay a verdict twice.
+or pay a verdict twice. The ledger's seen segments (§3.1) are created the same
+way (`If-None-Match: *` on `reliquary/corpus/jobs/<job>/seen/<sha256>.json`),
+so the create refusal also guards them; check the `If-Match` swap on an object
+of about 0.5 MB, the size a busy ledger reaches.
 
 ## 1. Preconditions
 
@@ -345,6 +348,67 @@ A validator-side audit failure (a lost GPU, an out-of-memory) is retried on the
 next pending rescan (every 60 s); after 5 in a row the process exits non-zero
 rather than run while paying nobody. A bucket outage answers miners 503, which
 they retry.
+
+### 3.1 Ledger schema v2: migration, verify, rollback
+
+Since ledger schema v2 the per-submission `ledgers.json` holds slots, cursors
+and only the last few hundred accepted digests (`seen_pending`). The rest of the
+seen set is sealed, 1024 digests at a time, into immutable segments at
+`reliquary/corpus/jobs/<job>/seen/<sha256>.json`, which the ledger names
+(`seen_segments`). A segment is never rewritten; one that nothing names (a
+ledger write lost after the seal) is harmless and never counts as seen.
+
+**Migration is automatic.** A v2 validator (the corpus validator, and the main
+validator's corpus mount) rewrites a v1 ledger at startup, before serving: a
+create-only backup at `reliquary/corpus/jobs/<job>/ledgers.v1-backup.json` (the
+first one is kept), then the seen set sealed into segments of up to 4096, then
+the ledger swapped under its ETag. Expect seconds to tens of seconds for about
+200k digests; startup then loads every segment before serving. If either
+fails, or takes over 120 s, the validator still starts (logs `could not be
+prepared at startup` or `startup preparation timed out`) and the route migrates
+on its first write instead. That inline migration writes **no** v1 backup.
+Only the first backup is ever kept, so after a downgrade and a re-migration it
+predates the later v1 state.
+
+**Rollout.** Pin the image for the rollout so Watchtower cannot bounce between
+versions. An older binary refuses a v2 ledger loudly (500
+`corpus_ledger_corrupt` on submit and cursor, before any write): the corpus
+route is down on it, nothing is corrupted.
+
+**Verify** after the first start on v2, and whenever the ledger is in doubt:
+
+```bash
+reliquary corpus ledgers verify --job <job>
+```
+
+It loads and checks every segment the ledger names (present, hashes to its
+name, count as named, no digest in two places) and prints the sizes as JSON.
+Expected: `"schema": "reliquary/corpus-ledgers/v2"`, `"problems": []`,
+`"seen"` equal to `"expected_seen"` (filled slots x `n`), `"backup": true` and
+`"ledger_bytes"` well under 1 MB. It exits 1 on any violation; a missing or
+altered segment is also what makes the route answer `corpus_ledger_corrupt`.
+Run `migrate` by hand only for a rehearsal or on a stopped fleet:
+
+```bash
+reliquary corpus ledgers migrate --job <job>    # <job>: migrated | v2 | absent
+```
+
+**Rollback to a pre-v2 image:**
+
+1. Stop every validator serving the job (a running v2 one would write v2 again
+   on its next accept).
+2. `reliquary corpus ledgers downgrade --job <job>`: it checks every segment,
+   then writes v1 (`seen` = pending plus every segment, sorted) under the v2
+   ETag. The segments stay in the bucket; a later v2 start reuses them only
+   if the seen set is unchanged (chunks are cut by sorted position, so one new
+   digest renames every chunk after it). Old segments are then orphans:
+   harmless, never counted.
+3. `reliquary corpus ledgers verify --job <job>` must show the v1 schema, the
+   same `seen` and no problems.
+4. Deploy the old image, pinned.
+
+A code rollback without step 2 is an outage of the corpus route, not a loss;
+running step 2 at any later point restores service.
 
 ## 4. Miners
 

@@ -274,3 +274,73 @@ def test_a_hung_ledger_write_makes_the_next_submission_retryable_not_stuck(
     assert second.status_code == 503
     assert second.json() == {"detail": "corpus_ledger_contention"}
     assert first.json()["accepted"] is True
+
+
+class _SegmentCountingStore(_CountingStore):
+    def __init__(self, client_kwargs):
+        super().__init__(client_kwargs)
+        self.segment_gets = 0
+        self.segment_puts = 0
+
+    async def read_seen_segment(self, job_id, segment_id):
+        self.segment_gets += 1
+        return await super().read_seen_segment(job_id, segment_id)
+
+    async def write_seen_segment(self, job_id, digests):
+        self.segment_puts += 1
+        return await super().write_seen_segment(job_id, digests)
+
+
+def _sealing_app(seeded_job, store, threshold):
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    app = FastAPI()
+    app.include_router(build_corpus_router(
+        job_id="swe-v1", store=store, tokenizer=_Tokenizer(), renderer=_Renderer(),
+        verify_signature=lambda request: True, prompt_job_for=seeded_job.prompt_job_for,
+        seal_threshold=threshold,
+    ))
+    return app
+
+
+def _many(count):
+    # Distinct work on distinct prompts, one slot each.
+    return [_request(f"5Hot{i % 7}", i) for i in range(count)]
+
+
+def test_ledger_body_bounded_after_many_accepts(fake_r2, seeded_job, _r2_client):
+    store = _SegmentCountingStore(fake_r2)
+    app = _sealing_app(seeded_job, store, threshold=64)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://v") as http:
+            for body in _many(600):
+                assert (await http.post("/corpus/submit", json=body)).json()["accepted"]
+
+    asyncio.run(scenario())
+    body, _ = _r2_client.objects["reliquary/corpus/jobs/swe-v1/ledgers.json"]
+    import json
+
+    ledger = json.loads(body)
+    seen_bytes = len(job_store._encode(
+        {"seen_pending": ledger["seen_pending"], "seen_segments": ledger["seen_segments"]}
+    ))
+    # v1 would carry all 600 digests (~40 KB); v2 carries under one threshold
+    # of them plus one small reference per sealed segment.
+    assert len(ledger["seen_pending"]) < 64
+    assert seen_bytes < 64 * 67 + len(ledger["seen_segments"]) * 100
+    assert seen_bytes < 600 * 67 / 4
+    assert store.segment_puts == 600 // 64
+
+
+def test_warm_path_does_no_segment_gets(fake_r2, seeded_job):
+    store = _SegmentCountingStore(fake_r2)
+    app = _sealing_app(seeded_job, store, threshold=4)
+
+    results = asyncio.run(_post_all(app, _many(30)))
+
+    assert all(r["accepted"] for r in results)
+    assert store.segment_puts == 30 // 4
+    # Every segment this process sealed it already holds; none is fetched.
+    assert store.segment_gets == 0

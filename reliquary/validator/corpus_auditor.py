@@ -721,10 +721,11 @@ class CorpusAuditor:
         for submission_id in pending:
             self.enqueue(submission_id)
         lag = self.queue_lag(pending)
-        # An undrawn record waits one hold by design; far beyond that,
-        # the auditor is not keeping up with the traffic.
+        # An undrawn record waits one hold plus the accept slack by design;
+        # far beyond that, the auditor is not keeping up with the traffic.
         level = (logging.WARNING if lag is not None
-                 and lag > self._params.hold_seconds + 2 * self._rescan_every
+                 and lag > self._params.hold_seconds + self._accept_slack
+                 + 2 * self._rescan_every
                  else logging.INFO)
         logger.log(level, "corpus audit queue lag: %d pending, oldest received %s s ago",
                    len(pending), "-" if lag is None else f"{lag:.0f}")

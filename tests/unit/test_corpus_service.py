@@ -160,6 +160,18 @@ class _CountingStore:
             raise job_store.CorpusStoreConflict("injected")
         return await job_store.write_ledgers(job_id, snapshot, etag, **self._kwargs)
 
+    async def write_seen_segment(self, job_id, digests):
+        return await job_store.write_seen_segment(job_id, digests, **self._kwargs)
+
+    async def read_seen_segment(self, job_id, segment_id):
+        return await job_store.read_seen_segment(job_id, segment_id, **self._kwargs)
+
+    async def write_ledgers_backup(self, job_id, snapshot):
+        return await job_store.write_ledgers_backup(job_id, snapshot, **self._kwargs)
+
+    async def read_ledgers_backup(self, job_id):
+        return await job_store.read_ledgers_backup(job_id, **self._kwargs)
+
 
 class _SeededJob:
     def __init__(self, store, renderer, environment, raw):

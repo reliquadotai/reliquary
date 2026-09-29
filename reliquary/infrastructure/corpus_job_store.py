@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 import weakref
 from collections.abc import Callable, Mapping
@@ -30,12 +32,25 @@ JOB_KEY_PREFIX = "reliquary/corpus/jobs/"
 # cannot outlive a few minutes.
 CLIENT_MAX_AGE_SECONDS = 600.0
 
+# A sealed segment of the seen-digest set; see ``write_seen_segment``.
+SEEN_SEGMENT_SCHEMA = "reliquary/corpus-seen-segment/v1"
+_SEGMENT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+# A create-only segment PUT can meet R2's 409 (another conditional write to the
+# key in flight): it is retried this many times, backing off from this delay.
+SEGMENT_WRITE_ATTEMPTS = 4
+SEGMENT_RETRY_DELAY_SECONDS = 0.2
+
 _ABSENT_CODES = {"NoSuchKey", "404", "NotFound"}
 _CONFLICT_CODES = {"PreconditionFailed", "412", "ConditionalRequestConflict"}
 
 
 class CorpusStoreConflict(Exception):
     """A concurrent writer landed first; the caller must re-read and retry."""
+
+
+class CorpusSegmentCorrupt(Exception):
+    """A seen segment a ledger names is absent or is not the bytes its name
+    hashes: reading it as empty would admit every duplicate it held."""
 
 
 def _error_code(exc) -> str:
@@ -56,6 +71,20 @@ def _job_key(job_id: str) -> str:
 
 def _ledgers_key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{job_id}/ledgers.json"
+
+
+def _ledgers_backup_key(job_id: str) -> str:
+    return f"{JOB_KEY_PREFIX}{job_id}/ledgers.v1-backup.json"
+
+
+def _validated_segment_id(segment_id: Any) -> str:
+    if not isinstance(segment_id, str) or not _SEGMENT_ID_RE.match(segment_id):
+        raise ValueError(f"unusable seen segment id {segment_id!r}")
+    return segment_id
+
+
+def _seen_segment_key(job_id: str, segment_id: str) -> str:
+    return f"{JOB_KEY_PREFIX}{job_id}/seen/{segment_id}.json"
 
 
 def _bucket(client_kwargs: dict[str, Any]) -> str:
@@ -291,6 +320,97 @@ async def write_ledgers(
     return await _put(_ledgers_key(validated), body, etag, **client_kwargs)
 
 
+def _is_strictly_sorted(digests) -> bool:
+    return all(a < b for a, b in zip(digests, digests[1:]))
+
+
+def _segment_body(digests) -> bytes:
+    digests = list(digests)
+    if not digests or any(not isinstance(d, str) for d in digests):
+        raise ValueError("a seen segment holds at least one digest string")
+    if not _is_strictly_sorted(digests):
+        # Sorted and unique is what makes the name a function of the set.
+        raise ValueError("a seen segment's digests must be sorted and unique")
+    return _encode({"schema": SEEN_SEGMENT_SCHEMA, "digests": digests})
+
+
+async def write_seen_segment(job_id: str, digests, **client_kwargs) -> str:
+    """Create-only put of a sealed segment; returns its id, the sha256 of its
+    bytes. A refused create counts as written only once the segment reads back
+    under its hash: R2's 409 means a write is in flight, not that one landed."""
+    validated = _validated_job_id(job_id)
+    body = await asyncio.to_thread(_segment_body, digests)
+    segment_id = hashlib.sha256(body).hexdigest()
+    key = _seen_segment_key(validated, segment_id)
+    for attempt in range(SEGMENT_WRITE_ATTEMPTS):
+        try:
+            await _put(key, body, None, **client_kwargs)
+            return segment_id
+        except CorpusStoreConflict:
+            pass
+        stored, _ = await _get(key, **client_kwargs)
+        if stored is not None:
+            # Present but not these bytes raises CorpusSegmentCorrupt.
+            await asyncio.to_thread(_decode_segment, segment_id, stored)
+            return segment_id
+        if attempt + 1 < SEGMENT_WRITE_ATTEMPTS:
+            await asyncio.sleep(SEGMENT_RETRY_DELAY_SECONDS * 2 ** attempt)
+    raise CorpusStoreConflict(f"{key} stayed contended and absent")
+
+
+def _decode_segment(segment_id: str, body: bytes) -> tuple[str, ...]:
+    if hashlib.sha256(body).hexdigest() != segment_id:
+        raise CorpusSegmentCorrupt(f"seen segment {segment_id} does not hash to its name")
+    try:
+        document = json.loads(body)
+    except ValueError as exc:
+        raise CorpusSegmentCorrupt(f"seen segment {segment_id} is not JSON") from exc
+    digests = document.get("digests") if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schema", "digests"}
+        or document["schema"] != SEEN_SEGMENT_SCHEMA
+        or not isinstance(digests, list)
+        or not digests
+        or any(not isinstance(d, str) for d in digests)
+        or not _is_strictly_sorted(digests)
+    ):
+        raise CorpusSegmentCorrupt(f"seen segment {segment_id} is not a sorted digest list")
+    return tuple(digests)
+
+
+async def read_seen_segment(job_id: str, segment_id: str, **client_kwargs) -> tuple[str, ...]:
+    """The segment's digests, checked against its name. Absent is corrupt."""
+    validated = _validated_job_id(job_id)
+    segment_id = _validated_segment_id(segment_id)
+    body, _ = await _get(_seen_segment_key(validated, segment_id), **client_kwargs)
+    if body is None:
+        raise CorpusSegmentCorrupt(f"seen segment {segment_id} of job {job_id!r} is absent")
+    return await asyncio.to_thread(_decode_segment, segment_id, body)
+
+
+async def write_ledgers_backup(
+    job_id: str, snapshot: Mapping[str, Any], **client_kwargs
+) -> bool:
+    """Create-only copy of the v1 ledgers taken before migration. False when a
+    backup already exists; the first one is kept."""
+    validated = _validated_job_id(job_id)
+    body = await asyncio.to_thread(_encode, dict(snapshot))
+    try:
+        await _put(_ledgers_backup_key(validated), body, None, **client_kwargs)
+    except CorpusStoreConflict:
+        return False
+    return True
+
+
+async def read_ledgers_backup(job_id: str, **client_kwargs) -> dict | None:
+    validated = _validated_job_id(job_id)
+    body, _ = await _get(_ledgers_backup_key(validated), **client_kwargs)
+    if body is None:
+        return None
+    return await asyncio.to_thread(_decode, body)
+
+
 class BucketJobStore:
     """The three calls the submission endpoint makes, bound to one bucket.
 
@@ -350,3 +470,19 @@ class BucketJobStore:
         if new_etag is not None and self._generation[job_id] == generation:
             self._ledgers[job_id] = (dict(snapshot), new_etag)
         return new_etag
+
+    async def write_seen_segment(self, job_id: str, digests) -> str:
+        return await write_seen_segment(job_id, digests, pool=self._pool, **self._client_kwargs)
+
+    async def read_seen_segment(self, job_id: str, segment_id: str) -> tuple[str, ...]:
+        return await read_seen_segment(
+            job_id, segment_id, pool=self._pool, **self._client_kwargs
+        )
+
+    async def write_ledgers_backup(self, job_id: str, snapshot: Mapping[str, Any]) -> bool:
+        return await write_ledgers_backup(
+            job_id, snapshot, pool=self._pool, **self._client_kwargs
+        )
+
+    async def read_ledgers_backup(self, job_id: str) -> dict | None:
+        return await read_ledgers_backup(job_id, pool=self._pool, **self._client_kwargs)

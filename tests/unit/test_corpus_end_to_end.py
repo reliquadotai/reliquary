@@ -28,6 +28,7 @@ from reliquary.environment.registry import ENVIRONMENT_SPECS
 from reliquary.infrastructure import corpus_job_store as job_store
 from reliquary.protocol.corpus_submission import CorpusSubmissionRequest
 from reliquary.validator.server import ValidatorServer
+from tests.unit.test_corpus_ledger_v2 import seen_union
 
 # The CLI's own fake bucket, fake registry and argument builder. A second copy
 # here would drift from the one `jobs create` is actually proved against, and
@@ -192,7 +193,7 @@ def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
     raw, _ = bucket.objects[f"reliquary/corpus/jobs/{job.job_id}/ledgers.json"]
     ledgers = json.loads(raw)
     assert ledgers["slots"] == {"0": SLOTS_PER_PROMPT, "1": 1}
-    assert len(ledgers["seen"]) == SLOTS_PER_PROMPT + 1
+    assert len(seen_union(bucket.objects, job.job_id)) == SLOTS_PER_PROMPT + 1
 
 
 def test_the_startup_path_binds_the_real_corpus_verifier(
@@ -223,6 +224,41 @@ def test_the_startup_path_binds_the_real_corpus_verifier(
 
     assert len(calls) == 1
     assert body["accepted"] is True
+
+
+def test_the_mount_migrates_a_v1_ledger_before_serving(bucket, registry):
+    """Both corpus entry points run the v2 migration before the route serves;
+    this is the one inside the main validator."""
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
+    entry = registry["entries"][TASK_ID]
+    key = f"reliquary/corpus/jobs/{entry.job_id}/ledgers.json"
+    seen = sorted(f"{i:064x}" for i in range(5))
+    bucket.objects[key] = (
+        json.dumps({"slots": {"0": 3, "1": 2}, "cursors": {}, "seen": seen}).encode(),
+        '"v1"',
+    )
+
+    server, mounted = _mount(entry)
+
+    assert mounted is True
+    ledgers = json.loads(bucket.objects[key][0])
+    assert ledgers["schema"] == "reliquary/corpus-ledgers/v2"
+    assert seen_union(bucket.objects, entry.job_id) == set(seen)
+
+    # The mount loaded the segments, so the first submission fetches none.
+    fetched = []
+    real_get = bucket.get_object
+
+    async def get_object(Bucket, Key):
+        fetched.append(Key)
+        return await real_get(Bucket=Bucket, Key=Key)
+
+    bucket.get_object = get_object
+    job, _ = asyncio.run(job_store.read_job(entry.job_id))
+    with TestClient(server.app) as client:
+        assert _submit(client, job, prompt_index=2, filler=1)["accepted"] is True
+    assert not [k for k in fetched if "/seen/" in k]
 
 
 def test_a_declared_job_with_no_manifest_refuses_to_start(bucket, registry):
@@ -509,6 +545,46 @@ def test_a_corpus_renderer_that_cannot_build_exits_four_before_any_download(
     result = CliRunner().invoke(cli_module.app, ["validate"])
 
     assert result.exit_code == 4, (result.output, result.exception)
+
+
+def test_the_corpus_validator_migrates_a_v1_ledger_right_after_reading_the_job(
+    monkeypatch, bucket, registry
+):
+    """The dedicated corpus validator migrates before anything else: driven
+    through the real `run_corpus_validator` up to its renderer refusal, the
+    first step after the migration, the ledger is already v2."""
+    from types import SimpleNamespace
+
+    import bittensor
+    import reliquary.cli.main as cli_module
+    import reliquary.infrastructure.chain as chain
+    from reliquary.validator import corpus_service
+
+    _seed_manifest("swe-v1")
+    entry = _corpus_entry_this_binary_can_resolve("swe-v1")
+    registry["entries"] = {entry.task_id: entry}
+    key = "reliquary/corpus/jobs/swe-v1/ledgers.json"
+    seen = sorted(f"{i:064x}" for i in range(3))
+    bucket.objects[key] = (
+        json.dumps({"slots": {"0": 3}, "cursors": {}, "seen": seen}).encode(), '"v1"'
+    )
+    monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
+
+    async def subtensor():
+        return SimpleNamespace()
+
+    monkeypatch.setattr(chain, "get_subtensor", subtensor)
+
+    def _stop_here(job, encode, **kwargs):
+        raise corpus_service.CorpusPromptSourceError("stop after the migration")
+
+    monkeypatch.setattr(corpus_service, "renderer_for_job", _stop_here)
+
+    result = CliRunner().invoke(cli_module.app, ["validate"])
+
+    assert result.exit_code == 4, (result.output, result.exception)
+    assert json.loads(bucket.objects[key][0])["schema"] == "reliquary/corpus-ledgers/v2"
+    assert seen_union(bucket.objects, "swe-v1") == set(seen)
 
 
 def test_a_corpus_job_naming_an_unknown_renderer_exits_four_before_any_download(

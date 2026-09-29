@@ -6364,6 +6364,7 @@ class ValidatorServer:
         records: Any = None,
         on_accepted: Callable[[str], None] | None = None,
         proof_chunk_tokens: int | None = None,
+        seen_index: Any = None,
     ) -> bool:
         """Serve corpus submissions, and only for a task that declares them.
 
@@ -6400,6 +6401,7 @@ class ValidatorServer:
                 records=records,
                 on_accepted=on_accepted,
                 proof_chunk_tokens=proof_chunk_tokens,
+                seen_index=seen_index,
             )
         )
         return True
