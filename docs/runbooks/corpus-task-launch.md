@@ -414,9 +414,18 @@ running step 2 at any later point restores service.
 
 A job has one prompt source. To generate, say, maths and code from the same
 teacher at once, declare two jobs and serve both from ONE validator process:
-the model is loaded once and both jobs' audits share the card, one forward pass
-at a time (a FIFO lock: a job with a backlog waits at most one pass before the
-other job's records are audited).
+the model is loaded once and both jobs' audits share the card, one job at a
+time (a FIFO lock).
+
+- **Fairness is per judge pass, not per record.** The lock is held for one
+  audit call: every record a judge pass audits together (up to 256 ids, packed
+  into sub-batches under `RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS`), or one
+  re-audit. So the other job's records wait at most one such pass, which on a
+  full backlog can take minutes; neither job waits indefinitely.
+- **One job's auditor halting stops the whole process.** After repeated
+  validator-side audit errors an auditor raises (spec §6: loud, not silently
+  paying nobody), and that ends the one process serving both jobs: both
+  routes go down until it is restarted. Watch for `stopping` in the log.
 
 The real rollout adds a job next to a live one, without stopping its miners:
 the live code task `corpus-code-v1` keeps running, and a maths task is added
