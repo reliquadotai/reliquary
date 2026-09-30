@@ -61,6 +61,9 @@ class CorpusRejectReason(str, Enum):
     BAD_CURSOR = "bad_cursor"
     PROMPT_MISMATCH = "prompt_mismatch"
     PROMPT_FULL = "prompt_full"
+    # A skip names a prompt that still has a slot: only a full prompt may be
+    # stepped over without answering it.
+    PROMPT_NOT_FULL = "prompt_not_full"
     BAD_COMPLETION_COUNT = "bad_completion_count"
     TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
     TOKEN_BUDGET_UNDERRUN = "token_budget_underrun"
@@ -135,5 +138,33 @@ class CorpusSubmissionResponse(BaseModel):
 
     reason: CorpusRejectReason
     accepted: bool
+    slots_remaining: int | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class CorpusSkipRequest(BaseModel):
+    """A signed request to step over the prompt this hotkey's walk names at
+    ``cursor``, granted only when that prompt has no slot left. It carries no
+    work, so nothing is paid and nothing is recorded; its signature is bound
+    under its own domain, so it can never stand in for a submission's."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    miner_hotkey: str = Field(min_length=1)
+    cursor: int = Field(ge=0)
+    prompt_index: int = Field(ge=0)
+    signature: str = Field(min_length=1)
+
+
+class CorpusSkipResponse(BaseModel):
+    """``skipped`` with ``reason`` ``accepted`` when the cursor moved;
+    ``cursor`` is then where this hotkey now stands."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: CorpusRejectReason
+    skipped: bool
+    cursor: int | None = None
     slots_remaining: int | None = None
     detail: dict[str, Any] = Field(default_factory=dict)

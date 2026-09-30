@@ -35,6 +35,8 @@ def _ok() -> CheckResult:
 REASON_MINER_BANNED = "miner_banned"
 # Applied by the route from the subnet's registrations, like the ban.
 REASON_HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
+# A skip of a prompt that still has a slot; produced by `admission.skip`.
+REASON_PROMPT_NOT_FULL = "prompt_not_full"
 
 
 def completion_digest(prompt_index: int, tokens: Sequence[int]) -> str:
