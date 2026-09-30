@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from reliquary.environment.abi import canonical_sha256
+from reliquary.protocol.composition import MODEL_IDENTITY_FIELDS
 from reliquary.shared.task_id import DEFAULT_TASK_ID
 from reliquary.shared.task_registry import (
     PRICE_PARAM_FIELDS,
@@ -199,7 +200,9 @@ def legacy_task_config() -> TaskConfig:
 # the checkpoint, the architecture it is loaded as, and the proof it is audited
 # with. Everything else a corpus job reads is its manifest's or its own
 # environment's (see `merge_corpus_contracts`).
-CORPUS_SHARED_CONTRACT_FIELDS = ("model_id", "model_revision", "model_architecture", "proofs")
+# The same tuple composition calls a model's identity, so a composed job and a
+# template-seeded one agree on what "the same model" means.
+CORPUS_SHARED_CONTRACT_FIELDS = MODEL_IDENTITY_FIELDS
 
 
 def merge_corpus_contracts(contracts: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:

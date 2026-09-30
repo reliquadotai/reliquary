@@ -813,6 +813,7 @@ def build_job_manifest(
     prompt_order,
     deadline_round,
     from_profile=None,
+    profile=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -865,8 +866,41 @@ def build_job_manifest(
     # after it. The profile checked against is the template the TASK is seeded
     # from, not whichever one this CLI process happens to run: it is the one
     # the fleet will render these prompts with.
-    prompt_job_for_spec(parse_job(manifest), profile=from_profile)
+    prompt_job_for_spec(
+        parse_job(manifest), profile=from_profile if profile is None else profile
+    )
     return manifest
+
+
+def _corpus_base_profile(
+    *, task_id, from_profile, model, model_revision, model_architecture,
+    prompt_encoding, renderer_id, prompt_source,
+):
+    """The profile a corpus job's contract is built from: the named template, or
+    one composed from the model, the ``corpus-v1`` run policy and the catalog."""
+    from reliquary.protocol.composition import RUN_POLICIES, ModelSpec, compose_profile
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_id import normalise_task_id
+    from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
+
+    if from_profile is not None:
+        if prompt_encoding is not None:
+            raise ValueError(
+                "--prompt-encoding has no effect with --from-profile: the template's "
+                "encoding is kept; omit --from-profile to compose the contract"
+            )
+        return resolve_protocol_profile(from_profile)
+    if prompt_encoding is None:
+        prompt_encoding = (
+            "chat_template" if renderer_id in CHAT_TEMPLATE_RENDERERS else "raw"
+        )
+    # No environment overrides: two jobs on one source must carry one body to merge.
+    return compose_profile(
+        profile_id=normalise_task_id(task_id),
+        model=ModelSpec(model, model_revision, model_architecture, prompt_encoding),
+        run=RUN_POLICIES["corpus-v1"],
+        environments=[prompt_source],
+    )
 
 
 @jobs_app.command("create")
@@ -888,11 +922,21 @@ def jobs_create(
         ..., "--checkpoint-sha256", help="64 lowercase hex characters"
     ),
     from_profile: str = typer.Option(
-        ..., "--from-profile", help="Template to seed the contract from"
+        None,
+        "--from-profile",
+        help="Legacy: seed the contract from a compiled template. Omit to compose "
+        "it from the model flags, the corpus-v1 run policy and the catalog",
+    ),
+    prompt_encoding: str = typer.Option(
+        None,
+        "--prompt-encoding",
+        help="Composing: raw or chat_template; defaults to chat_template for a "
+        "chat-template renderer, raw otherwise",
     ),
     prompt_source: str = typer.Option(
         ...,
         "--prompt-source",
+        "--env",
         help="The installed environment the job draws prompts from; it becomes "
         "the contract's single environment",
     ),
@@ -909,7 +953,7 @@ def jobs_create(
     max_new_tokens: int = typer.Option(
         None,
         "--max-new-tokens",
-        help="Omit to take the budget the template gives this prompt source",
+        help="Omit to take the budget the template (or the catalog) gives this prompt source",
     ),
     cap: float = typer.Option(
         ..., "--cap", help="The task's share of the pool; also its pinned price"
@@ -1008,12 +1052,16 @@ def jobs_create(
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
     }
     try:
+        base = _corpus_base_profile(
+            task_id=task_id or job_id, from_profile=from_profile, model=model,
+            model_revision=model_revision, model_architecture=model_architecture,
+            prompt_encoding=prompt_encoding, renderer_id=renderer_id,
+            prompt_source=prompt_source,
+        )
         if max_new_tokens is None:
-            # The template budgets each environment for its model, and the RL
-            # task on the same source generates to that length already.
-            from reliquary.protocol.profiles import resolve_protocol_profile
-
-            environments = resolve_protocol_profile(from_profile).environments
+            # The template or catalog budgets each environment; the length stays
+            # a manifest field, so the contract body is not overridden.
+            environments = base.environments
             if prompt_source not in environments:
                 raise ValueError(
                     f"template {from_profile!r} does not declare {prompt_source!r}; "
@@ -1032,9 +1080,9 @@ def jobs_create(
             prompt_source=prompt_source,
             prompt_count=prompt_count,
             renderer_id=renderer_id,
-            # The same template the entry's contract is built from, so the
-            # manifest is checked against the contract this command declares.
-            from_profile=from_profile,
+            # The profile the entry's contract is built from, so the manifest is
+            # checked against the contract this command declares.
+            profile=base,
             eos_token_id=eos_token_id,
             slots_per_prompt=slots_per_prompt,
             temperature=temperature,
@@ -1051,7 +1099,7 @@ def jobs_create(
         entry = build_corpus_task_entry(
             task_id=task_id or job_id,
             job_id=job_id,
-            from_profile=from_profile,
+            base=base,
             model_id=model,
             model_revision=model_revision,
             model_architecture=model_architecture,
