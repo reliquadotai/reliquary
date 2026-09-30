@@ -29,7 +29,7 @@ from typing import Any, NamedTuple, Protocol
 
 from fastapi import APIRouter, HTTPException
 
-from reliquary.corpus.admission import Verdict, admit
+from reliquary.corpus.admission import Verdict, admit, out_of_range_detail
 from reliquary.corpus.checks import CheckResult, completion_digest
 from reliquary.corpus.job import JobError, JobSpec
 from reliquary.corpus.slots import SlotLedger
@@ -272,12 +272,17 @@ class SingleTurnPromptRenderer:
 
 
 def _owned_position(job: JobSpec, prompt_index: int) -> int:
-    """The index, or a refusal naming the job's own bound."""
+    """The SOURCE index, or a refusal naming the job's own bounds. The index is
+    already a row of the source: a job starting at S owns rows [S, S+N)."""
     position = int(prompt_index)
-    if position < 0 or position >= job.prompt_count:
+    if not job.owns(position):
+        owned = (
+            f"owns source rows [{job.prompt_start}, {job.prompt_end})"
+            if job.prompt_start
+            else f"has {job.prompt_count} prompts"
+        )
         raise CorpusPromptSourceError(
-            f"job {job.job_id!r} has {job.prompt_count} prompts; "
-            f"{position} is outside it"
+            f"job {job.job_id!r} {owned}; {position} is outside it"
         )
     return position
 
@@ -449,10 +454,12 @@ def prompt_job_for_spec(
             f"prompt source {job.prompt_source!r} could not be built for job "
             f"{job.job_id!r}: {type(exc).__name__}: {exc}"
         ) from exc
-    if rows < job.prompt_count:
+    if rows < job.prompt_end:
         raise CorpusPromptSourceError(
-            f"job {job.job_id!r} claims {job.prompt_count} prompts but "
-            f"{job.prompt_source!r} has {rows}"
+            f"job {job.job_id!r} claims {job.prompt_count} prompts"
+            + (f" from row {job.prompt_start} (through row {job.prompt_end})"
+               if job.prompt_start else "")
+            + f" but {job.prompt_source!r} has {rows}"
         )
     if getattr(spec, "interaction_mode", None) == "episode":
         return EnvironmentPromptJob(job, environment)
@@ -610,7 +617,10 @@ def rebuild_ledgers(job: JobSpec, snapshot: Any) -> LedgerState:
         )
     try:
         slots = SlotLedger.from_snapshot(
-            job.prompt_count, job.slots_per_prompt, snapshot.get("slots") or {}
+            job.prompt_count,
+            job.slots_per_prompt,
+            snapshot.get("slots") or {},
+            prompt_start=job.prompt_start,
         )
         cursors = CursorLedger.from_snapshot(snapshot.get("cursors") or {})
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
@@ -1200,10 +1210,11 @@ def build_corpus_router(
         # `free` job this is the bound `admit` applies, reached earlier; on
         # `miner_walk` `admit` compares against `walk_index` instead, which is
         # a stricter rule inside this one.
-        if request.prompt_index >= job.prompt_count:
+        # The index is a SOURCE index: a job starting at S owns [S, S+N).
+        if not job.owns(request.prompt_index):
             return _refuse(
                 CorpusRejectReason.PROMPT_MISMATCH,
-                {"prompt_count": job.prompt_count, "got": request.prompt_index},
+                out_of_range_detail(job, request.prompt_index),
             )
         try:
             fidelity = await prompt_fidelity(
