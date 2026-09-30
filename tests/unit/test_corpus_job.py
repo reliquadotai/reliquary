@@ -214,3 +214,62 @@ def test_a_job_whose_token_cap_exceeds_the_wire_is_refused():
         "temperature": 1.0, "top_p": 1.0, "top_k": 0,
         "min_new_tokens": 2, "max_new_tokens": MAX_COMPLETION_TOKENS, "n": 1,
     })).sampling.max_new_tokens == MAX_COMPLETION_TOKENS
+
+
+# --------------------------------------------------------------------------
+# prompt_start: the job owns source rows [prompt_start, prompt_start + count)
+# --------------------------------------------------------------------------
+
+_LIVE_MANIFEST = (
+    __import__("pathlib").Path(__file__).parents[1]
+    / "fixtures" / "corpus_job_manifest_code_v1.json"
+)
+# The sha256 of the stored bytes of the fixture, taken before `prompt_start`
+# existed. A manifest that never set it must keep hashing to this.
+_LIVE_MANIFEST_SHA256 = "254c99ee6eedeaa57562706ce5e7b1f2e788743137b0163beb78fa102366758d"
+
+
+def test_a_manifest_without_prompt_start_starts_at_zero():
+    job = parse_job(_raw())
+    assert job.prompt_start == 0
+    assert "prompt_start" not in job.to_contract()
+
+
+def test_a_manifest_that_predates_prompt_start_stores_byte_identically():
+    import hashlib
+    import json
+
+    from reliquary.infrastructure.corpus_job_store import _encode
+
+    raw = json.loads(_LIVE_MANIFEST.read_text())
+    stored = _encode(parse_job(raw).to_contract())
+    assert stored == _encode(raw)
+    assert hashlib.sha256(stored).hexdigest() == _LIVE_MANIFEST_SHA256
+
+
+def test_an_explicit_zero_start_is_not_written_back():
+    # One serialisation per job: S=0 written or not must hash the same.
+    assert parse_job(_raw(prompt_start=0)).to_contract() == parse_job(_raw()).to_contract()
+
+
+def test_a_positive_start_round_trips():
+    job = parse_job(_raw(prompt_start=5000, prompt_count=1000))
+    assert job.prompt_start == 5000
+    assert job.prompt_end == 6000
+    contract = job.to_contract()
+    assert contract["prompt_start"] == 5000
+    assert parse_job(contract) == job
+    # The job is still sized by what it owns, not by where it starts.
+    assert job.total_slots == 1000 * 8
+
+
+def test_a_job_owns_exactly_its_range():
+    job = parse_job(_raw(prompt_start=100, prompt_count=10))
+    assert [i for i in range(90, 120) if job.owns(i)] == list(range(100, 110))
+    assert parse_job(_raw(prompt_count=10)).owns(0)
+
+
+@pytest.mark.parametrize("start", [-1, 1.0, True, "5", None])
+def test_an_unusable_start_is_refused(start):
+    with pytest.raises(JobError, match="prompt_start"):
+        parse_job(_raw(prompt_start=start))

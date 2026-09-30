@@ -29,6 +29,17 @@ def walk_index(job_id: str, hotkey: str, cursor: int, prompt_count: int) -> int:
     return int.from_bytes(digest.digest(), "big") % int(prompt_count)
 
 
+def job_walk_index(job, hotkey: str, cursor: int) -> int:
+    """The SOURCE row this miner's walk visits at ``cursor`` for ``job``.
+
+    The walk itself ranges over [0, prompt_count); the job owns rows from its
+    ``prompt_start``, so the shift makes this the index the miner renders, the
+    route checks and the slot ledger keys by. At a start of 0 it is the plain
+    walk, so existing jobs visit the same rows in the same order.
+    """
+    return job.prompt_start + walk_index(job.job_id, hotkey, cursor, job.prompt_count)
+
+
 class CursorLedger:
     """Where each miner is in its walk.
 

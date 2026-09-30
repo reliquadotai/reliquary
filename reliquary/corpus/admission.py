@@ -21,7 +21,7 @@ from reliquary.corpus.checks import (
 )
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobSpec
 from reliquary.corpus.slots import SlotLedger
-from reliquary.corpus.walk import CursorLedger, walk_index
+from reliquary.corpus.walk import CursorLedger, job_walk_index
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,19 +93,15 @@ def admit(
                 "bad_cursor",
                 detail={"expected": expected_cursor, "got": cursor},
             )
-        expected_index = walk_index(job.job_id, hotkey, cursor, job.prompt_count)
+        expected_index = job_walk_index(job, hotkey, cursor)
         if prompt_index != expected_index:
             return Verdict(
                 False,
                 "prompt_mismatch",
                 detail={"expected": expected_index, "got": prompt_index},
             )
-    elif prompt_index < 0 or prompt_index >= job.prompt_count:
-        return Verdict(
-            False,
-            "prompt_mismatch",
-            detail={"prompt_count": job.prompt_count, "got": prompt_index},
-        )
+    elif not job.owns(prompt_index):
+        return Verdict(False, "prompt_mismatch", detail=out_of_range_detail(job, prompt_index))
 
     # Callables, not results: a junk submission is refused on its first failing
     # check rather than walked once per check.
@@ -147,6 +143,15 @@ def admit(
     remaining = slots.consume(prompt_index)
     _advance(job, cursors, hotkey)
     return Verdict(True, "accepted", slots_remaining=remaining)
+
+
+def out_of_range_detail(job: JobSpec, prompt_index: int) -> dict[str, int]:
+    """What a ``prompt_mismatch`` for an index outside the job names. The start
+    appears only when it is set, so a job at 0 answers exactly as before."""
+    detail = {"prompt_count": job.prompt_count, "got": prompt_index}
+    if job.prompt_start:
+        detail = {"prompt_start": job.prompt_start, **detail}
+    return detail
 
 
 def _advance(job: JobSpec, cursors: CursorLedger, hotkey: str) -> None:
