@@ -195,23 +195,37 @@ def legacy_task_config() -> TaskConfig:
     )
 
 
+# What one loaded model and one auditor impose on every corpus job it serves:
+# the checkpoint, the architecture it is loaded as, and the proof it is audited
+# with. Everything else a corpus job reads is its manifest's or its own
+# environment's (see `merge_corpus_contracts`).
+CORPUS_SHARED_CONTRACT_FIELDS = ("model_id", "model_revision", "model_architecture", "proofs")
+
+
 def merge_corpus_contracts(contracts: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """One contract a process can run for several corpus tasks at once.
 
-    Each corpus contract is its template narrowed to one environment, so the
-    merge is the union of the environments; every other field (model, proofs,
-    sampling, ...) must already agree, or one process cannot serve them all.
+    The corpus path reads from the process contract only the model, the proofs
+    and each environment's own definition (its prompt template renders that
+    source's rows); sampling, lengths and the renderer come from each job's
+    manifest. So: the shared fields must agree, the environments are unioned
+    (one environment declared two ways refuses), and the remaining fields are
+    taken from the first task id in sorted order, whatever order is given. The
+    one of those the corpus path does read, ``protocol_version`` (openmathinstruct's
+    row set), must gate every environment the same way as each task's own.
     """
-    items = list(contracts.items())
+    from reliquary.constants import PROTOCOL_GATED_PROMPT_SOURCES
+
+    items = sorted(contracts.items())
     first_task, first = items[0]
     environments: dict[str, Any] = {}
     owner: dict[str, str] = {}
     for task_id, contract in items:
-        for key in sorted(set(first) | set(contract)):
-            if key != "environments" and first.get(key) != contract.get(key):
+        for key in CORPUS_SHARED_CONTRACT_FIELDS:
+            if first.get(key) != contract.get(key):
                 raise ValueError(
                     f"tasks {first_task!r} and {task_id!r} carry different {key!r}; "
-                    "one process can only serve contracts that differ in their environments"
+                    "one process loads one model and audits with one proof"
                 )
         for name, body in (contract.get("environments") or {}).items():
             if name in environments and environments[name] != body:
@@ -220,7 +234,21 @@ def merge_corpus_contracts(contracts: Mapping[str, Mapping[str, Any]]) -> dict[s
                 )
             environments.setdefault(name, body)
             owner.setdefault(name, task_id)
-    return {**first, "environments": environments}
+    merged = {**first, "environments": environments}
+    if len({contract.get("profile_id") for _, contract in items}) > 1:
+        merged["profile_id"] = "+".join(task_id for task_id, _ in items)
+    for task_id, contract in items:
+        for name in contract.get("environments") or ():
+            gate = PROTOCOL_GATED_PROMPT_SOURCES.get(name)
+            if gate is not None and gate(contract["protocol_version"]) != gate(
+                merged["protocol_version"]
+            ):
+                raise ValueError(
+                    f"task {task_id!r} reads {name!r} under protocol version "
+                    f"{contract['protocol_version']}, whose rows differ from those under "
+                    f"{merged['protocol_version']} (task {first_task!r})"
+                )
+    return merged
 
 
 def resolve_corpus_task_configs(
@@ -232,9 +260,10 @@ def resolve_corpus_task_configs(
 ) -> list[TaskConfig]:
     """Each corpus task one process serves, in ``task_ids`` order, or a refusal.
 
-    Every entry is resolved against its own carried contract, and that contract
-    must be exactly this process's contract narrowed to its environments: the
-    process renders and proves with ONE contract, the merge of all of them.
+    Every entry is resolved against its own carried contract (its own digest,
+    architecture and environments), and this process must run exactly the
+    merge of those contracts (`merge_corpus_contracts`): it renders and proves
+    with that one contract for every job.
     """
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
 
@@ -252,26 +281,26 @@ def resolve_corpus_task_configs(
                 f"task {task_id!r} carries no contract; a corpus validator serving several "
                 "tasks needs each one's contract to check it against the one it runs"
             )
-        contract = entry.contract if entry is not None else generation_contract
-        config = resolve_task_config(
-            entries, task_id, profile_id=profile_id, generation_contract=contract
+        configs.append(resolve_task_config(
+            entries, task_id,
+            profile_id=entry.profile_id if entry is not None else profile_id,
+            generation_contract=entry.contract if entry is not None else generation_contract,
+        ))
+    remedy = (
+        "start it with RELIQUARY_TASK_CONTRACT from `reliquary tasks contract "
+        f"--task-id {' --task-id '.join(task_ids)}`"
+    )
+    try:
+        merged = merge_corpus_contracts({c.task_id: c.entry.contract for c in configs})
+    except ValueError as exc:
+        raise TaskConfigError(f"{exc}; these tasks cannot share one validator") from exc
+    if canonical_sha256(merged) != canonical_sha256(generation_contract):
+        differing = sorted(
+            key for key in set(merged) | set(generation_contract)
+            if merged.get(key) != generation_contract.get(key)
         )
-        narrowed = {
-            **generation_contract,
-            "environments": {
-                name: (generation_contract.get("environments") or {}).get(name)
-                for name in (contract.get("environments") or {})
-            },
-        }
-        if canonical_sha256(narrowed) != canonical_sha256(contract):
-            differing = sorted(
-                key for key in set(narrowed) | set(contract)
-                if narrowed.get(key) != contract.get(key)
-            )
-            raise TaskConfigError(
-                f"task {task_id!r}'s contract differs from the one this process runs in "
-                f"{differing}; start it with RELIQUARY_TASK_CONTRACT from `reliquary tasks "
-                f"contract --task-id {' --task-id '.join(task_ids)}`"
-            )
-        configs.append(config)
+        raise TaskConfigError(
+            f"this process runs {profile_id!r}, whose contract differs from the merge of "
+            f"{list(task_ids)} in {differing}; {remedy}"
+        )
     return configs

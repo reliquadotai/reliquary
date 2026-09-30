@@ -420,9 +420,12 @@ other job's records are audited).
 
 1. **Declare two jobs on the same checkpoint** (§2), each under its own task:
    same `--model`, `--model-revision`, `--checkpoint-sha256` and
-   `--from-profile`; distinct `--job-id` and `--task-id`; one `--prompt-source`
-   each. Each task keeps its own cap, and all caps together (the RL task's
-   included) must still sum to at most 1.0 (§1.3):
+   `--model-architecture`; distinct `--job-id` and `--task-id`; one
+   `--prompt-source` each. `--from-profile` may differ: take for each job a
+   template that declares its source (e.g. `qwen3-4b-base-dapo-reliquary-v1`
+   for `openmathinstruct`, `teutonic-9b-reliquary-suite-v9-dev1` for
+   `reliquary_code_v1`). Each task keeps its own cap, and all caps together
+   (the RL task's included) must still sum to at most 1.0 (§1.3):
 
    ```bash
    reliquary jobs create --job-id <math-job> --task-id corpus-math \
@@ -433,13 +436,25 @@ other job's records are audited).
    ```
 
 2. **One merged contract.** Each task carries its template narrowed to its own
-   source; the process runs their union. `tasks contract` with several ids
-   prints it, and refuses tasks whose contracts differ in anything but their
-   environments (model, proofs, sampling):
+   source; the process runs their merge, which `tasks contract` with several
+   ids prints (the order of the ids does not matter):
 
    ```bash
    reliquary tasks contract --task-id corpus-math --task-id corpus-code > corpus-math-code.contract.json
    ```
+
+   The rule follows what the corpus path reads. From the process contract it
+   reads only the model, the toploc proof and, per environment, that
+   environment's definition (its prompt template renders the source's rows).
+   Sampling, lengths, the EOS and the renderer come from each job's manifest;
+   `prompt_encoding` is never read (the job's `renderer_id` decides the
+   encoding). So the merge refuses tasks whose `model_id`, `model_revision`,
+   `model_architecture` or `proofs` differ, and one environment declared two
+   ways. The environments are unioned; the other fields (`profile_id` becomes
+   `<task>+<task>`, `protocol_version`, `prompt_encoding`, `sampling`, ...)
+   come from the first task id in sorted order, except that a source whose
+   rows depend on the protocol version (`openmathinstruct`: train shards only
+   from v4) must get the same rows under the merge as under its own task.
 
 3. **Start one validator with both ids:**
 
@@ -451,8 +466,9 @@ other job's records are audited).
    ```
 
    It refuses to start (exit 4, before any download) if an id is not an active
-   `corpus-generation` task (never mix in an RL task), if a task's contract is
-   not the merged contract narrowed to its source, if the jobs name different
+   `corpus-generation` task (never mix in an RL task), if the contract it runs
+   is not the merge of the tasks' contracts, if a job's source is declared
+   differently there than in its own task, if the jobs name different
    checkpoints (repo, revision or sha256), if their toploc proofs differ, or if
    two tasks name the same job. `RELIQUARY_TASK_ID` is also the list of archive
    prefixes the settler may write under.

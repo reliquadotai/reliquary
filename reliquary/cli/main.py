@@ -576,6 +576,7 @@ def tasks_contract(
     import json
 
     from reliquary.infrastructure.task_registry_store import read_registry
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
     from reliquary.validator.task_config import merge_corpus_contracts
 
     entries, _ = asyncio.run(read_registry(strict=False))
@@ -588,6 +589,13 @@ def tasks_contract(
         if entry.contract is None:
             typer.echo(
                 f"error: task {task_id!r} is a legacy entry and carries no contract",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if len(task_ids) > 1 and entry.mechanism != MECHANISM_CORPUS_GENERATION:
+            typer.echo(
+                f"error: task {task_id!r} is {entry.mechanism!r}; only corpus tasks "
+                "share one validator's contract",
                 err=True,
             )
             raise typer.Exit(code=1)

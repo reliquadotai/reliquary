@@ -8,6 +8,7 @@ when told to (the RL validator's setter already pays every task).
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
 import re
@@ -52,14 +53,36 @@ def _contract_toploc(entry):
     return toploc_proof(profile_from_contract(contract))
 
 
-def multi_job_refusal(pairs, *, proof_of=_contract_toploc) -> str | None:
+def _entry_profile(entry):
+    """The profile an entry's own carried contract describes."""
+    from reliquary.protocol.profiles import profile_from_contract
+
+    return profile_from_contract(entry.contract)
+
+
+def multi_job_refusal(pairs, *, proof_of=_contract_toploc,
+                      process_contract=None) -> str | None:
     """Why several ``(entry, job)`` pairs cannot share one loaded model, or None.
 
     One process audits every job with one checkpoint and one toploc proof, so
     the jobs must name the same checkpoint and the entries the same proof; two
-    tasks naming one job would pay the same records twice.
+    tasks naming one job would pay the same records twice. The environment a
+    job draws from renders its rows through the process contract, so there it
+    must be exactly the one the job's own task declares.
     """
     first_entry, first_job = pairs[0]
+    if process_contract is not None:
+        served = process_contract.get("environments") or {}
+        for entry, job in pairs:
+            own = ((getattr(entry, "contract", None) or {}).get("environments") or {}).get(
+                job.prompt_source
+            )
+            if own is None or served.get(job.prompt_source) != own:
+                return (
+                    f"task {entry.task_id!r}'s contract declares prompt source "
+                    f"{job.prompt_source!r} differently from the contract this process runs; "
+                    "start it with the merged contract of `reliquary tasks contract`"
+                )
     seen: dict[str, str] = {}
     for entry, job in pairs:
         if job.job_id in seen:
@@ -236,7 +259,9 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         str(served.entry.job_id): build_corpus_router(
             job_id=str(served.entry.job_id), store=store, tokenizer=tokenizer,
             renderer=served.renderer, verify_signature=verify_signature,
-            prompt_job_for=prompt_job_for or prompt_job_for_spec, records=records,
+            prompt_job_for=(getattr(served, "prompt_job_for", None) or prompt_job_for
+                            or prompt_job_for_spec),
+            records=records,
             on_accepted=served.auditor.enqueue, proof_chunk_tokens=proof_chunk_tokens,
             vocab_size=vocab_size, is_banned=served.is_banned, registration=registration,
             seen_index=getattr(served, "seen_index", None),
@@ -290,7 +315,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.protocol.signatures import verify_corpus_signature
     from reliquary.shared.modeling import load_text_only_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
-    from reliquary.validator.corpus_service import renderer_for_job
+    from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
@@ -309,6 +334,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     from reliquary.validator.corpus_service import migrate_ledgers_at_startup
 
+    several = len(served) > 1
     wiring = []
     for task_entry, task_cap in served:
         job, _ = await store.read_job(str(task_entry.job_id))
@@ -319,9 +345,13 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # Before anything serves: the route would otherwise seal a v1 seen set
         # inside its first submission's ledger turn. One ledger, one index, per job.
         seen_index = await migrate_ledgers_at_startup(store, job)
+        # With several jobs the process runs their merged contract; each job's
+        # renderer is still checked against its OWN task's contract.
+        own_profile = (_entry_profile(task_entry)
+                       if several and task_entry.contract is not None else None)
         try:
             renderer = renderer_for_job(
-                job, encode, tokenizer=lambda: tokenizer_box["tokenizer"]
+                job, encode, tokenizer=lambda: tokenizer_box["tokenizer"], profile=own_profile
             )
         except ValueError as exc:
             # `CorpusPromptSourceError` (an unbuildable/mismatched prompt source)
@@ -333,11 +363,19 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 f"job {job.job_id!r} declares renderer {job.renderer_id!r} for "
                 f"prompt source {job.prompt_source!r}, which cannot be built: {exc}"
             ) from exc
-        wiring.append(SimpleNamespace(entry=task_entry, cap=task_cap, job=job, renderer=renderer,
-                                      seen_index=seen_index))
+        wiring.append(SimpleNamespace(
+            entry=task_entry, cap=task_cap, job=job, renderer=renderer, seen_index=seen_index,
+            prompt_job_for=(functools.partial(prompt_job_for_spec, profile=own_profile)
+                            if own_profile is not None else None),
+        ))
 
-    if len(wiring) > 1:
-        refusal = multi_job_refusal([(w.entry, w.job) for w in wiring])
+    if several:
+        # The CLI refuses a contract-less entry among several ids before this.
+        carried = all(w.entry.contract is not None for w in wiring)
+        refusal = multi_job_refusal(
+            [(w.entry, w.job) for w in wiring],
+            process_contract=ACTIVE_PROTOCOL_PROFILE.to_generation_contract() if carried else None,
+        )
         if refusal:
             raise RuntimeError(refusal)
 

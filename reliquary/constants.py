@@ -301,7 +301,15 @@ if ACTIVE_PROTOCOL_PROFILE.prompt_encoding not in ("raw", "chat_template"):
 # duplicates 8,000,000 rows (36.4% of the index space) and draws the curated
 # rows 2-4x too often. Changing this changes len(env), which is prompt-range
 # consensus, so it is only safe at a profile cutover.
-OMI_TRAIN_SHARDS_ONLY = PROTOCOL_VERSION >= 4
+def omi_train_shards_only(protocol_version: int) -> bool:
+    return int(protocol_version) >= 4
+
+
+OMI_TRAIN_SHARDS_ONLY = omi_train_shards_only(PROTOCOL_VERSION)
+
+# Prompt sources whose rows depend on the process's protocol version, so a
+# process serving several corpus jobs must answer each gate as every job would.
+PROTOCOL_GATED_PROMPT_SOURCES = {"openmathinstruct": omi_train_shards_only}
 
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
 # Under-thinking side: a non-forced rollout that finished early
