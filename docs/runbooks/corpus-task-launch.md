@@ -215,6 +215,23 @@ reliquary jobs create \
   must carry the same body to share a validator (§3.2).
 - `--prompt-count` is checked against the source's own length, which builds the
   source: a dataset-backed one must be readable from this machine.
+- `--prompt-start S` (default 0) makes the job own source rows
+  `[S, S+N)` instead of `[0, N)`; `S+N` past the source's length is refused
+  here. Use it to keep a corpus job (SFT data) off the rows an RL task or
+  another job trains or evaluates on: same source, disjoint ranges, so no
+  prompt is both distilled and rewarded. Every prompt index is a SOURCE
+  index: the walk visits `S + walk(N)`, the submission's `prompt_index`,
+  the fidelity render, the slot ledger and the export row all carry that
+  row number, and the route refuses an index outside the range with
+  `prompt_mismatch`. The field is written to the manifest only when `S > 0`,
+  so jobs declared without it are byte-identical to before; binaries older
+  than this field refuse a manifest carrying it (unknown field), so miners
+  and validators of such a job need this build. A corpus validator on an
+  older image serving several jobs refuses to boot, for ALL of them, as soon
+  as one manifest carries it: redeploy the corpus validator on this build
+  before declaring the first job with `S > 0`. Disjointness is not checked
+  for you: pick ranges that do not overlap other jobs or the rows an RL task
+  uses on the same source.
 - `--eos-token-id` is the id the miner's vLLM stops on and the route judges
   termination against (151643 for Qwen3-4B-Base).
 - `--max-new-tokens` is omitted on purpose: the job then takes the catalog's

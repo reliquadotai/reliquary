@@ -122,7 +122,8 @@ class _FakeEpisodeSpec:
         raise AssertionError("an episode-mode source must never be built to grade text")
 
 
-def _job_spec(*, job_id="math-v1", prompt_source="fake-env", filter_=None, prompt_count=10):
+def _job_spec(*, job_id="math-v1", prompt_source="fake-env", filter_=None, prompt_count=10,
+              prompt_start=0):
     from reliquary.corpus.job import JobSpec, Sampling
 
     return JobSpec(
@@ -141,6 +142,7 @@ def _job_spec(*, job_id="math-v1", prompt_source="fake-env", filter_=None, promp
         filter=filter_,
         prompt_order="free",
         deadline_round=None,
+        prompt_start=prompt_start,
     )
 
 
@@ -327,3 +329,43 @@ def test_jobs_export_mid_stream_failure_leaves_no_file_or_temp_file_behind(
     assert result.exit_code != 0
     assert not out.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_jobs_export_of_a_started_job_carries_and_grades_source_indices(
+    jobs, records, env_specs, tmp_path
+):
+    """Export, like the route, speaks source indices: the row's prompt_index is
+    the one the miner rendered, and the grader is asked about that row."""
+    from reliquary.corpus.job import Filter
+
+    asked = []
+    grade_row = _FakeEnvironment.get_problem
+
+    def get_problem(self, index):
+        asked.append(index)
+        return grade_row(self, index)
+
+    env_specs["fake-env"] = _FakeSpec()
+    _FakeEnvironment.get_problem = get_problem
+    try:
+        jobs["math-v1"] = _job_spec(
+            prompt_start=500, filter_=Filter(grader_id="fake-grader", threshold=0.5)
+        )
+        records.subs = {
+            "1" * 64: {"hotkey": "A", "prompt_index": 503, "rendered_prompt": "q503",
+                       "completions": [{"text": "yes", "tokens": [1]}]},
+        }
+        records.verdicts = {"1" * 64: {"passed": True}}
+        out = tmp_path / "dataset.jsonl"
+        result = CliRunner().invoke(
+            app, ["jobs", "export", "math-v1", "--out", str(out), "--apply-filter"]
+        )
+    finally:
+        _FakeEnvironment.get_problem = grade_row
+
+    assert result.exit_code == 0, result.output
+    rows = _read_lines(out)
+    assert [(r["prompt_index"], r["prompt"], r["accepted"]) for r in rows] == [
+        (503, "q503", True)
+    ]
+    assert asked == [503]

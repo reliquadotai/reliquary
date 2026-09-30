@@ -14,15 +14,27 @@ class SlotExhausted(Exception):
 
 
 class SlotLedger:
-    """V slots per prompt, consumed permanently. There is no timer."""
+    """V slots per prompt, consumed permanently. There is no timer.
 
-    __slots__ = ("_prompt_count", "_slots_per_prompt", "_consumed", "_filled")
+    Keyed by SOURCE index, over [prompt_start, prompt_start + prompt_count), so
+    a snapshot of a job that starts at 0 is the same whether or not the job
+    could have started elsewhere.
+    """
 
-    def __init__(self, prompt_count: int, slots_per_prompt: int) -> None:
+    __slots__ = (
+        "_prompt_start", "_prompt_count", "_slots_per_prompt", "_consumed", "_filled",
+    )
+
+    def __init__(
+        self, prompt_count: int, slots_per_prompt: int, *, prompt_start: int = 0
+    ) -> None:
         if prompt_count <= 0:
             raise ValueError(f"prompt_count must be positive, got {prompt_count}")
         if slots_per_prompt <= 0:
             raise ValueError(f"slots_per_prompt must be positive, got {slots_per_prompt}")
+        if prompt_start < 0:
+            raise ValueError(f"prompt_start must not be negative, got {prompt_start}")
+        self._prompt_start = int(prompt_start)
         self._prompt_count = int(prompt_count)
         self._slots_per_prompt = int(slots_per_prompt)
         self._consumed: dict[int, int] = {}
@@ -30,11 +42,20 @@ class SlotLedger:
 
     def _check(self, index: int) -> int:
         position = int(index)
-        if position < 0 or position >= self._prompt_count:
+        if not self._owns(position):
             raise IndexError(
-                f"prompt index {position} is outside a source of {self._prompt_count}"
+                f"prompt index {position} is outside {self._range()}"
             )
         return position
+
+    def _owns(self, position: int) -> bool:
+        return self._prompt_start <= position < self._prompt_start + self._prompt_count
+
+    def _range(self) -> str:
+        if self._prompt_start == 0:
+            return f"a source of {self._prompt_count}"
+        end = self._prompt_start + self._prompt_count
+        return f"the job's rows [{self._prompt_start}, {end})"
 
     def remaining(self, index: int) -> int:
         position = self._check(index)
@@ -75,14 +96,16 @@ class SlotLedger:
         prompt_count: int,
         slots_per_prompt: int,
         snapshot: Mapping[int, int],
+        *,
+        prompt_start: int = 0,
     ) -> "SlotLedger":
-        ledger = cls(prompt_count, slots_per_prompt)
+        ledger = cls(prompt_count, slots_per_prompt, prompt_start=prompt_start)
         filled = 0
         for index, taken in snapshot.items():
             position = int(index)
-            if position < 0 or position >= prompt_count:
+            if not ledger._owns(position):
                 raise ValueError(
-                    f"snapshot names prompt {position}, outside a source of {prompt_count}"
+                    f"snapshot names prompt {position}, outside {ledger._range()}"
                 )
             count = int(taken)
             if count <= 0 or count > slots_per_prompt:

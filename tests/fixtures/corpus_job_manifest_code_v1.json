@@ -1,0 +1,16 @@
+{
+ "checkpoint_repo": "Qwen/Qwen3.8-27B",
+ "checkpoint_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+ "checkpoint_sha256": "5b1e0c2a7d9f43e8a6b0c1d2e3f405162738495a6b7c8d9e0f1a2b3c4d5e6f70",
+ "deadline_round": null,
+ "eos_token_id": 248046,
+ "filter": {"grader_id": "reliquary_code_v1", "threshold": 1.0},
+ "job_id": "code-qwen38-27b-v1",
+ "prompt_count": 20000,
+ "prompt_order": "miner_walk",
+ "prompt_source": "reliquary_code_v1",
+ "renderer_id": "chat-template-v1",
+ "sampling": {"max_new_tokens": 8192, "min_new_tokens": 2, "n": 4, "temperature": 1.0, "top_k": 0, "top_p": 1.0},
+ "schema": "reliquary/corpus-job/v1",
+ "slots_per_prompt": 4
+}

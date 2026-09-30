@@ -81,3 +81,39 @@ def test_a_cursor_that_is_not_a_whole_number_is_refused_not_rounded(cursor):
     binary cannot read exactly is named rather than coerced."""
     with pytest.raises(ValueError):
         CursorLedger.from_snapshot({"5Gx": cursor})
+
+
+def _job(prompt_start, prompt_count, job_id="math-v1"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(job_id=job_id, prompt_start=prompt_start, prompt_count=prompt_count)
+
+
+def test_a_job_walk_is_the_plain_walk_shifted_by_its_start():
+    from reliquary.corpus.walk import job_walk_index
+
+    for start in (0, 1, 5000, 1 << 31):
+        job = _job(start, 97)
+        for cursor in range(2000):
+            index = job_walk_index(job, "5Gx", cursor)
+            assert index == start + walk_index("math-v1", "5Gx", cursor, 97)
+            assert start <= index < start + 97
+
+
+def test_a_job_walk_covers_its_range_and_nothing_else():
+    from reliquary.corpus.walk import job_walk_index
+
+    job = _job(300, 50)
+    seen = {job_walk_index(job, "5Gx", cursor) for cursor in range(2000)}
+    # Shifting is a bijection [0, N) -> [S, S+N): what the plain walk reaches,
+    # the job walk reaches exactly once shifted, and it reaches all of it.
+    assert seen == set(range(300, 350))
+
+
+def test_a_job_walk_at_zero_start_is_unchanged():
+    from reliquary.corpus.walk import job_walk_index
+
+    job = _job(0, 1000)
+    assert [job_walk_index(job, "5Gx", c) for c in range(64)] == [
+        walk_index("math-v1", "5Gx", c, 1000) for c in range(64)
+    ]

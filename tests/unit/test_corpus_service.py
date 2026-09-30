@@ -1099,3 +1099,121 @@ def test_a_token_id_outside_the_models_vocabulary_is_refused_before_any_write(se
     assert body["reason"] == "token_out_of_vocab"
     assert seeded_job.ledger_writes() == 0
     assert _submit(client, tokens=[7] * 15 + [vocab - 1, EOS]).json()["accepted"] is True
+
+
+# --------------------------------------------------------------------------
+# prompt_start: every index on the wire is a SOURCE index in [S, S+N)
+# --------------------------------------------------------------------------
+
+RANGE_START, RANGE_COUNT = 500, 100
+
+
+def _range_client(fake_r2, seeded_job, *, prompt_order="free", job_id="range-v1"):
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    raw = _manifest()
+    raw.update(job_id=job_id, prompt_order=prompt_order,
+               prompt_start=RANGE_START, prompt_count=RANGE_COUNT)
+    asyncio.run(job_store.write_job(raw, None, **fake_r2))
+    app = FastAPI()
+    app.include_router(
+        build_corpus_router(
+            job_id=job_id,
+            store=seeded_job.store,
+            tokenizer=_Tokenizer(),
+            renderer=seeded_job.renderer,
+            verify_signature=lambda request: True,
+            prompt_job_for=seeded_job.prompt_job_for,
+        )
+    )
+    client = TestClient(app)
+
+    def post(prompt_index, *, cursor=0, rendered_prompt=None):
+        tokens = [7] * 16 + [EOS]
+        request = CorpusSubmissionRequest(
+            job_id=job_id, miner_hotkey="5Hot", cursor=cursor,
+            prompt_index=prompt_index, checkpoint_sha256=CHECKPOINT,
+            rendered_prompt=(
+                _faithful_prompt(prompt_index) if rendered_prompt is None
+                else rendered_prompt
+            ),
+            completions=[{"tokens": tokens, "text": _text_for(tokens)}],
+            signature="ok",
+        )
+        return client.post("/corpus/submit", json=request.model_dump())
+
+    return post
+
+
+@pytest.mark.parametrize("index", [RANGE_START, RANGE_START + 42, RANGE_START + RANGE_COUNT - 1])
+def test_a_started_job_accepts_a_source_index_in_its_range(fake_r2, seeded_job, index):
+    post = _range_client(fake_r2, seeded_job)
+    body = post(index).json()
+    assert body["accepted"] is True, body
+    # The ledger keys by the source index the miner rendered, not an offset.
+    snapshot, _ = asyncio.run(job_store.read_ledgers("range-v1", **fake_r2))
+    assert snapshot["slots"] == {str(index): 1}
+
+
+@pytest.mark.parametrize("index", [0, 42, RANGE_START - 1, RANGE_START + RANGE_COUNT, 999, 5000])
+def test_a_started_job_refuses_an_index_outside_its_range(fake_r2, seeded_job, index):
+    post = _range_client(fake_r2, seeded_job)
+    before = seeded_job.ledger_writes()
+    response = post(index)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "prompt_mismatch"
+    assert body["detail"] == {
+        "prompt_start": RANGE_START, "prompt_count": RANGE_COUNT, "got": index,
+    }
+    assert seeded_job.ledger_writes() == before
+
+
+def test_a_started_job_checks_fidelity_against_the_source_row(fake_r2, seeded_job):
+    post = _range_client(fake_r2, seeded_job)
+    # The row the walk offset alone would name is not the prompt at that index.
+    body = post(RANGE_START + 3, rendered_prompt=_faithful_prompt(3)).json()
+    assert body["reason"] == "prompt_not_faithful"
+    assert post(RANGE_START + 3).json()["accepted"] is True
+
+
+def test_a_started_walk_job_admits_the_shifted_walk(fake_r2, seeded_job):
+    from reliquary.corpus.walk import walk_index
+
+    post = _range_client(fake_r2, seeded_job, prompt_order="miner_walk", job_id="range-walk-v1")
+    offset = walk_index("range-walk-v1", "5Hot", 0, RANGE_COUNT)
+    unshifted = post(offset).json()
+    assert unshifted["reason"] == "prompt_mismatch"
+    body = post(RANGE_START + offset).json()
+    assert body["accepted"] is True, body
+    snapshot, _ = asyncio.run(job_store.read_ledgers("range-walk-v1", **fake_r2))
+    assert snapshot["slots"] == {str(RANGE_START + offset): 1}
+    assert snapshot["cursors"] == {"5Hot": 1}
+
+
+def test_a_started_job_renders_its_source_rows(seeded_job):
+    from reliquary.validator.corpus_service import (
+        CorpusPromptSourceError,
+        prompt_job_for_spec,
+    )
+
+    raw = {**seeded_job.raw, "prompt_start": RANGE_START, "prompt_count": RANGE_COUNT}
+    prompts = prompt_job_for_spec(parse_job(raw), environments=seeded_job.environments())
+    assert prompts.task_for(RANGE_START + 7).id == f"row-{RANGE_START + 7}"
+    for outside in (7, RANGE_START - 1, RANGE_START + RANGE_COUNT):
+        with pytest.raises(CorpusPromptSourceError):
+            prompts.task_for(outside)
+
+
+def test_a_range_ending_past_the_source_is_refused(seeded_job):
+    from reliquary.validator.corpus_service import (
+        CorpusPromptSourceError,
+        prompt_job_for_spec,
+    )
+
+    fits = {**seeded_job.raw, "prompt_start": 900, "prompt_count": 100}
+    prompt_job_for_spec(parse_job(fits), environments=seeded_job.environments())
+    over = {**seeded_job.raw, "prompt_start": 901, "prompt_count": 100}
+    with pytest.raises(CorpusPromptSourceError, match="1001"):
+        prompt_job_for_spec(parse_job(over), environments=seeded_job.environments())

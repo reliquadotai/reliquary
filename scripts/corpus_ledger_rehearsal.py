@@ -238,7 +238,9 @@ class _Load:
         self.count = self.manifest["prompt_count"]
         self.n = self.manifest["sampling"]["n"]
         self.eos = self.manifest["eos_token_id"]
-        self.walk = lambda hk, c: walk_index(self.job_id, hk, c, self.count)
+        # Source indices, as the route expects: the walk shifted by the start.
+        self.start = self.manifest.get("prompt_start", 0)
+        self.walk = lambda hk, c: self.start + walk_index(self.job_id, hk, c, self.count)
         self.hotkeys = [f"5Rehearsal{args.tag}{i:02d}" for i in range(args.hotkeys)]
         self.log = open(args.log, "a")
         self.accepted: list[dict] = []  # bodies accepted so far, for copies

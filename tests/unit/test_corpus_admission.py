@@ -288,3 +288,41 @@ def test_a_proof_requirement_without_counts_is_malformed():
     verdict = _call(job, slots, cursors, proof_chunk_tokens=32)
     assert (verdict.accepted, verdict.reason) == (False, "malformed_submission")
     assert slots.filled == 0
+
+
+def _started_state(job):
+    return (
+        SlotLedger(job.prompt_count, job.slots_per_prompt, prompt_start=job.prompt_start),
+        CursorLedger(),
+    )
+
+
+def test_a_started_walk_job_expects_the_source_index():
+    job = _job(prompt_start=5000, prompt_count=100)
+    slots, cursors = _started_state(job)
+    expected = 5000 + walk_index(job.job_id, "5Gx", 0, job.prompt_count)
+    # The walk index itself, without the start, is not the prompt it names.
+    wrong = _call(job, slots, cursors, prompt_index=expected - 5000)
+    assert wrong.reason == "prompt_mismatch"
+    assert wrong.detail == {"expected": expected, "got": expected - 5000}
+    verdict = _call(job, slots, cursors, prompt_index=expected)
+    assert verdict.accepted is True
+    assert slots.snapshot() == {expected: 1}
+
+
+@pytest.mark.parametrize("index", [0, 4999, 5100, 10_000])
+def test_a_started_free_job_refuses_outside_its_range(index):
+    job = _job(prompt_start=5000, prompt_count=100, prompt_order=PROMPT_ORDER_FREE)
+    slots, cursors = _started_state(job)
+    verdict = _call(job, slots, cursors, prompt_index=index)
+    assert verdict.accepted is False
+    assert verdict.reason == "prompt_mismatch"
+    assert verdict.detail == {"prompt_start": 5000, "prompt_count": 100, "got": index}
+    assert slots.filled == 0
+
+
+@pytest.mark.parametrize("index", [5000, 5099])
+def test_a_started_free_job_accepts_its_own_range(index):
+    job = _job(prompt_start=5000, prompt_count=100, prompt_order=PROMPT_ORDER_FREE)
+    slots, cursors = _started_state(job)
+    assert _call(job, slots, cursors, prompt_index=index).accepted is True

@@ -71,3 +71,23 @@ def test_a_generated_source_costs_no_memory():
 def test_a_broken_snapshot_is_refused(snapshot):
     with pytest.raises(ValueError):
         SlotLedger.from_snapshot(5, 8, snapshot)
+
+
+def test_a_ledger_with_a_start_keys_by_source_index():
+    ledger = SlotLedger(prompt_count=3, slots_per_prompt=2, prompt_start=100)
+    for bad in (0, 99, 103):
+        with pytest.raises(IndexError):
+            ledger.remaining(bad)
+    assert ledger.consume(102) == 1
+    assert ledger.snapshot() == {102: 1}
+    assert ledger.total == 6
+    revived = SlotLedger.from_snapshot(3, 2, {102: 1}, prompt_start=100)
+    assert revived.remaining(102) == 1
+    assert revived.filled == 1
+
+
+def test_a_snapshot_outside_a_started_range_is_refused():
+    with pytest.raises(ValueError):
+        SlotLedger.from_snapshot(3, 2, {2: 1}, prompt_start=100)
+    with pytest.raises(ValueError):
+        SlotLedger.from_snapshot(3, 2, {103: 1}, prompt_start=100)

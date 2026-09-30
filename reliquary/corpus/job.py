@@ -54,6 +54,11 @@ _JOB_FIELDS = (
     "prompt_order",
     "deadline_round",
 )
+# Optional, and written only when it differs from its default, so every
+# manifest that predates it stores and hashes byte-identically. A binary that
+# predates it refuses a manifest carrying it (unknown field): miners and
+# validators of a job with ``prompt_start > 0`` need a build that knows it.
+_OPTIONAL_JOB_FIELDS = ("prompt_start",)
 
 
 class JobError(ValueError):
@@ -95,6 +100,18 @@ class JobSpec:
     filter: Filter | None
     prompt_order: str
     deadline_round: int | None
+    # The job owns source rows [prompt_start, prompt_start + prompt_count), and
+    # every prompt index it handles -- walk, submission, ledger, export -- is a
+    # SOURCE index in that range.
+    prompt_start: int = 0
+
+    @property
+    def prompt_end(self) -> int:
+        """One past the last source row this job owns."""
+        return self.prompt_start + self.prompt_count
+
+    def owns(self, prompt_index: int) -> bool:
+        return self.prompt_start <= prompt_index < self.prompt_end
 
     @property
     def total_slots(self) -> int:
@@ -136,6 +153,7 @@ class JobSpec:
             ),
             "prompt_order": self.prompt_order,
             "deadline_round": self.deadline_round,
+            **({"prompt_start": self.prompt_start} if self.prompt_start else {}),
         }
 
 
@@ -240,7 +258,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     """Read one manifest, or refuse it naming exactly what is wrong."""
     if not isinstance(raw, Mapping):
         raise JobError("a job manifest must be an object")
-    unknown = set(raw) - set(_JOB_FIELDS)
+    unknown = set(raw) - set(_JOB_FIELDS) - set(_OPTIONAL_JOB_FIELDS)
     if unknown:
         raise JobError(f"unknown job fields: {sorted(unknown)}")
     missing = [f for f in _JOB_FIELDS if f not in raw]
@@ -283,4 +301,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         filter=_parse_filter(raw["filter"]),
         prompt_order=prompt_order,
         deadline_round=deadline_round,
+        prompt_start=(
+            _non_negative_int(raw, "prompt_start") if "prompt_start" in raw else 0
+        ),
     )
