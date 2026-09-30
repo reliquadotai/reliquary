@@ -1162,6 +1162,33 @@ def build_corpus_router(
                     "corpus on_accepted callback failed for %s", submission_id[:12]
                 )
 
+    async def seal(chunks: list[list[str]]) -> list[SegmentRef]:
+        """Seal pending digests into segments; shared by submit and skip."""
+        # Written before any ledger names them (I2); a lost ledger write
+        # leaves them orphaned and uncounted (I4); resealing the same
+        # pending set later lands on the same names.
+        gate = asyncio.Semaphore(SEGMENT_PARALLELISM)
+
+        async def one(chunk: list[str]) -> SegmentRef:
+            async with gate:
+                try:
+                    segment_id = await _from_store(
+                        store.write_seen_segment(job_id, chunk), "seen segment write"
+                    )
+                except CorpusStoreConflict as exc:
+                    # A create that stayed contended with the key still
+                    # absent: nothing is named yet, so the miner retries.
+                    logger.warning("corpus seen segment for %s: %s", job_id, exc)
+                    raise HTTPException(
+                        status_code=503, detail="corpus_store_unavailable"
+                    ) from exc
+                except CorpusSegmentCorrupt as exc:
+                    raise _ledger_corrupt(LedgerSnapshotError(str(exc))) from exc
+            seen_index.remember(segment_id, chunk)
+            return SegmentRef(segment_id, len(chunk))
+
+        return await _all_or_cancel(one(chunk) for chunk in chunks)
+
     @router.get(JOB_PATH)
     async def corpus_job() -> dict:
         job = await _read_job_checked()
@@ -1311,32 +1338,6 @@ def build_corpus_router(
                 pending = set()
             # Everything but the segment list, which the seal completes.
             return verdict, (ledger_snapshot(slots, cursors, pending, state.segments), chunks)
-
-        async def seal(chunks: list[list[str]]) -> list[SegmentRef]:
-            # Written before any ledger names them (I2); a lost ledger write
-            # leaves them orphaned and uncounted (I4); resealing the same
-            # pending set later lands on the same names.
-            gate = asyncio.Semaphore(SEGMENT_PARALLELISM)
-
-            async def one(chunk: list[str]) -> SegmentRef:
-                async with gate:
-                    try:
-                        segment_id = await _from_store(
-                            store.write_seen_segment(job_id, chunk), "seen segment write"
-                        )
-                    except CorpusStoreConflict as exc:
-                        # A create that stayed contended with the key still
-                        # absent: nothing is named yet, so the miner retries.
-                        logger.warning("corpus seen segment for %s: %s", job_id, exc)
-                        raise HTTPException(
-                            status_code=503, detail="corpus_store_unavailable"
-                        ) from exc
-                    except CorpusSegmentCorrupt as exc:
-                        raise _ledger_corrupt(LedgerSnapshotError(str(exc))) from exc
-                seen_index.remember(segment_id, chunk)
-                return SegmentRef(segment_id, len(chunk))
-
-            return await _all_or_cancel(one(chunk) for chunk in chunks)
 
         for key in ("ledger_read", "segments", "admit", "ledger_write"):
             timing[key] = 0.0
@@ -1522,6 +1523,12 @@ def build_corpus_router(
             for _ in range(max_write_attempts):
                 snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
                 state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+                # The integrity step submit runs before it decides (I2, I3).
+                await _ensure_seen(state.segments)
+                try:
+                    await asyncio.to_thread(seen_index.check_pending, state.pending)
+                except LedgerSnapshotError as exc:
+                    raise _ledger_corrupt(exc) from exc
                 verdict = skip(
                     job,
                     hotkey=request.miner_hotkey,
@@ -1534,11 +1541,20 @@ def build_corpus_router(
                 if not verdict.accepted:
                     # Moved nothing, so it costs no write.
                     return _skip_refused(verdict)
-                # Pending and segments pass through untouched: a skip adds no
-                # digest, so it never has anything to seal.
-                after = ledger_snapshot(
-                    state.slots, state.cursors, state.pending, state.segments
-                )
+                # A skip adds no digest, but a ledger it rewrites may already
+                # hold a pending set past the threshold (a v1 object not yet
+                # migrated): sealed exactly as submit seals it.
+                pending, chunks = state.pending, []
+                if len(pending) >= seal_threshold:
+                    chunks = await asyncio.to_thread(seal_chunks, pending, segment_max)
+                    pending = set()
+                after = ledger_snapshot(state.slots, state.cursors, pending, state.segments)
+                if chunks:
+                    sealed = await seal(chunks)
+                    after["seen_segments"] = [
+                        *after["seen_segments"],
+                        *({"id": ref.id, "count": ref.count} for ref in sealed),
+                    ]
                 try:
                     await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
                 except CorpusStoreConflict:

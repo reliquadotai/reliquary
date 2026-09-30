@@ -730,3 +730,66 @@ def test_a_refused_skip_never_takes_the_ledger_lock(walk, fake_r2, seeded_job, s
     # The valid one did queue, and timed out behind the held lock.
     assert (waited.status_code, waited.detail) == (503, "corpus_ledger_contention")
     assert _ledger(fake_r2)["cursors"] == {}
+
+
+# --------------------------------------------------------------------------
+# the seen set a skip carries through
+# --------------------------------------------------------------------------
+
+
+def test_a_skip_over_an_unmigrated_ledger_seals_its_seen_set_like_submit(walk, fake_r2, seeded_job):
+    index = job_walk_index(walk, HOTKEY, 0)
+    seen = sorted(f"{i:064x}" for i in range(5))
+    v1 = {"schema": "reliquary/corpus-ledgers/v1", "slots": {str(index): 1}, "cursors": {},
+          "seen": seen}
+    asyncio.run(job_store.write_ledgers(JOB, v1, None, **fake_r2))
+
+    client = _client(_router(seeded_job, seal_threshold=4, segment_max=3))
+    assert client.post("/corpus/skip", json=_skip_body(walk)).json()["skipped"] is True
+
+    after = _ledger(fake_r2)
+    assert after["schema"] == "reliquary/corpus-ledgers/v2"
+    assert after["seen_pending"] == []
+    assert after["cursors"] == {HOTKEY: 1} and after["slots"] == {str(index): 1}
+    assert [ref["count"] for ref in after["seen_segments"]] == [3, 2]
+    sealed = []
+    for ref in after["seen_segments"]:
+        sealed += asyncio.run(job_store.read_seen_segment(JOB, ref["id"], **fake_r2))
+    assert sorted(sealed) == seen
+
+
+def test_a_skip_below_the_threshold_leaves_pending_as_it_is(walk, fake_r2, seeded_job):
+    index = job_walk_index(walk, HOTKEY, 0)
+    seeded = _seed(fake_r2, JOB, slots={index: 1}, pending={"ab" * 32, "cd" * 32})
+    client = _client(_router(seeded_job, seal_threshold=4))
+    assert client.post("/corpus/skip", json=_skip_body(walk)).json()["skipped"] is True
+    assert _ledger(fake_r2) == {**seeded, "cursors": {HOTKEY: 1}}
+
+
+def test_a_skip_over_a_corrupt_seen_set_is_refused_by_name(walk, fake_r2, seeded_job):
+    """The same integrity step submit runs: a digest both pending and sealed."""
+    digest = "ef" * 32
+    segment = asyncio.run(job_store.write_seen_segment(JOB, [digest], **fake_r2))
+    index = job_walk_index(walk, HOTKEY, 0)
+    snapshot = {"schema": "reliquary/corpus-ledgers/v2", "slots": {str(index): 1},
+                "cursors": {}, "seen_pending": [digest],
+                "seen_segments": [{"id": segment, "count": 1}]}
+    asyncio.run(job_store.write_ledgers(JOB, snapshot, None, **fake_r2))
+    before = seeded_job.ledger_writes()
+
+    response = _client(_router(seeded_job)).post("/corpus/skip", json=_skip_body(walk))
+
+    assert (response.status_code, response.json()["detail"]) == (500, "corpus_ledger_corrupt")
+    assert seeded_job.ledger_writes() == before
+    assert _ledger(fake_r2) == snapshot
+
+
+def test_a_skip_over_a_ledger_naming_a_missing_segment_is_refused(walk, fake_r2, seeded_job):
+    index = job_walk_index(walk, HOTKEY, 0)
+    snapshot = {"schema": "reliquary/corpus-ledgers/v2", "slots": {str(index): 1},
+                "cursors": {}, "seen_pending": [],
+                "seen_segments": [{"id": "0" * 64, "count": 1}]}
+    asyncio.run(job_store.write_ledgers(JOB, snapshot, None, **fake_r2))
+    response = _client(_router(seeded_job)).post("/corpus/skip", json=_skip_body(walk))
+    assert response.status_code == 500
+    assert _ledger(fake_r2) == snapshot
