@@ -151,7 +151,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, ver
 def build_contract_task_entry(
     *,
     task_id,
-    from_profile,
+    from_profile=None,
     model_id,
     model_revision,
     model_architecture,
@@ -159,8 +159,12 @@ def build_contract_task_entry(
     cap,
     overrides,
     verification=None,
+    base=None,
 ):
     """One registry entry that CARRIES its contract, seeded from a template.
+
+    The template is ``base`` (a profile, e.g. a composed one) or ``from_profile``
+    (a compiled profile id resolved here); exactly one is given.
 
     The template is a starting point, never the authority: the entry's contract
     is what the fleet will run, and its digest is computed from that contract.
@@ -182,7 +186,12 @@ def build_contract_task_entry(
     from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
     task_id = normalise_task_id(task_id)
-    contract = dict(resolve_protocol_profile(from_profile).to_generation_contract())
+    if (base is None) == (from_profile is None):
+        raise ValueError("a contract is seeded from exactly one of base or from_profile")
+    if base is None:
+        base = resolve_protocol_profile(from_profile)
+    from_profile = base.profile_id
+    contract = dict(base.to_generation_contract())
 
     # The task id IS the contract's profile id: two tasks seeded from one
     # template must stay distinguishable to the checks that compare them.
@@ -234,7 +243,7 @@ def build_corpus_task_entry(
     *,
     task_id,
     job_id,
-    from_profile,
+    from_profile=None,
     model_id,
     model_revision,
     model_architecture,
@@ -244,6 +253,7 @@ def build_corpus_task_entry(
     verification=None,
     min_incentive_share=0.0,
     audit_params: Mapping | None = None,
+    base=None,
 ):
     """One registry entry for a corpus generation job.
 
@@ -269,6 +279,7 @@ def build_corpus_task_entry(
     entry = build_contract_task_entry(
         task_id=task_id,
         from_profile=from_profile,
+        base=base,
         model_id=model_id,
         model_revision=model_revision,
         model_architecture=model_architecture,
@@ -348,6 +359,126 @@ def _parse_env_split_option(value: str | None) -> dict[str, float] | None:
     return shares
 
 
+def _parse_set_options(values) -> dict[str, dict[str, object]]:
+    """``["code.max_new_tokens=16384"]`` -> ``{"code": {"max_new_tokens": 16384}}``.
+
+    Values are typed here because the contract is: ``thinking`` is a JSON
+    boolean and every other tunable field a whole number. Which fields are
+    tunable at all is ``compose_profile``'s refusal, not this parser's.
+    """
+    from reliquary.protocol.environment_catalog import TUNABLE_FIELDS
+
+    overrides: dict[str, dict[str, object]] = {}
+    for raw in values or ():
+        target, sep, value = raw.partition("=")
+        name, dot, field = target.strip().partition(".")
+        if not sep or not dot or not name or not field:
+            raise ValueError(f"--set takes ENV.FIELD=VALUE, got {raw!r}")
+        value = value.strip()
+        if field not in TUNABLE_FIELDS:
+            parsed: object = value  # left for compose_profile to refuse by name
+        elif field == "thinking":
+            if value not in ("true", "false"):
+                raise ValueError(f"--set {target}: thinking is true or false, got {value!r}")
+            parsed = value == "true"
+        else:
+            try:
+                parsed = int(value)
+            except ValueError:
+                raise ValueError(
+                    f"--set {target}: expected a whole number, got {value!r}"
+                ) from None
+        overrides.setdefault(name, {})[field] = parsed
+    return overrides
+
+
+def _run_policy_named(name, *, rollouts=None, temperature=None, top_p=None, top_k=None):
+    """A named run policy, with any sampling flag the operator gave applied."""
+    from dataclasses import replace
+
+    from reliquary.protocol.composition import RUN_POLICIES
+
+    if name not in RUN_POLICIES:
+        raise ValueError(
+            f"unknown run policy {name!r}; expected one of {', '.join(sorted(RUN_POLICIES))}"
+        )
+    run = RUN_POLICIES[name]
+    sampling = {
+        k: v for k, v in (
+            ("rollouts", rollouts), ("temperature", temperature),
+            ("top_p", top_p), ("top_k", top_k),
+        ) if v is not None
+    }
+    if sampling:
+        run = replace(run, sampling=replace(run.sampling, **sampling))
+    return run
+
+
+def _proofs_named(proof, proof_mode):
+    """``--proof toploc --proof-mode M``: the deployed defaults in mode M."""
+    from dataclasses import replace
+
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
+
+    if proof is None and proof_mode is None:
+        return ()
+    if proof != "toploc":
+        raise ValueError(f"--proof takes 'toploc', got {proof!r}")
+    # Named, never defaulted: on an RL task enforce moves the decision off GRAIL.
+    if proof_mode not in ("shadow", "enforce"):
+        raise ValueError("--proof toploc needs --proof-mode shadow or enforce")
+    return (replace(TOPLOC_DEPLOYED_DEFAULTS, mode=proof_mode),)
+
+
+def _composed_task_entry(
+    *, task_id, model, model_revision, model_architecture, prompt_encoding, envs,
+    run_policy, set_values, rollouts, temperature, top_p, top_k, proof, proof_mode,
+    env_split, cap, overrides, verification,
+):
+    """``tasks create --model`` without a template: model + run policy + catalog."""
+    from reliquary.protocol.composition import ModelSpec, compose_profile
+    from reliquary.shared.task_id import normalise_task_id
+
+    if env_split is not None:
+        raise ValueError(
+            "--env-split has no effect with --model; a carried contract declares "
+            "its own environment set, selected with --envs"
+        )
+    missing = [
+        flag for flag, value in (
+            ("--model-revision", model_revision),
+            ("--model-architecture", model_architecture),
+            ("--prompt-encoding", prompt_encoding),
+            ("--envs", envs),
+            ("--run-policy", run_policy),
+        ) if value is None
+    ]
+    if missing:
+        raise ValueError(
+            f"composing a contract from --model requires {', '.join(missing)} "
+            "(or seed it from a template with --from-profile)"
+        )
+    task_id = normalise_task_id(task_id)
+    profile = compose_profile(
+        profile_id=task_id,
+        model=ModelSpec(
+            model_id=model, model_revision=model_revision,
+            model_architecture=model_architecture, prompt_encoding=prompt_encoding,
+            proofs=_proofs_named(proof, proof_mode),
+        ),
+        run=_run_policy_named(
+            run_policy, rollouts=rollouts, temperature=temperature, top_p=top_p, top_k=top_k,
+        ),
+        environments=[e.strip() for e in envs.split(",") if e.strip()],
+        overrides=_parse_set_options(set_values),
+    )
+    return build_contract_task_entry(
+        task_id=task_id, base=profile, model_id=model, model_revision=model_revision,
+        model_architecture=model_architecture, environments=None, cap=cap,
+        overrides=overrides, verification=verification,
+    )
+
+
 @tasks_app.command("create")
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
@@ -375,8 +506,25 @@ def tasks_create(
         None, "--from-profile", help="Template to seed the contract from"
     ),
     envs: str = typer.Option(
-        None, "--envs", help="Comma-separated subset of the template's environments"
+        None,
+        "--envs",
+        help="Comma-separated environments: a subset of the template's, or the catalog's when composing",
     ),
+    prompt_encoding: str = typer.Option(
+        None, "--prompt-encoding", help="Composing: raw (base model) or chat_template"
+    ),
+    run_policy: str = typer.Option(
+        None, "--run-policy", help="Composing: named run policy, e.g. dapo-v6 or suite-v9"
+    ),
+    set_values: list[str] = typer.Option(
+        None, "--set", help="Composing: ENV.FIELD=VALUE override of a tunable field; repeatable"
+    ),
+    rollouts: int = typer.Option(None, "--rollouts", help="Composing: overrides the run policy"),
+    temperature: float = typer.Option(None, "--temperature", help="Composing: overrides the run policy"),
+    top_p: float = typer.Option(None, "--top-p", help="Composing: overrides the run policy"),
+    top_k: int = typer.Option(None, "--top-k", help="Composing: overrides the run policy"),
+    proof: str = typer.Option(None, "--proof", help="Composing: 'toploc' adds the deployed TOPLOC defaults"),
+    proof_mode: str = typer.Option(None, "--proof-mode", help="With --proof: shadow or enforce"),
     verification: str = typer.Option(
         None,
         "--verification",
@@ -391,8 +539,34 @@ def tasks_create(
     from reliquary.shared.task_registry import RegistryError
 
     overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
+    # Flags that only mean something when the contract is composed.
+    compose_flags = [
+        flag for flag, value in (
+            ("--prompt-encoding", prompt_encoding), ("--run-policy", run_policy),
+            ("--set", set_values or None), ("--rollouts", rollouts),
+            ("--temperature", temperature), ("--top-p", top_p), ("--top-k", top_k),
+            ("--proof", proof), ("--proof-mode", proof_mode),
+        ) if value is not None
+    ]
     try:
-        if model is not None:
+        if compose_flags and (model is None or from_profile is not None):
+            # The template (or compiled profile) would silently win over them.
+            typer.echo(
+                f"error: {', '.join(compose_flags)} only apply when composing a "
+                "contract: give --model without --from-profile",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if model is not None and from_profile is None and profile_id is None:
+            entry = _composed_task_entry(
+                task_id=task_id, model=model, model_revision=model_revision,
+                model_architecture=model_architecture, prompt_encoding=prompt_encoding,
+                envs=envs, run_policy=run_policy, set_values=set_values,
+                rollouts=rollouts, temperature=temperature, top_p=top_p, top_k=top_k,
+                proof=proof, proof_mode=proof_mode, env_split=env_split, cap=cap,
+                overrides=overrides, verification=verification,
+            )
+        elif model is not None:
             if profile_id is not None:
                 # An operator who passes an option believes it does
                 # something; silently dropping --profile-id here would be
