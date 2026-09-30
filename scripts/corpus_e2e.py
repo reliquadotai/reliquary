@@ -344,7 +344,7 @@ def run_miner(args) -> None:
     from reliquary.corpus.job import parse_job
     from reliquary.miner.corpus_miner import VllmGenerator, mine_steps
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
-    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.protocol.signatures import sign_corpus_skip, sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
 
@@ -381,6 +381,8 @@ def run_miner(args) -> None:
             job=job, hotkey=keypair.ss58_address, client=client, generator=generator,
             tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
             sign=lambda body: sign_corpus_submission(signer, body), max_steps=steps,
+            # The rehearsal exercises next/skip as `corpus mine` does.
+            sign_skip=lambda body: sign_corpus_skip(signer, body),
         )
 
     if args.until_accepted:

@@ -338,3 +338,13 @@ def test_a_409_from_next_is_mined_like_an_old_validator():
                         sign_skip=lambda b: "skipsig", max_steps=2)
     assert counts == {"accepted": 2} and len(generator.prompts) == 2
     assert seen.count("/corpus/next/5Hot") == 1 and "/corpus/skip" not in seen
+
+
+def test_the_e2e_rehearsal_mines_with_skips_signed_like_the_cli():
+    import inspect
+
+    from scripts import corpus_e2e
+
+    source = inspect.getsource(corpus_e2e)
+    assert "sign_skip=lambda body: sign_corpus_skip(signer, body)" in source
+    assert "sign_corpus_skip, sign_corpus_submission" in source
