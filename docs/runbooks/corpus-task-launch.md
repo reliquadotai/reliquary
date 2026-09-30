@@ -618,6 +618,7 @@ asks first:
   names there, how many slots it still has, and `t`, the first cursor after
   `c` whose prompt has a free slot, looking at most K = 256 steps ahead
   (`c + 256` if none). A read, like the cursor route: no signature, no write.
+  On a `free` job it answers 409 `corpus_job_not_miner_walk`.
 - `POST /corpus/jobs/<job>/skip` (legacy `POST /corpus/skip`) with
   `{"job_id", "miner_hotkey", "cursor", "prompt_index", "to_cursor",
   "signature"}`, signed with `sign_corpus_skip` (domain
@@ -644,7 +645,7 @@ asks first:
 generation, unless 256 full positions in a row need another) and reads again,
 and it generates only for a prompt with a slot left. Its counts gain `skipped` (and
 `skip_<reason>` for refused skips). Against a validator without these routes
-(404) or one that cannot verify a skip, it mines exactly as before for the
+(404), a `free` job (409) or a validator that cannot verify a skip, it mines exactly as before for the
 rest of the run. Older miners never call them and see no change: submit, its
 refusals and the cursor route are the same.
 

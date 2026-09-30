@@ -793,3 +793,10 @@ def test_a_skip_over_a_ledger_naming_a_missing_segment_is_refused(walk, fake_r2,
     response = _client(_router(seeded_job)).post("/corpus/skip", json=_skip_body(walk))
     assert response.status_code == 500
     assert _ledger(fake_r2) == snapshot
+
+
+def test_next_on_a_free_job_is_a_409_naming_why(fake_r2, seeded_job):
+    _declare(fake_r2, "free-next-v1", prompt_order="free")
+    response = _client(_router(seeded_job, "free-next-v1")).get(f"/corpus/next/{HOTKEY}")
+    assert response.status_code == 409
+    assert response.json()["detail"] == "corpus_job_not_miner_walk"

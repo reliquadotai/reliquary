@@ -314,3 +314,27 @@ def test_the_corpus_mine_command_signs_skips_with_the_skip_binding():
     source = inspect.getsource(main.corpus_mine)
     assert "sign_skip=lambda body: sign_corpus_skip(wallet, body)" in source
     assert "sign=lambda body: sign_corpus_submission(wallet, body)" in source
+
+
+def test_a_409_from_next_is_mined_like_an_old_validator():
+    seen = []
+
+    def handle(request):
+        seen.append(request.url.path)
+        if request.url.path == "/corpus/next/5Hot":
+            return httpx.Response(409, json={"detail": "corpus_job_not_miner_walk"})
+        if request.url.path == "/corpus/cursor/5Hot":
+            return httpx.Response(200, json={"hotkey": "5Hot", "cursor": 0})
+        if request.url.path == "/corpus/submit":
+            return httpx.Response(200, json={"accepted": True, "reason": "accepted"})
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    client = HttpCorpusClient(httpx.Client(transport=httpx.MockTransport(handle), base_url="http://v"))
+    assert client.next_prompt("5Hot") is None
+    seen.clear()
+    generator = _Generator()
+    counts = mine_steps(job=_job(), hotkey="5Hot", client=client, generator=generator,
+                        tokenizer=_Tokenizer(), render=lambda i: f"q{i}", sign=lambda b: "sig",
+                        sign_skip=lambda b: "skipsig", max_steps=2)
+    assert counts == {"accepted": 2} and len(generator.prompts) == 2
+    assert seen.count("/corpus/next/5Hot") == 1 and "/corpus/skip" not in seen

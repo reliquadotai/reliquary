@@ -187,7 +187,8 @@ class HttpCorpusClient:
 
     def next_prompt(self, hotkey: str) -> dict | None:
         """Where this hotkey's walk stands and the slots left there, or None
-        from a validator that predates the route (a 404)."""
+        from a validator that predates the route (404) or a job that has no
+        walk (409)."""
         return _unless_absent(lambda: self._http.get(self._path(f"next/{hotkey}")))
 
     def skip(self, body: dict) -> dict | None:
@@ -199,7 +200,8 @@ def _unless_absent(request_call):
     try:
         return issue_corpus_request(request_call)
     except CorpusPermanentFailure as exc:
-        if exc.status == 404:
+        # 404: a validator from before the routes. 409: a job with no walk.
+        if exc.status in (404, 409):
             return None
         raise
 

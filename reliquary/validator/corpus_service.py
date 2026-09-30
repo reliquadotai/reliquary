@@ -38,7 +38,7 @@ from reliquary.corpus.admission import (
     skip_target,
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
-from reliquary.corpus.job import JobError, JobSpec
+from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobError, JobSpec
 from reliquary.corpus.slots import SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
 from reliquary.environment.agentic.types import EpisodeTask
@@ -1462,6 +1462,9 @@ def build_corpus_router(
         job = await _read_job_checked()
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
+        if job.prompt_order != PROMPT_ORDER_MINER_WALK:
+            # A free job has no walk: the miner chooses its prompts itself.
+            raise HTTPException(status_code=409, detail="corpus_job_not_miner_walk")
         state = await _read_state(job)
         cursor = state.cursors.expected(hotkey)
         prompt_index = job_walk_index(job, hotkey, cursor)
