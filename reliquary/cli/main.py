@@ -1644,7 +1644,7 @@ def corpus_mine(
         mine_steps,
     )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
-    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.protocol.signatures import sign_corpus_skip, sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
 
@@ -1696,6 +1696,9 @@ def corpus_mine(
                                     gpu_memory_utilization=gpu_memory_utilization),
             tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
             sign=lambda body: sign_corpus_submission(wallet, body),
+            # Full prompts are skipped, not generated for; an older validator
+            # without the routes is mined as before.
+            sign_skip=lambda body: sign_corpus_skip(wallet, body),
             max_steps=max_steps or None,
         )
     except CorpusMinerHalted as exc:

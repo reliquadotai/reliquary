@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 _RESYNC = frozenset({"prompt_full", "bad_cursor", "prompt_mismatch"})
 # Refusals no retry can change: generating on would only burn the card.
 _HALT = frozenset({"hotkey_not_registered", "miner_banned"})
+# Skip refusals that only say the read was stale: read `next` again.
+_SKIP_REREAD = frozenset({"bad_cursor", "prompt_not_full"})
+# How many stale skips in a row before generating anyway; submit then settles it.
+_MAX_STALE_SKIPS = 3
 
 # Backoff delays for a retried request, in seconds; the last value repeats.
 # Bounded so a long outage does not turn into an ever-growing sleep.
@@ -177,6 +181,28 @@ class HttpCorpusClient:
     def submit(self, body: dict) -> dict:
         return issue_corpus_request(lambda: self._http.post("/corpus/submit", json=body))
 
+    def _path(self, tail: str) -> str:
+        return (f"/corpus/{tail}" if self._job_id is None
+                else f"/corpus/jobs/{self._job_id}/{tail}")
+
+    def next_prompt(self, hotkey: str) -> dict | None:
+        """Where this hotkey's walk stands and the slots left there, or None
+        from a validator that predates the route (a 404)."""
+        return _unless_absent(lambda: self._http.get(self._path(f"next/{hotkey}")))
+
+    def skip(self, body: dict) -> dict | None:
+        """Step over a full prompt, or None from a validator without the route."""
+        return _unless_absent(lambda: self._http.post(self._path("skip"), json=body))
+
+
+def _unless_absent(request_call):
+    try:
+        return issue_corpus_request(request_call)
+    except CorpusPermanentFailure as exc:
+        if exc.status == 404:
+            return None
+        raise
+
 
 @dataclass(frozen=True)
 class Generation:
@@ -210,6 +236,18 @@ def build_submission(*, job, hotkey, cursor, prompt_index, rendered_prompt, gene
              "proofs": list(g.proofs)}
             for g in generations
         ],
+        "signature": "",
+    }
+    body["signature"] = sign(body)
+    return body
+
+
+def build_skip(*, job, hotkey, cursor, prompt_index, sign) -> dict:
+    body = {
+        "job_id": job.job_id,
+        "miner_hotkey": hotkey,
+        "cursor": cursor,
+        "prompt_index": prompt_index,
         "signature": "",
     }
     body["signature"] = sign(body)
@@ -254,14 +292,88 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
 
 def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                max_steps: int | None = None, sleep=time.sleep,
-               max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES) -> dict[str, int]:
+               max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
+               sign_skip=None) -> dict[str, int]:
+    """Mine up to ``max_steps`` generations.
+
+    With ``sign_skip`` on a ``miner_walk`` job, each step first asks the
+    validator where the walk stands and skips full prompts with a signed skip
+    rather than generating for them. A validator without those routes, or one
+    that cannot verify a skip, is mined exactly as before.
+    """
     counts: Counter[str] = Counter()
     retry_kwargs = dict(sleep=sleep, counts=counts, max_consecutive_failures=max_consecutive_failures)
     cursor = _retry(lambda: client.cursor(hotkey), **retry_kwargs)
     steps = 0
     consecutive_unreasoned = 0
+    skipping = (
+        sign_skip is not None
+        and getattr(job, "prompt_order", None) == "miner_walk"
+        and callable(getattr(client, "next_prompt", None))
+        and callable(getattr(client, "skip", None))
+    )
+
+    def past_full_prompts(cursor: int) -> int | None:
+        """The cursor of the next prompt worth generating for, or None when the
+        job is complete. Turns ``skipping`` off for the run on a validator
+        that cannot serve it."""
+        nonlocal skipping
+        stale = 0
+        while True:
+            position = _retry(lambda: client.next_prompt(hotkey), **retry_kwargs)
+            if position is None:
+                logger.info("the validator has no next/skip routes: generating for every step")
+                skipping = False
+                return cursor
+            try:
+                cursor = int(position["cursor"])
+                index = int(position["prompt_index"])
+                remaining = int(position["slots_remaining"])
+            except (KeyError, TypeError, ValueError):
+                logger.warning("unusable next answer %r: generating for every step", position)
+                skipping = False
+                return cursor
+            if remaining > 0:
+                return cursor
+            if index != job_walk_index(job, hotkey, cursor):
+                # Not our walk: generating lets submit name the disagreement.
+                logger.warning("the validator's walk names prompt %d at cursor %d, ours %d",
+                               index, cursor, job_walk_index(job, hotkey, cursor))
+                return cursor
+            body = build_skip(job=job, hotkey=hotkey, cursor=cursor, prompt_index=index,
+                              sign=sign_skip)
+            answer = _retry(lambda: client.skip(body), **retry_kwargs)
+            if answer is None:
+                logger.info("the validator has no skip route: generating for every step")
+                skipping = False
+                return cursor
+            reason = str(answer.get("reason"))
+            if answer.get("skipped"):
+                counts["skipped"] += 1
+                stale = 0
+                continue
+            if reason == "job_complete":
+                counts["job_complete"] += 1
+                return None
+            counts[f"skip_{reason}"] += 1
+            if reason in _HALT:
+                raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}",
+                                        counts=dict(counts))
+            if reason in _SKIP_REREAD and stale < _MAX_STALE_SKIPS:
+                stale += 1
+                continue
+            if reason not in _SKIP_REREAD:
+                logger.warning("corpus skip refused: %s %s; generating for every step",
+                               reason, answer.get("detail"))
+                skipping = False
+            return cursor
+
     while max_steps is None or steps < max_steps:
         steps += 1
+        if skipping:
+            cursor = past_full_prompts(cursor)
+            if cursor is None:
+                break
         # A SOURCE index: the one `render` draws and the route renders again.
         prompt_index = job_walk_index(job, hotkey, cursor)
         rendered = render(prompt_index)
