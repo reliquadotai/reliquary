@@ -143,8 +143,8 @@ class CorpusSubmissionResponse(BaseModel):
 
 
 class CorpusSkipRequest(BaseModel):
-    """A signed request to step over the prompt this hotkey's walk names at
-    ``cursor``, granted only when that prompt has no slot left. It carries no
+    """A signed request to step this hotkey's walk from ``cursor`` to
+    ``to_cursor``, granted only when every prompt in between has no slot left. It carries no
     work, so nothing is paid and nothing is recorded; its signature is bound
     under its own domain, so it can never stand in for a submission's."""
 
@@ -154,6 +154,9 @@ class CorpusSkipRequest(BaseModel):
     miner_hotkey: str = Field(min_length=1)
     cursor: int = Field(ge=0)
     prompt_index: int = Field(ge=0)
+    # Where the cursor lands: every walk position in [cursor, to_cursor) must
+    # be full, and the validator bounds the length.
+    to_cursor: int = Field(ge=1)
     signature: str = Field(min_length=1)
 
 

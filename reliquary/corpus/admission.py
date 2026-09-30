@@ -135,22 +135,34 @@ def admit(
     return Verdict(True, "accepted", slots_remaining=remaining)
 
 
-def skip(
+# The most walk steps one skip may cover, and how far `skip_target` looks.
+# Bounds the validator's work per skip; a longer run of full prompts is
+# crossed in several skips.
+MAX_SKIP_STEPS = 256
+
+
+def skip_target(job: JobSpec, hotkey: str, cursor: int, slots: SlotLedger) -> int:
+    """The first cursor after ``cursor`` whose walk position has a free slot,
+    looking at most ``MAX_SKIP_STEPS`` ahead; ``cursor + MAX_SKIP_STEPS`` if
+    every one of those is full."""
+    for step in range(cursor + 1, cursor + MAX_SKIP_STEPS):
+        if not slots.is_full(job_walk_index(job, hotkey, step)):
+            return step
+    return cursor + MAX_SKIP_STEPS
+
+
+def skip_refusal(
     job: JobSpec,
     *,
     hotkey: str,
     cursor: int,
     prompt_index: int,
+    to_cursor: int,
     slots: SlotLedger,
     cursors: CursorLedger,
-) -> Verdict:
-    """Step over the prompt this miner's walk names, only when it is FULL.
-
-    What a ``prompt_full`` refusal does, without the generation it used to
-    cost: the same position checks, then the same ``_advance``. No slot is
-    consumed and no digest is seen. Skipping a prompt that still has a slot is
-    refused, so this never lets a miner choose which open prompt it answers.
-    """
+) -> Verdict | None:
+    """Why this skip may not happen, or None. Reads the ledgers, never moves
+    them, so it can be asked of a shared cached state."""
     if slots.is_complete:
         return Verdict(False, "job_complete")
     if job.prompt_order != PROMPT_ORDER_MINER_WALK:
@@ -159,15 +171,49 @@ def skip(
     refused = _walk_position_refusal(job, cursors, hotkey, cursor, prompt_index)
     if refused is not None:
         return refused
-    remaining = slots.remaining(prompt_index)
-    if remaining:
+    if not 1 <= to_cursor - cursor <= MAX_SKIP_STEPS:
         return Verdict(
             False,
-            REASON_PROMPT_NOT_FULL,
-            slots_remaining=remaining,
-            detail={"prompt_index": prompt_index, "slots_remaining": remaining},
+            "malformed_submission",
+            detail={"cursor": cursor, "to_cursor": to_cursor, "max_skip_steps": MAX_SKIP_STEPS},
         )
-    _advance(job, cursors, hotkey)
+    # EVERY position crossed must be full: a skip never steps over a prompt
+    # the miner could have answered.
+    for step in range(cursor, to_cursor):
+        index = job_walk_index(job, hotkey, step)
+        remaining = slots.remaining(index)
+        if remaining:
+            return Verdict(
+                False,
+                REASON_PROMPT_NOT_FULL,
+                slots_remaining=remaining,
+                detail={"cursor": step, "prompt_index": index, "slots_remaining": remaining},
+            )
+    return None
+
+
+def skip(
+    job: JobSpec,
+    *,
+    hotkey: str,
+    cursor: int,
+    prompt_index: int,
+    to_cursor: int,
+    slots: SlotLedger,
+    cursors: CursorLedger,
+) -> Verdict:
+    """Step over the full walk positions [cursor, to_cursor), landing on
+    ``to_cursor``: what that many ``prompt_full`` refusals do, one ``_advance``
+    per position, without the generations they used to cost. No slot is
+    consumed and no digest is seen."""
+    refused = skip_refusal(
+        job, hotkey=hotkey, cursor=cursor, prompt_index=prompt_index,
+        to_cursor=to_cursor, slots=slots, cursors=cursors,
+    )
+    if refused is not None:
+        return refused
+    for _ in range(cursor, to_cursor):
+        _advance(job, cursors, hotkey)
     return Verdict(True, "accepted", slots_remaining=0)
 
 

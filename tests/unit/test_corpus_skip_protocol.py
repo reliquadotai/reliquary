@@ -22,7 +22,7 @@ from reliquary.protocol.signatures import (
 
 def _skip(**overrides):
     body = {"job_id": "math-v1", "miner_hotkey": "5Hot", "cursor": 3,
-            "prompt_index": 17, "signature": "00"}
+            "prompt_index": 17, "to_cursor": 9, "signature": "00"}
     body.update(overrides)
     return body
 
@@ -48,7 +48,12 @@ def test_a_skip_parses_and_refuses_unknown_fields():
     CorpusSkipRequest(**_skip())
     with pytest.raises(ValidationError):
         CorpusSkipRequest(**_skip(completions=[]))
-    for bad in ({"cursor": -1}, {"prompt_index": -1}, {"signature": ""}, {"job_id": ""}):
+    body = _skip()
+    del body["to_cursor"]
+    with pytest.raises(ValidationError):
+        CorpusSkipRequest(**body)
+    for bad in ({"cursor": -1}, {"prompt_index": -1}, {"signature": ""}, {"job_id": ""},
+                {"to_cursor": 0}):
         with pytest.raises(ValidationError):
             CorpusSkipRequest(**_skip(**bad))
 
@@ -60,6 +65,7 @@ def test_the_skip_binding_ignores_the_signature():
 
 @pytest.mark.parametrize("field,value", [
     ("job_id", "math-v2"), ("miner_hotkey", "5Other"), ("cursor", 4), ("prompt_index", 18),
+    ("to_cursor", 10),
 ])
 def test_every_skip_field_moves_the_binding(field, value):
     assert build_corpus_skip_binding(_skip(**{field: value})) != build_corpus_skip_binding(_skip())
@@ -116,3 +122,9 @@ def test_sign_corpus_skip_requires_bittensor(monkeypatch):
     with pytest.raises(ImportError):
         signatures.sign_corpus_skip(object(), _skip())
     assert signatures.verify_corpus_skip_signature(_skip()) is False
+
+
+def test_the_skip_domain_is_v2():
+    from reliquary.protocol import signatures
+
+    assert signatures.CORPUS_SKIP_DOMAIN == b"reliquary/corpus-skip/v2"

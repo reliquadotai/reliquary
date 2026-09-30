@@ -90,10 +90,23 @@ def _client(router):
     return TestClient(app)
 
 
-def _skip_body(job, *, cursor=0, prompt_index=None, hotkey=HOTKEY, signature="ok", job_id=None):
+def _skip_body(job, *, cursor=0, prompt_index=None, hotkey=HOTKEY, signature="ok", job_id=None,
+               to_cursor=None):
     index = job_walk_index(job, hotkey, cursor) if prompt_index is None else prompt_index
-    return CorpusSkipRequest(job_id=job_id or job.job_id, miner_hotkey=hotkey, cursor=cursor,
-                             prompt_index=index, signature=signature).model_dump()
+    return CorpusSkipRequest(
+        job_id=job_id or job.job_id, miner_hotkey=hotkey, cursor=cursor, prompt_index=index,
+        to_cursor=cursor + 1 if to_cursor is None else to_cursor, signature=signature,
+    ).model_dump()
+
+
+def _skip_to(job, cursor, full, hotkey=HOTKEY):
+    """What `next` should name: the first later position with a free slot."""
+    from reliquary.corpus.admission import MAX_SKIP_STEPS
+
+    for step in range(cursor + 1, cursor + MAX_SKIP_STEPS):
+        if job_walk_index(job, hotkey, step) not in full:
+            return step
+    return cursor + MAX_SKIP_STEPS
 
 
 def _submission(job, *, cursor=0, hotkey=HOTKEY, filler=7, signature="ok"):
@@ -120,7 +133,7 @@ def test_next_names_the_walk_position_of_a_fresh_hotkey(walk, seeded_job):
     client = _client(_router(seeded_job))
     body = client.get(f"/corpus/next/{HOTKEY}").json()
     assert body == {"cursor": 0, "prompt_index": job_walk_index(walk, HOTKEY, 0),
-                    "slots_remaining": 1}
+                    "slots_remaining": 1, "skip_to": 1}
 
 
 def test_next_follows_the_stored_cursor_and_reports_a_full_prompt(walk, fake_r2, seeded_job):
@@ -128,7 +141,8 @@ def test_next_follows_the_stored_cursor_and_reports_a_full_prompt(walk, fake_r2,
     _seed(fake_r2, JOB, slots={index: 1}, cursors={HOTKEY: 3})
     before = seeded_job.ledger_writes()
     body = _client(_router(seeded_job)).get(f"/corpus/next/{HOTKEY}").json()
-    assert body == {"cursor": 3, "prompt_index": index, "slots_remaining": 0}
+    assert body == {"cursor": 3, "prompt_index": index, "slots_remaining": 0,
+                    "skip_to": _skip_to(walk, 3, {index})}
     # A read: nothing written.
     assert seeded_job.ledger_writes() == before
 
@@ -189,19 +203,58 @@ def test_a_skip_leaves_the_ledger_a_prompt_full_submission_leaves(fake_r2, seede
     assert list(a["slots"].values()) == list(b["slots"].values()) == [1]
 
 
-def test_skips_walk_on_until_an_open_prompt(walk, fake_r2, seeded_job):
-    full = [job_walk_index(walk, HOTKEY, c) for c in range(3)]
-    open_index = job_walk_index(walk, HOTKEY, 3)
-    if open_index in full:
-        pytest.skip("walk revisits a row inside the first four steps")
-    _seed(fake_r2, JOB, slots=dict.fromkeys(full, 1))
+def _full_run(walk, fake_r2, length):
+    full = [job_walk_index(walk, HOTKEY, c) for c in range(length)]
+    if job_walk_index(walk, HOTKEY, length) in full:
+        pytest.skip("walk revisits a row inside the run")
+    return _seed(fake_r2, JOB, slots=dict.fromkeys(full, 1))
+
+
+def test_one_skip_crosses_a_run_of_full_prompts_to_the_first_open_one(walk, fake_r2, seeded_job):
+    seeded = _full_run(walk, fake_r2, 3)
     client = _client(_router(seeded_job))
-    for cursor in range(3):
-        assert client.post("/corpus/skip", json=_skip_body(walk, cursor=cursor)).json()["skipped"]
+    position = client.get(f"/corpus/next/{HOTKEY}").json()
+    assert position["slots_remaining"] == 0 and position["skip_to"] == 3
+    before = seeded_job.ledger_writes()
+
+    answer = client.post("/corpus/skip", json=_skip_body(walk, to_cursor=3)).json()
+
+    assert answer["skipped"] is True and answer["cursor"] == 3
+    # One ledger write for the whole run.
+    assert seeded_job.ledger_writes() == before + 1
+    assert _ledger(fake_r2) == {**seeded, "cursors": {HOTKEY: 3}}
     assert client.get(f"/corpus/next/{HOTKEY}").json() == {
-        "cursor": 3, "prompt_index": open_index, "slots_remaining": 1}
-    refused = client.post("/corpus/skip", json=_skip_body(walk, cursor=3)).json()
+        "cursor": 3, "prompt_index": job_walk_index(walk, HOTKEY, 3), "slots_remaining": 1,
+        "skip_to": _skip_to(walk, 3, set(map(int, seeded["slots"])))}
+    refused = client.post("/corpus/skip", json=_skip_body(walk, cursor=3, to_cursor=4)).json()
     assert refused["reason"] == "prompt_not_full"
+
+
+@pytest.mark.parametrize("open_at", [1, 2])
+def test_a_skip_over_an_open_prompt_is_refused_whole(walk, fake_r2, seeded_job, open_at):
+    """A miner can never jump over a prompt it could have answered."""
+    full = [job_walk_index(walk, HOTKEY, c) for c in range(4) if c != open_at]
+    open_index = job_walk_index(walk, HOTKEY, open_at)
+    if open_index in full:
+        pytest.skip("walk revisits a row inside the run")
+    _seed(fake_r2, JOB, slots=dict.fromkeys(full, 1))
+    answer = _refused_without_a_write(seeded_job, fake_r2, _client(_router(seeded_job)),
+                                      _skip_body(walk, to_cursor=4), "prompt_not_full")
+    assert answer["detail"] == {"cursor": open_at, "prompt_index": open_index,
+                                "slots_remaining": 1}
+
+
+def test_a_skip_longer_than_the_bound_is_refused(walk, fake_r2, seeded_job):
+    from reliquary.corpus.admission import MAX_SKIP_STEPS
+
+    _full_run(walk, fake_r2, 1)
+    answer = _refused_without_a_write(
+        seeded_job, fake_r2, _client(_router(seeded_job)),
+        _skip_body(walk, to_cursor=MAX_SKIP_STEPS + 1), "malformed_submission")
+    assert answer["detail"]["max_skip_steps"] == MAX_SKIP_STEPS
+    # A to_cursor of 0 never parses.
+    body = dict(_skip_body(walk), to_cursor=0)
+    assert _client(_router(seeded_job)).post("/corpus/skip", json=body).status_code == 422
 
 
 # --------------------------------------------------------------------------
@@ -226,7 +279,7 @@ def test_a_prompt_with_a_slot_left_is_not_skipped(walk, fake_r2, seeded_job):
     answer = _refused_without_a_write(seeded_job, fake_r2, _client(_router(seeded_job)),
                                       _skip_body(walk), "prompt_not_full")
     assert answer["slots_remaining"] == 1
-    assert answer["detail"] == {"prompt_index": job_walk_index(walk, HOTKEY, 0),
+    assert answer["detail"] == {"cursor": 0, "prompt_index": job_walk_index(walk, HOTKEY, 0),
                                 "slots_remaining": 1}
 
 
@@ -365,6 +418,35 @@ def test_a_skip_racing_a_submit_moves_the_cursor_once(walk, fake_r2, seeded_job,
         assert len(ledger["seen_pending"]) == 1
 
 
+@pytest.mark.parametrize("skip_first", [True, False])
+def test_a_range_skip_racing_a_submit_into_its_landing_prompt(walk, fake_r2, seeded_job, skip_first):
+    """The skip lands ON the open prompt at cursor 2; a submit at cursor 0
+    (full) races it. Whoever wins, the cursor is where one of them put it and
+    the open prompt stays unanswered by the skip."""
+    seeded = _full_run(walk, fake_r2, 2)
+    router = _router(seeded_job)
+    skip = CorpusSkipRequest(**_skip_body(walk, to_cursor=2))
+    submit = _submission(walk)
+
+    async def race():
+        calls = [router.skip_corpus(skip), router.submit_corpus(submit)]
+        if not skip_first:
+            calls.reverse()
+        answers = await asyncio.gather(*calls)
+        return answers if skip_first else answers[::-1]
+
+    skipped, submitted = asyncio.run(race())
+    ledger = _ledger(fake_r2)
+    assert ledger["slots"] == seeded["slots"]
+    if skipped.skipped:
+        assert submitted.reason.value == "bad_cursor"
+        assert ledger["cursors"] == {HOTKEY: 2}
+    else:
+        assert submitted.reason.value == "prompt_full"
+        assert skipped.reason.value == "bad_cursor"
+        assert ledger["cursors"] == {HOTKEY: 1}
+
+
 def test_a_skip_that_loses_the_swap_is_decided_again_on_the_winner(walk, fake_r2, seeded_job):
     """Another validator process moved this hotkey between our read and our
     write: the retry reads its ledger and refuses, rather than moving twice."""
@@ -481,9 +563,10 @@ def test_a_scoped_skip_moves_only_its_own_job(two_walks, fake_r2):
     assert _ledger(fake_r2, "walk-a-v1")["cursors"] == {HOTKEY: 1}
     assert _ledger(fake_r2, "walk-b-v1") == b_before
     assert client.get(f"/corpus/jobs/walk-a-v1/next/{HOTKEY}").json()["cursor"] == 1
+    b = jobs["walk-b-v1"]
     assert client.get(f"/corpus/jobs/walk-b-v1/next/{HOTKEY}").json() == {
-        "cursor": 0, "prompt_index": job_walk_index(jobs["walk-b-v1"], HOTKEY, 0),
-        "slots_remaining": 0}
+        "cursor": 0, "prompt_index": job_walk_index(b, HOTKEY, 0), "slots_remaining": 0,
+        "skip_to": _skip_to(b, 0, {job_walk_index(b, HOTKEY, 0)})}
 
 
 def test_a_scoped_skip_carrying_another_jobs_body_is_not_served(two_walks, fake_r2):

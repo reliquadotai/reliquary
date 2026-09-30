@@ -29,7 +29,13 @@ from typing import Any, NamedTuple, Protocol
 
 from fastapi import APIRouter, HTTPException
 
-from reliquary.corpus.admission import Verdict, admit, out_of_range_detail, skip
+from reliquary.corpus.admission import (
+    Verdict,
+    admit,
+    out_of_range_detail,
+    skip,
+    skip_target,
+)
 from reliquary.corpus.checks import CheckResult, completion_digest
 from reliquary.corpus.job import JobError, JobSpec
 from reliquary.corpus.slots import SlotLedger
@@ -1436,9 +1442,11 @@ def build_corpus_router(
 
     @router.get(NEXT_PATH)
     async def corpus_next(hotkey: str) -> dict:
-        """Where this hotkey's walk stands and how many slots that prompt has
-        left, so a miner can skip a full one instead of generating for it.
-        A read, exposed like the cursor: no signature, no write."""
+        """Where this hotkey's walk stands, how many slots that prompt has
+        left, and ``skip_to``: the first later cursor whose prompt has a free
+        slot (at most ``MAX_SKIP_STEPS`` on), so a miner crosses a run of full
+        prompts in one skip. A read, exposed like the cursor: no signature, no
+        write."""
         job = await _read_job_checked()
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
@@ -1450,14 +1458,16 @@ def build_corpus_router(
             "cursor": cursor,
             "prompt_index": prompt_index,
             "slots_remaining": state.slots.remaining(prompt_index),
+            "skip_to": skip_target(job, hotkey, cursor, state.slots),
         }
 
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus(request: CorpusSkipRequest) -> CorpusSkipResponse:
-        """Step this hotkey's cursor over a FULL prompt, exactly as a
-        ``prompt_full`` refusal would (``admission.skip``), under the same
-        ledger turn and compare-and-swap as submit. Nothing is paid or
-        recorded and no digest is seen."""
+        """Step this hotkey's cursor from ``cursor`` to ``to_cursor`` over walk
+        positions that are ALL full, exactly as that many ``prompt_full``
+        refusals would (``admission.skip``), in one ledger write under the same
+        turn and compare-and-swap as submit. Nothing is paid or recorded and
+        no digest is seen."""
         if request.job_id != job_id:
             return _refuse_skip(
                 CorpusRejectReason.JOB_NOT_SERVED,
@@ -1491,6 +1501,7 @@ def build_corpus_router(
                     hotkey=request.miner_hotkey,
                     cursor=request.cursor,
                     prompt_index=request.prompt_index,
+                    to_cursor=request.to_cursor,
                     slots=state.slots,
                     cursors=state.cursors,
                 )
@@ -1513,8 +1524,8 @@ def build_corpus_router(
                     continue
                 moved = state.cursors.expected(request.miner_hotkey)
                 logger.debug(
-                    "corpus skip %s: prompt %d full, cursor %d -> %d",
-                    request.miner_hotkey[:12], request.prompt_index, request.cursor, moved,
+                    "corpus skip %s: cursor %d -> %d over full prompts",
+                    request.miner_hotkey[:12], request.cursor, moved,
                 )
                 return CorpusSkipResponse(
                     reason=CorpusRejectReason.ACCEPTED,

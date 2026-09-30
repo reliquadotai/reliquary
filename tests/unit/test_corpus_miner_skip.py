@@ -33,16 +33,21 @@ class _SkippingClient(_Client):
     def next_prompt(self, hotkey):
         self.next_reads += 1
         index = self._index()
+        skip_to = self.position + 1
+        while (job_walk_index(self.job, "5Hot", skip_to) in self.full
+               and skip_to < self.position + 256):
+            skip_to += 1
         return {"cursor": self.position, "prompt_index": index,
-                "slots_remaining": 0 if index in self.full else 1}
+                "slots_remaining": 0 if index in self.full else 1, "skip_to": skip_to}
 
     def skip(self, body):
         self.skips.append(body)
         if self.skip_answers:
             return self.skip_answers.pop(0)
         assert body["cursor"] == self.position and body["prompt_index"] == self._index()
-        assert self._index() in self.full
-        self.position += 1
+        for step in range(body["cursor"], body["to_cursor"]):
+            assert job_walk_index(self.job, "5Hot", step) in self.full
+        self.position = body["to_cursor"]
         return {"reason": "accepted", "skipped": True, "cursor": self.position}
 
     def submit(self, body):
@@ -75,11 +80,12 @@ def test_full_prompts_are_skipped_without_generating():
     counts = _mine(client, generator, job=job, max_steps=1)
 
     assert len(generator.prompts) == 1
-    assert [b["cursor"] for b in client.skips] == list(range(open_cursor))
+    # One skip crosses the whole run.
+    assert [(b["cursor"], b["to_cursor"]) for b in client.skips] == [(0, open_cursor)]
     assert all(b["signature"] == "skipsig" for b in client.skips)
     assert [(b["cursor"], b["prompt_index"]) for b in client.submitted] == [
         (open_cursor, job_walk_index(job, "5Hot", open_cursor))]
-    assert counts == {"skipped": open_cursor, "accepted": 1}
+    assert counts == {"skipped": 1, "accepted": 1}
 
 
 def test_an_open_prompt_is_generated_for_with_no_skip():
@@ -99,6 +105,8 @@ def test_the_miner_generates_only_for_open_prompts_late_in_a_job():
     assert len(generator.prompts) == 5 == len(client.submitted)
     assert all(b["prompt_index"] not in full for b in client.submitted)
     assert counts["skipped"] == len(client.skips) > 0
+    # At most one skip per generation.
+    assert len(client.skips) <= 5
 
 
 def test_a_skip_refused_prompt_not_full_rereads_next_and_generates():
@@ -178,7 +186,8 @@ def test_repeated_stale_skips_give_up_and_generate():
 def test_a_walk_the_validator_disagrees_with_is_left_to_submit():
     job = _job()
     client = _SkippingClient(job, set())
-    client.next_prompt = lambda hotkey: {"cursor": 0, "prompt_index": 10_000, "slots_remaining": 0}
+    client.next_prompt = lambda hotkey: {"cursor": 0, "prompt_index": 10_000,
+                                         "slots_remaining": 0, "skip_to": 1}
     generator = _Generator()
     _mine(client, generator, job=job, max_steps=1)
     assert client.skips == [] and len(generator.prompts) == 1
@@ -210,10 +219,24 @@ def test_an_old_client_without_the_calls_mines_as_before():
 
 
 def test_the_skip_body_is_what_the_validator_verifies():
-    body = build_skip(job=_job(), hotkey="5Hot", cursor=4, prompt_index=9,
+    body = build_skip(job=_job(), hotkey="5Hot", cursor=4, prompt_index=9, to_cursor=7,
                       sign=lambda b: f"signed:{sorted(b)}:{b['signature']!r}")
     assert body == {"job_id": "math-v1", "miner_hotkey": "5Hot", "cursor": 4, "prompt_index": 9,
-                    "signature": "signed:['cursor', 'job_id', 'miner_hotkey', 'prompt_index', 'signature']:''"}
+                    "to_cursor": 7, "signature": "signed:['cursor', 'job_id', 'miner_hotkey', "
+                    "'prompt_index', 'signature', 'to_cursor']:''"}
+
+
+@pytest.mark.parametrize("skip_to", [None, 0, "x"])
+def test_a_next_without_a_usable_skip_to_turns_skipping_off(skip_to):
+    job = _job()
+    client = _SkippingClient(job, {job_walk_index(job, "5Hot", 0)}, answers=["prompt_full"] * 3)
+    answer = {"cursor": 0, "prompt_index": job_walk_index(job, "5Hot", 0), "slots_remaining": 0}
+    if skip_to is not None:
+        answer["skip_to"] = skip_to
+    client.next_prompt = lambda hotkey: answer
+    generator = _Generator()
+    _mine(client, generator, job=job, max_steps=2)
+    assert client.skips == [] and len(generator.prompts) == 2
 
 
 # --------------------------------------------------------------------------
@@ -233,7 +256,8 @@ def _validator(*, has_skip, job_id=None):
             return httpx.Response(200, json={"hotkey": "5Hot", "cursor": 0})
         if has_skip and path == f"{prefix}/next/5Hot":
             return httpx.Response(200, json={"cursor": 0, "prompt_index":
-                                             job_walk_index(job, "5Hot", 0), "slots_remaining": 1})
+                                             job_walk_index(job, "5Hot", 0), "slots_remaining": 1,
+                                             "skip_to": 1})
         if has_skip and path == f"{prefix}/skip":
             return httpx.Response(200, json={"reason": "accepted", "skipped": True, "cursor": 1})
         if path == "/corpus/submit":

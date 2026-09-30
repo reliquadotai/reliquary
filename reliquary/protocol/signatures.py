@@ -562,17 +562,18 @@ def verify_corpus_signature(request) -> bool:
 
 # Its own domain, so a skip signature never verifies as a submission's (or the
 # other way round) even over the same job, hotkey, cursor and index.
-CORPUS_SKIP_DOMAIN = b"reliquary/corpus-skip/v1"
+CORPUS_SKIP_DOMAIN = b"reliquary/corpus-skip/v2"
 
 
 def build_corpus_skip_binding(request) -> bytes:
-    """Digest of a skip: the job, the hotkey, and the walk step it gives up."""
+    """Digest of a skip: the job, the hotkey, and the walk steps it gives up."""
     body = _corpus_fields(request)
     parts = [
         str(body["job_id"]).encode("utf-8"),
         str(body["miner_hotkey"]).encode("utf-8"),
         int(body["cursor"]).to_bytes(8, "big", signed=False),
         int(body["prompt_index"]).to_bytes(8, "big", signed=False),
+        int(body["to_cursor"]).to_bytes(8, "big", signed=False),
     ]
     h = hashlib.sha256()
     h.update(CORPUS_SKIP_DOMAIN)

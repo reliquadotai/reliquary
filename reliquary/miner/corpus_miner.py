@@ -242,12 +242,13 @@ def build_submission(*, job, hotkey, cursor, prompt_index, rendered_prompt, gene
     return body
 
 
-def build_skip(*, job, hotkey, cursor, prompt_index, sign) -> dict:
+def build_skip(*, job, hotkey, cursor, prompt_index, to_cursor, sign) -> dict:
     body = {
         "job_id": job.job_id,
         "miner_hotkey": hotkey,
         "cursor": cursor,
         "prompt_index": prompt_index,
+        "to_cursor": to_cursor,
         "signature": "",
     }
     body["signature"] = sign(body)
@@ -329,6 +330,9 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                 cursor = int(position["cursor"])
                 index = int(position["prompt_index"])
                 remaining = int(position["slots_remaining"])
+                skip_to = int(position["skip_to"])
+                if skip_to <= cursor:
+                    raise ValueError(f"skip_to {skip_to} is not past cursor {cursor}")
             except (KeyError, TypeError, ValueError):
                 logger.warning("unusable next answer %r: generating for every step", position)
                 skipping = False
@@ -340,8 +344,9 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                 logger.warning("the validator's walk names prompt %d at cursor %d, ours %d",
                                index, cursor, job_walk_index(job, hotkey, cursor))
                 return cursor
+            # One skip over the whole run of full prompts `next` found.
             body = build_skip(job=job, hotkey=hotkey, cursor=cursor, prompt_index=index,
-                              sign=sign_skip)
+                              to_cursor=skip_to, sign=sign_skip)
             answer = _retry(lambda: client.skip(body), **retry_kwargs)
             if answer is None:
                 logger.info("the validator has no skip route: generating for every step")

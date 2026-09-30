@@ -613,28 +613,36 @@ taken. Without a check a miner generates the full `n` completions (up to
 asks first:
 
 - `GET /corpus/jobs/<job>/next/<hotkey>` (legacy `GET /corpus/next/<hotkey>`)
-  answers `{"cursor": c, "prompt_index": i, "slots_remaining": r}` for the
-  hotkey's CURRENT cursor: the source row its walk names there and how many
-  slots it still has. A read, like the cursor route: no signature, no write.
+  answers `{"cursor": c, "prompt_index": i, "slots_remaining": r,
+  "skip_to": t}` for the hotkey's CURRENT cursor: the source row its walk
+  names there, how many slots it still has, and `t`, the first cursor after
+  `c` whose prompt has a free slot, looking at most K = 256 steps ahead
+  (`c + 256` if none). A read, like the cursor route: no signature, no write.
 - `POST /corpus/jobs/<job>/skip` (legacy `POST /corpus/skip`) with
-  `{"job_id", "miner_hotkey", "cursor", "prompt_index", "signature"}`, signed
-  with `sign_corpus_skip` (domain `reliquary/corpus-skip/v1`, over job,
-  hotkey, cursor and index; it never verifies as a submission signature, nor
-  a submission's as a skip). After the signature, registration and ban gates
-  of submit, and under the same ledger lock and compare-and-swap, the cursor
-  moves one step exactly as a `prompt_full` refusal moves it, and only if
-  `cursor` is the ledger's, `prompt_index` is the walk's at that cursor and
-  the prompt is full. Answer: `{"reason": "accepted", "skipped": true,
-  "cursor": c+1, ...}`. Refusals move nothing and cost no write:
-  `prompt_not_full` (the prompt still has a slot: generate for it),
+  `{"job_id", "miner_hotkey", "cursor", "prompt_index", "to_cursor",
+  "signature"}`, signed with `sign_corpus_skip` (domain
+  `reliquary/corpus-skip/v2`, over job, hotkey, cursor, index and
+  `to_cursor`; it never verifies as a submission signature, nor a
+  submission's as a skip). After the signature, registration and ban gates of
+  submit, and under the same ledger lock and compare-and-swap, the cursor
+  moves straight to `to_cursor` in one ledger write, exactly as that many
+  `prompt_full` refusals would move it, and only if `cursor` is the ledger's,
+  `prompt_index` is the walk's at that cursor, `to_cursor - cursor` is in
+  [1, 256] and EVERY walk position in [`cursor`, `to_cursor`) is full: a skip
+  never crosses a prompt the miner could answer. Answer: `{"reason":
+  "accepted", "skipped": true, "cursor": to_cursor, ...}`. Refusals move
+  nothing and cost no write: `prompt_not_full` (a position in the range
+  still has a slot; the detail names its cursor: generate for it),
   `bad_cursor`, `prompt_mismatch`, `job_complete`, `bad_signature`,
   `signature_unverifiable`, `hotkey_not_registered`, `miner_banned`,
-  `job_not_served`, and `malformed_submission` on a `free` job (it has no walk
-  to skip along). Nothing is paid, recorded or audited for a skip.
+  `job_not_served`, and `malformed_submission` for a range outside [1, 256]
+  or on a `free` job (it has no walk to skip along). Nothing is paid,
+  recorded or audited for a skip.
 
 `reliquary corpus mine` does this on its own: before each generation it reads
-`next`; while `slots_remaining` is 0 it skips and reads again, and it
-generates only for a prompt with a slot left. Its counts gain `skipped` (and
+`next`; when `slots_remaining` is 0 it skips to `skip_to` (one skip per
+generation, unless 256 full positions in a row need another) and reads again,
+and it generates only for a prompt with a slot left. Its counts gain `skipped` (and
 `skip_<reason>` for refused skips). Against a validator without these routes
 (404) or one that cannot verify a skip, it mines exactly as before for the
 rest of the run. Older miners never call them and see no change: submit, its
