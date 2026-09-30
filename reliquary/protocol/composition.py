@@ -108,6 +108,13 @@ def check_profile_invariants(profile: ProtocolProfile) -> None:
             f"expected one of {', '.join(_PROMPT_ENCODINGS)}"
         )
     _check_sampling(profile.sampling)
+    for name, environment in sorted(profile.environments.items()):
+        episode = environment.episode
+        if episode is not None and episode.max_action_tokens > episode.max_episode_tokens:
+            raise ValueError(
+                f"environment {name!r} episode max_action_tokens {episode.max_action_tokens} "
+                f"exceeds max_episode_tokens {episode.max_episode_tokens}"
+            )
     omi = profile.environments.get("openmathinstruct")
     if omi is None:
         return

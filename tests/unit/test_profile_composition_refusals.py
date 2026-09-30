@@ -213,3 +213,16 @@ def test_invalid_sampling_is_refused_on_composition():
     bad = replace(run, sampling=replace(run.sampling, top_p=0.0))
     with pytest.raises(ValueError, match="top_p"):
         _compose(["reliquary_code_v1"], run=bad)
+
+
+def test_an_action_budget_above_the_episode_budget_is_refused():
+    with pytest.raises(ValueError, match="max_action_tokens"):
+        _compose(
+            ["reliquary_telecom_solo_v1"],
+            overrides={"reliquary_telecom_solo_v1": {"episode.max_action_tokens": 49153}},
+        )
+    # Equal is a single-turn episode's whole budget, and allowed.
+    _compose(
+        ["reliquary_telecom_solo_v1"],
+        overrides={"reliquary_telecom_solo_v1": {"episode.max_action_tokens": 49152}},
+    )
