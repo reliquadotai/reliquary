@@ -46,17 +46,9 @@ def test_constants_import_with_several_ids():
 
 
 def _capture_puts(monkeypatch) -> list[str]:
-    # Patched in the globals of every loaded `upload_window_dataset`, not only on
-    # this file's module object: another test may have reimported storage.
     keys: list[str] = []
-    fake = lambda bucket, key, body, *rest: keys.append(key)  # noqa: E731
-    for name, module in list(sys.modules.items()):
-        if not name.startswith("reliquary"):
-            continue
-        upload = getattr(module, "upload_window_dataset", None)
-        if upload is not None and hasattr(upload, "__globals__"):
-            monkeypatch.setitem(upload.__globals__, "_sync_boto3_put", fake)
-    monkeypatch.setattr(storage, "_sync_boto3_put", fake)
+    monkeypatch.setattr(storage, "_sync_boto3_put",
+                        lambda bucket, key, body, *rest: keys.append(key))
     return keys
 
 
