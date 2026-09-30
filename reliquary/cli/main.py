@@ -785,6 +785,65 @@ def tasks_contract(
     typer.echo(json.dumps(contract, sort_keys=True, separators=(",", ":")))
 
 
+envs_app = typer.Typer(
+    name="envs", help="The environment catalog composed contracts are built from"
+)
+app.add_typer(envs_app)
+
+
+@envs_app.command("list")
+def envs_list() -> None:
+    """Every catalogued environment, its default budget, source profile and digest."""
+    from reliquary.protocol.environment_catalog import (
+        CATALOG_PROVENANCE,
+        ENVIRONMENT_CATALOG,
+        environment_body_contract,
+    )
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    typer.echo(f"{'environment':<38} {'max_new_tokens':>14}  {'sha256':<12}  provenance")
+    for name in sorted(ENVIRONMENT_CATALOG):
+        digest = canonical_sha256(environment_body_contract(name))
+        typer.echo(
+            f"{name:<38} {ENVIRONMENT_CATALOG[name].max_new_tokens:>14}  "
+            f"{digest[:12]}  {CATALOG_PROVENANCE[name]}"
+        )
+
+
+@envs_app.command("show")
+def envs_show(name: str = typer.Argument(...)) -> None:
+    """One catalog body as JSON, with its digest, provenance and tunable fields."""
+    import json
+
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.protocol.environment_catalog import (
+        CATALOG_PROVENANCE,
+        ENVIRONMENT_CATALOG,
+        TUNABLE_FIELDS,
+        environment_body_contract,
+    )
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    if name not in ENVIRONMENT_CATALOG:
+        reason = (
+            "is installed but has no catalog entry; add and review one first"
+            if name in ENVIRONMENT_SPECS else "is not an environment"
+        )
+        typer.echo(
+            f"error: {name!r} {reason}; catalogued: {', '.join(sorted(ENVIRONMENT_CATALOG))}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    body = environment_body_contract(name)
+    typer.echo(json.dumps({
+        "name": name,
+        "body": body,
+        "canonical_sha256": canonical_sha256(body),
+        "provenance": CATALOG_PROVENANCE[name],
+        "tunable_fields": sorted(TUNABLE_FIELDS),
+    }, indent=2, sort_keys=True))
+
+
 jobs_app = typer.Typer(
     name="jobs", help="Declare and cancel corpus generation jobs"
 )

@@ -17,6 +17,8 @@ from reliquary.protocol.profiles import (
     EnvironmentProfile,
     EpisodeProfile,
     PromptTemplateProfile,
+    ProtocolProfile,
+    SamplingProfile,
 )
 
 # The only fields a task may override. Everything else is what the environment
@@ -215,4 +217,23 @@ CATALOG_PROVENANCE: Mapping[str, str] = MappingProxyType({
 })
 
 
-__all__ = ["CATALOG_PROVENANCE", "ENVIRONMENT_CATALOG", "TUNABLE_FIELDS"]
+def environment_body_contract(name: str) -> dict:
+    """A catalog body exactly as a contract writes it under ``environments``.
+
+    Serialized through a throwaway profile, so there is one writer for the bytes.
+    """
+    holder = ProtocolProfile(
+        profile_id="catalog", model_id="-", model_revision="-", protocol_version=0,
+        collection_seconds=0, upload_grace_seconds=0, prompt_encoding="raw",
+        sampling=SamplingProfile(rollouts=1, temperature=1.0, top_p=1.0, top_k=0, do_sample=False),
+        environments={name: ENVIRONMENT_CATALOG[name]},
+    )
+    return holder.to_generation_contract()["environments"][name]
+
+
+__all__ = [
+    "CATALOG_PROVENANCE",
+    "ENVIRONMENT_CATALOG",
+    "TUNABLE_FIELDS",
+    "environment_body_contract",
+]
