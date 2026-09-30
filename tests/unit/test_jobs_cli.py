@@ -413,6 +413,54 @@ def test_jobs_create_refuses_a_prompt_count_the_source_cannot_fill(
     ).exit_code == 0
 
 
+def test_jobs_create_without_a_start_writes_no_start(bucket, registry):
+    """Absent is 0, and 0 is never written: a job declared as before stores the
+    same bytes as before."""
+    import json
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(app, _create_args()).exit_code == 0
+    body, _ = bucket.objects["reliquary/corpus/jobs/swe-v1.json"]
+    assert "prompt_start" not in json.loads(body)
+
+
+def test_jobs_create_carries_a_prompt_start(bucket, registry, monkeypatch):
+    import json
+
+    stub_source_rows(monkeypatch, _prompt_source(_template()), 100)
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(
+        app, _create_args(**{"--prompt-start": "60", "--prompt-count": "40"})
+    )
+    assert result.exit_code == 0, result.output
+    body, _ = bucket.objects["reliquary/corpus/jobs/swe-v1.json"]
+    manifest = json.loads(body)
+    assert (manifest["prompt_start"], manifest["prompt_count"]) == (60, 40)
+
+
+def test_jobs_create_refuses_a_range_the_source_cannot_fill(bucket, registry, monkeypatch):
+    """S + N past the source's length is the same 500-forever as a count past
+    it, reached from the other end."""
+    stub_source_rows(monkeypatch, _prompt_source(_template()), 100)
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+
+    result = CliRunner().invoke(
+        app, _create_args(**{"--prompt-start": "61", "--prompt-count": "40"})
+    )
+    assert result.exit_code != 0
+    assert "101" in result.output and "100" in result.output
+    assert _manifest_keys(bucket) == []
+    assert set(registry["entries"]) == {"default"}
+
+
+def test_jobs_create_refuses_a_negative_start(bucket, registry):
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(app, _create_args(**{"--prompt-start": "-1"}))
+    assert result.exit_code != 0
+    assert "prompt_start" in result.output
+    assert _manifest_keys(bucket) == []
+
+
 def test_jobs_cancel_retires_the_entry_and_leaves_the_manifest(bucket, registry):
     """The entry is retired and the manifest stays readable for settlement."""
     registry["entries"] = {"default": _rl_entry("default", 0.5)}

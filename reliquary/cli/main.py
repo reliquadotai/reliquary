@@ -873,6 +873,7 @@ def build_job_manifest(
     deadline_round,
     from_profile=None,
     profile=None,
+    prompt_start=0,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -921,10 +922,15 @@ def build_job_manifest(
         "prompt_order": prompt_order,
         "deadline_round": deadline_round,
     }
+    if prompt_start != 0:
+        # Written only when set, so a job declared without it stores the bytes
+        # it always did; a negative start is left for `parse_job` to name.
+        manifest["prompt_start"] = prompt_start
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
-    # time: an unrenderable source fails fidelity forever, and a prompt_count
-    # above the source's length is a 500 on the first submission and every one
+    # time: an unrenderable source fails fidelity forever, and a range
+    # [prompt_start, prompt_start + prompt_count) running past the source's
+    # length is a 500 on the first submission and every one
     # after it. The profile checked against is the template the TASK is seeded
     # from, not whichever one this CLI process happens to run: it is the one
     # the fleet will render these prompts with.
@@ -1008,6 +1014,13 @@ def jobs_create(
         help="Rows of the source this job owns; checked against the source's "
         "own length, which BUILDS it -- a dataset-backed source must be "
         "readable from here to declare a job over it",
+    ),
+    prompt_start: int = typer.Option(
+        0,
+        "--prompt-start",
+        help="First source row this job owns; it serves rows [start, start + "
+        "count). Written to the manifest only when positive. Miners and "
+        "validators of a job with a start need a build that knows the field",
     ),
     renderer_id: str = typer.Option(..., "--renderer-id"),
     eos_token_id: int = typer.Option(..., "--eos-token-id"),
@@ -1141,6 +1154,7 @@ def jobs_create(
             checkpoint_sha256=checkpoint_sha256,
             prompt_source=prompt_source,
             prompt_count=prompt_count,
+            prompt_start=prompt_start,
             renderer_id=renderer_id,
             # The profile the entry's contract is built from, so the manifest is
             # checked against the contract this command declares.
@@ -1244,7 +1258,8 @@ def jobs_create(
 
     typer.echo(
         f"declared job {job_id} as task {entry.task_id} on {prompt_source} "
-        f"with cap {cap} pinned as its price"
+        + (f"rows [{prompt_start}, {prompt_start + prompt_count}) " if prompt_start else "")
+        + f"with cap {cap} pinned as its price"
         + (f", verified {entry.verification}" if entry.verification else "")
     )
 

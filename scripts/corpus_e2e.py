@@ -229,7 +229,8 @@ async def declare_job(state: Path, args, *, job_id: str, revision: str, sha256: 
     manifest = build_job_manifest(
         job_id=job_id, checkpoint_repo=args.honest_model, checkpoint_revision=revision,
         checkpoint_sha256=sha256, prompt_source=source,
-        prompt_count=args.prompt_count, renderer_id=renderer_id, eos_token_id=eos,
+        prompt_count=args.prompt_count, prompt_start=getattr(args, "prompt_start", 0),
+        renderer_id=renderer_id, eos_token_id=eos,
         slots_per_prompt=args.slots_per_prompt, temperature=sampling["temperature"],
         top_p=sampling["top_p"], top_k=sampling["top_k"], min_new_tokens=args.min_new_tokens,
         # A rehearsal may pass a short cap to run fast; a real job takes the
@@ -1041,6 +1042,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--renderer", default=None,
                        help="e.g. chat-template-thinking-v1; omit for the contract's own template")
         p.add_argument("--prompt-count", type=int, default=200)
+        p.add_argument("--prompt-start", type=int, default=0,
+                       help="first source row the job owns (every job of the run)")
         p.add_argument("--slots-per-prompt", type=int, default=4)
         p.add_argument("--n", type=int, default=4)
         p.add_argument("--min-new-tokens", type=int, default=16)
