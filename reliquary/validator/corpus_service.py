@@ -1084,6 +1084,8 @@ def build_corpus_router(
     # startup path hands in one it has already loaded.
     if seen_index is None:
         seen_index = SeenIndex(store, job_id)
+    # One rebuilt ledger state, keyed by the ETag it was read under (`_read_state`).
+    read_cache: dict[str, Any] = {}
 
     async def _from_store(call, what: str):
         try:
@@ -1162,8 +1164,7 @@ def build_corpus_router(
         job = await _read_job_checked()
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
-        snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger read")
-        state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+        state = await _read_state(job)
         return {"hotkey": hotkey, "cursor": state.cursors.expected(hotkey)}
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
@@ -1450,8 +1451,7 @@ def build_corpus_router(
         job = await _read_job_checked()
         if job is None:
             raise HTTPException(status_code=404, detail="corpus_job_unknown")
-        snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger read")
-        state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+        state = await _read_state(job)
         cursor = state.cursors.expected(hotkey)
         prompt_index = job_walk_index(job, hotkey, cursor)
         return {
@@ -1536,6 +1536,19 @@ def build_corpus_router(
         finally:
             ledger_lock.release()
         raise HTTPException(status_code=503, detail="corpus_ledger_contention")
+
+    async def _read_state(job: JobSpec) -> LedgerState:
+        """The ledgers for READING: rebuilt once per ETag and shared by the
+        cursor and next routes (and the skip's pre-check), so a miner polling
+        does not parse the ledger again. Callers must not mutate it; every
+        write path rebuilds its own copy under the lock."""
+        snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
+        if etag is not None and read_cache.get("etag") == etag:
+            return read_cache["state"]
+        state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+        if etag is not None:
+            read_cache.update(etag=etag, state=state)
+        return state
 
     async def _read_job_checked() -> JobSpec | None:
         """The manifest, or the same named 500 ``submit_corpus`` raises on one

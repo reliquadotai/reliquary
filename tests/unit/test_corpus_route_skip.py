@@ -641,3 +641,56 @@ def test_the_production_validator_wires_the_skip_verifier():
 
     source = inspect.getsource(corpus_validator.run_corpus_validator)
     assert "verify_skip_signature=verify_corpus_skip_signature" in source
+
+
+# --------------------------------------------------------------------------
+# the read cache
+# --------------------------------------------------------------------------
+
+
+def _counting_rebuilds(monkeypatch):
+    from reliquary.validator import corpus_service
+
+    calls = []
+    real = corpus_service.rebuild_ledgers
+
+    def counting(job, snapshot):
+        calls.append(job.job_id)
+        return real(job, snapshot)
+
+    monkeypatch.setattr(corpus_service, "rebuild_ledgers", counting)
+    return calls
+
+
+def test_reads_under_one_etag_rebuild_the_ledger_once(walk, fake_r2, seeded_job, monkeypatch):
+    _full_run(walk, fake_r2, 2)
+    calls = _counting_rebuilds(monkeypatch)
+    client = _client(_router(seeded_job))
+    first = client.get(f"/corpus/next/{HOTKEY}").json()
+    assert client.get(f"/corpus/next/{HOTKEY}").json() == first
+    assert client.get(f"/corpus/cursor/{HOTKEY}").json() == {"hotkey": HOTKEY, "cursor": 0}
+    assert client.get("/corpus/cursor/5Other").json()["cursor"] == 0
+    assert len(calls) == 1
+
+
+def test_a_new_etag_is_rebuilt_and_read_fresh(walk, fake_r2, seeded_job, monkeypatch):
+    _full_run(walk, fake_r2, 2)
+    calls = _counting_rebuilds(monkeypatch)
+    client = _client(_router(seeded_job))
+    assert client.get(f"/corpus/cursor/{HOTKEY}").json()["cursor"] == 0
+    assert client.post("/corpus/skip", json=_skip_body(walk, to_cursor=2)).json()["skipped"]
+    before = len(calls)
+    assert client.get(f"/corpus/cursor/{HOTKEY}").json()["cursor"] == 2
+    assert client.get(f"/corpus/next/{HOTKEY}").json()["cursor"] == 2
+    assert len(calls) == before + 1
+
+
+def test_the_cache_is_never_moved_by_a_skip(walk, fake_r2, seeded_job):
+    """The accept path decides on its own fresh copy: a cached state a skip
+    had advanced would serve a cursor the bucket never saw."""
+    _full_run(walk, fake_r2, 2)
+    seeded_job.fail_next_ledger_write_with_conflict(times=100)
+    client = _client(_router(seeded_job, max_write_attempts=2))
+    assert client.get(f"/corpus/cursor/{HOTKEY}").json()["cursor"] == 0
+    assert client.post("/corpus/skip", json=_skip_body(walk, to_cursor=2)).status_code == 503
+    assert client.get(f"/corpus/cursor/{HOTKEY}").json()["cursor"] == 0
