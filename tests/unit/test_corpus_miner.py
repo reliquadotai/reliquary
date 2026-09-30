@@ -493,3 +493,25 @@ def test_corpus_mine_on_a_multi_job_validator_without_job_id_mines_the_default(m
     assert isinstance(result.exception, _Downloading), (result.output, result.exception)
     assert "mining job math" in result.output and "code" in result.output
     assert "--job-id" in result.output
+
+
+def _single_job_validator():
+    """A validator from before several jobs: no /corpus/jobs routes at all."""
+    import httpx
+
+    def handle(request):
+        if request.url.path == "/corpus/job":
+            return httpx.Response(200, json={"job_id": "math"})
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    return httpx.Client(transport=httpx.MockTransport(handle), base_url="http://validator")
+
+
+@pytest.mark.parametrize("read", ["job", "contract"])
+def test_a_job_id_against_a_single_job_validator_says_to_drop_it(read):
+    from reliquary.miner.corpus_miner import CorpusJobSelectionError, HttpCorpusClient
+
+    client = HttpCorpusClient(_single_job_validator(), job_id="math")
+    with pytest.raises(CorpusJobSelectionError) as caught:
+        getattr(client, read)()
+    assert "single job" in str(caught.value) and "--job-id" in str(caught.value)

@@ -1076,7 +1076,14 @@ TRAINING_RUN_ID = (
 
 # Which task this process serves. "default" keeps the legacy archive paths, so
 # the running task is untouched by the existence of any other.
-TASK_IDS = parse_task_ids(_os.environ.get("RELIQUARY_TASK_ID"))
+try:
+    TASK_IDS = parse_task_ids(_os.environ.get("RELIQUARY_TASK_ID"))
+except ValueError as _exc:
+    # A deployment typo, not a bug: refuse with the corpus refusals' exit code.
+    import sys as _sys
+
+    print(f"error: RELIQUARY_TASK_ID is unusable: {_exc}", file=_sys.stderr)
+    raise SystemExit(4) from None
 # Several ids are a corpus-only configuration: `validate` refuses any other
 # mechanism among them before anything reads this single id.
 TASK_ID = TASK_IDS[0]

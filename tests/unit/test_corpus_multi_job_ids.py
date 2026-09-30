@@ -104,3 +104,16 @@ def test_the_settler_still_refuses_another_task_with_one_id(monkeypatch):
         asyncio.run(R2Archives().write("corpus-code", 3, {}))
     asyncio.run(R2Archives().write("corpus-math", 3, {}))
     assert keys == ["reliquary/tasks/corpus-math/dataset/window-3.json.gz"]
+
+
+@pytest.mark.parametrize("value", ["corpus-math,", "corpus-math,,corpus-code", "corpus-math,corpus-math"])
+def test_a_malformed_task_id_list_exits_four_without_a_traceback(value):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")}
+    env["RELIQUARY_TASK_ID"] = value
+    completed = subprocess.run(
+        [sys.executable, "-c", "import reliquary.constants"],
+        capture_output=True, text=True, env=env,
+    )
+    assert completed.returncode == 4, completed.stderr
+    assert "RELIQUARY_TASK_ID" in completed.stderr
+    assert "Traceback" not in completed.stderr

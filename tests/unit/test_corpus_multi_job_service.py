@@ -121,5 +121,6 @@ def test_one_job_keeps_the_legacy_routes_and_gains_the_scoped_ones(one_job):
     assert one_job.get("/corpus/jobs/swe-v1/job").json()["job_id"] == "swe-v1"
 
     refused = one_job.post("/corpus/submit", json=_body("other-job")).json()
-    assert refused["detail"] == {"job_id": "other-job", "serves": "swe-v1"}
+    # Always a list, one job or several.
+    assert refused["detail"] == {"job_id": "other-job", "serves": ["swe-v1"]}
     assert one_job.post("/corpus/submit", json=_body("swe-v1")).json()["accepted"] is True

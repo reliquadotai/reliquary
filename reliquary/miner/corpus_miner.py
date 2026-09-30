@@ -136,15 +136,26 @@ class HttpCorpusClient:
         except Exception:
             return []
 
+    def _refuse_unserved(self, response) -> None:
+        """A job-scoped 404: a job this validator does not serve, or a validator
+        from before several jobs, which has no job-scoped routes at all."""
+        if response.status_code != 404:
+            return
+        if _error_object(response).get("detail") == "corpus_job_not_served":
+            raise CorpusJobSelectionError(
+                f"the validator does not serve job {self._job_id!r}; it serves {self.served_jobs()}"
+            )
+        raise CorpusJobSelectionError(
+            "this validator serves a single job and has no job-scoped routes; "
+            "drop --job-id, or ask its operator to update it"
+        )
+
     def job(self) -> dict:
         if self._job_id is None:
             response = self._http.get("/corpus/job")
         else:
             response = self._http.get(f"/corpus/jobs/{self._job_id}/job")
-            if response.status_code == 404:
-                raise CorpusJobSelectionError(
-                    f"the validator does not serve job {self._job_id!r}; it serves {self.served_jobs()}"
-                )
+            self._refuse_unserved(response)
         response.raise_for_status()
         return response.json()
 
@@ -154,11 +165,7 @@ class HttpCorpusClient:
             response = self._http.get("/corpus/contract")
         else:
             response = self._http.get(f"/corpus/jobs/{self._job_id}/contract")
-            if (response.status_code == 404
-                    and _error_object(response).get("detail") == "corpus_job_not_served"):
-                raise CorpusJobSelectionError(
-                    f"the validator does not serve job {self._job_id!r}; it serves {self.served_jobs()}"
-                )
+            self._refuse_unserved(response)
         response.raise_for_status()
         return response.json()
 

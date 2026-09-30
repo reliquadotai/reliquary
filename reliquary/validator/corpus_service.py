@@ -1142,7 +1142,7 @@ def build_corpus_router(
         if request.job_id != job_id:
             return _refuse(
                 CorpusRejectReason.JOB_NOT_SERVED,
-                {"job_id": request.job_id, "serves": job_id},
+                {"job_id": request.job_id, "serves": [job_id]},
             )
 
         # Before anything reads or writes: an unsigned submission must not
