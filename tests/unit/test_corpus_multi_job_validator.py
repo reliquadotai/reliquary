@@ -238,3 +238,51 @@ def test_a_mismatched_second_job_refuses_before_any_download(
             wallet=None, netuid=0, signer_client=None, http_host="127.0.0.1", http_port=0,
             set_weights=False, registration_gate=False,
         ))
+
+
+# --------------------------------------------------------------------------
+# Ledger v2: each job migrated and its seen index preloaded at startup
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def v1_ledgers(_r2_client, monkeypatch):
+    """Both jobs' ledgers still v1, and every router's seen index recorded."""
+    from reliquary.infrastructure import corpus_job_store as store_module
+    from reliquary.validator import corpus_service
+    from tests.unit.test_corpus_ledger_migration import _digests
+
+    ledgers = {}
+    for job_id, salt in (("swe-v1", "a"), ("swe-v2", "b")):
+        seen = _digests(5000, salt)
+        ledgers[job_id] = {"schema": corpus_service.LEDGER_SCHEMA_V1,
+                           "slots": {str(i): 8 for i in range(len(seen) // 8)},
+                           "cursors": {"5Hot": 1}, "seen": seen}
+        _r2_client.objects[f"reliquary/corpus/jobs/{job_id}/ledgers.json"] = (
+            store_module._encode(ledgers[job_id]), '"seeded"')
+    indexes = {}
+    real = corpus_service.build_corpus_router
+
+    def recording(**kwargs):
+        indexes[kwargs["job_id"]] = kwargs.get("seen_index")
+        return real(**kwargs)
+
+    monkeypatch.setattr(corpus_service, "build_corpus_router", recording)
+    return SimpleNamespace(ledgers=ledgers, indexes=indexes, r2=_r2_client)
+
+
+def test_each_jobs_ledger_is_migrated_and_its_index_preloaded(v1_ledgers, booted):
+    import json
+
+    from reliquary.validator.corpus_service import LEDGER_SCHEMA_V2
+
+    for job_id, v1 in v1_ledgers.ledgers.items():
+        ledger = json.loads(v1_ledgers.r2.objects[f"reliquary/corpus/jobs/{job_id}/ledgers.json"][0])
+        assert ledger["schema"] == LEDGER_SCHEMA_V2
+        assert f"reliquary/corpus/jobs/{job_id}/ledgers.v1-backup.json" in v1_ledgers.r2.objects
+        index = v1_ledgers.indexes[job_id]
+        # Its own job's index, with that job's sealed digests and no other's.
+        assert index._job_id == job_id and len(index) > 0
+        sealed = set(index)
+        assert sealed | set(ledger["seen_pending"]) == set(v1["seen"])
+    assert not set(v1_ledgers.indexes["swe-v1"]) & set(v1_ledgers.indexes["swe-v2"])
