@@ -34,6 +34,7 @@ from reliquary.corpus.admission import (
     admit,
     out_of_range_detail,
     skip,
+    skip_refusal,
     skip_target,
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
@@ -1039,6 +1040,15 @@ def _refuse_skip(
     return CorpusSkipResponse(reason=reason, skipped=False, detail=dict(detail or {}))
 
 
+def _skip_refused(verdict: Verdict) -> CorpusSkipResponse:
+    return CorpusSkipResponse(
+        reason=CorpusRejectReason(verdict.reason),
+        skipped=False,
+        slots_remaining=verdict.slots_remaining,
+        detail=dict(verdict.detail),
+    )
+
+
 def build_corpus_router(
     *,
     job_id: str,
@@ -1488,6 +1498,22 @@ def build_corpus_router(
         if job is None:
             return _refuse_skip(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
 
+        # Decided first against the shared read state: a refusal writes
+        # nothing, so it need not queue behind submissions for the ledger. An
+        # accept is only a candidate; it is decided again under the lock.
+        cached = await _read_state(job)
+        refused = skip_refusal(
+            job,
+            hotkey=request.miner_hotkey,
+            cursor=request.cursor,
+            prompt_index=request.prompt_index,
+            to_cursor=request.to_cursor,
+            slots=cached.slots,
+            cursors=cached.cursors,
+        )
+        if refused is not None:
+            return _skip_refused(refused)
+
         try:
             await asyncio.wait_for(ledger_lock.acquire(), ledger_lock_timeout)
         except asyncio.TimeoutError:
@@ -1507,12 +1533,7 @@ def build_corpus_router(
                 )
                 if not verdict.accepted:
                     # Moved nothing, so it costs no write.
-                    return CorpusSkipResponse(
-                        reason=CorpusRejectReason(verdict.reason),
-                        skipped=False,
-                        slots_remaining=verdict.slots_remaining,
-                        detail=dict(verdict.detail),
-                    )
+                    return _skip_refused(verdict)
                 # Pending and segments pass through untouched: a skip adds no
                 # digest, so it never has anything to seal.
                 after = ledger_snapshot(
@@ -1601,6 +1622,7 @@ def build_corpus_router(
     router.submit_corpus = submit_corpus
     router.corpus_next = corpus_next
     router.skip_corpus = skip_corpus
+    router.ledger_lock = ledger_lock
     return router
 
 

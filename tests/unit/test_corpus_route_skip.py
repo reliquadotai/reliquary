@@ -694,3 +694,39 @@ def test_the_cache_is_never_moved_by_a_skip(walk, fake_r2, seeded_job):
     assert client.get(f"/corpus/cursor/{HOTKEY}").json()["cursor"] == 0
     assert client.post("/corpus/skip", json=_skip_body(walk, to_cursor=2)).status_code == 503
     assert client.get(f"/corpus/cursor/{HOTKEY}").json()["cursor"] == 0
+
+
+# --------------------------------------------------------------------------
+# refusals never queue for the ledger
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stale", [
+    dict(cursor=1, to_cursor=2),          # bad_cursor
+    dict(prompt_index=None, to_cursor=3),  # an open prompt in the range
+    dict(to_cursor=10_000),               # past the bound
+])
+def test_a_refused_skip_never_takes_the_ledger_lock(walk, fake_r2, seeded_job, stale):
+    from fastapi import HTTPException
+
+    _full_run(walk, fake_r2, 2)
+    router = _router(seeded_job, ledger_lock_timeout=0.2)
+    refused = CorpusSkipRequest(**_skip_body(walk, **stale))
+    valid = CorpusSkipRequest(**_skip_body(walk, to_cursor=2))
+
+    async def with_the_lock_held():
+        await router.ledger_lock.acquire()
+        try:
+            answer = await router.skip_corpus(refused)
+            with pytest.raises(HTTPException) as waited:
+                await router.skip_corpus(valid)
+            return answer, waited.value
+        finally:
+            router.ledger_lock.release()
+
+    answer, waited = asyncio.run(with_the_lock_held())
+    assert answer.skipped is False
+    assert answer.reason.value in ("bad_cursor", "prompt_not_full", "malformed_submission")
+    # The valid one did queue, and timed out behind the held lock.
+    assert (waited.status_code, waited.detail) == (503, "corpus_ledger_contention")
+    assert _ledger(fake_r2)["cursors"] == {}
