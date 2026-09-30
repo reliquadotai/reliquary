@@ -377,3 +377,141 @@ def test_a_vision_checkpoint_is_served_text_only(monkeypatch, tmp_path):
     text = VllmGenerator("/fake/checkpoint", sampling, proof, EOS)
     assert vision._llm.kwargs["limit_mm_per_prompt"] == {"image": 0, "video": 0}
     assert "limit_mm_per_prompt" not in text._llm.kwargs
+
+
+# --------------------------------------------------------------------------
+# HttpCorpusClient: the legacy paths, or one job's paths with --job-id
+# --------------------------------------------------------------------------
+
+
+def _validator(jobs):
+    """A validator serving ``jobs`` (job_id -> manifest), answering like the real routes."""
+    import httpx
+
+    seen = []
+
+    def handle(request):
+        seen.append((request.method, request.url.path))
+        path = request.url.path
+        if path == "/corpus/jobs":
+            return httpx.Response(200, json={"jobs": sorted(jobs)})
+        if path == "/corpus/job":
+            return httpx.Response(200, json=next(iter(jobs.values())))
+        if path == "/corpus/cursor/5Hot":
+            return httpx.Response(200, json={"hotkey": "5Hot", "cursor": 3})
+        if path.startswith("/corpus/jobs/"):
+            _, _, _, job_id, what, *rest = path.split("/")
+            if job_id not in jobs:
+                return httpx.Response(404, json={"detail": "corpus_job_not_served"})
+            if what == "job":
+                return httpx.Response(200, json=jobs[job_id])
+            return httpx.Response(200, json={"hotkey": rest[0], "cursor": 7})
+        if path == "/corpus/submit":
+            return httpx.Response(200, json={"accepted": True, "reason": "accepted"})
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    return httpx.Client(transport=httpx.MockTransport(handle), base_url="http://validator"), seen
+
+
+def test_without_a_job_id_the_client_uses_the_legacy_paths():
+    from reliquary.miner.corpus_miner import HttpCorpusClient
+
+    http, seen = _validator({"math": {"job_id": "math"}})
+    client = HttpCorpusClient(http)
+
+    assert client.job() == {"job_id": "math"}
+    assert client.cursor("5Hot") == 3
+    assert client.submit({"job_id": "math"})["accepted"] is True
+    assert [p for _, p in seen] == ["/corpus/job", "/corpus/cursor/5Hot", "/corpus/submit"]
+
+
+def test_with_a_job_id_the_client_uses_that_jobs_paths():
+    from reliquary.miner.corpus_miner import HttpCorpusClient
+
+    http, seen = _validator({"math": {"job_id": "math"}, "code": {"job_id": "code"}})
+    client = HttpCorpusClient(http, job_id="code")
+
+    assert client.job() == {"job_id": "code"}
+    assert client.cursor("5Hot") == 7
+    assert client.submit({"job_id": "code"})["accepted"] is True
+    assert [p for _, p in seen] == ["/corpus/jobs/code/job", "/corpus/jobs/code/cursor/5Hot",
+                                    "/corpus/submit"]
+
+
+def test_a_multi_job_validator_without_a_job_id_gives_its_first_listed_job():
+    from reliquary.miner.corpus_miner import HttpCorpusClient
+
+    http, _ = _validator({"math": {"job_id": "math"}, "code": {"job_id": "code"}})
+    client = HttpCorpusClient(http)
+
+    assert client.job() == {"job_id": "math"}
+    assert client.served_jobs() == ["code", "math"]
+
+
+def test_a_job_id_the_validator_does_not_serve_names_the_ones_it_does():
+    from reliquary.miner.corpus_miner import CorpusJobSelectionError, HttpCorpusClient
+
+    http, _ = _validator({"math": {"job_id": "math"}, "code": {"job_id": "code"}})
+
+    with pytest.raises(CorpusJobSelectionError) as caught:
+        HttpCorpusClient(http, job_id="nope").job()
+    assert "nope" in str(caught.value) and "code" in str(caught.value)
+
+
+def test_corpus_mine_on_a_multi_job_validator_without_job_id_mines_the_default(monkeypatch):
+    """Adding a job must not halt a live miner: it keeps mining the validator's
+    default job, and is told the others exist."""
+    from types import SimpleNamespace
+
+    import bittensor
+    import httpx
+    import huggingface_hub
+    from typer.testing import CliRunner
+
+    import reliquary.protocol.profiles as profiles
+    from reliquary.cli.main import app
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR, TOPLOC_DEPLOYED_DEFAULTS
+
+    class _Downloading(Exception):
+        pass
+
+    def download(repo, revision=None):
+        raise _Downloading(repo)
+
+    from tests.unit.test_corpus_service import _manifest
+
+    http, seen = _validator({"math": {**_manifest(), "job_id": "math"}, "code": {"job_id": "code"}})
+    monkeypatch.setenv(TASK_CONTRACT_ENV_VAR, "/unused-profile-is-patched")
+    monkeypatch.setattr(profiles, "ACTIVE_PROTOCOL_PROFILE",
+                        SimpleNamespace(profile_id="p", proofs=(TOPLOC_DEPLOYED_DEFAULTS,)))
+    monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
+    monkeypatch.setattr(httpx, "Client", lambda **kw: http)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+
+    result = CliRunner().invoke(app, ["corpus", "mine", "--validator-url", "http://validator"])
+
+    assert isinstance(result.exception, _Downloading), (result.output, result.exception)
+    assert "mining job math" in result.output and "code" in result.output
+    assert "--job-id" in result.output
+
+
+def _single_job_validator():
+    """A validator from before several jobs: no /corpus/jobs routes at all."""
+    import httpx
+
+    def handle(request):
+        if request.url.path == "/corpus/job":
+            return httpx.Response(200, json={"job_id": "math"})
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    return httpx.Client(transport=httpx.MockTransport(handle), base_url="http://validator")
+
+
+@pytest.mark.parametrize("read", ["job", "contract"])
+def test_a_job_id_against_a_single_job_validator_says_to_drop_it(read):
+    from reliquary.miner.corpus_miner import CorpusJobSelectionError, HttpCorpusClient
+
+    client = HttpCorpusClient(_single_job_validator(), job_id="math")
+    with pytest.raises(CorpusJobSelectionError) as caught:
+        getattr(client, read)()
+    assert "single job" in str(caught.value) and "--job-id" in str(caught.value)

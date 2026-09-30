@@ -153,6 +153,17 @@ def _make_service(checkpoint_hash=REV_A):
     return svc
 
 
+@pytest.fixture(autouse=True)
+def _restore_archive_upload():
+    # The service builder swaps storage's uploader for a mock; put it back so
+    # the rest of the session uploads through the real function.
+    import reliquary.validator.service as svc_mod
+
+    original = svc_mod.storage.upload_window_dataset
+    yield
+    svc_mod.storage.upload_window_dataset = original
+
+
 def _patch_open_grpo_window(svc):
     """Return a context manager that replaces open_grpo_window in the service
     module with a version that injects mock verifiers (no torch, no crypto).

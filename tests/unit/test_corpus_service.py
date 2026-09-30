@@ -557,7 +557,7 @@ def test_a_submission_for_another_job_never_reaches_this_validators_store(
 
     assert body["accepted"] is False
     assert body["reason"] == "job_not_served"
-    assert body["detail"]["serves"] == "swe-v1"
+    assert body["detail"]["serves"] == ["swe-v1"]
     assert seeded_job.store.job_reads == before_reads
     assert seeded_job.ledger_writes() == before_writes
 

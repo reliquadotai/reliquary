@@ -82,6 +82,11 @@ def _error_detail(response):
         return response.text[:500]
 
 
+def _error_object(response) -> dict:
+    detail = _error_detail(response)
+    return detail if isinstance(detail, dict) else {}
+
+
 def issue_corpus_request(request_call):
     """Run one httpx request against the corpus validator, translating its
     outcome into the two exceptions ``mine_steps`` understands. A status in
@@ -109,6 +114,68 @@ def issue_corpus_request(request_call):
             f"non-JSON body from {response.request.url}: {exc}",
             status=response.status_code,
         ) from exc
+
+
+class CorpusJobSelectionError(Exception):
+    """This miner named a job the validator does not serve: pass ``--job-id``
+    with one of the listed jobs."""
+
+
+class HttpCorpusClient:
+    """The ``CorpusClient`` over HTTP: the legacy paths (the validator's default
+    job), or with ``job_id`` that job's own paths on a validator serving several."""
+
+    def __init__(self, http, *, job_id: str | None = None) -> None:
+        self._http = http
+        self._job_id = job_id
+
+    def served_jobs(self) -> list:
+        """Every job the validator serves; empty when it cannot say."""
+        try:
+            return list(self._http.get("/corpus/jobs").json()["jobs"])
+        except Exception:
+            return []
+
+    def _refuse_unserved(self, response) -> None:
+        """A job-scoped 404: a job this validator does not serve, or a validator
+        from before several jobs, which has no job-scoped routes at all."""
+        if response.status_code != 404:
+            return
+        if _error_object(response).get("detail") == "corpus_job_not_served":
+            raise CorpusJobSelectionError(
+                f"the validator does not serve job {self._job_id!r}; it serves {self.served_jobs()}"
+            )
+        raise CorpusJobSelectionError(
+            "this validator serves a single job and has no job-scoped routes; "
+            "drop --job-id, or ask its operator to update it"
+        )
+
+    def job(self) -> dict:
+        if self._job_id is None:
+            response = self._http.get("/corpus/job")
+        else:
+            response = self._http.get(f"/corpus/jobs/{self._job_id}/job")
+            self._refuse_unserved(response)
+        response.raise_for_status()
+        return response.json()
+
+    def contract(self) -> dict:
+        """The task contract the validator serves for this job (or its only one)."""
+        if self._job_id is None:
+            response = self._http.get("/corpus/contract")
+        else:
+            response = self._http.get(f"/corpus/jobs/{self._job_id}/contract")
+            self._refuse_unserved(response)
+        response.raise_for_status()
+        return response.json()
+
+    def cursor(self, hotkey: str) -> int:
+        path = (f"/corpus/cursor/{hotkey}" if self._job_id is None
+                else f"/corpus/jobs/{self._job_id}/cursor/{hotkey}")
+        return int(issue_corpus_request(lambda: self._http.get(path))["cursor"])
+
+    def submit(self, body: dict) -> dict:
+        return issue_corpus_request(lambda: self._http.post("/corpus/submit", json=body))
 
 
 @dataclass(frozen=True)

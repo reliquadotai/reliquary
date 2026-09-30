@@ -219,6 +219,8 @@ def _sync_boto3_put(
 async def upload_window_dataset(
     window_start: int,
     data: dict,
+    *,
+    task_id: str | None = None,
     **client_kwargs,
 ) -> bool:
     """Upload archive to flat R2 path reliquary/dataset/window-<N>.json.gz.
@@ -245,7 +247,7 @@ async def upload_window_dataset(
     and a brief failure is non-fatal (they're called from less
     time-sensitive code paths).
     """
-    key = dataset_object_key(window_start)
+    key = dataset_object_key(window_start, task_id)
     payload = json.dumps(data, separators=(",", ":")).encode()
     compressed = gzip.compress(payload)
 

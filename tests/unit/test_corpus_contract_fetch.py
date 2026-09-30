@@ -42,8 +42,11 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
 
     job = {"job_id": "code-v1", "checkpoint_repo": "org/M", "checkpoint_revision": "r1"}
     served = {"/corpus/job": job, "/corpus/contract": CONTRACT}
+    requested = []
 
     class _Response:
+        status_code = 200
+
         def __init__(self, body):
             self._body = body
 
@@ -58,6 +61,7 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
             pass
 
         def get(self, path):
+            requested.append(path)
             return _Response(served[path])
 
     class _Restarted(Exception):
@@ -80,6 +84,8 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
     assert isinstance(result.exception, _Restarted), result.output
     (_, _, contract_path), = execs
     assert json.loads(open(contract_path).read()) == CONTRACT
+    # One job, no --job-id: the legacy paths, as before several jobs existed.
+    assert requested == ["/corpus/job", "/corpus/contract"]
 
 
 def test_the_restart_test_leaves_no_contract_behind():

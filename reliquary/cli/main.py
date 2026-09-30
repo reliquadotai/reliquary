@@ -151,7 +151,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, ver
 def build_contract_task_entry(
     *,
     task_id,
-    from_profile,
+    from_profile=None,
     model_id,
     model_revision,
     model_architecture,
@@ -159,8 +159,12 @@ def build_contract_task_entry(
     cap,
     overrides,
     verification=None,
+    base=None,
 ):
     """One registry entry that CARRIES its contract, seeded from a template.
+
+    The template is ``base`` (a profile, e.g. a composed one) or ``from_profile``
+    (a compiled profile id resolved here); exactly one is given.
 
     The template is a starting point, never the authority: the entry's contract
     is what the fleet will run, and its digest is computed from that contract.
@@ -182,7 +186,12 @@ def build_contract_task_entry(
     from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
     task_id = normalise_task_id(task_id)
-    contract = dict(resolve_protocol_profile(from_profile).to_generation_contract())
+    if (base is None) == (from_profile is None):
+        raise ValueError("a contract is seeded from exactly one of base or from_profile")
+    if base is None:
+        base = resolve_protocol_profile(from_profile)
+    from_profile = base.profile_id
+    contract = dict(base.to_generation_contract())
 
     # The task id IS the contract's profile id: two tasks seeded from one
     # template must stay distinguishable to the checks that compare them.
@@ -234,7 +243,7 @@ def build_corpus_task_entry(
     *,
     task_id,
     job_id,
-    from_profile,
+    from_profile=None,
     model_id,
     model_revision,
     model_architecture,
@@ -244,6 +253,7 @@ def build_corpus_task_entry(
     verification=None,
     min_incentive_share=0.0,
     audit_params: Mapping | None = None,
+    base=None,
 ):
     """One registry entry for a corpus generation job.
 
@@ -269,6 +279,7 @@ def build_corpus_task_entry(
     entry = build_contract_task_entry(
         task_id=task_id,
         from_profile=from_profile,
+        base=base,
         model_id=model_id,
         model_revision=model_revision,
         model_architecture=model_architecture,
@@ -348,6 +359,126 @@ def _parse_env_split_option(value: str | None) -> dict[str, float] | None:
     return shares
 
 
+def _parse_set_options(values) -> dict[str, dict[str, object]]:
+    """``["code.max_new_tokens=16384"]`` -> ``{"code": {"max_new_tokens": 16384}}``.
+
+    Values are typed here because the contract is: ``thinking`` is a JSON
+    boolean and every other tunable field a whole number. Which fields are
+    tunable at all is ``compose_profile``'s refusal, not this parser's.
+    """
+    from reliquary.protocol.environment_catalog import TUNABLE_FIELDS
+
+    overrides: dict[str, dict[str, object]] = {}
+    for raw in values or ():
+        target, sep, value = raw.partition("=")
+        name, dot, field = target.strip().partition(".")
+        if not sep or not dot or not name or not field:
+            raise ValueError(f"--set takes ENV.FIELD=VALUE, got {raw!r}")
+        value = value.strip()
+        if field not in TUNABLE_FIELDS:
+            parsed: object = value  # left for compose_profile to refuse by name
+        elif field == "thinking":
+            if value not in ("true", "false"):
+                raise ValueError(f"--set {target}: thinking is true or false, got {value!r}")
+            parsed = value == "true"
+        else:
+            try:
+                parsed = int(value)
+            except ValueError:
+                raise ValueError(
+                    f"--set {target}: expected a whole number, got {value!r}"
+                ) from None
+        overrides.setdefault(name, {})[field] = parsed
+    return overrides
+
+
+def _run_policy_named(name, *, rollouts=None, temperature=None, top_p=None, top_k=None):
+    """A named run policy, with any sampling flag the operator gave applied."""
+    from dataclasses import replace
+
+    from reliquary.protocol.composition import RUN_POLICIES
+
+    if name not in RUN_POLICIES:
+        raise ValueError(
+            f"unknown run policy {name!r}; expected one of {', '.join(sorted(RUN_POLICIES))}"
+        )
+    run = RUN_POLICIES[name]
+    sampling = {
+        k: v for k, v in (
+            ("rollouts", rollouts), ("temperature", temperature),
+            ("top_p", top_p), ("top_k", top_k),
+        ) if v is not None
+    }
+    if sampling:
+        run = replace(run, sampling=replace(run.sampling, **sampling))
+    return run
+
+
+def _proofs_named(proof, proof_mode):
+    """``--proof toploc --proof-mode M``: the deployed defaults in mode M."""
+    from dataclasses import replace
+
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
+
+    if proof is None and proof_mode is None:
+        return ()
+    if proof != "toploc":
+        raise ValueError(f"--proof takes 'toploc', got {proof!r}")
+    # Named, never defaulted: on an RL task enforce moves the decision off GRAIL.
+    if proof_mode not in ("shadow", "enforce"):
+        raise ValueError("--proof toploc needs --proof-mode shadow or enforce")
+    return (replace(TOPLOC_DEPLOYED_DEFAULTS, mode=proof_mode),)
+
+
+def _composed_task_entry(
+    *, task_id, model, model_revision, model_architecture, prompt_encoding, envs,
+    run_policy, set_values, rollouts, temperature, top_p, top_k, proof, proof_mode,
+    env_split, cap, overrides, verification,
+):
+    """``tasks create --model`` without a template: model + run policy + catalog."""
+    from reliquary.protocol.composition import ModelSpec, compose_profile
+    from reliquary.shared.task_id import normalise_task_id
+
+    if env_split is not None:
+        raise ValueError(
+            "--env-split has no effect with --model; a carried contract declares "
+            "its own environment set, selected with --envs"
+        )
+    missing = [
+        flag for flag, value in (
+            ("--model-revision", model_revision),
+            ("--model-architecture", model_architecture),
+            ("--prompt-encoding", prompt_encoding),
+            ("--envs", envs),
+            ("--run-policy", run_policy),
+        ) if value is None
+    ]
+    if missing:
+        raise ValueError(
+            f"composing a contract from --model requires {', '.join(missing)} "
+            "(or seed it from a template with --from-profile)"
+        )
+    task_id = normalise_task_id(task_id)
+    profile = compose_profile(
+        profile_id=task_id,
+        model=ModelSpec(
+            model_id=model, model_revision=model_revision,
+            model_architecture=model_architecture, prompt_encoding=prompt_encoding,
+            proofs=_proofs_named(proof, proof_mode),
+        ),
+        run=_run_policy_named(
+            run_policy, rollouts=rollouts, temperature=temperature, top_p=top_p, top_k=top_k,
+        ),
+        environments=[e.strip() for e in envs.split(",") if e.strip()],
+        overrides=_parse_set_options(set_values),
+    )
+    return build_contract_task_entry(
+        task_id=task_id, base=profile, model_id=model, model_revision=model_revision,
+        model_architecture=model_architecture, environments=None, cap=cap,
+        overrides=overrides, verification=verification,
+    )
+
+
 @tasks_app.command("create")
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
@@ -375,8 +506,25 @@ def tasks_create(
         None, "--from-profile", help="Template to seed the contract from"
     ),
     envs: str = typer.Option(
-        None, "--envs", help="Comma-separated subset of the template's environments"
+        None,
+        "--envs",
+        help="Comma-separated environments: a subset of the template's, or the catalog's when composing",
     ),
+    prompt_encoding: str = typer.Option(
+        None, "--prompt-encoding", help="Composing: raw (base model) or chat_template"
+    ),
+    run_policy: str = typer.Option(
+        None, "--run-policy", help="Composing: named run policy, e.g. dapo-v6 or suite-v9"
+    ),
+    set_values: list[str] = typer.Option(
+        None, "--set", help="Composing: ENV.FIELD=VALUE override of a tunable field; repeatable"
+    ),
+    rollouts: int = typer.Option(None, "--rollouts", help="Composing: overrides the run policy"),
+    temperature: float = typer.Option(None, "--temperature", help="Composing: overrides the run policy"),
+    top_p: float = typer.Option(None, "--top-p", help="Composing: overrides the run policy"),
+    top_k: int = typer.Option(None, "--top-k", help="Composing: overrides the run policy"),
+    proof: str = typer.Option(None, "--proof", help="Composing: 'toploc' adds the deployed TOPLOC defaults"),
+    proof_mode: str = typer.Option(None, "--proof-mode", help="With --proof: shadow or enforce"),
     verification: str = typer.Option(
         None,
         "--verification",
@@ -391,8 +539,34 @@ def tasks_create(
     from reliquary.shared.task_registry import RegistryError
 
     overrides = {k: v for k, v in (("start", start), ("decay", decay)) if v is not None}
+    # Flags that only mean something when the contract is composed.
+    compose_flags = [
+        flag for flag, value in (
+            ("--prompt-encoding", prompt_encoding), ("--run-policy", run_policy),
+            ("--set", set_values or None), ("--rollouts", rollouts),
+            ("--temperature", temperature), ("--top-p", top_p), ("--top-k", top_k),
+            ("--proof", proof), ("--proof-mode", proof_mode),
+        ) if value is not None
+    ]
     try:
-        if model is not None:
+        if compose_flags and (model is None or from_profile is not None):
+            # The template (or compiled profile) would silently win over them.
+            typer.echo(
+                f"error: {', '.join(compose_flags)} only apply when composing a "
+                "contract: give --model without --from-profile",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if model is not None and from_profile is None and profile_id is None:
+            entry = _composed_task_entry(
+                task_id=task_id, model=model, model_revision=model_revision,
+                model_architecture=model_architecture, prompt_encoding=prompt_encoding,
+                envs=envs, run_policy=run_policy, set_values=set_values,
+                rollouts=rollouts, temperature=temperature, top_p=top_p, top_k=top_k,
+                proof=proof, proof_mode=proof_mode, env_split=env_split, cap=cap,
+                overrides=overrides, verification=verification,
+            )
+        elif model is not None:
             if profile_id is not None:
                 # An operator who passes an option believes it does
                 # something; silently dropping --profile-id here would be
@@ -566,24 +740,108 @@ def tasks_retire(
 
 
 @tasks_app.command("contract")
-def tasks_contract(task_id: str = typer.Option(..., "--task-id")) -> None:
+def tasks_contract(
+    task_ids: list[str] = typer.Option(
+        ..., "--task-id",
+        help="Repeat for corpus tasks one validator serves together: prints their merged contract",
+    ),
+) -> None:
     """Print a task's carried contract, for a deployment to mount."""
     import json
 
     from reliquary.infrastructure.task_registry_store import read_registry
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+    from reliquary.validator.task_config import merge_corpus_contracts
 
     entries, _ = asyncio.run(read_registry(strict=False))
-    entry = entries.get(task_id)
-    if entry is None:
-        typer.echo(f"error: no task {task_id!r} in the registry", err=True)
-        raise typer.Exit(code=1)
-    if entry.contract is None:
+    contracts = {}
+    for task_id in task_ids:
+        entry = entries.get(task_id)
+        if entry is None:
+            typer.echo(f"error: no task {task_id!r} in the registry", err=True)
+            raise typer.Exit(code=1)
+        if entry.contract is None:
+            typer.echo(
+                f"error: task {task_id!r} is a legacy entry and carries no contract",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if len(task_ids) > 1 and entry.mechanism != MECHANISM_CORPUS_GENERATION:
+            typer.echo(
+                f"error: task {task_id!r} is {entry.mechanism!r}; only corpus tasks "
+                "share one validator's contract",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        contracts[task_id] = entry.contract
+    if len(contracts) == 1:
+        contract = next(iter(contracts.values()))
+    else:
+        try:
+            contract = merge_corpus_contracts(contracts)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(contract, sort_keys=True, separators=(",", ":")))
+
+
+envs_app = typer.Typer(
+    name="envs", help="The environment catalog composed contracts are built from"
+)
+app.add_typer(envs_app)
+
+
+@envs_app.command("list")
+def envs_list() -> None:
+    """Every catalogued environment, its default budget, source profile and digest."""
+    from reliquary.protocol.environment_catalog import (
+        CATALOG_PROVENANCE,
+        ENVIRONMENT_CATALOG,
+        environment_body_contract,
+    )
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    typer.echo(f"{'environment':<38} {'max_new_tokens':>14}  {'sha256':<12}  provenance")
+    for name in sorted(ENVIRONMENT_CATALOG):
+        digest = canonical_sha256(environment_body_contract(name))
         typer.echo(
-            f"error: task {task_id!r} is a legacy entry and carries no contract",
+            f"{name:<38} {ENVIRONMENT_CATALOG[name].max_new_tokens:>14}  "
+            f"{digest[:12]}  {CATALOG_PROVENANCE[name]}"
+        )
+
+
+@envs_app.command("show")
+def envs_show(name: str = typer.Argument(...)) -> None:
+    """One catalog body as JSON, with its digest, provenance and tunable fields."""
+    import json
+
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.protocol.environment_catalog import (
+        CATALOG_PROVENANCE,
+        ENVIRONMENT_CATALOG,
+        TUNABLE_FIELDS,
+        environment_body_contract,
+    )
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    if name not in ENVIRONMENT_CATALOG:
+        reason = (
+            "is installed but has no catalog entry; add and review one first"
+            if name in ENVIRONMENT_SPECS else "is not an environment"
+        )
+        typer.echo(
+            f"error: {name!r} {reason}; catalogued: {', '.join(sorted(ENVIRONMENT_CATALOG))}",
             err=True,
         )
         raise typer.Exit(code=1)
-    typer.echo(json.dumps(entry.contract, sort_keys=True, separators=(",", ":")))
+    body = environment_body_contract(name)
+    typer.echo(json.dumps({
+        "name": name,
+        "body": body,
+        "canonical_sha256": canonical_sha256(body),
+        "provenance": CATALOG_PROVENANCE[name],
+        "tunable_fields": sorted(TUNABLE_FIELDS),
+    }, indent=2, sort_keys=True))
 
 
 jobs_app = typer.Typer(
@@ -614,6 +872,7 @@ def build_job_manifest(
     prompt_order,
     deadline_round,
     from_profile=None,
+    profile=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -627,6 +886,9 @@ def build_job_manifest(
     from reliquary.corpus.job import JOB_SCHEMA, parse_job
     from reliquary.validator.corpus_service import prompt_job_for_spec
 
+    # Neither means the active profile; both would leave one silently unused.
+    if profile is not None and from_profile is not None:
+        raise ValueError("pass the job's profile or its template id, not both")
     if (grader_id is None) != (threshold is None):
         raise ValueError(
             "--grader-id and --threshold go together: a filter needs both, and "
@@ -666,8 +928,41 @@ def build_job_manifest(
     # after it. The profile checked against is the template the TASK is seeded
     # from, not whichever one this CLI process happens to run: it is the one
     # the fleet will render these prompts with.
-    prompt_job_for_spec(parse_job(manifest), profile=from_profile)
+    prompt_job_for_spec(
+        parse_job(manifest), profile=from_profile if profile is None else profile
+    )
     return manifest
+
+
+def _corpus_base_profile(
+    *, task_id, from_profile, model, model_revision, model_architecture,
+    prompt_encoding, renderer_id, prompt_source,
+):
+    """The profile a corpus job's contract is built from: the named template, or
+    one composed from the model, the ``corpus-v1`` run policy and the catalog."""
+    from reliquary.protocol.composition import RUN_POLICIES, ModelSpec, compose_profile
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_id import normalise_task_id
+    from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
+
+    if from_profile is not None:
+        if prompt_encoding is not None:
+            raise ValueError(
+                "--prompt-encoding has no effect with --from-profile: the template's "
+                "encoding is kept; omit --from-profile to compose the contract"
+            )
+        return resolve_protocol_profile(from_profile)
+    if prompt_encoding is None:
+        prompt_encoding = (
+            "chat_template" if renderer_id in CHAT_TEMPLATE_RENDERERS else "raw"
+        )
+    # No environment overrides: two jobs on one source must carry one body to merge.
+    return compose_profile(
+        profile_id=normalise_task_id(task_id),
+        model=ModelSpec(model, model_revision, model_architecture, prompt_encoding),
+        run=RUN_POLICIES["corpus-v1"],
+        environments=[prompt_source],
+    )
 
 
 @jobs_app.command("create")
@@ -689,11 +984,21 @@ def jobs_create(
         ..., "--checkpoint-sha256", help="64 lowercase hex characters"
     ),
     from_profile: str = typer.Option(
-        ..., "--from-profile", help="Template to seed the contract from"
+        None,
+        "--from-profile",
+        help="Legacy: seed the contract from a compiled template. Omit to compose "
+        "it from the model flags, the corpus-v1 run policy and the catalog",
+    ),
+    prompt_encoding: str = typer.Option(
+        None,
+        "--prompt-encoding",
+        help="Composing: raw or chat_template; defaults to chat_template for a "
+        "chat-template renderer, raw otherwise",
     ),
     prompt_source: str = typer.Option(
         ...,
         "--prompt-source",
+        "--env",
         help="The installed environment the job draws prompts from; it becomes "
         "the contract's single environment",
     ),
@@ -710,7 +1015,7 @@ def jobs_create(
     max_new_tokens: int = typer.Option(
         None,
         "--max-new-tokens",
-        help="Omit to take the budget the template gives this prompt source",
+        help="Omit to take the budget the template (or the catalog) gives this prompt source",
     ),
     cap: float = typer.Option(
         ..., "--cap", help="The task's share of the pool; also its pinned price"
@@ -809,12 +1114,16 @@ def jobs_create(
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
     }
     try:
+        base = _corpus_base_profile(
+            task_id=task_id or job_id, from_profile=from_profile, model=model,
+            model_revision=model_revision, model_architecture=model_architecture,
+            prompt_encoding=prompt_encoding, renderer_id=renderer_id,
+            prompt_source=prompt_source,
+        )
         if max_new_tokens is None:
-            # The template budgets each environment for its model, and the RL
-            # task on the same source generates to that length already.
-            from reliquary.protocol.profiles import resolve_protocol_profile
-
-            environments = resolve_protocol_profile(from_profile).environments
+            # The template or catalog budgets each environment; the length stays
+            # a manifest field, so the contract body is not overridden.
+            environments = base.environments
             if prompt_source not in environments:
                 raise ValueError(
                     f"template {from_profile!r} does not declare {prompt_source!r}; "
@@ -833,9 +1142,9 @@ def jobs_create(
             prompt_source=prompt_source,
             prompt_count=prompt_count,
             renderer_id=renderer_id,
-            # The same template the entry's contract is built from, so the
-            # manifest is checked against the contract this command declares.
-            from_profile=from_profile,
+            # The profile the entry's contract is built from, so the manifest is
+            # checked against the contract this command declares.
+            profile=base,
             eos_token_id=eos_token_id,
             slots_per_prompt=slots_per_prompt,
             temperature=temperature,
@@ -852,7 +1161,7 @@ def jobs_create(
         entry = build_corpus_task_entry(
             task_id=task_id or job_id,
             job_id=job_id,
-            from_profile=from_profile,
+            base=base,
             model_id=model,
             model_revision=model_revision,
             model_architecture=model_architecture,
@@ -1187,30 +1496,36 @@ corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
 
-def _restart_with_served_contract(validator_url: str) -> None:
+def _restart_with_served_contract(validator_url: str, job_id: str | None = None) -> None:
     """Take the task's contract from the validator and restart with it: the
-    active profile is fixed when this process imports it."""
+    active profile is fixed when this process imports it. With ``job_id``,
+    that job's own task contract on a validator serving several."""
     import sys
     from pathlib import Path
     from types import SimpleNamespace
 
     import httpx
 
-    from reliquary.miner.corpus_miner import CorpusContractError, save_served_contract
+    from reliquary.miner.corpus_miner import (
+        CorpusContractError,
+        CorpusJobSelectionError,
+        HttpCorpusClient,
+        save_served_contract,
+    )
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
-    http = httpx.Client(base_url=validator_url, timeout=60.0)
-    responses = {}
-    for path in ("/corpus/job", "/corpus/contract"):
-        response = http.get(path)
-        response.raise_for_status()
-        responses[path] = response.json()
-    raw = responses["/corpus/job"]
+    client = HttpCorpusClient(httpx.Client(base_url=validator_url, timeout=60.0), job_id=job_id)
+    try:
+        raw = client.job()
+        contract = client.contract()
+    except CorpusJobSelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     job = SimpleNamespace(job_id=raw.get("job_id"), checkpoint_repo=raw.get("checkpoint_repo"),
                           checkpoint_revision=raw.get("checkpoint_revision"))
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
     try:
-        path = save_served_contract(responses["/corpus/contract"], job, cache)
+        path = save_served_contract(contract, job, cache)
     except CorpusContractError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=4) from exc
@@ -1290,12 +1605,16 @@ def corpus_mine(
         None, "--gpu-memory-utilization",
         help="Share of the card vLLM may take; omit for vLLM's own default",
     ),
+    job_id: str = typer.Option(
+        None, "--job-id",
+        help="The job to mine on a validator serving several; one process mines one job",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
-        _restart_with_served_contract(validator_url)
+        _restart_with_served_contract(validator_url, job_id)
     import bittensor as bt
     import httpx
     from huggingface_hub import snapshot_download
@@ -1303,9 +1622,10 @@ def corpus_mine(
     from reliquary.corpus.encoding import checkpoint_fingerprint
     from reliquary.corpus.job import parse_job
     from reliquary.miner.corpus_miner import (
+        CorpusJobSelectionError,
         CorpusMinerHalted,
+        HttpCorpusClient,
         VllmGenerator,
-        issue_corpus_request as _issue,
         mine_steps,
     )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
@@ -1331,21 +1651,17 @@ def corpus_mine(
         wallet_kwargs["path"] = wallet_path
     wallet = bt.Wallet(**wallet_kwargs)
     http = httpx.Client(base_url=validator_url, timeout=120.0)
-
-    class _Client:
-        def job(self):
-            response = http.get("/corpus/job")
-            response.raise_for_status()
-            return response.json()
-
-        def cursor(self, hk):
-            return int(_issue(lambda: http.get(f"/corpus/cursor/{hk}"))["cursor"])
-
-        def submit(self, body):
-            return _issue(lambda: http.post("/corpus/submit", json=body))
-
-    client = _Client()
-    job = parse_job(client.job())
+    client = HttpCorpusClient(http, job_id=job_id)
+    try:
+        job = parse_job(client.job())
+    except CorpusJobSelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if job_id is None:
+        others = [served for served in client.served_jobs() if served != job.job_id]
+        if others:
+            typer.echo(f"mining job {job.job_id}, the validator's default; it also serves "
+                       f"{others}: pass --job-id to mine one of those", err=True)
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
     if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
         typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
@@ -2126,14 +2442,58 @@ def validate(
                 PROTOCOL_GENERATION_CONTRACT,
                 PROTOCOL_PROFILE_ID,
                 TASK_ID,
+                TASK_IDS,
             )
             from reliquary.infrastructure.task_registry_store import read_registry
             from reliquary.validator.task_config import (
                 TaskConfigError,
                 legacy_registry_fallback,
                 legacy_task_config,
+                resolve_corpus_task_configs,
                 resolve_task_config,
             )
+
+            if len(TASK_IDS) > 1:
+                # Several ids: one corpus validator, one loaded model, one job
+                # per id. Anything else among them refuses, like any other
+                # undeclared task, before the GPU is touched.
+                try:
+                    registry_entries, _ = await read_task_registry_with_retry(
+                        read_registry
+                    )
+                    corpus_configs = resolve_corpus_task_configs(
+                        registry_entries,
+                        TASK_IDS,
+                        profile_id=PROTOCOL_PROFILE_ID,
+                        generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                    )
+                except TaskConfigError as exc:
+                    logger.critical(
+                        "%s; declare them with `reliquary jobs create` before "
+                        "starting this validator",
+                        exc,
+                    )
+                    raise typer.Exit(code=4) from exc
+                except Exception as exc:
+                    logger.critical(
+                        "task registry could not be read (%s); refusing to start "
+                        "rather than pay under unknown rules",
+                        exc,
+                    )
+                    raise typer.Exit(code=4) from exc
+                from reliquary.validator.corpus_validator import run_corpus_validator
+
+                try:
+                    await run_corpus_validator(
+                        jobs=[(c.entry, c.emission_cap) for c in corpus_configs],
+                        wallet=wallet, netuid=netuid, signer_client=signer_client,
+                        http_host=http_host, http_port=http_port,
+                        set_weights=set_weights,
+                    )
+                except RuntimeError as exc:
+                    logger.critical("%s; fix the declaration before starting this validator", exc)
+                    raise typer.Exit(code=4) from exc
+                return
 
             try:
                 # `_run` is itself the coroutine `_run_validator_event_loop`

@@ -175,8 +175,12 @@ class R2Archives:
 
         from reliquary.infrastructure import storage
 
-        # upload_window_dataset keys by RELIQUARY_TASK_ID; the corpus validator
-        # runs under its own task id, so refuse to write anywhere else.
-        if os.getenv("RELIQUARY_TASK_ID") != task_id:
-            raise RuntimeError(f"RELIQUARY_TASK_ID is not {task_id!r}; refusing to archive")
-        await storage.upload_window_dataset(window, data)
+        from reliquary.shared.task_id import parse_task_ids
+
+        # The corpus validator runs under its own task id(s), so refuse to
+        # write under any task RELIQUARY_TASK_ID does not name.
+        # Unset is refused as before, never read as the legacy task.
+        served = os.getenv("RELIQUARY_TASK_ID")
+        if not served or task_id not in parse_task_ids(served):
+            raise RuntimeError(f"RELIQUARY_TASK_ID does not name {task_id!r}; refusing to archive")
+        await storage.upload_window_dataset(window, data, task_id=task_id)

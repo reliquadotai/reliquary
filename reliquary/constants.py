@@ -13,7 +13,7 @@ from reliquary.environment.grader import (
     GRADER_POOL_SIZE as GRADER_POOL_SIZE,
     GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
 )
-from reliquary.shared.task_id import normalise_task_id
+from reliquary.shared.task_id import parse_task_ids
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
@@ -301,7 +301,15 @@ if ACTIVE_PROTOCOL_PROFILE.prompt_encoding not in ("raw", "chat_template"):
 # duplicates 8,000,000 rows (36.4% of the index space) and draws the curated
 # rows 2-4x too often. Changing this changes len(env), which is prompt-range
 # consensus, so it is only safe at a profile cutover.
-OMI_TRAIN_SHARDS_ONLY = PROTOCOL_VERSION >= 4
+def omi_train_shards_only(protocol_version: int) -> bool:
+    return int(protocol_version) >= 4
+
+
+OMI_TRAIN_SHARDS_ONLY = omi_train_shards_only(PROTOCOL_VERSION)
+
+# Prompt sources whose rows depend on the process's protocol version, so a
+# process serving several corpus jobs must answer each gate as every job would.
+PROTOCOL_GATED_PROMPT_SOURCES = {"openmathinstruct": omi_train_shards_only}
 
 # Two-sided length reward shaping (applied to ADVANTAGES, not the σ-gate).
 # Under-thinking side: a non-forced rollout that finished early
@@ -1068,7 +1076,17 @@ TRAINING_RUN_ID = (
 
 # Which task this process serves. "default" keeps the legacy archive paths, so
 # the running task is untouched by the existence of any other.
-TASK_ID = normalise_task_id(_os.environ.get("RELIQUARY_TASK_ID"))
+try:
+    TASK_IDS = parse_task_ids(_os.environ.get("RELIQUARY_TASK_ID"))
+except ValueError as _exc:
+    # A deployment typo, not a bug: refuse with the corpus refusals' exit code.
+    import sys as _sys
+
+    print(f"error: RELIQUARY_TASK_ID is unusable: {_exc}", file=_sys.stderr)
+    raise SystemExit(4) from None
+# Several ids are a corpus-only configuration: `validate` refuses any other
+# mechanism among them before anything reads this single id.
+TASK_ID = TASK_IDS[0]
 
 # How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
 # checkpoint-publish cadence. Publishing can stall (training starvation, HF
