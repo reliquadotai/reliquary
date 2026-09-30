@@ -20,6 +20,10 @@ probation, then K steps with the dishonest model: it must turn suspect at its
 first failed audit, every record it still has in hold must be audited, and none
 of its switched records may be paid.
 
+With ``--compose`` the contract is composed as ``jobs create`` does without
+``--from-profile`` (model flags, the corpus-v1 run policy, the catalog body of the
+source); otherwise it is seeded from ``--base-profile``, as before.
+
 Prints one JSON summary on stdout and exits non-zero if any check fails.
 """
 
@@ -163,21 +167,47 @@ async def conditional_put_preflight() -> dict:
 # Declaration: the contract and the job
 # --------------------------------------------------------------------------
 
+DEFAULT_BASE_PROFILE = "qwen3-4b-reliquary-logic-v8-dev1"
+
+
+def check_compose_flags(args) -> None:
+    """--compose replaces the template, so a template flag beside it would be ignored."""
+    if getattr(args, "compose", False):
+        named = [flag for flag, value in (("--base-profile", args.base_profile),
+                                          ("--second-base-profile", args.second_base_profile))
+                 if value is not None]
+        if named:
+            raise SystemExit(f"--compose builds the contract without a template; drop {', '.join(named)}")
+    elif getattr(args, "prompt_encoding", None) is not None:
+        raise SystemExit("--prompt-encoding only applies with --compose")
+
+
 def declare_task(state: Path, args, *, task_id: str, job_id: str, revision: str,
                  prompt_source: str | None = None, suffix: str = "",
-                 base_profile: str | None = None) -> dict:
+                 base_profile: str | None = None, renderer: str | None = None) -> dict:
     """The registry entry `jobs create` would write, built by the same code, so
     the contract this run serves under is the one production would carry."""
     from dataclasses import asdict
 
-    from reliquary.cli.main import build_corpus_task_entry
+    from reliquary.cli.main import _corpus_base_profile, build_corpus_task_entry
     from reliquary.shared.task_registry import validate_entry
 
+    source = prompt_source or args.prompt_source
+    # With --compose, what `jobs create` builds when no --from-profile is named.
+    base = _corpus_base_profile(
+        task_id=task_id,
+        from_profile=(None if getattr(args, "compose", False)
+                      else base_profile or args.base_profile or DEFAULT_BASE_PROFILE),
+        model=args.honest_model, model_revision=revision,
+        model_architecture=args.model_architecture,
+        prompt_encoding=getattr(args, "prompt_encoding", None),
+        renderer_id=renderer, prompt_source=source,
+    )
     entry = build_corpus_task_entry(
-        task_id=task_id, job_id=job_id, from_profile=base_profile or args.base_profile,
+        task_id=task_id, job_id=job_id, base=base,
         model_id=args.honest_model, model_revision=revision,
         model_architecture=args.model_architecture,
-        prompt_source=prompt_source or args.prompt_source,
+        prompt_source=source,
         cap=args.cap, overrides={}, audit_params=audit_params_from_args(args),
     )
     validate_entry(entry)
@@ -641,6 +671,7 @@ def _route_ok(counts: dict, steps: int, *, may_be_banned: bool) -> bool:
 
 
 def orchestrate(args) -> int:
+    check_compose_flags(args)
     if args.second_prompt_source:
         return orchestrate_two_jobs(args)
     _refuse_production_bucket()
@@ -672,7 +703,8 @@ def orchestrate(args) -> int:
         honest_revision = honest_dir.name
         sha256 = checkpoint_fingerprint(honest_dir)
         eos = load_tokenizer(str(honest_dir)).eos_token_id
-        contract = declare_task(state, args, task_id=task_id, job_id=job_id, revision=honest_revision)
+        contract = declare_task(state, args, task_id=task_id, job_id=job_id, revision=honest_revision,
+                                renderer=args.renderer)
         params = json.loads((state / "entry.json").read_text())["params"]
         renderer_id = args.renderer or contract["environments"][args.prompt_source]["prompt_template"]["id"]
         manifest = asyncio.run(declare_job(
@@ -810,6 +842,12 @@ def two_job_checks(jobs: dict, miners: dict, verdicts: dict, archives: dict,
     return checks
 
 
+def _base_profile_label(args, base_profile):
+    if getattr(args, "compose", False):
+        return None  # composed: model flags + corpus-v1 + catalog
+    return base_profile or DEFAULT_BASE_PROFILE
+
+
 def orchestrate_two_jobs(args) -> int:
     """Two tasks and jobs on one checkpoint, one validator process serving both."""
     _refuse_production_bucket()
@@ -827,11 +865,11 @@ def orchestrate_two_jobs(args) -> int:
     jobs = {
         "a": {"task_id": f"corpus-e2e-{stamp}", "job_id": f"e2e-{stamp}",
               "prompt_source": args.prompt_source, "renderer": args.renderer, "cap": args.cap,
-              "base_profile": args.base_profile},
+              "base_profile": _base_profile_label(args, args.base_profile)},
         "b": {"task_id": f"corpus-e2e-{stamp}-b", "job_id": f"e2e-{stamp}-b",
               "prompt_source": args.second_prompt_source, "renderer": args.second_renderer,
               "cap": args.second_cap if args.second_cap is not None else args.cap,
-              "base_profile": args.second_base_profile or args.base_profile},
+              "base_profile": _base_profile_label(args, args.second_base_profile or args.base_profile)},
     }
     task_ids = ",".join(j["task_id"] for j in jobs.values())
     state = Path(args.state_dir) / stamp
@@ -858,7 +896,8 @@ def orchestrate_two_jobs(args) -> int:
             job["contract"] = declare_task(state, args, task_id=job["task_id"], job_id=job["job_id"],
                                            revision=honest_revision,
                                            prompt_source=job["prompt_source"], suffix=f"-{key}",
-                                           base_profile=job["base_profile"])
+                                           base_profile=job["base_profile"],
+                                           renderer=job["renderer"])
             job["params"] = json.loads((state / f"entry-{key}.json").read_text())["params"]
         # The one contract the process runs: what `tasks contract --task-id a --task-id b` prints.
         merged = merge_corpus_contracts({j["task_id"]: j["contract"] for j in jobs.values()})
@@ -976,7 +1015,7 @@ def _export(state: Path, env: dict, job_id: str) -> dict:
             "prompts": len({r["prompt_index"] for r in rows})}
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="role")
 
@@ -990,7 +1029,13 @@ def main() -> int:
         p.add_argument("--honest-revision", default=None)
         p.add_argument("--dishonest-model", default="Qwen/Qwen3-4B")
         p.add_argument("--dishonest-revision", default=None)
-        p.add_argument("--base-profile", default="qwen3-4b-reliquary-logic-v8-dev1")
+        p.add_argument("--base-profile", default=None,
+                       help=f"legacy: the template to seed the contract from; omit for {DEFAULT_BASE_PROFILE}")
+        p.add_argument("--compose", action="store_true",
+                       help="compose the contract as `jobs create` without --from-profile does: "
+                            "model flags, the corpus-v1 run policy and the catalog body of the source")
+        p.add_argument("--prompt-encoding", default=None,
+                       help="with --compose: raw or chat_template; omit to follow the renderer")
         p.add_argument("--model-architecture", default="Qwen3ForCausalLM")
         p.add_argument("--prompt-source", default="reliquarylogic_v1")
         p.add_argument("--renderer", default=None,
@@ -1043,8 +1088,11 @@ def main() -> int:
     m.add_argument("--gpu-memory-utilization", type=float, default=None)
     m.add_argument("--until-accepted", type=int, default=None)
     m.add_argument("--job-id", default=None)
+    return parser
 
-    args = parser.parse_args()
+
+def main() -> int:
+    args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.role == "validator":

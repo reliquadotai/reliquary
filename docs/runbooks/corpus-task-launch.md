@@ -8,7 +8,7 @@ validator of the fleet or move RL miners' weights.
 
 Placeholders: `<validator-ip>`, `<port>`, `<job>`, `<name>`, `<repo>`, `<rev>`,
 `<sha256>`, `<rl-profile-id>`, `<template-profile-id>`, `<source>`,
-`<renderer-id>`, `<eos-id>`, `<drand-round>`.
+`<renderer-id>`, `<eos-id>`, `<drand-round>`, `<arch>`.
 
 ## 0. Rehearse on a test card
 
@@ -38,12 +38,19 @@ hotkey that mines honestly through probation and then switches model:
 ```bash
 R2_BUCKET_ID=reliquary-corpus-e2e \
   setsid nohup python scripts/corpus_e2e.py --start-minio --state-dir /opt/corpus-e2e \
-    --honest-model <repo> --honest-revision <rev> --base-profile <template-profile-id> \
+    --honest-model <repo> --honest-revision <rev> --compose \
     --model-architecture <arch> --dishonest-model <other-repo> --dishonest-revision <rev> \
     --prompt-source <source> --max-new-tokens 512 \
     --honest-steps 20 --dishonest-steps 5 --late-cheater-steps 30 \
     --audit-q 0.2 --audit-probation 5 --audit-hold-seconds 300 > e2e.json 2> e2e.log </dev/null &
 ```
+
+`--compose` declares the task the way `jobs create` does without
+`--from-profile` (§2): the model flags, the `corpus-v1` run policy and the
+catalog body of `--prompt-source`; `--prompt-encoding` overrides the encoding
+the renderer implies. Without it the script seeds from `--base-profile`
+(legacy; default `qwen3-4b-reliquary-logic-v8-dev1`), and the two may not be
+combined.
 
 The late cheater's honest phase runs until exactly `--audit-probation`
 submissions are accepted, then a second process under the same mnemonic mines
@@ -110,9 +117,10 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_USE_V2_MODEL_RUNNER=0 \
 ```
 
 Go only if every honest chunk passes the thresholds the contract will carry
-(`jobs create` writes Prime Intellect's deployed 60/40/40 unless the template
-carries its own toploc entry). If the capture hook does not fit the checkpoint's
-architecture (Teutonic is a hybrid), stop: that is fixed in the miner first.
+(`jobs create` writes Prime Intellect's deployed 60/40/40; only a legacy
+`--from-profile` template that carries its own toploc entry changes that). If
+the capture hook does not fit the checkpoint's architecture (Teutonic is a
+hybrid), stop: that is fixed in the miner first.
 Note that 60/40/40 does not refuse fp8 on Qwen3-4B-Base; a job on it pays a
 miner running fp8.
 
@@ -159,7 +167,21 @@ above the RL task's latest (spec §7b).
 ## 2. Fingerprint and declare the job
 
 `jobs create` writes the job manifest and the corpus task's registry entry in
-one command (task id defaults to the job id; name it `corpus-<name>`):
+one command (task id defaults to the job id; name it `corpus-<name>`). The
+contract is composed from three parts, none of them a model's template:
+
+- the model: `--model`, `--model-revision`, `--model-architecture`, and the
+  prompt encoding (`chat_template` when `--renderer-id` is a chat-template
+  renderer, `raw` otherwise; `--prompt-encoding` names it explicitly);
+- the run policy `corpus-v1`: the top-level fields the live `corpus-code-v1`
+  carries (protocol 9, DAPO sampling, those of `teutonic-9b-reliquary-suite-v9-dev1`);
+- the environment: the catalog's default body for `<source>`, unchanged. Read
+  it first, with its digest and the profile it was taken from:
+
+```bash
+reliquary envs list
+reliquary envs show <source>
+```
 
 ```bash
 reliquary jobs fingerprint <repo> --revision <rev>
@@ -169,8 +191,7 @@ reliquary jobs create \
   --job-id <job> --task-id corpus-<name> \
   --model <repo> --model-revision <rev> --model-architecture Qwen3ForCausalLM \
   --checkpoint-sha256 <sha256> \
-  --from-profile <template-profile-id> \
-  --prompt-source <source> --prompt-count 200 \
+  --env <source> --prompt-count 200 \
   --renderer-id <renderer-id> --eos-token-id <eos-id> \
   --slots-per-prompt 4 --n 4 \
   --min-new-tokens 16 \
@@ -186,23 +207,27 @@ reliquary jobs create \
   `--model-revision`. Without it the model receives the raw row, which is only
   right for a base model. `--eos-token-id` is then the template's turn end
   (e.g. `<|im_end|>`).
-- `--from-profile` must declare `<source>` with a prompt template;
-  `<renderer-id>` is that template's id (the contract's
-  `environments.<source>.prompt_template.id`). A mismatch is refused here.
+- `--env` (alias of `--prompt-source`) must have a catalog entry; an
+  installed environment without one is refused until an entry is added and
+  reviewed. For a raw renderer, `<renderer-id>` is the body's template id
+  (`body.prompt_template.id` in `envs show`). A mismatch is refused here.
+- No environment field is overridden for a corpus job: two jobs on one source
+  must carry the same body to share a validator (§3.2).
 - `--prompt-count` is checked against the source's own length, which builds the
   source: a dataset-backed one must be readable from this machine.
 - `--eos-token-id` is the id the miner's vLLM stops on and the route judges
   termination against (151643 for Qwen3-4B-Base).
-- `--max-new-tokens` is omitted on purpose: the job then takes the budget the
-  template gives the source (32768 for DAPO maths on the Teutonic profile), the
-  length the RL task already generates to. A short cap cuts every reasoning
+- `--max-new-tokens` is omitted on purpose: the job then takes the catalog's
+  budget for the source (32768 for DAPO maths, 8192 for `reliquary_code_v1`),
+  the length the RL task already generates to. A short cap cuts every reasoning
   completion before its answer: in the 512-token rehearsal the filter kept 3 of
-  80. Pass it only to override the template.
+  80. A model that needs more (a teacher on code) passes it: it is a manifest
+  field, so the contract body, and the merge with other jobs, is unchanged.
 - `--min-new-tokens` at least 16. Never 1: the terminator counts, and 1 pays a
   slot for an empty completion (the parser refuses below 2).
 - The price is pinned: `floor == cap`, paid per verified token. The carried
-  contract gets an enforced toploc proof (the template's own, or the deployed
-  defaults); the corpus validator refuses a contract without one.
+  contract gets an enforced toploc proof (the deployed defaults); the corpus
+  validator refuses a contract without one.
 - `--grader-id/--threshold` only annotate the export; the filter never decides
   payment.
 - The minimum-incentive floor is per task: a hotkey's share is measured within
@@ -218,6 +243,17 @@ Check both halves landed:
 reliquary jobs list     # <job>  active  task=corpus-<name> cap=0.100
 reliquary tasks contract --task-id corpus-<name> > corpus-<name>.contract.json
 ```
+
+### 2.0 Legacy: seeding the contract from a template (`--from-profile`)
+
+`--from-profile <template-profile-id>` still works and its output is
+unchanged: the template's contract, re-pointed at `--model`, narrowed to the
+source. It must declare `<source>` with a prompt template, and its toploc entry,
+if it carries one, is enforced instead of the defaults. `--prompt-encoding` is
+refused next to it (the template's own is kept). A template-seeded job and a
+composed one on the same source share a validator when their bodies agree,
+which is the case for every template the catalog was taken from (`envs show`
+names it).
 
 ### 2.1 Partial audit parameters (`audit_*`)
 
@@ -435,20 +471,20 @@ beside it. Below, `corpus-code-v1` is the live task (declared from
 
 1. **Declare the new job on the live job's checkpoint** (§2), under its own
    task: same `--model`, `--model-revision`, `--checkpoint-sha256` and
-   `--model-architecture`; its own `--job-id` and `--task-id`; one
-   `--prompt-source`. `--from-profile` may differ from the live task's: take a
-   template that declares the source. `openmathinstruct` is declared only by
-   `qwen3-4b-base-dapo-reliquary-v1`. Each task keeps its own cap, and all caps
-   together (the RL task's included) must still sum to at most 1.0 (§1.3):
+   `--model-architecture`; its own `--job-id` and `--task-id`; one `--env`.
+   No template is needed: the catalog has a body for every source a profile
+   declares (`openmathinstruct` included), and composing `corpus-code-v1`'s
+   own definition this way gives its live contract byte for byte. Each task
+   keeps its own cap, and all caps together (the RL task's included) must
+   still sum to at most 1.0 (§1.3):
 
    ```bash
    reliquary jobs create --job-id <math-job> --task-id corpus-math-v1 \
-     --from-profile qwen3-4b-base-dapo-reliquary-v1 \
-     --prompt-source openmathinstruct --cap 0.05 ...   # model etc. as the live job, rest as in §2
+     --env openmathinstruct --cap 0.05 ...   # model etc. as the live job, rest as in §2
    reliquary tasks list   # e.g. default 0.9 + corpus-code-v1 0.05 + corpus-math-v1 0.05 <= 1.0
    ```
 
-2. **One merged contract.** Each task carries its template narrowed to its own
+2. **One merged contract.** Each task carries its contract narrowed to its own
    source; the process runs their merge, which `tasks contract` with several
    ids prints (the order of the ids does not matter):
 
