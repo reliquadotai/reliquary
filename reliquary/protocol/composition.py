@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 from reliquary.protocol.profiles import (
     PROFILES,
     EnvironmentProfile,
@@ -112,7 +113,7 @@ def compose_profile(
     model: ModelSpec,
     run: RunPolicy,
     environments: Iterable[str],
-    catalog: Mapping[str, EnvironmentProfile],
+    catalog: Mapping[str, EnvironmentProfile] = ENVIRONMENT_CATALOG,
 ) -> ProtocolProfile:
     bodies = {name: catalog[name] for name in sorted(environments)}
     return ProtocolProfile(
