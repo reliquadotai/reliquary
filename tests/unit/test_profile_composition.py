@@ -1,6 +1,7 @@
 """A profile splits into model, run policy and environment bodies, and back."""
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,9 @@ def test_run_policies_are_derived_from_compiled_profiles():
 
 def test_corpus_v1_policy_is_the_live_corpus_code_v1_top_level():
     contract = json.loads((FIXTURES / "corpus_code_v1_contract.json").read_text())
-    assert RUN_POLICIES["corpus-v1"] == run_policy_of(profile_from_contract(contract))
+    # By value: test_protocol_profiles reloads `profiles`, so the classes may differ.
+    live = run_policy_of(profile_from_contract(contract))
+    assert asdict(RUN_POLICIES["corpus-v1"]) == asdict(live)
     # The live task was seeded from teutonic-v9, the only profile it matches.
     matches = [
         pid for pid, p in PROFILES.items()
