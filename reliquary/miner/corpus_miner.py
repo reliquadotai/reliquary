@@ -117,19 +117,20 @@ def issue_corpus_request(request_call):
 
 
 class CorpusJobSelectionError(Exception):
-    """The validator serves several jobs and this miner named none, or named
-    one it does not serve: pass ``--job-id`` with one of the listed jobs."""
+    """This miner named a job the validator does not serve: pass ``--job-id``
+    with one of the listed jobs."""
 
 
 class HttpCorpusClient:
-    """The ``CorpusClient`` over HTTP: the legacy paths, or with ``job_id``
-    that job's own paths on a validator serving several jobs."""
+    """The ``CorpusClient`` over HTTP: the legacy paths (the validator's default
+    job), or with ``job_id`` that job's own paths on a validator serving several."""
 
     def __init__(self, http, *, job_id: str | None = None) -> None:
         self._http = http
         self._job_id = job_id
 
-    def _served(self) -> list:
+    def served_jobs(self) -> list:
+        """Every job the validator serves; empty when it cannot say."""
         try:
             return list(self._http.get("/corpus/jobs").json()["jobs"])
         except Exception:
@@ -138,17 +139,11 @@ class HttpCorpusClient:
     def job(self) -> dict:
         if self._job_id is None:
             response = self._http.get("/corpus/job")
-            if response.status_code == 409:
-                jobs = _error_object(response).get("jobs") or self._served()
-                raise CorpusJobSelectionError(
-                    f"the validator serves several jobs {jobs}; pass --job-id with the "
-                    "one to mine (run one miner process per job)"
-                )
         else:
             response = self._http.get(f"/corpus/jobs/{self._job_id}/job")
             if response.status_code == 404:
                 raise CorpusJobSelectionError(
-                    f"the validator does not serve job {self._job_id!r}; it serves {self._served()}"
+                    f"the validator does not serve job {self._job_id!r}; it serves {self.served_jobs()}"
                 )
         response.raise_for_status()
         return response.json()
@@ -157,18 +152,12 @@ class HttpCorpusClient:
         """The task contract the validator serves for this job (or its only one)."""
         if self._job_id is None:
             response = self._http.get("/corpus/contract")
-            if response.status_code == 409:
-                jobs = _error_object(response).get("jobs") or self._served()
-                raise CorpusJobSelectionError(
-                    f"the validator serves several jobs {jobs}; pass --job-id with the "
-                    "one to mine (run one miner process per job)"
-                )
         else:
             response = self._http.get(f"/corpus/jobs/{self._job_id}/contract")
             if (response.status_code == 404
                     and _error_object(response).get("detail") == "corpus_job_not_served"):
                 raise CorpusJobSelectionError(
-                    f"the validator does not serve job {self._job_id!r}; it serves {self._served()}"
+                    f"the validator does not serve job {self._job_id!r}; it serves {self.served_jobs()}"
                 )
         response.raise_for_status()
         return response.json()

@@ -26,9 +26,10 @@ def _served(seeded_job, job_id, contract):
     )
 
 
-def _two_jobs(seeded_job):
+def _two_jobs(seeded_job, order=("math-v1", "code-v1")):
+    contracts = {"math-v1": MATH, "code-v1": CODE}
     app = build_corpus_jobs_app(
-        jobs=[_served(seeded_job, "math-v1", MATH), _served(seeded_job, "code-v1", CODE)],
+        jobs=[_served(seeded_job, job_id, contracts[job_id]) for job_id in order],
         store=seeded_job.store, records=None, tokenizer=_Tokenizer(),
         verify_signature=lambda r: True, proof_chunk_tokens=None,
         prompt_job_for=seeded_job.prompt_job_for,
@@ -48,10 +49,19 @@ def test_an_unserved_jobs_contract_is_404(seeded_job):
     assert response.json()["detail"] == "corpus_job_not_served"
 
 
-def test_the_legacy_contract_path_refuses_to_pick_one_of_several(seeded_job):
-    response = _two_jobs(seeded_job).get("/corpus/contract")
-    assert response.status_code == 409
-    assert response.json() == {"detail": "several_jobs_served", "jobs": ["code-v1", "math-v1"]}
+@pytest.mark.parametrize("order", [("math-v1", "code-v1"), ("code-v1", "math-v1")])
+def test_the_legacy_contract_path_serves_the_first_listed_jobs(seeded_job, order):
+    contracts = {"math-v1": MATH, "code-v1": CODE}
+    response = _two_jobs(seeded_job, order).get("/corpus/contract")
+    assert response.status_code == 200 and response.json() == contracts[order[0]]
+
+
+def test_startup_logs_which_job_the_legacy_paths_serve(seeded_job, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="reliquary.validator.corpus_validator"):
+        _two_jobs(seeded_job, ("code-v1", "math-v1"))
+    assert "legacy paths serve job code-v1" in caplog.text
 
 
 def test_one_job_serves_its_contract_on_both_paths(seeded_job):
@@ -91,8 +101,11 @@ def _multi_job_validator():
     def handle(request):
         path = request.url.path
         seen.append(path)
-        if path in ("/corpus/job", "/corpus/contract"):
-            return httpx.Response(409, json={"detail": "several_jobs_served", "jobs": sorted(JOBS)})
+        # The legacy paths answer for the first job listed.
+        if path == "/corpus/job":
+            return httpx.Response(200, json=JOBS["math-v1"])
+        if path == "/corpus/contract":
+            return httpx.Response(200, json=CONTRACTS["math-v1"])
         if path == "/corpus/jobs":
             return httpx.Response(200, json={"jobs": sorted(JOBS)})
         _, _, _, job_id, what = path.split("/")
@@ -144,12 +157,13 @@ def test_a_miner_with_job_id_fetches_that_jobs_own_contract(monkeypatch, tmp_pat
     assert "/corpus/jobs/code-v1/contract" in seen and "/corpus/contract" not in seen
 
 
-def test_a_miner_without_job_id_on_several_jobs_exits_with_the_list(monkeypatch, tmp_path):
-    result, execs, _, _ = _mine(monkeypatch, tmp_path)
+def test_a_miner_without_job_id_on_several_jobs_takes_the_default_jobs_contract(monkeypatch, tmp_path):
+    result, execs, seen, restarted = _mine(monkeypatch, tmp_path)
 
-    assert result.exit_code == 2, (result.output, result.exception)
-    assert execs == []
-    assert "--job-id" in result.output and "code-v1" in result.output and "math-v1" in result.output
+    assert isinstance(result.exception, restarted), result.output
+    (path,) = execs
+    assert json.loads(open(path).read()) == CONTRACTS["math-v1"]
+    assert seen[:2] == ["/corpus/job", "/corpus/contract"]
 
 
 def test_a_miner_naming_an_unserved_job_exits_with_the_list(monkeypatch, tmp_path):

@@ -395,8 +395,6 @@ def _validator(jobs):
         path = request.url.path
         if path == "/corpus/jobs":
             return httpx.Response(200, json={"jobs": sorted(jobs)})
-        if path in ("/corpus/job", "/corpus/cursor/5Hot") and len(jobs) > 1:
-            return httpx.Response(409, json={"detail": "several_jobs_served", "jobs": sorted(jobs)})
         if path == "/corpus/job":
             return httpx.Response(200, json=next(iter(jobs.values())))
         if path == "/corpus/cursor/5Hot":
@@ -440,15 +438,14 @@ def test_with_a_job_id_the_client_uses_that_jobs_paths():
                                     "/corpus/submit"]
 
 
-def test_a_multi_job_validator_without_a_job_id_says_to_pass_one():
-    from reliquary.miner.corpus_miner import CorpusJobSelectionError, HttpCorpusClient
+def test_a_multi_job_validator_without_a_job_id_gives_its_first_listed_job():
+    from reliquary.miner.corpus_miner import HttpCorpusClient
 
     http, _ = _validator({"math": {"job_id": "math"}, "code": {"job_id": "code"}})
+    client = HttpCorpusClient(http)
 
-    with pytest.raises(CorpusJobSelectionError) as caught:
-        HttpCorpusClient(http).job()
-    message = str(caught.value)
-    assert "--job-id" in message and "code" in message and "math" in message
+    assert client.job() == {"job_id": "math"}
+    assert client.served_jobs() == ["code", "math"]
 
 
 def test_a_job_id_the_validator_does_not_serve_names_the_ones_it_does():
@@ -461,24 +458,38 @@ def test_a_job_id_the_validator_does_not_serve_names_the_ones_it_does():
     assert "nope" in str(caught.value) and "code" in str(caught.value)
 
 
-def test_corpus_mine_on_a_multi_job_validator_without_job_id_exits_with_the_list(monkeypatch):
+def test_corpus_mine_on_a_multi_job_validator_without_job_id_mines_the_default(monkeypatch):
+    """Adding a job must not halt a live miner: it keeps mining the validator's
+    default job, and is told the others exist."""
     from types import SimpleNamespace
 
     import bittensor
     import httpx
+    import huggingface_hub
     from typer.testing import CliRunner
 
     import reliquary.protocol.profiles as profiles
     from reliquary.cli.main import app
-    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR, TOPLOC_DEPLOYED_DEFAULTS
 
-    http, seen = _validator({"math": {"job_id": "math"}, "code": {"job_id": "code"}})
+    class _Downloading(Exception):
+        pass
+
+    def download(repo, revision=None):
+        raise _Downloading(repo)
+
+    from tests.unit.test_corpus_service import _manifest
+
+    http, seen = _validator({"math": {**_manifest(), "job_id": "math"}, "code": {"job_id": "code"}})
+    monkeypatch.setenv(TASK_CONTRACT_ENV_VAR, "/unused-profile-is-patched")
     monkeypatch.setattr(profiles, "ACTIVE_PROTOCOL_PROFILE",
                         SimpleNamespace(profile_id="p", proofs=(TOPLOC_DEPLOYED_DEFAULTS,)))
     monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
     monkeypatch.setattr(httpx, "Client", lambda **kw: http)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
 
     result = CliRunner().invoke(app, ["corpus", "mine", "--validator-url", "http://validator"])
 
-    assert result.exit_code == 2, (result.output, result.exception)
-    assert "--job-id" in result.output and "code" in result.output
+    assert isinstance(result.exception, _Downloading), (result.output, result.exception)
+    assert "mining job math" in result.output and "code" in result.output
+    assert "--job-id" in result.output

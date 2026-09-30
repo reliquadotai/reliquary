@@ -1456,12 +1456,13 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
     """The job-scoped reads over one ``build_corpus_router`` per served job.
 
     With several jobs it also owns the legacy paths: submit dispatches on the
-    request's ``job_id``, and the legacy reads answer 409 rather than pick one.
-    With one job those stay on that job's own router, unchanged.
+    request's ``job_id``, and the legacy reads answer for the FIRST job in
+    ``routers`` (the operator's order: the job live miners already mine, so
+    adding a job never halts them). With one job those stay on that job's own
+    router, unchanged.
     """
-    from fastapi.responses import JSONResponse
-
     served = sorted(routers)
+    default = routers[next(iter(routers))]
     router = APIRouter()
 
     def _served(job_id: str) -> APIRouter:
@@ -1485,16 +1486,13 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
     if len(routers) == 1:
         return router
 
-    def _several() -> JSONResponse:
-        return JSONResponse(status_code=409, content={"detail": "several_jobs_served", "jobs": served})
-
     @router.get(JOB_PATH)
-    async def corpus_job_legacy():
-        return _several()
+    async def corpus_job_legacy() -> dict:
+        return await default.corpus_job()
 
     @router.get(CURSOR_PATH)
-    async def corpus_cursor_legacy(hotkey: str):
-        return _several()
+    async def corpus_cursor_legacy(hotkey: str) -> dict:
+        return await default.corpus_cursor(hotkey)
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(request: CorpusSubmissionRequest) -> CorpusSubmissionResponse:

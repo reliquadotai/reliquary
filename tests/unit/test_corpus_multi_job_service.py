@@ -1,5 +1,6 @@
 """One HTTP face for several corpus jobs: submit dispatches on `job_id`, reads
-are job-scoped, and the legacy reads never silently pick one job."""
+are job-scoped, and the legacy reads serve the first job listed (the operator's
+default, so live miners keep working when a job is added)."""
 
 from __future__ import annotations
 
@@ -81,11 +82,18 @@ def test_a_job_scoped_read_of_an_unserved_job_is_404(two_jobs):
         assert response.json() == {"detail": "corpus_job_not_served"}
 
 
-def test_the_legacy_reads_refuse_to_pick_a_job(two_jobs):
-    for path in ("/corpus/job", "/corpus/cursor/5Hot"):
-        response = two_jobs.get(path)
-        assert response.status_code == 409
-        assert response.json() == {"detail": "several_jobs_served", "jobs": ["swe-v1", "swe-v2"]}
+def test_the_legacy_reads_serve_the_first_listed_job(seeded_job, fake_r2):
+    asyncio.run(job_store.write_job({**_manifest(), "job_id": "swe-v2"}, None, **fake_r2))
+    # Listed second-first: the default is the operator's order, not the sorted one.
+    client = _app({"swe-v2": _router(seeded_job, "swe-v2"),
+                   "swe-v1": _router(seeded_job, "swe-v1")})
+
+    assert client.get("/corpus/job").json()["job_id"] == "swe-v2"
+    assert client.get("/corpus/cursor/5Hot").json() == {"hotkey": "5Hot", "cursor": 0}
+    assert client.get("/corpus/jobs").json() == {"jobs": ["swe-v1", "swe-v2"]}
+    # A legacy miner's submission names its job, and still reaches only that one.
+    assert client.post("/corpus/submit", json=_body("swe-v2")).json()["accepted"] is True
+    assert _ledger("swe-v2") and not _ledger("swe-v1")
 
 
 def test_a_submission_reaches_only_its_own_jobs_ledgers(two_jobs):

@@ -1373,6 +1373,11 @@ def corpus_mine(
     except CorpusJobSelectionError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+    if job_id is None:
+        others = [served for served in client.served_jobs() if served != job.job_id]
+        if others:
+            typer.echo(f"mining job {job.job_id}, the validator's default; it also serves "
+                       f"{others}: pass --job-id to mine one of those", err=True)
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
     if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
         typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)

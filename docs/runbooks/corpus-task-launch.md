@@ -418,21 +418,25 @@ the model is loaded once and both jobs' audits share the card, one forward pass
 at a time (a FIFO lock: a job with a backlog waits at most one pass before the
 other job's records are audited).
 
-1. **Declare two jobs on the same checkpoint** (§2), each under its own task:
-   same `--model`, `--model-revision`, `--checkpoint-sha256` and
-   `--model-architecture`; distinct `--job-id` and `--task-id`; one
-   `--prompt-source` each. `--from-profile` may differ: take for each job a
-   template that declares its source (e.g. `qwen3-4b-base-dapo-reliquary-v1`
-   for `openmathinstruct`, `teutonic-9b-reliquary-suite-v9-dev1` for
-   `reliquary_code_v1`). Each task keeps its own cap, and all caps together
-   (the RL task's included) must still sum to at most 1.0 (§1.3):
+The real rollout adds a job next to a live one, without stopping its miners:
+the live code task `corpus-code-v1` keeps running, and a maths task is added
+beside it. Below, `corpus-code-v1` is the live task (declared from
+`teutonic-9b-reliquary-suite-v9-dev1`, source `reliquary_code_v1`) and
+`corpus-math-v1` the new one.
+
+1. **Declare the new job on the live job's checkpoint** (§2), under its own
+   task: same `--model`, `--model-revision`, `--checkpoint-sha256` and
+   `--model-architecture`; its own `--job-id` and `--task-id`; one
+   `--prompt-source`. `--from-profile` may differ from the live task's: take a
+   template that declares the source. `openmathinstruct` is declared only by
+   `qwen3-4b-base-dapo-reliquary-v1`. Each task keeps its own cap, and all caps
+   together (the RL task's included) must still sum to at most 1.0 (§1.3):
 
    ```bash
-   reliquary jobs create --job-id <math-job> --task-id corpus-math \
-     --prompt-source reliquary_dapo_math_v1 --cap 0.05 ...   # rest as in §2
-   reliquary jobs create --job-id <code-job> --task-id corpus-code \
-     --prompt-source reliquary_code_v1 --cap 0.05 ...
-   reliquary tasks list   # e.g. default 0.9 + corpus-math 0.05 + corpus-code 0.05 <= 1.0
+   reliquary jobs create --job-id <math-job> --task-id corpus-math-v1 \
+     --from-profile qwen3-4b-base-dapo-reliquary-v1 \
+     --prompt-source openmathinstruct --cap 0.05 ...   # model etc. as the live job, rest as in §2
+   reliquary tasks list   # e.g. default 0.9 + corpus-code-v1 0.05 + corpus-math-v1 0.05 <= 1.0
    ```
 
 2. **One merged contract.** Each task carries its template narrowed to its own
@@ -440,7 +444,7 @@ other job's records are audited).
    ids prints (the order of the ids does not matter):
 
    ```bash
-   reliquary tasks contract --task-id corpus-math --task-id corpus-code > corpus-math-code.contract.json
+   reliquary tasks contract --task-id corpus-code-v1 --task-id corpus-math-v1 > corpus-code-math.contract.json
    ```
 
    The rule follows what the corpus path reads. From the process contract it
@@ -456,14 +460,20 @@ other job's records are audited).
    rows depend on the protocol version (`openmathinstruct`: train shards only
    from v4) must get the same rows under the merge as under its own task.
 
-3. **Start one validator with both ids:**
+3. **Restart the validator with both ids, the live task FIRST:**
 
    ```bash
-   export RELIQUARY_TASK_ID=corpus-math,corpus-code
-   export RELIQUARY_TASK_CONTRACT=$PWD/corpus-math-code.contract.json
+   export RELIQUARY_TASK_ID=corpus-code-v1,corpus-math-v1
+   export RELIQUARY_TASK_CONTRACT=$PWD/corpus-code-math.contract.json
    reliquary validate --wallet-name <wallet> --hotkey <hotkey> \
      --http-host 0.0.0.0 --http-port <port> --no-set-weights
    ```
+
+   The first id listed is the default job: the legacy paths (`/corpus/job`,
+   `/corpus/cursor/<hotkey>`, `/corpus/contract`) keep answering for it, and
+   the validator logs `corpus legacy paths serve job <job>` at startup. So the
+   live miners need nothing: after the restart they reconnect to the same job.
+   Miners of the new job pass `--job-id <math-job>` (§4).
 
    It refuses to start (exit 4, before any download) if an id is not an active
    `corpus-generation` task (never mix in an RL task), if the contract it runs
@@ -485,10 +495,9 @@ detail listing the served ids). `GET /corpus/jobs` lists the served jobs;
 `GET /corpus/jobs/<job>/job` and `GET /corpus/jobs/<job>/cursor/<hotkey>`
 answer for one of them (404 `corpus_job_not_served` otherwise), and
 `GET /corpus/jobs/<job>/contract` serves that job's own task contract (not
-the merge). With several jobs, the legacy `GET /corpus/job`,
-`GET /corpus/cursor/<hotkey>` and `GET /corpus/contract` answer 409
-`{"detail": "several_jobs_served", "jobs": [...]}`; with one job they are
-unchanged (and the job-scoped routes work too).
+the merge). The legacy `GET /corpus/job`, `GET /corpus/cursor/<hotkey>` and
+`GET /corpus/contract` answer for the first id in `RELIQUARY_TASK_ID` (with
+one job, unchanged; the job-scoped routes work too).
 
 Rehearse it first (§0) with `--second-prompt-source <source>`: one validator
 serves both jobs, one honest miner per job, and one hotkey mines the first job
@@ -522,8 +531,9 @@ reliquary corpus mine --validator-url http://<validator-ip>:<port> \
 - `--job-id <job>` against a validator serving several jobs (§3.2): the miner
   then reads that job's `/corpus/jobs/<job>/...` routes, and without
   `RELIQUARY_TASK_CONTRACT` takes that job's own task contract from
-  `/corpus/jobs/<job>/contract`. Without it, such a validator's 409 stops the
-  miner with the list of jobs to choose from. One process mines one job: a
+  `/corpus/jobs/<job>/contract`. Without it, the miner mines the validator's
+  default job (the first task listed) and says which other jobs it serves.
+  One process mines one job: a
   miner who wants both runs two processes (two cards, or
   `--gpu-memory-utilization` to share one), each with its job's task contract
   (fetched, or `reliquary tasks contract --task-id <that task>`).

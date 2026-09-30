@@ -197,7 +197,8 @@ def test_the_app_serves_both_jobs(booted):
     client = TestClient(booted.app)
     assert client.get("/corpus/jobs").json() == {"jobs": ["swe-v1", "swe-v2"]}
     assert client.get("/corpus/jobs/swe-v2/job").json()["job_id"] == "swe-v2"
-    assert client.get("/corpus/job").status_code == 409
+    # The legacy read answers for the first task listed, as RELIQUARY_TASK_ID orders them.
+    assert client.get("/corpus/job").json()["job_id"] == "swe-v1"
 
 
 def test_a_ban_on_one_job_is_not_a_ban_on_the_other(booted):

@@ -249,7 +249,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     renderer, auditor queue and ban check); the registration gate is shared.
 
     With one job its router is mounted as is, so the legacy routes answer
-    exactly as before; the job-scoped reads are added either way.
+    exactly as before; the job-scoped reads are added either way. With several,
+    the legacy reads answer for the first job in ``jobs``.
     """
     from reliquary.validator.corpus_service import (
         build_corpus_jobs_router, build_corpus_router, prompt_job_for_spec,
@@ -273,23 +274,23 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         app.include_router(next(iter(routers.values())))
     app.include_router(build_corpus_jobs_router(routers))
 
-    # Miners have no registry access: each job's own task contract, and with one
-    # job the legacy path too (the contract this process then runs).
+    # Miners have no registry access: each job's own task contract. The legacy
+    # path serves the first job's, as the other legacy reads do (with one job,
+    # the contract this process runs).
     contracts = {str(served.entry.job_id): getattr(served.entry, "contract", None)
                  for served in jobs}
     if len(contracts) == 1:
         contracts = dict.fromkeys(contracts, contract)
+    default_job = next(iter(contracts))
+    if len(contracts) > 1:
+        logger.info("corpus legacy paths serve job %s (first listed); job-scoped paths serve %s",
+                    default_job, sorted(contracts))
 
     @app.get("/corpus/contract")
-    async def corpus_contract():
-        if len(contracts) > 1:
-            from fastapi.responses import JSONResponse
-
-            return JSONResponse(status_code=409, content={"detail": "several_jobs_served",
-                                                          "jobs": sorted(contracts)})
-        if contract is None:
+    async def corpus_contract() -> dict:
+        if contracts[default_job] is None:
             raise HTTPException(status_code=404, detail="corpus_contract_unknown")
-        return contract
+        return contracts[default_job]
 
     @app.get("/corpus/jobs/{job_id}/contract")
     async def corpus_job_contract(job_id: str) -> dict:
