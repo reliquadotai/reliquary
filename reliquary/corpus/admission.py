@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from reliquary.corpus.checks import (
+    REASON_PROMPT_NOT_FULL,
     CheckResult,
     check_completion_count,
     check_proof_shape,
@@ -86,20 +87,9 @@ def admit(
         )
 
     if job.prompt_order == PROMPT_ORDER_MINER_WALK:
-        expected_cursor = cursors.expected(hotkey)
-        if cursor != expected_cursor:
-            return Verdict(
-                False,
-                "bad_cursor",
-                detail={"expected": expected_cursor, "got": cursor},
-            )
-        expected_index = job_walk_index(job, hotkey, cursor)
-        if prompt_index != expected_index:
-            return Verdict(
-                False,
-                "prompt_mismatch",
-                detail={"expected": expected_index, "got": prompt_index},
-            )
+        refused = _walk_position_refusal(job, cursors, hotkey, cursor, prompt_index)
+        if refused is not None:
+            return refused
     elif not job.owns(prompt_index):
         return Verdict(False, "prompt_mismatch", detail=out_of_range_detail(job, prompt_index))
 
@@ -143,6 +133,64 @@ def admit(
     remaining = slots.consume(prompt_index)
     _advance(job, cursors, hotkey)
     return Verdict(True, "accepted", slots_remaining=remaining)
+
+
+def skip(
+    job: JobSpec,
+    *,
+    hotkey: str,
+    cursor: int,
+    prompt_index: int,
+    slots: SlotLedger,
+    cursors: CursorLedger,
+) -> Verdict:
+    """Step over the prompt this miner's walk names, only when it is FULL.
+
+    What a ``prompt_full`` refusal does, without the generation it used to
+    cost: the same position checks, then the same ``_advance``. No slot is
+    consumed and no digest is seen. Skipping a prompt that still has a slot is
+    refused, so this never lets a miner choose which open prompt it answers.
+    """
+    if slots.is_complete:
+        return Verdict(False, "job_complete")
+    if job.prompt_order != PROMPT_ORDER_MINER_WALK:
+        # A free job's cursor never moves, so there is no step to give up.
+        return Verdict(False, "malformed_submission", detail={"prompt_order": job.prompt_order})
+    refused = _walk_position_refusal(job, cursors, hotkey, cursor, prompt_index)
+    if refused is not None:
+        return refused
+    remaining = slots.remaining(prompt_index)
+    if remaining:
+        return Verdict(
+            False,
+            REASON_PROMPT_NOT_FULL,
+            slots_remaining=remaining,
+            detail={"prompt_index": prompt_index, "slots_remaining": remaining},
+        )
+    _advance(job, cursors, hotkey)
+    return Verdict(True, "accepted", slots_remaining=0)
+
+
+def _walk_position_refusal(
+    job: JobSpec, cursors: CursorLedger, hotkey: str, cursor: int, prompt_index: int
+) -> Verdict | None:
+    """The walk's own rule, shared by ``admit`` and ``skip``: the cursor is the
+    ledger's, and the index is the one the walk names there."""
+    expected_cursor = cursors.expected(hotkey)
+    if cursor != expected_cursor:
+        return Verdict(
+            False,
+            "bad_cursor",
+            detail={"expected": expected_cursor, "got": cursor},
+        )
+    expected_index = job_walk_index(job, hotkey, cursor)
+    if prompt_index != expected_index:
+        return Verdict(
+            False,
+            "prompt_mismatch",
+            detail={"expected": expected_index, "got": prompt_index},
+        )
+    return None
 
 
 def out_of_range_detail(job: JobSpec, prompt_index: int) -> dict[str, int]:
