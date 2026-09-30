@@ -483,9 +483,11 @@ HTTP: `POST /corpus/submit` is unchanged and routes on the submission's
 `job_id` (a job this validator does not serve is refused `job_not_served`, its
 detail listing the served ids). `GET /corpus/jobs` lists the served jobs;
 `GET /corpus/jobs/<job>/job` and `GET /corpus/jobs/<job>/cursor/<hotkey>`
-answer for one of them (404 `corpus_job_not_served` otherwise). With several
-jobs, the legacy `GET /corpus/job` and `GET /corpus/cursor/<hotkey>` answer
-409 `{"detail": "several_jobs_served", "jobs": [...]}`; with one job they are
+answer for one of them (404 `corpus_job_not_served` otherwise), and
+`GET /corpus/jobs/<job>/contract` serves that job's own task contract (not
+the merge). With several jobs, the legacy `GET /corpus/job`,
+`GET /corpus/cursor/<hotkey>` and `GET /corpus/contract` answer 409
+`{"detail": "several_jobs_served", "jobs": [...]}`; with one job they are
 unchanged (and the job-scoped routes work too).
 
 Rehearse it first (§0) with `--second-prompt-source <source>`: one validator
@@ -518,11 +520,13 @@ reliquary corpus mine --validator-url http://<validator-ip>:<port> \
 - The miner downloads the job's checkpoint and refuses to start if its
   fingerprint differs from the manifest.
 - `--job-id <job>` against a validator serving several jobs (§3.2): the miner
-  then reads that job's `/corpus/jobs/<job>/...` routes. Without it, such a
-  validator's 409 stops the miner with the list of jobs to choose from. One
-  process mines one job: a miner who wants both runs two processes (two cards,
-  or `--gpu-memory-utilization` to share one), with the merged contract file
-  or its job's task contract.
+  then reads that job's `/corpus/jobs/<job>/...` routes, and without
+  `RELIQUARY_TASK_CONTRACT` takes that job's own task contract from
+  `/corpus/jobs/<job>/contract`. Without it, such a validator's 409 stops the
+  miner with the list of jobs to choose from. One process mines one job: a
+  miner who wants both runs two processes (two cards, or
+  `--gpu-memory-utilization` to share one), each with its job's task contract
+  (fetched, or `reliquary tasks contract --task-id <that task>`).
 
 ## 5. Watch
 

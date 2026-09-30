@@ -273,12 +273,31 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         app.include_router(next(iter(routers.values())))
     app.include_router(build_corpus_jobs_router(routers))
 
+    # Miners have no registry access: each job's own task contract, and with one
+    # job the legacy path too (the contract this process then runs).
+    contracts = {str(served.entry.job_id): getattr(served.entry, "contract", None)
+                 for served in jobs}
+    if len(contracts) == 1:
+        contracts = dict.fromkeys(contracts, contract)
+
     @app.get("/corpus/contract")
-    async def corpus_contract() -> dict:
-        # Miners have no registry access; this is the contract this process runs.
+    async def corpus_contract():
+        if len(contracts) > 1:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(status_code=409, content={"detail": "several_jobs_served",
+                                                          "jobs": sorted(contracts)})
         if contract is None:
             raise HTTPException(status_code=404, detail="corpus_contract_unknown")
         return contract
+
+    @app.get("/corpus/jobs/{job_id}/contract")
+    async def corpus_job_contract(job_id: str) -> dict:
+        if job_id not in contracts:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        if contracts[job_id] is None:
+            raise HTTPException(status_code=404, detail="corpus_contract_unknown")
+        return contracts[job_id]
 
     from fastapi.exception_handlers import request_validation_exception_handler
     from fastapi.exceptions import RequestValidationError

@@ -82,6 +82,11 @@ def _error_detail(response):
         return response.text[:500]
 
 
+def _error_object(response) -> dict:
+    detail = _error_detail(response)
+    return detail if isinstance(detail, dict) else {}
+
+
 def issue_corpus_request(request_call):
     """Run one httpx request against the corpus validator, translating its
     outcome into the two exceptions ``mine_steps`` understands. A status in
@@ -134,7 +139,7 @@ class HttpCorpusClient:
         if self._job_id is None:
             response = self._http.get("/corpus/job")
             if response.status_code == 409:
-                jobs = (_error_detail(response) or {}).get("jobs") or self._served()
+                jobs = _error_object(response).get("jobs") or self._served()
                 raise CorpusJobSelectionError(
                     f"the validator serves several jobs {jobs}; pass --job-id with the "
                     "one to mine (run one miner process per job)"
@@ -142,6 +147,26 @@ class HttpCorpusClient:
         else:
             response = self._http.get(f"/corpus/jobs/{self._job_id}/job")
             if response.status_code == 404:
+                raise CorpusJobSelectionError(
+                    f"the validator does not serve job {self._job_id!r}; it serves {self._served()}"
+                )
+        response.raise_for_status()
+        return response.json()
+
+    def contract(self) -> dict:
+        """The task contract the validator serves for this job (or its only one)."""
+        if self._job_id is None:
+            response = self._http.get("/corpus/contract")
+            if response.status_code == 409:
+                jobs = _error_object(response).get("jobs") or self._served()
+                raise CorpusJobSelectionError(
+                    f"the validator serves several jobs {jobs}; pass --job-id with the "
+                    "one to mine (run one miner process per job)"
+                )
+        else:
+            response = self._http.get(f"/corpus/jobs/{self._job_id}/contract")
+            if (response.status_code == 404
+                    and _error_object(response).get("detail") == "corpus_job_not_served"):
                 raise CorpusJobSelectionError(
                     f"the validator does not serve job {self._job_id!r}; it serves {self._served()}"
                 )

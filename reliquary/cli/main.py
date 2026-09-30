@@ -1212,30 +1212,36 @@ corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
 
-def _restart_with_served_contract(validator_url: str) -> None:
+def _restart_with_served_contract(validator_url: str, job_id: str | None = None) -> None:
     """Take the task's contract from the validator and restart with it: the
-    active profile is fixed when this process imports it."""
+    active profile is fixed when this process imports it. With ``job_id``,
+    that job's own task contract on a validator serving several."""
     import sys
     from pathlib import Path
     from types import SimpleNamespace
 
     import httpx
 
-    from reliquary.miner.corpus_miner import CorpusContractError, save_served_contract
+    from reliquary.miner.corpus_miner import (
+        CorpusContractError,
+        CorpusJobSelectionError,
+        HttpCorpusClient,
+        save_served_contract,
+    )
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
-    http = httpx.Client(base_url=validator_url, timeout=60.0)
-    responses = {}
-    for path in ("/corpus/job", "/corpus/contract"):
-        response = http.get(path)
-        response.raise_for_status()
-        responses[path] = response.json()
-    raw = responses["/corpus/job"]
+    client = HttpCorpusClient(httpx.Client(base_url=validator_url, timeout=60.0), job_id=job_id)
+    try:
+        raw = client.job()
+        contract = client.contract()
+    except CorpusJobSelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
     job = SimpleNamespace(job_id=raw.get("job_id"), checkpoint_repo=raw.get("checkpoint_repo"),
                           checkpoint_revision=raw.get("checkpoint_revision"))
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
     try:
-        path = save_served_contract(responses["/corpus/contract"], job, cache)
+        path = save_served_contract(contract, job, cache)
     except CorpusContractError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=4) from exc
@@ -1324,7 +1330,7 @@ def corpus_mine(
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
-        _restart_with_served_contract(validator_url)
+        _restart_with_served_contract(validator_url, job_id)
     import bittensor as bt
     import httpx
     from huggingface_hub import snapshot_download
