@@ -226,7 +226,12 @@ reliquary jobs create \
   `prompt_mismatch`. The field is written to the manifest only when `S > 0`,
   so jobs declared without it are byte-identical to before; binaries older
   than this field refuse a manifest carrying it (unknown field), so miners
-  and validators of such a job need this build.
+  and validators of such a job need this build. A corpus validator on an
+  older image serving several jobs refuses to boot, for ALL of them, as soon
+  as one manifest carries it: redeploy the corpus validator on this build
+  before declaring the first job with `S > 0`. Disjointness is not checked
+  for you: pick ranges that do not overlap other jobs or the rows an RL task
+  uses on the same source.
 - `--eos-token-id` is the id the miner's vLLM stops on and the route judges
   termination against (151643 for Qwen3-4B-Base).
 - `--max-new-tokens` is omitted on purpose: the job then takes the catalog's

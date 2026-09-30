@@ -1208,8 +1208,8 @@ def build_corpus_router(
         # The fidelity check indexes the prompt source, so a miner-controlled
         # index is bounded before it can raise on the operator's behalf. On a
         # `free` job this is the bound `admit` applies, reached earlier; on
-        # `miner_walk` `admit` compares against `walk_index` instead, which is
-        # a stricter rule inside this one.
+        # `miner_walk` `admit` compares against `job_walk_index` instead, which
+        # is a stricter rule inside this one.
         # The index is a SOURCE index: a job starting at S owns [S, S+N).
         if not job.owns(request.prompt_index):
             return _refuse(
