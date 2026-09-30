@@ -206,3 +206,10 @@ def test_recomposing_a_compiled_profile_ignores_selection_order():
     assert canonical_sha256(composed.to_generation_contract()) == canonical_sha256(
         profile.to_generation_contract()
     )
+
+
+def test_invalid_sampling_is_refused_on_composition():
+    run = RUN_POLICIES["suite-v9"]
+    bad = replace(run, sampling=replace(run.sampling, top_p=0.0))
+    with pytest.raises(ValueError, match="top_p"):
+        _compose(["reliquary_code_v1"], run=bad)

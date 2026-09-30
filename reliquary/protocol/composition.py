@@ -8,6 +8,8 @@ this module, so resolving the active profile is unchanged.
 
 from __future__ import annotations
 
+import math
+
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -86,6 +88,18 @@ RUN_POLICIES: Mapping[str, RunPolicy] = MappingProxyType({
 })
 
 
+def _check_sampling(sampling: SamplingProfile) -> None:
+    """Bounds every compiled profile sits inside; top_k 0 means no top-k cut."""
+    if sampling.rollouts < 1:
+        raise ValueError(f"sampling rollouts must be at least 1, got {sampling.rollouts}")
+    if not math.isfinite(sampling.temperature) or sampling.temperature <= 0:
+        raise ValueError(f"sampling temperature must be finite and positive, got {sampling.temperature}")
+    if not math.isfinite(sampling.top_p) or not 0 < sampling.top_p <= 1:
+        raise ValueError(f"sampling top_p must be in (0, 1], got {sampling.top_p}")
+    if sampling.top_k < 0:
+        raise ValueError(f"sampling top_k must be 0 (disabled) or positive, got {sampling.top_k}")
+
+
 def check_profile_invariants(profile: ProtocolProfile) -> None:
     """The checks ``constants`` makes at import, without importing it."""
     if profile.prompt_encoding not in _PROMPT_ENCODINGS:
@@ -93,18 +107,19 @@ def check_profile_invariants(profile: ProtocolProfile) -> None:
             f"unknown prompt encoding {profile.prompt_encoding!r}; "
             f"expected one of {', '.join(_PROMPT_ENCODINGS)}"
         )
-    math = profile.environments.get("openmathinstruct")
-    if math is None:
+    _check_sampling(profile.sampling)
+    omi = profile.environments.get("openmathinstruct")
+    if omi is None:
         return
-    if math.answer_format not in _MATH_ANSWER_FORMATS:
+    if omi.answer_format not in _MATH_ANSWER_FORMATS:
         raise ValueError(
-            f"openmathinstruct answer format {math.answer_format!r} is not one "
+            f"openmathinstruct answer format {omi.answer_format!r} is not one "
             f"of {', '.join(_MATH_ANSWER_FORMATS)}"
         )
-    bft = math.bft
-    if bft is not None and math.max_new_tokens <= bft.thinking_budget + bft.answer_budget:
+    bft = omi.bft
+    if bft is not None and omi.max_new_tokens <= bft.thinking_budget + bft.answer_budget:
         raise ValueError(
-            f"openmathinstruct cap {math.max_new_tokens} must exceed the BFT "
+            f"openmathinstruct cap {omi.max_new_tokens} must exceed the BFT "
             f"budgets {bft.thinking_budget} + {bft.answer_budget}"
         )
 

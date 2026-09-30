@@ -132,3 +132,32 @@ def test_invariants_refuse_a_math_cap_that_cannot_hold_the_bft_budgets():
     profile = _with_math(PROFILES["qwen35-2b-auction-v2"], max_new_tokens=2048 + 512)
     with pytest.raises(ValueError, match="BFT"):
         check_profile_invariants(profile)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("rollouts", 0),
+    ("rollouts", -1),
+    ("temperature", 0.0),
+    ("temperature", -0.5),
+    ("temperature", float("nan")),
+    ("temperature", float("inf")),
+    ("top_p", 0.0),
+    ("top_p", 1.01),
+    ("top_p", float("nan")),
+    ("top_k", -1),
+])
+def test_invariants_refuse_invalid_sampling(field, value):
+    from dataclasses import replace
+
+    profile = PROFILES["teutonic-9b-reliquary-suite-v9-dev1"]
+    bad = replace(profile, sampling=replace(profile.sampling, **{field: value}))
+    with pytest.raises(ValueError, match=field):
+        check_profile_invariants(bad)
+
+
+def test_compiled_sampling_sits_inside_the_bounds_with_top_k_zero_meaning_disabled():
+    # Pinned so the bounds cannot be tightened past a profile the fleet runs.
+    seen = {(p.sampling.top_k, p.sampling.top_p, p.sampling.temperature) for p in PROFILES.values()}
+    assert seen == {(20, 0.95, 0.6), (0, 1.0, 1.0)}
+    for profile in PROFILES.values():
+        check_profile_invariants(profile)
