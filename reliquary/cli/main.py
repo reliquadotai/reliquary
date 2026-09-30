@@ -886,6 +886,9 @@ def build_job_manifest(
     from reliquary.corpus.job import JOB_SCHEMA, parse_job
     from reliquary.validator.corpus_service import prompt_job_for_spec
 
+    # Neither means the active profile; both would leave one silently unused.
+    if profile is not None and from_profile is not None:
+        raise ValueError("pass the job's profile or its template id, not both")
     if (grader_id is None) != (threshold is None):
         raise ValueError(
             "--grader-id and --threshold go together: a filter needs both, and "

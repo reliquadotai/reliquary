@@ -246,3 +246,19 @@ def test_the_shared_fields_are_the_model_identity():
     old = ("model_id", "model_revision", "model_architecture", "proofs")
     assert CORPUS_SHARED_CONTRACT_FIELDS == MODEL_IDENTITY_FIELDS == old
     assert CORPUS_SHARED_CONTRACT_FIELDS is MODEL_IDENTITY_FIELDS
+
+
+def test_build_job_manifest_refuses_both_a_profile_and_a_template():
+    from reliquary.cli.main import build_job_manifest
+    from reliquary.protocol.profiles import PROFILES
+
+    template = "qwen3-4b-reliquary-episode-v7-dev1"
+    with pytest.raises(ValueError, match="profile"):
+        build_job_manifest(
+            job_id="tools-v1", checkpoint_repo=MODEL, checkpoint_revision=REVISION,
+            checkpoint_sha256="a" * 64, prompt_source=EPISODE_SOURCE, prompt_count=100,
+            renderer_id="reliquary-jsonl-tools-v1", eos_token_id=151645, slots_per_prompt=8,
+            temperature=1.0, top_p=1.0, top_k=0, min_new_tokens=2, max_new_tokens=4096, n=1,
+            grader_id=None, threshold=None, prompt_order="free", deadline_round=None,
+            from_profile=template, profile=PROFILES[template],
+        )
