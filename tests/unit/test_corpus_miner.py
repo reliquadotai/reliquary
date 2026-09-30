@@ -28,8 +28,9 @@ class _Tokenizer:
         return "".join(chr(i) for i in ids)
 
 
-def _job(prompt_count=50, n=2):
-    return SimpleNamespace(job_id="math-v1", prompt_count=prompt_count, eos_token_id=EOS,
+def _job(prompt_count=50, n=2, prompt_start=0):
+    return SimpleNamespace(job_id="math-v1", prompt_count=prompt_count,
+                           prompt_start=prompt_start, eos_token_id=EOS,
                            checkpoint_sha256="a" * 64, sampling=SimpleNamespace(n=n),
                            prompt_order="miner_walk")
 
@@ -76,6 +77,25 @@ def test_the_miner_follows_its_own_walk():
                render=lambda i: f"q{i}", sign=lambda b: "sig", max_steps=3)
     assert [b["prompt_index"] for b in client.submitted] == [walk_index("math-v1", "5Hot", c, 50) for c in range(3)]
     assert [b["cursor"] for b in client.submitted] == [0, 1, 2]
+
+
+def test_a_started_job_renders_and_submits_the_source_row():
+    """The miner renders and submits the SOURCE index, the one the route's
+    fidelity check renders: the walk shifted by the job's start."""
+    rendered = []
+    client, generator = _Client(["accepted"] * 4), _Generator()
+
+    def render(index):
+        rendered.append(index)
+        return f"q{index}"
+
+    mine_steps(job=_job(prompt_start=7000), hotkey="5Hot", client=client, generator=generator,
+               tokenizer=_Tokenizer(), render=render, sign=lambda b: "sig", max_steps=4)
+    expected = [7000 + walk_index("math-v1", "5Hot", c, 50) for c in range(4)]
+    assert rendered == expected
+    assert [b["prompt_index"] for b in client.submitted] == expected
+    assert [b["rendered_prompt"] for b in client.submitted] == [f"q{i}" for i in expected]
+    assert all(7000 <= i < 7050 for i in expected)
 
 
 def test_a_refused_step_resynchronises_the_cursor():

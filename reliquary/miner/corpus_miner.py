@@ -23,7 +23,7 @@ import time
 from typing import Protocol
 
 from reliquary.corpus.encoding import completion_text, prompt_token_ids
-from reliquary.corpus.walk import walk_index
+from reliquary.corpus.walk import job_walk_index
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +262,8 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     consecutive_unreasoned = 0
     while max_steps is None or steps < max_steps:
         steps += 1
-        prompt_index = walk_index(job.job_id, hotkey, cursor, job.prompt_count)
+        # A SOURCE index: the one `render` draws and the route renders again.
+        prompt_index = job_walk_index(job, hotkey, cursor)
         rendered = render(prompt_index)
         try:
             generations = generator.generate(prompt_token_ids(tokenizer, rendered), job.sampling.n)
