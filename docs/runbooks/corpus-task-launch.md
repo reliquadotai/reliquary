@@ -362,7 +362,8 @@ signature check fails, so every draw is treated as unavailable and every
 One process on one H100 (the GRAIL validator's card is fine: nothing else of
 the RL service runs in it). It loads the job's checkpoint in bf16, refuses to
 start if the contract's model is not the job's checkpoint or the fingerprint
-differs, serves `GET /corpus/job`, `GET /corpus/cursor/{hotkey}` and
+differs, serves `GET /corpus/job`, `GET /corpus/cursor/{hotkey}`,
+`GET /corpus/next/{hotkey}`, `POST /corpus/skip` (§4.1) and
 `POST /corpus/submit`, audits accepted submissions per the job's `audit_*`
 parameters (§2.1 — `audit_q = 1.0`, the default, audits every one, as in V0)
 and settles every 60 s.
@@ -554,12 +555,15 @@ cap. Shared: the loaded model, the card, and the subnet-registration snapshot.
 HTTP: `POST /corpus/submit` is unchanged and routes on the submission's
 `job_id` (a job this validator does not serve is refused `job_not_served`, its
 detail listing the served ids). `GET /corpus/jobs` lists the served jobs;
-`GET /corpus/jobs/<job>/job` and `GET /corpus/jobs/<job>/cursor/<hotkey>`
+`GET /corpus/jobs/<job>/job`, `GET /corpus/jobs/<job>/cursor/<hotkey>`,
+`GET /corpus/jobs/<job>/next/<hotkey>` and `POST /corpus/jobs/<job>/skip`
 answer for one of them (404 `corpus_job_not_served` otherwise), and
 `GET /corpus/jobs/<job>/contract` serves that job's own task contract (not
 the merge). The legacy `GET /corpus/job`, `GET /corpus/cursor/<hotkey>` and
-`GET /corpus/contract` answer for the first id in `RELIQUARY_TASK_ID` (with
-one job, unchanged; the job-scoped routes work too).
+`GET /corpus/contract` and `GET /corpus/next/<hotkey>` answer for the first
+id in `RELIQUARY_TASK_ID` (with one job, unchanged; the job-scoped routes work
+too); the legacy `POST /corpus/skip` routes on the body's `job_id`, as submit
+does.
 
 Rehearse it first (§0) with `--second-prompt-source <source>`: one validator
 serves both jobs, one honest miner per job, and one hotkey mines the first job
@@ -599,6 +603,42 @@ reliquary corpus mine --validator-url http://<validator-ip>:<port> \
   miner who wants both runs two processes (two cards, or
   `--gpu-memory-utilization` to share one), each with its job's task contract
   (fetched, or `reliquary tasks contract --task-id <that task>`).
+
+### 4.1 Check before generating: next and skip
+
+On a `miner_walk` job each hotkey walks a fixed hash order that revisits rows,
+so late in a job most walk positions land on prompts whose slots are already
+taken. Without a check a miner generates the full `n` completions (up to
+`max_new_tokens` each) and only learns `prompt_full` on submit. The miner now
+asks first:
+
+- `GET /corpus/jobs/<job>/next/<hotkey>` (legacy `GET /corpus/next/<hotkey>`)
+  answers `{"cursor": c, "prompt_index": i, "slots_remaining": r}` for the
+  hotkey's CURRENT cursor: the source row its walk names there and how many
+  slots it still has. A read, like the cursor route: no signature, no write.
+- `POST /corpus/jobs/<job>/skip` (legacy `POST /corpus/skip`) with
+  `{"job_id", "miner_hotkey", "cursor", "prompt_index", "signature"}`, signed
+  with `sign_corpus_skip` (domain `reliquary/corpus-skip/v1`, over job,
+  hotkey, cursor and index; it never verifies as a submission signature, nor
+  a submission's as a skip). After the signature, registration and ban gates
+  of submit, and under the same ledger lock and compare-and-swap, the cursor
+  moves one step exactly as a `prompt_full` refusal moves it, and only if
+  `cursor` is the ledger's, `prompt_index` is the walk's at that cursor and
+  the prompt is full. Answer: `{"reason": "accepted", "skipped": true,
+  "cursor": c+1, ...}`. Refusals move nothing and cost no write:
+  `prompt_not_full` (the prompt still has a slot: generate for it),
+  `bad_cursor`, `prompt_mismatch`, `job_complete`, `bad_signature`,
+  `signature_unverifiable`, `hotkey_not_registered`, `miner_banned`,
+  `job_not_served`, and `malformed_submission` on a `free` job (it has no walk
+  to skip along). Nothing is paid, recorded or audited for a skip.
+
+`reliquary corpus mine` does this on its own: before each generation it reads
+`next`; while `slots_remaining` is 0 it skips and reads again, and it
+generates only for a prompt with a slot left. Its counts gain `skipped` (and
+`skip_<reason>` for refused skips). Against a validator without these routes
+(404) or one that cannot verify a skip, it mines exactly as before for the
+rest of the run. Older miners never call them and see no change: submit, its
+refusals and the cursor route are the same.
 
 ## 5. Watch
 
