@@ -295,6 +295,19 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             raise HTTPException(status_code=404, detail="corpus_contract_unknown")
         return legacy_contract
 
+    @app.get("/corpus/jobs/{job_id}/status")
+    async def corpus_job_status(job_id: str) -> dict:
+        # Public: counts only. The job set is attached once the process runs.
+        job_set = getattr(app.state, "corpus_jobs", None)
+        try:
+            status = await job_set.status(job_id) if job_set is not None else None
+        except Exception as exc:
+            logger.warning("corpus status of %s unavailable: %r", job_id, exc)
+            raise HTTPException(status_code=503, detail="corpus_status_unavailable") from exc
+        if status is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        return status
+
     @app.get("/corpus/jobs/{job_id}/contract")
     async def corpus_job_contract(job_id: str) -> dict:
         if job_id not in routes.routers:
@@ -397,11 +410,21 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         )
 
     def prepared(task_entry, task_cap, job, own_profile, renderer, seen_index):
-        return SimpleNamespace(
+        from reliquary.validator.corpus_job_status import JobStats
+
+        w = SimpleNamespace(
             entry=task_entry, cap=task_cap, job=job, renderer=renderer, seen_index=seen_index,
             prompt_job_for=(functools.partial(prompt_job_for_spec, profile=own_profile)
                             if own_profile is not None else None),
+            stats=JobStats(),
         )
+
+        def on_accepted(submission_id: str) -> None:
+            w.stats.accepted()
+            w.auditor.enqueue(submission_id)
+
+        w.on_accepted = on_accepted
+        return w
 
     wiring = []
     for task_entry, task_cap, job in manifests:
@@ -467,7 +490,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         w.auditor = CorpusAuditor(job_id=w.job.job_id, records=records, model=model,
                                   tokenizer=tokenizer, proof=proof, params=params,
                                   miner_states=miner_states, beacon=beacon, round_at=round_at,
-                                  gpu_lock=gpu_lock)
+                                  gpu_lock=gpu_lock, on_verdict=w.stats.observe)
         # `entry.cap` does not exist on `TaskEntry` (the cap lives in
         # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
         w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
@@ -509,13 +532,21 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     process_contract = (ACTIVE_PROTOCOL_PROFILE.to_generation_contract() if hot else {})
 
+    async def seed_status(w) -> None:
+        # Once, in the background: the status route counts verdicts from before this start.
+        try:
+            await w.stats.seed(records, w.job.job_id)
+        except Exception:
+            logger.exception("corpus status of %s could not be seeded", w.job.job_id)
+
     async def drained(w) -> bool:
         return await job_drained(auditor=w.auditor, records=records, job_id=w.job.job_id)
 
     job_set = CorpusJobSet(
         routes=app.state.corpus_routes, router_for=app.state.corpus_router_for,
         wire=wire_hot,
-        jobs_of=lambda w: [w.auditor.run(), settle_forever(w.entry.task_id, w.settler)],
+        jobs_of=lambda w: [w.auditor.run(), settle_forever(w.entry.task_id, w.settler),
+                           seed_status(w)],
         read_entries=read_registry, read_job=read_job,
         admit=lambda task_entry, job: hot_job_refusal(
             task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,

@@ -88,8 +88,11 @@ class CorpusAuditor:
                  round_at: Callable[[float], int] | None = None,
                  clock: Callable[[], float] = time.time,
                  accept_slack_seconds: float = ACCEPT_SLACK_SECONDS,
-                 gpu_lock: asyncio.Lock | None = None) -> None:
+                 gpu_lock: asyncio.Lock | None = None,
+                 on_verdict: Callable[[str, dict], None] | None = None) -> None:
         self._job_id = job_id
+        # Told of every verdict that stands, for the job's in-memory status.
+        self._on_verdict = on_verdict
         # Shared by every job's auditor on one loaded model: one forward pass
         # at a time, and asyncio.Lock wakes waiters FIFO so no job starves.
         self._gpu_lock = gpu_lock if gpu_lock is not None else contextlib.nullcontext()
@@ -374,10 +377,20 @@ class CorpusAuditor:
             written = await self._records.write_verdict(self._job_id, submission_id, verdict)
         if written:
             self._mark_judged(submission_id)
+            self._report(submission_id, verdict)
             return verdict, True
         standing = await self._records.read_verdict(self._job_id, submission_id)
         self._mark_judged(submission_id)
+        self._report(submission_id, standing)
         return standing, False
+
+    def _report(self, submission_id: str, verdict: dict | None) -> None:
+        if self._on_verdict is None or verdict is None:
+            return
+        try:
+            self._on_verdict(submission_id, verdict)
+        except Exception:
+            logger.exception("corpus verdict report for %s failed", submission_id[:12])
 
     async def _state(self, hotkey: str, now: float) -> MinerState:
         if self._miner_states is None:

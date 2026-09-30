@@ -16,3 +16,11 @@ Ruling: a cap changed in the registry (`set-cap`) reaches the running settler at
 Ruling: with the hot set on, the auditors share a GPU lock even when one job is served, since more may join.
 Ruling: the settler's archive guard (RELIQUARY_TASK_ID) also admits the task ids this process wired after boot.
 Ruling: a scoped submit route `POST /corpus/jobs/{job_id}/submit` joins the scoped reads, so every admission path of a job lives under its prefix.
+
+## R2 Job status route
+
+Ruling: `audited` counts submissions with a standing verdict (audited by the model or passed unaudited by sampling), `passed` the passing verdicts, `verified_tokens` their token counts — so `submissions_accepted - audited` is what is still waiting.
+Ruling: `submissions_accepted` and `prompts_full` come from the job's ledger object (each accepted submission fills one slot), read with one GET at most once per `STATUS_CACHE_SECONDS` and reused per ETag — a read, never a listing.
+Ruling: verdict counts are seeded once per process by one background listing when a job is wired, then kept from the auditor's own writes; `accepted_last_hour` counts from the process start (it can only undercount during the first hour).
+Ruling: `settled` is the settler's count as of its last settlement read (0 before its first).
+Ruling: a failed recompute serves the last status; with none cached it answers 503 `corpus_status_unavailable`; an unknown job 404; a drained job keeps its final status for the life of the process.

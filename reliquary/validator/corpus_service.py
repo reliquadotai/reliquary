@@ -1634,6 +1634,14 @@ def build_corpus_router(
         except LedgerSnapshotError as exc:
             raise _ledger_corrupt(exc) from exc
 
+    async def ledger_state() -> tuple[JobSpec | None, LedgerState | None]:
+        """The manifest and the ledgers as the reads see them, for the status route."""
+        job = await _read_job_checked()
+        if job is None:
+            return None, None
+        return job, await _read_state(job)
+
+    router.ledger_state = ledger_state
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
     router.corpus_job = corpus_job

@@ -120,8 +120,9 @@ class CorpusJobSet:
         self._refresh_every = refresh_every_seconds
         self._clock = clock
         self.served: dict[str, Any] = {}
-        # Jobs retired and drained, with when: the status route still names them.
-        self.finished: dict[str, float] = {}
+        # Jobs retired and drained, with their final status: the route still answers.
+        self.finished: dict[str, dict] = {}
+        self._status_cache: dict[str, tuple[float, dict]] = {}
         self._tasks: dict[str, list[asyncio.Task]] = {}
         # Task ids already decided against (ignored or refused): logged once.
         self._passed_over: set[str] = set()
@@ -242,12 +243,52 @@ class CorpusJobSet:
         except Exception:
             logger.exception("corpus job %s: drain check failed; retrying next refresh", job_id)
             return
+        try:
+            final = await self._compute_status(job_id, drained=True)
+        except Exception:
+            # Unwiring must not wait on a status read: the last one, marked drained.
+            logger.warning("corpus job %s: final status unreadable; keeping the last one", job_id)
+            last = self._status_cache.get(job_id)
+            final = {**(last[1] if last else {"job_id": job_id}), "state": "drained"}
         for task in self._tasks.pop(job_id, ()):
             task.cancel()
         self._routes.remove(job_id)
         del self.served[job_id]
-        self.finished[job_id] = self._clock()
+        self.finished[job_id] = final
+        self._status_cache.pop(job_id, None)
         logger.info("corpus job %s drained and unwired", job_id)
+
+    async def _compute_status(self, job_id: str, *, drained: bool = False) -> dict:
+        from reliquary.validator.corpus_job_status import job_status
+
+        wiring = self.served[job_id]
+        job, state = await self._routes.routers[job_id].ledger_state()
+        return job_status(job_id=job_id, job=job or wiring.job, slots=state.slots,
+                          stats=wiring.stats, settled=getattr(wiring.settler, "settled_count", 0),
+                          retired=self.is_retired(job_id), drained=drained)
+
+    async def status(self, job_id: str) -> dict | None:
+        """The public status of a served or drained job, recomputed at most once
+        per ``STATUS_CACHE_SECONDS``; a failed recompute serves the last one."""
+        from reliquary.validator.corpus_job_status import STATUS_CACHE_SECONDS
+
+        if job_id in self.finished:
+            return self.finished[job_id]
+        if job_id not in self.served:
+            return None
+        now = self._clock()
+        cached = self._status_cache.get(job_id)
+        if cached is not None and now - cached[0] < STATUS_CACHE_SECONDS:
+            return cached[1]
+        try:
+            fresh = await self._compute_status(job_id)
+        except Exception:
+            if cached is None:
+                raise
+            logger.warning("corpus status of %s: ledger unreadable, serving the last one", job_id)
+            return cached[1]
+        self._status_cache[job_id] = (now, fresh)
+        return fresh
 
     async def run(self) -> None:
         """Refresh forever (when a registry reader is given) and raise the first

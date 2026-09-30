@@ -64,6 +64,8 @@ class CorpusSettler:
         self._stall = stall_seconds
         self._advance_every = advance_every_seconds
         self._clock = clock
+        # How many verdicts stand settled, as of the last settlement read.
+        self.settled_count: int | None = None
 
     def set_cap(self, cap: float) -> None:
         """A cap changed in the registry: the next settlement pays under it."""
@@ -90,6 +92,7 @@ class CorpusSettler:
             "settled": sorted(set(state.get("settled") or []) | set(pending["ids"])),
             "pending": None,
         }
+        self.settled_count = len(final["settled"])
         if pending.get("alone"):
             # The finish time, not the choice time: a finish delayed by a crash
             # or a hold must still be one RL window from the next lone advance.
@@ -102,6 +105,7 @@ class CorpusSettler:
         state = {"schema": SETTLEMENT_SCHEMA, "last_window": None, "settled": [],
                  "other_max_seen": None, "other_max_seen_at": None, "advanced_at": None,
                  "pending": None, **state}
+        self.settled_count = len(state["settled"] or ())
 
         now = self._clock()
         other_max = await self._archives.other_max(self._task_id)
@@ -147,6 +151,7 @@ class CorpusSettler:
             # forever, so mark them settled in this same CAS write.
             state["settled"] = sorted(settled | set(new_ids))
             await self._records.write_settlement(self._job_id, state, etag)
+            self.settled_count = len(state["settled"])
             return None
 
         if clock_changed:

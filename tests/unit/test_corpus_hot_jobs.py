@@ -453,11 +453,13 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
                 seen["code_job"] = (await client.get("/corpus/jobs/code-v1/job")).json()
                 seen["code_contract"] = (await client.get("/corpus/jobs/code-v1/contract")).json()
                 seen["legacy"] = (await client.get("/corpus/job")).json()["job_id"]
+                seen["status_open"] = (await client.get("/corpus/jobs/code-v1/status")).json()
                 registry["corpus-code"] = _registry_entry(
                     tmp_path, "-b", "corpus-code", "code-v1", status="retired")
                 await job_set.refresh()
                 seen["retired_next"] = (await client.get("/corpus/jobs/code-v1/next/5Hot")).status_code
                 seen["served_after_drain"] = sorted(job_set.served)
+                seen["status_drained"] = (await client.get("/corpus/jobs/code-v1/status")).json()
             raise _Stop()
 
     monkeypatch.setattr(uvicorn, "Server", _Server)
@@ -478,3 +480,6 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
     assert seen["retired_next"] == 410
     # Nothing was submitted, so the retired job drained at once and left.
     assert seen["served_after_drain"] == ["math-v1"]
+    assert seen["status_open"]["state"] == "open"
+    assert seen["status_open"]["submissions_accepted"] == 0
+    assert seen["status_drained"]["state"] == "drained"
