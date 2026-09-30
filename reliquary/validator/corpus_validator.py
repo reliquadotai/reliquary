@@ -355,13 +355,28 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.validator.corpus_service import migrate_ledgers_at_startup
 
     several = len(served) > 1
-    wiring = []
+    manifests = []
     for task_entry, task_cap in served:
         job, _ = await store.read_job(str(task_entry.job_id))
         if job is None:
             raise RuntimeError(
                 f"task {task_entry.task_id!r} declares job {task_entry.job_id!r} but it has no manifest"
             )
+        manifests.append((task_entry, task_cap, job))
+
+    if several:
+        # Before any ledger is migrated: a start that refuses touches nothing.
+        # The CLI refuses a contract-less entry among several ids before this.
+        carried = all(getattr(e, "contract", None) is not None for e, _, _ in manifests)
+        refusal = multi_job_refusal(
+            [(e, job) for e, _, job in manifests],
+            process_contract=ACTIVE_PROTOCOL_PROFILE.to_generation_contract() if carried else None,
+        )
+        if refusal:
+            raise RuntimeError(refusal)
+
+    wiring = []
+    for task_entry, task_cap, job in manifests:
         # Before anything serves: the route would otherwise seal a v1 seen set
         # inside its first submission's ledger turn. One ledger, one index, per job.
         seen_index = await migrate_ledgers_at_startup(store, job)
@@ -388,16 +403,6 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             prompt_job_for=(functools.partial(prompt_job_for_spec, profile=own_profile)
                             if own_profile is not None else None),
         ))
-
-    if several:
-        # The CLI refuses a contract-less entry among several ids before this.
-        carried = all(getattr(w.entry, "contract", None) is not None for w in wiring)
-        refusal = multi_job_refusal(
-            [(w.entry, w.job) for w in wiring],
-            process_contract=ACTIVE_PROTOCOL_PROFILE.to_generation_contract() if carried else None,
-        )
-        if refusal:
-            raise RuntimeError(refusal)
 
     # Only the rehearsal turns the gate off: its local keys are not on the chain.
     registered = None

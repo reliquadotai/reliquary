@@ -287,3 +287,22 @@ def test_each_jobs_ledger_is_migrated_and_its_index_preloaded(v1_ledgers, booted
         sealed = set(index)
         assert sealed | set(ledger["seen_pending"]) == set(v1["seen"])
     assert not set(v1_ledgers.indexes["swe-v1"]) & set(v1_ledgers.indexes["swe-v2"])
+
+
+def test_a_refused_start_migrates_no_ledger(v1_ledgers, seeded_job, fake_r2):
+    """The manifests are checked against each other before any ledger is touched:
+    a start that refuses leaves every v1 ledger exactly as it was."""
+    from reliquary.validator.corpus_validator import run_corpus_validator
+
+    asyncio.run(job_store.write_job(
+        {**_manifest(), "job_id": "swe-v2", "checkpoint_sha256": "b" * 64}, None, **fake_r2))
+    before = dict(v1_ledgers.r2.objects)
+
+    with pytest.raises(RuntimeError, match="checkpoint_sha256"):
+        asyncio.run(run_corpus_validator(
+            jobs=[(_entry("corpus-math", "swe-v1"), 0.1), (_entry("corpus-code", "swe-v2"), 0.1)],
+            wallet=None, netuid=0, signer_client=None, http_host="127.0.0.1", http_port=0,
+            set_weights=False, registration_gate=False,
+        ))
+    after = {k: v for k, v in v1_ledgers.r2.objects.items() if "ledger" in k or "/seen/" in k}
+    assert after == {k: v for k, v in before.items() if "ledger" in k or "/seen/" in k}
