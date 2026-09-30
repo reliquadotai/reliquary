@@ -29,11 +29,11 @@ from typing import Any, NamedTuple, Protocol
 
 from fastapi import APIRouter, HTTPException
 
-from reliquary.corpus.admission import Verdict, admit, out_of_range_detail
+from reliquary.corpus.admission import Verdict, admit, out_of_range_detail, skip
 from reliquary.corpus.checks import CheckResult, completion_digest
 from reliquary.corpus.job import JobError, JobSpec
 from reliquary.corpus.slots import SlotLedger
-from reliquary.corpus.walk import CursorLedger
+from reliquary.corpus.walk import CursorLedger, job_walk_index
 from reliquary.environment.agentic.types import EpisodeTask
 from reliquary.environment.registry import ENVIRONMENT_SPECS
 from reliquary.infrastructure.corpus_job_store import (
@@ -42,6 +42,8 @@ from reliquary.infrastructure.corpus_job_store import (
 )
 from reliquary.protocol.corpus_submission import (
     CorpusRejectReason,
+    CorpusSkipRequest,
+    CorpusSkipResponse,
     CorpusSubmissionRequest,
     CorpusSubmissionResponse,
 )
@@ -60,6 +62,12 @@ CURSOR_PATH = "/corpus/cursor/{hotkey}"
 JOBS_PATH = "/corpus/jobs"
 JOB_SCOPED_PATH = "/corpus/jobs/{job_id}/job"
 CURSOR_SCOPED_PATH = "/corpus/jobs/{job_id}/cursor/{hotkey}"
+# Check before generating: where a hotkey's walk stands and whether that prompt
+# still has a slot, and the signed step over it when it has none.
+NEXT_PATH = "/corpus/next/{hotkey}"
+NEXT_SCOPED_PATH = "/corpus/jobs/{job_id}/next/{hotkey}"
+SKIP_PATH = "/corpus/skip"
+SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
 
 # The record's own schema tag, so a reader of the bucket can tell what shape
 # to expect before it parses the rest of the document.
@@ -1019,6 +1027,12 @@ def _respond(verdict: Verdict) -> CorpusSubmissionResponse:
     )
 
 
+def _refuse_skip(
+    reason: CorpusRejectReason, detail: Mapping[str, Any] | None = None
+) -> CorpusSkipResponse:
+    return CorpusSkipResponse(reason=reason, skipped=False, detail=dict(detail or {}))
+
+
 def build_corpus_router(
     *,
     job_id: str,
@@ -1026,6 +1040,7 @@ def build_corpus_router(
     tokenizer: Tokenizer,
     renderer: Renderer,
     verify_signature,
+    verify_skip_signature=None,
     prompt_job_for=prompt_job_for_spec,
     max_write_attempts: int = DEFAULT_WRITE_ATTEMPTS,
     records=None,
@@ -1050,6 +1065,8 @@ def build_corpus_router(
     or a validator not yet wired to one) leaves every hotkey admitted.
     ``registration`` likewise: it answers None for a hotkey registered on the
     subnet, else ``corpus_registration.NOT_REGISTERED`` or ``UNAVAILABLE``.
+    ``verify_skip_signature`` checks a skip's own binding; without one every
+    skip is refused ``signature_unverifiable`` and miners generate as before.
     """
 
     router = APIRouter()
@@ -1164,34 +1181,9 @@ def build_corpus_router(
         if not verified:
             return _refuse(CorpusRejectReason.BAD_SIGNATURE)
 
-        # An unregistered hotkey is never paid; refuse it before it costs a
-        # store read or an audit. Unknown registrations are retried, not refused.
-        if registration is not None:
-            from reliquary.validator.corpus_registration import NOT_REGISTERED
-
-            reason = await registration(request.miner_hotkey)
-            if reason == NOT_REGISTERED:
-                return _refuse(CorpusRejectReason.HOTKEY_NOT_REGISTERED)
-            if reason is not None:
-                raise HTTPException(status_code=503, detail="corpus_registration_unavailable")
-
-        # Right after the signature check and before anything is read or
-        # written: an unsigned request must not be able to probe ban status.
-        if is_banned is not None:
-            try:
-                banned = await is_banned(request.miner_hotkey)
-            except Exception as exc:
-                # Same response `_from_store` gives a bucket transport error:
-                # the miners document is unreachable, not that this hotkey
-                # was cleared to submit.
-                logger.warning(
-                    "corpus ban check for %s failed: %r", request.miner_hotkey[:12], exc
-                )
-                raise HTTPException(
-                    status_code=503, detail="corpus_store_unavailable"
-                ) from exc
-            if banned:
-                return _refuse(CorpusRejectReason.MINER_BANNED)
+        gated = await _hotkey_refusal(request.miner_hotkey)
+        if gated is not None:
+            return _refuse(gated)
 
         # `JobError` subclasses `ValueError`, so `_read_job_checked` catches it
         # first: a manifest in the bucket that no longer parses is an operator
@@ -1411,6 +1403,129 @@ def build_corpus_router(
         # Nothing was consumed, so the same work resubmits cleanly.
         raise HTTPException(status_code=503, detail="corpus_ledger_contention")
 
+    async def _hotkey_refusal(hotkey: str) -> CorpusRejectReason | None:
+        """The registration and ban gates, shared by submit and skip; called
+        only once a signature has verified."""
+        # An unregistered hotkey is never paid; refuse it before it costs a
+        # store read or an audit. Unknown registrations are retried, not refused.
+        if registration is not None:
+            from reliquary.validator.corpus_registration import NOT_REGISTERED
+
+            reason = await registration(hotkey)
+            if reason == NOT_REGISTERED:
+                return CorpusRejectReason.HOTKEY_NOT_REGISTERED
+            if reason is not None:
+                raise HTTPException(status_code=503, detail="corpus_registration_unavailable")
+
+        # Right after the signature check and before anything is read or
+        # written: an unsigned request must not be able to probe ban status.
+        if is_banned is not None:
+            try:
+                banned = await is_banned(hotkey)
+            except Exception as exc:
+                # Same response `_from_store` gives a bucket transport error:
+                # the miners document is unreachable, not that this hotkey
+                # was cleared to submit.
+                logger.warning("corpus ban check for %s failed: %r", hotkey[:12], exc)
+                raise HTTPException(
+                    status_code=503, detail="corpus_store_unavailable"
+                ) from exc
+            if banned:
+                return CorpusRejectReason.MINER_BANNED
+        return None
+
+    @router.get(NEXT_PATH)
+    async def corpus_next(hotkey: str) -> dict:
+        """Where this hotkey's walk stands and how many slots that prompt has
+        left, so a miner can skip a full one instead of generating for it.
+        A read, exposed like the cursor: no signature, no write."""
+        job = await _read_job_checked()
+        if job is None:
+            raise HTTPException(status_code=404, detail="corpus_job_unknown")
+        snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger read")
+        state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+        cursor = state.cursors.expected(hotkey)
+        prompt_index = job_walk_index(job, hotkey, cursor)
+        return {
+            "cursor": cursor,
+            "prompt_index": prompt_index,
+            "slots_remaining": state.slots.remaining(prompt_index),
+        }
+
+    @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
+    async def skip_corpus(request: CorpusSkipRequest) -> CorpusSkipResponse:
+        """Step this hotkey's cursor over a FULL prompt, exactly as a
+        ``prompt_full`` refusal would (``admission.skip``), under the same
+        ledger turn and compare-and-swap as submit. Nothing is paid or
+        recorded and no digest is seen."""
+        if request.job_id != job_id:
+            return _refuse_skip(
+                CorpusRejectReason.JOB_NOT_SERVED,
+                {"job_id": request.job_id, "serves": [job_id]},
+            )
+        if verify_skip_signature is None:
+            return _refuse_skip(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
+        try:
+            verified = verify_skip_signature(request)
+        except CorpusSignatureUnavailable:
+            return _refuse_skip(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
+        if not verified:
+            return _refuse_skip(CorpusRejectReason.BAD_SIGNATURE)
+        gated = await _hotkey_refusal(request.miner_hotkey)
+        if gated is not None:
+            return _refuse_skip(gated)
+        job = await _read_job_checked()
+        if job is None:
+            return _refuse_skip(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
+
+        try:
+            await asyncio.wait_for(ledger_lock.acquire(), ledger_lock_timeout)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=503, detail="corpus_ledger_contention") from None
+        try:
+            for _ in range(max_write_attempts):
+                snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
+                state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+                verdict = skip(
+                    job,
+                    hotkey=request.miner_hotkey,
+                    cursor=request.cursor,
+                    prompt_index=request.prompt_index,
+                    slots=state.slots,
+                    cursors=state.cursors,
+                )
+                if not verdict.accepted:
+                    # Moved nothing, so it costs no write.
+                    return CorpusSkipResponse(
+                        reason=CorpusRejectReason(verdict.reason),
+                        skipped=False,
+                        slots_remaining=verdict.slots_remaining,
+                        detail=dict(verdict.detail),
+                    )
+                # Pending and segments pass through untouched: a skip adds no
+                # digest, so it never has anything to seal.
+                after = ledger_snapshot(
+                    state.slots, state.cursors, state.pending, state.segments
+                )
+                try:
+                    await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
+                except CorpusStoreConflict:
+                    continue
+                moved = state.cursors.expected(request.miner_hotkey)
+                logger.debug(
+                    "corpus skip %s: prompt %d full, cursor %d -> %d",
+                    request.miner_hotkey[:12], request.prompt_index, request.cursor, moved,
+                )
+                return CorpusSkipResponse(
+                    reason=CorpusRejectReason.ACCEPTED,
+                    skipped=True,
+                    cursor=moved,
+                    slots_remaining=0,
+                )
+        finally:
+            ledger_lock.release()
+        raise HTTPException(status_code=503, detail="corpus_ledger_contention")
+
     async def _read_job_checked() -> JobSpec | None:
         """The manifest, or the same named 500 ``submit_corpus`` raises on one
         that no longer parses -- shared so the GET routes, which read the
@@ -1460,6 +1575,8 @@ def build_corpus_router(
     router.corpus_job = corpus_job
     router.corpus_cursor = corpus_cursor
     router.submit_corpus = submit_corpus
+    router.corpus_next = corpus_next
+    router.skip_corpus = skip_corpus
     return router
 
 
@@ -1494,6 +1611,16 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
     async def corpus_cursor_scoped(job_id: str, hotkey: str) -> dict:
         return await _served(job_id).corpus_cursor(hotkey)
 
+    @router.get(NEXT_SCOPED_PATH)
+    async def corpus_next_scoped(job_id: str, hotkey: str) -> dict:
+        return await _served(job_id).corpus_next(hotkey)
+
+    @router.post(SKIP_SCOPED_PATH, response_model=CorpusSkipResponse)
+    async def skip_corpus_scoped(job_id: str, request: CorpusSkipRequest) -> CorpusSkipResponse:
+        # The path picks the job's router; that router still refuses a body
+        # naming another job, so the two can never disagree silently.
+        return await _served(job_id).skip_corpus(request)
+
     if len(routers) == 1:
         return router
 
@@ -1504,6 +1631,21 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
     @router.get(CURSOR_PATH)
     async def corpus_cursor_legacy(hotkey: str) -> dict:
         return await default.corpus_cursor(hotkey)
+
+    @router.get(NEXT_PATH)
+    async def corpus_next_legacy(hotkey: str) -> dict:
+        return await default.corpus_next(hotkey)
+
+    @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
+    async def skip_corpus_legacy(request: CorpusSkipRequest) -> CorpusSkipResponse:
+        # Dispatched on the body, as submit is.
+        target = routers.get(request.job_id)
+        if target is None:
+            return _refuse_skip(
+                CorpusRejectReason.JOB_NOT_SERVED,
+                {"job_id": request.job_id, "serves": served},
+            )
+        return await target.skip_corpus(request)
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(request: CorpusSubmissionRequest) -> CorpusSubmissionResponse:
@@ -1526,6 +1668,10 @@ __all__ = [
     "CorpusSignatureUnavailable",
     "EnvironmentPromptJob",
     "JOBS_PATH",
+    "NEXT_PATH",
+    "NEXT_SCOPED_PATH",
+    "SKIP_PATH",
+    "SKIP_SCOPED_PATH",
     "JOB_PATH",
     "JOB_SCOPED_PATH",
     "LEDGER_SCHEMA",
