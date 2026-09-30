@@ -250,58 +250,58 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     """One app over one ``build_corpus_router`` per job (each with its own
     renderer, auditor queue and ban check); the registration gate is shared.
 
-    With one job its router is mounted as is, so the legacy routes answer
-    exactly as before; the job-scoped reads are added either way. With several,
-    the legacy reads answer for the first job in ``jobs``.
+    The legacy routes answer for the first job in ``jobs``; the job-scoped ones
+    for every job. ``app.state.corpus_routes`` is the live routing table and
+    ``app.state.corpus_router_for`` builds a router for a job wired later.
     """
     from reliquary.validator.corpus_service import (
-        build_corpus_jobs_router, build_corpus_router, prompt_job_for_spec,
+        CorpusJobRoutes, build_corpus_jobs_router, build_corpus_router, prompt_job_for_spec,
     )
 
-    routers = {
-        str(served.entry.job_id): build_corpus_router(
+    def router_for(served):
+        return build_corpus_router(
             job_id=str(served.entry.job_id), store=store, tokenizer=tokenizer,
             renderer=served.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature,
             prompt_job_for=(getattr(served, "prompt_job_for", None) or prompt_job_for
                             or prompt_job_for_spec),
             records=records,
-            on_accepted=served.auditor.enqueue, proof_chunk_tokens=proof_chunk_tokens,
-            vocab_size=vocab_size, is_banned=served.is_banned, registration=registration,
+            on_accepted=getattr(served, "on_accepted", None) or served.auditor.enqueue,
+            proof_chunk_tokens=proof_chunk_tokens,
+            vocab_size=vocab_size, is_banned=getattr(served, "is_banned", None),
+            registration=registration,
             seen_index=getattr(served, "seen_index", None),
         )
-        for served in jobs
-    }
-    app = FastAPI()
-    if len(routers) == 1:
-        app.include_router(next(iter(routers.values())))
-    app.include_router(build_corpus_jobs_router(routers))
 
-    # Miners have no registry access: each job's own task contract. The legacy
-    # path serves the first job's, as the other legacy reads do (with one job,
-    # the contract this process runs).
-    contracts = {str(served.entry.job_id): getattr(served.entry, "contract", None)
-                 for served in jobs}
-    if len(contracts) == 1:
-        contracts = dict.fromkeys(contracts, contract)
-    default_job = next(iter(contracts))
-    if len(contracts) > 1:
+    # Miners have no registry access: each job's own task contract. With one
+    # job at boot, the contract this process runs.
+    routes = CorpusJobRoutes()
+    for served in jobs:
+        routes.add(str(served.entry.job_id), router_for(served),
+                   contract=contract if len(jobs) == 1 else getattr(served.entry, "contract", None))
+    app = FastAPI()
+    app.include_router(build_corpus_jobs_router(routes, legacy=True))
+    app.state.corpus_routes = routes
+    app.state.corpus_router_for = router_for
+    default_job = routes.default
+    legacy_contract = routes.contracts.get(default_job)
+    if len(routes.routers) > 1:
         logger.info("corpus legacy paths serve job %s (first listed); job-scoped paths serve %s",
-                    default_job, sorted(contracts))
+                    default_job, sorted(routes.routers))
 
     @app.get("/corpus/contract")
     async def corpus_contract() -> dict:
-        if contracts[default_job] is None:
+        if legacy_contract is None:
             raise HTTPException(status_code=404, detail="corpus_contract_unknown")
-        return contracts[default_job]
+        return legacy_contract
 
     @app.get("/corpus/jobs/{job_id}/contract")
     async def corpus_job_contract(job_id: str) -> dict:
-        if job_id not in contracts:
+        if job_id not in routes.routers:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
-        if contracts[job_id] is None:
+        if routes.contracts.get(job_id) is None:
             raise HTTPException(status_code=404, detail="corpus_contract_unknown")
-        return contracts[job_id]
+        return routes.contracts[job_id]
 
     from fastapi.exception_handlers import request_validation_exception_handler
     from fastapi.exceptions import RequestValidationError
@@ -320,9 +320,16 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
 async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http_port,
                                set_weights: bool, entry=None, cap: float | None = None,
                                jobs=None, settle_every_seconds: float = 60.0,
-                               registration_gate: bool = True) -> None:
+                               registration_gate: bool = True, read_registry=None,
+                               refresh_every_seconds: float | None = None) -> None:
     """Serve one corpus task (``entry``, ``cap``) or several (``jobs``, a list
-    of ``(entry, cap)``) from one process and one loaded model."""
+    of ``(entry, cap)``) from one process and one loaded model.
+
+    With ``read_registry`` (an async callable returning the registry's
+    entries) the job set is hot: re-read every ``refresh_every_seconds``, new
+    jobs on this model are wired and retired ones drained without a restart.
+    Without it the jobs given here are the jobs served, as before.
+    """
     import threading
     from pathlib import Path
 
@@ -341,6 +348,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     )
     from reliquary.shared.modeling import load_text_only_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
+    from reliquary.validator.corpus_hot_jobs import (
+        JOB_REFRESH_SECONDS, CorpusJobSet, hot_job_refusal, job_drained,
+    )
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
@@ -381,6 +391,18 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         if refusal:
             raise RuntimeError(refusal)
 
+    def build_renderer(job, own_profile):
+        return renderer_for_job(
+            job, encode, tokenizer=lambda: tokenizer_box["tokenizer"], profile=own_profile
+        )
+
+    def prepared(task_entry, task_cap, job, own_profile, renderer, seen_index):
+        return SimpleNamespace(
+            entry=task_entry, cap=task_cap, job=job, renderer=renderer, seen_index=seen_index,
+            prompt_job_for=(functools.partial(prompt_job_for_spec, profile=own_profile)
+                            if own_profile is not None else None),
+        )
+
     wiring = []
     for task_entry, task_cap, job in manifests:
         # Before anything serves: the route would otherwise seal a v1 seen set
@@ -391,9 +413,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         own_profile = (_entry_profile(task_entry)
                        if several and getattr(task_entry, "contract", None) is not None else None)
         try:
-            renderer = renderer_for_job(
-                job, encode, tokenizer=lambda: tokenizer_box["tokenizer"], profile=own_profile
-            )
+            renderer = build_renderer(job, own_profile)
         except ValueError as exc:
             # `CorpusPromptSourceError` (an unbuildable/mismatched prompt source)
             # is a `ValueError` subclass; an episode job's `renderer_id` naming no
@@ -404,11 +424,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 f"job {job.job_id!r} declares renderer {job.renderer_id!r} for "
                 f"prompt source {job.prompt_source!r}, which cannot be built: {exc}"
             ) from exc
-        wiring.append(SimpleNamespace(
-            entry=task_entry, cap=task_cap, job=job, renderer=renderer, seen_index=seen_index,
-            prompt_job_for=(functools.partial(prompt_job_for_spec, profile=own_profile)
-                            if own_profile is not None else None),
-        ))
+        wiring.append(prepared(task_entry, task_cap, job, own_profile, renderer, seen_index))
 
     # Only the rehearsal turns the gate off: its local keys are not on the chain.
     registered = None
@@ -437,9 +453,14 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     ).to("cuda").eval()
     proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
     records = BucketRecordStore()
-    # One model, one forward pass at a time across every job; one job needs none.
-    gpu_lock = asyncio.Lock() if len(wiring) > 1 else None
-    for w in wiring:
+    # One model, one forward pass at a time across every job; one job needs
+    # none, unless more may join it.
+    hot = read_registry is not None
+    gpu_lock = asyncio.Lock() if len(wiring) > 1 or hot else None
+    job_set: CorpusJobSet | None = None
+    archives = R2Archives(served=lambda: job_set.task_ids() if job_set is not None else ())
+
+    def audit_and_settle(w) -> None:
         params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
             entry=w.entry, job=w.job, records=records
         )
@@ -450,7 +471,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # `entry.cap` does not exist on `TaskEntry` (the cap lives in
         # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
         w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
-                                  records=records, archives=R2Archives())
+                                  records=records, archives=archives)
+
+    for w in wiring:
+        audit_and_settle(w)
 
     app = build_corpus_jobs_app(jobs=wiring, store=store, records=records, tokenizer=tokenizer,
                                 verify_signature=verify_corpus_signature,
@@ -470,6 +494,40 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 logger.exception("corpus settlement failed; retrying next period")
             await asyncio.sleep(settle_every_seconds)
 
+    async def wire_hot(task_entry, task_cap, job):
+        # The renderer first: a job refused for it leaves its ledger untouched.
+        own_profile = _entry_profile(task_entry)
+        renderer = build_renderer(job, own_profile)
+        seen_index = await migrate_ledgers_at_startup(store, job)
+        w = prepared(task_entry, task_cap, job, own_profile, renderer, seen_index)
+        audit_and_settle(w)
+        return w
+
+    async def read_job(job_id):
+        job, _ = await store.read_job(job_id)
+        return job
+
+    process_contract = (ACTIVE_PROTOCOL_PROFILE.to_generation_contract() if hot else {})
+
+    async def drained(w) -> bool:
+        return await job_drained(auditor=w.auditor, records=records, job_id=w.job.job_id)
+
+    job_set = CorpusJobSet(
+        routes=app.state.corpus_routes, router_for=app.state.corpus_router_for,
+        wire=wire_hot,
+        jobs_of=lambda w: [w.auditor.run(), settle_forever(w.entry.task_id, w.settler)],
+        read_entries=read_registry, read_job=read_job,
+        admit=lambda task_entry, job: hot_job_refusal(
+            task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,
+            process_contract=process_contract, fingerprint=fingerprint),
+        drained=drained,
+        refresh_every_seconds=(refresh_every_seconds if refresh_every_seconds is not None
+                               else JOB_REFRESH_SECONDS),
+    )
+    app.state.corpus_jobs = job_set
+    for w in wiring:
+        job_set.adopt(w)
+
     if set_weights:
         from reliquary.validator.weight_only import WeightOnlyValidator
 
@@ -481,12 +539,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     background = [registered.refresh_forever()] if registered is not None else []
-    await asyncio.gather(
-        server.serve(),
-        *(w.auditor.run() for w in wiring),
-        *(settle_forever(w.entry.task_id, w.settler) for w in wiring),
-        *background,
-    )
+    await asyncio.gather(server.serve(), job_set.run(), *background)
 
 
 __all__ = [

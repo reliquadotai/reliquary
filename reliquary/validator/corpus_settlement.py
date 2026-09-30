@@ -65,6 +65,10 @@ class CorpusSettler:
         self._advance_every = advance_every_seconds
         self._clock = clock
 
+    def set_cap(self, cap: float) -> None:
+        """A cap changed in the registry: the next settlement pays under it."""
+        self._cap = float(cap)
+
     def _archive(self, window: int, rewards: Mapping[str, float]) -> dict:
         return {
             "window_start": int(window),
@@ -156,7 +160,14 @@ class CorpusSettler:
 
 
 class R2Archives:
-    """The two archive calls the settler makes, against the real bucket."""
+    """The two archive calls the settler makes, against the real bucket.
+
+    ``served`` names the tasks this process wired after boot, which
+    ``RELIQUARY_TASK_ID`` cannot list.
+    """
+
+    def __init__(self, *, served=None) -> None:
+        self._served = served
 
     async def other_max(self, task_id: str) -> int | None:
         from reliquary.infrastructure import storage
@@ -181,6 +192,7 @@ class R2Archives:
         # write under any task RELIQUARY_TASK_ID does not name.
         # Unset is refused as before, never read as the legacy task.
         served = os.getenv("RELIQUARY_TASK_ID")
-        if not served or task_id not in parse_task_ids(served):
+        hot = set(self._served()) if self._served is not None else set()
+        if not served or (task_id not in parse_task_ids(served) and task_id not in hot):
             raise RuntimeError(f"RELIQUARY_TASK_ID does not name {task_id!r}; refusing to archive")
         await storage.upload_window_dataset(window, data, task_id=task_id)

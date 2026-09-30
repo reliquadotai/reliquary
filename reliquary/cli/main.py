@@ -1873,6 +1873,23 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _corpus_hot_registry_reader():
+    """The registry reader that makes a corpus validator's job set hot, or None.
+
+    Off unless ``RELIQUARY_CORPUS_HOT_JOBS=1``: a hot validator starts serving
+    (and paying) any active corpus entry on its model, which an operator opts into.
+    """
+    if not _env_flag("RELIQUARY_CORPUS_HOT_JOBS"):
+        return None
+    from reliquary.infrastructure.task_registry_store import read_registry
+
+    async def entries():
+        found, _ = await read_registry()
+        return found
+
+    return entries
+
+
 def _miner_requires_grader(env_names: list[str]) -> bool:
     # Miners never grade: opencode reward is validator-authoritative, so the
     # reference miner only generates rollouts. The gVisor grader runs on the
@@ -2506,7 +2523,7 @@ def validate(
                         jobs=[(c.entry, c.emission_cap) for c in corpus_configs],
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
-                        set_weights=set_weights,
+                        set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
                     )
                 except RuntimeError as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
@@ -2577,7 +2594,7 @@ def validate(
                         entry=task_config.entry, wallet=wallet, netuid=netuid,
                         signer_client=signer_client, http_host=http_host,
                         http_port=http_port, cap=task_config.emission_cap,
-                        set_weights=set_weights,
+                        set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
                     )
                 except RuntimeError as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
