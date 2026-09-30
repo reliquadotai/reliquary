@@ -164,7 +164,8 @@ async def conditional_put_preflight() -> dict:
 # --------------------------------------------------------------------------
 
 def declare_task(state: Path, args, *, task_id: str, job_id: str, revision: str,
-                 prompt_source: str | None = None, suffix: str = "") -> dict:
+                 prompt_source: str | None = None, suffix: str = "",
+                 base_profile: str | None = None) -> dict:
     """The registry entry `jobs create` would write, built by the same code, so
     the contract this run serves under is the one production would carry."""
     from dataclasses import asdict
@@ -173,7 +174,7 @@ def declare_task(state: Path, args, *, task_id: str, job_id: str, revision: str,
     from reliquary.shared.task_registry import validate_entry
 
     entry = build_corpus_task_entry(
-        task_id=task_id, job_id=job_id, from_profile=args.base_profile,
+        task_id=task_id, job_id=job_id, from_profile=base_profile or args.base_profile,
         model_id=args.honest_model, model_revision=revision,
         model_architecture=args.model_architecture,
         prompt_source=prompt_source or args.prompt_source,
@@ -219,20 +220,26 @@ async def declare_job(state: Path, args, *, job_id: str, revision: str, sha256: 
 # Child: the validator
 # --------------------------------------------------------------------------
 
-def run_validator(args) -> None:
+def load_entry(path, *, task_id: str, job_id: str) -> SimpleNamespace:
+    """The entry `declare_task` wrote: its params (the audit parameters) and its
+    contract, which the validator serves and checks each job against."""
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+    raw = json.loads(Path(path).read_text())
+    return SimpleNamespace(task_id=task_id, job_id=job_id, mechanism=MECHANISM_CORPUS_GENERATION,
+                           params=raw["params"], contract=raw["contract"],
+                           profile_id=raw["profile_id"])
+
+
+def run_validator(args) -> None:
     from reliquary.validator.corpus_validator import run_corpus_validator
 
     # The audit parameters live in the entry's params, as the registry would carry them.
     # Comma lists: one validator process serving several tasks/jobs.
     task_ids, job_ids = args.task_id.split(","), args.job_id.split(",")
     caps, entries = args.cap.split(","), args.entry.split(",")
-    jobs = []
-    for task_id, job_id, cap, entry_path in zip(task_ids, job_ids, caps, entries, strict=True):
-        params = json.loads(Path(entry_path).read_text())["params"]
-        entry = SimpleNamespace(task_id=task_id, job_id=job_id,
-                                mechanism=MECHANISM_CORPUS_GENERATION, params=params)
-        jobs.append((entry, float(cap)))
+    jobs = [(load_entry(entry_path, task_id=task_id, job_id=job_id), float(cap))
+            for task_id, job_id, cap, entry_path in zip(task_ids, job_ids, caps, entries, strict=True)]
     # Settlement is driven by the orchestrator once every verdict is in, so the
     # archive it checks is the only one written.
     common = dict(wallet=None, netuid=0, signer_client=None, http_host="127.0.0.1",
@@ -819,10 +826,12 @@ def orchestrate_two_jobs(args) -> int:
     stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
     jobs = {
         "a": {"task_id": f"corpus-e2e-{stamp}", "job_id": f"e2e-{stamp}",
-              "prompt_source": args.prompt_source, "renderer": args.renderer, "cap": args.cap},
+              "prompt_source": args.prompt_source, "renderer": args.renderer, "cap": args.cap,
+              "base_profile": args.base_profile},
         "b": {"task_id": f"corpus-e2e-{stamp}-b", "job_id": f"e2e-{stamp}-b",
               "prompt_source": args.second_prompt_source, "renderer": args.second_renderer,
-              "cap": args.second_cap if args.second_cap is not None else args.cap},
+              "cap": args.second_cap if args.second_cap is not None else args.cap,
+              "base_profile": args.second_base_profile or args.base_profile},
     }
     task_ids = ",".join(j["task_id"] for j in jobs.values())
     state = Path(args.state_dir) / stamp
@@ -848,7 +857,8 @@ def orchestrate_two_jobs(args) -> int:
         for key, job in jobs.items():
             job["contract"] = declare_task(state, args, task_id=job["task_id"], job_id=job["job_id"],
                                            revision=honest_revision,
-                                           prompt_source=job["prompt_source"], suffix=f"-{key}")
+                                           prompt_source=job["prompt_source"], suffix=f"-{key}",
+                                           base_profile=job["base_profile"])
             job["params"] = json.loads((state / f"entry-{key}.json").read_text())["params"]
         # The one contract the process runs: what `tasks contract --task-id a --task-id b` prints.
         merged = merge_corpus_contracts({j["task_id"]: j["contract"] for j in jobs.values()})
@@ -861,7 +871,7 @@ def orchestrate_two_jobs(args) -> int:
                 renderer_id=renderer_id, contract=job["contract"], prompt_source=source,
                 suffix=f"-{key}"))
         dishonest_revision = _snapshot(args.dishonest_model, args.dishonest_revision).name
-        summary["jobs"] = {key: {k: j[k] for k in ("task_id", "job_id", "prompt_source", "cap")}
+        summary["jobs"] = {key: {k: j[k] for k in ("task_id", "job_id", "prompt_source", "cap", "base_profile")}
                            for key, j in jobs.items()}
         summary.update({"state_dir": str(state), "checkpoint": f"{args.honest_model}@{honest_revision}",
                         "checkpoint_sha256": sha256, "eos_token_id": eos,
@@ -890,7 +900,9 @@ def orchestrate_two_jobs(args) -> int:
         )
         miners = {}
         for role, mnemonic, key, steps, model, revision, may_be_banned in runs:
-            miners[role] = _run_miner_process(state, env, args, role.replace("_", "-"),
+            # A miner runs its own job's task contract, as the job-scoped fetch gives it.
+            miner_env = {**env, "RELIQUARY_TASK_CONTRACT": str(state / f"contract-{key}.json")}
+            miners[role] = _run_miner_process(state, miner_env, args, role.replace("_", "-"),
                                               mnemonics[mnemonic], steps, model, revision,
                                               job_id=jobs[key]["job_id"])
             miners[role]["job"] = key
@@ -1010,6 +1022,9 @@ def main() -> int:
         p.add_argument("--second-renderer", default=None,
                        help="the second job's renderer; omit for its contract's own template")
         p.add_argument("--second-cap", type=float, default=None, help="omit for --cap")
+        p.add_argument("--second-base-profile", default=None,
+                       help="the second task's template, e.g. teutonic-9b-reliquary-suite-v9-dev1; "
+                            "omit for --base-profile")
 
     v = sub.add_parser("validator")
     # Each a comma list when one process serves several tasks.

@@ -69,7 +69,10 @@ def _validator_args(tmp_path, n):
     paths = []
     for i in range(n):
         path = tmp_path / f"entry-{i}.json"
-        path.write_text(json.dumps({"params": {"cap": 0.1 * (i + 1), "audit_q": 1.0}}))
+        # The fields of the entry `declare_task` writes that the child reads.
+        path.write_text(json.dumps({"params": {"cap": 0.1 * (i + 1), "audit_q": 1.0},
+                                    "profile_id": f"corpus-{i}",
+                                    "contract": {"profile_id": f"corpus-{i}"}}))
         paths.append(str(path))
     return SimpleNamespace(task_id=",".join(f"corpus-{i}" for i in range(n)),
                            job_id=",".join(f"job-{i}" for i in range(n)), port=1,
@@ -102,3 +105,4 @@ def test_the_validator_child_with_two_tasks_serves_both_in_one_process(tmp_path,
     assert len(calls) == 1
     assert [(e.task_id, e.job_id, cap) for e, cap in calls[0]["jobs"]] == [
         ("corpus-0", "job-0", 0.1), ("corpus-1", "job-1", 0.2)]
+    assert [e.contract["profile_id"] for e, _ in calls[0]["jobs"]] == ["corpus-0", "corpus-1"]

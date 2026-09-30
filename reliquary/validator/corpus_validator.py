@@ -367,7 +367,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # With several jobs the process runs their merged contract; each job's
         # renderer is still checked against its OWN task's contract.
         own_profile = (_entry_profile(task_entry)
-                       if several and task_entry.contract is not None else None)
+                       if several and getattr(task_entry, "contract", None) is not None else None)
         try:
             renderer = renderer_for_job(
                 job, encode, tokenizer=lambda: tokenizer_box["tokenizer"], profile=own_profile
@@ -390,7 +390,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     if several:
         # The CLI refuses a contract-less entry among several ids before this.
-        carried = all(w.entry.contract is not None for w in wiring)
+        carried = all(getattr(w.entry, "contract", None) is not None for w in wiring)
         refusal = multi_job_refusal(
             [(w.entry, w.job) for w in wiring],
             process_contract=ACTIVE_PROTOCOL_PROFILE.to_generation_contract() if carried else None,
@@ -445,7 +445,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 proof_chunk_tokens=proof.chunk_tokens,
                                 vocab_size=model.get_input_embeddings().num_embeddings,
                                 registration=registered.reason if registered is not None else None,
-                                contract=wiring[0].entry.contract if len(wiring) == 1 else None)
+                                contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
 
     async def settle_forever(task_id: str, settler) -> None:
         while True:
