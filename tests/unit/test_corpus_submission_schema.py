@@ -220,3 +220,10 @@ def test_the_not_registered_reason_is_the_same_string_on_both_sides():
 
     assert (CorpusRejectReason.HOTKEY_NOT_REGISTERED.value
             == REASON_HOTKEY_NOT_REGISTERED == "hotkey_not_registered")
+
+
+def test_the_not_full_reason_is_the_same_string_on_both_sides():
+    from reliquary.corpus.checks import REASON_PROMPT_NOT_FULL
+
+    assert (CorpusRejectReason.PROMPT_NOT_FULL.value
+            == REASON_PROMPT_NOT_FULL == "prompt_not_full")

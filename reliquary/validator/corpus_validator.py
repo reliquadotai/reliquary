@@ -232,19 +232,21 @@ def build_corpus_audit_wiring(*, entry, job, records):
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
                      auditor, proof_chunk_tokens, prompt_job_for=None,
                      vocab_size=None, is_banned=None, registration=None,
-                     contract=None, seen_index=None) -> FastAPI:
+                     contract=None, seen_index=None, verify_skip_signature=None) -> FastAPI:
     return build_corpus_jobs_app(
         jobs=[SimpleNamespace(entry=entry, job=job, renderer=renderer, auditor=auditor,
                               is_banned=is_banned, seen_index=seen_index)],
         store=store, records=records, tokenizer=tokenizer, verify_signature=verify_signature,
         proof_chunk_tokens=proof_chunk_tokens, prompt_job_for=prompt_job_for,
         vocab_size=vocab_size, registration=registration, contract=contract,
+        verify_skip_signature=verify_skip_signature,
     )
 
 
 def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
                           proof_chunk_tokens, prompt_job_for=None, vocab_size=None,
-                          registration=None, contract=None) -> FastAPI:
+                          registration=None, contract=None,
+                          verify_skip_signature=None) -> FastAPI:
     """One app over one ``build_corpus_router`` per job (each with its own
     renderer, auditor queue and ban check); the registration gate is shared.
 
@@ -260,6 +262,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         str(served.entry.job_id): build_corpus_router(
             job_id=str(served.entry.job_id), store=store, tokenizer=tokenizer,
             renderer=served.renderer, verify_signature=verify_signature,
+            verify_skip_signature=verify_skip_signature,
             prompt_job_for=(getattr(served, "prompt_job_for", None) or prompt_job_for
                             or prompt_job_for_spec),
             records=records,
@@ -332,7 +335,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
-    from reliquary.protocol.signatures import verify_corpus_signature
+    from reliquary.protocol.signatures import (
+        verify_corpus_signature,
+        verify_corpus_skip_signature,
+    )
     from reliquary.shared.modeling import load_text_only_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
@@ -448,6 +454,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     app = build_corpus_jobs_app(jobs=wiring, store=store, records=records, tokenizer=tokenizer,
                                 verify_signature=verify_corpus_signature,
+                                verify_skip_signature=verify_corpus_skip_signature,
                                 proof_chunk_tokens=proof.chunk_tokens,
                                 vocab_size=model.get_input_embeddings().num_embeddings,
                                 registration=registered.reason if registered is not None else None,

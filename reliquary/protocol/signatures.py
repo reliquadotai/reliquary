@@ -558,3 +558,52 @@ def verify_corpus_signature(request) -> bool:
     except Exception as e:
         logger.debug("corpus signature verify failed: %s", e)
         return False
+
+
+# Its own domain, so a skip signature never verifies as a submission's (or the
+# other way round) even over the same job, hotkey, cursor and index.
+CORPUS_SKIP_DOMAIN = b"reliquary/corpus-skip/v2"
+
+
+def build_corpus_skip_binding(request) -> bytes:
+    """Digest of a skip: the job, the hotkey, and the walk steps it gives up."""
+    body = _corpus_fields(request)
+    parts = [
+        str(body["job_id"]).encode("utf-8"),
+        str(body["miner_hotkey"]).encode("utf-8"),
+        int(body["cursor"]).to_bytes(8, "big", signed=False),
+        int(body["prompt_index"]).to_bytes(8, "big", signed=False),
+        int(body["to_cursor"]).to_bytes(8, "big", signed=False),
+    ]
+    h = hashlib.sha256()
+    h.update(CORPUS_SKIP_DOMAIN)
+    for part in parts:
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def sign_corpus_skip(wallet, request) -> str:
+    if bt is None:
+        raise ImportError("bittensor is required for sign_corpus_skip")
+    return wallet.hotkey.sign(build_corpus_skip_binding(request)).hex()  # type: ignore[union-attr]
+
+
+def verify_corpus_skip_signature(request) -> bool:
+    """False on any failure; fail-closed without bittensor, like a submission."""
+    if bt is None:
+        logger.debug("verify_corpus_skip_signature: bittensor unavailable")
+        return False
+    body = _corpus_fields(request)
+    try:
+        sig_bytes = bytes.fromhex(str(body.get("signature") or ""))
+    except ValueError:
+        return False
+    if not sig_bytes:
+        return False
+    try:
+        keypair = bt.Keypair(ss58_address=str(body["miner_hotkey"]))  # type: ignore[union-attr]
+        return bool(keypair.verify(data=build_corpus_skip_binding(request), signature=sig_bytes))
+    except Exception as e:
+        logger.debug("corpus skip signature verify failed: %s", e)
+        return False

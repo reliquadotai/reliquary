@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from reliquary.corpus.checks import (
+    REASON_PROMPT_NOT_FULL,
     CheckResult,
     check_completion_count,
     check_proof_shape,
@@ -86,20 +87,9 @@ def admit(
         )
 
     if job.prompt_order == PROMPT_ORDER_MINER_WALK:
-        expected_cursor = cursors.expected(hotkey)
-        if cursor != expected_cursor:
-            return Verdict(
-                False,
-                "bad_cursor",
-                detail={"expected": expected_cursor, "got": cursor},
-            )
-        expected_index = job_walk_index(job, hotkey, cursor)
-        if prompt_index != expected_index:
-            return Verdict(
-                False,
-                "prompt_mismatch",
-                detail={"expected": expected_index, "got": prompt_index},
-            )
+        refused = _walk_position_refusal(job, cursors, hotkey, cursor, prompt_index)
+        if refused is not None:
+            return refused
     elif not job.owns(prompt_index):
         return Verdict(False, "prompt_mismatch", detail=out_of_range_detail(job, prompt_index))
 
@@ -143,6 +133,110 @@ def admit(
     remaining = slots.consume(prompt_index)
     _advance(job, cursors, hotkey)
     return Verdict(True, "accepted", slots_remaining=remaining)
+
+
+# The most walk steps one skip may cover, and how far `skip_target` looks.
+# Bounds the validator's work per skip; a longer run of full prompts is
+# crossed in several skips.
+MAX_SKIP_STEPS = 256
+
+
+def skip_target(job: JobSpec, hotkey: str, cursor: int, slots: SlotLedger) -> int:
+    """The first cursor after ``cursor`` whose walk position has a free slot,
+    looking at most ``MAX_SKIP_STEPS`` ahead; ``cursor + MAX_SKIP_STEPS`` if
+    every one of those is full."""
+    for step in range(cursor + 1, cursor + MAX_SKIP_STEPS):
+        if not slots.is_full(job_walk_index(job, hotkey, step)):
+            return step
+    return cursor + MAX_SKIP_STEPS
+
+
+def skip_refusal(
+    job: JobSpec,
+    *,
+    hotkey: str,
+    cursor: int,
+    prompt_index: int,
+    to_cursor: int,
+    slots: SlotLedger,
+    cursors: CursorLedger,
+) -> Verdict | None:
+    """Why this skip may not happen, or None. Reads the ledgers, never moves
+    them, so it can be asked of a shared cached state."""
+    if slots.is_complete:
+        return Verdict(False, "job_complete")
+    if job.prompt_order != PROMPT_ORDER_MINER_WALK:
+        # A free job's cursor never moves, so there is no step to give up.
+        return Verdict(False, "malformed_submission", detail={"prompt_order": job.prompt_order})
+    refused = _walk_position_refusal(job, cursors, hotkey, cursor, prompt_index)
+    if refused is not None:
+        return refused
+    if not 1 <= to_cursor - cursor <= MAX_SKIP_STEPS:
+        return Verdict(
+            False,
+            "malformed_submission",
+            detail={"cursor": cursor, "to_cursor": to_cursor, "max_skip_steps": MAX_SKIP_STEPS},
+        )
+    # EVERY position crossed must be full: a skip never steps over a prompt
+    # the miner could have answered.
+    for step in range(cursor, to_cursor):
+        index = job_walk_index(job, hotkey, step)
+        remaining = slots.remaining(index)
+        if remaining:
+            return Verdict(
+                False,
+                REASON_PROMPT_NOT_FULL,
+                slots_remaining=remaining,
+                detail={"cursor": step, "prompt_index": index, "slots_remaining": remaining},
+            )
+    return None
+
+
+def skip(
+    job: JobSpec,
+    *,
+    hotkey: str,
+    cursor: int,
+    prompt_index: int,
+    to_cursor: int,
+    slots: SlotLedger,
+    cursors: CursorLedger,
+) -> Verdict:
+    """Step over the full walk positions [cursor, to_cursor), landing on
+    ``to_cursor``: what that many ``prompt_full`` refusals do, one ``_advance``
+    per position, without the generations they used to cost. No slot is
+    consumed and no digest is seen."""
+    refused = skip_refusal(
+        job, hotkey=hotkey, cursor=cursor, prompt_index=prompt_index,
+        to_cursor=to_cursor, slots=slots, cursors=cursors,
+    )
+    if refused is not None:
+        return refused
+    for _ in range(cursor, to_cursor):
+        _advance(job, cursors, hotkey)
+    return Verdict(True, "accepted", slots_remaining=0)
+
+
+def _walk_position_refusal(
+    job: JobSpec, cursors: CursorLedger, hotkey: str, cursor: int, prompt_index: int
+) -> Verdict | None:
+    """The walk's own rule, shared by ``admit`` and ``skip``: the cursor is the
+    ledger's, and the index is the one the walk names there."""
+    expected_cursor = cursors.expected(hotkey)
+    if cursor != expected_cursor:
+        return Verdict(
+            False,
+            "bad_cursor",
+            detail={"expected": expected_cursor, "got": cursor},
+        )
+    expected_index = job_walk_index(job, hotkey, cursor)
+    if prompt_index != expected_index:
+        return Verdict(
+            False,
+            "prompt_mismatch",
+            detail={"expected": expected_index, "got": prompt_index},
+        )
+    return None
 
 
 def out_of_range_detail(job: JobSpec, prompt_index: int) -> dict[str, int]:
