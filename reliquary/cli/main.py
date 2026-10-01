@@ -1515,7 +1515,8 @@ def build_admin_app_from_environment():
 
     ``RELIQUARY_ADMIN_SECRET``, ``RELIQUARY_ADMIN_POOL_MAX`` and
     ``RELIQUARY_ADMIN_MODELS`` (a JSON file of qualified models) are required;
-    deliveries need ``RELIQUARY_PLATFORM_BUCKET`` and its scoped
+    ``RELIQUARY_ADMIN_TASK_PREFIX`` (default ``order-``) bounds the task and job
+    ids the platform may touch; deliveries need ``RELIQUARY_PLATFORM_BUCKET`` and its scoped
     ``RELIQUARY_PLATFORM_R2_*`` credentials, and are off without them.
     """
     import json
@@ -1538,8 +1539,9 @@ def build_admin_app_from_environment():
         from reliquary.corpus.delivery import R2DeliverySink
 
         deliveries = R2DeliverySink.from_environment()
+    prefix = os.getenv("RELIQUARY_ADMIN_TASK_PREFIX", "order-")
     return create_admin_app(secret=secret.encode(), pool_max=float(pool), models=models,
-                            deliveries=deliveries,
+                            deliveries=deliveries, task_prefix=prefix,
                             work_dir=os.getenv("RELIQUARY_ADMIN_WORK_DIR") or None)
 
 

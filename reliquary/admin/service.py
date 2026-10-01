@@ -27,6 +27,9 @@ from reliquary.admin.auth import (
 logger = logging.getLogger(__name__)
 
 _SUM_TOLERANCE = 1e-9
+# The only task and job ids the platform may create or touch: never an
+# operator-declared prod job.
+DEFAULT_TASK_PREFIX = "order-"
 # No admin request is larger; the bound is checked before the body is read.
 MAX_BODY_BYTES = 1024 * 1024
 # Renderer of a catalog source's rows: the model's own chat template.
@@ -131,7 +134,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      models: Mapping[str, QualifiedModel | Mapping], deliveries=None,
                      records=None, clock: Callable[[], float] = time.time,
                      current_round: Callable[[], int] = _current_round,
-                     prepare=None, work_dir=None) -> FastAPI:
+                     prepare=None, work_dir=None,
+                     task_prefix: str = DEFAULT_TASK_PREFIX) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export route off); ``records`` the subnet's record store."""
     from reliquary.infrastructure import corpus_executor_store as executors
@@ -142,6 +146,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     if not (isinstance(pool_max, (int, float)) and math.isfinite(pool_max)
             and 0.0 <= pool_max <= 1.0):
         raise ValueError(f"the admin pool must be in [0, 1], got {pool_max!r}")
+    if not task_prefix:
+        raise ValueError("the admin task prefix is empty: it would reach every task")
     catalog = {name: spec if isinstance(spec, QualifiedModel) else QualifiedModel(**spec)
                for name, spec in models.items()}
     verifier = HmacVerifier(secret, clock=clock)
@@ -170,6 +176,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     router = APIRouter(prefix="/admin/v1", dependencies=[Depends(signed)])
 
+    def in_scope(name: str) -> None:
+        if not name.startswith(task_prefix):
+            raise HTTPException(status_code=409, detail="outside_admin_scope")
+
     async def entries_naming(job_id: str) -> list:
         entries, _ = await registry_store.read_registry(strict=False)
         return [e for _, e in sorted(entries.items()) if e.job_id == job_id]
@@ -196,6 +206,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def create_job(body: CreateJob, response: Response) -> dict:
         from reliquary.corpus.job import parse_job
 
+        if not (body.job_id.startswith(task_prefix)
+                and (body.task_id or body.job_id).startswith(task_prefix)):
+            raise HTTPException(status_code=422, detail="task_id_outside_admin_scope")
         spec = catalog.get(body.model)
         if spec is None:
             raise HTTPException(status_code=422, detail=f"model {body.model!r} is not qualified")
@@ -264,6 +277,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.shared.task_id import DEFAULT_TASK_ID
         from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
 
+        in_scope(task_id)
         entries, _ = await registry_store.read_registry(strict=False)
         entry = entries.get(task_id)
         if entry is None:
@@ -306,6 +320,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def job_status(job_id: str) -> dict:
         from reliquary.validator.corpus_job_status import stored_job_counts
 
+        in_scope(job_id)
         try:
             job, _ = await job_store.read_job(job_id)
         except ValueError as exc:
@@ -357,6 +372,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.corpus.delivery import export_delivery, validated_delivery_id
         from reliquary.corpus.export import job_grader
 
+        in_scope(job_id)
         if deliveries is None:
             raise HTTPException(status_code=503, detail="deliveries_not_configured")
         try:
@@ -401,6 +417,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     app = FastAPI()
     app.include_router(router)
     app.state.exports = exports
+    app.state.task_prefix = task_prefix
     app.add_middleware(BodyLimit, limit=MAX_BODY_BYTES)
     return app
 

@@ -64,7 +64,7 @@ Ruling (review I8): only deterministic wiring refusals (a `ValueError`: renderer
 ## Review fix pass (R4)
 
 Ruling (review I5, M6, M7): the manifest is written create-only and never deleted (a racing call's task may name it; an orphan manifest is harmless and a later identical create completes it). A create that loses the manifest write to identical bytes proceeds; one that loses the registry write to an identical concurrent create answers that task as the idempotent 200; a second task for a job already declared answers 409.
-Ruling (review I6): cap and retire act only on corpus-generation tasks; `default` and every RL task answer 409 `not_a_corpus_task`. (A mark distinguishing platform-declared corpus tasks from operator-declared ones is left for later: the prod corpus jobs are reachable by the platform until then.)
+Ruling (review I6): cap and retire act only on corpus-generation tasks; `default` and every RL task answer 409 `not_a_corpus_task`. 
 Ruling (review I7): both cap limits count a retired corpus task's cap until its job is drained (checked with the stored counts at each guarded write, and remembered once drained, since drained is final).
 Ruling (review M4, M5): a signature that is not 64 hex characters is `bad_signature` (401), never a 500; a body over 1 MB answers 413 (and a chunked one without a length 411) before any of it is read or parsed.
 Ruling (review M8): a delivery of a job that is not drained answers 409 `job_not_drained`: a manifest makes a delivery final, so it must not freeze a partial dataset.
@@ -75,3 +75,4 @@ Ruling (review M9): a retire that loses its compare-and-swap to another retire a
 Fixed: M1, M2, M3 (commit 9b0ee317), M4, M5 for the admin service, M6, M7, M8, M9 (3af5fbb8), M10 (a4357f46), M11 (a bad recheck fraction now exits 4 with the critical line), M13 (b069b053), M14 (one `token_sha256`, one `_entry_profile`).
 Not fixed, M5 for `/corpus/internal/audit/*` — the corpus app has never had a body limit; nginx's `client_max_body_size` on `/corpus` bounds it in front of the validator, as it already does for submissions.
 Not fixed, M12 — a halted auditor stops the process for hot jobs exactly as for boot jobs; retiring one job on halt is a behaviour change for the single-box deployment, left for when hot jobs are on in prod.
+Ruling (review I6 residual): the admin scope is an id prefix, `RELIQUARY_ADMIN_TASK_PREFIX` (default `order-`, never empty). `POST /admin/v1/jobs` refuses a `job_id` or `task_id` outside it (422 `task_id_outside_admin_scope`); cap, retire, job status and deliveries refuse any task or job outside it (409 `outside_admin_scope`), checked before any read, so the platform can never touch an operator-declared prod job.

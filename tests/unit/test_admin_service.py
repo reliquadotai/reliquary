@@ -63,6 +63,7 @@ def admin(bucket, registry, monkeypatch, tmp_path):  # noqa: F811
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     records = _Records()
     app = create_admin_app(secret=SECRET, pool_max=0.3, models=MODELS, records=records,
+                           task_prefix="math-",
                            deliveries=LocalDirectorySink(tmp_path / "platform"),
                            current_round=lambda: 777, work_dir=tmp_path / "work")
     client = TestClient(app)
@@ -199,7 +200,7 @@ def test_retire_stamps_the_current_round_and_is_idempotent(admin):
     assert response.json() == {"task_id": "math-a", "status": "retired", "retired_at": 777}
     assert admin.registry["entries"]["math-a"].status == "retired"
     assert admin("POST", "/admin/v1/tasks/math-a/retire", {"retired_at": 9}).json()["retired_at"] == 777
-    assert admin("POST", "/admin/v1/tasks/nope/retire", {}).status_code == 404
+    assert admin("POST", "/admin/v1/tasks/math-nope/retire", {}).status_code == 404
 
 
 def test_job_status_proxies_the_stored_counts_and_the_manifest(admin):
@@ -212,7 +213,7 @@ def test_job_status_proxies_the_stored_counts_and_the_manifest(admin):
             status["drained"], status["last_window"]) == (2, 1, 1, 1, False, 4)
     assert status["manifest"]["job_id"] == "math-a"
     assert status["tasks"] == [{"task_id": "math-a", "status": "active", "cap": 0.1}]
-    assert admin("GET", "/admin/v1/jobs/ghost/status").status_code == 404
+    assert admin("GET", "/admin/v1/jobs/math-ghost/status").status_code == 404
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +270,7 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
 
 
 def test_a_delivery_of_an_unknown_job_is_404(admin):
-    assert admin("POST", "/admin/v1/jobs/ghost/deliveries", {}).status_code == 404
+    assert admin("POST", "/admin/v1/jobs/math-ghost/deliveries", {}).status_code == 404
 
 
 def test_a_bad_pool_is_refused_at_build():
@@ -345,10 +346,10 @@ def test_a_create_whose_manifest_write_races_an_identical_one_proceeds(admin, mo
     assert response.status_code == 201, response.text
 
 
-@pytest.mark.parametrize("task_id", ["default", "logic"])
+@pytest.mark.parametrize("task_id", ["math-rl"])
 def test_cap_and_retire_refuse_a_task_that_is_not_a_corpus_task(admin, task_id):
     """I6: the platform reaches its own corpus jobs only."""
-    admin.registry["entries"]["logic"] = _rl_entry("logic", 0.1)
+    admin.registry["entries"]["math-rl"] = _rl_entry("math-rl", 0.1)
     for path, body in ((f"/admin/v1/tasks/{task_id}/cap", {"cap": 0.0}),
                        (f"/admin/v1/tasks/{task_id}/retire", {})):
         response = admin("POST", path, body)
@@ -413,3 +414,50 @@ def test_an_oversized_body_is_refused_before_it_is_read(admin):
     """M5."""
     response = admin("POST", "/admin/v1/jobs", raw=b"x" * (1024 * 1024 + 1))
     assert response.status_code == 413
+
+
+
+# --------------------------------------------------------------------------
+# I6 residual: the admin scope is a task-id prefix
+# --------------------------------------------------------------------------
+
+
+def test_a_job_or_task_outside_the_admin_prefix_cannot_be_created(admin):
+    for body in (_job("order-a"), _job("math-a", task_id="corpus-a")):
+        response = admin("POST", "/admin/v1/jobs", body)
+        assert response.status_code == 422
+        assert response.json()["detail"] == "task_id_outside_admin_scope"
+    assert set(admin.registry["entries"]) == {"default"}
+
+
+@pytest.mark.parametrize("task_id", ["default", "logic", "corpus-code-v1"])
+def test_operator_tasks_and_jobs_are_outside_the_admin_scope(admin, task_id):
+    from dataclasses import replace
+
+    admin.registry["entries"]["logic"] = _rl_entry("logic", 0.1)
+    for method, path, body in (("POST", f"/admin/v1/tasks/{task_id}/cap", {"cap": 0.0}),
+                               ("POST", f"/admin/v1/tasks/{task_id}/retire", {}),
+                               ("GET", f"/admin/v1/jobs/{task_id}/status", None),
+                               ("POST", f"/admin/v1/jobs/{task_id}/deliveries", {})):
+        response = admin(method, path, body)
+        assert response.status_code == 409, (path, response.text)
+        assert response.json()["detail"] == "outside_admin_scope"
+    assert admin.registry["entries"]["default"].status == "active"
+
+
+def test_the_prefix_defaults_to_order_and_comes_from_the_environment(monkeypatch, tmp_path):
+    from reliquary.cli.main import build_admin_app_from_environment
+
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps(MODELS))
+    monkeypatch.setenv("RELIQUARY_ADMIN_SECRET", "x" * 32)
+    monkeypatch.setenv("RELIQUARY_ADMIN_MODELS", str(models))
+    monkeypatch.setenv("RELIQUARY_ADMIN_POOL_MAX", "0.3")
+    monkeypatch.delenv("RELIQUARY_PLATFORM_BUCKET", raising=False)
+    monkeypatch.delenv("RELIQUARY_ADMIN_TASK_PREFIX", raising=False)
+    assert build_admin_app_from_environment().state.task_prefix == "order-"
+    monkeypatch.setenv("RELIQUARY_ADMIN_TASK_PREFIX", "ds-")
+    assert build_admin_app_from_environment().state.task_prefix == "ds-"
+    monkeypatch.setenv("RELIQUARY_ADMIN_TASK_PREFIX", "")
+    with pytest.raises(ValueError):
+        build_admin_app_from_environment()
