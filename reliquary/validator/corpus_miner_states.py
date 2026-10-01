@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 import logging
 import math
 import re
+import time
 
 from reliquary.corpus.audit_policy import MinerState
 from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
@@ -102,19 +103,41 @@ def _validate_entry(entry: object, job_id: str, hotkey: str) -> Mapping:
 class MinerStates:
     """The per-job miners document, addressed one hotkey at a time."""
 
-    __slots__ = ("_records", "_job_id", "_sleep")
+    __slots__ = ("_records", "_job_id", "_sleep", "_clock", "_mirror", "_mirror_lock")
 
-    def __init__(self, records, job_id: str, *, sleep=asyncio.sleep) -> None:
+    def __init__(self, records, job_id: str, *, sleep=asyncio.sleep, clock=time.time) -> None:
         self._records = records
         self._job_id = job_id
         self._sleep = sleep
+        self._clock = clock
+        # The last document read or written, and when: the miner status route
+        # answers from it instead of reading the store per request.
+        self._mirror: tuple[Mapping, float] | None = None
+        self._mirror_lock: asyncio.Lock | None = None
 
     async def _read_document(self) -> tuple[Mapping, str | None]:
         document, etag = await self._records.read_miners(self._job_id)
-        return _validate_document(document, self._job_id), etag
+        document = _validate_document(document, self._job_id)
+        self._mirror = (document, self._clock())
+        return document, etag
 
     def _entry(self, document: Mapping, hotkey: str) -> MinerState:
         return MinerState.from_dict(_validate_entry(document.get(hotkey, {}), self._job_id, hotkey))
+
+    def mirror(self) -> tuple[Mapping, float] | None:
+        """The last document seen and when, or None before any read."""
+        return self._mirror
+
+    async def state_at_most(self, hotkey: str, max_age: float) -> tuple[MinerState, float]:
+        """``hotkey``'s state from a document at most ``max_age`` seconds old,
+        read only when the mirror is older; one read at a time."""
+        if self._mirror_lock is None:
+            self._mirror_lock = asyncio.Lock()
+        async with self._mirror_lock:
+            if self._mirror is None or self._clock() - self._mirror[1] > max_age:
+                await self._read_document()
+        document, at = self._mirror
+        return self._entry(document, hotkey), at
 
     async def get(self, hotkey: str) -> MinerState:
         document, _ = await self._read_document()
@@ -143,11 +166,9 @@ class MinerStates:
                 document, etag = await self._read_document()
                 updated = {hotkey: change(self._entry(document, hotkey))
                            for hotkey, change in changes.items()}
-                await self._records.write_miners(
-                    self._job_id,
-                    {**document, **{hotkey: state.to_dict() for hotkey, state in updated.items()}},
-                    etag,
-                )
+                written = {**document,
+                           **{hotkey: state.to_dict() for hotkey, state in updated.items()}}
+                await self._records.write_miners(self._job_id, written, etag)
             except CorpusStoreConflict:
                 continue
             except _TRANSIENT_ERRORS:
@@ -158,6 +179,7 @@ class MinerStates:
                                self._job_id, delay, exc_info=True)
                 await self._sleep(delay)
                 continue
+            self._mirror = (written, self._clock())
             return updated
         raise CorpusStoreConflict(
             f"could not update hotkeys {sorted(changes)!r} in job {self._job_id!r} "

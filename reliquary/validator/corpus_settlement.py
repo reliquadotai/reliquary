@@ -72,6 +72,8 @@ class CorpusSettler:
         self.totals: dict | None = None
         # Told which ids each settlement moved, once it is written.
         self.on_settled = on_settled
+        # Told each window paid and its rewards, once its archive is written.
+        self.on_window = None
 
     def set_cap(self, cap: float) -> None:
         """A cap changed in the registry: the next settlement pays under it."""
@@ -106,6 +108,11 @@ class CorpusSettler:
             final["advanced_at"] = now
         await self._records.write_settlement(self._job_id, final, etag)
         self._settled(final, pending["ids"])
+        if self.on_window is not None:
+            try:
+                self.on_window(pending["window"], pending["rewards"])
+            except Exception:
+                logger.exception("corpus window report for %s failed", self._task_id)
         return pending["window"]
 
     def _settled(self, state: dict, ids) -> None:

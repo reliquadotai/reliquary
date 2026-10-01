@@ -24,6 +24,9 @@ JOB_REFRESH_SECONDS = 60.0
 # Transient wiring failures of one task before they are logged as errors.
 WIRE_FAILURES_LOUD = 5
 
+# Miner statuses cached at once, across jobs: the oldest is dropped first.
+MINER_STATUS_ENTRIES = 4096
+
 OTHER_MODEL = "other_model"
 REFUSED = "refused"
 
@@ -150,6 +153,8 @@ class CorpusJobSet:
         self.finished: dict[str, dict] = {}
         self._status_cache: dict[str, tuple[float, dict]] = {}
         self._status_locks: dict[str, asyncio.Lock] = {}
+        # (job, hotkey) -> (computed at, status).
+        self._miner_cache: collections.OrderedDict = collections.OrderedDict()
         self._tasks: dict[str, list[asyncio.Task]] = {}
         # Task ids already decided against (ignored or refused): logged once.
         self._passed_over: set[str] = set()
@@ -315,6 +320,9 @@ class CorpusJobSet:
         self.finished[job_id] = final
         self._status_cache.pop(job_id, None)
         self._status_locks.pop(job_id, None)
+        book = getattr(wiring, "miners", None)
+        if book is not None:
+            book.close()
         if self._on_unwired is not None:
             try:
                 self._on_unwired(wiring)
@@ -366,6 +374,33 @@ class CorpusJobSet:
         if job_id in self.served:
             self._status_cache[job_id] = (now, fresh)
         return fresh
+
+    async def miner_status(self, job_id: str, hotkey: str) -> dict | None:
+        """One hotkey's status on a served job, recomputed at most once per
+        ``MINER_STATUS_CACHE_SECONDS``; None for a job not served. The first
+        request for a job starts its backfill in the background."""
+        from reliquary.validator.corpus_miner_status import (
+            MINER_STATUS_CACHE_SECONDS, miner_status,
+        )
+
+        wiring = self.served.get(job_id)
+        book = getattr(wiring, "miners", None)
+        if book is None:
+            return None
+        now = self._clock()
+        cached = self._miner_cache.get((job_id, hotkey))
+        if cached is not None and now - cached[0] < MINER_STATUS_CACHE_SECONDS:
+            return cached[1]
+        book.start_backfill()
+        state, _ = await wiring.miner_states.state_at_most(hotkey, MINER_STATUS_CACHE_SECONDS)
+        status = miner_status(job_id=job_id, hotkey=hotkey, book=book,
+                              pending=wiring.auditor.pending_count(hotkey), state=state,
+                              params=wiring.audit_params, cap=wiring.cap, now=now)
+        self._miner_cache[(job_id, hotkey)] = (now, status)
+        self._miner_cache.move_to_end((job_id, hotkey))
+        while len(self._miner_cache) > MINER_STATUS_ENTRIES:
+            self._miner_cache.popitem(last=False)
+        return status
 
     async def run(self) -> None:
         """Refresh forever (when a registry reader is given) and raise the first

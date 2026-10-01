@@ -308,6 +308,33 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
 
+    async def miner_status(job_id: str, hotkey: str) -> dict:
+        # Public: this hotkey's own state and counts, from memory, cached.
+        from reliquary.validator.corpus_miner_status import valid_hotkey
+
+        if not valid_hotkey(hotkey):
+            raise HTTPException(status_code=400, detail="invalid_hotkey")
+        job_set = getattr(app.state, "corpus_jobs", None)
+        try:
+            status = await job_set.miner_status(job_id, hotkey) if job_set is not None else None
+        except Exception as exc:
+            logger.warning("corpus miner status on %s unavailable: %r", job_id, exc)
+            raise HTTPException(status_code=503, detail="corpus_miner_status_unavailable") from exc
+        if status is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        return status
+
+    @app.get("/corpus/jobs/{job_id}/miners/{hotkey}")
+    async def corpus_miner_status(job_id: str, hotkey: str) -> dict:
+        return await miner_status(job_id, hotkey)
+
+    @app.get("/corpus/miners/{hotkey}")
+    async def corpus_miner_status_legacy(hotkey: str) -> dict:
+        # The legacy paths answer for the default job.
+        if routes.default is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        return await miner_status(routes.default, hotkey)
+
     @app.get("/corpus/jobs/{job_id}/contract")
     async def corpus_job_contract(job_id: str) -> dict:
         if job_id not in routes.routers:
@@ -371,6 +398,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         JOB_REFRESH_SECONDS, CorpusJobSet, eval_entry_screen, hot_job_refusal, job_drained,
     )
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
+    from reliquary.validator.corpus_miner_status import (
+        MinerBook, feed, proof_thresholds, read_recent_windows,
+    )
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
@@ -529,16 +559,23 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
             entry=w.entry, job=w.job, records=records
         )
+        # The miner status route's view: in memory, fed by the same reports.
+        w.audit_params, w.miner_states = params, miner_states
+        w.miners = MinerBook(job_id=w.job.job_id, task_id=w.entry.task_id, records=records,
+                             read_windows=read_recent_windows,
+                             thresholds=proof_thresholds(proof))
+        on_verdict, on_settled = feed(w.stats, w.miners)
         w.auditor = CorpusAuditor(job_id=w.job.job_id, records=records, model=model,
                                   tokenizer=tokenizer, proof=proof, params=params,
                                   miner_states=miner_states, beacon=beacon, round_at=round_at,
-                                  gpu_lock=gpu_lock, on_verdict=w.stats.observe,
-                                  remote=remote)
+                                  gpu_lock=gpu_lock, on_verdict=on_verdict,
+                                  remote=remote, on_voided=w.miners.voided)
         # `entry.cap` does not exist on `TaskEntry` (the cap lives in
         # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
         w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
                                   records=records, archives=archives,
-                                  on_settled=w.stats.settled)
+                                  on_settled=on_settled)
+        w.settler.on_window = w.miners.window
 
     for w in wiring:
         audit_and_settle(w)

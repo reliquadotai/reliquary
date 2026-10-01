@@ -378,6 +378,9 @@ class _Model:
         return SimpleNamespace(num_embeddings=200_000)
 
 
+_SS58 = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+
 def _registry_entry(tmp_path, suffix, task_id, job_id, status="active"):
     from dataclasses import replace
 
@@ -453,6 +456,8 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
                 seen["code_contract"] = (await client.get("/corpus/jobs/code-v1/contract")).json()
                 seen["legacy"] = (await client.get("/corpus/job")).json()["job_id"]
                 seen["status_open"] = (await client.get("/corpus/jobs/code-v1/status")).json()
+                seen["miner_hot"] = (await client.get(f"/corpus/jobs/code-v1/miners/{_SS58}")).json()
+                seen["miner_boot"] = (await client.get(f"/corpus/miners/{_SS58}")).json()
                 registry["corpus-code"] = _registry_entry(
                     tmp_path, "-b", "corpus-code", "code-v1", status="retired")
                 await job_set.refresh()
@@ -483,6 +488,10 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
     assert seen["status_open"]["state"] == "open"
     assert seen["status_open"]["submissions_accepted"] == 0
     assert seen["status_drained"]["state"] == "drained"
+    # The miner status route serves a boot job and a hot-added one alike.
+    assert seen["miner_hot"]["job_id"] == "code-v1" and seen["miner_hot"]["cap"] == 0.1
+    assert seen["miner_hot"]["audit_state"] == "probation"
+    assert seen["miner_boot"]["job_id"] == "math-v1"
 
 
 # --------------------------------------------------------------------------
