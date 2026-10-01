@@ -13,6 +13,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping
+from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -85,6 +86,15 @@ class CreateDelivery(BaseModel):
     apply_filter: bool = True
 
 
+class GradeEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    set_ids: list[str] = Field(min_length=1, max_length=64)
+    completion_keys: list[str] = Field(min_length=1, max_length=10_000)
+    problems_per_set: dict[str, int]
+    # Recorded in the report as given: model, revision, sampling, pod, GPU...
+    provenance: dict[str, Any] | None = None
+
+
 def cap_limits(pool_max: float, *, drained_tasks=frozenset()) -> Callable[[Mapping, Mapping], None]:
     """The registry guard: paying caps within 1.0, paying corpus caps within
     ``pool_max``. Paying means active, or a retired corpus task whose job is
@@ -135,9 +145,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      records=None, clock: Callable[[], float] = time.time,
                      current_round: Callable[[], int] = _current_round,
                      prepare=None, work_dir=None,
-                     task_prefix: str = DEFAULT_TASK_PREFIX) -> FastAPI:
+                     task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
+                     open_environment=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
-    the export route off); ``records`` the subnet's record store."""
+    the export and grade routes off); ``records`` the subnet's record store;
+    ``eval_store`` the subnet bucket holding the eval sets' grading files."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -160,6 +172,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     if prepare is None:
         from reliquary.cli.main import prepare_corpus_job as prepare
     exports: dict[str, asyncio.Task] = {}
+    # eval id -> (request digest, the running grading)
+    gradings: dict[str, tuple[str, asyncio.Task]] = {}
+    if eval_store is None:
+        from reliquary.eval.storage import SubnetEvalStore
+
+        eval_store = SubnetEvalStore()
+    if open_environment is None:
+        from reliquary.eval.sets import open_source as open_environment
 
     async def signed(request: Request) -> None:
         if request.url.query:
@@ -414,9 +434,59 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
+    @router.post("/evaluations/{eval_id}/grade")
+    async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
+        from reliquary.corpus.delivery import validated_delivery_id
+        from reliquary.eval import grading
+
+        in_scope(eval_id)
+        if deliveries is None:
+            raise HTTPException(status_code=503, detail="deliveries_not_configured")
+        try:
+            validated_delivery_id(eval_id)
+            keys = grading.validated_completion_keys(body.completion_keys)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        digest = grading.request_digest(body.set_ids, keys, body.problems_per_set)
+
+        def done(manifest: dict) -> dict:
+            if manifest.get("request_sha256") != digest:
+                raise HTTPException(status_code=409, detail="grade_exists_with_another_request")
+            return {"state": "done", "eval_id": eval_id, "keys": manifest["keys"],
+                    "rows": manifest["rows"]}
+
+        running = gradings.get(eval_id)
+        if running is not None and running[0] != digest:
+            raise HTTPException(status_code=409, detail="grade_exists_with_another_request")
+        if running is not None and running[1].done():
+            gradings.pop(eval_id)
+            failure = running[1].exception()
+            if failure is not None:
+                raise HTTPException(status_code=500, detail=f"grading failed: {failure}")
+            return done(running[1].result())
+        if running is None:
+            stored = await deliveries.get_json(f"{grading.DELIVERY_PREFIX}/{eval_id}/manifest.json")
+            if stored is not None:
+                return done(stored)
+            try:
+                # Refusals the caller can act on are answered now, not polled for.
+                await grading.load_sets(body.set_ids, body.problems_per_set, subnet=eval_store)
+            except grading.SetUnknown as exc:
+                raise HTTPException(status_code=404, detail="set_unknown") from exc
+            except grading.GradeRequestError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
+                eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,
+                problems_per_set=body.problems_per_set, provenance=body.provenance,
+                platform=deliveries, subnet=eval_store, open_environment=open_environment,
+                work_dir=work_dir, clock=clock)))
+        response.status_code = 202
+        return {"state": "running", "eval_id": eval_id}
+
     app = FastAPI()
     app.include_router(router)
     app.state.exports = exports
+    app.state.gradings = gradings
     app.state.task_prefix = task_prefix
     app.add_middleware(BodyLimit, limit=MAX_BODY_BYTES)
     return app
@@ -451,6 +521,7 @@ from reliquary.validator.corpus_audit_remote import token_sha256  # noqa: E402
 
 __all__ = [
     "CreateJob",
+    "GradeEvaluation",
     "QualifiedModel",
     "THINKING_RENDERERS",
     "cap_limits",
