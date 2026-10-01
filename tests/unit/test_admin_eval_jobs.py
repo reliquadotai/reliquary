@@ -92,10 +92,13 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
     client.__exit__(None, None, None)
 
 
+SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+
+
 def _qualification(**kw):
     return {"qualification_id": "order-q1", "model": MODEL, "revision": REVISION,
-            "set_id": "logic-eval-s1-n8", "problems": 4, "completions": 8,
-            "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+            "set_id": "logic-eval-s1-n8", "problems": 5, "completions": 8,
+            "sampling": SAMPLING,
             "max_new_tokens": 512, "thinking": False, **kw}
 
 
@@ -108,7 +111,9 @@ def _qualify(admin, status=qual.QUALIFIED):
             "thresholds": THRESHOLDS, "architecture": "Qwen3ForCausalLM",
             "checkpoint_sha256": "d" * 64, "eos_token_id": 151645,
             "band": {"exp_mismatch": 50, "mant_mean": 27.6, "mant_median": 20.0, "chunks": 90},
-            "tokens_per_gpu_hour": 3.6e6})
+            "clamped": [], "tokens_per_gpu_hour": 3.6e6,
+            "measurements": {"e1": {"provider_id": "lium-1", "host": "h1", "gpu": "H100"},
+                             "e2": {"provider_id": "lium-2", "host": "h2", "gpu": "H100"}}})
         await store.write(record, etag)
 
     asyncio.run(finish())
@@ -135,7 +140,8 @@ def test_a_qualification_is_queued_once_and_read_back(admin):
 def _eval_job(**kw):
     return {"job_id": "order-eval-7", "model": MODEL, "env": "logic", "prompt_count": 5,
             "samples_per_prompt": 4, "max_new_tokens": 512, "thinking": False,
-            "eval_set_id": "logic-eval-s1-n8", "qualification_id": "order-q1", **kw}
+            "sampling": SAMPLING, "eval_set_id": "logic-eval-s1-n8",
+            "qualification_id": "order-q1", **kw}
 
 
 def test_an_eval_job_takes_its_prompts_model_and_thresholds_from_set_and_qualification(admin):
@@ -151,6 +157,8 @@ def test_an_eval_job_takes_its_prompts_model_and_thresholds_from_set_and_qualifi
     assert (source.set_id, source.count) == ("logic-eval-s1-n8", 5)
     assert job.checkpoint_revision == REVISION and job.checkpoint_sha256 == "d" * 64
     assert job.seed is not None and job.slots_per_prompt == 4
+    # The order's sampling, the one qualification measured.
+    assert (job.sampling.temperature, job.sampling.top_p, job.sampling.top_k) == (0.6, 0.95, 20)
     entry = admin.registry["entries"]["order-eval-7"]
     assert entry.params["audit_q"] == 1.0
     toploc = [p for p in entry.contract["proofs"] if p["scheme"] == "toploc-v1"][0]
@@ -168,6 +176,12 @@ def test_an_eval_job_takes_its_prompts_model_and_thresholds_from_set_and_qualifi
     ({"model": "someone/else"}, 409),
     ({"qualification_id": None}, 422),
     ({"eval_set_id": "logic-eval-s9-n9"}, 404),
+    ({"sampling": {**SAMPLING, "temperature": 1.0}}, 409),  # not what was qualified
+    ({"max_new_tokens": 1024}, 409),
+    ({"thinking": True}, 409),
+    ({"prompt_count": 4}, 409),
+    ({"sampling": None}, 422),
+    ({"qualification_id": "x-q1"}, 409),                    # outside the admin scope
 ])
 def test_eval_job_refusals(admin, change, status):
     admin("POST", "/admin/v1/qualifications", _qualification())
@@ -185,6 +199,11 @@ def test_only_an_eval_job_may_take_the_eval_prefix(admin):
         "job_id": "order-9", "model": MODEL, "env": "reliquary_logic_v2",
         "prompt_count": 5, "samples_per_prompt": 1, "cap": 0.01, "seed": 3})
     assert response.status_code == 422
+    # A corpus job still names its cap: no silent default.
+    response = admin("POST", "/admin/v1/jobs", {
+        "job_id": "order-9", "model": MODEL, "env": "reliquary_logic_v2",
+        "prompt_count": 5, "samples_per_prompt": 1})
+    assert response.status_code == 422 and "cap_required" in response.text
 
 
 def test_thresholds_under_the_floor_are_refused():
@@ -211,7 +230,7 @@ def test_the_seed_is_written_only_when_present():
 
 
 PROVENANCE = {"model": MODEL, "revision": REVISION, "model_sha": REVISION,
-              "sampling": {"temperature": 0.6}, "thinking": False, "max_new_tokens": 512}
+              "sampling": SAMPLING, "thinking": False, "max_new_tokens": 512}
 
 
 def _grade_body(**kw):
@@ -249,8 +268,15 @@ def test_an_eval_job_is_graded_from_its_passing_records(admin):
     wrong = admin("POST", "/admin/v1/evaluations/order-e7/grade",
                   _grade_body(samples_per_set={"logic-eval-s1-n8": 2}))
     assert wrong.status_code == 422 and "grades as" in wrong.text
+    lying = admin("POST", "/admin/v1/evaluations/order-e7/grade", _grade_body(
+        provenance={**PROVENANCE, "sampling": {"temperature": 0.1}}))
+    assert lying.status_code == 422 and "provenance_mismatch" in lying.text
+    # Drained but not every prompt holds its samples: refused unless allowed.
+    incomplete = admin("POST", "/admin/v1/evaluations/order-e7/grade", _grade_body())
+    assert incomplete.status_code == 409 and "job_not_complete" in incomplete.text
     for _ in range(200):
-        response = admin("POST", "/admin/v1/evaluations/order-e7/grade", _grade_body())
+        response = admin("POST", "/admin/v1/evaluations/order-e7/grade",
+                         _grade_body(allow_incomplete=True))
         if response.status_code != 202:
             break
         time.sleep(0.02)
@@ -266,8 +292,27 @@ def test_an_eval_job_is_graded_from_its_passing_records(admin):
     assert provenance["generation"] == "sn81-miners" and provenance["miner_hotkeys"] == 2
     assert provenance["audited_fraction"] == 1.0 and provenance["sampling_verified"] is False
     assert "sampling not verified" in provenance["note"]
-    assert provenance["verification"]["thresholds"] == THRESHOLDS
+    # From the job and its qualification, not from the request.
+    assert provenance["checkpoint_sha256"] == "d" * 64 and provenance["sampling"] == SAMPLING
+    assert provenance["job_complete"] is False and provenance["allow_incomplete"] is True
+    verification = provenance["verification"]
+    assert verification["thresholds"] == THRESHOLDS and verification["qualification_id"] == "order-q1"
+    assert set(verification["qualification"]["qualifiers"]) == {"e1", "e2"}
     assert "vllm_version" not in provenance
+
+
+def test_a_job_with_no_submission_is_never_complete(admin):
+    from reliquary.eval.grading import job_complete
+
+    admin("POST", "/admin/v1/qualifications", _qualification())
+    _qualify(admin)
+    admin("POST", "/admin/v1/jobs", _eval_job())
+    job, _ = asyncio.run(job_store.read_job("order-eval-7"))
+    assert job_complete(job, {"samples_by_prompt": {}}, 4) is False
+    assert job_complete(job, {"samples_by_prompt": {i: 4 for i in range(5)}}, 4) is True
+    assert job_complete(job, {"samples_by_prompt": {i: 4 for i in range(4)}}, 4) is False
+    response = admin("POST", "/admin/v1/evaluations/order-e7/grade", _grade_body())
+    assert response.status_code == 409 and "job_not_complete" in response.text
 
 
 def test_a_job_grading_needs_a_job_and_an_uploads_grading_its_pod():
@@ -278,3 +323,19 @@ def test_a_job_grading_needs_a_job_and_an_uploads_grading_its_pod():
     with pytest.raises(ValueError):
         GradeEvaluation.model_validate({**_grade_body(), "source": "uploads",
                                         "job_id": None, "completion_keys": ["k"]})
+
+
+def test_the_eval_control_status_is_readable_by_the_platform(admin):
+    from reliquary.validator.eval_control import write_control_status
+
+    assert admin("GET", "/admin/v1/eval-control/status").status_code == 404
+    document = {"schema": "reliquary/eval-control-status/v1", "updated_at": 1.0,
+                "models": {f"{MODEL}@{REVISION}": {"executors_needed": 1, "live_executors": 2,
+                                                   "live_providers": 2, "waiting_batches": 3,
+                                                   "awaiting_third_scorer": 1}},
+                "jobs": {}, "quarantined": [], "stats": {}}
+    asyncio.run(write_control_status(document))
+    asyncio.run(write_control_status({**document, "updated_at": 2.0}))
+    read = admin("GET", "/admin/v1/eval-control/status")
+    assert read.status_code == 200 and read.json()["updated_at"] == 2.0
+    assert read.json()["models"][f"{MODEL}@{REVISION}"]["executors_needed"] == 1

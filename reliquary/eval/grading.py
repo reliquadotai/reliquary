@@ -342,6 +342,43 @@ async def upload_rows(platform, keys: Sequence[str], directory: Path):
         local.unlink()
 
 
+READ_CONCURRENCY = 16
+
+
+async def collect_job_records(job, records, *, concurrency: int = READ_CONCURRENCY) -> dict:
+    """An eval job's verdicts and passing (not voided) records, read
+    ``concurrency`` at a time: ``{"passing": [(sid, record)], "verdicts",
+    "audited", "samples_by_prompt"}``."""
+    ids = list(await records.list_verdict_ids(job.job_id))
+    lister = getattr(records, "list_voided_ids", None)
+    voided = set(await lister(job.job_id)) if lister is not None else set()
+    gate = asyncio.Semaphore(concurrency)
+
+    async def one(submission_id):
+        async with gate:
+            verdict = await records.read_verdict(job.job_id, submission_id)
+            if not verdict or not verdict.get("passed") or submission_id in voided:
+                return submission_id, verdict, None
+            return submission_id, verdict, await records.read_submission(job.job_id, submission_id)
+
+    read = await asyncio.gather(*(one(sid) for sid in ids))
+    passing = [(sid, record) for sid, _, record in read if record is not None]
+    samples: Counter = Counter()
+    for _, record in passing:
+        samples[int(record["prompt_index"])] += len(record["completions"])
+    verdicts = [v for _, v, _ in read if v]
+    return {"passing": passing, "verdicts": len(verdicts),
+            "audited": sum(1 for v in verdicts if v.get("audited")),
+            "samples_by_prompt": dict(samples)}
+
+
+def job_complete(job, collected: dict, samples: int) -> bool:
+    """Every prompt of the job holds its samples (never true with nothing)."""
+    held = collected["samples_by_prompt"]
+    return bool(held) and all(held.get(index, 0) >= samples
+                              for index in range(job.prompt_start, job.prompt_end))
+
+
 class JobRows:
     """The completions of an eval job's passing submissions, as grade rows.
 
@@ -351,32 +388,19 @@ class JobRows:
     A voided pass (its executor quarantined) is left out like a failed one.
     """
 
-    def __init__(self, *, job, records) -> None:
+    def __init__(self, *, job, collected: dict) -> None:
         self.job = job
-        self.records = records
+        self.collected = collected
         self.hotkeys: set[str] = set()
-        self.verdicts = 0
-        self.audited = 0
+        self.verdicts = collected["verdicts"]
+        self.audited = collected["audited"]
 
     async def __aiter__(self):
         from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
 
         rows = await asyncio.to_thread(load_eval_rows, parse_eval_source(self.job.prompt_source))
-        ids = list(await self.records.list_verdict_ids(self.job.job_id))
-        lister = getattr(self.records, "list_voided_ids", None)
-        voided = set(await lister(self.job.job_id)) if lister is not None else set()
         by_prompt: dict[int, list[tuple[str, dict]]] = defaultdict(list)
-        for submission_id in ids:
-            verdict = await self.records.read_verdict(self.job.job_id, submission_id)
-            if not verdict:
-                continue
-            self.verdicts += 1
-            self.audited += 1 if verdict.get("audited") else 0
-            if not verdict.get("passed") or submission_id in voided:
-                continue
-            record = await self.records.read_submission(self.job.job_id, submission_id)
-            if record is None:
-                continue
+        for submission_id, record in self.collected["passing"]:
             by_prompt[int(record["prompt_index"])].append((submission_id, record))
         for prompt_index in sorted(by_prompt):
             if not 0 <= prompt_index < len(rows):
@@ -571,6 +595,8 @@ __all__ = [
     "EVALUATION_PREFIX",
     "GRADED_COLUMNS",
     "JobRows",
+    "collect_job_records",
+    "job_complete",
     "GradeRequestError",
     "REPORT_SCHEMA",
     "SandboxUnavailable",

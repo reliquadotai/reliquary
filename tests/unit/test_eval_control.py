@@ -261,3 +261,169 @@ def test_settlement_archives_only_the_eval_tasks_this_process_serves():
         with pytest.raises(RuntimeError):
             asyncio.run(archives.write(task_id, 7, {}))
     assert asyncio.run(archives.other_max("order-eval-1")) == 7
+
+
+def _three_way(h, results):
+    async def go():
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF, "order-eval-1")
+                                        .score(ITEMS))
+        await asyncio.sleep(0)
+        for eid, result in zip(("a", "b", "c"), results):
+            lease = h.dispatcher.claim(_executor(eid))
+            assert lease is not None, eid
+            await h.dispatcher.result(eid, lease["lease_id"], result)
+        return scoring
+    return go
+
+
+def _lying_other():
+    return AuditResult.model_validate({"scores": [
+        {"status": "ok", "chunks": [[1, 1.0, 1.0]]}, {"status": "ok", "chunks": [[500, 1.0, 1.0]]}]})
+
+
+def test_three_scorers_without_an_agreeing_pair_park_the_batch_and_flag_the_job():
+    from reliquary.validator.eval_control import MAX_SCORERS, BatchParked
+
+    assert MAX_SCORERS == 3
+
+    async def go():
+        h = _Harness()
+        scoring = await _three_way(h, [_honest(), _lying(), _lying_other()])()
+        with pytest.raises(BatchParked):
+            await scoring
+        # Nobody is quarantined on a three-way split, no fourth seat is offered.
+        assert h.quarantined == [] and h.dispatcher.claim(_executor("d")) is None
+        status = h.dispatcher.status()
+        job = status["jobs"]["order-eval-1"]
+        assert job["needs_attention"] is True and job["parked_batches"] == 1
+    _run(go)
+
+
+def test_the_status_says_how_many_executors_the_fleet_must_add():
+    async def go():
+        h = _Harness()
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF, "j").score(ITEMS))
+        await asyncio.sleep(0)
+        model = f"{MODEL_A[0]}@{MODEL_A[1]}"
+        # Nobody connected yet: a pair is needed.
+        assert h.dispatcher.status()["models"][model]["executors_needed"] == 2
+        a = h.dispatcher.claim(_executor("a"))
+        b = h.dispatcher.claim(_executor("b"))
+        assert h.dispatcher.status()["models"][model]["executors_needed"] == 0
+        await h.dispatcher.result("a", a["lease_id"], _honest())
+        await h.dispatcher.result("b", b["lease_id"], _lying())
+        entry = h.dispatcher.status()["models"][model]
+        # A third provider is needed and none is live.
+        assert entry["executors_needed"] == 1 and entry["awaiting_third_scorer"] == 1
+        scoring.cancel()
+    _run(go)
+
+
+def test_heartbeats_reach_the_registry_at_a_bounded_rate():
+    async def go():
+        now = [0.0]
+        written = []
+
+        async def write(executor_id, at, detail):
+            written.append((executor_id, at))
+
+        dispatcher = PairedAuditDispatcher(directory=SimpleNamespace(revoke_locally=lambda e: None),
+                                           record_heartbeat=write, clock=lambda: now[0])
+        dispatcher.heartbeat("a")
+        await dispatcher.write_heartbeats()
+        now[0] = 10.0
+        dispatcher.heartbeat("a")
+        await dispatcher.write_heartbeats()  # too soon
+        now[0] = 45.0
+        dispatcher.heartbeat("a")
+        await dispatcher.write_heartbeats()
+        assert written == [("a", 0.0), ("a", 45.0)]
+    _run(go)
+
+
+def test_each_control_accepts_only_its_own_scope_and_quarantine_never_reaches_corpus(monkeypatch):
+    import hashlib
+
+    from reliquary.infrastructure import corpus_executor_store as store
+    from reliquary.validator.corpus_audit_remote import ExecutorDirectory
+    from reliquary.validator.eval_control import EvalExecutorDirectory
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+
+    fake = _FakeMultiObjectR2()
+    monkeypatch.setattr(store, "get_s3_client", lambda **kw: fake)
+    sha = lambda t: hashlib.sha256(t.encode()).hexdigest()  # noqa: E731
+
+    async def go():
+        await store.register_executor(executor_id="ev", token_sha256=sha("ev"), model_id="m",
+                                      model_revision="r", expires_at=1e12, now=0.0,
+                                      provider_id="p", host="h", scope="eval")
+        await store.register_executor(executor_id="co", token_sha256=sha("co"), model_id="m",
+                                      model_revision="r", expires_at=1e12, now=0.0)
+        documents = await store.list_executors()
+        corpus = ExecutorDirectory(model_id="m", model_revision="r",
+                                   list_documents=lambda: asyncio.sleep(0, documents))
+        evals = EvalExecutorDirectory(list_documents=lambda: asyncio.sleep(0, documents))
+        await corpus.refresh()
+        await evals.refresh()
+        assert corpus.authenticate("ev")[1] == "wrong_scope"
+        assert corpus.authenticate("co")[0]["executor_id"] == "co"
+        assert evals.authenticate("co")[1] == "wrong_scope"
+        assert evals.authenticate("ev")[0]["executor_id"] == "ev"
+        assert await store.set_executor_status("co", "quarantined", scope="eval") is None
+        assert (await store.read_executor("co"))["status"] == "active"
+        assert (await store.set_executor_status("ev", "quarantined", scope="eval"))["status"] \
+            == "quarantined"
+        with pytest.raises(ValueError):
+            await store.register_executor(executor_id="ev2", token_sha256=sha("x"),
+                                          model_id="m", model_revision="r", expires_at=1e12,
+                                          now=0.0, scope="eval")
+    _run(go)
+
+
+def test_a_parked_batch_leaves_records_pending_and_is_no_validator_error():
+    async def go():
+        h = _Harness()
+        auditor = eval_auditor(job_id="order-eval-1", records=None, tokenizer=_Tokenizer(),
+                               proof=PROOF, vocab_size=100,
+                               remote=h.dispatcher.view(*MODEL_A, PROOF, "order-eval-1"))
+        record = {"rendered_prompt": "ab", "completions": [
+            {"tokens": [1, 2], "proofs": ["p"]}], "hotkey": "h", "token_count": 2}
+
+        async def park_all(items):
+            from reliquary.validator.eval_control import BatchParked
+
+            raise BatchParked("split")
+
+        auditor._remote.score = park_all
+        results, failed = await auditor._audit_records(["s1"], [record], {})
+        assert results == [None] and failed == set()
+        assert auditor._validator_errors == 0 and auditor.parked_ids == {"s1"}
+    _run(go)
+
+
+def test_the_corpus_control_refuses_an_eval_task_at_boot_and_never_reads_one_hot():
+    from reliquary.validator.corpus_hot_jobs import CorpusJobSet, eval_entry_screen
+    from reliquary.validator.corpus_service import CorpusJobRoutes
+    from reliquary.validator.corpus_validator import run_corpus_validator
+
+    entry = SimpleNamespace(task_id="order-eval-1", job_id="order-eval-1", status="active",
+                            mechanism="corpus-generation", params={"cap": 0.02}, contract={})
+    with pytest.raises(RuntimeError, match="eval control"):
+        asyncio.run(run_corpus_validator(
+            entry=entry, cap=0.02, wallet=None, netuid=0, signer_client=None,
+            http_host="127.0.0.1", http_port=0, set_weights=False, registration_gate=False))
+
+    reads = []
+
+    async def read_job(job_id):
+        reads.append(job_id)
+
+    async def read_entries():
+        return {"order-eval-1": entry}
+
+    job_set = CorpusJobSet(routes=CorpusJobRoutes(), router_for=None, wire=None,
+                           jobs_of=lambda w: [], read_entries=read_entries, read_job=read_job,
+                           admit=lambda e, j: None, screen=eval_entry_screen)
+    asyncio.run(job_set.refresh())
+    asyncio.run(job_set.refresh())
+    assert reads == []

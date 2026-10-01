@@ -61,14 +61,26 @@ class CreateJob(BaseModel):
     samples_per_prompt: int = Field(gt=0)
     max_new_tokens: int | None = Field(default=None, gt=0)
     thinking: bool = False
-    # A fixed share of the pool, as every corpus job; eval jobs default to 0.02.
-    cap: float = Field(default=DEFAULT_EVAL_CAP, ge=0.0, le=1.0)
+    # A fixed share of the pool, as every corpus job; required, except that an
+    # eval job defaults to 0.02.
+    cap: float | None = Field(default=None, ge=0.0, le=1.0)
     # An evaluation job: its prompts are the eval set's first prompt_count
-    # problems, its model and thresholds come from the qualification record.
+    # problems, its model and thresholds come from the qualification record,
+    # whose conditions (set, count, sampling, budget, thinking) it must repeat.
     eval_set_id: str | None = Field(default=None, min_length=1, max_length=128)
     qualification_id: str | None = Field(default=None, min_length=1, max_length=63)
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
     audit_q: float | None = Field(default=None, gt=0.0, le=1.0)
+    sampling: "OrderSampling | None" = None
+
+
+class OrderSampling(BaseModel):
+    """The order's sampling: what miners are told and qualification measured."""
+
+    model_config = ConfigDict(extra="forbid")
+    temperature: float = Field(gt=0.0, le=4.0)
+    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    top_k: int = Field(default=0, ge=0)
 
 
 class RequestQualification(BaseModel):
@@ -77,12 +89,16 @@ class RequestQualification(BaseModel):
     model: str = Field(min_length=1, max_length=256)
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     set_id: str = Field(min_length=1, max_length=128)
-    # The first `problems` prompts of the set, `completions` decoded over them.
-    problems: int = Field(default=32, gt=0, le=1024)
-    completions: int = Field(default=32, gt=0, le=1024)
-    sampling: dict[str, float | int]
+    # The order's problem count: the job will be its set's first `problems`
+    # prompts; `completions` are decoded over the first of them.
+    problems: int = Field(gt=0, le=1_000_000)
+    completions: int = Field(default=32, gt=0, le=64)
+    sampling: OrderSampling
     max_new_tokens: int = Field(gt=0, le=131072)
     thinking: bool = False
+
+
+CreateJob.model_rebuild()
 
 
 class SetCap(BaseModel):
@@ -105,6 +121,8 @@ class RegisterExecutor(BaseModel):
     # Where it runs: the eval control pairs executors on distinct ones.
     provider_id: str | None = Field(default=None, min_length=1, max_length=256)
     host: str | None = Field(default=None, min_length=1, max_length=256)
+    # "eval" executors serve the eval control only (provider_id and host required).
+    scope: Literal["corpus", "eval"] = "corpus"
 
 
 class CreateDelivery(BaseModel):
@@ -141,6 +159,9 @@ class GradeEvaluation(BaseModel):
     # Samples ordered per problem, indexed 0..samples-1.
     samples_per_set: dict[str, int]
     provenance: Provenance
+    # Job mode: grade a job not every prompt of which holds its samples (the
+    # platform, after its deadline); the report says complete=false.
+    allow_incomplete: bool = False
 
     @model_validator(mode="after")
     def _source_fields(self):
@@ -208,7 +229,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      prepare=None, work_dir=None,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
                      open_environment=None, grade_scorer=None,
-                     require_sandbox=None, qualifications=None) -> FastAPI:
+                     require_sandbox=None, qualifications=None, eval_jobs=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -248,6 +269,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.eval.qualification import QualificationStore
 
         qualifications = QualificationStore()
+    if eval_jobs is None:
+        from reliquary.eval.qualification import EvalJobStore
+
+        eval_jobs = EvalJobStore()
 
     async def signed(request: Request) -> None:
         if request.url.query:
@@ -300,6 +325,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
         if body.qualification_id is None:
             raise HTTPException(status_code=422, detail="qualification_id_required")
+        in_scope(body.qualification_id)
+        if body.sampling is None or body.max_new_tokens is None:
+            raise HTTPException(status_code=422, detail="an eval job names its sampling and max_new_tokens")
         if body.prompt_start != 0:
             raise HTTPException(status_code=422, detail="an eval job starts at the set's first problem")
         if body.audit_q not in (None, 1.0):
@@ -325,15 +353,34 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=f"set {set_id} is a {card['env']} set")
         if body.prompt_count > int(card["count"]):
             raise HTTPException(status_code=422, detail=f"set {set_id} holds {card['count']} problems")
+        # Thresholds hold only for the conditions they were measured under.
+        wanted = {"set_id": set_id, "problems": body.prompt_count,
+                  "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
+                  "thinking": body.thinking}
+        differs = sorted(k for k, v in wanted.items() if record.get(k) != v)
+        if differs:
+            raise HTTPException(status_code=409,
+                                detail=f"qualification_conditions_differ: {differs}")
         source = eval_source_for(set_id, prompts_body, body.prompt_count)
         register_eval_prompts(source, prompts_body)
         seed = body.seed if body.seed is not None else int(
             hashlib.sha256(body.job_id.encode()).hexdigest()[:15], 16)
+        try:
+            await eval_jobs.create({
+                "schema": qual.EVAL_JOB_SCHEMA, "job_id": body.job_id,
+                "qualification_id": body.qualification_id, "set_id": set_id,
+                "problems": body.prompt_count, "samples": body.samples_per_prompt,
+                "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
+                "thinking": body.thinking})
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dict(
             model_revision=record["revision"], model_architecture=result["architecture"],
             checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
             prompt_source=source.name, contract_environment=card["source"], seed=seed,
             toploc_thresholds=result["thresholds"], audit_params={"audit_q": 1.0},
+            temperature=body.sampling.temperature, top_p=body.sampling.top_p,
+            top_k=body.sampling.top_k,
         )
 
     @router.post("/jobs")
@@ -354,9 +401,15 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if not evaluation and any(v is not None for v in (body.qualification_id, body.seed,
                                                            body.audit_q)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
+        cap = body.cap
         if evaluation:
             arguments = await eval_job_arguments(body)
+            cap = DEFAULT_EVAL_CAP if cap is None else cap
         else:
+            if cap is None:
+                raise HTTPException(status_code=422, detail="cap_required")
+            if body.sampling is not None:
+                raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
             spec = catalog.get(body.model)
             if spec is None:
                 raise HTTPException(status_code=422, detail=f"model {body.model!r} is not qualified")
@@ -376,7 +429,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 from_profile=None, prompt_encoding=None, prompt_count=body.prompt_count,
                 prompt_start=body.prompt_start, renderer_id=THINKING_RENDERERS[body.thinking],
                 slots_per_prompt=body.samples_per_prompt,
-                max_new_tokens=body.max_new_tokens, cap=body.cap, min_incentive_share=0.0,
+                max_new_tokens=body.max_new_tokens, cap=cap, min_incentive_share=0.0,
                 **arguments,
             )
         except (RegistryError, ValueError) as exc:
@@ -418,9 +471,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             status = 409 if isinstance(exc, RegistryError) else 503
             raise HTTPException(status_code=status, detail=str(exc)) from exc
         logger.info("admin: declared job %s as task %s, cap %s", body.job_id, entry.task_id,
-                    body.cap)
+                    cap)
         response.status_code = 201
-        return {**answer, "created": True, "status": "active", "cap": float(body.cap)}
+        return {**answer, "created": True, "status": "active", "cap": float(cap)}
 
     async def corpus_entry(task_id: str):
         """The task, refused unless it is a corpus task (never ``default``, never RL)."""
@@ -489,7 +542,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 executor_id=body.executor_id, token_sha256=body.token_sha256,
                 model_id=body.model_id, model_revision=body.model_revision,
                 expires_at=body.expires_at, now=clock(), provider_id=body.provider_id,
-                host=body.host)
+                host=body.host, scope=body.scope)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except executors.ExecutorConflict as exc:
@@ -565,6 +618,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
+    @router.get("/eval-control/status")
+    async def eval_control_status() -> dict:
+        """The eval control's last status: per model ``executors_needed`` (the
+        executors to rent, on distinct providers and hosts) and the jobs that
+        need attention."""
+        from reliquary.validator.eval_control import read_control_status
+
+        document = await read_control_status()
+        if document is None:
+            raise HTTPException(status_code=404, detail="eval_control_status_unknown")
+        return document
+
     @router.post("/qualifications")
     async def request_qualification(body: RequestQualification, response: Response) -> dict:
         """Queue a model's qualification for the eval control; idempotent on the id."""
@@ -581,11 +646,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if await eval_store.get_bytes(subnet_key(body.set_id, "prompts.jsonl")) is None:
             raise HTTPException(status_code=404, detail="set_unknown")
-        wanted = qual.new_request(
-            qualification_id=body.qualification_id, model=body.model, revision=body.revision,
-            set_id=body.set_id, problems=body.problems, completions=body.completions,
-            sampling=body.sampling, max_new_tokens=body.max_new_tokens, thinking=body.thinking,
-            clock=clock)
+        try:
+            wanted = qual.new_request(
+                qualification_id=body.qualification_id, model=body.model,
+                revision=body.revision, set_id=body.set_id, problems=body.problems,
+                completions=body.completions, sampling=body.sampling.model_dump(),
+                max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         def same(existing: dict) -> dict:
             if any(existing.get(k) != wanted[k] for k in qual.REQUEST_FIELDS):
@@ -617,11 +685,15 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         return record
 
     async def job_grading_source(body: GradeEvaluation):
-        """An eval job's passing records as the completions, once it is drained;
-        the request must name exactly the job's set, problems and samples."""
-        from reliquary.eval.grading import JobRows
+        """An eval job's passing records as the completions, once it is drained
+        and complete (or ``allow_incomplete``); the request must name exactly
+        the job's set, problems and samples. The provenance is the job's and its
+        qualification's; the request's is only checked against it."""
+        from reliquary.eval import qualification as qual
+        from reliquary.eval.grading import JobRows, collect_job_records, job_complete
         from reliquary.eval.prompt_source import parse_eval_source
         from reliquary.validator.corpus_job_status import stored_job_counts
+        from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
         try:
             job, _ = await job_store.read_job(body.job_id)
@@ -637,9 +709,31 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                  "samples_per_set": body.samples_per_set}
         if given != expected:
             raise HTTPException(status_code=422, detail=f"job {job.job_id} grades as {expected}")
+        declared = await eval_jobs.read(job.job_id)
+        record, _ = (await qualifications.read(declared["qualification_id"])
+                     if declared else (None, None))
+        if declared is None or record is None:
+            raise HTTPException(status_code=409, detail="eval_job_record_missing")
+        sampling = {"temperature": job.sampling.temperature, "top_p": job.sampling.top_p,
+                    "top_k": job.sampling.top_k}
+        facts = {"model": job.checkpoint_repo, "revision": job.checkpoint_revision,
+                 "model_sha": job.checkpoint_revision, "sampling": sampling,
+                 "thinking": CHAT_TEMPLATE_RENDERERS.get(job.renderer_id, False),
+                 "max_new_tokens": job.sampling.max_new_tokens}
+        claimed = body.provenance.model_dump()
+        differs = sorted(k for k, v in facts.items()
+                         if (claimed[k] if k != "sampling" else
+                             {**{"top_p": 1.0, "top_k": 0}, **claimed[k]}) != v)
+        if differs:
+            raise HTTPException(status_code=422, detail=f"provenance_mismatch: {differs}")
         if not (await stored_job_counts(records, job.job_id))["drained"]:
             raise HTTPException(status_code=409, detail="job_not_drained")
+        collected = await collect_job_records(job, records)
+        complete = job_complete(job, collected, samples)
+        if not complete and not body.allow_incomplete:
+            raise HTTPException(status_code=409, detail="job_not_complete")
         verification = {"scheme": "toploc-v1", "source": "qualification",
+                        "qualification_id": declared["qualification_id"],
                         "sampling_verified": False}
         for entry in await entries_naming(job.job_id):
             proofs = (entry.contract or {}).get("proofs") or ()
@@ -648,7 +742,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 verification["thresholds"] = {k: toploc[0][k] for k in (
                     "exp_mismatch_threshold", "mant_mean_threshold", "mant_median_threshold")}
                 verification["task_id"] = entry.task_id
-        return JobRows(job=job, records=records), verification
+        result = record.get("result") or {}
+        verification["qualification"] = {
+            "band": result.get("band"), "clamped": result.get("clamped"),
+            "qualifiers": {eid: {"provider_id": m.get("provider_id"), "host": m.get("host"),
+                                 "gpu": m.get("gpu")}
+                           for eid, m in (result.get("measurements") or {}).items()},
+            "status": record.get("status")}
+        provenance = {**facts, "checkpoint_sha256": job.checkpoint_sha256, "seed": job.seed,
+                      "eos_token_id": job.eos_token_id, "verification": verification,
+                      "job_complete": complete,
+                      **({"allow_incomplete": True} if body.allow_incomplete else {})}
+        return JobRows(job=job, collected=collected), provenance
 
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
@@ -711,8 +816,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 provenance = body.provenance.model_dump(exclude_none=True)
                 job_rows = None
                 if body.source == "job":
-                    job_rows, verification = await job_grading_source(body)
-                    provenance["verification"] = verification
+                    job_rows, provenance = await job_grading_source(body)
                 extra = {} if grade_scorer is None else {"scorer_for": grade_scorer}
                 gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
                     eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,

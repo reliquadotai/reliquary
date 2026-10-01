@@ -34,6 +34,16 @@ def _entry_profile(entry):
     return own_profile(entry)
 
 
+def eval_entry_screen(entry) -> tuple[str, str] | None:
+    """The corpus control's answer to an ``order-eval-`` entry, before any
+    manifest read: not its job (the eval control serves it)."""
+    from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+
+    if str(getattr(entry, "job_id", "") or "").startswith(EVAL_JOB_PREFIX):
+        return OTHER_MODEL, "an evaluation job, served by the eval control"
+    return None
+
+
 def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[str, Any],
                     fingerprint: str, profile_of=_entry_profile) -> tuple[str, str] | None:
     """Why a registry entry cannot join this running process, or None.
@@ -118,7 +128,13 @@ class CorpusJobSet:
                  admit: Callable[[Any, Any], tuple[str, str] | None] | None = None,
                  drained: Callable[[Any], Awaitable[bool]] | None = None,
                  refresh_every_seconds: float = JOB_REFRESH_SECONDS,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 screen: Callable[[Any], tuple[str, str] | None] | None = None,
+                 on_unwired: Callable[[Any], None] | None = None) -> None:
+        # ``screen(entry)`` decides from the entry alone, before any manifest
+        # read; ``on_unwired(wiring)`` releases what a drained job held.
+        self._screen = screen
+        self._on_unwired = on_unwired
         self._routes = routes
         self._router_for = router_for
         self._wire = wire
@@ -225,6 +241,10 @@ class CorpusJobSet:
         if job_id in self.served or job_id in self.finished:
             self._pass_over(task_id, REFUSED, f"job {job_id!r} was already served by this process")
             return
+        screened = self._screen(entry) if self._screen is not None else None
+        if screened is not None:
+            self._pass_over(task_id, *screened)
+            return
         try:
             job = await self._read_job(job_id)
         except Exception:
@@ -295,6 +315,11 @@ class CorpusJobSet:
         self.finished[job_id] = final
         self._status_cache.pop(job_id, None)
         self._status_locks.pop(job_id, None)
+        if self._on_unwired is not None:
+            try:
+                self._on_unwired(wiring)
+            except Exception:
+                logger.exception("corpus job %s: releasing its wiring failed", job_id)
         logger.info("corpus job %s drained and unwired", job_id)
 
     async def _compute_status(self, job_id: str, *, drained: bool = False) -> dict:
@@ -368,6 +393,7 @@ __all__ = [
     "JOB_REFRESH_SECONDS",
     "OTHER_MODEL",
     "REFUSED",
+    "eval_entry_screen",
     "hot_job_refusal",
     "job_drained",
 ]

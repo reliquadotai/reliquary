@@ -20,6 +20,7 @@ import asyncio
 import collections
 import functools
 import hmac
+import json
 import itertools
 import logging
 import secrets
@@ -55,9 +56,16 @@ from reliquary.validator.corpus_audit_remote import (
 logger = logging.getLogger(__name__)
 
 EVAL_AUDIT_PREFIX = "/corpus/internal/eval-audit"
-# Scorers of one batch before it is given up as undecidable (2, a third, then
-# two more chances to find a majority).
-MAX_SCORERS = 5
+# Scorers of one batch: a pair, and a third on disagreement. No agreement then:
+# the batch is parked (its records stay pending) and its job needs attention.
+MAX_SCORERS = 3
+STATUS_SECONDS = 30.0
+HEARTBEAT_WRITE_SECONDS = 30.0
+EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
+
+
+class BatchParked(Exception):
+    """No two scorers of a batch agree (or two agreeing pairs conflict)."""
 
 Score = tuple[str, tuple[ChunkResult, ...]]
 ModelKey = tuple[str, str]
@@ -101,6 +109,9 @@ class EvalExecutorDirectory:
     def _refusal(self, document: dict | None) -> str | None:
         if document is None:
             return "unknown_token"
+        if document.get("scope") != "eval":
+            # A corpus executor serves the corpus control, never this one.
+            return "wrong_scope"
         if document.get("status") != "active" or document["executor_id"] in self._revoked:
             return "revoked"
         if float(document.get("expires_at") or 0) <= self._clock():
@@ -145,6 +156,7 @@ class _Batch:
     places: dict[str, tuple[str, str]] = field(default_factory=dict)
     leased: set[str] = field(default_factory=set)
     needed: int = 2
+    job_id: str = ""
 
 
 @dataclass
@@ -184,25 +196,45 @@ class PairedAuditDispatcher:
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
         self._background: set[asyncio.Task] = set()
         self._unwritten: dict[str, str] = {}
+        self._documents: dict[str, dict] = {}
+        self._written: dict[str, float] = {}
+        # job id -> why it needs attention (parked batches), for the status.
+        self.attention: dict[str, list[str]] = collections.defaultdict(list)
+        self.parked: collections.Counter = collections.Counter()
         self.quarantined: set[str] = set()
         self.stats = collections.Counter()
 
     # -- the auditors' side ------------------------------------------------
 
-    def view(self, model_id: str, model_revision: str, proof) -> "PoolView":
-        return PoolView(self, (model_id, model_revision), proof)
+    def view(self, model_id: str, model_revision: str, proof, job_id: str = "") -> "PoolView":
+        return PoolView(self, (model_id, model_revision), proof, job_id)
 
     def subscribe(self, listener: Callable[[str], Awaitable[Any]]) -> None:
         self._listeners.append(listener)
 
-    async def score(self, model: ModelKey, proof, items: Sequence[dict]):
+    def unsubscribe(self, listener) -> None:
+        self._listeners = [other for other in self._listeners if other != listener]
+
+    def forget_job(self, job_id: str) -> None:
+        """A job unwired: its waiting batches and flags go with it."""
+        for queue in self._queues.values():
+            for batch in list(queue):
+                if batch.job_id == job_id:
+                    queue.remove(batch)
+                    if not batch.future.done():
+                        batch.future.cancel()
+        self.attention.pop(job_id, None)
+        self.parked.pop(job_id, None)
+
+    async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = ""):
         """``(status, chunks, scored_by)`` per item; ``scored_by`` is the
         tuple of executors whose agreement decided it."""
         loop = asyncio.get_running_loop()
         units = []
         for indexes in _lease_units(items):
             batch = _Batch(id=next(self._ids), model=model, proof=proof,
-                           items=[items[k] for k in indexes], future=loop.create_future())
+                           items=[items[k] for k in indexes], future=loop.create_future(),
+                           job_id=job_id)
             units.append((indexes, batch))
             self._queues[model].append(batch)
         scored: list = [None] * len(items)
@@ -218,8 +250,10 @@ class PairedAuditDispatcher:
 
     # -- the executors' side -----------------------------------------------
 
-    def heartbeat(self, executor_id: str) -> None:
+    def heartbeat(self, executor_id: str, document: dict | None = None) -> None:
         self._seen[executor_id] = self._clock()
+        if document is not None:
+            self._documents[executor_id] = document
 
     def _eligible(self, batch: _Batch, executor_id: str, place: tuple[str, str]) -> bool:
         if batch.future.done() or executor_id in batch.scores or executor_id in batch.leased:
@@ -235,7 +269,7 @@ class PairedAuditDispatcher:
         """An audit lease for this executor's model, or None. Raises
         ``LeaseRefused(409)`` for an executor whose placement is unknown."""
         executor_id = document["executor_id"]
-        self.heartbeat(executor_id)
+        self.heartbeat(executor_id, document)
         place = _placement(document)
         if place is None:
             raise LeaseRefused(409, "executor_provider_unknown")
@@ -296,30 +330,79 @@ class PairedAuditDispatcher:
         return "accepted"
 
     async def _decide(self, batch: _Batch) -> None:
+        """Two agreeing scorers decide. Three: exactly one decision held by an
+        agreeing pair decides, whoever agrees with nobody is quarantined. Never
+        an id-ordered pick: conflicting pairs, or no pair, park the batch."""
+        from reliquary.validator.corpus_audit import outcome_from_scores
+
         if len(batch.scores) < 2:
             return
         ids = sorted(batch.scores)
-        agreeing = {e: {o for o in ids if o != e and scores_agree(
-            batch.scores[e], batch.scores[o], batch.proof)} for e in ids}
-        majority = sorted(e for e, others in agreeing.items() if others)
-        if len(ids) == 2 and majority:
-            batch.future.set_result((batch.scores[ids[0]], tuple(ids)))
-            self.stats["agreed"] += 1
-            return
-        if len(ids) >= 3 and majority:
-            for minority in (e for e in ids if e not in majority):
-                await self.quarantine(minority, f"disagreed with executors {majority} on batch "
+        pairs = [(e, o) for k, e in enumerate(ids) for o in ids[k + 1:]
+                 if scores_agree(batch.scores[e], batch.scores[o], batch.proof)]
+
+        def decision(executor_id: str) -> tuple:
+            return tuple(outcome_from_scores(status, chunks, batch.proof).passed
+                         for status, chunks in batch.scores[executor_id])
+
+        decisions = {decision(e) for pair in pairs for e in pair}
+        members = sorted({e for pair in pairs for e in pair})
+        if len(decisions) == 1:
+            for minority in (e for e in ids if e not in members):
+                await self.quarantine(minority, f"disagreed with executors {members} on batch "
                                                 f"{batch.id}")
             if not batch.future.done():
-                batch.future.set_result((batch.scores[majority[0]], tuple(majority)))
-                self.stats["settled_by_majority"] += 1
+                batch.future.set_result((batch.scores[members[0]], tuple(members)))
+                self.stats["agreed" if len(ids) == 2 else "settled_by_majority"] += 1
             return
-        # Nobody agrees yet: one more executor, up to a bound.
-        self.stats["disagreements"] += 1
-        batch.needed = len(ids) + 1
-        if batch.needed > MAX_SCORERS and not batch.future.done():
-            batch.future.set_exception(RuntimeError(
-                f"batch {batch.id}: {len(ids)} executors and no two agree"))
+        if len(ids) < MAX_SCORERS and not pairs:
+            # One more executor, on yet another provider and host.
+            self.stats["disagreements"] += 1
+            batch.needed = len(ids) + 1
+            return
+        self._park(batch, "no agreeing pair" if not pairs else "conflicting agreeing pairs")
+
+    def _park(self, batch: _Batch, why: str) -> None:
+        self.stats["parked"] += 1
+        self.parked[batch.job_id] += 1
+        reason = (f"batch {batch.id}: {why} among {sorted(batch.scores)}; its records stay "
+                  "pending")
+        logger.error("eval audit of job %s parked: %s", batch.job_id, reason)
+        self.attention[batch.job_id].append(reason)
+        del self.attention[batch.job_id][:-10]
+        if not batch.future.done():
+            batch.future.set_exception(BatchParked(reason))
+
+    def live_executors(self, model: ModelKey) -> list[dict]:
+        now = self._clock()
+        return [document for eid, document in self._documents.items()
+                if now - self._seen.get(eid, float("-inf")) <= self._live
+                and eid not in self.quarantined
+                and (document.get("model_id"), document.get("model_revision")) == model
+                and _placement(document) is not None]
+
+    def status(self) -> dict:
+        """Per model, what the fleet must know: ``executors_needed`` more
+        executors (on providers and hosts distinct from the live ones) to
+        decide the batches waiting; per job, whether it needs attention."""
+        models = {}
+        for model, queue in self._queues.items():
+            waiting = [b for b in queue if not b.future.done()]
+            live = self.live_executors(model)
+            providers = {_placement(d)[0] for d in live}
+            hosts = {_placement(d)[1] for d in live}
+            required = max((b.needed for b in waiting), default=0)
+            models[f"{model[0]}@{model[1]}"] = {
+                "executors_needed": max(0, required - min(len(providers), len(hosts))),
+                "live_executors": len(live), "live_providers": len(providers),
+                "waiting_batches": len(waiting),
+                "awaiting_third_scorer": sum(1 for b in waiting if b.needed > 2)}
+        jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
+                         "reasons": list(reasons)}
+                for job_id, reasons in self.attention.items() if reasons}
+        return {"schema": "reliquary/eval-control-status/v1", "updated_at": self._clock(),
+                "models": models, "jobs": jobs,
+                "quarantined": sorted(self.quarantined), "stats": dict(self.stats)}
 
     async def quarantine(self, executor_id: str, reason: str) -> None:
         if executor_id in self.quarantined:
@@ -381,19 +464,32 @@ class PairedAuditDispatcher:
             await self._write_quarantines()
 
     async def write_heartbeats(self) -> None:
+        """Each executor's last contact into the registry, at most once per
+        ``HEARTBEAT_WRITE_SECONDS``, as the corpus control does."""
         if self._heartbeat_write is None:
             return
         for executor_id, seen in list(self._seen.items()):
+            written = self._written.get(executor_id)
+            if written is not None and (written == seen
+                                        or seen - written < HEARTBEAT_WRITE_SECONDS):
+                continue
             try:
                 await self._heartbeat_write(executor_id, seen, {})
+                self._written[executor_id] = seen
             except Exception:
                 logger.exception("heartbeat of executor %s not written", executor_id)
 
-    async def run(self, *, sweep_seconds: float = 2.0) -> None:
+    async def run(self, *, sweep_seconds: float = 2.0, write_status=None,
+                  status_seconds: float = STATUS_SECONDS) -> None:
+        last_status = float("-inf")
         while True:
             try:
                 await self._directory.maybe_refresh()
                 await self.sweep()
+                await self.write_heartbeats()
+                if write_status is not None and self._clock() - last_status >= status_seconds:
+                    await write_status(self.status())
+                    last_status = self._clock()
             except Exception:
                 logger.exception("eval audit dispatcher sweep failed; retrying")
             await asyncio.sleep(sweep_seconds)
@@ -403,18 +499,29 @@ class PoolView:
     """One job's window on the dispatcher: its model's pool and its own proof,
     in the shape ``CorpusAuditor`` uses a remote dispatcher."""
 
-    def __init__(self, dispatcher: PairedAuditDispatcher, model: ModelKey, proof) -> None:
+    def __init__(self, dispatcher: PairedAuditDispatcher, model: ModelKey, proof,
+                 job_id: str = "") -> None:
         self._dispatcher, self._model, self._proof = dispatcher, model, proof
+        self._job_id = job_id
+        self._listeners: list = []
 
     def connected(self) -> bool:
         # Always remote: there is no local GPU to fall back on.
         return True
 
     def subscribe(self, listener) -> None:
+        self._listeners.append(listener)
         self._dispatcher.subscribe(listener)
 
+    def close(self) -> None:
+        """The job is gone: no re-audit of it ever starts, its batches leave."""
+        for listener in self._listeners:
+            self._dispatcher.unsubscribe(listener)
+        self._listeners.clear()
+        self._dispatcher.forget_job(self._job_id)
+
     async def score(self, items: Sequence[dict]):
-        return await self._dispatcher.score(self._model, self._proof, items)
+        return await self._dispatcher.score(self._model, self._proof, items, self._job_id)
 
 
 class _VocabularyOnly:
@@ -448,8 +555,44 @@ def eval_auditor(**kwargs):
                 judged[i] = {**judged[i], "scored_by": sorted(executors)}
             return judged
 
+        async def _audit_outcomes(self, records, *, local: bool = False):
+            # A parked batch is neither the miner's fault nor a validator
+            # error: its records stay pending, untried, and its job is flagged.
+            try:
+                return await self._forward(records, local=local)
+            except BatchParked as exc:
+                for record in records:
+                    for sid, known in zip(self._current_ids, self._current_records):
+                        if known is record:
+                            self.parked_ids.add(sid)
+                return [_Parked(str(exc)) for _ in records]
+            except (ValueError, RuntimeError) as exc:
+                return [str(exc) for _ in records]
+
+        async def _audit_records(self, ids, records, draws):
+            self._current_ids, self._current_records = list(ids), list(records)
+            before = set(self.parked_ids)
+            try:
+                return await super()._audit_records(ids, records, draws)
+            finally:
+                # Parked records were counted as validator errors above: undone.
+                parked_now = len(self.parked_ids - before)
+                self._validator_errors = max(0, self._validator_errors - parked_now)
+                self._current_ids, self._current_records = [], []
+
+        async def judge_many(self, submission_ids):
+            # A parked record is not tried again until an operator acts.
+            await super().judge_many([s for s in submission_ids if s not in self.parked_ids])
+
     vocab_size = kwargs.pop("vocab_size")
-    return EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
+    auditor = EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
+    auditor.parked_ids = set()
+    auditor._current_ids, auditor._current_records = [], []
+    return auditor
+
+
+class _Parked(str):
+    """An outcome that is neither a verdict nor a validator error."""
 
 
 def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
@@ -489,7 +632,7 @@ def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
     @router.post(f"{EVAL_AUDIT_PREFIX}/heartbeat")
     async def heartbeat(body: HeartbeatRequest, request: Request) -> dict:
         document = authenticated(request, body.executor_id)
-        dispatcher.heartbeat(document["executor_id"])
+        dispatcher.heartbeat(document["executor_id"], document)
         return {"executor_id": document["executor_id"], "model_id": document["model_id"],
                 "model_revision": document["model_revision"]}
 
@@ -547,6 +690,28 @@ class EvalArchives:
             await self._upload(window, data, task_id)
 
 
+async def write_control_status(document: dict, **client_kwargs) -> None:
+    """The eval control's status (``executors_needed`` per model, jobs needing
+    attention), overwritten in the subnet bucket for the admin route."""
+    from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict, _get, _put
+
+    body = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    for _ in range(3):
+        _, etag = await _get(EVAL_CONTROL_STATUS_KEY, **dict(client_kwargs))
+        try:
+            await _put(EVAL_CONTROL_STATUS_KEY, body, etag, **dict(client_kwargs))
+            return
+        except CorpusStoreConflict:
+            continue
+
+
+async def read_control_status(**client_kwargs) -> dict | None:
+    from reliquary.infrastructure.corpus_job_store import _get
+
+    body, _ = await _get(EVAL_CONTROL_STATUS_KEY, **dict(client_kwargs))
+    return None if body is None else json.loads(body)
+
+
 def eval_job_refusal(entry, job) -> str | None:
     """Why the eval control will not serve a registry entry, or None."""
     from reliquary.eval.prompt_source import EVAL_JOB_PREFIX, is_eval_source
@@ -568,18 +733,33 @@ def eval_job_refusal(entry, job) -> str | None:
     return None
 
 
+# A tokenizer's files: never the weights, never a stray large text file.
+TOKENIZER_PATTERNS = ["*.json", "*.model", "*.tiktoken", "merges.txt", "vocab.txt", "*.jinja"]
+
+
+def _model_files(repo: str, revision: str) -> str:
+    """The model's small files at the pinned revision (public repos only: a
+    gated or missing repo is a refusal, never retried as transient)."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError
+
+    try:
+        return snapshot_download(repo, revision=revision, token=False,
+                                 allow_patterns=TOKENIZER_PATTERNS)
+    except (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError) as exc:
+        raise ValueError(f"{repo}@{revision} is not a public model at that revision: "
+                         f"{type(exc).__name__}") from exc
+
+
 def load_cpu_tokenizer(repo: str, revision: str):
-    """A model's tokenizer and vocabulary size, without its weights."""
+    """A model's tokenizer and vocabulary size (the embedding rows the config
+    declares, the auditor's bound on token ids), without its weights."""
     import json
     import os
 
-    from huggingface_hub import snapshot_download
-
     from reliquary.shared.modeling import load_tokenizer
 
-    directory = snapshot_download(repo, revision=revision, token=False,
-                                  allow_patterns=["*.json", "*.model", "*.tiktoken", "*.txt",
-                                                  "*.jinja"])
+    directory = _model_files(repo, revision)
     config = json.loads(open(os.path.join(directory, "config.json")).read())
     vocab = config.get("vocab_size") or (config.get("text_config") or {}).get("vocab_size")
     if not vocab:
@@ -587,11 +767,29 @@ def load_cpu_tokenizer(repo: str, revision: str):
     return load_tokenizer(directory), int(vocab)
 
 
+def model_facts(repo: str, revision: str) -> dict:
+    """The model's architecture and eos, read here from its own files (CPU):
+    never taken from an executor."""
+    import json
+    import os
+
+    from reliquary.shared.modeling import load_tokenizer
+
+    directory = _model_files(repo, revision)
+    config = json.loads(open(os.path.join(directory, "config.json")).read())
+    architectures = config.get("architectures") or []
+    eos = load_tokenizer(directory).eos_token_id
+    if not architectures or eos is None:
+        raise ValueError(f"{repo}@{revision} names no architecture or eos")
+    return {"architecture": str(architectures[0]), "eos_token_id": int(eos)}
+
+
 def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        directory: EvalExecutorDirectory, verify_signature,
                        verify_skip_signature=None, tokenizer_for=load_cpu_tokenizer,
                        qualifications=None, registration=None, settle_archives=None,
-                       read_entries=None, clock: Callable[[], float] = time.time):
+                       read_entries=None, clock: Callable[[], float] = time.time,
+                       refresh_every_seconds: float = 60.0):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
     settler; ``read_entries`` makes the set hot."""
@@ -653,7 +851,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
             on_verdict=w.stats.observe, vocab_size=vocab_size,
-            remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof))
+            remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
+                                   job.job_id))
         w.settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
                                   records=records, archives=settle_archives,
                                   on_settled=w.stats.settled)
@@ -681,6 +880,38 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     def admit(entry, job):
         refusal = eval_job_refusal(entry, job)
         return None if refusal is None else (OTHER_MODEL, refusal)
+
+    def screen(entry):
+        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+
+        # Not an eval job: never even read its manifest.
+        if not str(getattr(entry, "job_id", "") or "").startswith(EVAL_JOB_PREFIX):
+            return OTHER_MODEL, "not an evaluation job"
+        return None
+
+    def unwired(w) -> None:
+        """A drained job releases everything it held: its wiring, its pool view
+        and listeners, its prompts, and its model's tokenizer once unused."""
+        from reliquary.eval.prompt_source import forget_eval_prompts, parse_eval_source
+
+        served.pop(w.job.job_id, None)
+        w.auditor._remote.close()
+        forget_eval_prompts(parse_eval_source(w.job.prompt_source))
+        key = (w.job.checkpoint_repo, w.job.checkpoint_revision)
+        if not any((o.job.checkpoint_repo, o.job.checkpoint_revision) == key
+                   for o in served.values()):
+            tokenizers.pop(key, None)
+
+    async def guarded(w, coroutine):
+        """One job's background work: a failure flags the job, never the process."""
+        try:
+            await coroutine
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("eval job %s: its background work failed", w.job.job_id)
+            dispatcher.attention[w.job.job_id].append(
+                f"background work stopped: {type(exc).__name__}: {exc}"[:300])
 
     routes = CorpusJobRoutes()
     app = FastAPI()
@@ -712,13 +943,15 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                                                   qualifications=qualifications))
     job_set = CorpusJobSet(
         routes=routes, router_for=router_for, wire=wire,
-        jobs_of=lambda w: [w.auditor.run(), settle_forever(w)],
-        read_entries=read_entries, read_job=read_job, admit=admit,
+        jobs_of=lambda w: [guarded(w, w.auditor.run()), guarded(w, settle_forever(w))],
+        read_entries=read_entries, read_job=read_job, admit=admit, screen=screen,
+        on_unwired=unwired, refresh_every_seconds=refresh_every_seconds,
         drained=lambda w: job_drained(auditor=w.auditor, records=records,
                                       job_id=w.job.job_id),
         clock=clock)
     app.state.corpus_jobs = job_set
     app.state.eval_served = served
+    app.state.eval_tokenizers = tokenizers
     app.state.dispatcher = dispatcher
     return app, job_set
 
@@ -752,7 +985,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
     dispatcher = PairedAuditDispatcher(
         directory=directory,
         quarantine=lambda executor_id, reason: executor_store.set_executor_status(
-            executor_id, "quarantined", reason=reason),
+            executor_id, "quarantined", reason=reason, scope="eval"),
         record_heartbeat=lambda executor_id, at, detail: executor_store.record_heartbeat(
             executor_id, at=at, detail=detail))
     subnet = SubnetEvalStore()
@@ -760,7 +993,11 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
     async def read_prompts(set_id):
         return await subnet.get_bytes(subnet_key(set_id, "prompts.jsonl"))
 
-    qualifications = QualificationQueue(store=QualificationStore(), read_prompts=read_prompts)
+    async def facts(repo, revision):
+        return await asyncio.to_thread(model_facts, repo, revision)
+
+    qualifications = QualificationQueue(store=QualificationStore(), read_prompts=read_prompts,
+                                        model_facts=facts)
 
     async def read_entries():
         entries, _ = await registry_store.read_registry(strict=True)
@@ -773,7 +1010,8 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         directory=directory, verify_signature=verify_corpus_signature,
         verify_skip_signature=verify_corpus_skip_signature, qualifications=qualifications,
         registration=registered.reason if registered is not None else None,
-        settle_archives=archives, read_entries=read_entries)
+        settle_archives=archives, read_entries=read_entries,
+        refresh_every_seconds=refresh_every_seconds or 60.0)
 
     async def refresh_qualifications():
         while True:
@@ -783,7 +1021,8 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
                 logger.exception("qualification queue unreadable; retrying")
             await asyncio.sleep(30.0)
 
-    background = [dispatcher.run(), refresh_qualifications(), job_set.run()]
+    background = [dispatcher.run(write_status=write_control_status), refresh_qualifications(),
+                  job_set.run()]
     if registered is not None:
         background.append(registered.refresh_forever())
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
@@ -791,7 +1030,9 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
 
 
 __all__ = [
+    "BatchParked",
     "EVAL_AUDIT_PREFIX",
+    "EVAL_CONTROL_STATUS_KEY",
     "EvalArchives",
     "EvalExecutorDirectory",
     "MAX_SCORERS",
@@ -802,5 +1043,8 @@ __all__ = [
     "eval_auditor",
     "eval_job_refusal",
     "load_cpu_tokenizer",
+    "model_facts",
+    "read_control_status",
     "run_eval_control",
+    "write_control_status",
 ]

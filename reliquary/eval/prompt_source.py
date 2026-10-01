@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ SETS_DIR_ENV = "RELIQUARY_EVAL_SETS_DIR"
 _SOURCE_RE = re.compile(
     r"\Aeval-set:([a-z0-9][a-z0-9_-]{0,127}):([1-9][0-9]{0,8}):([0-9a-f]{64})\Z")
 
+logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 # (set_id, n, sha256) -> (the rows, their bytes), once checked.
 _loaded: dict[tuple[str, int, str], tuple[tuple[dict, ...], bytes]] = {}
@@ -83,12 +85,20 @@ def register_eval_prompts(source: EvalSource, body: bytes) -> tuple[dict, ...]:
     rows = tuple(json.loads(line) for line in head.splitlines())
     for row in rows:
         messages = row.get("messages")
-        if not (isinstance(messages, list) and messages
-                and isinstance(messages[-1].get("content"), str)):
-            raise ValueError(f"problem {row.get('problem_id')!r} carries no user turn")
+        # Exactly one user turn: anything else would be dropped silently.
+        if not (isinstance(messages, list) and len(messages) == 1
+                and messages[0].get("role") == "user"
+                and isinstance(messages[0].get("content"), str)):
+            raise ValueError(f"problem {row.get('problem_id')!r} is not one user turn")
     with _lock:
         _loaded[(source.set_id, source.count, source.sha256)] = (rows, head)
     return rows
+
+
+def forget_eval_prompts(source: EvalSource) -> None:
+    """A job unwired: its rows are not kept."""
+    with _lock:
+        _loaded.pop((source.set_id, source.count, source.sha256), None)
 
 
 def job_prompt_lines(source: EvalSource) -> bytes:
@@ -112,12 +122,17 @@ def _from_subnet_bucket(source: EvalSource) -> bytes | None:
 
     from reliquary.eval.storage import SubnetEvalStore, subnet_key
 
+    key = subnet_key(source.set_id, "prompts.jsonl")
+
     async def read():
-        return await SubnetEvalStore().get_bytes(subnet_key(source.set_id, "prompts.jsonl"))
+        return await SubnetEvalStore().get_bytes(key)
 
     # Called from sync code that may itself run inside an event loop.
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, read()).result()
+        body = pool.submit(asyncio.run, read()).result()
+    if body is None:
+        logger.warning("eval set prompts not in the subnet bucket: %s", key)
+    return body
 
 
 # Tried in order; tests replace this list.
@@ -176,6 +191,7 @@ __all__ = [
     "EvalSource",
     "FETCHERS",
     "eval_source_for",
+    "forget_eval_prompts",
     "head_lines",
     "is_eval_source",
     "job_prompt_lines",

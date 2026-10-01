@@ -20,6 +20,7 @@ from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
 from tests.unit.test_eval_sets import opener
 from tests.unit.test_jobs_cli import _rl_entry, registry  # noqa: F401
 
+SAMPLING = {"temperature": 0.6, "top_p": 1.0, "top_k": 0}
 MODELS = {"order-eval-a": ("customer/A", "a" * 40), "order-eval-b": ("customer/B", "b" * 40)}
 
 
@@ -57,8 +58,8 @@ def world(tmp_path, monkeypatch, registry):  # noqa: F811
         for job_id, (model, revision) in MODELS.items():
             qid = f"order-q-{job_id[-1]}"
             record = qual.new_request(qualification_id=qid, model=model, revision=revision,
-                                      set_id="logic-eval-s1-n6", problems=2, completions=2,
-                                      sampling={}, max_new_tokens=64, thinking=False)
+                                      set_id="logic-eval-s1-n6", problems=4, completions=2,
+                                      sampling=SAMPLING, max_new_tokens=64, thinking=False)
             record.update(status=qual.QUALIFIED, result={
                 "thresholds": THRESHOLDS, "architecture": "Qwen3ForCausalLM",
                 "checkpoint_sha256": job_id[-1] * 64, "eos_token_id": 2})
@@ -75,7 +76,8 @@ def world(tmp_path, monkeypatch, registry):  # noqa: F811
             for job_id, (model, _) in MODELS.items():
                 body = json.dumps({"job_id": job_id, "model": model, "env": "logic",
                                    "prompt_count": 4, "samples_per_prompt": 2,
-                                   "max_new_tokens": 64, "eval_set_id": "logic-eval-s1-n6",
+                                   "max_new_tokens": 64, "sampling": SAMPLING,
+                                   "eval_set_id": "logic-eval-s1-n6",
                                    "qualification_id": f"order-q-{job_id[-1]}"}).encode()
                 stamp, nonce = str(int(time.time())), secrets.token_hex(16)
                 path = "/admin/v1/jobs"
@@ -129,12 +131,19 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
                 executor_id=eid, token_sha256=__import__("hashlib").sha256(
                     token[eid].encode()).hexdigest(),
                 model_id="customer/A", model_revision="a" * 40, expires_at=1e12, now=0.0,
-                provider_id=provider, host=host)
+                provider_id=provider, host=host, scope="eval")
+        # A corpus executor of the same model: never this control's.
+        await executors.register_executor(
+            executor_id="prod", token_sha256=__import__("hashlib").sha256(b"prod").hexdigest(),
+            model_id="customer/A", model_revision="a" * 40, expires_at=1e12, now=0.0)
         directory = EvalExecutorDirectory()
         await directory.refresh()
         dispatcher = PairedAuditDispatcher(directory=directory)
+        async def facts(repo, revision):
+            return {"architecture": "Qwen3ForCausalLM", "eos_token_id": 2}
+
         queue = qual.QualificationQueue(store=qual.QualificationStore(),
-                                        read_prompts=read_prompts)
+                                        read_prompts=read_prompts, model_facts=facts)
         app, job_set = build_eval_control(
             store=BucketJobStore(), records=BucketRecordStore(), dispatcher=dispatcher,
             directory=directory, verify_signature=lambda request: True,
@@ -163,24 +172,32 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
             beat = await client.post("/corpus/internal/eval-audit/heartbeat",
                                      json={"executor_id": "e1"}, headers=headers)
             assert beat.status_code == 200
-            # A qualification for model A, leased over HTTP and recorded.
+            prod = await client.post("/corpus/internal/eval-audit/claim", headers={
+                "Authorization": "Bearer prod"}, json={**claim, "executor_id": "prod"})
+            assert prod.status_code == 401 and prod.json()["detail"] == "wrong_scope"
+            # A qualification for model A, measured by both executors over HTTP.
             await qual.QualificationStore().write(qual.new_request(
                 qualification_id="order-q-new", model="customer/A", revision="a" * 40,
-                set_id="logic-eval-s1-n6", problems=2, completions=4, sampling={},
+                set_id="logic-eval-s1-n6", problems=4, completions=4, sampling=SAMPLING,
                 max_new_tokens=64, thinking=False), None)
             await queue.refresh()
-            lease = await client.post("/corpus/internal/eval-audit/claim",
-                                      json={**claim, "kind": "qualify"}, headers=headers)
-            assert lease.status_code == 200 and lease.json()["type"] == "qualify"
             result = {"type": "qualify", "chunks": [[3, 2.0, 1.0]] * 20, "completions": 4,
                       "failed_completions": 0, "completion_tokens": 100,
                       "decode_seconds": 1.0, "gpu_count": 1, "gpu": "H100",
-                      "vllm_version": "0.1", "checkpoint_sha256": "a" * 64,
-                      "architecture": "Qwen3ForCausalLM", "eos_token_id": 2}
-            posted = await client.post(
-                f"/corpus/internal/eval-audit/{lease.json()['lease_id']}/result",
-                json=result, headers=headers)
-            assert posted.json() == {"lease_id": lease.json()["lease_id"], "outcome": "qualified"}
+                      "vllm_version": "0.1", "checkpoint_sha256": "a" * 64}
+            outcomes = []
+            for eid in ("e1", "e2"):
+                auth = {"Authorization": f"Bearer {token[eid]}"}
+                lease = await client.post("/corpus/internal/eval-audit/claim", headers=auth,
+                                          json={**claim, "executor_id": eid, "kind": "qualify"})
+                assert lease.status_code == 200 and lease.json()["type"] == "qualify"
+                posted = await client.post(
+                    f"/corpus/internal/eval-audit/{lease.json()['lease_id']}/result",
+                    json=result, headers=auth)
+                outcomes.append(posted.json()["outcome"])
+            assert outcomes == ["pending", "qualified"]
+            record, _ = await qual.QualificationStore().read("order-q-new")
+            assert record["result"]["eos_token_id"] == 2
         for tasks in job_set._tasks.values():
             for task in tasks:
                 task.cancel()
@@ -193,3 +210,57 @@ def test_the_routing_document_names_both_prefixes():
 
     text = Path("docs/design/2026-10-01-evaluation-on-subnet-design.md").read_text()
     assert "^/corpus/jobs/order-eval-" in text and "^/corpus/internal/eval-audit/" in text
+
+
+def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypatch):
+    from dataclasses import replace
+
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator.eval_control import (
+        EvalExecutorDirectory,
+        PairedAuditDispatcher,
+        build_eval_control,
+    )
+
+    registry, _ = world
+
+    async def idle(self):
+        await asyncio.sleep(3600)
+
+    async def nothing(self):
+        return []
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "pending_ids", nothing)
+    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", lambda self: idle(self))
+
+    async def read_entries():
+        return dict(registry["entries"])
+
+    async def go():
+        dispatcher = PairedAuditDispatcher(directory=EvalExecutorDirectory(
+            list_documents=lambda: asyncio.sleep(0, [])))
+        app, job_set = build_eval_control(
+            store=BucketJobStore(), records=BucketRecordStore(), dispatcher=dispatcher,
+            directory=EvalExecutorDirectory(list_documents=lambda: asyncio.sleep(0, [])),
+            verify_signature=lambda request: True,
+            tokenizer_for=lambda repo, revision: (_Tokenizer(), 100), read_entries=read_entries)
+        await job_set.refresh()
+        assert sorted(app.state.eval_served) == ["order-eval-a", "order-eval-b"]
+        listeners = len(dispatcher._listeners)
+        assert listeners == 2
+        for job_id in ("order-eval-a", "order-eval-b"):
+            registry["entries"][job_id] = replace(registry["entries"][job_id], status="retired",
+                                                  retired_at=5)
+        await job_set.refresh()
+        await job_set.refresh()
+        assert job_set.served == {}
+        assert app.state.eval_served == {} and app.state.eval_tokenizers == {}
+        assert dispatcher._listeners == [] and ps._loaded == {}
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+
+    asyncio.run(go())
