@@ -90,9 +90,12 @@ def test_a_bound_record_store_builds_one_client_for_many_calls(factory):
         await store.list_submission_ids("swe-v1")
         await store.read_miners("swe-v1")
         await store.read_settlement("swe-v1")
+        await store.list_verdict_ids("swe-v1")
 
     asyncio.run(scenario())
-    assert factory.built == 1
+    # One for the calls, one on the listing thread's own loop: listings are
+    # parsed off the serving loop, and reuse their client too.
+    assert factory.built == 2
 
 
 def test_a_connection_error_retires_the_client_and_the_next_call_builds_one(factory):

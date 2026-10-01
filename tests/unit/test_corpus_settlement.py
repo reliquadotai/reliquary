@@ -177,8 +177,9 @@ def test_r2archives_other_max_excludes_its_own_task_and_is_none_when_no_other_ta
         return ["corpus-math", "default"]
 
     async def fake_list_all_window_keys(*, strict=False, task_id=None, **kw):
-        assert task_id != "corpus-math"
-        return {"default": [46000, 46001]}.get(task_id, [])
+        # Every task is listed once for all the jobs' settlers; its own
+        # windows are never its own horizon.
+        return {"default": [46000, 46001], "corpus-math": [99999]}.get(task_id, [])
 
     with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=fake_list_task_ids)), \
          patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=fake_list_all_window_keys)):

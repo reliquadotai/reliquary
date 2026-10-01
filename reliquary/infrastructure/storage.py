@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Any
 
 from aiobotocore.session import get_session
@@ -50,6 +51,34 @@ def dataset_prefix(task_id: str | None = None) -> str:
 
 def dataset_object_key(window_start: int, task_id: str | None = None) -> str:
     return f"{dataset_prefix(task_id)}{int(window_start)}.json.gz"
+
+
+_LISTING_LOOP: asyncio.AbstractEventLoop | None = None
+_LISTING_LOOP_LOCK = threading.Lock()
+
+
+def _listing_loop() -> asyncio.AbstractEventLoop:
+    global _LISTING_LOOP
+    with _LISTING_LOOP_LOCK:
+        if _LISTING_LOOP is None or _LISTING_LOOP.is_closed():
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, name="r2-listing", daemon=True).start()
+            _LISTING_LOOP = loop
+        return _LISTING_LOOP
+
+
+async def off_loop(coro):
+    """Await ``coro`` run on a dedicated thread's own event loop.
+
+    A big listing's pages are parsed (XML) in the coroutine that reads them;
+    on the serving loop that held it for seconds (py-spy, 2026-10-01). On its
+    own loop the parse only competes for the GIL. Cancelling the caller
+    cancels the listing.
+    """
+    if asyncio.get_running_loop() is _LISTING_LOOP:
+        return await coro
+    future = asyncio.run_coroutine_threadsafe(coro, _listing_loop())
+    return await asyncio.wrap_future(future)
 
 
 async def list_task_ids(*, strict: bool = False, **client_kwargs) -> list[str]:

@@ -1023,7 +1023,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         prompt_job_for_spec,
         renderer_for_job,
     )
-    from reliquary.validator.corpus_settlement import CorpusSettler
+    from reliquary.validator.corpus_settlement import (
+        SETTLE_FULL_LIST_SECONDS, CorpusSettler, settler_fed,
+    )
     from reliquary.validator.corpus_validator import build_corpus_audit_wiring
 
     tokenizers: dict[ModelKey, tuple[Any, int]] = {}
@@ -1082,16 +1084,17 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
                             is_banned=is_banned, stats=JobStats())
+        w.settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
+                                  records=records, archives=settle_archives,
+                                  on_settled=w.stats.settled,
+                                  full_list_every_seconds=SETTLE_FULL_LIST_SECONDS)
         w.auditor = eval_auditor(
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
-            on_verdict=w.stats.observe, vocab_size=vocab_size, job=job, job_store=store,
-            reopen_slots=is_eval_source(job.prompt_source),
+            on_verdict=settler_fed(w.settler, w.stats.observe), vocab_size=vocab_size,
+            job=job, job_store=store, reopen_slots=is_eval_source(job.prompt_source),
             remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
                                    job.job_id))
-        w.settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
-                                  records=records, archives=settle_archives,
-                                  on_settled=w.stats.settled)
 
         def on_accepted(submission_id: str) -> None:
             w.stats.accepted()
