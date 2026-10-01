@@ -43,6 +43,21 @@ def eval_job_prefix(task_prefix: str | None = None) -> str:
 
 def is_eval_job_id(job_id, task_prefix: str | None = None) -> bool:
     return str(job_id or "").startswith(eval_job_prefix(task_prefix))
+
+
+def gen_job_prefix(task_prefix: str | None = None) -> str:
+    """``${RELIQUARY_ADMIN_TASK_PREFIX}gen-`` (``order-gen-`` by default): a
+    generation order on any model, served by the order control."""
+    return f"{eval_job_prefix(task_prefix)[:-len('eval-')]}gen-"
+
+
+def is_gen_job_id(job_id, task_prefix: str | None = None) -> bool:
+    return str(job_id or "").startswith(gen_job_prefix(task_prefix))
+
+
+def is_order_job_id(job_id, task_prefix: str | None = None) -> bool:
+    """An order job (eval or generation): the order control's, never the corpus control's."""
+    return is_eval_job_id(job_id, task_prefix) or is_gen_job_id(job_id, task_prefix)
 SETS_DIR_ENV = "RELIQUARY_EVAL_SETS_DIR"
 _SOURCE_RE = re.compile(
     r"\Aeval-set:([a-z0-9][a-z0-9_-]{0,127}):([1-9][0-9]{0,8}):([0-9a-f]{64})\Z")
@@ -198,7 +213,10 @@ class EvalSetSpec:
 
 __all__ = [
     "eval_job_prefix",
+    "gen_job_prefix",
     "is_eval_job_id",
+    "is_gen_job_id",
+    "is_order_job_id",
     "EVAL_SOURCE_PREFIX",
     "EvalSetEnvironment",
     "EvalSetSpec",

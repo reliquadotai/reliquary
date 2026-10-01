@@ -34,14 +34,18 @@ def _entry_profile(entry):
     return own_profile(entry)
 
 
-def eval_entry_screen(entry) -> tuple[str, str] | None:
-    """The corpus control's answer to an ``order-eval-`` entry, before any
-    manifest read: not its job (the eval control serves it)."""
-    from reliquary.eval.prompt_source import is_eval_job_id
+def order_entry_screen(entry) -> tuple[str, str] | None:
+    """The corpus control's answer to an order entry (``order-eval-`` or
+    ``order-gen-``), before any manifest read: not its job (the order control
+    serves it)."""
+    from reliquary.eval.prompt_source import is_order_job_id
 
-    if is_eval_job_id(getattr(entry, "job_id", "")):
-        return OTHER_MODEL, "an evaluation job, served by the eval control"
+    if is_order_job_id(getattr(entry, "job_id", "")):
+        return OTHER_MODEL, "an order job, served by the order control"
     return None
+
+
+eval_entry_screen = order_entry_screen
 
 
 def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[str, Any],
@@ -58,12 +62,11 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     from reliquary.protocol.profiles import toploc_proof
     from reliquary.validator.corpus_validator import startup_refusal
 
-    from reliquary.eval.prompt_source import is_eval_job_id
-
-    if is_eval_job_id(getattr(entry, "job_id", "")):
-        # Served by the eval control alone, whatever its model: two processes
+    screened = order_entry_screen(entry)
+    if screened is not None:
+        # Served by the order control alone, whatever its model: two processes
         # auditing and settling one job would pay its records twice.
-        return OTHER_MODEL, "an evaluation job, served by the eval control"
+        return screened
     if getattr(entry, "contract", None) is None:
         return REFUSED, "it carries no contract to check against the one this process runs"
     try:
@@ -394,6 +397,7 @@ __all__ = [
     "OTHER_MODEL",
     "REFUSED",
     "eval_entry_screen",
+    "order_entry_screen",
     "hot_job_refusal",
     "job_drained",
 ]
