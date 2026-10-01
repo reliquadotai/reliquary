@@ -114,13 +114,11 @@ def test_the_miner_reads_an_eval_jobs_prompts_and_submits_on_its_scoped_path():
     http = httpx.Client(base_url="http://v", transport=httpx.MockTransport(handle))
     client = HttpCorpusClient(http, job_id="order-eval-7")
     assert client.eval_prompts() == b'{"x":1}\n'
+    client.scoped_submit = True  # the miner sets it once the manifest names an eval set
     client.submit({"a": 1})
     assert ("POST", "/corpus/jobs/order-eval-7/submit") in seen
-    # A named job is always submitted on its own routes; only the default job
-    # (no --job-id) uses the legacy path.
-    HttpCorpusClient(http, job_id="code-v1").submit({"a": 1})
-    assert ("POST", "/corpus/jobs/code-v1/submit") in seen
-    HttpCorpusClient(http).submit({"a": 1})
+    plain = HttpCorpusClient(http, job_id="code-v1")
+    plain.submit({"a": 1})
     assert ("POST", "/corpus/submit") in seen
 
 

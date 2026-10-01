@@ -822,6 +822,9 @@ def order_job_refusal(entry, job) -> str | None:
             return refusal
         if job.renderer_id not in CHAT_TEMPLATE_RENDERERS:
             return f"renderer {job.renderer_id!r} is not the model's chat template"
+        if getattr(job, "submit", None) != "scoped":
+            # Its miners would post to /corpus/submit, which this control lacks.
+            return "its manifest does not send submissions to its scoped route"
         declared = list(((getattr(entry, "contract", None) or {}).get("environments") or {}))
         if getattr(entry, "contract", None) is not None and declared != [job.prompt_source]:
             return f"its contract declares environments {declared}, not {job.prompt_source!r} alone"

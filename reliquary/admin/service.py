@@ -514,6 +514,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             model_revision=record["revision"], model_architecture=result["architecture"],
             checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
             prompt_source=body.env, toploc_thresholds=result["thresholds"],
+            # Its miners submit on its own route (the order control has no legacy one).
+            submit="scoped",
             audit_params={**GEN_AUDIT_PARAMS,
                           **({"audit_q": body.audit_q} if body.audit_q is not None else {})},
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,

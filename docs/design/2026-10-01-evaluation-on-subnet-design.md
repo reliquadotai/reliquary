@@ -110,8 +110,9 @@ Regex locations win over the prefix one, so the order in the file does not matte
 `${RELIQUARY_ADMIN_TASK_PREFIX}eval-` (`order-eval-` with the default `order-`), the generation prefix
 `${RELIQUARY_ADMIN_TASK_PREFIX}gen-`; the admin service, the order control and the corpus control read it from
 `RELIQUARY_ADMIN_TASK_PREFIX`, which must be the same on every one of those processes, and `order-nginx` must be
-run with it. Miners need no setting: a miner given `--job-id` reads and submits on that job's own routes
-(`/corpus/jobs/<job_id>/...`), so nginx sends both to whichever control serves it. Executors for an eval
+run with it. Miners need no setting: an order job's manifest tells them to submit on its own route
+(`submit: "scoped"` for a generation order, an eval-set source for an evaluation), which this regex sends to the
+order control; every other job keeps the legacy `/corpus/submit`, which deployed corpus controls answer. Executors for an eval
 job run `reliquary corpus audit-executor --eval` (audits) and `reliquary corpus qualify --model repo@rev`
 (qualification) against the same origin. Miners mine an eval job with `--job-id order-eval-<id>`: they
 fetch its prompts from `/corpus/jobs/order-eval-<id>/eval-prompts`.

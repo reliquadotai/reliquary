@@ -319,7 +319,7 @@ def test_a_generation_job_on_any_model_is_declared_from_its_qualification(admin,
     assert job.renderer_id == "chat-template-thinking-v1" and job.slots_per_prompt == 2
     assert (job.sampling.temperature, job.sampling.top_p, job.sampling.top_k,
             job.sampling.max_new_tokens) == (0.7, 0.95, 0, 1024)
-    assert job.seed is None
+    assert job.seed is None and job.submit == "scoped"
     entry = admin.registry["entries"]["order-gen-11"]
     # The partial audit of corpus jobs: sampled at 15 % after a probation of 100.
     assert entry.params["audit_q"] == 0.15
@@ -404,7 +404,7 @@ def _gen_entry_and_job(**job_changes):
 
     job = replace(_job_spec(job_id="order-gen-1", prompt_source=GEN_ENV),
                   renderer_id="chat-template-v1", checkpoint_repo="org/Frozen",
-                  checkpoint_revision="abc123", **job_changes)
+                  checkpoint_revision="abc123", submit="scoped", **job_changes)
     contract = {"model_id": "org/Frozen", "model_revision": "abc123",
                 "model_architecture": "Qwen3ForCausalLM", "environments": {GEN_ENV: {}},
                 "proofs": [{"scheme": "toploc-v1", "mode": "enforce",
@@ -615,7 +615,16 @@ def test_order_control_is_the_command_and_eval_control_its_alias(monkeypatch, co
 
 
 def test_a_miner_submits_an_order_job_on_its_scoped_path():
-    from reliquary.miner.corpus_miner import HttpCorpusClient
+    from dataclasses import replace
 
-    assert HttpCorpusClient(object(), job_id="order-gen-1").scoped_submit is True
-    assert HttpCorpusClient(object(), job_id=None).scoped_submit is False
+    from reliquary.miner.corpus_miner import submits_scoped
+    from tests.unit.test_corpus_export import _job_spec
+
+    # By the manifest, never by the id or the miner's configuration.
+    assert submits_scoped(replace(_job_spec(job_id="sn81-gen-1", prompt_source=GEN_ENV),
+                                  submit="scoped"))
+    assert not submits_scoped(_job_spec(job_id="order-gen-1", prompt_source=GEN_ENV))
+    assert submits_scoped(_job_spec(job_id="order-eval-1",
+                                    prompt_source="eval-set:s:1:" + "0" * 64))
+    assert not submits_scoped(_job_spec(job_id="code-qwen38-27b-v1",
+                                        prompt_source="reliquary_code_v1"))

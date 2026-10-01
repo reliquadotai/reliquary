@@ -254,8 +254,9 @@ def test_a_refused_order_entry_is_named_in_the_control_status(monkeypatch):
 # -- I4. miners route without configuration; one source for the nginx regex --------
 
 
-def test_a_miner_mining_a_named_job_reads_and_submits_on_its_scoped_path():
-    from reliquary.miner.corpus_miner import HttpCorpusClient
+def _miner_posts(job, job_id):
+    """Where a miner set up as `reliquary corpus mine` does posts a submission."""
+    from reliquary.miner.corpus_miner import HttpCorpusClient, submits_scoped
 
     paths = []
 
@@ -265,10 +266,50 @@ def test_a_miner_mining_a_named_job_reads_and_submits_on_its_scoped_path():
             return SimpleNamespace(status_code=200, json=lambda: {"ok": True},
                                    raise_for_status=lambda: None)
 
-    # Any prefix, no environment variable: the job's own routes.
-    HttpCorpusClient(_Http(), job_id="sn81-gen-4").submit({})
-    HttpCorpusClient(_Http(), job_id=None).submit({})
-    assert paths == ["/corpus/jobs/sn81-gen-4/submit", "/corpus/submit"]
+    client = HttpCorpusClient(_Http(), job_id=job_id)
+    client.scoped_submit = submits_scoped(job)
+    client.submit({})
+    return paths
+
+
+def test_a_miner_on_an_operator_corpus_job_keeps_the_legacy_submit(admin, monkeypatch):  # noqa: F811
+    """Deployed corpus controls answer 404 on the scoped submit: a prod job
+    (no marker in its manifest) is submitted on /corpus/submit, --job-id or not."""
+    from tests.unit.test_corpus_export import _job_spec
+
+    prod = _job_spec(job_id="code-qwen38-27b-v1", prompt_source="reliquary_code_v1")
+    assert _miner_posts(prod, "code-qwen38-27b-v1") == ["/corpus/submit"]
+    assert _miner_posts(prod, None) == ["/corpus/submit"]
+    # An order job declared by the admin carries the marker: its own route.
+    entry, job, _, _ = _declared_gen(admin, monkeypatch)
+    assert job.submit == "scoped"
+    assert _miner_posts(job, job.job_id) == [f"/corpus/jobs/{job.job_id}/submit"]
+
+
+def test_a_manifest_without_the_marker_stores_and_parses_as_before():
+    from reliquary.corpus.job import JobError, parse_job
+    from tests.unit.test_corpus_export import _job_spec
+
+    plain = _job_spec().to_contract()
+    assert "submit" not in plain and parse_job(plain).submit is None
+    assert parse_job({**plain, "submit": "scoped"}).submit == "scoped"
+    with pytest.raises(JobError):
+        parse_job({**plain, "submit": "legacy"})
+
+
+def test_the_order_control_refuses_a_generation_job_without_the_marker(monkeypatch):
+    from reliquary.protocol import profiles
+    from reliquary.validator.eval_control import order_job_refusal
+    from tests.unit.test_order_any_model import _gen_entry_and_job
+
+    stub_catalog_env(monkeypatch)
+    monkeypatch.setattr(profiles, "profile_from_contract", lambda c: SimpleNamespace(
+        model_id=c["model_id"], model_revision=c["model_revision"], proofs=c["proofs"],
+        model_architecture=c.get("model_architecture")))
+    monkeypatch.setattr(profiles, "toploc_proof", lambda p: SimpleNamespace(mode="enforce"))
+    entry, job = _gen_entry_and_job()
+    assert order_job_refusal(entry, job) is None
+    assert "scoped" in order_job_refusal(entry, replace(job, submit=None))
 
 
 @pytest.mark.parametrize("prefix", ["order-", "sn81-", "a.b-"])
