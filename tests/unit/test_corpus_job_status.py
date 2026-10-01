@@ -6,7 +6,6 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-import httpx
 import pytest
 
 from reliquary.corpus.slots import SlotLedger

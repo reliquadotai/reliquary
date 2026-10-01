@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from reliquary.infrastructure import corpus_job_store as job_store
 from reliquary.validator.corpus_hot_jobs import (
     OTHER_MODEL,
     REFUSED,

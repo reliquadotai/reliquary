@@ -89,8 +89,11 @@ class CorpusAuditor:
                  clock: Callable[[], float] = time.time,
                  accept_slack_seconds: float = ACCEPT_SLACK_SECONDS,
                  gpu_lock: asyncio.Lock | None = None,
-                 on_verdict: Callable[[str, dict], None] | None = None) -> None:
+                 on_verdict: Callable[[str, dict], None] | None = None,
+                 remote=None) -> None:
         self._job_id = job_id
+        # A `RemoteAuditDispatcher`: used while an executor is connected.
+        self._remote = remote
         # Told of every verdict that stands, for the job's in-memory status.
         self._on_verdict = on_verdict
         # Shared by every job's auditor on one loaded model: one forward pass
@@ -295,15 +298,25 @@ class CorpusAuditor:
         del arrivals[:bisect.bisect_left(arrivals, now - self._params.hold_seconds)]
         return bisect.bisect_right(arrivals, now)
 
-    async def _forward(self, records: list[dict]) -> list[dict]:
+    async def _forward(self, records: list[dict], *, local: bool = False) -> list[dict]:
+        if not local and self._remote is not None and self._remote.connected():
+            # An executor computes the chunk scores; the decision stays here.
+            results, items = await asyncio.to_thread(self._prepare, records)
+            scores = await self._remote.score(
+                [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
+                 for _, _, tokens, n, proofs in items])
+            outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
+                        for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
+            return self._aggregate(records, results, outcomes)
         async with self._gpu_lock:
             return await asyncio.to_thread(self._judge_many, records)
 
-    async def _audit_outcomes(self, records: list[dict]) -> list[dict | str]:
+    async def _audit_outcomes(self, records: list[dict], *,
+                              local: bool = False) -> list[dict | str]:
         """One outcome per record; a string is a validator-side error message."""
         batch_failed, batch_error = False, ""
         try:
-            judged: list = await self._forward(records)
+            judged: list = await self._forward(records, local=local)
         except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as exc:
             # Record only the message here, then leave the block: `exc` and its
             # traceback pin every frame that was live when the batch failed
@@ -326,7 +339,7 @@ class CorpusAuditor:
             judged = []
             for record in records:
                 try:
-                    judged.append((await self._forward([record]))[0])
+                    judged.append((await self._forward([record], local=local))[0])
                 except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as solo_exc:
                     # A message, not the exception object: so this record's
                     # traceback (and whatever activations it pins) cannot
@@ -408,7 +421,8 @@ class CorpusAuditor:
         for k, outcome in enumerate(outcomes):
             if isinstance(outcome, dict) and not outcome["passed"]:
                 # §7.2: only a failure that a second, separate audit repeats counts.
-                outcomes[k] = (await self._audit_outcomes([records[k]]))[0]
+                # Always on this GPU: an executor alone can never fail a miner.
+                outcomes[k] = (await self._audit_outcomes([records[k]], local=True))[0]
 
         for submission_id, outcome in zip(ids, outcomes):
             if isinstance(outcome, dict):

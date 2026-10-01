@@ -1663,6 +1663,27 @@ def ledgers_downgrade(job_id: str = typer.Option(..., "--job")) -> None:
     typer.echo(f"{job_id}: {_run_on_ledgers(job_id, downgrade_ledgers_v1)}")
 
 
+@corpus_app.command("audit-executor")
+def corpus_audit_executor(
+    control: str = typer.Option(..., "--control", help="The corpus control's HTTPS origin"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    model_id: str = typer.Option(
+        None, "--model-id", help="Defaults to the model this executor is registered for"),
+    model_revision: str = typer.Option(None, "--model-revision"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Score corpus audit leases on this GPU. The only secret is the executor
+    token, in RELIQUARY_EXECUTOR_TOKEN; the model comes from the public HF repo."""
+    from reliquary.validator.corpus_audit_executor import TOKEN_ENV, run_audit_executor
+
+    setup_logging(log_level)
+    if not os.environ.get(TOKEN_ENV, "").strip():
+        typer.echo(f"error: {TOKEN_ENV} is not set", err=True)
+        raise typer.Exit(code=1)
+    run_audit_executor(control_url=control, executor_id=executor_id, model_id=model_id,
+                       model_revision=model_revision)
+
+
 @corpus_app.command("mine")
 def corpus_mine(
     validator_url: str = typer.Option(..., "--validator-url"),
@@ -1942,6 +1963,18 @@ def _corpus_hot_registry_reader():
         return found
 
     return entries
+
+
+def _corpus_remote_audit_options() -> dict:
+    """Remote audit executors, on with ``RELIQUARY_CORPUS_REMOTE_AUDIT=1``;
+    ``RELIQUARY_CORPUS_RECHECK_FRACTION`` (default 0.05) is the share of their
+    results this GPU recomputes."""
+    if not _env_flag("RELIQUARY_CORPUS_REMOTE_AUDIT"):
+        return {}
+    fraction = float(os.getenv("RELIQUARY_CORPUS_RECHECK_FRACTION", "0.05"))
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("RELIQUARY_CORPUS_RECHECK_FRACTION must be in (0, 1]")
+    return {"remote_audit": True, "recheck_fraction": fraction}
 
 
 def _miner_requires_grader(env_names: list[str]) -> bool:
@@ -2578,6 +2611,7 @@ def validate(
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
                         set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
+                        **_corpus_remote_audit_options(),
                     )
                 except RuntimeError as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
@@ -2649,6 +2683,7 @@ def validate(
                         signer_client=signer_client, http_host=http_host,
                         http_port=http_port, cap=task_config.emission_cap,
                         set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
+                        **_corpus_remote_audit_options(),
                     )
                 except RuntimeError as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)

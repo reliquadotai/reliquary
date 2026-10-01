@@ -334,7 +334,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                set_weights: bool, entry=None, cap: float | None = None,
                                jobs=None, settle_every_seconds: float = 60.0,
                                registration_gate: bool = True, read_registry=None,
-                               refresh_every_seconds: float | None = None) -> None:
+                               refresh_every_seconds: float | None = None,
+                               remote_audit: bool = False,
+                               recheck_fraction: float | None = None) -> None:
     """Serve one corpus task (``entry``, ``cap``) or several (``jobs``, a list
     of ``(entry, cap)``) from one process and one loaded model.
 
@@ -342,6 +344,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     entries) the job set is hot: re-read every ``refresh_every_seconds``, new
     jobs on this model are wired and retired ones drained without a restart.
     Without it the jobs given here are the jobs served, as before.
+
+    With ``remote_audit`` the ``/corpus/internal/audit/...`` routes are mounted
+    and connected executors score the audits; with none connected, this
+    process's GPU audits as before.
     """
     import threading
     from pathlib import Path
@@ -479,7 +485,36 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     # One model, one forward pass at a time across every job; one job needs
     # none, unless more may join it.
     hot = read_registry is not None
-    gpu_lock = asyncio.Lock() if len(wiring) > 1 or hot else None
+    gpu_lock = asyncio.Lock() if len(wiring) > 1 or hot or remote_audit else None
+    remote = directory = None
+    if remote_audit:
+        from reliquary.infrastructure import corpus_executor_store as executor_store
+        from reliquary.validator.corpus_audit import score_sequences
+        from reliquary.validator.corpus_audit_remote import (
+            RECHECK_FRACTION, ExecutorDirectory, RemoteAuditDispatcher,
+        )
+        from reliquary.validator.corpus_auditor import AUDIT_BATCH_TOKENS
+
+        async def local_scores(items):
+            # The trusted verifier: this GPU, in turn with every job's auditor.
+            async with gpu_lock:
+                scores, _, _ = await asyncio.to_thread(
+                    score_sequences, model,
+                    [(i["tokens"], i["prompt_len"], i["proofs"]) for i in items],
+                    chunk_tokens=proof.chunk_tokens, topk=proof.topk,
+                    batch_tokens=AUDIT_BATCH_TOKENS)
+            return scores
+
+        directory = ExecutorDirectory(model_id=first.checkpoint_repo,
+                                      model_revision=first.checkpoint_revision)
+        remote = RemoteAuditDispatcher(
+            directory=directory, proof=proof, local_scores=local_scores,
+            recheck_fraction=RECHECK_FRACTION if recheck_fraction is None else recheck_fraction,
+            quarantine=lambda executor_id, reason: executor_store.set_executor_status(
+                executor_id, "quarantined", reason=reason),
+            record_heartbeat=lambda executor_id, at, detail: executor_store.record_heartbeat(
+                executor_id, at=at, detail=detail),
+        )
     job_set: CorpusJobSet | None = None
     archives = R2Archives(served=lambda: job_set.task_ids() if job_set is not None else ())
 
@@ -490,7 +525,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         w.auditor = CorpusAuditor(job_id=w.job.job_id, records=records, model=model,
                                   tokenizer=tokenizer, proof=proof, params=params,
                                   miner_states=miner_states, beacon=beacon, round_at=round_at,
-                                  gpu_lock=gpu_lock, on_verdict=w.stats.observe)
+                                  gpu_lock=gpu_lock, on_verdict=w.stats.observe,
+                                  remote=remote)
         # `entry.cap` does not exist on `TaskEntry` (the cap lives in
         # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
         w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
@@ -568,8 +604,15 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             name="weight-setter", daemon=True,
         ).start()
 
-    server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     background = [registered.refresh_forever()] if registered is not None else []
+    if remote is not None:
+        from reliquary.validator.corpus_audit_remote import build_audit_executor_router
+
+        app.include_router(build_audit_executor_router(remote, directory))
+        app.state.corpus_audit_remote = remote
+        background.append(remote.run())
+
+    server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     await asyncio.gather(server.serve(), job_set.run(), *background)
 
 
