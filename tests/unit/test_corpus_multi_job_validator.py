@@ -306,3 +306,22 @@ def test_a_refused_start_migrates_no_ledger(v1_ledgers, seeded_job, fake_r2):
         ))
     after = {k: v for k, v in v1_ledgers.r2.objects.items() if "ledger" in k or "/seen/" in k}
     assert after == {k: v for k, v in before.items() if "ledger" in k or "/seen/" in k}
+
+
+def test_the_miner_status_route_serves_each_job_from_its_own_wiring(booted):
+    hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    auditor = next(a for a in booted.auditors if a._job_id == "swe-v2")
+    # The auditor's real verdict report reaches the book.
+    auditor._report("f" * 64, {"hotkey": hotkey, "passed": False, "audited": True,
+                               "reason": "mant_err_median", "audited_at": 5.0,
+                               "token_count": 9, "worst_exp": 0, "worst_mant_mean": 0.01,
+                               "worst_mant_median": 0.02})
+    client = TestClient(booted.app)
+    v2 = client.get(f"/corpus/jobs/swe-v2/miners/{hotkey}")
+    assert v2.status_code == 200, v2.text
+    assert v2.json()["cap"] == 0.2 and v2.json()["failed"] == 1
+    assert v2.json()["recent_failures"][0]["reason"] == "mant_err_median"
+    assert "mant_median" in v2.json()["toploc_thresholds"]
+    v1 = client.get(f"/corpus/jobs/swe-v1/miners/{hotkey}").json()
+    assert v1["cap"] == 0.1 and v1["failed"] == 0 and v1["audit_state"] == "probation"
+    assert client.get(f"/corpus/miners/{hotkey}").json()["job_id"] == "swe-v1"

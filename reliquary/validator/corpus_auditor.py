@@ -92,7 +92,8 @@ class CorpusAuditor:
                  accept_slack_seconds: float = ACCEPT_SLACK_SECONDS,
                  gpu_lock: asyncio.Lock | None = None,
                  on_verdict: Callable[[str, dict], None] | None = None,
-                 remote=None) -> None:
+                 remote=None,
+                 on_voided: Callable[[str, dict], None] | None = None) -> None:
         self._job_id = job_id
         # A `RemoteAuditDispatcher`: used while an executor is connected.
         self._remote = remote
@@ -103,6 +104,8 @@ class CorpusAuditor:
             remote.subscribe(self.reaudit_executor)
         # Told of every verdict that stands, for the job's in-memory status.
         self._on_verdict = on_verdict
+        # Told of every pass voided after its executor's quarantine.
+        self._on_voided = on_voided
         # Shared by every job's auditor on one loaded model: one forward pass
         # at a time, and asyncio.Lock wakes waiters FIFO so no job starves.
         self._gpu_lock = gpu_lock if gpu_lock is not None else contextlib.nullcontext()
@@ -169,6 +172,10 @@ class CorpusAuditor:
         for sid in judged - self._judged:
             self._mark_judged(sid)
         return [sid for sid in submitted if sid not in judged]
+
+    def pending_count(self, hotkey: str) -> int:
+        """Records of ``hotkey`` read and awaiting a verdict."""
+        return len(self._unjudged.get(hotkey, ()))
 
     def _mark_judged(self, submission_id: str) -> None:
         self._judged.add(submission_id)
@@ -396,6 +403,14 @@ class CorpusAuditor:
         except Exception:
             logger.exception("corpus verdict report for %s failed", submission_id[:12])
 
+    def _report_voided(self, submission_id: str, document: dict) -> None:
+        if self._on_voided is None:
+            return
+        try:
+            self._on_voided(submission_id, document)
+        except Exception:
+            logger.exception("corpus void report for %s failed", submission_id[:12])
+
     async def _state(self, hotkey: str, now: float) -> MinerState:
         if self._miner_states is None:
             return MinerState()
@@ -556,10 +571,12 @@ class CorpusAuditor:
             writer = getattr(self._records, "write_voided", None)
             for sid, outcome in failed.items():
                 if writer is not None:
-                    await writer(self._job_id, sid, {
+                    document = {
                         "schema": VOIDED_SCHEMA, "submission_id": sid,
                         "hotkey": records[sid]["hotkey"], "executor_id": executor_id,
-                        "reason": "executor_quarantined", "voided_at": now, **outcome})
+                        "reason": "executor_quarantined", "voided_at": now, **outcome}
+                    await writer(self._job_id, sid, document)
+                    self._report_voided(sid, document)
         logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
                        "%s; %d failed", self._job_id, len(ids), executor_id, len(failed))
         return sorted(failed)

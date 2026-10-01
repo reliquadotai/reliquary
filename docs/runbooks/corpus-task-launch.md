@@ -649,6 +649,35 @@ and it generates only for a prompt with a slot left. Its counts gain `skipped` (
 rest of the run. Older miners never call them and see no change: submit, its
 refusals and the cursor route are the same.
 
+### 4.2 Your own status: audit state, failures, pay
+
+`GET /corpus/jobs/<job>/miners/<hotkey>` (legacy `GET /corpus/miners/<hotkey>`,
+the default job) answers, for that hotkey only:
+
+- `audit_state`: `probation` (with `probation_remaining`, the audited passes
+  still needed), `sampled`, `suspect` (with `suspect_until`) or `banned` (with
+  `banned_until`), unix seconds;
+- `submissions_accepted`, `audited`, `passed` (of which `passed_unaudited`),
+  `failed`, `pending_audit`, `voided`;
+- `recent_failures`: the last 20 failed verdicts, newest first, with what the
+  verdict records (`reason`, e.g. `mant_err_mean`, and the worst chunk measures
+  `worst_exp`, `worst_mant_mean`, `worst_mant_median`), next to the job's
+  `toploc_thresholds`;
+- `verified_tokens_settled`, and `share_last_windows`: the hotkey's share of
+  the task's rewards over its last 24 settled windows, with the task `cap`
+  (the task's part of the emission);
+- `as_of`, and `counts_complete`: false while the validator is still reading
+  what was written before its last restart (the counts then only grow).
+
+A hotkey the job has never seen answers 200 with zeros and `probation`. The
+answer is cached 30 s per hotkey; it costs the validator no store listing.
+
+```bash
+reliquary corpus status --validator-url http://<validator-ip>:<port> \
+  --job-id <job> --hotkey <ss58>            # or --wallet-name/--wallet-hotkey
+reliquary corpus status ... --json          # the route's JSON as is
+```
+
 ## 5. Watch
 
 - **Audit backlog**: submissions vs verdicts. They must grow at the same rate;

@@ -471,6 +471,11 @@ On a healthy startup:
 
 If submissions are rejected, the `reason` field tells you why (see the rejection table above).
 
+Corpus (SFT) tasks: `reliquary corpus status --validator-url URL --job-id JOB
+--hotkey SS58` (route `GET /corpus/jobs/<job>/miners/<hotkey>`) shows your audit
+state, verdict counts, recent failures with their TOPLOC measures, and what the
+task paid you; see [Corpus task launch §4.2](runbooks/corpus-task-launch.md#42-your-own-status-audit-state-failures-pay).
+
 ## Monitoring and stopping
 
 The miner loop runs until killed. It prefers `/miner-state` with conditional ETag requests and falls back to `/state` when unsupported. Outside OPEN it normally waits 1 second between polls; state-fetch failures wait `POLL_INTERVAL_SECONDS` (10 seconds) after bounded HTTP attempts. The checkpoint identity is persisted locally and checked on restart. The verdict monitor runs independently of generation.
