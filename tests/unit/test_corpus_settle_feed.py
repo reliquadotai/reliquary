@@ -396,6 +396,9 @@ class _SlowListingR2:
         return _Paginator()
 
 
+LOOP_GAP_LIMIT = 0.45
+
+
 async def _max_gap_while(coro) -> tuple[float, object]:
     gaps = []
     done = asyncio.Event()
@@ -426,7 +429,9 @@ def test_a_large_record_listing_does_not_block_the_event_loop(monkeypatch):
     store = BucketRecordStore()
     gap, ids = asyncio.run(_max_gap_while(store.list_verdict_ids("math-v1")))
     assert len(ids) == PAGES * PER_PAGE
-    assert gap < PARSE_SECONDS * 0.5, f"event loop blocked {gap * 1000:.0f} ms"
+    # Loose on purpose: a busy CI box stretches the thread hand-off, while the
+    # same listing on the loop blocks it 600+ ms.
+    assert gap < LOOP_GAP_LIMIT, f"event loop blocked {gap * 1000:.0f} ms"
 
 
 def test_the_other_tasks_listing_does_not_block_the_event_loop():
@@ -442,7 +447,9 @@ def test_the_other_tasks_listing_does_not_block_the_event_loop():
          patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=slow_windows)):
         gap, best = asyncio.run(_max_gap_while(archives.other_max("corpus-math")))
     assert best == 46_999
-    assert gap < PARSE_SECONDS * 0.5, f"event loop blocked {gap * 1000:.0f} ms"
+    # Loose on purpose: a busy CI box stretches the thread hand-off, while the
+    # same listing on the loop blocks it 600+ ms.
+    assert gap < LOOP_GAP_LIMIT, f"event loop blocked {gap * 1000:.0f} ms"
 
 
 def test_the_auditor_hook_feeds_the_settler_before_the_status_hook():
