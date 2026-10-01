@@ -55,3 +55,8 @@ Ruling: a result that does not fit its lease answers 422 and the batch is re-que
 Ruling: the result body is `{scores}` only (the token names the executor and the lease must be its own); the heartbeat answers the registered `model_id`/`model_revision`, so `audit-executor` may omit them.
 Ruling: a lease holds at most 64 items and 262,144 tokens; an executor is connected while heard from within 90 s; the control writes its last contact into the executor's registry object at most every 30 s.
 Ruling: the control still loads the model in this phase: it is the trusted verifier for rechecks and the vocabulary check; a GPU-less control is left for later.
+
+## Review fix pass (R1)
+
+Ruling (review I1): submit and skip hold a per-job in-flight count while they run; a retired job is unwired only in a later refresh than the one that retired it, with no admission in flight, and only if it is still drained and still has nothing in flight after the drain check — the retired gate admits nothing new, so no record can appear after that.
+Ruling (review I8): only deterministic wiring refusals (a `ValueError`: renderer, prompt source, contract) are remembered; any other wiring failure (store, transport) is retried at every refresh and logged at ERROR from the 5th attempt.

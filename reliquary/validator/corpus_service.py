@@ -18,6 +18,8 @@ reversible step.
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -1666,6 +1668,9 @@ class CorpusJobRoutes:
         self.routers: dict[str, APIRouter] = dict(routers or {})
         self.contracts: dict[str, Any] = {}
         self.retired: set[str] = set()
+        # Admissions (submit, skip) past the retired check and not yet returned:
+        # a job is unwired only once none is left.
+        self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
 
     def add(self, job_id: str, router: APIRouter, *, contract: Any = None) -> None:
@@ -1686,6 +1691,20 @@ class CorpusJobRoutes:
 
     def open_jobs(self) -> list[str]:
         return sorted(j for j in self.routers if j not in self.retired)
+
+    @contextlib.asynccontextmanager
+    async def admission(self, job_id: str):
+        """The job's router for one write, refused once retired, counted while it runs."""
+        if job_id in self.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        router = self.routers.get(job_id)
+        if router is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        self.in_flight[job_id] += 1
+        try:
+            yield router
+        finally:
+            self.in_flight[job_id] -= 1
 
 
 JOB_RETIRED = "job_retired"
@@ -1742,13 +1761,15 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     async def skip_corpus_scoped(job_id: str, request: CorpusSkipRequest) -> CorpusSkipResponse:
         # The path picks the job's router; that router still refuses a body
         # naming another job, so the two can never disagree silently.
-        return await _admitting(job_id).skip_corpus(request)
+        async with routes.admission(job_id) as served:
+            return await served.skip_corpus(request)
 
     @router.post(SUBMIT_SCOPED_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus_scoped(
         job_id: str, request: CorpusSubmissionRequest
     ) -> CorpusSubmissionResponse:
-        return await _admitting(job_id).submit_corpus(request)
+        async with routes.admission(job_id) as served:
+            return await served.submit_corpus(request)
 
     if not legacy:
         return router
@@ -1775,26 +1796,26 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         # Dispatched on the body, as submit is.
         if request.job_id in routes.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
-        target = routes.routers.get(request.job_id)
-        if target is None:
+        if request.job_id not in routes.routers:
             return _refuse_skip(
                 CorpusRejectReason.JOB_NOT_SERVED,
                 {"job_id": request.job_id, "serves": routes.open_jobs()},
             )
-        return await target.skip_corpus(request)
+        async with routes.admission(request.job_id) as target:
+            return await target.skip_corpus(request)
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(request: CorpusSubmissionRequest) -> CorpusSubmissionResponse:
         # As a single job's route does: refused before any store is touched.
         if request.job_id in routes.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
-        target = routes.routers.get(request.job_id)
-        if target is None:
+        if request.job_id not in routes.routers:
             return _refuse(
                 CorpusRejectReason.JOB_NOT_SERVED,
                 {"job_id": request.job_id, "serves": routes.open_jobs()},
             )
-        return await target.submit_corpus(request)
+        async with routes.admission(request.job_id) as target:
+            return await target.submit_corpus(request)
 
     return router
 

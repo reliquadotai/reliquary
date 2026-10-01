@@ -456,6 +456,7 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
                 registry["corpus-code"] = _registry_entry(
                     tmp_path, "-b", "corpus-code", "code-v1", status="retired")
                 await job_set.refresh()
+                await job_set.refresh()
                 seen["retired_next"] = (await client.get("/corpus/jobs/code-v1/next/5Hot")).status_code
                 seen["served_after_drain"] = sorted(job_set.served)
                 seen["status_drained"] = (await client.get("/corpus/jobs/code-v1/status")).json()
@@ -482,3 +483,67 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
     assert seen["status_open"]["state"] == "open"
     assert seen["status_open"]["submissions_accepted"] == 0
     assert seen["status_drained"]["state"] == "drained"
+
+
+# --------------------------------------------------------------------------
+# Review fixes: I1 (drain race), I8 (transient wiring errors)
+# --------------------------------------------------------------------------
+
+
+def test_a_submit_in_flight_holds_the_job_wired_until_it_returns():
+    from tests.unit.test_corpus_multi_job_service import _body
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")])
+        await h.set.refresh()
+        router = h.routes.routers["swe-v1"]
+        release = asyncio.Event()
+
+        async def slow_submit(request):
+            await release.wait()
+            return {"reason": "accepted", "accepted": True}
+
+        router.submit_corpus = slow_submit
+        h.drained["swe-v1"] = True
+        async with h.client() as client:
+            submit = asyncio.ensure_future(client.post("/corpus/submit", json=_body("swe-v1")))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert h.routes.in_flight["swe-v1"] == 1
+            h.entries = [_hot_entry(job_id="swe-v1", status="retired")]
+            await h.set.refresh()
+            await h.set.refresh()
+            assert "swe-v1" in h.set.served  # the admitted submit is still running
+            release.set()
+            assert (await submit).status_code == 200
+        assert h.routes.in_flight["swe-v1"] == 0
+        await h.set.refresh()
+        assert "swe-v1" not in h.set.served
+
+    asyncio.run(go())
+
+
+def test_a_job_is_never_unwired_in_the_refresh_that_retired_it():
+    async def go():
+        h = _Harness([_hot_entry()])
+        await h.set.refresh()
+        h.drained["job-b"] = True
+        h.entries = [_hot_entry(status="retired")]
+        await h.set.refresh()
+        assert "job-b" in h.set.served
+        await h.set.refresh()
+        assert "job-b" not in h.set.served
+
+    asyncio.run(go())
+
+
+def test_a_transient_wiring_error_is_retried_on_the_next_refresh():
+    async def go():
+        h = _Harness([_hot_entry()], wire_error=OSError("r2 timeout"))
+        await h.set.refresh()
+        assert h.set.served == {}
+        h.wire_error = None
+        await h.set.refresh()
+        assert list(h.set.served) == ["job-b"]
+
+    asyncio.run(go())

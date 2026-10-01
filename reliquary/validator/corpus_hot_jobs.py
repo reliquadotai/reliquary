@@ -11,6 +11,7 @@ an entry is logged once, never once per refresh.
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -19,6 +20,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 JOB_REFRESH_SECONDS = 60.0
+
+# Transient wiring failures of one task before they are logged as errors.
+WIRE_FAILURES_LOUD = 5
 
 OTHER_MODEL = "other_model"
 REFUSED = "refused"
@@ -129,6 +133,10 @@ class CorpusJobSet:
         self._failure: asyncio.Future | None = None
         # One refresh at a time: two interleaved would wire one entry twice.
         self._refresh_lock = asyncio.Lock()
+        # Jobs retired as of the end of the last refresh: only those may be unwired.
+        self._retired_before: set[str] = set()
+        # Transient wiring failures per task id, retried every refresh.
+        self._wire_failures: collections.Counter = collections.Counter()
 
     @property
     def refreshing(self) -> bool:
@@ -193,8 +201,11 @@ class CorpusJobSet:
             if entry.status != "active" or task_id in by_task or task_id in self._passed_over:
                 continue
             await self._consider(entry)
-        for job_id in [j for j in self.served if self.is_retired(j)]:
+        # Never in the refresh that retired it: a submit admitted just before
+        # may not have written its record yet.
+        for job_id in [j for j in self.served if j in self._retired_before]:
             await self._maybe_unwire(job_id)
+        self._retired_before = {j for j in self.served if self.is_retired(j)}
 
     async def _consider(self, entry) -> None:
         task_id, job_id = str(entry.task_id), str(entry.job_id)
@@ -217,11 +228,21 @@ class CorpusJobSet:
         try:
             wiring = await self._wire(entry, float(entry.params["cap"]), job)
             router = self._router_for(wiring)
-        except Exception as exc:
-            # One job this binary cannot serve must never take the others down.
+        except ValueError as exc:
+            # Deterministic (the renderer, the prompt source): remembered.
             logger.exception("corpus task %s refused: job %s could not be wired", task_id, job_id)
             self._pass_over(task_id, REFUSED, f"wiring failed: {exc}", log=False)
             return
+        except Exception:
+            # A store or transport fault: tried again next refresh, never taking
+            # the other jobs down.
+            self._wire_failures[task_id] += 1
+            failures = self._wire_failures[task_id]
+            logger.log(logging.ERROR if failures >= WIRE_FAILURES_LOUD else logging.WARNING,
+                       "corpus task %s: wiring job %s failed (%d time(s)); retrying next refresh",
+                       task_id, job_id, failures, exc_info=True)
+            return
+        self._wire_failures.pop(task_id, None)
         self._routes.add(job_id, router, contract=entry.contract)
         self.served[job_id] = wiring
         self._start(wiring)
@@ -237,8 +258,12 @@ class CorpusJobSet:
 
     async def _maybe_unwire(self, job_id: str) -> None:
         wiring = self.served[job_id]
+        if self._routes.in_flight[job_id]:
+            return
         try:
-            if not await self._drained(wiring):
+            # The gate is closed (retired) and nothing is in flight: no record can
+            # appear after this check.
+            if not await self._drained(wiring) or self._routes.in_flight[job_id]:
                 return
         except Exception:
             logger.exception("corpus job %s: drain check failed; retrying next refresh", job_id)
@@ -287,7 +312,8 @@ class CorpusJobSet:
                 raise
             logger.warning("corpus status of %s: ledger unreadable, serving the last one", job_id)
             return cached[1]
-        self._status_cache[job_id] = (now, fresh)
+        if job_id in self.served:
+            self._status_cache[job_id] = (now, fresh)
         return fresh
 
     async def run(self) -> None:
