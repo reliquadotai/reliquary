@@ -21,6 +21,9 @@ from reliquary.protocol.profiles import PROOF_SCHEME_TOPLOC
 
 logger = logging.getLogger(__name__)
 
+# How long `/corpus/tasks` serves one registry read.
+TASKS_CACHE_SECONDS = 60.0
+
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -307,6 +310,34 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         if status is None:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
+
+    tasks_cache: dict = {}
+
+    @app.get("/corpus/tasks")
+    async def corpus_tasks() -> dict:
+        # Public: every declared task's emission share, from the registry, cached a minute.
+        now = time.time()
+        if tasks_cache.get("at", 0.0) + TASKS_CACHE_SECONDS > now:
+            return tasks_cache["body"]
+        reader = getattr(app.state, "task_registry_reader", None)
+        if reader is None:
+            from reliquary.infrastructure.task_registry_store import read_registry as reader
+        try:
+            entries, _ = await reader()
+        except Exception as exc:
+            logger.warning("corpus tasks: registry unavailable: %r", exc)
+            raise HTTPException(status_code=503, detail="task_registry_unavailable") from exc
+        tasks = [
+            {"task_id": e.task_id, "mechanism": e.mechanism, "cap": float(e.params["cap"]),
+             "status": e.status, "job_id": getattr(e, "job_id", None),
+             "retired_at": getattr(e, "retired_at", None)}
+            for e in sorted(entries.values(), key=lambda e: e.task_id)
+        ]
+        body = {"as_of": now, "tasks": tasks,
+                "active_cap_total": round(math.fsum(t["cap"] for t in tasks
+                                                    if t["status"] == "active"), 9)}
+        tasks_cache.update(at=now, body=body)
+        return body
 
     async def miner_status(job_id: str, hotkey: str) -> dict:
         # Public: this hotkey's own state and counts, from memory, cached.
