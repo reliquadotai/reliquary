@@ -65,7 +65,7 @@ def job_status(*, job_id: str, job: Any, slots: Any, stats: JobStats, settled: i
     ``counts_complete`` is False until the settler has read its totals, and
     for a job settled before totals were kept.
     """
-    full = sum(1 for taken in slots.snapshot().values() if taken >= job.slots_per_prompt)
+    full = sum(1 for index in slots.snapshot() if slots.remaining(index) <= 0)
     if drained:
         state = "drained"
     elif retired:
@@ -88,7 +88,21 @@ def job_status(*, job_id: str, job: Any, slots: Any, stats: JobStats, settled: i
         "settled": int(settled or 0),
         "accepted_last_hour": stats.accepted_last_hour(),
         "counts_complete": bool(totals is not None and totals.get("complete", True)),
+        **_eval_prompt_counts(job, slots),
     }
+
+
+def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:
+    """An eval job's completeness: ``prompts_complete`` (V slots of work not
+    failed), ``prompts_exhausted`` (every attempt used) and ``complete`` (each
+    prompt one or the other). Absent for every other job."""
+    from reliquary.eval.prompt_source import is_eval_source
+
+    if not is_eval_source(getattr(job, "prompt_source", "")):
+        return {}
+    counts = slots.prompt_counts()
+    return {"prompts_complete": counts["complete"], "prompts_exhausted": counts["exhausted"],
+            "complete": counts["open"] == 0}
 
 
 async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:

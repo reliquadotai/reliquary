@@ -128,6 +128,9 @@ class ExecutorDirectory:
     def _refusal(self, document: dict | None) -> str | None:
         if document is None:
             return "unknown_token"
+        if (document.get("scope") or "corpus") != "corpus":
+            # An eval executor serves the eval control, never this one.
+            return "wrong_scope"
         if document.get("status") != "active" or document["executor_id"] in self._revoked:
             return "revoked"
         if float(document.get("expires_at") or 0) <= self._clock():

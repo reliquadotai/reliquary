@@ -58,7 +58,7 @@ _JOB_FIELDS = (
 # manifest that predates it stores and hashes byte-identically. A binary that
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
-_OPTIONAL_JOB_FIELDS = ("prompt_start",)
+_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed")
 
 
 class JobError(ValueError):
@@ -104,6 +104,8 @@ class JobSpec:
     # every prompt index it handles -- walk, submission, ledger, export -- is a
     # SOURCE index in that range.
     prompt_start: int = 0
+    # Recorded for reproducibility (eval jobs); nothing verifies a miner used it.
+    seed: int | None = None
 
     @property
     def prompt_end(self) -> int:
@@ -154,6 +156,7 @@ class JobSpec:
             "prompt_order": self.prompt_order,
             "deadline_round": self.deadline_round,
             **({"prompt_start": self.prompt_start} if self.prompt_start else {}),
+            **({"seed": self.seed} if self.seed is not None else {}),
         }
 
 
@@ -304,4 +307,5 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         prompt_start=(
             _non_negative_int(raw, "prompt_start") if "prompt_start" in raw else 0
         ),
+        seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
     )

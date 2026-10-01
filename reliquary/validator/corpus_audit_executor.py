@@ -24,6 +24,8 @@ IDLE_SECONDS = 2.0
 ERROR_BACKOFF_SECONDS = 10.0
 REQUEST_TIMEOUT_SECONDS = 120.0
 TOKEN_ENV = "RELIQUARY_EXECUTOR_TOKEN"
+AUDIT_PREFIX = "/corpus/internal/audit"
+EVAL_AUDIT_PREFIX = "/corpus/internal/eval-audit"
 
 
 def load_public_model(model_id: str, revision: str):
@@ -48,11 +50,14 @@ class AuditExecutor:
                  batch_tokens: int | None = None,
                  heartbeat_seconds: float = HEARTBEAT_SECONDS,
                  idle_seconds: float = IDLE_SECONDS,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 prefix: str = AUDIT_PREFIX) -> None:
         if not token:
             raise ValueError(f"{TOKEN_ENV} is empty")
         self._http = http
         self._executor_id = executor_id
+        # The eval control serves the same protocol under its own prefix.
+        self._prefix = prefix
         self._headers = {"Authorization": f"Bearer {token}"}
         self.model_id, self.model_revision = model_id, model_revision
         self._load_model = load_model
@@ -73,7 +78,7 @@ class AuditExecutor:
                                      timeout=REQUEST_TIMEOUT_SECONDS)
 
     async def heartbeat(self) -> dict:
-        response = await self._post("/corpus/internal/audit/heartbeat", {
+        response = await self._post(f"{self._prefix}/heartbeat", {
             "executor_id": self._executor_id,
             "detail": {"leases": self.leases, "loaded": self._model is not None},
         })
@@ -117,7 +122,7 @@ class AuditExecutor:
         """One claim; True when a lease was scored and posted."""
         if self._last_heartbeat is None or self._clock() - self._last_heartbeat >= self._heartbeat_every:
             await self.heartbeat()
-        response = await self._post("/corpus/internal/audit/claim", {
+        response = await self._post(f"{self._prefix}/claim", {
             "executor_id": self._executor_id, "model_id": self.model_id,
             "model_revision": self.model_revision,
         })
@@ -126,7 +131,7 @@ class AuditExecutor:
         response.raise_for_status()
         lease = AuditLease.model_validate(response.json())
         scores = await asyncio.to_thread(self._score, lease)
-        posted = await self._post(f"/corpus/internal/audit/{lease.lease_id}/result",
+        posted = await self._post(f"{self._prefix}/{lease.lease_id}/result",
                                   {"scores": scores})
         if posted.status_code in (410, 422):
             logger.warning("audit lease %s not taken: %s", lease.lease_id[:8], posted.text[:200])
@@ -155,7 +160,7 @@ class AuditExecutor:
 
 
 def run_audit_executor(*, control_url: str, executor_id: str, model_id: str | None = None,
-                       model_revision: str | None = None) -> None:
+                       model_revision: str | None = None, prefix: str = AUDIT_PREFIX) -> None:
     import httpx
 
     token = os.environ.get(TOKEN_ENV, "").strip()
@@ -164,7 +169,8 @@ def run_audit_executor(*, control_url: str, executor_id: str, model_id: str | No
         async with httpx.AsyncClient(base_url=control_url.rstrip("/"),
                                      follow_redirects=False) as http:
             await AuditExecutor(http=http, executor_id=executor_id, token=token,
-                                model_id=model_id, model_revision=model_revision).run()
+                                model_id=model_id, model_revision=model_revision,
+                                prefix=prefix).run()
 
     asyncio.run(main())
 

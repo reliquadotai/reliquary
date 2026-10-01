@@ -21,6 +21,12 @@ from reliquary.infrastructure.storage import get_s3_client
 EXECUTOR_SCHEMA = "reliquary/corpus-executor/v1"
 EXECUTOR_PREFIX = "reliquary/corpus/executors/"
 EXECUTOR_STATUSES = frozenset({"active", "revoked", "quarantined"})
+# Which control an executor serves; a registration without one is the corpus control's.
+EXECUTOR_SCOPES = frozenset({"corpus", "eval"})
+
+
+def scope_of(document: Mapping) -> str:
+    return str(document.get("scope") or "corpus")
 WRITE_ATTEMPTS = 5
 READ_CONCURRENCY = 16
 
@@ -91,9 +97,12 @@ async def read_executor(executor_id: str, **client_kwargs) -> dict | None:
 
 async def register_executor(*, executor_id: str, token_sha256: str, model_id: str,
                             model_revision: str, expires_at: float, now: float,
-                            **client_kwargs) -> tuple[dict, bool]:
+                            provider_id: str | None = None, host: str | None = None,
+                            scope: str = "corpus", **client_kwargs) -> tuple[dict, bool]:
     """Create-only. The same registration again returns the stored one; the
-    same id with other credentials or another model is a conflict."""
+    same id with other credentials or another model is a conflict.
+    ``provider_id``/``host`` say where it runs (the eval control pairs
+    executors only across both); written only when given."""
     key = _key(executor_id)
     if not isinstance(token_sha256, str) or not _HEX64.fullmatch(token_sha256):
         raise ValueError("token_sha256 must be 64 lowercase hex characters")
@@ -109,14 +118,27 @@ async def register_executor(*, executor_id: str, token_sha256: str, model_id: st
         "expires_at": float(expires_at), "status": "active", "registered_at": float(now),
         "last_heartbeat": None,
     }
+    if scope not in EXECUTOR_SCOPES:
+        raise ValueError(f"scope must be one of {sorted(EXECUTOR_SCOPES)}")
+    if scope == "eval" and not (provider_id and host):
+        raise ValueError("an eval executor needs its provider_id and host")
+    if scope != "corpus":
+        # Written only off the default, so a corpus registration is unchanged.
+        document["scope"] = scope
+    for field, value in (("provider_id", provider_id), ("host", host)):
+        if value is not None:
+            if not isinstance(value, str) or not value or len(value) > 256:
+                raise ValueError(f"{field} must be a non-empty string")
+            document[field] = value
     for _ in range(WRITE_ATTEMPTS):
         if await _put(key, document, None, **dict(client_kwargs)):
             return document, True
         stored, _ = await _get(key, **dict(client_kwargs))
         if stored is None:
             continue
-        same = all(stored.get(f) == document[f]
-                   for f in ("token_sha256", "model_id", "model_revision", "expires_at"))
+        same = all(stored.get(f) == document.get(f)
+                   for f in ("token_sha256", "model_id", "model_revision", "expires_at",
+                             "provider_id", "host", "scope"))
         if not same:
             raise ExecutorConflict(f"executor {executor_id!r} is already registered differently")
         return stored, False
@@ -136,10 +158,16 @@ async def _update(executor_id: str, change: Callable[[dict], dict], **client_kwa
 
 
 async def set_executor_status(executor_id: str, status: str, *, reason: str | None = None,
-                              **client_kwargs) -> dict | None:
-    """Revoke or quarantine; never reactivates (a new id is registered instead)."""
+                              scope: str | None = None, **client_kwargs) -> dict | None:
+    """Revoke or quarantine; never reactivates (a new id is registered instead).
+    With ``scope``, an executor of another scope is left untouched (None): the
+    eval control can never quarantine a corpus executor."""
     if status not in EXECUTOR_STATUSES - {"active"}:
         raise ValueError(f"status {status!r} is not revoked or quarantined")
+    if scope is not None:
+        stored = await read_executor(executor_id, **dict(client_kwargs))
+        if stored is None or scope_of(stored) != scope:
+            return None
 
     def change(document: dict) -> dict:
         document["status"] = status
@@ -184,6 +212,7 @@ async def list_executors(**client_kwargs) -> list[dict]:
 
 __all__ = [
     "EXECUTOR_PREFIX",
+    "EXECUTOR_SCOPES",
     "EXECUTOR_SCHEMA",
     "EXECUTOR_STATUSES",
     "ExecutorConflict",
@@ -191,6 +220,7 @@ __all__ = [
     "read_executor",
     "record_heartbeat",
     "register_executor",
+    "scope_of",
     "set_executor_status",
     "validated_executor_id",
 ]
