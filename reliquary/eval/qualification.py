@@ -140,13 +140,12 @@ class QualificationStore:
                           **dict(self._client_kwargs))
 
     async def list_ids(self) -> list[str]:
-        from reliquary.infrastructure.corpus_job_store import _bucket
-        from reliquary.infrastructure.storage import get_s3_client
+        from reliquary.infrastructure import corpus_job_store as jobs
 
         kwargs = dict(self._client_kwargs)
-        bucket = _bucket(kwargs)
+        bucket = jobs._bucket(kwargs)
         ids = []
-        async with get_s3_client(**kwargs) as client:
+        async with jobs.get_s3_client(**kwargs) as client:
             paginator = client.get_paginator("list_objects_v2")
             async for page in paginator.paginate(Bucket=bucket, Prefix=QUALIFICATION_PREFIX):
                 for obj in page.get("Contents", []) or []:
@@ -156,6 +155,122 @@ class QualificationStore:
         return sorted(ids)
 
 
+QUALIFY_LEASE_SECONDS = 7200.0
+
+
+class QualificationQueue:
+    """The eval control's side: pending qualifications leased to an executor
+    registered for their model, and its measured band turned into a verdict."""
+
+    def __init__(self, *, store, read_prompts, proof=None, clock=time.time,
+                 lease_seconds: float = QUALIFY_LEASE_SECONDS) -> None:
+        if proof is None:
+            from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as proof
+        self._store = store
+        self._read_prompts = read_prompts
+        self._proof = proof
+        self._clock = clock
+        self._lease_seconds = lease_seconds
+        self._open: dict[str, dict] = {}
+
+    async def refresh(self) -> None:
+        for qualification_id in await self._store.list_ids():
+            record, _ = await self._store.read(qualification_id)
+            if record is None or record.get("status") in TERMINAL:
+                self._open.pop(qualification_id, None)
+            else:
+                self._open[qualification_id] = record
+
+    def _claimable(self, record: dict, executor: dict) -> bool:
+        if (record["model"], record["revision"]) != (executor.get("model_id"),
+                                                     executor.get("model_revision")):
+            return False
+        lease = record.get("lease") or {}
+        return record["status"] == PENDING or (
+            record["status"] == LEASED and float(lease.get("expires_at", 0)) <= self._clock())
+
+    async def claim(self, executor: dict) -> dict | None:
+        """A qualify lease for this executor's model, or None."""
+        import secrets
+
+        from reliquary.eval.prompt_source import head_lines
+        from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+
+        for qualification_id in sorted(self._open):
+            record, etag = await self._store.read(qualification_id)
+            if record is None or not self._claimable(record, executor):
+                continue
+            body = await self._read_prompts(record["set_id"])
+            if body is None:
+                continue
+            rows = [json.loads(line) for line in head_lines(
+                body, min(record["problems"], len(body.splitlines()))).splitlines()]
+            lease = {"lease_id": secrets.token_hex(16), "executor_id": executor["executor_id"],
+                     "expires_at": self._clock() + self._lease_seconds}
+            leased = {**record, "status": LEASED, "lease": lease}
+            try:
+                await self._store.write(leased, etag)
+            except CorpusStoreConflict:
+                continue
+            self._open[qualification_id] = leased
+            return {
+                "protocol": "reliquary.corpus-audit/v1", "type": "qualify",
+                "lease_id": lease["lease_id"], "qualification_id": qualification_id,
+                "model_id": record["model"], "model_revision": record["revision"],
+                "chunk_tokens": self._proof.chunk_tokens, "topk": self._proof.topk,
+                "expires_at": lease["expires_at"],
+                "prompts": [{"problem_id": r["problem_id"],
+                             "text": r["messages"][-1]["content"]} for r in rows],
+                "completions": record["completions"], "sampling": record["sampling"],
+                "max_new_tokens": record["max_new_tokens"], "thinking": record["thinking"],
+            }
+        return None
+
+    def lease_of(self, lease_id: str) -> str | None:
+        for qualification_id, record in self._open.items():
+            if (record.get("lease") or {}).get("lease_id") == lease_id:
+                return qualification_id
+        return None
+
+    async def result(self, executor: dict, lease_id: str, result) -> dict:
+        """Record a measured band; raises ``LeaseRefused`` for a lease not this
+        executor's or expired."""
+        from reliquary.validator.corpus_audit_remote import LeaseRefused
+
+        qualification_id = self.lease_of(lease_id)
+        record, etag = (await self._store.read(qualification_id)
+                        if qualification_id else (None, None))
+        lease = (record or {}).get("lease") or {}
+        if (record is None or record.get("status") != LEASED or lease.get("lease_id") != lease_id
+                or lease.get("executor_id") != executor["executor_id"]):
+            raise LeaseRefused(410, "lease_unknown")
+        if float(lease["expires_at"]) <= self._clock():
+            raise LeaseRefused(410, "lease_expired")
+        verdict = thresholds_from_band(result.chunks)
+        refused = verdict["refused"]
+        if result.failed_completions:
+            refused = (f"{result.failed_completions} honest completion(s) failed their own "
+                       "proofs on the executor that decoded them")
+        measured = {
+            "thresholds": verdict["thresholds"], "band": verdict["band"],
+            "refused_reason": refused,
+            "tokens_per_gpu_hour": result.completion_tokens / result.decode_seconds * 3600.0
+            / result.gpu_count,
+            "checkpoint_sha256": result.checkpoint_sha256, "architecture": result.architecture,
+            "eos_token_id": result.eos_token_id, "executor_id": executor["executor_id"],
+            "provider_id": executor.get("provider_id"), "host": executor.get("host"),
+            "gpu": result.gpu, "gpu_count": result.gpu_count,
+            "vllm_version": result.vllm_version, "completions": result.completions,
+            "failed_completions": result.failed_completions,
+            "completion_tokens": result.completion_tokens,
+            "decode_seconds": result.decode_seconds, "measured_at": self._clock(),
+        }
+        final = {**record, "status": REFUSED if refused else QUALIFIED, "result": measured}
+        await self._store.write(final, etag)
+        self._open.pop(qualification_id, None)
+        return final
+
+
 __all__ = [
     "FAILED",
     "LEASED",
@@ -163,6 +278,8 @@ __all__ = [
     "QUALIFICATION_SCHEMA",
     "QUALIFIED",
     "QUALIFY_COMPLETIONS",
+    "QUALIFY_LEASE_SECONDS",
+    "QualificationQueue",
     "QualificationStore",
     "REFUSED",
     "REQUEST_FIELDS",

@@ -1780,6 +1780,32 @@ def corpus_audit_executor(
                        model_revision=model_revision)
 
 
+@corpus_app.command("qualify")
+def corpus_qualify(
+    model: str = typer.Option(..., "--model", help="repo@revision of the model to qualify"),
+    control: str = typer.Option(..., "--control", help="The eval control's HTTPS origin"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Run one qualification of MODEL leased by the eval control: decode the
+    eval prompts with vLLM, verify them with the HF prefill, post the measured
+    TOPLOC band. The token is in RELIQUARY_EXECUTOR_TOKEN."""
+    import json
+
+    from reliquary.eval.qualify_executor import run_qualify
+
+    setup_logging(log_level)
+    if not os.environ.get("RELIQUARY_EXECUTOR_TOKEN", "").strip():
+        typer.echo("error: RELIQUARY_EXECUTOR_TOKEN is not set", err=True)
+        raise typer.Exit(code=1)
+    try:
+        answer = run_qualify(control_url=control, executor_id=executor_id, model=model)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(answer))
+
+
 @corpus_app.command("mine")
 def corpus_mine(
     validator_url: str = typer.Option(..., "--validator-url"),
