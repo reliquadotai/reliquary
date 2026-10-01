@@ -169,12 +169,13 @@ def test_an_unqualified_model_or_episode_env_is_refused(admin):
     assert response.status_code == 422
 
 
-def test_the_corpus_pool_limit_holds_and_takes_back_the_manifest(admin):
+def test_the_corpus_pool_limit_holds_and_keeps_the_manifest(admin):
     assert admin("POST", "/admin/v1/jobs", _job("math-a", cap=0.2)).status_code == 201
     over = admin("POST", "/admin/v1/jobs", _job("math-b", cap=0.15))
     assert over.status_code == 409 and "admin pool" in over.json()["detail"]
     assert "math-b" not in admin.registry["entries"]
-    assert "reliquary/corpus/jobs/math-b.json" not in admin.bucket.objects
+    # Never deleted: a racing call's task may name it; an orphan is harmless.
+    assert "reliquary/corpus/jobs/math-b.json" in admin.bucket.objects
 
 
 def test_the_sum_of_active_caps_stays_within_one(admin):
@@ -249,6 +250,7 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
     admin.records.verdicts = {sid: {"passed": True}}
     admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
                                 "completions": [{"text": "a", "tokens": [1]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
     first = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-1"})
     assert first.status_code == 202 and first.json()["state"] == "running"
     done = None
@@ -300,3 +302,114 @@ def test_admin_serve_refuses_to_start_unconfigured_and_serves_once_configured(
     result = CliRunner().invoke(app, ["admin", "serve", "--port", "9999"])
     assert result.exit_code == 0, result.output
     assert served and served[0][1]["port"] == 9999
+
+
+
+# --------------------------------------------------------------------------
+# Review fixes: I5, I6, I7 and the admin minors
+# --------------------------------------------------------------------------
+
+
+def test_a_create_losing_the_registry_race_answers_the_idempotent_200(admin, monkeypatch):
+    """I5: the other call's task now names the job; the manifest stays."""
+    from reliquary.infrastructure import task_registry_store as store
+    from reliquary.shared.task_registry import RegistryError
+
+    real = store.create_task
+
+    async def raced(entry, **kw):
+        await real(entry, **kw)  # the concurrent identical call lands first
+        raise RegistryError(f"task {entry.task_id!r} already exists")
+
+    monkeypatch.setattr(store, "create_task", raced)
+    response = admin("POST", "/admin/v1/jobs", _job())
+    assert response.status_code == 200 and response.json()["created"] is False
+    assert "reliquary/corpus/jobs/math-a.json" in admin.bucket.objects
+
+
+def test_a_create_whose_manifest_write_races_an_identical_one_proceeds(admin, monkeypatch):
+    """M6: the create-only manifest write lost to the same bytes is not a 409."""
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    del admin.registry["entries"]["math-a"]
+    real = job_store.read_job
+    calls = []
+
+    async def stale(job_id, **kw):
+        calls.append(job_id)
+        if len(calls) == 1:
+            return None, None  # read before the other call's write landed
+        return await real(job_id, **kw)
+
+    monkeypatch.setattr(job_store, "read_job", stale)
+    response = admin("POST", "/admin/v1/jobs", _job())
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.parametrize("task_id", ["default", "logic"])
+def test_cap_and_retire_refuse_a_task_that_is_not_a_corpus_task(admin, task_id):
+    """I6: the platform reaches its own corpus jobs only."""
+    admin.registry["entries"]["logic"] = _rl_entry("logic", 0.1)
+    for path, body in ((f"/admin/v1/tasks/{task_id}/cap", {"cap": 0.0}),
+                       (f"/admin/v1/tasks/{task_id}/retire", {})):
+        response = admin("POST", path, body)
+        assert response.status_code == 409 and response.json()["detail"] == "not_a_corpus_task"
+    assert admin.registry["entries"][task_id].status == "active"
+
+
+def test_a_retired_job_still_draining_holds_its_share_of_the_pool(admin):
+    """I7: its cap is still paid until it drains."""
+    assert admin("POST", "/admin/v1/jobs", _job("math-a", cap=0.2)).status_code == 201
+    assert admin("POST", "/admin/v1/tasks/math-a/retire", {}).status_code == 200
+    admin.records.subs = {"s1": {}}  # one submission still unaudited
+    assert admin("POST", "/admin/v1/jobs", _job("math-b", cap=0.15)).status_code == 409
+    admin.records.subs = {}
+    assert admin("POST", "/admin/v1/jobs", _job("math-b", cap=0.15)).status_code == 201
+
+
+def test_a_second_task_for_one_job_is_refused(admin):
+    """M7."""
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    response = admin("POST", "/admin/v1/jobs", _job(task_id="math-a-again"))
+    assert response.status_code == 409 and "math-a-again" not in admin.registry["entries"]
+
+
+def test_a_delivery_of_a_job_not_yet_drained_is_refused(admin):
+    """M8: a premature export would freeze a partial dataset under its id."""
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    admin.records.subs = {"s1": {}}
+    response = admin("POST", "/admin/v1/jobs/math-a/deliveries", {})
+    assert response.status_code == 409 and response.json()["detail"] == "job_not_drained"
+
+
+def test_a_retire_racing_another_answers_the_stored_stamp(admin, monkeypatch):
+    """M9."""
+    from dataclasses import replace
+
+    from reliquary.infrastructure import task_registry_store as store
+    from reliquary.shared.task_registry import RegistryError
+
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+
+    async def raced(task_id, retired_at, **kw):
+        entries = admin.registry["entries"]
+        entries[task_id] = replace(entries[task_id], status="retired", retired_at=555)
+        raise RegistryError("lost the race")
+
+    monkeypatch.setattr(store, "retire_task_entry", raced)
+    response = admin("POST", "/admin/v1/tasks/math-a/retire", {})
+    assert response.status_code == 200 and response.json()["retired_at"] == 555
+
+
+def test_a_non_ascii_signature_is_a_401_not_a_500(admin):
+    """M4."""
+    stamp = str(int(time.time()))
+    headers = {TIMESTAMP_HEADER: stamp, NONCE_HEADER: "ab" * 16,
+               SIGNATURE_HEADER: ("é" * 64).encode("latin-1")}
+    response = admin.client.get("/admin/v1/executors/pod-1", headers=headers)
+    assert response.status_code == 401
+
+
+def test_an_oversized_body_is_refused_before_it_is_read(admin):
+    """M5."""
+    response = admin("POST", "/admin/v1/jobs", raw=b"x" * (1024 * 1024 + 1))
+    assert response.status_code == 413

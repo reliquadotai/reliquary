@@ -22,6 +22,7 @@ NONCE_HEADER = "X-Reliquary-Nonce"
 SIGNATURE_HEADER = "X-Reliquary-Signature"
 
 _NONCE_RE = re.compile(r"^[0-9a-fA-F]{16,64}$")
+_SIGNATURE_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def sign_request(secret: bytes, timestamp: str, nonce: str, method: str, path: str,
@@ -59,6 +60,8 @@ class HmacVerifier:
         now = self._clock()
         if abs(now - stamp) > self._skew:
             return "stale_timestamp"
+        if not _SIGNATURE_RE.fullmatch(signature):
+            return "bad_signature"
         expected = sign_request(self._secret, timestamp, nonce, method, path, body)
         if not hmac.compare_digest(expected, signature.lower()):
             return "bad_signature"

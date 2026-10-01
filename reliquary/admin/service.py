@@ -28,6 +28,8 @@ from reliquary.admin.auth import (
 logger = logging.getLogger(__name__)
 
 _SUM_TOLERANCE = 1e-9
+# No admin request is larger; the bound is checked before the body is read.
+MAX_BODY_BYTES = 1024 * 1024
 # Renderer of a catalog source's rows: the model's own chat template.
 THINKING_RENDERERS = {False: "chat-template-v1", True: "chat-template-thinking-v1"}
 
@@ -81,13 +83,19 @@ class CreateDelivery(BaseModel):
     apply_filter: bool = True
 
 
-def cap_limits(pool_max: float) -> Callable[[Mapping, Mapping], None]:
-    """The registry guard: active caps within 1.0, active corpus caps within
-    ``pool_max``. A write that lowers a total is never refused by it."""
+def cap_limits(pool_max: float, *, drained_tasks=frozenset()) -> Callable[[Mapping, Mapping], None]:
+    """The registry guard: paying caps within 1.0, paying corpus caps within
+    ``pool_max``. Paying means active, or a retired corpus task whose job is
+    not in ``drained_tasks`` (it still settles). A write that lowers a total
+    is never refused by it."""
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION, RegistryError
 
+    def paying(e) -> bool:
+        return e.status == "active" or (e.mechanism == MECHANISM_CORPUS_GENERATION
+                                        and e.task_id not in drained_tasks)
+
     def totals(entries: Mapping) -> tuple[float, float]:
-        active = [e for e in entries.values() if e.status == "active"]
+        active = [e for e in entries.values() if paying(e)]
         return (sum(float(e.params["cap"]) for e in active),
                 sum(float(e.params["cap"]) for e in active
                     if e.mechanism == MECHANISM_CORPUS_GENERATION))
@@ -138,7 +146,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     catalog = {name: spec if isinstance(spec, QualifiedModel) else QualifiedModel(**spec)
                for name, spec in models.items()}
     verifier = HmacVerifier(secret, clock=clock)
-    guard = cap_limits(float(pool_max))
+    # Retired corpus tasks whose job is drained: their caps no longer pay.
+    drained_tasks: set[str] = set()
     if records is None:
         from reliquary.infrastructure.corpus_record_store import BucketRecordStore
 
@@ -165,6 +174,24 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def entries_naming(job_id: str) -> list:
         entries, _ = await registry_store.read_registry(strict=False)
         return [e for _, e in sorted(entries.items()) if e.job_id == job_id]
+
+    async def draining_limits():
+        """The cap guard, counting retired corpus tasks whose job has not drained."""
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+        from reliquary.validator.corpus_job_status import stored_job_counts
+
+        entries, _ = await registry_store.read_registry(strict=False)
+        for entry in entries.values():
+            if (entry.status == "retired" and entry.mechanism == MECHANISM_CORPUS_GENERATION
+                    and entry.job_id and entry.task_id not in drained_tasks):
+                if (await stored_job_counts(records, entry.job_id))["drained"]:
+                    # Drained is for good: never listed again.
+                    drained_tasks.add(entry.task_id)
+        return cap_limits(float(pool_max), drained_tasks=set(drained_tasks))
+
+    def idempotent(answer: dict, entry) -> dict:
+        return {**answer, "created": False, "status": entry.status,
+                "cap": float(entry.params["cap"])}
 
     @router.post("/jobs")
     async def create_job(body: CreateJob, response: Response) -> dict:
@@ -193,29 +220,39 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         except (RegistryError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         answer = {"job_id": body.job_id, "task_id": entry.task_id}
-        existing, _ = await job_store.read_job(body.job_id)
-        if existing is not None:
-            if existing.to_contract() != parse_job(manifest).to_contract():
-                raise HTTPException(status_code=409, detail="job_exists_with_another_manifest")
-            named = [e for e in await entries_naming(body.job_id) if e.task_id == entry.task_id]
-            if named:
-                response.status_code = 200
-                return {**answer, "created": False, "status": named[0].status,
-                        "cap": float(named[0].params["cap"])}
-        else:
-            try:
-                await job_store.write_job(manifest, None)
-            except job_store.CorpusStoreConflict as exc:
-                raise HTTPException(status_code=409, detail="job_manifest_raced") from exc
-        try:
-            await registry_store.create_task(entry, guard=guard)
-        except (RegistryError, registry_store.RegistryConflict) as exc:
-            # Nothing landed, so a manifest this call wrote is taken back.
+        wanted = parse_job(manifest).to_contract()
+
+        async def same_manifest_stored() -> bool:
+            existing, _ = await job_store.read_job(body.job_id)
             if existing is None:
-                try:
-                    await job_store.delete_job(body.job_id)
-                except Exception:
-                    logger.exception("admin: manifest of %s left behind", body.job_id)
+                return False
+            if existing.to_contract() != wanted:
+                raise HTTPException(status_code=409, detail="job_exists_with_another_manifest")
+            return True
+
+        if not await same_manifest_stored():
+            try:
+                # Create-only, and never deleted: a racing call's task may name it.
+                await job_store.write_job(manifest, None)
+            except job_store.CorpusStoreConflict:
+                if not await same_manifest_stored():
+                    raise HTTPException(status_code=503, detail="job_manifest_raced") from None
+        named = await entries_naming(body.job_id)
+        for other in named:
+            if other.task_id == entry.task_id:
+                response.status_code = 200
+                return idempotent(answer, other)
+        if named:
+            raise HTTPException(status_code=409, detail=(
+                f"job {body.job_id!r} is already declared by task {named[0].task_id!r}"))
+        try:
+            await registry_store.create_task(entry, guard=await draining_limits())
+        except (RegistryError, registry_store.RegistryConflict) as exc:
+            # Lost to an identical concurrent call: its task is this answer.
+            for other in await entries_naming(body.job_id):
+                if other.task_id == entry.task_id:
+                    response.status_code = 200
+                    return idempotent(answer, other)
             status = 409 if isinstance(exc, RegistryError) else 503
             raise HTTPException(status_code=status, detail=str(exc)) from exc
         logger.info("admin: declared job %s as task %s, cap %s", body.job_id, entry.task_id,
@@ -223,10 +260,24 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         response.status_code = 201
         return {**answer, "created": True, "status": "active", "cap": float(body.cap)}
 
+    async def corpus_entry(task_id: str):
+        """The task, refused unless it is a corpus task (never ``default``, never RL)."""
+        from reliquary.shared.task_id import DEFAULT_TASK_ID
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+        entries, _ = await registry_store.read_registry(strict=False)
+        entry = entries.get(task_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="task_unknown")
+        if task_id == DEFAULT_TASK_ID or entry.mechanism != MECHANISM_CORPUS_GENERATION:
+            raise HTTPException(status_code=409, detail="not_a_corpus_task")
+        return entry
+
     @router.post("/tasks/{task_id}/cap")
     async def set_cap(task_id: str, body: SetCap) -> dict:
+        await corpus_entry(task_id)
         try:
-            await registry_store.set_task_cap(task_id, body.cap, guard=guard)
+            await registry_store.set_task_cap(task_id, body.cap, guard=await draining_limits())
         except RegistryError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except registry_store.RegistryConflict as exc:
@@ -235,18 +286,20 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.post("/tasks/{task_id}/retire")
     async def retire(task_id: str, body: Retire) -> dict:
-        entries, _ = await registry_store.read_registry(strict=False)
-        entry = entries.get(task_id)
-        if entry is None:
-            raise HTTPException(status_code=404, detail="task_unknown")
+        entry = await corpus_entry(task_id)
         if entry.status == "retired":
             return {"task_id": task_id, "status": "retired", "retired_at": entry.retired_at}
         try:
             stamp = body.retired_at if body.retired_at is not None else current_round()
             await registry_store.retire_task_entry(task_id, stamp)
-        except RegistryError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except (registry_store.RegistryConflict, RuntimeError) as exc:
+        except (RegistryError, registry_store.RegistryConflict) as exc:
+            # A concurrent retire landed first: its stamp is the answer.
+            entry = await corpus_entry(task_id)
+            if entry.status == "retired":
+                return {"task_id": task_id, "status": "retired", "retired_at": entry.retired_at}
+            status = 409 if isinstance(exc, RegistryError) else 503
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"task_id": task_id, "status": "retired", "retired_at": stamp}
 
@@ -328,6 +381,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if stored is not None:
                 return {"state": "done", "delivery_id": delivery_id, "keys": stored["keys"],
                         "rows": stored["rows"]}
+            from reliquary.validator.corpus_job_status import stored_job_counts
+
+            # A delivery is final once written: never from a job still moving.
+            if not (await stored_job_counts(records, job_id))["drained"]:
+                raise HTTPException(status_code=409, detail="job_not_drained")
             grade, note = None, None
             if body.apply_filter and job.filter is not None:
                 try:
@@ -344,11 +402,35 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     app = FastAPI()
     app.include_router(router)
     app.state.exports = exports
+    app.add_middleware(BodyLimit, limit=MAX_BODY_BYTES)
     return app
 
 
-def token_sha256(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+class BodyLimit:
+    """Refuse a body over ``limit`` before any of it is read or parsed (pure
+    ASGI: FastAPI parses JSON bodies before the signature dependency runs)."""
+
+    def __init__(self, app, limit: int) -> None:
+        self.app, self.limit = app, limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope["headers"])
+            length = headers.get(b"content-length")
+            refusal = None
+            if length is None and headers.get(b"transfer-encoding"):
+                refusal = (411, b'{"detail":"length_required"}')
+            elif length is not None and (not length.isdigit() or int(length) > self.limit):
+                refusal = (413, b'{"detail":"body_too_large"}')
+            if refusal is not None:
+                await send({"type": "http.response.start", "status": refusal[0],
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": refusal[1]})
+                return
+        await self.app(scope, receive, send)
+
+
+from reliquary.validator.corpus_audit_remote import token_sha256  # noqa: E402
 
 
 __all__ = [

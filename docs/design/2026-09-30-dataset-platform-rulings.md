@@ -60,3 +60,12 @@ Ruling: the control still loads the model in this phase: it is the trusted verif
 
 Ruling (review I1): submit and skip hold a per-job in-flight count while they run; a retired job is unwired only in a later refresh than the one that retired it, with no admission in flight, and only if it is still drained and still has nothing in flight after the drain check — the retired gate admits nothing new, so no record can appear after that.
 Ruling (review I8): only deterministic wiring refusals (a `ValueError`: renderer, prompt source, contract) are remembered; any other wiring failure (store, transport) is retried at every refresh and logged at ERROR from the 5th attempt.
+
+## Review fix pass (R4)
+
+Ruling (review I5, M6, M7): the manifest is written create-only and never deleted (a racing call's task may name it; an orphan manifest is harmless and a later identical create completes it). A create that loses the manifest write to identical bytes proceeds; one that loses the registry write to an identical concurrent create answers that task as the idempotent 200; a second task for a job already declared answers 409.
+Ruling (review I6): cap and retire act only on corpus-generation tasks; `default` and every RL task answer 409 `not_a_corpus_task`. (A mark distinguishing platform-declared corpus tasks from operator-declared ones is left for later: the prod corpus jobs are reachable by the platform until then.)
+Ruling (review I7): both cap limits count a retired corpus task's cap until its job is drained (checked with the stored counts at each guarded write, and remembered once drained, since drained is final).
+Ruling (review M4, M5): a signature that is not 64 hex characters is `bad_signature` (401), never a 500; a body over 1 MB answers 413 (and a chunked one without a length 411) before any of it is read or parsed.
+Ruling (review M8): a delivery of a job that is not drained answers 409 `job_not_drained`: a manifest makes a delivery final, so it must not freeze a partial dataset.
+Ruling (review M9): a retire that loses its compare-and-swap to another retire answers the stored stamp.
