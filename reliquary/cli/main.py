@@ -895,6 +895,10 @@ def build_job_manifest(
             "--grader-id and --threshold go together: a filter needs both, and "
             "a job that keeps every completion declares neither"
         )
+    from reliquary.eval.sets import refuse_held_out_overlap
+
+    # Eval sets hold some rows out; a job may never sell them.
+    refuse_held_out_overlap(prompt_source, prompt_start, prompt_count)
     manifest = {
         "schema": JOB_SCHEMA,
         "job_id": job_id,
