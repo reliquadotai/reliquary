@@ -46,7 +46,7 @@ class QualifyLease(_Strict):
     topk: int = Field(gt=0)
     expires_at: float
     prompts: list[QualifyPrompt] = Field(min_length=1, max_length=MAX_QUALIFY_PROMPTS)
-    completions: int = Field(gt=0, le=4096)
+    completions: int = Field(gt=0, le=64)
     sampling: dict[str, float | int]
     max_new_tokens: int = Field(gt=0)
     thinking: bool
@@ -65,9 +65,9 @@ class QualifyResult(_Strict):
     gpu_count: int = Field(gt=0)
     gpu: str = Field(min_length=1, max_length=256)
     vllm_version: str = Field(min_length=1, max_length=64)
+    # The fingerprint of what this executor downloaded; both qualifiers must match.
+    # The model's eos and architecture are read by the control, never sent.
     checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    architecture: str = Field(min_length=1, max_length=256)
-    eos_token_id: int = Field(ge=0)
 
     @field_validator("chunks")
     @classmethod

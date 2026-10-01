@@ -29,24 +29,28 @@ def spread(completions: int, prompts: int) -> list[int]:
 
 def qualify_lease(lease: dict, *, tokenizer, generator, score: Callable[[list], list],
                   model_info: dict, clock: Callable[[], float] = time.monotonic) -> dict:
-    """The result body for a qualify lease. ``generator.generate(prompt_ids, n)``
-    returns ``Generation(tokens, proofs)``; ``score(items)`` is the prefill
-    verifier over ``(tokens, prompt_len, proofs)``."""
+    """The result body for a qualify lease. Every prompt is decoded in one
+    batch when the generator offers ``generate_many(prompt_ids, ns)``, else
+    prompt by prompt with ``generate(prompt_ids, n)``; each returns
+    ``Generation(tokens, proofs)``. ``score(items)`` is the prefill verifier
+    over ``(tokens, prompt_len, proofs)``."""
     from reliquary.corpus.encoding import prompt_token_ids
     from reliquary.validator.corpus_audit_protocol import ITEM_OK
     from reliquary.validator.corpus_service import ChatTemplatePromptRenderer
 
     renderer = ChatTemplatePromptRenderer(tokenizer, thinking=bool(lease["thinking"]))
-    items, generated = [], 0
-    decode_seconds = 0.0
     counts = spread(int(lease["completions"]), len(lease["prompts"]))
-    for prompt, n in zip(lease["prompts"], counts):
-        if n == 0:
-            continue
-        ids = prompt_token_ids(tokenizer, renderer.initial_text(SimpleNamespace(prompt=prompt["text"])))
-        started = clock()
-        generations = generator.generate(ids, n)
-        decode_seconds += clock() - started
+    prompts = [(prompt_token_ids(tokenizer, renderer.initial_text(
+        SimpleNamespace(prompt=prompt["text"]))), n)
+        for prompt, n in zip(lease["prompts"], counts) if n > 0]
+    started = clock()
+    if callable(getattr(generator, "generate_many", None)):
+        grouped = generator.generate_many([ids for ids, _ in prompts], [n for _, n in prompts])
+    else:
+        grouped = [generator.generate(ids, n) for ids, n in prompts]
+    decode_seconds = clock() - started
+    items, generated = [], 0
+    for (ids, _), generations in zip(prompts, grouped):
         for generation in generations:
             generated += len(generation.tokens)
             items.append((ids + list(generation.tokens), len(ids), list(generation.proofs)))
@@ -108,8 +112,6 @@ class QualifyExecutor:
 
 def load_qualifier(model_id: str, revision: str):
     """The real decode, verifier and model facts for one model (GPU)."""
-    import json as _json
-
     import torch
     import vllm
     from huggingface_hub import snapshot_download
@@ -119,16 +121,14 @@ def load_qualifier(model_id: str, revision: str):
     from reliquary.validator.corpus_audit_executor import load_public_model
 
     directory = snapshot_download(model_id, revision=revision, token=False)
-    config = _json.loads(open(os.path.join(directory, "config.json")).read())
     tokenizer = load_tokenizer(directory)
-    eos = tokenizer.eos_token_id
     info = {"gpu_count": max(1, torch.cuda.device_count()),
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "vllm_version": str(vllm.__version__),
-            "checkpoint_sha256": checkpoint_fingerprint(directory),
-            "architecture": (config.get("architectures") or ["unknown"])[0],
-            "eos_token_id": int(eos)}
-    return SimpleNamespace(directory=directory, tokenizer=tokenizer, info=info,
+            "checkpoint_sha256": checkpoint_fingerprint(directory)}
+    # Decoding stops on the model's own eos; the control records it independently.
+    eos = int(tokenizer.eos_token_id)
+    return SimpleNamespace(directory=directory, tokenizer=tokenizer, info=info, eos=eos,
                            load_model=lambda: load_public_model(model_id, revision))
 
 
@@ -152,7 +152,7 @@ def run_lease_on_gpu(lease: dict, loaded) -> dict:
         temperature=float(sampling.get("temperature", 1.0)),
         top_p=float(sampling.get("top_p", 1.0)), top_k=int(sampling.get("top_k") or 0),
         min_new_tokens=2, max_new_tokens=int(lease["max_new_tokens"]), n=1),
-        proof, loaded.info["eos_token_id"])
+        proof, loaded.eos)
     pending: list = []
 
     def collect(items):

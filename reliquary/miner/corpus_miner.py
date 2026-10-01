@@ -568,23 +568,41 @@ class VllmGenerator:
         self._proof = proof
 
     def generate(self, prompt_ids: list[int], n: int) -> list[Generation]:
-        import base64
-
         from vllm.inputs import TokensPrompt
+
+        outputs = self._llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)] * n, self._params)
+        return self._generations(outputs, [len(prompt_ids)] * n)
+
+    def generate_many(self, prompts: list[list[int]], ns: list[int]) -> list[list[Generation]]:
+        """Several prompts, ``ns[i]`` completions each, decoded in one batch
+        (qualification); grouped back per prompt."""
+        from vllm.inputs import TokensPrompt
+
+        flat = [ids for ids, n in zip(prompts, ns) for _ in range(n)]
+        outputs = self._llm.generate([TokensPrompt(prompt_token_ids=ids) for ids in flat],
+                                     self._params)
+        generations = self._generations(outputs, [len(ids) for ids in flat])
+        grouped, start = [], 0
+        for n in ns:
+            grouped.append(generations[start:start + n])
+            start += n
+        return grouped
+
+    def _generations(self, outputs, prompt_lengths: list[int]) -> list[Generation]:
+        import base64
 
         from reliquary.miner.vllm_hidden_capture import completion_rows
         from reliquary.protocol.toploc_proof import build_chunk_proofs
 
-        outputs = self._llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)] * n, self._params)
         generations = []
-        for index, output in enumerate(outputs):
+        for index, (output, prompt_length) in enumerate(zip(outputs, prompt_lengths)):
             tokens = list(output.outputs[0].token_ids)
             # `pop`, not `for_request`: this generator lives for the whole
             # mining run, and a request's rows are never read again after its
             # proof is built, so keeping them would grow CPU memory unbounded.
             try:
                 rows = completion_rows(self._capture.pop(output.request_id),
-                                       len(prompt_ids), len(prompt_ids) + len(tokens))
+                                       prompt_length, prompt_length + len(tokens))
             except ValueError:
                 # A row-count mismatch usually means vLLM preempted and
                 # recomputed this request under KV pressure mid-batch: the
