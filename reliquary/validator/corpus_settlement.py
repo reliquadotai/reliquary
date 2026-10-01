@@ -8,8 +8,10 @@ alive. Settlement is two-phase so a crash can delay a payment, never repeat it.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Mapping
 import logging
+import os
 import time
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,12 @@ SETTLEMENT_SCHEMA = "reliquary/corpus-settlement/v1"
 # so the shared replay horizon never moves faster than RL itself moved it.
 RL_WINDOW_SECONDS = 16 * 60
 
+# A fed settler learns new verdicts from the auditor; the store is listed at
+# boot and this often, as the net for any verdict the feed did not report.
+SETTLE_FULL_LIST_SECONDS = float(os.environ.get("RELIQUARY_CORPUS_SETTLE_FULL_LIST_SECONDS", "1800"))
+# How long the other tasks' highest window is reused before it is listed again.
+OTHER_MAX_TTL_SECONDS = 300.0
+
 
 def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
     tokens: dict[str, int] = {}
@@ -31,6 +39,10 @@ def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
     if total <= 0:
         return {}
     return {hotkey: cap * count / total for hotkey, count in tokens.items()}
+
+
+def _union(settled, ids) -> list[str]:
+    return sorted(set(settled or []) | set(ids))
 
 
 def _stalled(other_max_seen_at, now, stall_seconds) -> bool:
@@ -56,7 +68,7 @@ class CorpusSettler:
     def __init__(self, *, task_id, job_id, cap, records, archives,
                  stall_seconds: float = 3 * RL_WINDOW_SECONDS,
                  advance_every_seconds: float = RL_WINDOW_SECONDS, clock=time.time,
-                 on_settled=None) -> None:
+                 on_settled=None, full_list_every_seconds: float | None = None) -> None:
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
@@ -74,6 +86,28 @@ class CorpusSettler:
         self.on_settled = on_settled
         # Told each window paid and its rewards, once its archive is written.
         self.on_window = None
+        # None lists every verdict id on every call. Otherwise `observe` feeds
+        # new ids and the store is listed at boot, then at most this often.
+        self._full_list_every = full_list_every_seconds
+        self._listed_at: float | None = None
+        # Ids with a verdict, not yet seen settled: fed or listed.
+        self._unsettled: set[str] = set()
+
+    def observe(self, submission_id: str, verdict=None) -> None:
+        """A verdict stands for ``submission_id`` (the auditor's ``on_verdict``)."""
+        self._unsettled.add(submission_id)
+
+    async def _verdict_ids(self, settled: set) -> list[str]:
+        """The verdict ids not yet settled, sorted as the store lists them."""
+        now = self._clock()
+        due = (self._full_list_every is None or self._listed_at is None
+               or not 0 <= now - self._listed_at < self._full_list_every)
+        if due:
+            listed = await self._records.list_verdict_ids(self._job_id)
+            self._unsettled.update(listed)
+            self._listed_at = now
+        self._unsettled -= settled
+        return sorted(self._unsettled)
 
     def set_cap(self, cap: float) -> None:
         """A cap changed in the registry: the next settlement pays under it."""
@@ -97,7 +131,7 @@ class CorpusSettler:
         final = {
             **state,
             "last_window": pending["window"],
-            "settled": sorted(set(state.get("settled") or []) | set(pending["ids"])),
+            "settled": await asyncio.to_thread(_union, state.get("settled"), pending["ids"]),
             "pending": None,
             # Carried in the pending step, so a repeated finish adds nothing twice.
             "totals": pending.get("totals", state.get("totals")),
@@ -163,8 +197,9 @@ class CorpusSettler:
                 return None
             return await self._finish(state, etag, now)
 
-        settled = set(state["settled"])
-        new_ids = [sid for sid in await self._records.list_verdict_ids(self._job_id) if sid not in settled]
+        # 300k+ ids on a long job: built off the serving loop.
+        settled = await asyncio.to_thread(set, state["settled"])
+        new_ids = await self._verdict_ids(settled)
         window = choose_window(last_window=state["last_window"], other_max=other_max,
                                other_max_seen_at=state["other_max_seen_at"], now=now,
                                stall_seconds=self._stall, last_advanced_at=state["advanced_at"],
@@ -189,7 +224,7 @@ class CorpusSettler:
             # Every verdict this period failed (spec §7): no archive, the
             # index does not move, but these ids must not be reconsidered
             # forever, so mark them settled in this same CAS write.
-            state["settled"] = sorted(settled | set(new_ids))
+            state["settled"] = await asyncio.to_thread(_union, settled, new_ids)
             state["totals"] = totals
             await self._records.write_settlement(self._job_id, state, etag)
             self._settled(state, new_ids)
@@ -205,6 +240,18 @@ class CorpusSettler:
         return None
 
 
+def settler_fed(settler: CorpusSettler, on_verdict=None):
+    """The auditor's ``on_verdict``: the settler hears of the verdict first,
+    so a failing status hook can never keep it from being paid on time."""
+
+    def report(submission_id: str, verdict) -> None:
+        settler.observe(submission_id, verdict)
+        if on_verdict is not None:
+            on_verdict(submission_id, verdict)
+
+    return report
+
+
 class R2Archives:
     """The two archive calls the settler makes, against the real bucket.
 
@@ -212,19 +259,43 @@ class R2Archives:
     ``RELIQUARY_TASK_ID`` cannot list.
     """
 
-    def __init__(self, *, served=None) -> None:
+    def __init__(self, *, served=None, ttl_seconds: float = OTHER_MAX_TTL_SECONDS,
+                 clock=time.monotonic) -> None:
         self._served = served
+        self._ttl = ttl_seconds
+        self._clock = clock
+        # Per task, its highest window (None: no archive), as of `_listed_at`;
+        # shared by every job's settler, raised by this process's own writes.
+        self._max: dict[str, int | None] | None = None
+        self._listed_at: float | None = None
+        self._refresh: asyncio.Lock | None = None
+
+    @staticmethod
+    async def _list_maxes() -> dict[str, int | None]:
+        from reliquary.infrastructure import storage
+
+        maxes: dict[str, int | None] = {}
+        for task in await storage.list_task_ids(strict=True):
+            windows = await storage.list_all_window_keys(task_id=task, strict=True)
+            maxes[task] = max(windows) if windows else None
+        return maxes
 
     async def other_max(self, task_id: str) -> int | None:
         from reliquary.infrastructure import storage
 
+        if self._refresh is None:
+            self._refresh = asyncio.Lock()
+        async with self._refresh:
+            now = self._clock()
+            if self._max is None or not 0 <= now - self._listed_at < self._ttl:
+                # Another task's fresh window shows within the TTL; the stall
+                # rule (minutes of silence, not seconds) is unchanged by it.
+                self._max = await storage.off_loop(self._list_maxes())
+                self._listed_at = now
         best = None
-        for other in await storage.list_task_ids(strict=True):
-            if other == task_id:
-                continue
-            windows = await storage.list_all_window_keys(task_id=other, strict=True)
-            if windows:
-                best = max(best or 0, max(windows))
+        for other, window in self._max.items():
+            if other != task_id and window is not None:
+                best = max(best or 0, window)
         return best
 
     async def write(self, task_id: str, window: int, data: dict) -> None:
@@ -242,3 +313,7 @@ class R2Archives:
         if not served or (task_id not in parse_task_ids(served) and task_id not in hot):
             raise RuntimeError(f"RELIQUARY_TASK_ID does not name {task_id!r}; refusing to archive")
         await storage.upload_window_dataset(window, data, task_id=task_id)
+        if self._max is not None:
+            # Seen at once by the other jobs' settlers, without a listing.
+            known = self._max.get(task_id)
+            self._max[task_id] = window if known is None else max(known, int(window))

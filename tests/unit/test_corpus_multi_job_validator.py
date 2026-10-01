@@ -121,7 +121,7 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
 
     asyncio.run(job_store.write_job({**_manifest(), "job_id": "swe-v2"}, None, **fake_r2))
     loads = {"snapshot": 0, "model": 0, "tokenizer": 0}
-    built = {"auditors": [], "settled": [], "app": None}
+    built = {"auditors": [], "settled": [], "settlers": [], "app": None}
 
     def snapshot(repo, revision=None):
         loads["snapshot"] += 1
@@ -149,6 +149,7 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
 
     async def settle_once(self):
         built["settled"].append((self._task_id, self._job_id, self._cap))
+        built["settlers"].append(self)
         return None
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", run)
@@ -191,6 +192,17 @@ def test_each_job_gets_its_own_auditor_on_one_shared_gpu_lock(booted):
 
 def test_each_task_settles_its_own_job_under_its_own_cap(booted):
     assert sorted(booted.settled) == [("corpus-code", "swe-v2", 0.2), ("corpus-math", "swe-v1", 0.1)]
+
+
+def test_each_auditors_verdicts_feed_its_own_jobs_settler(booted):
+    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS
+
+    settlers = {s._job_id: s for s in booted.settlers}
+    for auditor in booted.auditors:
+        auditor._on_verdict("e" * 64, {"hotkey": "h", "token_count": 1, "passed": True})
+    for job_id, settler in settlers.items():
+        assert settler._full_list_every == SETTLE_FULL_LIST_SECONDS
+        assert settler._unsettled == {"e" * 64}
 
 
 def test_the_app_serves_both_jobs(booted):

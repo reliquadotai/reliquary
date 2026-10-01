@@ -432,7 +432,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.validator.corpus_miner_status import (
         MinerBook, feed, proof_thresholds, read_recent_windows,
     )
-    from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
+    from reliquary.validator.corpus_settlement import (
+        SETTLE_FULL_LIST_SECONDS, CorpusSettler, R2Archives, settler_fed,
+    )
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
     from reliquary.eval.prompt_source import is_order_job_id
@@ -597,16 +599,19 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                              read_windows=read_recent_windows,
                              thresholds=proof_thresholds(proof))
         on_verdict, on_settled = feed(w.stats, w.miners)
+        # `entry.cap` does not exist on `TaskEntry` (the cap lives in
+        # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
+        # Fed by the auditor: the store is listed only as the net.
+        w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
+                                  records=records, archives=archives,
+                                  on_settled=on_settled,
+                                  full_list_every_seconds=SETTLE_FULL_LIST_SECONDS)
         w.auditor = CorpusAuditor(job_id=w.job.job_id, records=records, model=model,
                                   tokenizer=tokenizer, proof=proof, params=params,
                                   miner_states=miner_states, beacon=beacon, round_at=round_at,
-                                  gpu_lock=gpu_lock, on_verdict=on_verdict,
+                                  gpu_lock=gpu_lock,
+                                  on_verdict=settler_fed(w.settler, on_verdict),
                                   remote=remote, on_voided=w.miners.voided)
-        # `entry.cap` does not exist on `TaskEntry` (the cap lives in
-        # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
-        w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
-                                  records=records, archives=archives,
-                                  on_settled=on_settled)
         w.settler.on_window = w.miners.window
 
     for w in wiring:
