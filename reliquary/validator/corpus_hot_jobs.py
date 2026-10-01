@@ -37,9 +37,9 @@ def _entry_profile(entry):
 def eval_entry_screen(entry) -> tuple[str, str] | None:
     """The corpus control's answer to an ``order-eval-`` entry, before any
     manifest read: not its job (the eval control serves it)."""
-    from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+    from reliquary.eval.prompt_source import is_eval_job_id
 
-    if str(getattr(entry, "job_id", "") or "").startswith(EVAL_JOB_PREFIX):
+    if is_eval_job_id(getattr(entry, "job_id", "")):
         return OTHER_MODEL, "an evaluation job, served by the eval control"
     return None
 
@@ -58,9 +58,9 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     from reliquary.protocol.profiles import toploc_proof
     from reliquary.validator.corpus_validator import startup_refusal
 
-    from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+    from reliquary.eval.prompt_source import is_eval_job_id
 
-    if str(getattr(entry, "job_id", "") or "").startswith(EVAL_JOB_PREFIX):
+    if is_eval_job_id(getattr(entry, "job_id", "")):
         # Served by the eval control alone, whatever its model: two processes
         # auditing and settling one job would pay its records twice.
         return OTHER_MODEL, "an evaluation job, served by the eval control"

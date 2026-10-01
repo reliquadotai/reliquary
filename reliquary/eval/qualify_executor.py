@@ -65,6 +65,39 @@ def qualify_lease(lease: dict, *, tokenizer, generator, score: Callable[[list], 
     }
 
 
+HEARTBEAT_SECONDS = 20.0
+
+
+class _Heartbeats:
+    """Heartbeats beside the work (model load and qualification included), so
+    the platform sees the executor alive: ``{"loaded": bool, "leases": int}``."""
+
+    def __init__(self, send: Callable[[dict], None], every: float) -> None:
+        import threading
+
+        self._send, self._every = send, every
+        self.state = {"loaded": False, "leases": 0}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="qualify-heartbeat",
+                                        daemon=True)
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                self._send(dict(self.state))
+            except Exception:
+                logger.warning("qualify heartbeat failed", exc_info=True)
+            if self._stop.wait(self._every):
+                return
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
 class QualifyExecutor:
     """Claims qualify leases for its model and runs them, synchronously."""
 
@@ -77,6 +110,17 @@ class QualifyExecutor:
         self._executor_id = executor_id
         self._model = (model_id, model_revision)
         self._run = run
+        # Set by run_qualify: the heartbeats this executor keeps up.
+        self.beats: _Heartbeats | None = None
+
+    def heartbeat(self, detail: dict) -> None:
+        response = self._http.post(f"{EVAL_AUDIT_PREFIX}/heartbeat", headers=self._headers,
+                                   json={"executor_id": self._executor_id, "detail": detail},
+                                   timeout=REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+
+    def heartbeats(self, every: float = HEARTBEAT_SECONDS) -> _Heartbeats:
+        return _Heartbeats(self.heartbeat, every)
 
     def step(self) -> dict | None:
         """One claim; the posted answer, or None when nothing was waiting."""
@@ -90,7 +134,13 @@ class QualifyExecutor:
             return None
         response.raise_for_status()
         lease = QualifyLease.model_validate(response.json()).model_dump()
-        body = self._run(lease)
+        if self.beats is not None:
+            self.beats.state["leases"] = 1
+        try:
+            body = self._run(lease)
+        finally:
+            if self.beats is not None:
+                self.beats.state["leases"] = 0
         posted = self._http.post(f"{EVAL_AUDIT_PREFIX}/{lease['lease_id']}/result",
                                  headers=self._headers, json=body,
                                  timeout=REQUEST_TIMEOUT_SECONDS)
@@ -182,14 +232,22 @@ def run_qualify(*, control_url: str, executor_id: str, model: str) -> dict | Non
     model_id, _, revision = model.partition("@")
     if not revision:
         raise ValueError("--model must be repo@revision")
-    loaded = load_qualifier(model_id, revision)
     with httpx.Client(base_url=control_url.rstrip("/"), follow_redirects=False) as http:
+        state: dict = {}
         executor = QualifyExecutor(
             http=http, executor_id=executor_id,
             token=os.environ.get("RELIQUARY_EXECUTOR_TOKEN", "").strip(),
             model_id=model_id, model_revision=revision,
-            run=lambda lease: run_lease_on_gpu(lease, loaded))
-        return executor.run()
+            run=lambda lease: run_lease_on_gpu(lease, state["loaded"]))
+        # Alive from the first second: the download and load take long.
+        executor.beats = executor.heartbeats()
+        executor.beats.start()
+        try:
+            state["loaded"] = load_qualifier(model_id, revision)
+            executor.beats.state["loaded"] = True
+            return executor.run()
+        finally:
+            executor.beats.stop()
 
 
 __all__ = [

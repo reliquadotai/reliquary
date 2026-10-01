@@ -197,7 +197,8 @@ class PairedAuditDispatcher:
         self._background: set[asyncio.Task] = set()
         self._unwritten: dict[str, str] = {}
         self._documents: dict[str, dict] = {}
-        self._written: dict[str, float] = {}
+        self._detail: dict[str, dict] = {}
+        self._written: dict[str, tuple[float, dict]] = {}
         # job id -> why it needs attention (parked batches), for the status.
         self.attention: dict[str, list[str]] = collections.defaultdict(list)
         self.parked: collections.Counter = collections.Counter()
@@ -250,10 +251,22 @@ class PairedAuditDispatcher:
 
     # -- the executors' side -----------------------------------------------
 
-    def heartbeat(self, executor_id: str, document: dict | None = None) -> None:
+    def heartbeat(self, executor_id: str, document: dict | None = None,
+                  detail: dict | None = None) -> None:
         self._seen[executor_id] = self._clock()
         if document is not None:
             self._documents[executor_id] = document
+        if detail is not None:
+            self._detail[executor_id] = dict(detail)
+
+    def heartbeat_detail(self, executor_id: str) -> dict:
+        """What the registry records of an executor's last heartbeat:
+        ``{"leases": int, "loaded": bool}``, as the corpus control writes it."""
+        detail = self._detail.get(executor_id, {})
+        held = sum(1 for lease in self._leases.values() if lease.executor_id == executor_id)
+        leases = detail.get("leases", held)
+        return {"leases": int(leases) if isinstance(leases, (int, float)) else held,
+                "loaded": bool(detail.get("loaded", False))}
 
     def _eligible(self, batch: _Batch, executor_id: str, place: tuple[str, str]) -> bool:
         if batch.future.done() or executor_id in batch.scores or executor_id in batch.leased:
@@ -464,22 +477,24 @@ class PairedAuditDispatcher:
             await self._write_quarantines()
 
     async def write_heartbeats(self) -> None:
-        """Each executor's last contact into the registry, at most once per
-        ``HEARTBEAT_WRITE_SECONDS``, as the corpus control does."""
+        """Each executor's last contact and ``{"leases", "loaded"}`` into the
+        registry: at once when ``loaded`` or ``leases`` changed, otherwise at
+        most once per ``HEARTBEAT_WRITE_SECONDS``, as the corpus control does."""
         if self._heartbeat_write is None:
             return
         for executor_id, seen in list(self._seen.items()):
+            detail = self.heartbeat_detail(executor_id)
             written = self._written.get(executor_id)
-            if written is not None and (written == seen
-                                        or seen - written < HEARTBEAT_WRITE_SECONDS):
+            if written is not None and (written[0] == seen or (
+                    seen - written[0] < HEARTBEAT_WRITE_SECONDS and written[1] == detail)):
                 continue
             try:
-                await self._heartbeat_write(executor_id, seen, {})
-                self._written[executor_id] = seen
+                await self._heartbeat_write(executor_id, seen, detail)
+                self._written[executor_id] = (seen, detail)
             except Exception:
                 logger.exception("heartbeat of executor %s not written", executor_id)
 
-    async def run(self, *, sweep_seconds: float = 2.0, write_status=None,
+    async def run(self, *, sweep_seconds: float = 2.0, write_status=None, status_of=None,
                   status_seconds: float = STATUS_SECONDS) -> None:
         last_status = float("-inf")
         while True:
@@ -488,7 +503,8 @@ class PairedAuditDispatcher:
                 await self.sweep()
                 await self.write_heartbeats()
                 if write_status is not None and self._clock() - last_status >= status_seconds:
-                    await write_status(self.status())
+                    document = await status_of() if status_of is not None else self.status()
+                    await write_status(document)
                     last_status = self._clock()
             except Exception:
                 logger.exception("eval audit dispatcher sweep failed; retrying")
@@ -584,10 +600,69 @@ def eval_auditor(**kwargs):
             # A parked record is not tried again until an operator acts.
             await super().judge_many([s for s in submission_ids if s not in self.parked_ids])
 
+        # -- an eval job stays completable: a failure reopens its slot ------
+
+        async def _record_failure(self, submission_id: str) -> None:
+            from reliquary.validator.corpus_service import record_prompt_failure
+
+            if self.job is None or self.job_store is None:
+                return
+            try:
+                record = await self._records.read_submission(self._job_id, submission_id)
+                if record is None:
+                    return
+                outcome = await record_prompt_failure(
+                    self.job_store, self.job, int(record["prompt_index"]), submission_id)
+                if outcome is False:
+                    logger.warning("eval job %s: prompt %s exhausted its attempts",
+                                   self._job_id, record["prompt_index"])
+            except Exception:
+                # Retried at the next start's reconcile; never stops the auditor.
+                logger.exception("eval job %s: failure of %s not recorded in the ledger",
+                                 self._job_id, submission_id[:12])
+
+        async def _write(self, submission_id, verdict):
+            stored, written = await super()._write(submission_id, verdict)
+            if not (stored or verdict).get("passed"):
+                await self._record_failure(submission_id)
+            return stored, written
+
+        async def reaudit_executor(self, executor_id):
+            failed = await super().reaudit_executor(executor_id)
+            for submission_id in failed:
+                await self._record_failure(submission_id)
+            return failed
+
+        async def reconcile_failures(self) -> int:
+            """Every failed or voided submission recorded in the ledger (a crash
+            between a verdict and its ledger write would otherwise leave the
+            prompt without its slot)."""
+            ids = list(await self._records.list_verdict_ids(self._job_id))
+            lister = getattr(self._records, "list_voided_ids", None)
+            voided = set(await lister(self._job_id)) if lister is not None else set()
+            failed = []
+            for submission_id in ids:
+                verdict = await self._records.read_verdict(self._job_id, submission_id)
+                if verdict and (not verdict.get("passed") or submission_id in voided):
+                    failed.append(submission_id)
+            for submission_id in failed:
+                await self._record_failure(submission_id)
+            return len(failed)
+
+        async def run(self):
+            try:
+                await self.reconcile_failures()
+            except Exception:
+                logger.exception("eval job %s: failure reconcile failed", self._job_id)
+            await super().run()
+
     vocab_size = kwargs.pop("vocab_size")
+    job = kwargs.pop("job", None)
+    job_store = kwargs.pop("job_store", None)
     auditor = EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
     auditor.parked_ids = set()
     auditor._current_ids, auditor._current_records = [], []
+    auditor.job, auditor.job_store = job, job_store
     return auditor
 
 
@@ -616,6 +691,8 @@ def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
         if (body.model_id, body.model_revision) != (document["model_id"],
                                                     document["model_revision"]):
             raise HTTPException(status_code=409, detail="wrong_model")
+        # Every contact counts as one, qualification included.
+        dispatcher.heartbeat(document["executor_id"], document)
         if body.kind in ("qualify", "any") and qualifications is not None:
             lease = await qualifications.claim(document)
             if lease is not None:
@@ -632,13 +709,14 @@ def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
     @router.post(f"{EVAL_AUDIT_PREFIX}/heartbeat")
     async def heartbeat(body: HeartbeatRequest, request: Request) -> dict:
         document = authenticated(request, body.executor_id)
-        dispatcher.heartbeat(document["executor_id"], document)
+        dispatcher.heartbeat(document["executor_id"], document, body.detail or {})
         return {"executor_id": document["executor_id"], "model_id": document["model_id"],
                 "model_revision": document["model_revision"]}
 
     @router.post(f"{EVAL_AUDIT_PREFIX}/{{lease_id}}/result")
     async def result(lease_id: str, request: Request) -> dict:
         document = authenticated(request)
+        dispatcher.heartbeat(document["executor_id"], document)
         body = await request.json()
         try:
             if qualifications is not None and qualifications.lease_of(lease_id) is not None:
@@ -677,9 +755,9 @@ class EvalArchives:
         return await self._other_max(task_id)
 
     async def write(self, task_id: str, window: int, data: dict) -> None:
-        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+        from reliquary.eval.prompt_source import is_eval_job_id
 
-        if not task_id.startswith(EVAL_JOB_PREFIX) or task_id not in set(self._served()):
+        if not is_eval_job_id(task_id) or task_id not in set(self._served()):
             raise RuntimeError(f"task {task_id!r} is not an eval task this process serves; "
                                "refusing to archive")
         if self._upload is None:
@@ -714,10 +792,10 @@ async def read_control_status(**client_kwargs) -> dict | None:
 
 def eval_job_refusal(entry, job) -> str | None:
     """Why the eval control will not serve a registry entry, or None."""
-    from reliquary.eval.prompt_source import EVAL_JOB_PREFIX, is_eval_source
+    from reliquary.eval.prompt_source import is_eval_job_id, is_eval_source
     from reliquary.protocol.profiles import profile_from_contract, toploc_proof
 
-    if not str(entry.job_id or "").startswith(EVAL_JOB_PREFIX):
+    if not is_eval_job_id(entry.job_id):
         return "not an evaluation job"
     if not is_eval_source(job.prompt_source):
         return f"prompt source {job.prompt_source!r} is not an eval set"
@@ -850,7 +928,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         w.auditor = eval_auditor(
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
-            on_verdict=w.stats.observe, vocab_size=vocab_size,
+            on_verdict=w.stats.observe, vocab_size=vocab_size, job=job, job_store=store,
             remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
                                    job.job_id))
         w.settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
@@ -882,10 +960,10 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         return None if refusal is None else (OTHER_MODEL, refusal)
 
     def screen(entry):
-        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+        from reliquary.eval.prompt_source import is_eval_job_id
 
         # Not an eval job: never even read its manifest.
-        if not str(getattr(entry, "job_id", "") or "").startswith(EVAL_JOB_PREFIX):
+        if not is_eval_job_id(getattr(entry, "job_id", "")):
             return OTHER_MODEL, "not an evaluation job"
         return None
 
@@ -949,6 +1027,25 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         drained=lambda w: job_drained(auditor=w.auditor, records=records,
                                       job_id=w.job.job_id),
         clock=clock)
+    async def control_status() -> dict:
+        """The dispatcher's status, with each served job's completeness."""
+        document = dispatcher.status()
+        for job_id in list(served):
+            try:
+                status = await job_set.status(job_id)
+            except Exception:
+                logger.warning("eval status of %s unavailable", job_id, exc_info=True)
+                continue
+            if status is None:
+                continue
+            entry = document["jobs"].setdefault(
+                job_id, {"needs_attention": False, "parked_batches": 0, "reasons": []})
+            entry.update({key: status.get(key) for key in (
+                "state", "prompts_total", "prompts_full", "prompts_complete",
+                "prompts_exhausted", "complete")})
+        return document
+
+    app.state.control_status = control_status
     app.state.corpus_jobs = job_set
     app.state.eval_served = served
     app.state.eval_tokenizers = tokenizers
@@ -1021,7 +1118,8 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
                 logger.exception("qualification queue unreadable; retrying")
             await asyncio.sleep(30.0)
 
-    background = [dispatcher.run(write_status=write_control_status), refresh_qualifications(),
+    background = [dispatcher.run(write_status=write_control_status,
+                                 status_of=app.state.control_status), refresh_qualifications(),
                   job_set.run()]
     if registered is not None:
         background.append(registered.refresh_forever())

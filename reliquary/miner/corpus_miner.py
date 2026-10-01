@@ -139,6 +139,7 @@ class HttpCorpusClient:
     def __init__(self, http, *, job_id: str | None = None) -> None:
         self._http = http
         self._job_id = job_id
+        self.scoped_submit = False
 
     def served_jobs(self) -> list:
         """Every job the validator serves; empty when it cannot say."""
@@ -186,12 +187,10 @@ class HttpCorpusClient:
         return int(issue_corpus_request(lambda: self._http.get(path))["cursor"])
 
     def submit(self, body: dict) -> dict:
-        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
-
-        # An eval job is served behind its own prefix only (the eval control).
+        # An eval job is served behind its own prefix only (the eval control):
+        # set by the caller once the job's manifest names an eval set.
         path = (f"/corpus/jobs/{self._job_id}/submit"
-                if self._job_id is not None and self._job_id.startswith(EVAL_JOB_PREFIX)
-                else "/corpus/submit")
+                if self._job_id is not None and self.scoped_submit else "/corpus/submit")
         return issue_corpus_request(lambda: self._http.post(path, json=body))
 
     def eval_prompts(self) -> bytes:

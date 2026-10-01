@@ -17,7 +17,8 @@ update; the report states this.
 1. A customer orders an evaluation through the platform API. This is unchanged.
 2. **Qualification.** The fleet rents an audit executor for the customer's model. It measures the model's
    honest TOPLOC band and writes the job's thresholds. See "Per-model qualification" below.
-3. **Job.** The admin service creates a corpus-generation job `order-eval-<id>`:
+3. **Job.** The admin service creates a corpus-generation job `<task prefix>eval-<id>` (`order-eval-<id>` by
+   default):
    - prompt source = the eval set's prompts (rendered, no grading data);
    - `samples_per_prompt` = the order's samples;
    - the customer's model and revision;
@@ -102,7 +103,10 @@ location /corpus/ {
 }
 ```
 
-Regex locations win over the prefix one, so the order in the file does not matter. Executors for an eval
+Regex locations win over the prefix one, so the order in the file does not matter. The eval job prefix is
+`${RELIQUARY_ADMIN_TASK_PREFIX}eval-` (`order-eval-` with the default `order-`); the admin service, the eval
+control and the corpus control all read it from `RELIQUARY_ADMIN_TASK_PREFIX`, which must be the same on every
+process, and the nginx regex must use the same value (e.g. `^/corpus/jobs/acme-eval-` for `acme-`). Executors for an eval
 job run `reliquary corpus audit-executor --eval` (audits) and `reliquary corpus qualify --model repo@rev`
 (qualification) against the same origin. Miners mine an eval job with `--job-id order-eval-<id>`: they
 fetch its prompts from `/corpus/jobs/order-eval-<id>/eval-prompts` and submit on the scoped path.

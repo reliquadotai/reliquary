@@ -386,18 +386,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     @router.post("/jobs")
     async def create_job(body: CreateJob, response: Response) -> dict:
         from reliquary.corpus.job import parse_job
-        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+        from reliquary.eval.prompt_source import eval_job_prefix
 
+        eval_prefix = eval_job_prefix(task_prefix)
         if not (body.job_id.startswith(task_prefix)
                 and (body.task_id or body.job_id).startswith(task_prefix)):
             raise HTTPException(status_code=422, detail="task_id_outside_admin_scope")
         evaluation = body.eval_set_id is not None
         # The eval control serves exactly the order-eval- ids (and routing
         # sends it exactly those): one is an eval job if and only if it says so.
-        if evaluation != body.job_id.startswith(EVAL_JOB_PREFIX) or (
-                evaluation and not (body.task_id or body.job_id).startswith(EVAL_JOB_PREFIX)):
+        if evaluation != body.job_id.startswith(eval_prefix) or (
+                evaluation and not (body.task_id or body.job_id).startswith(eval_prefix)):
             raise HTTPException(status_code=422, detail=(
-                f"an eval job's ids start with {EVAL_JOB_PREFIX!r}, and only an eval job's"))
+                f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))
         if not evaluation and any(v is not None for v in (body.qualification_id, body.seed,
                                                            body.audit_q)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
@@ -684,13 +685,20 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="qualification_unknown")
         return record
 
+    def _problem_id(source, index: int) -> str:
+        from reliquary.eval.prompt_source import load_eval_rows
+
+        return load_eval_rows(source)[index]["problem_id"]
+
     async def job_grading_source(body: GradeEvaluation):
         """An eval job's passing records as the completions, once it is drained
         and complete (or ``allow_incomplete``); the request must name exactly
         the job's set, problems and samples. The provenance is the job's and its
         qualification's; the request's is only checked against it."""
         from reliquary.eval import qualification as qual
-        from reliquary.eval.grading import JobRows, collect_job_records, job_complete
+        from reliquary.eval.grading import (
+            JobRows, collect_job_records, exhausted_prompts, job_complete,
+        )
         from reliquary.eval.prompt_source import parse_eval_source
         from reliquary.validator.corpus_job_status import stored_job_counts
         from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
@@ -729,7 +737,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if not (await stored_job_counts(records, job.job_id))["drained"]:
             raise HTTPException(status_code=409, detail="job_not_drained")
         collected = await collect_job_records(job, records)
-        complete = job_complete(job, collected, samples)
+        from reliquary.validator.corpus_service import rebuild_ledgers
+
+        snapshot, _ = await job_store.read_ledgers(job.job_id)
+        slots = rebuild_ledgers(job, snapshot).slots
+        complete = job_complete(job, collected, samples, slots)
+        exhausted = exhausted_prompts(job, collected, samples, slots)
         if not complete and not body.allow_incomplete:
             raise HTTPException(status_code=409, detail="job_not_complete")
         verification = {"scheme": "toploc-v1", "source": "qualification",
@@ -752,6 +765,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         provenance = {**facts, "checkpoint_sha256": job.checkpoint_sha256, "seed": job.seed,
                       "eos_token_id": job.eos_token_id, "verification": verification,
                       "job_complete": complete,
+                      # Every attempt used: their missing samples are failures.
+                      "prompts_exhausted": len(exhausted),
+                      "exhausted_problem_ids": [_problem_id(source, i) for i in exhausted],
                       **({"allow_incomplete": True} if body.allow_incomplete else {})}
         return JobRows(job=job, collected=collected), provenance
 
@@ -770,10 +786,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if body.source == "job":
-            from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+            from reliquary.eval.prompt_source import eval_job_prefix
 
             in_scope(body.job_id)
-            if not body.job_id.startswith(EVAL_JOB_PREFIX):
+            if not body.job_id.startswith(eval_job_prefix(task_prefix)):
                 raise HTTPException(status_code=422, detail="not_an_eval_job")
         digest = grading.request_digest(body.set_ids, keys, body.problems_per_set,
                                         body.samples_per_set, job_id=body.job_id)

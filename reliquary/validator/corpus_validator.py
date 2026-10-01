@@ -374,10 +374,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
-    from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+    from reliquary.eval.prompt_source import is_eval_job_id
 
     for task_entry, _ in served:
-        if str(task_entry.job_id or "").startswith(EVAL_JOB_PREFIX):
+        if is_eval_job_id(task_entry.job_id):
             # Its own process serves it; two would pay its records twice.
             raise RuntimeError(f"task {task_entry.task_id!r} is an evaluation job: the eval "
                                "control serves it, never the corpus control")

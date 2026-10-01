@@ -101,7 +101,9 @@ LEDGER_SCHEMA = LEDGER_SCHEMA_V2
 LEDGER_FIELDS = {
     LEDGER_SCHEMA_V1: frozenset({"schema", "slots", "cursors", "seen"}),
     LEDGER_SCHEMA_V2: frozenset(
-        {"schema", "slots", "cursors", "seen_pending", "seen_segments"}
+        # `failed` only on an eval job's ledger, written only once a
+        # submission failed: every other ledger is byte-identical.
+        {"schema", "slots", "cursors", "seen_pending", "seen_segments", "failed"}
     ),
 }
 
@@ -652,6 +654,7 @@ def rebuild_ledgers(job: JobSpec, snapshot: Any) -> LedgerState:
             job.slots_per_prompt,
             snapshot.get("slots") or {},
             prompt_start=job.prompt_start,
+            failed=snapshot.get("failed") or {},
         )
         cursors = CursorLedger.from_snapshot(snapshot.get("cursors") or {})
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
@@ -680,13 +683,42 @@ def ledger_snapshot(
     """The JSON-native v2 form the store persists. Prompt indices are
     stringified here rather than by the encoder, so a snapshot compares equal
     to the one that comes back out of the bucket."""
-    return {
+    snapshot = {
         "schema": LEDGER_SCHEMA_V2,
         "slots": {str(index): count for index, count in slots.snapshot().items()},
         "cursors": cursors.snapshot(),
         "seen_pending": sorted(pending),
         "seen_segments": [{"id": ref.id, "count": ref.count} for ref in segments],
     }
+    failed = slots.failed_snapshot()
+    if failed:
+        snapshot["failed"] = {str(index): count for index, count in failed.items()}
+    return snapshot
+
+
+async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
+                                submission_id: str, *,
+                                attempts: int = DEFAULT_WRITE_ATTEMPTS) -> bool | None:
+    """An eval job's submission failed its audit: record it in the ledger
+    (idempotent per submission), which reopens the prompt's slot until its
+    attempts run out. True: reopened; False: exhausted; None: already recorded.
+    Compare-and-swap against the route's own writes, which retry on conflict."""
+    for _ in range(attempts):
+        snapshot, etag = await store.read_ledgers(job.job_id)
+        state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
+        if snapshot and state.schema != LEDGER_SCHEMA_V2:
+            raise LedgerSnapshotError(f"job {job.job_id!r} ledgers are not v2")
+        outcome = state.slots.record_failure(prompt_index, submission_id)
+        if outcome is None:
+            return None
+        after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments)
+        try:
+            await store.write_ledgers(job.job_id, after, etag)
+        except CorpusStoreConflict:
+            continue
+        return outcome
+    raise CorpusStoreConflict(f"job {job.job_id!r}: the failure of {submission_id[:12]} "
+                              "kept losing its ledger race")
 
 
 def seal_chunks(digests: Iterable[str], segment_max: int = SEGMENT_MAX) -> list[list[str]]:

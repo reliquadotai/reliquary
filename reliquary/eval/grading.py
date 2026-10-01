@@ -372,11 +372,23 @@ async def collect_job_records(job, records, *, concurrency: int = READ_CONCURREN
             "samples_by_prompt": dict(samples)}
 
 
-def job_complete(job, collected: dict, samples: int) -> bool:
-    """Every prompt of the job holds its samples (never true with nothing)."""
+def job_complete(job, collected: dict, samples: int, slots=None) -> bool:
+    """Every prompt of the job holds its passing samples, or (with the job's
+    ledger ``slots``) has used every attempt and is exhausted, its missing
+    samples counted as failures. Never true with nothing passing."""
     held = collected["samples_by_prompt"]
-    return bool(held) and all(held.get(index, 0) >= samples
-                              for index in range(job.prompt_start, job.prompt_end))
+    if not held:
+        return False
+    return all(held.get(index, 0) >= samples
+               or (slots is not None and slots.prompt_state(index) == "exhausted")
+               for index in range(job.prompt_start, job.prompt_end))
+
+
+def exhausted_prompts(job, collected: dict, samples: int, slots) -> list[int]:
+    """The prompts short of their samples whose every attempt is used."""
+    held = collected["samples_by_prompt"]
+    return [index for index in range(job.prompt_start, job.prompt_end)
+            if held.get(index, 0) < samples and slots.prompt_state(index) == "exhausted"]
 
 
 class JobRows:
@@ -596,6 +608,7 @@ __all__ = [
     "GRADED_COLUMNS",
     "JobRows",
     "collect_job_records",
+    "exhausted_prompts",
     "job_complete",
     "GradeRequestError",
     "REPORT_SCHEMA",

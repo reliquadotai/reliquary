@@ -1793,9 +1793,10 @@ def corpus_eval_control(
     port: int = typer.Option(8791, "--port"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
-    """Serve every order-eval- corpus job, whatever its model, with no GPU:
-    tokenizers on CPU, audits by executor pairs on distinct providers. Route
-    ^/corpus/jobs/order-eval- and ^/corpus/internal/eval-audit/ here; the
+    """Serve every eval corpus job (ids ${RELIQUARY_ADMIN_TASK_PREFIX}eval-,
+    order-eval- by default), whatever its model, with no GPU: tokenizers on
+    CPU, audits by executor pairs on distinct providers. Route
+    ^/corpus/jobs/<prefix>eval- and ^/corpus/internal/eval-audit/ here; the
     corpus control keeps everything else."""
     from reliquary.validator.eval_control import run_eval_control
 
@@ -1914,6 +1915,7 @@ def corpus_mine(
     if is_eval_source(job.prompt_source):
         # An eval job's prompts come from the control serving it, checked
         # against the sha256 its manifest names.
+        client.scoped_submit = True
         try:
             register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
         except (ValueError, CorpusJobSelectionError) as exc:

@@ -28,8 +28,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 EVAL_SOURCE_PREFIX = "eval-set:"
-# Job ids of evaluation jobs: the eval control serves them, the corpus control never.
-EVAL_JOB_PREFIX = "order-eval-"
+# Job ids of evaluation jobs are `<admin task prefix>eval-`: the eval control
+# serves them, the corpus control never.
+TASK_PREFIX_ENV = "RELIQUARY_ADMIN_TASK_PREFIX"
+DEFAULT_TASK_PREFIX = "order-"
+
+
+def eval_job_prefix(task_prefix: str | None = None) -> str:
+    """``${RELIQUARY_ADMIN_TASK_PREFIX}eval-`` (``order-eval-`` by default)."""
+    base = task_prefix if task_prefix is not None else (
+        os.environ.get(TASK_PREFIX_ENV, "").strip() or DEFAULT_TASK_PREFIX)
+    return f"{base}eval-"
+
+
+def is_eval_job_id(job_id, task_prefix: str | None = None) -> bool:
+    return str(job_id or "").startswith(eval_job_prefix(task_prefix))
 SETS_DIR_ENV = "RELIQUARY_EVAL_SETS_DIR"
 _SOURCE_RE = re.compile(
     r"\Aeval-set:([a-z0-9][a-z0-9_-]{0,127}):([1-9][0-9]{0,8}):([0-9a-f]{64})\Z")
@@ -184,7 +197,8 @@ class EvalSetSpec:
 
 
 __all__ = [
-    "EVAL_JOB_PREFIX",
+    "eval_job_prefix",
+    "is_eval_job_id",
     "EVAL_SOURCE_PREFIX",
     "EvalSetEnvironment",
     "EvalSetSpec",
