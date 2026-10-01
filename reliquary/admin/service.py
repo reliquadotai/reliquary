@@ -86,13 +86,30 @@ class CreateDelivery(BaseModel):
     apply_filter: bool = True
 
 
+class Provenance(BaseModel):
+    """What the report names as having produced the completions. The core keys
+    are required; the platform may add more, recorded as given."""
+
+    model_config = ConfigDict(extra="allow")
+    model: str = Field(min_length=1)
+    revision: str = Field(min_length=1)
+    model_sha: str = Field(min_length=1)
+    sampling: dict[str, Any]
+    thinking: bool
+    max_new_tokens: int = Field(gt=0)
+    vllm_version: str = Field(min_length=1)
+    gpu: str = Field(min_length=1)
+    pod_provider_id: str = Field(min_length=1)
+
+
 class GradeEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     set_ids: list[str] = Field(min_length=1, max_length=64)
     completion_keys: list[str] = Field(min_length=1, max_length=10_000)
     problems_per_set: dict[str, int]
-    # Recorded in the report as given: model, revision, sampling, pod, GPU...
-    provenance: dict[str, Any] | None = None
+    # Samples ordered per problem, indexed 0..samples-1.
+    samples_per_set: dict[str, int]
+    provenance: Provenance
 
 
 def cap_limits(pool_max: float, *, drained_tasks=frozenset()) -> Callable[[Mapping, Mapping], None]:
@@ -146,7 +163,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      current_round: Callable[[], int] = _current_round,
                      prepare=None, work_dir=None,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
-                     open_environment=None) -> FastAPI:
+                     open_environment=None, grade_scorer=None,
+                     require_sandbox=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -174,6 +192,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     exports: dict[str, asyncio.Task] = {}
     # eval id -> (request digest, the running grading)
     gradings: dict[str, tuple[str, asyncio.Task]] = {}
+    # One decision at a time per eval id, so two first calls start one grading.
+    grade_locks: dict[str, asyncio.Lock] = {}
     if eval_store is None:
         from reliquary.eval.storage import SubnetEvalStore
 
@@ -447,39 +467,53 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             keys = grading.validated_completion_keys(body.completion_keys)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        digest = grading.request_digest(body.set_ids, keys, body.problems_per_set)
+        digest = grading.request_digest(body.set_ids, keys, body.problems_per_set,
+                                        body.samples_per_set)
 
         def done(manifest: dict) -> dict:
             if manifest.get("request_sha256") != digest:
                 raise HTTPException(status_code=409, detail="grade_exists_with_another_request")
             return {"state": "done", "eval_id": eval_id, "keys": manifest["keys"],
-                    "rows": manifest["rows"]}
+                    "rows": manifest["rows"], "complete": manifest["complete"]}
 
-        running = gradings.get(eval_id)
-        if running is not None and running[0] != digest:
-            raise HTTPException(status_code=409, detail="grade_exists_with_another_request")
-        if running is not None and running[1].done():
-            gradings.pop(eval_id)
-            failure = running[1].exception()
-            if failure is not None:
-                raise HTTPException(status_code=500, detail=f"grading failed: {failure}")
-            return done(running[1].result())
-        if running is None:
-            stored = await deliveries.get_json(f"{grading.DELIVERY_PREFIX}/{eval_id}/manifest.json")
-            if stored is not None:
-                return done(stored)
-            try:
-                # Refusals the caller can act on are answered now, not polled for.
-                await grading.load_sets(body.set_ids, body.problems_per_set, subnet=eval_store)
-            except grading.SetUnknown as exc:
-                raise HTTPException(status_code=404, detail="set_unknown") from exc
-            except grading.GradeRequestError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
-                eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,
-                problems_per_set=body.problems_per_set, provenance=body.provenance,
-                platform=deliveries, subnet=eval_store, open_environment=open_environment,
-                work_dir=work_dir, clock=clock)))
+        lock = grade_locks.setdefault(eval_id, asyncio.Lock())
+        async with lock:
+            running = gradings.get(eval_id)
+            if running is not None and running[0] != digest:
+                raise HTTPException(status_code=409,
+                                    detail="grade_exists_with_another_request")
+            if running is not None and running[1].done():
+                gradings.pop(eval_id)
+                failure = running[1].exception()
+                if failure is not None:
+                    raise HTTPException(status_code=500, detail=f"grading failed: {failure}")
+                return done(running[1].result())
+            if running is None:
+                stored = await deliveries.get_json(
+                    f"{grading.evaluation_prefix(eval_id)}/manifest.json")
+                if stored is not None:
+                    return done(stored)
+                try:
+                    # Refusals the caller can act on are answered now, not polled for.
+                    sets = await grading.load_sets(body.set_ids, body.problems_per_set,
+                                                   body.samples_per_set, subnet=eval_store)
+                    grading.require_sandboxes(sets, require_sandbox)
+                except grading.SetUnknown as exc:
+                    raise HTTPException(status_code=404, detail="set_unknown") from exc
+                except grading.GradeRequestError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                except grading.SandboxUnavailable as exc:
+                    raise HTTPException(status_code=503,
+                                        detail="code_sandbox_unavailable") from exc
+                extra = {} if grade_scorer is None else {"scorer_for": grade_scorer}
+                gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
+                    eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,
+                    problems_per_set=body.problems_per_set,
+                    samples_per_set=body.samples_per_set,
+                    provenance=body.provenance.model_dump(), platform=deliveries,
+                    subnet=eval_store, open_environment=open_environment,
+                    require_sandbox=require_sandbox, work_dir=work_dir, clock=clock,
+                    **extra)))
         response.status_code = 202
         return {"state": "running", "eval_id": eval_id}
 
@@ -522,6 +556,7 @@ from reliquary.validator.corpus_audit_remote import token_sha256  # noqa: E402
 __all__ = [
     "CreateJob",
     "GradeEvaluation",
+    "Provenance",
     "QualifiedModel",
     "THINKING_RENDERERS",
     "cap_limits",

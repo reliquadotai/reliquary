@@ -1,13 +1,18 @@
 """Grading an evaluation order on the admin host, and its report.
 
 The pod's completions are read from the platform bucket; the problems' source
-rows come from the private ``grading.jsonl`` in the subnet bucket. Every row is
-graded with its environment's own grader (``compute_reward``, the path
-``jobs export --apply-filter`` uses) or flagged: a grader crash is
-``score=None`` with its ``grader_detail``, never a silent 0.
+rows come from the private ``grading.jsonl`` in the subnet bucket. Each row is
+scored as admission scores it (``reward_scorer``: code goes to the sandboxed
+grading service, never to the package's own runner) or flagged: a grader crash
+is ``score=None`` with its ``grader_detail``, never a silent 0.
 
-Written under ``deliveries/{eval_id}/``: ``graded.parquet``, ``report.json``,
-then ``manifest.json``, whose presence makes the grading final.
+Each problem is expected to have exactly ``samples_per_set[set_id]`` samples,
+indexed ``0..samples-1``. The headline pass@k counts a missing or ungraded
+sample as a failure; the variant that leaves them out is shown beside it.
+
+Written under ``evaluations/{eval_id}/`` (never ``deliveries/``, the corpus
+exports' namespace): ``graded.parquet``, ``report.json``, then
+``manifest.json``, whose presence makes the grading final.
 """
 
 from __future__ import annotations
@@ -31,11 +36,12 @@ from reliquary.eval.storage import subnet_key
 
 logger = logging.getLogger(__name__)
 
-REPORT_SCHEMA = "reliquary/eval-report/v1"
-DELIVERY_PREFIX = "deliveries"
+REPORT_SCHEMA = "reliquary/eval-report/v2"
+EVALUATION_PREFIX = "evaluations"
 BOOTSTRAP_SEED = 0
 BATCH_ROWS = 512
 MAX_COMPLETION_KEYS = 10_000
+MAX_SAMPLES = 1024
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/=-]{0,511}$")
 _FENCE_RE = re.compile(r"(?s)(```|~~~)[^\n]*\n.*?\1")
 GRADED_COLUMNS = ("env", "set_id", "problem_id", "sample_index", "completion", "tokens",
@@ -50,11 +56,21 @@ class GradeRequestError(ValueError):
     """A grade request that can never succeed as sent."""
 
 
+class SandboxUnavailable(RuntimeError):
+    """A code set cannot be graded on this host: the grading service is absent."""
+
+
+def evaluation_prefix(eval_id: str) -> str:
+    return f"{EVALUATION_PREFIX}/{eval_id}"
+
+
 def request_digest(set_ids: Sequence[str], completion_keys: Sequence[str],
-                   problems_per_set: Mapping[str, int]) -> str:
+                   problems_per_set: Mapping[str, int],
+                   samples_per_set: Mapping[str, int]) -> str:
     """What makes two grade calls the same grading."""
     body = {"set_ids": list(set_ids), "completion_keys": list(completion_keys),
-            "problems_per_set": {k: int(v) for k, v in sorted(problems_per_set.items())}}
+            "problems_per_set": {k: int(v) for k, v in sorted(problems_per_set.items())},
+            "samples_per_set": {k: int(v) for k, v in sorted(samples_per_set.items())}}
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
@@ -69,14 +85,22 @@ def validated_completion_keys(keys: Sequence[str]) -> list[str]:
     return list(keys)
 
 
-async def load_sets(set_ids: Sequence[str], problems_per_set: Mapping[str, int], *,
+def _count(value: Any, *, low: int, high: int, what: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise GradeRequestError(f"{what} must be in [{low}, {high}], got {value!r}")
+    return value
+
+
+async def load_sets(set_ids: Sequence[str], problems_per_set: Mapping[str, int],
+                    samples_per_set: Mapping[str, int], *,
                     subnet) -> dict[str, tuple[dict, list[dict]]]:
     """Each set's card and its first ``problems_per_set[set_id]`` grading rows,
     from the subnet bucket; ``SetUnknown`` for a set it does not hold."""
     if not set_ids:
         raise GradeRequestError("no set ids")
-    if len(set(set_ids)) != len(set_ids) or set(problems_per_set) != set(set_ids):
-        raise GradeRequestError("problems_per_set must name each set id once")
+    if (len(set(set_ids)) != len(set_ids) or set(problems_per_set) != set(set_ids)
+            or set(samples_per_set) != set(set_ids)):
+        raise GradeRequestError("problems_per_set and samples_per_set must name each set once")
     loaded = {}
     for set_id in set_ids:
         try:
@@ -90,14 +114,26 @@ async def load_sets(set_ids: Sequence[str], problems_per_set: Mapping[str, int],
         card = json.loads(card_body)
         if hashlib.sha256(grading_body).hexdigest() != card.get("grading_sha256"):
             raise RuntimeError(f"set {set_id}: grading.jsonl does not match its card")
-        wanted = problems_per_set[set_id]
-        if not isinstance(wanted, int) or isinstance(wanted, bool) or not \
-                1 <= wanted <= int(card["count"]):
-            raise GradeRequestError(
-                f"set {set_id} holds {card['count']} problems; {wanted!r} asked")
+        wanted = _count(problems_per_set[set_id], low=1, high=int(card["count"]),
+                        what=f"problems_per_set[{set_id}]")
+        _count(samples_per_set[set_id], low=1, high=MAX_SAMPLES,
+               what=f"samples_per_set[{set_id}]")
         rows = [json.loads(line) for line in grading_body.decode().splitlines()[:wanted]]
         loaded[set_id] = (card, rows)
     return loaded
+
+
+def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None) -> None:
+    """Refuse an order with a code set where the grading service is not running."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    if require is None:
+        from reliquary.corpus.export import require_code_sandbox as require
+    for card, _ in sets.values():
+        try:
+            require(ENVIRONMENT_SPECS[card["source"]])
+        except ValueError as exc:
+            raise SandboxUnavailable(str(exc)) from exc
 
 
 def answer_text(policy: str, completion: str) -> str:
@@ -113,7 +149,8 @@ def answer_text(policy: str, completion: str) -> str:
 
 
 def format_failed(policy: str, answer: str) -> bool:
-    """The grader would find no answer to read."""
+    """The grader would find no answer to read (an approximation of each
+    package's own extractor; see the rulings)."""
     if policy == "boxed":
         from reliquary.environment.openmathinstruct import _last_boxed_only_string
 
@@ -135,36 +172,40 @@ def format_failed(policy: str, answer: str) -> bool:
 
 
 class _Graders:
-    """One environment per (source, split), opened on first use."""
+    """One environment and its scorer per (source, split), opened on first use."""
 
-    def __init__(self, open_environment: Callable[[str, str], Any]) -> None:
+    def __init__(self, open_environment: Callable[[str, str], Any],
+                 scorer_for: Callable[[Any, Any], Callable[[dict, str], float]]) -> None:
         self._open = open_environment
-        self._environments: dict[tuple[str, str], Any] = {}
+        self._scorer_for = scorer_for
+        self._opened: dict[tuple[str, str], tuple[Any, Callable]] = {}
 
-    def policy(self, source: str) -> str:
+    @staticmethod
+    def spec(source: str):
         from reliquary.environment.registry import ENVIRONMENT_SPECS
 
-        return ENVIRONMENT_SPECS[source].final_answer_policy
+        return ENVIRONMENT_SPECS[source]
 
     def grade(self, grading: dict, completion: str) -> tuple[float | None, str, bool]:
         """``(score, grader_detail, format_failure)``."""
         source, split = grading["source"], grading["split"]
-        policy = self.policy(source)
-        answer = answer_text(policy, completion)
-        failed_format = format_failed(policy, answer)
+        spec = self.spec(source)
+        answer = answer_text(spec.final_answer_policy, completion)
+        failed_format = format_failed(spec.final_answer_policy, answer)
         try:
             key = (source, split)
-            if key not in self._environments:
-                self._environments[key] = self._open(source, split)
-            environment = self._environments[key]
+            if key not in self._opened:
+                environment = self._open(source, split)
+                self._opened[key] = (environment, self._scorer_for(spec, environment))
+            environment, score = self._opened[key]
             problem = environment.get_problem(int(grading["source_index"]))
             if prompt_sha256(problem["prompt"]) != grading["prompt_sha256"]:
                 return None, "source_drift: the source row is not the frozen prompt", \
                     failed_format
-            score = float(environment.compute_reward(problem, answer))
+            value = float(score(problem, answer))
         except Exception as exc:
             return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
-        return score, "format_failure" if failed_format else "", failed_format
+        return value, "format_failure" if failed_format else "", failed_format
 
 
 def _graded_schema():
@@ -186,25 +227,59 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _env_report(problems: list[str], per_problem: Mapping[str, list[dict]],
+def _pass_block(problems: list[tuple[int, int]], ks: list[int], *, seed: int) -> dict:
+    """pass@1 with its CI and pass@k, over ``(c, n)`` problems."""
+    if not problems:
+        return {"pass@1": None, "pass@k": {}}
+    per_problem = [c / n for c, n in problems]
+    low, high = bootstrap_mean_ci(per_problem, seed=seed)
+    block: dict[str, Any] = {
+        "pass@1": {"value": sum(per_problem) / len(problems), "ci95": [low, high]},
+        "pass@k": {},
+    }
+    for k in ks:
+        eligible = [(c, n) for c, n in problems if n >= k]
+        if eligible:
+            block["pass@k"][str(k)] = {"value": pass_at_k(eligible, k),
+                                       "n_problems": len(eligible)}
+    return block
+
+
+def _env_report(problems: list[tuple[str, int]], per_problem: Mapping[str, list[dict]],
                 counts: Mapping[str, int], *, seed: int) -> dict:
-    graded = []
-    for problem_id in problems:
-        rows = [r for r in per_problem.get(problem_id, ()) if r["score"] is not None]
-        if rows:
-            graded.append((sum(1 for r in rows if r["correct"]), len(rows),
-                           sum(r["score"] for r in rows) / len(rows)))
-    all_rows = [r for p in problems for r in per_problem.get(p, ())]
-    samples = max((len(per_problem.get(p, ())) for p in problems), default=0)
+    """``problems`` is ``(problem_id, samples ordered)``."""
+    conservative, graded_only, scores = [], [], []
+    for problem_id, samples in problems:
+        rows = per_problem.get(problem_id, ())
+        graded = [r for r in rows if r["score"] is not None]
+        correct = sum(1 for r in graded if r["correct"])
+        # Missing and ungraded samples count as failures in the headline.
+        conservative.append((correct, samples))
+        if graded:
+            graded_only.append((correct, len(graded)))
+            scores.append(sum(r["score"] for r in graded) / len(graded))
+    all_rows = [r for p, _ in problems for r in per_problem.get(p, ())]
+    expected = sum(s for _, s in problems)
+    graded_rows = sum(1 for r in all_rows if r["score"] is not None)
+    samples = max(s for _, s in problems)
+    ks = report_ks(samples)
+    headline = _pass_block(conservative, ks, seed=seed)
+    excluded = _pass_block(graded_only, ks, seed=seed)
     report: dict[str, Any] = {
         "n_problems": len(problems),
-        "n_problems_graded": len(graded),
-        "missing_problems": sum(1 for p in problems if not per_problem.get(p)),
+        "n_problems_graded": len(graded_only),
+        "missing_problems": sum(1 for p, _ in problems if not per_problem.get(p)),
         "samples": samples,
-        "rows": len(all_rows),
-        "rows_graded": sum(1 for r in all_rows if r["score"] is not None),
-        "grader_errors": sum(1 for r in all_rows if r["score"] is None),
+        "expected_rows": expected,
+        "graded_rows": graded_rows,
+        "ungraded_rows": len(all_rows) - graded_rows,
+        "missing_rows": expected - len(all_rows),
         "duplicate_rows": counts.get("duplicate_rows", 0),
+        "out_of_range_rows": counts.get("out_of_range_rows", 0),
+        "no_graded_rows": graded_rows == 0,
+        **headline,
+        "excluding_ungraded_and_missing": excluded,
+        "mean_score": sum(scores) / len(scores) if scores else None,
         "truncation_rate": (sum(1 for r in all_rows if r["finish_reason"] == "length")
                             / len(all_rows)) if all_rows else None,
         "format_failure_rate": (sum(1 for r in all_rows if r["format_failure"])
@@ -212,31 +287,19 @@ def _env_report(problems: list[str], per_problem: Mapping[str, list[dict]],
         "mean_completion_tokens": (sum(r["tokens"] for r in all_rows) / len(all_rows))
         if all_rows else None,
     }
-    if not graded:
-        report.update({"pass@1": None, "pass@k": {}, "mean_score": None})
-        return report
-    per_problem_pass1 = [c / n for c, n, _ in graded]
-    low, high = bootstrap_mean_ci(per_problem_pass1, seed=seed)
-    report["pass@1"] = {"value": sum(per_problem_pass1) / len(graded), "ci95": [low, high]}
-    report["pass@k"] = {}
-    for k in report_ks(samples):
-        eligible = [(c, n) for c, n, _ in graded if n >= k]
-        if eligible:
-            report["pass@k"][str(k)] = {"value": pass_at_k(eligible, k),
-                                        "n_problems": len(eligible)}
-    report["mean_score"] = sum(s for _, _, s in graded) / len(graded)
+    report["complete"] = report["missing_rows"] == 0 and report["ungraded_rows"] == 0
     return report
 
 
 def _macro(envs: Mapping[str, dict]) -> dict:
-    scored = [r for r in envs.values() if r["pass@1"] is not None]
-    if not scored:
-        return {"pass@1": None, "pass@k": {}, "envs": 0}
-    common = set.intersection(*(set(r["pass@k"]) for r in scored))
+    """The mean over every ordered environment; one with no graded row counts
+    as 0 (its headline is conservative) and is named."""
+    common = set.intersection(*(set(r["pass@k"]) for r in envs.values()))
     return {
-        "envs": len(scored),
-        "pass@1": sum(r["pass@1"]["value"] for r in scored) / len(scored),
-        "pass@k": {k: sum(r["pass@k"][k]["value"] for r in scored) / len(scored)
+        "envs": len(envs),
+        "envs_without_graded_rows": sorted(e for e, r in envs.items() if r["no_graded_rows"]),
+        "pass@1": sum(r["pass@1"]["value"] for r in envs.values()) / len(envs),
+        "pass@k": {k: sum(r["pass@k"][k]["value"] for r in envs.values()) / len(envs)
                    for k in sorted(common, key=int)},
     }
 
@@ -250,35 +313,45 @@ def _reliquary_version() -> str:
         return "unknown"
 
 
+def _default_scorer(spec, environment):
+    from reliquary.corpus.export import reward_scorer
+
+    return reward_scorer(spec, environment)
+
+
 async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                            completion_keys: Sequence[str],
-                           problems_per_set: Mapping[str, int], platform, subnet,
-                           provenance: Mapping[str, Any] | None = None,
+                           problems_per_set: Mapping[str, int],
+                           samples_per_set: Mapping[str, int], platform, subnet,
+                           provenance: Mapping[str, Any],
                            open_environment: Callable[[str, str], Any] = open_source,
+                           scorer_for: Callable = _default_scorer,
+                           require_sandbox=None,
                            work_dir: str | Path | None = None,
                            clock: Callable[[], float] = time.time,
                            bootstrap_seed: int = BOOTSTRAP_SEED) -> dict:
-    """Grade every completion and write the delivery; the manifest. A grading
+    """Grade every completion and write the evaluation; the manifest. A grading
     whose manifest exists is returned as stored."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    prefix = f"{DELIVERY_PREFIX}/{eval_id}"
+    prefix = evaluation_prefix(eval_id)
     manifest_key = f"{prefix}/manifest.json"
     stored = await platform.get_json(manifest_key)
     if stored is not None:
         return stored
     keys = validated_completion_keys(completion_keys)
-    sets = await load_sets(set_ids, problems_per_set, subnet=subnet)
-    selected: dict[str, tuple[str, dict, dict]] = {}
+    sets = await load_sets(set_ids, problems_per_set, samples_per_set, subnet=subnet)
+    require_sandboxes(sets, require_sandbox)
+    selected: dict[str, tuple[str, dict, dict, int]] = {}
     for set_id, (card, rows) in sets.items():
         for row in rows:
-            selected[row["problem_id"]] = (set_id, card, row)
-    graders = _Graders(open_environment)
+            selected[row["problem_id"]] = (set_id, card, row, int(samples_per_set[set_id]))
+    graders = _Graders(open_environment, scorer_for)
     per_problem: dict[str, list[dict]] = defaultdict(list)
     seen: set[tuple[str, int]] = set()
     counts: Counter = Counter()
-    duplicates_by_env: Counter = Counter()
+    by_env_counts: dict[str, Counter] = defaultdict(Counter)
     root = Path(work_dir) if work_dir is not None else Path(tempfile.gettempdir())
     root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=f"grade-{eval_id}-", dir=root))
@@ -290,7 +363,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                 local = directory / "completions.jsonl"
                 if not await platform.get_file(key, local):
                     raise GradeRequestError(f"completion key {key!r} does not exist")
-                batch: list[tuple[dict, dict]] = []
+                batch: list[tuple[dict, tuple]] = []
                 with open(local, encoding="utf-8") as handle:
                     for line in handle:
                         if not line.strip():
@@ -298,18 +371,26 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                         try:
                             row = json.loads(line)
                             problem_id = str(row["problem_id"])
-                            sample_index = int(row["sample_index"])
+                            sample_index = row["sample_index"]
+                            if not isinstance(sample_index, int) or isinstance(sample_index,
+                                                                               bool):
+                                raise TypeError("sample_index")
                         except (ValueError, KeyError, TypeError):
                             counts["malformed_rows"] += 1
                             continue
                         if problem_id not in selected:
                             counts["unexpected_rows"] += 1
                             continue
+                        entry = selected[problem_id]
+                        env = entry[1]["env"]
+                        if not 0 <= sample_index < entry[3]:
+                            by_env_counts[env]["out_of_range_rows"] += 1
+                            continue
                         if (problem_id, sample_index) in seen:
-                            duplicates_by_env[selected[problem_id][1]["env"]] += 1
+                            by_env_counts[env]["duplicate_rows"] += 1
                             continue
                         seen.add((problem_id, sample_index))
-                        batch.append((row, selected[problem_id]))
+                        batch.append((row, entry))
                         if len(batch) >= BATCH_ROWS:
                             await _grade_batch(batch, graders, per_problem, writer, pa)
                             batch = []
@@ -318,27 +399,34 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                 local.unlink()
         finally:
             writer.close()
-        by_env: dict[str, list[str]] = defaultdict(list)
-        for problem_id, (set_id, card, _) in selected.items():
-            by_env[card["env"]].append(problem_id)
-        envs = {env: _env_report(problems, per_problem,
-                                 {"duplicate_rows": duplicates_by_env[env]},
+        by_env: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for problem_id, (_, card, _, samples) in selected.items():
+            by_env[card["env"]].append((problem_id, samples))
+        envs = {env: _env_report(problems, per_problem, by_env_counts[env],
                                  seed=bootstrap_seed)
                 for env, problems in sorted(by_env.items())}
         report = {
             "schema": REPORT_SCHEMA, "eval_id": eval_id, "created_at": clock(),
+            "complete": all(r["complete"] for r in envs.values())
+            and not counts["malformed_rows"],
             "envs": envs, "macro": _macro(envs),
             "counts": {"unexpected_rows": counts["unexpected_rows"],
                        "malformed_rows": counts["malformed_rows"]},
+            "headline": "missing and ungraded samples count as failures; "
+                        "excluding_ungraded_and_missing leaves them out",
             "bootstrap": {"seed": bootstrap_seed, "level": 0.95, "unit": "problem"},
             "provenance": {
-                **dict(provenance or {}),
+                **dict(provenance),
                 "sets": [{"set_id": set_id, "env": card["env"], "source": card["source"],
                           "split": card["split"], "problems": problems_per_set[set_id],
+                          "samples": samples_per_set[set_id],
                           "prompts_sha256": card["prompts_sha256"],
                           "grading_sha256": card["grading_sha256"],
                           "environment_manifest_sha256":
-                              card.get("environment_manifest_sha256")}
+                              card.get("environment_manifest_sha256"),
+                          "rl_disjointness": card.get("disjointness", {}).get("rl"),
+                          "contamination_note":
+                              card.get("disjointness", {}).get("contamination_note")}
                          for set_id, (card, _) in sets.items()],
                 "completion_keys": keys,
                 "reliquary_version": _reliquary_version(),
@@ -349,14 +437,17 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
         files = []
         for path in (graded_path, report_path):
             key = f"{prefix}/{path.name}"
+            # Hashed before the upload, from the bytes uploaded.
+            digest = await asyncio.to_thread(_sha256, path)
             await platform.put_file(key, path)
             files.append({"name": path.name, "key": key, "bytes": path.stat().st_size,
-                          "sha256": await asyncio.to_thread(_sha256, path)})
+                          "sha256": digest})
     finally:
         shutil.rmtree(directory, ignore_errors=True)
     manifest = {
         "schema": REPORT_SCHEMA, "eval_id": eval_id, "created_at": report["created_at"],
-        "request_sha256": request_digest(set_ids, keys, problems_per_set),
+        "request_sha256": request_digest(set_ids, keys, problems_per_set, samples_per_set),
+        "complete": report["complete"],
         "rows": sum(len(v) for v in per_problem.values()), "files": files,
         "keys": [f["key"] for f in files] + [manifest_key],
     }
@@ -368,7 +459,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
 async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa) -> None:
     def run() -> list[dict]:
         out = []
-        for row, (set_id, card, grading) in batch:
+        for row, (set_id, card, grading, _) in batch:
             completion = row.get("completion")
             completion = completion if isinstance(completion, str) else ""
             score, detail, failed_format = graders.grade(grading, completion)
@@ -382,7 +473,7 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa) -> Non
             })
         return out
 
-    # Graders are synchronous and may run code: off the event loop.
+    # Graders are synchronous and may be slow: off the event loop.
     rows = await asyncio.to_thread(run)
     for row in rows:
         per_problem[row["problem_id"]].append(
@@ -394,14 +485,18 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa) -> Non
 
 
 __all__ = [
+    "EVALUATION_PREFIX",
     "GRADED_COLUMNS",
     "GradeRequestError",
     "REPORT_SCHEMA",
+    "SandboxUnavailable",
     "SetUnknown",
     "answer_text",
+    "evaluation_prefix",
     "format_failed",
     "grade_evaluation",
     "load_sets",
     "request_digest",
+    "require_sandboxes",
     "validated_completion_keys",
 ]
