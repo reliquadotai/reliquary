@@ -254,6 +254,7 @@ def build_corpus_task_entry(
     min_incentive_share=0.0,
     audit_params: Mapping | None = None,
     base=None,
+    toploc_thresholds: Mapping | None = None,
 ):
     """One registry entry for a corpus generation job.
 
@@ -301,7 +302,7 @@ def build_corpus_task_entry(
     # none unless told to.
     if audit_params:
         params.update(audit_params)
-    contract = _with_enforced_toploc(entry.contract)
+    contract = _with_enforced_toploc(entry.contract, toploc_thresholds)
     return replace(
         entry,
         mechanism=MECHANISM_CORPUS_GENERATION,
@@ -312,20 +313,25 @@ def build_corpus_task_entry(
     )
 
 
-def _with_enforced_toploc(contract):
+def _with_enforced_toploc(contract, thresholds=None):
     """A corpus task is paid only on audited work, and the corpus validator
     refuses a contract without an enforced toploc proof. No compiled template
     carries one, so the template's own toploc entry is enforced if it has one,
-    and Prime Intellect's deployed defaults are added otherwise."""
+    and Prime Intellect's deployed defaults are added otherwise. ``thresholds``
+    (a qualification's, never under the floors) replace the proof's own."""
     from reliquary.protocol.profiles import PROOF_SCHEME_TOPLOC, TOPLOC_DEPLOYED_DEFAULTS
 
     proofs = [dict(p) for p in contract.get("proofs") or ()]
     toploc = [p for p in proofs if p.get("scheme") == PROOF_SCHEME_TOPLOC]
-    if toploc:
-        for proof in toploc:
-            proof["mode"] = "enforce"
-    else:
+    if not toploc:
         proofs.append(TOPLOC_DEPLOYED_DEFAULTS.to_contract())
+        toploc = [proofs[-1]]
+    for proof in toploc:
+        proof["mode"] = "enforce"
+        if thresholds:
+            from reliquary.eval.qualification import check_thresholds
+
+            proof.update(check_thresholds(dict(thresholds)))
     return {**contract, "proofs": proofs}
 
 
@@ -874,6 +880,7 @@ def build_job_manifest(
     from_profile=None,
     profile=None,
     prompt_start=0,
+    seed=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -930,6 +937,8 @@ def build_job_manifest(
         # Written only when set, so a job declared without it stores the bytes
         # it always did; a negative start is left for `parse_job` to name.
         manifest["prompt_start"] = prompt_start
+    if seed is not None:
+        manifest["seed"] = seed
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
     # time: an unrenderable source fails fidelity forever, and a range
@@ -981,26 +990,31 @@ def prepare_corpus_job(
     eos_token_id, slots_per_prompt, max_new_tokens, cap, min_incentive_share, audit_params,
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
-    verification=None,
+    verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
-    checked without writing either (the admin service declares jobs with it)."""
+    checked without writing either (the admin service declares jobs with it).
+
+    ``contract_environment`` is the catalog environment the contract declares
+    when the prompt source is not one (an eval set: its own environment);
+    ``toploc_thresholds`` replaces the proof's thresholds (from qualification)."""
+    environment = contract_environment or prompt_source
     base = _corpus_base_profile(
         task_id=task_id or job_id, from_profile=from_profile, model=model,
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-        prompt_source=prompt_source,
+        prompt_source=environment,
     )
     if max_new_tokens is None:
         # The template or catalog budgets each environment; the length stays
         # a manifest field, so the contract body is not overridden.
         environments = base.environments
-        if prompt_source not in environments:
+        if environment not in environments:
             raise ValueError(
-                f"template {from_profile!r} does not declare {prompt_source!r}; "
+                f"template {from_profile!r} does not declare {environment!r}; "
                 "pass --max-new-tokens"
             )
-        max_new_tokens = environments[prompt_source].max_new_tokens
+        max_new_tokens = environments[environment].max_new_tokens
     manifest = build_job_manifest(
         job_id=job_id,
         # The contract's model IS the job's frozen checkpoint. Taking both
@@ -1029,6 +1043,7 @@ def prepare_corpus_job(
         threshold=threshold,
         prompt_order=prompt_order,
         deadline_round=deadline_round,
+        seed=seed,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -1037,12 +1052,13 @@ def prepare_corpus_job(
         model_id=model,
         model_revision=model_revision,
         model_architecture=model_architecture,
-        prompt_source=prompt_source,
+        prompt_source=environment,
         cap=cap,
         overrides=dict(overrides or {}),
         verification=verification,
         min_incentive_share=min_incentive_share,
         audit_params=dict(audit_params),
+        toploc_thresholds=toploc_thresholds,
     )
     return manifest, entry
 

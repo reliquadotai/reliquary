@@ -9,6 +9,8 @@ active caps stay within the one pool, and the corpus caps within
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
 import time
@@ -33,6 +35,7 @@ _SUM_TOLERANCE = 1e-9
 DEFAULT_TASK_PREFIX = "order-"
 # No admin request is larger; the bound is checked before the body is read.
 MAX_BODY_BYTES = 1024 * 1024
+DEFAULT_EVAL_CAP = 0.02
 # Renderer of a catalog source's rows: the model's own chat template.
 THINKING_RENDERERS = {False: "chat-template-v1", True: "chat-template-thinking-v1"}
 
@@ -58,7 +61,28 @@ class CreateJob(BaseModel):
     samples_per_prompt: int = Field(gt=0)
     max_new_tokens: int | None = Field(default=None, gt=0)
     thinking: bool = False
-    cap: float = Field(ge=0.0, le=1.0)
+    # A fixed share of the pool, as every corpus job; eval jobs default to 0.02.
+    cap: float = Field(default=DEFAULT_EVAL_CAP, ge=0.0, le=1.0)
+    # An evaluation job: its prompts are the eval set's first prompt_count
+    # problems, its model and thresholds come from the qualification record.
+    eval_set_id: str | None = Field(default=None, min_length=1, max_length=128)
+    qualification_id: str | None = Field(default=None, min_length=1, max_length=63)
+    seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    audit_q: float | None = Field(default=None, gt=0.0, le=1.0)
+
+
+class RequestQualification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    qualification_id: str = Field(min_length=1, max_length=63)
+    model: str = Field(min_length=1, max_length=256)
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    set_id: str = Field(min_length=1, max_length=128)
+    # The first `problems` prompts of the set, `completions` decoded over them.
+    problems: int = Field(default=32, gt=0, le=1024)
+    completions: int = Field(default=32, gt=0, le=1024)
+    sampling: dict[str, float | int]
+    max_new_tokens: int = Field(gt=0, le=131072)
+    thinking: bool = False
 
 
 class SetCap(BaseModel):
@@ -164,7 +188,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      prepare=None, work_dir=None,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
                      open_environment=None, grade_scorer=None,
-                     require_sandbox=None) -> FastAPI:
+                     require_sandbox=None, qualifications=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -200,6 +224,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         eval_store = SubnetEvalStore()
     if open_environment is None:
         from reliquary.eval.sets import open_source as open_environment
+    if qualifications is None:
+        from reliquary.eval.qualification import QualificationStore
+
+        qualifications = QualificationStore()
 
     async def signed(request: Request) -> None:
         if request.url.query:
@@ -242,32 +270,94 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         return {**answer, "created": False, "status": entry.status,
                 "cap": float(entry.params["cap"])}
 
+    async def eval_job_arguments(body: CreateJob) -> dict:
+        """What an evaluation job is declared from: its set's first
+        prompt_count prompts, the qualification's model and thresholds."""
+        from reliquary.eval import qualification as qual
+        from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
+        from reliquary.eval.sets import validated_set_id
+        from reliquary.eval.storage import subnet_key
+
+        if body.qualification_id is None:
+            raise HTTPException(status_code=422, detail="qualification_id_required")
+        if body.prompt_start != 0:
+            raise HTTPException(status_code=422, detail="an eval job starts at the set's first problem")
+        if body.audit_q not in (None, 1.0):
+            raise HTTPException(status_code=422, detail="an eval job audits every submission (audit_q 1.0)")
+        try:
+            set_id = validated_set_id(body.eval_set_id)
+            record, _ = await qualifications.read(body.qualification_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail="qualification_unknown")
+        if record.get("status") != qual.QUALIFIED:
+            raise HTTPException(status_code=409, detail=f"model_not_qualified: {record.get('status')}")
+        if record["model"] != body.model:
+            raise HTTPException(status_code=409, detail="qualification_is_for_another_model")
+        result = record["result"]
+        card_body = await eval_store.get_bytes(subnet_key(set_id, "set.json"))
+        prompts_body = await eval_store.get_bytes(subnet_key(set_id, "prompts.jsonl"))
+        if card_body is None or prompts_body is None:
+            raise HTTPException(status_code=404, detail="set_unknown")
+        card = json.loads(card_body)
+        if body.env not in (card["env"], card["source"]):
+            raise HTTPException(status_code=422, detail=f"set {set_id} is a {card['env']} set")
+        if body.prompt_count > int(card["count"]):
+            raise HTTPException(status_code=422, detail=f"set {set_id} holds {card['count']} problems")
+        source = eval_source_for(set_id, prompts_body, body.prompt_count)
+        register_eval_prompts(source, prompts_body)
+        seed = body.seed if body.seed is not None else int(
+            hashlib.sha256(body.job_id.encode()).hexdigest()[:15], 16)
+        return dict(
+            model_revision=record["revision"], model_architecture=result["architecture"],
+            checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
+            prompt_source=source.name, contract_environment=card["source"], seed=seed,
+            toploc_thresholds=result["thresholds"], audit_params={"audit_q": 1.0},
+        )
+
     @router.post("/jobs")
     async def create_job(body: CreateJob, response: Response) -> dict:
         from reliquary.corpus.job import parse_job
+        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
 
         if not (body.job_id.startswith(task_prefix)
                 and (body.task_id or body.job_id).startswith(task_prefix)):
             raise HTTPException(status_code=422, detail="task_id_outside_admin_scope")
-        spec = catalog.get(body.model)
-        if spec is None:
-            raise HTTPException(status_code=422, detail=f"model {body.model!r} is not qualified")
-        from reliquary.environment.registry import ENVIRONMENT_SPECS
+        evaluation = body.eval_set_id is not None
+        # The eval control serves exactly the order-eval- ids (and routing
+        # sends it exactly those): one is an eval job if and only if it says so.
+        if evaluation != body.job_id.startswith(EVAL_JOB_PREFIX) or (
+                evaluation and not (body.task_id or body.job_id).startswith(EVAL_JOB_PREFIX)):
+            raise HTTPException(status_code=422, detail=(
+                f"an eval job's ids start with {EVAL_JOB_PREFIX!r}, and only an eval job's"))
+        if not evaluation and any(v is not None for v in (body.qualification_id, body.seed,
+                                                           body.audit_q)):
+            raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
+        if evaluation:
+            arguments = await eval_job_arguments(body)
+        else:
+            spec = catalog.get(body.model)
+            if spec is None:
+                raise HTTPException(status_code=422, detail=f"model {body.model!r} is not qualified")
+            from reliquary.environment.registry import ENVIRONMENT_SPECS
 
-        env = ENVIRONMENT_SPECS.get(body.env)
-        if env is None or getattr(env, "interaction_mode", None) != "single_turn":
-            raise HTTPException(status_code=422,
-                                detail=f"env {body.env!r} is not a single-turn catalog source")
+            env = ENVIRONMENT_SPECS.get(body.env)
+            if env is None or getattr(env, "interaction_mode", None) != "single_turn":
+                raise HTTPException(status_code=422,
+                                    detail=f"env {body.env!r} is not a single-turn catalog source")
+            arguments = dict(model_revision=spec.revision, model_architecture=spec.architecture,
+                             checkpoint_sha256=spec.checkpoint_sha256,
+                             eos_token_id=spec.eos_token_id, prompt_source=body.env,
+                             audit_params={})
         try:
             manifest, entry = await asyncio.to_thread(
                 prepare, job_id=body.job_id, task_id=body.task_id, model=body.model,
-                model_revision=spec.revision, model_architecture=spec.architecture,
-                checkpoint_sha256=spec.checkpoint_sha256, from_profile=None,
-                prompt_encoding=None, prompt_source=body.env, prompt_count=body.prompt_count,
+                from_profile=None, prompt_encoding=None, prompt_count=body.prompt_count,
                 prompt_start=body.prompt_start, renderer_id=THINKING_RENDERERS[body.thinking],
-                eos_token_id=spec.eos_token_id, slots_per_prompt=body.samples_per_prompt,
+                slots_per_prompt=body.samples_per_prompt,
                 max_new_tokens=body.max_new_tokens, cap=body.cap, min_incentive_share=0.0,
-                audit_params={},
+                **arguments,
             )
         except (RegistryError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -454,6 +544,57 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
+    @router.post("/qualifications")
+    async def request_qualification(body: RequestQualification, response: Response) -> dict:
+        """Queue a model's qualification for the eval control; idempotent on the id."""
+        from reliquary.eval import qualification as qual
+        from reliquary.eval.sets import validated_set_id
+        from reliquary.eval.storage import subnet_key
+        from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+
+        in_scope(body.qualification_id)
+        try:
+            qual.validated_qualification_id(body.qualification_id)
+            validated_set_id(body.set_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if await eval_store.get_bytes(subnet_key(body.set_id, "prompts.jsonl")) is None:
+            raise HTTPException(status_code=404, detail="set_unknown")
+        wanted = qual.new_request(
+            qualification_id=body.qualification_id, model=body.model, revision=body.revision,
+            set_id=body.set_id, problems=body.problems, completions=body.completions,
+            sampling=body.sampling, max_new_tokens=body.max_new_tokens, thinking=body.thinking,
+            clock=clock)
+
+        def same(existing: dict) -> dict:
+            if any(existing.get(k) != wanted[k] for k in qual.REQUEST_FIELDS):
+                raise HTTPException(status_code=409,
+                                    detail="qualification_exists_with_another_request")
+            response.status_code = 200
+            return existing
+
+        existing, _ = await qualifications.read(body.qualification_id)
+        if existing is not None:
+            return same(existing)
+        try:
+            await qualifications.write(wanted, None)
+        except CorpusStoreConflict:
+            existing, _ = await qualifications.read(body.qualification_id)
+            return same(existing)
+        response.status_code = 201
+        return wanted
+
+    @router.get("/qualifications/{qualification_id}")
+    async def read_qualification(qualification_id: str) -> dict:
+        in_scope(qualification_id)
+        try:
+            record, _ = await qualifications.read(qualification_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="qualification_unknown") from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail="qualification_unknown")
+        return record
+
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
         from reliquary.corpus.delivery import validated_delivery_id
@@ -556,6 +697,7 @@ from reliquary.validator.corpus_audit_remote import token_sha256  # noqa: E402
 __all__ = [
     "CreateJob",
     "GradeEvaluation",
+    "RequestQualification",
     "Provenance",
     "QualifiedModel",
     "THINKING_RENDERERS",
