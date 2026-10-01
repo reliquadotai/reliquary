@@ -15,12 +15,15 @@ binds the conditions it was measured under, which the job must repeat.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 import time
 from collections.abc import Sequence
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 QUALIFICATION_SCHEMA = "reliquary/eval-qualification/v2"
 QUALIFICATION_PREFIX = "reliquary/eval/qualifications/"
@@ -258,6 +261,31 @@ class QualificationQueue:
         self._open: dict[str, dict] = {}
         # Ids already terminal: never read again.
         self._done: set[str] = set()
+        # (repo, revision) -> the model's facts, read once.
+        self._facts: dict[tuple[str, str], dict] = {}
+
+    async def facts_of(self, model: str, revision: str) -> dict:
+        key = (model, revision)
+        if key not in self._facts:
+            self._facts[key] = await self._model_facts(model, revision)
+        return self._facts[key]
+
+    async def model_refusal(self, record: dict) -> dict | None:
+        """The result refusing a qualification before any executor is leased:
+        an architecture outside ``SUPPORTED_ARCHITECTURES``, or model files
+        that are not public at the revision. None: go on (a transient read
+        failure raises)."""
+        from reliquary.constants import SUPPORTED_ARCHITECTURES
+
+        try:
+            facts = await self.facts_of(record["model"], record["revision"])
+        except ValueError as exc:
+            return {"refused_reason": "model_files_unreadable", "detail": str(exc)[:300]}
+        if facts["architecture"] not in SUPPORTED_ARCHITECTURES:
+            return {"refused_reason": "architecture_unsupported",
+                    "architecture": facts["architecture"],
+                    "supported_architectures": sorted(SUPPORTED_ARCHITECTURES)}
+        return None
 
     async def refresh(self) -> None:
         for qualification_id in await self._store.list_ids():
@@ -318,6 +346,16 @@ class QualificationQueue:
                 continue
             if (record["model"], record["revision"]) != (executor.get("model_id"),
                                                          executor.get("model_revision")):
+                continue
+            try:
+                refusal = await self.model_refusal(record)
+            except Exception:
+                logger.warning("model facts of %s@%s unreadable; retrying", record["model"],
+                               record["revision"], exc_info=True)
+                continue
+            if refusal is not None:
+                await self._finish(qualification_id, {**record, "status": REFUSED,
+                                                      "result": refusal}, etag)
                 continue
             record = self._expire(record)
             if record["status"] == FAILED:
@@ -417,7 +455,10 @@ class QualificationQueue:
         band = {name: max(a["band"][name], b["band"][name]) for name in MEASURES}
         band["chunks"] = a["band"]["chunks"] + b["band"]["chunks"]
         verdict = thresholds_from_band(band)
-        facts = await self._model_facts(record["model"], record["revision"])
+        refusal = await self.model_refusal(record)
+        if refusal is not None:
+            return {**record, "status": REFUSED, "result": refusal}
+        facts = await self.facts_of(record["model"], record["revision"])
         result = {
             "thresholds": verdict["thresholds"], "clamped": verdict["clamped"], "band": band,
             "refused_reason": verdict["refused"],

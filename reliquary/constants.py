@@ -110,9 +110,35 @@ PROTOCOL_GENERATION_CONTRACT = (
 # profile names an MoE checkpoint, so that architecture is deliberately absent
 # rather than pre-approved on spec. A task contract naming anything else is
 # refused at startup rather than at the first forward pass.
-SUPPORTED_MODEL_ARCHITECTURES = frozenset(
-    {"Qwen3ForCausalLM", "Qwen3_5ForConditionalGeneration"}
-)
+#
+# The one table: ``architectures[0]`` of a model's config.json that both the
+# miner (vLLM, decode capture) and the verifier (HF prefill, TOPLOC) are known
+# to handle, each with the tests, fixtures and runbook records behind it
+# (``path`` or ``path::text it contains``). Dataset orders on any model are
+# refused ``architecture_unsupported`` at qualification for anything else;
+# ``GET /admin/v1/architectures`` serves it. A new entry needs its own evidence.
+SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
+    # Dense Qwen3 (Qwen/Qwen3-4B-Base): the 2026-09-22 H100 bench and the
+    # 2026-09-24 rehearsal measured vLLM capture + HF verification on it.
+    "Qwen3ForCausalLM": (
+        "tests/unit/test_modeling_helpers.py::test_legacy_config_uses_causal_lm_auto_class",
+        "tests/unit/test_corpus_end_to_end.py::model_architecture=\"Qwen3ForCausalLM\"",
+        "scripts/corpus_e2e.py::--honest-model\", default=\"Qwen/Qwen3-4B-Base\"",
+        "docs/runbooks/corpus-task-launch.md::Qwen3-4B-Base (906bfd4b), on one H100",
+    ),
+    # Qwen3.5's conditional-generation class, served text-only (the miner's
+    # limit_mm rule, the verifier's text-config load): the production corpus
+    # jobs on Qwen/Qwen3.8-27B since 2026-09-26.
+    "Qwen3_5ForConditionalGeneration": (
+        "tests/unit/test_modeling_helpers.py::test_qwen35_conditional_config_uses_image_text_auto_class",
+        "tests/unit/test_modeling_helpers.py::test_a_text_only_load_takes_the_language_model_of_a_multimodal_checkpoint",
+        "tests/unit/test_corpus_miner.py::test_a_vision_checkpoint_is_served_text_only",
+        "tests/unit/test_corpus_audit_batched.py::measured\non Qwen3.8-27B",
+        "tests/fixtures/corpus_code_v1_contract.json::\"model_architecture\":\"Qwen3_5ForConditionalGeneration\"",
+        "tests/fixtures/live_registry_2026_09_30.json::Qwen3_5ForConditionalGeneration",
+    ),
+}
+SUPPORTED_MODEL_ARCHITECTURES = frozenset(SUPPORTED_ARCHITECTURES)
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
 

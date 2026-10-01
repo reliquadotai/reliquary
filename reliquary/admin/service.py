@@ -315,6 +315,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         return {**answer, "created": False, "status": entry.status,
                 "cap": float(entry.params["cap"])}
 
+    def refuse_unsupported(result: dict) -> None:
+        from reliquary.constants import SUPPORTED_ARCHITECTURES
+
+        # A record qualified before the table changed is not trusted for it.
+        if result.get("architecture") not in SUPPORTED_ARCHITECTURES:
+            raise HTTPException(status_code=409, detail=(
+                f"architecture_unsupported: {result.get('architecture')!r}"))
+
     async def eval_job_arguments(body: CreateJob) -> dict:
         """What an evaluation job is declared from: its set's first
         prompt_count prompts, the qualification's model and thresholds."""
@@ -344,6 +352,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if record["model"] != body.model:
             raise HTTPException(status_code=409, detail="qualification_is_for_another_model")
         result = record["result"]
+        refuse_unsupported(result)
         card_body = await eval_store.get_bytes(subnet_key(set_id, "set.json"))
         prompts_body = await eval_store.get_bytes(subnet_key(set_id, "prompts.jsonl"))
         if card_body is None or prompts_body is None:
@@ -618,6 +627,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 grade=grade, filter_note=note, work_dir=work_dir, clock=clock))
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
+
+    @router.get("/architectures")
+    async def architectures() -> dict:
+        """The model architectures orders on any model may use, with the
+        evidence each entry rests on (``SUPPORTED_ARCHITECTURES``)."""
+        from reliquary.constants import SUPPORTED_ARCHITECTURES
+
+        return {"schema": "reliquary/architectures/v1",
+                "architectures": sorted(SUPPORTED_ARCHITECTURES),
+                "evidence": {k: list(v) for k, v in SUPPORTED_ARCHITECTURES.items()}}
 
     @router.get("/eval-control/status")
     async def eval_control_status() -> dict:

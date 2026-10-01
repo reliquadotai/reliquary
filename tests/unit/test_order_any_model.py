@@ -8,6 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.unit.test_admin_eval_jobs import admin  # noqa: F401
+from tests.unit.test_jobs_cli import registry  # noqa: F401
+
 
 # -- 1. the prefixes and the corpus control --------------------------------------
 
@@ -75,3 +78,80 @@ def test_slot_reopening_stays_eval_only():
     with pytest.raises(ValueError, match="eval"):
         asyncio.run(record_prompt_failure(_Store(), gen, 0, "a" * 64))
     assert calls == []
+
+
+# -- 5. supported architectures --------------------------------------------------
+
+
+def test_every_supported_architecture_names_evidence_that_exists():
+    from pathlib import Path
+
+    from reliquary.constants import SUPPORTED_ARCHITECTURES, SUPPORTED_MODEL_ARCHITECTURES
+
+    root = Path(__file__).resolve().parents[2]
+    assert set(SUPPORTED_ARCHITECTURES) == {"Qwen3ForCausalLM",
+                                            "Qwen3_5ForConditionalGeneration"}
+    # One table: the startup check reads the same names.
+    assert SUPPORTED_MODEL_ARCHITECTURES == frozenset(SUPPORTED_ARCHITECTURES)
+    for architecture, evidence in SUPPORTED_ARCHITECTURES.items():
+        assert evidence, architecture
+        for reference in evidence:
+            path = reference.split("::")[0]
+            assert (root / path).exists(), (architecture, reference)
+            if "::" in reference:
+                assert reference.split("::")[1] in (root / path).read_text(), reference
+
+
+def _queue_with(store, facts):
+    from tests.unit.test_eval_qualification import _queue
+
+    return _queue(store, [0.0], facts=facts)
+
+
+def test_an_unsupported_architecture_is_refused_before_any_executor_is_leased(monkeypatch):
+    from reliquary.eval import qualification as qual
+    from tests.unit.test_eval_qualification import _executor, _request
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+    from reliquary.infrastructure import corpus_job_store as job_store
+
+    fake = _FakeMultiObjectR2()
+    monkeypatch.setattr(job_store, "get_s3_client", lambda **kw: fake)
+    store = qual.QualificationStore()
+    queue = _queue_with(store, {"architecture": "MambaForCausalLM", "eos_token_id": 2})
+    _request(store)
+    asyncio.run(queue.refresh())
+    assert asyncio.run(queue.claim(_executor("e1"))) is None
+    record, _ = asyncio.run(store.read("order-q1"))
+    assert record["status"] == qual.REFUSED and record["leases"] == {}
+    assert record["result"]["refused_reason"] == "architecture_unsupported"
+    assert record["result"]["architecture"] == "MambaForCausalLM"
+    assert "Qwen3ForCausalLM" in record["result"]["supported_architectures"]
+
+
+def test_the_admin_serves_the_architecture_table(admin):  # noqa: F811
+    from reliquary.constants import SUPPORTED_ARCHITECTURES
+
+    response = admin("GET", "/admin/v1/architectures")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"schema": "reliquary/architectures/v1",
+                    "architectures": sorted(SUPPORTED_ARCHITECTURES),
+                    "evidence": {k: list(v) for k, v in SUPPORTED_ARCHITECTURES.items()}}
+
+
+def test_a_job_on_a_record_of_an_unsupported_architecture_is_refused(admin):  # noqa: F811
+    from reliquary.eval import qualification as qual
+    from tests.unit.test_admin_eval_jobs import _eval_job, _qualification, _qualify
+
+    admin("POST", "/admin/v1/qualifications", _qualification())
+    _qualify(admin)
+
+    async def rewrite():
+        store = qual.QualificationStore()
+        record, etag = await store.read("order-q1")
+        record["result"]["architecture"] = "MambaForCausalLM"
+        await store.write(record, etag)
+
+    asyncio.run(rewrite())
+    response = admin("POST", "/admin/v1/jobs", _eval_job())
+    assert response.status_code == 409 and "architecture_unsupported" in response.text
