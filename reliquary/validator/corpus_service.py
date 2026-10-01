@@ -124,6 +124,10 @@ DEFAULT_WRITE_ATTEMPTS = 4
 # the turn for botocore's full ~135 s; past this the miner gets the retryable 503.
 LEDGER_LOCK_TIMEOUT_SECONDS = 30.0
 
+# The most submissions and skips one ledger turn decides (group commit): one
+# read and one compare-and-swap for all of them instead of one each.
+LEDGER_BATCH_MAX = 64
+
 # Each resolved source holds a built environment, and a validator serves only a
 # handful of live jobs at once, so the cache is bounded rather than growing with
 # every job this process has ever seen.
@@ -866,6 +870,100 @@ class SeenView(AbstractSet):
         yield from self._index
 
 
+@dataclass(eq=False)
+class _TurnEntry:
+    """One submission or skip waiting for, then inside, a ledger turn."""
+
+    job: JobSpec
+    # Decides against (slots, cursors, seen), mutating the ledgers as `admit`
+    # and `skip` do; returns the verdict.
+    decide: Callable[[SlotLedger, CursorLedger, AbstractSet[str]], Verdict]
+    # What an accept adds to the seen set: a submission's digests, a skip none.
+    digests: Sequence[str]
+    future: asyncio.Future
+    enqueued: float
+    # Run once the verdict is in, by a task the HTTP handler cannot cancel.
+    settled: Callable[["_TurnResult"], Awaitable[None]] | None = None
+    taken: bool = False
+    finisher: asyncio.Task | None = None
+
+
+class _TurnResult(NamedTuple):
+    # None when the ledgers stayed contended over every attempt.
+    verdict: Verdict | None
+    attempts: int
+    batch: int
+    timing: dict[str, float]
+
+
+class TurnPlan(NamedTuple):
+    # Per entry: its verdict, or the exception its decision raised.
+    outcomes: list
+    # The ledger to write without the segments `chunks` will add, or None when
+    # no entry moved anything.
+    after: dict[str, Any] | None
+    # Segment bodies to seal, in the order the sequential path sealed them.
+    chunks: list[list[str]]
+
+
+def plan_turn(
+    job: JobSpec,
+    state: LedgerState,
+    snapshot: Any,
+    entries: Sequence[Any],
+    seen_index: Any,
+    *,
+    seal_threshold: int = SEAL_THRESHOLD,
+    segment_max: int = SEGMENT_MAX,
+) -> TurnPlan:
+    """Decide ``entries`` in order against one ledger read, exactly as one
+    turn each would have: each sees the ledgers the ones before it left, and a
+    seal happens after the same entry and over the same digests it would have.
+    Pure and CPU-bound; ``state`` is consumed (rebuilt from ``snapshot``)."""
+    outcomes: list = [None] * len(entries)
+    failed: set[int] = set()
+    while True:
+        slots, cursors, pending = state.slots, state.cursors, state.pending
+        # Sealed earlier in this turn: seen exactly as if a ledger named them.
+        sealed: set[str] = set()
+        chunks: list[list[str]] = []
+        moved = False
+        for position, entry in enumerate(entries):
+            if position in failed:
+                continue
+            # `consume` is the only slot mutator `admit` and `skip` reach, and
+            # it always bumps `filled`, so this sees any slot that moved.
+            before = (slots.filled, cursors.snapshot())
+            try:
+                verdict = entry.decide(slots, cursors, SeenView(SeenView(seen_index, sealed), pending))
+            except Exception as exc:
+                # It fails alone; the ones before it are decided again on a
+                # fresh copy, since it may have moved the ledgers half way.
+                outcomes[position] = exc
+                failed.add(position)
+                break
+            outcomes[position] = verdict
+            if verdict.accepted:
+                # `admit` reads `seen`, it does not grow it: recording what was
+                # paid for is the caller's half of the duplicate check.
+                pending.update(entry.digests)
+            elif (slots.filled, cursors.snapshot()) == before:
+                # A refusal that moved nothing costs no write.
+                continue
+            moved = True
+            if len(pending) >= seal_threshold:
+                chunks.extend(seal_chunks(pending, segment_max))
+                sealed.update(pending)
+                pending = set()
+        else:
+            if not moved:
+                return TurnPlan(outcomes, None, [])
+            return TurnPlan(
+                outcomes, ledger_snapshot(slots, cursors, pending, state.segments), chunks
+            )
+        state = rebuild_ledgers(job, snapshot)
+
+
 async def _write_segments(
     store: Any, job_id: str, chunks: Sequence[Sequence[str]], parallelism: int
 ) -> list[SegmentRef]:
@@ -1122,6 +1220,7 @@ def build_corpus_router(
     seal_threshold: int = SEAL_THRESHOLD,
     segment_max: int = SEGMENT_MAX,
     seen_index: SeenIndex | None = None,
+    ledger_batch_max: int = LEDGER_BATCH_MAX,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1143,6 +1242,12 @@ def build_corpus_router(
     # This process's submissions take turns on the ledger: interleaved, each
     # would read the same ETag and all but one would lose the compare-and-swap.
     ledger_lock = asyncio.Lock()
+    # Group commit: what arrives while a turn runs waits for the next one, which
+    # decides it in arrival order alongside the rest (`_commit_turns`).
+    turn_queue: collections.deque[_TurnEntry] = collections.deque()
+    committer: list[asyncio.Task] = []
+    # Strong references to the post-turn tasks until they finish.
+    finishing: set[asyncio.Task] = set()
     # The sealed part of the seen set, touched only under `ledger_lock`; the
     # startup path hands in one it has already loaded.
     if seen_index is None:
@@ -1354,17 +1459,10 @@ def build_corpus_router(
 
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
-        def admit_against(
-            state: LedgerState,
-        ) -> tuple[Verdict, tuple[dict[str, Any], list[list[str]]] | None]:
-            # Pure and CPU-bound, so it runs in a thread; the lock keeps two of
-            # these from ever working on one state, and `seen_index` already
-            # holds exactly the segments `state` names.
-            seen_index.check_pending(state.pending)
-            slots, cursors, pending = state.slots, state.cursors, state.pending
-            before = (slots.snapshot(), cursors.snapshot())
-
-            verdict = admit(
+        def decide(slots: SlotLedger, cursors: CursorLedger, seen: AbstractSet[str]) -> Verdict:
+            # Run inside a ledger turn, against the ledgers as the entries
+            # before this one in the turn left them (`plan_turn`).
+            return admit(
                 job,
                 hotkey=request.miner_hotkey,
                 cursor=request.cursor,
@@ -1375,30 +1473,32 @@ def build_corpus_router(
                 digests=digests,
                 slots=slots,
                 cursors=cursors,
-                seen=SeenView(seen_index, pending),
+                seen=seen,
                 proof_counts=[len(c.proofs) for c in request.completions],
                 proof_chunk_tokens=proof_chunk_tokens,
             )
-            if verdict.accepted:
-                # `admit` reads `seen`, it does not grow it: recording what was
-                # paid for is the caller's half of the duplicate check.
-                pending.update(digests)
-            elif (slots.snapshot(), cursors.snapshot()) == before:
-                return verdict, None
-            chunks: list[list[str]] = []
-            if len(pending) >= seal_threshold:
-                chunks = seal_chunks(pending, segment_max)
-                pending = set()
-            # Everything but the segment list, which the seal completes.
-            return verdict, (ledger_snapshot(slots, cursors, pending, state.segments), chunks)
 
-        for key in ("ledger_read", "segments", "admit", "ledger_write"):
-            timing[key] = 0.0
-        waited = time.perf_counter()
-        written: Verdict | None = None
-        attempts = 0
+        async def settled(turn: _TurnResult) -> None:
+            # Outside the turn: the record is create-only and keyed by its own
+            # id, so it needs no turn on the ledger. Run even if the miner hung
+            # up, so a slot the ledger consumed always gets its record.
+            if turn.verdict is None or not turn.verdict.accepted:
+                return
+            timing.update(turn.timing)
+            mark = time.perf_counter()
+            await _record_accepted(request, job_id)
+            timing["record_write"] = time.perf_counter() - mark
+            timing["total"] = time.perf_counter() - started
+            logger.info(
+                "corpus submission timing %s: %s attempts=%d batch=%d",
+                request.miner_hotkey[:12],
+                " ".join(f"{k}={v:.3f}" for k, v in timing.items()),
+                turn.attempts,
+                turn.batch,
+            )
+
         try:
-            await asyncio.wait_for(ledger_lock.acquire(), ledger_lock_timeout)
+            turn = await _take_turn(job, decide, digests, settled)
         except asyncio.TimeoutError:
             logger.warning(
                 "corpus ledger turn for %s not granted within %.0f s (miner %s)",
@@ -1406,63 +1506,9 @@ def build_corpus_router(
             )
             # Nothing was consumed, so the same work resubmits cleanly.
             raise HTTPException(status_code=503, detail="corpus_ledger_contention") from None
-        try:
-            timing["lock_wait"] = time.perf_counter() - waited
-            for attempts in range(1, max_write_attempts + 1):
-                mark = time.perf_counter()
-                snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
-                state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
-                timing["ledger_read"] += time.perf_counter() - mark
-
-                mark = time.perf_counter()
-                await _ensure_seen(state.segments)
-                timing["segments"] += time.perf_counter() - mark
-
-                mark = time.perf_counter()
-                try:
-                    verdict, planned = await asyncio.to_thread(admit_against, state)
-                except LedgerSnapshotError as exc:
-                    raise _ledger_corrupt(exc) from exc
-                timing["admit"] += time.perf_counter() - mark
-                if planned is None:
-                    # A refusal that moved nothing costs no write, so a miner
-                    # spraying junk cannot bill us a bucket write per attempt.
-                    return _respond(verdict)
-                after, chunks = planned
-                mark = time.perf_counter()
-                if chunks:
-                    sealed = await seal(chunks)
-                    after["seen_segments"] = [
-                        *after["seen_segments"],
-                        *({"id": ref.id, "count": ref.count} for ref in sealed),
-                    ]
-                timing["segments"] += time.perf_counter() - mark
-                mark = time.perf_counter()
-                try:
-                    await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
-                except CorpusStoreConflict:
-                    continue
-                finally:
-                    timing["ledger_write"] += time.perf_counter() - mark
-                written = verdict
-                break
-        finally:
-            ledger_lock.release()
+        written = turn.verdict
 
         if written is not None:
-            # Outside the lock: the record is create-only and keyed by its own
-            # id, so it needs no turn on the ledger.
-            mark = time.perf_counter()
-            if written.accepted:
-                await _record_accepted(request, job_id)
-                timing["record_write"] = time.perf_counter() - mark
-                timing["total"] = time.perf_counter() - started
-                logger.info(
-                    "corpus submission timing %s: %s attempts=%d",
-                    request.miner_hotkey[:12],
-                    " ".join(f"{k}={v:.3f}" for k, v in timing.items()),
-                    attempts,
-                )
             return _respond(written)
 
         logger.warning(
@@ -1571,64 +1617,213 @@ def build_corpus_router(
         if refused is not None:
             return _skip_refused(refused)
 
+        landed: list[int] = []
+
+        def decide(slots: SlotLedger, cursors: CursorLedger, seen: AbstractSet[str]) -> Verdict:
+            # Decided again inside the turn, against the ledgers as the entries
+            # before it left them; a refusal moves nothing and costs no write.
+            verdict = skip(
+                job,
+                hotkey=request.miner_hotkey,
+                cursor=request.cursor,
+                prompt_index=request.prompt_index,
+                to_cursor=request.to_cursor,
+                slots=slots,
+                cursors=cursors,
+            )
+            # Where THIS skip left the cursor, before a later entry moves it.
+            landed[:] = [cursors.expected(request.miner_hotkey)]
+            return verdict
+
         try:
-            await asyncio.wait_for(ledger_lock.acquire(), ledger_lock_timeout)
+            turn = await _take_turn(job, decide, ())
         except asyncio.TimeoutError:
             raise HTTPException(status_code=503, detail="corpus_ledger_contention") from None
+        verdict = turn.verdict
+        if verdict is None:
+            raise HTTPException(status_code=503, detail="corpus_ledger_contention")
+        if not verdict.accepted:
+            return _skip_refused(verdict)
+        moved = landed[0]
+        logger.debug(
+            "corpus skip %s: cursor %d -> %d over full prompts",
+            request.miner_hotkey[:12], request.cursor, moved,
+        )
+        return CorpusSkipResponse(
+            reason=CorpusRejectReason.ACCEPTED,
+            skipped=True,
+            cursor=moved,
+            slots_remaining=0,
+        )
+
+    async def _take_turn(job: JobSpec, decide, digests: Sequence[str],
+                         settled=None) -> "_TurnResult":
+        """Queue one decision for the next ledger turn and wait for its
+        verdict. Raises ``asyncio.TimeoutError`` when no turn takes it within
+        ``ledger_lock_timeout`` (it is then withdrawn: nothing was consumed);
+        once a turn has taken it, it waits for that turn as a lock holder did."""
+        loop = asyncio.get_running_loop()
+        entry = _TurnEntry(job, decide, digests, loop.create_future(), time.perf_counter(),
+                           settled)
+        turn_queue.append(entry)
+        _wake_committer()
         try:
-            for _ in range(max_write_attempts):
+            done, _ = await asyncio.wait({entry.future}, timeout=ledger_lock_timeout)
+        except BaseException:
+            if not entry.taken:
+                turn_queue.remove(entry)
+            raise
+        if not done and not entry.taken:
+            turn_queue.remove(entry)
+            raise asyncio.TimeoutError
+        # Shielded: a request cancelled now must not cancel its turn's result
+        # out from under the batch it shares, nor its record write.
+        return await asyncio.shield(entry.finisher)
+
+    async def _finish(entry: _TurnEntry) -> _TurnResult:
+        turn = await entry.future
+        if entry.settled is not None:
+            await entry.settled(turn)
+        return turn
+
+    def _finished(task: asyncio.Task) -> None:
+        finishing.discard(task)
+        if not task.cancelled():
+            # Retrieved, so one whose handler hung up is not logged as lost;
+            # a handler still waiting raises it itself.
+            task.exception()
+
+    def _wake_committer() -> None:
+        running = committer[0] if committer else None
+        if (
+            running is None
+            or running.done()
+            or running.get_loop() is not asyncio.get_running_loop()
+        ):
+            committer[:] = [asyncio.get_running_loop().create_task(_commit_turns())]
+
+    async def _commit_turns() -> None:
+        """Run ledger turns while anything waits for one. Each turn holds
+        `ledger_lock` and takes up to ``ledger_batch_max`` waiting entries in
+        arrival order, all read under one manifest."""
+        loop = asyncio.get_running_loop()
+        while turn_queue:
+            async with ledger_lock:
+                batch: list[_TurnEntry] = []
+                while turn_queue and len(batch) < ledger_batch_max:
+                    entry = turn_queue[0]
+                    if entry.future.get_loop() is not loop or entry.future.done():
+                        # Left behind by a loop that is gone; nobody awaits it.
+                        turn_queue.popleft()
+                        continue
+                    if batch and entry.job is not batch[0].job and entry.job != batch[0].job:
+                        # A changed manifest waits for its own turn.
+                        break
+                    turn_queue.popleft()
+                    entry.taken = True
+                    # Started at the take, before any await: from here the
+                    # verdict and its record no longer depend on the handler.
+                    entry.finisher = loop.create_task(_finish(entry))
+                    finishing.add(entry.finisher)
+                    entry.finisher.add_done_callback(_finished)
+                    batch.append(entry)
+                if batch:
+                    await _run_turn(batch)
+
+    async def _run_turn(batch: list[_TurnEntry]) -> None:
+        """One read, every entry decided in order, at most one seal and one
+        compare-and-swap; then each entry gets its own verdict. A conflict
+        decides the whole batch again from a fresh read."""
+        began = time.perf_counter()
+        job = batch[0].job
+        live = list(batch)
+        timing = dict.fromkeys(("ledger_read", "segments", "admit", "ledger_write"), 0.0)
+        attempts = 0
+
+        def settle(entry: _TurnEntry, verdict: Verdict | None) -> None:
+            if not entry.future.done():
+                entry.future.set_result(_TurnResult(
+                    verdict, attempts, len(batch),
+                    {**timing, "lock_wait": began - entry.enqueued},
+                ))
+
+        def fail(entry: _TurnEntry, exc: BaseException) -> None:
+            if isinstance(exc, HTTPException):
+                # One instance per waiter: each raises it in its own task.
+                exc = HTTPException(exc.status_code, detail=exc.detail, headers=exc.headers)
+            if not entry.future.done():
+                entry.future.set_exception(exc)
+
+        try:
+            for attempts in range(1, max_write_attempts + 1):
+                mark = time.perf_counter()
                 snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
                 state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
-                # The integrity step submit runs before it decides (I2, I3).
+                timing["ledger_read"] += time.perf_counter() - mark
+
+                # The integrity step before anything is decided (I2, I3).
+                mark = time.perf_counter()
                 await _ensure_seen(state.segments)
+                timing["segments"] += time.perf_counter() - mark
+
+                mark = time.perf_counter()
                 try:
                     await asyncio.to_thread(seen_index.check_pending, state.pending)
                 except LedgerSnapshotError as exc:
                     raise _ledger_corrupt(exc) from exc
-                verdict = skip(
-                    job,
-                    hotkey=request.miner_hotkey,
-                    cursor=request.cursor,
-                    prompt_index=request.prompt_index,
-                    to_cursor=request.to_cursor,
-                    slots=state.slots,
-                    cursors=state.cursors,
-                )
-                if not verdict.accepted:
-                    # Moved nothing, so it costs no write.
-                    return _skip_refused(verdict)
-                # A skip adds no digest, but a ledger it rewrites may already
-                # hold a pending set past the threshold (a v1 object not yet
-                # migrated): sealed exactly as submit seals it.
-                pending, chunks = state.pending, []
-                if len(pending) >= seal_threshold:
-                    chunks = await asyncio.to_thread(seal_chunks, pending, segment_max)
-                    pending = set()
-                after = ledger_snapshot(state.slots, state.cursors, pending, state.segments)
-                if chunks:
-                    sealed = await seal(chunks)
+                try:
+                    plan = await asyncio.to_thread(
+                        plan_turn, job, state, snapshot, live, seen_index,
+                        seal_threshold=seal_threshold, segment_max=segment_max,
+                    )
+                except LedgerSnapshotError as exc:
+                    raise _ledger_corrupt(exc) from exc
+                timing["admit"] += time.perf_counter() - mark
+                # An entry whose decision raised fails alone, with its own error.
+                decided = []
+                for entry, outcome in zip(live, plan.outcomes):
+                    if isinstance(outcome, BaseException):
+                        if isinstance(outcome, LedgerSnapshotError):
+                            outcome = _ledger_corrupt(outcome)
+                        fail(entry, outcome)
+                    else:
+                        decided.append((entry, outcome))
+                live = [entry for entry, _ in decided]
+                if plan.after is None:
+                    # Refusals that moved nothing cost no write.
+                    for entry, verdict in decided:
+                        settle(entry, verdict)
+                    return
+                after = plan.after
+                mark = time.perf_counter()
+                if plan.chunks:
+                    sealed = await seal(plan.chunks)
                     after["seen_segments"] = [
                         *after["seen_segments"],
                         *({"id": ref.id, "count": ref.count} for ref in sealed),
                     ]
+                timing["segments"] += time.perf_counter() - mark
+                mark = time.perf_counter()
                 try:
                     await _from_store(store.write_ledgers(job_id, after, etag), "ledger write")
                 except CorpusStoreConflict:
                     continue
-                moved = state.cursors.expected(request.miner_hotkey)
-                logger.debug(
-                    "corpus skip %s: cursor %d -> %d over full prompts",
-                    request.miner_hotkey[:12], request.cursor, moved,
-                )
-                return CorpusSkipResponse(
-                    reason=CorpusRejectReason.ACCEPTED,
-                    skipped=True,
-                    cursor=moved,
-                    slots_remaining=0,
-                )
+                finally:
+                    timing["ledger_write"] += time.perf_counter() - mark
+                for entry, verdict in decided:
+                    settle(entry, verdict)
+                return
+            # Contended past every attempt: each caller answers the retryable 503.
+            for entry in live:
+                settle(entry, None)
+        except Exception as exc:
+            # A store or ledger failure is every entry's: none of them was written.
+            for entry in live:
+                fail(entry, exc)
         finally:
-            ledger_lock.release()
-        raise HTTPException(status_code=503, detail="corpus_ledger_contention")
+            for entry in batch:
+                if not entry.future.done():
+                    entry.future.cancel()
 
     async def _read_state(job: JobSpec) -> LedgerState:
         """The ledgers for READING: rebuilt once per ETag and shared by the
@@ -1705,6 +1900,8 @@ def build_corpus_router(
     router.corpus_next = corpus_next
     router.skip_corpus = skip_corpus
     router.ledger_lock = ledger_lock
+    # How many decisions wait for the next ledger turn.
+    router.ledger_waiting = lambda: len(turn_queue)
     return router
 
 

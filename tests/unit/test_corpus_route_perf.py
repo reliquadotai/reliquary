@@ -97,9 +97,10 @@ def test_concurrent_submissions_do_not_race_each_other(fake_r2, seeded_job):
 
     assert [r["accepted"] for r in results] == [True] * 6
     # One writer, one process: its own requests take turns on the ledger
-    # instead of spending the retry budget beating each other.
+    # instead of spending the retry budget beating each other, and the ones
+    # that queue behind a turn share the next one's write (group commit).
     assert store.conflicts == 0
-    assert store.ledger_write_attempts == 6
+    assert 1 <= store.ledger_write_attempts < 6
     snapshot, _ = asyncio.run(job_store.read_ledgers("swe-v1", **fake_r2))
     assert sorted(snapshot["slots"]) == [str(i) for i in range(6)]
 
