@@ -1766,18 +1766,41 @@ def corpus_audit_executor(
     model_id: str = typer.Option(
         None, "--model-id", help="Defaults to the model this executor is registered for"),
     model_revision: str = typer.Option(None, "--model-revision"),
+    eval_control: bool = typer.Option(
+        False, "--eval", help="Score for the eval control (its /corpus/internal/eval-audit routes)"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Score corpus audit leases on this GPU. The only secret is the executor
     token, in RELIQUARY_EXECUTOR_TOKEN; the model comes from the public HF repo."""
-    from reliquary.validator.corpus_audit_executor import TOKEN_ENV, run_audit_executor
+    from reliquary.validator.corpus_audit_executor import (
+        EVAL_AUDIT_PREFIX, TOKEN_ENV, run_audit_executor,
+    )
 
     setup_logging(log_level)
     if not os.environ.get(TOKEN_ENV, "").strip():
         typer.echo(f"error: {TOKEN_ENV} is not set", err=True)
         raise typer.Exit(code=1)
+    # The corpus control's call is left exactly as it was.
+    route = {"prefix": EVAL_AUDIT_PREFIX} if eval_control else {}
     run_audit_executor(control_url=control, executor_id=executor_id, model_id=model_id,
-                       model_revision=model_revision)
+                       model_revision=model_revision, **route)
+
+
+@corpus_app.command("eval-control")
+def corpus_eval_control(
+    netuid: int = typer.Option(81, "--netuid"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8791, "--port"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Serve every order-eval- corpus job, whatever its model, with no GPU:
+    tokenizers on CPU, audits by executor pairs on distinct providers. Route
+    ^/corpus/jobs/order-eval- and ^/corpus/internal/eval-audit/ here; the
+    corpus control keeps everything else."""
+    from reliquary.validator.eval_control import run_eval_control
+
+    setup_logging(log_level)
+    asyncio.run(run_eval_control(netuid=netuid, http_host=host, http_port=port))
 
 
 @corpus_app.command("qualify")

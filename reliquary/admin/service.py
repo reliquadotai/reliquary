@@ -102,6 +102,9 @@ class RegisterExecutor(BaseModel):
     model_id: str = Field(min_length=1)
     model_revision: str = Field(min_length=1)
     expires_at: float
+    # Where it runs: the eval control pairs executors on distinct ones.
+    provider_id: str | None = Field(default=None, min_length=1, max_length=256)
+    host: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class CreateDelivery(BaseModel):
@@ -468,7 +471,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             document, created = await executors.register_executor(
                 executor_id=body.executor_id, token_sha256=body.token_sha256,
                 model_id=body.model_id, model_revision=body.model_revision,
-                expires_at=body.expires_at, now=clock())
+                expires_at=body.expires_at, now=clock(), provider_id=body.provider_id,
+                host=body.host)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except executors.ExecutorConflict as exc:

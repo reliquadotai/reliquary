@@ -73,6 +73,31 @@ Customer models change on every order, so the eval control loads **no model**:
 - The fleet target for an eval order is **2 executors on distinct providers**, plus 1 during
   qualification. It reuses every fleet guard.
 
+### Routing (nginx)
+
+The eval control runs as its own process (`reliquary corpus eval-control --port 8791`) beside the corpus
+control. Two location prefixes go to it; everything else, including the legacy `/corpus/...` paths, still
+goes to the corpus control:
+
+```nginx
+# Evaluation jobs: miners' scoped reads and submits, and the job's eval prompts.
+location ~ ^/corpus/jobs/order-eval- {
+    proxy_pass http://127.0.0.1:8791;
+}
+# Its executors (audit pairs and qualification): never the corpus control's.
+location ~ ^/corpus/internal/eval-audit/ {
+    proxy_pass http://127.0.0.1:8791;
+}
+location /corpus/ {
+    proxy_pass http://127.0.0.1:8000;   # the corpus control, unchanged
+}
+```
+
+Regex locations win over the prefix one, so the order in the file does not matter. Executors for an eval
+job run `reliquary corpus audit-executor --eval` (audits) and `reliquary corpus qualify --model repo@rev`
+(qualification) against the same origin. Miners mine an eval job with `--job-id order-eval-<id>`: they
+fetch its prompts from `/corpus/jobs/order-eval-<id>/eval-prompts` and submit on the scoped path.
+
 ## Grading from subnet records
 
 `POST /admin/v1/evaluations/{eval_id}/grade` gains a source mode `{"source": "job", "job_id": ...}`. It reads

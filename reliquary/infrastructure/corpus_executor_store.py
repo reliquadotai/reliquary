@@ -91,9 +91,12 @@ async def read_executor(executor_id: str, **client_kwargs) -> dict | None:
 
 async def register_executor(*, executor_id: str, token_sha256: str, model_id: str,
                             model_revision: str, expires_at: float, now: float,
+                            provider_id: str | None = None, host: str | None = None,
                             **client_kwargs) -> tuple[dict, bool]:
     """Create-only. The same registration again returns the stored one; the
-    same id with other credentials or another model is a conflict."""
+    same id with other credentials or another model is a conflict.
+    ``provider_id``/``host`` say where it runs (the eval control pairs
+    executors only across both); written only when given."""
     key = _key(executor_id)
     if not isinstance(token_sha256, str) or not _HEX64.fullmatch(token_sha256):
         raise ValueError("token_sha256 must be 64 lowercase hex characters")
@@ -109,14 +112,20 @@ async def register_executor(*, executor_id: str, token_sha256: str, model_id: st
         "expires_at": float(expires_at), "status": "active", "registered_at": float(now),
         "last_heartbeat": None,
     }
+    for field, value in (("provider_id", provider_id), ("host", host)):
+        if value is not None:
+            if not isinstance(value, str) or not value or len(value) > 256:
+                raise ValueError(f"{field} must be a non-empty string")
+            document[field] = value
     for _ in range(WRITE_ATTEMPTS):
         if await _put(key, document, None, **dict(client_kwargs)):
             return document, True
         stored, _ = await _get(key, **dict(client_kwargs))
         if stored is None:
             continue
-        same = all(stored.get(f) == document[f]
-                   for f in ("token_sha256", "model_id", "model_revision", "expires_at"))
+        same = all(stored.get(f) == document.get(f)
+                   for f in ("token_sha256", "model_id", "model_revision", "expires_at",
+                             "provider_id", "host"))
         if not same:
             raise ExecutorConflict(f"executor {executor_id!r} is already registered differently")
         return stored, False
