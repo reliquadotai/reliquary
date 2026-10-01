@@ -2613,7 +2613,7 @@ def validate(
                         set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
                         **_corpus_remote_audit_options(),
                     )
-                except RuntimeError as exc:
+                except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
                     raise typer.Exit(code=4) from exc
                 return
@@ -2685,7 +2685,7 @@ def validate(
                         set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
                         **_corpus_remote_audit_options(),
                     )
-                except RuntimeError as exc:
+                except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
                     raise typer.Exit(code=4) from exc
                 return

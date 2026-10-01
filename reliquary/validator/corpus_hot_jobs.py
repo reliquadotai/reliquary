@@ -29,9 +29,9 @@ REFUSED = "refused"
 
 
 def _entry_profile(entry):
-    from reliquary.protocol.profiles import profile_from_contract
+    from reliquary.validator.corpus_validator import _entry_profile as own_profile
 
-    return profile_from_contract(entry.contract)
+    return own_profile(entry)
 
 
 def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[str, Any],
