@@ -24,3 +24,20 @@ Ruling: `submissions_accepted` and `prompts_full` come from the job's ledger obj
 Ruling: verdict counts are seeded once per process by one background listing when a job is wired, then kept from the auditor's own writes; `accepted_last_hour` counts from the process start (it can only undercount during the first hour).
 Ruling: `settled` is the settler's count as of its last settlement read (0 before its first).
 Ruling: a failed recompute serves the last status; with none cached it answers 503 `corpus_status_unavailable`; an unknown job 404; a drained job keeps its final status for the life of the process.
+
+## R4 Subnet admin service
+
+Ruling (contract amendment from the platform side): the signed string is `timestamp\nnonce\nMETHOD\npath\nsha256hex(body)` with a required `X-Reliquary-Nonce` of 16-64 hex characters; the replay cache keys on the nonce (case-folded) inside the ±300 s window — with the signature alone, two identical requests in one second were indistinguishable from a replay.
+Ruling: a request carrying a query string is refused (400 `query_not_signed`): the signature covers the path only, and no route takes a query.
+Ruling: `RELIQUARY_ADMIN_SECRET` must be at least 32 characters, `RELIQUARY_ADMIN_POOL_MAX` and `RELIQUARY_ADMIN_MODELS` are required; `admin serve` refuses to start without them.
+Ruling: the body's `model` must be a key of the admin host's qualified-model file (`RELIQUARY_ADMIN_MODELS`: revision, architecture, checkpoint_sha256, eos_token_id per model) — the platform names a model, the subnet pins what that name means.
+Ruling: `POST /admin/v1/jobs` declares single-turn catalog sources only, through the model's chat template (`thinking` picks `chat-template-thinking-v1` over `chat-template-v1`); `samples_per_prompt` is the manifest's `slots_per_prompt` with `n = 1`; everything else takes `jobs create`'s defaults (composed contract, prompt_order `free`, audit q 1.0); the service acknowledges `--fleet-knows-corpus-generation` itself.
+Ruling: idempotent on `job_id`: the same manifest with its task present answers 200 `created: false` (with the task's current status and cap), the same manifest without its task completes the registry write, another manifest under the id answers 409.
+Ruling: the cap limits are a registry guard re-applied on every compare-and-swap retry: active caps ≤ 1.0 and active corpus caps ≤ the pool; a write that does not raise a total is never refused by them (so a cap can always be lowered). The registry's own rule (every cap, retired included, ≤ 1.0) still applies underneath.
+Ruling: retire without `retired_at` stamps the current drand round; retiring a retired task answers its stored stamp.
+Ruling: `GET /admin/v1/jobs/{job_id}/status` lists the bucket (it is `jobs status`, for an operator-rate caller); the public route of R2 is the one that never lists.
+Ruling: executor responses never carry `token_sha256`; a registration repeated identically answers 200, a different one under the same id 409; revoked and quarantined executors are never reactivated (a new pod gets a new id).
+Ruling: a delivery runs beside the request: `POST .../deliveries` answers 202 `running` until the manifest exists, then 200 `done` with the keys; it is idempotent on `delivery_id` (default: the job id), and a failed run answers 500 once and is retried by the next POST.
+Ruling: delivery rows carry no hotkey (`job_id, submission_id, prompt_index, completion_index, prompt, completion, completion_tokens, accepted, score`); zstd Parquet; a shard is closed before its raw bytes could pass 500 MB less 1 MB of footer room, a row group at 2048 rows or 64 MB, and 64 verdicts are read per window with 16 reads in flight.
+Ruling: the grader annotates only when the job declares a filter and its source can grade a single completion; otherwise `report.json` says why (`filter.applied: false`).
+Ruling: pyarrow is already a core dependency (`pyarrow>=14.0.0`), so no extra was added.

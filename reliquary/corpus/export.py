@@ -37,3 +37,29 @@ async def export_rows(*, job, records, grade=None):
                 accepted, score = grade(record["prompt_index"], completion["text"])
                 row["accepted"], row["score"] = bool(accepted), float(score)
             yield row
+
+
+def job_grader(job):
+    """The grader a job's filter annotates with: its own prompt source, at its
+    own threshold. Raises ValueError for a job with no filter, or an
+    episode-mode source, which cannot grade a single completion text."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.validator.corpus_service import _owned_position
+
+    if job.filter is None:
+        raise ValueError(f"job {job.job_id!r} has no filter to apply")
+    spec = ENVIRONMENT_SPECS[job.prompt_source]
+    if spec.interaction_mode == "episode":
+        raise ValueError(
+            f"prompt source {job.prompt_source!r} is episode-mode; "
+            "a filter cannot grade a single completion text against it"
+        )
+    environment = spec.create()
+    threshold = job.filter.threshold
+
+    def grade(prompt_index: int, text: str) -> tuple[bool, float]:
+        problem = environment.get_problem(_owned_position(job, prompt_index))
+        reward = environment.compute_reward(problem, text)
+        return reward >= threshold, reward
+
+    return grade

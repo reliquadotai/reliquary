@@ -93,8 +93,10 @@ Rules:
 
 ### R4 Subnet admin service
 `reliquary admin serve --host --port` exposes FastAPI routes. Every request carries `X-Reliquary-Timestamp`
-(±300 s) and `X-Reliquary-Signature` (hex HMAC-SHA256 of `timestamp\nMETHOD\npath\nsha256(body)`), keyed by
-`RELIQUARY_ADMIN_SECRET`. A replayed signature is refused, using a nonce cache for the timestamp window.
+(±300 s), a required `X-Reliquary-Nonce` (16-64 hex characters, fresh per request) and `X-Reliquary-Signature`
+(hex HMAC-SHA256 of `timestamp\nnonce\nMETHOD\npath\nsha256hex(body)`), keyed by `RELIQUARY_ADMIN_SECRET`.
+A reused nonce is refused as a replay, using a nonce cache for the timestamp window; two identical requests in
+one second pass under two nonces.
 
 | Route | Action |
 |---|---|

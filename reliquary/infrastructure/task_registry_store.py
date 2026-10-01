@@ -111,16 +111,25 @@ async def _mutate(change, *, attempts: int, **client_kwargs) -> None:
     )
 
 
-def _create(entries: Mapping[str, TaskEntry], entry: TaskEntry):
+def _create(entries: Mapping[str, TaskEntry], entry: TaskEntry, guard=None):
     # Checked inside the change function, not before the read: `_mutate`
     # re-applies it against the winner of a lost race, so two operators
     # racing cannot slip a non-`default` first entry past each other.
     require_default_declared_first(entries, entry)
-    return add_task(entries, entry)
+    return _guarded(entries, add_task(entries, entry), guard)
 
 
-async def create_task(entry: TaskEntry, *, attempts: int = 5, **client_kwargs) -> None:
-    await _mutate(lambda e: _create(e, entry), attempts=attempts, **client_kwargs)
+def _guarded(before, updated, guard):
+    """``guard(before, updated)`` sees the registry read and the one a change
+    would write, and raises to refuse it; re-applied on every retry."""
+    if guard is not None:
+        guard(before, updated)
+    return updated
+
+
+async def create_task(entry: TaskEntry, *, attempts: int = 5, guard=None,
+                      **client_kwargs) -> None:
+    await _mutate(lambda e: _create(e, entry, guard), attempts=attempts, **client_kwargs)
 
 
 async def retire_task_entry(
@@ -147,16 +156,17 @@ async def set_task_cap(
     audit_ban_window_seconds: float | None = None,
     audit_ban_seconds: float | None = None,
     attempts: int = 5,
+    guard=None,
     **client_kwargs,
 ) -> None:
     """Re-applied against the winner of a lost race, so the new cap is checked
     against the registry that is actually there, not the one first read."""
     await _mutate(
-        lambda e: set_cap(
+        lambda e: _guarded(e, set_cap(
             e, task_id, cap, floor, min_incentive_share, audit_q,
             audit_probation_submissions, audit_hold_seconds, audit_suspect_seconds,
             audit_ban_after_failures, audit_ban_window_seconds, audit_ban_seconds,
-        ),
+        ), guard),
         attempts=attempts,
         **client_kwargs,
     )

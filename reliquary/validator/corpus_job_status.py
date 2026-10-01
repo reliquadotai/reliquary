@@ -103,10 +103,31 @@ def job_status(*, job_id: str, job: Any, slots: Any, stats: JobStats, settled: i
     }
 
 
+async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
+    """What the bucket says of a job's drain, by listing it: the counts
+    `jobs status` prints and the admin service proxies."""
+    submissions = set(await records.list_submission_ids(job_id))
+    verdicts = set(await records.list_verdict_ids(job_id))
+    state, _ = await records.read_settlement(job_id)
+    state = state or {}
+    settled = verdicts & set(state.get("settled") or ())
+    pending = state.get("pending")
+    unaudited = len(submissions - verdicts)
+    unsettled = len(verdicts - settled)
+    return {
+        "submissions": len(submissions), "verdicts": len(verdicts), "unaudited": unaudited,
+        "settled": len(settled), "unsettled": unsettled,
+        "pending_window": pending["window"] if pending else None,
+        "last_window": state.get("last_window"),
+        "drained": unaudited == 0 and unsettled == 0 and pending is None,
+    }
+
+
 __all__ = [
     "ACCEPTED_WINDOW_SECONDS",
     "JobStats",
     "SEED_CONCURRENCY",
     "STATUS_CACHE_SECONDS",
     "job_status",
+    "stored_job_counts",
 ]
