@@ -43,15 +43,19 @@ tokens, with the existing settlement unchanged.
 
 ## Per-model qualification (TOPLOC thresholds)
 
-The executor runs `reliquary corpus qualify --model repo@rev`:
-1. It generates 32 completions with vLLM (decode), sampled the same way as the job and from the job's own
-   eval prompts.
+**Two executors on distinct providers and hosts** each run `reliquary corpus qualify --model repo@rev`:
+1. It generates up to 64 completions in one vLLM batch (decode), sampled exactly as the job will be and from
+   the job's own eval prompts.
 2. It verifies them with the HF prefill path the auditor uses.
 3. It records the honest band: exponent mismatches, mantissa mean and median per chunk.
 
-Thresholds come out as `max(band_p99 × 1.5, floor)`, with floors = the current 60/40/40 profile values
-whenever the band is tighter. They are written into the job's contract. A model whose honest band exceeds the
-hard ceiling (config) is refused: the order fails with a full refund.
+The two bands must agree (each p99 within 1.5× of the other) and the two checkpoint fingerprints must be
+identical; otherwise another pair is tried, and after three pairs the qualification fails (full refund).
+Thresholds come out as `max(band_p99 × 1.5, floor)` over the agreed (larger) band, floors = the current
+60/40/40, then **clamped to a hard threshold ceiling** (config, 120/80/80 by default). A model whose honest
+p99 is itself over that ceiling is refused: the order fails with a full refund. The model's eos and
+architecture are read by the control from the model's own files, never from an executor. The record binds
+the set, problem count, sampling, `max_new_tokens` and thinking; the job must repeat them exactly.
 
 This also yields the measured `tokens_per_gpu_hour`, reported as information. Qualification is itself a
 leased executor task and reuses R3's protocol: a new task type, `qualify`.
@@ -66,12 +70,17 @@ Customer models change on every order, so the eval control loads **no model**:
   both recorded.
   - Agreement (same decision per item, drift within the R3 tolerance) → verdict.
   - Disagreement → the batch goes to a third executor; the side in the minority is quarantined and its
-    batches re-audited (R3 rules).
+    batches re-audited (R3 rules). At most three scorers: still no agreement, the batch is parked, its
+    records stay pending and the job is flagged `needs_attention`.
   - With only one executor available, verdicts wait. They are never decided alone.
+  - The control publishes, per model, `executors_needed` (`GET /admin/v1/eval-control/status`) so the
+    fleet rents a third provider when a batch waits for one.
+  - Eval executors are registered with `scope: "eval"`: the eval control accepts only those, the corpus
+    control never does, and an eval quarantine cannot touch a corpus executor.
 - **Routing:** nginx sends `^/corpus/jobs/order-eval-` to the eval control's port and everything else to
   the corpus control. The legacy `/corpus/...` routes are untouched.
-- The fleet target for an eval order is **2 executors on distinct providers**, plus 1 during
-  qualification. It reuses every fleet guard.
+- The fleet target for an eval order is **2 executors on distinct providers**, plus a third when the
+  status asks for one; qualification needs 2 on distinct providers too. It reuses every fleet guard.
 
 ### Routing (nginx)
 
