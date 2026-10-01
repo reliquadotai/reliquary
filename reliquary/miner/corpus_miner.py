@@ -68,6 +68,11 @@ class CorpusPermanentFailure(Exception):
         self.detail = detail
 
 
+class CorpusJobRetired(Exception):
+    """The validator answered 410 ``job_retired``: the job admits nothing more.
+    A job end, not a failure: the miner stops it without retrying."""
+
+
 class CorpusMinerHalted(Exception):
     """Raised out of ``mine_steps`` after too many consecutive permanent
     failures on one call, so the CLI can report why and exit non-zero
@@ -103,6 +108,8 @@ def issue_corpus_request(request_call):
         response = request_call()
     except httpx.TransportError as exc:
         raise CorpusTransientFailure(f"transport error: {exc}") from exc
+    if response.status_code == 410 and _error_object(response).get("detail") == "job_retired":
+        raise CorpusJobRetired(f"410 job_retired from {response.request.url}")
     if response.status_code in TRANSIENT_STATUSES:
         raise CorpusTransientFailure(f"{response.status_code} from {response.request.url}")
     if response.status_code >= 400:
@@ -297,6 +304,23 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                max_steps: int | None = None, sleep=time.sleep,
                max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
                sign_skip=None) -> dict[str, int]:
+    """``_mine_steps``, ended cleanly (one log line, no retry) when the
+    validator says the job is retired."""
+    counts: Counter[str] = Counter()
+    try:
+        return _mine_steps(job=job, hotkey=hotkey, client=client, generator=generator,
+                           tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
+                           sleep=sleep, max_consecutive_failures=max_consecutive_failures,
+                           sign_skip=sign_skip, counts=counts)
+    except CorpusJobRetired as exc:
+        counts["job_retired"] += 1
+        logger.info("corpus job %s is retired; stopping it (%s)", job.job_id, exc)
+        return dict(counts)
+
+
+def _mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
+                max_steps: int | None, sleep, max_consecutive_failures: int,
+                sign_skip, counts: Counter) -> dict[str, int]:
     """Mine up to ``max_steps`` generations.
 
     With ``sign_skip`` on a ``miner_walk`` job, each step first asks the
@@ -304,7 +328,6 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     rather than generating for them. A validator without those routes, or one
     that cannot verify a skip, is mined exactly as before.
     """
-    counts: Counter[str] = Counter()
     retry_kwargs = dict(sleep=sleep, counts=counts, max_consecutive_failures=max_consecutive_failures)
     cursor = _retry(lambda: client.cursor(hotkey), **retry_kwargs)
     steps = 0
