@@ -36,6 +36,13 @@ DEFAULT_TASK_PREFIX = "order-"
 # No admin request is larger; the bound is checked before the body is read.
 MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_EVAL_CAP = 0.02
+# A generation order on any model: the cap share it defaults to, and the
+# partial audit of corpus jobs (probation 100, then 15 % sampled by drand).
+DEFAULT_GEN_CAP = 0.02
+GEN_AUDIT_PARAMS = {"audit_q": 0.15, "audit_probation_submissions": 100,
+                    "audit_hold_seconds": 4320, "audit_suspect_seconds": 86400,
+                    "audit_ban_after_failures": 3, "audit_ban_window_seconds": 604800,
+                    "audit_ban_seconds": 604800}
 # Renderer of a catalog source's rows: the model's own chat template.
 THINKING_RENDERERS = {False: "chat-template-v1", True: "chat-template-thinking-v1"}
 
@@ -361,6 +368,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if record is None:
             raise HTTPException(status_code=404, detail="qualification_unknown")
+        if record.get("kind") == qual.GENERATION:
+            raise HTTPException(status_code=409, detail="qualification_is_for_another_kind")
         if record.get("status") != qual.QUALIFIED:
             raise HTTPException(status_code=409, detail=f"model_not_qualified: {record.get('status')}")
         if record["model"] != body.model:
@@ -406,12 +415,64 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             top_k=body.sampling.top_k,
         )
 
+    async def gen_job_arguments(body: CreateJob) -> dict:
+        """What a generation order on any model is declared from: its catalog
+        env's range, the qualification's model and thresholds, whose
+        conditions (env, range, package, sampling, budget, thinking) it repeats."""
+        from reliquary.eval import qualification as qual
+        from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+        if body.qualification_id is None:
+            raise HTTPException(status_code=422, detail="qualification_id_required")
+        in_scope(body.qualification_id)
+        if body.sampling is None or body.max_new_tokens is None:
+            raise HTTPException(status_code=422,
+                                detail="a generation order names its sampling and max_new_tokens")
+        refusal = qual.order_environment_refusal(body.env)
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
+        try:
+            record, _ = await qualifications.read(body.qualification_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail="qualification_unknown")
+        if record.get("kind") != qual.GENERATION:
+            raise HTTPException(status_code=409, detail="qualification_is_for_another_kind")
+        if record.get("status") != qual.QUALIFIED:
+            raise HTTPException(status_code=409, detail=f"model_not_qualified: {record.get('status')}")
+        if record["model"] != body.model:
+            raise HTTPException(status_code=409, detail="qualification_is_for_another_model")
+        result = record["result"]
+        refuse_unsupported(result)
+        profile = ENVIRONMENT_CATALOG.get(body.env)
+        wanted = {"env": body.env, "prompt_start": body.prompt_start,
+                  "problems": body.prompt_count, "sampling": body.sampling.model_dump(),
+                  "max_new_tokens": body.max_new_tokens, "thinking": body.thinking,
+                  # The package the rows render through, as it is here now.
+                  "environment_manifest_sha256": getattr(
+                      profile, "environment_manifest_sha256", None)}
+        differs = sorted(k for k, v in wanted.items() if record.get(k) != v)
+        if differs:
+            raise HTTPException(status_code=409,
+                                detail=f"qualification_conditions_differ: {differs}")
+        return dict(
+            model_revision=record["revision"], model_architecture=result["architecture"],
+            checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
+            prompt_source=body.env, toploc_thresholds=result["thresholds"],
+            audit_params={**GEN_AUDIT_PARAMS,
+                          **({"audit_q": body.audit_q} if body.audit_q is not None else {})},
+            temperature=body.sampling.temperature, top_p=body.sampling.top_p,
+            top_k=body.sampling.top_k,
+        )
+
     @router.post("/jobs")
     async def create_job(body: CreateJob, response: Response) -> dict:
         from reliquary.corpus.job import parse_job
-        from reliquary.eval.prompt_source import eval_job_prefix
+        from reliquary.eval.prompt_source import eval_job_prefix, gen_job_prefix
 
         eval_prefix = eval_job_prefix(task_prefix)
+        gen_prefix = gen_job_prefix(task_prefix)
         if not (body.job_id.startswith(task_prefix)
                 and (body.task_id or body.job_id).startswith(task_prefix)):
             raise HTTPException(status_code=422, detail="task_id_outside_admin_scope")
@@ -422,13 +483,24 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 evaluation and not (body.task_id or body.job_id).startswith(eval_prefix)):
             raise HTTPException(status_code=422, detail=(
                 f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))
-        if not evaluation and any(v is not None for v in (body.qualification_id, body.seed,
-                                                           body.audit_q)):
+        # A generation order on any model: order-gen- ids, both of them, and
+        # always from a qualification record.
+        generation = body.job_id.startswith(gen_prefix)
+        if generation and not (body.task_id or body.job_id).startswith(gen_prefix):
+            raise HTTPException(status_code=422, detail=(
+                f"a generation order's ids both start with {gen_prefix!r}"))
+        if generation and body.seed is not None:
+            raise HTTPException(status_code=422, detail="eval fields on a generation order")
+        if not evaluation and not generation and any(
+                v is not None for v in (body.qualification_id, body.seed, body.audit_q)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
         cap = body.cap
         if evaluation:
             arguments = await eval_job_arguments(body)
             cap = DEFAULT_EVAL_CAP if cap is None else cap
+        elif generation:
+            arguments = await gen_job_arguments(body)
+            cap = DEFAULT_GEN_CAP if cap is None else cap
         else:
             if cap is None:
                 raise HTTPException(status_code=422, detail="cap_required")

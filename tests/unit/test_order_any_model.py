@@ -266,3 +266,127 @@ def test_a_generation_qualification_is_measured_on_the_first_prompts_of_its_rang
     second = asyncio.run(queue.claim(_executor("e2", model="m")))
     assert second["prompts"] == lease["prompts"]
     assert asyncio.run(store.read("order-gq1"))[0]["sample_sha256"] == sample
+
+
+# -- 4. admin: generation jobs on any model -----------------------------------------
+
+GEN_THRESHOLDS = {"exp_mismatch_threshold": 66, "mant_mean_threshold": 44.0,
+                  "mant_median_threshold": 41.0}
+
+
+def _qualify_gen(admin, qid="order-gq1", architecture="Qwen3_5ForConditionalGeneration",  # noqa: F811
+                 status="qualified", **kw):
+    from reliquary.eval import qualification as qual
+
+    created = admin("POST", "/admin/v1/qualifications", _gen_qualification(
+        qualification_id=qid, **kw))
+    assert created.status_code in (200, 201), created.text
+
+    async def finish():
+        store = qual.QualificationStore()
+        record, etag = await store.read(qid)
+        record.update(status=status, result={
+            "thresholds": GEN_THRESHOLDS, "architecture": architecture,
+            "checkpoint_sha256": "f" * 64, "eos_token_id": 248046, "clamped": [],
+            "band": {"exp_mismatch": 44, "mant_mean": 29.3, "mant_median": 27.3,
+                     "chunks": 120}})
+        await store.write(record, etag)
+
+    asyncio.run(finish())
+
+
+def _gen_job(**kw):
+    return {"job_id": "order-gen-11", "model": "customer/Gen-8B", "env": GEN_ENV,
+            "prompt_start": 100, "prompt_count": 500, "samples_per_prompt": 2,
+            "max_new_tokens": 1024, "thinking": True, "sampling": GEN_SAMPLING,
+            "qualification_id": "order-gq1", **kw}
+
+
+def test_a_generation_job_on_any_model_is_declared_from_its_qualification(admin, monkeypatch):  # noqa: F811
+    from reliquary.infrastructure import corpus_job_store as job_store
+
+    stub_catalog_env(monkeypatch)
+    _qualify_gen(admin)
+    created = admin("POST", "/admin/v1/jobs", _gen_job())
+    assert created.status_code == 201, created.text
+    assert created.json() == {"job_id": "order-gen-11", "task_id": "order-gen-11",
+                              "created": True, "status": "active", "cap": 0.02}
+    job, _ = asyncio.run(job_store.read_job("order-gen-11"))
+    assert (job.prompt_source, job.prompt_start, job.prompt_count) == (GEN_ENV, 100, 500)
+    assert job.checkpoint_repo == "customer/Gen-8B" and job.checkpoint_revision == "e" * 40
+    assert job.checkpoint_sha256 == "f" * 64 and job.eos_token_id == 248046
+    assert job.renderer_id == "chat-template-thinking-v1" and job.slots_per_prompt == 2
+    assert (job.sampling.temperature, job.sampling.top_p, job.sampling.top_k,
+            job.sampling.max_new_tokens) == (0.7, 0.95, 0, 1024)
+    assert job.seed is None
+    entry = admin.registry["entries"]["order-gen-11"]
+    # The partial audit of corpus jobs: sampled at 15 % after a probation of 100.
+    assert entry.params["audit_q"] == 0.15
+    assert entry.params["audit_probation_submissions"] == 100
+    assert entry.contract["model_architecture"] == "Qwen3_5ForConditionalGeneration"
+    toploc = [p for p in entry.contract["proofs"] if p["scheme"] == "toploc-v1"][0]
+    assert {k: toploc[k] for k in GEN_THRESHOLDS} == GEN_THRESHOLDS
+    assert toploc["mode"] == "enforce"
+    assert list(entry.contract["environments"]) == [GEN_ENV]
+    assert admin("POST", "/admin/v1/jobs", _gen_job()).status_code == 200
+    # Its cap is the operator's to set; audit_q may be raised.
+    other = admin("POST", "/admin/v1/jobs", _gen_job(job_id="order-gen-12", cap=0.01,
+                                                     audit_q=0.5))
+    assert other.status_code == 201 and other.json()["cap"] == 0.01
+    assert admin.registry["entries"]["order-gen-12"].params["audit_q"] == 0.5
+
+
+@pytest.mark.parametrize("change,status,detail", [
+    ({"qualification_id": None}, 422, "qualification_id_required"),
+    ({"prompt_start": 0}, 409, "qualification_conditions_differ"),
+    ({"prompt_count": 400}, 409, "qualification_conditions_differ"),
+    ({"sampling": {**GEN_SAMPLING, "temperature": 1.0}}, 409, "qualification_conditions_differ"),
+    ({"max_new_tokens": 2048}, 409, "qualification_conditions_differ"),
+    ({"thinking": False}, 409, "qualification_conditions_differ"),
+    ({"env": "reliquary_dapo_math_v1"}, 409, "qualification_conditions_differ"),
+    ({"model": "someone/else"}, 409, "qualification_is_for_another_model"),
+    ({"sampling": None}, 422, "sampling"),
+    ({"seed": 3}, 422, "eval fields"),
+    ({"eval_set_id": "logic-eval-s1-n8"}, 422, "eval-"),
+    ({"task_id": "order-11"}, 422, "gen-"),
+    ({"qualification_id": "x-gq1"}, 409, "outside_admin_scope"),
+    ({"qualification_id": "order-q1"}, 409, "qualification_is_for_another_kind"),
+])
+def test_generation_job_refusals(admin, monkeypatch, change, status, detail):  # noqa: F811
+    from tests.unit.test_admin_eval_jobs import _qualification, _qualify
+
+    stub_catalog_env(monkeypatch)
+    stub_catalog_env(monkeypatch, "reliquary_dapo_math_v1")
+    _qualify_gen(admin)
+    admin("POST", "/admin/v1/qualifications", _qualification())
+    _qualify(admin)
+    response = admin("POST", "/admin/v1/jobs", {**_gen_job(), **change})
+    assert response.status_code == status, response.text
+    assert detail in response.text
+
+
+@pytest.mark.parametrize("architecture,status", [("MambaForCausalLM", "qualified"),
+                                                 ("Qwen3ForCausalLM", "pending"),
+                                                 ("Qwen3ForCausalLM", "refused")])
+def test_a_generation_job_needs_a_qualified_record_of_a_supported_architecture(
+        admin, monkeypatch, architecture, status):  # noqa: F811
+    stub_catalog_env(monkeypatch)
+    _qualify_gen(admin, architecture=architecture, status=status)
+    assert admin("POST", "/admin/v1/jobs", _gen_job()).status_code == 409
+
+
+def test_an_eval_job_refuses_a_generation_record(admin, monkeypatch):  # noqa: F811
+    from tests.unit.test_admin_eval_jobs import _eval_job
+
+    stub_catalog_env(monkeypatch)
+    _qualify_gen(admin)
+    response = admin("POST", "/admin/v1/jobs", _eval_job(qualification_id="order-gq1"))
+    assert response.status_code == 409 and "qualification_is_for_another_kind" in response.text
+
+
+def test_a_catalog_job_may_not_take_the_generation_prefix(admin, monkeypatch):  # noqa: F811
+    stub_catalog_env(monkeypatch)
+    response = admin("POST", "/admin/v1/jobs", {
+        "job_id": "order-gen-9", "model": "customer/Gen-8B", "env": GEN_ENV,
+        "prompt_count": 5, "samples_per_prompt": 1, "cap": 0.01})
+    assert response.status_code == 422 and "qualification_id_required" in response.text
