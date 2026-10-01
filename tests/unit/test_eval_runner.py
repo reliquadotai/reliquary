@@ -162,6 +162,6 @@ def test_rendering_uses_the_chat_template_when_there_is_one():
 
 
 def test_the_runner_imports_without_vllm():
-    code = ("import sys, reliquary.eval.runner; "
+    code = ("import sys, reliquary.eval.runner, reliquary.eval.grading; "
             "assert 'vllm' not in sys.modules")
     subprocess.run([sys.executable, "-c", code], check=True)
