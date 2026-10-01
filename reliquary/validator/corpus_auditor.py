@@ -40,6 +40,8 @@ from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
 logger = logging.getLogger(__name__)
 
 VERDICT_SCHEMA = "reliquary/corpus-verdict/v1"
+# A pass withdrawn after the executor that scored it was quarantined.
+VOIDED_SCHEMA = "reliquary/corpus-voided/v1"
 
 RESCAN_SECONDS = 60.0
 # The minute rescan requeues pending records the auditor already knows; the
@@ -94,6 +96,11 @@ class CorpusAuditor:
         self._job_id = job_id
         # A `RemoteAuditDispatcher`: used while an executor is connected.
         self._remote = remote
+        # Per executor, the passes written from its scores: re-audited here if
+        # it is ever quarantined.
+        self._remote_scored: dict[str, list[str]] = {}
+        if remote is not None and callable(getattr(remote, "subscribe", None)):
+            remote.subscribe(self.reaudit_executor)
         # Told of every verdict that stands, for the job's in-memory status.
         self._on_verdict = on_verdict
         # Shared by every job's auditor on one loaded model: one forward pass
@@ -305,9 +312,15 @@ class CorpusAuditor:
             scores = await self._remote.score(
                 [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
                  for _, _, tokens, n, proofs in items])
-            outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
-                        for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
-            return self._aggregate(records, results, outcomes)
+            outcomes, scored_by = {}, {}
+            for (i, c_idx, *_), (status, chunks, executor) in zip(items, scores):
+                outcomes[i, c_idx] = outcome_from_scores(status, chunks, self._proof)
+                if executor is not None:
+                    scored_by.setdefault(i, set()).add(executor)
+            judged = self._aggregate(records, results, outcomes)
+            for i, executors in scored_by.items():
+                judged[i] = {**judged[i], "scored_by": sorted(executors)}
+            return judged
         async with self._gpu_lock:
             return await asyncio.to_thread(self._judge_many, records)
 
@@ -443,21 +456,12 @@ class CorpusAuditor:
                 failures.setdefault(records[k]["hotkey"], []).append(ids[k])
         failed_hotkeys = set(failures)
         states: dict[str, MinerState] = {}
-        if failures and self._miner_states is not None:
+        if failures:
             # Escalate before the verdicts exist: a crash in between then
             # re-audits the records, and the retry counts nothing twice
             # (idempotent by submission id), instead of leaving a caught
-            # cheater unsuspected while its held records are paid. One write
-            # for the whole batch: miners.json is one key, rate-limited.
-            def escalate(sids: list[str]) -> Callable[[MinerState], MinerState]:
-                def change(m: MinerState) -> MinerState:
-                    for sid in sids:
-                        m = after_confirmed_failure(m, self._params, now, sid)
-                    return m
-                return change
-
-            states.update(await self._miner_states.update_many(
-                {hotkey: escalate(sids) for hotkey, sids in failures.items()}))
+            # cheater unsuspected while its held records are paid.
+            states.update(await self._escalate(failures, now))
 
         # Failures first: a ban they cause must void this batch's passes of that hotkey.
         passes: dict[str, list[float]] = {}
@@ -477,6 +481,8 @@ class CorpusAuditor:
             # (stale queue entry, restart) must never count twice.
             if written and outcome["passed"] and outcome["audited"]:
                 passes.setdefault(hotkey, []).append((submission_id, outcome["worst_mant_mean"]))
+                for executor_id in outcome.get("scored_by", ()):
+                    self._remote_scored.setdefault(executor_id, []).append(submission_id)
 
         def count(batch: list[tuple[str, float]]) -> Callable[[MinerState], MinerState]:
             def change(m: MinerState) -> MinerState:
@@ -496,6 +502,67 @@ class CorpusAuditor:
             await self._miner_states.update_many(
                 {hotkey: count(batch) for hotkey, batch in chunk.items()})
         return results, failed_hotkeys
+
+    async def _escalate(self, failures: dict[str, list[str]],
+                        now: float) -> dict[str, MinerState]:
+        """Each hotkey's confirmed failures, in one write (miners.json is one key)."""
+        if self._miner_states is None:
+            return {}
+
+        def escalate(sids: list[str]) -> Callable[[MinerState], MinerState]:
+            def change(m: MinerState) -> MinerState:
+                for sid in sids:
+                    m = after_confirmed_failure(m, self._params, now, sid)
+                return m
+            return change
+
+        return await self._miner_states.update_many(
+            {hotkey: escalate(sids) for hotkey, sids in failures.items()})
+
+    async def reaudit_executor(self, executor_id: str) -> list[str]:
+        """Re-audit on this GPU every pass written from a quarantined executor's
+        scores that is unsettled or settled inside the hold window. A failure
+        (confirmed by a second audit, as §7.2 asks) is charged to its miner as
+        any failed audit is, and its submission is voided so it is not paid."""
+        sids = self._remote_scored.pop(executor_id, [])
+        if not sids:
+            return []
+        now = self._clock()
+        state, _ = await self._records.read_settlement(self._job_id) \
+            if callable(getattr(self._records, "read_settlement", None)) else ({}, None)
+        settled = set((state or {}).get("settled") or ())
+        chosen = []
+        for sid in dict.fromkeys(sids):
+            if sid in settled:
+                verdict = await self._records.read_verdict(self._job_id, sid)
+                audited_at = float((verdict or {}).get("audited_at") or 0.0)
+                if now - audited_at > self._params.hold_seconds:
+                    continue
+            chosen.append(sid)
+        records = await self._read_all(chosen)
+        ids = [sid for sid in chosen if sid in records]
+        failed: dict[str, dict] = {}
+        for sid, outcome in zip(ids, await self._audit_outcomes(
+                [records[sid] for sid in ids], local=True)):
+            if isinstance(outcome, dict) and not outcome["passed"]:
+                again = (await self._audit_outcomes([records[sid]], local=True))[0]
+                if isinstance(again, dict) and not again["passed"]:
+                    failed[sid] = again
+        if failed:
+            by_hotkey: dict[str, list[str]] = {}
+            for sid in failed:
+                by_hotkey.setdefault(records[sid]["hotkey"], []).append(sid)
+            await self._escalate(by_hotkey, now)
+            writer = getattr(self._records, "write_voided", None)
+            for sid, outcome in failed.items():
+                if writer is not None:
+                    await writer(self._job_id, sid, {
+                        "schema": VOIDED_SCHEMA, "submission_id": sid,
+                        "hotkey": records[sid]["hotkey"], "executor_id": executor_id,
+                        "reason": "executor_quarantined", "voided_at": now, **outcome})
+        logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
+                       "%s; %d failed", self._job_id, len(ids), executor_id, len(failed))
+        return sorted(failed)
 
     async def _randomness_for(self, round_number: int) -> str | None:
         """The drand randomness of a round, lowercased, or None (fetch error,

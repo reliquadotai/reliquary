@@ -1,11 +1,12 @@
 """The control's half of remote auditing: executor tokens, leases, rechecks.
 
 An executor pulls a lease (token ids, prompt length, committed proofs), returns
-each item's chunk comparisons, and never writes a verdict. Its results stay
-provisional until a recheck on the control's own GPU agrees with one of them;
-that recheck then vouches for everything the executor scored before it. A
-disagreement quarantines the executor and re-queues every batch it scored since
-its last passed recheck. With no executor connected, work is scored locally.
+each item's chunk comparisons, and never writes a verdict. Each batch is drawn
+for a recheck on the control's own GPU independently, with an unpredictable
+source; a recheck vouches only for its own batch. A recheck that disagrees
+quarantines the executor, and every auditor re-audits locally what that
+executor scored, penalising the miners whose work fails. With no executor
+connected, work is scored locally.
 """
 
 from __future__ import annotations
@@ -16,11 +17,12 @@ import hashlib
 import hmac
 import itertools
 import logging
+import os
 import random
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -39,18 +41,36 @@ from reliquary.validator.corpus_audit_protocol import (
 
 logger = logging.getLogger(__name__)
 
-AUDIT_LEASE_SECONDS = 300.0
+
+def _bounded_env(name: str, default: float, low: float, high: float) -> float:
+    value = float(os.environ.get(name, default))
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be in [{low}, {high}], got {value}")
+    return value
+
+
+# A lease's life; bounded so an executor cannot hold work for long.
+AUDIT_LEASE_SECONDS = _bounded_env("RELIQUARY_CORPUS_AUDIT_LEASE_SECONDS", 300.0, 30.0, 600.0)
 RECHECK_FRACTION = 0.05
+# Cross-hardware drift a recheck tolerates per chunk: far below the acceptance
+# thresholds, so a measure under-reported to cross one is a divergence.
+RECHECK_EXP_DRIFT = int(_bounded_env("RELIQUARY_CORPUS_RECHECK_EXP_DRIFT", 2, 0, 64))
+RECHECK_MANT_DRIFT_FRACTION = _bounded_env(
+    "RELIQUARY_CORPUS_RECHECK_MANT_DRIFT_FRACTION", 0.1, 0.0, 0.5)
 # An executor not heard from for this long is not connected.
 EXECUTOR_LIVE_SECONDS = 90.0
 REGISTRY_REFRESH_SECONDS = 30.0
-# A provisional result older than this forces a recheck of a random one.
-PROVISIONAL_MAX_SECONDS = 120.0
+# Leases one executor may hold at once, and lease expiries in a row that quarantine it.
+MAX_LEASES_PER_EXECUTOR = 2
+LEASE_EXPIRY_STRIKES = 3
+# A batch no executor claimed within this long is scored locally.
+QUEUE_WAIT_SECONDS = 60.0
 # Remote attempts at one batch before the control scores it itself.
 REMOTE_ATTEMPTS = 2
 SWEEP_SECONDS = 2.0
 HEARTBEAT_WRITE_SECONDS = 30.0
 
+# (status, chunk comparisons, executor id or None when scored locally)
 Score = tuple[str, tuple[ChunkResult, ...]]
 
 
@@ -154,15 +174,6 @@ class _Lease:
     expires_at: float
 
 
-@dataclass
-class _Scored:
-    seq: int
-    work: _Work
-    scores: list[Score]
-    at: float
-    rechecking: bool = field(default=False)
-
-
 def _lease_units(items: Sequence[dict]) -> list[list[int]]:
     """Item indexes grouped into leases under the item and token bounds."""
     units: list[list[int]] = []
@@ -180,20 +191,30 @@ def _lease_units(items: Sequence[dict]) -> list[list[int]]:
     return units
 
 
-def scores_agree(remote: Sequence[Score], local: Sequence[Score], thresholds) -> bool:
-    """Within the proof tolerance: same status per item, and every chunk measure
-    of the remote within the threshold of the control's own."""
+def scores_agree(remote: Sequence[Score], local: Sequence[Score], proof, *,
+                 exp_drift: int = RECHECK_EXP_DRIFT,
+                 mant_drift_fraction: float = RECHECK_MANT_DRIFT_FRACTION) -> bool:
+    """The same decision per item, and every chunk measure within the
+    cross-hardware drift (a small fraction of the threshold, never a whole one)."""
+    from reliquary.validator.corpus_audit import outcome_from_scores
+
     if len(remote) != len(local):
         return False
+    thresholds = proof.thresholds()
+    mean_drift = mant_drift_fraction * thresholds.mant_mean
+    median_drift = mant_drift_fraction * thresholds.mant_median
     for (r_status, r_chunks), (l_status, l_chunks) in zip(remote, local):
         if r_status != l_status or len(r_chunks) != len(l_chunks):
             return False
+        if (outcome_from_scores(r_status, r_chunks, proof).passed
+                != outcome_from_scores(l_status, l_chunks, proof).passed):
+            return False
         for r, l in zip(r_chunks, l_chunks):
-            if abs(r.exp_mismatches - l.exp_mismatches) > thresholds.exp_mismatch:
+            if abs(r.exp_mismatches - l.exp_mismatches) > exp_drift:
                 return False
-            if abs(r.mant_err_mean - l.mant_err_mean) > thresholds.mant_mean:
+            if abs(r.mant_err_mean - l.mant_err_mean) > mean_drift:
                 return False
-            if abs(r.mant_err_median - l.mant_err_median) > thresholds.mant_median:
+            if abs(r.mant_err_median - l.mant_err_median) > median_drift:
                 return False
     return True
 
@@ -202,8 +223,9 @@ class RemoteAuditDispatcher:
     """Batches the auditors hand over, leased to executors or scored locally.
 
     ``local_scores(items)`` is the trusted verifier (the control's GPU), used
-    for rechecks and whenever no executor is connected; ``quarantine`` and
-    ``record_heartbeat`` write the executor registry.
+    for rechecks and whenever no executor will take the work; ``quarantine``
+    and ``record_heartbeat`` write the executor registry. ``score`` answers,
+    per item, the scores and the executor that computed them (None: here).
     """
 
     def __init__(self, *, directory: ExecutorDirectory, proof, local_scores,
@@ -213,30 +235,40 @@ class RemoteAuditDispatcher:
                  recheck_fraction: float = RECHECK_FRACTION,
                  lease_seconds: float = AUDIT_LEASE_SECONDS,
                  live_seconds: float = EXECUTOR_LIVE_SECONDS,
-                 provisional_max_seconds: float = PROVISIONAL_MAX_SECONDS) -> None:
+                 queue_wait_seconds: float = QUEUE_WAIT_SECONDS,
+                 max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
+                 expiry_strikes: int = LEASE_EXPIRY_STRIKES) -> None:
         self._directory = directory
         self._proof = proof
         self._local_scores = local_scores
         self._quarantine_write = quarantine
         self._heartbeat_write = record_heartbeat
         self._clock = clock
-        self._rng = rng or random.SystemRandom()
+        # Each batch is drawn on its own, from the OS: an executor cannot predict it.
+        self._rng = rng or secrets.SystemRandom()
         self._fraction = recheck_fraction
         self._lease_seconds = lease_seconds
         self._live = live_seconds
-        self._provisional_max = provisional_max_seconds
+        self._queue_wait = queue_wait_seconds
+        self._max_leases = max_leases_per_executor
+        self._strikes_limit = expiry_strikes
         self._ids = itertools.count()
-        self._seq = itertools.count()
         self._queue: collections.deque[_Work] = collections.deque()
         self._local: collections.deque[_Work] = collections.deque()
         self._leases: dict[str, _Lease] = {}
-        self._provisional: dict[str, list[_Scored]] = {}
+        self._strikes: collections.Counter = collections.Counter()
         self._seen: dict[str, float] = {}
         self._detail: dict[str, dict] = {}
         self._written: dict[str, float] = {}
+        self._unwritten_quarantines: dict[str, str] = {}
+        self._listeners: list[Callable[[str], Awaitable[Any]]] = []
         self._background: set[asyncio.Task] = set()
         self.quarantined: set[str] = set()
         self.stats = collections.Counter()
+
+    def subscribe(self, listener: Callable[[str], Awaitable[Any]]) -> None:
+        """``listener(executor_id)`` runs when an executor is quarantined."""
+        self._listeners.append(listener)
 
     # -- the auditor's side ------------------------------------------------
 
@@ -245,9 +277,10 @@ class RemoteAuditDispatcher:
         return any(now - seen <= self._live and self._directory.is_authorized(eid)
                    and eid not in self.quarantined for eid, seen in self._seen.items())
 
-    async def score(self, items: Sequence[dict]) -> list[Score]:
-        """Chunk scores for ``items`` (``tokens``, ``prompt_len``, ``proofs``),
-        each one either vouched for by a recheck or computed here."""
+    async def score(self, items: Sequence[dict]) -> list[tuple[str, tuple, str | None]]:
+        """``(status, chunks, scored_by)`` for each item (``tokens``,
+        ``prompt_len``, ``proofs``); ``scored_by`` is None when the control
+        computed it."""
         loop = asyncio.get_running_loop()
         units = []
         for indexes in _lease_units(items):
@@ -257,8 +290,9 @@ class RemoteAuditDispatcher:
             self._queue.append(work)
         scored: list = [None] * len(items)
         for indexes, work in units:
-            for k, score in zip(indexes, await work.future):
-                scored[k] = score
+            scores, scored_by = await work.future
+            for k, (status, chunks) in zip(indexes, scores):
+                scored[k] = (status, chunks, scored_by)
         return scored
 
     # -- the executor's side -----------------------------------------------
@@ -273,6 +307,9 @@ class RemoteAuditDispatcher:
 
     def claim(self, executor_id: str) -> dict | None:
         self._contact(executor_id)
+        held = sum(1 for lease in self._leases.values() if lease.executor_id == executor_id)
+        if held >= self._max_leases:
+            return None
         while self._queue:
             work = self._queue.popleft()
             if work.future.done():
@@ -303,6 +340,7 @@ class RemoteAuditDispatcher:
         if lease.expires_at <= self._clock():
             self._requeue(work)
             raise LeaseRefused(410, "lease_expired")
+        self._strikes[executor_id] = 0
         scores = result.scores
         if len(scores) != len(work.items) or any(
                 s.status == ITEM_OK and len(s.chunks) != len(item["proofs"])
@@ -316,11 +354,12 @@ class RemoteAuditDispatcher:
             return "requeued"
         converted = [(s.status, tuple(ChunkResult(int(e), float(m), float(d))
                                       for e, m, d in s.chunks)) for s in scores]
-        entry = _Scored(seq=next(self._seq), work=work, scores=converted, at=self._clock())
-        self._provisional.setdefault(executor_id, []).append(entry)
         self.stats["scored"] += 1
         if self._rng.random() < self._fraction:
-            self._spawn(self._recheck(executor_id, entry))
+            # Held until this GPU agrees; vouches for this batch alone.
+            self._spawn(self._recheck(executor_id, work, converted))
+        else:
+            self._resolve(work, converted, executor_id)
         return "accepted"
 
     # -- rechecks, expiry, fallback ------------------------------------------
@@ -342,57 +381,64 @@ class RemoteAuditDispatcher:
             self._queue.appendleft(work)
 
     @staticmethod
-    def _resolve(work: _Work, scores: list[Score]) -> None:
+    def _resolve(work: _Work, scores: list[Score], scored_by: str | None) -> None:
         if not work.future.done():
-            work.future.set_result(scores)
+            work.future.set_result((scores, scored_by))
 
-    async def _recheck(self, executor_id: str, entry: _Scored) -> None:
-        entry.rechecking = True
+    async def _recheck(self, executor_id: str, work: _Work, remote: list[Score]) -> None:
         try:
-            local = await self._local_scores(entry.work.items)
+            local = await self._local_scores(work.items)
         except Exception:
-            # Ours, not the executor's: it stays provisional for a later recheck.
+            # Ours, not the executor's: the batch is scored again, here or by another.
             logger.exception("corpus audit recheck of executor %s failed locally", executor_id)
-            entry.rechecking = False
+            self._requeue(work)
             return
         self.stats["rechecks"] += 1
-        pending = self._provisional.get(executor_id, [])
-        if executor_id in self.quarantined:
-            self._resolve(entry.work, local)
-            return
-        if scores_agree(entry.scores, local, self._proof.thresholds()):
-            vouched = [e for e in pending if e.seq <= entry.seq]
-            self._provisional[executor_id] = [e for e in pending if e.seq > entry.seq]
-            for e in vouched:
-                self._resolve(e.work, local if e is entry else e.scores)
-            return
-        await self._quarantine(executor_id, entry, local)
+        self._resolve(work, local, None)
+        if executor_id not in self.quarantined and not scores_agree(remote, local, self._proof):
+            await self.quarantine(
+                executor_id, f"recheck of batch {work.id} disagreed beyond the drift tolerance")
 
-    async def _quarantine(self, executor_id: str, entry: _Scored, local: list[Score]) -> None:
-        reason = f"recheck of batch {entry.work.id} diverged beyond the proof tolerance"
+    async def quarantine(self, executor_id: str, reason: str) -> None:
+        """Refuse the executor from now on, take back its leases, and have every
+        auditor re-audit locally what it scored."""
+        if executor_id in self.quarantined:
+            return
         logger.error("corpus audit executor %s quarantined: %s", executor_id, reason)
         self.quarantined.add(executor_id)
         self._directory.revoke_locally(executor_id)
         self.stats["quarantined"] += 1
-        self._resolve(entry.work, local)
-        # Everything it scored since its last passed recheck, and what it holds now.
-        for e in self._provisional.pop(executor_id, []):
-            if e is not entry:
-                self._requeue(e.work)
         for lease_id, lease in list(self._leases.items()):
             if lease.executor_id == executor_id:
                 del self._leases[lease_id]
                 self._requeue(lease.work)
-        if self._quarantine_write is not None:
+        self._unwritten_quarantines[executor_id] = reason
+        await self._write_quarantines()
+        for listener in self._listeners:
+            self._spawn(self._notify(listener, executor_id))
+
+    @staticmethod
+    async def _notify(listener, executor_id: str) -> None:
+        try:
+            await listener(executor_id)
+        except Exception:
+            logger.exception("re-audit after quarantining %s failed", executor_id)
+
+    async def _write_quarantines(self) -> None:
+        # Retried every sweep until it lands, so a restart cannot forget it.
+        if self._quarantine_write is None:
+            self._unwritten_quarantines.clear()
+            return
+        for executor_id, reason in list(self._unwritten_quarantines.items()):
             try:
                 await self._quarantine_write(executor_id, reason)
+                del self._unwritten_quarantines[executor_id]
             except Exception:
-                logger.exception("executor %s quarantine not written to the registry",
-                                 executor_id)
+                logger.exception("executor %s quarantine not written yet; retrying", executor_id)
 
     async def sweep(self) -> None:
-        """One pass: expire leases, force due rechecks, score locally what no
-        executor will take."""
+        """One pass: expire leases (striking their executor), score locally what
+        no executor will take, write pending quarantines."""
         now = self._clock()
         for lease_id, lease in list(self._leases.items()):
             if lease.expires_at <= now:
@@ -400,29 +446,28 @@ class RemoteAuditDispatcher:
                 logger.warning("corpus audit lease %s of executor %s expired; re-queued",
                                lease_id[:8], lease.executor_id)
                 self._requeue(lease.work)
-        for executor_id, entries in list(self._provisional.items()):
-            if not entries or any(e.rechecking for e in entries):
-                continue
-            busy = any(lease.executor_id == executor_id for lease in self._leases.values())
-            if now - entries[0].at >= self._provisional_max or not (self._queue or busy):
-                # Random among them: an executor cannot tell which batch is checked.
-                self._spawn(self._recheck(executor_id, self._rng.choice(entries)))
+                self._strikes[lease.executor_id] += 1
+                if self._strikes[lease.executor_id] >= self._strikes_limit:
+                    await self.quarantine(lease.executor_id,
+                                          f"{self._strikes_limit} leases expired in a row")
         if not self.connected():
             while self._queue:
                 self._local.append(self._queue.popleft())
         else:
-            while self._queue and now - self._queue[0].queued_at > self._lease_seconds:
+            while self._queue and now - self._queue[0].queued_at > self._queue_wait:
                 self._local.append(self._queue.popleft())
         while self._local:
             work = self._local.popleft()
             if work.future.done():
                 continue
             try:
-                self._resolve(work, await self._local_scores(work.items))
+                self._resolve(work, await self._local_scores(work.items), None)
                 self.stats["local"] += 1
             except Exception as exc:
                 if not work.future.done():
                     work.future.set_exception(exc)
+        if self._unwritten_quarantines:
+            await self._write_quarantines()
 
     async def write_heartbeats(self) -> None:
         if self._heartbeat_write is None:
@@ -496,6 +541,10 @@ def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
 
 __all__ = [
     "AUDIT_LEASE_SECONDS",
+    "LEASE_EXPIRY_STRIKES",
+    "MAX_LEASES_PER_EXECUTOR",
+    "RECHECK_EXP_DRIFT",
+    "RECHECK_MANT_DRIFT_FRACTION",
     "ExecutorDirectory",
     "LeaseRefused",
     "RECHECK_FRACTION",

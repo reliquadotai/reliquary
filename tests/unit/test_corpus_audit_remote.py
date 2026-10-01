@@ -6,7 +6,6 @@ locally as before."""
 from __future__ import annotations
 
 import asyncio
-import random
 from types import SimpleNamespace
 
 import httpx
@@ -126,8 +125,18 @@ def _lying_scores(lease):
         for item in lease["items"]]})
 
 
+class _Draws:
+    """A recheck draw per result, in order: 0.0 always rechecks, 1.0 never does."""
+
+    def __init__(self, *values):
+        self.values = list(values)
+
+    def random(self):
+        return self.values.pop(0) if self.values else 1.0
+
+
 class _Harness:
-    def __init__(self, model, *, fraction=0.0, docs=None, seed=0):
+    def __init__(self, model, *, fraction=0.0, docs=None, draws=None, gate=None):
         self.clock = _Clock()
         self.model = model
         self.directory = _directory(docs or [_doc(), _doc("pod-2", OTHER)], self.clock)
@@ -136,6 +145,8 @@ class _Harness:
 
         async def local_scores(items):
             self.local_calls += 1
+            if gate is not None:
+                await gate.wait()
             scores, _, _ = score_sequences(model, _wire(items), chunk_tokens=PROOF.chunk_tokens,
                                            topk=PROOF.topk, batch_tokens=1 << 20)
             return scores
@@ -145,7 +156,7 @@ class _Harness:
 
         self.dispatcher = RemoteAuditDispatcher(
             directory=self.directory, proof=PROOF, local_scores=local_scores,
-            quarantine=quarantine, clock=self.clock, rng=random.Random(seed),
+            quarantine=quarantine, clock=self.clock, rng=draws or _Draws(),
             recheck_fraction=fraction)
 
 
@@ -156,62 +167,184 @@ async def _drain(dispatcher, rounds=20):
         await asyncio.sleep(0)
 
 
-def test_an_honest_executor_scores_and_a_forced_recheck_vouches_for_it():
+def test_an_undrawn_batch_is_resolved_from_its_executor_and_says_so():
     model = _tiny(0)
 
     async def go():
-        h = _Harness(model)
+        h = _Harness(model, fraction=0.05, draws=_Draws(0.5))
         await h.directory.refresh()
-        items = _items(model)
         h.dispatcher.heartbeat("pod-1")
         assert h.dispatcher.connected()
-        task = asyncio.ensure_future(h.dispatcher.score(items))
+        task = asyncio.ensure_future(h.dispatcher.score(_items(model)))
         await asyncio.sleep(0)
         lease = h.dispatcher.claim("pod-1")
-        assert h.dispatcher.claim("pod-1") is None
         assert h.dispatcher.result("pod-1", lease["lease_id"], _honest_scores(model, lease)) == "accepted"
-        assert not task.done()  # provisional until a recheck vouches
-        await _drain(h.dispatcher)
         scores = await task
-        assert [s for s, _ in scores] == ["ok", "ok", "ok"]
+        assert [(s, by) for s, _, by in scores] == [("ok", "pod-1")] * 3
+        assert h.local_calls == 0
+
+    asyncio.run(go())
+
+
+def test_a_drawn_batch_is_resolved_from_the_local_recheck():
+    model = _tiny(0)
+
+    async def go():
+        h = _Harness(model, fraction=0.05, draws=_Draws(0.0))
+        await h.directory.refresh()
+        h.dispatcher.heartbeat("pod-1")
+        task = asyncio.ensure_future(h.dispatcher.score(_items(model)))
+        await asyncio.sleep(0)
+        lease = h.dispatcher.claim("pod-1")
+        h.dispatcher.result("pod-1", lease["lease_id"], _honest_scores(model, lease))
+        scores = await task
+        assert [by for _, _, by in scores] == [None] * 3
         assert h.local_calls == 1 and h.quarantined == []
 
     asyncio.run(go())
 
 
-def test_a_lying_executor_is_quarantined_and_its_batches_requeued():
+def test_the_review_counterexample_is_a_divergence():
+    """C1: a measure under-reported by just under one threshold flips the decision."""
+    from dataclasses import replace
+
+    from reliquary.protocol.toploc import ChunkResult
+    from reliquary.validator.corpus_audit_remote import scores_agree
+
+    proof = replace(PROOF, exp_mismatch_threshold=90, mant_mean_threshold=10.0,
+                    mant_median_threshold=8.0, min_allowed_failures=0, ratio_allowed_failures=0.0)
+    local = [("ok", (ChunkResult(170, 19.0, 15.0),))]
+    assert not scores_agree([("ok", (ChunkResult(85, 9.5, 7.5),))], local, proof)
+    # The same decision but a drift past the hardware tolerance is a divergence too.
+    near = [("ok", (ChunkResult(10, 2.0, 2.0),))]
+    assert not scores_agree([("ok", (ChunkResult(13, 2.0, 2.0),))], near, proof)
+    assert not scores_agree([("ok", (ChunkResult(10, 3.1, 2.0),))], near, proof)
+    # Hardware noise inside the tolerance agrees.
+    assert scores_agree([("ok", (ChunkResult(12, 2.9, 2.7),))], near, proof)
+
+
+def test_a_lying_executor_is_quarantined_and_the_rechecked_lie_is_never_written():
     model, other = _tiny(0), _tiny(1)
 
     async def go():
-        h = _Harness(model, fraction=0.0)
+        h = _Harness(model, fraction=0.05, draws=_Draws(0.0))
         await h.directory.refresh()
-        # Proofs from another model: every item truly fails.
-        bad = _items(other, n=2)
+        bad = _items(other, n=1)
         h.dispatcher.heartbeat("pod-1")
-        h.dispatcher.heartbeat("pod-2")
-        first = asyncio.ensure_future(h.dispatcher.score(bad[:1]))
-        second = asyncio.ensure_future(h.dispatcher.score(bad[1:]))
+        listened = []
+
+        async def listener(executor_id):
+            listened.append(executor_id)
+
+        h.dispatcher.subscribe(listener)
+        task = asyncio.ensure_future(h.dispatcher.score(bad))
         await asyncio.sleep(0)
-        for _ in range(2):
-            lease = h.dispatcher.claim("pod-1")
-            h.dispatcher.result("pod-1", lease["lease_id"], _lying_scores(lease))
-        # A recheck of one of them diverges: both batches are back in play.
-        h.dispatcher._fraction = 1.0
-        await _drain(h.dispatcher, rounds=3)
-        assert [q[0] for q in h.quarantined] == ["pod-1"]
-        assert h.dispatcher.quarantined == {"pod-1"}
-        assert h.directory.authenticate(GOOD)[1] == "revoked"
-        # The re-queued batch goes to the honest executor.
-        h.dispatcher._fraction = 0.0
-        lease = h.dispatcher.claim("pod-2")
-        if lease is not None:
-            h.dispatcher.result("pod-2", lease["lease_id"], _honest_scores(model, lease))
-        await _drain(h.dispatcher)
-        results = [await first, await second]
+        lease = h.dispatcher.claim("pod-1")
+        h.dispatcher.result("pod-1", lease["lease_id"], _lying_scores(lease))
+        scores = await task
+        await _drain(h.dispatcher, rounds=2)
         from reliquary.validator.corpus_audit import outcome_from_scores
 
-        for scores in results:
-            assert all(not outcome_from_scores(s, c, PROOF).passed for s, c in scores)
+        assert all(not outcome_from_scores(s, c, PROOF).passed for s, c, _ in scores)
+        assert [q[0] for q in h.quarantined] == ["pod-1"]
+        assert listened == ["pod-1"]
+        assert h.directory.authenticate(GOOD)[1] == "revoked"
+
+    asyncio.run(go())
+
+
+def test_concurrent_rechecks_never_vouch_for_each_other():
+    """I3: an honest batch's recheck finishing first leaves the lying one held."""
+    model, other = _tiny(0), _tiny(1)
+
+    async def go():
+        gate = asyncio.Event()
+        h = _Harness(model, fraction=0.05, draws=_Draws(0.0, 0.0), gate=gate)
+        await h.directory.refresh()
+        h.dispatcher.heartbeat("pod-1")
+        lie = asyncio.ensure_future(h.dispatcher.score(_items(other, n=1)))
+        honest = asyncio.ensure_future(h.dispatcher.score(_items(model, n=1)))
+        await asyncio.sleep(0)
+        lie_lease, honest_lease = h.dispatcher.claim("pod-1"), h.dispatcher.claim("pod-1")
+        h.dispatcher.result("pod-1", lie_lease["lease_id"], _lying_scores(lie_lease))
+        h.dispatcher.result("pod-1", honest_lease["lease_id"], _honest_scores(model, honest_lease))
+        await asyncio.sleep(0)
+        assert not lie.done() and not honest.done()
+        gate.set()
+        from reliquary.validator.corpus_audit import outcome_from_scores
+
+        assert all(not outcome_from_scores(s, c, PROOF).passed for s, c, _ in await lie)
+        assert [by for _, _, by in await honest] == [None]
+        await _drain(h.dispatcher, rounds=2)
+        assert [q[0] for q in h.quarantined] == ["pod-1"]
+
+    asyncio.run(go())
+
+
+def test_an_executor_holds_at_most_two_leases():
+    model = _tiny(0)
+
+    async def go():
+        h = _Harness(model)
+        await h.directory.refresh()
+        h.dispatcher.heartbeat("pod-1")
+        tasks = [asyncio.ensure_future(h.dispatcher.score(_items(model, n=1))) for _ in range(3)]
+        await asyncio.sleep(0)
+        assert h.dispatcher.claim("pod-1") is not None
+        assert h.dispatcher.claim("pod-1") is not None
+        assert h.dispatcher.claim("pod-1") is None
+        assert h.dispatcher.claim("pod-2") is not None
+        for task in tasks:
+            task.cancel()
+
+    asyncio.run(go())
+
+
+def test_three_expired_leases_in_a_row_quarantine_the_executor():
+    model = _tiny(0)
+
+    async def go():
+        h = _Harness(model)
+        await h.directory.refresh()
+        tasks = []
+        for _ in range(3):
+            tasks.append(asyncio.ensure_future(h.dispatcher.score(_items(model, n=1))))
+            await asyncio.sleep(0)
+            h.dispatcher.heartbeat("pod-2")
+            h.dispatcher.heartbeat("pod-1")
+            assert h.dispatcher.claim("pod-1") is not None
+            h.clock.now += 301
+            h.dispatcher.heartbeat("pod-2")
+            await h.dispatcher.sweep()
+        assert [q[0] for q in h.quarantined] == ["pod-1"]
+        for task in tasks:
+            task.cancel()
+
+    asyncio.run(go())
+
+
+def test_the_lease_life_is_bounded(monkeypatch):
+    from reliquary.validator.corpus_audit_remote import AUDIT_LEASE_SECONDS, _bounded_env
+
+    monkeypatch.setenv("RELIQUARY_CORPUS_AUDIT_LEASE_SECONDS", "3600")
+    with pytest.raises(ValueError):
+        _bounded_env("RELIQUARY_CORPUS_AUDIT_LEASE_SECONDS", 300.0, 30.0, 600.0)
+    assert 30.0 <= AUDIT_LEASE_SECONDS <= 600.0
+
+
+def test_work_nobody_claims_within_a_minute_is_scored_locally():
+    model = _tiny(0)
+
+    async def go():
+        h = _Harness(model)
+        await h.directory.refresh()
+        h.dispatcher.heartbeat("pod-1")
+        task = asyncio.ensure_future(h.dispatcher.score(_items(model, n=1)))
+        await asyncio.sleep(0)
+        h.clock.now += 61
+        h.dispatcher.heartbeat("pod-1")
+        await h.dispatcher.sweep()
+        assert [by for _, _, by in await task] == [None]
 
     asyncio.run(go())
 
@@ -236,8 +369,7 @@ def test_an_expired_lease_is_requeued_and_its_late_result_refused():
             h.dispatcher.result("pod-1", stale["lease_id"], _honest_scores(model, stale))
         assert refused.value.status == 410
         h.dispatcher.result("pod-2", fresh["lease_id"], _honest_scores(model, fresh))
-        await _drain(h.dispatcher)
-        assert [s for s, _ in await task] == ["ok"]
+        assert [s for s, _, _ in await task] == ["ok"]
 
     asyncio.run(go())
 
@@ -271,7 +403,7 @@ def test_with_no_executor_connected_the_control_scores_locally():
         assert not h.dispatcher.connected()
         task = asyncio.ensure_future(h.dispatcher.score(_items(model, n=2)))
         await _drain(h.dispatcher, rounds=2)
-        assert [s for s, _ in await task] == ["ok", "ok"]
+        assert [s for s, _, _ in await task] == ["ok", "ok"]
         assert h.local_calls == 1
 
     asyncio.run(go())
@@ -291,32 +423,62 @@ def test_an_executor_silent_past_the_live_window_is_not_connected():
     asyncio.run(go())
 
 
+def test_a_quarantine_that_fails_to_write_is_retried_until_it_lands():
+    model = _tiny(0)
+
+    async def go():
+        h = _Harness(model)
+        await h.directory.refresh()
+        failures = [OSError("r2 down")]
+
+        async def flaky(executor_id, reason):
+            if failures:
+                raise failures.pop()
+            h.quarantined.append((executor_id, reason))
+
+        h.dispatcher._quarantine_write = flaky
+        await h.dispatcher.quarantine("pod-1", "test")
+        assert h.quarantined == []
+        await h.dispatcher.sweep()
+        assert [q[0] for q in h.quarantined] == ["pod-1"]
+
+    asyncio.run(go())
+
+
 # --------------------------------------------------------------------------
 # The auditor over a dispatcher: the decision stays on the control
 # --------------------------------------------------------------------------
 
 
 class _AlwaysConnected:
-    def __init__(self, model, lie=False):
-        self.model, self.lie, self.calls = model, lie, 0
+    def __init__(self, model, lie=False, lie_pass=False, executor="pod-1"):
+        self.model, self.lie, self.lie_pass, self.calls = model, lie, lie_pass, 0
+        self.executor = executor
+        self.listeners = []
 
     def connected(self):
         return True
 
+    def subscribe(self, listener):
+        self.listeners.append(listener)
+
     async def score(self, items):
+        from reliquary.protocol.toploc import ChunkResult
+
         self.calls += 1
         if self.lie:
             # Claims every proof fails, to get honest miners failed.
-            from reliquary.protocol.toploc import ChunkResult
-
-            return [("ok", tuple(ChunkResult(10_000, 1e9, 1e9) for _ in i["proofs"]))
+            return [("ok", tuple(ChunkResult(10_000, 1e9, 1e9) for _ in i["proofs"]), self.executor)
+                    for i in items]
+        if self.lie_pass:
+            return [("ok", tuple(ChunkResult(0, 0.0, 0.0) for _ in i["proofs"]), self.executor)
                     for i in items]
         scores, _, _ = score_sequences(self.model, _wire(items), chunk_tokens=PROOF.chunk_tokens,
                                        topk=PROOF.topk, batch_tokens=1 << 20)
-        return scores
+        return [(s, c, self.executor) for s, c in scores]
 
 
-def test_the_auditor_judges_remote_scores_itself():
+def test_the_auditor_judges_remote_scores_itself_and_records_who_scored():
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
     model, other = _tiny(0), _tiny(1)
@@ -327,8 +489,10 @@ def test_the_auditor_judges_remote_scores_itself():
                             proof=PROOF, remote=remote)
     asyncio.run(auditor.audit_many([sid_good, sid_bad]))
     assert records.verdicts[sid_good]["passed"] is True
+    assert records.verdicts[sid_good]["scored_by"] == ["pod-1"]
     assert records.verdicts[sid_bad]["passed"] is False
-    assert remote.calls == 1  # the failure was confirmed on the control's own GPU
+    assert "scored_by" not in records.verdicts[sid_bad]  # confirmed on this GPU
+    assert remote.calls == 1
 
 
 def test_an_executor_alone_can_never_fail_an_honest_miner():
@@ -341,6 +505,92 @@ def test_an_executor_alone_can_never_fail_an_honest_miner():
                             proof=PROOF, remote=_AlwaysConnected(model, lie=True))
     asyncio.run(auditor.audit_many([sid]))
     assert records.verdicts[sid]["passed"] is True
+
+
+class _VoidingRecords(_Records):
+    def __init__(self, submissions):
+        super().__init__(submissions)
+        self.voided, self.settlement = {}, {}
+
+    async def write_voided(self, job_id, sid, document):
+        self.voided[sid] = document
+        return True
+
+    async def list_voided_ids(self, job_id):
+        return sorted(self.voided)
+
+    async def read_settlement(self, job_id):
+        return dict(self.settlement), None
+
+
+class _States:
+    def __init__(self):
+        from reliquary.corpus.audit_policy import MinerState
+
+        self.states = {}
+        self._blank = MinerState
+
+    async def get(self, hotkey):
+        return self.states.get(hotkey, self._blank())
+
+    async def update(self, hotkey, change):
+        self.states[hotkey] = change(await self.get(hotkey))
+        return self.states[hotkey]
+
+    async def update_many(self, changes):
+        return {hotkey: await self.update(hotkey, change) for hotkey, change in changes.items()}
+
+
+def test_a_quarantine_reaudits_every_pass_its_executor_scored_and_penalises_the_miner():
+    """C1(c): collusion has a cost. Passes the liar got written are re-audited
+    here; a failure is charged to the miner and the submission voided."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model, other = _tiny(0), _tiny(1)
+    cheat, honest, old = "a" * 64, "b" * 64, "c" * 64
+    records = _VoidingRecords({cheat: _record(other), honest: _record(model),
+                               old: _record(other)})
+    states = _States()
+    remote = _AlwaysConnected(model, lie_pass=True)
+    clock = _Clock(100_000.0)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote, miner_states=states, clock=clock)
+    asyncio.run(auditor.audit_many([old]))
+    clock.now += 5000  # `old` is settled and now outside the hold window
+    asyncio.run(auditor.audit_many([cheat, honest]))
+    assert all(records.verdicts[s]["passed"] for s in (cheat, honest, old))
+    records.settlement = {"settled": [old]}
+    voided = asyncio.run(remote.listeners[0]("pod-1"))
+    assert voided == [cheat]
+    assert set(records.voided) == {cheat}
+    assert states.states["5Hot"].confirmed_failures  # the same path as a failed audit
+    # The settler pays nothing for a voided pass.
+    from reliquary.validator.corpus_settlement import CorpusSettler
+
+    class _Archives:
+        written = {}
+
+        async def other_max(self, task_id):
+            return None
+
+        async def write(self, task_id, window, data):
+            self.written[window] = data
+
+    records.verdicts = {cheat: records.verdicts[cheat]}
+    records.state, records.etag = {}, None
+
+    async def read_settlement(job_id):
+        return dict(records.state), records.etag
+
+    async def write_settlement(job_id, state, etag):
+        records.state, records.etag = dict(state), "e"
+        return "e"
+
+    records.read_settlement, records.write_settlement = read_settlement, write_settlement
+    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
+                            archives=_Archives(), clock=lambda: 0.0)
+    asyncio.run(settler.settle_once())
+    assert _Archives.written == {} and records.state["settled"] == [cheat]
 
 
 def test_without_a_connected_executor_the_auditor_runs_locally():
@@ -402,8 +652,7 @@ def test_the_executor_client_heartbeats_claims_scores_and_posts():
             task = asyncio.ensure_future(h.dispatcher.score(_items(model, n=2)))
             await asyncio.sleep(0)
             assert await executor.step() is True
-            await _drain(h.dispatcher)
-            assert [s for s, _ in await task] == ["ok", "ok"]
+            assert [s for s, _, _ in await task] == ["ok", "ok"]
             # Quarantined: the next call is refused outright.
             h.directory.revoke_locally("pod-1")
             with pytest.raises(httpx.HTTPStatusError):

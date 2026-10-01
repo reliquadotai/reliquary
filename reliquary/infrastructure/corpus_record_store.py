@@ -96,6 +96,14 @@ async def list_verdict_ids(job_id, **client_kwargs) -> list[str]:
     return await _list_ids(_prefix(job_id, "verdicts"), **client_kwargs)
 
 
+async def write_voided(job_id, submission_id, document, **client_kwargs) -> bool:
+    return await _create(_key(job_id, "voided", submission_id), document, **client_kwargs)
+
+
+async def list_voided_ids(job_id, **client_kwargs) -> list[str]:
+    return await _list_ids(_prefix(job_id, "voided"), **client_kwargs)
+
+
 def _settlement_key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/settlement.json"
 
@@ -159,6 +167,12 @@ class BucketRecordStore:
 
     async def list_verdict_ids(self, job_id):
         return await list_verdict_ids(job_id, **self._kw)
+
+    async def write_voided(self, job_id, submission_id, document):
+        return await write_voided(job_id, submission_id, document, **self._kw)
+
+    async def list_voided_ids(self, job_id):
+        return await list_voided_ids(job_id, **self._kw)
 
     async def read_settlement(self, job_id):
         return await read_settlement(job_id, **self._kw)

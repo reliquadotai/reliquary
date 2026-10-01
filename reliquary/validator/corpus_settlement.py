@@ -139,6 +139,11 @@ class CorpusSettler:
 
         if new_ids and window is not None:
             verdicts = [await self._records.read_verdict(self._job_id, sid) for sid in new_ids]
+            lister = getattr(self._records, "list_voided_ids", None)
+            if lister is not None:
+                # Withdrawn after a quarantined executor's re-audit: settled, never paid.
+                voided = set(await lister(self._job_id))
+                verdicts = [v for sid, v in zip(new_ids, verdicts) if sid not in voided]
             rewards = rewards_for(verdicts, self._cap)
             if rewards:
                 alone = other_max is None or window > other_max
