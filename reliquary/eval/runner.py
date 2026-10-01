@@ -46,39 +46,73 @@ class Completion:
 
 
 class Generator(Protocol):
-    def load(self, *, repo: str, revision: str, gpu_count: int,
-             max_new_tokens: int) -> dict:
-        """Load the model; ``{vllm_version, gpu, model_sha}``."""
+    def load(self, *, repo: str, revision: str, gpu_count: int, max_new_tokens: int,
+             rows: Sequence[dict], thinking: bool) -> dict:
+        """Load the model; ``{vllm_version, gpu, model_sha}`` (and may add
+        ``chat_template_sha256``). ``rows`` are the task's problems, for sizing."""
 
-    def render(self, row: dict, *, thinking: bool) -> str:
-        """The prompt text for one problem row."""
+    def render(self, row: dict, *, thinking: bool) -> Any:
+        """One problem's prompt, as ``generate`` takes it (token ids for vLLM)."""
 
-    def generate(self, prompts: Sequence[str], *, samples: Sequence[int],
+    def generate(self, prompts: Sequence[Any], *, samples: Sequence[int],
                  seeds: Sequence[int], sampling: dict,
                  max_new_tokens: int) -> list[list[Completion]]:
         """``samples[i]`` completions of ``prompts[i]``, each request seeded."""
 
 
-def render_prompt(tokenizer: Any, row: dict, *, thinking: bool) -> str:
-    """The model's chat template over the row's messages when it has one
-    (``enable_thinking`` passed; a template that ignores it is unchanged),
-    else the row's raw text."""
+def render_prompt(tokenizer: Any, row: dict, *, thinking: bool) -> list[int]:
+    """The prompt's token ids. With a chat template, the template's text (passed
+    ``enable_thinking``; a template that ignores it is unchanged) is encoded
+    WITHOUT special tokens: the template already holds its BOS, and adding one
+    again (a Llama-style double BOS) degrades every score. Raw text, with no
+    template to hold it, is encoded with them."""
     messages = row.get("messages")
     if messages and getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(messages, tokenize=False,
+        text = tokenizer.apply_chat_template(messages, tokenize=False,
                                              add_generation_prompt=True,
                                              enable_thinking=thinking)
+        return list(tokenizer(text, add_special_tokens=False)["input_ids"])
     if isinstance(row.get("text"), str):
-        return row["text"]
-    if messages:
-        return "\n\n".join(str(m.get("content", "")) for m in messages)
-    raise ValueError(f"problem {row.get('problem_id')!r} has neither messages nor text")
+        text = row["text"]
+    elif messages:
+        text = "\n\n".join(str(m.get("content", "")) for m in messages)
+    else:
+        raise ValueError(f"problem {row.get('problem_id')!r} has neither messages nor text")
+    return list(tokenizer(text, add_special_tokens=True)["input_ids"])
+
+
+def normalized_sampling(sampling: dict | None) -> dict:
+    """The sampling a task names, with an absent or null field at its default:
+    temperature 1, top_p 1, no top-k, seed 0."""
+    sampling = dict(sampling or {})
+
+    def value(name, default, kind):
+        raw = sampling.get(name)
+        return default if raw is None else kind(raw)
+
+    return {"temperature": value("temperature", 1.0, float), "top_p": value("top_p", 1.0, float),
+            "top_k": value("top_k", 0, int), "seed": value("seed", 0, int)}
 
 
 def problem_seed(seed: int, problem_id: str) -> int:
     """One seed per problem, so a chunk boundary never changes a sample."""
     digest = hashlib.sha256(f"{int(seed)}:{problem_id}".encode()).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def resolved_revision(directory: str | Path, revision: str) -> str:
+    """The commit a Hugging Face snapshot was downloaded at (its directory
+    name), refused unless it is the pinned revision."""
+    resolved = Path(directory).name
+    if len(resolved) != 40 or any(c not in "0123456789abcdef" for c in resolved):
+        raise RuntimeError(f"snapshot directory {directory} does not name a commit")
+    if revision != resolved and not (len(revision) < 40 and resolved.startswith(revision)):
+        raise RuntimeError(f"asked for revision {revision}, Hugging Face served {resolved}")
+    return resolved
+
+
+# What a snapshot needs to load; skips duplicate original/*.pth checkpoints.
+SNAPSHOT_PATTERNS = ["*.json", "*.safetensors", "*.model", "*.tiktoken", "*.txt", "*.jinja"]
 
 
 class VLLMGenerator:
@@ -88,32 +122,43 @@ class VLLMGenerator:
         self._llm = None
         self._tokenizer = None
 
-    def load(self, *, repo: str, revision: str, gpu_count: int, max_new_tokens: int) -> dict:
+    def load(self, *, repo: str, revision: str, gpu_count: int, max_new_tokens: int,
+             rows: Sequence[dict], thinking: bool) -> dict:
         import torch
         import vllm
         from huggingface_hub import snapshot_download
+        from transformers import AutoTokenizer
 
-        directory = snapshot_download(repo, revision=revision, token=False)
+        directory = snapshot_download(repo, revision=revision, token=False,
+                                      allow_patterns=SNAPSHOT_PATTERNS)
+        model_sha = resolved_revision(directory, revision)
+        self._tokenizer = AutoTokenizer.from_pretrained(directory)
+        # The context the task needs, not the model's maximum: a 128k default
+        # can refuse to start on the GPUs the quote sized for this task.
+        longest = max(len(render_prompt(self._tokenizer, r, thinking=thinking)) for r in rows)
         self._llm = vllm.LLM(model=directory, tensor_parallel_size=int(gpu_count),
-                             trust_remote_code=False)
-        self._tokenizer = self._llm.get_tokenizer()
+                             trust_remote_code=False,
+                             max_model_len=longest + int(max_new_tokens))
         name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        template = getattr(self._tokenizer, "chat_template", None) or ""
         return {"vllm_version": str(vllm.__version__), "gpu": f"{gpu_count}x {name}",
-                "model_sha": revision}
+                "model_sha": model_sha,
+                "chat_template_sha256": hashlib.sha256(str(template).encode()).hexdigest()}
 
-    def render(self, row: dict, *, thinking: bool) -> str:
+    def render(self, row: dict, *, thinking: bool) -> list[int]:
         return render_prompt(self._tokenizer, row, thinking=thinking)
 
     def generate(self, prompts, *, samples, seeds, sampling, max_new_tokens):
         from vllm import SamplingParams
 
-        top_k = sampling.get("top_k")
-        params = [SamplingParams(n=int(n), temperature=float(sampling["temperature"]),
-                                 top_p=float(sampling.get("top_p", 1.0)),
-                                 top_k=-1 if not top_k else int(top_k), seed=int(seed),
-                                 max_tokens=int(max_new_tokens))
+        sampling = normalized_sampling(sampling)
+        params = [SamplingParams(n=int(n), temperature=sampling["temperature"],
+                                 top_p=sampling["top_p"],
+                                 top_k=-1 if not sampling["top_k"] else sampling["top_k"],
+                                 seed=int(seed), max_tokens=int(max_new_tokens))
                   for n, seed in zip(samples, seeds)]
-        outputs = self._llm.generate(list(prompts), params, use_tqdm=False)
+        outputs = self._llm.generate([{"prompt_token_ids": list(ids)} for ids in prompts],
+                                     params, use_tqdm=False)
         return [[Completion(text=o.text, tokens=len(o.token_ids),
                             finish_reason=str(o.finish_reason)) for o in out.outputs]
                 for out in outputs]
@@ -245,13 +290,13 @@ class EvalRunner:
         rows = self._rows(task)
         plan = hashlib.sha256(json.dumps(
             [self._chunk, [(r["problem_id"], r["samples"]) for r in rows],
-             task["model"], task["sampling"], task["max_new_tokens"], bool(task["thinking"])],
+             task["model"], task.get("sampling"), task["max_new_tokens"], bool(task["thinking"])],
             sort_keys=True).encode()).hexdigest()
         state = self._load_state(task_id, plan)
         directory = self._root / task_id
         directory.mkdir(parents=True, exist_ok=True)
         chunks = [rows[i:i + self._chunk] for i in range(0, len(rows), self._chunk)]
-        sampling, thinking = task["sampling"], bool(task["thinking"])
+        sampling, thinking = normalized_sampling(task.get("sampling")), bool(task["thinking"])
         keys, total_rows, done = [], 0, 0
 
         def ensure_loaded() -> dict:
@@ -260,12 +305,13 @@ class EvalRunner:
                 info = self._generator.load(
                     repo=task["model"]["repo"], revision=task["model"]["revision"],
                     gpu_count=int(task.get("gpu_count") or 1),
-                    max_new_tokens=int(task["max_new_tokens"]))
+                    max_new_tokens=int(task["max_new_tokens"]), rows=rows, thinking=thinking)
                 state["info"] = {k: str(info[k]) for k in ("vllm_version", "gpu", "model_sha")}
                 self._save_state(state)
                 self._loaded_for = task_id
-                self._client.event("model_loaded", {**state["info"],
-                                                    "seconds": self._clock() - loaded_at})
+                self._client.event("model_loaded", {
+                    **{k: str(v) for k, v in info.items()},
+                    "seconds": self._clock() - loaded_at})
             return state["info"]
 
         for index, chunk in enumerate(chunks):
@@ -282,7 +328,7 @@ class EvalRunner:
                     prompts = [self._generator.render(r, thinking=thinking) for r in chunk]
                     outputs = self._generator.generate(
                         prompts, samples=[r["samples"] for r in chunk],
-                        seeds=[problem_seed(sampling.get("seed", 0), r["problem_id"])
+                        seeds=[problem_seed(sampling["seed"], r["problem_id"])
                                for r in chunk],
                         sampling=sampling, max_new_tokens=int(task["max_new_tokens"]))
                     body = self._chunk_body(chunk, outputs)
@@ -353,7 +399,9 @@ __all__ = [
     "EvalRunner",
     "Generator",
     "VLLMGenerator",
+    "normalized_sampling",
     "problem_seed",
     "render_prompt",
+    "resolved_revision",
     "run_evaluation",
 ]

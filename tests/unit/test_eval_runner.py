@@ -9,7 +9,14 @@ import sys
 import pytest
 
 from reliquary.eval.platform_client import LeaseLost, PlatformError
-from reliquary.eval.runner import Completion, EvalRunner, problem_seed, render_prompt
+from reliquary.eval.runner import (
+    Completion,
+    EvalRunner,
+    normalized_sampling,
+    problem_seed,
+    render_prompt,
+    resolved_revision,
+)
 from tests.unit.test_eval_platform_client import FakePlatform, _task
 
 
@@ -17,8 +24,9 @@ class FakeGenerator:
     def __init__(self, *, fail=False) -> None:
         self.loads, self.generated, self.fail = 0, [], fail
 
-    def load(self, *, repo, revision, gpu_count, max_new_tokens):
+    def load(self, *, repo, revision, gpu_count, max_new_tokens, rows, thinking):
         self.loads += 1
+        self.load_rows = len(rows)
         return {"vllm_version": "0.0-fake", "gpu": f"{gpu_count}x FakeGPU", "model_sha": revision}
 
     def render(self, row, *, thinking):
@@ -141,24 +149,71 @@ def test_seeds_do_not_depend_on_chunking(tmp_path):
     assert problem_seed(7, "p") == problem_seed(7, "p") != problem_seed(8, "p")
 
 
-class _Tokenizer:
-    def __init__(self, template):
+class LlamaStyleTokenizer:
+    """A Llama-3 style tokenizer: BOS id 1, written as ``<s>`` by the chat
+    template itself, and prepended again by ``add_special_tokens=True``."""
+
+    BOS = 1
+
+    def __init__(self, template="llama"):
         self.chat_template, self.calls = template, []
 
     def apply_chat_template(self, messages, **kwargs):
         self.calls.append(kwargs)
-        return f"<chat>{messages[0]['content']}"
+        return f"<s>[INST] {messages[0]['content']} [/INST]"
+
+    def __call__(self, text, add_special_tokens=True):
+        ids = [self.BOS] if add_special_tokens else []
+        rest = text
+        while rest:
+            if rest.startswith("<s>"):
+                ids.append(self.BOS)
+                rest = rest[3:]
+            else:
+                ids.append(100 + ord(rest[0]))
+                rest = rest[1:]
+        return {"input_ids": ids}
 
 
-def test_rendering_uses_the_chat_template_when_there_is_one():
+def test_rendering_a_chat_template_never_doubles_the_bos():
     row = {"problem_id": "p", "messages": [{"role": "user", "content": "q"}]}
-    with_template = _Tokenizer("{{ messages }}")
-    assert render_prompt(with_template, row, thinking=True) == "<chat>q"
-    assert with_template.calls == [{"tokenize": False, "add_generation_prompt": True,
-                                    "enable_thinking": True}]
-    assert render_prompt(_Tokenizer(None), row, thinking=True) == "q"
-    assert render_prompt(_Tokenizer(None), {"problem_id": "p", "text": "raw"},
-                         thinking=False) == "raw"
+    tokenizer = LlamaStyleTokenizer()
+    ids = render_prompt(tokenizer, row, thinking=True)
+    assert ids.count(LlamaStyleTokenizer.BOS) == 1 and ids[0] == LlamaStyleTokenizer.BOS
+    assert tokenizer.calls == [{"tokenize": False, "add_generation_prompt": True,
+                                "enable_thinking": True}]
+
+
+def test_raw_text_gets_its_special_tokens():
+    plain = LlamaStyleTokenizer(template=None)
+    ids = render_prompt(plain, {"problem_id": "p", "text": "raw"}, thinking=False)
+    assert ids == [1, 100 + ord("r"), 100 + ord("a"), 100 + ord("w")]
+    messages = {"problem_id": "p", "messages": [{"role": "user", "content": "q"}]}
+    assert render_prompt(plain, messages, thinking=False) == [1, 100 + ord("q")]
+
+
+def test_sampling_defaults_fill_absent_and_null_fields():
+    assert normalized_sampling({"temperature": 0.6, "seed": None}) == {
+        "temperature": 0.6, "top_p": 1.0, "top_k": 0, "seed": 0}
+    assert normalized_sampling(None)["temperature"] == 1.0
+
+
+def test_the_model_sha_is_the_commit_hugging_face_served():
+    sha = "ab" * 20
+    assert resolved_revision(f"/cache/models--o--m/snapshots/{sha}", sha) == sha
+    assert resolved_revision(f"/cache/snapshots/{sha}", "abab") == sha
+    with pytest.raises(RuntimeError, match="served"):
+        resolved_revision(f"/cache/snapshots/{sha}", "cd" * 20)
+    with pytest.raises(RuntimeError):
+        resolved_revision("/cache/snapshots/main", "main")
+
+
+def test_a_task_with_a_null_seed_runs(tmp_path):
+    task = _task()
+    task["sampling"]["seed"] = None
+    platform = FakePlatform(tasks=[task], prompts=_prompts(), part_size=1000)
+    result = EvalRunner(platform.client(), FakeGenerator(), work_dir=tmp_path).run()
+    assert result["rows"] == 14
 
 
 def test_the_runner_imports_without_vllm():
