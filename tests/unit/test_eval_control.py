@@ -240,3 +240,24 @@ def test_the_audit_executor_speaks_the_eval_prefix_when_told():
 
     asyncio.run(go())
     assert paths == [f"{EVAL_AUDIT_PREFIX}/heartbeat", f"{EVAL_AUDIT_PREFIX}/claim"]
+
+
+def test_settlement_archives_only_the_eval_tasks_this_process_serves():
+    from reliquary.validator.eval_control import EvalArchives
+
+    written = []
+
+    async def upload(window, data, task_id):
+        written.append((task_id, window))
+
+    async def other_max(task_id):
+        return 7
+
+    archives = EvalArchives(served=lambda: {"order-eval-1", "code-v1"}, upload=upload,
+                            other_max=other_max)
+    asyncio.run(archives.write("order-eval-1", 7, {}))
+    assert written == [("order-eval-1", 7)]
+    for task_id in ("order-eval-2", "code-v1"):
+        with pytest.raises(RuntimeError):
+            asyncio.run(archives.write(task_id, 7, {}))
+    assert asyncio.run(archives.other_max("order-eval-1")) == 7

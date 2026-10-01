@@ -518,6 +518,35 @@ def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
 # ---------------------------------------------------------------------------
 
 
+class EvalArchives:
+    """The settler's archives for eval tasks: written only under a task this
+    process wired and named order-eval- (RELIQUARY_TASK_ID lists no eval task:
+    they are all wired hot)."""
+
+    def __init__(self, *, served: Callable[[], Any], upload=None, other_max=None) -> None:
+        from reliquary.validator.corpus_settlement import R2Archives
+
+        self._served = served
+        self._other_max = other_max or R2Archives().other_max
+        self._upload = upload
+
+    async def other_max(self, task_id: str) -> int | None:
+        return await self._other_max(task_id)
+
+    async def write(self, task_id: str, window: int, data: dict) -> None:
+        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+
+        if not task_id.startswith(EVAL_JOB_PREFIX) or task_id not in set(self._served()):
+            raise RuntimeError(f"task {task_id!r} is not an eval task this process serves; "
+                               "refusing to archive")
+        if self._upload is None:
+            from reliquary.infrastructure import storage
+
+            await storage.upload_window_dataset(window, data, task_id=task_id)
+        else:
+            await self._upload(window, data, task_id)
+
+
 def eval_job_refusal(entry, job) -> str | None:
     """Why the eval control will not serve a registry entry, or None."""
     from reliquary.eval.prompt_source import EVAL_JOB_PREFIX, is_eval_source
@@ -710,8 +739,6 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         verify_corpus_signature,
         verify_corpus_skip_signature,
     )
-    from reliquary.validator.corpus_settlement import R2Archives
-
     registered = None
     if registration_gate:
         from reliquary.validator.corpus_registration import (
@@ -740,7 +767,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         return entries
 
     job_set = None
-    archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set else ())
+    archives = EvalArchives(served=lambda: job_set.task_ids() if job_set else ())
     app, job_set = build_eval_control(
         store=BucketJobStore(), records=BucketRecordStore(), dispatcher=dispatcher,
         directory=directory, verify_signature=verify_corpus_signature,
@@ -765,6 +792,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
 
 __all__ = [
     "EVAL_AUDIT_PREFIX",
+    "EvalArchives",
     "EvalExecutorDirectory",
     "MAX_SCORERS",
     "PairedAuditDispatcher",
