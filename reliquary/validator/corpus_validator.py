@@ -395,7 +395,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.shared.modeling import load_text_only_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_hot_jobs import (
-        JOB_REFRESH_SECONDS, CorpusJobSet, eval_entry_screen, hot_job_refusal, job_drained,
+        JOB_REFRESH_SECONDS, CorpusJobSet, hot_job_refusal, job_drained, order_entry_screen,
     )
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
     from reliquary.validator.corpus_miner_status import (
@@ -404,13 +404,14 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
-    from reliquary.eval.prompt_source import is_eval_job_id
+    from reliquary.eval.prompt_source import is_order_job_id
 
     for task_entry, _ in served:
-        if is_eval_job_id(task_entry.job_id):
+        if is_order_job_id(task_entry.job_id):
             # Its own process serves it; two would pay its records twice.
-            raise RuntimeError(f"task {task_entry.task_id!r} is an evaluation job: the eval "
-                               "control serves it, never the corpus control")
+            raise RuntimeError(f"task {task_entry.task_id!r} is an order job (eval or "
+                               "generation): the order control (eval control) serves it, "
+                               "never the corpus control")
     store = BucketJobStore()
 
     # A tokenizer isn't loaded yet, but the renderer only calls `encode` once
@@ -621,7 +622,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         wire=wire_hot,
         jobs_of=lambda w: [w.auditor.run(), settle_forever(w.entry.task_id, w.settler)],
         read_entries=read_registry, read_job=read_job,
-        screen=eval_entry_screen,
+        screen=order_entry_screen,
         admit=lambda task_entry, job: hot_job_refusal(
             task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,
             process_contract=process_contract, fingerprint=fingerprint),

@@ -221,7 +221,7 @@ def test_a_failed_audit_reopens_its_prompts_slot(monkeypatch):
     auditor = eval_auditor(job_id=job.job_id, records=records, tokenizer=None,
                            proof=TOPLOC_DEPLOYED_DEFAULTS, vocab_size=10,
                            remote=SimpleNamespace(subscribe=lambda l: None), job=job,
-                           job_store=store)
+                           job_store=store, reopen_slots=True)
 
     async def go():
         await auditor._write("a" * 64, {"passed": False})

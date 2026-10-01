@@ -209,7 +209,7 @@ def test_the_routing_document_names_both_prefixes():
     from pathlib import Path
 
     text = Path("docs/design/2026-10-01-evaluation-on-subnet-design.md").read_text()
-    assert "^/corpus/jobs/order-eval-" in text and "^/corpus/internal/eval-audit/" in text
+    assert "^/corpus/jobs/order-(eval|gen)-" in text and "^/corpus/internal/eval-audit/" in text
 
 
 def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypatch):

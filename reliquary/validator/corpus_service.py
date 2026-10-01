@@ -703,6 +703,11 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
     (idempotent per submission), which reopens the prompt's slot until its
     attempts run out. True: reopened; False: exhausted; None: already recorded.
     Compare-and-swap against the route's own writes, which retry on conflict."""
+    from reliquary.eval.prompt_source import is_eval_source
+
+    if not is_eval_source(job.prompt_source):
+        # Any other job's slots are consumed for good, generation orders included.
+        raise ValueError(f"job {job.job_id!r} is not an eval job: its slots never reopen")
     for _ in range(attempts):
         snapshot, etag = await store.read_ledgers(job.job_id)
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)

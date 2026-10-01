@@ -37,14 +37,18 @@ def _entry_profile(entry):
     return own_profile(entry)
 
 
-def eval_entry_screen(entry) -> tuple[str, str] | None:
-    """The corpus control's answer to an ``order-eval-`` entry, before any
-    manifest read: not its job (the eval control serves it)."""
-    from reliquary.eval.prompt_source import is_eval_job_id
+def order_entry_screen(entry) -> tuple[str, str] | None:
+    """The corpus control's answer to an order entry (``order-eval-`` or
+    ``order-gen-``), before any manifest read: not its job (the order control
+    serves it)."""
+    from reliquary.eval.prompt_source import is_order_job_id
 
-    if is_eval_job_id(getattr(entry, "job_id", "")):
-        return OTHER_MODEL, "an evaluation job, served by the eval control"
+    if is_order_job_id(getattr(entry, "job_id", "")):
+        return OTHER_MODEL, "an order job, served by the order control"
     return None
+
+
+eval_entry_screen = order_entry_screen
 
 
 def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[str, Any],
@@ -61,12 +65,11 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     from reliquary.protocol.profiles import toploc_proof
     from reliquary.validator.corpus_validator import startup_refusal
 
-    from reliquary.eval.prompt_source import is_eval_job_id
-
-    if is_eval_job_id(getattr(entry, "job_id", "")):
-        # Served by the eval control alone, whatever its model: two processes
+    screened = order_entry_screen(entry)
+    if screened is not None:
+        # Served by the order control alone, whatever its model: two processes
         # auditing and settling one job would pay its records twice.
-        return OTHER_MODEL, "an evaluation job, served by the eval control"
+        return screened
     if getattr(entry, "contract", None) is None:
         return REFUSED, "it carries no contract to check against the one this process runs"
     try:
@@ -133,11 +136,17 @@ class CorpusJobSet:
                  refresh_every_seconds: float = JOB_REFRESH_SECONDS,
                  clock: Callable[[], float] = time.time,
                  screen: Callable[[Any], tuple[str, str] | None] | None = None,
-                 on_unwired: Callable[[Any], None] | None = None) -> None:
+                 on_unwired: Callable[[Any], None] | None = None,
+                 finals=None, wire_retired: bool = False) -> None:
         # ``screen(entry)`` decides from the entry alone, before any manifest
         # read; ``on_unwired(wiring)`` releases what a drained job held.
+        # ``finals`` (``read_final_status``/``write_final_status``) keeps a
+        # drained job's status across restarts; with ``wire_retired`` a retired
+        # entry not yet drained is wired again (admission closed) to finish.
         self._screen = screen
         self._on_unwired = on_unwired
+        self._finals = finals
+        self._wire_retired = wire_retired
         self._routes = routes
         self._router_for = router_for
         self._wire = wire
@@ -232,14 +241,35 @@ class CorpusJobSet:
                 wiring.cap = cap
                 wiring.settler.set_cap(cap)
         for task_id, entry in corpus.items():
-            if entry.status != "active" or task_id in by_task or task_id in self._passed_over:
+            if task_id in by_task or task_id in self._passed_over:
                 continue
+            if entry.status != "active":
+                if not (self._wire_retired and entry.status == "retired"):
+                    continue
+                if await self._finished_for_good(task_id, str(entry.job_id)):
+                    continue
             await self._consider(entry)
         # Never in the refresh that retired it: a submit admitted just before
         # may not have written its record yet.
         for job_id in [j for j in self.served if j in self._retired_before]:
             await self._maybe_unwire(job_id)
         self._retired_before = {j for j in self.served if self.is_retired(j)}
+
+    async def _finished_for_good(self, task_id: str, job_id: str) -> bool:
+        """A retired job whose final status is stored: never wired again."""
+        if job_id in self.finished:
+            return True
+        try:
+            final = await self._finals.read_final_status(job_id) if self._finals else None
+        except Exception:
+            logger.warning("corpus job %s: final status unreadable; retrying", job_id,
+                           exc_info=True)
+            return True
+        if final is not None:
+            self.finished[job_id] = final
+            self._passed_over.add(task_id)
+            return True
+        return False
 
     async def _consider(self, entry) -> None:
         task_id, job_id = str(entry.task_id), str(entry.job_id)
@@ -282,6 +312,9 @@ class CorpusJobSet:
             return
         self._wire_failures.pop(task_id, None)
         self._routes.add(job_id, router, contract=entry.contract)
+        if entry.status != "active":
+            # Wired only to finish its audits and settlement: no admission.
+            self._routes.retire(job_id)
         self.served[job_id] = wiring
         self._start(wiring)
         logger.info("corpus task %s wired: job %s now served without a restart", task_id, job_id)
@@ -313,6 +346,13 @@ class CorpusJobSet:
             logger.warning("corpus job %s: final status unreadable; keeping the last one", job_id)
             last = self._status_cache.get(job_id)
             final = {**(last[1] if last else {"job_id": job_id}), "state": "drained"}
+        if self._finals is not None:
+            try:
+                # Kept before anything is released: a restart serves it.
+                await self._finals.write_final_status(job_id, final)
+            except Exception:
+                logger.exception("corpus job %s: final status not written; retrying", job_id)
+                return
         for task in self._tasks.pop(job_id, ()):
             task.cancel()
         self._routes.remove(job_id)
@@ -349,7 +389,15 @@ class CorpusJobSet:
         if job_id in self.finished:
             return self.finished[job_id]
         if job_id not in self.served:
-            return None
+            if self._finals is None:
+                return None
+            try:
+                final = await self._finals.read_final_status(job_id)
+            except ValueError:
+                return None  # not a job id at all
+            if final is not None:
+                self.finished[job_id] = final
+            return final
         now = self._clock()
         cached = self._status_cache.get(job_id)
         if cached is not None and now - cached[0] < STATUS_CACHE_SECONDS:
@@ -429,6 +477,7 @@ __all__ = [
     "OTHER_MODEL",
     "REFUSED",
     "eval_entry_screen",
+    "order_entry_screen",
     "hot_job_refusal",
     "job_drained",
 ]

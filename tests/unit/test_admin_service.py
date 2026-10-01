@@ -461,3 +461,19 @@ def test_the_prefix_defaults_to_order_and_comes_from_the_environment(monkeypatch
     monkeypatch.setenv("RELIQUARY_ADMIN_TASK_PREFIX", "")
     with pytest.raises(ValueError):
         build_admin_app_from_environment()
+
+
+# sha256 of the canonical (manifest, task contract, params) of `_job(thinking=True)`,
+# pinned on 7753e5e4 before dataset orders on any model: an operator catalog job
+# must stay byte-identical (tests/unit/test_order_settlement_identity.py).
+CATALOG_JOB_GOLDEN = "821713d9f8458aaef010f4d70af62c075a39dffa8236afc18120f86ea086caf2"
+
+
+def test_an_operator_catalog_job_is_declared_byte_identically(admin):
+    assert admin("POST", "/admin/v1/jobs", _job(thinking=True)).status_code == 201
+    entry = admin.registry["entries"]["math-a"]
+    manifest = json.loads(admin.bucket.objects["reliquary/corpus/jobs/math-a.json"][0])
+    document = {"manifest": manifest, "contract": entry.contract, "params": entry.params}
+    digest = hashlib.sha256(json.dumps(document, sort_keys=True,
+                                       separators=(",", ":")).encode()).hexdigest()
+    assert digest == CATALOG_JOB_GOLDEN

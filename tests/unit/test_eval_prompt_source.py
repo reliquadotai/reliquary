@@ -130,4 +130,4 @@ def test_the_corpus_control_never_wires_an_eval_job():
     entry = SimpleNamespace(job_id="order-eval-3", contract={"model_id": "x"})
     verdict = hot_job_refusal(entry, None, process_profile=None, process_contract={},
                               fingerprint="f")
-    assert verdict[0] == OTHER_MODEL and "eval control" in verdict[1]
+    assert verdict[0] == OTHER_MODEL and "order control" in verdict[1]

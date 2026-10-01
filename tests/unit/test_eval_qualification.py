@@ -278,7 +278,9 @@ def test_both_qualifiers_failing_their_own_proofs_refuse_the_model(store):
     assert final["status"] == qual.REFUSED
 
 
-def test_expired_qualify_leases_free_the_seat_then_fail_the_qualification(store):
+def test_expired_qualify_leases_free_the_seat_then_fail_the_qualification(store, monkeypatch):
+    # Lease expiries alone (the request's own expiry is tested apart).
+    monkeypatch.setenv("RELIQUARY_QUALIFY_EXPIRY_SECONDS", "1e9")
     now = [0.0]
     queue = _queue(store, now)
     _request(store)

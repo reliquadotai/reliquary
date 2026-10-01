@@ -43,6 +43,41 @@ def eval_job_prefix(task_prefix: str | None = None) -> str:
 
 def is_eval_job_id(job_id, task_prefix: str | None = None) -> bool:
     return str(job_id or "").startswith(eval_job_prefix(task_prefix))
+
+
+def gen_job_prefix(task_prefix: str | None = None) -> str:
+    """``${RELIQUARY_ADMIN_TASK_PREFIX}gen-`` (``order-gen-`` by default): a
+    generation order on any model, served by the order control."""
+    return f"{eval_job_prefix(task_prefix)[:-len('eval-')]}gen-"
+
+
+def is_gen_job_id(job_id, task_prefix: str | None = None) -> bool:
+    return str(job_id or "").startswith(gen_job_prefix(task_prefix))
+
+
+def is_order_job_id(job_id, task_prefix: str | None = None) -> bool:
+    """An order job (eval or generation): the order control's, never the corpus control's."""
+    return is_eval_job_id(job_id, task_prefix) or is_gen_job_id(job_id, task_prefix)
+
+
+def order_jobs_route_regex(task_prefix: str | None = None) -> str:
+    """The nginx location regex of every order job's routes, from the one
+    prefix setting (``RELIQUARY_ADMIN_TASK_PREFIX``)."""
+    base = eval_job_prefix(task_prefix)[:-len("eval-")]
+    escaped = "".join(f"\\{c}" if c in ".^$*+?{}[]\\|()" else c for c in base)
+    return f"^/corpus/jobs/{escaped}(eval|gen)-"
+
+
+def order_routes_nginx(task_prefix: str | None = None, *, port: int = 8791) -> str:
+    """The nginx locations sending order jobs and their executors to the order
+    control (``reliquary corpus order-nginx`` prints them)."""
+    return (
+        "# Order jobs (eval and generation): miners' scoped reads and submits.\n"
+        f"location ~ {order_jobs_route_regex(task_prefix)} {{\n"
+        f"    proxy_pass http://127.0.0.1:{port};\n}}\n"
+        "# Their executors (audit pairs and qualification): never the corpus control's.\n"
+        "location ~ ^/corpus/internal/eval-audit/ {\n"
+        f"    proxy_pass http://127.0.0.1:{port};\n}}\n")
 SETS_DIR_ENV = "RELIQUARY_EVAL_SETS_DIR"
 _SOURCE_RE = re.compile(
     r"\Aeval-set:([a-z0-9][a-z0-9_-]{0,127}):([1-9][0-9]{0,8}):([0-9a-f]{64})\Z")
@@ -198,7 +233,12 @@ class EvalSetSpec:
 
 __all__ = [
     "eval_job_prefix",
+    "gen_job_prefix",
     "is_eval_job_id",
+    "is_gen_job_id",
+    "is_order_job_id",
+    "order_jobs_route_regex",
+    "order_routes_nginx",
     "EVAL_SOURCE_PREFIX",
     "EvalSetEnvironment",
     "EvalSetSpec",
