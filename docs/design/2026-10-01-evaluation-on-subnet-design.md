@@ -85,13 +85,15 @@ Customer models change on every order, so the eval control loads **no model**:
 
 ### Routing (nginx)
 
-The eval control runs as its own process (`reliquary corpus eval-control --port 8791`) beside the corpus
-control. Two location prefixes go to it; everything else, including the legacy `/corpus/...` paths, still
-goes to the corpus control:
+The eval control runs as its own process (`reliquary corpus order-control --port 8791`; `eval-control` is
+the same command) beside the corpus control. It serves every order job: evaluations (`order-eval-`) and,
+since `2026-10-01-any-model-datasets-design.md`, generation orders on any model (`order-gen-`). Two location
+prefixes go to it; everything else, including the legacy `/corpus/...` paths, still goes to the corpus
+control:
 
 ```nginx
-# Evaluation jobs: miners' scoped reads and submits, and the job's eval prompts.
-location ~ ^/corpus/jobs/order-eval- {
+# Order jobs (eval and generation): miners' scoped reads and submits, an eval job's prompts.
+location ~ ^/corpus/jobs/order-(eval|gen)- {
     proxy_pass http://127.0.0.1:8791;
 }
 # Its executors (audit pairs and qualification): never the corpus control's.
@@ -104,9 +106,10 @@ location /corpus/ {
 ```
 
 Regex locations win over the prefix one, so the order in the file does not matter. The eval job prefix is
-`${RELIQUARY_ADMIN_TASK_PREFIX}eval-` (`order-eval-` with the default `order-`); the admin service, the eval
-control and the corpus control all read it from `RELIQUARY_ADMIN_TASK_PREFIX`, which must be the same on every
-process, and the nginx regex must use the same value (e.g. `^/corpus/jobs/acme-eval-` for `acme-`). Executors for an eval
+`${RELIQUARY_ADMIN_TASK_PREFIX}eval-` (`order-eval-` with the default `order-`), the generation prefix
+`${RELIQUARY_ADMIN_TASK_PREFIX}gen-`; the admin service, the order control, the corpus control and the miner
+all read it from `RELIQUARY_ADMIN_TASK_PREFIX`, which must be the same on every process, and the nginx regex
+must use the same value (e.g. `^/corpus/jobs/acme-(eval|gen)-` for `acme-`). Executors for an eval
 job run `reliquary corpus audit-executor --eval` (audits) and `reliquary corpus qualify --model repo@rev`
 (qualification) against the same origin. Miners mine an eval job with `--job-id order-eval-<id>`: they
 fetch its prompts from `/corpus/jobs/order-eval-<id>/eval-prompts` and submit on the scoped path.

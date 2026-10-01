@@ -487,6 +487,16 @@ def _has_vision_encoder(checkpoint_dir: str) -> bool:
     return isinstance(config, dict) and "vision_config" in config
 
 
+def submits_scoped(job) -> bool:
+    """Whether a job's submissions go to ``/corpus/jobs/{job_id}/submit``: an
+    eval job (its manifest names an eval set) and a generation order
+    (``${RELIQUARY_ADMIN_TASK_PREFIX}gen-``), both served by the order
+    control, which has no legacy paths."""
+    from reliquary.eval.prompt_source import is_eval_source, is_gen_job_id
+
+    return is_eval_source(job.prompt_source) or is_gen_job_id(job.job_id)
+
+
 class CorpusContractError(RuntimeError):
     """The validator served a contract that does not describe this job."""
 

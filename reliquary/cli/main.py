@@ -1786,22 +1786,27 @@ def corpus_audit_executor(
                        model_revision=model_revision, **route)
 
 
-@corpus_app.command("eval-control")
-def corpus_eval_control(
+@corpus_app.command("order-control")
+def corpus_order_control(
     netuid: int = typer.Option(81, "--netuid"),
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8791, "--port"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
-    """Serve every eval corpus job (ids ${RELIQUARY_ADMIN_TASK_PREFIX}eval-,
-    order-eval- by default), whatever its model, with no GPU: tokenizers on
-    CPU, audits by executor pairs on distinct providers. Route
-    ^/corpus/jobs/<prefix>eval- and ^/corpus/internal/eval-audit/ here; the
-    corpus control keeps everything else."""
-    from reliquary.validator.eval_control import run_eval_control
+    """Serve every order job, eval (${RELIQUARY_ADMIN_TASK_PREFIX}eval-) and
+    generation (${RELIQUARY_ADMIN_TASK_PREFIX}gen-), order-eval- and order-gen-
+    by default, whatever its model, with no GPU: tokenizers on CPU, audits by
+    executor pairs on distinct providers. Route ^/corpus/jobs/<prefix>(eval|gen)-
+    and ^/corpus/internal/eval-audit/ here; the corpus control keeps everything
+    else. `eval-control` is the same command."""
+    from reliquary.validator import eval_control
 
     setup_logging(log_level)
-    asyncio.run(run_eval_control(netuid=netuid, http_host=host, http_port=port))
+    asyncio.run(eval_control.run_order_control(netuid=netuid, http_host=host, http_port=port))
+
+
+# The command's first name, kept for existing deployments.
+corpus_app.command("eval-control", help="Alias of `order-control`.")(corpus_order_control)
 
 
 @corpus_app.command("qualify")
@@ -1911,11 +1916,13 @@ def corpus_mine(
     from reliquary.eval.prompt_source import (
         is_eval_source, parse_eval_source, register_eval_prompts,
     )
+    from reliquary.miner.corpus_miner import submits_scoped
 
+    # An order job is served by the order control, on its scoped paths only.
+    client.scoped_submit = submits_scoped(job)
     if is_eval_source(job.prompt_source):
         # An eval job's prompts come from the control serving it, checked
         # against the sha256 its manifest names.
-        client.scoped_submit = True
         try:
             register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
         except (ValueError, CorpusJobSelectionError) as exc:

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.unit.test_admin_eval_jobs import admin  # noqa: F401
+from tests.unit.test_eval_control_process import world  # noqa: F401
 from tests.unit.test_jobs_cli import registry  # noqa: F401
 
 
@@ -390,3 +391,234 @@ def test_a_catalog_job_may_not_take_the_generation_prefix(admin, monkeypatch):  
         "job_id": "order-gen-9", "model": "customer/Gen-8B", "env": GEN_ENV,
         "prompt_count": 5, "samples_per_prompt": 1, "cap": 0.01})
     assert response.status_code == 422 and "qualification_id_required" in response.text
+
+
+# -- 1. one order control for every order job -----------------------------------------
+
+
+def _gen_entry_and_job(**job_changes):
+    from dataclasses import replace
+
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as proof
+    from tests.unit.test_corpus_export import _job_spec
+
+    job = replace(_job_spec(job_id="order-gen-1", prompt_source=GEN_ENV),
+                  renderer_id="chat-template-v1", checkpoint_repo="org/Frozen",
+                  checkpoint_revision="abc123", **job_changes)
+    contract = {"model_id": "org/Frozen", "model_revision": "abc123",
+                "environments": {GEN_ENV: {}},
+                "proofs": [{"scheme": "toploc-v1", "mode": "enforce",
+                            "chunk_tokens": proof.chunk_tokens, "topk": proof.topk,
+                            "exp_mismatch_threshold": 60, "mant_mean_threshold": 40.0,
+                            "mant_median_threshold": 40.0, "min_allowed_failures": 0,
+                            "ratio_allowed_failures": 0.0}]}
+    return SimpleNamespace(job_id="order-gen-1", contract=contract), job
+
+
+def test_the_order_control_serves_order_jobs_only(monkeypatch):
+    from reliquary.protocol import profiles
+    from reliquary.validator.eval_control import eval_job_refusal, order_job_refusal
+
+    assert eval_job_refusal is order_job_refusal
+    # The contract's reading is the profiles module's; only its outcome matters here.
+    monkeypatch.setattr(profiles, "profile_from_contract", lambda c: SimpleNamespace(
+        model_id=c["model_id"], model_revision=c["model_revision"], proofs=c["proofs"]))
+    monkeypatch.setattr(profiles, "toploc_proof", lambda p: SimpleNamespace(
+        mode=p.proofs[0]["mode"]) if p.proofs else None)
+    entry, job = _gen_entry_and_job()
+    plain = SimpleNamespace(job_id="code-v1", contract={})
+    assert order_job_refusal(plain, job) == "not an order job"
+    assert "eval set" in order_job_refusal(SimpleNamespace(job_id="order-eval-1", contract={}),
+                                           job)
+    stub_catalog_env(monkeypatch)
+    assert order_job_refusal(entry, job) is None
+    from dataclasses import replace
+
+    assert "process profile" in order_job_refusal(entry, replace(job, prompt_source="openmathinstruct"))
+    assert "chat template" in order_job_refusal(entry, replace(job, renderer_id="reliquary-external-prompt-v1"))
+    assert "contract" in order_job_refusal(SimpleNamespace(job_id="order-gen-1", contract=None), job)
+    other = SimpleNamespace(job_id="order-gen-1", contract={**entry.contract, "model_id": "x/y"})
+    assert "checkpoint" in order_job_refusal(other, job)
+    two = SimpleNamespace(job_id="order-gen-1", contract={
+        **entry.contract, "environments": {GEN_ENV: {}, "reliquary_code_v1": {}}})
+    assert "environment" in order_job_refusal(two, job)
+
+
+def test_a_generation_job_never_reopens_a_slot(monkeypatch):
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
+    from reliquary.validator.eval_control import eval_auditor
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+    from tests.unit.test_eval_cross_side import _Records
+
+    fake = _FakeMultiObjectR2()
+    monkeypatch.setattr(job_store, "get_s3_client", lambda **kw: fake)
+    store = BucketJobStore()
+    _, job = _gen_entry_and_job()
+    records = _Records()
+    records.subs = {"a" * 64: {"prompt_index": 2}}
+    records.verdicts = {"a" * 64: {"passed": False}}
+    auditor = eval_auditor(job_id=job.job_id, records=records, tokenizer=None,
+                           proof=TOPLOC_DEPLOYED_DEFAULTS, vocab_size=10,
+                           remote=SimpleNamespace(subscribe=lambda l: None), job=job,
+                           job_store=store, reopen_slots=False)
+
+    async def go():
+        await auditor._write("a" * 64, {"passed": False})
+        assert await auditor.reconcile_failures() == 0
+        snapshot, _ = await store.read_ledgers(job.job_id)
+        assert not snapshot  # no ledger write at all: today's corpus semantics
+    asyncio.run(go())
+
+
+def test_the_order_archives_take_generation_tasks_it_serves():
+    from reliquary.validator.eval_control import EvalArchives, OrderArchives
+
+    assert EvalArchives is OrderArchives
+    written = []
+
+    async def upload(window, data, task_id):
+        written.append((task_id, window))
+
+    async def other_max(task_id):
+        return None
+
+    archives = OrderArchives(served=lambda: {"order-gen-1", "order-eval-1", "code-v1"},
+                             upload=upload, other_max=other_max)
+    asyncio.run(archives.write("order-gen-1", 3, {}))
+    asyncio.run(archives.write("order-eval-1", 4, {}))
+    assert written == [("order-gen-1", 3), ("order-eval-1", 4)]
+    for task_id in ("order-gen-2", "code-v1"):
+        with pytest.raises(RuntimeError):
+            asyncio.run(archives.write(task_id, 5, {}))
+
+
+def _signed_post(app, path, body):
+    import json
+    import secrets
+    import time
+
+    import httpx
+
+    from reliquary.admin.auth import NONCE_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, sign_request
+
+    async def post():
+        data = json.dumps(body).encode()
+        stamp, nonce = str(int(time.time())), secrets.token_hex(16)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://admin") as client:
+            return await client.post(path, content=data, headers={
+                TIMESTAMP_HEADER: stamp, NONCE_HEADER: nonce,
+                SIGNATURE_HEADER: sign_request(b"s" * 32, stamp, nonce, "POST", path, data),
+                "content-type": "application/json"})
+
+    return asyncio.run(post())
+
+
+def test_one_order_control_serves_a_generation_job_on_a_third_model_next_to_eval_jobs(
+        world, monkeypatch):  # noqa: F811
+    import httpx
+
+    from reliquary.admin.service import create_admin_app
+    from reliquary.eval import qualification as qual
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator.eval_control import (
+        EvalExecutorDirectory,
+        PairedAuditDispatcher,
+        build_order_control,
+    )
+    from tests.unit.test_eval_control_process import _Tokenizer
+
+    registry, _ = world
+    stub_catalog_env(monkeypatch)
+    record = qual.new_generation_request(
+        qualification_id="order-gq-c", model="customer/C", revision="c" * 40, env=GEN_ENV,
+        prompt_start=100, problems=500, sampling=GEN_SAMPLING, max_new_tokens=64,
+        thinking=False)
+    record.update(status=qual.QUALIFIED, result={
+        "thresholds": GEN_THRESHOLDS, "architecture": "Qwen3ForCausalLM",
+        "checkpoint_sha256": "c" * 64, "eos_token_id": 2})
+    asyncio.run(qual.QualificationStore().write(record, None))
+    admin = create_admin_app(secret=b"s" * 32, pool_max=0.3, models={}, records=object(),
+                             current_round=lambda: 1)
+    created = _signed_post(admin, "/admin/v1/jobs", {
+        "job_id": "order-gen-c", "model": "customer/C", "env": GEN_ENV, "prompt_start": 100,
+        "prompt_count": 500, "samples_per_prompt": 2, "max_new_tokens": 64,
+        "sampling": GEN_SAMPLING, "qualification_id": "order-gq-c"})
+    assert created.status_code == 201, created.text
+
+    async def idle(self):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
+    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", lambda self: idle(self))
+
+    async def read_entries():
+        return dict(registry["entries"])
+
+    async def go():
+        directory = EvalExecutorDirectory(list_documents=lambda: _none())
+        dispatcher = PairedAuditDispatcher(directory=directory)
+        app, job_set = build_order_control(
+            store=BucketJobStore(), records=BucketRecordStore(), dispatcher=dispatcher,
+            directory=directory, verify_signature=lambda request: True,
+            tokenizer_for=lambda repo, rev: (_Tokenizer(), 100), read_entries=read_entries)
+        await job_set.refresh()
+        assert sorted(job_set.served) == ["order-eval-a", "order-eval-b", "order-gen-c"]
+        served = app.state.eval_served["order-gen-c"]
+        # The corpus jobs' partial audit, every audited batch through the pair.
+        assert (served.auditor._params.q, served.auditor._params.probation_submissions) == (
+            0.15, 100)
+        assert served.auditor.reopen_slots is False
+        assert app.state.eval_served["order-eval-a"].auditor.reopen_slots is True
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://order") as client:
+            job = (await client.get("/corpus/jobs/order-gen-c/job")).json()
+            assert (job["checkpoint_repo"], job["prompt_source"]) == ("customer/C", GEN_ENV)
+            contract = (await client.get("/corpus/jobs/order-gen-c/contract")).json()
+            assert contract["model_id"] == "customer/C"
+            # Its prompts are the catalog's: no eval-prompts route for it.
+            assert (await client.get("/corpus/jobs/order-gen-c/eval-prompts")).status_code == 404
+            status = (await client.get("/corpus/jobs/order-gen-c/status")).json()
+            assert status["prompts_total"] == 500
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+
+    asyncio.run(go())
+
+
+async def _none():
+    return []
+
+
+@pytest.mark.parametrize("command", ["order-control", "eval-control"])
+def test_order_control_is_the_command_and_eval_control_its_alias(monkeypatch, command):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.validator import eval_control
+
+    calls = []
+
+    async def run(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(eval_control, "run_order_control", run)
+    result = CliRunner().invoke(app, ["corpus", command, "--port", "8792"])
+    assert result.exit_code == 0, result.output
+    assert calls == [{"netuid": 81, "http_host": "127.0.0.1", "http_port": 8792}]
+
+
+def test_a_miner_submits_an_order_job_on_its_scoped_path():
+    from reliquary.miner.corpus_miner import submits_scoped
+    from tests.unit.test_corpus_export import _job_spec
+
+    assert submits_scoped(_job_spec(job_id="order-gen-1", prompt_source=GEN_ENV))
+    assert submits_scoped(_job_spec(job_id="order-eval-1",
+                                    prompt_source="eval-set:s:1:" + "0" * 64))
+    assert not submits_scoped(_job_spec(job_id="code-qwen38-27b-v1",
+                                        prompt_source="reliquary_code_v1"))

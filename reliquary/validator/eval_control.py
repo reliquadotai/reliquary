@@ -552,7 +552,8 @@ class _VocabularyOnly:
 
 def eval_auditor(**kwargs):
     """A ``CorpusAuditor`` that never touches a GPU: every batch, re-audits
-    included, goes to an executor pair; ``scored_by`` lists both executors."""
+    included, goes to an executor pair; ``scored_by`` lists both executors.
+    ``reopen_slots`` (eval jobs only) reopens a slot on each failed audit."""
     from reliquary.validator.corpus_audit import outcome_from_scores
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
@@ -601,11 +602,12 @@ def eval_auditor(**kwargs):
             await super().judge_many([s for s in submission_ids if s not in self.parked_ids])
 
         # -- an eval job stays completable: a failure reopens its slot ------
+        # (a generation order's never does: today's corpus semantics)
 
         async def _record_failure(self, submission_id: str) -> None:
             from reliquary.validator.corpus_service import record_prompt_failure
 
-            if self.job is None or self.job_store is None:
+            if not self.reopen_slots or self.job is None or self.job_store is None:
                 return
             try:
                 record = await self._records.read_submission(self._job_id, submission_id)
@@ -637,6 +639,8 @@ def eval_auditor(**kwargs):
             """Every failed or voided submission recorded in the ledger (a crash
             between a verdict and its ledger write would otherwise leave the
             prompt without its slot)."""
+            if not self.reopen_slots:
+                return 0
             ids = list(await self._records.list_verdict_ids(self._job_id))
             lister = getattr(self._records, "list_voided_ids", None)
             voided = set(await lister(self._job_id)) if lister is not None else set()
@@ -659,7 +663,9 @@ def eval_auditor(**kwargs):
     vocab_size = kwargs.pop("vocab_size")
     job = kwargs.pop("job", None)
     job_store = kwargs.pop("job_store", None)
+    reopen_slots = kwargs.pop("reopen_slots", True)
     auditor = EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
+    auditor.reopen_slots = bool(reopen_slots)
     auditor.parked_ids = set()
     auditor._current_ids, auditor._current_records = [], []
     auditor.job, auditor.job_store = job, job_store
@@ -739,10 +745,10 @@ def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
 # ---------------------------------------------------------------------------
 
 
-class EvalArchives:
-    """The settler's archives for eval tasks: written only under a task this
-    process wired and named order-eval- (RELIQUARY_TASK_ID lists no eval task:
-    they are all wired hot)."""
+class OrderArchives:
+    """The settler's archives for order tasks: written only under a task this
+    process wired and named order-eval- or order-gen- (RELIQUARY_TASK_ID lists
+    no order task: they are all wired hot)."""
 
     def __init__(self, *, served: Callable[[], Any], upload=None, other_max=None) -> None:
         from reliquary.validator.corpus_settlement import R2Archives
@@ -755,10 +761,10 @@ class EvalArchives:
         return await self._other_max(task_id)
 
     async def write(self, task_id: str, window: int, data: dict) -> None:
-        from reliquary.eval.prompt_source import is_eval_job_id
+        from reliquary.eval.prompt_source import is_order_job_id
 
-        if not is_eval_job_id(task_id) or task_id not in set(self._served()):
-            raise RuntimeError(f"task {task_id!r} is not an eval task this process serves; "
+        if not is_order_job_id(task_id) or task_id not in set(self._served()):
+            raise RuntimeError(f"task {task_id!r} is not an order task this process serves; "
                                "refusing to archive")
         if self._upload is None:
             from reliquary.infrastructure import storage
@@ -766,6 +772,9 @@ class EvalArchives:
             await storage.upload_window_dataset(window, data, task_id=task_id)
         else:
             await self._upload(window, data, task_id)
+
+
+EvalArchives = OrderArchives
 
 
 async def write_control_status(document: dict, **client_kwargs) -> None:
@@ -790,25 +799,46 @@ async def read_control_status(**client_kwargs) -> dict | None:
     return None if body is None else json.loads(body)
 
 
-def eval_job_refusal(entry, job) -> str | None:
-    """Why the eval control will not serve a registry entry, or None."""
-    from reliquary.eval.prompt_source import is_eval_job_id, is_eval_source
-    from reliquary.protocol.profiles import profile_from_contract, toploc_proof
+def order_job_refusal(entry, job) -> str | None:
+    """Why the order control will not serve a registry entry, or None: an eval
+    job draws from its eval set, a generation order from a packaged catalog
+    source through the model's chat template; both carry an enforced TOPLOC
+    proof on the job's own checkpoint."""
+    from reliquary.eval.prompt_source import is_eval_job_id, is_eval_source, is_gen_job_id
+    from reliquary.protocol import profiles
 
-    if not is_eval_job_id(entry.job_id):
-        return "not an evaluation job"
-    if not is_eval_source(job.prompt_source):
-        return f"prompt source {job.prompt_source!r} is not an eval set"
+    if is_eval_job_id(entry.job_id):
+        if not is_eval_source(job.prompt_source):
+            return f"prompt source {job.prompt_source!r} is not an eval set"
+    elif is_gen_job_id(entry.job_id):
+        from reliquary.eval.qualification import order_environment_refusal
+        from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
+
+        if is_eval_source(job.prompt_source):
+            return "a generation order does not draw from an eval set"
+        refusal = order_environment_refusal(job.prompt_source)
+        if refusal is not None:
+            return refusal
+        if job.renderer_id not in CHAT_TEMPLATE_RENDERERS:
+            return f"renderer {job.renderer_id!r} is not the model's chat template"
+        declared = list(((getattr(entry, "contract", None) or {}).get("environments") or {}))
+        if getattr(entry, "contract", None) is not None and declared != [job.prompt_source]:
+            return f"its contract declares environments {declared}, not {job.prompt_source!r} alone"
+    else:
+        return "not an order job"
     if getattr(entry, "contract", None) is None:
         return "it carries no contract"
-    profile = profile_from_contract(entry.contract)
-    proof = toploc_proof(profile)
+    profile = profiles.profile_from_contract(entry.contract)
+    proof = profiles.toploc_proof(profile)
     if proof is None or proof.mode != "enforce":
         return "its contract names no enforced toploc proof"
     if (profile.model_id, profile.model_revision) != (job.checkpoint_repo,
                                                       job.checkpoint_revision):
         return "its contract's model is not the job's checkpoint"
     return None
+
+
+eval_job_refusal = order_job_refusal
 
 
 # A tokenizer's files: never the weights, never a stray large text file.
@@ -901,7 +931,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index)
 
     async def wire(entry, cap, job):
-        refusal = eval_job_refusal(entry, job)
+        from reliquary.eval.prompt_source import is_eval_source
+
+        refusal = order_job_refusal(entry, job)
         if refusal is not None:
             raise ValueError(refusal)
         key = (job.checkpoint_repo, job.checkpoint_revision)
@@ -917,7 +949,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
         renderer = renderer_for_job(job, encode, tokenizer=tokenizer, profile=profile)
         prompt_job_for = functools.partial(prompt_job_for_spec, profile=profile)
-        await asyncio.to_thread(prompt_job_for, job)  # the set's prompts, read and checked
+        # The set's prompts (or the catalog source's rows), read and checked.
+        await asyncio.to_thread(prompt_job_for, job)
         seen_index = await migrate_ledgers_at_startup(store, job)
         params, miner_states, is_banned, beacon, round_at = build_corpus_audit_wiring(
             entry=entry, job=job, records=records)
@@ -929,6 +962,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
             on_verdict=w.stats.observe, vocab_size=vocab_size, job=job, job_store=store,
+            reopen_slots=is_eval_source(job.prompt_source),
             remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
                                    job.job_id))
         w.settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
@@ -956,25 +990,28 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         return job
 
     def admit(entry, job):
-        refusal = eval_job_refusal(entry, job)
+        refusal = order_job_refusal(entry, job)
         return None if refusal is None else (OTHER_MODEL, refusal)
 
     def screen(entry):
-        from reliquary.eval.prompt_source import is_eval_job_id
+        from reliquary.eval.prompt_source import is_order_job_id
 
-        # Not an eval job: never even read its manifest.
-        if not is_eval_job_id(getattr(entry, "job_id", "")):
-            return OTHER_MODEL, "not an evaluation job"
+        # Not an order job: never even read its manifest.
+        if not is_order_job_id(getattr(entry, "job_id", "")):
+            return OTHER_MODEL, "not an order job"
         return None
 
     def unwired(w) -> None:
         """A drained job releases everything it held: its wiring, its pool view
         and listeners, its prompts, and its model's tokenizer once unused."""
-        from reliquary.eval.prompt_source import forget_eval_prompts, parse_eval_source
+        from reliquary.eval.prompt_source import (
+            forget_eval_prompts, is_eval_source, parse_eval_source,
+        )
 
         served.pop(w.job.job_id, None)
         w.auditor._remote.close()
-        forget_eval_prompts(parse_eval_source(w.job.prompt_source))
+        if is_eval_source(w.job.prompt_source):
+            forget_eval_prompts(parse_eval_source(w.job.prompt_source))
         key = (w.job.checkpoint_repo, w.job.checkpoint_revision)
         if not any((o.job.checkpoint_repo, o.job.checkpoint_revision) == key
                    for o in served.values()):
@@ -997,9 +1034,14 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
     @app.get("/corpus/jobs/{job_id}/eval-prompts")
     async def eval_prompts(job_id: str) -> Response:
+        from reliquary.eval.prompt_source import is_eval_source
+
         w = served.get(job_id)
         if w is None or job_id not in routes.routers:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        if not is_eval_source(w.job.prompt_source):
+            # A generation order's rows are the catalog source's, as every miner builds them.
+            raise HTTPException(status_code=404, detail="not_an_eval_job")
         body = await asyncio.to_thread(job_prompt_lines, parse_eval_source(w.job.prompt_source))
         return Response(content=body, media_type="application/x-ndjson")
 
@@ -1056,7 +1098,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
                            registration_gate: bool = True,
                            refresh_every_seconds: float | None = None) -> None:
-    """Serve every active ``order-eval-`` corpus task of the registry, hot."""
+    """Serve every active order task (``order-eval-`` and ``order-gen-``) of
+    the registry, hot."""
     import uvicorn
 
     from reliquary.eval.qualification import QualificationQueue, QualificationStore
@@ -1101,7 +1144,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         return entries
 
     job_set = None
-    archives = EvalArchives(served=lambda: job_set.task_ids() if job_set else ())
+    archives = OrderArchives(served=lambda: job_set.task_ids() if job_set else ())
     app, job_set = build_eval_control(
         store=BucketJobStore(), records=BucketRecordStore(), dispatcher=dispatcher,
         directory=directory, verify_signature=verify_corpus_signature,
@@ -1127,8 +1170,16 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
     await asyncio.gather(server.serve(), *background)
 
 
+build_order_control = build_eval_control
+run_order_control = run_eval_control
+
+
 __all__ = [
     "BatchParked",
+    "OrderArchives",
+    "build_order_control",
+    "order_job_refusal",
+    "run_order_control",
     "EVAL_AUDIT_PREFIX",
     "EVAL_CONTROL_STATUS_KEY",
     "EvalArchives",
