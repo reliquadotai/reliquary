@@ -425,6 +425,8 @@ def _validator(jobs):
                 return httpx.Response(404, json={"detail": "corpus_job_not_served"})
             if what == "job":
                 return httpx.Response(200, json=jobs[job_id])
+            if what == "submit":
+                return httpx.Response(200, json={"accepted": True, "reason": "accepted"})
             return httpx.Response(200, json={"hotkey": rest[0], "cursor": 7})
         if path == "/corpus/submit":
             return httpx.Response(200, json={"accepted": True, "reason": "accepted"})
@@ -454,8 +456,10 @@ def test_with_a_job_id_the_client_uses_that_jobs_paths():
     assert client.job() == {"job_id": "code"}
     assert client.cursor("5Hot") == 7
     assert client.submit({"job_id": "code"})["accepted"] is True
+    # Submitted on the job's own routes too: every control serving several
+    # jobs (the corpus control, the order control) answers them.
     assert [p for _, p in seen] == ["/corpus/jobs/code/job", "/corpus/jobs/code/cursor/5Hot",
-                                    "/corpus/submit"]
+                                    "/corpus/jobs/code/submit"]
 
 
 def test_a_multi_job_validator_without_a_job_id_gives_its_first_listed_job():

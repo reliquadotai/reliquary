@@ -406,7 +406,7 @@ def _gen_entry_and_job(**job_changes):
                   renderer_id="chat-template-v1", checkpoint_repo="org/Frozen",
                   checkpoint_revision="abc123", **job_changes)
     contract = {"model_id": "org/Frozen", "model_revision": "abc123",
-                "environments": {GEN_ENV: {}},
+                "model_architecture": "Qwen3ForCausalLM", "environments": {GEN_ENV: {}},
                 "proofs": [{"scheme": "toploc-v1", "mode": "enforce",
                             "chunk_tokens": proof.chunk_tokens, "topk": proof.topk,
                             "exp_mismatch_threshold": 60, "mant_mean_threshold": 40.0,
@@ -422,7 +422,8 @@ def test_the_order_control_serves_order_jobs_only(monkeypatch):
     assert eval_job_refusal is order_job_refusal
     # The contract's reading is the profiles module's; only its outcome matters here.
     monkeypatch.setattr(profiles, "profile_from_contract", lambda c: SimpleNamespace(
-        model_id=c["model_id"], model_revision=c["model_revision"], proofs=c["proofs"]))
+        model_id=c["model_id"], model_revision=c["model_revision"], proofs=c["proofs"],
+        model_architecture=c.get("model_architecture")))
     monkeypatch.setattr(profiles, "toploc_proof", lambda p: SimpleNamespace(
         mode=p.proofs[0]["mode"]) if p.proofs else None)
     entry, job = _gen_entry_and_job()
@@ -614,11 +615,7 @@ def test_order_control_is_the_command_and_eval_control_its_alias(monkeypatch, co
 
 
 def test_a_miner_submits_an_order_job_on_its_scoped_path():
-    from reliquary.miner.corpus_miner import submits_scoped
-    from tests.unit.test_corpus_export import _job_spec
+    from reliquary.miner.corpus_miner import HttpCorpusClient
 
-    assert submits_scoped(_job_spec(job_id="order-gen-1", prompt_source=GEN_ENV))
-    assert submits_scoped(_job_spec(job_id="order-eval-1",
-                                    prompt_source="eval-set:s:1:" + "0" * 64))
-    assert not submits_scoped(_job_spec(job_id="code-qwen38-27b-v1",
-                                        prompt_source="reliquary_code_v1"))
+    assert HttpCorpusClient(object(), job_id="order-gen-1").scoped_submit is True
+    assert HttpCorpusClient(object(), job_id=None).scoped_submit is False

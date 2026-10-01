@@ -250,7 +250,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      prepare=None, work_dir=None,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
                      open_environment=None, grade_scorer=None,
-                     require_sandbox=None, qualifications=None, eval_jobs=None) -> FastAPI:
+                     require_sandbox=None, qualifications=None, eval_jobs=None,
+                     model_facts=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -294,6 +295,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.eval.qualification import EvalJobStore
 
         eval_jobs = EvalJobStore()
+    if model_facts is None:
+        async def model_facts(repo: str, revision: str) -> dict:
+            from reliquary.validator.eval_control import model_facts as read_facts
+
+            # The model's own config and tokenizer files, on CPU (no weights).
+            return await asyncio.to_thread(read_facts, repo, revision)
+    # Rows of each order source, counted once (building one reads its package).
+    source_rows: dict[str, int] = {}
 
     async def signed(request: Request) -> None:
         if request.url.query:
@@ -335,6 +344,41 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     def idempotent(answer: dict, entry) -> dict:
         return {**answer, "created": False, "status": entry.status,
                 "cap": float(entry.params["cap"])}
+
+    async def refuse_unservable_model(model: str, revision: str) -> None:
+        """422 ``architecture_unsupported`` / ``model_files_unreadable`` from the
+        model's own files; 503 ``model_files_unavailable`` when the hub cannot
+        be read now."""
+        from reliquary.constants import SUPPORTED_ARCHITECTURES
+
+        try:
+            facts = await model_facts(model, revision)
+        except ValueError as exc:
+            raise HTTPException(status_code=422,
+                                detail=f"model_files_unreadable: {exc}"[:500]) from exc
+        except Exception as exc:
+            logger.warning("model files of %s@%s unavailable", model, revision, exc_info=True)
+            raise HTTPException(status_code=503, detail="model_files_unavailable") from exc
+        if facts["architecture"] not in SUPPORTED_ARCHITECTURES:
+            raise HTTPException(status_code=422, detail=(
+                f"architecture_unsupported: {facts['architecture']!r}; supported: "
+                f"{sorted(SUPPORTED_ARCHITECTURES)}"))
+
+    async def refuse_past_the_source(env: str, start: int, count: int) -> None:
+        """The whole range inside the source, as job creation will check it."""
+        from reliquary.validator import corpus_service
+
+        if env not in source_rows:
+            try:
+                source_rows[env] = await asyncio.to_thread(
+                    lambda: len(corpus_service.ENVIRONMENT_SPECS[env].create()))
+            except Exception as exc:
+                logger.warning("source %s could not be built", env, exc_info=True)
+                raise HTTPException(status_code=503, detail="source_unavailable") from exc
+        if start + count > source_rows[env]:
+            raise HTTPException(status_code=422, detail=(
+                f"rows [{start}, {start + count}) run past {env!r}, which has "
+                f"{source_rows[env]} rows"))
 
     def refuse_unsupported(result: dict) -> None:
         from reliquary.constants import SUPPORTED_ARCHITECTURES
@@ -456,6 +500,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if differs:
             raise HTTPException(status_code=409,
                                 detail=f"qualification_conditions_differ: {differs}")
+        try:
+            # What the order control checks the job against before serving it.
+            await eval_jobs.create({
+                "schema": qual.ORDER_JOB_SCHEMA, "job_id": body.job_id, "kind": qual.GENERATION,
+                "qualification_id": body.qualification_id, "env": body.env,
+                "prompt_start": body.prompt_start, "problems": body.prompt_count,
+                "samples": body.samples_per_prompt, "sampling": body.sampling.model_dump(),
+                "max_new_tokens": body.max_new_tokens, "thinking": body.thinking})
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dict(
             model_revision=record["revision"], model_architecture=result["architecture"],
             checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
@@ -476,6 +530,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if not (body.job_id.startswith(task_prefix)
                 and (body.task_id or body.job_id).startswith(task_prefix)):
             raise HTTPException(status_code=422, detail="task_id_outside_admin_scope")
+        task_id = body.task_id or body.job_id
+        for order_prefix in (eval_prefix, gen_prefix):
+            if task_id.startswith(order_prefix) and not body.job_id.startswith(order_prefix):
+                raise HTTPException(status_code=422, detail=(
+                    f"an {order_prefix!r} task id names an {order_prefix!r} job id"))
         evaluation = body.eval_set_id is not None
         # The eval control serves exactly the order-eval- ids (and routing
         # sends it exactly those): one is an eval job if and only if it says so.
@@ -770,6 +829,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if body.env is not None:
+            await refuse_past_the_source(body.env, wanted["prompt_start"], body.problems)
+        existing, _ = await qualifications.read(body.qualification_id)
+        if existing is None:
+            # Before any executor is rented: a model that can never be served.
+            await refuse_unservable_model(body.model, body.revision)
 
         def same(existing: dict) -> dict:
             if any(existing.get(k) != wanted.get(k) for k in qual.request_fields(wanted)) \
@@ -779,7 +844,6 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             response.status_code = 200
             return existing
 
-        existing, _ = await qualifications.read(body.qualification_id)
         if existing is not None:
             return same(existing)
         try:

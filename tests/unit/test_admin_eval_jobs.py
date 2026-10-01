@@ -70,7 +70,17 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
     from tests.unit.test_eval_grading import GradingEnvironment, _plain_scorer
 
     records = _JobRecords()
+    # What the admin reads of a model's own files: per model, facts or an error.
+    facts = {}
+
+    async def model_facts(repo, revision):
+        found = facts.get(repo, {"architecture": "Qwen3ForCausalLM", "eos_token_id": 151645})
+        if isinstance(found, Exception):
+            raise found
+        return found
+
     app = create_admin_app(secret=SECRET, pool_max=0.3, models={}, records=records,
+                           model_facts=model_facts,
                            current_round=lambda: 1,
                            deliveries=LocalDirectorySink(tmp_path / "p"),
                            open_environment=lambda source, split: GradingEnvironment(source),
@@ -88,6 +98,7 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
         return client.request(method, path, content=data, headers=headers)
 
     call.registry, call.bucket, call.records, call.root = registry, fake, records, tmp_path
+    call.facts = facts
     yield call
     client.__exit__(None, None, None)
 

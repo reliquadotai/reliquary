@@ -56,6 +56,13 @@ def threshold_ceilings() -> dict[str, float]:
                 "RELIQUARY_QUALIFY_THRESHOLD_CEILING_MANT_MEDIAN", 80.0))}
 
 
+def qualification_expiry_seconds() -> float:
+    """A qualification still pending this long after its request fails
+    (``qualification_expired``), whether or not an executor ever claimed it:
+    six hours by default, ``RELIQUARY_QUALIFY_EXPIRY_SECONDS`` overrides."""
+    return float(os.environ.get("RELIQUARY_QUALIFY_EXPIRY_SECONDS", 6 * 3600))
+
+
 def qualify_lease_seconds(max_new_tokens: int) -> float:
     """A qualification decodes every completion in one batch, then verifies:
     half an hour plus a quarter second per token of budget."""
@@ -180,13 +187,30 @@ def request_fields(record: dict) -> tuple[str, ...]:
     return GEN_REQUEST_FIELDS if record.get("kind") == GENERATION else REQUEST_FIELDS
 
 
+# The sources a generation order may draw from, by name: a new packaged
+# source is a decision, never enabled by its shape alone.
+ORDER_ENVIRONMENTS = frozenset({
+    "reliquary_logic_v2", "reliquary_dapo_math_v1",
+    "reliquary_instruction_following_v1", "reliquary_code_v1"})
+
+
 def order_environment_refusal(env: str) -> str | None:
-    """Why a generation order may not draw from ``env``, or None. Only a
+    """Why a generation order may not draw from ``env``, or None. Only a listed
     packaged single-turn source qualifies: it renders its own rows, so one
     order control renders every job's prompts as its miners do, whatever
     profile that process runs."""
     from reliquary.validator import corpus_service
 
+    if env not in ORDER_ENVIRONMENTS:
+        known = corpus_service.ENVIRONMENT_SPECS.get(env)
+        if known is None:
+            return f"env {env!r} is not an installed environment"
+        if getattr(known, "interaction_mode", None) == "single_turn" \
+                and getattr(known, "external_distribution", None) is None:
+            return f"env {env!r} renders through the process profile, not a packaged source"
+        if getattr(known, "interaction_mode", None) != "single_turn":
+            return f"env {env!r} is not a single-turn source"
+        return f"env {env!r} is not one of the order sources {sorted(ORDER_ENVIRONMENTS)}"
     spec = corpus_service.ENVIRONMENT_SPECS.get(env)
     if spec is None:
         return f"env {env!r} is not an installed environment"
@@ -289,6 +313,8 @@ class QualificationStore:
 
 
 EVAL_JOB_SCHEMA = "reliquary/eval-job/v1"
+# A generation order's record, in the same store: its qualification and conditions.
+ORDER_JOB_SCHEMA = "reliquary/order-job/v1"
 EVAL_JOB_KEY_PREFIX = "reliquary/eval/jobs/"
 
 
@@ -380,14 +406,28 @@ class QualificationQueue:
                     "supported_architectures": sorted(SUPPORTED_ARCHITECTURES)}
         return None
 
+    def _expired(self, record: dict) -> bool:
+        return self._clock() - float(record.get("requested_at") or 0) \
+            >= qualification_expiry_seconds()
+
     async def refresh(self) -> None:
+        """Read every open record; one pending past its expiry fails, with or
+        without an executor of its model."""
+        from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+
         for qualification_id in await self._store.list_ids():
             if qualification_id in self._done:
                 continue
-            record, _ = await self._store.read(qualification_id)
+            record, etag = await self._store.read(qualification_id)
             if record is None or record.get("status") in TERMINAL:
                 self._open.pop(qualification_id, None)
                 self._done.add(qualification_id)
+            elif self._expired(record):
+                try:
+                    await self._finish(qualification_id, {**record, "status": FAILED, "result": {
+                        "failed_reason": "qualification_expired"}}, etag)
+                except CorpusStoreConflict:
+                    continue
             else:
                 self._open[qualification_id] = record
 
@@ -439,6 +479,10 @@ class QualificationQueue:
                 continue
             if (record["model"], record["revision"]) != (executor.get("model_id"),
                                                          executor.get("model_revision")):
+                continue
+            if self._expired(record):
+                await self._finish(qualification_id, {**record, "status": FAILED, "result": {
+                    "failed_reason": "qualification_expired"}}, etag)
                 continue
             try:
                 refusal = await self.model_refusal(record)
@@ -587,6 +631,9 @@ __all__ = [
     "EvalJobStore",
     "FAILED",
     "GENERATION",
+    "ORDER_ENVIRONMENTS",
+    "ORDER_JOB_SCHEMA",
+    "qualification_expiry_seconds",
     "GEN_REQUEST_FIELDS",
     "catalog_prompts",
     "new_generation_request",

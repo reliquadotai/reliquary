@@ -139,7 +139,10 @@ class HttpCorpusClient:
     def __init__(self, http, *, job_id: str | None = None) -> None:
         self._http = http
         self._job_id = job_id
-        self.scoped_submit = False
+        # A named job is submitted on its own routes, the ones its reads use:
+        # whichever control nginx routes them to (an order job's included),
+        # with no configuration on the miner.
+        self.scoped_submit = job_id is not None
 
     def served_jobs(self) -> list:
         """Every job the validator serves; empty when it cannot say."""
@@ -187,8 +190,6 @@ class HttpCorpusClient:
         return int(issue_corpus_request(lambda: self._http.get(path))["cursor"])
 
     def submit(self, body: dict) -> dict:
-        # An eval job is served behind its own prefix only (the eval control):
-        # set by the caller once the job's manifest names an eval set.
         path = (f"/corpus/jobs/{self._job_id}/submit"
                 if self._job_id is not None and self.scoped_submit else "/corpus/submit")
         return issue_corpus_request(lambda: self._http.post(path, json=body))
@@ -485,16 +486,6 @@ def _has_vision_encoder(checkpoint_dir: str) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(config, dict) and "vision_config" in config
-
-
-def submits_scoped(job) -> bool:
-    """Whether a job's submissions go to ``/corpus/jobs/{job_id}/submit``: an
-    eval job (its manifest names an eval set) and a generation order
-    (``${RELIQUARY_ADMIN_TASK_PREFIX}gen-``), both served by the order
-    control, which has no legacy paths."""
-    from reliquary.eval.prompt_source import is_eval_source, is_gen_job_id
-
-    return is_eval_source(job.prompt_source) or is_gen_job_id(job.job_id)
 
 
 class CorpusContractError(RuntimeError):

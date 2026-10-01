@@ -1205,6 +1205,13 @@ def jobs_create(
     ),
 ) -> None:
     """Write the job manifest and the registry entry that pays for it."""
+    from reliquary.eval.prompt_source import is_order_job_id
+
+    if is_order_job_id(job_id) or is_order_job_id(task_id):
+        # An order job is served only from its qualification record.
+        typer.echo(f"error: {task_id or job_id!r} is an order id: only the admin service "
+                   "declares order jobs (POST /admin/v1/jobs)", err=True)
+        raise typer.Exit(code=2)
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure.task_registry_store import (
         RegistryConflict,
@@ -1809,6 +1816,32 @@ def corpus_order_control(
 corpus_app.command("eval-control", help="Alias of `order-control`.")(corpus_order_control)
 
 
+@corpus_app.command("order-control-check")
+def corpus_order_control_check() -> None:
+    """Check the order control's runtime (drand, hub, tokenizers, and every
+    order source's package against the catalog): JSON, exit 1 if anything is
+    missing. Run at image build."""
+    import json as _json
+
+    from reliquary.validator.eval_control import order_control_runtime_check
+
+    report = order_control_runtime_check()
+    typer.echo(_json.dumps(report, indent=1, sort_keys=True))
+    if not report["ok"]:
+        raise typer.Exit(code=1)
+
+
+@corpus_app.command("order-nginx")
+def corpus_order_nginx(
+    port: int = typer.Option(8791, "--port", help="The order control's local port"),
+) -> None:
+    """Print the nginx locations for the order control, built from
+    RELIQUARY_ADMIN_TASK_PREFIX: the one source of the routing regex."""
+    from reliquary.eval.prompt_source import order_routes_nginx
+
+    typer.echo(order_routes_nginx(port=port), nl=False)
+
+
 @corpus_app.command("qualify")
 def corpus_qualify(
     model: str = typer.Option(..., "--model", help="repo@revision of the model to qualify"),
@@ -1916,10 +1949,6 @@ def corpus_mine(
     from reliquary.eval.prompt_source import (
         is_eval_source, parse_eval_source, register_eval_prompts,
     )
-    from reliquary.miner.corpus_miner import submits_scoped
-
-    # An order job is served by the order control, on its scoped paths only.
-    client.scoped_submit = submits_scoped(job)
     if is_eval_source(job.prompt_source):
         # An eval job's prompts come from the control serving it, checked
         # against the sha256 its manifest names.
