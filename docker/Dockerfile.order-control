@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.6
+# The order control (`reliquary corpus order-control`): the validator image,
+# plus the packaged sources generation orders draw from, layered the way the
+# production corpus image is (prod image + `pip install` of the reviewed
+# environment wheels from reliquary-environments). See docs/runbooks/order-control.md.
+#
+#   docker build -f docker/Dockerfile.order-control \
+#     --build-arg BASE_IMAGE=<the validator image> \
+#     --build-context envs=<directory holding exactly the four reviewed wheels> .
+#
+# Wheels (distribution -> source):
+#   reliquary-logic                  -> reliquary_logic_v2
+#   reliquary-dapo-math              -> reliquary_dapo_math_v1
+#   reliquary-instruction-following  -> reliquary_instruction_following_v1
+#   reliquary-code                   -> reliquary_code_v1
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN --mount=type=bind,from=envs,target=/tmp/envs \
+    pip install /tmp/envs/reliquary_logic-*.whl \
+                /tmp/envs/reliquary_dapo_math-*.whl \
+                /tmp/envs/reliquary_instruction_following-*.whl \
+                /tmp/envs/reliquary_code-*.whl
+
+# Fails the build unless bittensor_drand (the partial audit's draw), the hub
+# and tokenizer libraries import and every package verifies against the
+# catalog digest orders are qualified on.
+RUN reliquary corpus order-control-check
+
+LABEL ai.reliquary.role="order-control"
+EXPOSE 8791
+# No wallet and no grader: the order control signs nothing and grades nothing.
+ENTRYPOINT ["reliquary", "corpus", "order-control", "--host", "0.0.0.0", "--port", "8791"]

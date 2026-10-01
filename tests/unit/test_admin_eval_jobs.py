@@ -70,7 +70,17 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
     from tests.unit.test_eval_grading import GradingEnvironment, _plain_scorer
 
     records = _JobRecords()
+    # What the admin reads of a model's own files: per model, facts or an error.
+    facts = {}
+
+    async def model_facts(repo, revision):
+        found = facts.get(repo, {"architecture": "Qwen3ForCausalLM", "eos_token_id": 151645})
+        if isinstance(found, Exception):
+            raise found
+        return found
+
     app = create_admin_app(secret=SECRET, pool_max=0.3, models={}, records=records,
+                           model_facts=model_facts,
                            current_round=lambda: 1,
                            deliveries=LocalDirectorySink(tmp_path / "p"),
                            open_environment=lambda source, split: GradingEnvironment(source),
@@ -88,6 +98,7 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
         return client.request(method, path, content=data, headers=headers)
 
     call.registry, call.bucket, call.records, call.root = registry, fake, records, tmp_path
+    call.facts = facts
     yield call
     client.__exit__(None, None, None)
 
@@ -339,3 +350,22 @@ def test_the_eval_control_status_is_readable_by_the_platform(admin):
     read = admin("GET", "/admin/v1/eval-control/status")
     assert read.status_code == 200 and read.json()["updated_at"] == 2.0
     assert read.json()["models"][f"{MODEL}@{REVISION}"]["executors_needed"] == 1
+
+
+# sha256 of the canonical (manifest, task contract, params) of `_eval_job()`,
+# pinned on 7753e5e4 before dataset orders on any model.
+EVAL_JOB_GOLDEN = "b9f0cf09e91a7327a7b54f6962f36d4e34b1618066ba0c040ddaec1bda0c4c6a"
+
+
+def test_an_eval_job_is_declared_byte_identically(admin):
+    import hashlib
+
+    admin("POST", "/admin/v1/qualifications", _qualification())
+    _qualify(admin)
+    assert admin("POST", "/admin/v1/jobs", _eval_job()).status_code == 201
+    entry = admin.registry["entries"]["order-eval-7"]
+    manifest = json.loads(admin.bucket.objects["reliquary/corpus/jobs/order-eval-7.json"][0])
+    document = {"manifest": manifest, "contract": entry.contract, "params": entry.params}
+    digest = hashlib.sha256(json.dumps(document, sort_keys=True,
+                                       separators=(",", ":")).encode()).hexdigest()
+    assert digest == EVAL_JOB_GOLDEN

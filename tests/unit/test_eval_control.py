@@ -190,7 +190,7 @@ def test_the_eval_auditor_scores_through_the_pair_and_names_both():
 
 def test_only_eval_jobs_are_served():
     entry = SimpleNamespace(job_id="code-v1", contract={})
-    assert eval_job_refusal(entry, SimpleNamespace(prompt_source="x")) == "not an evaluation job"
+    assert eval_job_refusal(entry, SimpleNamespace(prompt_source="x")) == "not an order job"
     entry = SimpleNamespace(job_id="order-eval-1", contract={})
     assert "eval set" in eval_job_refusal(entry, SimpleNamespace(prompt_source="reliquary_logic_v2"))
 

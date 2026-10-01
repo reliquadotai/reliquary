@@ -881,6 +881,7 @@ def build_job_manifest(
     profile=None,
     prompt_start=0,
     seed=None,
+    submit=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -939,6 +940,8 @@ def build_job_manifest(
         manifest["prompt_start"] = prompt_start
     if seed is not None:
         manifest["seed"] = seed
+    if submit is not None:
+        manifest["submit"] = submit
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
     # time: an unrenderable source fails fidelity forever, and a range
@@ -991,6 +994,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
+    submit=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1044,6 +1048,7 @@ def prepare_corpus_job(
         prompt_order=prompt_order,
         deadline_round=deadline_round,
         seed=seed,
+        submit=submit,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -1205,6 +1210,13 @@ def jobs_create(
     ),
 ) -> None:
     """Write the job manifest and the registry entry that pays for it."""
+    from reliquary.eval.prompt_source import is_order_job_id
+
+    if is_order_job_id(job_id) or is_order_job_id(task_id):
+        # An order job is served only from its qualification record.
+        typer.echo(f"error: {task_id or job_id!r} is an order id: only the admin service "
+                   "declares order jobs (POST /admin/v1/jobs)", err=True)
+        raise typer.Exit(code=2)
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure.task_registry_store import (
         RegistryConflict,
@@ -1786,22 +1798,53 @@ def corpus_audit_executor(
                        model_revision=model_revision, **route)
 
 
-@corpus_app.command("eval-control")
-def corpus_eval_control(
+@corpus_app.command("order-control")
+def corpus_order_control(
     netuid: int = typer.Option(81, "--netuid"),
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8791, "--port"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
-    """Serve every eval corpus job (ids ${RELIQUARY_ADMIN_TASK_PREFIX}eval-,
-    order-eval- by default), whatever its model, with no GPU: tokenizers on
-    CPU, audits by executor pairs on distinct providers. Route
-    ^/corpus/jobs/<prefix>eval- and ^/corpus/internal/eval-audit/ here; the
-    corpus control keeps everything else."""
-    from reliquary.validator.eval_control import run_eval_control
+    """Serve every order job, eval (${RELIQUARY_ADMIN_TASK_PREFIX}eval-) and
+    generation (${RELIQUARY_ADMIN_TASK_PREFIX}gen-), order-eval- and order-gen-
+    by default, whatever its model, with no GPU: tokenizers on CPU, audits by
+    executor pairs on distinct providers. Route ^/corpus/jobs/<prefix>(eval|gen)-
+    and ^/corpus/internal/eval-audit/ here; the corpus control keeps everything
+    else. `eval-control` is the same command."""
+    from reliquary.validator import eval_control
 
     setup_logging(log_level)
-    asyncio.run(run_eval_control(netuid=netuid, http_host=host, http_port=port))
+    asyncio.run(eval_control.run_order_control(netuid=netuid, http_host=host, http_port=port))
+
+
+# The command's first name, kept for existing deployments.
+corpus_app.command("eval-control", help="Alias of `order-control`.")(corpus_order_control)
+
+
+@corpus_app.command("order-control-check")
+def corpus_order_control_check() -> None:
+    """Check the order control's runtime (drand, hub, tokenizers, and every
+    order source's package against the catalog): JSON, exit 1 if anything is
+    missing. Run at image build."""
+    import json as _json
+
+    from reliquary.validator.eval_control import order_control_runtime_check
+
+    report = order_control_runtime_check()
+    typer.echo(_json.dumps(report, indent=1, sort_keys=True))
+    if not report["ok"]:
+        raise typer.Exit(code=1)
+
+
+@corpus_app.command("order-nginx")
+def corpus_order_nginx(
+    port: int = typer.Option(8791, "--port", help="The order control's local port"),
+) -> None:
+    """Print the nginx locations for the order control, built from
+    RELIQUARY_ADMIN_TASK_PREFIX: the one source of the routing regex."""
+    from reliquary.eval.prompt_source import order_routes_nginx
+
+    typer.echo(order_routes_nginx(port=port), nl=False)
 
 
 @corpus_app.command("qualify")
@@ -1911,11 +1954,13 @@ def corpus_mine(
     from reliquary.eval.prompt_source import (
         is_eval_source, parse_eval_source, register_eval_prompts,
     )
+    from reliquary.miner.corpus_miner import submits_scoped
 
+    # Only a job whose manifest says so (order jobs) leaves /corpus/submit.
+    client.scoped_submit = submits_scoped(job)
     if is_eval_source(job.prompt_source):
         # An eval job's prompts come from the control serving it, checked
         # against the sha256 its manifest names.
-        client.scoped_submit = True
         try:
             register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
         except (ValueError, CorpusJobSelectionError) as exc:

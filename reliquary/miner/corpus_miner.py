@@ -139,6 +139,8 @@ class HttpCorpusClient:
     def __init__(self, http, *, job_id: str | None = None) -> None:
         self._http = http
         self._job_id = job_id
+        # Set from the job's manifest (`submits_scoped`): every other job keeps
+        # the legacy /corpus/submit, which deployed corpus controls answer.
         self.scoped_submit = False
 
     def served_jobs(self) -> list:
@@ -187,8 +189,6 @@ class HttpCorpusClient:
         return int(issue_corpus_request(lambda: self._http.get(path))["cursor"])
 
     def submit(self, body: dict) -> dict:
-        # An eval job is served behind its own prefix only (the eval control):
-        # set by the caller once the job's manifest names an eval set.
         path = (f"/corpus/jobs/{self._job_id}/submit"
                 if self._job_id is not None and self.scoped_submit else "/corpus/submit")
         return issue_corpus_request(lambda: self._http.post(path, json=body))
@@ -485,6 +485,17 @@ def _has_vision_encoder(checkpoint_dir: str) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(config, dict) and "vision_config" in config
+
+
+def submits_scoped(job) -> bool:
+    """Whether a job's submissions go to ``/corpus/jobs/{job_id}/submit``: when
+    its manifest says ``submit: "scoped"`` (generation orders) or names an eval
+    set (eval orders), both served by the order control, which has no legacy
+    path. Read from the job, never from the miner's configuration."""
+    from reliquary.corpus.job import SUBMIT_SCOPED
+    from reliquary.eval.prompt_source import is_eval_source
+
+    return getattr(job, "submit", None) == SUBMIT_SCOPED or is_eval_source(job.prompt_source)
 
 
 class CorpusContractError(RuntimeError):

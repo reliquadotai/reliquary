@@ -118,6 +118,20 @@ async def write_settlement(job_id, state, etag, **client_kwargs) -> str | None:
     return await _put(_settlement_key(job_id), body, etag, **client_kwargs)
 
 
+def _final_status_key(job_id: str) -> str:
+    return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/final-status.json"
+
+
+async def read_final_status(job_id, **client_kwargs) -> dict | None:
+    return await _read(_final_status_key(job_id), **client_kwargs)
+
+
+async def write_final_status(job_id, status, **client_kwargs) -> bool:
+    """A drained job's last status, beside its settlement: create-only (a
+    drained job never changes); False when one is already written."""
+    return await _create(_final_status_key(job_id), status, **client_kwargs)
+
+
 def _miners_key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/miners.json"
 
@@ -179,6 +193,12 @@ class BucketRecordStore:
 
     async def write_settlement(self, job_id, state, etag):
         return await write_settlement(job_id, state, etag, **self._kw)
+
+    async def read_final_status(self, job_id):
+        return await read_final_status(job_id, **self._kw)
+
+    async def write_final_status(self, job_id, status):
+        return await write_final_status(job_id, status, **self._kw)
 
     async def read_miners(self, job_id):
         return await read_miners(job_id, **self._kw)

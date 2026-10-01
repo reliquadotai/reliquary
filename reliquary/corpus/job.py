@@ -58,11 +58,22 @@ _JOB_FIELDS = (
 # manifest that predates it stores and hashes byte-identically. A binary that
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
-_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed")
+_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit")
+# The one value of `submit`: submissions go to the job's own scoped route
+# (order jobs, on the order control); absent, to the legacy `/corpus/submit`.
+SUBMIT_SCOPED = "scoped"
 
 
 class JobError(ValueError):
     """The manifest does not describe a job this code can run."""
+
+
+def _submit(raw) -> str | None:
+    if "submit" not in raw:
+        return None
+    if raw["submit"] != SUBMIT_SCOPED:
+        raise JobError(f"submit must be {SUBMIT_SCOPED!r} when present, got {raw['submit']!r}")
+    return SUBMIT_SCOPED
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +117,8 @@ class JobSpec:
     prompt_start: int = 0
     # Recorded for reproducibility (eval jobs); nothing verifies a miner used it.
     seed: int | None = None
+    # "scoped" (order jobs only): miners submit on /corpus/jobs/{job_id}/submit.
+    submit: str | None = None
 
     @property
     def prompt_end(self) -> int:
@@ -157,6 +170,7 @@ class JobSpec:
             "deadline_round": self.deadline_round,
             **({"prompt_start": self.prompt_start} if self.prompt_start else {}),
             **({"seed": self.seed} if self.seed is not None else {}),
+            **({"submit": self.submit} if self.submit is not None else {}),
         }
 
 
@@ -308,4 +322,5 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
             _non_negative_int(raw, "prompt_start") if "prompt_start" in raw else 0
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
+        submit=_submit(raw),
     )

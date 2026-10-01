@@ -15,12 +15,15 @@ binds the conditions it was measured under, which the job must repeat.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 import time
 from collections.abc import Sequence
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 QUALIFICATION_SCHEMA = "reliquary/eval-qualification/v2"
 QUALIFICATION_PREFIX = "reliquary/eval/qualifications/"
@@ -51,6 +54,13 @@ def threshold_ceilings() -> dict[str, float]:
                 "RELIQUARY_QUALIFY_THRESHOLD_CEILING_MANT_MEAN", 80.0)),
             "mant_median": float(os.environ.get(
                 "RELIQUARY_QUALIFY_THRESHOLD_CEILING_MANT_MEDIAN", 80.0))}
+
+
+def qualification_expiry_seconds() -> float:
+    """A qualification still pending this long after its request fails
+    (``qualification_expired``), whether or not an executor ever claimed it:
+    six hours by default, ``RELIQUARY_QUALIFY_EXPIRY_SECONDS`` overrides."""
+    return float(os.environ.get("RELIQUARY_QUALIFY_EXPIRY_SECONDS", 6 * 3600))
 
 
 def qualify_lease_seconds(max_new_tokens: int) -> float:
@@ -164,6 +174,107 @@ def new_request(*, qualification_id: str, model: str, revision: str, set_id: str
 REQUEST_FIELDS = ("model", "revision", "set_id", "problems", "completions", "sampling",
                   "max_new_tokens", "thinking")
 
+# A generation order's qualification: its catalog environment and range (the
+# first ``min(problems, completions)`` rows from ``prompt_start`` are decoded),
+# the package it renders through, and the same conditions.
+GENERATION = "generation"
+GEN_REQUEST_FIELDS = ("kind", "model", "revision", "env", "prompt_start", "problems",
+                      "completions", "sampling", "max_new_tokens", "thinking",
+                      "environment_manifest_sha256")
+
+
+def request_fields(record: dict) -> tuple[str, ...]:
+    return GEN_REQUEST_FIELDS if record.get("kind") == GENERATION else REQUEST_FIELDS
+
+
+# The sources a generation order may draw from, by name: a new packaged
+# source is a decision, never enabled by its shape alone.
+ORDER_ENVIRONMENTS = frozenset({
+    "reliquary_logic_v2", "reliquary_dapo_math_v1",
+    "reliquary_instruction_following_v1", "reliquary_code_v1"})
+
+
+def order_environment_refusal(env: str) -> str | None:
+    """Why a generation order may not draw from ``env``, or None. Only a listed
+    packaged single-turn source qualifies: it renders its own rows, so one
+    order control renders every job's prompts as its miners do, whatever
+    profile that process runs."""
+    from reliquary.validator import corpus_service
+
+    if env not in ORDER_ENVIRONMENTS:
+        known = corpus_service.ENVIRONMENT_SPECS.get(env)
+        if known is None:
+            return f"env {env!r} is not an installed environment"
+        if getattr(known, "interaction_mode", None) == "single_turn" \
+                and getattr(known, "external_distribution", None) is None:
+            return f"env {env!r} renders through the process profile, not a packaged source"
+        if getattr(known, "interaction_mode", None) != "single_turn":
+            return f"env {env!r} is not a single-turn source"
+        return f"env {env!r} is not one of the order sources {sorted(ORDER_ENVIRONMENTS)}"
+    spec = corpus_service.ENVIRONMENT_SPECS.get(env)
+    if spec is None:
+        return f"env {env!r} is not an installed environment"
+    if getattr(spec, "interaction_mode", None) != "single_turn":
+        return f"env {env!r} is not a single-turn source"
+    if getattr(spec, "external_distribution", None) is None:
+        return f"env {env!r} renders through the process profile, not a packaged source"
+    return None
+
+
+def new_generation_request(*, qualification_id: str, model: str, revision: str, env: str,
+                           prompt_start: int, problems: int, sampling: dict,
+                           max_new_tokens: int, thinking: bool,
+                           completions: int = QUALIFY_COMPLETIONS, clock=time.time) -> dict:
+    from reliquary.eval.sets import refuse_held_out_overlap
+    from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+    refusal = order_environment_refusal(env)
+    if refusal is not None:
+        raise ValueError(refusal)
+    if int(prompt_start) < 0:
+        raise ValueError("prompt_start must not be negative")
+    # The held-out rows of the eval sets are never generated for an order.
+    refuse_held_out_overlap(env, int(prompt_start), int(problems))
+    record = new_request(qualification_id=qualification_id, model=model, revision=revision,
+                         set_id="", problems=problems, sampling=sampling,
+                         max_new_tokens=max_new_tokens, thinking=thinking,
+                         completions=completions, clock=clock)
+    del record["set_id"]
+    profile = ENVIRONMENT_CATALOG.get(env)
+    record.update(kind=GENERATION, env=env, prompt_start=int(prompt_start),
+                  environment_manifest_sha256=getattr(profile, "environment_manifest_sha256",
+                                                      None))
+    return record
+
+
+def catalog_prompts(env: str, start: int, count: int, *, environments=None) -> list[dict]:
+    """Rows ``[start, start + count)`` of a packaged source, as a qualify
+    lease carries them (``problem_id`` = ``<env>#<index>``, as the job names
+    a row). ``environments`` caches built sources by name."""
+    from reliquary.validator import corpus_service
+
+    cache = environments if environments is not None else {}
+    if env not in cache:
+        cache[env] = corpus_service.ENVIRONMENT_SPECS[env].create()
+    environment = cache[env]
+    if start + count > len(environment):
+        raise ValueError(f"{env!r} has {len(environment)} rows, fewer than {start + count}")
+    rows = []
+    for index in range(start, start + count):
+        prompt = environment.get_problem(index).get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError(f"{env!r} row {index} has no prompt")
+        rows.append({"problem_id": f"{env}#{index}", "text": prompt})
+    return rows
+
+
+def sample_sha256(prompts: Sequence[dict]) -> str:
+    import hashlib
+
+    body = json.dumps([[p["problem_id"], p["text"]] for p in prompts],
+                      separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()
+
 
 class QualificationStore:
     """Qualification records in the subnet bucket, compare-and-swap."""
@@ -202,6 +313,8 @@ class QualificationStore:
 
 
 EVAL_JOB_SCHEMA = "reliquary/eval-job/v1"
+# A generation order's record, in the same store: its qualification and conditions.
+ORDER_JOB_SCHEMA = "reliquary/order-job/v1"
 EVAL_JOB_KEY_PREFIX = "reliquary/eval/jobs/"
 
 
@@ -247,26 +360,74 @@ class QualificationQueue:
     model's architecture and eos from its own files (CPU)."""
 
     def __init__(self, *, store, read_prompts, model_facts, proof=None,
-                 clock=time.time) -> None:
+                 clock=time.time, read_catalog_prompts=None) -> None:
         if proof is None:
             from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as proof
         self._store = store
         self._read_prompts = read_prompts
+        if read_catalog_prompts is None:
+            import asyncio
+
+            environments: dict = {}
+
+            async def read_catalog_prompts(env, start, count):
+                return await asyncio.to_thread(catalog_prompts, env, start, count,
+                                               environments=environments)
+        self._read_catalog_prompts = read_catalog_prompts
         self._model_facts = model_facts
         self._proof = proof
         self._clock = clock
         self._open: dict[str, dict] = {}
         # Ids already terminal: never read again.
         self._done: set[str] = set()
+        # (repo, revision) -> the model's facts, read once.
+        self._facts: dict[tuple[str, str], dict] = {}
+
+    async def facts_of(self, model: str, revision: str) -> dict:
+        key = (model, revision)
+        if key not in self._facts:
+            self._facts[key] = await self._model_facts(model, revision)
+        return self._facts[key]
+
+    async def model_refusal(self, record: dict) -> dict | None:
+        """The result refusing a qualification before any executor is leased:
+        an architecture outside ``SUPPORTED_ARCHITECTURES``, or model files
+        that are not public at the revision. None: go on (a transient read
+        failure raises)."""
+        from reliquary.constants import SUPPORTED_ARCHITECTURES
+
+        try:
+            facts = await self.facts_of(record["model"], record["revision"])
+        except ValueError as exc:
+            return {"refused_reason": "model_files_unreadable", "detail": str(exc)[:300]}
+        if facts["architecture"] not in SUPPORTED_ARCHITECTURES:
+            return {"refused_reason": "architecture_unsupported",
+                    "architecture": facts["architecture"],
+                    "supported_architectures": sorted(SUPPORTED_ARCHITECTURES)}
+        return None
+
+    def _expired(self, record: dict) -> bool:
+        return self._clock() - float(record.get("requested_at") or 0) \
+            >= qualification_expiry_seconds()
 
     async def refresh(self) -> None:
+        """Read every open record; one pending past its expiry fails, with or
+        without an executor of its model."""
+        from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+
         for qualification_id in await self._store.list_ids():
             if qualification_id in self._done:
                 continue
-            record, _ = await self._store.read(qualification_id)
+            record, etag = await self._store.read(qualification_id)
             if record is None or record.get("status") in TERMINAL:
                 self._open.pop(qualification_id, None)
                 self._done.add(qualification_id)
+            elif self._expired(record):
+                try:
+                    await self._finish(qualification_id, {**record, "status": FAILED, "result": {
+                        "failed_reason": "qualification_expired"}}, etag)
+                except CorpusStoreConflict:
+                    continue
             else:
                 self._open[qualification_id] = record
 
@@ -319,18 +480,51 @@ class QualificationQueue:
             if (record["model"], record["revision"]) != (executor.get("model_id"),
                                                          executor.get("model_revision")):
                 continue
+            if self._expired(record):
+                await self._finish(qualification_id, {**record, "status": FAILED, "result": {
+                    "failed_reason": "qualification_expired"}}, etag)
+                continue
+            try:
+                refusal = await self.model_refusal(record)
+            except Exception:
+                logger.warning("model facts of %s@%s unreadable; retrying", record["model"],
+                               record["revision"], exc_info=True)
+                continue
+            if refusal is not None:
+                await self._finish(qualification_id, {**record, "status": REFUSED,
+                                                      "result": refusal}, etag)
+                continue
             record = self._expire(record)
             if record["status"] == FAILED:
                 await self._finish(qualification_id, record, etag)
                 continue
             if not self._eligible(record, executor):
                 continue
-            body = await self._read_prompts(record["set_id"])
-            if body is None:
-                continue
-            # Only the prompts a completion is decoded for.
-            count = min(record["problems"], record["completions"], len(body.splitlines()))
-            rows = [json.loads(line) for line in head_lines(body, count).splitlines()]
+            if record.get("kind") == GENERATION:
+                count = min(record["problems"], record["completions"])
+                try:
+                    prompts = await self._read_catalog_prompts(
+                        record["env"], record["prompt_start"], count)
+                except ValueError as exc:
+                    await self._finish(qualification_id, {**record, "status": REFUSED, "result": {
+                        "refused_reason": "prompts_unreadable", "detail": str(exc)[:300]}}, etag)
+                    continue
+                sample = sample_sha256(prompts)
+                if record.get("sample_sha256", sample) != sample:
+                    # The package moved under the record: never measured on two samples.
+                    await self._finish(qualification_id, {**record, "status": FAILED, "result": {
+                        "failed_reason": "the environment's sample changed"}}, etag)
+                    continue
+                record = {**record, "sample_sha256": sample}
+            else:
+                body = await self._read_prompts(record["set_id"])
+                if body is None:
+                    continue
+                # Only the prompts a completion is decoded for.
+                count = min(record["problems"], record["completions"], len(body.splitlines()))
+                rows = [json.loads(line) for line in head_lines(body, count).splitlines()]
+                prompts = [{"problem_id": r["problem_id"], "text": r["messages"][-1]["content"]}
+                           for r in rows]
             seconds = qualify_lease_seconds(record["max_new_tokens"])
             lease = {"lease_id": secrets.token_hex(16), "expires_at": self._clock() + seconds,
                      "provider_id": executor["provider_id"], "host": executor["host"]}
@@ -346,8 +540,7 @@ class QualificationQueue:
                 "model_id": record["model"], "model_revision": record["revision"],
                 "chunk_tokens": self._proof.chunk_tokens, "topk": self._proof.topk,
                 "expires_at": lease["expires_at"],
-                "prompts": [{"problem_id": r["problem_id"],
-                             "text": r["messages"][-1]["content"]} for r in rows],
+                "prompts": prompts,
                 "completions": record["completions"], "sampling": record["sampling"],
                 "max_new_tokens": record["max_new_tokens"], "thinking": record["thinking"],
             }
@@ -417,7 +610,10 @@ class QualificationQueue:
         band = {name: max(a["band"][name], b["band"][name]) for name in MEASURES}
         band["chunks"] = a["band"]["chunks"] + b["band"]["chunks"]
         verdict = thresholds_from_band(band)
-        facts = await self._model_facts(record["model"], record["revision"])
+        refusal = await self.model_refusal(record)
+        if refusal is not None:
+            return {**record, "status": REFUSED, "result": refusal}
+        facts = await self.facts_of(record["model"], record["revision"])
         result = {
             "thresholds": verdict["thresholds"], "clamped": verdict["clamped"], "band": band,
             "refused_reason": verdict["refused"],
@@ -434,6 +630,16 @@ __all__ = [
     "BAND_AGREEMENT_RATIO",
     "EvalJobStore",
     "FAILED",
+    "GENERATION",
+    "ORDER_ENVIRONMENTS",
+    "ORDER_JOB_SCHEMA",
+    "qualification_expiry_seconds",
+    "GEN_REQUEST_FIELDS",
+    "catalog_prompts",
+    "new_generation_request",
+    "order_environment_refusal",
+    "request_fields",
+    "sample_sha256",
     "MAX_QUALIFY_ATTEMPTS",
     "PENDING",
     "QUALIFICATION_SCHEMA",
