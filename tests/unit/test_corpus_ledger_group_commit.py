@@ -387,3 +387,63 @@ def test_a_request_queued_past_the_timeout_is_withdrawn_not_decided_later(
 
     assert asyncio.run(scenario()) == ("error", 503, "corpus_ledger_contention")
     assert seeded_job.store.ledger_write_attempts == 0
+
+
+def test_a_miner_that_hangs_up_after_its_turn_began_still_gets_its_record(
+    fake_r2, seeded_job
+):
+    """The ledger consumed the slot, so the record must follow even though
+    the handler was cancelled (a client disconnect) while the write ran."""
+    from tests.unit.test_corpus_route_skip import _Records
+
+    _declare(fake_r2, FREE, prompt_order="free", slots_per_prompt=1)
+    writing, release = asyncio.Event(), asyncio.Event()
+
+    class _HeldStore(_CountingStore):
+        async def write_ledgers(self, job_id, snapshot, etag):
+            writing.set()
+            await release.wait()
+            return await super().write_ledgers(job_id, snapshot, etag)
+
+    seeded_job.store = _HeldStore(fake_r2)
+    records, announced = _Records(), []
+    router = _router(seeded_job, FREE, records=records, on_accepted=announced.append)
+
+    async def scenario():
+        handler = asyncio.ensure_future(router.submit_corpus(_submit(FREE, "5A", 0, 1)))
+        await writing.wait()
+        handler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+        release.set()
+        for _ in range(200):
+            if records.written:
+                break
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)
+
+    asyncio.run(scenario())
+    ledger, _ = asyncio.run(job_store.read_ledgers(FREE, **fake_r2))
+    assert ledger["slots"] == {"0": 1}
+    assert len(records.written) == 1 and announced == records.written
+
+
+def test_a_corrupt_ledger_found_inside_a_decision_is_named(fake_r2, seeded_job, monkeypatch):
+    from reliquary.validator import corpus_service
+
+    real_admit = corpus_service.admit
+
+    def admit(job, **kwargs):
+        if kwargs["hotkey"] == "5Bad":
+            raise corpus_service.LedgerSnapshotError("corrupt")
+        return real_admit(job, **kwargs)
+
+    monkeypatch.setattr(corpus_service, "admit", admit)
+    _declare(fake_r2, FREE, prompt_order="free", slots_per_prompt=1)
+    router = _router(seeded_job, FREE)
+    requests = [_submit(FREE, "5A", 0, 1), _submit(FREE, "5Bad", 1, 2), _submit(FREE, "5C", 2, 3)]
+
+    verdicts = asyncio.run(_queued_in_order(router, requests))
+
+    assert verdicts[1] == ("error", 500, "corpus_ledger_corrupt")
+    assert [verdicts[0][1]["reason"], verdicts[2][1]["reason"]] == ["accepted", "accepted"]
