@@ -1520,8 +1520,10 @@ def build_admin_app_from_environment():
     ``RELIQUARY_ADMIN_SECRET``, ``RELIQUARY_ADMIN_POOL_MAX`` and
     ``RELIQUARY_ADMIN_MODELS`` (a JSON file of qualified models) are required;
     ``RELIQUARY_ADMIN_TASK_PREFIX`` (default ``order-``) bounds the task and job
-    ids the platform may touch; deliveries need ``RELIQUARY_PLATFORM_BUCKET`` and its scoped
-    ``RELIQUARY_PLATFORM_R2_*`` credentials, and are off without them.
+    ids the platform may touch; deliveries and evaluation grading need
+    ``RELIQUARY_PLATFORM_BUCKET`` and its scoped ``RELIQUARY_PLATFORM_R2_*``
+    credentials, and are off without them. Eval sets' grading files are read
+    from the subnet bucket (``R2_*``).
     """
     import json
 
@@ -1565,6 +1567,78 @@ def admin_serve(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     uvicorn.run(admin, host=host, port=port, log_level=log_level.lower())
+
+
+eval_app = typer.Typer(name="eval", help="Evaluation orders: frozen sets and the pod runner")
+app.add_typer(eval_app)
+
+
+@eval_app.command("build-set")
+def eval_build_set(
+    env: str = typer.Option(..., "--env", help="math, code, logic or instruction_following"),
+    count: int = typer.Option(..., "--count", min=1),
+    seed: int = typer.Option(..., "--seed"),
+    out: str = typer.Option(..., "--out", help="An empty directory for the three files"),
+    set_id: str | None = typer.Option(None, "--set-id"),
+) -> None:
+    """Freeze COUNT held-out problems: prompts.jsonl, grading.jsonl, set.json."""
+    import json
+
+    from reliquary.eval import sets
+
+    try:
+        card = sets.build_set(env, count=count, seed=seed, out=out, set_id=set_id,
+                              open_environment=sets.open_source)
+    except (ValueError, FileExistsError, KeyError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps({k: card[k] for k in ("set_id", "env", "source", "split", "count",
+                                                "index_range", "prompts_sha256",
+                                                "grading_sha256")}, indent=1))
+
+
+@eval_app.command("publish-set")
+def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote")) -> None:
+    """Upload a set: prompts.jsonl and set.json to the platform bucket
+    (RELIQUARY_PLATFORM_*), grading.jsonl and set.json to the subnet bucket (R2_*)."""
+    import json
+
+    from reliquary.corpus.delivery import R2DeliverySink
+    from reliquary.eval.storage import SetConflict, SubnetEvalStore, publish_set
+
+    try:
+        answer = asyncio.run(publish_set(directory, platform=R2DeliverySink.from_environment(),
+                                         subnet=SubnetEvalStore()))
+    except (ValueError, OSError, RuntimeError, SetConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(answer, indent=1))
+
+
+@eval_app.command("run")
+def eval_run(
+    platform: str = typer.Option(..., "--platform", help="The platform's base URL"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    work_dir: str = typer.Option("/opt/reliquary-eval", "--work-dir",
+                                 help="Chunks and resume state; keep it across restarts"),
+    chunk_problems: int = typer.Option(64, "--chunk-problems", min=1),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Claim one evaluation task and generate it with vLLM (token in
+    RELIQUARY_EXECUTOR_TOKEN)."""
+    import json
+
+    from reliquary.eval.platform_client import LeaseLost
+    from reliquary.eval.runner import run_evaluation
+
+    setup_logging(log_level)
+    try:
+        result = run_evaluation(platform=platform, executor_id=executor_id, work_dir=work_dir,
+                                chunk_problems=chunk_problems)
+    except (ValueError, LeaseLost) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(result) if result is not None else "no evaluation task to claim")
 
 
 corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
