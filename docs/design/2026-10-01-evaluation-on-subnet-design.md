@@ -24,82 +24,22 @@ update; the report states this.
    - thinking and `max_new_tokens` from the order;
    - a deterministic `seed` recorded in the job;
    - audit `q = 1.0` (every submission is audited; probation is irrelevant);
-   - the pricing parameters (next section).
+   - its cap share (next section).
 4. Miners fetch `/corpus/jobs/order-eval-<id>/...`, generate and submit, exactly like SFT jobs.
 5. The eval control audits through remote executors (see "GPU-less eval control") and settles. Miners are
-   paid per verified token.
+   paid from the task's cap share, split by verified tokens.
 6. When every prompt holds its samples, the job is retired and drained. Grading then runs as in v1 over the
    job's passing records instead of pod uploads. Report, delivery and webhook follow.
 
-## Incentive logic
+## Incentives
 
-### What a miner needs
-For a model of size S on the reference GPU (H100 80 GB):
-- variable cost per token: `c_tok = gpu_hour_price / tokens_per_gpu_hour(S, max_new_tokens)`. The price
-  comes from **live Lium offers**, which the fleet already lists (median of the 10 cheapest qualifying
-  offers). The throughput comes from a measured table per size bucket, updated by qualification runs.
-- fixed cost per participating miner: `c_fix = (download_bytes / bandwidth + load_seconds + idle_tail) ×
-  gpu_hour_price`. Download dominates: 55 GB for a 27B.
-- a margin `m_miner` (default 0.5), so the job is worth taking compared with the miner's other tasks.
-
-### Per-token price with burn (settlement change)
-Today a corpus window pays its **whole cap**, split by tokens. That over-pays the last rare prompts and makes
-the cost of a job depend on speed. For eval jobs (any job whose manifest carries `price_per_token`):
-
-```
-window_reward(hotkey) = min(cap_share, tokens_hotkey × price_per_token_frac)
-price_per_token_frac  = price_alpha_per_token / miner_alpha_per_window
-```
-
-- `cap_share` is this hotkey's proportional share of `cap`, the throughput ceiling.
-- The remainder of `cap` burns. The weight replay already burns any task share that does not sum to its cap.
-- `miner_alpha_per_window` is the subnet's miner emission per RL window. It is read from the chain at job
-  creation and **recorded in the job manifest**, so every validator replays the same numbers.
-- `price_alpha_per_token` comes from `(c_tok × (1 + m_miner)) / alpha_usd` at creation, plus
-  `c_fix × expected_miners / total_tokens` to amortise the downloads.
-
-A job's emission cost is then `tokens × price`, whatever the speed: no over-payment at the tail and no
-dependency on how many prompts are left.
-
-### Cap = throughput ceiling, sized for the deadline
-```
-target_tokens_per_window = est_tokens / (deadline_hours × 3600 / RL_WINDOW_SECONDS) × 1.5
-cap = target_tokens_per_window × price_per_token_frac
-```
-The cap is reserved from the SFT pool. The admin's pool limit applies, and an order whose cap does not fit
-waits in `queued` (its ETA states it).
-
-### Pace controller (platform cron, every 10 minutes)
-- `expected(t)` = a linear schedule from first-miner-seen to the deadline, after a 45-minute start-up grace
-  (downloads).
-- **Behind:** `done < 0.8 × expected`. Raise `price_per_token` by 15 % and the cap in proportion. The
-  ceiling is `p_max = 2 × p0`, the worst case the customer was quoted.
-- **No miner** after 90 minutes: one step straight to `p_max`, and flag `needs_attention`.
-- Never lower the price during a job: miners must be able to trust a running job's price.
-- Every change goes through `POST /admin/v1/tasks/{id}/pricing {price_per_token, cap}`, recorded with its
-  time.
-
-### Customer price
-```
-quote = est_tokens × p_max × alpha_usd                       (worst-case emission value)
-      + executor cost (qualification + 2 executors × duration)
-      + grading fee
-      × (1 + margin)
-```
-At delivery, the unused part is refunded: `(p_max − p_paid_average) × tokens`. Emission is not customer
-money. The rule is that the customer pays at least the market value of the emission the job spends, which
-funds the alpha buyback, so the subnet never subsidises an order.
-
-### Small orders
-Fixed miner costs make tiny evaluations expensive per token. Two remedies:
-- **Pooling:** orders on the same model and revision within a 30-minute window join one job (prompts
-  concatenated, per-order slices tracked).
-- **Minimum order:** about 2 M estimated tokens, config.
-
-### Units and determinism
-All prices are stored as integers: micro-alpha per token, and parts-per-billion of emission. Settlement uses
-only the values recorded in the manifest and the pricing history in R2. A weight-only validator replays the
-archives and needs nothing else.
+Eval jobs are paid exactly like today's corpus/SFT jobs: a fixed cap share per task, split by verified
+tokens, with the existing settlement unchanged.
+- The share defaults to **0.02**. The operator (through the platform) sets it when the job is created,
+  and the existing cap route (`POST /admin/v1/tasks/{id}/cap`) changes it.
+- The criteria for choosing the share are to be decided with the user later.
+- Per-token pricing (a price per verified token with the rest of the cap burned, a pace controller) is a
+  possible later update; it is not part of this version.
 
 ## Per-model qualification (TOPLOC thresholds)
 
@@ -113,7 +53,7 @@ Thresholds come out as `max(band_p99 × 1.5, floor)`, with floors = the current 
 whenever the band is tighter. They are written into the job's contract. A model whose honest band exceeds the
 hard ceiling (config) is refused: the order fails with a full refund.
 
-This also yields the measured `tokens_per_gpu_hour` for the pricing table. Qualification is itself a
+This also yields the measured `tokens_per_gpu_hour`, reported as information. Qualification is itself a
 leased executor task and reuses R3's protocol: a new task type, `qualify`.
 
 ## GPU-less eval control
@@ -150,22 +90,15 @@ The report's provenance adds:
 ## Platform changes
 - Order states for subnet mode:
   ```
-  reserved → qualifying → queued (pool) → running → draining → grading → delivered
+  reserved → qualifying → queued (pool limit) → running → draining → grading → delivered
   ```
   Failure paths refund as in v1.
-- The pace controller and pricing calls, through the admin client.
 - Fleet targets for qualification and the 2-provider executor pair.
-- Quotes with `p_max`, the executor cost and the minimum order. `mode: "subnet"` is the default, and
-  `"direct"` stays available behind a flag.
+- Quotes with the executor cost. `mode: "subnet"` is the default, and `"direct"` stays available behind
+  a flag.
 
 ## Acceptance
-- **Settlement:**
-  - per-token price with burn;
-  - the cap ceiling holds;
-  - replay is deterministic from the manifest and the pricing history;
-  - an existing corpus job without `price_per_token` pays exactly as today (byte-identical test).
-- **Pace controller:** behind → raise, capped at `p_max`; never lowers; no miner → straight to `p_max` and
-  flagged.
+- **Settlement:** unchanged; an eval job pays its cap share by verified tokens like any corpus job.
 - **Qualification:** thresholds from the band; refusal over the ceiling.
 - **Eval control:**
   - two-executor agreement and disagreement;
@@ -173,5 +106,5 @@ The report's provenance adds:
   - multi-model jobs in one process;
   - routing by prefix.
 - **Grade from job records:** prompt-to-problem mapping and completeness.
-- **End to end against fakes:** order → qualifying → running → delivered, with refund of the unused price.
+- **End to end against fakes:** order → qualifying → running → delivered.
 - CI green. No deploy, no real rent.
