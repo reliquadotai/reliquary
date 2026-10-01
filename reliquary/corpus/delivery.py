@@ -274,6 +274,20 @@ class LocalDirectorySink:
         path = self._root / key
         return json.loads(path.read_text()) if path.exists() else None
 
+    async def put_bytes(self, key: str, body: bytes) -> None:
+        self._path(key).write_bytes(body)
+
+    async def get_bytes(self, key: str) -> bytes | None:
+        path = self._root / key
+        return path.read_bytes() if path.exists() else None
+
+    async def get_file(self, key: str, path: Path) -> bool:
+        source = self._root / key
+        if not source.exists():
+            return False
+        await asyncio.to_thread(shutil.copyfile, source, path)
+        return True
+
 
 class R2DeliverySink:
     """The platform bucket, through credentials scoped to it and held by the
@@ -331,6 +345,33 @@ class R2DeliverySink:
                 return None
             raise
         return json.loads(await asyncio.to_thread(response["Body"].read))
+
+    async def put_bytes(self, key: str, body: bytes) -> None:
+        await asyncio.to_thread(self._client.put_object, Bucket=self._bucket, Key=key, Body=body)
+
+    async def get_bytes(self, key: str) -> bytes | None:
+        from botocore.exceptions import ClientError
+
+        try:
+            response = await asyncio.to_thread(self._client.get_object, Bucket=self._bucket,
+                                               Key=key)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404", "NotFound"}:
+                return None
+            raise
+        return await asyncio.to_thread(response["Body"].read)
+
+    async def get_file(self, key: str, path: Path) -> bool:
+        """Stream an object to ``path``; False when it does not exist."""
+        from botocore.exceptions import ClientError
+
+        try:
+            await asyncio.to_thread(self._client.download_file, self._bucket, key, str(path))
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404", "NotFound"}:
+                return False
+            raise
+        return True
 
 
 __all__ = [
