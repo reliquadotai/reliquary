@@ -339,3 +339,22 @@ def test_the_eval_control_status_is_readable_by_the_platform(admin):
     read = admin("GET", "/admin/v1/eval-control/status")
     assert read.status_code == 200 and read.json()["updated_at"] == 2.0
     assert read.json()["models"][f"{MODEL}@{REVISION}"]["executors_needed"] == 1
+
+
+# sha256 of the canonical (manifest, task contract, params) of `_eval_job()`,
+# pinned on 7753e5e4 before dataset orders on any model.
+EVAL_JOB_GOLDEN = "b9f0cf09e91a7327a7b54f6962f36d4e34b1618066ba0c040ddaec1bda0c4c6a"
+
+
+def test_an_eval_job_is_declared_byte_identically(admin):
+    import hashlib
+
+    admin("POST", "/admin/v1/qualifications", _qualification())
+    _qualify(admin)
+    assert admin("POST", "/admin/v1/jobs", _eval_job()).status_code == 201
+    entry = admin.registry["entries"]["order-eval-7"]
+    manifest = json.loads(admin.bucket.objects["reliquary/corpus/jobs/order-eval-7.json"][0])
+    document = {"manifest": manifest, "contract": entry.contract, "params": entry.params}
+    digest = hashlib.sha256(json.dumps(document, sort_keys=True,
+                                       separators=(",", ":")).encode()).hexdigest()
+    assert digest == EVAL_JOB_GOLDEN
