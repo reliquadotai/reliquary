@@ -1842,6 +1842,18 @@ def corpus_mine(
         encoded = tokenizer.encode(text, add_special_tokens=False)
         return list(getattr(encoded, "ids", encoded))
 
+    from reliquary.eval.prompt_source import (
+        is_eval_source, parse_eval_source, register_eval_prompts,
+    )
+
+    if is_eval_source(job.prompt_source):
+        # An eval job's prompts come from the control serving it, checked
+        # against the sha256 its manifest names.
+        try:
+            register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
+        except (ValueError, CorpusJobSelectionError) as exc:
+            typer.echo(f"error: the eval job's prompts are unusable: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
     renderer = renderer_for_job(job, encode, tokenizer=tokenizer)
     prompts = prompt_job_for_spec(job)
     try:

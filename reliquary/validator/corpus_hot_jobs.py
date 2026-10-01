@@ -48,6 +48,12 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     from reliquary.protocol.profiles import toploc_proof
     from reliquary.validator.corpus_validator import startup_refusal
 
+    from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+
+    if str(getattr(entry, "job_id", "") or "").startswith(EVAL_JOB_PREFIX):
+        # Served by the eval control alone, whatever its model: two processes
+        # auditing and settling one job would pay its records twice.
+        return OTHER_MODEL, "an evaluation job, served by the eval control"
     if getattr(entry, "contract", None) is None:
         return REFUSED, "it carries no contract to check against the one this process runs"
     try:

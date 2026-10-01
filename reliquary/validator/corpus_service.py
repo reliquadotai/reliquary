@@ -365,6 +365,20 @@ def resolve_prompt_source(
     the profile that validator actually runs. Two sources of truth for what the
     miner was asked cannot be left to agree by construction.
     """
+    from reliquary.eval.prompt_source import EvalSetSpec, is_eval_source
+
+    if is_eval_source(prompt_source):
+        # An eval set's rows are already rendered by its catalog template; only
+        # the model's own chat template wraps them.
+        if renderer_id not in CHAT_TEMPLATE_RENDERERS:
+            raise CorpusPromptSourceError(
+                f"an eval-set prompt source renders through the model's chat template, "
+                f"not {renderer_id!r}"
+            )
+        try:
+            return EvalSetSpec(prompt_source)
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
     specs = ENVIRONMENT_SPECS if environments is None else environments
     try:
         spec = specs[prompt_source]

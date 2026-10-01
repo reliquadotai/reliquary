@@ -26,7 +26,7 @@ def test_build_then_publish_a_set(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "SubnetEvalStore", lambda: LocalDirectorySink(tmp_path / "s"))
     published = runner.invoke(app, ["eval", "publish-set", str(tmp_path / "set")])
     assert published.exit_code == 0, published.output
-    assert len(json.loads(published.output)["written"]) == 4
+    assert len(json.loads(published.output)["written"]) == 5
     again = runner.invoke(app, ["eval", "build-set", "--env", "logic", "--count", "3",
                                 "--seed", "4", "--out", str(tmp_path / "set")])
     assert again.exit_code == 1

@@ -22,11 +22,12 @@ def test_publish_splits_the_set_between_the_buckets(tmp_path):
     platform, subnet = LocalDirectorySink(tmp_path / "p"), LocalDirectorySink(tmp_path / "s")
     answer = asyncio.run(publish_set(_built(tmp_path), platform=platform, subnet=subnet))
     set_id = "logic-eval-s1-n4"
-    assert answer["set_id"] == set_id and len(answer["written"]) == 4
+    assert answer["set_id"] == set_id and len(answer["written"]) == 5
     assert (tmp_path / "p" / "eval-sets" / set_id / "prompts.jsonl").exists()
     assert (tmp_path / "p" / "eval-sets" / set_id / "set.json").exists()
     assert not (tmp_path / "p" / "eval-sets" / set_id / "grading.jsonl").exists()
     assert (tmp_path / "s" / "reliquary" / "eval-sets" / set_id / "grading.jsonl").exists()
+    assert (tmp_path / "s" / "reliquary" / "eval-sets" / set_id / "prompts.jsonl").exists()
     assert (tmp_path / "s" / "reliquary" / "eval-sets" / set_id / "set.json").exists()
     # Again: nothing to write.
     again = asyncio.run(publish_set(_built_again(tmp_path), platform=platform, subnet=subnet))

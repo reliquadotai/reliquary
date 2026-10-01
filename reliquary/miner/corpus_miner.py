@@ -186,7 +186,20 @@ class HttpCorpusClient:
         return int(issue_corpus_request(lambda: self._http.get(path))["cursor"])
 
     def submit(self, body: dict) -> dict:
-        return issue_corpus_request(lambda: self._http.post("/corpus/submit", json=body))
+        from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+
+        # An eval job is served behind its own prefix only (the eval control).
+        path = (f"/corpus/jobs/{self._job_id}/submit"
+                if self._job_id is not None and self._job_id.startswith(EVAL_JOB_PREFIX)
+                else "/corpus/submit")
+        return issue_corpus_request(lambda: self._http.post(path, json=body))
+
+    def eval_prompts(self) -> bytes:
+        """An eval job's prompt lines, which the job's manifest hashes."""
+        response = self._http.get(f"/corpus/jobs/{self._job_id}/eval-prompts")
+        self._refuse_unserved(response)
+        response.raise_for_status()
+        return response.content
 
     def _path(self, tail: str) -> str:
         return (f"/corpus/{tail}" if self._job_id is None

@@ -1,9 +1,10 @@
 """Where a published set lives, and `publish-set`.
 
 The platform bucket holds what the platform and the pod may read:
-``eval-sets/{set_id}/prompts.jsonl`` and ``set.json``. The subnet bucket, which
-only the admin host reads, holds ``reliquary/eval-sets/{set_id}/grading.jsonl``
-and its own copy of ``set.json``: the grader trusts that copy, never the
+``eval-sets/{set_id}/prompts.jsonl`` and ``set.json``. The subnet bucket holds
+``reliquary/eval-sets/{set_id}/grading.jsonl`` (read by the admin host only),
+``prompts.jsonl`` (for the validators of an eval job) and its own copy of
+``set.json``: the grader trusts that copy, never the
 platform's. A set is frozen, so publishing is create-only: the same bytes again
 are a no-op, other bytes are refused.
 """
@@ -87,6 +88,8 @@ async def publish_set(directory: str | Path, *, platform, subnet) -> dict:
     written = []
     for store, key, body in (
         (subnet, subnet_key(set_id, "grading.jsonl"), grading),
+        # Validators of an eval job read its prompts here (no platform credential).
+        (subnet, subnet_key(set_id, "prompts.jsonl"), prompts),
         (subnet, subnet_key(set_id, "set.json"), card_body),
         (platform, platform_key(set_id, "prompts.jsonl"), prompts),
         (platform, platform_key(set_id, "set.json"), card_body),
