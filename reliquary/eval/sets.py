@@ -112,9 +112,16 @@ HELD_OUT: dict[str, HeldOut] = {
 
 # Environments whose held-out region RL could sample, each by a ruling.
 RL_OVERLAP_RULED: dict[str, str] = {
-    "code": ("ruled: RL samples the whole train split, so these rows were eligible for "
-             "past RL; no split of the source exists. Excluding them from RL sampling is "
-             "a follow-up."),
+    "code": ("ruled: RL samples the whole train split of reliquary_code_v1 and of "
+             "opencodeinstruct (the same curation, the same row indices), so these rows "
+             "were eligible for past RL; no split of the source exists. Excluding them from "
+             "RL sampling is a follow-up."),
+}
+# What a customer reads beside an environment's score when RL may have seen it.
+CONTAMINATION_NOTES: dict[str, str] = {
+    "code": ("These problems were eligible for Reliquary's RL training (OpenCodeInstruct "
+             "rows sampled by reliquary_code_v1 and opencodeinstruct). Scores of models "
+             "trained by Reliquary may be inflated; other models are unaffected by this."),
 }
 
 
@@ -128,9 +135,36 @@ def rl_ranges() -> list[UsedRange]:
             for source in sorted(ENVIRONMENT_CATALOG)]
 
 
+# Source -> (the corpus its rows come from, its index space). Two sources of
+# one corpus may share content; when they also share an index space, row i is
+# the same problem in both (reliquary_code_v1 says so of opencodeinstruct).
+SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
+    "opencodeinstruct": ("nvidia/OpenCodeInstruct", "R0mAI/opencodeinstruct-curated@d3caaefc"),
+    "reliquary_code_v1": ("nvidia/OpenCodeInstruct", "R0mAI/opencodeinstruct-curated@d3caaefc"),
+    "openmathinstruct": ("nvidia/OpenMathInstruct-2", "openmathinstruct"),
+    "reliquary_dapo_math_v1": ("BytedTsinghua-SIA/DAPO-Math-17k", "reliquary_dapo_math_v1"),
+    "reliquarylogic_v1": ("reliquary-logic-generator-v1", "reliquarylogic_v1"),
+    "reliquary_logic_v2": ("reliquary-logic-generator-v2", "reliquary_logic_v2"),
+    "reliquary_instruction_following_v1": ("nvidia/Nemotron-Cascade-2-RL-data:IF-RL",
+                                           "reliquary_instruction_following_v1"),
+}
+
+
+def lineage(source: str) -> tuple[str, str]:
+    return SOURCE_LINEAGE.get(source, (source, source))
+
+
 def overlaps(a: UsedRange, b: UsedRange) -> bool:
-    if (a.source, a.split) != (b.source, b.split):
+    """Whether two ranges can hold one problem. Sources of one corpus with
+    different index spaces, or splits not comparable, are taken to overlap."""
+    (corpus_a, space_a), (corpus_b, space_b) = lineage(a.source), lineage(b.source)
+    if corpus_a != corpus_b:
         return False
+    if space_a != space_b:
+        return True
+    if a.split != b.split:
+        # Splits of one source partition it; across sources they say nothing.
+        return a.source != b.source
     a_end = float("inf") if a.end is None else a.end
     b_end = float("inf") if b.end is None else b.end
     return a.start < b_end and b.start < a_end
@@ -140,7 +174,9 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
     """A corpus job (train split) may not take rows an eval set holds out."""
     job = UsedRange("corpus", source, RL_SPLIT, int(prompt_start), int(prompt_count), "job")
     for held in HELD_OUT.values():
-        if overlaps(job, held.region):
+        # Only an index range can be refused; a source of the same corpus with
+        # another index space is a lineage question, not a range (rulings).
+        if lineage(source)[1] == lineage(held.source)[1] and overlaps(job, held.region):
             raise ValueError(
                 f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
                 f"{held.env!r} evaluation set; this job's [{job.start}, {job.end}) reaches them"
@@ -148,8 +184,8 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
 
 
 def _disjointness(held: HeldOut) -> dict:
-    corpus = [r for r in CORPUS_RANGES if r.source == held.source]
-    rl = [r for r in rl_ranges() if r.source == held.source]
+    corpus = [r for r in CORPUS_RANGES if lineage(r.source)[0] == lineage(held.source)[0]]
+    rl = [r for r in rl_ranges() if lineage(r.source)[0] == lineage(held.source)[0]]
     hit = [r for r in corpus if overlaps(held.region, r)]
     if hit:
         raise ValueError(f"{held.env!r} held-out region overlaps corpus job {hit[0].what!r}")
@@ -163,6 +199,7 @@ def _disjointness(held: HeldOut) -> dict:
         "justification": held.justification,
         "corpus": "disjoint",
         "rl": rl_verdict,
+        "contamination_note": CONTAMINATION_NOTES.get(held.env),
         "checked_against": [
             {"kind": r.kind, "what": r.what, "source": r.source, "split": r.split,
              "start": r.start, "end": r.end} for r in corpus + rl
@@ -270,7 +307,10 @@ __all__ = [
     "CORPUS_RANGES",
     "HELD_OUT",
     "HeldOut",
+    "CONTAMINATION_NOTES",
     "RL_OVERLAP_RULED",
+    "SOURCE_LINEAGE",
+    "lineage",
     "SET_SCHEMA",
     "UsedRange",
     "build_set",

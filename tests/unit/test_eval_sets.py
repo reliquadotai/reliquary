@@ -189,3 +189,34 @@ def test_build_set_refuses_an_existing_directory_with_files(tmp_path):
     build_set("logic", count=2, seed=2, out=tmp_path / "c", open_environment=opener())
     with pytest.raises(FileExistsError):
         build_set("logic", count=2, seed=2, out=tmp_path / "c", open_environment=opener())
+
+
+def test_disjointness_follows_source_lineage():
+    held = HELD_OUT["code"]
+    # opencodeinstruct is the same curation, row for row.
+    with pytest.raises(ValueError, match="held out"):
+        refuse_held_out_overlap("opencodeinstruct", held.start, 10)
+    refuse_held_out_overlap("opencodeinstruct", 0, 100_000)
+    rl_oci = sets.UsedRange("rl", "opencodeinstruct", "train", 0, None, "rl")
+    assert overlaps(held.region, rl_oci)
+    # Sources of one corpus with different index spaces are taken to overlap.
+    a = sets.UsedRange("corpus", "x", "train", 0, 1, "a")
+    b = sets.UsedRange("corpus", "y", "eval", 99, 1, "b")
+    original = dict(sets.SOURCE_LINEAGE)
+    try:
+        sets.SOURCE_LINEAGE.update({"x": ("C", "x"), "y": ("C", "y")})
+        assert overlaps(a, b)
+    finally:
+        sets.SOURCE_LINEAGE.clear()
+        sets.SOURCE_LINEAGE.update(original)
+
+
+def test_the_code_card_carries_its_contamination_note(tmp_path):
+    held = HELD_OUT["code"]
+    card = build_set("code", count=2, seed=2, out=tmp_path / "c",
+                     open_environment=opener(held.source_length), clock=lambda: 1.0)
+    assert "inflated" in card["disjointness"]["contamination_note"]
+    assert "opencodeinstruct" in card["disjointness"]["rl"]
+    logic = build_set("logic", count=2, seed=2, out=tmp_path / "l",
+                      open_environment=opener(), clock=lambda: 1.0)
+    assert logic["disjointness"]["contamination_note"] is None
