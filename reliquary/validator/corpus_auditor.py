@@ -34,7 +34,7 @@ from reliquary.corpus.audit_policy import (
 )
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.protocol.profiles import ProofProfile
-from reliquary.validator.corpus_audit import audit_completion, batch_completion_hidden_states
+from reliquary.validator.corpus_audit import outcome_from_scores, score_sequences
 from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
 
 logger = logging.getLogger(__name__)
@@ -171,13 +171,13 @@ class CorpusAuditor:
         times = [self._meta[sid][1] for sid in pending if sid in self._meta]
         return self._clock() - min(times) if times else None
 
-    def _judge_many(self, records: list[dict]) -> list[dict]:
-        """Judge several records at once: every completion of every record that
-        needs the GPU is packed, sorted by length, into shared forward passes."""
+    def _prepare(self, records: list[dict]) -> tuple[list[dict | None], list[tuple]]:
+        """The records failed before any forward pass, and every completion the
+        rest need scored as ``(record, completion, tokens, prompt_len, proofs)``."""
         worst_zero = _WORST_ZERO
         results: list[dict | None] = [None] * len(records)
-        prompts: list[list[int] | None] = [None] * len(records)
         vocabulary = self._model.get_input_embeddings().num_embeddings
+        items = []
         for i, record in enumerate(records):
             if not record["completions"]:
                 # Fail closed like sequence_verdict does for an empty chunk sequence:
@@ -195,57 +195,21 @@ class CorpusAuditor:
             if out_of_vocab:
                 results[i] = {"passed": False, "reason": REASON_TOKEN_OUT_OF_VOCAB, **worst_zero}
                 continue
-            prompts[i] = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
+            prompt = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
+            for c_idx, completion in enumerate(record["completions"]):
+                items.append((i, c_idx, prompt + list(completion["tokens"]), len(prompt),
+                              completion["proofs"]))
+        return results, items
 
-        # Every remaining completion, from every record, packed shortest first so
-        # padding waste stays low, into sub-batches under the token budget.
-        queue = sorted(
-            (len(prompts[i]) + len(completion["tokens"]), i, c_idx)
-            for i, record in enumerate(records)
-            if results[i] is None
-            for c_idx, completion in enumerate(record["completions"])
-        )
-        sub_batches: list[list[tuple[int, int]]] = []
-        current: list[tuple[int, int]] = []
-        current_width = 0
-        for length, i, c_idx in queue:
-            width = max(current_width, length)
-            if current and (len(current) + 1) * width > AUDIT_BATCH_TOKENS:
-                sub_batches.append(current)
-                current, width = [], length
-            current.append((i, c_idx))
-            current_width = width
-        if current:
-            sub_batches.append(current)
-
-        outcomes = {}
-        forward_seconds = verify_seconds = 0.0
-        for sub_batch in sub_batches:
-            sequences = [
-                (prompts[i] + list(records[i]["completions"][c_idx]["tokens"]), len(prompts[i]))
-                for i, c_idx in sub_batch
-            ]
-            mark = time.perf_counter()
-            hidden_states = batch_completion_hidden_states(self._model, sequences)
-            if hidden_states and hidden_states[0].is_cuda:
-                # Kernels are queued asynchronously: without this the forward's
-                # time would be billed to the first verification that reads it.
-                torch.cuda.synchronize(hidden_states[0].device)
-            forward_seconds += time.perf_counter() - mark
-            mark = time.perf_counter()
-            for (i, c_idx), hidden in zip(sub_batch, hidden_states):
-                completion = records[i]["completions"][c_idx]
-                outcomes[i, c_idx] = audit_completion(hidden, completion["proofs"], self._proof)
-            verify_seconds += time.perf_counter() - mark
-            # Drop this sub-batch's padded activations before the next one is
-            # computed: two final-hidden-state tensors must never be live at once.
-            del hidden_states, sequences, hidden
-
+    def _aggregate(self, records: list[dict], results: list[dict | None],
+                   outcomes: dict) -> list[dict]:
+        """One verdict body per record: the first failing completion's reason and
+        the worst chunk measures over all of them."""
         for i, record in enumerate(records):
             if results[i] is not None:
                 continue
             passed, reason = True, None
-            worst = dict(worst_zero)
+            worst = dict(_WORST_ZERO)
             for c_idx in range(len(record["completions"])):
                 outcome = outcomes[i, c_idx]
                 for result in outcome.results:
@@ -255,7 +219,21 @@ class CorpusAuditor:
                 if not outcome.passed and passed:
                     passed, reason = False, outcome.reason
             results[i] = {"passed": passed, "reason": reason, **worst}
-        self._log_batch(records, queue, forward_seconds, verify_seconds)
+        return results
+
+    def _judge_many(self, records: list[dict]) -> list[dict]:
+        """Judge several records at once: every completion of every record that
+        needs the GPU is packed, sorted by length, into shared forward passes."""
+        results, items = self._prepare(records)
+        scores, forward_seconds, verify_seconds = score_sequences(
+            self._model, [(tokens, n, proofs) for _, _, tokens, n, proofs in items],
+            chunk_tokens=self._proof.chunk_tokens, topk=self._proof.topk,
+            batch_tokens=AUDIT_BATCH_TOKENS)
+        outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
+                    for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
+        self._aggregate(records, results, outcomes)
+        self._log_batch(records, [(len(t), i, c) for i, c, t, _, _ in items],
+                        forward_seconds, verify_seconds)
         return results
 
     def _log_batch(self, records: list[dict], queue: list, forward: float,
