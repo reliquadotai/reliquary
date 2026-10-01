@@ -89,14 +89,15 @@ The eval control runs as its own process (`reliquary corpus order-control --port
 the same command) beside the corpus control. It serves every order job: evaluations (`order-eval-`) and,
 since `2026-10-01-any-model-datasets-design.md`, generation orders on any model (`order-gen-`). Two location
 prefixes go to it; everything else, including the legacy `/corpus/...` paths, still goes to the corpus
-control:
+control. The one source of the regex is `RELIQUARY_ADMIN_TASK_PREFIX` on the host: generate the locations
+with `reliquary corpus order-nginx --port 8791` (shown here for the default `order-`) and add the corpus one:
 
 ```nginx
-# Order jobs (eval and generation): miners' scoped reads and submits, an eval job's prompts.
+# Order jobs (eval and generation): miners' scoped reads and submits.
 location ~ ^/corpus/jobs/order-(eval|gen)- {
     proxy_pass http://127.0.0.1:8791;
 }
-# Its executors (audit pairs and qualification): never the corpus control's.
+# Their executors (audit pairs and qualification): never the corpus control's.
 location ~ ^/corpus/internal/eval-audit/ {
     proxy_pass http://127.0.0.1:8791;
 }
@@ -107,12 +108,13 @@ location /corpus/ {
 
 Regex locations win over the prefix one, so the order in the file does not matter. The eval job prefix is
 `${RELIQUARY_ADMIN_TASK_PREFIX}eval-` (`order-eval-` with the default `order-`), the generation prefix
-`${RELIQUARY_ADMIN_TASK_PREFIX}gen-`; the admin service, the order control, the corpus control and the miner
-all read it from `RELIQUARY_ADMIN_TASK_PREFIX`, which must be the same on every process, and the nginx regex
-must use the same value (e.g. `^/corpus/jobs/acme-(eval|gen)-` for `acme-`). Executors for an eval
+`${RELIQUARY_ADMIN_TASK_PREFIX}gen-`; the admin service, the order control and the corpus control read it from
+`RELIQUARY_ADMIN_TASK_PREFIX`, which must be the same on every one of those processes, and `order-nginx` must be
+run with it. Miners need no setting: a miner given `--job-id` reads and submits on that job's own routes
+(`/corpus/jobs/<job_id>/...`), so nginx sends both to whichever control serves it. Executors for an eval
 job run `reliquary corpus audit-executor --eval` (audits) and `reliquary corpus qualify --model repo@rev`
 (qualification) against the same origin. Miners mine an eval job with `--job-id order-eval-<id>`: they
-fetch its prompts from `/corpus/jobs/order-eval-<id>/eval-prompts` and submit on the scoped path.
+fetch its prompts from `/corpus/jobs/order-eval-<id>/eval-prompts`.
 
 ## Grading from subnet records
 
