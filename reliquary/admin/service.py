@@ -9,7 +9,6 @@ active caps stay within the one pool, and the corpus caps within
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import math
 import time
