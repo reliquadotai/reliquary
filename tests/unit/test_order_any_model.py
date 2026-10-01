@@ -461,7 +461,7 @@ def test_a_generation_job_never_reopens_a_slot(monkeypatch):
     records.verdicts = {"a" * 64: {"passed": False}}
     auditor = eval_auditor(job_id=job.job_id, records=records, tokenizer=None,
                            proof=TOPLOC_DEPLOYED_DEFAULTS, vocab_size=10,
-                           remote=SimpleNamespace(subscribe=lambda l: None), job=job,
+                           remote=SimpleNamespace(subscribe=lambda listener: None), job=job,
                            job_store=store, reopen_slots=False)
 
     async def go():
@@ -532,7 +532,7 @@ def test_one_order_control_serves_a_generation_job_on_a_third_model_next_to_eval
     )
     from tests.unit.test_eval_control_process import _Tokenizer
 
-    registry, _ = world
+    entries, _ = world
     stub_catalog_env(monkeypatch)
     record = qual.new_generation_request(
         qualification_id="order-gq-c", model="customer/C", revision="c" * 40, env=GEN_ENV,
@@ -542,9 +542,9 @@ def test_one_order_control_serves_a_generation_job_on_a_third_model_next_to_eval
         "thresholds": GEN_THRESHOLDS, "architecture": "Qwen3ForCausalLM",
         "checkpoint_sha256": "c" * 64, "eos_token_id": 2})
     asyncio.run(qual.QualificationStore().write(record, None))
-    admin = create_admin_app(secret=b"s" * 32, pool_max=0.3, models={}, records=object(),
-                             current_round=lambda: 1)
-    created = _signed_post(admin, "/admin/v1/jobs", {
+    admin_app = create_admin_app(secret=b"s" * 32, pool_max=0.3, models={}, records=object(),
+                                 current_round=lambda: 1)
+    created = _signed_post(admin_app, "/admin/v1/jobs", {
         "job_id": "order-gen-c", "model": "customer/C", "env": GEN_ENV, "prompt_start": 100,
         "prompt_count": 500, "samples_per_prompt": 2, "max_new_tokens": 64,
         "sampling": GEN_SAMPLING, "qualification_id": "order-gq-c"})
@@ -557,7 +557,7 @@ def test_one_order_control_serves_a_generation_job_on_a_third_model_next_to_eval
     monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", lambda self: idle(self))
 
     async def read_entries():
-        return dict(registry["entries"])
+        return dict(entries["entries"])
 
     async def go():
         directory = EvalExecutorDirectory(list_documents=lambda: _none())
