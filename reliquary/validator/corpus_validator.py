@@ -516,7 +516,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 executor_id, at=at, detail=detail),
         )
     job_set: CorpusJobSet | None = None
-    archives = R2Archives(served=lambda: job_set.task_ids() if job_set is not None else ())
+    archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 
     def audit_and_settle(w) -> None:
         params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
@@ -530,7 +530,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # `entry.cap` does not exist on `TaskEntry` (the cap lives in
         # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
         w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
-                                  records=records, archives=archives)
+                                  records=records, archives=archives,
+                                  on_settled=w.stats.settled)
 
     for w in wiring:
         audit_and_settle(w)
@@ -568,21 +569,13 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     process_contract = (ACTIVE_PROTOCOL_PROFILE.to_generation_contract() if hot else {})
 
-    async def seed_status(w) -> None:
-        # Once, in the background: the status route counts verdicts from before this start.
-        try:
-            await w.stats.seed(records, w.job.job_id)
-        except Exception:
-            logger.exception("corpus status of %s could not be seeded", w.job.job_id)
-
     async def drained(w) -> bool:
         return await job_drained(auditor=w.auditor, records=records, job_id=w.job.job_id)
 
     job_set = CorpusJobSet(
         routes=app.state.corpus_routes, router_for=app.state.corpus_router_for,
         wire=wire_hot,
-        jobs_of=lambda w: [w.auditor.run(), settle_forever(w.entry.task_id, w.settler),
-                           seed_status(w)],
+        jobs_of=lambda w: [w.auditor.run(), settle_forever(w.entry.task_id, w.settler)],
         read_entries=read_registry, read_job=read_job,
         admit=lambda task_entry, job: hot_job_refusal(
             task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,

@@ -1636,9 +1636,11 @@ def build_corpus_router(
         except LedgerSnapshotError as exc:
             raise _ledger_corrupt(exc) from exc
 
-    async def ledger_state() -> tuple[JobSpec | None, LedgerState | None]:
-        """The manifest and the ledgers as the reads see them, for the status route."""
-        job = await _read_job_checked()
+    async def ledger_state(job: JobSpec | None = None) -> tuple[JobSpec | None, LedgerState | None]:
+        """The manifest (read unless given) and the ledgers as the reads see
+        them, for the status route."""
+        if job is None:
+            job = await _read_job_checked()
         if job is None:
             return None, None
         return job, await _read_state(job)

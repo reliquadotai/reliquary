@@ -14,14 +14,14 @@ Ruling: `/corpus/jobs` lists open jobs only; a retired job's next, skip and subm
 Ruling: the legacy `/corpus/...` paths keep the first job wired at boot for the life of the process; once that job is drained they answer 410 `job_retired`.
 Ruling: a cap changed in the registry (`set-cap`) reaches the running settler at the next refresh.
 Ruling: with the hot set on, the auditors share a GPU lock even when one job is served, since more may join.
-Ruling: the settler's archive guard (RELIQUARY_TASK_ID) also admits the task ids this process wired after boot.
+Ruling: the settler's archive guard (RELIQUARY_TASK_ID) also admits the task ids this process wired after boot, and only those (review M3).
 Ruling: a scoped submit route `POST /corpus/jobs/{job_id}/submit` joins the scoped reads, so every admission path of a job lives under its prefix.
 
 ## R2 Job status route
 
 Ruling: `audited` counts submissions with a standing verdict (audited by the model or passed unaudited by sampling), `passed` the passing verdicts, `verified_tokens` their token counts — so `submissions_accepted - audited` is what is still waiting.
-Ruling: `submissions_accepted` and `prompts_full` come from the job's ledger object (each accepted submission fills one slot), read with one GET at most once per `STATUS_CACHE_SECONDS` and reused per ETag — a read, never a listing.
-Ruling: verdict counts are seeded once per process by one background listing when a job is wired, then kept from the auditor's own writes; `accepted_last_hour` counts from the process start (it can only undercount during the first hour).
+Ruling: `submissions_accepted` and `prompts_full` come from the job's ledger object (each accepted submission fills one slot), one GET (the wired manifest is reused) at most once per `STATUS_CACHE_SECONDS`, single-flight per job — a read, never a listing.
+Ruling (review I2, superseding the boot seed): verdict counts are never seeded by listing. The settler accumulates `totals` (verdicts, passed, verified tokens) into the settlement object in the same compare-and-swap that settles them (carried in the pending step, so a repeated finish adds nothing twice); verdicts written since and not yet settled are held in memory from the auditor's own writes and dropped once settled. With the flags off, boot does no read beyond what the auditor and settler already do. `counts_complete` is false until the settler has read its totals, and for a job settled before totals were kept; verdicts written before a restart count once settled; `accepted_last_hour` counts from the process start.
 Ruling: `settled` is the settler's count as of its last settlement read (0 before its first).
 Ruling: a failed recompute serves the last status; with none cached it answers 503 `corpus_status_unavailable`; an unknown job 404; a drained job keeps its final status for the life of the process.
 

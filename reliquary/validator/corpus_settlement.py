@@ -55,7 +55,8 @@ def choose_window(*, last_window, other_max, other_max_seen_at, now, stall_secon
 class CorpusSettler:
     def __init__(self, *, task_id, job_id, cap, records, archives,
                  stall_seconds: float = 3 * RL_WINDOW_SECONDS,
-                 advance_every_seconds: float = RL_WINDOW_SECONDS, clock=time.time) -> None:
+                 advance_every_seconds: float = RL_WINDOW_SECONDS, clock=time.time,
+                 on_settled=None) -> None:
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
@@ -66,6 +67,11 @@ class CorpusSettler:
         self._clock = clock
         # How many verdicts stand settled, as of the last settlement read.
         self.settled_count: int | None = None
+        # Verdict totals of everything settled, persisted in the settlement
+        # object (the status route's counts, with no listing).
+        self.totals: dict | None = None
+        # Told which ids each settlement moved, once it is written.
+        self.on_settled = on_settled
 
     def set_cap(self, cap: float) -> None:
         """A cap changed in the registry: the next settlement pays under it."""
@@ -91,21 +97,41 @@ class CorpusSettler:
             "last_window": pending["window"],
             "settled": sorted(set(state.get("settled") or []) | set(pending["ids"])),
             "pending": None,
+            # Carried in the pending step, so a repeated finish adds nothing twice.
+            "totals": pending.get("totals", state.get("totals")),
         }
-        self.settled_count = len(final["settled"])
         if pending.get("alone"):
             # The finish time, not the choice time: a finish delayed by a crash
             # or a hold must still be one RL window from the next lone advance.
             final["advanced_at"] = now
         await self._records.write_settlement(self._job_id, final, etag)
+        self._settled(final, pending["ids"])
         return pending["window"]
+
+    def _settled(self, state: dict, ids) -> None:
+        self.settled_count = len(state["settled"] or ())
+        self.totals = state.get("totals")
+        if self.on_settled is not None and ids:
+            self.on_settled(list(ids))
+
+    @staticmethod
+    def _add(totals: dict, verdicts) -> dict:
+        passed = [v for v in verdicts if v and v.get("passed")]
+        return {**totals, "verdicts": totals["verdicts"] + len(verdicts),
+                "passed": totals["passed"] + len(passed),
+                "verified_tokens": totals["verified_tokens"]
+                + sum(int(v["token_count"]) for v in passed)}
 
     async def settle_once(self) -> int | None:
         state, etag = await self._records.read_settlement(self._job_id)
         state = {"schema": SETTLEMENT_SCHEMA, "last_window": None, "settled": [],
                  "other_max_seen": None, "other_max_seen_at": None, "advanced_at": None,
-                 "pending": None, **state}
-        self.settled_count = len(state["settled"] or ())
+                 "pending": None, "totals": None, **state}
+        if state["totals"] is None:
+            # A job settled before totals were kept: counted from here on.
+            state["totals"] = {"verdicts": 0, "passed": 0, "verified_tokens": 0,
+                               "complete": not state["settled"]}
+        self._settled(state, ())
 
         now = self._clock()
         other_max = await self._archives.other_max(self._task_id)
@@ -143,20 +169,23 @@ class CorpusSettler:
             if lister is not None:
                 # Withdrawn after a quarantined executor's re-audit: settled, never paid.
                 voided = set(await lister(self._job_id))
-                verdicts = [v for sid, v in zip(new_ids, verdicts) if sid not in voided]
+                verdicts = [v if sid not in voided else {**(v or {}), "passed": False}
+                            for sid, v in zip(new_ids, verdicts)]
             rewards = rewards_for(verdicts, self._cap)
+            totals = self._add(state["totals"], verdicts)
             if rewards:
                 alone = other_max is None or window > other_max
                 state["pending"] = {"window": window, "ids": new_ids, "rewards": rewards,
-                                    "alone": alone, "at": now}
+                                    "alone": alone, "at": now, "totals": totals}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
                 return await self._finish(state, etag, now)
             # Every verdict this period failed (spec §7): no archive, the
             # index does not move, but these ids must not be reconsidered
             # forever, so mark them settled in this same CAS write.
             state["settled"] = sorted(settled | set(new_ids))
+            state["totals"] = totals
             await self._records.write_settlement(self._job_id, state, etag)
-            self.settled_count = len(state["settled"])
+            self._settled(state, new_ids)
             return None
 
         if clock_changed:

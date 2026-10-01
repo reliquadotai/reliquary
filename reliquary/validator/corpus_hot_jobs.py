@@ -127,6 +127,7 @@ class CorpusJobSet:
         # Jobs retired and drained, with their final status: the route still answers.
         self.finished: dict[str, dict] = {}
         self._status_cache: dict[str, tuple[float, dict]] = {}
+        self._status_locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, list[asyncio.Task]] = {}
         # Task ids already decided against (ignored or refused): logged once.
         self._passed_over: set[str] = set()
@@ -145,11 +146,17 @@ class CorpusJobSet:
     def task_ids(self) -> set[str]:
         return {str(w.entry.task_id) for w in self.served.values()}
 
+    def hot_task_ids(self) -> set[str]:
+        """The tasks wired after boot (their archives are not in RELIQUARY_TASK_ID)."""
+        return {str(w.entry.task_id) for w in self.served.values()
+                if not getattr(w, "at_boot", False)}
+
     def is_retired(self, job_id: str) -> bool:
         return job_id in self._routes.retired
 
     def adopt(self, wiring) -> None:
         """A job wired at boot: its routes already exist, start its tasks."""
+        wiring.at_boot = True
         self.served[str(wiring.entry.job_id)] = wiring
         self._start(wiring)
 
@@ -281,15 +288,18 @@ class CorpusJobSet:
         del self.served[job_id]
         self.finished[job_id] = final
         self._status_cache.pop(job_id, None)
+        self._status_locks.pop(job_id, None)
         logger.info("corpus job %s drained and unwired", job_id)
 
     async def _compute_status(self, job_id: str, *, drained: bool = False) -> dict:
         from reliquary.validator.corpus_job_status import job_status
 
         wiring = self.served[job_id]
-        job, state = await self._routes.routers[job_id].ledger_state()
+        # The wired manifest: one ledger GET per recompute, no manifest read.
+        job, state = await self._routes.routers[job_id].ledger_state(wiring.job)
         return job_status(job_id=job_id, job=job or wiring.job, slots=state.slots,
                           stats=wiring.stats, settled=getattr(wiring.settler, "settled_count", 0),
+                          totals=getattr(wiring.settler, "totals", None),
                           retired=self.is_retired(job_id), drained=drained)
 
     async def status(self, job_id: str) -> dict | None:
@@ -305,6 +315,16 @@ class CorpusJobSet:
         cached = self._status_cache.get(job_id)
         if cached is not None and now - cached[0] < STATUS_CACHE_SECONDS:
             return cached[1]
+        lock = self._status_locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            # One recompute per period, however many requests wait on it.
+            cached = self._status_cache.get(job_id)
+            if cached is not None and self._clock() - cached[0] < STATUS_CACHE_SECONDS:
+                return cached[1]
+            return await self._recompute(job_id, cached)
+
+    async def _recompute(self, job_id: str, cached) -> dict:
+        now = self._clock()
         try:
             fresh = await self._compute_status(job_id)
         except Exception:
