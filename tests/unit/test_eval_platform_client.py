@@ -33,6 +33,7 @@ class FakePlatform:
         self.heartbeat_status = 200
         self.flaky: list[int] = []  # statuses returned once each, first
         self.calls: list[tuple[str, str]] = []
+        self.status_reports_key = True
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -87,14 +88,22 @@ class FakePlatform:
         upload = self.uploads.get(upload_id)
         if upload is None:
             return httpx.Response(404, json={"detail": "upload_unknown"})
+        if upload.get("expired"):
+            return httpx.Response(410, json={"detail": "upload_expired"})
         if tail is None and method == "GET":
-            return httpx.Response(200, json={"parts": sorted(upload["parts"])})
+            answer = {"parts": sorted(upload["parts"])}
+            if self.status_reports_key and upload.get("key"):
+                answer["key"] = upload["key"]
+            return httpx.Response(200, json=answer)
         if tail == "complete":
+            if upload.get("key"):
+                return httpx.Response(409, json={"detail": "upload_complete"})
             data = b"".join(upload["parts"][n] for n in sorted(upload["parts"]))
             if len(data) != upload["size"] or hashlib.sha256(data).hexdigest() != upload["sha256"]:
                 return httpx.Response(422, json={"detail": "incomplete"})
             key = f"evaluations/{task_id}/{upload['name']}"
             self.objects[key] = data
+            upload["key"] = key
             return httpx.Response(200, json={"key": key})
         if method == "PUT":
             if self.fail_puts_after is not None and self.puts >= self.fail_puts_after:
@@ -179,3 +188,49 @@ def test_an_unknown_resume_starts_a_new_upload(tmp_path):
     path.write_bytes(b"x" * 25)
     key = client.upload_file(path, name="c", resume={"upload_id": "gone", "part_size": 10})
     assert platform.objects[key] == b"x" * 25
+
+
+def test_an_upload_already_complete_is_success_not_a_lost_lease(tmp_path):
+    platform = FakePlatform(tasks=[_task()], part_size=10)
+    client = platform.client()
+    client.claim()
+    path = tmp_path / "c"
+    path.write_bytes(b"y" * 25)
+    started = []
+    key = client.upload_file(path, name="c", on_created=started.append)
+    puts = platform.puts
+    # A crash after `complete` but before the key was saved: resume finds it done.
+    assert client.upload_file(path, name="c", resume=started[0]) == key
+    assert platform.puts == puts
+    # A platform whose status does not name the key: complete answers 409 once
+    # done, and the client starts a fresh upload rather than stopping.
+    platform.status_reports_key = False
+    again = client.upload_file(path, name="c", resume=started[0])
+    assert platform.objects[again] == b"y" * 25
+
+
+def test_an_expired_upload_is_restarted(tmp_path):
+    platform = FakePlatform(tasks=[_task()], part_size=10)
+    client = platform.client()
+    client.claim()
+    path = tmp_path / "c"
+    path.write_bytes(b"z" * 25)
+    started = []
+    platform.fail_puts_after = 1
+    with pytest.raises(PlatformError):
+        client.upload_file(path, name="c", on_created=started.append)
+    platform.fail_puts_after = None
+    platform.uploads[started[0]["upload_id"]]["expired"] = True
+    key = client.upload_file(path, name="c", resume=started[0])
+    assert platform.objects[key] == b"z" * 25
+
+
+def test_a_refused_token_on_an_upload_still_stops(tmp_path):
+    platform = FakePlatform(tasks=[_task()], part_size=10)
+    client = platform.client()
+    client.claim()
+    path = tmp_path / "c"
+    path.write_bytes(b"z" * 25)
+    client._token = "revoked"
+    with pytest.raises(LeaseLost):
+        client.upload_file(path, name="c")

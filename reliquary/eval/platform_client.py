@@ -28,6 +28,9 @@ RETRIES = 4
 RETRY_BACKOFF_SECONDS = 2.0
 # The platform no longer recognises this pod or its lease: stop, never retry.
 LOST_STATUSES = frozenset({401, 403, 409, 410})
+# On one upload's own routes a 409/410 is about that upload (complete,
+# expired), not the lease: only the token's refusal stops the pod there.
+UPLOAD_LOST_STATUSES = frozenset({401, 403})
 
 
 class PlatformError(RuntimeError):
@@ -38,6 +41,10 @@ class PlatformError(RuntimeError):
 
 class LeaseLost(PlatformError):
     """The token or the lease was refused: the work stops."""
+
+
+class UploadConflict(PlatformError):
+    """An upload is already complete, or gone: never a reason to stop."""
 
 
 def sha256_hex(body: bytes) -> str:
@@ -75,7 +82,8 @@ class PlatformClient:
 
     def _request(self, method: str, path: str, *, json_body: Any = None,
                  content: bytes | None = None, headers: dict | None = None,
-                 ok: tuple[int, ...] = (200, 201, 202, 204)):
+                 ok: tuple[int, ...] = (200, 201, 202, 204),
+                 lost: frozenset[int] = LOST_STATUSES):
         """One call, retried on transport errors and 5xx; a refused token or
         lease raises ``LeaseLost`` at once."""
         import httpx
@@ -93,9 +101,12 @@ class PlatformClient:
             if response.status_code in ok:
                 return response
             detail = response.text[:300]
-            if response.status_code in LOST_STATUSES:
+            if response.status_code in lost:
                 raise LeaseLost(f"{method} {path}: {response.status_code} {detail}",
                                 response.status_code)
+            if response.status_code in LOST_STATUSES:
+                raise UploadConflict(f"{method} {path}: {response.status_code} {detail}",
+                                     response.status_code)
             last = PlatformError(f"{method} {path}: {response.status_code} {detail}",
                                  response.status_code)
             if response.status_code < 500 and response.status_code != 429:
@@ -142,41 +153,54 @@ class PlatformClient:
         return self._request("POST", self._task_path("uploads"), json_body={
             "name": name, "size": size, "sha256": sha256}).json()
 
-    def uploaded_parts(self, upload_id: str) -> set[int]:
-        return {int(n) for n in
-                self._request("GET", self._task_path(f"uploads/{upload_id}")).json()["parts"]}
+    def upload_status(self, upload_id: str) -> dict:
+        """``{parts: set[int], key: str | None}``; ``key`` once it is complete."""
+        answer = self._request("GET", self._task_path(f"uploads/{upload_id}"),
+                               lost=UPLOAD_LOST_STATUSES).json()
+        return {"parts": {int(n) for n in answer.get("parts", ())},
+                "key": answer.get("key")}
 
     def put_part(self, upload_id: str, part: int, body: bytes) -> None:
         self._request("PUT", self._task_path(f"uploads/{upload_id}/{part}"), content=body,
                       headers={PART_SHA_HEADER: sha256_hex(body),
-                               "Content-Type": "application/octet-stream"})
+                               "Content-Type": "application/octet-stream"},
+                      lost=UPLOAD_LOST_STATUSES)
 
     def complete_upload(self, upload_id: str) -> str:
         return str(self._request("POST", self._task_path(f"uploads/{upload_id}/complete"),
-                                 json_body={}).json()["key"])
+                                 json_body={}, lost=UPLOAD_LOST_STATUSES).json()["key"])
 
     def upload_file(self, path: Path, *, name: str, resume: dict | None = None,
                     on_created: Callable[[dict], None] | None = None) -> str:
         """Upload ``path`` in parts and return its key. ``resume`` is a
         ``{upload_id, part_size}`` this file was already started under: only
-        the parts the platform lacks are sent."""
+        the parts the platform lacks are sent, and an upload already complete
+        answers its key. An upload that is gone or conflicts is started again,
+        once; only a refused token or lease stops."""
         body = Path(path).read_bytes()
-        digest = sha256_hex(body)
-        upload, done = resume, set()
-        if upload is not None:
+        if resume is not None:
             try:
-                done = self.uploaded_parts(upload["upload_id"])
-            except LeaseLost:
-                raise
-            except PlatformError:
-                upload = None
-        if upload is None:
-            upload = self.create_upload(name=name, size=len(body), sha256=digest)
-            upload = {"upload_id": str(upload["upload_id"]),
-                      "part_size": int(upload["part_size"])}
-            if on_created is not None:
-                on_created(upload)
-        size = upload["part_size"]
+                return self._send(body, resume)
+            except UploadConflict as exc:
+                logger.warning("upload %s of %s: %s; starting it again",
+                               resume.get("upload_id"), name, exc)
+            except PlatformError as exc:
+                if exc.status != 404:
+                    raise
+        created = self.create_upload(name=name, size=len(body), sha256=sha256_hex(body))
+        upload = {"upload_id": str(created["upload_id"]), "part_size": int(created["part_size"])}
+        if on_created is not None:
+            on_created(upload)
+        return self._send(body, upload, fresh=True)
+
+    def _send(self, body: bytes, upload: dict, *, fresh: bool = False) -> str:
+        done: set[int] = set()
+        if not fresh:
+            status = self.upload_status(upload["upload_id"])
+            if status["key"]:
+                return str(status["key"])
+            done = status["parts"]
+        size = int(upload["part_size"])
         if size <= 0:
             raise PlatformError(f"part size {size} is not positive")
         parts = max(1, -(-len(body) // size))
@@ -199,5 +223,6 @@ __all__ = [
     "PlatformClient",
     "PlatformError",
     "TOKEN_ENV",
+    "UploadConflict",
     "sha256_hex",
 ]
