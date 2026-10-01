@@ -1942,6 +1942,42 @@ def corpus_mine(
     typer.echo(counts)
 
 
+@corpus_app.command("status")
+def corpus_status(
+    validator_url: str = typer.Option(..., "--validator-url"),
+    job_id: str = typer.Option(
+        None, "--job-id", help="The job; omit for the validator's default job",
+    ),
+    hotkey: str = typer.Option(
+        None, "--hotkey", help="SS58 address; omit to use the wallet's hotkey",
+    ),
+    wallet_name: str = typer.Option("default", "--wallet-name"),
+    wallet_hotkey: str = typer.Option("default", "--wallet-hotkey"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), "--wallet-path"),
+    as_json: bool = typer.Option(False, "--json", help="Print the validator's JSON as is"),
+) -> None:
+    """One hotkey's audit state, counts, recent failures and pay on a corpus job."""
+    import json
+
+    from reliquary.miner import corpus_status as status_client
+
+    if hotkey is None:
+        import bittensor as bt
+
+        wallet_kwargs = {"name": wallet_name, "hotkey": wallet_hotkey}
+        if wallet_path:
+            wallet_kwargs["path"] = wallet_path
+        wallet = bt.Wallet(**wallet_kwargs)
+        # The public half only: no password asked for a read.
+        hotkey = (getattr(wallet, "hotkeypub", None) or wallet.hotkey).ss58_address
+    try:
+        status = status_client.fetch_miner_status(validator_url, hotkey, job_id)
+    except Exception as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(status, indent=2) if as_json else status_client.format_miner_status(status))
+
+
 @app.command("watch-verdicts")
 def watch_verdicts(
     hotkey: str = typer.Option(..., help="Public miner SS58 address; no wallet or private key required"),
