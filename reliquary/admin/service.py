@@ -88,14 +88,28 @@ class RequestQualification(BaseModel):
     qualification_id: str = Field(min_length=1, max_length=63)
     model: str = Field(min_length=1, max_length=256)
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
-    set_id: str = Field(min_length=1, max_length=128)
-    # The order's problem count: the job will be its set's first `problems`
-    # prompts; `completions` are decoded over the first of them.
-    problems: int = Field(gt=0, le=1_000_000)
+    # An evaluation names its set; a generation order its catalog env and the
+    # first row of its range. Exactly one of set_id and env.
+    set_id: str | None = Field(default=None, min_length=1, max_length=128)
+    env: str | None = Field(default=None, min_length=1, max_length=128)
+    prompt_start: int | None = Field(default=None, ge=0)
+    # The order's problem count: the job will be its set's (or its range's)
+    # first `problems` prompts; `completions` are decoded over the first of them.
+    problems: int = Field(gt=0, le=100_000_000)
     completions: int = Field(default=32, gt=0, le=64)
     sampling: OrderSampling
     max_new_tokens: int = Field(gt=0, le=131072)
     thinking: bool = False
+
+    @model_validator(mode="after")
+    def _one_source(self):
+        if (self.set_id is None) == (self.env is None):
+            raise ValueError("a qualification names exactly one of set_id and env")
+        if self.set_id is not None and (self.prompt_start is not None
+                                        or self.problems > 1_000_000):
+            raise ValueError("an eval qualification has no prompt_start and at most "
+                             "1,000,000 problems")
+        return self
 
 
 CreateJob.model_rebuild()
@@ -661,22 +675,33 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         in_scope(body.qualification_id)
         try:
             qual.validated_qualification_id(body.qualification_id)
-            validated_set_id(body.set_id)
+            if body.set_id is not None:
+                validated_set_id(body.set_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if await eval_store.get_bytes(subnet_key(body.set_id, "prompts.jsonl")) is None:
+        if body.set_id is not None and await eval_store.get_bytes(
+                subnet_key(body.set_id, "prompts.jsonl")) is None:
             raise HTTPException(status_code=404, detail="set_unknown")
         try:
-            wanted = qual.new_request(
-                qualification_id=body.qualification_id, model=body.model,
-                revision=body.revision, set_id=body.set_id, problems=body.problems,
-                completions=body.completions, sampling=body.sampling.model_dump(),
-                max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
+            if body.env is not None:
+                wanted = qual.new_generation_request(
+                    qualification_id=body.qualification_id, model=body.model,
+                    revision=body.revision, env=body.env,
+                    prompt_start=body.prompt_start or 0, problems=body.problems,
+                    completions=body.completions, sampling=body.sampling.model_dump(),
+                    max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
+            else:
+                wanted = qual.new_request(
+                    qualification_id=body.qualification_id, model=body.model,
+                    revision=body.revision, set_id=body.set_id, problems=body.problems,
+                    completions=body.completions, sampling=body.sampling.model_dump(),
+                    max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         def same(existing: dict) -> dict:
-            if any(existing.get(k) != wanted[k] for k in qual.REQUEST_FIELDS):
+            if any(existing.get(k) != wanted.get(k) for k in qual.request_fields(wanted)) \
+                    or qual.request_fields(existing) != qual.request_fields(wanted):
                 raise HTTPException(status_code=409,
                                     detail="qualification_exists_with_another_request")
             response.status_code = 200

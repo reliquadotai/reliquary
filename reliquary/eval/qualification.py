@@ -167,6 +167,90 @@ def new_request(*, qualification_id: str, model: str, revision: str, set_id: str
 REQUEST_FIELDS = ("model", "revision", "set_id", "problems", "completions", "sampling",
                   "max_new_tokens", "thinking")
 
+# A generation order's qualification: its catalog environment and range (the
+# first ``min(problems, completions)`` rows from ``prompt_start`` are decoded),
+# the package it renders through, and the same conditions.
+GENERATION = "generation"
+GEN_REQUEST_FIELDS = ("kind", "model", "revision", "env", "prompt_start", "problems",
+                      "completions", "sampling", "max_new_tokens", "thinking",
+                      "environment_manifest_sha256")
+
+
+def request_fields(record: dict) -> tuple[str, ...]:
+    return GEN_REQUEST_FIELDS if record.get("kind") == GENERATION else REQUEST_FIELDS
+
+
+def order_environment_refusal(env: str) -> str | None:
+    """Why a generation order may not draw from ``env``, or None. Only a
+    packaged single-turn source qualifies: it renders its own rows, so one
+    order control renders every job's prompts as its miners do, whatever
+    profile that process runs."""
+    from reliquary.validator import corpus_service
+
+    spec = corpus_service.ENVIRONMENT_SPECS.get(env)
+    if spec is None:
+        return f"env {env!r} is not an installed environment"
+    if getattr(spec, "interaction_mode", None) != "single_turn":
+        return f"env {env!r} is not a single-turn source"
+    if getattr(spec, "external_distribution", None) is None:
+        return f"env {env!r} renders through the process profile, not a packaged source"
+    return None
+
+
+def new_generation_request(*, qualification_id: str, model: str, revision: str, env: str,
+                           prompt_start: int, problems: int, sampling: dict,
+                           max_new_tokens: int, thinking: bool,
+                           completions: int = QUALIFY_COMPLETIONS, clock=time.time) -> dict:
+    from reliquary.eval.sets import refuse_held_out_overlap
+    from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+    refusal = order_environment_refusal(env)
+    if refusal is not None:
+        raise ValueError(refusal)
+    if int(prompt_start) < 0:
+        raise ValueError("prompt_start must not be negative")
+    # The held-out rows of the eval sets are never generated for an order.
+    refuse_held_out_overlap(env, int(prompt_start), int(problems))
+    record = new_request(qualification_id=qualification_id, model=model, revision=revision,
+                         set_id="", problems=problems, sampling=sampling,
+                         max_new_tokens=max_new_tokens, thinking=thinking,
+                         completions=completions, clock=clock)
+    del record["set_id"]
+    profile = ENVIRONMENT_CATALOG.get(env)
+    record.update(kind=GENERATION, env=env, prompt_start=int(prompt_start),
+                  environment_manifest_sha256=getattr(profile, "environment_manifest_sha256",
+                                                      None))
+    return record
+
+
+def catalog_prompts(env: str, start: int, count: int, *, environments=None) -> list[dict]:
+    """Rows ``[start, start + count)`` of a packaged source, as a qualify
+    lease carries them (``problem_id`` = ``<env>#<index>``, as the job names
+    a row). ``environments`` caches built sources by name."""
+    from reliquary.validator import corpus_service
+
+    cache = environments if environments is not None else {}
+    if env not in cache:
+        cache[env] = corpus_service.ENVIRONMENT_SPECS[env].create()
+    environment = cache[env]
+    if start + count > len(environment):
+        raise ValueError(f"{env!r} has {len(environment)} rows, fewer than {start + count}")
+    rows = []
+    for index in range(start, start + count):
+        prompt = environment.get_problem(index).get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError(f"{env!r} row {index} has no prompt")
+        rows.append({"problem_id": f"{env}#{index}", "text": prompt})
+    return rows
+
+
+def sample_sha256(prompts: Sequence[dict]) -> str:
+    import hashlib
+
+    body = json.dumps([[p["problem_id"], p["text"]] for p in prompts],
+                      separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()
+
 
 class QualificationStore:
     """Qualification records in the subnet bucket, compare-and-swap."""
@@ -250,11 +334,20 @@ class QualificationQueue:
     model's architecture and eos from its own files (CPU)."""
 
     def __init__(self, *, store, read_prompts, model_facts, proof=None,
-                 clock=time.time) -> None:
+                 clock=time.time, read_catalog_prompts=None) -> None:
         if proof is None:
             from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as proof
         self._store = store
         self._read_prompts = read_prompts
+        if read_catalog_prompts is None:
+            import asyncio
+
+            environments: dict = {}
+
+            async def read_catalog_prompts(env, start, count):
+                return await asyncio.to_thread(catalog_prompts, env, start, count,
+                                               environments=environments)
+        self._read_catalog_prompts = read_catalog_prompts
         self._model_facts = model_facts
         self._proof = proof
         self._clock = clock
@@ -363,12 +456,31 @@ class QualificationQueue:
                 continue
             if not self._eligible(record, executor):
                 continue
-            body = await self._read_prompts(record["set_id"])
-            if body is None:
-                continue
-            # Only the prompts a completion is decoded for.
-            count = min(record["problems"], record["completions"], len(body.splitlines()))
-            rows = [json.loads(line) for line in head_lines(body, count).splitlines()]
+            if record.get("kind") == GENERATION:
+                count = min(record["problems"], record["completions"])
+                try:
+                    prompts = await self._read_catalog_prompts(
+                        record["env"], record["prompt_start"], count)
+                except ValueError as exc:
+                    await self._finish(qualification_id, {**record, "status": REFUSED, "result": {
+                        "refused_reason": "prompts_unreadable", "detail": str(exc)[:300]}}, etag)
+                    continue
+                sample = sample_sha256(prompts)
+                if record.get("sample_sha256", sample) != sample:
+                    # The package moved under the record: never measured on two samples.
+                    await self._finish(qualification_id, {**record, "status": FAILED, "result": {
+                        "failed_reason": "the environment's sample changed"}}, etag)
+                    continue
+                record = {**record, "sample_sha256": sample}
+            else:
+                body = await self._read_prompts(record["set_id"])
+                if body is None:
+                    continue
+                # Only the prompts a completion is decoded for.
+                count = min(record["problems"], record["completions"], len(body.splitlines()))
+                rows = [json.loads(line) for line in head_lines(body, count).splitlines()]
+                prompts = [{"problem_id": r["problem_id"], "text": r["messages"][-1]["content"]}
+                           for r in rows]
             seconds = qualify_lease_seconds(record["max_new_tokens"])
             lease = {"lease_id": secrets.token_hex(16), "expires_at": self._clock() + seconds,
                      "provider_id": executor["provider_id"], "host": executor["host"]}
@@ -384,8 +496,7 @@ class QualificationQueue:
                 "model_id": record["model"], "model_revision": record["revision"],
                 "chunk_tokens": self._proof.chunk_tokens, "topk": self._proof.topk,
                 "expires_at": lease["expires_at"],
-                "prompts": [{"problem_id": r["problem_id"],
-                             "text": r["messages"][-1]["content"]} for r in rows],
+                "prompts": prompts,
                 "completions": record["completions"], "sampling": record["sampling"],
                 "max_new_tokens": record["max_new_tokens"], "thinking": record["thinking"],
             }
@@ -475,6 +586,13 @@ __all__ = [
     "BAND_AGREEMENT_RATIO",
     "EvalJobStore",
     "FAILED",
+    "GENERATION",
+    "GEN_REQUEST_FIELDS",
+    "catalog_prompts",
+    "new_generation_request",
+    "order_environment_refusal",
+    "request_fields",
+    "sample_sha256",
     "MAX_QUALIFY_ATTEMPTS",
     "PENDING",
     "QUALIFICATION_SCHEMA",

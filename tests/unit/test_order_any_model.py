@@ -155,3 +155,114 @@ def test_a_job_on_a_record_of_an_unsupported_architecture_is_refused(admin):  # 
     asyncio.run(rewrite())
     response = admin("POST", "/admin/v1/jobs", _eval_job())
     assert response.status_code == 409 and "architecture_unsupported" in response.text
+
+
+# -- 3. generation qualifications --------------------------------------------------
+
+GEN_ENV = "reliquary_logic_v2"
+GEN_SAMPLING = {"temperature": 0.7, "top_p": 0.95, "top_k": 0}
+
+
+class _CatalogSpec:
+    """A packaged single-turn source whose rows are cheap: the real spec's
+    declarations, a fake build (``row k`` reads ``<env> problem k``)."""
+
+    def __init__(self, spec, rows):
+        self._spec, self._rows = spec, rows
+
+    def __getattr__(self, name):
+        return getattr(self._spec, name)
+
+    def create(self):
+        from tests.unit.test_eval_sets import FakeEnvironment
+
+        return FakeEnvironment(self._spec.name, self._rows)
+
+
+def stub_catalog_env(monkeypatch, env=GEN_ENV, rows=1000):
+    from reliquary.validator import corpus_service
+
+    specs = corpus_service.ENVIRONMENT_SPECS
+    monkeypatch.setattr(corpus_service, "ENVIRONMENT_SPECS",
+                        {**specs, env: _CatalogSpec(specs[env], rows)})
+
+
+def _gen_qualification(**kw):
+    return {"qualification_id": "order-gq1", "model": "customer/Gen-8B",
+            "revision": "e" * 40, "env": GEN_ENV, "prompt_start": 100, "problems": 500,
+            "sampling": GEN_SAMPLING, "max_new_tokens": 1024, "thinking": True, **kw}
+
+
+def test_a_generation_qualification_binds_the_env_range_and_the_conditions(admin, monkeypatch):  # noqa: F811
+    from reliquary.eval import qualification as qual
+    from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+    stub_catalog_env(monkeypatch)
+    created = admin("POST", "/admin/v1/qualifications", _gen_qualification())
+    assert created.status_code == 201, created.text
+    record = created.json()
+    assert record["kind"] == "generation" and "set_id" not in record
+    assert (record["env"], record["prompt_start"], record["problems"]) == (GEN_ENV, 100, 500)
+    assert record["completions"] == qual.QUALIFY_COMPLETIONS == 32
+    assert record["environment_manifest_sha256"] == \
+        ENVIRONMENT_CATALOG[GEN_ENV].environment_manifest_sha256
+    assert (record["sampling"], record["max_new_tokens"], record["thinking"]) == (
+        GEN_SAMPLING, 1024, True)
+    again = admin("POST", "/admin/v1/qualifications", _gen_qualification())
+    assert again.status_code == 200
+    other = admin("POST", "/admin/v1/qualifications", _gen_qualification(prompt_start=0))
+    assert other.status_code == 409
+
+
+@pytest.mark.parametrize("change", [
+    {"env": "openmathinstruct"},                 # renders through the process profile
+    {"env": "reliquary_stateful_tools_v2"},      # an episode source
+    {"env": "nope"},
+    {"set_id": "logic-eval-s1-n8"},              # both an eval set and an env
+    {"env": None},                               # neither
+    {"prompt_start": 2_381_806},                 # code's held-out tail, on code
+])
+def test_generation_qualification_refusals(admin, monkeypatch, change):  # noqa: F811
+    stub_catalog_env(monkeypatch)
+    body = _gen_qualification(**change)
+    if change.get("prompt_start"):
+        body["env"] = "reliquary_code_v1"
+    body = {k: v for k, v in body.items() if v is not None}
+    response = admin("POST", "/admin/v1/qualifications", body)
+    assert response.status_code == 422, response.text
+
+
+def test_a_generation_qualification_is_measured_on_the_first_prompts_of_its_range(monkeypatch):
+    from reliquary.eval import qualification as qual
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+    from tests.unit.test_eval_qualification import _executor
+
+    fake = _FakeMultiObjectR2()
+    monkeypatch.setattr(job_store, "get_s3_client", lambda **kw: fake)
+    stub_catalog_env(monkeypatch)
+    store = qual.QualificationStore()
+    asyncio.run(store.write(qual.new_generation_request(
+        qualification_id="order-gq1", model="m", revision="r" * 40, env=GEN_ENV,
+        prompt_start=100, problems=500, sampling=GEN_SAMPLING, max_new_tokens=64,
+        thinking=False, clock=lambda: 0.0), None))
+
+    async def facts(repo, revision):
+        return {"architecture": "Qwen3ForCausalLM", "eos_token_id": 2}
+
+    async def no_set(set_id):
+        raise AssertionError("a generation qualification reads no eval set")
+
+    queue = qual.QualificationQueue(store=store, read_prompts=no_set, model_facts=facts,
+                                    clock=lambda: 0.0)
+    asyncio.run(queue.refresh())
+    lease = asyncio.run(queue.claim(_executor("e1", model="m")))
+    assert [p["problem_id"] for p in lease["prompts"]] == [
+        f"{GEN_ENV}#{k}" for k in range(100, 132)]
+    assert lease["prompts"][0]["text"] == f"{GEN_ENV} problem 100"
+    record, _ = asyncio.run(store.read("order-gq1"))
+    sample = record["sample_sha256"]
+    # The second qualifier is leased exactly the same sample.
+    second = asyncio.run(queue.claim(_executor("e2", model="m")))
+    assert second["prompts"] == lease["prompts"]
+    assert asyncio.run(store.read("order-gq1"))[0]["sample_sha256"] == sample
