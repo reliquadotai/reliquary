@@ -29,6 +29,31 @@ THRESHOLDS = {"exp_mismatch_threshold": 75, "mant_mean_threshold": 41.5,
               "mant_median_threshold": 40.0}
 
 
+class _JobRecords:
+    """An eval job's records: submissions, verdicts, voided ids, settlement."""
+
+    def __init__(self):
+        self.subs, self.verdicts, self.voided, self.settled = {}, {}, set(), []
+
+    async def list_submission_ids(self, job_id):
+        return sorted(self.subs)
+
+    async def list_verdict_ids(self, job_id):
+        return sorted(self.verdicts)
+
+    async def list_voided_ids(self, job_id):
+        return sorted(self.voided)
+
+    async def read_verdict(self, job_id, sid):
+        return self.verdicts.get(sid)
+
+    async def read_submission(self, job_id, sid):
+        return self.subs.get(sid)
+
+    async def read_settlement(self, job_id):
+        return {"settled": list(self.settled), "pending": None}, None
+
+
 @pytest.fixture
 def admin(tmp_path, monkeypatch, registry):  # noqa: F811
     from reliquary.corpus.delivery import LocalDirectorySink
@@ -42,8 +67,15 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
               clock=lambda: 1.0)
     asyncio.run(publish_set(tmp_path / "set", platform=LocalDirectorySink(tmp_path / "p"),
                             subnet=SubnetEvalStore()))
-    app = create_admin_app(secret=SECRET, pool_max=0.3, models={}, records=object(),
-                           current_round=lambda: 1)
+    from tests.unit.test_eval_grading import GradingEnvironment, _plain_scorer
+
+    records = _JobRecords()
+    app = create_admin_app(secret=SECRET, pool_max=0.3, models={}, records=records,
+                           current_round=lambda: 1,
+                           deliveries=LocalDirectorySink(tmp_path / "p"),
+                           open_environment=lambda source, split: GradingEnvironment(source),
+                           grade_scorer=_plain_scorer, require_sandbox=lambda spec: None,
+                           work_dir=tmp_path / "work")
     client = TestClient(app)
     client.__enter__()
 
@@ -55,7 +87,7 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
                    "content-type": "application/json"}
         return client.request(method, path, content=data, headers=headers)
 
-    call.registry, call.bucket = registry, fake
+    call.registry, call.bucket, call.records, call.root = registry, fake, records, tmp_path
     yield call
     client.__exit__(None, None, None)
 
@@ -176,3 +208,73 @@ def test_the_seed_is_written_only_when_present():
     assert seeded["seed"] == 12 and parse_job(seeded).seed == 12
     with pytest.raises(ValueError):
         parse_job({**plain, "seed": -1})
+
+
+PROVENANCE = {"model": MODEL, "revision": REVISION, "model_sha": REVISION,
+              "sampling": {"temperature": 0.6}, "thinking": False, "max_new_tokens": 512}
+
+
+def _grade_body(**kw):
+    return {"source": "job", "job_id": "order-eval-7", "set_ids": ["logic-eval-s1-n8"],
+            "problems_per_set": {"logic-eval-s1-n8": 5},
+            "samples_per_set": {"logic-eval-s1-n8": 4}, "provenance": PROVENANCE, **kw}
+
+
+def test_an_eval_job_is_graded_from_its_passing_records(admin):
+    admin("POST", "/admin/v1/qualifications", _qualification())
+    _qualify(admin)
+    assert admin("POST", "/admin/v1/jobs", _eval_job()).status_code == 201
+    grading = [json.loads(l) for l in (admin.root / "set" / "grading.jsonl").read_text().splitlines()]
+    index = [g["source_index"] for g in grading]
+    right = lambda i: f'```json\n{{"a": "={index[i]}"}}\n```'  # noqa: E731
+
+    def submit(sid, prompt, texts, passed=True, hotkey="hk1", audited=True):
+        admin.records.subs[sid] = {"prompt_index": prompt, "hotkey": hotkey, "completions": [
+            {"text": t, "tokens": [5, 2]} for t in texts]}
+        admin.records.verdicts[sid] = {"passed": passed, "audited": audited, "hotkey": hotkey}
+        admin.records.settled.append(sid)
+
+    for k in range(4):
+        submit(f"{k:064x}", 0, [right(0)])
+    submit("a" * 64, 1, [right(1)], hotkey="hk2")
+    submit("b" * 64, 1, ["no json"], hotkey="hk2")
+    submit("c" * 64, 1, [right(1)], passed=False)
+    submit("d" * 64, 2, [right(2)])
+    admin.records.voided.add("d" * 64)
+    # Not drained: refused.
+    admin.records.subs["e" * 64] = {"prompt_index": 3, "hotkey": "x", "completions": []}
+    assert admin("POST", "/admin/v1/evaluations/order-e7/grade",
+                 _grade_body()).status_code == 409
+    del admin.records.subs["e" * 64]
+    wrong = admin("POST", "/admin/v1/evaluations/order-e7/grade",
+                  _grade_body(samples_per_set={"logic-eval-s1-n8": 2}))
+    assert wrong.status_code == 422 and "grades as" in wrong.text
+    for _ in range(200):
+        response = admin("POST", "/admin/v1/evaluations/order-e7/grade", _grade_body())
+        if response.status_code != 202:
+            break
+        time.sleep(0.02)
+    assert response.status_code == 200, response.text
+    assert response.json()["complete"] is False
+    report = json.loads((admin.root / "p" / "evaluations" / "order-e7" / "report.json").read_text())
+    logic = report["envs"]["logic"]
+    assert (logic["n_problems"], logic["samples"], logic["expected_rows"]) == (5, 4, 20)
+    assert (logic["graded_rows"], logic["missing_rows"]) == (6, 14)
+    # c/n: 4/4, 1/4, then three problems with nothing.
+    assert logic["pass@1"]["value"] == pytest.approx((1 + 0.25) / 5)
+    provenance = report["provenance"]
+    assert provenance["generation"] == "sn81-miners" and provenance["miner_hotkeys"] == 2
+    assert provenance["audited_fraction"] == 1.0 and provenance["sampling_verified"] is False
+    assert "sampling not verified" in provenance["note"]
+    assert provenance["verification"]["thresholds"] == THRESHOLDS
+    assert "vllm_version" not in provenance
+
+
+def test_a_job_grading_needs_a_job_and_an_uploads_grading_its_pod():
+    from reliquary.admin.service import GradeEvaluation
+
+    with pytest.raises(ValueError):
+        GradeEvaluation.model_validate(_grade_body(job_id=None))
+    with pytest.raises(ValueError):
+        GradeEvaluation.model_validate({**_grade_body(), "source": "uploads",
+                                        "job_id": None, "completion_keys": ["k"]})

@@ -15,10 +15,10 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from reliquary.admin.auth import (
     NONCE_HEADER,
@@ -124,19 +124,36 @@ class Provenance(BaseModel):
     sampling: dict[str, Any]
     thinking: bool
     max_new_tokens: int = Field(gt=0)
-    vllm_version: str = Field(min_length=1)
-    gpu: str = Field(min_length=1)
-    pod_provider_id: str = Field(min_length=1)
+    # The pod's, required when the completions are its uploads.
+    vllm_version: str | None = Field(default=None, min_length=1)
+    gpu: str | None = Field(default=None, min_length=1)
+    pod_provider_id: str | None = Field(default=None, min_length=1)
 
 
 class GradeEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    # "uploads": the v1 pod's completion files; "job": an eval job's passing records.
+    source: Literal["uploads", "job"] = "uploads"
+    job_id: str | None = Field(default=None, min_length=1, max_length=63)
     set_ids: list[str] = Field(min_length=1, max_length=64)
-    completion_keys: list[str] = Field(min_length=1, max_length=10_000)
+    completion_keys: list[str] = Field(default_factory=list, max_length=10_000)
     problems_per_set: dict[str, int]
     # Samples ordered per problem, indexed 0..samples-1.
     samples_per_set: dict[str, int]
     provenance: Provenance
+
+    @model_validator(mode="after")
+    def _source_fields(self):
+        if self.source == "uploads":
+            if self.job_id is not None or not self.completion_keys:
+                raise ValueError("an uploads grading names completion_keys and no job_id")
+            missing = [k for k in ("vllm_version", "gpu", "pod_provider_id")
+                       if getattr(self.provenance, k) is None]
+            if missing:
+                raise ValueError(f"an uploads grading's provenance needs {missing}")
+        elif self.job_id is None or self.completion_keys:
+            raise ValueError("a job grading names job_id and no completion_keys")
+        return self
 
 
 def cap_limits(pool_max: float, *, drained_tasks=frozenset()) -> Callable[[Mapping, Mapping], None]:
@@ -599,6 +616,40 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="qualification_unknown")
         return record
 
+    async def job_grading_source(body: GradeEvaluation):
+        """An eval job's passing records as the completions, once it is drained;
+        the request must name exactly the job's set, problems and samples."""
+        from reliquary.eval.grading import JobRows
+        from reliquary.eval.prompt_source import parse_eval_source
+        from reliquary.validator.corpus_job_status import stored_job_counts
+
+        try:
+            job, _ = await job_store.read_job(body.job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="job_unknown") from exc
+        if job is None:
+            raise HTTPException(status_code=404, detail="job_unknown")
+        source = parse_eval_source(job.prompt_source)
+        samples = job.slots_per_prompt * job.sampling.n
+        expected = {"set_ids": [source.set_id], "problems_per_set": {source.set_id: source.count},
+                    "samples_per_set": {source.set_id: samples}}
+        given = {"set_ids": body.set_ids, "problems_per_set": body.problems_per_set,
+                 "samples_per_set": body.samples_per_set}
+        if given != expected:
+            raise HTTPException(status_code=422, detail=f"job {job.job_id} grades as {expected}")
+        if not (await stored_job_counts(records, job.job_id))["drained"]:
+            raise HTTPException(status_code=409, detail="job_not_drained")
+        verification = {"scheme": "toploc-v1", "source": "qualification",
+                        "sampling_verified": False}
+        for entry in await entries_naming(job.job_id):
+            proofs = (entry.contract or {}).get("proofs") or ()
+            toploc = [p for p in proofs if p.get("scheme") == "toploc-v1"]
+            if toploc:
+                verification["thresholds"] = {k: toploc[0][k] for k in (
+                    "exp_mismatch_threshold", "mant_mean_threshold", "mant_median_threshold")}
+                verification["task_id"] = entry.task_id
+        return JobRows(job=job, records=records), verification
+
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
         from reliquary.corpus.delivery import validated_delivery_id
@@ -609,11 +660,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=503, detail="deliveries_not_configured")
         try:
             validated_delivery_id(eval_id)
-            keys = grading.validated_completion_keys(body.completion_keys)
+            keys = (grading.validated_completion_keys(body.completion_keys)
+                    if body.source == "uploads" else [])
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if body.source == "job":
+            from reliquary.eval.prompt_source import EVAL_JOB_PREFIX
+
+            in_scope(body.job_id)
+            if not body.job_id.startswith(EVAL_JOB_PREFIX):
+                raise HTTPException(status_code=422, detail="not_an_eval_job")
         digest = grading.request_digest(body.set_ids, keys, body.problems_per_set,
-                                        body.samples_per_set)
+                                        body.samples_per_set, job_id=body.job_id)
 
         def done(manifest: dict) -> dict:
             if manifest.get("request_sha256") != digest:
@@ -650,12 +708,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 except grading.SandboxUnavailable as exc:
                     raise HTTPException(status_code=503,
                                         detail="code_sandbox_unavailable") from exc
+                provenance = body.provenance.model_dump(exclude_none=True)
+                job_rows = None
+                if body.source == "job":
+                    job_rows, verification = await job_grading_source(body)
+                    provenance["verification"] = verification
                 extra = {} if grade_scorer is None else {"scorer_for": grade_scorer}
                 gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
                     eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,
                     problems_per_set=body.problems_per_set,
-                    samples_per_set=body.samples_per_set,
-                    provenance=body.provenance.model_dump(), platform=deliveries,
+                    samples_per_set=body.samples_per_set, job_rows=job_rows,
+                    provenance=provenance, platform=deliveries,
                     subnet=eval_store, open_environment=open_environment,
                     require_sandbox=require_sandbox, work_dir=work_dir, clock=clock,
                     **extra)))

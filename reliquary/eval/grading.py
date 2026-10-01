@@ -66,11 +66,14 @@ def evaluation_prefix(eval_id: str) -> str:
 
 def request_digest(set_ids: Sequence[str], completion_keys: Sequence[str],
                    problems_per_set: Mapping[str, int],
-                   samples_per_set: Mapping[str, int]) -> str:
+                   samples_per_set: Mapping[str, int], job_id: str | None = None) -> str:
     """What makes two grade calls the same grading."""
     body = {"set_ids": list(set_ids), "completion_keys": list(completion_keys),
             "problems_per_set": {k: int(v) for k, v in sorted(problems_per_set.items())},
             "samples_per_set": {k: int(v) for k, v in sorted(samples_per_set.items())}}
+    if job_id is not None:
+        # Only when set, so an uploads grading hashes as it always did.
+        body["job_id"] = job_id
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
@@ -319,11 +322,85 @@ def _default_scorer(spec, environment):
     return reward_scorer(spec, environment)
 
 
+MALFORMED = object()
+
+
+async def upload_rows(platform, keys: Sequence[str], directory: Path):
+    """The pod's completion lines, file by file; ``MALFORMED`` for a bad line."""
+    for key in keys:
+        local = directory / "completions.jsonl"
+        if not await platform.get_file(key, local):
+            raise GradeRequestError(f"completion key {key!r} does not exist")
+        with open(local, encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    yield MALFORMED
+        local.unlink()
+
+
+class JobRows:
+    """The completions of an eval job's passing submissions, as grade rows.
+
+    ``prompt_index`` maps to ``problem_id`` through the set's order (row i of
+    the job is line i of the set); within a problem, passing submissions in
+    submission-id order and their completions in order are samples 0, 1, ...
+    A voided pass (its executor quarantined) is left out like a failed one.
+    """
+
+    def __init__(self, *, job, records) -> None:
+        self.job = job
+        self.records = records
+        self.hotkeys: set[str] = set()
+        self.verdicts = 0
+        self.audited = 0
+
+    async def __aiter__(self):
+        from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
+
+        rows = await asyncio.to_thread(load_eval_rows, parse_eval_source(self.job.prompt_source))
+        ids = list(await self.records.list_verdict_ids(self.job.job_id))
+        lister = getattr(self.records, "list_voided_ids", None)
+        voided = set(await lister(self.job.job_id)) if lister is not None else set()
+        by_prompt: dict[int, list[tuple[str, dict]]] = defaultdict(list)
+        for submission_id in ids:
+            verdict = await self.records.read_verdict(self.job.job_id, submission_id)
+            if not verdict:
+                continue
+            self.verdicts += 1
+            self.audited += 1 if verdict.get("audited") else 0
+            if not verdict.get("passed") or submission_id in voided:
+                continue
+            record = await self.records.read_submission(self.job.job_id, submission_id)
+            if record is None:
+                continue
+            by_prompt[int(record["prompt_index"])].append((submission_id, record))
+        for prompt_index in sorted(by_prompt):
+            if not 0 <= prompt_index < len(rows):
+                yield MALFORMED
+                continue
+            sample = 0
+            for _, record in sorted(by_prompt[prompt_index], key=lambda pair: pair[0]):
+                self.hotkeys.add(record["hotkey"])
+                for completion in record["completions"]:
+                    tokens = completion.get("tokens") or ()
+                    yield {"problem_id": rows[prompt_index]["problem_id"],
+                           "sample_index": sample, "completion": completion["text"],
+                           "completion_tokens": len(tokens),
+                           "finish_reason": ("stop" if tokens and tokens[-1] == self.job.eos_token_id
+                                             else "length")}
+                    sample += 1
+
+
 async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                            completion_keys: Sequence[str],
                            problems_per_set: Mapping[str, int],
                            samples_per_set: Mapping[str, int], platform, subnet,
                            provenance: Mapping[str, Any],
+                           job_rows: "JobRows | None" = None,
                            open_environment: Callable[[str, str], Any] = open_source,
                            scorer_for: Callable = _default_scorer,
                            require_sandbox=None,
@@ -331,7 +408,8 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                            clock: Callable[[], float] = time.time,
                            bootstrap_seed: int = BOOTSTRAP_SEED) -> dict:
     """Grade every completion and write the evaluation; the manifest. A grading
-    whose manifest exists is returned as stored."""
+    whose manifest exists is returned as stored. The completions are the pod's
+    uploads (``completion_keys``) or an eval job's passing records (``job_rows``)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -340,7 +418,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     stored = await platform.get_json(manifest_key)
     if stored is not None:
         return stored
-    keys = validated_completion_keys(completion_keys)
+    keys = validated_completion_keys(completion_keys) if job_rows is None else []
     sets = await load_sets(set_ids, problems_per_set, samples_per_set, subnet=subnet)
     require_sandboxes(sets, require_sandbox)
     selected: dict[str, tuple[str, dict, dict, int]] = {}
@@ -359,46 +437,49 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     try:
         writer = pq.ParquetWriter(str(graded_path), _graded_schema(), compression="zstd")
         try:
-            for key in keys:
-                local = directory / "completions.jsonl"
-                if not await platform.get_file(key, local):
-                    raise GradeRequestError(f"completion key {key!r} does not exist")
-                batch: list[tuple[dict, tuple]] = []
-                with open(local, encoding="utf-8") as handle:
-                    for line in handle:
-                        if not line.strip():
-                            continue
-                        try:
-                            row = json.loads(line)
-                            problem_id = str(row["problem_id"])
-                            sample_index = row["sample_index"]
-                            if not isinstance(sample_index, int) or isinstance(sample_index,
-                                                                               bool):
-                                raise TypeError("sample_index")
-                        except (ValueError, KeyError, TypeError):
-                            counts["malformed_rows"] += 1
-                            continue
-                        if problem_id not in selected:
-                            counts["unexpected_rows"] += 1
-                            continue
-                        entry = selected[problem_id]
-                        env = entry[1]["env"]
-                        if not 0 <= sample_index < entry[3]:
-                            by_env_counts[env]["out_of_range_rows"] += 1
-                            continue
-                        if (problem_id, sample_index) in seen:
-                            by_env_counts[env]["duplicate_rows"] += 1
-                            continue
-                        seen.add((problem_id, sample_index))
-                        batch.append((row, entry))
-                        if len(batch) >= BATCH_ROWS:
-                            await _grade_batch(batch, graders, per_problem, writer, pa)
-                            batch = []
-                if batch:
+            batch: list[tuple[dict, tuple]] = []
+            source = upload_rows(platform, keys, directory) if job_rows is None else job_rows
+            async for row in source:
+                try:
+                    if row is MALFORMED:
+                        raise TypeError("line")
+                    problem_id = str(row["problem_id"])
+                    sample_index = row["sample_index"]
+                    if not isinstance(sample_index, int) or isinstance(sample_index, bool):
+                        raise TypeError("sample_index")
+                except (ValueError, KeyError, TypeError):
+                    counts["malformed_rows"] += 1
+                    continue
+                if problem_id not in selected:
+                    counts["unexpected_rows"] += 1
+                    continue
+                entry = selected[problem_id]
+                env = entry[1]["env"]
+                if not 0 <= sample_index < entry[3]:
+                    by_env_counts[env]["out_of_range_rows"] += 1
+                    continue
+                if (problem_id, sample_index) in seen:
+                    by_env_counts[env]["duplicate_rows"] += 1
+                    continue
+                seen.add((problem_id, sample_index))
+                batch.append((row, entry))
+                if len(batch) >= BATCH_ROWS:
                     await _grade_batch(batch, graders, per_problem, writer, pa)
-                local.unlink()
+                    batch = []
+            if batch:
+                await _grade_batch(batch, graders, per_problem, writer, pa)
         finally:
             writer.close()
+        if job_rows is not None:
+            provenance = {
+                **dict(provenance), "generation": "sn81-miners", "job_id": job_rows.job.job_id,
+                "miner_hotkeys": len(job_rows.hotkeys),
+                "audited_fraction": (job_rows.audited / job_rows.verdicts
+                                     if job_rows.verdicts else None),
+                "sampling_verified": False,
+                "note": "sampling not verified: TOPLOC proves the completions were computed "
+                        "by the model, not that they were sampled as the order asked",
+            }
         by_env: dict[str, list[tuple[str, int]]] = defaultdict(list)
         for problem_id, (_, card, _, samples) in selected.items():
             by_env[card["env"]].append((problem_id, samples))
@@ -446,7 +527,9 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
         shutil.rmtree(directory, ignore_errors=True)
     manifest = {
         "schema": REPORT_SCHEMA, "eval_id": eval_id, "created_at": report["created_at"],
-        "request_sha256": request_digest(set_ids, keys, problems_per_set, samples_per_set),
+        "request_sha256": request_digest(
+            set_ids, keys, problems_per_set, samples_per_set,
+            job_id=None if job_rows is None else job_rows.job.job_id),
         "complete": report["complete"],
         "rows": sum(len(v) for v in per_problem.values()), "files": files,
         "keys": [f["key"] for f in files] + [manifest_key],
@@ -487,6 +570,7 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa) -> Non
 __all__ = [
     "EVALUATION_PREFIX",
     "GRADED_COLUMNS",
+    "JobRows",
     "GradeRequestError",
     "REPORT_SCHEMA",
     "SandboxUnavailable",
