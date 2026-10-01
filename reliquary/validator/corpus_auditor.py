@@ -34,12 +34,14 @@ from reliquary.corpus.audit_policy import (
 )
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.protocol.profiles import ProofProfile
-from reliquary.validator.corpus_audit import audit_completion, batch_completion_hidden_states
+from reliquary.validator.corpus_audit import outcome_from_scores, score_sequences
 from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
 
 logger = logging.getLogger(__name__)
 
 VERDICT_SCHEMA = "reliquary/corpus-verdict/v1"
+# A pass withdrawn after the executor that scored it was quarantined.
+VOIDED_SCHEMA = "reliquary/corpus-voided/v1"
 
 RESCAN_SECONDS = 60.0
 # The minute rescan requeues pending records the auditor already knows; the
@@ -88,8 +90,19 @@ class CorpusAuditor:
                  round_at: Callable[[float], int] | None = None,
                  clock: Callable[[], float] = time.time,
                  accept_slack_seconds: float = ACCEPT_SLACK_SECONDS,
-                 gpu_lock: asyncio.Lock | None = None) -> None:
+                 gpu_lock: asyncio.Lock | None = None,
+                 on_verdict: Callable[[str, dict], None] | None = None,
+                 remote=None) -> None:
         self._job_id = job_id
+        # A `RemoteAuditDispatcher`: used while an executor is connected.
+        self._remote = remote
+        # Per executor, the passes written from its scores: re-audited here if
+        # it is ever quarantined.
+        self._remote_scored: dict[str, list[str]] = {}
+        if remote is not None and callable(getattr(remote, "subscribe", None)):
+            remote.subscribe(self.reaudit_executor)
+        # Told of every verdict that stands, for the job's in-memory status.
+        self._on_verdict = on_verdict
         # Shared by every job's auditor on one loaded model: one forward pass
         # at a time, and asyncio.Lock wakes waiters FIFO so no job starves.
         self._gpu_lock = gpu_lock if gpu_lock is not None else contextlib.nullcontext()
@@ -168,13 +181,13 @@ class CorpusAuditor:
         times = [self._meta[sid][1] for sid in pending if sid in self._meta]
         return self._clock() - min(times) if times else None
 
-    def _judge_many(self, records: list[dict]) -> list[dict]:
-        """Judge several records at once: every completion of every record that
-        needs the GPU is packed, sorted by length, into shared forward passes."""
+    def _prepare(self, records: list[dict]) -> tuple[list[dict | None], list[tuple]]:
+        """The records failed before any forward pass, and every completion the
+        rest need scored as ``(record, completion, tokens, prompt_len, proofs)``."""
         worst_zero = _WORST_ZERO
         results: list[dict | None] = [None] * len(records)
-        prompts: list[list[int] | None] = [None] * len(records)
         vocabulary = self._model.get_input_embeddings().num_embeddings
+        items = []
         for i, record in enumerate(records):
             if not record["completions"]:
                 # Fail closed like sequence_verdict does for an empty chunk sequence:
@@ -192,57 +205,21 @@ class CorpusAuditor:
             if out_of_vocab:
                 results[i] = {"passed": False, "reason": REASON_TOKEN_OUT_OF_VOCAB, **worst_zero}
                 continue
-            prompts[i] = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
+            prompt = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
+            for c_idx, completion in enumerate(record["completions"]):
+                items.append((i, c_idx, prompt + list(completion["tokens"]), len(prompt),
+                              completion["proofs"]))
+        return results, items
 
-        # Every remaining completion, from every record, packed shortest first so
-        # padding waste stays low, into sub-batches under the token budget.
-        queue = sorted(
-            (len(prompts[i]) + len(completion["tokens"]), i, c_idx)
-            for i, record in enumerate(records)
-            if results[i] is None
-            for c_idx, completion in enumerate(record["completions"])
-        )
-        sub_batches: list[list[tuple[int, int]]] = []
-        current: list[tuple[int, int]] = []
-        current_width = 0
-        for length, i, c_idx in queue:
-            width = max(current_width, length)
-            if current and (len(current) + 1) * width > AUDIT_BATCH_TOKENS:
-                sub_batches.append(current)
-                current, width = [], length
-            current.append((i, c_idx))
-            current_width = width
-        if current:
-            sub_batches.append(current)
-
-        outcomes = {}
-        forward_seconds = verify_seconds = 0.0
-        for sub_batch in sub_batches:
-            sequences = [
-                (prompts[i] + list(records[i]["completions"][c_idx]["tokens"]), len(prompts[i]))
-                for i, c_idx in sub_batch
-            ]
-            mark = time.perf_counter()
-            hidden_states = batch_completion_hidden_states(self._model, sequences)
-            if hidden_states and hidden_states[0].is_cuda:
-                # Kernels are queued asynchronously: without this the forward's
-                # time would be billed to the first verification that reads it.
-                torch.cuda.synchronize(hidden_states[0].device)
-            forward_seconds += time.perf_counter() - mark
-            mark = time.perf_counter()
-            for (i, c_idx), hidden in zip(sub_batch, hidden_states):
-                completion = records[i]["completions"][c_idx]
-                outcomes[i, c_idx] = audit_completion(hidden, completion["proofs"], self._proof)
-            verify_seconds += time.perf_counter() - mark
-            # Drop this sub-batch's padded activations before the next one is
-            # computed: two final-hidden-state tensors must never be live at once.
-            del hidden_states, sequences, hidden
-
+    def _aggregate(self, records: list[dict], results: list[dict | None],
+                   outcomes: dict) -> list[dict]:
+        """One verdict body per record: the first failing completion's reason and
+        the worst chunk measures over all of them."""
         for i, record in enumerate(records):
             if results[i] is not None:
                 continue
             passed, reason = True, None
-            worst = dict(worst_zero)
+            worst = dict(_WORST_ZERO)
             for c_idx in range(len(record["completions"])):
                 outcome = outcomes[i, c_idx]
                 for result in outcome.results:
@@ -252,7 +229,21 @@ class CorpusAuditor:
                 if not outcome.passed and passed:
                     passed, reason = False, outcome.reason
             results[i] = {"passed": passed, "reason": reason, **worst}
-        self._log_batch(records, queue, forward_seconds, verify_seconds)
+        return results
+
+    def _judge_many(self, records: list[dict]) -> list[dict]:
+        """Judge several records at once: every completion of every record that
+        needs the GPU is packed, sorted by length, into shared forward passes."""
+        results, items = self._prepare(records)
+        scores, forward_seconds, verify_seconds = score_sequences(
+            self._model, [(tokens, n, proofs) for _, _, tokens, n, proofs in items],
+            chunk_tokens=self._proof.chunk_tokens, topk=self._proof.topk,
+            batch_tokens=AUDIT_BATCH_TOKENS)
+        outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
+                    for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
+        self._aggregate(records, results, outcomes)
+        self._log_batch(records, [(len(t), i, c) for i, c, t, _, _ in items],
+                        forward_seconds, verify_seconds)
         return results
 
     def _log_batch(self, records: list[dict], queue: list, forward: float,
@@ -314,15 +305,31 @@ class CorpusAuditor:
         del arrivals[:bisect.bisect_left(arrivals, now - self._params.hold_seconds)]
         return bisect.bisect_right(arrivals, now)
 
-    async def _forward(self, records: list[dict]) -> list[dict]:
+    async def _forward(self, records: list[dict], *, local: bool = False) -> list[dict]:
+        if not local and self._remote is not None and self._remote.connected():
+            # An executor computes the chunk scores; the decision stays here.
+            results, items = await asyncio.to_thread(self._prepare, records)
+            scores = await self._remote.score(
+                [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
+                 for _, _, tokens, n, proofs in items])
+            outcomes, scored_by = {}, {}
+            for (i, c_idx, *_), (status, chunks, executor) in zip(items, scores):
+                outcomes[i, c_idx] = outcome_from_scores(status, chunks, self._proof)
+                if executor is not None:
+                    scored_by.setdefault(i, set()).add(executor)
+            judged = self._aggregate(records, results, outcomes)
+            for i, executors in scored_by.items():
+                judged[i] = {**judged[i], "scored_by": sorted(executors)}
+            return judged
         async with self._gpu_lock:
             return await asyncio.to_thread(self._judge_many, records)
 
-    async def _audit_outcomes(self, records: list[dict]) -> list[dict | str]:
+    async def _audit_outcomes(self, records: list[dict], *,
+                              local: bool = False) -> list[dict | str]:
         """One outcome per record; a string is a validator-side error message."""
         batch_failed, batch_error = False, ""
         try:
-            judged: list = await self._forward(records)
+            judged: list = await self._forward(records, local=local)
         except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as exc:
             # Record only the message here, then leave the block: `exc` and its
             # traceback pin every frame that was live when the batch failed
@@ -345,7 +352,7 @@ class CorpusAuditor:
             judged = []
             for record in records:
                 try:
-                    judged.append((await self._forward([record]))[0])
+                    judged.append((await self._forward([record], local=local))[0])
                 except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as solo_exc:
                     # A message, not the exception object: so this record's
                     # traceback (and whatever activations it pins) cannot
@@ -374,10 +381,20 @@ class CorpusAuditor:
             written = await self._records.write_verdict(self._job_id, submission_id, verdict)
         if written:
             self._mark_judged(submission_id)
+            self._report(submission_id, verdict)
             return verdict, True
         standing = await self._records.read_verdict(self._job_id, submission_id)
         self._mark_judged(submission_id)
+        self._report(submission_id, standing)
         return standing, False
+
+    def _report(self, submission_id: str, verdict: dict | None) -> None:
+        if self._on_verdict is None or verdict is None:
+            return
+        try:
+            self._on_verdict(submission_id, verdict)
+        except Exception:
+            logger.exception("corpus verdict report for %s failed", submission_id[:12])
 
     async def _state(self, hotkey: str, now: float) -> MinerState:
         if self._miner_states is None:
@@ -417,7 +434,8 @@ class CorpusAuditor:
         for k, outcome in enumerate(outcomes):
             if isinstance(outcome, dict) and not outcome["passed"]:
                 # §7.2: only a failure that a second, separate audit repeats counts.
-                outcomes[k] = (await self._audit_outcomes([records[k]]))[0]
+                # Always on this GPU: an executor alone can never fail a miner.
+                outcomes[k] = (await self._audit_outcomes([records[k]], local=True))[0]
 
         for submission_id, outcome in zip(ids, outcomes):
             if isinstance(outcome, dict):
@@ -438,21 +456,12 @@ class CorpusAuditor:
                 failures.setdefault(records[k]["hotkey"], []).append(ids[k])
         failed_hotkeys = set(failures)
         states: dict[str, MinerState] = {}
-        if failures and self._miner_states is not None:
+        if failures:
             # Escalate before the verdicts exist: a crash in between then
             # re-audits the records, and the retry counts nothing twice
             # (idempotent by submission id), instead of leaving a caught
-            # cheater unsuspected while its held records are paid. One write
-            # for the whole batch: miners.json is one key, rate-limited.
-            def escalate(sids: list[str]) -> Callable[[MinerState], MinerState]:
-                def change(m: MinerState) -> MinerState:
-                    for sid in sids:
-                        m = after_confirmed_failure(m, self._params, now, sid)
-                    return m
-                return change
-
-            states.update(await self._miner_states.update_many(
-                {hotkey: escalate(sids) for hotkey, sids in failures.items()}))
+            # cheater unsuspected while its held records are paid.
+            states.update(await self._escalate(failures, now))
 
         # Failures first: a ban they cause must void this batch's passes of that hotkey.
         passes: dict[str, list[float]] = {}
@@ -472,6 +481,8 @@ class CorpusAuditor:
             # (stale queue entry, restart) must never count twice.
             if written and outcome["passed"] and outcome["audited"]:
                 passes.setdefault(hotkey, []).append((submission_id, outcome["worst_mant_mean"]))
+                for executor_id in outcome.get("scored_by", ()):
+                    self._remote_scored.setdefault(executor_id, []).append(submission_id)
 
         def count(batch: list[tuple[str, float]]) -> Callable[[MinerState], MinerState]:
             def change(m: MinerState) -> MinerState:
@@ -491,6 +502,67 @@ class CorpusAuditor:
             await self._miner_states.update_many(
                 {hotkey: count(batch) for hotkey, batch in chunk.items()})
         return results, failed_hotkeys
+
+    async def _escalate(self, failures: dict[str, list[str]],
+                        now: float) -> dict[str, MinerState]:
+        """Each hotkey's confirmed failures, in one write (miners.json is one key)."""
+        if self._miner_states is None:
+            return {}
+
+        def escalate(sids: list[str]) -> Callable[[MinerState], MinerState]:
+            def change(m: MinerState) -> MinerState:
+                for sid in sids:
+                    m = after_confirmed_failure(m, self._params, now, sid)
+                return m
+            return change
+
+        return await self._miner_states.update_many(
+            {hotkey: escalate(sids) for hotkey, sids in failures.items()})
+
+    async def reaudit_executor(self, executor_id: str) -> list[str]:
+        """Re-audit on this GPU every pass written from a quarantined executor's
+        scores that is unsettled or settled inside the hold window. A failure
+        (confirmed by a second audit, as §7.2 asks) is charged to its miner as
+        any failed audit is, and its submission is voided so it is not paid."""
+        sids = self._remote_scored.pop(executor_id, [])
+        if not sids:
+            return []
+        now = self._clock()
+        state, _ = await self._records.read_settlement(self._job_id) \
+            if callable(getattr(self._records, "read_settlement", None)) else ({}, None)
+        settled = set((state or {}).get("settled") or ())
+        chosen = []
+        for sid in dict.fromkeys(sids):
+            if sid in settled:
+                verdict = await self._records.read_verdict(self._job_id, sid)
+                audited_at = float((verdict or {}).get("audited_at") or 0.0)
+                if now - audited_at > self._params.hold_seconds:
+                    continue
+            chosen.append(sid)
+        records = await self._read_all(chosen)
+        ids = [sid for sid in chosen if sid in records]
+        failed: dict[str, dict] = {}
+        for sid, outcome in zip(ids, await self._audit_outcomes(
+                [records[sid] for sid in ids], local=True)):
+            if isinstance(outcome, dict) and not outcome["passed"]:
+                again = (await self._audit_outcomes([records[sid]], local=True))[0]
+                if isinstance(again, dict) and not again["passed"]:
+                    failed[sid] = again
+        if failed:
+            by_hotkey: dict[str, list[str]] = {}
+            for sid in failed:
+                by_hotkey.setdefault(records[sid]["hotkey"], []).append(sid)
+            await self._escalate(by_hotkey, now)
+            writer = getattr(self._records, "write_voided", None)
+            for sid, outcome in failed.items():
+                if writer is not None:
+                    await writer(self._job_id, sid, {
+                        "schema": VOIDED_SCHEMA, "submission_id": sid,
+                        "hotkey": records[sid]["hotkey"], "executor_id": executor_id,
+                        "reason": "executor_quarantined", "voided_at": now, **outcome})
+        logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
+                       "%s; %d failed", self._job_id, len(ids), executor_id, len(failed))
+        return sorted(failed)
 
     async def _randomness_for(self, round_number: int) -> str | None:
         """The drand randomness of a round, lowercased, or None (fetch error,

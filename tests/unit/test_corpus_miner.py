@@ -535,3 +535,30 @@ def test_a_job_id_against_a_single_job_validator_says_to_drop_it(read):
     with pytest.raises(CorpusJobSelectionError) as caught:
         getattr(client, read)()
     assert "single job" in str(caught.value) and "--job-id" in str(caught.value)
+
+
+def test_a_retired_job_is_a_410_job_retired_not_a_permanent_failure():
+    from reliquary.miner.corpus_miner import CorpusJobRetired, issue_corpus_request
+
+    with pytest.raises(CorpusJobRetired):
+        issue_corpus_request(lambda: _response(410, b'{"detail": "job_retired"}'))
+
+
+def test_a_retired_job_ends_the_miner_cleanly_with_one_log_line(caplog):
+    import logging
+
+    from reliquary.miner.corpus_miner import CorpusJobRetired
+
+    class _RetiringClient(_Client):
+        def submit(self, body):
+            self.submitted.append(body)
+            raise CorpusJobRetired("410 from the validator")
+
+    client = _RetiringClient([])
+    sleeps = []
+    with caplog.at_level(logging.INFO, logger="reliquary.miner.corpus_miner"):
+        counts = mine_steps(job=_job(), hotkey="5Hot", client=client, generator=_Generator(),
+                            tokenizer=_Tokenizer(), render=lambda i: f"q{i}",
+                            sign=lambda b: "sig", max_steps=10, sleep=sleeps.append)
+    assert counts["job_retired"] == 1 and len(client.submitted) == 1 and sleeps == []
+    assert len([r for r in caplog.records if "retired" in r.getMessage()]) == 1

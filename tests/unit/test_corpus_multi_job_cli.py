@@ -241,3 +241,27 @@ def test_tasks_contract_refuses_contracts_that_cannot_share_a_process(registry):
                                       "--task-id", "corpus-code"])
     assert result.exit_code == 1
     assert "proofs" in result.output
+
+
+def test_the_job_set_is_hot_only_when_the_operator_opts_in(monkeypatch, registry):  # noqa: F811
+    registry["entries"] = _entries()
+    monkeypatch.delenv("RELIQUARY_CORPUS_HOT_JOBS", raising=False)
+    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"])
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert calls[0]["read_registry"] is None
+
+    monkeypatch.setenv("RELIQUARY_CORPUS_HOT_JOBS", "1")
+    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"])
+    assert result.exit_code == 0, (result.output, result.exception)
+    import asyncio
+
+    assert set(asyncio.run(calls[0]["read_registry"]())) == set(registry["entries"])
+
+
+def test_a_bad_recheck_fraction_exits_four_with_the_critical_line(monkeypatch, registry):  # noqa: F811
+    registry["entries"] = _entries()
+    monkeypatch.setenv("RELIQUARY_CORPUS_REMOTE_AUDIT", "1")
+    monkeypatch.setenv("RELIQUARY_CORPUS_RECHECK_FRACTION", "0")
+    result, calls = _boot(monkeypatch, registry, ["corpus-math", "corpus-code"])
+    assert result.exit_code == 4, (result.output, result.exception)
+    assert calls == []

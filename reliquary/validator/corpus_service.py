@@ -18,6 +18,8 @@ reversible step.
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -1634,6 +1636,16 @@ def build_corpus_router(
         except LedgerSnapshotError as exc:
             raise _ledger_corrupt(exc) from exc
 
+    async def ledger_state(job: JobSpec | None = None) -> tuple[JobSpec | None, LedgerState | None]:
+        """The manifest (read unless given) and the ledgers as the reads see
+        them, for the status route."""
+        if job is None:
+            job = await _read_job_checked()
+        if job is None:
+            return None, None
+        return job, await _read_state(job)
+
+    router.ledger_state = ledger_state
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
     router.corpus_job = corpus_job
@@ -1645,28 +1657,95 @@ def build_corpus_router(
     return router
 
 
-def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
+class CorpusJobRoutes:
+    """The jobs one app serves, changeable while it serves: a hot-added job's
+    router joins, a retired job stops admitting and later leaves.
+
+    ``default`` is the job the legacy paths answer for: the first one wired
+    at boot, kept for the life of the process.
+    """
+
+    def __init__(self, routers: Mapping[str, APIRouter] | None = None, *,
+                 default: str | None = None) -> None:
+        self.routers: dict[str, APIRouter] = dict(routers or {})
+        self.contracts: dict[str, Any] = {}
+        self.retired: set[str] = set()
+        # Admissions (submit, skip) past the retired check and not yet returned:
+        # a job is unwired only once none is left.
+        self.in_flight: collections.Counter = collections.Counter()
+        self.default = default if default is not None else next(iter(self.routers), None)
+
+    def add(self, job_id: str, router: APIRouter, *, contract: Any = None) -> None:
+        self.routers[job_id] = router
+        self.contracts[job_id] = contract
+        self.retired.discard(job_id)
+        if self.default is None:
+            self.default = job_id
+
+    def retire(self, job_id: str) -> None:
+        self.retired.add(job_id)
+
+    def remove(self, job_id: str) -> None:
+        # Stays in `retired`: its miners keep hearing 410, not an unknown job.
+        self.retired.add(job_id)
+        self.routers.pop(job_id, None)
+        self.contracts.pop(job_id, None)
+
+    def open_jobs(self) -> list[str]:
+        return sorted(j for j in self.routers if j not in self.retired)
+
+    @contextlib.asynccontextmanager
+    async def admission(self, job_id: str):
+        """The job's router for one write, refused once retired, counted while it runs."""
+        if job_id in self.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        router = self.routers.get(job_id)
+        if router is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        self.in_flight[job_id] += 1
+        try:
+            yield router
+        finally:
+            self.in_flight[job_id] -= 1
+
+
+JOB_RETIRED = "job_retired"
+SUBMIT_SCOPED_PATH = "/corpus/jobs/{job_id}/submit"
+
+
+def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes, *,
+                             legacy: bool | None = None) -> APIRouter:
     """The job-scoped reads over one ``build_corpus_router`` per served job.
 
-    With several jobs it also owns the legacy paths: submit dispatches on the
-    request's ``job_id``, and the legacy reads answer for the FIRST job in
-    ``routers`` (the operator's order: the job live miners already mine, so
-    adding a job never halts them). With one job those stay on that job's own
-    router, unchanged.
+    With several jobs (or ``legacy=True``) it also owns the legacy paths:
+    submit dispatches on the request's ``job_id``, and the legacy reads answer
+    for the default job (the FIRST in ``routers``: the job live miners already
+    mine, so adding a job never halts them). ``routers`` may be a
+    ``CorpusJobRoutes`` the caller keeps changing; a retired job's next, skip
+    and submit answer 410 ``job_retired``.
     """
-    served = sorted(routers)
-    default = routers[next(iter(routers))]
+    routes = routers if isinstance(routers, CorpusJobRoutes) else CorpusJobRoutes(routers)
+    if legacy is None:
+        legacy = len(routes.routers) > 1
     router = APIRouter()
 
     def _served(job_id: str) -> APIRouter:
-        try:
-            return routers[job_id]
-        except KeyError:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served") from None
+        served = routes.routers.get(job_id)
+        if served is not None:
+            return served
+        if job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        raise HTTPException(status_code=404, detail="corpus_job_not_served")
+
+    def _admitting(job_id: str) -> APIRouter:
+        # Before any store is touched: a retired job admits nothing more.
+        if job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        return _served(job_id)
 
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
-        return {"jobs": served}
+        return {"jobs": routes.open_jobs()}
 
     @router.get(JOB_SCOPED_PATH)
     async def corpus_job_scoped(job_id: str) -> dict:
@@ -1678,50 +1757,67 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
 
     @router.get(NEXT_SCOPED_PATH)
     async def corpus_next_scoped(job_id: str, hotkey: str) -> dict:
-        return await _served(job_id).corpus_next(hotkey)
+        return await _admitting(job_id).corpus_next(hotkey)
 
     @router.post(SKIP_SCOPED_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_scoped(job_id: str, request: CorpusSkipRequest) -> CorpusSkipResponse:
         # The path picks the job's router; that router still refuses a body
         # naming another job, so the two can never disagree silently.
-        return await _served(job_id).skip_corpus(request)
+        async with routes.admission(job_id) as served:
+            return await served.skip_corpus(request)
 
-    if len(routers) == 1:
+    @router.post(SUBMIT_SCOPED_PATH, response_model=CorpusSubmissionResponse)
+    async def submit_corpus_scoped(
+        job_id: str, request: CorpusSubmissionRequest
+    ) -> CorpusSubmissionResponse:
+        async with routes.admission(job_id) as served:
+            return await served.submit_corpus(request)
+
+    if not legacy:
         return router
+
+    def _default() -> str:
+        if routes.default is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        return routes.default
 
     @router.get(JOB_PATH)
     async def corpus_job_legacy() -> dict:
-        return await default.corpus_job()
+        return await _served(_default()).corpus_job()
 
     @router.get(CURSOR_PATH)
     async def corpus_cursor_legacy(hotkey: str) -> dict:
-        return await default.corpus_cursor(hotkey)
+        return await _served(_default()).corpus_cursor(hotkey)
 
     @router.get(NEXT_PATH)
     async def corpus_next_legacy(hotkey: str) -> dict:
-        return await default.corpus_next(hotkey)
+        return await _admitting(_default()).corpus_next(hotkey)
 
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_legacy(request: CorpusSkipRequest) -> CorpusSkipResponse:
         # Dispatched on the body, as submit is.
-        target = routers.get(request.job_id)
-        if target is None:
+        if request.job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if request.job_id not in routes.routers:
             return _refuse_skip(
                 CorpusRejectReason.JOB_NOT_SERVED,
-                {"job_id": request.job_id, "serves": served},
+                {"job_id": request.job_id, "serves": routes.open_jobs()},
             )
-        return await target.skip_corpus(request)
+        async with routes.admission(request.job_id) as target:
+            return await target.skip_corpus(request)
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(request: CorpusSubmissionRequest) -> CorpusSubmissionResponse:
         # As a single job's route does: refused before any store is touched.
-        target = routers.get(request.job_id)
-        if target is None:
+        if request.job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if request.job_id not in routes.routers:
             return _refuse(
                 CorpusRejectReason.JOB_NOT_SERVED,
-                {"job_id": request.job_id, "serves": served},
+                {"job_id": request.job_id, "serves": routes.open_jobs()},
             )
-        return await target.submit_corpus(request)
+        async with routes.admission(request.job_id) as target:
+            return await target.submit_corpus(request)
 
     return router
 
@@ -1729,7 +1825,9 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter]) -> APIRouter:
 __all__ = [
     "CURSOR_PATH",
     "CURSOR_SCOPED_PATH",
+    "CorpusJobRoutes",
     "CorpusPromptSourceError",
+    "JOB_RETIRED",
     "CorpusSignatureUnavailable",
     "EnvironmentPromptJob",
     "JOBS_PATH",
@@ -1750,6 +1848,7 @@ __all__ = [
     "SEAL_THRESHOLD",
     "SEGMENT_MAX",
     "SUBMIT_PATH",
+    "SUBMIT_SCOPED_PATH",
     "SeenIndex",
     "SeenView",
     "SegmentRef",
