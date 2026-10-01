@@ -7,6 +7,7 @@ is new. A problem is ``(c, n)``: ``c`` correct of ``n`` graded samples.
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Sequence
 
@@ -66,15 +67,19 @@ def bootstrap_mean_ci(values: Sequence[float], *, seed: int,
     Seeded, so the same values always give the same interval."""
     if not values:
         raise ValueError("no values to bootstrap")
-    n = len(values)
     rng = random.Random(seed)
-    means = sorted(sum(values[rng.randrange(n)] for _ in range(n)) / n
-                   for _ in range(resamples))
+    means = sorted(_resampled_mean(values, rng) for _ in range(resamples))
     tail = (1.0 - level) / 2.0
-    low = means[min(resamples - 1, int(tail * resamples))]
-    high = means[min(resamples - 1, int((1.0 - tail) * resamples))]
-    return low, high
 
+    def nearest_rank(q: float) -> float:
+        return means[min(resamples - 1, max(0, math.ceil(round(q * resamples, 9)) - 1))]
+
+    return nearest_rank(tail), nearest_rank(1.0 - tail)
+
+
+def _resampled_mean(values: Sequence[float], rng: random.Random) -> float:
+    n = len(values)
+    return sum(values[rng.randrange(n)] for _ in range(n)) / n
 
 __all__ = [
     "BOOTSTRAP_RESAMPLES",

@@ -102,3 +102,22 @@ def test_bootstrap_is_deterministic_and_brackets_the_mean():
     assert bootstrap_mean_ci([0.5], seed=1) == (0.5, 0.5)
     with pytest.raises(ValueError):
         bootstrap_mean_ci([], seed=1)
+
+
+def test_bootstrap_takes_the_nearest_rank_percentiles(monkeypatch):
+    # With R resamples the q-th percentile is the ceil(q*R)-th smallest mean.
+    from reliquary.eval import metrics
+
+    means = iter(range(2000))
+
+    class Rng:
+        def __init__(self, seed):
+            pass
+
+        def randrange(self, n):
+            return 0
+
+    monkeypatch.setattr(metrics.random, "Random", Rng)
+    monkeypatch.setattr(metrics, "_resampled_mean", lambda values, rng: next(means))
+    low, high = metrics.bootstrap_mean_ci([0.0, 1.0], seed=1, resamples=2000)
+    assert (low, high) == (49, 1949)
