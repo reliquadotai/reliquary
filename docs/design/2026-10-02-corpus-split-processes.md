@@ -121,6 +121,9 @@ children every second; a child that exits is restarted alone after a backoff
 child (SIGTERM, 20 s grace, SIGKILL). Each child asks the kernel for SIGKILL on
 the supervisor's death (`PR_SET_PDEATHSIG`), so no orphan survives a crashed
 supervisor; Docker's restart policy then restarts the container as today.
+Judges and the GPU process run at nice +5 (`RELIQUARY_CORPUS_SPLIT_NICE`): on
+a saturated host the front is served first. Within one process the auditors
+prepare and score one at a time (the in-process GPU lock, kept).
 
 Refused with the split, for now: `set_weights` (prod runs `--no-set-weights`;
 the RL validator's setter pays every task) and `RELIQUARY_CORPUS_REMOTE_AUDIT`
@@ -229,11 +232,15 @@ process, unchanged.
   inside the front (their forward still goes to the GPU process: one model
   copy). Default when unset: `*`.
 
-Step 1 (math only):
-`RELIQUARY_CORPUS_SPLIT_JUDGES=math-omi-qwen38-27b-v1` - math in its own
-process; code, IF and logic judged in the front as today (low volume).
-Variant if the front still shows judge contention:
-`math-omi-qwen38-27b-v1;code-qwen38-27b-v1,if-qwen38-27b-v1,logic-qwen38-27b-v1`.
+Step 1 (math only out of the front's judging), recommended form:
+`RELIQUARY_CORPUS_SPLIT_JUDGES=math-omi-qwen38-27b-v1;code-qwen38-27b-v1,if-qwen38-27b-v1,logic-qwen38-27b-v1`
+- math in its own process, the three others together in a second one: the
+front judges nothing. Measured (section 8) at the no-judge baseline.
+
+Allowed but not recommended: `RELIQUARY_CORPUS_SPLIT_JUDGES=math-omi-qwen38-27b-v1`
+(code, IF and logic judged inside the front, as today). Their catch-up then
+degrades the front exactly as today's single process does (p99 1.58 s vs
+1.56 s single, 0.70 s grouped).
 
 Step 2: `RELIQUARY_CORPUS_SPLIT_JUDGES=*`.
 
@@ -258,7 +265,7 @@ docker run -d --name corpus-validator --restart unless-stopped \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS=32768 \
   -e RELIQUARY_CORPUS_SPLIT=1 \
-  -e RELIQUARY_CORPUS_SPLIT_JUDGES=math-omi-qwen38-27b-v1 \
+  -e 'RELIQUARY_CORPUS_SPLIT_JUDGES=math-omi-qwen38-27b-v1;code-qwen38-27b-v1,if-qwen38-27b-v1,logic-qwen38-27b-v1' \
   -v /opt/corpus-prod:/work -v /workspace/hf:/hf \
   -w /work --entrypoint /opt/reliquary-venv/bin/reliquary \
   <image> \
@@ -290,6 +297,38 @@ Costs: each child imports torch (~0.5 GB RSS; front + GPU + up to 4 judges
 
 Measured numbers are in section 8.
 
-## 8. Measurements
+## 8. Measurements (2026-10-02, 8 vCPU shared VPS)
 
-(filled in from the harness runs; see the branch report)
+Harness: real processes, on-disk bucket (reads 50-100 ms, puts 100-200 ms,
+list pages 100 ms), realistic math records (16-32k tokens, 0.5-1 MB), proof
+check spending the real `verify_chunk_proofs` CPU, forward at 4.86k tok/s.
+Four jobs: math 20,000 behind with a 300k-id settlement, three others 1,500
+behind each; miners submit 16-32k token records at 2/s for 180 s.
+
+| layout | submit p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| no judge work (baseline, 30 s) | 0.43 | - | 0.62 | 0.63 |
+| single process (today) | 0.66 | 1.18 | 1.56 | 1.93 |
+| split, math alone + 3 jobs in the front | 0.47 | 1.05 | 1.58 | 1.92 |
+| split, math alone + 3 jobs in one judge | 0.45 | 0.57 | 0.70 | 0.75 |
+
+The harness underestimates the in-process cost (no botocore/aiohttp/TLS CPU
+per store call, which prod pays on the route's loop), so prod's degradation
+was larger (p50 4 s -> 50-65 s waves); the split removes the judge from the
+front either way.
+
+Drain (virtual time, `corpus_judge_sim`, reads 50-100 ms, create-only PUTs
+1.2-1.8 s, 64 connections, prod arrivals 6.9k/h on top, q 0.15, hold 4320 s):
+
+- 80k pending up to 10 h old, 10k-token mean records (what a 17 %-busy GPU at
+  ~2k verdicts/h implies): pending reaches the floor that can never drain
+  (arrivals inside hold + slack, ~9.1k) after ~27 h; GPU 84 % busy; ~9.6k
+  verdicts/h vs 1.7-2k/h on main before #298.
+- 24k-token mean records (the 16-32k range): drawn audits alone need 1.42
+  GPU-hours per hour of arrivals (1,035 drawn/h x 4.9 s): no judge layout
+  drains that on one card at 4.86k tok/s; the backlog grows. Every drawn
+  sibling inside a hold is audited before an undrawn record is paid, so the
+  drain is GPU-bound by design.
+- Seeding after a restart reads every pending record once (~130 records/s
+  of 0.75 MB here): 80k is ~10 min before the first pass, and peak memory is
+  SEED_SLICE_IDS (2048) decoded records, ~2.7 GB at 24k tokens per judge.
