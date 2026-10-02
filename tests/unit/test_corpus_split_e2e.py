@@ -169,6 +169,23 @@ def _audited_passes(root, job):
     return count
 
 
+def _counts_caught_up(root, jobs) -> bool:
+    """miners.json counts every audited pass written so far. A pass is counted
+    one store round trip after its verdict lands, so a reader that stops the
+    processes the moment the verdicts are there can cut that write: the
+    single process loses the same count when it is stopped there. Waited for
+    while the judging processes still run (exact there); a count that never
+    catches up is a real inconsistency and fails the wait. Stopping the
+    supervisor afterwards is itself a kill: a pass still writing then may
+    lose its count, so after the stop only "never above" is checked."""
+    for job in jobs:
+        counted = _passes_counted(root, job)
+        audited = _audited_passes(root, job)
+        if {hk: counted.get(hk, 0) for hk in audited} != dict(audited):
+            return False
+    return True
+
+
 def _invariants(root, *, killed=()):
     """Nothing judged or paid twice, however often a process was killed.
 
@@ -229,8 +246,9 @@ def test_a_gpu_process_that_dies_makes_audits_wait_never_fail(bucket):
         _wait(lambda: _settled_all(root, MATH) and _settled_all(root, CODE), 60, "settlements")
         # Waiting is not failing: no auditor halted, no child but the GPU restarted.
         assert sup.children["judge-0"].starts == 1 and sup.children["front"].starts == 1
+        _wait(lambda: _counts_caught_up(root, (MATH, CODE)), 60, "every pass counted")
     assert _audited(root) > 100 and _audited(root, CODE) > 100
-    _invariants(root)
+    _invariants(root, killed=(MATH, CODE))   # the final stop kills both
 
 
 def test_a_front_that_dies_leaves_the_judges_judging(bucket):
@@ -252,9 +270,10 @@ def test_a_front_that_dies_leaves_the_judges_judging(bucket):
               "every old record judged")
         _wait(lambda: _settled_all(root, MATH), 60, "a settlement")
         assert sup.children["judge-0"].starts == 1
+        _wait(lambda: _counts_caught_up(root, (MATH,)), 60, "every pass counted")
     # The judge listed the store for its first front and for the new one.
     assert log.read_text().count("corpus feed: front epoch") >= 2
-    _invariants(root, killed=(CODE,))   # code is judged in the front
+    _invariants(root, killed=(MATH, CODE))   # code's front was killed; the stop kills all
 
 
 def test_a_judge_killed_mid_pass_resumes_from_the_bucket(bucket):
@@ -269,5 +288,6 @@ def test_a_judge_killed_mid_pass_resumes_from_the_bucket(bucket):
         _wait(lambda: _verdicts(root) >= 1200, 300, "every old math record judged")
         _wait(lambda: _settled_all(root, MATH), 60, "a settlement")
         assert sup.children["front"].starts == 1 and sup.children["gpu"].starts == 1
+        _wait(lambda: _counts_caught_up(root, (CODE,)), 60, "every pass counted")
     assert killed_at < 1200
-    _invariants(root, killed=(MATH,))
+    _invariants(root, killed=(MATH, CODE))   # the math judge was killed; the stop kills all
