@@ -68,3 +68,30 @@ def test_tasks_answers_503_when_the_registry_cannot_be_read(seeded_job):  # noqa
 
     client.app.state.task_registry_reader = broken
     assert client.get("/corpus/tasks").status_code == 503
+
+
+def test_an_expired_cache_answers_at_once_and_refreshes_behind(seeded_job, monkeypatch):  # noqa: F811
+    import asyncio
+
+    import reliquary.validator.corpus_validator as cv
+    from tests.unit.test_corpus_route_skip import _app
+
+    client = _app(seeded_job, ("swe-v1",))
+    gate = asyncio.Event()
+    calls = []
+
+    async def slow_read():
+        calls.append(1)
+        if len(calls) > 1:
+            await gate.wait()  # the refresh never finishes inside this request
+        return _registry(), "etag"
+
+    client.app.state.task_registry_reader = slow_read
+    first = client.get("/corpus/tasks").json()
+    monkeypatch.setattr(cv, "TASKS_CACHE_SECONDS", 0.0)
+    # Stale: served immediately from the last read while a refresh runs behind.
+    second = client.get("/corpus/tasks")
+    assert second.status_code == 200
+    assert second.json()["tasks"] == first["tasks"]
+    assert second.json()["as_of"] == first["as_of"]
+    assert len(calls) == 2
