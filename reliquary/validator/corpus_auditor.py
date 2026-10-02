@@ -63,6 +63,8 @@ WRITE_CONCURRENCY = 32
 DRAND_CONCURRENCY = 16
 # Records read at once when a restart seeds the hold window's arrivals.
 SEED_SLICE_IDS = 2048
+# Metadata (tail) reads in flight at once while seeding: a few KB each.
+SEED_META_CONCURRENCY = 64
 # `run()` judges at most this many due ids per pass, the earliest due first.
 RUN_BATCH_IDS = 512
 # Records one pass audits at most (its own and its siblings'), and their
@@ -429,18 +431,46 @@ class CorpusAuditor:
             self._unreadable.add(submission_id)
             return None
         self._unreadable.discard(submission_id)
-        if submission_id not in self._meta:
-            received = record.get("received_at")
-            # An older record carries no arrival time: its hold counts from when
-            # we first saw it, never as already over.
-            received_at = float(received) if received is not None else self._clock()
-            self._meta[submission_id] = (
-                record["hotkey"], received_at, int(record["token_count"]),
-            )
-            bisect.insort(self._arrivals.setdefault(record["hotkey"], []), received_at)
-            if submission_id not in self._judged:
-                self._unjudged.setdefault(record["hotkey"], set()).add(submission_id)
+        self._remember(submission_id, record)
         return record
+
+    def _remember(self, submission_id: str, meta) -> None:
+        """A record's (hotkey, arrival, size), from the record or its metadata."""
+        if submission_id in self._meta:
+            return
+        received = meta.get("received_at")
+        # An older record carries no arrival time: its hold counts from when
+        # we first saw it, never as already over.
+        received_at = float(received) if received is not None else self._clock()
+        self._meta[submission_id] = (meta["hotkey"], received_at, int(meta["token_count"]))
+        bisect.insort(self._arrivals.setdefault(meta["hotkey"], []), received_at)
+        if submission_id not in self._judged:
+            self._unjudged.setdefault(meta["hotkey"], set()).add(submission_id)
+
+    async def _read_meta_all(self, submission_ids, reader) -> None:
+        """Each id's metadata (``reader``: the store's tail read),
+        SEED_META_CONCURRENCY at a time; a failed one is unreadable, as a
+        failed record read is."""
+        gate = asyncio.Semaphore(SEED_META_CONCURRENCY)
+
+        async def one(submission_id):
+            async with gate:
+                try:
+                    meta = await reader(self._job_id, submission_id)
+                except Exception:
+                    logger.exception("corpus metadata read of %s failed; leaving it pending",
+                                     submission_id[:12])
+                    self._unreadable.add(submission_id)
+                    return
+            if meta is None:
+                logger.error("corpus submission %s has no record", submission_id[:12])
+                self._unreadable.add(submission_id)
+                return
+            self._unreadable.discard(submission_id)
+            self._remember(submission_id, meta)
+
+        with self._timed("read"):
+            await asyncio.gather(*(one(sid) for sid in dict.fromkeys(submission_ids)))
 
     async def _read_all(self, submission_ids) -> dict[str, dict]:
         """_read for many ids, READ_CONCURRENCY at a time; the readable ones."""
@@ -1179,8 +1209,23 @@ class CorpusAuditor:
         slices: only the arrival times are kept, so 50k records read after a
         restart are never all in memory at once."""
         unread = [sid for sid in pending if sid not in self._meta]
+        reader = getattr(self._records, "read_submission_meta", None)
+        started = time.monotonic()
         for i in range(0, len(unread), SEED_SLICE_IDS):
-            await self._read_all(unread[i:i + SEED_SLICE_IDS])
+            if reader is not None:
+                # The tail of each record (hotkey, arrival, size), never the
+                # whole: a restart on 122k records read 12-24 GB before (2026-10-02).
+                await self._read_meta_all(unread[i:i + SEED_SLICE_IDS], reader)
+            else:
+                await self._read_all(unread[i:i + SEED_SLICE_IDS])
+            if (i // SEED_SLICE_IDS) % 10 == 9:
+                logger.info("corpus job %s: seeded %d/%d pending record(s) in %.0f s",
+                            self._job_id, min(i + SEED_SLICE_IDS, len(unread)), len(unread),
+                            time.monotonic() - started)
+        if unread:
+            logger.info("corpus job %s: seeded %d pending record(s) in %.0f s (%s)", self._job_id,
+                        len(unread), time.monotonic() - started,
+                        "metadata" if reader is not None else "whole records")
         self._seeded = True
 
     async def _start(self) -> None:

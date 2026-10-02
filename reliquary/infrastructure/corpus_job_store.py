@@ -198,14 +198,16 @@ def _decode(body: bytes) -> Any:
 
 
 async def _get(
-    key: str, *, pool: _ClientPool | None = None, **client_kwargs
+    key: str, *, pool: _ClientPool | None = None, byte_range: str | None = None,
+    **client_kwargs,
 ) -> tuple[bytes | None, str | None]:
     from botocore.exceptions import ClientError
 
     bucket = _bucket(client_kwargs)
+    ranged = {"Range": byte_range} if byte_range else {}
     async with _client(pool, client_kwargs) as client:
         try:
-            response = await client.get_object(Bucket=bucket, Key=key)
+            response = await client.get_object(Bucket=bucket, Key=key, **ranged)
         except ClientError as exc:
             if _error_code(exc) in _ABSENT_CODES:
                 return None, None
