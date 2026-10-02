@@ -127,7 +127,13 @@ class CorpusSettler:
             async with gate:
                 return sid, await self._records.read_verdict(self._job_id, sid)
 
-        read = dict(await asyncio.gather(*(one(sid) for sid in ids if sid not in self._fed)))
+        # Every read finishes before an error is raised: none outlives the call.
+        pairs = await asyncio.gather(*(one(sid) for sid in ids if sid not in self._fed),
+                                     return_exceptions=True)
+        for pair in pairs:
+            if isinstance(pair, BaseException):
+                raise pair
+        read = dict(pairs)
         return [self._fed[sid] if sid in self._fed else read[sid] for sid in ids]
 
     def set_cap(self, cap: float) -> None:

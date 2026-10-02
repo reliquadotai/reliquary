@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # How long `/corpus/tasks` serves one registry read.
 TASKS_CACHE_SECONDS = 60.0
-# Store connections shared by every job's auditor and settler (32 writes a job).
+# Store connections shared by every job's auditor and settler (32 writes, 16 reads a job).
 JUDGE_POOL_CONNECTIONS = 64
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -448,6 +448,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     )
     from reliquary.shared.modeling import load_text_only_model, load_tokenizer
     from reliquary.validator.corpus_auditor import CorpusAuditor
+    from reliquary.validator.corpus_miner_states import MinerStates
     from reliquary.validator.corpus_hot_jobs import (
         JOB_REFRESH_SECONDS, CorpusJobSet, hot_job_refusal, job_drained, order_entry_screen,
     )
@@ -576,8 +577,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     ).to("cuda").eval()
     proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
     records = BucketRecordStore()
-    # The auditors' and settlers' own connections: their reads and writes in
-    # flight (up to 32 a job) never queue the route's behind botocore's 10.
+    # The auditors' and settlers' own connections (miners.json included): their
+    # reads and writes in flight (up to 32 a job) never queue the route's behind
+    # botocore's 10. The route's ban check keeps the route's client.
     judge_records = BucketRecordStore(max_pool_connections=JUDGE_POOL_CONNECTIONS)
     # One model, one forward pass at a time across every job; one job needs
     # none, unless more may join it.
@@ -634,7 +636,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                   full_list_every_seconds=SETTLE_FULL_LIST_SECONDS)
         w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                                   tokenizer=tokenizer, proof=proof, params=params,
-                                  miner_states=miner_states, beacon=beacon, round_at=round_at,
+                                  miner_states=MinerStates(judge_records, w.job.job_id),
+                                  beacon=beacon, round_at=round_at,
                                   gpu_lock=gpu_lock,
                                   on_verdict=settler_fed(w.settler, on_verdict),
                                   remote=remote, on_voided=w.miners.voided)
