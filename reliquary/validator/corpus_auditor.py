@@ -135,6 +135,8 @@ class CorpusAuditor:
         self._wake: asyncio.Event | None = None
         # Set by a pass for the ids it leaves pending: when to judge them again.
         self._next_due: dict[str, float] = {}
+        # Write errors of the current judge_many, raised after its backward audit.
+        self._deferred: list[BaseException] = []
         # Pending ids whose draw is known and undrawn: as a sibling they can
         # neither be audited nor be undecidable, so a pass need not decide them.
         self._undrawn: set[str] = set()
@@ -491,7 +493,8 @@ class CorpusAuditor:
         self._report(submission_id, standing)
         return standing, False
 
-    # Verdict writes of one pass in flight at once; 1 writes them in order.
+    # Verdict writes of this auditor in flight at once, over every concurrent
+    # `_write_all`; 1 writes them one at a time.
     write_concurrency = WRITE_CONCURRENCY
 
     async def _write_all(self, items: list[tuple[str, dict]]) -> list:
@@ -500,7 +503,11 @@ class CorpusAuditor:
         is tried, so one store error does not leave the others unwritten."""
         if not items:
             return []
-        gate = asyncio.Semaphore(max(1, self.write_concurrency))
+        # One gate per auditor (and event loop), shared by overlapping calls.
+        key = (asyncio.get_running_loop(), self.write_concurrency)
+        if getattr(self, "_write_gate", (None, None))[0] != key:
+            self._write_gate = (key, asyncio.Semaphore(max(1, self.write_concurrency)))
+        gate = self._write_gate[1]
 
         async def one(submission_id, verdict):
             async with gate:
@@ -579,7 +586,8 @@ class CorpusAuditor:
         return results
 
     async def _audit_records(self, ids: list[str], records: list[dict],
-                             draws: dict[str, dict]) -> tuple[list[dict | None], set[str]]:
+                             draws: dict[str, dict], *,
+                             deferred: list | None = None) -> tuple[list[dict | None], set[str]]:
         """Audit, re-audit each failure alone, write the verdicts and move each
         hotkey's state. Returns the verdicts and the hotkeys with a confirmed failure."""
         outcomes = await self._audit_outcomes(records)
@@ -663,7 +671,10 @@ class CorpusAuditor:
             await self._miner_states.update_many(
                 {hotkey: count(batch) for hotkey, batch in chunk.items()})
         # Counted first: a write that failed leaves its record pending, the rest stand.
-        self._raise_first(landed)
+        if deferred is not None:
+            deferred.extend(r for r in landed if isinstance(r, BaseException))
+        else:
+            self._raise_first(landed)
         return results, failed_hotkeys
 
     async def _escalate(self, failures: dict[str, list[str]],
@@ -902,7 +913,9 @@ class CorpusAuditor:
         errored: set[str] = set()
         pairs: list[tuple[str, dict]] = []
         if audit_ids:
-            records = [read.get(sid) or await self._read(sid) for sid in audit_ids]
+            # Known records (seeded, siblings) are not in `read`: fetched together.
+            read.update(await self._read_all([sid for sid in audit_ids if sid not in read]))
+            records = [read.get(sid) for sid in audit_ids]
             pairs = [(sid, r) for sid, r in zip(audit_ids, records) if r is not None]
             errored = {self._meta[sid][0] for sid, r in zip(audit_ids, records) if r is None}
         # Nothing the audit does reads the store: what is unreadable is known now.
@@ -940,7 +953,8 @@ class CorpusAuditor:
             if pairs:
                 with self._timed("audit"):
                     results, failed = await self._audit_records(
-                        [sid for sid, _ in pairs], [r for _, r in pairs], draws)
+                        [sid for sid, _ in pairs], [r for _, r in pairs], draws,
+                        deferred=self._deferred)
                 errored |= {r["hotkey"] for (_, r), result in zip(pairs, results) if result is None}
         finally:
             landed = await alongside
@@ -949,7 +963,8 @@ class CorpusAuditor:
             (sid, verdict) for sid, verdict in late
             # A failed hotkey is suspect now: the backward audit decides its records.
             if verdict["hotkey"] not in failed and verdict["hotkey"] not in errored])
-        self._raise_first(landed)
+        # Raised by judge_many once the backward audit of `failed` has run.
+        self._deferred.extend(r for r in landed if isinstance(r, BaseException))
         return failed
 
     async def judge_many(self, submission_ids: list[str]) -> None:
@@ -957,6 +972,7 @@ class CorpusAuditor:
         void it for a ban; then audit backwards after every confirmed failure."""
         start = time.monotonic()
         self._next_due.clear()
+        self._deferred = []
         try:
             failed = await self._judge_once(list(submission_ids))
             # At q = 1 every held record is already being audited on arrival.
@@ -967,6 +983,9 @@ class CorpusAuditor:
                 await self._read_all([sid for sid in pending if sid not in self._meta])
                 held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed]
                 failed = await self._judge_once(held)
+            # A write that failed leaves its record pending; raised only now, so
+            # it never kept a caught hotkey's held records from their audit.
+            self._raise_first(self._deferred)
         finally:
             # decide includes drand; audit includes gpu_wait, forward and the writes of
             # audited verdicts; drand sums its concurrent fetches, the others are wall time.
