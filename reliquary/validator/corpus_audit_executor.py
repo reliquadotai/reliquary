@@ -113,10 +113,9 @@ class AuditExecutor:
             logger.exception("audit executor could not score lease %s", lease.lease_id[:8])
             return [{"status": ITEM_ERROR, "chunks": [], "detail": str(exc)[:500]}
                     for _ in lease.items]
-        return [{"status": status,
-                 "chunks": [[r.exp_mismatches, float(r.mant_err_mean), float(r.mant_err_median)]
-                            for r in results]}
-                for status, results in scores]
+        from reliquary.validator.corpus_gpu import scores_to_wire
+
+        return [{"status": status, "chunks": chunks} for status, chunks in scores_to_wire(scores)]
 
     async def step(self) -> bool:
         """One claim; True when a lease was scored and posted."""
