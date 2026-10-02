@@ -23,7 +23,6 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -279,13 +278,24 @@ def _free_cuda() -> None:
 
 
 async def serve_unix(app, path: str | Path) -> None:
-    """``app`` on the unix socket ``path`` (a stale one is removed first)."""
+    """``app`` on the unix socket ``path`` (a stale one is removed first).
+
+    Signals are left to the process (``corpus_split.child_main``): an
+    internal server has nothing to drain, and its owner must not keep running
+    after the server alone shut down."""
+    import contextlib
+
     import uvicorn
+
+    class _Server(uvicorn.Server):
+        @contextlib.contextmanager
+        def capture_signals(self):
+            yield
 
     path = Path(path)
     path.unlink(missing_ok=True)
-    server = uvicorn.Server(uvicorn.Config(app, uds=str(path), log_level="warning", ws="none",
-                                           timeout_keep_alive=600))
+    server = _Server(uvicorn.Config(app, uds=str(path), log_level="warning", ws="none",
+                                    timeout_keep_alive=600))
     await server.serve()
 
 

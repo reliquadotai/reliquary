@@ -138,6 +138,12 @@ def _set_parent_death_signal() -> None:
         logger.debug("PR_SET_PDEATHSIG unavailable", exc_info=True)
 
 
+def _exit_now(signum, frame) -> None:
+    logging.getLogger(__name__).info("corpus split: signal %d, exiting", signum)
+    logging.shutdown()
+    os._exit(0)
+
+
 def _call(path: str) -> None:
     module, _, name = path.partition(":")
     getattr(importlib.import_module(module), name)()
@@ -193,6 +199,11 @@ def child_main(role: str, index: int, spec: SplitSpec) -> None:
         # Never a CUDA context outside the GPU process.
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     _set_parent_death_signal()
+    # SIGTERM ends the child at once: what it was doing is safe to cut (create-only
+    # verdicts, CAS ledgers and settlement). The front's HTTP server takes the
+    # signal first, drains in-flight submissions, then re-raises it here.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _exit_now)
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s | {name} | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
