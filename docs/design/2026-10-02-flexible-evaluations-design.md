@@ -189,3 +189,32 @@ samples, sampling, budget, thinking) and says which.
 - CLI: `eval create` against the admin app in process (httpx ASGI transport): request,
   poll, create, idempotent second run; `eval grade` writes the three files; `eval
   compare` refuses differing conditions.
+
+## Rulings taken while implementing
+
+- **Verifiers rows are scored in a spawned child process.** Packaged rewards are written
+  for the `eval` CLI's main thread: math-verify (AIME, MMLU-Pro) times its parse out with
+  `signal.alarm` and, on any other thread, refuses — the reward then reads 0 for a right
+  answer, silently. Grading runs off the event loop, so each row goes to a child scorer
+  (`ChildScorer`, one worker per grading, `spawn`), which also keeps a taskset's code out
+  of the admin process. An injected `open_taskset` (tests) scores in process.
+- **The external environment's manifest is a statement.** `EnvironmentProfile` requires a
+  manifest sha256 beside the contract id; with no package to hash, the sha256 covers a
+  canonical four-line statement of what the environment is (`EXTERNAL_EVAL_MANIFEST`).
+- **A catalog source must be single-turn** to build a set; an `episode` source is refused
+  at build until multi-turn sets exist.
+- **Set ids.** Catalog `<source>-<split>-r<start>-n<count>[-k<sample>-s<seed>]`; Verifiers
+  `verifiers-<id>[-a<args sha[:8]>]-r<start>-n<count>[...]`. Default job ids carry the
+  problems and samples (`<prefix>eval-<rev[:8]>-<set>-n<N>x<S>`), so two orders on one set
+  with different sizes are two jobs; past 63 characters the tail is a hash.
+- **Qualification completions** are lowered to fit the admin's
+  `completions × max_new_tokens ≤ 64 × 32768` (two at 1M tokens, 64 at 32k).
+- **`eval compare` pads with ties.** A problem neither grading has a row for failed on
+  both sides; it counts as a zero difference over the report's `n_problems`, as it counts
+  in each pass@1. The model may differ (that is the point); sampling, budget, thinking and
+  the sets (id, problems, samples) may not.
+- **`verifiers` is not a dependency of reliquary.** The admin host that builds and grades
+  Verifiers sets installs it with the tasksets
+  (`verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers@b2e4e815…`, packages
+  from `research-environments` at a pinned commit); miners, validators and executors never
+  need it. Its tests run when it is installed and are skipped otherwise.
