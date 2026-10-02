@@ -2217,6 +2217,39 @@ def _corpus_remote_audit_options() -> dict:
     return {"remote_audit": True, "recheck_fraction": fraction}
 
 
+async def _run_corpus(*, jobs, wallet, netuid, signer_client, http_host, http_port,
+                      set_weights) -> None:
+    """The corpus validator: one process, or with ``RELIQUARY_CORPUS_SPLIT=1``
+    a supervisor over front, judge and GPU processes
+    (``RELIQUARY_CORPUS_SPLIT_JUDGES`` says which jobs leave the front)."""
+    read_registry = _corpus_hot_registry_reader()
+    remote = _corpus_remote_audit_options()
+    if _env_flag("RELIQUARY_CORPUS_SPLIT"):
+        from reliquary.validator.corpus_split import run_corpus_split
+
+        await run_corpus_split(
+            served=jobs, netuid=netuid, http_host=http_host, http_port=http_port,
+            set_weights=set_weights, hot=read_registry is not None,
+            remote_audit=bool(remote.get("remote_audit")),
+        )
+        return
+    from reliquary.validator.corpus_validator import run_corpus_validator
+
+    if len(jobs) == 1:
+        (entry, cap), = jobs
+        await run_corpus_validator(
+            entry=entry, cap=cap, wallet=wallet, netuid=netuid, signer_client=signer_client,
+            http_host=http_host, http_port=http_port, set_weights=set_weights,
+            read_registry=read_registry, **remote,
+        )
+        return
+    await run_corpus_validator(
+        jobs=jobs, wallet=wallet, netuid=netuid, signer_client=signer_client,
+        http_host=http_host, http_port=http_port, set_weights=set_weights,
+        read_registry=read_registry, **remote,
+    )
+
+
 def _miner_requires_grader(env_names: list[str]) -> bool:
     # Miners never grade: opencode reward is validator-authoritative, so the
     # reference miner only generates rollouts. The gVisor grader runs on the
@@ -2843,15 +2876,12 @@ def validate(
                         exc,
                     )
                     raise typer.Exit(code=4) from exc
-                from reliquary.validator.corpus_validator import run_corpus_validator
-
                 try:
-                    await run_corpus_validator(
+                    await _run_corpus(
                         jobs=[(c.entry, c.emission_cap) for c in corpus_configs],
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
-                        set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
-                        **_corpus_remote_audit_options(),
+                        set_weights=set_weights,
                     )
                 except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
@@ -2915,15 +2945,12 @@ def validate(
                 # A corpus task runs one process on one card with no RL
                 # machinery at all: branch before any of it -- model load,
                 # proof plane, batching -- is even imported.
-                from reliquary.validator.corpus_validator import run_corpus_validator
-
                 try:
-                    await run_corpus_validator(
-                        entry=task_config.entry, wallet=wallet, netuid=netuid,
-                        signer_client=signer_client, http_host=http_host,
-                        http_port=http_port, cap=task_config.emission_cap,
-                        set_weights=set_weights, read_registry=_corpus_hot_registry_reader(),
-                        **_corpus_remote_audit_options(),
+                    await _run_corpus(
+                        jobs=[(task_config.entry, task_config.emission_cap)],
+                        wallet=wallet, netuid=netuid, signer_client=signer_client,
+                        http_host=http_host, http_port=http_port,
+                        set_weights=set_weights,
                     )
                 except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)

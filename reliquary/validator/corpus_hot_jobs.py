@@ -118,6 +118,35 @@ async def job_drained(*, auditor, records, job_id: str) -> bool:
     return state.get("pending") is None and verdicts <= set(state.get("settled") or ())
 
 
+class JudgedStats:
+    """A job's ``JobStats`` when its judge runs in another process: the
+    unsettled counts as the judge reported them, acceptances counted here."""
+
+    def __init__(self, local, unsettled) -> None:
+        self._local = local
+        self._unsettled = tuple(int(x) for x in unsettled)
+
+    def unsettled(self) -> tuple[int, int, int]:
+        return self._unsettled
+
+    def accepted_last_hour(self) -> int:
+        return self._local.accepted_last_hour()
+
+
+class JudgedBook:
+    """A ``MinerBook``'s answers for one hotkey, as its judge process sent them."""
+
+    def __init__(self, judged: Mapping[str, Any]) -> None:
+        self._judged = judged
+        self.thresholds = judged.get("thresholds")
+
+    def counts(self, hotkey: str) -> dict:
+        return dict(self._judged["counts"])
+
+    def share(self, hotkey: str) -> dict:
+        return dict(self._judged["share"])
+
+
 class CorpusJobSet:
     """The wired jobs, their background tasks, and the refresh that changes them.
 
@@ -376,9 +405,19 @@ class CorpusJobSet:
         wiring = self.served[job_id]
         # The wired manifest: one ledger GET per recompute, no manifest read.
         job, state = await self._routes.routers[job_id].ledger_state(wiring.job)
+        stats = wiring.stats
+        settled = getattr(wiring.settler, "settled_count", 0)
+        totals = getattr(wiring.settler, "totals", None)
+        link = getattr(wiring, "judge_link", None)
+        if link is not None:
+            # Judged in another process: its counts come from there.
+            judged = await link.stats(job_id)
+            if judged is None:
+                raise RuntimeError(f"the judge of {job_id} does not serve it")
+            stats = JudgedStats(wiring.stats, judged["unsettled"])
+            settled, totals = judged["settled_count"], judged["totals"]
         return job_status(job_id=job_id, job=job or wiring.job, slots=state.slots,
-                          stats=wiring.stats, settled=getattr(wiring.settler, "settled_count", 0),
-                          totals=getattr(wiring.settler, "totals", None),
+                          stats=stats, settled=settled, totals=totals,
                           retired=self.is_retired(job_id), drained=drained)
 
     async def status(self, job_id: str) -> dict | None:
@@ -432,17 +471,26 @@ class CorpusJobSet:
         )
 
         wiring = self.served.get(job_id)
+        link = getattr(wiring, "judge_link", None)
         book = getattr(wiring, "miners", None)
-        if book is None:
+        if book is None and link is None:
             return None
         now = self._clock()
         cached = self._miner_cache.get((job_id, hotkey))
         if cached is not None and now - cached[0] < MINER_STATUS_CACHE_SECONDS:
             return cached[1]
-        book.start_backfill()
+        if link is not None:
+            # Judged in another process: the book and the pending count are there.
+            judged = await link.miner(job_id, hotkey)
+            if judged is None:
+                raise RuntimeError(f"the judge of {job_id} does not serve it")
+            book, pending = JudgedBook(judged), int(judged["pending"])
+        else:
+            book.start_backfill()
+            pending = wiring.auditor.pending_count(hotkey)
         state, _ = await wiring.miner_states.state_at_most(hotkey, MINER_STATUS_CACHE_SECONDS)
         status = miner_status(job_id=job_id, hotkey=hotkey, book=book,
-                              pending=wiring.auditor.pending_count(hotkey), state=state,
+                              pending=pending, state=state,
                               params=wiring.audit_params, cap=wiring.cap, now=now)
         self._miner_cache[(job_id, hotkey)] = (now, status)
         self._miner_cache.move_to_end((job_id, hotkey))
@@ -473,6 +521,8 @@ class CorpusJobSet:
 
 __all__ = [
     "CorpusJobSet",
+    "JudgedBook",
+    "JudgedStats",
     "JOB_REFRESH_SECONDS",
     "OTHER_MODEL",
     "REFUSED",

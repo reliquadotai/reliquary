@@ -6,6 +6,10 @@ The hold is shortened to 10 minutes so a run stays short; the rate is not."""
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from reliquary.corpus.audit_policy import AuditParams
 from reliquary.validator import corpus_auditor
 from tests.unit import corpus_judge_sim as sim
@@ -49,3 +53,42 @@ def test_a_restart_backlog_drains_while_traffic_continues():
     final = result.pending_series[-1]
     assert final[2] <= FLOOR + MARGIN, result.pending_series
     assert result.pending_end <= PROD_RATE * (FLOOR + MARGIN) / 3600
+
+
+# -- the catch-up of 2026-10-02: tens of thousands of math records behind ------
+
+MATH_TOKENS = 10_000  # mean record: what a 17 %-busy GPU at ~2k verdicts/h implies
+
+
+def _catch_up(backlog, hours, *, tokens=MATH_TOKENS, seed=0):
+    params = AuditParams(q=0.15, probation_submissions=100, hold_seconds=4320.0,
+                         ban_after_failures=1000)
+    population = sim.Population.prod_like(seed=seed, probation=0)
+    population.tokens = tokens
+    return sim.simulate(
+        corpus_auditor, rate_per_hour=PROD_RATE, hours=hours, params=params, seed=seed,
+        population=population, store=_store(seed), start_backlog=backlog,
+        backlog_age=10 * 3600.0, sample_every=1800.0)
+
+
+def test_a_math_backlog_drains_as_fast_as_the_gpu_allows():
+    """20,000 records up to 10 h old, prod traffic on top: the judge keeps the
+    GPU busy and the backlog shrinks every half hour (it is GPU-bound: every
+    drawn sibling is audited before an undrawn record is paid)."""
+    result = _catch_up(20_000, hours=6.0)
+    # What can never drain: the arrivals still inside their hold and slack.
+    floor = PROD_RATE * (4320.0 + 420.0) / 3600
+    assert result.pending_end <= 1.25 * floor, result.pending_series
+    assert result.gpu_busy > 0.8 * 6 * 3600, result.gpu_busy
+
+
+@pytest.mark.skipif(os.environ.get("RELIQUARY_CORPUS_SPLIT_LOAD_TEST") != "1",
+                    reason="80k catch-up (~5 min CPU): set RELIQUARY_CORPUS_SPLIT_LOAD_TEST=1")
+def test_the_80k_math_backlog_of_2026_10_02_drains():
+    """Measured 2026-10-02: 80k pending -> the floor (arrivals inside hold +
+    slack, ~9k) in ~27 h of virtual time, the GPU 84 % busy, ~9.6k verdicts/h
+    (main before #298: 1.7-2k/h, GPU 17 %)."""
+    result = _catch_up(80_000, hours=30.0)
+    floor = PROD_RATE * (4320.0 + 420.0) / 3600
+    print("\n80k catch-up:", result.pending_series, result.gpu_busy / 3600)
+    assert result.pending_end <= floor * 1.25, result.pending_series
