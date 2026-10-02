@@ -234,6 +234,107 @@ def build_corpus_audit_wiring(*, entry, job, records):
     return params, miner_states, is_banned, drand_beacon, LazyRoundAt()
 
 
+def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof, model,
+                   tokenizer, gpu_lock=None, remote=None, scorer=None, vocab_size=None,
+                   arrivals_complete=None, auditor_kwargs=None) -> None:
+    """One job's auditor, settler and status books, on ``w`` (which carries
+    ``entry``, ``job``, ``cap`` and ``stats``): what judges and pays the job,
+    in whichever process runs it.
+
+    ``records`` is the route-side store (the ban check, the status books);
+    ``judge_records`` the judges' own (connections and codec threads).
+    ``scorer``/``vocab_size`` stand for ``model`` in a process that has none.
+    """
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+    from reliquary.validator.corpus_miner_states import MinerStates
+    from reliquary.validator.corpus_miner_status import (
+        MinerBook, feed, proof_thresholds, read_recent_windows,
+    )
+    from reliquary.validator.corpus_settlement import (
+        SETTLE_FULL_LIST_SECONDS, CorpusSettler, settler_fed,
+    )
+
+    params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
+        entry=w.entry, job=w.job, records=records
+    )
+    # The miner status route's view: in memory, fed by the same reports.
+    w.audit_params, w.miner_states = params, miner_states
+    w.miners = MinerBook(job_id=w.job.job_id, task_id=w.entry.task_id, records=records,
+                         read_windows=read_recent_windows,
+                         thresholds=proof_thresholds(proof))
+    on_verdict, on_settled = feed(w.stats, w.miners)
+    # `entry.cap` does not exist on `TaskEntry` (the cap lives in
+    # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
+    # Fed by the auditor: the store is listed only as the net.
+    w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
+                              records=judge_records, archives=archives,
+                              on_settled=on_settled,
+                              full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
+                              executor=judge_threads.codec)
+    w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
+                              tokenizer=tokenizer, proof=proof, params=params,
+                              miner_states=MinerStates(judge_records, w.job.job_id),
+                              beacon=beacon, round_at=round_at,
+                              gpu_lock=gpu_lock,
+                              on_verdict=settler_fed(w.settler, on_verdict),
+                              remote=remote, on_voided=w.miners.voided,
+                              threads=judge_threads, scorer=scorer, vocab_size=vocab_size,
+                              arrivals_complete=arrivals_complete,
+                              **(auditor_kwargs or {}))
+    w.settler.on_window = w.miners.window
+
+
+async def settle_forever(task_id: str, settler, every_seconds: float) -> None:
+    while True:
+        try:
+            window = await settler.settle_once()
+            if window is not None:
+                logger.info("corpus task %s settled window %d", task_id, window)
+        except Exception:
+            logger.exception("corpus settlement failed; retrying next period")
+        await asyncio.sleep(every_seconds)
+
+
+class JudgedElsewhere:
+    """The front's stand-ins for a job judged in another process: what the
+    job set calls on a wiring's auditor and settler."""
+
+    settled_count = None
+    totals = None
+
+    def __init__(self, records, job_id: str) -> None:
+        self._records, self._job_id = records, job_id
+
+    def set_cap(self, cap: float) -> None:
+        # The judge process reads the registry itself (`refresh_caps`).
+        return None
+
+    async def pending_ids(self) -> list[str]:
+        """For the drain check: listed, as the auditor's own net does."""
+        submitted = await self._records.list_submission_ids(self._job_id)
+        judged = set(await self._records.list_verdict_ids(self._job_id))
+        return [sid for sid in submitted if sid not in judged]
+
+
+def wire_job_front_only(w, *, records, link) -> None:
+    """A job whose judge runs in another process: the front keeps its ban
+    check and miner states, and hands each accepted id to ``link``."""
+    params, miner_states, w.is_banned, _, _ = build_corpus_audit_wiring(
+        entry=w.entry, job=w.job, records=records
+    )
+    w.audit_params, w.miner_states = params, miner_states
+    w.judge_link = link
+    w.miners = None
+    w.auditor = w.settler = JudgedElsewhere(records, str(w.job.job_id))
+    job_id = str(w.job.job_id)
+
+    def on_accepted(submission_id: str) -> None:
+        w.stats.accepted()
+        link.accepted(job_id, submission_id)
+
+    w.on_accepted = on_accepted
+
+
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
                      auditor, proof_chunk_tokens, prompt_job_for=None,
                      vocab_size=None, is_banned=None, registration=None,
@@ -417,7 +518,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                registration_gate: bool = True, read_registry=None,
                                refresh_every_seconds: float | None = None,
                                remote_audit: bool = False,
-                               recheck_fraction: float | None = None) -> None:
+                               recheck_fraction: float | None = None,
+                               split=None, auditor_kwargs=None) -> None:
     """Serve one corpus task (``entry``, ``cap``) or several (``jobs``, a list
     of ``(entry, cap)``) from one process and one loaded model.
 
@@ -429,7 +531,18 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     With ``remote_audit`` the ``/corpus/internal/audit/...`` routes are mounted
     and connected executors score the audits; with none connected, this
     process's GPU audits as before.
+
+    With ``split`` (``corpus_split.FrontSplit``) this is the front of the split
+    validator: no model is loaded (the supervisor checked the checkpoint and
+    the GPU process scores), the jobs in ``split.links`` are judged in their
+    own processes and every other job here, scoring on the GPU process.
     """
+    if split is not None and remote_audit:
+        raise RuntimeError("remote audit executors are not served by the split validator; "
+                           "unset RELIQUARY_CORPUS_REMOTE_AUDIT or RELIQUARY_CORPUS_SPLIT")
+    if split is not None and set_weights:
+        raise RuntimeError("the split validator does not set weights; run it with "
+                           "--no-set-weights (the RL validator's setter pays every task)")
     import threading
     from pathlib import Path
 
@@ -447,21 +560,14 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         verify_corpus_skip_signature,
     )
     from reliquary.shared.modeling import load_text_only_model, load_tokenizer
-    from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_judge_threads import (
         JudgeThreads, judge_record_store, run_in,
     )
-    from reliquary.validator.corpus_miner_states import MinerStates
     from reliquary.validator.corpus_hot_jobs import (
         JOB_REFRESH_SECONDS, CorpusJobSet, hot_job_refusal, job_drained, order_entry_screen,
     )
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
-    from reliquary.validator.corpus_miner_status import (
-        MinerBook, feed, proof_thresholds, read_recent_windows,
-    )
-    from reliquary.validator.corpus_settlement import (
-        SETTLE_FULL_LIST_SECONDS, CorpusSettler, R2Archives, settler_fed,
-    )
+    from reliquary.validator.corpus_settlement import R2Archives
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
     from reliquary.eval.prompt_source import is_order_job_id
@@ -566,19 +672,33 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     # Every job names this one checkpoint (`multi_job_refusal`): load it once.
     first = wiring[0].job
-    directory = Path(snapshot_download(first.checkpoint_repo, revision=first.checkpoint_revision))
-    fingerprint = checkpoint_fingerprint(directory)
-    for w in wiring:
-        refusal = startup_refusal(w.entry, w.job, ACTIVE_PROTOCOL_PROFILE, fingerprint)
-        if refusal:
-            raise RuntimeError(refusal if len(wiring) == 1 else f"task {w.entry.task_id!r}: {refusal}")
+    if split is None:
+        directory = Path(snapshot_download(first.checkpoint_repo,
+                                           revision=first.checkpoint_revision))
+        fingerprint = checkpoint_fingerprint(directory)
+        for w in wiring:
+            refusal = startup_refusal(w.entry, w.job, ACTIVE_PROTOCOL_PROFILE, fingerprint)
+            if refusal:
+                raise RuntimeError(refusal if len(wiring) == 1
+                                   else f"task {w.entry.task_id!r}: {refusal}")
+    else:
+        # Checked by the supervisor before any child started.
+        directory, fingerprint = Path(split.directory), split.fingerprint
 
     tokenizer = load_tokenizer(str(directory))
     tokenizer_box["tokenizer"] = tokenizer
-    model = load_text_only_model(
-        str(directory), torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
-    ).to("cuda").eval()
-    proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+    scorer = None
+    if split is None:
+        model = load_text_only_model(
+            str(directory), torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
+        ).to("cuda").eval()
+        proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+        vocab_size = model.get_input_embeddings().num_embeddings
+    else:
+        from reliquary.validator.corpus_gpu import read_info
+
+        model, proof = None, split.proof
+        vocab_size = (await read_info(split.run_dir))["vocab_size"]
     records = BucketRecordStore()
     # The auditors' and settlers' own connections (miners.json included): their
     # reads and writes in flight (up to 32 a job) never queue the route's behind
@@ -591,7 +711,14 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     # One model, one forward pass at a time across every job; one job needs
     # none, unless more may join it.
     hot = read_registry is not None
-    gpu_lock = asyncio.Lock() if len(wiring) > 1 or hot or remote_audit else None
+    gpu_lock = (asyncio.Lock() if split is None and (len(wiring) > 1 or hot or remote_audit)
+                else None)
+    if split is not None:
+        from reliquary.validator.corpus_gpu import GPU_SOCKET, GpuScorer
+
+        # The GPU process orders every forward itself.
+        scorer = GpuScorer(Path(split.run_dir) / GPU_SOCKET, chunk_tokens=proof.chunk_tokens,
+                           topk=proof.topk, executor=judge_threads.codec)
     remote = directory = None
     if remote_audit:
         from reliquary.infrastructure import corpus_executor_store as executor_store
@@ -624,32 +751,15 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 
     def audit_and_settle(w) -> None:
-        params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
-            entry=w.entry, job=w.job, records=records
-        )
-        # The miner status route's view: in memory, fed by the same reports.
-        w.audit_params, w.miner_states = params, miner_states
-        w.miners = MinerBook(job_id=w.job.job_id, task_id=w.entry.task_id, records=records,
-                             read_windows=read_recent_windows,
-                             thresholds=proof_thresholds(proof))
-        on_verdict, on_settled = feed(w.stats, w.miners)
-        # `entry.cap` does not exist on `TaskEntry` (the cap lives in
-        # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
-        # Fed by the auditor: the store is listed only as the net.
-        w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
-                                  records=judge_records, archives=archives,
-                                  on_settled=on_settled,
-                                  full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-                                  executor=judge_threads.codec)
-        w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
-                                  tokenizer=tokenizer, proof=proof, params=params,
-                                  miner_states=MinerStates(judge_records, w.job.job_id),
-                                  beacon=beacon, round_at=round_at,
-                                  gpu_lock=gpu_lock,
-                                  on_verdict=settler_fed(w.settler, on_verdict),
-                                  remote=remote, on_voided=w.miners.voided,
-                                  threads=judge_threads)
-        w.settler.on_window = w.miners.window
+        link = split.links.get(str(w.job.job_id)) if split is not None else None
+        if link is not None:
+            wire_job_front_only(w, records=records, link=link)
+            return
+        wire_job_judge(w, records=records, judge_records=judge_records,
+                       judge_threads=judge_threads, archives=archives, proof=proof,
+                       model=model, tokenizer=tokenizer, gpu_lock=gpu_lock, remote=remote,
+                       scorer=scorer, vocab_size=vocab_size if split is not None else None,
+                       auditor_kwargs=auditor_kwargs)
 
     for w in wiring:
         audit_and_settle(w)
@@ -658,19 +768,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 verify_signature=verify_corpus_signature,
                                 verify_skip_signature=verify_corpus_skip_signature,
                                 proof_chunk_tokens=proof.chunk_tokens,
-                                vocab_size=model.get_input_embeddings().num_embeddings,
+                                vocab_size=vocab_size,
                                 registration=registered.reason if registered is not None else None,
                                 contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
-
-    async def settle_forever(task_id: str, settler) -> None:
-        while True:
-            try:
-                window = await settler.settle_once()
-                if window is not None:
-                    logger.info("corpus task %s settled window %d", task_id, window)
-            except Exception:
-                logger.exception("corpus settlement failed; retrying next period")
-            await asyncio.sleep(settle_every_seconds)
 
     async def wire_hot(task_entry, task_cap, job):
         # The renderer first: a job refused for it leaves its ledger untouched.
@@ -693,7 +793,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     job_set = CorpusJobSet(
         routes=app.state.corpus_routes, router_for=app.state.corpus_router_for,
         wire=wire_hot,
-        jobs_of=lambda w: [w.auditor.run(), settle_forever(w.entry.task_id, w.settler)],
+        jobs_of=lambda w: ([] if getattr(w, "judge_link", None) is not None else
+                           [w.auditor.run(),
+                            settle_forever(w.entry.task_id, w.settler, settle_every_seconds)]),
         read_entries=read_registry, read_job=read_job,
         screen=order_entry_screen,
         admit=lambda task_entry, job: hot_job_refusal(
@@ -717,6 +819,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         ).start()
 
     background = [registered.refresh_forever()] if registered is not None else []
+    if split is not None:
+        # One sender per judge process, whatever number of jobs it judges.
+        background += [link.run() for link in {id(k): k for k in split.links.values()}.values()]
     if remote is not None:
         from reliquary.validator.corpus_audit_remote import build_audit_executor_router
 
@@ -729,6 +834,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
 
 __all__ = [
+    "JudgedElsewhere",
     "LazyRoundAt",
     "build_corpus_app",
     "build_corpus_audit_wiring",
@@ -737,5 +843,8 @@ __all__ = [
     "make_round_at",
     "multi_job_refusal",
     "run_corpus_validator",
+    "settle_forever",
     "startup_refusal",
+    "wire_job_front_only",
+    "wire_job_judge",
 ]
