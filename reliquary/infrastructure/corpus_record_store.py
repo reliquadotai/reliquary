@@ -162,8 +162,11 @@ class BucketRecordStore:
 
     __slots__ = ("_kw",)
 
-    def __init__(self, **client_kwargs: Any) -> None:
+    def __init__(self, *, max_pool_connections: int | None = None, **client_kwargs: Any) -> None:
         credentials = {k: v for k, v in client_kwargs.items() if k != "bucket_name"}
+        if max_pool_connections:
+            # Its own connection pool, larger than botocore's 10.
+            credentials["max_pool_connections"] = max_pool_connections
         # One long-lived client for every call (see `_ClientPool`); resolved
         # at build time so a patched `get_s3_client` applies.
         pool = _ClientPool(lambda: get_s3_client(**credentials))

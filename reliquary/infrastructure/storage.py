@@ -109,6 +109,7 @@ def get_s3_client(
     access_key_id: str | None = None,
     secret_access_key: str | None = None,
     bucket_name: str | None = None,
+    max_pool_connections: int | None = None,
 ):
     """Create a fresh S3 client context for R2.
 
@@ -138,6 +139,8 @@ def get_s3_client(
         connect_timeout=15,
         read_timeout=30,
         retries={"max_attempts": 3, "mode": "standard"},
+        # botocore's default (10) unless a caller needs more calls in flight.
+        **({"max_pool_connections": max_pool_connections} if max_pool_connections else {}),
     )
     # Fresh session per call — see module docstring.
     return get_session().create_client(
