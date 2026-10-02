@@ -140,3 +140,35 @@ def test_qualification_prompts_from_set_rows():
     assert lease_prompt(SYSTEM_ROW) == {"problem_id": "s-000000", "text": "q0",
                                         "system": "be brief"}
     assert lease_prompt(USER_ROW) == {"problem_id": "s-000001", "text": "q1"}
+
+
+def test_a_system_row_passes_fidelity_and_a_dropped_system_turn_fails(tmp_path, monkeypatch):
+    """The miner renders what the validator expects; a miner leaving the system
+    turn out (an easier prompt) is refused."""
+    from dataclasses import replace
+
+    from reliquary.eval.sets import build_source_set
+    from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
+    from reliquary.validator.corpus_text import check_prompt_fidelity
+    from tests.unit.test_corpus_export import _job_spec
+    from tests.unit.test_eval_verifiers_source import FakeTask, fake_handle
+    from tests.unit.test_eval_verifiers_source import opener as taskset_opener
+
+    card = build_source_set("verifiers:fake", out=tmp_path / "vset", open_taskset=taskset_opener(
+        fake_handle([FakeTask(0, system="be brief"), FakeTask(1)])))
+    monkeypatch.setattr(ps, "_loaded", {})
+    monkeypatch.setattr(ps, "FETCHERS", [ps._from_directory])
+    monkeypatch.setenv(ps.SETS_DIR_ENV, str(tmp_path))
+    (tmp_path / card["set_id"]).symlink_to(tmp_path / "vset")
+    data = (tmp_path / "vset" / "prompts.jsonl").read_bytes()
+    source = ps.eval_source_for(card["set_id"], data, 2)
+    job = replace(_job_spec(job_id="order-eval-1", prompt_source=source.name, prompt_count=2),
+                  renderer_id="chat-template-thinking-v1")
+    tokenizer = Tokenizer()
+    renderer = renderer_for_job(job, None, tokenizer=tokenizer)
+    prompts = prompt_job_for_spec(job)
+    miner_text = renderer.initial_text(prompts.task_for(0))
+    assert miner_text == "<system>be brief<user>question 0<assistant>"
+    assert check_prompt_fidelity(miner_text, job=prompts, prompt_index=0, renderer=renderer).ok
+    easier = "<user>question 0<assistant>"
+    assert not check_prompt_fidelity(easier, job=prompts, prompt_index=0, renderer=renderer).ok

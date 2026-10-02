@@ -219,8 +219,17 @@ def compose_profile(
     unselected = sorted(set(overrides) - set(names))
     if unselected:
         raise ValueError(f"overrides name environments not selected: {', '.join(unselected)}")
+    from reliquary.protocol.external_eval import EXTERNAL_BODIES
+
     bodies = {}
     for name in sorted(names):
+        if name in EXTERNAL_BODIES:
+            # An external eval set's statement, not an installed package: there
+            # is no spec to check it against, and nothing to tune.
+            if overrides.get(name):
+                raise ValueError(f"environment {name!r} takes no overrides")
+            bodies[name] = EXTERNAL_BODIES[name]
+            continue
         if name not in catalog:
             raise ValueError(
                 f"environment {name!r} has no catalog entry; add and review one first"

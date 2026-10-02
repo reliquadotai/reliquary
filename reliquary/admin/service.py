@@ -395,6 +395,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
         from reliquary.eval.sets import validated_set_id
         from reliquary.eval.storage import subnet_key
+        from reliquary.protocol.external_eval import contract_environment_for
 
         if body.qualification_id is None:
             raise HTTPException(status_code=422, detail="qualification_id_required")
@@ -453,7 +454,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         return dict(
             model_revision=record["revision"], model_architecture=result["architecture"],
             checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
-            prompt_source=source.name, contract_environment=card["source"], seed=seed,
+            prompt_source=source.name, contract_environment=contract_environment_for(card),
+            seed=seed,
             toploc_thresholds=result["thresholds"], audit_params={"audit_q": 1.0},
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
             top_k=body.sampling.top_k,
