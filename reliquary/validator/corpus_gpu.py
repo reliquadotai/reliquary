@@ -14,11 +14,13 @@ record never fails another's. Transport is HTTP over a unix socket.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import collections
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -79,17 +81,40 @@ def scores_from_wire(wire: Sequence) -> list:
 
 
 def encode_request(rows: Sequence, *, chunk_tokens: int, topk: int) -> bytes:
-    return json.dumps({
-        "chunk_tokens": int(chunk_tokens), "topk": int(topk),
-        "items": [{"tokens": [int(t) for t in tokens], "prompt_len": int(n),
-                   "proofs": list(proofs)} for tokens, n, proofs in rows],
-    }, separators=(",", ":")).encode()
+    """A JSON header line, then every row's token ids as int32, then every
+    proof (base64 never holds a newline) joined by newlines. A pass's rows
+    are tens of megabytes as JSON, whose encode held the sender's GIL for
+    seconds; packed, they are a copy."""
+    items, proofs = [], []
+    tokens = array.array("i")
+    for row_tokens, prompt_len, row_proofs in rows:
+        tokens.extend(row_tokens)
+        proofs.extend(row_proofs)
+        items.append([len(row_tokens), int(prompt_len), len(row_proofs)])
+    header = json.dumps({"chunk_tokens": int(chunk_tokens), "topk": int(topk), "items": items,
+                         "token_bytes": len(tokens) * tokens.itemsize})
+    if sys.byteorder != "little":
+        tokens.byteswap()
+    return b"".join([header.encode(), b"\n", tokens.tobytes(), "\n".join(proofs).encode()])
 
 
 def decode_request(body: bytes) -> tuple[list, int, int]:
-    doc = json.loads(body)
-    rows = [(item["tokens"], int(item["prompt_len"]), item["proofs"]) for item in doc["items"]]
-    return rows, int(doc["chunk_tokens"]), int(doc["topk"])
+    end = body.index(b"\n")
+    header = json.loads(body[:end])
+    start = end + 1
+    tokens = array.array("i")
+    tokens.frombytes(body[start:start + header["token_bytes"]])
+    if sys.byteorder != "little":
+        tokens.byteswap()
+    flat = tokens.tolist()
+    text = body[start + header["token_bytes"]:]
+    proofs = text.decode().split("\n") if text else []
+    rows, at, proof_at = [], 0, 0
+    for n_tokens, prompt_len, n_proofs in header["items"]:
+        rows.append((flat[at:at + n_tokens], prompt_len, proofs[proof_at:proof_at + n_proofs]))
+        at += n_tokens
+        proof_at += n_proofs
+    return rows, int(header["chunk_tokens"]), int(header["topk"])
 
 
 @dataclass
@@ -383,7 +408,8 @@ class GpuScorer:
         while True:
             try:
                 response = await self._http().post(
-                    "/score", content=body, headers={"content-type": "application/json"})
+                    "/score", content=body,
+                    headers={"content-type": "application/octet-stream"})
             except httpx.TransportError as exc:
                 await self._reset()
                 why = repr(exc)

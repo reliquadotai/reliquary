@@ -35,8 +35,9 @@ def test_scores_cross_the_wire_unchanged():
 
 
 def test_a_request_round_trips():
-    rows = [([1, 2, 3], 1, ["a", "b"]), ([9] * 5, 2, [])]
+    rows = [([1, 2, 151645], 1, ["QUJD", "RA=="]), ([9] * 5, 2, []), ([2**31 - 1, 0], 1, ["x"])]
     assert decode_request(encode_request(rows, chunk_tokens=32, topk=128)) == (rows, 32, 128)
+    assert decode_request(encode_request([], chunk_tokens=32, topk=128)) == ([], 32, 128)
 
 
 def _rows(n, *, length=10, forged=False):
