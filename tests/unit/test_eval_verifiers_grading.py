@@ -31,7 +31,7 @@ def _line(problem_id, index, text):
                        "completion_tokens": 10, "finish_reason": "stop"}) + "\n"
 
 
-def _grade(tmp_path, card, lines, handle, problems):
+def _grade(tmp_path, card, lines, handle, problems, provenance=None):
     platform = tmp_path / "platform" / "evaluations" / "order-e1"
     platform.mkdir(parents=True, exist_ok=True)
     (platform / "completions-00000.jsonl").write_text("".join(lines))
@@ -44,7 +44,8 @@ def _grade(tmp_path, card, lines, handle, problems):
     manifest = asyncio.run(grade_evaluation(
         eval_id="order-e1", platform=LocalDirectorySink(tmp_path / "platform"),
         subnet=LocalDirectorySink(tmp_path / "subnet"), work_dir=tmp_path / "work",
-        clock=lambda: 5.0, provenance={"model": "org/m"}, set_ids=[card["set_id"]],
+        clock=lambda: 5.0, provenance=provenance or {"model": "org/m"},
+        set_ids=[card["set_id"]],
         completion_keys=["evaluations/order-e1/completions-00000.jsonl"],
         problems_per_set={card["set_id"]: problems}, samples_per_set={card["set_id"]: 2},
         open_environment=lambda s, sp: (_ for _ in ()).throw(AssertionError("catalog")),
@@ -113,3 +114,16 @@ def test_a_system_turn_is_part_of_the_checked_prompt(tmp_path):
     _, _, rows, _ = _grade(tmp_path, card, [_line(grading[0]["problem_id"], 0, "0")],
                            fake_handle(moved), 1)
     assert rows[0]["grader_detail"].startswith("source_drift")
+
+
+def test_with_thinking_on_a_completion_cut_before_closing_is_not_an_answer(tmp_path):
+    """The template opened the reasoning block in the prompt: a completion cut at
+    its budget carries no tag, and grading its reasoning would score a guess."""
+    tasks = [FakeTask(0)]
+    card, grading = _publish(tmp_path, tasks)
+    lines = [_line(grading[0]["problem_id"], 0, "0"),             # no tag at all: cut short
+             _line(grading[0]["problem_id"], 1, "hmm</think>0")]  # closed: an answer
+    _, _, rows, _ = _grade(tmp_path, card, lines, fake_handle(tasks), 1,
+                           provenance={"model": "org/m", "thinking": True})
+    assert [(r["score"], r["grader_detail"]) for r in rows] == [
+        (0.0, "format_failure"), (1.0, "")]

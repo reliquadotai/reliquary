@@ -282,6 +282,11 @@ def test_a_drifted_source_flags_rows_instead_of_scoring_them(tmp_path):
 def test_free_text_is_graded_after_the_reasoning():
     assert answer_text("text", "<think>plan</think>The answer.") == "The answer."
     assert answer_text("text", "<think>never closed") == ""
+    # Thinking on: the template opened the block in the prompt, so a completion
+    # cut at its budget has no tag at all and is reasoning, not an answer.
+    assert answer_text("text", "so it is 42. But wait", thinking=True) == ""
+    assert answer_text("text", "plan</think>42", thinking=True) == "42"
+    assert answer_text("text", "42", thinking=False) == "42"
     assert answer_text("json", "<think>x</think>y") == "<think>x</think>y"
     assert format_failed("text", "") and not format_failed("text", "ok")
     assert format_failed("boxed", "no box") and not format_failed("boxed", "\\boxed{3}")

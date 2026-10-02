@@ -142,14 +142,17 @@ def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None)
             raise SandboxUnavailable(str(exc)) from exc
 
 
-def answer_text(policy: str, completion: str) -> str:
+def answer_text(policy: str, completion: str, *, thinking: bool = False) -> str:
     """What a free-text grader reads: the part after the reasoning block. An
-    unterminated block is all reasoning, so nothing is left."""
+    unterminated block is all reasoning, so nothing is left. With thinking on,
+    the chat template opens the block in the prompt itself, so a completion cut
+    at its budget carries no tag at all: without a closing tag it is all
+    reasoning too, never an answer."""
     if policy != "text":
         return completion
     if "</think>" in completion:
         return completion.rsplit("</think>", 1)[1]
-    if "<think>" in completion:
+    if thinking or "<think>" in completion:
         return ""
     return completion
 
@@ -182,7 +185,9 @@ class _Graders:
 
     def __init__(self, open_environment: Callable[[str, str], Any],
                  scorer_for: Callable[[Any, Any], Callable[[dict, str], float]],
-                 open_taskset: Callable[[str, dict], Any] | None = None) -> None:
+                 open_taskset: Callable[[str, dict], Any] | None = None,
+                 thinking: bool = False) -> None:
+        self._thinking = thinking
         self._open = open_environment
         self._scorer_for = scorer_for
         self._open_taskset = open_taskset
@@ -209,7 +214,7 @@ class _Graders:
             return self._grade_verifiers(grading, completion, card or {})
         source, split = grading["source"], grading["split"]
         spec = self.spec(source)
-        answer = answer_text(spec.final_answer_policy, completion)
+        answer = answer_text(spec.final_answer_policy, completion, thinking=self._thinking)
         failed_format = format_failed(spec.final_answer_policy, answer)
         try:
             key = (source, split)
@@ -233,7 +238,7 @@ class _Graders:
         model considered, not what it answered."""
         from reliquary.eval import verifiers_source
 
-        answer = answer_text("text", completion)
+        answer = answer_text("text", completion, thinking=self._thinking)
         failed_format = format_failed("text", answer)
         taskset = card.get("taskset") or {}
         try:
@@ -513,7 +518,10 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     for set_id, (card, rows) in sets.items():
         for row in rows:
             selected[row["problem_id"]] = (set_id, card, row, int(samples_per_set[set_id]))
-    graders = _Graders(open_environment, scorer_for, open_taskset)
+    # The order's thinking mode, from the job (or the pod's provenance): it
+    # decides whether a completion with no closing tag holds an answer at all.
+    graders = _Graders(open_environment, scorer_for, open_taskset,
+                       thinking=bool(provenance.get("thinking")))
     per_problem: dict[str, list[dict]] = defaultdict(list)
     seen: set[tuple[str, int]] = set()
     counts: Counter = Counter()
