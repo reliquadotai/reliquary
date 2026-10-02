@@ -65,6 +65,13 @@ DRAND_CONCURRENCY = 16
 SEED_SLICE_IDS = 2048
 # `run()` judges at most this many due ids per pass, the earliest due first.
 RUN_BATCH_IDS = 512
+# Records one pass audits at most (its own and its siblings'), and their
+# tokens: one GPU call, then the pass's verdicts are written. What is over is
+# judged in the next passes. Unbounded, the first pass after a 110k restart
+# backlog audited every drawn sibling in one call and wrote nothing for an
+# hour (2026-10-02 20:05).
+PASS_AUDIT_ROWS = int(os.environ.get("RELIQUARY_CORPUS_PASS_AUDIT_ROWS", "512"))
+PASS_AUDIT_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_PASS_AUDIT_TOKENS", "2000000"))
 # How soon a record whose draw round is not out yet is judged again: one
 # quicknet period. Every arrival of those seconds then shares one pass.
 UNDECIDABLE_RETRY_SECONDS = 3.0
@@ -394,7 +401,7 @@ class CorpusAuditor:
         return results
 
     def _log_batch(self, records: list[dict], queue: list, forward: float,
-                   verify: float) -> None:
+                   verify: float, called: float | None = None) -> None:
         """One line per judged batch: what it held, how long its oldest record
         had waited, and the speed of the GPU forward and the proof check."""
         completion_tokens = sum(len(records[i]["completions"][c]["tokens"]) for _, i, c in queue)
@@ -402,9 +409,10 @@ class CorpusAuditor:
         wait = f"{self._clock() - min(arrivals):.1f}s" if arrivals else "-"
         busy = forward + verify
         logger.info(
-            "corpus audit batch: records=%d completions=%d completion_tokens=%d "
-            "oldest_wait=%s forward=%.3fs verify=%.3fs tokens_per_s=%.0f",
-            len(records), len(queue), completion_tokens, wait, forward, verify,
+            "corpus audit batch: job=%s records=%d completions=%d completion_tokens=%d "
+            "oldest_wait=%s call=%.1fs forward=%.3fs verify=%.3fs tokens_per_s=%.0f",
+            self._job_id, len(records), len(queue), completion_tokens, wait,
+            busy if called is None else called, forward, verify,
             completion_tokens / busy if busy > 0 else 0.0,
         )
 
@@ -488,14 +496,17 @@ class CorpusAuditor:
             results, items = await self._in("codec", self._prepare, records)
             forward = verify = 0.0
             scores: list = []
+            called = time.monotonic()
             if items:
                 with self._timed("forward"):
                     scores, forward, verify = await self._scorer(
                         [(tokens, n, proofs) for _, _, tokens, n, proofs in items])
+            called = time.monotonic() - called
         outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
                     for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
         self._aggregate(records, results, outcomes)
-        self._log_batch(records, [(len(t), i, c) for i, c, t, _, _ in items], forward, verify)
+        self._log_batch(records, [(len(t), i, c) for i, c, t, _, _ in items], forward, verify,
+                        called)
         return results
 
     async def _audit_outcomes(self, records: list[dict], *,
@@ -982,6 +993,15 @@ class CorpusAuditor:
                     elif choice == "undecidable":
                         undecided.setdefault(hotkey, []).append(self._meta[sid][1])
 
+        # The pass's budget: the oldest audits first, the rest in later passes.
+        # A hotkey with a deferred audit pays nothing unaudited this pass (the
+        # deferred one may be the drawn sibling that would catch it).
+        audit_ids, later = self._within_budget(audit_ids, set(submission_ids))
+        deferred_hotkeys = {self._meta[sid][0] for sid in later}
+        for sid in later:
+            self._next_due[sid] = now
+            self._schedule(sid, now)
+
         failed: set[str] = set()
         errored: set[str] = set()
         pairs: list[tuple[str, dict]] = []
@@ -1019,8 +1039,9 @@ class CorpusAuditor:
                 if covered is not None:
                     self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
-            if any(t <= received_at + self._params.hold_seconds
-                   for t in undecided.get(hotkey, ())):
+            if hotkey in deferred_hotkeys or any(
+                    t <= received_at + self._params.hold_seconds
+                    for t in undecided.get(hotkey, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
             verdict = (submission_id, self._verdict(
@@ -1055,6 +1076,27 @@ class CorpusAuditor:
         # Raised by judge_many once the backward audit of `failed` has run.
         self._deferred.extend(r for r in landed if isinstance(r, BaseException))
         return failed
+
+    def _within_budget(self, audit_ids: list[str], in_pass: set[str]) -> tuple[list[str], list[str]]:
+        """The audits this pass makes (oldest first, at least one) and those
+        over PASS_AUDIT_ROWS / PASS_AUDIT_TOKENS, left for the next passes."""
+        if not audit_ids:
+            return [], []
+        order = sorted(dict.fromkeys(audit_ids), key=lambda sid: (self._meta[sid][1], sid))
+        kept, tokens = [], 0
+        for sid in order:
+            size = int(self._meta[sid][2])
+            if kept and (len(kept) >= PASS_AUDIT_ROWS or tokens + size > PASS_AUDIT_TOKENS):
+                break
+            kept.append(sid)
+            tokens += size
+        later = order[len(kept):]
+        if later:
+            self._choices["audit_deferred"] += len(later)
+            logger.info("corpus job %s: pass audits %d record(s) (%d tokens); %d deferred to the "
+                        "next passes", self._job_id, len(kept), tokens, len(later))
+        keep = set(kept)
+        return [sid for sid in audit_ids if sid in keep], later
 
     async def judge_many(self, submission_ids: list[str]) -> None:
         """Decide each record: audit now, wait out its hold, pass it unaudited, or
