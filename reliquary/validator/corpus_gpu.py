@@ -51,10 +51,24 @@ def queue_tokens() -> int:
     return int(os.environ.get("RELIQUARY_CORPUS_GPU_QUEUE_TOKENS", 16 * _batch_tokens()))
 
 
-# Exceptions the auditor treats as a validator-side audit error (retry each
-# record alone, then count it); anything else propagates like a crash.
-_AUDIT_ERRORS = {"ValueError": ValueError, "RuntimeError": RuntimeError,
-                 "OutOfMemoryError": RuntimeError}
+# Forward failures in a row (out of memory aside) after which the card is
+# taken for broken: the GPU process exits and the supervisor reloads the model.
+FATAL_AFTER = 3
+_STICKY = ("illegal memory access", "device-side assert", "unspecified launch failure",
+           "cuda error", "cudnn_status", "cublas_status", "nccl error", "ecc error")
+
+
+def is_out_of_memory(exc: BaseException) -> bool:
+    return type(exc).__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower()
+
+
+def is_sticky_fault(exc: BaseException) -> bool:
+    """A CUDA error the context does not recover from: every later forward
+    fails too, until the process reloads."""
+    if is_out_of_memory(exc):
+        return False
+    text = str(exc).lower()
+    return type(exc).__name__ == "AcceleratorError" or any(m in text for m in _STICKY)
 
 
 class GpuBusy(Exception):
@@ -108,7 +122,11 @@ def decode_request(body: bytes) -> tuple[list, int, int]:
         tokens.byteswap()
     flat = tokens.tolist()
     text = body[start + header["token_bytes"]:]
-    proofs = text.decode().split("\n") if text else []
+    total = sum(n for _, _, n in header["items"])
+    # An empty proof is a proof (a failing one), never "no proof".
+    proofs = text.decode().split("\n") if total else []
+    if len(proofs) != total or len(flat) != sum(n for n, _, _ in header["items"]):
+        raise ValueError("a request's proofs or tokens do not match its header")
     rows, at, proof_at = [], 0, 0
     for n_tokens, prompt_len, n_proofs in header["items"]:
         rows.append((flat[at:at + n_tokens], prompt_len, proofs[proof_at:proof_at + n_proofs]))
@@ -137,7 +155,8 @@ class GpuBatcher:
 
     def __init__(self, score: Callable[..., tuple], *, executor=None,
                  merge_tokens_limit: int | None = None,
-                 queue_tokens_limit: int | None = None, on_error=None) -> None:
+                 queue_tokens_limit: int | None = None, on_error=None,
+                 on_fatal=None, fatal_after: int = FATAL_AFTER) -> None:
         self._score = score
         self._executor = executor
         self._merge = merge_tokens_limit if merge_tokens_limit is not None else merge_tokens()
@@ -147,6 +166,10 @@ class GpuBatcher:
         self._wake: asyncio.Event | None = None
         # Called after a failed call, before the retries (frees CUDA memory).
         self._on_error = on_error
+        # Called with the reason once the card looks broken (the process exits).
+        self._on_fatal = on_fatal
+        self._fatal_after = fatal_after
+        self._failures = 0
         self.stats = collections.Counter()
 
     @property
@@ -181,6 +204,27 @@ class GpuBatcher:
 
         return await run_in(self._executor, self._score, rows, chunk_tokens, topk)
 
+    def _failed(self, exc: BaseException) -> None:
+        if self._on_error is not None:
+            self._on_error()
+        if not is_out_of_memory(exc):
+            self._failures += 1
+        if self._on_fatal is not None and (is_sticky_fault(exc)
+                                           or self._failures >= self._fatal_after):
+            logger.critical("corpus gpu: %r after %d failed forward(s) in a row; exiting so the "
+                            "model is reloaded", exc, self._failures)
+            self._on_fatal(str(exc))
+            self._on_fatal = None
+
+    @staticmethod
+    def _settle(request: _Request, result=None, exc: BaseException | None = None) -> None:
+        if request.future.done():
+            return  # its caller went away
+        if exc is not None:
+            request.future.set_exception(exc)
+        else:
+            request.future.set_result(result)
+
     async def _run_batch(self, batch: list[_Request]) -> None:
         live = [r for r in batch if not r.future.done()]
         if not live:
@@ -191,28 +235,29 @@ class GpuBatcher:
             scores, forward, verify = await self._call(rows, live[0].chunk_tokens, live[0].topk)
         except Exception as exc:  # noqa: BLE001 - handed to the requests
             self.stats["failed_batches"] += 1
-            if self._on_error is not None:
-                self._on_error()
+            self._failed(exc)
             if len(live) == 1:
-                live[0].future.set_exception(exc)
+                self._settle(live[0], exc=exc)
                 return
             logger.warning("corpus gpu batch of %d requests failed (%r); each alone",
                            len(live), exc)
             for request in live:
                 try:
-                    request.future.set_result(await self._call(
-                        request.rows, request.chunk_tokens, request.topk))
+                    result = await self._call(request.rows, request.chunk_tokens, request.topk)
                 except Exception as alone:  # noqa: BLE001
-                    if self._on_error is not None:
-                        self._on_error()
-                    request.future.set_exception(alone)
+                    self._failed(alone)
+                    self._settle(request, exc=alone)
+                else:
+                    self._failures = 0
+                    self._settle(request, result)
             return
+        self._failures = 0
         total = sum(r.tokens for r in live) or 1
         at = 0
         for request in live:
             share = request.tokens / total
-            request.future.set_result((scores[at:at + len(request.rows)],
-                                       forward * share, verify * share))
+            self._settle(request, (scores[at:at + len(request.rows)],
+                                   forward * share, verify * share))
             at += len(request.rows)
         self.stats["batches"] += 1
         self.stats["requests"] += len(live)
@@ -248,7 +293,11 @@ def build_gpu_app(batcher: GpuBatcher, info: dict) -> FastAPI:
         except GpuBusy:
             return Response(status_code=503)
         except Exception as exc:  # noqa: BLE001 - the judge decides what it means
-            return JSONResponse({"error": str(exc)[:2000], "kind": type(exc).__name__})
+            # By class, not name: torch.AcceleratorError and friends subclass
+            # RuntimeError and are audit errors like it.
+            return JSONResponse({"error": str(exc)[:2000], "kind": type(exc).__name__,
+                                 "value_error": isinstance(exc, ValueError),
+                                 "runtime_error": isinstance(exc, RuntimeError)})
         return JSONResponse({"scores": scores_to_wire(scores), "forward_seconds": forward,
                              "verify_seconds": verify})
 
@@ -341,8 +390,14 @@ async def run_gpu_process(*, directory: str, run_dir: str, model_id: str = "",
         return corpus_audit.score_sequences(model, rows, chunk_tokens=chunk_tokens, topk=topk,
                                             batch_tokens=batch)
 
+    loop = asyncio.get_running_loop()
+
+    def fatal(reason: str) -> None:
+        # The answers in flight go out first; then the supervisor reloads us.
+        loop.call_later(1.0, os._exit, 1)
+
     batcher = GpuBatcher(score, executor=ThreadPoolExecutor(1, thread_name_prefix="corpus-gpu"),
-                         on_error=_free_cuda)
+                         on_error=_free_cuda, on_fatal=fatal)
     app = build_gpu_app(batcher, info)
     server = asyncio.ensure_future(serve_unix(app, Path(run_dir) / GPU_SOCKET))
     worker = asyncio.ensure_future(batcher.run())
@@ -417,10 +472,13 @@ class GpuScorer:
                 if response.status_code == 200:
                     doc = await run_in(self._executor, response.json)
                     if "error" in doc:
-                        kind = _AUDIT_ERRORS.get(doc.get("kind"))
-                        if kind is None:
-                            raise GpuScoreError(f"{doc.get('kind')}: {doc['error']}")
-                        raise kind(doc["error"])
+                        message = f"{doc.get('kind')}: {doc['error']}"
+                        logger.error("corpus gpu process failed a forward: %s", message[:500])
+                        if doc.get("value_error"):
+                            raise ValueError(message)
+                        if doc.get("runtime_error"):
+                            raise RuntimeError(message)
+                        raise GpuScoreError(message)
                     return scores_from_wire(doc["scores"]), doc["forward_seconds"], \
                         doc["verify_seconds"]
                 if response.status_code != 503:

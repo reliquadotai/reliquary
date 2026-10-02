@@ -191,3 +191,33 @@ def test_a_judge_that_does_not_answer_is_a_status_failure(tmp_path):
         asyncio.run(js.status("math"))
     with pytest.raises(Exception):
         asyncio.run(js.miner_status("math", "5A"))
+
+
+def test_every_child_exit_is_logged_for_alerting(caplog):
+    import logging
+
+    from reliquary.validator.corpus_split import Supervisor
+
+    spec = SplitSpec(served=[], directory="/x", fingerprint="f", proof=fakes.PROOF,
+                     run_dir="/tmp/x", groups=[["math"]])
+    sup = Supervisor(spec, clock=lambda: 100.0)
+    started = []
+    sup._start = lambda child: started.append(child.name)
+
+    class _Dead:
+        exitcode = -9
+        pid = 1
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    for child in sup.children.values():
+        child.process, child.started_at = _Dead(), 40.0
+    with caplog.at_level(logging.ERROR, logger="reliquary.validator.corpus_split"):
+        sup.check()
+    lines = [r.getMessage() for r in caplog.records]
+    for name in ("gpu", "judge-0", "front"):
+        assert any(line.startswith(f"corpus split: {name} exited (code -9)") for line in lines), lines

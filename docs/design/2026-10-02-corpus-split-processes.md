@@ -221,7 +221,8 @@ replay reads the same archives.
 | judge stuck on R2 | same, front unaffected | as in-process (botocore timeouts) |
 | front crashes | miners get connection refused for the restart (~tens of s); judges keep judging and settling; unaudited passes pause (stale feed) | supervisor restarts the front; first post (new epoch) -> judges list once -> unaudited passes resume |
 | GPU process crashes | drawn audits wait (client retries), undrawn passes and voids continue; no validator-side error is counted | supervisor restarts it (model reload ~1-2 min) |
-| GPU OOM / bad batch | merged batch re-run per request; failing request gets an error | auditor's existing per-record retry, then validator-error count (5 in a row halts that judge; supervisor restarts it, as the container restart did before) |
+| GPU OOM / bad batch | merged batch re-run per request; failing request gets an error (any ValueError/RuntimeError subclass, e.g. `torch.AcceleratorError`, reaches the auditor as an audit error) | auditor's existing per-record retry, then validator-error count (5 in a row halts that judge; supervisor restarts it, as the container restart did before) |
+| sticky CUDA fault (illegal access, launch failure, `AcceleratorError`) or 3 failed forwards in a row (OOM excepted) | the GPU process answers the requests in flight, then exits | supervisor reloads the model; audits wait meanwhile |
 | notify queue overflow | oldest ids dropped, `dropped` sent | full listing before any unaudited pass |
 | supervisor dies | children receive SIGKILL (PDEATHSIG) | Docker restart policy |
 
@@ -300,7 +301,11 @@ Costs: each child imports torch (~0.5 GB RSS; front + GPU + up to 4 judges
 - `test_corpus_judge_throughput.py`: 80k-record catch-up drain time.
 - `test_corpus_split_crash.py`: kill judge mid-pass, front, GPU process.
 
-Measured numbers are in section 8.
+Measured numbers are in section 8. Rulings kept from the 2026-10-02 review:
+the settlers of two judge processes see each other's archive writes after
+<= 300 s (rules unchanged, no double pay); miner status answers 503 while its
+judge is unreachable. Every child exit logs `corpus split: <child> exited
+(code N)`: alert on it (the container stays Up while a child crash-loops).
 
 ## 8. Measurements (2026-10-02, 8 vCPU shared VPS)
 

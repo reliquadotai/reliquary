@@ -192,3 +192,100 @@ def test_a_gpu_process_that_is_down_is_waited_for(tmp_path):
     finally:
         stop()
     assert scores == fakes.score_rows(_rows(1)) and scorer.retries >= 3
+
+
+# -- review fixes: sticky CUDA faults, error kinds, empty proofs ---------------
+
+
+class AcceleratorError(RuntimeError):
+    """What torch raises after an illegal memory access (a RuntimeError subclass)."""
+
+
+def test_an_empty_proof_crosses_as_one_proof():
+    rows = [([1, 2, 3], 1, [""]), ([4, 5], 1, ["", "QQ=="])]
+    assert decode_request(encode_request(rows, chunk_tokens=32, topk=128)) == (rows, 32, 128)
+
+
+def test_a_body_whose_proof_count_does_not_match_is_refused():
+    body = encode_request([([1, 2], 1, ["a", "b"])], chunk_tokens=32, topk=128)
+    with pytest.raises(ValueError):
+        decode_request(body.replace(b'"items": [[2, 1, 2]]', b'"items": [[2, 1, 3]]'))
+
+
+def test_a_cuda_fault_makes_the_gpu_process_exit_for_a_reload():
+    fatal = []
+
+    def score(rows, chunk_tokens, topk):
+        raise AcceleratorError("CUDA error: an illegal memory access was encountered")
+
+    async def scenario():
+        batcher = GpuBatcher(score, queue_tokens_limit=10_000, on_fatal=fatal.append)
+        worker = asyncio.ensure_future(batcher.run())
+        with pytest.raises(AcceleratorError):
+            await batcher.submit(_rows(1), 32, 128)
+        worker.cancel()
+
+    asyncio.run(scenario())
+    assert len(fatal) == 1 and "illegal memory access" in fatal[0]
+
+
+def test_repeated_forward_failures_make_it_exit_too_but_not_out_of_memory():
+    fatal = []
+    errors = iter([RuntimeError("CUDA out of memory")] * 5 + [RuntimeError("cuBLAS failed")] * 3)
+
+    def score(rows, chunk_tokens, topk):
+        raise next(errors)
+
+    async def scenario():
+        batcher = GpuBatcher(score, queue_tokens_limit=10_000, on_fatal=fatal.append,
+                             fatal_after=3)
+        worker = asyncio.ensure_future(batcher.run())
+        for _ in range(8):
+            with pytest.raises(RuntimeError):
+                await batcher.submit(_rows(1), 32, 128)
+            if _ == 4:
+                assert fatal == []          # five OOMs: a batch too big, not a broken card
+        worker.cancel()
+
+    asyncio.run(scenario())
+    assert len(fatal) == 1
+
+
+def test_a_runtime_error_subclass_is_an_audit_error_on_the_judge(tmp_path):
+    def score(rows, chunk_tokens, topk):
+        raise AcceleratorError("CUDA error: unspecified launch failure")
+
+    path, stop = _serve(tmp_path, score)
+    try:
+        scorer = GpuScorer(path, chunk_tokens=32, topk=128, retry_seconds=0.05)
+        with pytest.raises(RuntimeError) as raised:
+            asyncio.run(scorer(_rows(1)))
+    finally:
+        stop()
+    # Counted by the auditor as a validator-side error (5 in a row halt it),
+    # never the silent crash-and-retry of GpuScoreError.
+    assert not isinstance(raised.value, GpuScoreError)
+    assert "launch failure" in str(raised.value)
+
+
+def test_a_request_cancelled_while_queued_does_not_kill_the_worker():
+    calls = []
+
+    def score(rows, chunk_tokens, topk):
+        calls.append(len(rows))
+        return fakes.score_rows(rows), 0.0, 0.0
+
+    async def scenario():
+        batcher = GpuBatcher(score, merge_tokens_limit=10_000, queue_tokens_limit=10_000)
+        gone = asyncio.ensure_future(batcher.submit(_rows(1), 32, 128))
+        kept = asyncio.ensure_future(batcher.submit(_rows(2), 32, 128))
+        await asyncio.sleep(0)
+        gone.cancel()
+        worker = asyncio.ensure_future(batcher.run())
+        scores, _, _ = await kept
+        later = await batcher.submit(_rows(1), 32, 128)
+        worker.cancel()
+        return scores, later
+
+    scores, later = asyncio.run(scenario())
+    assert len(scores) == 2 and len(later[0]) == 1
