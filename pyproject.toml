@@ -47,6 +47,7 @@ wandb = [
 
 [project.scripts]
 reliquary = "reliquary.cli.main:app"
+affine-runtime = "reliquary.integrations.affine_cli:main"
 
 [build-system]
 requires = ["hatchling"]
