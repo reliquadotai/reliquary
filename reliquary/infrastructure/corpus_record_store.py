@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import json
 import re
 from typing import Any
 
@@ -90,6 +91,56 @@ async def write_submission(job_id, submission_id, record, **client_kwargs) -> bo
 
 async def read_submission(job_id, submission_id, **client_kwargs) -> dict | None:
     return await _read(_key(job_id, "submissions", submission_id), **client_kwargs)
+
+
+# A stored record is sorted JSON: its completions come first, then cursor,
+# hotkey, job_id, prompt_index, received_at, rendered_prompt, schema,
+# submission_id and token_count. Their last bytes carry what scheduling needs.
+SUBMISSION_TAIL_BYTES = 8192
+_META_KEYS = {
+    "hotkey": re.compile(rb'"hotkey":"((?:[^"\\]|\\.)*)"'),
+    "received_at": re.compile(rb'"received_at":(-?[0-9][0-9.eE+-]*|null)'),
+    "token_count": re.compile(rb'"token_count":([0-9]+)'),
+}
+
+
+def submission_meta(tail: bytes) -> dict | None:
+    """``hotkey``, ``received_at`` (None when absent) and ``token_count`` from
+    the end of a stored record, or None when ``tail`` does not reach back to
+    them. Inside a JSON string every quote is escaped, so a completion text or
+    a prompt spelling ``"hotkey":"...`` never matches."""
+    if b'"cursor":' not in tail:
+        return None
+    found = {}
+    for name, pattern in _META_KEYS.items():
+        matches = pattern.findall(tail)
+        found[name] = matches[-1] if matches else None
+    if found["hotkey"] is None or found["token_count"] is None:
+        return None
+    received = found["received_at"]
+    return {"hotkey": json.loads(b'"' + found["hotkey"] + b'"'),
+            "received_at": None if received in (None, b"null") else float(received),
+            "token_count": int(found["token_count"])}
+
+
+async def read_submission_meta(job_id, submission_id, *,
+                               tail_bytes: int = SUBMISSION_TAIL_BYTES,
+                               **client_kwargs) -> dict | None:
+    """What scheduling a pending record needs, from its last bytes (one ranged
+    GET); the whole record only when its prompt is longer than the tail."""
+    key = _key(job_id, "submissions", submission_id)
+    executor = client_kwargs.pop("executor", None)
+    tail, _ = await _get(key, byte_range=f"bytes=-{int(tail_bytes)}", **client_kwargs)
+    if tail is None:
+        return None
+    meta = submission_meta(tail)
+    if meta is not None:
+        return meta
+    record = await _read(key, executor=executor, **client_kwargs)
+    if record is None:
+        return None
+    return {"hotkey": record["hotkey"], "received_at": record.get("received_at"),
+            "token_count": int(record["token_count"])}
 
 
 async def list_submission_ids(job_id, **client_kwargs) -> list[str]:
@@ -195,6 +246,9 @@ class BucketRecordStore:
             self._reads = asyncio.Semaphore(self._max_reads)
         async with self._reads:
             return await read_submission(job_id, submission_id, **self._kw)
+
+    async def read_submission_meta(self, job_id, submission_id):
+        return await read_submission_meta(job_id, submission_id, **self._kw)
 
     async def list_submission_ids(self, job_id):
         return await list_submission_ids(job_id, **self._kw)
