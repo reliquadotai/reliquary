@@ -58,13 +58,24 @@ def test_ids_are_deterministic_and_bounded():
     assert first == op.qualification_id_for("order-", dict(reversed(conditions.items())))
     assert first.startswith("order-q-") and len(first) <= 63
     assert first != op.qualification_id_for("order-", {**conditions, "problems": 4})
-    short = op.default_job_id("order-", "a" * 40, "aime26", 30, 8)
-    assert short == "order-eval-aaaaaaaa-aime26-n30x8"
+    order = {"model": "org/m", "sampling": {"temperature": 0.6}, "max_new_tokens": 512,
+             "thinking": True}
+    short = op.default_job_id("order-", "a" * 40, "aime26", 30, 8, order)
+    assert short.startswith("order-eval-aaaaaaaa-aime26-n30x8-") and len(short) == 39
+    # Another sampling, budget or thinking mode is another job.
+    for change in ({"sampling": {"temperature": 1.0}}, {"thinking": False},
+                   {"max_new_tokens": 1024}, {"model": "org/other"}):
+        assert op.default_job_id("order-", "a" * 40, "aime26", 30, 8,
+                                 {**order, **change}) != short
     long = op.default_job_id("order-", "a" * 40, "verifiers-livecodebench-a1b2c3d4-r0-n1055",
-                             1055, 1)
-    assert len(long) == 63 and long.startswith("order-eval-aaaaaaaa-verifiers")
-    assert long != op.default_job_id("order-", "b" * 40,
-                                     "verifiers-livecodebench-a1b2c3d4-r0-n1055", 1055, 1)
+                             1055, 1, order)
+    assert len(long) <= 63 and long.startswith("order-eval-aaaaaaaa-verifiers")
+    # A catalog set id holds underscores; a job id may not.
+    catalog = op.default_job_id("order-", "a" * 40, "reliquary_dapo_math_v1-eval-r0-n100",
+                                100, 4, order)
+    assert op.checked_job_id(catalog) == catalog and "_" not in catalog
+    with pytest.raises(ValueError, match=r"\[a-z0-9-\]"):
+        op.checked_job_id("order-eval-a_b")
 
 
 def test_create_qualifies_waits_then_creates_and_a_second_run_reuses_both(admin):  # noqa: F811
@@ -81,7 +92,7 @@ def test_create_qualifies_waits_then_creates_and_a_second_run_reuses_both(admin)
                   log=logs.append, poll_seconds=7)
     created = op.create_evaluations(client, **kwargs)
     assert slept == [7]
-    assert created[0]["job_id"] == f"order-eval-{REVISION[:8]}-{card['set_id']}-n5x4"
+    assert created[0]["job_id"].startswith(f"order-eval-{REVISION[:8]}-{card['set_id']}-n5x4-")
     job, _ = asyncio.run(job_store.read_job(created[0]["job_id"]))
     assert job.slots_per_prompt == 4 and job.checkpoint_revision == REVISION
     assert any("qualification" in line and "qualified" in line for line in logs)
@@ -165,3 +176,36 @@ def test_compare_refuses_different_conditions(tmp_path):
     write_grading(tmp_path / "c", n_problems=2, correct={"p0": [True, True]}, set_id="s2")
     with pytest.raises(ValueError, match=r"\['sets'\]"):
         op.compare_reports(tmp_path / "a", tmp_path / "c")
+
+
+def test_a_failed_qualification_is_asked_again_only_with_another_attempt(admin):  # noqa: F811
+    client, logs = client_for(admin), []
+    card = card_of(admin)
+
+    def qid_of():
+        return [line.split()[1] for line in logs
+                if line.endswith("requested for " + card["set_id"])][-1]
+
+    kwargs = dict(cards=[card], model=MODEL, revision=REVISION, samples=2,
+                  max_new_tokens=512, thinking=False, sampling=SAMPLING, log=logs.append)
+    with pytest.raises(RuntimeError, match="rerun with --attempt 1"):
+        op.create_evaluations(client, **kwargs,
+                              sleep=lambda s: finish(qid_of(), status=qual.FAILED))
+    failed = qid_of()
+    created = op.create_evaluations(client, **kwargs, attempt=1,
+                                    sleep=lambda s: finish(qid_of()))
+    assert created[0]["qualification_id"] != failed
+
+
+def test_a_bad_job_id_costs_no_qualification(admin):  # noqa: F811
+    with pytest.raises(ValueError, match=r"\[a-z0-9-\]"):
+        op.create_evaluations(client_for(admin), cards=[card_of(admin)], model=MODEL,
+                              revision=REVISION, samples=2, max_new_tokens=512, thinking=False,
+                              sampling=SAMPLING, job_id="order-eval-Bad_Id")
+    card = card_of(admin)
+    conditions = {"model": MODEL, "revision": REVISION, "set_id": card["set_id"],
+                  "problems": card["count"], "sampling": SAMPLING, "max_new_tokens": 512,
+                  "thinking": False}
+    qid = op.qualification_id_for("order-", {**conditions, "completions": 32, "attempt": 0})
+    record, _ = asyncio.run(qual.QualificationStore().read(qid))
+    assert record is None

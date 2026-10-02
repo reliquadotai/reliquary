@@ -81,12 +81,26 @@ def qualification_id_for(prefix: str, conditions: Mapping[str, Any]) -> str:
     return f"{prefix}q-{_digest(dict(conditions))[:40]}"
 
 
-def default_job_id(prefix: str, revision: str, set_id: str, count: int, samples: int) -> str:
-    job_id = f"{prefix}eval-{revision[:8]}-{set_id}-n{count}x{samples}"
+def default_job_id(prefix: str, revision: str, set_id: str, count: int, samples: int,
+                   conditions: Mapping[str, Any]) -> str:
+    """Readable where it can be (revision, set, size), unique where it must be:
+    the tail hashes every condition, so two orders differing in sampling,
+    budget, thinking or repo never meet on one id. Job ids are [a-z0-9-]."""
+    slug = re.sub(r"[^a-z0-9-]+", "-", set_id.lower()).strip("-")
+    tag = _digest({**dict(conditions), "samples": samples})[:6]
+    job_id = f"{prefix}eval-{revision[:8]}-{slug}-n{count}x{samples}-{tag}"
     if len(job_id) <= MAX_ID:
         return job_id
-    tail = _digest([revision, set_id, count, samples])[:10]
-    return f"{job_id[:MAX_ID - 11]}-{tail}"
+    tail = _digest([job_id])[:10]
+    return f"{job_id[:MAX_ID - 11].rstrip('-')}-{tail}"
+
+
+def checked_job_id(job_id: str) -> str:
+    from reliquary.corpus.job import JOB_ID_RE
+
+    if not JOB_ID_RE.match(job_id):
+        raise ValueError(f"job id {job_id!r} is not [a-z0-9-], at most 63 characters")
+    return job_id
 
 
 def read_set_card(set_id: str, store=None) -> dict:
@@ -135,18 +149,22 @@ def create_evaluations(client: AdminClient, *, cards: list[dict], model: str, re
                        cap: float | None = None, seed: int | None = None,
                        job_id: str | None = None, completions: int = 32,
                        prefix: str = "order-", poll_seconds: float = 30.0,
-                       timeout_seconds: float = 6 * 3600.0,
+                       timeout_seconds: float = 6 * 3600.0, attempt: int = 0,
                        sleep: Callable[[float], None] = time.sleep,
                        log: Callable[[str], None] = print,
                        clock: Callable[[], float] = time.monotonic) -> list[dict]:
     """One qualification and one eval job per set, all on ``model@revision``.
 
     Qualifications are requested together, then waited for; a set whose model
-    is refused or fails qualification gets no job, and the error names why."""
+    is refused or fails qualification gets no job, and the error names why.
+    Every id is derived and checked before anything is requested, so a rerun
+    finds what the first run made and a bad id never costs a qualification.
+    A failed qualification stays failed under its id: ``attempt`` asks again."""
     if job_id is not None and len(cards) != 1:
         raise ValueError("--job-id names one job: give one set")
     if completions * max_new_tokens > 64 * 32768:
         completions = max(1, (64 * 32768) // max_new_tokens)
+    completions = min(completions, 64)
     plans = []
     for card in cards:
         problems = int(card["count"]) if count is None else int(count)
@@ -155,22 +173,27 @@ def create_evaluations(client: AdminClient, *, cards: list[dict], model: str, re
         conditions = {"model": model, "revision": revision, "set_id": card["set_id"],
                       "problems": problems, "sampling": dict(sampling),
                       "max_new_tokens": max_new_tokens, "thinking": thinking}
-        qid = qualification_id_for(prefix, conditions)
+        qid = qualification_id_for(prefix, {**conditions, "completions": completions,
+                                            "attempt": attempt})
+        name = checked_job_id(job_id or default_job_id(prefix, revision, card["set_id"],
+                                                       problems, samples, conditions))
+        plans.append((card, problems, qid, conditions, name))
+    for card, _, qid, conditions, _ in plans:
         client.json("POST", "/admin/v1/qualifications", {
-            "qualification_id": qid, **conditions, "completions": min(completions, 64)})
+            "qualification_id": qid, **conditions, "completions": completions})
         log(f"qualification {qid} requested for {card['set_id']}")
-        plans.append((card, problems, qid))
-    records = _wait(client, [qid for _, _, qid in plans], poll_seconds=poll_seconds,
+    records = _wait(client, [plan[2] for plan in plans], poll_seconds=poll_seconds,
                     timeout_seconds=timeout_seconds, sleep=sleep, log=log, clock=clock)
     created = []
-    for card, problems, qid in plans:
+    for card, problems, qid, _, name in plans:
         record = records[qid]
         if record.get("status") != "qualified":
             result = record.get("result") or {}
+            again = (f"; to ask again, rerun with --attempt {attempt + 1}"
+                     if record.get("status") == "failed" else "")
             raise RuntimeError(f"{model}@{revision[:8]} on {card['set_id']}: qualification "
-                               f"{record.get('status')}: {json.dumps(result)[:300]}")
-        body = {"job_id": job_id or default_job_id(prefix, revision, card["set_id"], problems,
-                                                   samples),
+                               f"{record.get('status')}: {json.dumps(result)[:300]}{again}")
+        body = {"job_id": name,
                 "model": model, "env": card["source"], "prompt_count": problems,
                 "samples_per_prompt": samples, "max_new_tokens": max_new_tokens,
                 "thinking": thinking, "sampling": dict(sampling),

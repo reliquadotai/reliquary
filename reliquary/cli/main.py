@@ -1686,6 +1686,8 @@ def eval_create(
     seed: int | None = typer.Option(None, "--seed"),
     job_id: str | None = typer.Option(None, "--job-id", help="With one --set only"),
     completions: int = typer.Option(32, "--qualify-completions", min=1, max=64),
+    attempt: int = typer.Option(0, "--attempt", min=0,
+                                help="Ask for a new qualification after a failed one"),
     poll_seconds: float = typer.Option(30.0, "--poll-seconds"),
     admin_url: str = _ADMIN_URL,
 ) -> None:
@@ -1707,7 +1709,7 @@ def eval_create(
             max_new_tokens=max_new_tokens, thinking=thinking,
             sampling={"temperature": temperature, "top_p": top_p, "top_k": top_k},
             count=count, cap=cap, seed=seed, job_id=job_id, completions=completions,
-            prefix=prefix, poll_seconds=poll_seconds,
+            prefix=prefix, poll_seconds=poll_seconds, attempt=attempt,
             log=lambda line: typer.echo(line, err=True))
     except (ValueError, RuntimeError, TimeoutError, operator.AdminError) as exc:
         typer.echo(f"error: {exc}", err=True)
