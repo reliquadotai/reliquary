@@ -94,12 +94,46 @@ def test_aime26_as_a_set(tmp_path):
     assert card["needs_runtime"] is False
     handle = vs.open_taskset("aime26", {})
     grading = rows(tmp_path / "s", "grading.jsonl")[0]
-    prompt = rows(tmp_path / "s", "prompts.jsonl")[0]["messages"][-1]["content"]
     answer = handle.task(grading["task_key"]).data.answer
-    assert vs.score_answer(handle, grading["task_key"], None, prompt,
-                           f"so \\boxed{{{answer}}}") == 1.0
-    assert vs.score_answer(handle, grading["task_key"], None, prompt, "\\boxed{1000}") == 0.0
+    frozen = grading["prompt_sha256"]
+    assert vs.score_answer(handle, grading["task_key"], frozen, f"so \\boxed{{{answer}}}") == 1.0
+    assert vs.score_answer(handle, grading["task_key"], frozen, "\\boxed{1000}") == 0.0
 
 
 def rows(directory, name):
     return [json.loads(line) for line in (directory / name).read_text().splitlines()]
+
+
+def test_aime26_graded_end_to_end(tmp_path):
+    pytest.importorskip("aime26")
+    import pyarrow.parquet as pq
+
+    from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.eval.grading import grade_evaluation
+    from reliquary.eval.storage import publish_set
+
+    card = build_source_set("verifiers:aime26", count=2, out=tmp_path / "s")
+    asyncio.run(publish_set(tmp_path / "s", platform=LocalDirectorySink(tmp_path / "platform"),
+                            subnet=LocalDirectorySink(tmp_path / "subnet")))
+    handle = vs.open_taskset("aime26", {})
+    grading = rows(tmp_path / "s", "grading.jsonl")
+    answers = [handle.task(g["task_key"]).data.answer for g in grading]
+    lines = [
+        {"problem_id": grading[0]["problem_id"], "sample_index": 0,
+         "completion": f"<think>maybe \\boxed{{1}}</think>So \\boxed{{{answers[0]}}}"},
+        {"problem_id": grading[1]["problem_id"], "sample_index": 0,
+         "completion": f"<think>it is \\boxed{{{answers[1]}}}"},  # never closed
+    ]
+    platform = tmp_path / "platform" / "evaluations" / "order-e1"
+    platform.mkdir(parents=True)
+    (platform / "c.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+    asyncio.run(grade_evaluation(
+        eval_id="order-e1", platform=LocalDirectorySink(tmp_path / "platform"),
+        subnet=LocalDirectorySink(tmp_path / "subnet"), work_dir=tmp_path / "w",
+        provenance={"model": "m"}, set_ids=[card["set_id"]],
+        completion_keys=["evaluations/order-e1/c.jsonl"],
+        problems_per_set={card["set_id"]: 2}, samples_per_set={card["set_id"]: 1}))
+    graded = sorted(pq.read_table(platform / "graded.parquet").to_pylist(),
+                    key=lambda r: r["problem_id"])
+    assert [(r["score"], r["grader_detail"]) for r in graded] == [
+        (1.0, ""), (0.0, "format_failure")]

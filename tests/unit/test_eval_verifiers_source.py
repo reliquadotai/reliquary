@@ -154,17 +154,18 @@ def test_an_image_is_refused():
 def test_score_an_answer():
     scored = []
     handle = fake_handle([FakeTask(i) for i in range(3)], scored=scored)
-    assert vs.score_answer(handle, "key002", None, "question 2", "2") == 1.0
-    assert vs.score_answer(handle, "key002", None, "question 2", "7") == 0.0
+    frozen = vs.prompt_digest(None, "question 2")
+    assert vs.score_answer(handle, "key002", frozen, "2") == 1.0
+    assert vs.score_answer(handle, "key002", frozen, "7") == 0.0
     assert scored[0][0] == "key002" and scored[0][2] == "2"
 
 
 def test_a_drifted_prompt_is_not_scored():
     handle = fake_handle([FakeTask(0)])
     with pytest.raises(LookupError, match="source_drift"):
-        vs.score_answer(handle, "key000", None, "the frozen question", "0")
+        vs.score_answer(handle, "key000", vs.prompt_digest(None, "the frozen question"), "0")
 
 
 def test_an_unknown_key_is_not_scored():
     with pytest.raises(KeyError):
-        vs.score_answer(fake_handle([FakeTask(0)]), "nope", None, "question 0", "0")
+        vs.score_answer(fake_handle([FakeTask(0)]), "nope", vs.prompt_digest(None, "q"), "0")

@@ -255,13 +255,55 @@ def _docker_missing(exc: BaseException) -> bool:
     return any(s in text for s in ("docker", "no such file or directory", "connection refused"))
 
 
-def score_answer(handle: TasksetHandle, key: str, system: str | None, prompt: str,
-                 answer: str) -> float:
+def score_answer(handle: TasksetHandle, key: str, frozen_sha256: str, answer: str) -> float:
+    """The task's score for ``answer``; ``LookupError("source_drift")`` when the
+    task no longer holds the prompt the set froze (``frozen_sha256``)."""
     task = handle.task(key)
     frozen = freeze(task)
-    if prompt_digest(frozen.system, frozen.prompt) != prompt_digest(system, prompt):
+    if prompt_digest(frozen.system, frozen.prompt) != frozen_sha256:
         raise LookupError("source_drift")
     return float(handle.score_trace(task, frozen, answer))
+
+
+# Tasksets a child scorer has opened, by (id, canonical args).
+_CHILD_HANDLES: dict[tuple[str, str], TasksetHandle] = {}
+
+
+def _score_in_child(name: str, args_json: str, key: str, frozen_sha256: str,
+                    answer: str) -> float:
+    handle = _CHILD_HANDLES.get((name, args_json))
+    if handle is None:
+        handle = _CHILD_HANDLES[(name, args_json)] = open_taskset(name, json.loads(args_json))
+    return score_answer(handle, key, frozen_sha256, answer)
+
+
+class ChildScorer:
+    """Scores in a spawned child process, on its main thread.
+
+    Packaged graders are written for the `eval` CLI's main thread: math-verify,
+    which AIME's and MMLU-Pro's rewards call, times its parse out with
+    ``signal.alarm`` and, on any other thread, refuses and the reward reads 0 —
+    a silent wrong score. Grading runs off the event loop, so it hands each row
+    to a child; the child also keeps a taskset's code out of the admin process."""
+
+    def __init__(self) -> None:
+        self._pool = None
+
+    def score(self, name: str, args: dict, key: str, frozen_sha256: str, answer: str) -> float:
+        if self._pool is None:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+
+            self._pool = ProcessPoolExecutor(
+                max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+        args_json = json.dumps(args, sort_keys=True, separators=(",", ":"))
+        return self._pool.submit(_score_in_child, name, args_json, key, frozen_sha256,
+                                 answer).result()
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
 
 
 def _args_tag(args: dict) -> str:
@@ -328,6 +370,7 @@ def build_set(source: str, *, out: str | Path, start: int, count: int | None,
 
 
 __all__ = [
+    "ChildScorer",
     "FrozenTask",
     "RuntimeUnavailable",
     "TasksetHandle",
