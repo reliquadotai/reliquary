@@ -208,8 +208,12 @@ def compose_profile(
     environments: Iterable[str],
     overrides: Mapping[str, Mapping[str, object]] | None = None,
     catalog: Mapping[str, EnvironmentProfile] = ENVIRONMENT_CATALOG,
+    external_eval: bool = False,
 ) -> ProtocolProfile:
-    """An ordinary profile from its parts, or a ``ValueError`` naming the part."""
+    """An ordinary profile from its parts, or a ``ValueError`` naming the part.
+
+    ``external_eval`` admits the external eval environment: only a job that
+    draws its prompts from an eval set may declare it, never an RL task."""
     names = list(environments)
     if not names:
         raise ValueError("at least one environment must be selected")
@@ -226,6 +230,9 @@ def compose_profile(
         if name in EXTERNAL_BODIES:
             # An external eval set's statement, not an installed package: there
             # is no spec to check it against, and nothing to tune.
+            if not external_eval:
+                raise ValueError(
+                    f"environment {name!r} is declared only by a job reading an eval set")
             if overrides.get(name):
                 raise ValueError(f"environment {name!r} takes no overrides")
             bodies[name] = EXTERNAL_BODIES[name]

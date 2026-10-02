@@ -80,20 +80,31 @@ def _verified(directory: Path) -> tuple[dict, bytes, bytes, bytes]:
     return card, card_body, prompts, grading
 
 
+def is_operator_set(card: dict) -> bool:
+    """A set `build_source_set` built (any source, any range): the operator's
+    own, never orderable by the platform's customers."""
+    return "source_kind" in card
+
+
 async def publish_set(directory: str | Path, *, platform, subnet) -> dict:
     """Upload a built set. The platform's ``set.json`` goes last: its presence
-    is what makes a set orderable."""
+    is what makes a set orderable — so an operator's set never goes there, and
+    needs no platform credential."""
     card, card_body, prompts, grading = _verified(Path(directory))
     set_id = card["set_id"]
     written = []
-    for store, key, body in (
+    uploads = [
         (subnet, subnet_key(set_id, "grading.jsonl"), grading),
         # Validators of an eval job read its prompts here (no platform credential).
         (subnet, subnet_key(set_id, "prompts.jsonl"), prompts),
         (subnet, subnet_key(set_id, "set.json"), card_body),
-        (platform, platform_key(set_id, "prompts.jsonl"), prompts),
-        (platform, platform_key(set_id, "set.json"), card_body),
-    ):
+    ]
+    if not is_operator_set(card):
+        if platform is None:
+            raise ValueError(f"set {set_id} is a platform preset: it needs the platform bucket")
+        uploads += [(platform, platform_key(set_id, "prompts.jsonl"), prompts),
+                    (platform, platform_key(set_id, "set.json"), card_body)]
+    for store, key, body in uploads:
         if await _create(store, key, body):
             written.append(key)
     return {"set_id": set_id, "written": written, "count": card["count"],
@@ -105,6 +116,7 @@ __all__ = [
     "SUBNET_PREFIX",
     "SetConflict",
     "SubnetEvalStore",
+    "is_operator_set",
     "platform_key",
     "publish_set",
     "subnet_key",

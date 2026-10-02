@@ -1042,9 +1042,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         import tempfile
         from pathlib import Path
 
+        from reliquary.corpus.delivery import validated_delivery_id
         from reliquary.eval.grading import evaluation_prefix
 
         in_scope(eval_id)
+        try:
+            validated_delivery_id(eval_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if name not in GRADED_FILES:
             raise HTTPException(status_code=422, detail=f"a graded evaluation's files are "
                                                         f"{list(GRADED_FILES)}")

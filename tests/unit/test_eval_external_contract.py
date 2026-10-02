@@ -31,7 +31,7 @@ def model():
 def test_the_external_environment_composes():
     profile = compose_profile(profile_id="order-eval-x", model=model(),
                               run=RUN_POLICIES["corpus-v1"],
-                              environments=[EXTERNAL_EVAL_ENVIRONMENT])
+                              environments=[EXTERNAL_EVAL_ENVIRONMENT], external_eval=True)
     assert profile.environments == {EXTERNAL_EVAL_ENVIRONMENT: EXTERNAL_EVAL_BODY}
     body = profile.to_generation_contract()["environments"][EXTERNAL_EVAL_ENVIRONMENT]
     assert body["environment_contract_id"] == "reliquary/external-eval/v1"
@@ -40,8 +40,15 @@ def test_the_external_environment_composes():
 def test_it_takes_no_overrides():
     with pytest.raises(ValueError, match="takes no overrides"):
         compose_profile(profile_id="x", model=model(), run=RUN_POLICIES["corpus-v1"],
-                        environments=[EXTERNAL_EVAL_ENVIRONMENT],
+                        environments=[EXTERNAL_EVAL_ENVIRONMENT], external_eval=True,
                         overrides={EXTERNAL_EVAL_ENVIRONMENT: {"max_new_tokens": 9}})
+
+
+def test_only_an_eval_set_job_may_declare_it():
+    """An RL task or a corpus job naming it is refused at declaration."""
+    with pytest.raises(ValueError, match="only by a job reading an eval set"):
+        compose_profile(profile_id="x", model=model(), run=RUN_POLICIES["corpus-v1"],
+                        environments=[EXTERNAL_EVAL_ENVIRONMENT])
 
 
 def test_an_unknown_environment_is_still_refused():

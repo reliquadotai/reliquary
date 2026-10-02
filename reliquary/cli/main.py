@@ -958,7 +958,7 @@ def build_job_manifest(
 
 def _corpus_base_profile(
     *, task_id, from_profile, model, model_revision, model_architecture,
-    prompt_encoding, renderer_id, prompt_source,
+    prompt_encoding, renderer_id, prompt_source, external_eval=False,
 ):
     """The profile a corpus job's contract is built from: the named template, or
     one composed from the model, the ``corpus-v1`` run policy and the catalog."""
@@ -984,6 +984,7 @@ def _corpus_base_profile(
         model=ModelSpec(model, model_revision, model_architecture, prompt_encoding),
         run=RUN_POLICIES["corpus-v1"],
         environments=[prompt_source],
+        external_eval=external_eval,
     )
 
 
@@ -1002,12 +1003,14 @@ def prepare_corpus_job(
     ``contract_environment`` is the catalog environment the contract declares
     when the prompt source is not one (an eval set: its own environment);
     ``toploc_thresholds`` replaces the proof's thresholds (from qualification)."""
+    from reliquary.eval.prompt_source import is_eval_source
+
     environment = contract_environment or prompt_source
     base = _corpus_base_profile(
         task_id=task_id or job_id, from_profile=from_profile, model=model,
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-        prompt_source=environment,
+        prompt_source=environment, external_eval=is_eval_source(prompt_source),
     )
     if max_new_tokens is None:
         # The template or catalog budgets each environment; the length stays
@@ -1781,15 +1784,22 @@ def eval_compare(
 
 @eval_app.command("publish-set")
 def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote")) -> None:
-    """Upload a set: prompts.jsonl and set.json to the platform bucket
-    (RELIQUARY_PLATFORM_*), grading.jsonl and set.json to the subnet bucket (R2_*)."""
+    """Upload a set: its three files to the subnet bucket (R2_*); a platform
+    preset's prompts.jsonl and set.json to the platform bucket too
+    (RELIQUARY_PLATFORM_*), which makes it orderable. An operator's set
+    (build-set --source) never goes there."""
     import json
+    from pathlib import Path
 
     from reliquary.corpus.delivery import R2DeliverySink
-    from reliquary.eval.storage import SetConflict, SubnetEvalStore, publish_set
+    from reliquary.eval.storage import (
+        SetConflict, SubnetEvalStore, is_operator_set, publish_set,
+    )
 
     try:
-        answer = asyncio.run(publish_set(directory, platform=R2DeliverySink.from_environment(),
+        card = json.loads((Path(directory) / "set.json").read_text())
+        platform = None if is_operator_set(card) else R2DeliverySink.from_environment()
+        answer = asyncio.run(publish_set(directory, platform=platform,
                                          subnet=SubnetEvalStore()))
     except (ValueError, OSError, RuntimeError, SetConflict) as exc:
         typer.echo(f"error: {exc}", err=True)

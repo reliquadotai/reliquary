@@ -115,3 +115,22 @@ def test_compare_prints_the_difference(tmp_path):
     result = CliRunner().invoke(app, ["eval", "compare", str(tmp_path / "a"), str(tmp_path / "b")])
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["envs"]["math"]["diff"] == 0.5
+
+
+def test_an_operator_set_is_published_to_the_subnet_bucket_only(tmp_path, monkeypatch):
+    from reliquary.corpus import delivery
+    from reliquary.eval import sets, storage
+
+    monkeypatch.setattr(sets, "open_source", lambda source, split: FakeEnvironment(source))
+    monkeypatch.setattr(storage, "SubnetEvalStore", lambda: LocalDirectorySink(tmp_path / "s"))
+    monkeypatch.setattr(delivery.R2DeliverySink, "from_environment",
+                        classmethod(lambda cls: (_ for _ in ()).throw(
+                            AssertionError("no platform credential needed"))))
+    runner = CliRunner()
+    assert runner.invoke(app, ["eval", "build-set", "--source", "reliquary_dapo_math_v1",
+                               "--split", "eval", "--count", "2",
+                               "--out", str(tmp_path / "set")]).exit_code == 0
+    published = runner.invoke(app, ["eval", "publish-set", str(tmp_path / "set")])
+    assert published.exit_code == 0, published.output
+    written = json.loads(published.stdout)["written"]
+    assert len(written) == 3 and all(key.startswith("reliquary/eval-sets/") for key in written)
