@@ -79,4 +79,4 @@ def test_the_graded_files_are_served(admin):  # noqa: F811
     assert parquet.status_code == 200 and parquet.content[:4] == b"PAR1"
     assert admin("GET", "/admin/v1/evaluations/order-eval-7/files/set.json").status_code == 422
     assert admin("GET", "/admin/v1/evaluations/other-1/files/report.json").status_code == 409
-    assert admin("GET", "/admin/v1/evaluations/order-UP/files/report.json").status_code == 422
+    assert admin("GET", "/admin/v1/evaluations/order-a.b/files/report.json").status_code == 422
