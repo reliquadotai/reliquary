@@ -133,7 +133,7 @@ async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, sock
         wire_job_judge(w, records=records, judge_records=judge_records,
                        judge_threads=judge_threads, archives=archives, proof=proof, model=None,
                        tokenizer=tokenizer, gpu_lock=gpu_lock, scorer=scorer,
-                       vocab_size=vocab_size, arrivals_complete=feed.complete,
+                       vocab_size=vocab_size, arrivals_covered=feed.covered,
                        auditor_kwargs=auditor_kwargs)
         wiring[str(job.job_id)] = w
     feed.auditors = {job_id: w.auditor for job_id, w in wiring.items()}

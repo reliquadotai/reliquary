@@ -83,6 +83,10 @@ NEGATIVE_BEACON_CACHE_SECONDS = 30.0
 # connect + 30 s read: 405 s. An unaudited pass waits this long past the hold,
 # so every sibling received inside that hold is visible before it is paid.
 ACCEPT_SLACK_SECONDS = 420.0
+# How much of the accept slack is margin over the route's record-write bound
+# (420 - 405): a sibling received inside a record's hold was handed over by
+# its receipt + hold + (slack - this margin).
+FEED_MARGIN_SECONDS = 15.0
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _WORST_ZERO = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
 _BANNED_VOID = {"passed": False, "audited": False, "reason": "banned"}
@@ -108,16 +112,18 @@ class CorpusAuditor:
                  threads=None,
                  scorer: Callable | None = None,
                  vocab_size: int | None = None,
-                 arrivals_complete: Callable[[], bool] | None = None) -> None:
+                 arrivals_covered: Callable[[], float | None] | None = None) -> None:
         self._job_id = job_id
         # In a judge process: ``await scorer(rows)`` scores (tokens,
         # prompt_len, proofs) rows on the GPU process, as ``score_sequences``
         # would here, and ``vocab_size`` stands for the model's embeddings.
         self._scorer = scorer
         self._vocab_size = vocab_size
-        # In a judge process: False while an arrival the front accepted may
-        # not have reached this auditor yet; unaudited passes then wait.
-        self._arrivals_complete = arrivals_complete
+        # In a judge process: the instant up to which every arrival the front
+        # accepted has been enqueued here (None: not known yet). A record is
+        # passed unaudited only once it covers all the siblings that could
+        # catch it (`_covers`); otherwise it waits.
+        self._arrivals_covered = arrivals_covered
         # A `JudgeThreads`: drand races, forwards and record preparation run
         # on these, never on the loop's default executor the route needs.
         self._threads = threads
@@ -256,6 +262,23 @@ class CorpusAuditor:
             if submission_id not in self._judged:
                 self._schedule(submission_id, self._next_due.get(submission_id, retry))
         self._next_due.clear()
+
+    def _covered(self) -> float | None:
+        if self._arrivals_covered is None:
+            return math.inf
+        try:
+            return self._arrivals_covered()
+        except Exception:
+            logger.exception("corpus arrival feed state unreadable; holding unaudited passes")
+            return None
+
+    def _covers(self, covered: float | None, received_at: float) -> bool:
+        """Every sibling received inside this record's hold has been handed
+        over: each was accepted by receipt + hold + (slack - margin)."""
+        if covered is None:
+            return False
+        return covered >= (received_at + self._params.hold_seconds
+                           + self._accept_slack - FEED_MARGIN_SECONDS)
 
     def _wait_until(self, submission_id: str, now: float) -> float:
         """When a record decided "wait" at ``now`` could be decided otherwise
@@ -919,7 +942,12 @@ class CorpusAuditor:
             elif choice == "wait":
                 self._next_due[submission_id] = self._wait_until(submission_id, now)
 
+        covered: float | None = math.inf
         if unaudited:
+            # Sampled BEFORE the siblings are collected: only what was enqueued
+            # by then is considered, so only that may vouch for X (a listing
+            # finishing mid-pass must not).
+            covered = self._covered()
             # Queue lag can exceed the hold: a drawn sibling received within X's
             # hold may still sit in the queue. Decide every such sibling now and
             # audit the drawn ones in this pass, so a failure among them reaches
@@ -970,12 +998,11 @@ class CorpusAuditor:
                 "%d pending corpus record(s) unreadable (e.g. %s); every unaudited pass "
                 "waits until they read or get a verdict",
                 len(self._unreadable), min(self._unreadable)[:12])
-        # A sibling the front accepted may not have been handed over yet: as
-        # with an unreadable record, its hotkey could be any of these.
-        blind = self._arrivals_complete is not None and not self._arrivals_complete()
-        if unaudited and blind:
-            logger.warning("corpus job %s: arrival feed incomplete; %d unaudited pass(es) wait",
-                           self._job_id, len(unaudited))
+        if unaudited:
+            # And again now: the lesser of the two (a new front since resets it).
+            after = self._covered()
+            covered = None if covered is None or after is None else min(covered, after)
+        uncovered = 0
         audited_hotkeys = {self._meta[sid][0] for sid in audit_ids}
         early, late = [], []
         for submission_id, draw in unaudited:
@@ -983,8 +1010,15 @@ class CorpusAuditor:
             # Wait while a sibling that could still catch this record is
             # undecided or hit a validator error this pass, or while any
             # pending record is unreadable (its hotkey could be this one).
-            if unreadable or blind or hotkey in errored:
+            if unreadable or hotkey in errored:
                 continue  # judged again at the next rescan
+            if not self._covers(covered, received_at):
+                # A sibling the front accepted may not have been handed over
+                # yet: as with an unreadable record, it could catch this one.
+                uncovered += 1
+                if covered is not None:
+                    self._next_due[submission_id] = self._retry_at(hotkey, now)
+                continue
             if any(t <= received_at + self._params.hold_seconds
                    for t in undecided.get(hotkey, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
@@ -995,6 +1029,10 @@ class CorpusAuditor:
             # No record of this hotkey is audited in this pass, so no failure
             # or error of it can come from the audit: written alongside it.
             (late if hotkey in audited_hotkeys else early).append(verdict)
+        if uncovered:
+            logger.warning("corpus job %s: arrival feed covers up to %s; %d unaudited pass(es) "
+                           "wait", self._job_id, "nothing" if covered is None
+                           else f"{now - covered:.0f} s ago", uncovered)
         for submission_id in voided:
             hotkey, _, token_count = self._meta[submission_id]
             early.append((submission_id, self._verdict(

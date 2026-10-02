@@ -108,22 +108,22 @@ def test_the_feed_is_complete_only_after_a_listing_and_while_fresh():
         assert not feed.complete()          # listing still running
         gate.set()
         await asyncio.sleep(0.01)
-        assert auditor.listings == 1 and feed.complete()
-        clock.t = 1011.0                     # no post for 11 s
-        assert not feed.complete()
+        assert auditor.listings == 1 and feed.complete() and feed.covered() == 1000.0
+        clock.t = 1011.0                     # no post for 11 s: stale, still vouching
+        assert not feed.complete() and feed.covered() == 1000.0
         feed.receive({"epoch": "e1", "dropped": False, "ids": {}, "as_of": 1011.0})
         assert feed.complete() and auditor.listings == 1
         # A new front: list again before trusting it.
         gate.clear()
         feed.receive({"epoch": "e2", "dropped": False, "ids": {}, "as_of": 1011.5})
-        assert not feed.complete()
+        assert not feed.complete() and feed.covered() is None
         gate.set()
         await asyncio.sleep(0.01)
         assert feed.complete() and auditor.listings == 2
         # Dropped ids: list again.
         auditor.fail = 1
         feed.receive({"epoch": "e2", "dropped": True, "ids": {}, "as_of": 1011.6})
-        assert not feed.complete()
+        assert not feed.complete() and feed.covered() is None
         await asyncio.sleep(0.05)
         assert feed.complete() and auditor.listings == 3
 
@@ -137,4 +137,4 @@ def test_ids_of_a_job_judged_elsewhere_are_counted_not_lost_silently():
         return feed
 
     feed = asyncio.run(scenario())
-    assert feed.unknown_ids == 1 and not feed.complete()
+    assert feed.unknown_ids == 1 and not feed.complete() and feed.covered() is None

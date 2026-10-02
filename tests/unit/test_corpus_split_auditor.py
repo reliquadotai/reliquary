@@ -88,10 +88,13 @@ class _Store(sim.Store):
         return {}, None
 
 
-def _gated_run(complete):
+def _gated_run(covered):
     """Two hotkeys well past probation, q=0.5, one beacon: some records are
-    drawn (audited), the rest pass unaudited once their hold is over --
-    unless the feed is incomplete."""
+    drawn (audited), the rest pass unaudited once their hold and slack are
+    over -- if the feed covers their siblings. ``covered(now)`` is what the
+    feed vouches for: every arrival accepted up to then is enqueued (None:
+    nothing yet). Hold 30 s, slack 30 s: a record's siblings are all handed
+    over once the feed covers its receipt + hold + 15 s."""
     loop = sim.VirtualTimeLoop()
 
     async def scenario():
@@ -105,14 +108,15 @@ def _gated_run(complete):
             job_id="math-v1", records=store, model=None, tokenizer=None, proof=None,
             params=params, miner_states=MinerStates(store, "math-v1", clock=clock),
             beacon=sim.Beacon(latency=0.0), round_at=sim.round_at, clock=clock,
-            accept_slack_seconds=5.0, rescan_every_seconds=10.0,
-            arrivals_complete=lambda: complete["now"])
+            accept_slack_seconds=30.0, rescan_every_seconds=10.0,
+            arrivals_covered=lambda: covered(clock()))
 
         async def forward(records, *, local=False):
             return [{"passed": True, "reason": None, "worst_exp": 0,
                      "worst_mant_mean": 0.01, "worst_mant_median": 0.01} for _ in records]
 
         auditor._forward = forward
+
         async def arrive():
             # Steady traffic, so neither hotkey falls under the slow-hotkey rule.
             for i in range(10_000):
@@ -125,10 +129,10 @@ def _gated_run(complete):
 
         feeder = asyncio.ensure_future(arrive())
         runner = asyncio.ensure_future(auditor.run())
-        await asyncio.sleep(120.0)
+        await asyncio.sleep(150.0)
         before = dict(store.verdicts)
-        complete["now"] = True
-        await asyncio.sleep(120.0)
+        covered.release = True
+        await asyncio.sleep(150.0)
         feeder.cancel()
         runner.cancel()
         return before, dict(store.verdicts)
@@ -139,13 +143,50 @@ def _gated_run(complete):
         loop.close()
 
 
-def test_an_incomplete_feed_holds_unaudited_passes_but_not_audits():
-    before, after = _gated_run({"now": False})
+class _Covered:
+    """``lag`` s behind now once released (or from the start); None before."""
+
+    def __init__(self, lag=0.0, released=False):
+        self.lag, self.release = lag, released
+
+    def __call__(self, now):
+        return now - self.lag if self.release else None
+
+
+def test_an_uncovered_feed_holds_unaudited_passes_but_not_audits():
+    before, after = _gated_run(_Covered())
     assert len(before) > 50 and all(v["audited"] for v in before.values())
-    # Once complete, the held records pass at once (the next rescan).
+    # Once covered, the held records pass at the next rescan.
     assert sum(not v["audited"] for v in after.values()) > 100
 
 
-def test_a_complete_feed_changes_nothing():
-    before, _ = _gated_run({"now": True})
+def test_a_covered_feed_changes_nothing():
+    before, _ = _gated_run(_Covered(released=True))
     assert sum(not v["audited"] for v in before.values()) > 50
+
+
+def test_a_15_second_stall_of_the_feed_blinds_no_record_it_covers():
+    """The front's loop (or the judge's) stalled: the newest vouched instant
+    is 15 s old. Every record whose siblings it covers is still decided."""
+    stalled, _ = _gated_run(_Covered(lag=15.0, released=True))
+    live, _ = _gated_run(_Covered(released=True))
+    unaudited = lambda vs: sum(not v["audited"] for v in vs.values())  # noqa: E731
+    assert unaudited(stalled) >= unaudited(live) - 2 > 50
+
+
+class _CompletesMidPass:
+    """A listing that completes between the sibling read and the decision:
+    uncovered when sampled before the read, covered right after."""
+
+    def __init__(self):
+        self.calls = 0
+        self.release = False
+
+    def __call__(self, now):
+        self.calls += 1
+        return None if self.calls % 2 else now
+
+
+def test_a_listing_that_completes_mid_pass_pays_nothing_unaudited_that_pass():
+    before, after = _gated_run(_CompletesMidPass())
+    assert all(v["audited"] for v in after.values()) and len(after) > 50

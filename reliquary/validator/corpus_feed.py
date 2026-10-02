@@ -9,16 +9,19 @@ a drawn sibling's failure always reaches X before X is paid.
 Across processes the front queues each accepted id for its judge
 (``JudgeLink.accepted``, never awaited by the route) and posts the queue over
 a unix socket, plus a heartbeat every couple of seconds. The judge
-(``ArrivalFeed``) enqueues what it receives and answers ``complete()`` -- the
-auditor's ``arrivals_complete`` -- only while nothing accepted can be missing:
+(``ArrivalFeed``) enqueues what it receives and answers ``covered()`` -- the
+auditor's ``arrivals_covered``: the instant up to which every accepted id has
+been enqueued here, or None:
 
 - after a new front (a new ``epoch``, the first one this judge sees included)
-  or a queue overflow (``dropped``), not before a full listing of the store has
+  or a queue overflow (``dropped``), None until a full listing of the store has
   enqueued every pending record;
-- and only while the last post that emptied the front's queue (``as_of``) is
-  at most ``FEED_FRESH_SECONDS`` old.
+- then the newest ``as_of`` received (the front's clock when a post emptied its
+  queue: everything accepted before it was in that post or an earlier one).
 
-While incomplete, unaudited passes wait; audits, voids and failures go on.
+The auditor passes a record unaudited only once ``covered()`` reaches that
+record's receipt + hold + 405 s (every sibling that could catch it was
+accepted by then), so a stalled feed only delays the newest records.
 """
 
 from __future__ import annotations
@@ -36,8 +39,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# The newest as_of may be this old; inside the 15 s the 420 s accept slack
-# leaves over the route's 405 s record-write bound.
+# How old the newest as_of may be for ``complete()`` (health, logs only).
 FEED_FRESH_SECONDS = 10.0
 # An empty post at least this often, so an idle front still vouches.
 FEED_HEARTBEAT_SECONDS = 2.0
@@ -195,14 +197,21 @@ class ArrivalFeed:
         self._tasks: set[asyncio.Task] = set()
         self.unknown_ids = 0
 
+    def covered(self) -> float | None:
+        """Every id the front accepted before this instant is enqueued here;
+        None while a listing for the current front (or a drop) is pending."""
+        if self.epoch is None or self._listed != self._generation:
+            return None
+        return self.covered_until
+
     def complete(self) -> bool:
-        return (self.epoch is not None and self._listed == self._generation
-                and self.covered_until is not None
-                and self._clock() - self.covered_until <= self._fresh)
+        covered = self.covered()
+        return covered is not None and self._clock() - covered <= self._fresh
 
     def state(self) -> dict:
         return {"epoch": self.epoch, "covered_until": self.covered_until,
-                "listed": self._listed == self._generation, "complete": self.complete()}
+                "listed": self._listed == self._generation, "complete": self.complete(),
+                "covered": self.covered()}
 
     def receive(self, doc: Mapping) -> None:
         for job_id, ids in (doc.get("ids") or {}).items():

@@ -184,16 +184,21 @@ another process. What changes is only how three inputs reach it:
    finished its record write (<= 405 s) and was enqueued before that, so a
    drawn sibling's failure reaches X first. Across processes a notification can
    be late or lost (front crash between the record write and the post; queue
-   overflow; judge down). Guard, in the judge (`arrivals_complete`):
-   - every new `epoch` (including the first one a judge sees) and every
-     `dropped` triggers a full listing of the job (`_rescan_once(full=True)`:
-     every pending record is enqueued) before the feed counts as complete;
-   - the feed is complete only while `now - as_of <= 10 s`.
+   overflow; judge down). Guard, in the judge (`arrivals_covered`):
+   - the feed vouches for an instant `covered`: every id the front accepted
+     before it is enqueued in the judge. It is the newest `as_of` received,
+     and None after every new `epoch` (including the first one a judge sees)
+     and every `dropped`, until a full listing of the job
+     (`_rescan_once(full=True)`: every pending record enqueued) completes;
+   - X is passed unaudited only if `covered >= X.received_at + hold + 405 s`
+     (slack minus a 15 s margin): every sibling that could catch X was
+     accepted, so handed over, by then. `covered` is sampled before the pass
+     collects X's siblings and again at the decision, and the lesser is used:
+     a listing finishing mid-pass cannot vouch for siblings the pass never saw.
 
-   While incomplete, an unaudited pass waits (exactly like the existing
-   "a pending record is unreadable" guard); audits, voids and failures go on.
-   With a 2 s heartbeat the normal lag is milliseconds, and 10 s sits inside the
-   15 s the 420 s slack leaves over the 405 s write bound.
+   An uncovered record waits (as for an unreadable record); audits, voids and
+   failures go on. The check is per record, so a stalled front or judge loop
+   only delays the newest records, never a backlog whose receipts are covered.
 3. **Settlement.** Each judge process has its own `R2Archives` (other tasks'
    highest window cached 300 s). In-process the settlers of one process saw each
    other's archive writes at once; across processes after <= 300 s. The rules

@@ -236,7 +236,7 @@ def build_corpus_audit_wiring(*, entry, job, records):
 
 def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof, model,
                    tokenizer, gpu_lock=None, remote=None, scorer=None, vocab_size=None,
-                   arrivals_complete=None, auditor_kwargs=None) -> None:
+                   arrivals_covered=None, auditor_kwargs=None) -> None:
     """One job's auditor, settler and status books, on ``w`` (which carries
     ``entry``, ``job``, ``cap`` and ``stats``): what judges and pays the job,
     in whichever process runs it.
@@ -279,7 +279,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               on_verdict=settler_fed(w.settler, on_verdict),
                               remote=remote, on_voided=w.miners.voided,
                               threads=judge_threads, scorer=scorer, vocab_size=vocab_size,
-                              arrivals_complete=arrivals_complete,
+                              arrivals_covered=arrivals_covered,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
 
