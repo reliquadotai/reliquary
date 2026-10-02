@@ -210,7 +210,13 @@ async def _get(
             if _error_code(exc) in _ABSENT_CODES:
                 return None, None
             raise
-        body = await response["Body"].read()
+        try:
+            body = await response["Body"].read()
+        finally:
+            # Released even when the read fails, so no connection stays held.
+            close = getattr(response["Body"], "close", None)
+            if close is not None:
+                close()
         return body, response.get("ETag")
 
 

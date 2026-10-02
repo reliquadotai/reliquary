@@ -70,7 +70,10 @@ class CorpusSettler:
     def __init__(self, *, task_id, job_id, cap, records, archives,
                  stall_seconds: float = 3 * RL_WINDOW_SECONDS,
                  advance_every_seconds: float = RL_WINDOW_SECONDS, clock=time.time,
-                 on_settled=None, full_list_every_seconds: float | None = None) -> None:
+                 on_settled=None, full_list_every_seconds: float | None = None,
+                 executor=None) -> None:
+        # Whose threads build the settled sets (the judges', so never the route's).
+        self._executor = executor
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
@@ -97,6 +100,11 @@ class CorpusSettler:
         # The fed verdicts themselves, until settled: verdicts are create-only,
         # so the one the auditor reports is the one a read would return.
         self._fed: dict[str, Mapping] = {}
+
+    async def _off(self, func, *args):
+        from reliquary.validator.corpus_judge_threads import run_in
+
+        return await run_in(self._executor, func, *args)
 
     def observe(self, submission_id: str, verdict=None) -> None:
         """A verdict stands for ``submission_id`` (the auditor's ``on_verdict``)."""
@@ -158,7 +166,7 @@ class CorpusSettler:
         final = {
             **state,
             "last_window": pending["window"],
-            "settled": await asyncio.to_thread(_union, state.get("settled"), pending["ids"]),
+            "settled": await self._off(_union, state.get("settled"), pending["ids"]),
             "pending": None,
             # Carried in the pending step, so a repeated finish adds nothing twice.
             "totals": pending.get("totals", state.get("totals")),
@@ -225,7 +233,7 @@ class CorpusSettler:
             return await self._finish(state, etag, now)
 
         # 300k+ ids on a long job: built off the serving loop.
-        settled = await asyncio.to_thread(set, state["settled"])
+        settled = await self._off(set, state["settled"])
         new_ids = await self._verdict_ids(settled)
         window = choose_window(last_window=state["last_window"], other_max=other_max,
                                other_max_seen_at=state["other_max_seen_at"], now=now,
@@ -251,7 +259,7 @@ class CorpusSettler:
             # Every verdict this period failed (spec §7): no archive, the
             # index does not move, but these ids must not be reconsidered
             # forever, so mark them settled in this same CAS write.
-            state["settled"] = await asyncio.to_thread(_union, settled, new_ids)
+            state["settled"] = await self._off(_union, settled, new_ids)
             state["totals"] = totals
             await self._records.write_settlement(self._job_id, state, etag)
             self._settled(state, new_ids)

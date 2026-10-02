@@ -104,8 +104,12 @@ class CorpusAuditor:
                  gpu_lock: asyncio.Lock | None = None,
                  on_verdict: Callable[[str, dict], None] | None = None,
                  remote=None,
-                 on_voided: Callable[[str, dict], None] | None = None) -> None:
+                 on_voided: Callable[[str, dict], None] | None = None,
+                 threads=None) -> None:
         self._job_id = job_id
+        # A `JudgeThreads`: drand races, forwards and record preparation run
+        # on these, never on the loop's default executor the route needs.
+        self._threads = threads
         # A `RemoteAuditDispatcher`: used while an executor is connected.
         self._remote = remote
         # Per executor, the passes written from its scores: re-audited here if
@@ -176,6 +180,12 @@ class CorpusAuditor:
         # once per pass so an idle GPU shows what it was waiting for.
         self._phase: Counter = Counter()
         self._choices: Counter = Counter()
+
+    async def _in(self, pool: str, func, *args):
+        """``func`` on the judges' ``pool`` threads, or the default executor."""
+        from reliquary.validator.corpus_judge_threads import run_in
+
+        return await run_in(getattr(self._threads, pool, None), func, *args)
 
     @contextlib.contextmanager
     def _timed(self, phase: str):
@@ -410,7 +420,7 @@ class CorpusAuditor:
     async def _forward(self, records: list[dict], *, local: bool = False) -> list[dict]:
         if not local and self._remote is not None and self._remote.connected():
             # An executor computes the chunk scores; the decision stays here.
-            results, items = await asyncio.to_thread(self._prepare, records)
+            results, items = await self._in("codec", self._prepare, records)
             scores = await self._remote.score(
                 [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
                  for _, _, tokens, n, proofs in items])
@@ -428,7 +438,7 @@ class CorpusAuditor:
             # Shared FIFO with every job's auditor: the wait is not this job's work.
             self._phase["gpu_wait"] += time.monotonic() - waited
             with self._timed("forward"):
-                return await asyncio.to_thread(self._judge_many, records)
+                return await self._in("gpu", self._judge_many, records)
 
     async def _audit_outcomes(self, records: list[dict], *,
                               local: bool = False) -> list[dict | str]:
@@ -754,7 +764,7 @@ class CorpusAuditor:
             return None
         try:
             with self._timed("drand"):
-                value = await asyncio.to_thread(self._beacon, round_number)
+                value = await self._in("beacon", self._beacon, round_number)
         except Exception:
             logger.warning("drand round %d unavailable; auditing", round_number, exc_info=True)
             value = None
