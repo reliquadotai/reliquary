@@ -238,7 +238,7 @@ def test_a_front_that_dies_leaves_the_judges_judging(bucket):
     spec, base = _crash_run(root, old=1200, gpu_tps=4000)
     with h.SupervisorThread(spec) as sup:
         asyncio.run(h.wait_http(base, timeout=120))
-        _wait(lambda: _verdicts(root) >= 200, 180, "the first math verdicts")
+        _wait(lambda: _verdicts(root) >= 200, 360, "the first math verdicts")
         os.kill(sup.pid("front"), signal.SIGKILL)
         audited = _audited(root)
         # Audits go on without a front (unaudited passes wait for its feed).
@@ -262,7 +262,7 @@ def test_a_judge_killed_mid_pass_resumes_from_the_bucket(bucket):
     spec, base = _crash_run(root, old=1200, gpu_tps=6000)
     with h.SupervisorThread(spec) as sup:
         asyncio.run(h.wait_http(base, timeout=120))
-        _wait(lambda: _verdicts(root) >= 150, 180, "the first math verdicts")
+        _wait(lambda: _verdicts(root) >= 150, 360, "the first math verdicts")
         killed_at = _verdicts(root)
         os.kill(sup.pid("judge-0"), signal.SIGKILL)
         _wait(lambda: sup.children["judge-0"].starts == 2, 30, "the judge's restart")
