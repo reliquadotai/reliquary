@@ -36,6 +36,8 @@ SPLIT_ENV = "RELIQUARY_CORPUS_SPLIT"
 JUDGES_ENV = "RELIQUARY_CORPUS_SPLIT_JUDGES"
 DIR_ENV = "RELIQUARY_CORPUS_SPLIT_DIR"
 DEFAULT_RUN_DIR = "/tmp/reliquary-corpus-split"
+NICE_ENV = "RELIQUARY_CORPUS_SPLIT_NICE"
+DEFAULT_NICE = 5
 RESTART_BACKOFF_SECONDS = 1.0
 MAX_RESTART_BACKOFF_SECONDS = 60.0
 # A child up this long has its backoff reset.
@@ -198,6 +200,12 @@ def child_main(role: str, index: int, spec: SplitSpec) -> None:
     if role != "gpu":
         # Never a CUDA context outside the GPU process.
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if role != "front":
+        # A saturated host serves miners first; judging catches up after.
+        try:
+            os.nice(int(os.environ.get(NICE_ENV, DEFAULT_NICE)))
+        except OSError:
+            pass
     _set_parent_death_signal()
     # SIGTERM ends the child at once: what it was doing is safe to cut (create-only
     # verdicts, CAS ledgers and settlement). The front's HTTP server takes the

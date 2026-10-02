@@ -711,12 +711,13 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     # One model, one forward pass at a time across every job; one job needs
     # none, unless more may join it.
     hot = read_registry is not None
-    gpu_lock = (asyncio.Lock() if split is None and (len(wiring) > 1 or hot or remote_audit)
+    gpu_lock = (asyncio.Lock() if split is not None or len(wiring) > 1 or hot or remote_audit
                 else None)
     if split is not None:
         from reliquary.validator.corpus_gpu import GPU_SOCKET, GpuScorer
 
-        # The GPU process orders every forward itself.
+        # The GPU process orders every forward; the lock keeps this process's
+        # auditors from preparing their records all at once.
         scorer = GpuScorer(Path(split.run_dir) / GPU_SOCKET, chunk_tokens=proof.chunk_tokens,
                            topk=proof.topk, executor=judge_threads.codec)
     remote = directory = None

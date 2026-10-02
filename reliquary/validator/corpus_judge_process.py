@@ -125,13 +125,16 @@ async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, sock
     scorer = GpuScorer(Path(run_dir) / GPU_SOCKET, chunk_tokens=proof.chunk_tokens,
                        topk=proof.topk, executor=judge_threads.codec)
     feed = ArrivalFeed()
+    # One job of this process prepares and scores at a time, as in-process.
+    gpu_lock = asyncio.Lock()
     wiring: dict[str, Any] = {}
     for entry, cap, job in jobs:
         w = SimpleNamespace(entry=entry, cap=cap, job=job, stats=JobStats())
         wire_job_judge(w, records=records, judge_records=judge_records,
                        judge_threads=judge_threads, archives=archives, proof=proof, model=None,
-                       tokenizer=tokenizer, scorer=scorer, vocab_size=vocab_size,
-                       arrivals_complete=feed.complete, auditor_kwargs=auditor_kwargs)
+                       tokenizer=tokenizer, gpu_lock=gpu_lock, scorer=scorer,
+                       vocab_size=vocab_size, arrivals_complete=feed.complete,
+                       auditor_kwargs=auditor_kwargs)
         wiring[str(job.job_id)] = w
     feed.auditors = {job_id: w.auditor for job_id, w in wiring.items()}
     app = build_judge_app(wiring, feed)

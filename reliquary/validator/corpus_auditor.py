@@ -457,13 +457,18 @@ class CorpusAuditor:
     async def _scored(self, records: list[dict]) -> list[dict]:
         """``_judge_many`` with the forward on the GPU process: the same
         preparation and decision here, only the chunk scores cross."""
-        results, items = await self._in("codec", self._prepare, records)
-        forward = verify = 0.0
-        scores: list = []
-        if items:
-            with self._timed("forward"):
-                scores, forward, verify = await self._scorer(
-                    [(tokens, n, proofs) for _, _, tokens, n, proofs in items])
+        waited = time.monotonic()
+        async with self._gpu_lock:
+            # As in-process: one job of this process prepares and scores at a
+            # time, so their record preparations never pile up at once.
+            self._phase["gpu_wait"] += time.monotonic() - waited
+            results, items = await self._in("codec", self._prepare, records)
+            forward = verify = 0.0
+            scores: list = []
+            if items:
+                with self._timed("forward"):
+                    scores, forward, verify = await self._scorer(
+                        [(tokens, n, proofs) for _, _, tokens, n, proofs in items])
         outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
                     for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
         self._aggregate(records, results, outcomes)
