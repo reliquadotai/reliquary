@@ -43,19 +43,26 @@ def _key(job_id: str, kind: str, submission_id: str) -> str:
     return f"{_prefix(job_id, kind)}{_validated_id(submission_id)}.json"
 
 
-async def _create(key: str, document: Mapping, **client_kwargs) -> bool:
+async def _off(executor, func, *args):
+    """``func`` on ``executor``'s threads, or the loop's default ones when None."""
+    if executor is None:
+        return await asyncio.to_thread(func, *args)
+    return await asyncio.get_running_loop().run_in_executor(executor, func, *args)
+
+
+async def _create(key: str, document: Mapping, *, executor=None, **client_kwargs) -> bool:
     try:
         # Encoded and decoded off the loop, which the route and auditor share.
-        body = await asyncio.to_thread(_encode, dict(document))
+        body = await _off(executor, _encode, dict(document))
         await _put(key, body, None, **client_kwargs)
     except CorpusStoreConflict:
         return False
     return True
 
 
-async def _read(key: str, **client_kwargs) -> dict | None:
+async def _read(key: str, *, executor=None, **client_kwargs) -> dict | None:
     body, _ = await _get(key, **client_kwargs)
-    return None if body is None else await asyncio.to_thread(_decode, body)
+    return None if body is None else await _off(executor, _decode, body)
 
 
 async def _list_ids(prefix: str, *, pool: _ClientPool | None = None, **client_kwargs) -> list[str]:
@@ -113,13 +120,13 @@ def _settlement_key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/settlement.json"
 
 
-async def read_settlement(job_id, **client_kwargs) -> tuple[dict, str | None]:
+async def read_settlement(job_id, *, executor=None, **client_kwargs) -> tuple[dict, str | None]:
     body, etag = await _get(_settlement_key(job_id), **client_kwargs)
-    return ({}, None) if body is None else (await asyncio.to_thread(_decode, body), etag)
+    return ({}, None) if body is None else (await _off(executor, _decode, body), etag)
 
 
-async def write_settlement(job_id, state, etag, **client_kwargs) -> str | None:
-    body = await asyncio.to_thread(_encode, dict(state))
+async def write_settlement(job_id, state, etag, *, executor=None, **client_kwargs) -> str | None:
+    body = await _off(executor, _encode, dict(state))
     return await _put(_settlement_key(job_id), body, etag, **client_kwargs)
 
 
@@ -141,28 +148,29 @@ def _miners_key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/miners.json"
 
 
-async def read_miners(job_id, **client_kwargs) -> tuple[dict, str | None]:
+async def read_miners(job_id, *, executor=None, **client_kwargs) -> tuple[dict, str | None]:
     """Every hotkey's audit state for this job, whole-document. Absent reads
     as ({}, None): a hotkey with no entry is handled by the caller (§5,
     "unknown is probation"), not by this store."""
     body, etag = await _get(_miners_key(job_id), **client_kwargs)
-    return ({}, None) if body is None else (await asyncio.to_thread(_decode, body), etag)
+    return ({}, None) if body is None else (await _off(executor, _decode, body), etag)
 
 
-async def write_miners(job_id, state, etag, **client_kwargs) -> str | None:
+async def write_miners(job_id, state, etag, *, executor=None, **client_kwargs) -> str | None:
     """Compare-and-swap of the whole miners document, like the settlement
     state: two auditors racing on different hotkeys must not let one
     overwrite the other's write."""
-    body = await asyncio.to_thread(_encode, dict(state))
+    body = await _off(executor, _encode, dict(state))
     return await _put(_miners_key(job_id), body, etag, **client_kwargs)
 
 
 class BucketRecordStore:
     """The record calls bound to one bucket, so tests can hand the services a fake."""
 
-    __slots__ = ("_kw",)
+    __slots__ = ("_kw", "_max_reads", "_reads")
 
-    def __init__(self, *, max_pool_connections: int | None = None, **client_kwargs: Any) -> None:
+    def __init__(self, *, max_pool_connections: int | None = None, executor=None,
+                 max_reads: int | None = None, **client_kwargs: Any) -> None:
         credentials = {k: v for k, v in client_kwargs.items() if k != "bucket_name"}
         if max_pool_connections:
             # Its own connection pool, larger than botocore's 10.
@@ -170,13 +178,23 @@ class BucketRecordStore:
         # One long-lived client for every call (see `_ClientPool`); resolved
         # at build time so a patched `get_s3_client` applies.
         pool = _ClientPool(lambda: get_s3_client(**credentials))
-        self._kw = {**client_kwargs, "pool": pool}
+        # `executor`: whose threads encode and decode (the loop's default when
+        # None); the judges pass their own so the route's never wait for them.
+        self._kw = {**client_kwargs, "pool": pool, "executor": executor}
+        # Record reads in flight at once (records run to megabytes); None: no bound.
+        self._max_reads = max_reads
+        self._reads: asyncio.Semaphore | None = None
 
     async def write_submission(self, job_id, submission_id, record):
         return await write_submission(job_id, submission_id, record, **self._kw)
 
     async def read_submission(self, job_id, submission_id):
-        return await read_submission(job_id, submission_id, **self._kw)
+        if self._max_reads is None:
+            return await read_submission(job_id, submission_id, **self._kw)
+        if self._reads is None:
+            self._reads = asyncio.Semaphore(self._max_reads)
+        async with self._reads:
+            return await read_submission(job_id, submission_id, **self._kw)
 
     async def list_submission_ids(self, job_id):
         return await list_submission_ids(job_id, **self._kw)
