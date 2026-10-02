@@ -1069,6 +1069,11 @@ class CorpusAuditor:
         logger.log(level, "corpus audit queue lag: %d pending, oldest received %s s ago",
                    len(pending), "-" if lag is None else f"{lag:.0f}")
 
+    async def rescan_store(self) -> None:
+        """List the store now and schedule every pending record not yet
+        scheduled (the arrival feed's net after a front restart)."""
+        await self._rescan_once(full=True)
+
     async def _rescan_forever(self) -> None:
         # The retry for an id whose audit failed or that was waiting out its
         # hold: from memory every period, from a store listing every
