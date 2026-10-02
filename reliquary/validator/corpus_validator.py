@@ -313,20 +313,12 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
 
     tasks_cache: dict = {}
 
-    @app.get("/corpus/tasks")
-    async def corpus_tasks() -> dict:
-        # Public: every declared task's emission share, from the registry, cached a minute.
-        now = time.time()
-        if tasks_cache.get("at", 0.0) + TASKS_CACHE_SECONDS > now:
-            return tasks_cache["body"]
+    async def read_tasks() -> dict:
         reader = getattr(app.state, "task_registry_reader", None)
         if reader is None:
             from reliquary.infrastructure.task_registry_store import read_registry as reader
-        try:
-            entries, _ = await reader()
-        except Exception as exc:
-            logger.warning("corpus tasks: registry unavailable: %r", exc)
-            raise HTTPException(status_code=503, detail="task_registry_unavailable") from exc
+        now = time.time()
+        entries, _ = await reader()
         tasks = [
             {"task_id": e.task_id, "mechanism": e.mechanism, "cap": float(e.params["cap"]),
              "status": e.status, "job_id": getattr(e, "job_id", None),
@@ -338,6 +330,35 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
                                                     if t["status"] == "active"), 9)}
         tasks_cache.update(at=now, body=body)
         return body
+
+    async def refresh_tasks() -> None:
+        try:
+            await read_tasks()
+        except Exception as exc:
+            logger.warning("corpus tasks: registry unavailable: %r", exc)
+
+    def refresh_tasks_behind() -> None:
+        # One refresh at a time; the task is kept so it is not collected mid-read.
+        running = tasks_cache.get("refresh")
+        if running is None or running.done():
+            tasks_cache["refresh"] = asyncio.get_running_loop().create_task(refresh_tasks())
+
+    # The serving process warms it at start (`run_corpus_validator`).
+    app.state.warm_corpus_tasks = refresh_tasks
+
+    @app.get("/corpus/tasks")
+    async def corpus_tasks() -> dict:
+        # Public: every declared task's emission share. Served from the last registry
+        # read at once; a stale one is refreshed behind, so no request waits on R2.
+        if "body" in tasks_cache:
+            if tasks_cache["at"] + TASKS_CACHE_SECONDS <= time.time():
+                refresh_tasks_behind()
+            return tasks_cache["body"]
+        try:
+            return await read_tasks()
+        except Exception as exc:
+            logger.warning("corpus tasks: registry unavailable: %r", exc)
+            raise HTTPException(status_code=503, detail="task_registry_unavailable") from exc
 
     async def miner_status(job_id: str, hotkey: str) -> dict:
         # Public: this hotkey's own state and counts, from memory, cached.
@@ -688,7 +709,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         background.append(remote.run())
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
-    await asyncio.gather(server.serve(), job_set.run(), *background)
+    await asyncio.gather(server.serve(), job_set.run(), app.state.warm_corpus_tasks(), *background)
 
 
 __all__ = [
