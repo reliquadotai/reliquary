@@ -909,3 +909,84 @@ def test_an_unreadable_record_is_requeued_by_the_memory_rescan():
     auditor._unreadable.add(ids[0])
     asyncio.run(auditor._rescan_once(full=False))
     assert auditor._queued == {ids[0]}
+
+
+# --- Pre-deploy review: parallel audit reads, a write error after the backward audit ---
+
+
+def test_records_already_known_are_read_together_for_their_audit():
+    """A restart seeds every pending record, so a probation miner's 1,466
+    held records were then re-read one GET at a time for their audit."""
+    ids = _ids(False, 24, start=9000)
+    records = _SlowRecords({sid: _rec(0) for sid in ids})
+    auditor = _judge(records, _States(), _Clock(T0 + 10), beacon=_Beacon())
+    for sid in ids:
+        asyncio.run(auditor._read(sid))
+    records.peak = 0
+    asyncio.run(auditor.judge_many(ids))
+    assert set(records.verdicts) == set(ids)
+    assert records.peak > 1
+
+
+class _OneWriteFails(_Records):
+    def __init__(self, submissions, fail_id):
+        super().__init__(submissions)
+        self.fail_id = fail_id
+
+    async def write_verdict(self, job_id, sid, verdict):
+        if sid == self.fail_id:
+            raise ConnectionError("PUT reset")
+        return await super().write_verdict(job_id, sid, verdict)
+
+
+def test_a_failed_write_in_the_pass_still_lets_the_backward_audit_run():
+    other = "5Other"
+    hit = _ids(True, 1)[0]
+    held = _ids(False, 1)[0]
+    x, *steady = _ids(False, 3, start=3000)
+    now = T0 + HOLD + 1
+    records = _OneWriteFails({
+        hit: _rec(1, received_at=now - 10), held: _rec(1, received_at=T0 + 500),
+        x: _rec(0, hotkey=other),
+        **{sid: _rec(0, received_at=T0 + 500, hotkey=other) for sid in steady},
+    }, fail_id=x)
+    states = _States({HK: SAMPLED, other: SAMPLED})
+    auditor = _judge(records, states, _Clock(now), beacon=_Beacon())
+    for sid in steady:
+        asyncio.run(auditor._read(sid))
+    with pytest.raises(ConnectionError):
+        asyncio.run(auditor.judge_many([hit, held, x]))
+    assert records.verdicts[hit]["passed"] is False
+    # The caught hotkey's held record was audited in the same pass.
+    assert (records.verdicts[held]["passed"], records.verdicts[held]["audited"]) == (False, True)
+    assert x not in records.verdicts
+
+
+def test_writes_of_one_auditor_share_one_bound():
+    other = "5Other"
+    hits = _ids(True, 4)
+    xs = _ids(False, 60, start=3000)
+    now = T0 + HOLD + 1
+
+    class _Counting(_Records):
+        in_flight = peak = 0
+
+        async def write_verdict(self, job_id, sid, verdict):
+            type(self).in_flight += 1
+            type(self).peak = max(type(self).peak, type(self).in_flight)
+            try:
+                await asyncio.sleep(0.01)
+                return await super().write_verdict(job_id, sid, verdict)
+            finally:
+                type(self).in_flight -= 1
+
+    records = _Counting({**{sid: _rec(0, received_at=now - 10) for sid in hits},
+                         **{sid: _rec(0, hotkey=other) for sid in xs},
+                         **{sid: _rec(0, received_at=T0 + 500, hotkey=other)
+                            for sid in _ids(False, 2, start=6000)}})
+    auditor = _judge(records, _States({HK: SAMPLED, other: SAMPLED}), _Clock(now),
+                     beacon=_Beacon())
+    auditor.write_concurrency = 2
+    asyncio.run(auditor.judge_many([*hits, *xs]))
+    assert set(hits) | set(xs) <= set(records.verdicts)
+    assert _Counting.peak <= 2

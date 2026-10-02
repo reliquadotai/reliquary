@@ -143,6 +143,11 @@ class MinerStates:
         document, _ = await self._read_document()
         return self._entry(document, hotkey)
 
+    async def get_many(self, hotkeys) -> dict[str, MinerState]:
+        """Several hotkeys' states from one read of the document."""
+        document, _ = await self._read_document()
+        return {hotkey: self._entry(document, hotkey) for hotkey in hotkeys}
+
     async def hotkeys(self) -> list[str]:
         document, _ = await self._read_document()
         return sorted(document)

@@ -64,6 +64,24 @@ class _Records:
         return self.etag
 
 
+class _SlowVerdictReads(_Records):
+    """Each verdict read takes a while; counts reads and how many overlap."""
+
+    def __init__(self, verdicts=None):
+        super().__init__(verdicts)
+        self.reads, self.in_flight, self.peak = 0, 0, 0
+
+    async def read_verdict(self, job_id, sid):
+        self.reads += 1
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0.005)
+            return await super().read_verdict(job_id, sid)
+        finally:
+            self.in_flight -= 1
+
+
 class _Archives:
     def __init__(self, other_max):
         self.other = other_max
@@ -193,8 +211,9 @@ def test_a_crash_after_the_archive_finishes_the_same_window_once():
 
 def _scenario(fed: bool):
     """One fixed sequence of verdicts, voids, horizon moves and settle calls;
-    every verdict is reported to the feed the moment it is written."""
-    records, archives, clock = _Records(), _Archives(46000), _Clock()
+    every verdict is reported the moment it is written: with itself when fed,
+    by id only otherwise, so that settler reads every verdict back."""
+    records, archives, clock = _SlowVerdictReads(), _Archives(46000), _Clock()
     settler = _settler(records, archives, clock, fed=fed)
     n = 0
     for step in range(40):
@@ -203,12 +222,13 @@ def _scenario(fed: bool):
             n += 1
             verdict = _v("ABCDE"[(n * 7) % 5], 10 + (n * 13) % 97, ok=(n % 3 != 0))
             records.verdicts[_id(n)] = verdict
-            settler.observe(_id(n), verdict)
+            settler.observe(_id(n), dict(verdict) if fed else None)
         if step % 9 == 4 and n:
             records.voided.add(_id(n))
         if step % 5 == 0 or step > 30:
             archives.other = 46000 + step // 5
         asyncio.run(settler.settle_once())
+    assert (records.reads == 0) == fed
     return archives.written, records.state
 
 
@@ -468,3 +488,46 @@ def test_the_auditor_hook_feeds_the_settler_before_the_status_hook():
         report(_id(1), records.verdicts[_id(1)])
     archives.other, clock.now = 46001, 60.0
     assert asyncio.run(settler.settle_once()) == 46001
+
+
+def test_a_fed_verdict_is_settled_without_reading_it_back():
+    """Math's settlement read each new verdict one at a time and paid one
+    window in three hours (2026-10-02): the auditor's report is the verdict."""
+    records, archives, clock = _SlowVerdictReads(), _Archives(46000), _Clock()
+    settler = _settler(records, archives, clock)
+    asyncio.run(settler.settle_once())
+    for n in range(50):
+        records.verdicts[_id(n)] = _v("A" if n % 2 else "B", 10)
+        settler.observe(_id(n), records.verdicts[_id(n)])
+    archives.other, clock.now = 46001, 60.0
+    assert asyncio.run(settler.settle_once()) == 46001
+    assert records.reads == 0
+    assert json.loads(archives.written[46001])["rewards_by_hotkey"] == pytest.approx(
+        {"A": 0.05, "B": 0.05})
+
+
+def test_unfed_verdicts_are_read_together():
+    records = _SlowVerdictReads({_id(n): _v("A", 10) for n in range(40)})
+    archives, clock = _Archives(46000), _Clock()
+    assert asyncio.run(_settler(records, archives, clock).settle_once()) == 46000
+    assert records.reads == 40 and records.peak > 1
+    assert records.state["settled"] == sorted(_id(n) for n in range(40))
+
+
+def test_a_failed_verdict_read_raises_after_the_others_finish():
+    class _OneFails(_SlowVerdictReads):
+        async def read_verdict(self, job_id, sid):
+            if sid == _id(3):
+                raise OSError("reset")
+            return await super().read_verdict(job_id, sid)
+
+    records = _OneFails({_id(n): _v("A", 10) for n in range(20)})
+    settler = _settler(records, _Archives(46000), _Clock())
+
+    async def settle():
+        with pytest.raises(OSError):
+            await settler.settle_once()
+        return records.in_flight
+
+    assert asyncio.run(settle()) == 0
+    assert records.state == {}

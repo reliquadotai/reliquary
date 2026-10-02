@@ -28,6 +28,8 @@ RL_WINDOW_SECONDS = 16 * 60
 SETTLE_FULL_LIST_SECONDS = float(os.environ.get("RELIQUARY_CORPUS_SETTLE_FULL_LIST_SECONDS", "1800"))
 # How long the other tasks' highest window is reused before it is listed again.
 OTHER_MAX_TTL_SECONDS = 300.0
+# Verdict reads in flight at once for the verdicts the auditor did not feed.
+VERDICT_READ_CONCURRENCY = 16
 
 
 def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
@@ -92,10 +94,15 @@ class CorpusSettler:
         self._listed_at: float | None = None
         # Ids with a verdict, not yet seen settled: fed or listed.
         self._unsettled: set[str] = set()
+        # The fed verdicts themselves, until settled: verdicts are create-only,
+        # so the one the auditor reports is the one a read would return.
+        self._fed: dict[str, Mapping] = {}
 
     def observe(self, submission_id: str, verdict=None) -> None:
         """A verdict stands for ``submission_id`` (the auditor's ``on_verdict``)."""
         self._unsettled.add(submission_id)
+        if isinstance(verdict, Mapping):
+            self._fed[submission_id] = verdict
 
     async def _verdict_ids(self, settled: set) -> list[str]:
         """The verdict ids not yet settled, sorted as the store lists them."""
@@ -107,7 +114,27 @@ class CorpusSettler:
             self._unsettled.update(listed)
             self._listed_at = now
         self._unsettled -= settled
+        if self._fed:
+            self._fed = {sid: v for sid, v in self._fed.items() if sid not in settled}
         return sorted(self._unsettled)
+
+    async def _verdicts(self, ids: list[str]) -> list:
+        """Each id's verdict: as fed, else read (one read at a time took
+        ~2 minutes per RL window at 7k verdicts an hour)."""
+        gate = asyncio.Semaphore(VERDICT_READ_CONCURRENCY)
+
+        async def one(sid):
+            async with gate:
+                return sid, await self._records.read_verdict(self._job_id, sid)
+
+        # Every read finishes before an error is raised: none outlives the call.
+        pairs = await asyncio.gather(*(one(sid) for sid in ids if sid not in self._fed),
+                                     return_exceptions=True)
+        for pair in pairs:
+            if isinstance(pair, BaseException):
+                raise pair
+        read = dict(pairs)
+        return [self._fed[sid] if sid in self._fed else read[sid] for sid in ids]
 
     def set_cap(self, cap: float) -> None:
         """A cap changed in the registry: the next settlement pays under it."""
@@ -206,7 +233,7 @@ class CorpusSettler:
                                advance_every_seconds=self._advance_every)
 
         if new_ids and window is not None:
-            verdicts = [await self._records.read_verdict(self._job_id, sid) for sid in new_ids]
+            verdicts = await self._verdicts(new_ids)
             lister = getattr(self._records, "list_voided_ids", None)
             if lister is not None:
                 # Withdrawn after a quarantined executor's re-audit: settled, never paid.
