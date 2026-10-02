@@ -558,6 +558,10 @@ def eval_auditor(**kwargs):
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
     class EvalAuditor(CorpusAuditor):
+        # A failed verdict's write also moves the ledger (a CAS per failure):
+        # one at a time, as before, so those writes never race each other.
+        write_concurrency = 1
+
         async def _forward(self, records, *, local: bool = False):
             results, items = await asyncio.to_thread(self._prepare, records)
             scores = await self._remote.score(
