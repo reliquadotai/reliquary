@@ -105,8 +105,19 @@ class CorpusAuditor:
                  on_verdict: Callable[[str, dict], None] | None = None,
                  remote=None,
                  on_voided: Callable[[str, dict], None] | None = None,
-                 threads=None) -> None:
+                 threads=None,
+                 scorer: Callable | None = None,
+                 vocab_size: int | None = None,
+                 arrivals_complete: Callable[[], bool] | None = None) -> None:
         self._job_id = job_id
+        # In a judge process: ``await scorer(rows)`` scores (tokens,
+        # prompt_len, proofs) rows on the GPU process, as ``score_sequences``
+        # would here, and ``vocab_size`` stands for the model's embeddings.
+        self._scorer = scorer
+        self._vocab_size = vocab_size
+        # In a judge process: False while an arrival the front accepted may
+        # not have reached this auditor yet; unaudited passes then wait.
+        self._arrivals_complete = arrivals_complete
         # A `JudgeThreads`: drand races, forwards and record preparation run
         # on these, never on the loop's default executor the route needs.
         self._threads = threads
@@ -298,7 +309,8 @@ class CorpusAuditor:
         rest need scored as ``(record, completion, tokens, prompt_len, proofs)``."""
         worst_zero = _WORST_ZERO
         results: list[dict | None] = [None] * len(records)
-        vocabulary = self._model.get_input_embeddings().num_embeddings
+        vocabulary = (self._vocab_size if self._vocab_size is not None
+                      else self._model.get_input_embeddings().num_embeddings)
         items = []
         for i, record in enumerate(records):
             if not record["completions"]:
@@ -433,12 +445,30 @@ class CorpusAuditor:
             for i, executors in scored_by.items():
                 judged[i] = {**judged[i], "scored_by": sorted(executors)}
             return judged
+        if self._scorer is not None:
+            return await self._scored(records)
         waited = time.monotonic()
         async with self._gpu_lock:
             # Shared FIFO with every job's auditor: the wait is not this job's work.
             self._phase["gpu_wait"] += time.monotonic() - waited
             with self._timed("forward"):
                 return await self._in("gpu", self._judge_many, records)
+
+    async def _scored(self, records: list[dict]) -> list[dict]:
+        """``_judge_many`` with the forward on the GPU process: the same
+        preparation and decision here, only the chunk scores cross."""
+        results, items = await self._in("codec", self._prepare, records)
+        forward = verify = 0.0
+        scores: list = []
+        if items:
+            with self._timed("forward"):
+                scores, forward, verify = await self._scorer(
+                    [(tokens, n, proofs) for _, _, tokens, n, proofs in items])
+        outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
+                    for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
+        self._aggregate(records, results, outcomes)
+        self._log_batch(records, [(len(t), i, c) for i, c, t, _, _ in items], forward, verify)
+        return results
 
     async def _audit_outcomes(self, records: list[dict], *,
                               local: bool = False) -> list[dict | str]:
@@ -935,6 +965,12 @@ class CorpusAuditor:
                 "%d pending corpus record(s) unreadable (e.g. %s); every unaudited pass "
                 "waits until they read or get a verdict",
                 len(self._unreadable), min(self._unreadable)[:12])
+        # A sibling the front accepted may not have been handed over yet: as
+        # with an unreadable record, its hotkey could be any of these.
+        blind = self._arrivals_complete is not None and not self._arrivals_complete()
+        if unaudited and blind:
+            logger.warning("corpus job %s: arrival feed incomplete; %d unaudited pass(es) wait",
+                           self._job_id, len(unaudited))
         audited_hotkeys = {self._meta[sid][0] for sid in audit_ids}
         early, late = [], []
         for submission_id, draw in unaudited:
@@ -942,7 +978,7 @@ class CorpusAuditor:
             # Wait while a sibling that could still catch this record is
             # undecided or hit a validator error this pass, or while any
             # pending record is unreadable (its hotkey could be this one).
-            if unreadable or hotkey in errored:
+            if unreadable or blind or hotkey in errored:
                 continue  # judged again at the next rescan
             if any(t <= received_at + self._params.hold_seconds
                    for t in undecided.get(hotkey, ())):
