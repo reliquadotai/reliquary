@@ -139,7 +139,7 @@ def _serve(tmp_path, score, *, start_after=0.0):
     def run():
         try:
             loop.run_until_complete(task)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001
             import traceback
             traceback.print_exc()
 
