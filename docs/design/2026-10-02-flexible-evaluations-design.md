@@ -204,9 +204,31 @@ samples, sampling, budget, thinking) and says which.
 - **A catalog source must be single-turn** to build a set; an `episode` source is refused
   at build until multi-turn sets exist.
 - **Set ids.** Catalog `<source>-<split>-r<start>-n<count>[-k<sample>-s<seed>]`; Verifiers
-  `verifiers-<id>[-a<args sha[:8]>]-r<start>-n<count>[...]`. Default job ids carry the
-  problems and samples (`<prefix>eval-<rev[:8]>-<set>-n<N>x<S>`), so two orders on one set
-  with different sizes are two jobs; past 63 characters the tail is a hash.
+  `verifiers-<id>[-a<args sha[:8]>]-r<start>-n<count>[...]`.
+- **Job ids** are `[a-z0-9-]` (a catalog set id's underscores are slugged):
+  `<prefix>eval-<rev[:8]>-<set>-n<N>x<S>-<sha6 of every condition>`, so two orders that
+  differ in repo, sampling, budget, thinking or size are two jobs; past 63 characters the
+  tail is a hash. Ids are checked before any qualification is requested.
+- **Qualification ids** hash the conditions, the qualify completions and an attempt
+  number: a failed qualification stays failed under its id, `--attempt N` asks again.
+- **Thinking and free text.** With thinking on, the chat template opens the reasoning
+  block in the generation prompt, so a completion cut at its budget carries no tag: every
+  free-text grader (Verifiers rows, and the catalog's instruction following) reads a
+  completion with no closing tag as reasoning — a format failure — when the order's
+  provenance says thinking. Without it, an AIME trace holding a tentative boxed answer
+  scored 1.0.
+- **The child scorer** replaces a child that died once and retries the row, cuts a row
+  at 30 minutes and kills its child, and closes without waiting. A task gone from its
+  taskset is `source_drift`.
+- **Grader versions.** The report records, per Verifiers set, the taskset and verifiers
+  versions that scored it beside the build's, and flags a difference; `eval compare`
+  refuses two gradings scored by different versions, and refuses ungraded rows (they
+  count as failures in pass@1) unless `--allow-ungraded`.
+- **Only an eval-set job may declare the external environment**
+  (`compose_profile(external_eval=True)`); anything else naming it is refused at
+  declaration.
+- **Operator sets stay off the platform.** `publish-set` writes a `build-set --source`
+  set to the subnet bucket only: the platform's `set.json` is what makes a set orderable.
 - **Qualification completions** are lowered to fit the admin's
   `completions × max_new_tokens ≤ 64 × 32768` (two at 1M tokens, 64 at 32k).
 - **`eval compare` pads with ties.** A problem neither grading has a row for failed on
