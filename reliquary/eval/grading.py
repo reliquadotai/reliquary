@@ -193,6 +193,8 @@ class _Graders:
         self._open_taskset = open_taskset
         self._opened: dict[tuple[str, str], tuple[Any, Callable]] = {}
         self._tasksets: dict[str, Any] = {}
+        # What scored each taskset's rows here: (id, args) -> installed versions.
+        self.taskset_versions: dict[str, dict] = {}
         self._child = None
 
     def close(self) -> None:
@@ -246,15 +248,18 @@ class _Graders:
             if name != taskset.get("id"):
                 raise ValueError(f"the card names taskset {taskset.get('id')!r}, not {name!r}")
             args = dict(taskset.get("args") or {})
+            cache = json.dumps([name, args], sort_keys=True)
             if self._open_taskset is None:
                 if self._child is None:
                     self._child = verifiers_source.ChildScorer()
+                if cache not in self.taskset_versions:
+                    self.taskset_versions[cache] = self._child.provenance(name, args)
                 value = float(self._child.score(name, args, grading["task_key"],
                                                 grading["prompt_sha256"], answer))
             else:
-                cache = json.dumps([name, args], sort_keys=True)
                 if cache not in self._tasksets:
                     self._tasksets[cache] = self._open_taskset(name, args)
+                    self.taskset_versions[cache] = self._tasksets[cache].provenance()
                 value = float(verifiers_source.score_answer(
                     self._tasksets[cache], grading["task_key"], grading["prompt_sha256"],
                     answer))
@@ -265,6 +270,19 @@ class _Graders:
         except Exception as exc:
             return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
         return value, "format_failure" if failed_format else "", failed_format
+
+
+def _taskset_grading(card: Mapping, graders: "_Graders") -> dict:
+    """The taskset a Verifiers set was built from and the one that scored it
+    here. A reward can change between versions while every prompt still
+    matches, so a difference is reported, never silently absorbed."""
+    built = dict(card.get("taskset") or {})
+    cache = json.dumps([built.get("id"), dict(built.get("args") or {})], sort_keys=True)
+    graded = graders.taskset_versions.get(cache)
+    keys = ("package_version", "verifiers_version")
+    return {"taskset": built, "taskset_at_grading": graded,
+            "grader_version_drift": None if graded is None else any(
+                built.get(k) != graded.get(k) for k in keys)}
 
 
 def _graded_schema():
@@ -610,7 +628,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                               "selection": card.get("selection"),
                               "training_overlap": card.get("disjointness")}
                              if "source_kind" in card else {}),
-                          **({"taskset": card.get("taskset")}
+                          **(_taskset_grading(card, graders)
                              if card.get("source_kind") == "verifiers" else {})}
                          for set_id, (card, _) in sets.items()],
                 "completion_keys": keys,

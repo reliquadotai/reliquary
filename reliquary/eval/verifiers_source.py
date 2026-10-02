@@ -31,6 +31,13 @@ class RuntimeUnavailable(RuntimeError):
     """A task's reward runs code in a runtime and this host has none."""
 
 
+class ScoreTimeout(RuntimeError):
+    """A row's scoring outlived its budget; its child was killed."""
+
+
+SCORE_TIMEOUT_SECONDS = 1800.0
+
+
 def is_verifiers_source(name: Any) -> bool:
     return isinstance(name, str) and name.startswith(VERIFIERS_PREFIX)
 
@@ -258,7 +265,11 @@ def _docker_missing(exc: BaseException) -> bool:
 def score_answer(handle: TasksetHandle, key: str, frozen_sha256: str, answer: str) -> float:
     """The task's score for ``answer``; ``LookupError("source_drift")`` when the
     task no longer holds the prompt the set froze (``frozen_sha256``)."""
-    task = handle.task(key)
+    try:
+        task = handle.task(key)
+    except KeyError:
+        # The taskset no longer holds the frozen task at all: drift, not a crash.
+        raise LookupError("source_drift") from None
     frozen = freeze(task)
     if prompt_digest(frozen.system, frozen.prompt) != frozen_sha256:
         raise LookupError("source_drift")
@@ -269,12 +280,20 @@ def score_answer(handle: TasksetHandle, key: str, frozen_sha256: str, answer: st
 _CHILD_HANDLES: dict[tuple[str, str], TasksetHandle] = {}
 
 
-def _score_in_child(name: str, args_json: str, key: str, frozen_sha256: str,
-                    answer: str) -> float:
+def _child_handle(name: str, args_json: str) -> TasksetHandle:
     handle = _CHILD_HANDLES.get((name, args_json))
     if handle is None:
         handle = _CHILD_HANDLES[(name, args_json)] = open_taskset(name, json.loads(args_json))
-    return score_answer(handle, key, frozen_sha256, answer)
+    return handle
+
+
+def _score_in_child(name: str, args_json: str, key: str, frozen_sha256: str,
+                    answer: str) -> float:
+    return score_answer(_child_handle(name, args_json), key, frozen_sha256, answer)
+
+
+def _provenance_in_child(name: str, args_json: str) -> dict:
+    return _child_handle(name, args_json).provenance()
 
 
 class ChildScorer:
@@ -286,24 +305,60 @@ class ChildScorer:
     a silent wrong score. Grading runs off the event loop, so it hands each row
     to a child; the child also keeps a taskset's code out of the admin process."""
 
-    def __init__(self) -> None:
+    def __init__(self, timeout_seconds: float = SCORE_TIMEOUT_SECONDS) -> None:
         self._pool = None
+        self._timeout = timeout_seconds
+
+    def _start(self):
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        self._pool = ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+        return self._pool
+
+    def _kill(self) -> None:
+        """Never waits: a hung reward must not hold the admin's event loop."""
+        pool, self._pool = self._pool, None
+        if pool is None:
+            return
+        processes = list((getattr(pool, "_processes", None) or {}).values())
+        pool.shutdown(wait=False, cancel_futures=True)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+
+    def _call(self, fn, *args):
+        from concurrent.futures.process import BrokenProcessPool
+
+        for attempt in (1, 2):
+            pool = self._pool or self._start()
+            future = pool.submit(fn, *args)
+            try:
+                return future.result(timeout=self._timeout)
+            except BrokenProcessPool:
+                # The child died (OOM, a crashing reward): one fresh child, one
+                # retry, rather than every remaining row read as a failure.
+                self._kill()
+                if attempt == 2:
+                    raise
+            except TimeoutError:
+                self._kill()
+                raise ScoreTimeout(f"scoring took over {self._timeout:.0f} s") from None
 
     def score(self, name: str, args: dict, key: str, frozen_sha256: str, answer: str) -> float:
-        if self._pool is None:
-            import multiprocessing
-            from concurrent.futures import ProcessPoolExecutor
+        return self._call(_score_in_child, name, _canonical(args), key, frozen_sha256, answer)
 
-            self._pool = ProcessPoolExecutor(
-                max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-        args_json = json.dumps(args, sort_keys=True, separators=(",", ":"))
-        return self._pool.submit(_score_in_child, name, args_json, key, frozen_sha256,
-                                 answer).result()
+    def provenance(self, name: str, args: dict) -> dict:
+        """The taskset and verifiers versions installed where rows are scored."""
+        return self._call(_provenance_in_child, name, _canonical(args))
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.shutdown(wait=True, cancel_futures=True)
-            self._pool = None
+        self._kill()
+
+
+def _canonical(args: dict) -> str:
+    return json.dumps(args, sort_keys=True, separators=(",", ":"))
 
 
 def _args_tag(args: dict) -> str:
@@ -373,6 +428,7 @@ __all__ = [
     "ChildScorer",
     "FrozenTask",
     "RuntimeUnavailable",
+    "ScoreTimeout",
     "TasksetHandle",
     "VERIFIERS_PREFIX",
     "build_set",

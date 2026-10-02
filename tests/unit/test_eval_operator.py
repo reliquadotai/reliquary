@@ -136,7 +136,7 @@ def test_grade_brings_the_three_files_home(admin, tmp_path):  # noqa: F811
 
 
 def write_grading(directory, *, correct, n_problems, samples=2, sampling=None, set_id="s1",
-                  revision="a" * 40):
+                  revision="a" * 40, ungraded=0, grader=None):
     """correct: {problem: [bool, ...]}; problems absent from it have no row."""
     directory.mkdir(parents=True)
     rows = [{"env": "math", "problem_id": p, "correct": c} for p, cs in correct.items() for c in cs]
@@ -144,12 +144,15 @@ def write_grading(directory, *, correct, n_problems, samples=2, sampling=None, s
     rate = sum(sum(cs) for cs in correct.values()) / (n_problems * samples)
     (directory / "report.json").write_text(json.dumps({
         "eval_id": directory.name,
-        "envs": {"math": {"pass@1": {"value": rate}, "n_problems": n_problems}},
+        "envs": {"math": {"pass@1": {"value": rate}, "n_problems": n_problems,
+                          "ungraded_rows": ungraded, "missing_rows": 0}},
         "provenance": {"model": "org/m", "revision": revision,
                        "sampling": sampling or {"temperature": 0.6}, "max_new_tokens": 512,
                        "thinking": True,
                        "sets": [{"set_id": set_id, "env": "math", "problems": n_problems,
-                                 "samples": samples}]}}))
+                                 "samples": samples,
+                                 **({"source_kind": "verifiers",
+                                     "taskset_at_grading": grader} if grader else {})}]}}))
 
 
 def test_compare_two_checkpoints_on_the_same_problems(tmp_path):
@@ -209,3 +212,21 @@ def test_a_bad_job_id_costs_no_qualification(admin):  # noqa: F811
     qid = op.qualification_id_for("order-", {**conditions, "completions": 32, "attempt": 0})
     record, _ = asyncio.run(qual.QualificationStore().read(qid))
     assert record is None
+
+
+def test_compare_refuses_ungraded_rows_unless_told(tmp_path):
+    write_grading(tmp_path / "a", n_problems=2, correct={"p0": [True, True]})
+    write_grading(tmp_path / "b", n_problems=2, correct={"p0": [True, False]}, ungraded=1)
+    with pytest.raises(ValueError, match="ungraded rows"):
+        op.compare_reports(tmp_path / "a", tmp_path / "b")
+    result = op.compare_reports(tmp_path / "a", tmp_path / "b", allow_ungraded=True)
+    assert result["envs"]["math"]["ungraded_rows_b"] == 1
+
+
+def test_compare_refuses_two_grader_versions(tmp_path):
+    write_grading(tmp_path / "a", n_problems=1, correct={"p0": [True, True]},
+                  grader={"package_version": "1.0", "verifiers_version": "0.3.1"})
+    write_grading(tmp_path / "b", n_problems=1, correct={"p0": [True, True]},
+                  grader={"package_version": "1.1", "verifiers_version": "0.3.1"})
+    with pytest.raises(ValueError, match="grader versions"):
+        op.compare_reports(tmp_path / "a", tmp_path / "b")

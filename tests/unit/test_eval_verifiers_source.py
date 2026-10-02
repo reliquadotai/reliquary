@@ -166,6 +166,6 @@ def test_a_drifted_prompt_is_not_scored():
         vs.score_answer(handle, "key000", vs.prompt_digest(None, "the frozen question"), "0")
 
 
-def test_an_unknown_key_is_not_scored():
-    with pytest.raises(KeyError):
+def test_a_task_gone_from_the_taskset_is_drift():
+    with pytest.raises(LookupError, match="source_drift"):
         vs.score_answer(fake_handle([FakeTask(0)]), "nope", vs.prompt_digest(None, "q"), "0")

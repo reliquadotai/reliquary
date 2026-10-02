@@ -127,3 +127,16 @@ def test_with_thinking_on_a_completion_cut_before_closing_is_not_an_answer(tmp_p
                            provenance={"model": "org/m", "thinking": True})
     assert [(r["score"], r["grader_detail"]) for r in rows] == [
         (0.0, "format_failure"), (1.0, "")]
+
+
+def test_a_grader_upgraded_since_the_build_is_reported(tmp_path):
+    tasks = [FakeTask(0)]
+    card, grading = _publish(tmp_path, tasks)
+    upgraded = fake_handle(tasks)
+    upgraded.package_version = "2.0"
+    _, report, rows, _ = _grade(tmp_path, card, [_line(grading[0]["problem_id"], 0, "0")],
+                                upgraded, 1)
+    sets = report["provenance"]["sets"][0]
+    assert sets["taskset"]["package_version"] == "1.0"
+    assert sets["taskset_at_grading"]["package_version"] == "2.0"
+    assert sets["grader_version_drift"] is True and rows[0]["score"] == 1.0

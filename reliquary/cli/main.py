@@ -1763,6 +1763,8 @@ def eval_grade(
 def eval_compare(
     a: str = typer.Argument(..., help="A graded directory (eval grade --out)"),
     b: str = typer.Argument(..., help="Another, on the same sets and conditions"),
+    allow_ungraded: bool = typer.Option(False, "--allow-ungraded",
+                                        help="Count ungraded rows as failures instead of refusing"),
 ) -> None:
     """pass@1 of two gradings and their difference, with a paired bootstrap interval."""
     import json
@@ -1770,7 +1772,7 @@ def eval_compare(
     from reliquary.eval.operator import compare_reports
 
     try:
-        result = compare_reports(a, b)
+        result = compare_reports(a, b, allow_ungraded=allow_ungraded)
     except (ValueError, OSError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc

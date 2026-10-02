@@ -267,7 +267,14 @@ def _sets(report: dict) -> list[tuple]:
                   for s in report["provenance"]["sets"])
 
 
-def compare_reports(a: str | Path, b: str | Path, *, seed: int = 0) -> dict:
+def _grader_versions(report: dict) -> dict:
+    return {s["set_id"]: {k: (s.get("taskset_at_grading") or {}).get(k)
+                          for k in ("package_version", "verifiers_version")}
+            for s in report["provenance"]["sets"] if s.get("source_kind") == "verifiers"}
+
+
+def compare_reports(a: str | Path, b: str | Path, *, seed: int = 0,
+                    allow_ungraded: bool = False) -> dict:
     """Two gradings of the same sets under the same conditions, side by side:
     pass@1 of each and their difference with a paired bootstrap interval over
     the problems (missing and ungraded samples count as failures, as in each
@@ -281,8 +288,19 @@ def compare_reports(a: str | Path, b: str | Path, *, seed: int = 0) -> dict:
     differs = [k for k in CONDITIONS if k != "model" and prov_a.get(k) != prov_b.get(k)]
     if _sets(report_a) != _sets(report_b):
         differs.append("sets")
+    if _grader_versions(report_a) != _grader_versions(report_b):
+        # Another reward may score the same answer differently.
+        differs.append("grader versions")
     if differs:
         raise ValueError(f"the two gradings differ in {differs}; compare like with like")
+    ungraded = {side: {env: r.get("ungraded_rows", 0) for env, r in report["envs"].items()
+                       if r.get("ungraded_rows")}
+                for side, report in (("a", report_a), ("b", report_b))}
+    if not allow_ungraded and (ungraded["a"] or ungraded["b"]):
+        # An ungraded row counts as a failure in pass@1: a grading that could
+        # not score (no Docker, drift, a dead scorer) would read as a regression.
+        raise ValueError(f"ungraded rows {ungraded}: regrade them, or pass "
+                         "--allow-ungraded to count them as failures")
     samples = {s["set_id"]: int(s["samples"]) for s in prov_a["sets"]}
     envs = {}
     for env in sorted(set(report_a["envs"]) | set(report_b["envs"])):
@@ -306,6 +324,9 @@ def compare_reports(a: str | Path, b: str | Path, *, seed: int = 0) -> dict:
             "diff": sum(diffs) / len(diffs) if diffs else None,
             "ci95": [low, high], "problems_with_rows": len(problems),
             "n_problems": report_a["envs"].get(env, {}).get("n_problems"),
+            **{f"{key}_{side}": report["envs"].get(env, {}).get(key)
+               for side, report in (("a", report_a), ("b", report_b))
+               for key in ("missing_rows", "ungraded_rows")},
         }
     return {"a": {"model": prov_a.get("model"), "revision": prov_a.get("revision"),
                   "eval_id": report_a.get("eval_id")},
