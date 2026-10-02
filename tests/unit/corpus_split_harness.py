@@ -117,6 +117,9 @@ class _Body:
         pass
 
 
+_COUNTS = {"records": 0}
+
+
 class FileS3:
     """An aiobotocore client's calls over a directory: each object a file,
     its ETag its inode and mtime; conditional puts under a per-key flock, so
@@ -162,6 +165,12 @@ class FileS3:
             raise _client_error("NoSuchKey") from None
         if data.startswith(SYNTH):
             data = expand(data)
+            _COUNTS["records"] += 1
+            if _COUNTS["records"] % 1000 == 0:
+                import logging
+
+                logging.getLogger("harness").info("harness: %d record reads in this process",
+                                                  _COUNTS["records"])
         return {"Body": _Body(data), "ETag": etag}
 
     @contextlib.contextmanager
@@ -284,15 +293,42 @@ def round_at(t: float) -> int:
     return int(t // 3) + 1
 
 
+_PROBE: dict = {}
+
+
+def verify_cpu(chunks: int) -> None:
+    """The proof check's CPU, as the real one spends it: ``verify_chunk_proofs``
+    over honest proofs, ``chunks`` chunks (the top-k runs on small rows here;
+    on the card it is a kernel, the rest is this same Python)."""
+    import torch
+
+    from reliquary.protocol.toploc_proof import build_chunk_proofs, verify_chunk_proofs
+
+    if not _PROBE:
+        torch.manual_seed(0)
+        hidden = torch.randn(64 * 32, 128, dtype=torch.bfloat16)
+        _PROBE.update(hidden=hidden, raw=build_chunk_proofs(hidden, chunk_tokens=32, topk=128))
+    left = chunks
+    while left > 0:
+        k = min(left, 64)
+        verify_chunk_proofs(_PROBE["hidden"][: k * 32], _PROBE["raw"][:k], chunk_tokens=32,
+                            topk=128)
+        left -= k
+
+
 def gpu_score_sequences(model, sequences, *, chunk_tokens, topk, batch_tokens):
-    """The forward at the measured rate (it blocks its thread, as a GPU call
-    does, without holding the GIL), honest unless a completion is forged."""
+    """The forward at the measured rate: the proof check's real CPU (holding
+    the GIL, as it does), then the rest of the time asleep (a GPU kernel does
+    not hold it). Honest unless a completion is forged."""
     from tests.unit.corpus_split_fakes import score_rows
 
     tokens = sum(len(t) - n for t, n, _ in sequences)
-    seconds = tokens / float(os.environ.get(GPU_TPS_ENV, "4860"))
-    time.sleep(seconds)
-    return score_rows(sequences), seconds, 0.0
+    start = time.perf_counter()
+    verify_cpu(sum(len(proofs) for _, _, proofs in sequences))
+    verify = time.perf_counter() - start
+    forward = max(0.0, tokens / float(os.environ.get(GPU_TPS_ENV, "4860")) - verify)
+    time.sleep(forward)
+    return score_rows(sequences), forward, verify
 
 
 def install(single: bool = False) -> None:
@@ -426,21 +462,39 @@ def settlement(root: Path, job_id: str) -> dict:
 # -- miners -----------------------------------------------------------------
 
 
+_BODIES: dict = {}
+
+
 def submission_body(job_id: str, hotkey: str, prompt_index: int, n: int, *,
                     rng: random.Random, forged: bool = False) -> bytes:
-    tokens = [rng.randrange(100_000, 200_000) for _ in range(n - 1)]
-    if forged:
-        from tests.unit.corpus_split_fakes import FORGED
+    """A miner's submission of ``n`` tokens. One template per size: the first
+    eight tokens (and their text) make each body unique, so building one is
+    a few replaces, not a 1 MB encode, and the load generator keeps its pace."""
+    key = (job_id, n, forged)
+    if key not in _BODIES:
+        rand = random.Random(n)
+        tokens = [rand.randrange(100_000, 200_000) for _ in range(n - 1)]
+        if forged:
+            from tests.unit.corpus_split_fakes import FORGED
 
-        tokens[len(tokens) // 2] = FORGED
-    tokens.append(EOS)
-    return json.dumps({
-        "job_id": job_id, "miner_hotkey": hotkey, "cursor": 0, "prompt_index": prompt_index,
-        "checkpoint_sha256": CHECKPOINT, "rendered_prompt": f"<prompt row-{prompt_index}>",
-        "completions": [{"tokens": tokens, "text": "".join(map(str, tokens[:-1])),
-                         "proofs": [PROOF_TEXT] * math.ceil(n / 32)}],
-        "signature": "ok",
-    }).encode()
+            tokens[len(tokens) // 2] = FORGED
+        head = [111111 + k for k in range(8)]
+        tokens[:8] = head
+        tokens.append(EOS)
+        body = json.dumps({
+            "job_id": job_id, "miner_hotkey": "@@HK@@", "cursor": 0, "prompt_index": 999999999,
+            "checkpoint_sha256": CHECKPOINT, "rendered_prompt": "<prompt row-999999999>",
+            "completions": [{"tokens": tokens, "text": "".join(map(str, tokens[:-1])),
+                             "proofs": [PROOF_TEXT] * math.ceil(n / 32)}],
+            "signature": "ok",
+        }).encode()
+        _BODIES[key] = (body, json.dumps(head)[1:-1].encode(), "".join(map(str, head)).encode())
+    body, head_ids, head_text = _BODIES[key]
+    fresh = [rng.randrange(100_000, 200_000) for _ in range(8)]
+    return (body.replace(head_ids, json.dumps(fresh)[1:-1].encode(), 1)
+            .replace(head_text, "".join(map(str, fresh)).encode(), 1)
+            .replace(b"@@HK@@", hotkey.encode(), 1)
+            .replace(b"999999999", str(prompt_index).encode(), 2))
 
 
 async def submit_load(base_url: str, job_id: str, *, seconds: float, rate: float,
@@ -468,18 +522,40 @@ async def submit_load(base_url: str, job_id: str, *, seconds: float, rate: float
                         "accepted": bool(answer and answer.get("accepted")),
                         "reason": answer.get("reason") if answer else None, "hotkey": hotkey})
 
-    async with httpx.AsyncClient(base_url=base_url, timeout=300.0) as http:
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
+    limits = httpx.Limits(max_connections=200, max_keepalive_connections=0)
+    async with httpx.AsyncClient(base_url=base_url, timeout=300.0, limits=limits) as http:
+        start = time.monotonic()
+        due = start
+        while due < start + seconds:
             hotkey = hotkeys[rng.randrange(len(hotkeys))]
-            n = size[0] + rng.randrange(size[1] - size[0] + 1)
+            n = size[0] + 32 * rng.randrange((size[1] - size[0]) // 32 + 1)
             body = submission_body(job_id, hotkey, prompt, n, rng=rng,
                                    forged=hotkey in forged_hotkeys)
             prompt += 1
+            # On schedule, whatever the last one cost: an open-loop load.
+            await asyncio.sleep(max(0.0, due - time.monotonic()))
             tasks.append(asyncio.ensure_future(one(http, hotkey, body)))
-            await asyncio.sleep(rng.expovariate(rate))
+            due += rng.expovariate(rate)
         await asyncio.gather(*tasks)
     return results
+
+
+def _load_main(args, out) -> None:
+    out.put(asyncio.run(submit_load(*args[:2], **args[2])))
+
+
+def load_in_process(base_url: str, job_id: str, **kwargs) -> list[dict]:
+    """``submit_load`` from a process of its own: the generator's pace never
+    depends on the test process (or its supervisor thread)."""
+    ctx = multiprocessing.get_context("spawn")
+    out = ctx.Queue()
+    process = ctx.Process(target=_load_main, args=((base_url, job_id, kwargs), out),
+                          daemon=True)
+    process.start()
+    try:
+        return out.get(timeout=kwargs.get("seconds", 60) + 600)
+    finally:
+        process.join(10)
 
 
 def quantiles(results: list[dict]) -> dict:
@@ -523,7 +599,7 @@ def free_port() -> int:
 
 
 def harness_env(root: Path, **extra) -> dict:
-    env = {ROOT_ENV: str(root), LATENCY_ENV: DEFAULT_LATENCY, SEED_SLICE_ENV: "256"}
+    env = {ROOT_ENV: str(root), LATENCY_ENV: DEFAULT_LATENCY, SEED_SLICE_ENV: "64"}
     env.update({k: str(v) for k, v in extra.items()})
     return env
 
