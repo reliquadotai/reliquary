@@ -590,11 +590,11 @@ def eval_auditor(**kwargs):
             except (ValueError, RuntimeError) as exc:
                 return [str(exc) for _ in records]
 
-        async def _audit_records(self, ids, records, draws):
+        async def _audit_records(self, ids, records, draws, *, deferred=None):
             self._current_ids, self._current_records = list(ids), list(records)
             before = set(self.parked_ids)
             try:
-                return await super()._audit_records(ids, records, draws)
+                return await super()._audit_records(ids, records, draws, deferred=deferred)
             finally:
                 # Parked records were counted as validator errors above: undone.
                 parked_now = len(self.parked_ids - before)
