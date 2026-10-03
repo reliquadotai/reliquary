@@ -166,6 +166,10 @@ async def write_voided(job_id, submission_id, document, **client_kwargs) -> bool
     return await _create(_key(job_id, "voided", submission_id), document, **client_kwargs)
 
 
+async def read_voided(job_id, submission_id, **client_kwargs) -> dict | None:
+    return await _read(_key(job_id, "voided", submission_id), **client_kwargs)
+
+
 async def list_voided_ids(job_id, **client_kwargs) -> list[str]:
     return await _list_ids(_prefix(job_id, "voided"), **client_kwargs)
 
@@ -288,6 +292,9 @@ class BucketRecordStore:
 
     async def write_voided(self, job_id, submission_id, document):
         return await write_voided(job_id, submission_id, document, **self._kw)
+
+    async def read_voided(self, job_id, submission_id):
+        return await read_voided(job_id, submission_id, **self._kw)
 
     async def list_voided_ids(self, job_id):
         return await list_voided_ids(job_id, **self._kw)

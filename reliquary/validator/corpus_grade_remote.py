@@ -166,6 +166,13 @@ class RemoteGradeDispatcher(ExecutorLeases):
         self._lease_seconds = {**GRADE_LEASE_SECONDS, **(lease_seconds or {})}
         self._dispute_seconds = float(dispute_seconds)
         self._queue: collections.deque[_Work] = collections.deque()
+        self._holders: list[Callable[[str], Any]] = []
+
+    def hold_on_quarantine(self, holder: Callable[[str], Any]) -> None:
+        """``holder(executor_id)`` runs synchronously the moment an executor is
+        quarantined, before any registry write or listener: what it decided
+        alone can be held from payment at once."""
+        self._holders.append(holder)
 
     @property
     def env_pin(self) -> tuple[str, str]:
@@ -351,6 +358,11 @@ class RemoteGradeDispatcher(ExecutorLeases):
     def _on_quarantined(self, executor_id: str) -> None:
         """Its votes on undecided items stop counting before anything awaits,
         so no result arriving meanwhile can agree with a quarantined executor."""
+        for holder in self._holders:
+            try:
+                holder(executor_id)
+            except Exception:
+                logger.exception("quarantine hold for %s failed", executor_id)
         leased = {id(lease.work) for lease in self._leases.values()}
         for work in list(self._queue) + [lease.work for lease in self._leases.values()]:
             if work.future.done() or executor_id not in work.results:

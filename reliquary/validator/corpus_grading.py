@@ -86,6 +86,15 @@ class CorpusGrader:
         self._awaiting_draw: dict[str, dict] = {}
         # Regrades that failed (a store or dispatcher error): retried by the rescan.
         self._regrade_retry: set[str] = set()
+        # Graded alone by a quarantined executor, regrade not yet written:
+        # never ready, so nothing it certified alone is paid meanwhile.
+        self._regrading: set[str] = set()
+        # Quarantined executors whose grades from before boot are not yet
+        # indexed: every unindexed grade is held until they are.
+        self._held_executors: set[str] = set()
+        self._regrades_inflight: set[str] = set()
+        # Submissions listed but without a grade, as of the last rescan.
+        self._ungraded: int | None = None
 
     # -- what the settler and the route see -----------------------------------
 
@@ -97,17 +106,32 @@ class CorpusGrader:
             self._seeded = True
 
     async def ready(self, ids) -> set[str]:
-        """Which of ``ids`` have their grade written (the settler pays only those)."""
+        """Which of ``ids`` may be paid: graded, and not waiting for a regrade
+        after a quarantine (the settler pays only those)."""
         await self._seed()
-        return {sid for sid in ids if sid in self._final}
+        held = self._unindexed if self._held_executors else ()
+        return {sid for sid in ids
+                if sid in self._final and sid not in self._regrading and sid not in held}
+
+    def status(self) -> dict:
+        """For the job status route."""
+        stats = getattr(self._dispatcher, "stats", None) or {}
+        return {"graded": len(self._final), "ungraded": self._ungraded,
+                "grading": len(self._inflight), "awaiting_draw": len(self._awaiting_draw),
+                "regrading": len(self._regrading),
+                "dispatcher_waiting": stats.get("waiting")}
+
+    def _gated(self):
+        if self._gate is None:
+            self._gate = asyncio.Semaphore(self._concurrency)
+        return self._gate
 
     def enqueue(self, submission_id: str) -> None:
         if submission_id not in self._final and submission_id not in self._inflight:
             self._start(submission_id)
 
     def _start(self, submission_id: str) -> None:
-        if self._gate is None:
-            self._gate = asyncio.Semaphore(self._concurrency)
+        self._gated()
         self._inflight.add(submission_id)
         asyncio.ensure_future(self._guarded(submission_id))
 
@@ -124,10 +148,16 @@ class CorpusGrader:
         while True:
             try:
                 await self._seed()
-                for sid in await self._records.list_submission_ids(self._job.job_id):
+                listed = await self._records.list_submission_ids(self._job.job_id)
+                for sid in listed:
                     self.enqueue(sid)
-                for sid in sorted(self._regrade_retry):
-                    await self._regrade(sid)
+                self._ungraded = sum(1 for sid in listed if sid not in self._final)
+                for executor_id in sorted(self._held_executors):
+                    # Its regrade could not index the grades from before boot.
+                    asyncio.ensure_future(self._regrade_executor_logged(executor_id))
+                for sid in sorted(self._regrade_retry - self._regrades_inflight):
+                    # In the background: a slow regrade never holds the rescan.
+                    asyncio.ensure_future(self._regrade(sid))
             except Exception:
                 logger.exception("grader rescan of %s failed", self._job.job_id)
             await asyncio.sleep(self._rescan)
@@ -194,11 +224,18 @@ class CorpusGrader:
                     return None              # the round is not out yet: the next rescan
             self._awaiting_draw.pop(submission_id, None)
             if graded_success or draw["drawn"]:
-                replayed = await self._dispatcher.decide(
-                    {**state["item"], "mode": "replay", "actions": state["actions"]})
-                replay = self._replay_document(submission_id, replayed, draw)
-                if replay["failed"]:
-                    await self._confirmed_failure(submission_id, state["base"]["hotkey"], replay)
+                voided = await self._replay_void(submission_id)
+                if voided is not None:
+                    # Voided by a replay before a crash kept its grade from
+                    # being written: the grade is that replay, never a new one.
+                    replay = self._replay_from_void(voided, draw)
+                else:
+                    replayed = await self._dispatcher.decide(
+                        {**state["item"], "mode": "replay", "actions": state["actions"]})
+                    replay = self._replay_document(submission_id, replayed, draw)
+                    if replay["failed"]:
+                        await self._confirmed_failure(submission_id, state["base"]["hotkey"],
+                                                      replay)
             else:
                 replay = {"drawn": False, "draw": draw}
         document = {**state["base"], "status": graded.status, "instance_id": state["instance_id"],
@@ -207,6 +244,26 @@ class CorpusGrader:
                     "replay_certified": bool(replay and replay.get("certified")),
                     "graded_at": self._clock()}
         return await self._write(submission_id, document, regrade=regrade)
+
+    async def _replay_void(self, submission_id: str) -> dict | None:
+        reader = getattr(self._records, "read_voided", None)
+        if reader is None:
+            return None
+        document = await reader(self._job.job_id, submission_id)
+        if document is None or document.get("reason") != "replay_failed":
+            return None
+        return document
+
+    @staticmethod
+    def _replay_from_void(voided: dict, draw) -> dict:
+        replay = voided.get("replay") or {}
+        return {"drawn": True, "draw": draw, "status": "ok", "certified": False, "failed": True,
+                "unconfirmed": False, "from_void": True,
+                "replay_diff_equal": replay.get("replay_diff_equal"),
+                "observations_compared": replay.get("observations_compared"),
+                "observations_mismatched": list(replay.get("observations_mismatched") or []),
+                "allowed": replay.get("allowed"), "graded_by": list(voided.get("graded_by") or []),
+                "providers": list(voided.get("providers") or [])}
 
     @staticmethod
     def _replay_document(submission_id: str, decision, draw) -> dict:
@@ -271,7 +328,11 @@ class CorpusGrader:
 
     async def _write(self, submission_id: str, document: dict, *, regrade: bool) -> dict:
         writer = self._records.write_regrade if regrade else self._records.write_grade
-        await writer(self._job.job_id, submission_id, document)
+        written = await writer(self._job.job_id, submission_id, document)
+        if regrade and written is False:
+            logger.warning("corpus job %s: %s already has a regrade; this one (by %s) was not "
+                           "written", self._job.job_id, submission_id[:12],
+                           document.get("graded_by"))
         self._final.add(submission_id)
         if not regrade:
             self._index(submission_id, document)
@@ -286,43 +347,66 @@ class CorpusGrader:
                 self._sole.setdefault(lone, set()).add(submission_id)
 
     async def _index_unindexed(self) -> None:
-        """Read the grades written before this process started, once."""
-        pending, self._unindexed = sorted(self._unindexed), set()
+        """Read the grades written before this process started, once. They
+        stay in ``_unindexed`` (held while an executor is) until all are read."""
+        pending = sorted(self._unindexed)
         gate = asyncio.Semaphore(INDEX_READ_CONCURRENCY)
 
         async def one(sid):
             async with gate:
                 return sid, await self._records.read_grade(self._job.job_id, sid)
 
-        try:
-            for sid, document in await asyncio.gather(*(one(sid) for sid in pending)):
-                if document is not None:
-                    self._index(sid, document)
-        except Exception:
-            self._unindexed |= set(pending)           # retried by the next quarantine
-            raise
+        for sid, document in await asyncio.gather(*(one(sid) for sid in pending)):
+            if document is not None:
+                self._index(sid, document)
+        self._unindexed -= set(pending)
 
     async def _regrade(self, submission_id: str) -> None:
+        if submission_id in self._regrades_inflight:
+            return
+        self._regrades_inflight.add(submission_id)
         try:
-            await self.grade_one(submission_id, regrade=True)
-            self._regrade_retry.discard(submission_id)
+            async with self._gated():
+                await self.grade_one(submission_id, regrade=True)
         except Exception:
             logger.exception("re-grading %s failed; retried on the next rescan",
                              submission_id[:12])
             self._regrade_retry.add(submission_id)
+        else:
+            # Payable again (unless the regrade voided it: the settler reads voids).
+            self._regrade_retry.discard(submission_id)
+            self._regrading.discard(submission_id)
+        finally:
+            self._regrades_inflight.discard(submission_id)
 
-    async def regrade_executor(self, executor_id: str) -> list[str]:
-        """Grade again, without it, what a quarantined executor decided alone."""
+    def hold_executor(self, executor_id: str) -> None:
+        """Synchronous, at the quarantine itself: what the executor decided
+        alone stops being payable before anything awaits."""
+        self._held_executors.add(executor_id)
+        self._regrading |= self._sole.get(executor_id, set())
         # A grade waiting for its draw is dropped: graded again from the start.
         for sid, state in list(self._awaiting_draw.items()):
             if executor_id in set(state["graded"].graded_by):
                 del self._awaiting_draw[sid]
+
+    async def _regrade_executor_logged(self, executor_id: str) -> None:
+        try:
+            await self.regrade_executor(executor_id)
+        except Exception:
+            logger.exception("regrade of executor %s failed; retried on the next rescan",
+                             executor_id)
+
+    async def regrade_executor(self, executor_id: str) -> list[str]:
+        """Grade again, without it, what a quarantined executor decided alone."""
+        self.hold_executor(executor_id)
         await self._seed()
         if self._unindexed:
+            # On failure the executor stays held; the rescan retries.
             await self._index_unindexed()
         sids = sorted(self._sole.pop(executor_id, set()))
-        for sid in sids:
-            await self._regrade(sid)
+        self._regrading |= set(sids)
+        self._held_executors.discard(executor_id)
+        await asyncio.gather(*(self._regrade(sid) for sid in sids))
         if sids:
             logger.warning("corpus job %s: re-graded %d submission(s) of quarantined executor %s",
                            self._job.job_id, len(sids), executor_id)

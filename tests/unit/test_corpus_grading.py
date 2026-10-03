@@ -70,6 +70,9 @@ class _Records:
         self.regrades[sid] = document
         return True
 
+    async def read_voided(self, job_id, sid):
+        return self.voided.get(sid)
+
     async def write_voided(self, job_id, sid, document):
         if sid in self.voided:
             return False
@@ -600,3 +603,197 @@ def test_the_void_document_is_the_auditors():
     from reliquary.validator import corpus_auditor, corpus_grading
 
     assert corpus_grading.VOIDED_SCHEMA == corpus_auditor.VOIDED_SCHEMA
+
+
+# -- fix round 1: payment held while a quarantined executor's grades are redone --
+
+
+class _Gated(_Sequence):
+    """Replays wait for ``release`` once ``hold_replays`` is set."""
+
+    def __init__(self, grades, replays):
+        super().__init__(grades, replays)
+        self.release = None
+        self.hold_replays = False
+
+    async def decide(self, item):
+        if item["mode"] == "replay" and self.hold_replays:
+            await self.release.wait()
+        return await super().decide(item)
+
+
+def test_a_lone_certified_submission_is_not_paid_while_regraded():
+    records = _Records()
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    dispatcher = _Gated([PASSED, regraded], [CERTIFIED, CERTIFIED])
+    grader, _ = _grader(records, dispatcher)
+
+    async def scenario():
+        await grader.grade_one(SID)
+        assert await grader.ready([SID]) == {SID}
+        grader.hold_executor("g0")                         # the quarantine, synchronously
+        assert await grader.ready([SID]) == set()
+        dispatcher.release, dispatcher.hold_replays = asyncio.Event(), True
+        regrade = asyncio.ensure_future(grader.regrade_executor("g0"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not regrade.done() and await grader.ready([SID]) == set()
+        dispatcher.release.set()
+        assert await regrade == [SID]
+        return await grader.ready([SID])
+
+    assert asyncio.run(scenario()) == {SID}
+    assert records.regrades[SID]["replay_certified"] is True
+
+
+def test_a_regrade_that_voids_leaves_the_void_to_the_settler():
+    records, states = _Records(), _States()
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    grader, voided = _grader(records, _Sequence([PASSED, regraded], [CERTIFIED, FORGED]),
+                             states=states)
+
+    async def scenario():
+        await grader.grade_one(SID)
+        await grader.regrade_executor("g1")                # g1 certified the replay alone
+
+    asyncio.run(scenario())
+    assert records.voided[SID]["reason"] == "replay_failed" and voided == [SID]
+    assert records.regrades[SID]["replay"]["failed"] is True
+    assert states.states["5Hot"].failure_ids == [SID]
+
+
+def test_a_failed_regrade_holds_payment_until_it_succeeds():
+    records = _Records()
+
+    class _Flaky(_Sequence):
+        async def decide(self, item):
+            if len(self.items) == 2:
+                self.items.append(None)
+                raise OSError("dispatcher down")
+            return await super().decide(item)
+
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    grader, _ = _grader(records, _Flaky([PASSED, regraded], [CERTIFIED, CERTIFIED]))
+    grader._rescan = 3600.0
+
+    async def scenario():
+        await grader.grade_one(SID)
+        await grader.regrade_executor("g0")
+        held = await grader.ready([SID])
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(grader.run(), 0.5)
+        return held, await grader.ready([SID])
+
+    assert asyncio.run(scenario()) == (set(), {SID})
+
+
+def test_grades_from_before_boot_are_held_while_they_are_indexed():
+    records = _Records()
+    first, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    asyncio.run(first.grade_one(SID))
+    second, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+
+    async def scenario():
+        assert await second.ready([SID]) == {SID}
+        second.hold_executor("g9")                         # who knows what g9 decided alone
+        held = await second.ready([SID])
+        assert await second.regrade_executor("g9") == []
+        return held, await second.ready([SID])
+
+    assert asyncio.run(scenario()) == (set(), {SID})
+
+
+def test_regrades_run_side_by_side():
+    other = "b" * 64
+    records = _Records()
+    records.submissions[other] = _record()
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    dispatcher = _Gated([PASSED, PASSED, regraded, regraded], [CERTIFIED] * 4)
+    grader, _ = _grader(records, dispatcher)
+
+    async def scenario():
+        await grader.grade_one(SID)
+        await grader.grade_one(other)
+        dispatcher.release, dispatcher.hold_replays = asyncio.Event(), True
+        regrade = asyncio.ensure_future(grader.regrade_executor("g0"))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # Both regrades are past their grade and waiting on their replay at once.
+        replays_waiting = [i["mode"] for i in dispatcher.items].count("grade")
+        dispatcher.release.set()
+        await regrade
+        return replays_waiting
+
+    assert asyncio.run(scenario()) == 4
+    assert set(records.regrades) == {SID, other}
+
+
+def test_an_existing_void_is_the_grade_never_a_new_replay():
+    records, states = _Records(), _States()
+    records.voided[SID] = {"schema": "reliquary/corpus-voided/v1", "submission_id": SID,
+                           "hotkey": "5Hot", "reason": "replay_failed", "voided_at": 900.0,
+                           "graded_by": ["g0", "g1"], "providers": ["p0", "p1"],
+                           "replay": {"replay_diff_equal": False, "observations_compared": 1,
+                                      "observations_mismatched": [], "allowed": 5}}
+    dispatcher = _Dispatcher(PASSED, CERTIFIED)
+    grader, voided = _grader(records, dispatcher, states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert [i["mode"] for i in dispatcher.items] == ["grade"]
+    assert doc["replay"]["failed"] is True and doc["replay"]["from_void"] is True
+    assert doc["replay"]["graded_by"] == ["g0", "g1"] and doc["replay_certified"] is False
+    assert voided == [] and states.states == {}           # counted when it was written
+
+
+def test_an_existing_regrade_is_not_overwritten_and_says_so(monkeypatch):
+    from reliquary.validator import corpus_grading
+
+    warned = []
+    monkeypatch.setattr(corpus_grading.logger, "warning",
+                        lambda *a, **k: warned.append(a[0] % a[1:]))
+    records = _Records()
+    records.regrades[SID] = {"graded_by": ["g7"]}
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    grader, _ = _grader(records, _Sequence([PASSED, regraded], [CERTIFIED, CERTIFIED]))
+
+    async def scenario():
+        await grader.grade_one(SID)
+        await grader.regrade_executor("g0")
+
+    asyncio.run(scenario())
+    assert records.regrades[SID] == {"graded_by": ["g7"]}
+    assert any("already has a regrade" in w for w in warned)
+
+
+def test_the_grader_reports_its_backlog():
+    records = _Records()
+    records.submissions["b" * 64] = _record()
+    grader, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    grader._rescan = 3600.0
+
+    async def scenario():
+        await grader.grade_one(SID)
+        grader.enqueue = lambda sid: None                  # the rescan only counts here
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(grader.run(), 0.2)
+        return grader.status()
+
+    status = asyncio.run(scenario())
+    assert status["graded"] == 1 and status["ungraded"] == 1 and status["regrading"] == 0
+    assert "dispatcher_waiting" in status
+
+
+def test_the_split_refuses_an_episode_job_at_startup(monkeypatch):
+    from reliquary.infrastructure import corpus_job_store
+    from reliquary.validator.corpus_validator import SPLIT_EPISODE_REFUSAL, run_corpus_validator
+
+    class _Store:
+        async def read_job(self, job_id):
+            return _job(), None
+
+    monkeypatch.setattr(corpus_job_store, "BucketJobStore", _Store)
+    entry = SimpleNamespace(task_id="corpus-swe", job_id="swe-agentic-v1", params={})
+    with pytest.raises(RuntimeError) as refused:
+        asyncio.run(run_corpus_validator(
+            wallet=None, netuid=1, signer_client=None, http_host="h", http_port=1,
+            set_weights=False, entry=entry, cap=0.1, split=SimpleNamespace(links={})))
+    assert str(refused.value) == SPLIT_EPISODE_REFUSAL

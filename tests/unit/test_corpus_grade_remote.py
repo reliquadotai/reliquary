@@ -587,3 +587,18 @@ async def test_an_agreed_decision_names_its_providers():
     _answer(d, "g2", REPLAY_BAD)
     got = await decision
     assert got.providers == ("a", "b") and d.env_pin == (PACKAGE, VERSION)
+
+
+async def test_a_quarantine_holds_before_any_listener_runs():
+    seen = []
+    d = await _dispatcher()
+    d.hold_on_quarantine(lambda eid: seen.append(("hold", eid)))
+
+    async def listener(eid):
+        seen.append(("listener", eid))
+
+    d.subscribe(listener)
+    await d.quarantine("g0", "caught")
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert seen == [("hold", "g0"), ("listener", "g0")]

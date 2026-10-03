@@ -766,6 +766,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 f"task {task_entry.task_id!r} declares job {task_entry.job_id!r} but it has no manifest"
             )
         manifests.append((task_entry, task_cap, job))
+    if split is not None and any(job.episode is not None for _, _, job in manifests):
+        # Before any download or ledger migration: the split cannot grade.
+        raise RuntimeError(SPLIT_EPISODE_REFUSAL)
 
     if several:
         # Before any ledger is migrated: a start that refuses touches nothing.
@@ -958,6 +961,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     def audit_and_settle(w) -> None:
         if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
             w.episode_intake = episode_intake_for(w)
+        if split is not None and w.job.episode is not None:
+            raise RuntimeError(SPLIT_EPISODE_REFUSAL)          # never graded half-wired
         if w.job.episode is not None:
             wire_job_grader(w, records=records, judge_records=judge_records,
                             dispatcher=grade_dispatcher)
@@ -1051,6 +1056,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         app.state.corpus_grade_remote = grade_dispatcher
         # What a quarantined executor decided alone is graded again, in every
         # episode job this process grades (hot-added ones included).
+        grade_dispatcher.hold_on_quarantine(lambda executor_id: [
+            grader.hold_executor(executor_id) for grader in list(graders.values())])
         grade_dispatcher.subscribe(lambda executor_id: asyncio.gather(
             *(grader.regrade_executor(executor_id) for grader in list(graders.values())),
             return_exceptions=True))
