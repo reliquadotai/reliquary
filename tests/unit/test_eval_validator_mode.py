@@ -92,3 +92,108 @@ def test_the_corpus_control_serves_an_eval_jobs_prompts(seeded_job, monkeypatch)
     catalog = app_for(seeded_job.job)
     refused = catalog.get(f"/corpus/jobs/{seeded_job.job.job_id}/eval-prompts")
     assert refused.status_code == 404 and refused.json()["detail"] == "not_an_eval_job"
+
+
+# --------------------------------------------------------------------------
+# jobs create --eval-set
+# --------------------------------------------------------------------------
+
+from tests.unit.test_jobs_cli import ACK, _rl_entry, bucket, registry  # noqa: E402,F401
+
+REVISION = "c" * 40
+
+
+def _eval_args(**overrides):
+    options = {"--job-id": "eval-teutonic-aime26", "--model": "org/Teutonic",
+               "--model-revision": REVISION, "--model-architecture": "Qwen3ForCausalLM",
+               "--checkpoint-sha256": "a" * 64, "--eval-set": "verifiers-fake-r0-n5",
+               "--renderer-id": "chat-template-thinking-v1", "--eos-token-id": "151645",
+               "--max-new-tokens": "1024", "--slots-per-prompt": "4", "--cap": "0.02"}
+    options.update(overrides)
+    argv = ["jobs", "create", ACK]
+    for flag, value in options.items():
+        if value is not None:
+            argv += [flag, value]
+    return argv
+
+
+@pytest.fixture
+def published(tmp_path, monkeypatch):
+    """A Verifiers set in the sets directory, the way validators and the CLI read it."""
+    from reliquary.eval import prompt_source as ps
+    from reliquary.eval.sets import build_source_set
+    from tests.unit.test_eval_verifiers_source import FakeTask, fake_handle, opener
+
+    card = build_source_set("verifiers:fake", out=tmp_path / "verifiers-fake-r0-n5",
+                            open_taskset=opener(fake_handle([FakeTask(i) for i in range(5)])))
+    monkeypatch.setattr(ps, "_loaded", {})
+    monkeypatch.setattr(ps, "FETCHERS", [ps._from_directory])
+    monkeypatch.setenv(ps.SETS_DIR_ENV, str(tmp_path))
+    return card
+
+
+def test_jobs_create_declares_an_eval_job_on_any_model(bucket, registry, published):
+    import asyncio
+
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.eval import prompt_source as ps
+    from reliquary.infrastructure import corpus_job_store as job_store
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(app, _eval_args(**{"--prompt-count": "3"}))
+    assert result.exit_code == 0, result.output
+    job, _ = asyncio.run(job_store.read_job("eval-teutonic-aime26"))
+    source = ps.parse_eval_source(job.prompt_source)
+    assert (source.set_id, source.count) == ("verifiers-fake-r0-n5", 3)
+    assert job.seed is not None and job.renderer_id == "chat-template-thinking-v1"
+    entry = registry["entries"]["eval-teutonic-aime26"]
+    assert list(entry.contract["environments"]) == ["reliquary_external_eval_v1"]
+    assert entry.params["audit_q"] == 1.0
+    assert entry.contract["model_id"] == "org/Teutonic"
+
+
+def test_the_whole_set_by_default(bucket, registry, published):
+    import asyncio
+
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.eval import prompt_source as ps
+    from reliquary.infrastructure import corpus_job_store as job_store
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(app, _eval_args()).exit_code == 0
+    job, _ = asyncio.run(job_store.read_job("eval-teutonic-aime26"))
+    assert ps.parse_eval_source(job.prompt_source).count == 5
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"--prompt-source": "reliquary_dapo_math_v1"}, "exactly one of --prompt-source and --eval-set"),
+    ({"--renderer-id": "reliquary-external-prompt-v1"}, "model's chat template"),
+    ({"--audit-q": "0.5"}, "audits every submission"),
+    ({"--prompt-start": "2"}, "starts at the set's first problem"),
+    ({"--grader-id": "x", "--threshold": "1"}, "no filter"),
+    ({"--prompt-count": "9"}, "holds 5 problems"),
+    ({"--from-profile": "qwen3-4b-base-dapo-reliquary-v1"}, "composed"),
+])
+def test_an_eval_job_is_refused_what_would_make_it_wrong(bucket, registry, published, change,
+                                                       message):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(app, _eval_args(**change))
+    assert result.exit_code != 0 and message in result.output, result.output
+    assert "eval-teutonic-aime26" not in registry["entries"]
+
+
+def test_an_unpublished_set_is_named(bucket, registry, published):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    result = CliRunner().invoke(app, _eval_args(**{"--eval-set": "nope"}))
+    assert result.exit_code != 0 and "nope" in result.output

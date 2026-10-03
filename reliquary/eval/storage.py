@@ -86,6 +86,33 @@ def is_operator_set(card: dict) -> bool:
     return "source_kind" in card
 
 
+def read_published_set(set_id: str) -> tuple[dict, bytes]:
+    """A published set's card and prompt lines: from ``RELIQUARY_EVAL_SETS_DIR``
+    when it holds the set, else from the subnet bucket."""
+    import asyncio
+    import os
+
+    from reliquary.eval.prompt_source import SETS_DIR_ENV
+
+    validated_set_id(set_id)
+    root = os.environ.get(SETS_DIR_ENV, "").strip()
+    if root:
+        directory = Path(root) / set_id
+        if (directory / "set.json").exists() and (directory / "prompts.jsonl").exists():
+            return (json.loads((directory / "set.json").read_text()),
+                    (directory / "prompts.jsonl").read_bytes())
+
+    async def read():
+        store = SubnetEvalStore()
+        return (await store.get_bytes(subnet_key(set_id, "set.json")),
+                await store.get_bytes(subnet_key(set_id, "prompts.jsonl")))
+
+    card, prompts = asyncio.run(read())
+    if card is None or prompts is None:
+        raise ValueError(f"set {set_id!r} is not published (reliquary eval publish-set)")
+    return json.loads(card), prompts
+
+
 async def publish_set(directory: str | Path, *, platform, subnet) -> dict:
     """Upload a built set. The platform's ``set.json`` goes last: its presence
     is what makes a set orderable — so an operator's set never goes there, and
@@ -119,5 +146,6 @@ __all__ = [
     "is_operator_set",
     "platform_key",
     "publish_set",
+    "read_published_set",
     "subnet_key",
 ]

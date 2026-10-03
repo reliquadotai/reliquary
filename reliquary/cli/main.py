@@ -1071,6 +1071,43 @@ def prepare_corpus_job(
     return manifest, entry
 
 
+def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id, audit_q,
+                     grader_id, threshold, from_profile):
+    """What an evaluation job served by our own validator is declared from: the
+    set's first N problems as its prompt source (checked against the lines'
+    sha256), the set's environment as its contract's, a seed from its id.
+    Refuses what would make it something else than a measurement."""
+    import hashlib
+
+    from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
+    from reliquary.eval.storage import read_published_set
+    from reliquary.protocol.external_eval import contract_environment_for
+    from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
+
+    if renderer_id not in CHAT_TEMPLATE_RENDERERS:
+        raise ValueError(f"an eval set's rows render only through the model's chat template "
+                         f"({sorted(CHAT_TEMPLATE_RENDERERS)}), not {renderer_id!r}")
+    if prompt_start:
+        raise ValueError("an eval job starts at the set's first problem (--prompt-start 0)")
+    if audit_q != 1.0:
+        raise ValueError("an eval job audits every submission (--audit-q 1.0): an unaudited "
+                         "completion would be graded as the model's")
+    if grader_id is not None or threshold is not None:
+        raise ValueError("an eval job has no filter: every completion is graded, "
+                         "right or wrong")
+    if from_profile is not None:
+        raise ValueError("an eval job's contract is composed from the model and the set's "
+                         "environment: omit --from-profile")
+    card, prompts = read_published_set(eval_set)
+    count = int(card["count"]) if prompt_count is None else int(prompt_count)
+    if not 1 <= count <= int(card["count"]):
+        raise ValueError(f"set {eval_set} holds {card['count']} problems, not {count}")
+    source = eval_source_for(eval_set, prompts, count)
+    register_eval_prompts(source, prompts)
+    seed = int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)
+    return source.name, count, contract_environment_for(card), seed
+
+
 @jobs_app.command("create")
 def jobs_create(
     job_id: str = typer.Option(..., "--job-id", help="Name of the corpus job"),
@@ -1102,18 +1139,26 @@ def jobs_create(
         "chat-template renderer, raw otherwise",
     ),
     prompt_source: str = typer.Option(
-        ...,
+        None,
         "--prompt-source",
         "--env",
         help="The installed environment the job draws prompts from; it becomes "
         "the contract's single environment",
     ),
+    eval_set: str = typer.Option(
+        None,
+        "--eval-set",
+        help="An evaluation: a published eval set (reliquary eval build-set / "
+        "publish-set) instead of --prompt-source. Every submission is audited "
+        "and graded later with `reliquary eval grade`",
+    ),
     prompt_count: int = typer.Option(
-        ...,
+        None,
         "--prompt-count",
         help="Rows of the source this job owns; checked against the source's "
         "own length, which BUILDS it -- a dataset-backed source must be "
-        "readable from here to declare a job over it",
+        "readable from here to declare a job over it. With --eval-set: the "
+        "set's first N problems (default: all of them)",
     ),
     prompt_start: int = typer.Option(
         0,
@@ -1233,6 +1278,20 @@ def jobs_create(
     overrides = {
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
     }
+    contract_environment = seed = None
+    try:
+        if (prompt_source is None) == (eval_set is None):
+            raise ValueError("give exactly one of --prompt-source and --eval-set")
+        if eval_set is not None:
+            prompt_source, prompt_count, contract_environment, seed = _eval_job_source(
+                job_id=job_id, eval_set=eval_set, prompt_count=prompt_count,
+                prompt_start=prompt_start, renderer_id=renderer_id, audit_q=audit_q,
+                grader_id=grader_id, threshold=threshold, from_profile=from_profile)
+        elif prompt_count is None:
+            raise ValueError("--prompt-count is required with --prompt-source")
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     try:
         manifest, entry = prepare_corpus_job(
             job_id=job_id, task_id=task_id, model=model, model_revision=model_revision,
@@ -1254,6 +1313,7 @@ def jobs_create(
             min_new_tokens=min_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
             n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
             deadline_round=deadline_round, overrides=overrides, verification=verification,
+            contract_environment=contract_environment, seed=seed,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
