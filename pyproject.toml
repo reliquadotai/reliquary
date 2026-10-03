@@ -40,6 +40,7 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "PyNaCl==1.6.2",
 ]
 wandb = [
     "wandb>=0.16",
@@ -47,6 +48,7 @@ wandb = [
 
 [project.scripts]
 reliquary = "reliquary.cli.main:app"
+affine-runtime = "reliquary.integrations.affine_cli:main"
 
 [build-system]
 requires = ["hatchling"]
