@@ -74,6 +74,11 @@ RUN_BATCH_IDS = 512
 # hour (2026-10-02 20:05).
 PASS_AUDIT_ROWS = int(os.environ.get("RELIQUARY_CORPUS_PASS_AUDIT_ROWS", "512"))
 PASS_AUDIT_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_PASS_AUDIT_TOKENS", "2000000"))
+# Siblings one pass decides for its payable records (each may need a drand
+# round): the oldest payable records first, the rest wait for the next passes.
+# Unbounded, the first pass after a 130k restart decided thousands of siblings
+# over ~1.5k rounds and never finished (2026-10-02 23:02).
+PASS_SIBLINGS = int(os.environ.get("RELIQUARY_CORPUS_PASS_SIBLINGS", "2048"))
 # How soon a record whose draw round is not out yet is judged again: one
 # quicknet period. Every arrival of those seconds then shares one pass.
 UNDECIDABLE_RETRY_SECONDS = 3.0
@@ -87,6 +92,11 @@ BEACON_GRACE_SECONDS = 2.0
 # attempt: every sampled submission whose draw lands on a bad round would
 # otherwise refetch it once per judging pass.
 NEGATIVE_BEACON_CACHE_SECONDS = 30.0
+# The same for a round older than OLD_ROUND_ROUNDS: relays that fail on an old
+# round (2026-10-02: "All relays/paths failed" for rounds of a 15 h backlog)
+# keep failing, and every pass that races it again waits out the whole race.
+OLD_ROUND_NEGATIVE_CACHE_SECONDS = 1800.0
+OLD_ROUND_ROUNDS = 200
 # The route stamps received_at before its record write, which it tries
 # RECORD_WRITE_ATTEMPTS (3) times, each up to 3 botocore attempts of 15 s
 # connect + 30 s read: 405 s. An unaudited pass waits this long past the hold,
@@ -191,6 +201,9 @@ class CorpusAuditor:
         # ones are not re-read, so `recent` can only undercount (more audits).
         self._seeded = False
         self._randomness: dict[int, str] = {}
+        # Rounds raced in the current judge_many: one race per round per pass,
+        # never one per record whose draw lands on a failing round.
+        self._raced: set[int] = set()
         # Round -> when its fetch last failed; a negative cache, so a bad
         # round is retried at most once every NEGATIVE_BEACON_CACHE_SECONDS.
         self._failed_rounds: dict[int, float] = {}
@@ -859,8 +872,11 @@ class CorpusAuditor:
         if randomness is not None:
             return randomness
         failed_at = self._failed_rounds.get(round_number)
-        if failed_at is not None and self._clock() - failed_at < NEGATIVE_BEACON_CACHE_SECONDS:
+        if failed_at is not None and self._clock() - failed_at < self._negative_window(round_number):
             return None
+        if round_number in self._raced:
+            return None  # failed already in this pass
+        self._raced.add(round_number)
         try:
             with self._timed("drand"):
                 value = await self._in("beacon", self._beacon, round_number)
@@ -877,11 +893,19 @@ class CorpusAuditor:
             self._failed_rounds[round_number] = self._clock()
         return randomness
 
-    async def _prefetch_rounds(self, submission_ids, now: float, states: dict) -> None:
+    def _negative_window(self, round_number: int) -> float:
+        try:
+            old = int(self._round_at(self._clock())) - round_number > OLD_ROUND_ROUNDS
+        except Exception:
+            old = False
+        return OLD_ROUND_NEGATIVE_CACHE_SECONDS if old else NEGATIVE_BEACON_CACHE_SECONDS
+
+    async def _prefetch_rounds(self, submission_ids, now: float, states: dict) -> int:
         """Fetch together the drand rounds _decide will ask for one by one; it
-        then reads them from the cache. Any failure is left for _decide."""
+        then reads them from the cache. A round that fails is not raced again
+        this pass (``_raced``). Returns how many rounds were raced."""
         if self._params.q >= 1.0 or self._beacon is None or self._round_at is None:
-            return
+            return 0
         rounds = set()
         for sid in submission_ids:
             hotkey, received_at, _ = self._meta[sid]
@@ -892,8 +916,11 @@ class CorpusAuditor:
                 if int(self._round_at(now - BEACON_GRACE_SECONDS)) <= round_number:
                     continue  # not out yet: _decide calls it undecidable
             except Exception:
-                return
-            if round_number not in self._randomness:
+                return 0
+            failed_at = self._failed_rounds.get(round_number)
+            if (round_number not in self._randomness and round_number not in self._raced
+                    and (failed_at is None
+                         or now - failed_at >= self._negative_window(round_number))):
                 rounds.add(round_number)
         gate = asyncio.Semaphore(DRAND_CONCURRENCY)
 
@@ -902,6 +929,7 @@ class CorpusAuditor:
                 await self._randomness_for(round_number)
 
         await asyncio.gather(*(one(r) for r in sorted(rounds)))
+        return len(rounds)
 
     async def _decide(self, submission_id: str, now: float,
                       state: MinerState) -> tuple[str, dict | None]:
@@ -963,7 +991,7 @@ class CorpusAuditor:
         # Per hotkey, arrival times of records whose draw round is not out yet.
         undecided: dict[str, list[float]] = {}
         with self._timed("decide"):
-            await self._prefetch_rounds(known, now, states)
+            rounds_needed = await self._prefetch_rounds(known, now, states)
         for submission_id in known:
             hotkey, received_at, _ = self._meta[submission_id]
             with self._timed("decide"):
@@ -983,6 +1011,9 @@ class CorpusAuditor:
             elif choice == "wait":
                 self._next_due[submission_id] = self._wait_until(submission_id, now)
 
+        if not unaudited:
+            logger.info("corpus judge pass started: job=%s ids=%d payable=0 payable_waiting=0 "
+                        "siblings=0 rounds_needed=%d", self._job_id, len(known), rounds_needed)
         covered: float | None = math.inf
         if unaudited:
             # Sampled BEFORE the siblings are collected: only what was enqueued
@@ -996,21 +1027,45 @@ class CorpusAuditor:
             await self._read_all(sorted(
                 sid for sid in self._queued | self._unreadable
                 if sid not in self._meta and sid not in self._judged))
-            hold_end: dict[str, float] = {}
-            for submission_id, _ in unaudited:
-                hotkey, received_at, _ = self._meta[submission_id]
-                hold_end[hotkey] = max(hold_end.get(hotkey, 0.0),
-                                       received_at + self._params.hold_seconds)
             in_pass = set(known)
             # A sibling known undrawn decides "wait" or "pass_unaudited" here:
             # its hotkey's state and recent count are X's, its draw is fixed.
-            siblings = {hotkey: [sid for sid in sorted(self._unjudged.get(hotkey, ()))
-                                 if sid not in in_pass and sid not in self._undrawn
-                                 and self._meta[sid][1] <= until]
-                        for hotkey, until in hold_end.items()}
+            candidates = {}
+            for hotkey in {self._meta[sid][0] for sid, _ in unaudited}:
+                candidates[hotkey] = sorted(
+                    (self._meta[sid][1], sid) for sid in self._unjudged.get(hotkey, ())
+                    if sid not in in_pass and sid not in self._undrawn)
+            # The oldest payable records first, while their siblings fit the
+            # pass; the others wait for the next passes (nothing is paid early).
+            hold_end: dict[str, float] = {}
+            taken: dict[str, int] = {}
+            kept, waiting = [], []
+            for submission_id, draw in sorted(unaudited, key=lambda u: self._meta[u[0]][1]):
+                hotkey, received_at, _ = self._meta[submission_id]
+                until = max(hold_end.get(hotkey, 0.0), received_at + self._params.hold_seconds)
+                count = bisect.bisect_right(candidates[hotkey], (until, "\uffff"))
+                grown = sum(taken.values()) - taken.get(hotkey, 0) + count
+                if grown > PASS_SIBLINGS:
+                    if not hold_end:
+                        # Even the oldest does not fit: decide the first of its
+                        # siblings now (their draws become known, the undrawn
+                        # leave its set) and pay it in a later pass.
+                        hold_end[hotkey], taken[hotkey] = until, PASS_SIBLINGS
+                    waiting.append(submission_id)
+                    continue
+                hold_end[hotkey], taken[hotkey] = until, count
+                kept.append((submission_id, draw))
+            for submission_id in waiting:
+                self._next_due[submission_id] = now
+            unaudited = [u for u in unaudited if u in kept]
+            siblings = {hotkey: [sid for _, sid in candidates[hotkey][:taken[hotkey]]]
+                        for hotkey in hold_end}
             with self._timed("decide"):
-                await self._prefetch_rounds(
+                rounds_needed += await self._prefetch_rounds(
                     [sid for sids in siblings.values() for sid in sids], now, states)
+            logger.info("corpus judge pass started: job=%s ids=%d payable=%d payable_waiting=%d "
+                        "siblings=%d rounds_needed=%d", self._job_id, len(known), len(kept),
+                        len(waiting), sum(taken.values()), rounds_needed)
             for hotkey, sids in siblings.items():
                 for sid in sids:
                     with self._timed("decide"):
@@ -1134,6 +1189,7 @@ class CorpusAuditor:
         start = time.monotonic()
         self._next_due.clear()
         self._deferred = []
+        self._raced = set()
         try:
             failed = await self._judge_once(list(submission_ids))
             # At q = 1 every held record is already being audited on arrival.

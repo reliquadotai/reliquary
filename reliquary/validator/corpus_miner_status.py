@@ -26,6 +26,9 @@ RECENT_FAILURES = 20
 SHARE_WINDOWS = 24
 # Store reads in flight at once while backfilling: far below the auditor's.
 BACKFILL_CONCURRENCY = 4
+# Verdict reads a second while backfilling, across its readers: in a judge
+# process the backfill shares the loop (and the GIL) with judging.
+BACKFILL_READS_PER_SECOND = 100.0
 BACKFILL_RETRY_SECONDS = 300.0
 # An SS58 address: base58, never longer than this.
 _HOTKEY = re.compile(r"[1-9A-HJ-NP-Za-km-z]{1,64}")
@@ -227,10 +230,16 @@ class MinerBook:
                     if _key(sid) not in self._seen]
             queue = iter(todo)
 
+            pause = BACKFILL_CONCURRENCY / BACKFILL_READS_PER_SECOND
+
             async def reader():
                 # A few readers over one iterator: never a coroutine per verdict.
                 for sid in queue:
+                    started = asyncio.get_running_loop().time()
                     self.observe(sid, await self._records.read_verdict(self._job_id, sid))
+                    rest = pause - (asyncio.get_running_loop().time() - started)
+                    if rest > 0:
+                        await asyncio.sleep(rest)
 
             await asyncio.gather(*(reader() for _ in range(BACKFILL_CONCURRENCY)))
             last = state.get("last_window")
