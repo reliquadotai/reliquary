@@ -67,9 +67,15 @@ async def list_period_archives(task_id: str, **client_kwargs) -> list[tuple[int,
 
 
 class R2PeriodArchives:
-    """The settler's and the weight setter's view of the bucket."""
+    """The settler's and the weight setter's view of the bucket. ``guard``
+    (the settler's window archives) refuses a task this process does not serve."""
+
+    def __init__(self, guard=None) -> None:
+        self._guard = guard
 
     async def write(self, task_id, work_period, entry_period, document) -> None:
+        if self._guard is not None:
+            self._guard.refuse_unserved(task_id)
         await write_period_archive(task_id, work_period, entry_period, document)
 
     async def list(self, task_id) -> list[tuple[int, int]]:

@@ -333,20 +333,23 @@ class R2Archives:
                 best = max(best or 0, window)
         return best
 
-    async def write(self, task_id: str, window: int, data: dict) -> None:
+    def refuse_unserved(self, task_id: str) -> None:
+        """The corpus validator runs under its own task id(s), so it refuses to
+        write under any task RELIQUARY_TASK_ID (or its hot set) does not name.
+        Unset is refused as before, never read as the legacy task."""
         import os
-
-        from reliquary.infrastructure import storage
 
         from reliquary.shared.task_id import parse_task_ids
 
-        # The corpus validator runs under its own task id(s), so refuse to
-        # write under any task RELIQUARY_TASK_ID does not name.
-        # Unset is refused as before, never read as the legacy task.
         served = os.getenv("RELIQUARY_TASK_ID")
         hot = set(self._served()) if self._served is not None else set()
         if not served or (task_id not in parse_task_ids(served) and task_id not in hot):
             raise RuntimeError(f"RELIQUARY_TASK_ID does not name {task_id!r}; refusing to archive")
+
+    async def write(self, task_id: str, window: int, data: dict) -> None:
+        from reliquary.infrastructure import storage
+
+        self.refuse_unserved(task_id)
         await storage.upload_window_dataset(window, data, task_id=task_id)
         if self._max is not None:
             # Seen at once by the other jobs' settlers, without a listing.
