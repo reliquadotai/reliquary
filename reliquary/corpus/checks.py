@@ -13,7 +13,7 @@ import hashlib
 from typing import Any
 
 from reliquary.corpus.job import Sampling
-from reliquary.protocol.toploc import expected_chunks
+from reliquary.protocol.toploc import MIN_CHUNK_TOKENS, expected_chunks, span_chunk_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,4 +158,87 @@ def check_proof_shape(
                 reason="bad_proof_shape",
                 detail={"completion": position, "expected": expected, "got": proofs},
             )
+    return _ok()
+
+
+# A turn shorter than MIN_CHUNK_TOKENS is proven by one chunk that is never
+# judged alone (Task 3 / spec §7 M1); this many of them per trajectory at most,
+# so unproven tokens stay a handful.
+MAX_SHORT_TURNS = 2
+
+
+def check_turn_spans(spans: Sequence[tuple[int, int]], length: int, max_turns: int) -> CheckResult:
+    """Ordered assistant spans in `tokens`, a segment between each two, the
+    first right after the prompt, the last ending the tokens."""
+    def refuse(why: str) -> CheckResult:
+        return CheckResult(ok=False, reason=REASON_BAD_TURNS, detail={"why": why})
+
+    if not spans:
+        return refuse("no turns")
+    if len(spans) > max_turns:
+        return refuse(f"{len(spans)} turns, at most {max_turns}")
+    if spans[0][0] != 0:
+        return refuse("the first turn does not follow the prompt")
+    previous_end = None
+    for start, end in spans:
+        if not start < end:
+            return refuse(f"empty turn [{start}, {end})")
+        if previous_end is not None and start <= previous_end:
+            return refuse(f"turn [{start}, {end}) is not after the previous one's segment")
+        previous_end = end
+    if previous_end != length:
+        return refuse(f"the last turn ends at {previous_end}, the tokens at {length}")
+    return _ok()
+
+
+def check_short_turns(spans: Sequence[tuple[int, int]], min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+                      max_short: int = MAX_SHORT_TURNS) -> CheckResult:
+    short = sum(1 for start, end in spans if end - start < min_chunk_tokens)
+    if short > max_short:
+        return CheckResult(ok=False, reason=REASON_SHORT_TURNS,
+                           detail={"short_turns": short, "max": max_short})
+    return _ok()
+
+
+def check_turn_budget(spans: Sequence[tuple[int, int]], *, prompt_len: int, length: int,
+                      max_tokens_per_turn: int, max_total_tokens: int) -> CheckResult:
+    if prompt_len + length > max_total_tokens:
+        return CheckResult(ok=False, reason="token_budget_exceeded",
+                           detail={"tokens": prompt_len + length, "max_total_tokens": max_total_tokens})
+    for position, (start, end) in enumerate(spans):
+        if end - start > max_tokens_per_turn:
+            return CheckResult(ok=False, reason="token_budget_exceeded",
+                               detail={"turn": position, "tokens": end - start,
+                                       "max_tokens_per_turn": max_tokens_per_turn})
+    return _ok()
+
+
+def check_turn_termination(tokens: Sequence[int], spans: Sequence[tuple[int, int]], *,
+                           prompt_len: int, terminator_id: int, stop_ids: AbstractSet[int],
+                           max_tokens_per_turn: int, max_total_tokens: int) -> CheckResult:
+    """Each turn ends where generation stops: on the turn terminator (any
+    stop id for the final turn) or exactly at the cap the endpoint applied,
+    ``min(max_tokens_per_turn, max_total_tokens - prompt so far)``."""
+    last = len(spans) - 1
+    for position, (start, end) in enumerate(spans):
+        cap = min(max_tokens_per_turn, max_total_tokens - (prompt_len + start))
+        token = tokens[end - 1]
+        ended = token in stop_ids if position == last else token == terminator_id
+        if not ended and end - start != cap:
+            return CheckResult(ok=False, reason="bad_termination",
+                               detail={"turn": position, "tokens": end - start, "cap": cap,
+                                       "last_token_id": int(token)})
+    return _ok()
+
+
+def check_turn_proof_shape(spans: Sequence[tuple[int, int]], proof_counts: Sequence[int],
+                           chunk_tokens: int, min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> CheckResult:
+    if len(spans) != len(proof_counts):
+        return CheckResult(ok=False, reason="bad_proof_shape",
+                           detail={"turns": len(spans), "proof_lists": len(proof_counts)})
+    for position, ((start, end), got) in enumerate(zip(spans, proof_counts)):
+        expected = span_chunk_count(end - start, chunk_tokens, min_chunk_tokens)
+        if got != expected:
+            return CheckResult(ok=False, reason="bad_proof_shape",
+                               detail={"turn": position, "expected": expected, "got": got})
     return _ok()

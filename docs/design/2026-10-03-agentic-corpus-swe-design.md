@@ -116,6 +116,8 @@ New pure functions in `reliquary/corpus/checks.py`, applied when the job carries
    the pinned renderer, at most the env's `max_observation_bytes`.
 7. Duplicate digest over the full `tokens`.
 
+Ruling P8: the implementation accepts a capped (length-limited) turn that is not the last one, so check 3 reads "a non-final span ends with the terminator or at its cap".
+
 `token_count` stored in the record counts assistant-span tokens only, so the
 existing settlement (`cap × passed token share`) pays for generated tokens.
 
