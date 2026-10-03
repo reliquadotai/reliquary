@@ -1,5 +1,13 @@
 # Flexible evaluations on the subnet (operator side)
 
+> **How we run our own evaluations: on our validator** (2026-10-03). The order path below
+> (order control, qualification by two executors) is the customers' — models we do not
+> know, verified on rented cards. Our checkpoints are evaluated like any corpus job:
+> `jobs create --eval-set` declares the job, the corpus validator started on that model's
+> GPU audits TOPLOC locally, `eval grade --job` grades on CPU. Runbook:
+> `docs/runbooks/evaluation-on-our-validator.md`. Sets, the system turn, the external
+> environment, grading and `eval compare` below are shared by both paths.
+
 2026-10-02. Extends `2026-10-01-evaluation-on-subnet-design.md` (v2). Nothing in the
 customer flow changes: the platform keeps ordering evaluations from the four held-out
 presets. What this adds is the operator's own way in, as flexible as `jobs create`.
