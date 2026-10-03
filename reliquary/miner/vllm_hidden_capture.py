@@ -90,6 +90,12 @@ class HiddenStateCapture:
             raise KeyError(f"{len(matches)} captured requests match {request_id!r}")
         return torch.cat(self._rows[matches[0]], 0)
 
+    def ids(self) -> list[str]:
+        return list(self._rows)
+
+    def discard(self, request_id: str) -> None:
+        self._rows.pop(request_id, None)
+
     def pop(self, request_id: str) -> torch.Tensor:
         """Like ``for_request``, but forgets the rows: a long-lived miner process
         must not keep every completion's activations resident forever."""

@@ -22,6 +22,7 @@ import queue
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -53,6 +54,12 @@ class TurnCore(Protocol):
 
     def has_unfinished(self) -> bool: ...
 
+    # Optional: ``abort(request_id)`` stops a request nobody waits for any more.
+
+
+MAX_STEP_FAILURES = 5
+_DROPPED_KEPT = 4096
+
 
 @dataclass
 class SessionLog:
@@ -78,6 +85,10 @@ class GenerateEngine:
         self._pending: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Future]] = {}
         self._sessions: dict[str, SessionLog] = {}
         self._lock = threading.Lock()
+        self._inflight: dict[str, str] = {}  # request id -> session id
+        self._dropped: OrderedDict[str, None] = OrderedDict()
+        self._step_failures = 0
+        self.healthy = True
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -100,15 +111,30 @@ class GenerateEngine:
                 continue
             try:
                 finished = self._core.step()
-            except Exception as exc:  # the engine itself failed: every waiter learns it
+            except Exception as exc:  # engine.step() itself failed: every waiter learns it
                 logger.exception("generate engine step failed")
+                self._step_failures += 1
+                if self._step_failures >= MAX_STEP_FAILURES:
+                    self.healthy = False
                 with self._lock:
                     waiting = list(self._pending)
                 for request_id in waiting:
                     self._resolve(Finished(request_id, error=f"engine step failed: {exc}"))
+                    self._abort(request_id)
+                self._stopping.wait(0.05)
                 continue
+            self._step_failures = 0
             for done in finished:
                 self._resolve(done)
+
+    def _abort(self, request_id: str) -> None:
+        abort = getattr(self._core, "abort", None)
+        if abort is None:
+            return
+        try:
+            abort(request_id)
+        except Exception:
+            logger.exception("aborting request %s failed", request_id)
 
     def _drain(self, *, block: bool) -> None:
         try:
@@ -116,11 +142,17 @@ class GenerateEngine:
         except queue.Empty:
             return
         while item is not None:
-            request_id, prompt_ids, max_tokens = item
-            try:
-                self._core.add(request_id, prompt_ids, max_tokens)
-            except Exception as exc:
-                self._resolve(Finished(request_id, error=f"request refused by the engine: {exc}"))
+            if item[0] == "abort":
+                self._abort(item[1])
+            else:
+                _, request_id, prompt_ids, max_tokens = item
+                with self._lock:
+                    waited = request_id in self._pending
+                if waited:  # a waiter that already gave up is not worth a prefill
+                    try:
+                        self._core.add(request_id, prompt_ids, max_tokens)
+                    except Exception as exc:
+                        self._resolve(Finished(request_id, error=f"request refused by the engine: {exc}"))
             try:
                 item = self._inbox.get_nowait()
             except queue.Empty:
@@ -129,6 +161,7 @@ class GenerateEngine:
     def _resolve(self, done: Finished) -> None:
         with self._lock:
             entry = self._pending.pop(done.request_id, None)
+            self._inflight.pop(done.request_id, None)
         if entry is not None:
             loop, future = entry
             loop.call_soon_threadsafe(_settle, future, done)
@@ -138,6 +171,8 @@ class GenerateEngine:
     async def generate(self, session_id: str, prompt_ids: list[int], max_tokens: int | None) -> dict:
         cap = min(self._per_turn, self.max_total_tokens - len(prompt_ids),
                   max_tokens if max_tokens else self._per_turn)
+        if not self.healthy:
+            raise RuntimeError("the generate engine is unhealthy (repeated engine step failures)")
         if cap < 1:
             raise ValueError(f"a prompt of {len(prompt_ids)} tokens leaves no room under "
                              f"{self.max_total_tokens}")
@@ -147,11 +182,21 @@ class GenerateEngine:
         future = loop.create_future()
         with self._lock:
             self._pending[request_id] = (loop, future)
-        self._inbox.put((request_id, list(prompt_ids), cap))
-        done: Finished = await future
+            self._inflight[request_id] = session_id
+        self._inbox.put(("add", request_id, list(prompt_ids), cap))
+        try:
+            done: Finished = await future
+        except BaseException:  # cancelled (client gone): free the engine slot
+            with self._lock:
+                self._pending.pop(request_id, None)
+                self._inflight.pop(request_id, None)
+            self._inbox.put(("abort", request_id))
+            raise
         if done.error is not None:
             raise RuntimeError(done.error)
         with self._lock:
+            if session_id in self._dropped:
+                raise RuntimeError("the session was dropped while the turn ran")
             log = self._sessions.setdefault(session_id, SessionLog())
             log.turns.append(GeneratedTurn(tuple(prompt_ids), done.completion_ids, done.proofs))
             log.touched = self._clock()
@@ -164,6 +209,8 @@ class GenerateEngine:
     def _note_prompt(self, session_id: str, prompt_ids: list[int]) -> None:
         now = self._clock()
         with self._lock:
+            if session_id in self._dropped:
+                raise ValueError("this session was dropped")
             for stale in [s for s, log in self._sessions.items() if now - log.touched > self._ttl]:
                 del self._sessions[stale]
             log = self._sessions.setdefault(session_id, SessionLog(touched=now))
@@ -179,7 +226,15 @@ class GenerateEngine:
             return self._sessions.pop(session_id, None)
 
     def drop_session(self, session_id: str) -> None:
-        self.take_session(session_id)
+        with self._lock:
+            self._sessions.pop(session_id, None)
+            self._dropped[session_id] = None
+            while len(self._dropped) > _DROPPED_KEPT:
+                self._dropped.popitem(last=False)
+            running = [r for r, s in self._inflight.items() if s == session_id]
+        for request_id in running:
+            self._resolve(Finished(request_id, error="session dropped"))
+            self._inbox.put(("abort", request_id))
 
 
 def _logprob(entry: Any, token: int) -> float:
@@ -227,16 +282,47 @@ class VllmTurnCore:
     def add(self, request_id: str, prompt_ids: list[int], max_tokens: int) -> None:
         from vllm.inputs import TokensPrompt
 
-        self._prompt_len[request_id] = len(prompt_ids)
         self._engine.add_request(request_id, TokensPrompt(prompt_token_ids=prompt_ids),
                                  self._params(max_tokens=max_tokens, **self._sampling))
+        self._prompt_len[request_id] = len(prompt_ids)
+
+    def abort(self, request_id: str) -> None:
+        self._prompt_len.pop(request_id, None)
+        try:
+            self._engine.abort_request([request_id])
+        finally:
+            self._sweep_capture()
+
+    def pending_capture_count(self) -> int:
+        """Captured requests still held: 0 once every batch has drained."""
+        return len(self._capture.ids())
+
+    def _sweep_capture(self) -> None:
+        # Rows of requests nobody will pop: the async surplus row recorded
+        # after a pop, or a request aborted / failed by an engine-step error.
+        for captured in self._capture.ids():
+            if self._own_id(captured) is None:
+                self._capture.discard(captured)
 
     def has_unfinished(self) -> bool:
         return bool(self._engine.has_unfinished_requests())
 
     def step(self) -> list[Finished]:
-        return [self._finish(output) for output in self._engine.step()
-                if getattr(output, "finished", False)]
+        outputs = self._engine.step()
+        results = []
+        for output in outputs:
+            if not getattr(output, "finished", False):
+                continue
+            engine_id = str(getattr(output, "request_id", ""))
+            request_id = self._own_id(engine_id) or engine_id
+            try:
+                results.append(self._finish(output))
+            except Exception as exc:  # one bad turn must not fail its batch-mates
+                logger.exception("finishing request %s failed", engine_id)
+                self._prompt_len.pop(request_id, None)
+                results.append(Finished(request_id, error=f"turn cannot be finished: {exc}"))
+        self._sweep_capture()
+        return results
 
     def _own_id(self, engine_id: str) -> str | None:
         return next((k for k in self._prompt_len
@@ -286,6 +372,8 @@ def build_generate_app(engine: GenerateEngine, *, model_name: str) -> FastAPI:
         if body.get("model") not in (None, model_name):
             raise HTTPException(status_code=404, detail=f"this endpoint serves {model_name}")
         max_tokens = (body.get("sampling_params") or {}).get("max_tokens")
+        if isinstance(max_tokens, bool):
+            raise HTTPException(status_code=400, detail="max_tokens must be an integer")
         try:
             return await engine.generate(session, ids,
                                          max_tokens if isinstance(max_tokens, int) else None)
