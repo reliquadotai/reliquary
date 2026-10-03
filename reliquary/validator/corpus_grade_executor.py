@@ -1,0 +1,157 @@
+"""`reliquary corpus grade-executor`: a CPU box with Docker that grades and
+replays agentic trajectories (spec §5 N5).
+
+It holds one secret, its token, pulls leases over HTTPS it opens itself, and
+returns facts: whether the diff applied and the tests passed, whether the
+replay reproduced the diff, which observations differed. It never decides a
+verdict. Hostile code runs here, never on the control; the boxes come from the
+task's public images pinned by digest. `verifiers` and `reliquary_swe` are
+imported here only.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Callable
+
+from reliquary.corpus.replay_compare import Action, compare
+from reliquary.validator.corpus_grade_protocol import GradeItem, GradeLease
+from reliquary.validator.lease_executor import TOKEN_ENV, LeaseExecutor, serve_executor
+
+logger = logging.getLogger(__name__)
+
+GRADE_PREFIX = "/corpus/internal/grade"
+HEARTBEAT_SECONDS = 20.0
+IDLE_SECONDS = 5.0
+DEFAULT_SCORING_SECONDS = 1800.0
+
+
+async def grade_patch(task, patch: str):
+    """`reliquary_swe.grading.grade` in a fresh box from the task's pinned
+    image, network cut, as `SweEnv._grade` does it (one attempt: a failure
+    goes back to the control, which re-leases it)."""
+    import verifiers.v1 as vf
+    from reliquary_swe import grading
+    from verifiers.v1.runtimes import provision_runtime
+
+    config = vf.DockerConfig(image=task.data.image, workdir=task.data.workdir,
+                             allow=task.data.network_allow)
+    async with asyncio.timeout(task.data.timeout.scoring or DEFAULT_SCORING_SECONDS):
+        async with provision_runtime(config, env=task.runtime_env()) as box:
+            await box.prepare_setup()
+            await box.prepare_execution([])
+            return await grading.grade(box, task.data, patch)
+
+
+async def run_grade_item(item: GradeItem, *, task_for=None, grade=grade_patch, replay=None) -> dict:
+    """The facts for one item, as a ``GradeItemResult`` body. ``error`` and
+    ``timeout`` are this executor's, never the miner's: the control re-leases."""
+    from reliquary.validator.agentic_replay import ReplayTimeout, replay_swe, swesmith_task
+
+    task_for = task_for or swesmith_task
+    replay = replay or replay_swe
+    try:
+        task = task_for(item.instance_id)
+        if item.mode == "grade":
+            report = await grade(task, item.final_diff)
+            return {"status": "ok", "diff_applied": bool(report.applied),
+                    "tests_passed": float(report.reward) >= 1.0}
+        actions = [Action(a.tool, a.arguments, a.observation) for a in item.actions]
+        observations, diff = await replay(task, actions)
+        # The renderer writes each observation stripped; compare like with like.
+        report = compare(actions, [o.strip() for o in observations], item.final_diff, diff)
+        return {"status": "ok", "replay_diff_equal": report.diff_equal,
+                "observations_compared": report.compared,
+                "observations_mismatched": list(report.mismatched)}
+    except ReplayTimeout as exc:
+        return {"status": "timeout", "detail": str(exc)[:500]}
+    except Exception as exc:  # ours, not the miner's: the control re-leases it
+        logger.exception("grade item %s (%s) failed", item.submission_id[:12], item.mode)
+        return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:500]}
+
+
+def installed_env_refusal(package: str, version: str) -> str | None:
+    """Why this box cannot grade for ``package@version``, or None."""
+    from reliquary.environment.agentic_swe import (
+        SUPPORTED_VERIFIERS,
+        installed_env_commit,
+        installed_verifiers_commit,
+    )
+
+    if package != "reliquary-swe":
+        return f"this executor grades reliquary-swe, not {package!r}"
+    if installed_env_commit() != version:
+        return f"reliquary-swe is installed at {installed_env_commit()}, registered for {version}"
+    if installed_verifiers_commit() != SUPPORTED_VERIFIERS:
+        return f"verifiers is installed at {installed_verifiers_commit()}, not {SUPPORTED_VERIFIERS}"
+    return None
+
+
+class GradeExecutor(LeaseExecutor):
+    kind = "grade executor"
+
+    def __init__(self, *, http, executor_id: str, token: str, concurrency: int = 4,
+                 run_item: Callable = run_grade_item,
+                 env_check: Callable[[str, str], str | None] | None = None,
+                 heartbeat_seconds: float = HEARTBEAT_SECONDS, idle_seconds: float = IDLE_SECONDS,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        super().__init__(http=http, executor_id=executor_id, token=token, prefix=GRADE_PREFIX,
+                         heartbeat_seconds=heartbeat_seconds, idle_seconds=idle_seconds,
+                         clock=clock)
+        self._concurrency = max(1, int(concurrency))
+        self._run_item = run_item
+        self._env_check = env_check or installed_env_refusal
+        self._running: set[asyncio.Task] = set()
+        self.env_package: str | None = None
+        self.env_version: str | None = None
+
+    def heartbeat_detail(self) -> dict:
+        return {"leases": self.leases, "running": len(self._running)}
+
+    async def start(self) -> None:
+        """Learn the env pin this executor is registered for, and refuse to
+        grade with anything else installed."""
+        answer = await self.heartbeat()
+        self.env_package, self.env_version = answer["model_id"], answer["model_revision"]
+        refusal = self._env_check(self.env_package, self.env_version)
+        if refusal:
+            raise RuntimeError(refusal)
+
+    async def _work(self, lease: GradeLease) -> None:
+        try:
+            result = await self._run_item(lease.items[0])
+            await self.post_result(lease.lease_id, {"results": [result]})
+        except Exception:
+            # The lease expires on the control and goes to another executor.
+            logger.exception("grade lease %s was not completed", lease.lease_id[:8])
+
+    async def step(self) -> bool:
+        """One claim when there is room; True when a lease was started."""
+        await self.heartbeat_if_due()
+        if len(self._running) >= self._concurrency:
+            return False
+        response = await self._post(f"{GRADE_PREFIX}/claim", {
+            "executor_id": self._executor_id, "env_package": self.env_package,
+            "env_version": self.env_version})
+        if response.status_code == 204:
+            return False
+        response.raise_for_status()
+        lease = GradeLease.model_validate(response.json())
+        if (lease.env.package, lease.env.version) != (self.env_package, self.env_version):
+            raise RuntimeError(f"a lease for {lease.env.package}@{lease.env.version}, "
+                               f"this executor grades {self.env_package}@{self.env_version}")
+        task = asyncio.create_task(self._work(lease))
+        self._running.add(task)
+        task.add_done_callback(self._running.discard)
+        return True
+
+
+def run_grade_executor(*, control_url: str, executor_id: str, concurrency: int = 4) -> None:
+    serve_executor(control_url, lambda **client: GradeExecutor(
+        executor_id=executor_id, concurrency=concurrency, **client))
+
+
+__all__ = ["GRADE_PREFIX", "GradeExecutor", "TOKEN_ENV", "grade_patch", "installed_env_refusal",
+           "run_grade_executor", "run_grade_item"]

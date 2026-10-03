@@ -142,8 +142,10 @@ class RegisterExecutor(BaseModel):
     # Where it runs: the eval control pairs executors on distinct ones.
     provider_id: str | None = Field(default=None, min_length=1, max_length=256)
     host: str | None = Field(default=None, min_length=1, max_length=256)
-    # "eval" executors serve the eval control only (provider_id and host required).
-    scope: Literal["corpus", "eval"] = "corpus"
+    # "eval" executors serve the eval control only (provider_id and host required);
+    # "grade" executors grade and replay for the corpus control, bound to an env
+    # pin (model_id = env package, model_revision = env commit).
+    scope: Literal["corpus", "eval", "grade"] = "corpus"
 
 
 class CreateDelivery(BaseModel):

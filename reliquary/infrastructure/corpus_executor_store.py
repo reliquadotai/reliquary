@@ -21,8 +21,11 @@ from reliquary.infrastructure.storage import get_s3_client
 EXECUTOR_SCHEMA = "reliquary/corpus-executor/v1"
 EXECUTOR_PREFIX = "reliquary/corpus/executors/"
 EXECUTOR_STATUSES = frozenset({"active", "revoked", "quarantined"})
-# Which control an executor serves; a registration without one is the corpus control's.
-EXECUTOR_SCOPES = frozenset({"corpus", "eval"})
+# Which control an executor serves: the corpus control's audits, the eval
+# control, or the corpus control's grade leases (bound to an env pin, not a
+# model: model_id = env package, model_revision = env commit). A registration
+# without one is the corpus control's.
+EXECUTOR_SCOPES = frozenset({"corpus", "eval", "grade"})
 
 
 def scope_of(document: Mapping) -> str:
@@ -32,6 +35,7 @@ READ_CONCURRENCY = 16
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _ABSENT = {"NoSuchKey", "404", "NotFound"}
 _CONFLICT = {"PreconditionFailed", "412", "ConditionalRequestConflict"}
 
@@ -122,6 +126,9 @@ async def register_executor(*, executor_id: str, token_sha256: str, model_id: st
         raise ValueError(f"scope must be one of {sorted(EXECUTOR_SCOPES)}")
     if scope == "eval" and not (provider_id and host):
         raise ValueError("an eval executor needs its provider_id and host")
+    if scope == "grade" and not _COMMIT.fullmatch(model_revision):
+        # A grade executor is bound to the env commit the job pins, never a branch.
+        raise ValueError("a grade executor's model_revision is its env commit (40 hex)")
     if scope != "corpus":
         # Written only off the default, so a corpus registration is unchanged.
         document["scope"] = scope

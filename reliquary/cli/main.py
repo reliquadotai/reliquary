@@ -2051,6 +2051,52 @@ def corpus_audit_executor(
                        model_revision=model_revision, **route)
 
 
+@corpus_app.command("register-grade-executor")
+def corpus_register_grade_executor(
+    executor_id: str = typer.Option(..., "--executor-id"),
+    env_version: str = typer.Option(
+        ..., "--env-version", help="reliquary-environments commit the job pins"),
+    env_package: str = typer.Option("reliquary-swe", "--env-package"),
+    days: float = typer.Option(30.0, "--days"),
+) -> None:
+    """Register a grade executor in the bucket and print its token once."""
+    import hashlib
+    import json
+    import secrets
+    import time
+
+    from reliquary.infrastructure import corpus_executor_store
+
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    document, created = asyncio.run(corpus_executor_store.register_executor(
+        executor_id=executor_id, token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+        model_id=env_package, model_revision=env_version, expires_at=now + days * 86400.0,
+        now=now, scope="grade"))
+    typer.echo(json.dumps({"executor_id": document["executor_id"], "created": created,
+                           "token": token if created else None}))
+
+
+@corpus_app.command("grade-executor")
+def corpus_grade_executor(
+    control_url: str = typer.Option(..., "--control-url"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    concurrency: int = typer.Option(4, "--concurrency", help="Items graded or replayed at once"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Grade and replay agentic trajectories for a corpus control. The only
+    secret is the executor token, in RELIQUARY_EXECUTOR_TOKEN; boxes come from
+    public images."""
+    from reliquary.validator import corpus_grade_executor as grade
+
+    setup_logging(log_level)
+    if not os.environ.get(grade.TOKEN_ENV, "").strip():
+        typer.echo(f"error: {grade.TOKEN_ENV} is not set", err=True)
+        raise typer.Exit(code=1)
+    grade.run_grade_executor(control_url=control_url, executor_id=executor_id,
+                             concurrency=concurrency)
+
+
 @corpus_app.command("order-control")
 def corpus_order_control(
     netuid: int = typer.Option(81, "--netuid"),
