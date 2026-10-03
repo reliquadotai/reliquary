@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import logging
 import os
 import threading
@@ -382,6 +383,95 @@ def get_current_chain() -> dict[str, Any]:
     return rec
 
 
+_G1_HEX = re.compile(r"\A[0-9a-fA-F]{96}\Z")
+
+
+def g1_signature(signature_hex: Any) -> bytes | None:
+    """The 48 bytes of a quicknet signature (one compressed G1 point), or None
+    for anything else: bytes appended or missing, whitespace, a 0x prefix.
+    The BLS check reads only the first 48 bytes, so anything after them would
+    let a relay choose SHA256(signature), the randomness."""
+    if not isinstance(signature_hex, str) or not _G1_HEX.fullmatch(signature_hex):
+        return None
+    return bytes.fromhex(signature_hex)
+
+
+def verify_round_signature(round_number: int, signature_hex: str) -> bool:
+    """True iff ``signature_hex`` is quicknet's BLS signature of
+    ``round_number``, checked here, offline, in ~7 ms.
+
+    A quicknet round's signature is the identity key of that round in drand's
+    time-lock scheme: a message encrypted to the round (``encrypt_at_round``,
+    the chain's public key built into bittensor-drand) opens with it and with
+    nothing else (``decrypt_with_signature`` fails on any other bytes, or on
+    another round's signature). No relay has to be trusted.
+    """
+    import secrets
+
+    point = g1_signature(signature_hex)
+    if point is None:
+        return False
+    try:
+        import bittensor_drand
+
+        nonce = secrets.token_bytes(16)
+        sealed = bittensor_drand.encrypt_at_round(nonce, int(round_number))
+        ciphertext = sealed[0] if isinstance(sealed, (tuple, list)) else sealed
+        return bittensor_drand.decrypt_with_signature(ciphertext, point.hex()) == nonce
+    except Exception:
+        return False
+
+
+def get_verified_beacon(round_id: int) -> dict[str, Any] | None:
+    """Round ``round_id`` from the first relay whose answer verifies by BLS
+    (``verify_round_signature``) and whose randomness is SHA256(signature):
+    the fastest relay's answer (~60 ms), not the slowest of two. None when no
+    relay gives a verifiable answer."""
+    import hashlib
+
+    _ensure_params(refresh=False)
+    if _DRAND_CHAIN_HASH is None:
+        return None
+    rid = str(int(round_id))
+    paths = [f"/v2/chains/{_DRAND_CHAIN_HASH}/rounds/{rid}", f"/{_DRAND_CHAIN_HASH}/public/{rid}"]
+    urls = [f"{base}{path}" for base in DRAND_URLS for path in paths]
+
+    def _try(url: str) -> dict[str, Any] | None:
+        try:
+            r = _get_thread_session().get(url, timeout=(0.5, 2.0), headers=_HEADERS)
+            data = r.json() if r.status_code == 200 else None
+        except Exception as e:
+            logger.debug(f"[Drand] GET {url} error: {e}")
+            return None
+        if not isinstance(data, dict) or data.get("round") != int(round_id):
+            return None
+        point = g1_signature(data.get("signature"))
+        if point is None:
+            return None
+        sig = point.hex()
+        randomness = hashlib.sha256(point).hexdigest()
+        given = data.get("randomness")
+        if given is not None and str(given).lower() != randomness:
+            return None
+        if not verify_round_signature(int(round_id), sig):
+            logger.warning("[Drand] %s gave a signature for round %s that does not verify",
+                           url.split("/")[2], rid)
+            return None
+        return {"round": int(round_id), "signature": sig, "randomness": randomness}
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(urls))
+    futures = [ex.submit(_try, url) for url in urls]
+    ex.shutdown(wait=False, cancel_futures=False)
+    for fut in concurrent.futures.as_completed(futures):
+        try:
+            beacon = fut.result()
+        except concurrent.futures.CancelledError:
+            continue
+        if beacon is not None:
+            return beacon
+    return None
+
+
 def get_agreed_beacon(round_id: int, *, agree: int = 2) -> dict[str, Any] | None:
     """Round ``round_id`` as ``agree`` distinct relays sign it, or None.
 
@@ -421,13 +511,11 @@ def get_agreed_beacon(round_id: int, *, agree: int = 2) -> dict[str, Any] | None
             continue
         if not isinstance(data, dict) or data.get("round") != int(round_id):
             continue
-        sig = data.get("signature")
-        if not isinstance(sig, str):
+        point = g1_signature(data.get("signature"))
+        if point is None:
             continue
-        try:
-            randomness = hashlib.sha256(bytes.fromhex(sig)).hexdigest()
-        except ValueError:
-            continue
+        sig = point.hex()
+        randomness = hashlib.sha256(point).hexdigest()
         given = data.get("randomness")
         if given is not None and str(given).lower() != randomness:
             continue

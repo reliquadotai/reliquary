@@ -229,7 +229,8 @@ def _sid(rng: random.Random) -> str:
 
 
 async def _drive(module, *, rate_per_hour, hours, params, population, seed, store, gpu,
-                 beacon, auditor_kwargs, sample_every, start_backlog, backlog_age, drain_hours):
+                 beacon, auditor_kwargs, sample_every, start_backlog, backlog_age, drain_hours,
+                 backlog_newest=0.0):
     from reliquary.validator.corpus_miner_states import MinerStates
 
     rng = random.Random(seed)
@@ -256,7 +257,7 @@ async def _drive(module, *, rate_per_hour, hours, params, population, seed, stor
 
     # A backlog older than the run, already listed by a restarted process.
     for _ in range(start_backlog):
-        submit(virtual_clock() - rng.uniform(0, backlog_age))
+        submit(virtual_clock() - rng.uniform(backlog_newest, backlog_age))
 
     runner = asyncio.ensure_future(auditor.run())
     series = []
@@ -312,7 +313,8 @@ def simulate(module, *, rate_per_hour: float, hours: float, params: AuditParams 
              population: Population | None = None, seed: int = 0, store: Store | None = None,
              gpu: Gpu | None = None, beacon: Beacon | None = None, auditor_kwargs=None,
              sample_every: float = 600.0, start_backlog: int = 0, backlog_age: float = 7 * 3600,
-             drain_hours: float = 0.0, patch_time: bool = True) -> Result:
+             drain_hours: float = 0.0, patch_time: bool = True,
+             backlog_newest: float = 0.0) -> Result:
     """Run ``module.CorpusAuditor.run()`` under ``rate_per_hour`` arrivals for
     ``hours`` of virtual time (then ``drain_hours`` without arrivals)."""
     params = params or AuditParams(q=0.15, probation_submissions=100, hold_seconds=4320.0,
@@ -330,7 +332,7 @@ def simulate(module, *, rate_per_hour: float, hours: float, params: AuditParams 
             population=population or Population.prod_like(seed=seed), seed=seed, store=store,
             gpu=gpu or Gpu(), beacon=beacon or Beacon(), auditor_kwargs=auditor_kwargs or {},
             sample_every=sample_every, start_backlog=start_backlog, backlog_age=backlog_age,
-            drain_hours=drain_hours))
+            drain_hours=drain_hours, backlog_newest=backlog_newest))
     finally:
         module.time = saved
         asyncio.set_event_loop(None)

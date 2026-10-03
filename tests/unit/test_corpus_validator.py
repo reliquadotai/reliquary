@@ -292,12 +292,13 @@ def test_round_at_boundary_at_a_30s_period():
 
 @pytest.fixture(autouse=True)
 def _drand_offline(monkeypatch):
-    """No relay is ever asked for real: no two agree, nothing is cached, so
+    """No relay is ever asked for real: none verifies, no two agree, nothing is cached, so
     ``drand_beacon`` decides through its cross-checked path, as these tests ask."""
     from reliquary.infrastructure import drand
     from reliquary.validator import corpus_validator
 
     monkeypatch.setattr(drand, "get_agreed_beacon", lambda round_id, **kw: None)
+    monkeypatch.setattr(drand, "get_verified_beacon", lambda round_id, **kw: None)
     monkeypatch.setattr(corpus_validator, "_BEACONS", {})
     monkeypatch.delenv("RELIQUARY_CORPUS_DRAND_CACHE", raising=False)
 

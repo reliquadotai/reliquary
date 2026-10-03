@@ -31,7 +31,8 @@ from tests.unit import _main_corpus_auditor as main_module
 
 
 def _sig(round_number, forged=False):
-    return hashlib.sha256(f"sig-{round_number}-{forged}".encode()).hexdigest() * 3
+    # 48 bytes, the size of a quicknet signature (a G1 point).
+    return (hashlib.sha256(f"sig-{round_number}-{forged}".encode()).hexdigest() * 2)[:96]
 
 
 class _Relays:
@@ -69,6 +70,8 @@ def relays(monkeypatch):
         monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
         monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
         monkeypatch.setattr(drand, "_DRAND_PERIOD", 3)
+        # Their signatures are fakes: only agreement can vouch for them here.
+        monkeypatch.setattr(drand, "get_verified_beacon", lambda round_id: None)
         return fake
 
     return install

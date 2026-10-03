@@ -62,7 +62,9 @@ def _restart(monkeypatch, *, siblings, n=20000, hours=1.0):
             job_id="math-v1", records=store, model=None, tokenizer=None, proof=None,
             params=params, miner_states=MinerStates(store, "math-v1", clock=clock),
             beacon=beacon, round_at=sim.round_at, clock=clock,
-            accept_slack_seconds=30.0, rescan_every_seconds=20.0)
+            accept_slack_seconds=30.0, rescan_every_seconds=20.0,
+            # The pass's own races are counted here, not the background prefetch's.
+            prefetch_rounds=False)
 
         async def forward(records, *, local=False):
             await asyncio.sleep(0.05 * len(records))
