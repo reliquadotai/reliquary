@@ -297,17 +297,29 @@ export R2_ACCESS_KEY_ID=e2e$(openssl rand -hex 6) R2_SECRET_ACCESS_KEY=$(openssl
 gpu() {  # run "$1" on the GPU box with the bucket's credentials, from /opt/reliquary
   printf '%s\n%s\n' "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" | ssh -p 20300 root@162.243.212.30 \
     "read -r R2_ACCESS_KEY_ID; read -r R2_SECRET_ACCESS_KEY; export R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; \
-     export R2_BUCKET_ID=reliquary-agentic-e2e HF_HOME=/opt/hf; cd /opt/reliquary && $1"
+     export R2_BUCKET_ID=reliquary-agentic-e2e R2_ENDPOINT_URL=http://127.0.0.1:9000 R2_REGION=us-east-1 \
+            HF_HOME=/opt/hf; cd /opt/reliquary || exit 1; $1"
 }
 E2E="/opt/vllm/venv/bin/python scripts/agentic_corpus_e2e.py"
 CLI="/opt/vllm/venv/bin/python -m reliquary.cli.main"
 S=/opt/agentic-e2e
 ```
 
+Two details of `gpu` matter. The endpoint and region point the plain CLI
+(`register-grade-executor`, `jobs export`) at the MinIO; without them it
+builds `https://.r2.cloudflarestorage.com` and fails (`Invalid endpoint`); the
+script's subcommands read them from the state directory anyway. And
+`cd ... || exit 1; $1`, never `cd ... && $1`: with `&&`, a `$1` ending in
+`&` backgrounds the whole list in a subshell that keeps ssh's output open, so
+the call never returns and `$!` is that subshell's pid, not the process
+group `kill -- -$(cat ...pid)` needs later. The same holds for every
+`ssh '... setsid nohup ... &'` below.
+
 1. Prepare (MinIO, the job; the fingerprint takes minutes over 52 GB):
    `gpu "$E2E prepare --state $S --env-commit $ENV_COMMIT --start-minio"`.
    Expect one JSON line with `"prompts": [0, 8]`. MinIO runs as container
-   `agentic-e2e-minio` on 127.0.0.1:9000 with the shell's credentials; a
+   `agentic-e2e-minio` on 127.0.0.1:9000 with the shell's credentials (image
+   `cgr.dev/chainguard/minio` by digest: MinIO no longer publishes its own); a
    single-turn e2e's `corpus-e2e-minio` holding port 9000 makes it fail, never
    removed.
 2. Control, intake-only, in the background:
@@ -325,10 +337,14 @@ S=/opt/agentic-e2e
    }
    TOKEN_A=$(token grade-a hetzner) && TOKEN_B=$(token grade-b digitalocean) \
      || { unset TOKEN_A TOKEN_B; echo "STOP: an executor got no token" >&2; }
+   # The control re-reads the executor registry every 30 s: an executor that
+   # starts before it does gets 401 on its first heartbeat and exits, and its
+   # token, shown once, is gone with the shell variable.
+   sleep 35
    ssh -f -N -o ExitOnForwardFailure=yes -L 18100:127.0.0.1:8100 -p 20300 root@162.243.212.30
    ssh -f -N -o ExitOnForwardFailure=yes -R 18100:127.0.0.1:18100 root@5.161.244.56
-   [ -n "$TOKEN_A" ] && printf '%s\n' "$TOKEN_A" | ssh root@5.161.244.56 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary && setsid nohup .venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:18100 --executor-id grade-a --concurrency 4 > /root/grade-a.log 2>&1 < /dev/null & echo $! > /root/grade-a.pid'
-   [ -n "$TOKEN_B" ] && printf '%s\n' "$TOKEN_B" | ssh -p 20300 root@162.243.212.30 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary && setsid nohup /opt/vllm/venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:8100 --executor-id grade-b --concurrency 2 > /opt/agentic-e2e/grade-b.log 2>&1 < /dev/null & echo $! > /opt/agentic-e2e/grade-b.pid'
+   [ -n "$TOKEN_A" ] && printf '%s\n' "$TOKEN_A" | ssh root@5.161.244.56 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary || exit 1; setsid nohup .venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:18100 --executor-id grade-a --concurrency 4 > /root/grade-a.log 2>&1 < /dev/null & echo $! > /root/grade-a.pid'
+   [ -n "$TOKEN_B" ] && printf '%s\n' "$TOKEN_B" | ssh -p 20300 root@162.243.212.30 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary || exit 1; setsid nohup /opt/vllm/venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:8100 --executor-id grade-b --concurrency 2 > /opt/agentic-e2e/grade-b.log 2>&1 < /dev/null & echo $! > /opt/agentic-e2e/grade-b.pid'
    unset TOKEN_A TOKEN_B
    ```
 
