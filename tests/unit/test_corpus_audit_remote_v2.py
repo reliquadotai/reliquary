@@ -102,10 +102,6 @@ async def test_a_rechecked_v2_batch_is_rescored_locally_with_its_spans():
 
     seen = []
 
-    async def local(items):
-        seen.append(items)
-        return [("ok", ((0, 0.0, 0.0), (0, 0.0, 0.0))) for _ in items]
-
     from reliquary.protocol.toploc import ChunkResult
 
     async def local_cr(items):
@@ -131,5 +127,93 @@ def test_old_claims_default_to_v1_and_a_v2_lease_needs_spans():
 
 
 def test_an_item_fits_a_60k_trajectory_with_its_prompt():
-    AuditItem(tokens=list(range(60_000 + 8_000)), prompt_len=8_000, proofs=[], spans=[(8_000, 68_000)])
-    assert MAX_SEQUENCE_TOKENS >= 68_000
+    AuditItem(tokens=list(range(60_000)), prompt_len=8_000, proofs=[], spans=[(8_000, 60_000)])
+    assert MAX_SEQUENCE_TOKENS == 65_536
+
+
+@pytest.mark.parametrize("spans", [[(3, 20)], [(5, 5)], [(20, 30), (5, 10)], [(5, 30), (25, 40)],
+                                   [(5, 21)]])
+def test_malformed_spans_are_refused_at_parse_time(spans):
+    with pytest.raises(ValidationError):
+        AuditItem(tokens=list(range(20)), prompt_len=5, proofs=[], spans=spans)
+
+
+async def test_each_v2_row_gets_its_own_lease():
+    d, _ = _dispatcher()
+    task = asyncio.ensure_future(d.score([V2_ITEM, V2_ITEM, V2_ITEM]))
+    await asyncio.sleep(0)
+    leases = [d.claim("pod-1", protocols=BOTH) for _ in range(2)]
+    assert all(len(lease["items"]) == 1 for lease in leases)
+    assert len(d._queue) == 1
+    task.cancel()
+
+
+async def test_a_v1_claim_still_gets_v1_work_queued_behind_v2_work():
+    d, _ = _dispatcher()
+    d._queue.clear()
+    t2 = asyncio.ensure_future(d.score([V2_ITEM]))
+    await asyncio.sleep(0)
+    t1 = asyncio.ensure_future(d.score([V1_ITEM]))
+    await asyncio.sleep(0)
+    assert d._queue[0].protocol == AUDIT_PROTOCOL_V2
+    lease = d.claim("pod-1")
+    assert lease["protocol"] == AUDIT_PROTOCOL
+    assert len(d._queue) == 1 and d._queue[0].protocol == AUDIT_PROTOCOL_V2
+    t1.cancel(); t2.cancel()
+
+
+async def _router_claim(body):
+    import httpx
+    from fastapi import FastAPI
+
+    from reliquary.validator.corpus_audit_remote import build_audit_executor_router
+    from tests.unit.test_corpus_audit_remote import GOOD, MODEL, REVISION
+
+    clock = _Clock()
+    directory = _directory([_doc()], clock)
+    await directory.refresh()
+    seen = []
+
+    class Stub:
+        def claim(self, executor_id, protocols=(AUDIT_PROTOCOL,)):
+            seen.append(tuple(protocols))
+            return None
+
+    app = FastAPI()
+    app.include_router(build_audit_executor_router(Stub(), directory))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://control") as client:
+        await client.post("/corpus/internal/audit/claim", headers={"Authorization": f"Bearer {GOOD}"},
+                          json={"executor_id": "pod-1", "model_id": MODEL,
+                                "model_revision": REVISION, **body})
+    return seen
+
+
+async def test_the_router_passes_the_claimed_protocols_and_defaults_to_v1():
+    assert await _router_claim({"protocols": list(BOTH)}) == [BOTH]
+    assert await _router_claim({}) == [(AUDIT_PROTOCOL,)]
+
+
+async def _claim_body(prefix):
+    from reliquary.validator.corpus_audit_executor import AuditExecutor
+
+    posts = []
+
+    class Http:
+        async def post(self, path, json=None, **kw):
+            posts.append((path, json))
+            return type("R", (), {"status_code": 204, "raise_for_status": lambda self: None,
+                                  "json": lambda self: {}})()
+
+    executor = AuditExecutor(http=Http(), executor_id="pod-1", token="x", model_id="m",
+                             model_revision="r", load_model=lambda m, r: None, prefix=prefix)
+    executor._last_heartbeat = executor._clock()
+    await executor.step()
+    return next(body for path, body in posts if path.endswith("/claim"))
+
+
+async def test_the_corpus_claim_carries_protocols_and_the_eval_claim_does_not():
+    from reliquary.validator.corpus_audit_executor import AUDIT_PREFIX, EVAL_AUDIT_PREFIX
+
+    assert (await _claim_body(AUDIT_PREFIX))["protocols"] == list(BOTH)
+    assert "protocols" not in await _claim_body(EVAL_AUDIT_PREFIX)

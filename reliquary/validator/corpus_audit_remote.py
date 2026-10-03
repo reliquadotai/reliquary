@@ -301,7 +301,11 @@ class RemoteAuditDispatcher:
         spanned = [k for k, item in enumerate(items) if item.get("spans") is not None]
         plain = [k for k, item in enumerate(items) if item.get("spans") is None]
         for protocol, group in ((AUDIT_PROTOCOL, plain), (AUDIT_PROTOCOL_V2, spanned)):
-            for unit in _lease_units([items[k] for k in group]):
+            # One trajectory per v2 lease: a 60k prefill takes ~16 s (M3), and
+            # several would outrun the lease and strike an honest executor.
+            grouped = ([[k] for k in range(len(group))] if protocol == AUDIT_PROTOCOL_V2
+                       else _lease_units([items[k] for k in group]))
+            for unit in grouped:
                 indexes = [group[k] for k in unit]
                 work = _Work(id=next(self._ids), items=[items[k] for k in indexes],
                              future=loop.create_future(), queued_at=self._clock(),

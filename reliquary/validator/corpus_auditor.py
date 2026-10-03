@@ -440,9 +440,9 @@ class CorpusAuditor:
 
     @staticmethod
     def _refuse_trajectories(items: list[tuple]) -> None:
-        """The remote executors' wire does not carry spans yet: a trajectory
-        scored there would be read as a single-turn row and fail an honest
-        miner, so it is a validator-side error instead (no miner verdict)."""
+        """For the eval auditor only: eval jobs never carry trajectories, and
+        the eval executors speak v1, so a trajectory there is a validator-side
+        error (no miner verdict)."""
         if any(item[5] is not None for item in items):
             raise RuntimeError("trajectory audit is not available on remote executors")
 

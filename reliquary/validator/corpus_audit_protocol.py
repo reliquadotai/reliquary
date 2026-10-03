@@ -22,8 +22,7 @@ MAX_ITEM_SPANS = 64
 # Bounds of one lease: what keeps a request and a response a few megabytes.
 MAX_LEASE_ITEMS = 64
 MAX_LEASE_TOKENS = 262_144
-# A 60k-token trajectory plus its prompt (one H100 holds 60k).
-MAX_SEQUENCE_TOKENS = 131_072
+MAX_SEQUENCE_TOKENS = 65_536
 MAX_ITEM_PROOFS = 4096
 
 ITEM_OK = "ok"
@@ -59,6 +58,16 @@ class AuditItem(_Strict):
     proofs: list[Proof] = Field(max_length=MAX_ITEM_PROOFS)
     # v2: assistant spans in `tokens` coordinates; `proofs` are their lists concatenated.
     spans: list[tuple[int, int]] | None = Field(default=None, max_length=MAX_ITEM_SPANS)
+
+    @model_validator(mode="after")
+    def _spans_fit(self) -> "AuditItem":
+        if self.spans is not None:
+            edge = self.prompt_len
+            for start, end in self.spans:
+                if not (edge <= start < end <= len(self.tokens)):
+                    raise ValueError("spans must be ordered, disjoint, after the prompt and inside tokens")
+                edge = end
+        return self
 
 
 class AuditLease(_Strict):
