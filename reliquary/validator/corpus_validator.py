@@ -449,7 +449,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             vocab_size=vocab_size, is_banned=getattr(served, "is_banned", None),
             registration=registration,
             seen_index=getattr(served, "seen_index", None),
-            episode_intake=getattr(served, "episode_intake", None),
+            episode_intake=getattr(served, "episode_intake", None), job=getattr(served, "job", None),
         )
 
     # Miners have no registry access: each job's own task contract. With one
@@ -845,13 +845,18 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     job_set: CorpusJobSet | None = None
     archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 
+    def episode_intake_for(w):
+        # Loads the task set and the renderer: blocking, so a hot-added job
+        # builds it off the event loop (`wire_hot`).
+        from reliquary.validator.agentic_intake import build_episode_intake
+
+        return build_episode_intake(
+            w.job, checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
+            vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
+
     def audit_and_settle(w) -> None:
         if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
-            from reliquary.validator.agentic_intake import build_episode_intake
-
-            w.episode_intake = build_episode_intake(
-                w.job, checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
-                vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
+            w.episode_intake = episode_intake_for(w)
         link = split.links.get(str(w.job.job_id)) if split is not None else None
         if link is not None:
             wire_job_front_only(w, records=records, link=link)
@@ -874,11 +879,17 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
 
     async def wire_hot(task_entry, task_cap, job):
+        if split is not None and job.episode is not None:
+            # As at boot: the split validator's GPU process does not replay episodes.
+            raise RuntimeError(f"job {job.job_id!r}: episode jobs are not served by the "
+                               "split validator; unset RELIQUARY_CORPUS_SPLIT")
         # The renderer first: a job refused for it leaves its ledger untouched.
         own_profile = _entry_profile(task_entry)
         renderer = build_renderer(job, own_profile)
         seen_index = await migrate_ledgers_at_startup(store, job)
         w = prepared(task_entry, task_cap, job, own_profile, renderer, seen_index)
+        if job.episode is not None:
+            w.episode_intake = await asyncio.to_thread(episode_intake_for, w)
         audit_and_settle(w)
         return w
 

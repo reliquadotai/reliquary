@@ -198,7 +198,7 @@ def test_the_intake_decodes_under_a_lock():
 
 # --- the request-body cap (ruling P9) ---------------------------------------
 
-from reliquary.validator.corpus_service import MAX_SUBMIT_BODY_BYTES  # noqa: E402
+from reliquary.validator.corpus_service import MIN_SUBMIT_BODY_BYTES as MAX_SUBMIT_BODY_BYTES  # noqa: E402
 
 
 def _signature_spy():
@@ -249,3 +249,98 @@ def test_the_scoped_and_legacy_routes_are_capped_too(episode_store):
 
 def test_an_honest_body_is_far_under_the_cap():
     assert len(_request().model_dump_json()) < MAX_SUBMIT_BODY_BYTES // 100
+
+
+# --- ruling P10: the cap follows the job ------------------------------------
+
+MIB = 1024 * 1024
+
+
+def _single_turn_job(n=16, max_new_tokens=32768):
+    raw = _manifest(with_episode=False, prompt_count=3)
+    raw["sampling"] = {**raw["sampling"], "max_new_tokens": max_new_tokens, "n": n}
+    return parse_job(raw)
+
+
+def test_worst_case_body_by_job_kind():
+    from reliquary.protocol.corpus_submission import MAX_RENDERED_PROMPT_CHARS
+    from reliquary.validator.corpus_service import worst_case_body
+
+    big = _single_turn_job()
+    assert worst_case_body(big) == 16 * 32768 * 24 + MAX_RENDERED_PROMPT_CHARS + 64 * 1024
+    assert worst_case_body(big) > 12_000_000
+    assert worst_case_body(_single_turn_job(n=1, max_new_tokens=64)) == 8 * MIB     # never below
+    assert worst_case_body(parse_job(_manifest(prompt_count=3))) == 8 * MIB          # episode
+
+
+def _router(job, store, **kw):
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    return build_corpus_router(
+        job_id=str(job.job_id), store=store, tokenizer=TOKENIZER, renderer=None,
+        verify_signature=lambda r: True, proof_chunk_tokens=32, job=job, **kw)
+
+
+def test_a_single_turn_job_takes_a_twelve_megabyte_body(episode_store):
+    job = _single_turn_job()
+    app = FastAPI()
+    app.include_router(_router(job, episode_store))
+    client = TestClient(app)
+    junk = b"x" * 12_000_000          # not JSON: past the cap check it parses and answers 422
+    assert client.post("/corpus/submit", content=junk).status_code == 422
+    over = b"x" * (_router(job, episode_store).body_cap + 1)
+    assert client.post("/corpus/submit", content=over).status_code == 413
+
+
+def test_an_episode_job_refuses_nine_mebibytes(episode_store):
+    job = parse_job(_manifest(prompt_count=3))
+    app = FastAPI()
+    app.include_router(_router(job, episode_store, episode_intake=_intake()))
+    response = TestClient(app).post("/corpus/submit", content=b"x" * (9 * MIB))
+    assert response.status_code == 413
+
+
+def test_scoped_uses_its_own_job_and_legacy_the_max_over_served_jobs(episode_store):
+    from reliquary.validator.corpus_service import CorpusJobRoutes, build_corpus_jobs_router
+
+    small = _router(parse_job(_manifest(prompt_count=3)), episode_store, episode_intake=_intake())
+    routes = CorpusJobRoutes()
+    routes.add("swe-agentic-v1", small)
+    app = FastAPI()
+    app.include_router(build_corpus_jobs_router(routes, legacy=True))
+    client = TestClient(app)
+    body = b"x" * (9 * MIB)
+    assert client.post("/corpus/submit", content=body).status_code == 413
+    # A big single-turn job joins while serving (hot add): read at request time.
+    big_job = _single_turn_job()
+    routes.add("big-v1", _router(big_job, episode_store))
+    assert client.post("/corpus/submit", content=body).status_code == 422
+    assert client.post("/corpus/jobs/big-v1/submit", content=body).status_code == 422
+    assert client.post("/corpus/jobs/swe-agentic-v1/submit", content=body).status_code == 413
+
+
+def test_every_check_reason_is_a_reject_reason():
+    from reliquary.corpus import checks, trajectory_parse
+    from reliquary.protocol.corpus_submission import CorpusRejectReason
+
+    values = {r.value for r in CorpusRejectReason}
+    found = [(m.__name__, name, v) for m in (checks, trajectory_parse) for name, v in vars(m).items()
+             if name.startswith("REASON_") and isinstance(v, str)]
+    assert found
+    assert [f for f in found if f[2] not in values] == []
+
+
+def test_an_unknown_intake_reason_is_a_server_error(episode_store):
+    from reliquary.validator.agentic_intake import IntakeRefusal
+
+    class Broken:
+        def check(self, request):
+            return IntakeRefusal("not_a_reason", {})
+
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    app = FastAPI()
+    app.include_router(build_corpus_router(
+        job_id="swe-agentic-v1", store=episode_store, tokenizer=TOKENIZER, renderer=None,
+        verify_signature=lambda r: True, proof_chunk_tokens=32, episode_intake=Broken()))
+    assert TestClient(app).post("/corpus/submit", json=_request().model_dump()).status_code == 500

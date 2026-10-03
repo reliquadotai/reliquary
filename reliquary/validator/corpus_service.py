@@ -52,6 +52,7 @@ from reliquary.infrastructure.corpus_job_store import (
     CorpusStoreConflict,
 )
 from reliquary.protocol.corpus_submission import (
+    MAX_RENDERED_PROMPT_CHARS,
     CorpusRejectReason,
     CorpusSkipRequest,
     CorpusSkipResponse,
@@ -86,10 +87,11 @@ SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
 # to expect before it parses the rest of the document.
 RECORD_SCHEMA = "reliquary/corpus-submission-record/v1"
 
-# Ruling P9: a corpus submission body is refused past this many bytes, before
-# it is parsed. A 60k-token trajectory is < 1 MB of ids, ~0.7 MB of proofs, a
-# 1 MiB rendered prompt and a diff: about 3x headroom.
-MAX_SUBMIT_BODY_BYTES = 8 * 1024 * 1024
+# Rulings P9/P10: a corpus submission body is refused past a cap, before it is
+# parsed; the cap is the job's `worst_case_body`, never below this. A 60k-token
+# trajectory is < 1 MB of ids, ~0.7 MB of proofs, a 1 MiB rendered prompt and a
+# diff: about 3x headroom for an episode job.
+MIN_SUBMIT_BODY_BYTES = 8 * 1024 * 1024
 # Mirrors `DEFAULT_WRITE_ATTEMPTS` below: a handful of rounds against a
 # transient bucket fault, not a queue a miner's request should block behind.
 RECORD_WRITE_ATTEMPTS = 3
@@ -1292,38 +1294,56 @@ def _skip_refused(verdict: Verdict) -> CorpusSkipResponse:
     )
 
 
-class _CappedSubmitRoute(APIRoute):
-    """Submit routes refuse a body over ``MAX_SUBMIT_BODY_BYTES`` (413) before
-    FastAPI parses it: by the declared length, and by counting a chunked body
-    as it streams."""
+def worst_case_body(job: JobSpec) -> int:
+    """The largest honest submission body for ``job``, never below
+    ``MIN_SUBMIT_BODY_BYTES`` (ruling P10). A single-turn job's is its n
+    completions at about 24 JSON bytes a token, plus the rendered prompt and
+    slack; an episode job's trajectory is bounded by the minimum."""
+    if job.episode is not None:
+        return MIN_SUBMIT_BODY_BYTES
+    sampling = job.sampling
+    return max(MIN_SUBMIT_BODY_BYTES,
+               sampling.n * sampling.max_new_tokens * 24 + MAX_RENDERED_PROMPT_CHARS + 64 * 1024)
 
-    def get_route_handler(self):
-        handler = super().get_route_handler()
-        if not self.path.endswith("/submit"):
-            return handler
 
-        async def capped(request: Request) -> Response:
-            declared = request.headers.get("content-length")
-            if declared is not None and declared.isdigit() and int(declared) > MAX_SUBMIT_BODY_BYTES:
-                return _body_too_large()
-            body = bytearray()
-            async for chunk in request.stream():
-                body += chunk
-                if len(body) > MAX_SUBMIT_BODY_BYTES:
+def _capped_route(cap_for: Callable[[Request], int]) -> type[APIRoute]:
+    """A route class whose ``.../submit`` routes refuse a body over
+    ``cap_for(request)`` (413) before FastAPI parses it: by the declared
+    length, and by counting a chunked body as it streams."""
+
+    class CappedSubmitRoute(APIRoute):
+        def get_route_handler(self):
+            handler = super().get_route_handler()
+            if not self.path.endswith("/submit"):
+                return handler
+
+            async def capped(request: Request) -> Response:
+                cap = cap_for(request)
+                declared = request.headers.get("content-length")
+                if declared is not None and declared.isdigit() and int(declared) > cap:
                     return _body_too_large()
-            payload = bytes(body)
-            delivered = False
+                chunks: list[bytes] = []
+                received = 0
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > cap:
+                        return _body_too_large()
+                    chunks.append(chunk)
+                # Replay the chunks as received, held once; an empty final
+                # message ends the body.
+                pending = iter(chunks)
 
-            async def replay() -> dict:
-                nonlocal delivered
-                if delivered:
-                    return {"type": "http.disconnect"}
-                delivered = True
-                return {"type": "http.request", "body": payload, "more_body": False}
+                async def feed() -> dict:
+                    chunk = next(pending, None)
+                    if chunk is None:
+                        return {"type": "http.request", "body": b"", "more_body": False}
+                    return {"type": "http.request", "body": chunk, "more_body": True}
 
-            return await handler(Request(request.scope, replay))
+                return await handler(Request(request.scope, feed))
 
-        return capped
+            return capped
+
+    return CappedSubmitRoute
 
 
 def _body_too_large() -> JSONResponse:
@@ -1353,6 +1373,7 @@ def build_corpus_router(
     seen_index: SeenIndex | None = None,
     ledger_batch_max: int = LEDGER_BATCH_MAX,
     episode_intake=None,
+    job: JobSpec | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1369,9 +1390,13 @@ def build_corpus_router(
     skip is refused ``signature_unverifiable`` and miners generate as before.
     ``episode_intake`` checks an episode job's trajectories
     (``agentic_intake.EpisodeIntake``); an episode job without one answers 500.
+    ``job`` (the spec this router serves, when the caller has it) sets the
+    submit body cap, ``router.body_cap``; without it the minimum applies.
     """
 
-    router = APIRouter(route_class=_CappedSubmitRoute)
+    body_cap = worst_case_body(job) if job is not None else MIN_SUBMIT_BODY_BYTES
+    router = APIRouter(route_class=_capped_route(lambda request: body_cap))
+    router.body_cap = body_cap
     prompt_fidelity = PromptFidelity(renderer=renderer, prompt_job_for=prompt_job_for)
     # This process's submissions take turns on the ledger: interleaved, each
     # would read the same ETag and all but one would lose the compare-and-swap.
@@ -1569,8 +1594,9 @@ def build_corpus_router(
                 try:
                     reason = CorpusRejectReason(outcome.reason)
                 except ValueError:
+                    # A validator bug, not the miner's fault.
                     logger.error("episode intake refused with unknown reason %r", outcome.reason)
-                    reason = CorpusRejectReason.MALFORMED_SUBMISSION
+                    raise HTTPException(status_code=500, detail="corpus_episode_intake_reason") from None
                 return _refuse(reason, outcome.detail)
             episode_facts = outcome
             token_counts = [outcome.token_count]
@@ -2150,7 +2176,17 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     routes = routers if isinstance(routers, CorpusJobRoutes) else CorpusJobRoutes(routers)
     if legacy is None:
         legacy = len(routes.routers) > 1
-    router = APIRouter(route_class=_CappedSubmitRoute)
+
+    def _cap_for(request: Request) -> int:
+        # Read per request, so a hot-added job is covered at once: a scoped
+        # path by its own job's cap, the legacy path by the largest served.
+        served = routes.routers.get(request.path_params.get("job_id"))
+        if served is not None:
+            return getattr(served, "body_cap", MIN_SUBMIT_BODY_BYTES)
+        return max([getattr(r, "body_cap", MIN_SUBMIT_BODY_BYTES) for r in routes.routers.values()]
+                   + [MIN_SUBMIT_BODY_BYTES])
+
+    router = APIRouter(route_class=_capped_route(_cap_for))
 
     def _served(job_id: str) -> APIRouter:
         served = routes.routers.get(job_id)
