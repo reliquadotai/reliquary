@@ -6,6 +6,7 @@ thread, never on the event loop."""
 from __future__ import annotations
 
 import functools
+import logging
 import threading
 from dataclasses import dataclass, field
 
@@ -20,6 +21,8 @@ from reliquary.corpus.checks import (
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
 from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
 from reliquary.validator.corpus_text import REASON_PROMPT_MISMATCH, REASON_TOKEN_OUT_OF_VOCAB
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,9 @@ def build_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_size: int
     refusal = agentic_swe.episode_support_refusal(job.episode, need_verifiers=False)
     if refusal:
         raise RuntimeError(f"job {job.job_id!r}: {refusal}")
+    # Which copy of verifiers' network notice the prompt render uses (ruling P13).
+    logger.info("job %s renders prompts with the %s network notice", job.job_id,
+                agentic_swe.network_notice()[1])
     return EpisodeIntake(job=job, source=agentic_swe.load_swe_source(job.episode.env.num_images),
                          renderer=agentic_swe.load_turn_renderer(checkpoint_dir),
                          tokenizer=tokenizer, vocab_size=vocab_size, chunk_tokens=chunk_tokens)

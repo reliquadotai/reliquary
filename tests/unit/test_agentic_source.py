@@ -247,3 +247,46 @@ def test_a_served_agentic_job_without_episode_is_refused(supported):
 def test_a_job_with_episode_on_another_source_is_refused(supported):
     with pytest.raises(CorpusPromptSourceError, match=AGENTIC_SWE_ENVIRONMENT):
         prompt_job_for_spec(_job(prompt_source="openmathinstruct"))
+
+
+# -- ruling P13: the prompt the model sees carries verifiers' restricted-network notice --
+
+def test_the_source_prompt_carries_the_network_notice():
+    notice, _ = agentic_swe.network_notice()
+    assert SweSource(ROWS).prompt(1) == "fix b\n\n" + notice
+    assert SweSource([("x", "")]).prompt(0) == notice      # append_user_notice on empty content
+    assert SweSource(ROWS).task_for(1).prompt == "fix b"   # the task itself is unchanged
+
+
+def test_the_pinned_notice_is_verifiers_own():
+    base = pytest.importorskip("verifiers.v1.dialects.base")
+    assert agentic_swe.PINNED_NETWORK_NOTICE == base.CAPABILITY_NOTICE
+    agentic_swe.network_notice.cache_clear()
+    assert agentic_swe.network_notice() == (base.CAPABILITY_NOTICE, "verifiers")
+
+
+def test_without_verifiers_the_pinned_notice_is_used(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_verifiers(name, *args, **kwargs):
+        if name.startswith("verifiers"):
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_verifiers)
+    agentic_swe.network_notice.cache_clear()
+    try:
+        assert agentic_swe.network_notice() == (agentic_swe.PINNED_NETWORK_NOTICE, "pinned")
+    finally:
+        monkeypatch.undo()
+        agentic_swe.network_notice.cache_clear()
+
+
+def test_the_messages_mirror_append_user_notice():
+    base = pytest.importorskip("verifiers.v1.dialects.base")
+    for prompt in ("fix b", ""):
+        messages = [{"role": "user", "content": prompt}]
+        base.append_user_notice(messages)
+        assert SweSource([("x", prompt)]).prompt(0) == messages[0]["content"]

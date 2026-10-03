@@ -17,7 +17,11 @@ from tests.unit.test_corpus_route_records import _Records
 from tests.unit.test_corpus_service import (  # noqa: F401  (fixtures)
     _CountingStore, _r2_client, _Tokenizer, fake_r2, seeded_job,
 )
-from tests.unit.test_trajectory_parse import CALL, PROMPT, TERM, TEXT, R, build
+from tests.unit.test_trajectory_parse import CALL, TERM, TEXT, R, build
+
+ROWS = [("repo__a.1", "fix it"), ("repo__b.2", "x"), ("repo__c.3", "y")]
+# The validator's render of prompt 0: the task plus verifiers' network notice (ruling P13).
+PROMPT = R.initial_ids(SweSource(ROWS).prompt(0))
 
 PROOF = "A" * 200   # the wire bounds a trajectory's proof chars by its tokens (11 per token + 344)
 TOKENIZER = _Tokenizer()
@@ -31,7 +35,7 @@ def episode_store(fake_r2):
 
 def _intake():
     job = parse_job(_manifest(prompt_count=3))
-    source = SweSource([("repo__a.1", "fix it"), ("repo__b.2", "x"), ("repo__c.3", "y")])
+    source = SweSource(ROWS)
     return EpisodeIntake(job=job, source=source, renderer=R, tokenizer=TOKENIZER,
                          vocab_size=None, chunk_tokens=32)
 
@@ -164,7 +168,9 @@ def test_the_record_keeps_its_trajectory_before_the_cursor_for_the_tail_read(epi
     assert record["schema"] == RECORD_SCHEMA_V2
     stored = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
     assert stored.index(b'"completions"') < stored.index(b'"cursor"')
-    meta = submission_meta(stored[-400:])
+    # A tail from the cursor on: the rendered prompt (now with the network
+    # notice) sorts after it and its length is the test tokenizer's business.
+    meta = submission_meta(stored[stored.index(b'"cursor"'):])
     assert meta["hotkey"] == "5Hot" and meta["token_count"] == 30
 
 

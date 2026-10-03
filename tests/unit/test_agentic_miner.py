@@ -135,3 +135,92 @@ def test_the_generate_endpoint_listens_on_loopback_only():
             await serving
 
     asyncio.run(scenario())
+
+
+# -- the pre-signing check (ruling P14): the validator's own parse, before signing --
+
+def test_a_trajectory_the_precheck_refuses_is_dropped_and_counted():
+    seen = []
+
+    def precheck(built):
+        seen.append(built)
+        return ("bad_turns", {"turn": 0, "why": "span does not re-render to itself"})
+
+    client = FakeClient()
+    counts = asyncio.run(mine_agentic(
+        job=JOB, identities=[Identity("5Hot", sign=lambda b: "s", episodes=3)], client=client,
+        engine=FakeEngine(), runners={harness_key(None): FakeRunner()},
+        decode=lambda ids: "", concurrency=2, precheck=precheck))
+    assert client.bodies == [] and len(seen) == 3
+    assert counts["5Hot"]["precheck_refused"] == 3
+    assert counts["5Hot"]["precheck_refused:bad_turns"] == 3
+
+
+def test_the_precheck_runs_before_the_forgery_hook():
+    forge = Identity("5Bad", sign=lambda b: "s", episodes=1,
+                     transform=lambda built, index: __import__("dataclasses").replace(
+                         built, final_diff="forged"))
+    client = FakeClient()
+    asyncio.run(mine_agentic(
+        job=JOB, identities=[forge], client=client, engine=FakeEngine(),
+        runners={harness_key(None): FakeRunner()}, decode=lambda ids: "", concurrency=1,
+        precheck=lambda built: None))
+    assert client.bodies[0]["trajectory"]["final_diff"] == "forged"
+
+
+def _fake_built(turns, stop="agent_completed"):
+    from reliquary.corpus.trajectory import BuiltTrajectory
+    from tests.unit.test_trajectory_parse import PROMPT, build
+
+    tokens, spans = build(turns)
+    return BuiltTrajectory(tuple(PROMPT), tuple(tokens), tuple(spans),
+                           tuple(("p",) for _ in spans), "", stop)
+
+
+def test_trajectory_precheck_is_the_validators_parse_and_span_check():
+    from reliquary.miner.agentic_miner import trajectory_precheck
+    from tests.unit.test_trajectory_parse import CALL, TERM, TEXT, FakeRenderer
+
+    honest = _fake_built([([TEXT, CALL, TERM], ["out"]), ([TEXT, TERM], None)])
+    renderer = FakeRenderer()
+    assert trajectory_precheck(renderer, max_turns=40)(honest) is None
+    renderer.canonical = False                     # what a dropped malformed call does
+    assert trajectory_precheck(renderer, max_turns=40)(honest)[0] == "bad_turns"
+    assert trajectory_precheck(FakeRenderer(), max_turns=1)(honest)[0] == "bad_turns"
+
+
+def test_a_real_malformed_call_trajectory_is_dropped_not_submitted():
+    import os
+
+    import pytest
+
+    pytest.importorskip("renderers")
+    tokenizer = os.environ.get("RELIQUARY_QWEN38_TOKENIZER")
+    if not tokenizer:
+        pytest.skip("set RELIQUARY_QWEN38_TOKENIZER")
+    from reliquary.environment.agentic_swe import load_turn_renderer
+    from reliquary.miner.agentic_miner import trajectory_precheck
+    from reliquary.protocol.toploc import span_chunk_count
+
+    r = load_turn_renderer(tokenizer)
+    enc = lambda text: tuple(r._tokenizer.encode(text, add_special_tokens=False))
+    prompt = tuple(r.initial_ids("Fix the bug."))
+    # What verifiers' train client did on the real stack: the unnamed call is
+    # dropped, the named one answered, then the agent completes.
+    first = enc("Look.\n</think>\n\n<tool_call>\n<function=>\n</function>\n</tool_call>\n<tool_call>\n"
+                "<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call><|im_end|>")
+    second_prompt = tuple(r.next_prompt(list(prompt), list(first), ["README.md"]))
+    second = enc("Done.\n</think>\n\nAll good.<|im_end|>")
+    proofs = lambda ids: tuple("p" for _ in range(span_chunk_count(len(ids), 32)))
+
+    class RealEngine(FakeEngine):
+        def take_session(self, session_id):
+            return SessionLog([GeneratedTurn(prompt, first, proofs(first)),
+                               GeneratedTurn(second_prompt, second, proofs(second))], True)
+
+    client = FakeClient()
+    counts = asyncio.run(mine_agentic(
+        job=JOB, identities=[Identity("5Hot", sign=lambda b: "s", episodes=1)], client=client,
+        engine=RealEngine(), runners={harness_key(None): FakeRunner()}, decode=lambda ids: "",
+        concurrency=1, precheck=trajectory_precheck(r, max_turns=JOB.episode.max_turns)))
+    assert client.bodies == [] and counts["5Hot"]["precheck_refused:bad_turns"] == 1

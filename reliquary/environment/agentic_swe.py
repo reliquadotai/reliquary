@@ -50,6 +50,34 @@ BASH_HARNESS_TOOLS: tuple[dict, ...] = (
 )
 
 
+# dialects/base.py CAPABILITY_NOTICE: verifiers' interception appends it to the
+# first user message of every request whose runtime restricts egress, which the
+# episode config always does (`block: ["*"]`). Pinned here for a validator
+# without verifiers; `tests/unit/test_agentic_source.py` holds it equal.
+PINNED_NETWORK_NOTICE = (
+    "Network protocol blocked fetching a resource. Continue without those capabilities; "
+    "use local tools or inline data already present in the conversation, and do not retry "
+    "the blocked provider-side operation."
+)
+
+
+@functools.cache
+def network_notice() -> tuple[str, str]:
+    """The notice and where it came from: the pinned verifiers when it is
+    importable ("verifiers"), else this module's copy ("pinned")."""
+    try:
+        from verifiers.v1.dialects.base import CAPABILITY_NOTICE
+    except ImportError:
+        return PINNED_NETWORK_NOTICE, "pinned"
+    return CAPABILITY_NOTICE, "verifiers"
+
+
+def with_network_notice(content: str) -> str:
+    """`append_user_notice` on a string user message."""
+    notice, _ = network_notice()
+    return f"{content}\n\n{notice}" if content else notice
+
+
 def _dist_commit(name: str) -> str | None:
     """The commit a distribution was installed from: its VCS pin, or the HEAD
     of the checkout an editable install points at. None when unknowable."""
@@ -131,7 +159,9 @@ class SweSource:
         return self._rows[index][0]
 
     def prompt(self, index: int) -> str:
-        return self._rows[index][1]
+        """The first user message as the model sees it: the task prompt plus
+        verifiers' restricted-network notice (ruling P13)."""
+        return with_network_notice(self._rows[index][1])
 
     def task_for(self, index: int) -> EpisodeTask:
         instance_id, prompt = self._rows[index]

@@ -50,13 +50,36 @@ def build_trajectory_submission(*, job, hotkey, cursor, prompt_index, rendered_p
     return body
 
 
+def trajectory_precheck(renderer, *, max_turns: int) -> Callable[[BuiltTrajectory], tuple[str, dict] | None]:
+    """The validator's own refusals, run on a built trajectory before it is
+    signed (ruling P14): its span check and ``parse_trajectory`` through the
+    same pinned renderer. Returns ``(reason, detail)`` or None."""
+    from reliquary.corpus.checks import check_turn_spans
+    from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
+
+    def precheck(built: BuiltTrajectory) -> tuple[str, dict] | None:
+        spans = [tuple(span) for span in built.spans]
+        result = check_turn_spans(spans, len(built.tokens), max_turns)
+        if not result.ok:
+            return result.reason or "bad_turns", dict(result.detail)
+        try:
+            parse_trajectory(renderer, prompt_ids=list(built.prompt_ids), tokens=list(built.tokens),
+                             spans=spans, stop=built.stop, max_turns=max_turns)
+        except TrajectoryRefused as refused:
+            return refused.reason, dict(refused.detail)
+        return None
+
+    return precheck
+
+
 def _submit(client, body: dict, counts: Counter) -> dict:
     return _retry(lambda: client.submit(body), sleep=time.sleep, counts=counts,
                   max_consecutive_failures=5)
 
 
 async def _mine_identity(*, job, identity: Identity, client, engine, runner, decode,
-                         slots: asyncio.Semaphore, counts: Counter, stop: asyncio.Event) -> None:
+                         slots: asyncio.Semaphore, counts: Counter, stop: asyncio.Event,
+                         precheck=None) -> None:
     async def one(cursor: int) -> None:
         prompt_index = job_walk_index(job, identity.hotkey, cursor)
         try:
@@ -80,6 +103,15 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
         except TrajectoryUnbuildable as exc:
             counts["unbuildable"] += 1
             logger.warning("episode %d not submitted: %s", prompt_index, exc)
+            return
+        # Before the forgery hook: the hook tests the validator, the check the honest run.
+        refusal = await asyncio.to_thread(precheck, built) if precheck is not None else None
+        if refusal is not None:
+            reason, detail = refusal
+            counts["precheck_refused"] += 1
+            counts[f"precheck_refused:{reason}"] += 1
+            logger.warning("episode %d of %s not submitted, the validator would refuse it: %s %s",
+                           prompt_index, identity.hotkey[:8], reason, detail)
             return
         if identity.transform is not None:
             built = identity.transform(built, prompt_index)
@@ -122,16 +154,18 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
 
 
 async def mine_agentic(*, job, identities, client, engine, runners, decode,
-                       concurrency: int) -> dict[str, Counter]:
+                       concurrency: int, precheck=None) -> dict[str, Counter]:
     """Every identity mines until its episode count or the job's end; at most
-    ``concurrency`` episodes run at once across them."""
+    ``concurrency`` episodes run at once across them. ``precheck`` (see
+    ``trajectory_precheck``) drops what the validator would refuse, unsigned."""
     slots = asyncio.Semaphore(concurrency)
     counts = {identity.hotkey: Counter() for identity in identities}
     stops = {identity.hotkey: asyncio.Event() for identity in identities}
     await asyncio.gather(*(
         _mine_identity(job=job, identity=identity, client=client, engine=engine,
                        runner=runners[harness_key(identity.harness_env)], decode=decode,
-                       slots=slots, counts=counts[identity.hotkey], stop=stops[identity.hotkey])
+                       slots=slots, counts=counts[identity.hotkey], stop=stops[identity.hotkey],
+                       precheck=precheck)
         for identity in identities))
     return counts
 
@@ -164,7 +198,8 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
         GenerateEngine, VllmTurnCore, build_generate_app,
     )
 
-    stop_ids = sorted(load_turn_renderer(checkpoint_dir).stop_ids)
+    renderer = load_turn_renderer(checkpoint_dir)
+    stop_ids = sorted(renderer.stop_ids)
     core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof, stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
                         gpu_memory_utilization=gpu_memory_utilization)
@@ -188,7 +223,8 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                 job=job, identities=identities, client=client, engine=engine, runners=runners,
                 decode=lambda ids: tokenizer.decode(ids, skip_special_tokens=False,
                                                     clean_up_tokenization_spaces=False),
-                concurrency=concurrency)
+                concurrency=concurrency,
+                precheck=trajectory_precheck(renderer, max_turns=job.episode.max_turns))
     finally:
         if server is not None:
             server.should_exit = True
@@ -197,4 +233,4 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
 
 
 __all__ = ["Identity", "build_trajectory_submission", "harness_key", "mine_agentic",
-           "run_agentic_miner", "serve_loopback"]
+           "run_agentic_miner", "serve_loopback", "trajectory_precheck"]

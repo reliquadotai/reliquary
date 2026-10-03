@@ -25,11 +25,11 @@ from reliquary.corpus.job import parse_job
 MODEL = "Qwen/Qwen3.8-27B"
 
 
-def smoke_job(env_commit: str, num_images: int, max_turns: int):
+def smoke_job(env_commit: str, num_images: int, max_turns: int, prompt_count: int = 1):
     return parse_job({
         "schema": "reliquary/corpus-job/v1", "job_id": "agentic-smoke", "checkpoint_repo": MODEL,
         "checkpoint_revision": "main", "checkpoint_sha256": "0" * 64,
-        "prompt_source": "reliquary_agentic_swe_v1", "prompt_count": 1,
+        "prompt_source": "reliquary_agentic_swe_v1", "prompt_count": prompt_count,
         "renderer_id": "renderers:qwen38@0.1.11", "eos_token_id": 0,
         "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 2,
                      "max_new_tokens": 8192, "n": 1},
@@ -239,15 +239,20 @@ async def generate(args):
 
 
 def verify(args):
+    """The validator's path on each recorded trajectory: the miner's pre-sign
+    check, the episode intake (prompt, spans, parse, budgets, proof shape),
+    then the per-span TOPLOC audit."""
     import torch
     from huggingface_hub import snapshot_download
 
-    from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
-    from reliquary.environment.agentic_swe import load_swe_source, load_turn_renderer
+    from reliquary.corpus.trajectory import BuiltTrajectory
+    from reliquary.environment.agentic_swe import load_swe_source, load_turn_renderer, network_notice
+    from reliquary.miner.agentic_miner import build_trajectory_submission, trajectory_precheck
+    from reliquary.protocol.corpus_submission import CorpusSubmissionRequest
     from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
     from reliquary.shared.modeling import load_text_only_model
+    from reliquary.validator.agentic_intake import EpisodeIntake, IntakeFacts
     from reliquary.validator.corpus_audit import score_sequences, trajectory_outcome
-    from verifiers.v1.dialects.base import CAPABILITY_NOTICE
 
     with open(args.work) as handle:
         rows = [r for r in json.load(handle)["rows"] if "tokens" in r]
@@ -255,43 +260,48 @@ def verify(args):
         raise SystemExit("no trajectory to verify")
     directory = snapshot_download(MODEL)
     renderer = load_turn_renderer(directory)
+    tokenizer = renderer._tokenizer
     source = load_swe_source(args.num_images)
+    job = smoke_job(args.env_commit, args.num_images, args.max_turns, prompt_count=len(source))
+    intake = EpisodeIntake(job=job, source=source, renderer=renderer, tokenizer=tokenizer,
+                           vocab_size=None, chunk_tokens=PROOF.chunk_tokens)
+    precheck = trajectory_precheck(renderer, max_turns=job.episode.max_turns)
     model = load_text_only_model(directory, torch_dtype=torch.bfloat16,
                                  attn_implementation="sdpa").to("cuda").eval()
     report = []
     for r in rows:
         prompt = r["prompt_ids"]
-        validator_render = prompt == renderer.initial_ids(source.prompt(r["index"]))
-        # verifiers' interception appends its restricted-network notice to the
-        # first user message whenever the runtime blocks egress: say whether
-        # that is the whole difference.
-        render_with_notice = prompt == renderer.initial_ids(
-            f"{source.prompt(r['index'])}\n\n{CAPABILITY_NOTICE}")
+        built = BuiltTrajectory(tuple(prompt), tuple(r["tokens"]), tuple(tuple(s) for s in r["spans"]),
+                                tuple(tuple(p) for p in r["proofs"]), r["final_diff"], r["stop"])
+        refusal = precheck(built)
+        body = build_trajectory_submission(
+            job=job, hotkey="5Smoke", cursor=0, prompt_index=r["index"],
+            rendered_prompt=tokenizer.decode(prompt, skip_special_tokens=False,
+                                             clean_up_tokenization_spaces=False),
+            trajectory=built, sign=lambda body: "00")
+        outcome_intake = intake.check(CorpusSubmissionRequest.model_validate(body))
+        intake_ok = isinstance(outcome_intake, IntakeFacts)
         absolute = [(len(prompt) + s, len(prompt) + e) for s, e in r["spans"]]
         flat = [p for turn in r["proofs"] for p in turn]
         (scored,), forward, _ = score_sequences(model, [(prompt + r["tokens"], len(prompt), flat, absolute)],
                                                 chunk_tokens=PROOF.chunk_tokens, topk=PROOF.topk,
                                                 batch_tokens=131072)
         outcome = trajectory_outcome(*scored, [e - s for s, e in r["spans"]], PROOF)
-        try:
-            parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=r["tokens"],
-                                      spans=[tuple(s) for s in r["spans"]], stop=r["stop"],
-                                      max_turns=args.max_turns)
-            parse = {"ok": True, "actions": len(parsed.actions)}
-        except TrajectoryRefused as refused:
-            parse = {"ok": False, "reason": refused.reason, "detail": refused.detail}
-        report.append({"index": r["index"], "prompt_is_validator_render": validator_render,
-                       "prompt_is_render_plus_network_notice": render_with_notice,
+        report.append({"index": r["index"],
+                       "prompt_is_validator_render": tuple(prompt) == intake.initial_ids(r["index"]),
+                       "precheck": refusal,
+                       "intake": "accepted" if intake_ok else {"reason": outcome_intake.reason,
+                                                               "detail": outcome_intake.detail},
                        "tokens": len(prompt) + len(r["tokens"]),
                        "turns": len(r["spans"]), "audit_passed": outcome.passed,
                        "audit_reason": outcome.reason, "forward_s": round(forward, 2),
                        "worst_exp": max((c.exp_mismatches for c in outcome.results), default=None),
                        "worst_mant_mean": max((c.mant_err_mean for c in outcome.results
-                                               if math.isfinite(c.mant_err_mean)), default=None),
-                       "parse": parse})
+                                               if math.isfinite(c.mant_err_mean)), default=None)})
+    print(json.dumps({"network_notice_from": network_notice()[1]}))
     print(json.dumps(report, indent=1, default=str))
-    if not all(x["prompt_is_validator_render"] and x["audit_passed"] and x["parse"]["ok"]
-               for x in report):
+    if not all(x["prompt_is_validator_render"] and x["precheck"] is None and x["intake"] == "accepted"
+               and x["audit_passed"] for x in report):
         raise SystemExit("smoke failed")
 
 
