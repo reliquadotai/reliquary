@@ -12,6 +12,7 @@ import functools
 import importlib.metadata
 import json
 import subprocess
+import threading
 from collections.abc import Sequence
 
 from reliquary.environment.agentic.types import EpisodeTask
@@ -147,3 +148,92 @@ def load_swe_source(num_images: int) -> SweSource:
     return SweSource([(row.instance_id,
                        PROMPT.format(workdir=row.workdir, problem_statement=row.problem_statement))
                       for row in rows])
+
+
+def _locked(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+class QwenTurnRenderer:
+    """`trajectory_parse.TurnRenderer` over the pinned `renderers` Qwen3.8
+    renderer: the one verifiers' train client renders every turn with."""
+
+    def __init__(self, renderer) -> None:
+        from renderers.base import ToolCallParseStatus
+
+        self._r = renderer
+        # P6: HF tokenizers are not thread-safe; intake, grading and export share this.
+        self._lock = threading.RLock()
+        self._tokenizer = renderer._tokenizer
+        self._unknown = ToolCallParseStatus.UNKNOWN_TOOL
+        stops = list(renderer.get_stop_token_ids())
+        self.terminator_id = int(stops[0])
+        self.stop_ids = frozenset(int(t) for t in stops)
+        self._open = renderer._token_id("<tool_response>")
+        self._close = renderer._token_id("</tool_response>")
+        self._tools = [dict(tool) for tool in BASH_HARNESS_TOOLS]
+
+    @_locked
+    def initial_ids(self, prompt: str) -> list[int]:
+        rendered = self._r.render(
+            [{"role": "system", "content": BASH_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            tools=self._tools, add_generation_prompt=True)
+        return [int(t) for t in rendered.token_ids]
+
+    @_locked
+    def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
+        parsed = self._r.parse_response(list(completion_ids), tools=self._tools)
+        return [(call.name, call.arguments if isinstance(call.arguments, str)
+                 else json.dumps(call.arguments or {}))
+                for call in parsed.tool_calls if call.name and call.status != self._unknown]
+
+    @_locked
+    def observations(self, segment_ids) -> list[str]:
+        out, start = [], None
+        for k, token in enumerate(segment_ids):
+            if token == self._open:
+                start = k + 1
+            elif token == self._close and start is not None:
+                text = self._tokenizer.decode(list(segment_ids[start:k]), skip_special_tokens=False,
+                                              clean_up_tokenization_spaces=False)
+                # The renderer writes "\n" + content.strip() + "\n".
+                text = text[1:] if text.startswith("\n") else text
+                text = text[:-1] if text.endswith("\n") else text
+                out.append(text)
+                start = None
+        return out
+
+    @_locked
+    def next_prompt(self, prompt_ids, completion_ids, observations) -> list[int] | None:
+        messages = [{"role": "tool", "tool_call_id": f"call_{i}", "content": text}
+                    for i, text in enumerate(observations)]
+        rendered = self._r.bridge_to_next_turn(list(prompt_ids), list(completion_ids), messages,
+                                               tools=self._tools)
+        return None if rendered is None else [int(t) for t in rendered.token_ids]
+
+    @_locked
+    def assistant_message(self, completion_ids) -> dict:
+        parsed = self._r.parse_response(list(completion_ids), tools=self._tools)
+        message = {"role": "assistant", "content": parsed.content or ""}
+        if parsed.reasoning_content:
+            message["reasoning_content"] = parsed.reasoning_content
+        calls = self.tool_calls(completion_ids)
+        if calls:
+            message["tool_calls"] = [{"id": f"call_{i}", "type": "function",
+                                      "function": {"name": name, "arguments": arguments}}
+                                     for i, (name, arguments) in enumerate(calls)]
+        return message
+
+
+def load_turn_renderer(checkpoint_dir: str) -> QwenTurnRenderer:
+    """The renderer the train client builds for this checkpoint
+    (`create_renderer(load_tokenizer(model), Qwen38RendererConfig())`)."""
+    from renderers import create_renderer
+    from renderers.base import load_tokenizer
+    from renderers.configs import Qwen38RendererConfig
+
+    return QwenTurnRenderer(create_renderer(load_tokenizer(checkpoint_dir), Qwen38RendererConfig()))

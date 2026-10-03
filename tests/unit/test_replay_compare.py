@@ -170,3 +170,10 @@ def test_an_mtime_outside_an_ls_line_is_not_hidden():
 def test_a_hash_after_commit_mid_line_is_not_hidden():
     a = "see commit 5b26444a37283a20ca4cef1cc14ef10498b85cb9 for details"
     assert normalize(a) != normalize(a.replace("5b26", "6c37"))
+
+
+def test_an_action_without_a_recorded_observation_is_replayed_but_not_compared():
+    from reliquary.corpus.replay_compare import compare
+
+    report = compare([Action("bash", "{}", "x"), Action("bash", "{}", None)], ["x", "y"], "d", "d")
+    assert report.compared == 1 and report.mismatched == [] and report.diff_equal

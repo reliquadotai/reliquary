@@ -37,7 +37,9 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
 class Action:
     tool: str
     arguments: str
-    observation: str
+    # None: executed in the box but never answered in the tokens (a final
+    # turn cut by context_length), so replayed and not compared.
+    observation: str | None
 
 
 @dataclass(frozen=True)
@@ -110,9 +112,10 @@ def within_tolerance(report: ReplayReport) -> bool:
 
 def compare(recorded: Sequence[Action], replayed: Sequence[str],
             recorded_diff: str, replayed_diff: str) -> ReplayReport:
+    compared = [i for i, action in enumerate(recorded) if action.observation is not None]
     mismatched = [
-        i for i, action in enumerate(recorded)
-        if i >= len(replayed) or normalize(action.observation) != normalize(replayed[i])
+        i for i in compared
+        if i >= len(replayed) or normalize(recorded[i].observation) != normalize(replayed[i])
     ]
-    return ReplayReport(compared=len(recorded), mismatched=mismatched,
+    return ReplayReport(compared=len(compared), mismatched=mismatched,
                         diff_equal=recorded_diff == replayed_diff)
