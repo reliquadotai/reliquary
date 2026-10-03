@@ -211,6 +211,22 @@ is recorded in this file before the dependent component is written.
   passes the job thresholds with margins inside the measured honest band. If it
   fails, N1 runs with prefix caching off and the miner hardware requirement is
   re-measured.
+  **M1 result (2026-10-03, H100, Qwen3.8-27B, vLLM 0.30, `scripts/agentic_proof_gate.py`,
+  data in `docs/design/measurements/2026-10-03-m1-agentic-proofs.json`).**
+  32 trajectories x 6 turns x 512 max tokens, prefix cache on: 63/192 turns were
+  served partly from the cache (hybrid model, `mamba_cache_mode=align`, block size
+  784 tokens, so a turn can only hit once its prompt exceeds one block; the 4B
+  smoke hit 28/32). Audit by one HF prefill per trajectory: **192/192 spans pass
+  at 60/40/40.** Worst chunk measures: exp 60, mant mean 18.63, median 14.00,
+  against the honest band exp <= 16, mant mean <= 4.14, so the band clause is
+  NOT met literally. Mean over chunks: exp 3.20, mant 1.23; 98.9% of chunks have
+  exp <= 16; p99 = 17. The worst chunk is a 1-token span (tokens 643-644), where a
+  per-chunk statistic is noisy. Control with prefix cache OFF (same script,
+  `--no-prefix-cache`, 0/192 hits, `...-control-cache-off.json`): 192/192 pass,
+  identical worst (exp 60, mant 18.63), mean exp 3.24, 99.0% <= 16. The cache
+  therefore changes nothing measurable. Decision: prefix caching ON for N1, with
+  the open point that the honest band must be restated per span length (short
+  spans exceed it with or without the cache); cache-off is not needed.
 - **M2 — honest replay agreement.** Replay the 66 recorded 27B trajectories.
   Pass: `final_diff` reproduced for at least 98% of them; derive the
   normalisation rules and the mismatch tolerance from the mismatches observed.
