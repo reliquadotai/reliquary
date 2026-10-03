@@ -407,6 +407,20 @@ def wire_job_front_only(w, *, records, link) -> None:
     w.on_accepted = on_accepted
 
 
+SPLIT_EPISODE_REFUSAL = ("episode jobs are not served by the split validator; "
+                         "unset RELIQUARY_CORPUS_SPLIT")
+
+
+def split_episode_refusal(split, job):
+    """``(REFUSED, why)`` for an episode job a split validator cannot serve,
+    else None. A permanent refusal, not a transient one to retry."""
+    if split is None or getattr(job, "episode", None) is None:
+        return None
+    from reliquary.validator.corpus_hot_jobs import REFUSED
+
+    return REFUSED, SPLIT_EPISODE_REFUSAL
+
+
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
                      auditor, proof_chunk_tokens, prompt_job_for=None,
                      vocab_size=None, is_banned=None, registration=None,
@@ -812,8 +826,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         scorer = GpuScorer(Path(split.run_dir) / GPU_SOCKET, chunk_tokens=proof.chunk_tokens,
                            topk=proof.topk, executor=judge_threads.codec)
     if split is not None and any(w.job.episode is not None for w in wiring):
-        raise RuntimeError("episode jobs are not served by the split validator; "
-                           "unset RELIQUARY_CORPUS_SPLIT")
+        raise RuntimeError(SPLIT_EPISODE_REFUSAL)
     remote = directory = None
     if remote_audit:
         from reliquary.infrastructure import corpus_executor_store as executor_store
@@ -879,10 +892,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
 
     async def wire_hot(task_entry, task_cap, job):
-        if split is not None and job.episode is not None:
-            # As at boot: the split validator's GPU process does not replay episodes.
-            raise RuntimeError(f"job {job.job_id!r}: episode jobs are not served by the "
-                               "split validator; unset RELIQUARY_CORPUS_SPLIT")
+        if split_episode_refusal(split, job) is not None:
+            # Backstop: `admit` refuses it first, for good; a ValueError is permanent.
+            raise ValueError(SPLIT_EPISODE_REFUSAL)
         # The renderer first: a job refused for it leaves its ledger untouched.
         own_profile = _entry_profile(task_entry)
         renderer = build_renderer(job, own_profile)
@@ -910,7 +922,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                             settle_forever(w.entry.task_id, w.settler, settle_every_seconds)]),
         read_entries=read_registry, read_job=read_job,
         screen=order_entry_screen,
-        admit=lambda task_entry, job: hot_job_refusal(
+        admit=lambda task_entry, job: split_episode_refusal(split, job) or hot_job_refusal(
             task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,
             process_contract=process_contract, fingerprint=fingerprint),
         drained=drained,

@@ -1051,7 +1051,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             verify_skip_signature=verify_skip_signature, prompt_job_for=w.prompt_job_for,
             records=records, on_accepted=w.on_accepted,
             proof_chunk_tokens=w.proof.chunk_tokens, vocab_size=w.vocab_size,
-            is_banned=w.is_banned, registration=registration, seen_index=w.seen_index)
+            is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
+            job=getattr(w, "job", None))
 
     async def wire(entry, cap, job):
         from reliquary.eval.prompt_source import is_eval_source

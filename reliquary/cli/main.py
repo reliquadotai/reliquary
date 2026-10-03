@@ -2958,6 +2958,7 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         renderer=renderer_for_job(job, encode, tokenizer=tokenizer),
         verify_signature=verify_signature,
         seen_index=seen_index,
+        job=job,
     )
     if not mounted:
         # The server applies the same rule to the same entry, so a refusal
