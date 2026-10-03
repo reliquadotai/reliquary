@@ -1,0 +1,356 @@
+"""The control's half of grading (spec §5 N5): grade executor tokens, leases,
+and agreement.
+
+The control never runs a container, so the audit dispatcher's local recheck
+becomes agreement between executors: a result drawn for a recheck (5%, drawn
+from the OS) and every replay that would fail the miner is repeated by a
+second, distinct executor; a disagreement goes to a third, the majority
+stands, and each executor that disagreed with it is quarantined. An executor
+alone can never fail a miner. Timeouts, executor errors and expired leases
+re-lease the item elsewhere and never judge anyone: two timeouts (an expired
+lease counts as one) resolve as ``timeout``, three errors as ``error``.
+
+An item no lease can carry (actions or observations beyond the
+``GradeLease`` bounds) is never leased: every executor would refuse the lease
+and it would cycle forever. It resolves at once as ``ungradeable``, the
+validator's own limit, never evidence against the miner.
+
+Executor liveness, lease caps, expiry strikes, quarantine and heartbeat writes
+are the audit dispatcher's (``ExecutorLeases``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import collections
+import logging
+import secrets
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request, Response
+from pydantic import ValidationError
+
+from reliquary.corpus.replay_compare import ReplayReport, within_tolerance
+from reliquary.validator.corpus_audit_protocol import HeartbeatRequest
+from reliquary.validator.corpus_audit_remote import (
+    EXECUTOR_LIVE_SECONDS,
+    LEASE_EXPIRY_STRIKES,
+    ExecutorDirectory,
+    ExecutorLeases,
+    LeaseRefused,
+    _bounded_env,
+    bearer_authenticator,
+)
+from reliquary.validator.corpus_grade_protocol import (
+    GRADE_PROTOCOL,
+    GradeClaimRequest,
+    GradeItem,
+    GradeItemResult,
+    GradeResult,
+)
+
+logger = logging.getLogger(__name__)
+
+GRADE_PREFIX = "/corpus/internal/grade"
+# A lease's life per mode. The executor does not renew a lease while it works,
+# so each covers the work's own bound plus the box's start and the corpus
+# load: a grade runs under its 1800 s scoring timeout, a replay under its
+# 3600 s episode deadline.
+GRADE_LEASE_SECONDS = {
+    "grade": _bounded_env("RELIQUARY_CORPUS_GRADE_LEASE_SECONDS", 2400.0, 2100.0, 7200.0),
+    "replay": _bounded_env("RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS", 4200.0, 3900.0, 10800.0),
+}
+GRADE_RECHECK_FRACTION = 0.05
+MAX_RESULTS_PER_ITEM = 3
+MAX_TIMEOUTS = 2
+MAX_ERRORS = 3
+MAX_LEASES_PER_EXECUTOR = 8
+UNGRADEABLE = "ungradeable"
+
+# The facts an "ok" result must carry for its mode.
+_MODE_FACTS = {"grade": ("diff_applied", "tests_passed"), "replay": ("replay_diff_equal",)}
+
+
+@dataclass(frozen=True)
+class GradeDecision:
+    # "ok", "error", "timeout" or "ungradeable"; only "ok" judges the miner.
+    status: str
+    result: dict | None                 # the agreed result, when "ok"
+    graded_by: tuple[str, ...]
+
+
+def replay_certified(result: dict) -> bool:
+    return within_tolerance(ReplayReport(
+        compared=int(result.get("observations_compared") or 0),
+        mismatched=list(result.get("observations_mismatched") or []),
+        diff_equal=bool(result.get("replay_diff_equal"))))
+
+
+def decision_key(mode: str, result: dict) -> tuple:
+    """What two executors must agree on: the facts the control decides from."""
+    if mode == "grade":
+        return (result.get("diff_applied"), result.get("tests_passed"))
+    return (result.get("replay_diff_equal"), replay_certified(result))
+
+
+@dataclass
+class _Work:
+    id: int
+    item: dict
+    future: asyncio.Future
+    queued_at: float
+    results: dict[str, dict] = field(default_factory=dict)
+    excluded: set[str] = field(default_factory=set)
+    drawn: bool | None = None           # recheck draw, made at the first result
+    timeouts: int = 0
+    errors: int = 0
+
+    @property
+    def mode(self) -> str:
+        return self.item["mode"]
+
+    @property
+    def agree_needed(self) -> int:
+        failing = self.mode == "replay" and any(
+            not replay_certified(r) for r in self.results.values())
+        return 2 if self.drawn or failing else 1
+
+
+@dataclass
+class _Lease:
+    lease_id: str
+    work: _Work
+    executor_id: str
+    expires_at: float
+
+
+class RemoteGradeDispatcher(ExecutorLeases):
+    kind = "grade executor"
+
+    def __init__(self, *, directory: ExecutorDirectory, env_package: str, env_version: str,
+                 quarantine: Callable[[str, str], Awaitable[Any]] | None = None,
+                 record_heartbeat: Callable[[str, float, dict], Awaitable[Any]] | None = None,
+                 clock: Callable[[], float] = time.time, rng=None,
+                 recheck_fraction: float = GRADE_RECHECK_FRACTION,
+                 live_seconds: float = EXECUTOR_LIVE_SECONDS,
+                 max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
+                 expiry_strikes: int = LEASE_EXPIRY_STRIKES,
+                 lease_seconds: dict[str, float] | None = None) -> None:
+        super().__init__(directory=directory, quarantine=quarantine,
+                         record_heartbeat=record_heartbeat, clock=clock,
+                         live_seconds=live_seconds,
+                         max_leases_per_executor=max_leases_per_executor,
+                         expiry_strikes=expiry_strikes)
+        self._env = {"package": env_package, "version": env_version}
+        # Each result is drawn on its own, from the OS: an executor cannot predict it.
+        self._rng = rng or secrets.SystemRandom()
+        self._fraction = recheck_fraction
+        self._lease_seconds = {**GRADE_LEASE_SECONDS, **(lease_seconds or {})}
+        self._queue: collections.deque[_Work] = collections.deque()
+
+    # -- the grader's side ------------------------------------------------------
+
+    async def decide(self, item: dict) -> GradeDecision:
+        """The agreed facts for one grade or replay item."""
+        try:
+            item = GradeItem.model_validate(item).model_dump()
+        except ValidationError as exc:
+            # Every executor would refuse this lease: never lease it.
+            self.stats[UNGRADEABLE] += 1
+            logger.error("grade item %s (%s) exceeds the lease bounds; ungradeable: %s",
+                         str(item.get("submission_id"))[:12], item.get("mode"),
+                         str(exc).splitlines()[0][:300])
+            return GradeDecision(UNGRADEABLE, None, ())
+        loop = asyncio.get_running_loop()
+        work = _Work(id=next(self._ids), item=item, future=loop.create_future(),
+                     queued_at=self._clock())
+        self._queue.append(work)
+        return await work.future
+
+    # -- the executor's side ----------------------------------------------------
+
+    def claim(self, executor_id: str) -> dict | None:
+        self._contact(executor_id)
+        if executor_id in self.quarantined or self._held(executor_id) >= self._max_leases:
+            return None
+        for work in list(self._queue):
+            if work.future.done():
+                self._queue.remove(work)
+                continue
+            if executor_id in work.excluded:
+                continue                         # an item is never answered twice by one executor
+            self._queue.remove(work)
+            lease = _Lease(lease_id=secrets.token_hex(16), work=work, executor_id=executor_id,
+                           expires_at=self._clock() + self._lease_seconds[work.mode])
+            self._leases[lease.lease_id] = lease
+            self.stats["leased"] += 1
+            return {"protocol": GRADE_PROTOCOL, "lease_id": lease.lease_id,
+                    "expires_at": lease.expires_at, "env": dict(self._env), "items": [work.item]}
+        return None
+
+    @staticmethod
+    def _misfit(work: _Work, answer: GradeItemResult) -> str | None:
+        if answer.submission_id != work.item["submission_id"]:
+            return "for another submission"
+        if answer.status == "ok" and any(getattr(answer, fact) is None
+                                         for fact in _MODE_FACTS[work.mode]):
+            return f"an ok {work.mode} result without {_MODE_FACTS[work.mode]}"
+        return None
+
+    def result(self, executor_id: str, lease_id: str, result: GradeResult) -> str:
+        """Take an executor's facts for its lease; raises ``LeaseRefused``."""
+        self._contact(executor_id)
+        lease = self._leases.get(lease_id)
+        if lease is None or lease.executor_id != executor_id:
+            raise LeaseRefused(410, "lease_unknown")
+        del self._leases[lease_id]
+        work = lease.work
+        if lease.expires_at <= self._clock():
+            # Counted like a sweep would have: an expiry, then elsewhere.
+            self._take_back(lease, expired=True)
+            raise LeaseRefused(410, "lease_expired")
+        answer = result.results[0]
+        work.excluded.add(executor_id)
+        misfit = self._misfit(work, answer)
+        if misfit is not None:
+            # Never an honest executor's answer (it echoes the item it ran).
+            logger.error("grade executor %s answered lease %s with %s; refused",
+                         executor_id, lease_id[:8], misfit)
+            self.stats["misfit_results"] += 1
+            self._failed_attempt(work, "errors")
+            if self._strike(executor_id):
+                self._spawn(self.quarantine(executor_id, f"{self._strikes_limit} strikes, "
+                                            f"the last a result {misfit}"))
+            raise LeaseRefused(422, "result_does_not_fit_the_lease")
+        self._strikes[executor_id] = 0
+        if answer.status in ("error", "timeout"):
+            # The executor's or the box's, never the miner's.
+            self.stats[f"executor_{answer.status}s"] += 1
+            self._failed_attempt(work, f"{answer.status}s")
+            return "requeued"
+        if work.drawn is None:
+            work.drawn = self._rng.random() < self._fraction
+        work.results[executor_id] = answer.model_dump()
+        self.stats["graded"] += 1
+        self._settle(work)
+        return "accepted"
+
+    def _failed_attempt(self, work: _Work, kind: str) -> None:
+        """An attempt that judged nobody; enough of them resolve the item unjudged."""
+        count = getattr(work, kind) + 1
+        setattr(work, kind, count)
+        limit, status = (MAX_TIMEOUTS, "timeout") if kind == "timeouts" else (MAX_ERRORS, "error")
+        if count >= limit:
+            logger.warning("grade item %d (%s): %d %s; resolved unjudged", work.id, work.mode,
+                           count, kind)
+            self._resolve(work, GradeDecision(status, None, ()))
+        else:
+            self._requeue(work)
+
+    def _settle(self, work: _Work) -> None:
+        if not work.results:
+            self._requeue(work)
+            return
+        keys = collections.Counter(decision_key(work.mode, r) for r in work.results.values())
+        key, count = keys.most_common(1)[0]
+        if count >= work.agree_needed:
+            agreeing = tuple(sorted(e for e, r in work.results.items()
+                                    if decision_key(work.mode, r) == key))
+            self._resolve(work, GradeDecision("ok", dict(work.results[agreeing[0]]), agreeing))
+            for dissenter in sorted(set(work.results) - set(agreeing)):
+                self._spawn(self.quarantine(
+                    dissenter, f"grade item {work.id} ({work.mode}) disagreed with {list(agreeing)}"))
+            return
+        if len(work.results) >= MAX_RESULTS_PER_ITEM:
+            logger.error("grade item %d: %d executors without two agreeing; unjudged",
+                         work.id, len(work.results))
+            self._resolve(work, GradeDecision("error", None, tuple(sorted(work.results))))
+            return
+        self._requeue(work)
+
+    # -- expiry, quarantine, background ----------------------------------------
+
+    def _requeue(self, work: _Work) -> None:
+        if not work.future.done() and work not in self._queue:
+            work.queued_at = self._clock()
+            self._queue.append(work)
+
+    def _take_back(self, lease: _Lease, *, expired: bool) -> None:
+        lease.work.excluded.add(lease.executor_id)
+        if expired:
+            self._failed_attempt(lease.work, "timeouts")
+        else:
+            self._requeue(lease.work)
+
+    @staticmethod
+    def _resolve(work: _Work, decision: GradeDecision) -> None:
+        if not work.future.done():
+            work.future.set_result(decision)
+
+    async def quarantine(self, executor_id: str, reason: str) -> None:
+        """As every lease dispatcher, and its votes on undecided items no
+        longer count (each item may then need another executor)."""
+        if executor_id in self.quarantined:
+            return
+        queued = [w for w in self._queue if executor_id in w.results]
+        leased = [lease.work for lease in self._leases.values() if executor_id in lease.work.results]
+        await super().quarantine(executor_id, reason)
+        for work in leased:
+            work.results.pop(executor_id, None)  # settled when its lease answers
+        for work in queued:
+            work.results.pop(executor_id, None)
+            self._settle(work)
+
+    async def sweep(self) -> None:
+        await self._expire_leases()
+        waiting = [w for w in self._queue if not w.future.done()]
+        self.stats["waiting"] = len(waiting)
+        if waiting and not self.connected():
+            logger.warning("%d grade items wait and no grade executor is connected", len(waiting))
+        if self._unwritten_quarantines:
+            await self._write_quarantines()
+
+
+def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
+                                directory: ExecutorDirectory) -> APIRouter:
+    """``/corpus/internal/grade/...``: claim, result, heartbeat, each behind
+    ``Authorization: Bearer <grade executor token>``."""
+    router = APIRouter()
+    _authenticated = bearer_authenticator(directory)
+
+    @router.post(f"{GRADE_PREFIX}/claim")
+    async def claim(body: GradeClaimRequest, request: Request):
+        document = _authenticated(request, body.executor_id)
+        if (body.env_package, body.env_version) != (document["model_id"], document["model_revision"]):
+            raise HTTPException(status_code=409, detail="wrong_env")
+        lease = dispatcher.claim(document["executor_id"])
+        if lease is None:
+            return Response(status_code=204)
+        return lease
+
+    @router.post(f"{GRADE_PREFIX}/heartbeat")
+    async def heartbeat(body: HeartbeatRequest, request: Request) -> dict:
+        document = _authenticated(request, body.executor_id)
+        dispatcher.heartbeat(document["executor_id"], body.detail)
+        # The executor learns its env pin here (GradeExecutor.start).
+        return {"executor_id": document["executor_id"], "model_id": document["model_id"],
+                "model_revision": document["model_revision"]}
+
+    @router.post(GRADE_PREFIX + "/{lease_id}/result")
+    async def result(lease_id: str, body: GradeResult, request: Request) -> dict:
+        document = _authenticated(request)
+        try:
+            outcome = dispatcher.result(document["executor_id"], lease_id, body)
+        except LeaseRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        return {"lease_id": lease_id, "outcome": outcome}
+
+    return router
+
+
+__all__ = ["GRADE_LEASE_SECONDS", "GRADE_PREFIX", "UNGRADEABLE", "GradeDecision",
+           "RemoteGradeDispatcher", "build_grade_executor_router", "decision_key",
+           "replay_certified"]
