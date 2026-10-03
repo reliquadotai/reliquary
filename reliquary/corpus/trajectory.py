@@ -4,6 +4,8 @@ Pure. Each turn's prompt must extend the previous prompt and completion:
 verifiers' train client bridges history token for token, and a turn it had to
 re-render from messages instead (a rewritten history) is not one sequence the
 audit could prefill, so it is refused here, before anything is signed.
+Stop condition and final-span consistency are checked at intake (parse_trajectory),
+not here.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from reliquary.corpus.job import EPISODE_STOPS
+from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
+from reliquary.protocol.toploc import span_chunk_count
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,8 @@ class TrajectoryUnbuildable(ValueError):
     """The session cannot be one trajectory: nothing is submitted for it."""
 
 
-def build_trajectory(turns: Sequence[GeneratedTurn], *, final_diff: str, stop: str) -> BuiltTrajectory:
+def build_trajectory(turns: Sequence[GeneratedTurn], *, final_diff: str, stop: str,
+                     chunk_tokens: int = TOPLOC_DEPLOYED_DEFAULTS.chunk_tokens) -> BuiltTrajectory:
     if stop not in EPISODE_STOPS:
         raise TrajectoryUnbuildable(f"stop {stop!r} is not one of {EPISODE_STOPS}")
     if not turns:
@@ -59,7 +64,13 @@ def build_trajectory(turns: Sequence[GeneratedTurn], *, final_diff: str, stop: s
         if k and len(prompt) == len(sequence):
             raise TrajectoryUnbuildable(f"turn {k} follows turn {k - 1} with no observation between")
         start = len(prompt) - len(first)
-        spans.append((start, start + len(turn.completion_ids)))
+        end = start + len(turn.completion_ids)
+        span_length = end - start
+        expected_proof_count = span_chunk_count(span_length, chunk_tokens)
+        if len(turn.proofs) != expected_proof_count:
+            raise TrajectoryUnbuildable(
+                f"turn {k} has {len(turn.proofs)} proofs but {span_length} tokens require {expected_proof_count}")
+        spans.append((start, end))
         proofs.append(tuple(turn.proofs))
         sequence = prompt + list(turn.completion_ids)
     return BuiltTrajectory(prompt_ids=tuple(first), tokens=tuple(sequence[len(first):]),
