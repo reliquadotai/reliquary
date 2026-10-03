@@ -210,7 +210,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
     def _provider(self, executor_id: str) -> str | None:
         document = self._directory.document(executor_id) or {}
         provider = document.get("provider_id")
-        return str(provider) if provider else None
+        # Normalized as at registration, for any document written before it was.
+        provider = str(provider).strip().lower() if provider else ""
+        return provider or None
 
     def _eligible(self, executor_id: str, work: _Work) -> bool:
         provider = self._provider(executor_id)
@@ -255,6 +257,15 @@ class RemoteGradeDispatcher(ExecutorLeases):
                                             f"the last a result {misfit}"))
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
         self._strikes[executor_id] = 0
+        provider = self._provider(executor_id)
+        if provider is None:
+            # Its registry entry lost its provider since the claim: a vote that
+            # could not be told apart from another provider's never counts.
+            logger.error("grade executor %s has no provider_id at result time; refused",
+                         executor_id)
+            self.stats["providerless_results"] += 1
+            self._requeue(work)
+            raise LeaseRefused(403, "executor_has_no_provider")
         if answer.status in ("error", "timeout"):
             # The executor's or the box's, never the miner's.
             self.stats[f"executor_{answer.status}s"] += 1
@@ -263,7 +274,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
         if work.drawn is None:
             work.drawn = self._rng.random() < self._fraction
         work.results[executor_id] = answer.model_dump()
-        work.providers[executor_id] = self._provider(executor_id) or executor_id
+        work.providers[executor_id] = provider
         self.stats["graded"] += 1
         self._settle(work)
         return "accepted"

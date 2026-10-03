@@ -124,6 +124,9 @@ async def register_executor(*, executor_id: str, token_sha256: str, model_id: st
     }
     if scope not in EXECUTOR_SCOPES:
         raise ValueError(f"scope must be one of {sorted(EXECUTOR_SCOPES)}")
+    if scope == "grade" and isinstance(provider_id, str):
+        # One provider, one vote: "Hetzner" and " hetzner" are the same one.
+        provider_id = provider_id.strip().lower() or None
     if scope == "eval" and not (provider_id and host):
         raise ValueError("an eval executor needs its provider_id and host")
     if scope == "grade" and not provider_id:

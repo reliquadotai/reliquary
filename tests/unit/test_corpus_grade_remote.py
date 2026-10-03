@@ -524,3 +524,56 @@ async def test_a_dissenter_is_quarantined_at_decision_time():
         d.result("g0", lease["lease_id"], _result(REPLAY_OK))
     assert (await second).graded_by == ("g1", "g2")
     assert not first.done()
+
+
+# --------------------------------------------------------------------------
+# Carried into Task 17: a vote always carries its executor's provider
+# --------------------------------------------------------------------------
+
+
+async def test_a_result_from_an_executor_that_lost_its_provider_is_refused():
+    docs = _docs()
+
+    async def listed():
+        return [dict(d) for d in docs]
+
+    directory = ExecutorDirectory(model_id=PACKAGE, model_revision=VERSION, list_documents=listed,
+                                  clock=_Clock(), scope="grade")
+    await directory.refresh()
+    d = RemoteGradeDispatcher(directory=directory, env_package=PACKAGE, env_version=VERSION,
+                              clock=_Clock(), rng=_Rng(1.0))
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    lease = d.claim("g0")
+    docs[0].pop("provider_id")                   # the registry no longer names its provider
+    await directory.refresh()
+    with pytest.raises(LeaseRefused) as refused:
+        d.result("g0", lease["lease_id"], _result(REPLAY_OK))
+    assert refused.value.status == 403
+    assert not decision.done()                   # its answer never counted, not even as g0
+    _answer(d, "g1", REPLAY_OK)
+    assert (await decision).graded_by == ("g1",)
+
+
+async def test_providers_count_once_whatever_their_spelling():
+    d = await _dispatcher(recheck=0.0, providers={"g0": "Hetzner", "g1": " hetzner ",
+                                                  "g2": "OVH", "g3": "ovh"})
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    assert d.claim("g1") is None                 # the same provider, written otherwise
+    _answer(d, "g2", REPLAY_BAD)
+    assert (await decision).graded_by == ("g0", "g2")
+
+
+def test_a_grade_executor_provider_is_normalized_at_registration(monkeypatch):
+    from reliquary.infrastructure import corpus_executor_store as executors
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+
+    monkeypatch.setattr(executors, "get_s3_client", lambda **kw: _FakeMultiObjectR2())
+    fields = dict(executor_id="g1", token_sha256="d" * 64, model_id="reliquary-swe",
+                  model_revision="b" * 40, expires_at=2e9, now=1000.0, scope="grade")
+    with pytest.raises(ValueError, match="provider_id"):
+        asyncio.run(executors.register_executor(**fields, provider_id="   "))
+    doc, _ = asyncio.run(executors.register_executor(**fields, provider_id="  Hetzner "))
+    assert doc["provider_id"] == "hetzner"
