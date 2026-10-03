@@ -109,7 +109,72 @@ def multi_job_refusal(pairs, *, proof_of=_contract_toploc,
     return None
 
 
+# Verified rounds, for the life of the process (rounds never change), and on
+# disk when RELIQUARY_CORPUS_DRAND_CACHE names a file (one JSON line a round):
+# a restarted judge does not race the rounds of its backlog again.
+_BEACONS: dict[int, str] = {}
+_DISK_LOADED: set[str] = set()
+_BEACONS_LOCK = __import__("threading").Lock()
+DRAND_CACHE_ENV = "RELIQUARY_CORPUS_DRAND_CACHE"
+
+
+def _cached_beacon(round_number: int) -> str | None:
+    import json
+    import os
+
+    path = os.environ.get(DRAND_CACHE_ENV)
+    with _BEACONS_LOCK:
+        if path and path not in _DISK_LOADED:
+            _DISK_LOADED.add(path)
+            try:
+                with open(path) as handle:
+                    for line in handle:
+                        try:
+                            doc = json.loads(line)
+                            if _HEX64.fullmatch(doc["randomness"]):
+                                _BEACONS[int(doc["round"])] = doc["randomness"]
+                        except (ValueError, KeyError, TypeError):
+                            continue
+            except FileNotFoundError:
+                pass
+        return _BEACONS.get(round_number)
+
+
+def _remember_beacon(round_number: int, randomness: str) -> None:
+    import json
+    import os
+
+    path = os.environ.get(DRAND_CACHE_ENV)
+    with _BEACONS_LOCK:
+        _BEACONS[round_number] = randomness
+        if path:
+            try:
+                with open(path, "a") as handle:
+                    handle.write(json.dumps({"round": round_number, "randomness": randomness}) + "\n")
+            except OSError:
+                logger.warning("drand cache %s not writable", path, exc_info=True)
+
+
 def drand_beacon(round_number: int) -> str | None:
+    """A verified round, from the cache, else from two agreeing relays, else
+    through the cross-checked path below (``_drand_beacon_checked``)."""
+    from reliquary.infrastructure import drand
+
+    cached = _cached_beacon(round_number)
+    if cached is not None:
+        return cached
+    agreed = None
+    try:
+        agreed = drand.get_agreed_beacon(round_number)
+    except Exception:
+        logger.debug("drand agreement for round %d failed", round_number, exc_info=True)
+    randomness = agreed["randomness"] if agreed else _drand_beacon_checked(round_number)
+    if randomness is not None:
+        _remember_beacon(round_number, randomness)
+    return randomness
+
+
+def _drand_beacon_checked(round_number: int) -> str | None:
     """The randomness of drand round ``round_number``, lowercased, or
     ``None``: a fetch error, a relay answering for the wrong round, malformed
     randomness, or a signature ``verify_beacon_signature`` cannot confirm --

@@ -197,6 +197,9 @@ async def _gpu(spec: SplitSpec) -> None:
 def child_main(role: str, index: int, spec: SplitSpec) -> None:
     """The entry point of every child (spawned: a fresh interpreter)."""
     name = role if role != "judge" else f"judge-{index}"
+    # Verified drand rounds survive a child's restart (rounds never change).
+    os.environ.setdefault("RELIQUARY_CORPUS_DRAND_CACHE",
+                          str(Path(spec.run_dir) / f"drand-rounds-{name}.jsonl"))
     if role != "gpu":
         # Never a CUDA context outside the GPU process.
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
