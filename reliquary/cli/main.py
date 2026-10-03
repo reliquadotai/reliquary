@@ -745,6 +745,27 @@ def tasks_retire(
     )
 
 
+@tasks_app.command("close")
+def tasks_close(
+    task_id: str = typer.Option(..., "--task-id"),
+    cut_tail: bool = typer.Option(
+        False, "--cut-tail",
+        help="A task settled by RL window: stop paying its frozen tail now",
+    ),
+) -> None:
+    """Close a finished corpus task: cap 0 and retired, so it pays nothing more
+    and its share of the pool is free. Refused while its job is not drained, or
+    while a period-settled task still pays what it earned."""
+    from reliquary.validator.corpus_close import TaskNotClosable, close_task
+
+    try:
+        message = asyncio.run(close_task(task_id, cut_tail=cut_tail))
+    except TaskNotClosable as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(message)
+
+
 @tasks_app.command("contract")
 def tasks_contract(
     task_ids: list[str] = typer.Option(
@@ -1246,6 +1267,23 @@ def jobs_create(
             "validator derive it from its own card."
         ),
     ),
+    settlement: str = typer.Option(
+        "period-ema-v1",
+        "--settlement",
+        help="How the task is paid: period-ema-v1 (its own 72-minute drand periods, "
+        "design 2026-10-03) or windows (the RL window index, as tasks declared "
+        "before it). Every validator serving it must know period-ema-v1",
+    ),
+    fleet_knows_period_settlement: bool = typer.Option(
+        False,
+        "--fleet-knows-period-settlement",
+        help=(
+            "Required with --settlement period-ema-v1 (the default). Confirms that "
+            "the corpus validator serving the job and every weight setter run a "
+            "binary that settles and replays period-ema-v1; an older one settles "
+            "it by window, or does not pay it at all."
+        ),
+    ),
     fleet_knows_corpus_generation: bool = typer.Option(
         False,
         "--fleet-knows-corpus-generation",
@@ -1318,6 +1356,19 @@ def jobs_create(
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+    if settlement not in ("period-ema-v1", "windows"):
+        typer.echo(f"error: --settlement is period-ema-v1 or windows, not {settlement!r}",
+                   err=True)
+        raise typer.Exit(code=1)
+    if settlement == "period-ema-v1" and not fleet_knows_period_settlement:
+        typer.echo("error: a period-ema-v1 job needs every validator to know it: pass "
+                   "--fleet-knows-period-settlement, or --settlement windows", err=True)
+        raise typer.Exit(code=1)
+    if settlement == "period-ema-v1":
+        from dataclasses import replace as _replace
+
+        # Outside the contract: how the task is paid, not how it generates.
+        entry = _replace(entry, params={**entry.params, "settlement": settlement})
 
     # Before either write, so a refusal leaves nothing behind. The guard is in
     # `task_registry` and does not know this CLI, so the flag is named here.

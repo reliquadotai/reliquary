@@ -208,14 +208,20 @@ class WeightOnlyValidator:
             # nothing. Abstain and let the next epoch retry the listing.
             logger.exception("Archive listing failed; abstaining from this epoch")
             return False
-        if not by_task:
-            logger.info("No archives yet; nothing to submit")
-            return False
-
         try:
             declared, _ = await read_registry()
         except Exception:
             logger.exception("Task registry unreadable; abstaining from this epoch")
+            return False
+        try:
+            periods = await self._period_weights(declared)
+        except Exception:
+            # A period task's pay unreadable: a vector without it would hand its
+            # share to nobody this epoch and look confident doing so.
+            logger.exception("Period-settled pay unreadable; abstaining from this epoch")
+            return False
+        if not by_task and not periods:
+            logger.info("No archives yet; nothing to submit")
             return False
         undeclared = self._undeclared_tasks(by_task, declared)
         if undeclared:
@@ -248,6 +254,7 @@ class WeightOnlyValidator:
             archives,
             caps=self._caps_by_task(declared),
             floors=self._floors_by_task(declared),
+            periods=periods,
         )
         miner_weights = dict(ema)
 
@@ -263,6 +270,44 @@ class WeightOnlyValidator:
         finally:
             await chain.close_subtensor(subtensor)
         return submitted
+
+    @staticmethod
+    async def _period_weights(declared: Mapping[str, Any], *, archives=None,
+                              now: float | None = None,
+                              genesis: float | None = None) -> dict[str, dict[str, float]]:
+        """Each period-settled task's weights at the current drand period: its
+        archives that entered within the replay depth, decayed once per period
+        (design 2026-10-03). Window archives never hold these tasks' pay."""
+        from reliquary.validator import corpus_periods as cp
+
+        tasks = sorted(str(t) for t, e in (declared or {}).items() if cp.is_period_task(e))
+        if not tasks:
+            return {}
+        if archives is None:
+            from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+
+            archives = R2PeriodArchives()
+        if genesis is None:
+            from reliquary.validator.corpus_period_settlement import _drand_genesis
+
+            genesis = _drand_genesis()
+        current = cp.period_of(time.time() if now is None else now, genesis)
+        weights: dict[str, dict[str, float]] = {}
+        for task_id in tasks:
+            keys = [(work, entry) for work, entry in await archives.list(task_id)
+                    if 0 <= current - entry <= cp.REPLAY_DEPTH]
+            docs = []
+            for work, entry in keys:
+                doc = await archives.read(task_id, work, entry)
+                if doc is None:
+                    raise RuntimeError(f"period archive {task_id} {work}-{entry} listed "
+                                       "but unreadable")
+                docs.append({"entry_period": entry,
+                             "rewards_by_hotkey": doc.get("rewards_by_hotkey") or {}})
+            replayed = cp.replay(docs, current)
+            if replayed:
+                weights[task_id] = replayed
+        return weights
 
     @staticmethod
     def _merge_archives(by_task: Mapping[str, list[dict]]) -> list[dict]:
@@ -401,6 +446,7 @@ class WeightOnlyValidator:
         *,
         caps: Mapping[str, float] | None = None,
         floors: Mapping[str, tuple[float, float]] | None = None,
+        periods: Mapping[str, Mapping[str, float]] | None = None,
     ) -> dict[str, float]:
         """Replay the per-window emission distribution into an EMA.
 
@@ -445,10 +491,15 @@ class WeightOnlyValidator:
             by_task.setdefault(record.get("task_id", ""), []).append(record)
 
         combined: dict[str, float] = {}
-        for task_id, records in by_task.items():
-            ema: dict[str, float] = {}
+        # Period-settled tasks arrive already replayed on their own clock, and
+        # are added to whatever window archives the same task still has (a job
+        # settled by window before its validator learnt periods): neither tail
+        # is dropped. The cap and the floor apply to the sum, as to every task.
+        periods = periods or {}
+        for task_id in dict.fromkeys((*by_task, *periods)):
+            ema = {}
             alpha = EMA_ALPHA
-            for record in sorted(records, key=lambda r: int(r["window_start"])):
+            for record in sorted(by_task.get(task_id, ()), key=lambda r: int(r["window_start"])):
                 if record.get("window_status", "completed") == "aborted":
                     continue
                 rewards: dict[str, float] = record.get("rewards_by_hotkey", {})
@@ -457,6 +508,8 @@ class WeightOnlyValidator:
                     fraction = rewards.get(hk, 0.0)
                     ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
                 ema = {hk: v for hk, v in ema.items() if v > 1e-6}
+            for hk, v in (periods.get(task_id) or {}).items():
+                ema[hk] = ema.get(hk, 0.0) + float(v)
             ema = WeightOnlyValidator._clamp_to_cap(
                 task_id, ema, None if caps is None else caps.get(task_id)
             )

@@ -47,7 +47,7 @@ def _args(**overrides):
         "--cap": "0.1",
     }
     options.update(overrides)
-    argv = ["jobs", "create", ACK]
+    argv = ["jobs", "create", ACK, "--fleet-knows-period-settlement"]
     for flag, value in options.items():
         if value is not None:
             argv += [flag, value]
