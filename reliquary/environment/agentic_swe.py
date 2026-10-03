@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import importlib.metadata
 import json
+import re
 import subprocess
 import threading
 from collections.abc import Sequence
@@ -178,6 +179,13 @@ class QwenTurnRenderer:
         self.turn_markup_ids = frozenset(
             int(renderer._token_id(t)) for t in ("<|im_start|>", "<tool_response>", "</tool_response>"))
         self._tools = [dict(tool) for tool in BASH_HARNESS_TOOLS]
+        self._im_start = int(renderer._token_id("<|im_start|>"))
+        self._think = int(renderer._token_id("<think>"))
+        self._think_end = int(renderer._token_id("</think>"))
+        literals = set(getattr(self._tokenizer, "all_special_tokens", []) or [])
+        for added in (getattr(self._tokenizer, "added_tokens_decoder", {}) or {}).values():
+            literals.add(str(getattr(added, "content", added)))
+        self._literals = tuple(sorted(t for t in literals if t))
 
     @_locked
     def initial_ids(self, prompt: str) -> list[int]:
@@ -216,6 +224,53 @@ class QwenTurnRenderer:
         rendered = self._r.bridge_to_next_turn(list(prompt_ids), list(completion_ids), messages,
                                                tools=self._tools)
         return None if rendered is None else [int(t) for t in rendered.token_ids]
+
+    def _tail(self, ids) -> list[int]:
+        """The ids after the last <|im_start|>: role line, and any opened <think>."""
+        for k in range(len(ids) - 1, -1, -1):
+            if ids[k] == self._im_start:
+                return list(ids[k + 1:])
+        return list(ids)
+
+    @_locked
+    def reasoning_unclosed(self, prompt_ids, completion_ids) -> bool:
+        ids = list(completion_ids)
+        if self._think_end in ids:
+            return False
+        return self._think in ids or self._think in self._tail(prompt_ids)
+
+    @_locked
+    def span_is_canonical(self, prompt_ids, completion_ids) -> bool:
+        """Round trip: parse the span to a message, render that message as an
+        assistant turn, and require the span's own tokens, so no text can pose
+        as turn structure once the message is re-encoded for export."""
+        completion = [int(t) for t in completion_ids]
+        message = self.assistant_message(completion)
+        texts = [message.get("content") or "", message.get("reasoning_content") or ""]
+        for call in message.get("tool_calls") or []:
+            texts += [call["function"]["name"], call["function"]["arguments"]]
+        if any(literal in text for text in texts for literal in self._literals):
+            return False
+        rendered = self._r.render([{"role": "user", "content": "x"}, message], tools=self._tools,
+                                  add_generation_prompt=False).token_ids
+        tail = self._tail([int(t) for t in rendered])
+        closes = [k for k, t in enumerate(tail) if t == self.terminator_id]
+        if not closes:
+            return False
+        tail = tail[:closes[-1] + 1]                    # drop the template's trailing newline
+        if not completion or completion[-1] not in self.stop_ids:
+            tail = tail[:-1]                           # capped turn: the bridge adds its own close
+        expected = self._tail(prompt_ids) + completion
+        if tail == expected:
+            return True
+        # The pinned parser strips the whitespace around a parameter value (an
+        # indented `old_str` loses its indentation: 4 % of honest recorded
+        # turns), so an exact comparison would refuse honest edits. Fall back
+        # to the same comparison with whitespace erased: what the parser
+        # dropped or changed beyond whitespace still fails it, and spelled
+        # markup was already refused by the literal check above.
+        squeeze = lambda ids: re.sub(r"\s+", "", self._tokenizer.decode(ids, skip_special_tokens=False))
+        return squeeze(tail) == squeeze(expected)
 
     @_locked
     def assistant_message(self, completion_ids) -> dict:

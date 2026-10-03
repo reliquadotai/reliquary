@@ -47,6 +47,14 @@ class TurnRenderer(Protocol):
 
     def assistant_message(self, completion_ids: Sequence[int]) -> dict: ...
 
+    def span_is_canonical(self, prompt_ids: Sequence[int], completion_ids: Sequence[int]) -> bool:
+        """The message parsed from the span, re-rendered as an assistant turn
+        after ``prompt_ids``, gives exactly the span's tokens, and no added
+        token's literal text appears in what was parsed."""
+        ...
+
+    def reasoning_unclosed(self, prompt_ids: Sequence[int], completion_ids: Sequence[int]) -> bool: ...
+
 
 @dataclass(frozen=True)
 class ParsedTurn:
@@ -89,8 +97,9 @@ def parse_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
                      stop: str, max_turns: int | None = None) -> ParsedTrajectory:
     """The trajectory's turns and actions, or ``TrajectoryRefused``.
 
-    ``spans`` are assistant spans in ``tokens`` coordinates, already checked
-    ordered and in bounds (``checks.check_turn_spans``)."""
+    ``spans`` are assistant spans in ``tokens`` coordinates; this function
+    checks them itself (order, bounds, no stop or turn markup inside, and a
+    canonical re-rendering), whatever the caller checked before."""
     if stop not in STOPS:
         raise TrajectoryRefused(REASON_BAD_STOP, {"stop": stop})
     if not spans:
@@ -106,6 +115,12 @@ def parse_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
     actions: list[Action] = []
     for k, (start, end) in enumerate(spans):
         completion = list(tokens[start:end])
+        last = k == len(spans) - 1
+        if last and stop == "agent_completed" and renderer.reasoning_unclosed(full[:offset + start], completion):
+            # An unclosed reasoning block can hold a whole tool call as "thought".
+            raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "why": "final reasoning is not closed"})
+        if not renderer.span_is_canonical(full[:offset + start], completion):
+            raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "span does not re-render to itself"})
         calls = tuple(renderer.tool_calls(completion))
         if k == len(spans) - 1:
             if end != len(tokens):

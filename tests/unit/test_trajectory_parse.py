@@ -18,6 +18,14 @@ class FakeRenderer:
     terminator_id = TERM
     stop_ids = frozenset({TERM, EOT})
     turn_markup_ids = frozenset({TR, TRE})
+    canonical = True
+    unclosed = False
+
+    def span_is_canonical(self, prompt_ids, completion_ids):
+        return self.canonical
+
+    def reasoning_unclosed(self, prompt_ids, completion_ids):
+        return self.unclosed
 
     def initial_ids(self, prompt):
         return [TEXT + (ord(c) % 50) for c in prompt] + [GEN]
@@ -191,3 +199,17 @@ def test_spans_out_of_order_or_bounds_are_refused():
                 [(spans[0][0], spans[1][1]), spans[1]]):
         with pytest.raises(TrajectoryRefused, match="bad_turns"):
             parse(tokens, bad)
+
+
+def test_a_span_that_does_not_re_render_to_itself_is_refused(monkeypatch):
+    tokens, spans = build([([TEXT, CALL, TERM], ["a"]), ([TEXT, TERM], None)])
+    monkeypatch.setattr(FakeRenderer, "canonical", False)
+    with pytest.raises(TrajectoryRefused, match="bad_turns"):
+        parse(tokens, spans)
+
+
+def test_an_unclosed_final_reasoning_is_refused_under_agent_completed(monkeypatch):
+    tokens, spans = build([([TEXT, TEXT, TERM], None)])
+    monkeypatch.setattr(FakeRenderer, "unclosed", True)
+    with pytest.raises(TrajectoryRefused, match="bad_stop"):
+        parse(tokens, spans)
