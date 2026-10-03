@@ -566,7 +566,7 @@ def eval_auditor(**kwargs):
             results, items = await asyncio.to_thread(self._prepare, records)
             scores = await self._remote.score(
                 [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
-                 for _, _, tokens, n, proofs in items])
+                 for _, _, tokens, n, proofs, _spans in items])
             outcomes, scored_by = {}, {}
             for (i, c_idx, *_), (status, chunks, executors) in zip(items, scores):
                 outcomes[i, c_idx] = outcome_from_scores(status, chunks, self._proof)
