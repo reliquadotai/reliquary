@@ -1064,6 +1064,8 @@ class CorpusAuditor:
             # pass; the others wait for the next passes (nothing is paid early).
             hold_end: dict[str, float] = {}
             taken: dict[str, int] = {}
+            # Per hotkey cut short: the receipt of its first sibling not decided.
+            horizon: dict[str, float] = {}
             kept, waiting = [], []
             for submission_id, draw in sorted(unaudited, key=lambda u: self._meta[u[0]][1]):
                 hotkey, received_at, _ = self._meta[submission_id]
@@ -1074,8 +1076,10 @@ class CorpusAuditor:
                     if not hold_end:
                         # Even the oldest does not fit: decide the first of its
                         # siblings now (their draws become known, the undrawn
-                        # leave its set) and pay it in a later pass.
+                        # leave its set) and pay it in a later pass. Only what
+                        # lies before the first sibling left out is decided.
                         hold_end[hotkey], taken[hotkey] = until, PASS_SIBLINGS
+                        horizon[hotkey] = candidates[hotkey][PASS_SIBLINGS][0]
                     waiting.append(submission_id)
                     continue
                 hold_end[hotkey], taken[hotkey] = until, count
@@ -1104,8 +1108,11 @@ class CorpusAuditor:
                             draws[sid] = draw
                     elif choice == "undecidable":
                         undecided.setdefault(hotkey, []).append(self._meta[sid][1])
-                    elif (choice == "pass_unaudited" and self._meta[sid][1]
-                          + self._params.hold_seconds <= hold_end[hotkey]):
+                    elif (choice == "pass_unaudited"
+                          and (self._meta[sid][1] + self._params.hold_seconds
+                               < horizon[hotkey] if hotkey in horizon
+                               else self._meta[sid][1] + self._params.hold_seconds
+                               <= hold_end[hotkey])):
                         # Payable, and every sibling that could catch it is
                         # decided in this pass too (its hold ends inside the
                         # window): paid here under the same guards, not decided
@@ -1400,7 +1407,8 @@ class CorpusAuditor:
                     await asyncio.sleep(PREFETCH_IDLE_SECONDS)
                     continue
                 scanned = (len(self._meta), self._clock())
-                wanted = self._rounds_wanted(self._clock())
+                # One round_at per pending record: off the event loop.
+                wanted = await asyncio.to_thread(self._rounds_wanted, self._clock())
                 for i in range(0, len(wanted), PREFETCH_ROUNDS):
                     await asyncio.gather(*(one(r) for r in wanted[i:i + PREFETCH_ROUNDS]))
                 if wanted:

@@ -164,3 +164,68 @@ def test_without_the_prefetcher_a_pass_waits_on_its_rounds(caplog):
     decide, _ = _passes(False, caplog)
     later = decide[len(decide) // 3:]
     assert later and sorted(later)[len(later) // 2] > 20.0, decide
+
+
+# -- review B1: exactly one 48-byte G1 point, and only it is hashed -------------------------
+
+ROUND = 32_700_000
+SIG = ("afaef99ecc0a56993fc66f032403971368456f07f3d727bdcd365af742331a2c"
+       "57ffad1c5ad3052166b4beaa7ea7727c")
+
+
+def test_the_genuine_quicknet_vector_verifies_offline():
+    assert drand.verify_round_signature(ROUND, SIG) is True
+    assert drand.verify_round_signature(ROUND, SIG.upper()) is True   # the same 48 bytes
+    assert drand.verify_round_signature(ROUND + 1, SIG) is False
+
+
+@pytest.mark.parametrize("variant", [
+    SIG + "00", SIG + "deadbeef", SIG + "ff" * 48,     # bytes appended: the relay's choice
+    SIG[:-2], SIG[:-1],                                # truncated
+    " " + SIG, SIG + " ", SIG[:48] + " " + SIG[48:],   # whitespace (bytes.fromhex skips it)
+    "0x" + SIG,
+])
+def test_a_signature_that_is_not_exactly_one_g1_point_is_refused(variant):
+    assert drand.verify_round_signature(ROUND, variant) is False
+
+
+@pytest.mark.parametrize("variant", [SIG + "00", SIG + "deadbeef", SIG + "ff" * 48])
+def test_a_relay_padding_the_signature_cannot_choose_the_randomness(monkeypatch, variant):
+    class _One:
+        def get(self, url, timeout=None, headers=None):
+            class _R:
+                status_code = 200
+                text = ""
+
+                def json(_self):
+                    return {"round": ROUND, "signature": variant}
+
+            return _R()
+
+    monkeypatch.setattr(drand, "DRAND_URLS", ["https://evil"])
+    monkeypatch.setattr(drand, "_get_thread_session", lambda: _One())
+    monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
+    monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
+    assert drand.get_verified_beacon(ROUND) is None
+    assert drand.get_agreed_beacon(ROUND, agree=1) is None
+
+
+def test_the_randomness_is_the_hash_of_the_verified_48_bytes(monkeypatch):
+    class _One:
+        def get(self, url, timeout=None, headers=None):
+            class _R:
+                status_code = 200
+                text = ""
+
+                def json(_self):
+                    return {"round": ROUND, "signature": SIG.upper()}
+
+            return _R()
+
+    monkeypatch.setattr(drand, "DRAND_URLS", ["https://cf"])
+    monkeypatch.setattr(drand, "_get_thread_session", lambda: _One())
+    monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
+    monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
+    beacon = drand.get_verified_beacon(ROUND)
+    assert beacon["randomness"] == hashlib.sha256(bytes.fromhex(SIG)).hexdigest()
+    assert beacon["signature"] == SIG

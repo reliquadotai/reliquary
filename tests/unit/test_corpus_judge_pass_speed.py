@@ -31,7 +31,8 @@ from tests.unit import _main_corpus_auditor as main_module
 
 
 def _sig(round_number, forged=False):
-    return hashlib.sha256(f"sig-{round_number}-{forged}".encode()).hexdigest() * 3
+    # 48 bytes, the size of a quicknet signature (a G1 point).
+    return (hashlib.sha256(f"sig-{round_number}-{forged}".encode()).hexdigest() * 2)[:96]
 
 
 class _Relays:
