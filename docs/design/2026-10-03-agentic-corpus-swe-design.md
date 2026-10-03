@@ -86,7 +86,7 @@ it (body `{model, token_ids, sampling_params}`; response
 ### N2. Trajectory builder
 
 `reliquary/corpus/trajectory.py` (pure) builds a `CorpusTrajectory` from a
-verifiers `Trace` produced with the train client:
+verifiers `Trace` produced with the train client (the trajectory is sourced from the miner's generate endpoint session log, keyed by the trace's X-Session-ID header):
 
 - `tokens`: the interleaved token sequence after the initial prompt (assistant
   turns, tool observations, turn scaffolding), exactly as rendered.
