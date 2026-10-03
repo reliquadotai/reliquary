@@ -19,6 +19,10 @@ import math
 from collections.abc import Iterable, Mapping
 
 SETTLEMENT_PERIOD_EMA = "period-ema-v1"
+# Where period 0 starts: drand quicknet's genesis. A protocol constant rather
+# than a fetched value, so the settler and every weight setter count the same
+# periods with no network (any fixed origin would do; it must only be shared).
+PERIOD_EPOCH = 1692803367.0
 # One Bittensor epoch: the rate weights are set at.
 PERIOD_SECONDS = 4320
 PERIOD_EMA_N = 6
@@ -34,12 +38,12 @@ def is_period_task(entry) -> bool:
     return isinstance(params, Mapping) and params.get("settlement") == SETTLEMENT_PERIOD_EMA
 
 
-def period_of(t: float, genesis: float) -> int:
+def period_of(t: float, genesis: float = PERIOD_EPOCH) -> int:
     """The period holding instant ``t`` (seconds), counted from drand genesis."""
     return math.floor((float(t) - float(genesis)) / PERIOD_SECONDS)
 
 
-def period_end(period: int, genesis: float) -> float:
+def period_end(period: int, genesis: float = PERIOD_EPOCH) -> float:
     return float(genesis) + (int(period) + 1) * PERIOD_SECONDS
 
 
@@ -77,6 +81,7 @@ def replay(archives: Iterable[Mapping], current_period: int, *,
 __all__ = [
     "CLOSE_THRESHOLD",
     "PERIOD_ALPHA",
+    "PERIOD_EPOCH",
     "PERIOD_EMA_N",
     "PERIOD_SECONDS",
     "REPLAY_DEPTH",

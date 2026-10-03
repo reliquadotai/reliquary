@@ -213,3 +213,35 @@ Evaluation jobs are corpus tasks: once this ships they are declared
 - `tasks close`: refused while undrained, above threshold, or window-settled without
   `--cut-tail`; a real corpus entry takes cap 0 then retires; a 0 cap frees its
   share in `total_cap`.
+
+## Rulings from the branch review
+
+- **One entry period per archive, strictly increasing** (`last_entry` in the
+  settlement state). An entry period never carries more than one period's cap, so a
+  catch-up after an audit backlog is paid in full, later, instead of being clamped
+  at the task's cap (a 12-period backlog entering at once lost ~24 %). It also makes
+  every archive key unique: a late verdict of a settled period never overwrites the
+  archive that paid it. Archive writes refuse another document under an existing key.
+- **An archive not written yet when its entry period is under way enters again**,
+  at the next period, before it is written: the weight-sets that ran meanwhile
+  never saw it. An archive already written before a crash is not written again.
+- **Closing bounds** (the auditor's `oldest_pending_received_at`): an id admitted
+  live and not read yet counts from its enqueue time less the accept slack (the
+  route stamps the arrival before a write that can take that long); a split judge
+  never closes past its arrival feed's coverage less the slack, and closes nothing
+  while that coverage is unreadable; an id found by a listing whose arrival stays
+  unreadable holds periods open for two periods, then is left out with an error,
+  so one corrupt record cannot freeze a task's pay. An undecided submission older
+  than six periods is reported.
+- **A late verdict** (one whose period was already settled, which the bounds above
+  should prevent) is still paid against the period's whole token count, logged as
+  an error: the period pays slightly over its cap rather than the worker nothing.
+- **The period origin is a protocol constant** (drand quicknet's genesis,
+  1692803367): no weight-set depends on reaching a drand relay.
+- **Window and period pay of one task add up** in the weight setter; neither tail
+  is dropped if a job's settlement changes under it. A period settler refuses a job
+  whose settlement state is a window one.
+- **Deploying:** `jobs create` refuses a `period-ema-v1` job without
+  `--fleet-knows-period-settlement`, the corpus-generation guard's pattern.
+- **A cap change applies to what is replayed from then on**, earned tails included,
+  as for window tasks: lower a period task's cap only once its job is drained.

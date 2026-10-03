@@ -1274,6 +1274,16 @@ def jobs_create(
         "design 2026-10-03) or windows (the RL window index, as tasks declared "
         "before it). Every validator serving it must know period-ema-v1",
     ),
+    fleet_knows_period_settlement: bool = typer.Option(
+        False,
+        "--fleet-knows-period-settlement",
+        help=(
+            "Required with --settlement period-ema-v1 (the default). Confirms that "
+            "the corpus validator serving the job and every weight setter run a "
+            "binary that settles and replays period-ema-v1; an older one settles "
+            "it by window, or does not pay it at all."
+        ),
+    ),
     fleet_knows_corpus_generation: bool = typer.Option(
         False,
         "--fleet-knows-corpus-generation",
@@ -1349,6 +1359,10 @@ def jobs_create(
     if settlement not in ("period-ema-v1", "windows"):
         typer.echo(f"error: --settlement is period-ema-v1 or windows, not {settlement!r}",
                    err=True)
+        raise typer.Exit(code=1)
+    if settlement == "period-ema-v1" and not fleet_knows_period_settlement:
+        typer.echo("error: a period-ema-v1 job needs every validator to know it: pass "
+                   "--fleet-knows-period-settlement, or --settlement windows", err=True)
         raise typer.Exit(code=1)
     if settlement == "period-ema-v1":
         from dataclasses import replace as _replace

@@ -108,6 +108,9 @@ OLD_ROUND_ROUNDS = 200
 # connect + 30 s read: 405 s. An unaudited pass waits this long past the hold,
 # so every sibling received inside that hold is visible before it is paid.
 ACCEPT_SLACK_SECONDS = 420.0
+# How long a pending id whose arrival cannot be read holds a period-settled
+# task's periods open: two periods.
+UNKNOWN_ARRIVAL_GIVE_UP_SECONDS = 2 * 4320.0
 # How much of the accept slack is margin over the route's record-write bound
 # (420 - 405): a sibling received inside a record's hold was handed over by
 # its receipt + hold + (slack - this margin).
@@ -212,6 +215,10 @@ class CorpusAuditor:
         # When this process first heard of each id (enqueued or seeded): the
         # arrival bound of a pending id whose record is not read yet.
         self._seen_at: dict[str, float] = {}
+        # Pending ids with no known arrival (found by a listing, unreadable):
+        # when this process first counted them, and those given up on.
+        self._unknown_since: dict[str, float] = {}
+        self._given_up: set[str] = set()
         self._randomness: dict[int, str] = {}
         # Rounds raced in the current judge_many: one race per round per pass,
         # never one per record whose draw lands on a failing round.
@@ -346,22 +353,46 @@ class CorpusAuditor:
         return arrivals[seen - self._enough] + self._params.hold_seconds + WINDOW_EPSILON_SECONDS
 
     def oldest_pending_received_at(self) -> float | None:
-        """When the oldest submission still undecided was received, from memory:
-        every pending id this process knows (seeded at start, enqueued since,
-        rescanned). None when nothing is pending. Raises ``LookupError`` before
-        the seed: until then an unknown backlog may hold anything."""
+        """The earliest instant a submission still undecided may have been
+        received, from memory; None when nothing is pending and nothing can
+        still arrive unseen. A period ending before it can gain no more work.
+
+        - read: its own arrival time;
+        - admitted live, not read yet: when it was enqueued, less the accept
+          slack (the route stamps the arrival before a write that can take that
+          long);
+        - fed by a front (a split judge): never later than the feed's coverage,
+          less the slack;
+        - found by a listing and never readable: it holds every period open for
+          ``UNKNOWN_ARRIVAL_GIVE_UP_SECONDS``, then is logged and left out, so one
+          corrupt record cannot freeze a task's pay for ever.
+
+        Raises ``LookupError`` before the seed, or while the feed's coverage is
+        unreadable: until then an unknown backlog may hold anything."""
         if not self._seeded:
             raise LookupError("the pending records are not seeded yet")
-        oldest = None
+        covered = self._covered()
+        if covered is None:
+            raise LookupError("the arrival feed's coverage is unreadable")
+        oldest = None if covered == math.inf else covered - self._accept_slack
+        now = self._clock()
         for sid in dict.fromkeys((*self._meta, *self._unreadable, *self._queued)):
             if sid in self._judged:
                 continue
             if sid in self._meta:
                 at = self._meta[sid][1]
+            elif sid in self._seen_at:
+                at = self._seen_at[sid] - self._accept_slack
             else:
-                # Not read yet: its arrival is no later than when we heard of it;
-                # never heard of at a known time, it holds every period open.
-                at = self._seen_at.get(sid, -math.inf)
+                first = self._unknown_since.setdefault(sid, now)
+                if now - first > UNKNOWN_ARRIVAL_GIVE_UP_SECONDS:
+                    if sid not in self._given_up:
+                        self._given_up.add(sid)
+                        logger.error("corpus job %s: pending %s has had no readable arrival "
+                                     "for %.0f s; periods close without it (its verdict, if "
+                                     "one comes, is paid late)", self._job_id, sid, now - first)
+                    continue
+                at = -math.inf
             oldest = at if oldest is None else min(oldest, at)
         return oldest
 

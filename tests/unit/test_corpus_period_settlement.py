@@ -48,7 +48,11 @@ class Archives:
         if self.fail_once:
             self.fail_once = False
             raise ConnectionError("lost")
+        assert (work, entry) not in self.docs, "an archive is never overwritten"
         self.docs[(work, entry)] = document
+
+    async def read(self, task_id, work, entry):
+        return self.docs.get((work, entry))
 
 
 def verdict(sid, hotkey, tokens, received, passed=True):
@@ -71,10 +75,11 @@ def test_each_closed_period_is_paid_its_own_cap_by_its_own_tokens():
     }
     # Now in period 5, nothing pending: periods up to 4 are closed.
     assert asyncio.run(settler(records, archives, at(5, 1000)).settle_once()) == 4
-    assert set(archives.docs) == {(3, 6), (4, 6)}  # entering the period after this one
+    # Entering after this period, one entry period each: never two caps at once.
+    assert set(archives.docs) == {(3, 6), (4, 7)}
     assert archives.docs[(3, 6)]["rewards_by_hotkey"] == {"a": pytest.approx(0.075),
                                                           "b": pytest.approx(0.025)}
-    assert archives.docs[(4, 6)]["rewards_by_hotkey"] == {"a": pytest.approx(0.1)}
+    assert archives.docs[(4, 7)]["rewards_by_hotkey"] == {"a": pytest.approx(0.1)}
     assert sorted(records.state["settled"]) == ["a1", "a2", "b1"]
     assert records.state["totals"]["verified_tokens"] == 450
 
@@ -133,9 +138,52 @@ def test_a_crash_after_choosing_pays_once():
     with pytest.raises(ConnectionError):
         asyncio.run(settler(records, archives, at(9)).settle_once())
     assert records.state["pending"]["work_period"] == 2
-    # Restarted later, in another period: the same archive, same entry period.
+    # Restarted in period 15: the weight-sets of 10..15 never saw it, so it enters
+    # at 16 instead, whole, rather than at 10 with most of its pay decayed away.
     assert asyncio.run(settler(records, archives, at(15)).settle_once()) == 2
+    assert set(archives.docs) == {(2, 16)} and records.state["pending"] is None
+    assert records.state["last_entry"] == 16
+
+
+def test_a_crash_after_the_write_does_not_write_again():
+    records, archives = Records(), Archives()
+    records.verdicts = {"a": verdict("a", "a", 10, at(2))}
+    s = settler(records, archives, at(9))
+
+    async def crash_after_write():
+        original = records.write_settlement
+        calls = []
+
+        async def flaky(job_id, state, etag):
+            calls.append(state)
+            if state.get("pending") is None and len(calls) > 1:
+                raise ConnectionError("lost after the archive")
+            return await original(job_id, state, etag)
+
+        records.write_settlement = flaky
+        with pytest.raises(ConnectionError):
+            await s.settle_once()
+        records.write_settlement = original
+
+    asyncio.run(crash_after_write())
+    assert set(archives.docs) == {(2, 10)} and records.state["pending"] is not None
+    asyncio.run(settler(records, archives, at(14)).settle_once())
     assert set(archives.docs) == {(2, 10)} and records.state["pending"] is None
+
+
+def test_a_backlog_enters_one_period_at_a_time():
+    records, archives = Records(), Archives()
+    records.verdicts = {f"v{p}": verdict(f"v{p}", "a", 10, at(p)) for p in range(2, 8)}
+    asyncio.run(settler(records, archives, at(9)).settle_once())
+    assert sorted(entry for _, entry in archives.docs) == list(range(10, 16))
+
+
+def test_a_window_settled_job_is_not_settled_by_period():
+    records, archives = Records(), Archives()
+    records.state = {"last_window": 45000, "settled": [], "pending": None}
+    records.verdicts = {"a": verdict("a", "a", 10, at(2))}
+    assert asyncio.run(settler(records, archives, at(9)).settle_once()) is None
+    assert archives.docs == {}
 
 
 def test_late_verdicts_of_a_paid_period_are_paid_against_its_whole_count():
@@ -143,8 +191,10 @@ def test_late_verdicts_of_a_paid_period_are_paid_against_its_whole_count():
     records.verdicts = {"a": verdict("a", "a", 30, at(2))}
     asyncio.run(settler(records, archives, at(9)).settle_once())
     records.verdicts["b"] = verdict("b", "b", 10, at(2))
-    asyncio.run(settler(records, archives, at(12)).settle_once())
-    assert archives.docs[(2, 13)]["rewards_by_hotkey"] == {"b": pytest.approx(0.1 * 10 / 40)}
+    asyncio.run(settler(records, archives, at(9, 3000)).settle_once())
+    # Same settling period, its own entry: the first payees' archive is untouched.
+    assert archives.docs[(2, 10)]["rewards_by_hotkey"] == {"a": pytest.approx(0.1)}
+    assert archives.docs[(2, 11)]["rewards_by_hotkey"] == {"b": pytest.approx(0.1 * 10 / 40)}
 
 
 def test_an_old_verdict_without_arrival_is_dated_by_its_audit():

@@ -215,3 +215,15 @@ def test_unreadable_period_pay_abstains(monkeypatch):
     wov = WeightOnlyValidator.__new__(WeightOnlyValidator)
     monkeypatch.setattr(wov, "_period_weights", broken, raising=False)
     assert asyncio.run(wov.submit_once()) is False
+
+
+def test_window_and_period_pay_of_one_task_add_up():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    window = [{"task_id": "corpus-x", "window_start": 5, "rewards_by_hotkey": {"a": 0.04}}]
+    alone = WeightOnlyValidator._replay_ema(window, caps={"corpus-x": 0.04},
+                                            floors={"corpus-x": (0.0, 0.0)})["a"]
+    both = WeightOnlyValidator._replay_ema(window, caps={"corpus-x": 0.04},
+                                           floors={"corpus-x": (0.0, 0.0)},
+                                           periods={"corpus-x": {"a": 0.001, "b": 0.002}})
+    assert both["a"] == pytest.approx(alone + 0.001) and both["b"] == pytest.approx(0.002)

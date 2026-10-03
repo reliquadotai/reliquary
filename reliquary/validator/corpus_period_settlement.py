@@ -30,15 +30,12 @@ PERIOD_ARCHIVE_SCHEMA = "reliquary/corpus-period/v1"
 # A submission received at a period's very end reaches the store within the
 # auditor's accept slack (corpus_auditor: 420 s).
 ADMISSION_SLACK_SECONDS = 420.0
+# Periods an undecided submission may hold the close before it is reported.
+STUCK_PERIODS = 6
 
 
 def _drand_genesis() -> float:
-    from reliquary.infrastructure import drand
-
-    genesis = drand.get_current_chain().get("genesis_time")
-    if genesis is None:
-        raise RuntimeError("drand chain info has no genesis time yet")
-    return float(genesis)
+    return cp.PERIOD_EPOCH
 
 
 class CorpusPeriodSettler:
@@ -147,10 +144,19 @@ class CorpusPeriodSettler:
 
     async def _finish(self, state: dict, etag) -> int:
         pending = state["pending"]
-        # Idempotent: the same key and the same document, however often a crash
-        # makes this run again.
-        await self._archives.write(self._task_id, pending["work_period"],
-                                   pending["entry_period"], self._archive(pending))
+        written = await self._archives.read(self._task_id, pending["work_period"],
+                                            pending["entry_period"])
+        if written is None:
+            # Not written yet. An entry period already under way, or past, would
+            # be missed by the weight-sets that ran before the archive lands:
+            # entered again, after them, so no share of it is ever skipped.
+            due = cp.period_of(self._clock(), self._genesis()) + 1
+            if pending["entry_period"] < due:
+                pending = {**pending, "entry_period": due}
+                state = {**state, "pending": pending, "last_entry": due}
+                etag = await self._records.write_settlement(self._job_id, state, etag)
+            await self._archives.write(self._task_id, pending["work_period"],
+                                       pending["entry_period"], self._archive(pending))
         period_tokens = {**(state.get("period_tokens") or {}),
                          str(pending["work_period"]): pending["period_tokens"]}
         final = {**state, "settled": await self._off(_union, state.get("settled"), pending["ids"]),
@@ -168,8 +174,15 @@ class CorpusPeriodSettler:
         """Settle every closed period with unsettled verdicts, oldest first; the
         last work period archived, or None."""
         state, etag = await self._records.read_settlement(self._job_id)
+        if state and (state.get("last_window") is not None
+                      or "window" in (state.get("pending") or {})):
+            # Settled by RL window until now (declared before this binary, or its
+            # settlement changed): moving it to periods mid-job is not exact.
+            logger.error("corpus task %s: job %s has a window settlement state; it is "
+                         "not settled by period", self._task_id, self._job_id)
+            return None
         state = {"schema": PERIOD_SETTLEMENT_SCHEMA, "settled": [], "pending": None,
-                 "period_tokens": {}, **(state or {})}
+                 "period_tokens": {}, "last_entry": None, **(state or {})}
         if state.get("totals") is None:
             state["totals"] = {"verdicts": 0, "passed": 0, "verified_tokens": 0}
         self._report(state, ())
@@ -188,6 +201,10 @@ class CorpusPeriodSettler:
         now = self._clock()
         closed = cp.closed_through(now=now, oldest_pending=oldest, genesis=genesis,
                                    slack=self._slack)
+        if oldest is not None and cp.period_of(now, genesis) - cp.period_of(
+                max(oldest, now - 10**9), genesis) > STUCK_PERIODS:
+            logger.warning("corpus task %s: an undecided submission from %.1f h ago holds every "
+                           "later period's pay", self._task_id, (now - oldest) / 3600)
         verdicts = await self._verdicts(new_ids)
         lister = getattr(self._records, "list_voided_ids", None)
         voided = set(await lister(self._job_id)) if lister is not None else set()
@@ -215,13 +232,21 @@ class CorpusPeriodSettler:
                 self._report(state, ids)
                 continue
             if earlier:
-                # Verdicts for a period already paid: only possible if one landed
-                # after its close. Paid against the period's whole token count.
-                logger.warning("corpus task %s: %d late verdict(s) for settled period %d",
-                               self._task_id, len(ids), period)
+                # A verdict for a period already paid: its close missed it (it
+                # should not). Paid against the period's whole token count, so the
+                # period pays slightly over its cap; loud, never silent.
+                logger.error("corpus task %s: %d late verdict(s) for settled period %d",
+                             self._task_id, len(ids), period)
             share = rewards_for(batch, self._cap * new_tokens / (earlier + new_tokens))
-            state = {**state, "pending": {
-                "work_period": period, "entry_period": max(period, cp.period_of(now, genesis)) + 1,
+            # One entry period per archive, strictly increasing: an entry never
+            # carries more than one period's cap, so a catch-up after a backlog is
+            # paid in full, later, instead of clamped at the task's cap.
+            last_entry = state.get("last_entry")
+            entry = cp.period_of(now, genesis) + 1
+            if last_entry is not None:
+                entry = max(entry, int(last_entry) + 1)
+            state = {**state, "last_entry": entry, "pending": {
+                "work_period": period, "entry_period": entry,
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
                 "period_tokens": earlier + new_tokens}}
             etag = await self._records.write_settlement(self._job_id, state, etag)

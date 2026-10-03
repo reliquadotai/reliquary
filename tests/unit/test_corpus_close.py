@@ -139,3 +139,15 @@ def test_a_real_corpus_entry_takes_cap_zero_then_retires(bucket, registry):  # n
 
 async def _none():
     return {}
+
+
+def test_a_period_job_needs_the_fleet_acknowledgement(bucket, registry):  # noqa: F811
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    argv = [a for a in _create_args() if a != "--fleet-knows-period-settlement"]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 1 and "--fleet-knows-period-settlement" in result.output
+    assert "corpus-run" not in registry["entries"]

@@ -491,25 +491,25 @@ class WeightOnlyValidator:
             by_task.setdefault(record.get("task_id", ""), []).append(record)
 
         combined: dict[str, float] = {}
-        # Period-settled tasks arrive already replayed on their own clock; the
-        # cap and the floor apply to them exactly as to the others.
-        replayed = {task_id: None for task_id in by_task}
-        replayed.update({task_id: dict(w) for task_id, w in (periods or {}).items()})
-        for task_id, ready in replayed.items():
-            if ready is not None:
-                ema = ready
-            else:
-                ema = {}
-                alpha = EMA_ALPHA
-                for record in sorted(by_task[task_id], key=lambda r: int(r["window_start"])):
-                    if record.get("window_status", "completed") == "aborted":
-                        continue
-                    rewards: dict[str, float] = record.get("rewards_by_hotkey", {})
-                    all_hotkeys = set(ema) | set(rewards)
-                    for hk in all_hotkeys:
-                        fraction = rewards.get(hk, 0.0)
-                        ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
-                    ema = {hk: v for hk, v in ema.items() if v > 1e-6}
+        # Period-settled tasks arrive already replayed on their own clock, and
+        # are added to whatever window archives the same task still has (a job
+        # settled by window before its validator learnt periods): neither tail
+        # is dropped. The cap and the floor apply to the sum, as to every task.
+        periods = periods or {}
+        for task_id in dict.fromkeys((*by_task, *periods)):
+            ema = {}
+            alpha = EMA_ALPHA
+            for record in sorted(by_task.get(task_id, ()), key=lambda r: int(r["window_start"])):
+                if record.get("window_status", "completed") == "aborted":
+                    continue
+                rewards: dict[str, float] = record.get("rewards_by_hotkey", {})
+                all_hotkeys = set(ema) | set(rewards)
+                for hk in all_hotkeys:
+                    fraction = rewards.get(hk, 0.0)
+                    ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
+                ema = {hk: v for hk, v in ema.items() if v > 1e-6}
+            for hk, v in (periods.get(task_id) or {}).items():
+                ema[hk] = ema.get(hk, 0.0) + float(v)
             ema = WeightOnlyValidator._clamp_to_cap(
                 task_id, ema, None if caps is None else caps.get(task_id)
             )

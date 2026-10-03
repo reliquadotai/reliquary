@@ -110,7 +110,7 @@ def _eval_args(**overrides):
                "--renderer-id": "chat-template-thinking-v1", "--eos-token-id": "151645",
                "--max-new-tokens": "1024", "--slots-per-prompt": "4", "--cap": "0.02"}
     options.update(overrides)
-    argv = ["jobs", "create", ACK]
+    argv = ["jobs", "create", ACK, "--fleet-knows-period-settlement"]
     for flag, value in options.items():
         if value is not None:
             argv += [flag, value]

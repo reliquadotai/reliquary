@@ -76,6 +76,14 @@ class R2PeriodArchives:
     async def write(self, task_id, work_period, entry_period, document) -> None:
         if self._guard is not None:
             self._guard.refuse_unserved(task_id)
+        existing = await read_period_archive(task_id, work_period, entry_period)
+        if existing is not None:
+            if existing != document:
+                # Each archive has its own entry period: another document under the
+                # same key would be pay paid twice, or erased.
+                raise RuntimeError(f"period archive {task_id} {work_period}-{entry_period} "
+                                   "already holds another document")
+            return
         await write_period_archive(task_id, work_period, entry_period, document)
 
     async def list(self, task_id) -> list[tuple[int, int]]:
