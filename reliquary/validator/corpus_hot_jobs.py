@@ -87,7 +87,10 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     refusal = startup_refusal(entry, job, own, fingerprint)
     if refusal:
         return REFUSED, refusal
-    source = job.prompt_source
+    from reliquary.eval.prompt_source import declared_environment
+
+    # An eval job reads a frozen set; its contract declares the set's environment.
+    source = declared_environment(entry.contract, job.prompt_source) or job.prompt_source
     declared = (entry.contract.get("environments") or {}).get(source)
     served = (process_contract.get("environments") or {}).get(source)
     if declared is None or declared != served:
@@ -340,7 +343,8 @@ class CorpusJobSet:
                        task_id, job_id, failures, exc_info=True)
             return
         self._wire_failures.pop(task_id, None)
-        self._routes.add(job_id, router, contract=entry.contract)
+        self._routes.add(job_id, router, contract=entry.contract,
+                         prompt_source=job.prompt_source)
         if entry.status != "active":
             # Wired only to finish its audits and settlement: no admission.
             self._routes.retire(job_id)
