@@ -114,6 +114,15 @@ def completion_chunk_scores(
     return SCORE_OK, tuple(results)
 
 
+def rows_of_items(items: Sequence[dict]) -> list[tuple]:
+    """``score_sequences`` rows from ``{tokens, prompt_len, proofs[, spans]}``
+    dicts: a trajectory's spans must reach the scorer or it is read as a
+    single-turn row."""
+    return [(i["tokens"], i["prompt_len"], i["proofs"])
+            if i.get("spans") is None
+            else (i["tokens"], i["prompt_len"], i["proofs"], i["spans"]) for i in items]
+
+
 def trajectory_chunk_scores(
     span_rows: Sequence[torch.Tensor], proofs_b64: Sequence[str], *, chunk_tokens: int,
     topk: int, min_chunk_tokens: int = MIN_CHUNK_TOKENS,

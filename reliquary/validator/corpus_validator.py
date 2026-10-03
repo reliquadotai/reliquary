@@ -830,7 +830,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     remote = directory = None
     if remote_audit:
         from reliquary.infrastructure import corpus_executor_store as executor_store
-        from reliquary.validator.corpus_audit import score_sequences
+        from reliquary.validator.corpus_audit import rows_of_items, score_sequences
         from reliquary.validator.corpus_audit_remote import (
             RECHECK_FRACTION, ExecutorDirectory, RemoteAuditDispatcher,
         )
@@ -840,7 +840,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             # The trusted verifier: this GPU, in turn with every job's auditor.
             async with gpu_lock:
                 scores, _, _ = await run_in(judge_threads.gpu, lambda: score_sequences(
-                    model, [(i["tokens"], i["prompt_len"], i["proofs"]) for i in items],
+                    model, rows_of_items(items),
                     chunk_tokens=proof.chunk_tokens, topk=proof.topk,
                     batch_tokens=AUDIT_BATCH_TOKENS))
             return scores

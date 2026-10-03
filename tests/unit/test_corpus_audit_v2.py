@@ -113,3 +113,120 @@ def test_item_spans_are_offset_by_the_prompt_length():
     (item,) = items
     assert item[5] == [(8, 48), (63, 98)] and item[3] == 8
     assert item[2] == PROMPT + TOKENS and results == [None]
+
+
+# ---- fix round 1: every scorer carries the spans, malformed records are ours ----
+
+import copy
+import json
+
+import pytest
+
+from reliquary.protocol.toploc import ChunkResult
+from reliquary.validator.corpus_audit import SCORE_OK, rows_of_items
+from reliquary.validator.corpus_gpu import decode_request, encode_request
+
+
+def test_the_gpu_wire_carries_a_trajectorys_spans():
+    rows = [(PROMPT + TOKENS, 8, ["a", "b"], [(8, 48), (63, 98)]), ([1, 2, 3], 1, ["c"])]
+    back, chunk, topk = decode_request(encode_request(rows, chunk_tokens=32, topk=128))
+    assert back == [(PROMPT + TOKENS, 8, ["a", "b"], [(8, 48), (63, 98)]), ([1, 2, 3], 1, ["c"])]
+    assert (chunk, topk) == (32, 128)
+
+
+def test_a_gpu_process_scorer_receives_the_spans_and_judges_a_trajectory():
+    model = _tiny(0)
+    seen = []
+
+    async def scorer(rows):
+        seen.extend(rows)
+        rows = decode_request(encode_request(rows, chunk_tokens=32, topk=128))[0]
+        scores, _, _ = score_sequences(model, rows, chunk_tokens=32, topk=128, batch_tokens=10_000)
+        return scores, 0.0, 0.0
+
+    records = _Records({ID: _record(model)})
+    auditor = CorpusAuditor(job_id="swe-agentic-v1", records=records, model=None,
+                            tokenizer=_Tokenizer(), proof=PROOF, scorer=scorer,
+                            vocab_size=1000)
+    verdict = asyncio.run(auditor.audit(ID))
+    assert verdict["passed"] is True, verdict
+    assert len(seen[0]) == 4 and seen[0][3] == [(8, 48), (63, 98)]
+
+
+def test_rows_of_items_keeps_the_spans():
+    items = [{"tokens": [1, 2], "prompt_len": 1, "proofs": ["p"]},
+             {"tokens": [1, 2, 3], "prompt_len": 1, "proofs": ["p"], "spans": [(1, 3)]}]
+    assert rows_of_items(items) == [([1, 2], 1, ["p"]), ([1, 2, 3], 1, ["p"], [(1, 3)])]
+
+
+class _Remote:
+    def __init__(self):
+        self.calls = 0
+
+    def connected(self):
+        return True
+
+    def subscribe(self, listener):
+        pass
+
+    async def score(self, items):
+        self.calls += 1
+        raise AssertionError("a trajectory must never reach the remote executors")
+
+
+def test_a_trajectory_on_the_remote_branch_is_a_validator_error_not_a_verdict():
+    model = _tiny(0)
+    remote = _Remote()
+    records = _Records({ID: _record(model)})
+    auditor = CorpusAuditor(job_id="swe-agentic-v1", records=records, model=model,
+                            tokenizer=_Tokenizer(), proof=PROOF, remote=remote)
+    (outcome,) = asyncio.run(auditor._audit_outcomes([_record(model)]))
+    assert isinstance(outcome, str) and "remote" in outcome
+    assert remote.calls == 0 and records.verdicts == {}
+
+
+def test_the_eval_auditor_refuses_a_trajectory_too():
+    from reliquary.validator.eval_control import eval_auditor
+
+    auditor = eval_auditor(job_id="order-eval-1", records=None, tokenizer=_Tokenizer(),
+                           proof=PROOF, vocab_size=1000, remote=_Remote())
+    with pytest.raises(RuntimeError):
+        asyncio.run(auditor._forward([_record(_tiny(0))], local=True))
+
+
+def _broken(mutate):
+    record = copy.deepcopy(_record(_tiny(0)))
+    mutate(record)
+    return record
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda r: r["completions"][0].pop("turns"),
+    lambda r: r["completions"][0].pop("prompt_tokens"),
+    lambda r: r["completions"][0]["turns"][0].pop("proofs"),
+    lambda r: r["completions"][0]["turns"][1].update(end=500),     # out of bounds
+    lambda r: r["completions"][0]["turns"][1].update(start=30),    # overlaps the first
+    lambda r: r["completions"].append(copy.deepcopy(r["completions"][0])),  # two completions
+])
+def test_a_malformed_v2_record_is_a_validator_error_and_spares_its_neighbours(mutate):
+    model = _tiny(0)
+    auditor = _auditor(model, _Records({}))
+    good, bad = _record(model), _broken(mutate)
+    outcomes = asyncio.run(auditor._audit_outcomes([bad, good]))
+    assert isinstance(outcomes[0], str) and outcomes[0]
+    assert outcomes[1]["passed"] is True
+
+
+def test_the_first_failing_span_names_the_reason():
+    ok, bad = ChunkResult(0, 0.0, 0.0), ChunkResult(10_000, 1e9, 1e9)
+    outcome = trajectory_outcome("ok", [ok, bad, bad, ok], [40, 40, 35], PROOF)
+    # spans: 40 -> 2 chunks (ok, bad); 40 -> 2 chunks (bad, ok); the third has none left.
+    assert outcome.passed is False and outcome.reason
+    assert outcome.reason == trajectory_outcome("ok", [ok, bad], [40], PROOF).reason
+    first_good_then_bad = trajectory_outcome("ok", [ok, ok, bad, bad], [40, 40], PROOF)
+    assert first_good_then_bad.passed is False
+
+
+def test_a_bad_status_fails_the_trajectory_with_that_status():
+    outcome = trajectory_outcome("proof_undecodable", (), [40, 35], PROOF)
+    assert (outcome.passed, outcome.reason) == (False, "proof_undecodable")

@@ -37,7 +37,7 @@ from reliquary.corpus.audit_policy import (
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.protocol.profiles import ProofProfile
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
-from reliquary.validator.corpus_audit import outcome_from_scores, score_sequences, trajectory_outcome
+from reliquary.validator.corpus_audit import check_spans, outcome_from_scores, score_sequences, trajectory_outcome
 from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
 
 logger = logging.getLogger(__name__)
@@ -370,6 +370,13 @@ class CorpusAuditor:
                       else self._model.get_input_embeddings().num_embeddings)
         items = []
         for i, record in enumerate(records):
+            if record.get("schema") == RECORD_SCHEMA_V2:
+                item = self._prepare_trajectory(record)
+                if min(item[1]) < 0 or max(item[1]) >= vocabulary:
+                    results[i] = {"passed": False, "reason": REASON_TOKEN_OUT_OF_VOCAB, **worst_zero}
+                else:
+                    items.append((i, *item))
+                continue
             if not record["completions"]:
                 # Fail closed like sequence_verdict does for an empty chunk sequence:
                 # no completions must never read as a vacuous pass paid like honest work.
@@ -385,15 +392,6 @@ class CorpusAuditor:
             )
             if out_of_vocab:
                 results[i] = {"passed": False, "reason": REASON_TOKEN_OUT_OF_VOCAB, **worst_zero}
-                continue
-            if record.get("schema") == RECORD_SCHEMA_V2:
-                # The validator's own render of the prompt, recorded at intake.
-                trajectory = record["completions"][0]
-                prompt = [int(t) for t in trajectory["prompt_tokens"]]
-                spans = [(len(prompt) + turn["start"], len(prompt) + turn["end"])
-                         for turn in trajectory["turns"]]
-                proofs = [p for turn in trajectory["turns"] for p in turn["proofs"]]
-                items.append((i, 0, prompt + list(trajectory["tokens"]), len(prompt), proofs, spans))
                 continue
             prompt = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
             for c_idx, completion in enumerate(record["completions"]):
@@ -420,6 +418,33 @@ class CorpusAuditor:
                     passed, reason = False, outcome.reason
             results[i] = {"passed": passed, "reason": reason, **worst}
         return results
+
+    @staticmethod
+    def _prepare_trajectory(record: dict) -> tuple:
+        """``(0, tokens, prompt_len, proofs, spans)`` of a stored v2 record. The
+        record was written by this validator's intake, so a malformed one is
+        our fault: a ValueError (a validator-side error, no miner verdict)."""
+        try:
+            (trajectory,) = record["completions"]
+            prompt = [int(t) for t in trajectory["prompt_tokens"]]
+            tokens = [int(t) for t in trajectory["tokens"]]
+            turns = trajectory["turns"]
+            spans = [(len(prompt) + int(t["start"]), len(prompt) + int(t["end"])) for t in turns]
+            proofs = [p for t in turns for p in t["proofs"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"malformed trajectory record: {exc!r}") from None
+        check_spans(spans, len(prompt) + len(tokens))
+        if not tokens:
+            raise ValueError("malformed trajectory record: no tokens")
+        return 0, prompt + tokens, len(prompt), proofs, spans
+
+    @staticmethod
+    def _refuse_trajectories(items: list[tuple]) -> None:
+        """The remote executors' wire does not carry spans yet: a trajectory
+        scored there would be read as a single-turn row and fail an honest
+        miner, so it is a validator-side error instead (no miner verdict)."""
+        if any(item[5] is not None for item in items):
+            raise RuntimeError("trajectory audit is not available on remote executors")
 
     def _outcome(self, item: tuple, status: str, chunks):
         spans = item[5]
@@ -535,10 +560,10 @@ class CorpusAuditor:
         if not local and self._remote is not None and self._remote.connected():
             # An executor computes the chunk scores; the decision stays here.
             results, items = await self._in("codec", self._prepare, records)
+            self._refuse_trajectories(items)
             scores = await self._remote.score(
-                [{"tokens": tokens, "prompt_len": n, "proofs": proofs,
-                  **({"spans": spans} if spans is not None else {})}
-                 for _, _, tokens, n, proofs, spans in items])
+                [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
+                 for _, _, tokens, n, proofs, _spans in items])
             outcomes, scored_by = {}, {}
             for item, (status, chunks, executor) in zip(items, scores):
                 outcomes[item[0], item[1]] = self._outcome(item, status, chunks)

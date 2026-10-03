@@ -101,10 +101,11 @@ def encode_request(rows: Sequence, *, chunk_tokens: int, topk: int) -> bytes:
     seconds; packed, they are a copy."""
     items, proofs = [], []
     tokens = array.array("i")
-    for row_tokens, prompt_len, row_proofs in rows:
+    for row_tokens, prompt_len, row_proofs, *rest in rows:
         tokens.extend(row_tokens)
         proofs.extend(row_proofs)
-        items.append([len(row_tokens), int(prompt_len), len(row_proofs)])
+        items.append([len(row_tokens), int(prompt_len), len(row_proofs)]
+                     + ([[[int(a), int(b)] for a, b in rest[0]]] if rest and rest[0] is not None else []))
     header = json.dumps({"chunk_tokens": int(chunk_tokens), "topk": int(topk), "items": items,
                          "token_bytes": len(tokens) * tokens.itemsize})
     if sys.byteorder != "little":
@@ -122,14 +123,15 @@ def decode_request(body: bytes) -> tuple[list, int, int]:
         tokens.byteswap()
     flat = tokens.tolist()
     text = body[start + header["token_bytes"]:]
-    total = sum(n for _, _, n in header["items"])
+    total = sum(item[2] for item in header["items"])
     # An empty proof is a proof (a failing one), never "no proof".
     proofs = text.decode().split("\n") if total else []
-    if len(proofs) != total or len(flat) != sum(n for n, _, _ in header["items"]):
+    if len(proofs) != total or len(flat) != sum(item[0] for item in header["items"]):
         raise ValueError("a request's proofs or tokens do not match its header")
     rows, at, proof_at = [], 0, 0
-    for n_tokens, prompt_len, n_proofs in header["items"]:
-        rows.append((flat[at:at + n_tokens], prompt_len, proofs[proof_at:proof_at + n_proofs]))
+    for n_tokens, prompt_len, n_proofs, *spans in header["items"]:
+        row = (flat[at:at + n_tokens], prompt_len, proofs[proof_at:proof_at + n_proofs])
+        rows.append(row + ([tuple(s) for s in spans[0]],) if spans else row)
         at += n_tokens
         proof_at += n_proofs
     return rows, int(header["chunk_tokens"]), int(header["topk"])
@@ -145,7 +147,7 @@ class _Request:
     queued_at: float = field(default_factory=time.monotonic)
 
     def __post_init__(self) -> None:
-        self.tokens = sum(len(tokens) for tokens, _, _ in self.rows)
+        self.tokens = sum(len(row[0]) for row in self.rows)
 
 
 class GpuBatcher:

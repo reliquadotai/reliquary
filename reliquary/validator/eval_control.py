@@ -564,6 +564,7 @@ def eval_auditor(**kwargs):
 
         async def _forward(self, records, *, local: bool = False):
             results, items = await asyncio.to_thread(self._prepare, records)
+            self._refuse_trajectories(items)
             scores = await self._remote.score(
                 [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
                  for _, _, tokens, n, proofs, _spans in items])
