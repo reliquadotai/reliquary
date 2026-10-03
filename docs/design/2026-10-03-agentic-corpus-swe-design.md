@@ -258,6 +258,25 @@ is recorded in this file before the dependent component is written.
   whose box differs for real, so no rule was added.
 - **M3 — audit cost.** Time the TOPLOC prefill of 40k-token trajectories on the
   27B. It sets `audit_q` for the job.
+  **M3 result (2026-10-03, H100 80 GB, Qwen3.8-27B bf16 text-only, sdpa,
+  `scripts/agentic_audit_cost.py`, data in
+  `docs/design/measurements/2026-10-03-m3-audit-cost.json`).** One prefill of the
+  whole trajectory plus proof verification of one 400-token span per 1000 tokens
+  (3 repeats, stable to 1%; synthetic tokens, cost depends on length only):
+  10k = 2.0 s, 20k = 4.3 s (+0.26 s verify), 40k = 9.7 s (+0.5 s), 50k = 12.5 s,
+  60k = 15.4 s (+0.8 s). Roughly linear, about 0.25 ms/token. Peak memory with
+  the weights (about 50 GB): 54 GB at 10k, 57 at 20k, 64 at 40k, 68 at 50k,
+  71.5 at 60k. **60k fits on one 80 GB card, no OOM**, but with 8 GB of headroom
+  and allocator retries logged; 60k is the practical ceiling for
+  `max_total_tokens` on this hardware without chunked prefill. Audit capacity of
+  one audit GPU, `3600 / (prefill + verify)` per hour: 783/h at 20k, 350/h at 40k,
+  223/h at 60k. With about 1 trajectory/min per miner (60/h): 10 miners produce
+  600/h, 50 miners 3000/h. `audit_q = min(1, capacity / produced)`: at 20k median
+  1.0 at 10 miners (1.3 before the cap) and 0.26 at 50; at 40k median 0.58 at
+  10 and 0.12 at 50; at 60k 0.37 and 0.07. One audit GPU therefore covers all
+  trajectories only at 10 miners with a median of 20k tokens or less; beyond
+  that either more audit GPUs (n GPUs multiply `audit_q` by n) or a lower
+  `audit_q` is needed.
 
 ## 8. Prerequisites outside this repository
 
