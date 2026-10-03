@@ -283,3 +283,37 @@ def test_the_agentic_run_never_names_the_single_turn_container():
     from scripts import agentic_corpus_e2e, corpus_e2e
 
     assert agentic_corpus_e2e.MINIO_CONTAINER != corpus_e2e.MINIO_CONTAINER
+
+
+def test_the_forged_bash_env_names_a_file_every_box_has():
+    # bash ignores a BASH_ENV file that does not exist (measured 2026-10-03:
+    # the forged episode's observations equalled the replay's), so the forgery
+    # sources a file present in every container whose content is no command.
+    from scripts.agentic_corpus_e2e import FORGED_BASH_ENV
+
+    assert FORGED_BASH_ENV == {"BASH_ENV": "/etc/hostname"}
+
+
+def test_forger_keys_land_on_prompts_nobody_else_visits():
+    from scripts.agentic_corpus_e2e import pick_forger_keys
+    from reliquary.corpus.walk import job_walk_index
+
+    job = SimpleNamespace(job_id=JOB_ID, prompt_start=8, prompt_count=8)
+    honest = "5FjxQw33tLKUwqeoJ8oDtgmejcRUw25eKAaApKoawiV7CWur"
+    counter = iter(range(10_000))
+    keys = pick_forger_keys(job, honest, honest_episodes=6,
+                            make_key=lambda: SimpleNamespace(ss58_address=f"key-{next(counter)}"))
+    honest_prompts = {job_walk_index(job, honest, c) for c in range(6)}
+    forger_prompts = [job_walk_index(job, keys[r].ss58_address, 0) for r in ("forge_diff", "forge_obs")]
+    assert len(set(forger_prompts)) == 2
+    assert not set(forger_prompts) & honest_prompts
+
+
+def test_forger_keys_refuse_when_no_prompt_is_free():
+    from scripts.agentic_corpus_e2e import pick_forger_keys
+
+    job = SimpleNamespace(job_id=JOB_ID, prompt_start=0, prompt_count=1)
+    counter = iter(range(10_000))
+    with pytest.raises(SystemExit):
+        pick_forger_keys(job, "honest", honest_episodes=1,
+                         make_key=lambda: SimpleNamespace(ss58_address=f"key-{next(counter)}"))

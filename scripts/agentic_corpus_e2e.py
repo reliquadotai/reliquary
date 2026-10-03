@@ -62,10 +62,16 @@ SANCTION_EXECUTORS = 2
 # in it, the new file touches no test) but is not what the actions produce.
 FORGED_HUNK = ("diff --git a/FORGED.txt b/FORGED.txt\nnew file mode 100644\n--- /dev/null\n"
                "+++ b/FORGED.txt\n@@ -0,0 +1 @@\n+forged\n")
-# Every bash command of the forging box prints this missing file's error: the
-# model sees it, the replay box does not, so every bash observation differs.
-# Edit observations are untouched (the edit tool runs no bash).
-FORGED_BASH_ENV = {"BASH_ENV": "/nonexistent/forged-observation"}
+# Every bash command of the forging box sources /etc/hostname (present in every
+# container, its content the container id) and prints "/etc/hostname: line 1:
+# <id>: command not found": the model sees it, the replay box does not, so
+# every bash observation differs. A missing file would not do: bash ignores a
+# BASH_ENV that does not exist (measured 2026-10-03, a first run's forged
+# episode replayed with 0 mismatches). Edit observations are untouched (the
+# edit tool runs no bash).
+FORGED_BASH_ENV = {"BASH_ENV": "/etc/hostname"}
+# Fresh keys tried per forger before giving up on a free prompt.
+FORGER_KEY_ATTEMPTS = 2000
 # Environment variables never written to the state directory.
 _SECRET_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
 # Never the single-turn e2e's "corpus-e2e-minio": starting this run must not
@@ -174,6 +180,32 @@ def forgeable_bash_observations(actions: Iterable) -> int:
             continue
         count += isinstance(arguments, dict)
     return count
+
+
+def pick_forger_keys(job, honest_hotkey: str, *, honest_episodes: int, make_key) -> dict:
+    """A key per forger whose first prompt no other role visits.
+
+    The walk draws prompts with replacement, so a forger's single episode can
+    land on a prompt the honest miner (or the other forger) fills first and be
+    refused ``prompt_full`` (a 2026-10-03 run lost its forged diff that way).
+    Keys are free: draw until each forger's cursor 0 is a prompt nobody else's
+    walk visits."""
+    from reliquary.corpus.walk import job_walk_index
+
+    taken = {job_walk_index(job, honest_hotkey, c) for c in range(honest_episodes)}
+    keys = {}
+    for role in FORGERS:
+        for _ in range(FORGER_KEY_ATTEMPTS):
+            key = make_key()
+            prompt = job_walk_index(job, key.ss58_address, 0)
+            if prompt not in taken:
+                keys[role] = key
+                taken.add(prompt)
+                break
+        else:
+            raise SystemExit(f"no free prompt for {role}: the honest walk and the other "
+                             f"forger cover every prompt; raise --prompt-count")
+    return keys
 
 
 def forged_diff(gold_patch: str) -> str:
@@ -324,7 +356,12 @@ def mine(args) -> None:
         raise SystemExit("refusing to mine: the downloaded checkpoint does not match the "
                          "job's fingerprint")
     # Throwaway, unregistered keys held in memory only: the run never needs them again.
-    keys = {role: bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic()) for role in ROLES}
+    def new_key():
+        return bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
+
+    keys = {"honest": new_key()}
+    keys.update(pick_forger_keys(job, keys["honest"].ss58_address,
+                                 honest_episodes=args.honest_episodes, make_key=new_key))
     (state / "hotkeys.json").write_text(json.dumps({r: k.ss58_address for r, k in keys.items()}))
 
     def signer(keypair):
