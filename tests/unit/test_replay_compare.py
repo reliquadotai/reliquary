@@ -53,3 +53,34 @@ def test_a_short_replay_counts_missing_observations_as_mismatched():
 def test_non_utf8_replacement_characters_compare():
     rec = [Action("bash", "{}", "x�")]
     assert compare(rec, ["x�"], "", "").mismatched == []
+
+
+def test_normalize_hides_object_addresses():
+    assert normalize("<Raise l.1 at 0x73afef757920>") == normalize("<Raise l.1 at 0x758af2b72690>")
+
+
+def test_normalize_hides_the_base_commit_hash():
+    assert normalize("88dd52e base\n") == normalize("5143544 base\n")
+    assert normalize("c7816e1 base") != normalize("c7816e1 other")
+
+
+def test_normalize_hides_hash_in_built_version_strings():
+    assert normalize("Project version: 0+untagged.1.g07cd5ea") == normalize("Project version: 0+untagged.1.g83c8afb")
+
+
+def test_normalize_hides_ls_mtimes_but_not_sizes_or_names():
+    a = "-rw-r--r-- 1 root root   664 Oct  2 19:36 /testbed/src/docx/image/__init__.py"
+    b = "-rw-r--r-- 1 root root   664 Oct  3 09:31 /testbed/src/docx/image/__init__.py"
+    assert normalize(a) == normalize(b)
+    assert normalize(a) != normalize(b.replace("664", "665"))
+
+
+def test_normalize_hides_date_output():
+    assert normalize("Fri Oct  2 19:49:31 UTC 2026") == normalize("Sat Oct  3 09:32:48 UTC 2026")
+
+
+def test_normalize_hides_git_show_commit_and_date():
+    a = "commit 5b26444a37283a20ca4cef1cc14ef10498b85cb9\nAuthor: reliquary-swe <r@localhost>\nDate:   Fri Oct  2 19:49:46 2026 +0000\n"
+    b = "commit ea9e4f8435e5ae79a89adf40ba36335089d60ff2\nAuthor: reliquary-swe <r@localhost>\nDate:   Sat Oct  3 09:32:51 2026 +0000\n"
+    assert normalize(a) == normalize(b)
+    assert normalize(a) != normalize(b.replace("Author: reliquary-swe", "Author: someone"))

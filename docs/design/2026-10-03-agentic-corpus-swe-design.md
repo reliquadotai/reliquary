@@ -233,6 +233,29 @@ is recorded in this file before the dependent component is written.
   If the diff is not reproducible for more than 2%, replay is downgraded to
   "grade the replay's diff" (outcome reproduction instead of diff equality) and
   this spec is amended.
+  **M2 result (2026-10-03, sandbox-dev-01, 8 concurrent replays,
+  `docs/design/measurements/2026-10-03-m2-replay-agreement.json`).** PASS:
+  `diff_equal` 66/66 of the 66 replayed episodes (0 errors); the diff is
+  reproduced exactly, so diff equality is kept (no downgrade to "grade the
+  replay's diff"). Observations: 2017 compared. Mismatch share 186/2017 = 9.2%
+  with the first rule set (durations, timestamps), 68/2017 = 3.4% after the
+  rules added from the observed pairs: object addresses (`0x...`), the box's own
+  `base` commit hash, hashes in built version strings, `ls -l` mtimes, `date`
+  and `git log/show` dates and full hashes. **Replay tolerance: 5.4% of
+  observations (3.4% + 2 points)**; the per-episode spread is in the JSON.
+  Residual mismatches (not normalisable, absorbed by the tolerance): pytest
+  `--durations` lists and parallel ninja progress lines, whose order follows
+  timing (30 of 68); commands listing the recording box's pip cache, conda
+  channels, or `find /` (28); user-site `sys.path` (see below); `stat %Y` epochs.
+  Replay cost: p50 42.6 s per episode; about 288 vCPU-seconds per replay
+  (vmstat over the 22 min run, 8 in parallel, includes box start and the
+  episodes' own test suites; first run 294).
+  **User-site decision: (b), leave it counted.** The recording harness installed
+  its own dependencies into `/root/.local/lib/python3.12/site-packages`, so
+  commands printing `sys.path`/`pip list`/`env` differ. Measured on the
+  recorded traces: 6 of 2017 observations (0.3%), in 6 of 66 episodes. That is
+  inside the tolerance, and a rule hiding that path would also hide a miner
+  whose box differs for real, so no rule was added.
 - **M3 — audit cost.** Time the TOPLOC prefill of 40k-token trajectories on the
   27B. It sets `audit_q` for the job.
 

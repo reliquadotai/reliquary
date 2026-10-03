@@ -19,6 +19,16 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b\d+(\.\d+)?s\b"), "<dur>"),                           # "0.75s"
     (re.compile(r"\b\d+(\.\d+)? ?(ms|seconds?|secs?)\b"), "<dur>"),       # "12 ms"
     (re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?"), "<ts>"),  # ISO timestamps
+    (re.compile(r"\b0x[0-9a-f]{6,}\b"), "<addr>"),                       # object addresses in reprs
+    (re.compile(r"\b[0-9a-f]{7,40}(?= base\b)"), "<commit>"),             # the box's own "base" commit
+    (re.compile(r"\.g[0-9a-f]{7,40}\b"), ".g<commit>"),                  # version strings built from it
+    (re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                r" +\d{1,2} \d{2}:\d{2}:\d{2} [A-Z]{2,5} \d{4}\b"), "<date>"),  # `date`
+    (re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                r" +\d{1,2} \d{2}:\d{2}:\d{2} \d{4} [+-]\d{4}\b"), "<gitdate>"),   # git log/show Date:
+    (re.compile(r"(?<=commit )[0-9a-f]{40}\b"), "<commit>"),             # git log/show full hash
+    (re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} +\d{2}:\d{2}\b"),
+     "<mtime>"),                                                         # ls -l mtimes (checkout time)
 )
 
 
