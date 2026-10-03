@@ -78,13 +78,15 @@ def resolve_task_config(
 
         # Shape is the registry's job; whether this binary can execute the
         # contract is ours, and it must fail here rather than mid-window.
+        from reliquary.protocol.agentic_source import AGENTIC_BODIES
         from reliquary.protocol.external_eval import EXTERNAL_BODIES
         from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
 
         declared = set(entry.contract.get("environments") or ())
         # An evaluation job's set environment is a statement, not a package:
         # its rows come frozen from the set, so only a corpus task may carry it.
-        statements = (set(EXTERNAL_BODIES)
+        # The agentic contract environment is the same kind of statement.
+        statements = (set(EXTERNAL_BODIES) | set(AGENTIC_BODIES)
                       if entry.mechanism == MECHANISM_CORPUS_GENERATION else set())
         missing = sorted(declared - set(ENVIRONMENT_SPECS) - statements)
         if missing:

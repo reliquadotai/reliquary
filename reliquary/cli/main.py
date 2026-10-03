@@ -882,6 +882,7 @@ def build_job_manifest(
     prompt_start=0,
     seed=None,
     submit=None,
+    episode=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -942,6 +943,8 @@ def build_job_manifest(
         manifest["seed"] = seed
     if submit is not None:
         manifest["submit"] = submit
+    if episode is not None:
+        manifest["episode"] = episode
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
     # time: an unrenderable source fails fidelity forever, and a range
@@ -959,6 +962,7 @@ def build_job_manifest(
 def _corpus_base_profile(
     *, task_id, from_profile, model, model_revision, model_architecture,
     prompt_encoding, renderer_id, prompt_source, external_eval=False,
+    agentic=False,
 ):
     """The profile a corpus job's contract is built from: the named template, or
     one composed from the model, the ``corpus-v1`` run policy and the catalog."""
@@ -985,6 +989,7 @@ def _corpus_base_profile(
         run=RUN_POLICIES["corpus-v1"],
         environments=[prompt_source],
         external_eval=external_eval,
+        agentic=agentic,
     )
 
 
@@ -995,7 +1000,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None,
+    submit=None, episode=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1010,7 +1015,7 @@ def prepare_corpus_job(
         task_id=task_id or job_id, from_profile=from_profile, model=model,
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-        prompt_source=environment, external_eval=is_eval_source(prompt_source),
+        prompt_source=environment, external_eval=is_eval_source(prompt_source), agentic=episode is not None,
     )
     if max_new_tokens is None:
         # The template or catalog budgets each environment; the length stays
@@ -1052,6 +1057,7 @@ def prepare_corpus_job(
         deadline_round=deadline_round,
         seed=seed,
         submit=submit,
+        episode=episode,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -1246,6 +1252,12 @@ def jobs_create(
             "validator derive it from its own card."
         ),
     ),
+    episode_file: str = typer.Option(
+        None,
+        "--episode-file",
+        help="An agentic job: a JSON file holding the manifest's `episode` object "
+        "(spec section 6). Its prompt source is reliquary_agentic_swe_v1",
+    ),
     fleet_knows_corpus_generation: bool = typer.Option(
         False,
         "--fleet-knows-corpus-generation",
@@ -1278,7 +1290,7 @@ def jobs_create(
     overrides = {
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
     }
-    contract_environment = seed = None
+    contract_environment = seed = episode = None
     try:
         if (prompt_source is None) == (eval_set is None):
             raise ValueError("give exactly one of --prompt-source and --eval-set")
@@ -1289,7 +1301,12 @@ def jobs_create(
                 grader_id=grader_id, threshold=threshold, from_profile=from_profile)
         elif prompt_count is None:
             raise ValueError("--prompt-count is required with --prompt-source")
-    except ValueError as exc:
+        if episode_file is not None:
+            import json
+
+            with open(episode_file, encoding="utf-8") as handle:
+                episode = json.load(handle)
+    except (OSError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     try:
@@ -1313,7 +1330,7 @@ def jobs_create(
             min_new_tokens=min_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
             n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
             deadline_round=deadline_round, overrides=overrides, verification=verification,
-            contract_environment=contract_environment, seed=seed,
+            contract_environment=contract_environment, seed=seed, episode=episode,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)

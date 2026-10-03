@@ -304,6 +304,69 @@ class SingleTurnPromptRenderer:
         return task.prompt
 
 
+class AgenticSourceSpec:
+    """What `resolve_prompt_source` returns for the agentic contract
+    environment: the job's `episode`, buildable into its SWE-smith rows."""
+
+    interaction_mode = "agentic"
+
+    def __init__(self, episode: Any) -> None:
+        self.episode = episode
+
+    def create(self):
+        from reliquary.environment import agentic_swe
+
+        return agentic_swe.load_swe_source(self.episode.env.num_images)
+
+
+class AgenticPromptJob:
+    """The rows of an episode job, bounded to the ones it owns."""
+
+    __slots__ = ("_job", "_source")
+
+    def __init__(self, job: JobSpec, source: Any) -> None:
+        self._job = job
+        self._source = source
+
+    @property
+    def source(self):
+        return self._source
+
+    def task_for(self, prompt_index: int) -> EpisodeTask:
+        return self._source.task_for(_owned_position(self._job, prompt_index))
+
+
+class EpisodePromptRenderer:
+    """An episode job's prompt is checked as token ids by its episode intake
+    (`validator/agentic_intake.py`), never by the text fidelity check."""
+
+    @staticmethod
+    def initial_text(task: EpisodeTask) -> str:
+        raise CorpusPromptSourceError(
+            "an episode job's prompt is checked by its episode intake, not rendered as text")
+
+
+def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
+    from reliquary.environment import agentic_swe
+    from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
+
+    if episode is None:
+        raise CorpusPromptSourceError(
+            f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "
+            "must declare `episode`")
+    if prompt_source != AGENTIC_SWE_ENVIRONMENT:
+        raise CorpusPromptSourceError(
+            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r}, "
+            f"not {prompt_source!r}")
+    if renderer_id is not None and renderer_id != episode.renderer:
+        raise CorpusPromptSourceError(
+            f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
+    refusal = agentic_swe.episode_support_refusal(episode, need_verifiers=False)
+    if refusal:
+        raise CorpusPromptSourceError(refusal)
+    return AgenticSourceSpec(episode)
+
+
 def _owned_position(job: JobSpec, prompt_index: int) -> int:
     """The SOURCE index, or a refusal naming the job's own bounds. The index is
     already a row of the source: a job starting at S owns rows [S, S+N)."""
@@ -363,6 +426,7 @@ def resolve_prompt_source(
     environments: Mapping[str, Any] | None = None,
     renderer_id: str | None = None,
     profile: Any | None = None,
+    episode: Any | None = None,
 ) -> Any:
     """The environment spec a prompt source names, or a named refusal.
 
@@ -382,7 +446,10 @@ def resolve_prompt_source(
     miner was asked cannot be left to agree by construction.
     """
     from reliquary.eval.prompt_source import EvalSetSpec, is_eval_source
+    from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
+    if prompt_source == AGENTIC_SWE_ENVIRONMENT or episode is not None:
+        return _resolve_agentic(prompt_source, renderer_id, episode)
     if is_eval_source(prompt_source):
         # An eval set's rows are already rendered by its catalog template; only
         # the model's own chat template wraps them.
@@ -456,7 +523,10 @@ def renderer_for_job(
         environments=environments,
         renderer_id=job.renderer_id,
         profile=profile,
+        episode=job.episode,
     )
+    if getattr(spec, "interaction_mode", None) == "agentic":
+        return EpisodePromptRenderer()
     if getattr(spec, "interaction_mode", None) == "episode":
         return renderer_for(job.renderer_id, encode)
     if job.renderer_id in CHAT_TEMPLATE_RENDERERS:
@@ -476,7 +546,7 @@ def prompt_job_for_spec(
     *,
     environments: Mapping[str, Any] | None = None,
     profile: Any | None = None,
-) -> EnvironmentPromptJob | SingleTurnPromptJob:
+) -> EnvironmentPromptJob | SingleTurnPromptJob | AgenticPromptJob:
     """Resolve a job's prompt source to the rows a fidelity check needs.
 
     Builds the environment, which for a real source reads a dataset — so
@@ -487,6 +557,7 @@ def prompt_job_for_spec(
         environments=environments,
         renderer_id=job.renderer_id,
         profile=profile,
+        episode=job.episode,
     )
     try:
         environment = spec.create()
@@ -508,6 +579,8 @@ def prompt_job_for_spec(
                if job.prompt_start else "")
             + f" but {job.prompt_source!r} has {rows}"
         )
+    if getattr(spec, "interaction_mode", None) == "agentic":
+        return AgenticPromptJob(job, environment)
     if getattr(spec, "interaction_mode", None) == "episode":
         return EnvironmentPromptJob(job, environment)
     return SingleTurnPromptJob(job, environment)
