@@ -40,7 +40,6 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping
@@ -69,8 +68,9 @@ FORGED_HUNK = ("diff --git a/FORGED.txt b/FORGED.txt\nnew file mode 100644\n--- 
 FORGED_BASH_ENV = {"BASH_ENV": "/nonexistent/forged-observation"}
 # Environment variables never written to the state directory.
 _SECRET_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
-MINIO_CONTAINER = "corpus-e2e-minio"
-MINIO_IMAGE = "quay.io/minio/minio:latest"
+# Never the single-turn e2e's "corpus-e2e-minio": starting this run must not
+# remove a MinIO another run is using.
+MINIO_CONTAINER = "agentic-e2e-minio"
 
 
 # --------------------------------------------------------------------------
@@ -212,32 +212,6 @@ def _load_env(state: Path) -> None:
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 
-def _start_minio() -> None:
-    """MinIO on 127.0.0.1:9000 with the credentials already in the environment."""
-    import urllib.request
-
-    subprocess.run(["docker", "rm", "-f", MINIO_CONTAINER], capture_output=True, check=False)
-    env = {**os.environ, "MINIO_ROOT_USER": os.environ["R2_ACCESS_KEY_ID"],
-           "MINIO_ROOT_PASSWORD": os.environ["R2_SECRET_ACCESS_KEY"]}
-    # `-e NAME` without a value: docker takes it from its own environment, so
-    # the credentials never appear on a command line.
-    subprocess.run(["docker", "run", "-d", "--name", MINIO_CONTAINER, "-e", "MINIO_ROOT_USER",
-                    "-e", "MINIO_ROOT_PASSWORD", "-p", "127.0.0.1:9000:9000", MINIO_IMAGE,
-                    "server", "/data"], check=True, capture_output=True, env=env)
-    # Forced, never defaulted: an endpoint left in the environment would send
-    # the run to another store than the MinIO just started.
-    os.environ["R2_ENDPOINT_URL"] = "http://127.0.0.1:9000"
-    os.environ["R2_REGION"] = "us-east-1"
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:9000/minio/health/live", timeout=2):
-                return
-        except OSError:
-            time.sleep(1)
-    raise RuntimeError("MinIO did not come up within 60s")
-
-
 # --------------------------------------------------------------------------
 # Subcommands
 # --------------------------------------------------------------------------
@@ -246,7 +220,9 @@ def prepare(args) -> None:
     state = Path(args.state)
     os.environ.setdefault("R2_BUCKET_ID", DEFAULT_BUCKET)
     _require_credentials()
-    from scripts.corpus_e2e import _refuse_production_bucket, conditional_put_preflight, ensure_bucket
+    from scripts.corpus_e2e import (
+        _refuse_production_bucket, conditional_put_preflight, ensure_bucket, start_minio,
+    )
 
     _refuse_production_bucket()
     if (state / "job.json").exists():
@@ -263,7 +239,7 @@ def prepare(args) -> None:
                # Both forgeries are replayed whatever their grade.
                "replay_fraction_failed": 1.0}
     if args.start_minio:
-        _start_minio()
+        start_minio(container=MINIO_CONTAINER, credentials_from_env=True)
     state.mkdir(parents=True, exist_ok=True)
     (state / "env.json").write_text(json.dumps(public_r2_settings(os.environ), indent=1))
     asyncio.run(ensure_bucket())
@@ -340,6 +316,13 @@ def mine(args) -> None:
     if refusal:
         raise SystemExit(f"refusing to mine: {refusal}")
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
+    # As `corpus mine-agentic` does: a checkpoint other than the job's would
+    # only fail TOPLOC, and the run would read as a forgery test gone wrong.
+    from reliquary.corpus.encoding import checkpoint_fingerprint
+
+    if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
+        raise SystemExit("refusing to mine: the downloaded checkpoint does not match the "
+                         "job's fingerprint")
     # Throwaway, unregistered keys held in memory only: the run never needs them again.
     keys = {role: bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic()) for role in ROLES}
     (state / "hotkeys.json").write_text(json.dumps({r: k.ss58_address for r, k in keys.items()}))

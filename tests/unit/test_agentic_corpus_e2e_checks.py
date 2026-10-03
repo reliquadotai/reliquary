@@ -230,3 +230,56 @@ def test_the_subcommands_all_take_a_state_directory():
         with pytest.raises(SystemExit):
             parser.parse_args(argv)
     assert JOB_ID == "agentic-e2e"
+
+
+# -- MinIO, shared with the single-turn e2e ----------------------------------
+
+def _fake_docker(monkeypatch):
+    from scripts import corpus_e2e
+
+    calls = []
+    monkeypatch.setattr(corpus_e2e.subprocess, "run",
+                        lambda argv, **kw: calls.append((list(argv), kw.get("env"))))
+    monkeypatch.setattr(corpus_e2e, "_wait_minio_live", lambda port: None)
+    for name in ("R2_ENDPOINT_URL", "R2_REGION", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    return corpus_e2e, calls
+
+
+def test_minio_takes_its_credentials_from_the_environment_never_argv(monkeypatch):
+    corpus_e2e, calls = _fake_docker(monkeypatch)
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "e2euser")
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "s3cr3t-password")
+    monkeypatch.setenv("R2_ENDPOINT_URL", "https://production.example")
+    corpus_e2e.start_minio(container="agentic-e2e-minio", credentials_from_env=True)
+    (rm, _), (run, env) = calls
+    assert rm == ["docker", "rm", "-f", "agentic-e2e-minio"]
+    assert "agentic-e2e-minio" in run and "corpus-e2e-minio" not in run
+    assert not any("s3cr3t" in a or "e2euser" in a for a in run)
+    assert env["MINIO_ROOT_USER"] == "e2euser" and env["MINIO_ROOT_PASSWORD"] == "s3cr3t-password"
+    import os
+    assert os.environ["R2_ENDPOINT_URL"] == "http://127.0.0.1:9000"   # forced, never defaulted
+    assert os.environ["R2_SECRET_ACCESS_KEY"] == "s3cr3t-password"
+
+
+def test_minio_from_env_refuses_missing_credentials(monkeypatch):
+    corpus_e2e, calls = _fake_docker(monkeypatch)
+    with pytest.raises(RuntimeError):
+        corpus_e2e.start_minio(container="agentic-e2e-minio", credentials_from_env=True)
+    assert calls == []
+
+
+def test_the_single_turn_default_generates_credentials_out_of_argv(monkeypatch):
+    corpus_e2e, calls = _fake_docker(monkeypatch)
+    corpus_e2e.start_minio()
+    (rm, _), (run, env) = calls
+    assert rm == ["docker", "rm", "-f", "corpus-e2e-minio"]
+    import os
+    assert os.environ["R2_SECRET_ACCESS_KEY"] == env["MINIO_ROOT_PASSWORD"]
+    assert not any(env["MINIO_ROOT_PASSWORD"] in a for a in run)
+
+
+def test_the_agentic_run_never_names_the_single_turn_container():
+    from scripts import agentic_corpus_e2e, corpus_e2e
+
+    assert agentic_corpus_e2e.MINIO_CONTAINER != corpus_e2e.MINIO_CONTAINER

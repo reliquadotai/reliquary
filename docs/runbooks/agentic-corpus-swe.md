@@ -14,6 +14,17 @@ Placeholders: `<ENV_COMMIT>` (the reliquary-environments commit the job
 pins, 40 hex), `<control>` (the control's public URL), `<w>`/`<h>` (wallet
 and hotkey names), `<CAP>`, `<Q>`.
 
+## Before merging: `main` deploys
+
+**Merging this work into `main` is a deployment, not a code review step.**
+CI publishes `:latest` on every merge to `main`, Watchtower rolls it out to
+the weight-only validators within about 5 minutes, and the trainer runs
+`:latest` unpinned. Before merging, either coordinate the release with every
+operator running those images (the rollout happens whether or not anyone is
+watching), or pin the production images to their current digest first and
+roll forward deliberately. The same holds for every later fix to this job's
+code.
+
 ## Pins
 
 - reliquary-environments commit `<ENV_COMMIT>` (SWE-smith images pinned by digest; empty problem statements dropped).
@@ -180,11 +191,14 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_USE_V2_MODEL_RUNNER=0 \
 - vLLM runs in the miner's process, behind an OpenAI-style generate endpoint
   bound to `127.0.0.1:--port` (8011 by default; no auth, never exposed); the
   port must be free.
-- It refuses to start (`refusing to mine: ...`) when the installed verifiers'
-  restricted-network notice differs from the one the validator renders
-  prompts with (every trajectory would be refused `prompt_mismatch`), when an
-  install is off its pin, or when the downloaded checkpoint does not match the
-  job's fingerprint.
+- It refuses to start, with exit code 4 and `error: <reason>`, when an
+  install is off its pin (e.g. `error: reliquary-swe is installed at ..., the
+  job pins ...`) or when the downloaded checkpoint does not match the job's
+  fingerprint (`error: the downloaded checkpoint does not match the job's
+  fingerprint`). It stops with `refusing to mine: the installed verifiers'
+  network notice differs ...` when verifiers' restricted-network notice is
+  not the one the validator renders prompts with (every trajectory would be
+  refused `prompt_mismatch`).
 - `--concurrency` episodes at once (8 to 11 on one H100, spec §9);
   `--max-num-seqs` (16) bounds vLLM's batch: lower it if turns fail as
   preempted. `--episodes N` stops after N episodes (0: until the job
@@ -292,7 +306,10 @@ S=/opt/agentic-e2e
 
 1. Prepare (MinIO, the job; the fingerprint takes minutes over 52 GB):
    `gpu "$E2E prepare --state $S --env-commit $ENV_COMMIT --start-minio"`.
-   Expect one JSON line with `"prompts": [0, 8]`.
+   Expect one JSON line with `"prompts": [0, 8]`. MinIO runs as container
+   `agentic-e2e-minio` on 127.0.0.1:9000 with the shell's credentials; a
+   single-turn e2e's `corpus-e2e-minio` holding port 9000 makes it fail, never
+   removed.
 2. Control, intake-only, in the background:
    `gpu "setsid nohup $E2E validator --state $S --intake-only > $S/validator-intake.log 2>&1 < /dev/null & echo \$! > $S/validator.pid"`,
    then `ssh -p 20300 root@162.243.212.30 "curl -s http://127.0.0.1:8100/corpus/jobs/agentic-e2e/job | head -c 300" </dev/null`
@@ -300,12 +317,19 @@ S=/opt/agentic-e2e
 3. Register the executors and start them (tokens never touch a file):
 
    ```bash
-   token() { gpu "$CLI corpus register-grade-executor --executor-id $1 --env-version $ENV_COMMIT --provider-id $2" \
-             | tail -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'; }
+   # Fails (exit 1, message on stderr) when no token comes back: an id registered
+   # before answers created=false and token null, and its token is not shown again.
+   token() {
+     local line; line=$(gpu "$CLI corpus register-grade-executor --executor-id $1 --env-version $ENV_COMMIT --provider-id $2" | tail -1)
+     python3 -c 'import json,sys; t=json.loads(sys.argv[1]).get("token"); print(t) if t else sys.exit("no token for this executor id: " + sys.argv[1] + " (already registered: use a new --executor-id)")' "$line"
+   }
+   TOKEN_A=$(token grade-a hetzner) && TOKEN_B=$(token grade-b digitalocean) \
+     || { unset TOKEN_A TOKEN_B; echo "STOP: an executor got no token" >&2; }
    ssh -f -N -o ExitOnForwardFailure=yes -L 18100:127.0.0.1:8100 -p 20300 root@162.243.212.30
    ssh -f -N -o ExitOnForwardFailure=yes -R 18100:127.0.0.1:18100 root@5.161.244.56
-   token grade-a hetzner | ssh root@5.161.244.56 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary && setsid nohup .venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:18100 --executor-id grade-a --concurrency 4 > /root/grade-a.log 2>&1 < /dev/null & echo $! > /root/grade-a.pid'
-   token grade-b digitalocean | ssh -p 20300 root@162.243.212.30 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary && setsid nohup /opt/vllm/venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:8100 --executor-id grade-b --concurrency 2 > /opt/agentic-e2e/grade-b.log 2>&1 < /dev/null & echo $! > /opt/agentic-e2e/grade-b.pid'
+   [ -n "$TOKEN_A" ] && printf '%s\n' "$TOKEN_A" | ssh root@5.161.244.56 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary && setsid nohup .venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:18100 --executor-id grade-a --concurrency 4 > /root/grade-a.log 2>&1 < /dev/null & echo $! > /root/grade-a.pid'
+   [ -n "$TOKEN_B" ] && printf '%s\n' "$TOKEN_B" | ssh -p 20300 root@162.243.212.30 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary && setsid nohup /opt/vllm/venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:8100 --executor-id grade-b --concurrency 2 > /opt/agentic-e2e/grade-b.log 2>&1 < /dev/null & echo $! > /opt/agentic-e2e/grade-b.pid'
+   unset TOKEN_A TOKEN_B
    ```
 
    Both logs quiet after 30 s (no traceback, no `refused by the control`).
@@ -323,6 +347,6 @@ S=/opt/agentic-e2e
    to exercise the real export, `gpu "$CLI jobs export agentic-e2e --out $S/export.sft.jsonl --sft --allow-incomplete"`
    (the run never settles, so `drained` is false in its counts file).
 8. Clean up: `kill -- -$(cat <pidfile>)` for the control, `grade-b` and
-   `grade-a`; `docker rm -f corpus-e2e-minio`; the two tunnels on the VPS
+   `grade-a`; `docker rm -f agentic-e2e-minio`; the two tunnels on the VPS
    (`kill $(pgrep -f 'ExitOnForwardFailure=yes -[LR] 18100')`); restart the
    GPU box's serving vLLM with the command recorded in `/opt/vllm/serve.sh` usage.
