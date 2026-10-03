@@ -40,6 +40,7 @@ reliquary-infra/inventory/known_hosts
 /reports/private/
 /affine-state/
 *.affine-private.json
+*.affine-private.md
 
 # Generated ML and research artifacts
 /wandb/
