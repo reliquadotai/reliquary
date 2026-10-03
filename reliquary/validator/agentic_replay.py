@@ -40,6 +40,7 @@ import asyncio
 import contextlib
 import functools
 import json
+import logging
 import math
 import secrets
 import subprocess
@@ -48,6 +49,8 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
 from reliquary.corpus.replay_compare import Action
+
+logger = logging.getLogger(__name__)
 
 TOOL_PROGRAM = r'''
 import json, subprocess, sys
@@ -113,7 +116,9 @@ _FIND_PYTHON = ["sh", "-c", "command -v python3 || command -v python"]
 DEFAULT_EPISODE_DEADLINE = 3600.0
 
 
-BOX_NAME_PREFIX = "reliquary-grade-"
+# Distinct from any role container's name (e.g. "reliquary-grade-executor"),
+# so the orphan sweep can never remove the executor itself.
+BOX_NAME_PREFIX = "reliquary-gradebox-"
 
 
 @dataclass(frozen=True)
@@ -171,14 +176,28 @@ async def bounded_box(task, limits: BoxLimits = DEFAULT_BOX_LIMITS) -> AsyncIter
 
 def sweep_orphan_boxes() -> int:
     """Remove every box of ours on this Docker host; the count removed. Run at
-    executor start, so one executor per Docker host."""
-    listed = subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^/?{BOX_NAME_PREFIX}"],
-                            capture_output=True, text=True, timeout=60, check=True)
-    ids = listed.stdout.split()
-    if ids:
-        subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, text=True,
-                       timeout=300, check=True)
-    return len(ids)
+    executor start, so one executor per Docker host. Never raises: a sweep that
+    fails is logged and the executor starts anyway (its boxes are bounded)."""
+    try:
+        listed = subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^/?{BOX_NAME_PREFIX}"],
+                                capture_output=True, text=True, timeout=60, check=False)
+        if listed.returncode != 0:
+            logger.error("orphan box sweep: docker ps failed (%d): %s",
+                         listed.returncode, (listed.stderr or "").strip()[:500])
+            return 0
+        ids = listed.stdout.split()
+        if not ids:
+            return 0
+        removed = subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, text=True,
+                                 timeout=300, check=False)
+        if removed.returncode != 0:
+            logger.error("orphan box sweep: docker rm of %d boxes failed (%d): %s", len(ids),
+                         removed.returncode, (removed.stderr or "").strip()[:500])
+            return 0
+        return len(ids)
+    except (OSError, subprocess.SubprocessError):
+        logger.exception("orphan box sweep failed; starting without it")
+        return 0
 
 
 class ReplayTimeout(Exception):

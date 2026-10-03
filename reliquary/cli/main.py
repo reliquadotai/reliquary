@@ -2099,9 +2099,12 @@ def corpus_grade_executor(
     if not os.environ.get(grade.TOKEN_ENV, "").strip():
         typer.echo(f"error: {grade.TOKEN_ENV} is not set", err=True)
         raise typer.Exit(code=1)
+    try:
+        limits = BoxLimits(cpu=cpus, memory_gb=memory_gb, pids=pids_limit)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     grade.run_grade_executor(control_url=control_url, executor_id=executor_id,
-                             concurrency=concurrency,
-                             limits=BoxLimits(cpu=cpus, memory_gb=memory_gb, pids=pids_limit))
+                             concurrency=concurrency, limits=limits)
 
 
 @corpus_app.command("order-control")

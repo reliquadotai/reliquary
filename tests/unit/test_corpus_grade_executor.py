@@ -379,3 +379,68 @@ def test_the_grade_executor_command_needs_its_token(monkeypatch):
     assert result.exit_code == 0, result.output
     assert calls == [{"control_url": "https://control", "executor_id": "g1", "concurrency": 2,
                       "limits": BoxLimits(cpu=1.5, memory_gb=4.0, pids=512)}]
+
+
+def test_the_grade_executor_command_refuses_bad_box_limits_cleanly(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    calls = []
+    monkeypatch.setattr(corpus_grade_executor, "run_grade_executor", lambda **kw: calls.append(kw))
+    monkeypatch.setenv("RELIQUARY_EXECUTOR_TOKEN", "t" * 43)
+    argv = ["corpus", "grade-executor", "--control-url", "https://control", "--executor-id", "g1"]
+    for bad in (["--cpus", "0"], ["--memory-gb", "-1"], ["--pids-limit", "0"], ["--cpus", "nan"]):
+        result = CliRunner().invoke(app, argv + bad)
+        assert result.exit_code == 2, (bad, result.output)
+        assert result.exception is None or isinstance(result.exception, SystemExit), bad
+        assert "must be" in result.output, (bad, result.output)
+    assert calls == []
+
+
+def test_box_names_never_match_a_role_container():
+    from reliquary.validator.agentic_replay import BOX_NAME_PREFIX
+
+    assert BOX_NAME_PREFIX == "reliquary-gradebox-"
+    for role in ("reliquary-grade-executor", "reliquary-grade", "reliquary-grader"):
+        assert not role.startswith(BOX_NAME_PREFIX)
+
+
+def _completed(returncode, stdout=""):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="boom")
+
+
+def test_the_orphan_sweep_never_stops_the_executor(monkeypatch):
+    from reliquary.validator import agentic_replay
+
+    calls, logged = [], []
+    monkeypatch.setattr(agentic_replay.logger, "error", lambda *a, **k: logged.append(a[0] % a[1:]))
+    monkeypatch.setattr(agentic_replay.logger, "exception", lambda *a, **k: logged.append(a[0]))
+
+    def listing_fails(argv, **kw):
+        calls.append(argv)
+        assert kw.get("check") is not True
+        return _completed(1)
+
+    monkeypatch.setattr(agentic_replay.subprocess, "run", listing_fails)
+    assert agentic_replay.sweep_orphan_boxes() == 0
+    assert len(calls) == 1 and "docker ps failed" in logged[-1]
+
+    def removal_fails(argv, **kw):
+        assert kw.get("check") is not True
+        return _completed(0, "abc\ndef\n") if argv[1] == "ps" else _completed(1)
+
+    monkeypatch.setattr(agentic_replay.subprocess, "run", removal_fails)
+    assert agentic_replay.sweep_orphan_boxes() == 0 and "docker rm of 2 boxes" in logged[-1]
+
+    def no_docker(argv, **kw):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(agentic_replay.subprocess, "run", no_docker)
+    assert agentic_replay.sweep_orphan_boxes() == 0 and "sweep failed" in logged[-1]
+
+    def removed(argv, **kw):
+        return _completed(0, "abc\ndef\n") if argv[1] == "ps" else _completed(0)
+
+    monkeypatch.setattr(agentic_replay.subprocess, "run", removed)
+    assert agentic_replay.sweep_orphan_boxes() == 2

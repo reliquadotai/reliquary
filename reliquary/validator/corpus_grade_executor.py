@@ -8,7 +8,7 @@ verdict. Hostile code runs here, never on the control; the boxes come from the
 task's public images pinned by digest, each under ``BoxLimits`` (CPUs, memory
 without swap, pids). Size the host for ``concurrency * memory_gb`` plus the
 executor itself; run one executor per Docker host (``start`` removes every box
-named ``BOX_NAME_PREFIX`` it finds, the ones a killed executor left behind).
+named ``BOX_NAME_PREFIX`` ("reliquary-gradebox-") it finds, the ones a killed executor left behind).
 `verifiers` and `reliquary_swe` are imported here only.
 """
 
