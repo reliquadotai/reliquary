@@ -408,6 +408,22 @@ def wire_job_grader(w, *, records, judge_records, dispatcher) -> None:
                             round_at=round_at)
 
 
+async def regrade_everywhere(graders, executor_id: str) -> list:
+    """The grade quarantine listener: every grader regrades what the executor
+    decided alone; one grader's failure is logged and never stops the others."""
+    results = await asyncio.gather(*(g.regrade_executor(executor_id) for g in graders),
+                                   return_exceptions=True)
+    done = []
+    for grader, result in zip(graders, results):
+        if isinstance(result, BaseException):
+            job = getattr(getattr(grader, "_job", None), "job_id", "?")
+            logger.error("regrade of quarantined executor %s failed for job %s: %r",
+                         executor_id, job, result)
+        else:
+            done.append(result)
+    return done
+
+
 def _config_vocab_size(directory) -> int:
     import json
 
@@ -1058,9 +1074,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # episode job this process grades (hot-added ones included).
         grade_dispatcher.hold_on_quarantine(lambda executor_id: [
             grader.hold_executor(executor_id) for grader in list(graders.values())])
-        grade_dispatcher.subscribe(lambda executor_id: asyncio.gather(
-            *(grader.regrade_executor(executor_id) for grader in list(graders.values())),
-            return_exceptions=True))
+        grade_dispatcher.subscribe(
+            lambda executor_id: regrade_everywhere(list(graders.values()), executor_id))
         background.append(grade_dispatcher.run())
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))

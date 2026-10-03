@@ -797,3 +797,96 @@ def test_the_split_refuses_an_episode_job_at_startup(monkeypatch):
             wallet=None, netuid=1, signer_client=None, http_host="h", http_port=1,
             set_weights=False, entry=entry, cap=0.1, split=SimpleNamespace(links={})))
     assert str(refused.value) == SPLIT_EPISODE_REFUSAL
+
+
+# -- fix round 2: a decision finished after its executor's quarantine ------------
+
+
+@pytest.mark.parametrize("lone", ["g0", "g1"], ids=["lone-grader", "lone-replayer"])
+def test_a_lone_decision_finished_after_the_quarantine_is_regraded(lone):
+    records = _Records()
+    first = PASSED if lone == "g0" else GradeDecision("ok", PASSED.result, ("g0", "g3"), ("p0", "p3"))
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    recertified = GradeDecision("ok", CERTIFIED.result, ("g4",), ("p4",))
+    dispatcher = _Gated([first, regraded], [CERTIFIED, recertified])
+    dispatcher.quarantined = set()
+    grader, _ = _grader(records, dispatcher)
+
+    async def scenario():
+        dispatcher.release, dispatcher.hold_replays = asyncio.Event(), True
+        grading = asyncio.ensure_future(grader.grade_one(SID))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not grading.done()                          # the replay is in flight
+        dispatcher.quarantined.add(lone)                   # quarantined meanwhile
+        grader.hold_executor(lone)
+        assert await grader.regrade_executor(lone) == []   # nothing written yet to regrade
+        dispatcher.hold_replays = False
+        dispatcher.release.set()
+        await grading
+        held = await grader.ready([SID])                   # before the regrade task runs
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return held, await grader.ready([SID])
+
+    assert asyncio.run(scenario()) == (set(), {SID})
+    assert SID in records.regrades and lone not in records.regrades[SID]["graded_by"]
+
+
+def test_an_executor_regrade_is_launched_once_while_it_runs():
+    records = _Records()
+    grader, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    grader._rescan = 0.01
+    calls, gate = [], asyncio.Event()
+
+    async def blocked(executor_id):
+        calls.append(executor_id)
+        await gate.wait()
+        return []
+
+    grader.regrade_executor = blocked
+    grader._held_executors.add("g9")
+
+    async def scenario():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(grader.run(), 0.3)
+
+    asyncio.run(scenario())
+    assert calls == ["g9"]
+
+
+def test_the_status_shows_a_job_wide_hold():
+    records = _Records()
+    first, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    asyncio.run(first.grade_one(SID))
+    second, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+
+    async def scenario():
+        await second.ready([SID])
+        second.hold_executor("g9")
+        return second.status()
+
+    status = asyncio.run(scenario())
+    assert status["held_executors"] == ["g9"] and status["unindexed"] == 1
+
+
+def test_the_quarantine_listener_logs_a_grader_failure(monkeypatch):
+    from reliquary.validator import corpus_validator
+
+    logged = []
+    monkeypatch.setattr(corpus_validator.logger, "error",
+                        lambda *a, **k: logged.append(a[0] % a[1:]))
+
+    class _Good:
+        async def regrade_executor(self, eid):
+            return ["x"]
+
+    class _Bad:
+        _job = SimpleNamespace(job_id="swe-v1")
+
+        async def regrade_executor(self, eid):
+            raise OSError("bucket down")
+
+    result = asyncio.run(corpus_validator.regrade_everywhere([_Good(), _Bad()], "g0"))
+    assert result == [["x"]]
+    assert any("g0" in line and "bucket down" in line for line in logged)

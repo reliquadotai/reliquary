@@ -93,6 +93,7 @@ class CorpusGrader:
         # indexed: every unindexed grade is held until they are.
         self._held_executors: set[str] = set()
         self._regrades_inflight: set[str] = set()
+        self._executor_regrades_inflight: set[str] = set()
         # Submissions listed but without a grade, as of the last rescan.
         self._ungraded: int | None = None
 
@@ -119,6 +120,9 @@ class CorpusGrader:
         return {"graded": len(self._final), "ungraded": self._ungraded,
                 "grading": len(self._inflight), "awaiting_draw": len(self._awaiting_draw),
                 "regrading": len(self._regrading),
+                # Non-empty: every grade from before boot is held (job-wide).
+                "held_executors": sorted(self._held_executors),
+                "unindexed": len(self._unindexed),
                 "dispatcher_waiting": stats.get("waiting")}
 
     def _gated(self):
@@ -152,7 +156,7 @@ class CorpusGrader:
                 for sid in listed:
                     self.enqueue(sid)
                 self._ungraded = sum(1 for sid in listed if sid not in self._final)
-                for executor_id in sorted(self._held_executors):
+                for executor_id in sorted(self._held_executors - self._executor_regrades_inflight):
                     # Its regrade could not index the grades from before boot.
                     asyncio.ensure_future(self._regrade_executor_logged(executor_id))
                 for sid in sorted(self._regrade_retry - self._regrades_inflight):
@@ -336,7 +340,25 @@ class CorpusGrader:
         self._final.add(submission_id)
         if not regrade:
             self._index(submission_id, document)
+            self._regrade_if_quarantined(submission_id, document)
         return document
+
+    def _regrade_if_quarantined(self, submission_id: str, document: dict) -> None:
+        """A decision made alone by an executor quarantined while this grade
+        was in flight: the quarantine's regrade found nothing to redo yet, so
+        the grade is held and redone here."""
+        quarantined = set(getattr(self._dispatcher, "quarantined", ()) or ()) | self._held_executors
+        lone = {_lone(document.get("graded_by")),
+                _lone((document.get("replay") or {}).get("graded_by"))} - {None}
+        caught = sorted(lone & quarantined)
+        if not caught:
+            return
+        for executor_id in caught:
+            self._sole.get(executor_id, set()).discard(submission_id)
+        self._regrading.add(submission_id)
+        logger.warning("corpus job %s: %s was decided alone by quarantined executor(s) %s; "
+                       "regrading it", self._job.job_id, submission_id[:12], caught)
+        asyncio.ensure_future(self._regrade(submission_id))
 
     def _index(self, submission_id: str, document: dict) -> None:
         """Each decision one executor made alone, under that executor."""
@@ -390,11 +412,16 @@ class CorpusGrader:
                 del self._awaiting_draw[sid]
 
     async def _regrade_executor_logged(self, executor_id: str) -> None:
+        if executor_id in self._executor_regrades_inflight:
+            return
+        self._executor_regrades_inflight.add(executor_id)
         try:
             await self.regrade_executor(executor_id)
         except Exception:
             logger.exception("regrade of executor %s failed; retried on the next rescan",
                              executor_id)
+        finally:
+            self._executor_regrades_inflight.discard(executor_id)
 
     async def regrade_executor(self, executor_id: str) -> list[str]:
         """Grade again, without it, what a quarantined executor decided alone."""
