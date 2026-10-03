@@ -43,6 +43,38 @@ def completion_rows(rows: torch.Tensor, prompt_len: int, total_len: int) -> torc
     return rows[prompt_len - 1 : expected]
 
 
+def turn_rows(rows: torch.Tensor, completion_len: int, prompt_rows: int) -> torch.Tensor:
+    """The rows that produced one completion when the prompt may have come from
+    the prefix cache.
+
+    ``prompt_rows`` is the number of prompt tokens the engine actually
+    scheduled (prompt length minus cached tokens). A cached prompt contributes
+    no rows, but vLLM always recomputes at least its last token, so
+    ``prompt_rows >= 1``; that last prompt row predicts the first completion
+    token and every decode step after it adds one row. The completion's rows
+    are therefore ``rows[prompt_rows - 1 : prompt_rows - 1 + completion_len]``,
+    and a single trailing surplus row (async scheduling) is ignored. Any other
+    row count -- a request preempted and recomputed, or rows attributed to the
+    wrong request -- is refused rather than silently shifted. There is no
+    fallback without ``prompt_rows``: taking the last ``completion_len`` rows
+    would keep the async surplus row and drop the first real one.
+    """
+    if completion_len < 1:
+        raise ValueError(f"completion_len must be >= 1, got {completion_len}")
+    if isinstance(prompt_rows, bool) or not isinstance(prompt_rows, int) or prompt_rows < 1:
+        raise ValueError(f"prompt_rows must be an int >= 1 (vLLM recomputes the last prompt token), got {prompt_rows!r}")
+    count = rows.shape[0]
+    if count < completion_len:
+        raise ValueError(f"{count} rows for a {completion_len}-token completion")
+    expected = prompt_rows + completion_len - 1
+    if count not in (expected, expected + 1):
+        raise ValueError(
+            f"{count} rows where {expected} were scheduled: the request was "
+            "recomputed or rows were attributed to the wrong request"
+        )
+    return rows[prompt_rows - 1 : prompt_rows - 1 + completion_len]
+
+
 class HiddenStateCapture:
     def __init__(self) -> None:
         self._rows: dict[str, list[torch.Tensor]] = {}
