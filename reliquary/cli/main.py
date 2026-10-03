@@ -2612,6 +2612,11 @@ async def _run_corpus(*, jobs, wallet, netuid, signer_client, http_host, http_po
     (``RELIQUARY_CORPUS_SPLIT_JUDGES`` says which jobs leave the front)."""
     read_registry = _corpus_hot_registry_reader()
     remote = _corpus_remote_audit_options()
+    # Intake and grading only, no model and no audit (the end-to-end run).
+    intake_only = _env_flag("RELIQUARY_CORPUS_INTAKE_ONLY")
+    if intake_only and _env_flag("RELIQUARY_CORPUS_SPLIT"):
+        raise RuntimeError("RELIQUARY_CORPUS_INTAKE_ONLY serves no audit: the split validator "
+                           "is not intake-only; unset RELIQUARY_CORPUS_SPLIT")
     if _env_flag("RELIQUARY_CORPUS_SPLIT"):
         from reliquary.validator.corpus_split import run_corpus_split
 
@@ -2628,13 +2633,13 @@ async def _run_corpus(*, jobs, wallet, netuid, signer_client, http_host, http_po
         await run_corpus_validator(
             entry=entry, cap=cap, wallet=wallet, netuid=netuid, signer_client=signer_client,
             http_host=http_host, http_port=http_port, set_weights=set_weights,
-            read_registry=read_registry, **remote,
+            read_registry=read_registry, intake_only=intake_only, **remote,
         )
         return
     await run_corpus_validator(
         jobs=jobs, wallet=wallet, netuid=netuid, signer_client=signer_client,
         http_host=http_host, http_port=http_port, set_weights=set_weights,
-        read_registry=read_registry, **remote,
+        read_registry=read_registry, intake_only=intake_only, **remote,
     )
 
 

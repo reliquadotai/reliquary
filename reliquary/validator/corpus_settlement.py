@@ -9,7 +9,7 @@ alive. Settlement is two-phase so a crash can delay a payment, never repeat it.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 import logging
 import os
 import time
@@ -71,7 +71,12 @@ class CorpusSettler:
                  stall_seconds: float = 3 * RL_WINDOW_SECONDS,
                  advance_every_seconds: float = RL_WINDOW_SECONDS, clock=time.time,
                  on_settled=None, full_list_every_seconds: float | None = None,
-                 executor=None) -> None:
+                 executor=None,
+                 ready: Callable[[list[str]], Awaitable[set[str]]] | None = None) -> None:
+        # ``ready(ids)`` answers which of ``ids`` may be paid now; an episode
+        # job's grader answers those already graded, so a replay that voids a
+        # submission lands before its payment. None pays every verdict as before.
+        self._ready = ready
         # Whose threads build the settled sets (the judges', so never the route's).
         self._executor = executor
         self._task_id = task_id
@@ -235,6 +240,9 @@ class CorpusSettler:
         # 300k+ ids on a long job: built off the serving loop.
         settled = await self._off(set, state["settled"])
         new_ids = await self._verdict_ids(settled)
+        if self._ready is not None and new_ids:
+            payable = await self._ready(new_ids)
+            new_ids = [sid for sid in new_ids if sid in payable]
         window = choose_window(last_window=state["last_window"], other_max=other_max,
                                other_max_seen_at=state["other_max_seen_at"], now=now,
                                stall_seconds=self._stall, last_advanced_at=state["advanced_at"],

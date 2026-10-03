@@ -342,7 +342,9 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               records=judge_records, archives=archives,
                               on_settled=on_settled,
                               full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-                              executor=judge_threads.codec)
+                              executor=judge_threads.codec,
+                              ready=(w.grader.ready if getattr(w, "grader", None) is not None
+                                     else None))
     w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                               tokenizer=tokenizer, proof=proof, params=params,
                               miner_states=MinerStates(judge_records, w.job.job_id),
@@ -354,6 +356,8 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               arrivals_covered=arrivals_covered,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
+    if getattr(w, "grader", None) is not None:
+        w.grader.on_voided = w.miners.voided
 
 
 async def settle_forever(task_id: str, settler, every_seconds: float) -> None:
@@ -365,6 +369,53 @@ async def settle_forever(task_id: str, settler, every_seconds: float) -> None:
         except Exception:
             logger.exception("corpus settlement failed; retrying next period")
         await asyncio.sleep(every_seconds)
+
+
+def judge_jobs(w, *, intake_only: bool, settle_every_seconds: float, settle=None) -> list:
+    """The coroutines that judge one job in this process: the auditor and the
+    settler unless intake-only, and the grader of an episode job."""
+    if getattr(w, "judge_link", None) is not None:
+        return []
+    settle = settle or settle_forever
+    jobs = ([] if intake_only else
+            [w.auditor.run(), settle(w.entry.task_id, w.settler, settle_every_seconds)])
+    if getattr(w, "grader", None) is not None:
+        jobs.append(w.grader.run())
+    return jobs
+
+
+def wire_job_grader(w, *, records, judge_records, dispatcher) -> None:
+    """An episode job's grader, on ``w`` (which carries ``entry``, ``job`` and
+    ``episode_intake``), leasing to ``dispatcher``; once per job. A job this
+    process cannot grade (no dispatcher, another env pin) is refused with a
+    ``ValueError``, which the job set takes as permanent until a restart."""
+    if w.job.episode is None or getattr(w, "grader", None) is not None:
+        return
+    pin = (w.job.episode.env.package, w.job.episode.env.version)
+    if dispatcher is None:
+        raise ValueError(f"episode job {w.job.job_id!r} joined a validator started without "
+                         "one; restart it to grade the job")
+    if tuple(dispatcher.env_pin) != pin:
+        raise ValueError(f"this validator grades {tuple(dispatcher.env_pin)}, episode job "
+                         f"{w.job.job_id!r} pins {pin}; restart it to grade the job")
+    from reliquary.validator.corpus_grading import CorpusGrader
+
+    params, miner_states, _, beacon, round_at = build_corpus_audit_wiring(
+        entry=w.entry, job=w.job, records=records)
+    w.grader = CorpusGrader(job=w.job, records=judge_records, dispatcher=dispatcher,
+                            renderer=w.episode_intake.renderer, source=w.episode_intake.source,
+                            params=params, miner_states=miner_states, beacon=beacon,
+                            round_at=round_at)
+
+
+def _config_vocab_size(directory) -> int:
+    import json
+
+    config = json.loads((directory / "config.json").read_text())
+    size = config.get("vocab_size") or (config.get("text_config") or {}).get("vocab_size")
+    if not isinstance(size, int):
+        raise RuntimeError(f"{directory}/config.json names no vocab_size")
+    return size
 
 
 class JudgedElsewhere:
@@ -623,7 +674,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                refresh_every_seconds: float | None = None,
                                remote_audit: bool = False,
                                recheck_fraction: float | None = None,
-                               split=None, auditor_kwargs=None) -> None:
+                               split=None, auditor_kwargs=None,
+                               intake_only: bool = False) -> None:
     """Serve one corpus task (``entry``, ``cap``) or several (``jobs``, a list
     of ``(entry, cap)``) from one process and one loaded model.
 
@@ -640,7 +692,15 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     validator: no model is loaded (the supervisor checked the checkpoint and
     the GPU process scores), the jobs in ``split.links`` are judged in their
     own processes and every other job here, scoring on the GPU process.
+
+    With ``intake_only`` no model is loaded and nothing is audited or settled:
+    the route takes submissions and episode jobs are graded (the end-to-end
+    run, while the miner holds the card). Payment waits for the audits of a
+    later start without it.
     """
+    if intake_only and (remote_audit or split is not None):
+        raise RuntimeError("intake-only serves no audit; unset RELIQUARY_CORPUS_REMOTE_AUDIT "
+                           "and RELIQUARY_CORPUS_SPLIT")
     if split is not None and remote_audit:
         raise RuntimeError("remote audit executors are not served by the split validator; "
                            "unset RELIQUARY_CORPUS_REMOTE_AUDIT or RELIQUARY_CORPUS_SPLIT")
@@ -735,7 +795,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
         def on_accepted(submission_id: str) -> None:
             w.stats.accepted()
-            w.auditor.enqueue(submission_id)
+            if not intake_only:
+                w.auditor.enqueue(submission_id)
+            if getattr(w, "grader", None) is not None:
+                w.grader.enqueue(submission_id)
 
         w.on_accepted = on_accepted
         return w
@@ -793,12 +856,17 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     tokenizer_box["tokenizer"] = tokenizer
     checkpoint_dir = str(directory)
     scorer = None
-    if split is None:
+    if split is None and not intake_only:
         model = load_text_only_model(
             str(directory), torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
         ).to("cuda").eval()
         proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
         vocab_size = model.get_input_embeddings().num_embeddings
+    elif split is None:
+        # Intake and grading only: the card is someone else's (the miner's, in
+        # the end-to-end run); audits start when the process restarts without it.
+        model, proof = None, toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+        vocab_size = _config_vocab_size(Path(checkpoint_dir))
     else:
         from reliquary.validator.corpus_gpu import read_info
 
@@ -855,6 +923,26 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             record_heartbeat=lambda executor_id, at, detail: executor_store.record_heartbeat(
                 executor_id, at=at, detail=detail),
         )
+    # One grade dispatcher for every episode job: one env pin per validator.
+    grade_dispatcher = grade_directory = None
+    graders: dict[str, object] = {}
+    pins = {(w.job.episode.env.package, w.job.episode.env.version)
+            for w in wiring if w.job.episode is not None}
+    if len(pins) > 1:
+        raise RuntimeError(f"one validator grades one env pin, these jobs name {sorted(pins)}")
+    if pins:
+        from reliquary.infrastructure import corpus_executor_store as grade_store
+        from reliquary.validator.corpus_audit_remote import ExecutorDirectory
+        from reliquary.validator.corpus_grade_remote import RemoteGradeDispatcher
+
+        (package, version), = pins
+        grade_directory = ExecutorDirectory(model_id=package, model_revision=version, scope="grade")
+        grade_dispatcher = RemoteGradeDispatcher(
+            directory=grade_directory, env_package=package, env_version=version,
+            quarantine=lambda executor_id, reason: grade_store.set_executor_status(
+                executor_id, "quarantined", reason=reason, scope="grade"),
+            record_heartbeat=lambda executor_id, at, detail: grade_store.record_heartbeat(
+                executor_id, at=at, detail=detail))
     job_set: CorpusJobSet | None = None
     archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 
@@ -870,6 +958,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     def audit_and_settle(w) -> None:
         if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
             w.episode_intake = episode_intake_for(w)
+        if w.job.episode is not None:
+            wire_job_grader(w, records=records, judge_records=judge_records,
+                            dispatcher=grade_dispatcher)
+            graders[str(w.job.job_id)] = w.grader
         link = split.links.get(str(w.job.job_id)) if split is not None else None
         if link is not None:
             wire_job_front_only(w, records=records, link=link)
@@ -917,9 +1009,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     job_set = CorpusJobSet(
         routes=app.state.corpus_routes, router_for=app.state.corpus_router_for,
         wire=wire_hot,
-        jobs_of=lambda w: ([] if getattr(w, "judge_link", None) is not None else
-                           [w.auditor.run(),
-                            settle_forever(w.entry.task_id, w.settler, settle_every_seconds)]),
+        jobs_of=lambda w: judge_jobs(w, intake_only=intake_only,
+                                     settle_every_seconds=settle_every_seconds),
         read_entries=read_registry, read_job=read_job,
         screen=order_entry_screen,
         admit=lambda task_entry, job: split_episode_refusal(split, job) or hot_job_refusal(
@@ -953,6 +1044,18 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         app.state.corpus_audit_remote = remote
         background.append(remote.run())
 
+    if grade_dispatcher is not None:
+        from reliquary.validator.corpus_grade_remote import build_grade_executor_router
+
+        app.include_router(build_grade_executor_router(grade_dispatcher, grade_directory))
+        app.state.corpus_grade_remote = grade_dispatcher
+        # What a quarantined executor decided alone is graded again, in every
+        # episode job this process grades (hot-added ones included).
+        grade_dispatcher.subscribe(lambda executor_id: asyncio.gather(
+            *(grader.regrade_executor(executor_id) for grader in list(graders.values())),
+            return_exceptions=True))
+        background.append(grade_dispatcher.run())
+
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     await asyncio.gather(server.serve(), job_set.run(), app.state.warm_corpus_tasks(), *background)
 
@@ -964,11 +1067,13 @@ __all__ = [
     "build_corpus_audit_wiring",
     "build_corpus_jobs_app",
     "drand_beacon",
+    "judge_jobs",
     "make_round_at",
     "multi_job_refusal",
     "run_corpus_validator",
     "settle_forever",
     "startup_refusal",
     "wire_job_front_only",
+    "wire_job_grader",
     "wire_job_judge",
 ]

@@ -65,3 +65,19 @@ def test_settlement_is_compare_and_swap(r2):
 def test_an_id_that_is_not_a_digest_never_reaches_a_key(r2, bad):
     with pytest.raises(ValueError):
         run(records.write_submission("math-v1", bad, {}))
+
+
+def test_grades_and_regrades_are_written_once_under_their_own_keys(r2):
+    assert run(records.write_grade("math-v1", ID, {"status": "ok"})) is True
+    assert run(records.write_grade("math-v1", ID, {"status": "error"})) is False
+    assert run(records.read_grade("math-v1", ID)) == {"status": "ok"}
+    assert run(records.list_grade_ids("math-v1")) == [ID]
+    assert run(records.read_regrade("math-v1", ID)) is None
+    assert run(records.write_regrade("math-v1", ID, {"status": "ok", "graded_by": ["g2"]})) is True
+    assert run(records.write_regrade("math-v1", ID, {"status": "error"})) is False
+    assert run(records.read_regrade("math-v1", ID)) == {"status": "ok", "graded_by": ["g2"]}
+    assert run(records.list_grade_ids("math-v1")) == [ID]
+    assert run(records.list_submission_ids("math-v1")) == []
+    store = records.BucketRecordStore()
+    assert run(store.read_grade("math-v1", ID)) == {"status": "ok"}
+    assert run(store.list_grade_ids("math-v1")) == [ID]

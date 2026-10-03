@@ -170,6 +170,27 @@ async def list_voided_ids(job_id, **client_kwargs) -> list[str]:
     return await _list_ids(_prefix(job_id, "voided"), **client_kwargs)
 
 
+async def write_grade(job_id, submission_id, document, **client_kwargs) -> bool:
+    return await _create(_key(job_id, "grades", submission_id), document, **client_kwargs)
+
+
+async def read_grade(job_id, submission_id, **client_kwargs) -> dict | None:
+    return await _read(_key(job_id, "grades", submission_id), **client_kwargs)
+
+
+async def list_grade_ids(job_id, **client_kwargs) -> list[str]:
+    return await _list_ids(_prefix(job_id, "grades"), **client_kwargs)
+
+
+async def write_regrade(job_id, submission_id, document, **client_kwargs) -> bool:
+    """A grade redone after its only executor was quarantined; it supersedes the grade."""
+    return await _create(_key(job_id, "regrades", submission_id), document, **client_kwargs)
+
+
+async def read_regrade(job_id, submission_id, **client_kwargs) -> dict | None:
+    return await _read(_key(job_id, "regrades", submission_id), **client_kwargs)
+
+
 def _settlement_key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/settlement.json"
 
@@ -270,6 +291,21 @@ class BucketRecordStore:
 
     async def list_voided_ids(self, job_id):
         return await list_voided_ids(job_id, **self._kw)
+
+    async def write_grade(self, job_id, submission_id, document):
+        return await write_grade(job_id, submission_id, document, **self._kw)
+
+    async def read_grade(self, job_id, submission_id):
+        return await read_grade(job_id, submission_id, **self._kw)
+
+    async def list_grade_ids(self, job_id):
+        return await list_grade_ids(job_id, **self._kw)
+
+    async def write_regrade(self, job_id, submission_id, document):
+        return await write_regrade(job_id, submission_id, document, **self._kw)
+
+    async def read_regrade(self, job_id, submission_id):
+        return await read_regrade(job_id, submission_id, **self._kw)
 
     async def read_settlement(self, job_id):
         return await read_settlement(job_id, **self._kw)

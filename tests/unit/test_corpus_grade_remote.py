@@ -577,3 +577,13 @@ def test_a_grade_executor_provider_is_normalized_at_registration(monkeypatch):
         asyncio.run(executors.register_executor(**fields, provider_id="   "))
     doc, _ = asyncio.run(executors.register_executor(**fields, provider_id="  Hetzner "))
     assert doc["provider_id"] == "hetzner"
+
+
+async def test_an_agreed_decision_names_its_providers():
+    d = await _dispatcher(recheck=1.0, providers={"g0": "a", "g1": "a", "g2": "b", "g3": "c"})
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    _answer(d, "g2", REPLAY_BAD)
+    got = await decision
+    assert got.providers == ("a", "b") and d.env_pin == (PACKAGE, VERSION)

@@ -90,6 +90,9 @@ class GradeDecision:
     status: str
     result: dict | None                 # the agreed result, when "ok"
     graded_by: tuple[str, ...]
+    # The distinct providers of the agreeing executors, when "ok": a sanction
+    # needs two (ruling P17), which the grader checks again on its side.
+    providers: tuple[str, ...] = ()
 
 
 def replay_certified(result: dict) -> bool:
@@ -163,6 +166,11 @@ class RemoteGradeDispatcher(ExecutorLeases):
         self._lease_seconds = {**GRADE_LEASE_SECONDS, **(lease_seconds or {})}
         self._dispute_seconds = float(dispute_seconds)
         self._queue: collections.deque[_Work] = collections.deque()
+
+    @property
+    def env_pin(self) -> tuple[str, str]:
+        """The env package and commit every lease of this dispatcher runs."""
+        return self._env["package"], self._env["version"]
 
     # -- the grader's side ------------------------------------------------------
 
@@ -305,7 +313,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
                           key=lambda kv: len({work.providers[e] for e in kv[1]}))
         if len({work.providers[e] for e in voters}) >= work.agree_needed:
             agreeing = tuple(sorted(voters))
-            self._resolve(work, GradeDecision("ok", dict(work.results[agreeing[0]]), agreeing))
+            self._resolve(work, GradeDecision(
+                "ok", dict(work.results[agreeing[0]]), agreeing,
+                tuple(sorted({work.providers[e] for e in agreeing}))))
             for dissenter in sorted(set(work.results) - set(agreeing)):
                 # Refused at once; the registry write and listeners follow.
                 if self._mark_quarantined(dissenter, f"grade item {work.id} ({work.mode}) "

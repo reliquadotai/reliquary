@@ -53,6 +53,14 @@ class EpisodeIntake:
         self._tokenizer_lock = threading.Lock()
         self.initial_ids = functools.lru_cache(maxsize=4096)(self._initial_ids)
 
+    @property
+    def renderer(self):
+        return self._renderer
+
+    @property
+    def source(self):
+        return self._source
+
     def _initial_ids(self, prompt_index: int) -> tuple[int, ...]:
         return tuple(self._renderer.initial_ids(self._source.prompt(prompt_index)))
 

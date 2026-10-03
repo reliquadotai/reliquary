@@ -1,0 +1,602 @@
+"""The grading policy: grade everything, replay passes and drawn failures,
+two executors agreeing on a failed replay void the submission once."""
+
+import asyncio
+import hashlib
+from types import SimpleNamespace
+
+import pytest
+
+from reliquary.corpus.audit_policy import AuditParams, MinerState, drawn, replay_drawn
+from reliquary.corpus.job import parse_job
+from reliquary.environment.agentic_swe import SweSource
+from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
+from reliquary.validator.corpus_grade_remote import GradeDecision
+from reliquary.validator.corpus_grading import GRADE_SCHEMA, CorpusGrader
+from tests.unit.test_corpus_job_episode import _episode, _manifest
+from tests.unit.test_trajectory_parse import CALL, PROMPT, TERM, TEXT, R, build
+
+SID = "a" * 64
+TURNS = [([TEXT] * 8 + [CALL, TERM], ["a.py"]), ([TEXT] * 9 + [TERM], None)]
+
+
+def _job(fraction=1.0, **episode):
+    return parse_job(_manifest(prompt_count=3,
+                               episode=_episode(replay_fraction_failed=fraction, **episode)))
+
+
+def _record(stop="agent_completed"):
+    tokens, spans = build(TURNS)
+    return {"schema": RECORD_SCHEMA_V2, "hotkey": "5Hot", "prompt_index": 1, "received_at": 100.0,
+            "completions": [{"prompt_tokens": PROMPT, "tokens": tokens, "final_diff": "D",
+                             "stop": stop,
+                             "turns": [{"start": s, "end": e, "proofs": ["A" * 8]} for s, e in spans]}]}
+
+
+class _Records:
+    def __init__(self, verdict=None, fail_grade_writes=0, stop="agent_completed"):
+        self.submissions = {SID: _record(stop)}
+        self.verdicts = {} if verdict is None else {SID: verdict}
+        self.grades, self.regrades, self.voided = {}, {}, {}
+        self._fail = fail_grade_writes
+
+    async def read_submission(self, job_id, sid):
+        return self.submissions.get(sid)
+
+    async def list_submission_ids(self, job_id):
+        return sorted(self.submissions)
+
+    async def read_verdict(self, job_id, sid):
+        return self.verdicts.get(sid)
+
+    async def write_grade(self, job_id, sid, document):
+        if self._fail:
+            self._fail -= 1
+            raise OSError("bucket down")
+        if sid in self.grades:
+            return False
+        self.grades[sid] = document
+        return True
+
+    async def read_grade(self, job_id, sid):
+        return self.grades.get(sid)
+
+    async def list_grade_ids(self, job_id):
+        return sorted(self.grades)
+
+    async def write_regrade(self, job_id, sid, document):
+        if sid in self.regrades:
+            return False
+        self.regrades[sid] = document
+        return True
+
+    async def write_voided(self, job_id, sid, document):
+        if sid in self.voided:
+            return False
+        self.voided[sid] = document
+        return True
+
+
+class _States:
+    def __init__(self):
+        self.states = {}
+
+    async def update_many(self, changes):
+        for hotkey, change in changes.items():
+            self.states[hotkey] = change(self.states.get(hotkey, MinerState()))
+        return dict(self.states)
+
+
+class _Dispatcher:
+    def __init__(self, grade, replay):
+        self.items, self._answers = [], {"grade": grade, "replay": replay}
+
+    async def decide(self, item):
+        self.items.append(item)
+        return self._answers[item["mode"]]
+
+
+PASSED = GradeDecision("ok", {"status": "ok", "diff_applied": True, "tests_passed": True},
+                       ("g0",), ("p0",))
+FAILED = GradeDecision("ok", {"status": "ok", "diff_applied": True, "tests_passed": False},
+                       ("g0",), ("p0",))
+NOT_APPLIED = GradeDecision("ok", {"status": "ok", "diff_applied": False, "tests_passed": False},
+                            ("g0",), ("p0",))
+CERTIFIED = GradeDecision("ok", {"status": "ok", "replay_diff_equal": True, "observations_compared": 1,
+                                 "observations_mismatched": []}, ("g1",), ("p1",))
+_BAD_REPLAY = {"status": "ok", "replay_diff_equal": False, "observations_compared": 1,
+               "observations_mismatched": []}
+FORGED = GradeDecision("ok", _BAD_REPLAY, ("g0", "g1"), ("p0", "p1"))
+
+
+def _grader(records, dispatcher, *, job=None, states=None, beacon=None):
+    voided = []
+    grader = CorpusGrader(job=job or _job(), records=records, dispatcher=dispatcher, renderer=R,
+                          source=SweSource([("i0", "p"), ("repo__x.1", "fix it"), ("i2", "q")]),
+                          params=AuditParams(), miner_states=states, beacon=beacon,
+                          round_at=(lambda t: 7) if beacon else None, on_voided=lambda s, d: voided.append(s),
+                          clock=lambda: 1000.0)
+    return grader, voided
+
+
+def test_a_passing_grade_is_replayed_and_certified():
+    records, dispatcher = _Records(), _Dispatcher(PASSED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["schema"] == GRADE_SCHEMA and doc["status"] == "ok"
+    assert doc["graded_success"] is True and doc["replay_certified"] is True
+    grade_item, replay_item = dispatcher.items
+    assert grade_item["instance_id"] == "repo__x.1" and grade_item["final_diff"] == "D"
+    assert replay_item["mode"] == "replay"
+    assert replay_item["actions"] == [{"tool": "bash", "arguments": '{"command": "c0"}', "observation": "a.py"}]
+    assert records.grades[SID] == doc
+
+
+def test_a_failing_grade_is_replayed_only_when_drawn():
+    records, dispatcher = _Records(), _Dispatcher(FAILED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher, job=_job(fraction=0.0))
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"] == {"drawn": False, "draw": {"fraction": 0.0, "drawn": False}}
+    assert [i["mode"] for i in dispatcher.items] == ["grade"]
+
+
+def test_the_draw_uses_the_drand_round_after_arrival():
+    randomness = "c" * 64
+    records, dispatcher = _Records(), _Dispatcher(FAILED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher, job=_job(fraction=0.5), beacon=lambda r: randomness)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["draw"]["round"] == 8
+    assert doc["replay"]["drawn"] is replay_drawn(randomness, SID, 0.5)
+
+
+def test_an_unpublished_round_leaves_the_submission_pending():
+    records, dispatcher = _Records(), _Dispatcher(FAILED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher, job=_job(fraction=0.5), beacon=lambda r: None)
+    assert asyncio.run(grader.grade_one(SID)) is None and records.grades == {}
+
+
+def test_a_grade_waiting_for_its_round_is_not_graded_again():
+    # Ruling P7: the rescan retries the draw, never the grade.
+    published = {"round": None}
+    records, dispatcher = _Records(), _Dispatcher(FAILED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher, job=_job(fraction=0.5),
+                        beacon=lambda r: published["round"])
+
+    async def scenario():
+        assert await grader.grade_one(SID) is None
+        assert await grader.grade_one(SID) is None
+        published["round"] = "c" * 64
+        return await grader.grade_one(SID)
+
+    doc = asyncio.run(scenario())
+    assert [i["mode"] for i in dispatcher.items].count("grade") == 1
+    assert doc["grade"] == FAILED.result and doc["replay"]["draw"]["round"] == 8
+
+
+def test_an_agreed_failed_replay_voids_and_escalates():
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(PASSED, FORGED), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["failed"] is True and doc["replay_certified"] is False
+    assert records.voided[SID]["reason"] == "replay_failed" and voided == [SID]
+    assert states.states["5Hot"].suspect_until is not None
+    assert states.states["5Hot"].failure_ids == [SID]
+
+
+def test_a_drawn_failing_grade_whose_replay_fails_by_agreement_is_voided():
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(FAILED, FORGED), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["graded_success"] is False and doc["replay"]["failed"] is True
+    assert voided == [SID] and states.states["5Hot"].failure_ids == [SID]
+
+
+@pytest.mark.parametrize("decision", [
+    # One executor alone, whatever it says.
+    GradeDecision("ok", _BAD_REPLAY, ("g0",), ("p0",)),
+    # Two executors, one provider: one vote.
+    GradeDecision("ok", _BAD_REPLAY, ("g0", "g1"), ("p0",)),
+    # Agreement whose providers are not known.
+    GradeDecision("ok", _BAD_REPLAY, ("g0", "g1")),
+], ids=["one-executor", "one-provider", "no-providers"])
+def test_a_failed_replay_without_two_providers_sanctions_nobody(decision):
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(PASSED, decision), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["failed"] is False and doc["replay"]["certified"] is False
+    assert doc["replay"]["unconfirmed"] is True and doc["replay_certified"] is False
+    assert records.voided == {} and states.states == {} and voided == []
+
+
+@pytest.mark.parametrize("grade", [FAILED, NOT_APPLIED], ids=["tests-failed", "diff-not-applied"])
+def test_a_failing_grade_by_one_undrawn_executor_never_sanctions(grade):
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(grade, FORGED), job=_job(fraction=0.0),
+                             states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["status"] == "ok" and doc["graded_success"] is False
+    assert doc["replay_certified"] is False and doc["replay"]["drawn"] is False
+    assert records.voided == {} and states.states == {} and voided == []
+
+
+@pytest.mark.parametrize("status", ["timeout", "error", "ungradeable", "disputed"])
+def test_a_grade_without_a_decision_judges_nobody_and_certifies_nothing(status):
+    records, states = _Records(), _States()
+    dispatcher = _Dispatcher(GradeDecision(status, None, ()), FORGED)
+    grader, voided = _grader(records, dispatcher, states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["status"] == status                         # its own outcome, on record
+    assert doc["graded_success"] is False and doc["replay"] is None
+    assert doc["replay_certified"] is False
+    assert [i["mode"] for i in dispatcher.items] == ["grade"]
+    assert records.voided == {} and states.states == {} and voided == []
+    assert records.grades[SID] == doc
+
+
+@pytest.mark.parametrize("status", ["timeout", "error", "ungradeable", "disputed"])
+def test_a_replay_without_a_decision_judges_nobody(status):
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(PASSED, GradeDecision(status, None, ("g0", "g1"))),
+                             states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["status"] == status
+    assert doc["replay"]["certified"] is False and doc["replay"]["failed"] is False
+    assert doc["replay_certified"] is False and doc["graded_success"] is True
+    assert records.voided == {} and states.states == {} and voided == []
+
+
+def test_an_audit_failure_is_not_graded():
+    records, dispatcher = _Records(verdict={"passed": False}), _Dispatcher(PASSED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher)
+    assert asyncio.run(grader.grade_one(SID))["status"] == "audit_failed"
+    assert dispatcher.items == []
+
+
+def test_the_actions_are_parsed_under_the_job_turn_limit():
+    # A max_turns stop is only accepted against the job's own limit.
+    records, dispatcher = _Records(stop="max_turns"), _Dispatcher(PASSED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher, job=_job(max_turns=2))
+    assert asyncio.run(grader.grade_one(SID))["replay_certified"] is True
+    records, dispatcher = _Records(stop="max_turns"), _Dispatcher(PASSED, CERTIFIED)
+    grader, _ = _grader(records, dispatcher, job=_job(max_turns=3))
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["status"] == "unparseable" and doc["reason"] == "bad_stop"
+    assert dispatcher.items == [] and records.voided == {}
+
+
+def test_a_confirmed_failure_is_counted_once_across_a_restart():
+    records, states = _Records(fail_grade_writes=1), _States()
+    first, _ = _grader(records, _Dispatcher(PASSED, FORGED), states=states)
+    with pytest.raises(OSError):
+        asyncio.run(first.grade_one(SID))              # crashed after the void, before the grade
+    second, voided = _grader(records, _Dispatcher(PASSED, FORGED), states=states)
+    asyncio.run(second.grade_one(SID))
+    assert states.states["5Hot"].failure_ids == [SID]
+    assert len(states.states["5Hot"].confirmed_failures) == 1
+    assert list(records.voided) == [SID] and voided == []      # written once, announced once
+
+
+def test_ready_lists_only_graded_submissions():
+    records = _Records()
+    records.grades["b" * 64] = {}
+    grader, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    assert asyncio.run(grader.ready([SID, "b" * 64])) == {"b" * 64}
+
+
+def test_ready_learns_of_a_grade_this_process_wrote():
+    records = _Records()
+    grader, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+
+    async def scenario():
+        before = await grader.ready([SID])
+        await grader.grade_one(SID)
+        return before, await grader.ready([SID])
+
+    assert asyncio.run(scenario()) == (set(), {SID})
+
+
+def test_the_replay_draw_is_independent_of_the_audit_draw():
+    sids = [hashlib.sha256(bytes([k])).hexdigest() for k in range(64)]
+    randomness = "d" * 64
+    assert [replay_drawn(randomness, s, 0.5) for s in sids] != [drawn(randomness, s, 0.5) for s in sids]
+    assert replay_drawn(randomness, sids[0], 1.0) and not replay_drawn(randomness, sids[0], 0.0)
+
+
+# -- quarantine: what an executor decided alone is graded again ---------------
+
+
+class _Sequence:
+    """A dispatcher answering each mode from its own list, in order."""
+
+    def __init__(self, grades, replays):
+        self.items, self._answers = [], {"grade": list(grades), "replay": list(replays)}
+
+    async def decide(self, item):
+        self.items.append(item)
+        return self._answers[item["mode"]].pop(0)
+
+
+def test_a_quarantined_executor_alone_on_a_decision_is_regraded():
+    records = _Records()
+    regraded_pass = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    dispatcher = _Sequence([PASSED, regraded_pass], [CERTIFIED, CERTIFIED])
+    grader, _ = _grader(records, dispatcher)
+
+    async def scenario():
+        await grader.grade_one(SID)                        # g0 graded alone, g1 replayed alone
+        return await grader.regrade_executor("g0"), await grader.regrade_executor("g0")
+
+    first, again = asyncio.run(scenario())
+    assert first == [SID] and again == []
+    assert records.regrades[SID]["graded_by"] == ["g2"]
+    assert records.grades[SID]["graded_by"] == ["g0"]      # the grade stays, superseded
+
+
+def test_the_lone_replayer_is_tracked_too():
+    records = _Records()
+    grader, _ = _grader(records, _Sequence([PASSED, PASSED], [CERTIFIED, CERTIFIED]))
+
+    async def scenario():
+        await grader.grade_one(SID)
+        return await grader.regrade_executor("g1")
+
+    assert asyncio.run(scenario()) == [SID] and SID in records.regrades
+
+
+def test_an_agreed_decision_is_not_regraded():
+    records, states = _Records(), _States()
+    agreed = GradeDecision("ok", PASSED.result, ("g0", "g3"), ("p0", "p3"))
+    grader, _ = _grader(records, _Dispatcher(agreed, FORGED), states=states)
+
+    async def scenario():
+        await grader.grade_one(SID)
+        return await grader.regrade_executor("g0"), await grader.regrade_executor("g1")
+
+    assert asyncio.run(scenario()) == ([], [])
+    assert records.regrades == {}
+
+
+def test_grades_written_before_a_restart_are_regraded_too():
+    records = _Records()
+    first, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    asyncio.run(first.grade_one(SID))
+    second, _ = _grader(records, _Dispatcher(GradeDecision("ok", PASSED.result, ("g2",), ("p2",)),
+                                             CERTIFIED))
+
+    async def scenario():
+        await second.ready([SID])                          # seeded from the store
+        return await second.regrade_executor("g0")
+
+    assert asyncio.run(scenario()) == [SID]
+    assert records.regrades[SID]["graded_by"] == ["g2"]
+
+
+def test_a_cached_grade_of_a_quarantined_executor_is_dropped():
+    published = {"round": None}
+    records = _Records()
+    regraded = GradeDecision("ok", FAILED.result, ("g2",), ("p2",))
+    dispatcher = _Sequence([FAILED, regraded], [CERTIFIED])
+    grader, _ = _grader(records, dispatcher, job=_job(fraction=0.5),
+                        beacon=lambda r: published["round"])
+
+    async def scenario():
+        assert await grader.grade_one(SID) is None         # g0's grade waits for its round
+        await grader.regrade_executor("g0")
+        published["round"] = "c" * 64
+        return await grader.grade_one(SID)
+
+    doc = asyncio.run(scenario())
+    assert doc["graded_by"] == ["g2"]
+
+
+# -- the payment gate ------------------------------------------------------------
+
+
+def test_settlement_waits_for_the_grade():
+    from reliquary.validator.corpus_settlement import CorpusSettler
+    from tests.unit.test_corpus_settlement import _Archives
+    from tests.unit.test_corpus_settlement import _Records as _SettleRecords
+
+    verdict = {"passed": True, "hotkey": "5Hot", "token_count": 10}
+    records = _SettleRecords({SID: verdict, "b" * 64: dict(verdict)})
+    graded = {"b" * 64}
+
+    async def ready(ids):
+        return {s for s in ids if s in graded}
+
+    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
+                            archives=_Archives(other_max=None), ready=ready,
+                            advance_every_seconds=0.0)
+    asyncio.run(settler.settle_once())
+    assert records.state["settled"] == ["b" * 64]
+    graded.add(SID)
+    asyncio.run(settler.settle_once())
+    assert sorted(records.state["settled"]) == sorted([SID, "b" * 64])
+
+
+def test_a_void_landing_before_payment_is_never_paid():
+    from reliquary.validator.corpus_settlement import CorpusSettler
+    from tests.unit.test_corpus_settlement import _Archives
+    from tests.unit.test_corpus_settlement import _Records as _SettleRecords
+
+    class _Voiding(_SettleRecords):
+        async def list_voided_ids(self, job_id):
+            return [SID]
+
+    records = _Voiding({SID: {"passed": True, "hotkey": "5Hot", "token_count": 10},
+                        "b" * 64: {"passed": True, "hotkey": "5Other", "token_count": 10}})
+
+    async def ready(ids):
+        return set(ids)
+
+    archives = _Archives(other_max=None)
+    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
+                            archives=archives, ready=ready)
+    asyncio.run(settler.settle_once())
+    (archive,) = archives.written.values()
+    assert archive["rewards_by_hotkey"] == {"5Other": pytest.approx(0.1)}
+
+
+# -- the control's wiring --------------------------------------------------------
+
+
+def test_judge_jobs_follow_the_mode():
+    from reliquary.validator.corpus_validator import judge_jobs
+
+    calls = []
+
+    class _Runner:
+        def __init__(self, name):
+            self.name = name
+
+        def run(self):
+            calls.append(self.name)
+            return self.name
+
+    w = SimpleNamespace(entry=SimpleNamespace(task_id="t"), auditor=_Runner("auditor"),
+                        settler=object(), grader=_Runner("grader"))
+    full = judge_jobs(w, intake_only=False, settle_every_seconds=60.0,
+                      settle=lambda task_id, settler, every: "settle")
+    assert full == ["auditor", "settle", "grader"]
+    assert judge_jobs(w, intake_only=True, settle_every_seconds=60.0,
+                      settle=lambda *a: "settle") == ["grader"]
+    w.grader = None
+    assert judge_jobs(w, intake_only=False, settle_every_seconds=60.0,
+                      settle=lambda *a: "settle") == ["auditor", "settle"]
+    w.judge_link = object()
+    assert judge_jobs(w, intake_only=False, settle_every_seconds=60.0,
+                      settle=lambda *a: "settle") == []
+
+
+def _wired(job, intake=True):
+    return SimpleNamespace(
+        entry=SimpleNamespace(task_id="t", params={}), job=job,
+        episode_intake=SimpleNamespace(renderer=R, source=SweSource([("i0", "p")])) if intake else None)
+
+
+def test_an_episode_job_gets_a_grader_on_the_pinned_env():
+    from reliquary.validator.corpus_validator import wire_job_grader
+
+    job = _job()
+    dispatcher = SimpleNamespace(env_pin=(job.episode.env.package, job.episode.env.version))
+    w = _wired(job)
+    wire_job_grader(w, records=_Records(), judge_records=_Records(), dispatcher=dispatcher)
+    assert isinstance(w.grader, CorpusGrader)
+    graders = w.grader
+    wire_job_grader(w, records=_Records(), judge_records=_Records(), dispatcher=dispatcher)
+    assert w.grader is graders                             # once per job
+
+
+def test_a_job_without_an_episode_gets_no_grader():
+    from reliquary.validator.corpus_validator import wire_job_grader
+
+    w = _wired(parse_job(_manifest(with_episode=False)), intake=False)
+    wire_job_grader(w, records=_Records(), judge_records=_Records(), dispatcher=None)
+    assert getattr(w, "grader", None) is None
+
+
+def test_an_episode_job_without_its_grade_dispatcher_is_refused():
+    from reliquary.validator.corpus_validator import wire_job_grader
+
+    job = _job()
+    with pytest.raises(ValueError, match="restart"):
+        wire_job_grader(_wired(job), records=_Records(), judge_records=_Records(), dispatcher=None)
+    other = SimpleNamespace(env_pin=(job.episode.env.package, "f" * 40))
+    with pytest.raises(ValueError, match="grades"):
+        wire_job_grader(_wired(job), records=_Records(), judge_records=_Records(), dispatcher=other)
+
+
+def test_intake_only_refuses_any_audit():
+    from reliquary.validator.corpus_validator import run_corpus_validator
+
+    for kwargs in ({"remote_audit": True}, {"split": object()}):
+        with pytest.raises(RuntimeError, match="intake-only serves no audit"):
+            asyncio.run(run_corpus_validator(
+                wallet=None, netuid=1, signer_client=None, http_host="h", http_port=1,
+                set_weights=False, intake_only=True, **kwargs))
+
+
+def test_the_vocab_size_is_read_from_the_config(tmp_path):
+    from reliquary.validator.corpus_validator import _config_vocab_size
+
+    (tmp_path / "config.json").write_text('{"text_config": {"vocab_size": 248320}}')
+    assert _config_vocab_size(tmp_path) == 248320
+    (tmp_path / "config.json").write_text('{"vocab_size": 151936}')
+    assert _config_vocab_size(tmp_path) == 151936
+    (tmp_path / "config.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="vocab_size"):
+        _config_vocab_size(tmp_path)
+
+
+@pytest.mark.parametrize("flag", ["1", "0"])
+def test_the_cli_passes_intake_only(monkeypatch, flag):
+    from reliquary.cli import main
+    from reliquary.validator import corpus_validator
+
+    seen = []
+
+    async def fake(**kwargs):
+        seen.append(kwargs)
+
+    monkeypatch.setattr(corpus_validator, "run_corpus_validator", fake)
+    monkeypatch.setenv("RELIQUARY_CORPUS_INTAKE_ONLY", flag)
+    for jobs in ([("e", 0.1)], [("e", 0.1), ("f", 0.2)]):
+        asyncio.run(main._run_corpus(jobs=jobs, wallet=None, netuid=1, signer_client=None,
+                                     http_host="h", http_port=1, set_weights=False))
+    assert [k["intake_only"] for k in seen] == [flag == "1"] * 2
+
+
+def test_the_cli_refuses_intake_only_with_the_split(monkeypatch):
+    from reliquary.cli import main
+
+    monkeypatch.setenv("RELIQUARY_CORPUS_INTAKE_ONLY", "1")
+    monkeypatch.setenv("RELIQUARY_CORPUS_SPLIT", "1")
+    with pytest.raises(RuntimeError, match="intake-only"):
+        asyncio.run(main._run_corpus(jobs=[("e", 0.1)], wallet=None, netuid=1, signer_client=None,
+                                     http_host="h", http_port=1, set_weights=False))
+
+
+def test_the_judge_pays_only_graded_submissions_and_hears_of_voids():
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
+    from reliquary.validator.corpus_job_status import JobStats
+    from reliquary.validator.corpus_validator import wire_job_judge
+
+    grader, _ = _grader(_Records(), _Dispatcher(PASSED, CERTIFIED))
+    w = SimpleNamespace(entry=SimpleNamespace(task_id="t", params={}), job=_job(), cap=0.1,
+                        stats=JobStats(), grader=grader)
+    wire_job_judge(w, records=_Records(), judge_records=_Records(),
+                   judge_threads=SimpleNamespace(codec=None, gpu=None), archives=object(),
+                   proof=toploc_proof(ACTIVE_PROTOCOL_PROFILE), model=None, tokenizer=None)
+    assert w.settler._ready == grader.ready
+    assert grader.on_voided == w.miners.voided
+
+
+def test_a_failed_regrade_is_retried_by_the_rescan():
+    records = _Records()
+
+    class _Flaky(_Sequence):
+        async def decide(self, item):
+            if len(self.items) == 2:                       # the regrade's first dispatch
+                self.items.append(None)
+                raise OSError("dispatcher down")
+            return await super().decide(item)
+
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    grader, _ = _grader(records, _Flaky([PASSED, regraded], [CERTIFIED, CERTIFIED]))
+    grader._rescan = 3600.0
+
+    async def scenario():
+        await grader.grade_one(SID)
+        assert await grader.regrade_executor("g0") == [SID]
+        assert SID not in records.regrades
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(grader.run(), 0.5)
+
+    asyncio.run(scenario())
+    assert records.regrades[SID]["graded_by"] == ["g2"]
+
+
+def test_the_void_document_is_the_auditors():
+    from reliquary.validator import corpus_auditor, corpus_grading
+
+    assert corpus_grading.VOIDED_SCHEMA == corpus_auditor.VOIDED_SCHEMA
