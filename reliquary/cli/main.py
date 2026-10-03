@@ -1807,16 +1807,28 @@ def eval_grade(
     poll_seconds: float = typer.Option(10.0, "--poll-seconds"),
     admin_url: str = _ADMIN_URL,
 ) -> None:
-    """Grade a drained eval job on the admin host and bring its files home."""
+    """Grade a drained eval job and write its report, manifest and graded rows.
+
+    A job our validator served (jobs create --eval-set) is graded here, on this
+    host's CPU, from the subnet bucket (R2_*); an order job (order-eval-*) by
+    the admin service, which then sends its files home."""
     import json
 
     from reliquary.eval import operator
+    from reliquary.eval.job_grading import JobNotGradable, grade_served_job
+    from reliquary.eval.prompt_source import is_order_job_id
 
     try:
-        answer = operator.grade_job(_admin_client(admin_url), job_id, out=out, eval_id=eval_id,
-                                    allow_incomplete=allow_incomplete,
-                                    poll_seconds=poll_seconds)
-    except (ValueError, TimeoutError, operator.AdminError) as exc:
+        if not is_order_job_id(job_id):
+            if out is None:
+                raise ValueError("--out is required: the grading is written here")
+            answer = asyncio.run(grade_served_job(job_id, out=out,
+                                                  allow_incomplete=allow_incomplete))
+        else:
+            answer = operator.grade_job(_admin_client(admin_url), job_id, out=out,
+                                        eval_id=eval_id, allow_incomplete=allow_incomplete,
+                                        poll_seconds=poll_seconds)
+    except (ValueError, TimeoutError, operator.AdminError, JobNotGradable) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(json.dumps(answer, indent=1))

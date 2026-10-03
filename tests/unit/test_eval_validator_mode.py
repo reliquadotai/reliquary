@@ -197,3 +197,115 @@ def test_an_unpublished_set_is_named(bucket, registry, published):
 
     result = CliRunner().invoke(app, _eval_args(**{"--eval-set": "nope"}))
     assert result.exit_code != 0 and "nope" in result.output
+
+
+# --------------------------------------------------------------------------
+# grading a job our validator served
+# --------------------------------------------------------------------------
+
+
+def test_a_served_eval_job_is_graded_on_cpu_from_its_audited_records(
+        bucket, registry, published, tmp_path):
+    import asyncio
+    import json
+
+    import pyarrow.parquet as pq
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.eval.job_grading import JobNotGradable, grade_served_job
+    from reliquary.eval.storage import publish_set
+    from tests.unit.test_admin_eval_jobs import _JobRecords
+    from tests.unit.test_eval_verifiers_source import FakeTask, fake_handle
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(app, _eval_args(**{"--prompt-count": "3"})).exit_code == 0
+    subnet = LocalDirectorySink(tmp_path / "subnet")
+    asyncio.run(publish_set(tmp_path / "verifiers-fake-r0-n5", platform=None, subnet=subnet))
+    records = _JobRecords()
+
+    def submit(sid, prompt, texts):
+        records.subs[sid] = {"prompt_index": prompt, "hotkey": f"hk{prompt}",
+                             "completions": [{"text": t, "tokens": [1, 151645]} for t in texts]}
+        records.verdicts[sid] = {"passed": True, "audited": True, "hotkey": f"hk{prompt}"}
+        records.settled.append(sid)
+
+    handle = fake_handle([FakeTask(i) for i in range(5)])
+
+    async def entries():
+        return registry["entries"].values()
+
+    def grade(**kw):
+        return asyncio.run(grade_served_job(
+            "eval-teutonic-aime26", out=tmp_path / "out", records=records, subnet=subnet,
+            entries=entries, open_taskset=lambda name, args: handle, **kw))
+
+    # Nothing audited yet: an empty job is not complete.
+    with pytest.raises(JobNotGradable, match="misses samples"):
+        grade()
+    for prompt in range(3):
+        for k in range(4):
+            right = f"<think>hmm</think>{prompt}"
+            submit(f"{prompt:032x}{k:032x}", prompt, [right if k < 2 + (prompt == 0) else "x"])
+    records.subs["f" * 64] = {"prompt_index": 0, "hotkey": "late", "completions": []}
+    with pytest.raises(JobNotGradable, match="not drained"):
+        grade()
+    del records.subs["f" * 64]
+    manifest = grade()
+    assert manifest["complete"] is True
+    report = json.loads((tmp_path / "out" / "report.json").read_text())
+    env = report["envs"]["verifiers:fake"]
+    # p0: 3/4 right, p1 and p2: 2/4 right; thinking on, "x" has no closing tag.
+    assert env["pass@1"]["value"] == pytest.approx((0.75 + 0.5 + 0.5) / 3)
+    provenance = report["provenance"]
+    assert provenance["model"] == "org/Teutonic" and provenance["thinking"] is True
+    assert provenance["verification"]["source"] == "task contract"
+    assert provenance["verification"]["thresholds"]["exp_mismatch_threshold"] is not None
+    assert provenance["generation"] == "sn81-miners" and provenance["miner_hotkeys"] == 3
+    assert pq.read_table(tmp_path / "out" / "graded.parquet").num_rows == 12
+
+
+def test_an_order_job_or_a_catalog_job_is_not_graded_here(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    from reliquary.eval.job_grading import JobNotGradable, grade_served_job
+
+    async def read_job(job_id):
+        return SimpleNamespace(prompt_source="reliquary_dapo_math_v1"), None
+
+    async def read_ledgers(job_id):
+        return {}, None
+
+    with pytest.raises(JobNotGradable, match="admin service"):
+        asyncio.run(grade_served_job("order-eval-1", out=tmp_path, records=object(),
+                                     subnet=object(), read_job=read_job,
+                                     read_ledgers=read_ledgers))
+    with pytest.raises(JobNotGradable, match="not an eval set"):
+        asyncio.run(grade_served_job("corpus-math", out=tmp_path, records=object(),
+                                     subnet=object(), read_job=read_job,
+                                     read_ledgers=read_ledgers))
+
+
+def test_eval_grade_grades_a_served_job_here(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.eval import job_grading
+
+    seen = {}
+
+    async def grade(job_id, *, out, allow_incomplete):
+        seen.update(job_id=job_id, out=out, allow_incomplete=allow_incomplete)
+        return {"complete": True}
+
+    monkeypatch.setattr(job_grading, "grade_served_job", grade)
+    monkeypatch.delenv("RELIQUARY_ADMIN_SECRET", raising=False)
+    result = CliRunner().invoke(app, ["eval", "grade", "--job", "eval-teutonic-aime26",
+                                      "--out", str(tmp_path / "o"), "--allow-incomplete"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"job_id": "eval-teutonic-aime26", "out": str(tmp_path / "o"),
+                    "allow_incomplete": True}
+    missing = CliRunner().invoke(app, ["eval", "grade", "--job", "eval-x"])
+    assert missing.exit_code == 1 and "--out is required" in missing.output
