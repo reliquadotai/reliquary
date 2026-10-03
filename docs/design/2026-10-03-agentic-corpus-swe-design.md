@@ -153,7 +153,9 @@ expiry, strikes, quarantine and 5% local recheck:
     drawn like audits (drand, submission id);
   - a replay that does not reproduce `final_diff` or exceeds the mismatch
     tolerance is recorded as a confirmed audit failure (void, suspect, ban), the
-    same path as a TOPLOC failure.
+    same path as a TOPLOC failure. The tolerance is per episode:
+    `allowed = max(5, ceil(0.12 x n))` mismatched observations out of `n`
+    (`replay_compare.within_tolerance`, derived in gate M2).
 - Results go to `reliquary/corpus/jobs/{job}/grades/{sid}.json`. Grades never
   change payment except through the audit-failure path above.
 
@@ -241,8 +243,27 @@ is recorded in this file before the dependent component is written.
   with the first rule set (durations, timestamps), 68/2017 = 3.4% after the
   rules added from the observed pairs: object addresses (`0x...`), the box's own
   `base` commit hash, hashes in built version strings, `ls -l` mtimes, `date`
-  and `git log/show` dates and full hashes. **Replay tolerance: 5.4% of
-  observations (3.4% + 2 points)**; the per-episode spread is in the JSON.
+  and `git log/show` dates and full hashes. The 3.4% is pooled over 2,017
+  observations; the tolerance is applied **per episode**, where the spread is
+  wide. Per episode (n = 5 to 58 observations): 29 of 66 episodes have no
+  mismatch, 17 have 1, 10 have 2, 9 have 3, 1 has 4; max 4 mismatches, p90 3;
+  max share 20% (3 of 15), p90 share 8.7%; 16 of 66 honest episodes exceed
+  5.4%, so a pooled-share tolerance would void a quarter of honest work.
+  **Replay tolerance, per episode: at most `max(5, ceil(0.12 x n))`
+  mismatched observations in an episode of `n`** (`reliquary/corpus/
+  replay_compare.py`, `within_tolerance`). All 66 honest episodes pass with at
+  least 2 observations to spare. The floor of 5 covers short episodes (one
+  pandas rebuild can make 3 of 15 differ); the 12% share covers long ones
+  (worst honest share above 40 observations: 4 of 42, 9.5%). No exemption by
+  command class: the residual mismatches below come from ordinary commands
+  (`pytest`, `python -c`, `find`, `pip`, `ls`, `git log`), and a class rule
+  would be a free pass for any forged observation whose command matches it.
+  **Forgery budget (cost to price in plan 4):** a miner can forge up to
+  `max(5, ceil(0.12 x n))` observations per episode undetected by replay:
+  every observation of an episode of 5 or fewer, 5 of 6-41 observations, 6 at
+  42-50, 7 at 58, 12 at 100. The diff must still match exactly, so forged
+  observations cannot change the delivered patch, only the text the student is
+  trained to read.
   Residual mismatches (not normalisable, absorbed by the tolerance): pytest
   `--durations` lists and parallel ninja progress lines, whose order follows
   timing (30 of 68); commands listing the recording box's pip cache, conda

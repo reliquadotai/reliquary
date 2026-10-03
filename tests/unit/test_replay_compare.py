@@ -84,3 +84,61 @@ def test_normalize_hides_git_show_commit_and_date():
     b = "commit ea9e4f8435e5ae79a89adf40ba36335089d60ff2\nAuthor: reliquary-swe <r@localhost>\nDate:   Sat Oct  3 09:32:51 2026 +0000\n"
     assert normalize(a) == normalize(b)
     assert normalize(a) != normalize(b.replace("Author: reliquary-swe", "Author: someone"))
+
+
+# --- per-episode tolerance, from gate M2's recorded honest episodes ---------
+
+from pathlib import Path  # noqa: E402
+
+from reliquary.corpus.replay_compare import allowed_mismatches, within_tolerance  # noqa: E402
+
+_M2 = Path(__file__).resolve().parents[2] / "docs/design/measurements/2026-10-03-m2-replay-agreement.json"
+
+
+def _m2_episodes():
+    return json.loads(_M2.read_text())["episodes"]
+
+
+def test_allowed_mismatches_floor_then_share():
+    assert allowed_mismatches(0) == 5
+    assert allowed_mismatches(15) == 5
+    assert allowed_mismatches(42) == 6
+    assert allowed_mismatches(100) == 12
+
+
+def test_every_honest_m2_episode_is_within_tolerance_with_two_to_spare():
+    episodes = _m2_episodes()
+    assert len(episodes) == 66
+    for e in episodes:
+        report = ReplayReport(compared=e["actions"], mismatched=list(e["mismatched"]),
+                              diff_equal=e["diff_equal"])
+        assert within_tolerance(report), e["instance_id"]
+        assert allowed_mismatches(e["actions"]) - len(e["mismatched"]) >= 2
+
+
+def test_real_m2_pairs_compare_as_mismatched_and_stay_within_tolerance():
+    # The worst share in M2: 3 of 15 observations differ (20 %).
+    worst = max(_m2_episodes(), key=lambda e: len(e["mismatched"]) / e["actions"])
+    assert (len(worst["mismatched"]), worst["actions"]) == (3, 15)
+    samples = {s["index"]: s for s in worst["samples"]}
+    recorded, replayed = [], []
+    for i in range(worst["actions"]):
+        s = samples.get(i)
+        recorded.append(Action("bash", s["arguments"] if s else "{}", s["recorded"] if s else f"o{i}"))
+        replayed.append(s["replayed"] if s else f"o{i}")
+    report = compare(recorded, replayed, "diff", "diff")
+    # The JSON's samples are truncated, so a pair whose difference lies past the
+    # cut compares equal here; the visible ones must still be caught.
+    visible = [i for i, x in samples.items() if normalize(x["recorded"]) != normalize(x["replayed"])]
+    assert len(visible) >= 2
+    assert report.mismatched == sorted(visible)
+    assert within_tolerance(report)
+    assert within_tolerance(ReplayReport(compared=worst["actions"], mismatched=list(worst["mismatched"]),
+                                         diff_equal=True))
+
+
+def test_too_many_mismatches_or_a_different_diff_fail():
+    assert not within_tolerance(ReplayReport(compared=15, mismatched=list(range(6)), diff_equal=True))
+    assert within_tolerance(ReplayReport(compared=15, mismatched=list(range(5)), diff_equal=True))
+    assert not within_tolerance(ReplayReport(compared=15, mismatched=[], diff_equal=False))
+    assert not within_tolerance(ReplayReport(compared=100, mismatched=list(range(13)), diff_equal=True))

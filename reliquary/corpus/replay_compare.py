@@ -3,11 +3,12 @@
 Pure: the actions come from a verifiers trace, the replayed observations from
 ``reliquary.validator.agentic_replay``. A replay certifies an episode when its
 final diff is identical and few observations differ after normalization (gate
-M2 sets the rules and the tolerance).
+M2 sets the rules and the tolerance, see ``within_tolerance``).
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -77,6 +78,28 @@ def normalize(text: str) -> str:
     for pattern, replacement in _RULES:
         text = pattern.sub(replacement, text)
     return text
+
+
+# Per-episode replay tolerance, derived from gate M2's 66 honest episodes
+# (docs/design/measurements/2026-10-03-m2-replay-agreement.json): at most 4
+# mismatched observations in any episode, at most 20 % (3 of 15) in a short
+# one, at most 9.5 % (4 of 42) in one of 40+ observations. The floor covers
+# short episodes, the share covers long ones; every M2 episode passes with
+# at least 2 observations to spare. It is also the forgery budget: a miner
+# may forge up to this many observations in an episode without failing it.
+TOLERANCE_FLOOR = 5
+TOLERANCE_SHARE = 0.12
+
+
+def allowed_mismatches(observations: int) -> int:
+    """Mismatched observations an episode of ``observations`` may carry."""
+    return max(TOLERANCE_FLOOR, math.ceil(TOLERANCE_SHARE * observations))
+
+
+def within_tolerance(report: ReplayReport) -> bool:
+    """True when a replay certifies the episode: identical final diff and no
+    more mismatched observations than ``allowed_mismatches`` allows."""
+    return report.diff_equal and len(report.mismatched) <= allowed_mismatches(report.compared)
 
 
 def compare(recorded: Sequence[Action], replayed: Sequence[str],
