@@ -126,6 +126,9 @@ async def register_executor(*, executor_id: str, token_sha256: str, model_id: st
         raise ValueError(f"scope must be one of {sorted(EXECUTOR_SCOPES)}")
     if scope == "eval" and not (provider_id and host):
         raise ValueError("an eval executor needs its provider_id and host")
+    if scope == "grade" and not provider_id:
+        # Agreement counts distinct providers only (one provider, one vote).
+        raise ValueError("a grade executor needs its provider_id")
     if scope == "grade" and not _COMMIT.fullmatch(model_revision):
         # A grade executor is bound to the env commit the job pins, never a branch.
         raise ValueError("a grade executor's model_revision is its env commit (40 hex)")

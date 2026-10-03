@@ -320,12 +320,12 @@ def test_grade_is_a_registry_scope(monkeypatch):
     monkeypatch.setattr(executors, "get_s3_client", lambda **kw: fake)
     doc, created = asyncio.run(executors.register_executor(
         executor_id="g1", token_sha256="d" * 64, model_id="reliquary-swe", model_revision="b" * 40,
-        expires_at=2e9, now=1000.0, scope="grade"))
+        expires_at=2e9, now=1000.0, scope="grade", provider_id="hetzner"))
     assert created and doc["scope"] == "grade"
     with pytest.raises(ValueError, match="env commit"):
         asyncio.run(executors.register_executor(
             executor_id="g2", token_sha256="d" * 64, model_id="reliquary-swe", model_revision="main",
-            expires_at=2e9, now=1000.0, scope="grade"))
+            expires_at=2e9, now=1000.0, scope="grade", provider_id="hetzner"))
 
 
 def test_the_admin_service_registers_a_grade_executor():
@@ -352,7 +352,7 @@ def test_the_register_command_binds_the_env_pin_and_prints_the_token_once(monkey
 
     monkeypatch.setattr(corpus_executor_store, "register_executor", register)
     result = CliRunner().invoke(app, ["corpus", "register-grade-executor", "--executor-id", "g1",
-                                      "--env-version", "b" * 40])
+                                      "--env-version", "b" * 40, "--provider-id", "hetzner"])
     assert result.exit_code == 0, result.output
     printed = json.loads(result.output.strip().splitlines()[-1])
     (call,) = calls

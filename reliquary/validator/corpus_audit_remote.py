@@ -160,6 +160,9 @@ class ExecutorDirectory:
             return None, "wrong_executor"
         return document, None
 
+    def document(self, executor_id: str) -> dict | None:
+        return self._by_id.get(executor_id)
+
     def is_authorized(self, executor_id: str) -> bool:
         return self._refusal(self._by_id.get(executor_id)) is None
 
@@ -311,11 +314,15 @@ class ExecutorLeases:
                     await self.quarantine(lease.executor_id,
                                           f"{self._strikes_limit} leases expired in a row")
 
-    async def quarantine(self, executor_id: str, reason: str) -> None:
-        """Refuse the executor from now on, take back its leases, and tell the
-        listeners (who re-check what it computed)."""
+    def _on_quarantined(self, executor_id: str) -> None:
+        """Called synchronously as an executor is quarantined, before any await:
+        a subclass drops what it must no longer count from that executor."""
+
+    def _mark_quarantined(self, executor_id: str, reason: str) -> bool:
+        """The synchronous half of a quarantine: refused from now on, its
+        leases taken back. False when it already was."""
         if executor_id in self.quarantined:
-            return
+            return False
         logger.error("%s %s quarantined: %s", self.kind, executor_id, reason)
         self.quarantined.add(executor_id)
         self._directory.revoke_locally(executor_id)
@@ -324,10 +331,20 @@ class ExecutorLeases:
             if lease.executor_id == executor_id:
                 del self._leases[lease_id]
                 self._take_back(lease, expired=False)
+        self._on_quarantined(executor_id)
         self._unwritten_quarantines[executor_id] = reason
+        return True
+
+    async def _publish_quarantine(self, executor_id: str) -> None:
         await self._write_quarantines()
         for listener in self._listeners:
             self._spawn(self._notify(listener, executor_id))
+
+    async def quarantine(self, executor_id: str, reason: str) -> None:
+        """Refuse the executor from now on, take back its leases, and tell the
+        listeners (who re-check what it computed)."""
+        if self._mark_quarantined(executor_id, reason):
+            await self._publish_quarantine(executor_id)
 
     @staticmethod
     async def _notify(listener, executor_id: str) -> None:

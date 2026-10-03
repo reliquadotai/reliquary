@@ -10,6 +10,13 @@ alone can never fail a miner. Timeouts, executor errors and expired leases
 re-lease the item elsewhere and never judge anyone: two timeouts (an expired
 lease counts as one) resolve as ``timeout``, three errors as ``error``.
 
+Executors count by provider (ruling P17): each grade executor registers its
+``provider_id``, an item is never leased to a provider that already voted on
+it, and agreement counts distinct providers, so one operator's boxes are one
+vote. Every wait for a next distinct executor is bounded (ruling P16): an item
+that holds a vote and finds no further executor within ``dispute_seconds``
+resolves ``disputed``, which sanctions nobody and certifies nothing.
+
 An item no lease can carry (actions or observations beyond the
 ``GradeLease`` bounds) is never leased: every executor would refuse the lease
 and it would cycle forever. It resolves at once as ``ungradeable``, the
@@ -68,7 +75,10 @@ MAX_RESULTS_PER_ITEM = 3
 MAX_TIMEOUTS = 2
 MAX_ERRORS = 3
 MAX_LEASES_PER_EXECUTOR = 8
+# How long an item holding a vote waits for a next distinct-provider executor.
+GRADE_DISPUTE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS", 1800.0, 60.0, 86400.0)
 UNGRADEABLE = "ungradeable"
+DISPUTED = "disputed"
 
 # The facts an "ok" result must carry for its mode.
 _MODE_FACTS = {"grade": ("diff_applied", "tests_passed"), "replay": ("replay_diff_equal",)}
@@ -76,7 +86,7 @@ _MODE_FACTS = {"grade": ("diff_applied", "tests_passed"), "replay": ("replay_dif
 
 @dataclass(frozen=True)
 class GradeDecision:
-    # "ok", "error", "timeout" or "ungradeable"; only "ok" judges the miner.
+    # "ok", "error", "timeout", "ungradeable" or "disputed"; only "ok" judges the miner.
     status: str
     result: dict | None                 # the agreed result, when "ok"
     graded_by: tuple[str, ...]
@@ -103,6 +113,7 @@ class _Work:
     future: asyncio.Future
     queued_at: float
     results: dict[str, dict] = field(default_factory=dict)
+    providers: dict[str, str] = field(default_factory=dict)   # voter -> its provider
     excluded: set[str] = field(default_factory=set)
     drawn: bool | None = None           # recheck draw, made at the first result
     timeouts: int = 0
@@ -138,7 +149,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
                  live_seconds: float = EXECUTOR_LIVE_SECONDS,
                  max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
                  expiry_strikes: int = LEASE_EXPIRY_STRIKES,
-                 lease_seconds: dict[str, float] | None = None) -> None:
+                 lease_seconds: dict[str, float] | None = None,
+                 dispute_seconds: float = GRADE_DISPUTE_SECONDS) -> None:
         super().__init__(directory=directory, quarantine=quarantine,
                          record_heartbeat=record_heartbeat, clock=clock,
                          live_seconds=live_seconds,
@@ -149,6 +161,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
         self._rng = rng or secrets.SystemRandom()
         self._fraction = recheck_fraction
         self._lease_seconds = {**GRADE_LEASE_SECONDS, **(lease_seconds or {})}
+        self._dispute_seconds = float(dispute_seconds)
         self._queue: collections.deque[_Work] = collections.deque()
 
     # -- the grader's side ------------------------------------------------------
@@ -176,12 +189,15 @@ class RemoteGradeDispatcher(ExecutorLeases):
         self._contact(executor_id)
         if executor_id in self.quarantined or self._held(executor_id) >= self._max_leases:
             return None
+        if self._provider(executor_id) is None:
+            logger.error("grade executor %s has no provider_id; never leased", executor_id)
+            return None
         for work in list(self._queue):
             if work.future.done():
                 self._queue.remove(work)
                 continue
-            if executor_id in work.excluded:
-                continue                         # an item is never answered twice by one executor
+            if not self._eligible(executor_id, work):
+                continue                         # one vote per executor, and per provider
             self._queue.remove(work)
             lease = _Lease(lease_id=secrets.token_hex(16), work=work, executor_id=executor_id,
                            expires_at=self._clock() + self._lease_seconds[work.mode])
@@ -190,6 +206,16 @@ class RemoteGradeDispatcher(ExecutorLeases):
             return {"protocol": GRADE_PROTOCOL, "lease_id": lease.lease_id,
                     "expires_at": lease.expires_at, "env": dict(self._env), "items": [work.item]}
         return None
+
+    def _provider(self, executor_id: str) -> str | None:
+        document = self._directory.document(executor_id) or {}
+        provider = document.get("provider_id")
+        return str(provider) if provider else None
+
+    def _eligible(self, executor_id: str, work: _Work) -> bool:
+        provider = self._provider(executor_id)
+        return (executor_id not in work.excluded and provider is not None
+                and provider not in work.providers.values())
 
     @staticmethod
     def _misfit(work: _Work, answer: GradeItemResult) -> str | None:
@@ -211,6 +237,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
         if lease.expires_at <= self._clock():
             # Counted like a sweep would have: an expiry, then elsewhere.
             self._take_back(lease, expired=True)
+            if self._strike(executor_id):
+                self._spawn(self.quarantine(executor_id,
+                                            f"{self._strikes_limit} grade leases expired in a row"))
             raise LeaseRefused(410, "lease_expired")
         answer = result.results[0]
         work.excluded.add(executor_id)
@@ -234,6 +263,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
         if work.drawn is None:
             work.drawn = self._rng.random() < self._fraction
         work.results[executor_id] = answer.model_dump()
+        work.providers[executor_id] = self._provider(executor_id) or executor_id
         self.stats["graded"] += 1
         self._settle(work)
         return "accepted"
@@ -251,18 +281,25 @@ class RemoteGradeDispatcher(ExecutorLeases):
             self._requeue(work)
 
     def _settle(self, work: _Work) -> None:
+        if work.future.done():
+            return
         if not work.results:
             self._requeue(work)
             return
-        keys = collections.Counter(decision_key(work.mode, r) for r in work.results.values())
-        key, count = keys.most_common(1)[0]
-        if count >= work.agree_needed:
-            agreeing = tuple(sorted(e for e, r in work.results.items()
-                                    if decision_key(work.mode, r) == key))
+        groups: dict[tuple, list[str]] = collections.defaultdict(list)
+        for executor_id, answer in work.results.items():
+            groups[decision_key(work.mode, answer)].append(executor_id)
+        # Agreement counts providers, not executors: one operator is one vote.
+        key, voters = max(groups.items(),
+                          key=lambda kv: len({work.providers[e] for e in kv[1]}))
+        if len({work.providers[e] for e in voters}) >= work.agree_needed:
+            agreeing = tuple(sorted(voters))
             self._resolve(work, GradeDecision("ok", dict(work.results[agreeing[0]]), agreeing))
             for dissenter in sorted(set(work.results) - set(agreeing)):
-                self._spawn(self.quarantine(
-                    dissenter, f"grade item {work.id} ({work.mode}) disagreed with {list(agreeing)}"))
+                # Refused at once; the registry write and listeners follow.
+                if self._mark_quarantined(dissenter, f"grade item {work.id} ({work.mode}) "
+                                                     f"disagreed with {list(agreeing)}"):
+                    self._spawn(self._publish_quarantine(dissenter))
             return
         if len(work.results) >= MAX_RESULTS_PER_ITEM:
             logger.error("grade item %d: %d executors without two agreeing; unjudged",
@@ -290,26 +327,45 @@ class RemoteGradeDispatcher(ExecutorLeases):
         if not work.future.done():
             work.future.set_result(decision)
 
-    async def quarantine(self, executor_id: str, reason: str) -> None:
-        """As every lease dispatcher, and its votes on undecided items no
-        longer count (each item may then need another executor)."""
-        if executor_id in self.quarantined:
-            return
-        queued = [w for w in self._queue if executor_id in w.results]
-        leased = [lease.work for lease in self._leases.values() if executor_id in lease.work.results]
-        await super().quarantine(executor_id, reason)
-        for work in leased:
-            work.results.pop(executor_id, None)  # settled when its lease answers
-        for work in queued:
+    def _on_quarantined(self, executor_id: str) -> None:
+        """Its votes on undecided items stop counting before anything awaits,
+        so no result arriving meanwhile can agree with a quarantined executor."""
+        leased = {id(lease.work) for lease in self._leases.values()}
+        for work in list(self._queue) + [lease.work for lease in self._leases.values()]:
+            if work.future.done() or executor_id not in work.results:
+                continue
             work.results.pop(executor_id, None)
-            self._settle(work)
+            work.providers.pop(executor_id, None)
+            if id(work) not in leased:
+                self._settle(work)               # a leased one settles when its lease answers
 
     async def sweep(self) -> None:
         await self._expire_leases()
-        waiting = [w for w in self._queue if not w.future.done()]
-        self.stats["waiting"] = len(waiting)
-        if waiting and not self.connected():
-            logger.warning("%d grade items wait and no grade executor is connected", len(waiting))
+        now = self._clock()
+        live = self._live_executors()
+        waiting = 0
+        for work in list(self._queue):
+            if work.future.done():
+                continue
+            if work.results and now - work.queued_at >= self._dispute_seconds:
+                # No distinct executor came for the next vote: nobody is judged.
+                self.stats[DISPUTED] += 1
+                logger.warning(
+                    "grade item %d (%s, submission %s) disputed: no distinct-provider executor "
+                    "voted within %.0f s after %s; no sanction, not certified", work.id,
+                    work.mode, work.item["submission_id"][:12], self._dispute_seconds,
+                    {e: decision_key(work.mode, r) for e, r in sorted(work.results.items())})
+                self._resolve(work, GradeDecision(DISPUTED, None, tuple(sorted(work.results))))
+                continue
+            waiting += 1
+            if live and not any(self._eligible(eid, work) for eid in live):
+                self.stats["stranded"] += 1
+                logger.warning("grade item %d (%s) waits: every live grade executor is excluded "
+                               "from it (voted, failed it, or same provider as a voter)",
+                               work.id, work.mode)
+        self.stats["waiting"] = waiting
+        if waiting and not live:
+            logger.warning("%d grade items wait and no grade executor is connected", waiting)
         if self._unwritten_quarantines:
             await self._write_quarantines()
 
@@ -351,6 +407,7 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
     return router
 
 
-__all__ = ["GRADE_LEASE_SECONDS", "GRADE_PREFIX", "UNGRADEABLE", "GradeDecision",
+__all__ = ["DISPUTED", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
+           "UNGRADEABLE", "GradeDecision",
            "RemoteGradeDispatcher", "build_grade_executor_router", "decision_key",
            "replay_certified"]

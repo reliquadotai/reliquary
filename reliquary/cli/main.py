@@ -2056,6 +2056,9 @@ def corpus_register_grade_executor(
     executor_id: str = typer.Option(..., "--executor-id"),
     env_version: str = typer.Option(
         ..., "--env-version", help="reliquary-environments commit the job pins"),
+    provider_id: str = typer.Option(
+        ..., "--provider-id",
+        help="Who runs the box (e.g. hetzner); agreement counts distinct providers only"),
     env_package: str = typer.Option("reliquary-swe", "--env-package"),
     days: float = typer.Option(30.0, "--days"),
 ) -> None:
@@ -2072,7 +2075,7 @@ def corpus_register_grade_executor(
     document, created = asyncio.run(corpus_executor_store.register_executor(
         executor_id=executor_id, token_sha256=hashlib.sha256(token.encode()).hexdigest(),
         model_id=env_package, model_revision=env_version, expires_at=now + days * 86400.0,
-        now=now, scope="grade"))
+        now=now, provider_id=provider_id, scope="grade"))
     typer.echo(json.dumps({"executor_id": document["executor_id"], "created": created,
                            "token": token if created else None}))
 

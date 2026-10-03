@@ -29,9 +29,12 @@ TOKENS = {f"g{k}": f"token-{k}-" + "x" * 30 for k in range(4)}
 SID = "a" * 64
 
 
-def _docs(scope="grade"):
+def _docs(scope="grade", providers=None):
+    # Each executor on its own provider unless told otherwise (ruling P17).
+    providers = providers or {eid: f"p{k}" for k, eid in enumerate(TOKENS)}
     return [dict(executor_id=eid, token_sha256=token_sha256(token), model_id=PACKAGE,
-                 model_revision=VERSION, expires_at=1e12, status="active", scope=scope)
+                 model_revision=VERSION, expires_at=1e12, status="active", scope=scope,
+                 **({"provider_id": providers[eid]} if providers.get(eid) else {}))
             for eid, token in TOKENS.items()]
 
 
@@ -43,20 +46,24 @@ class _Rng:
         return self.value
 
 
-def _dispatcher(recheck=1.0, clock=None, quarantined=None):
+async def _dispatcher(recheck=1.0, clock=None, quarantined=None, providers=None,
+                      write=None, **kw):
     clock = clock or _Clock()
 
     async def listed():
-        return _docs()
+        return _docs(providers=providers)
 
     async def quarantine(eid, reason):
+        if write is not None:
+            await write(eid, reason)
         if quarantined is not None:
             quarantined.append(eid)
 
     directory = ExecutorDirectory(model_id=PACKAGE, model_revision=VERSION, list_documents=listed,
                                   clock=clock, scope="grade")
+    await directory.refresh()
     return RemoteGradeDispatcher(directory=directory, env_package=PACKAGE, env_version=VERSION,
-                                 quarantine=quarantine, clock=clock, rng=_Rng(recheck))
+                                 quarantine=quarantine, clock=clock, rng=_Rng(recheck), **kw)
 
 
 def _item(mode="grade", **kw):
@@ -94,7 +101,7 @@ def test_decision_keys():
 
 
 async def test_an_undrawn_pass_needs_one_executor():
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item()))
     await asyncio.sleep(0)
     lease = d.claim("g0")
@@ -106,7 +113,7 @@ async def test_an_undrawn_pass_needs_one_executor():
 
 
 async def test_a_drawn_recheck_needs_a_second_executor():
-    d = _dispatcher(recheck=0.0)
+    d = await _dispatcher(recheck=0.0)
     decision = asyncio.ensure_future(d.decide(_item()))
     await asyncio.sleep(0)
     _answer(d, "g0", PASS)
@@ -116,7 +123,7 @@ async def test_a_drawn_recheck_needs_a_second_executor():
 
 
 async def test_a_failure_with_one_executor_waits_for_a_second():
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     _answer(d, "g0", REPLAY_BAD)
@@ -130,7 +137,7 @@ async def test_a_failure_with_one_executor_waits_for_a_second():
 
 async def test_a_disagreement_is_arbitrated_by_a_third_executor():
     quarantined = []
-    d = _dispatcher(recheck=1.0, quarantined=quarantined)
+    d = await _dispatcher(recheck=1.0, quarantined=quarantined)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     _answer(d, "g0", REPLAY_BAD)                 # a lying executor fails an honest miner
@@ -144,7 +151,7 @@ async def test_a_disagreement_is_arbitrated_by_a_third_executor():
 
 
 async def test_three_results_without_two_agreeing_judge_nobody():
-    d = _dispatcher(recheck=0.0)
+    d = await _dispatcher(recheck=0.0)
     decision = asyncio.ensure_future(d.decide(_item()))
     await asyncio.sleep(0)
     _answer(d, "g0", PASS)
@@ -156,7 +163,7 @@ async def test_three_results_without_two_agreeing_judge_nobody():
 
 
 async def test_a_quarantined_executor_loses_its_pending_vote():
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     _answer(d, "g0", REPLAY_BAD)                 # waits for a second executor
@@ -167,7 +174,7 @@ async def test_a_quarantined_executor_loses_its_pending_vote():
 
 
 async def test_a_quarantined_vote_on_a_leased_item_is_dropped_too():
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     _answer(d, "g0", REPLAY_BAD)
@@ -179,7 +186,7 @@ async def test_a_quarantined_vote_on_a_leased_item_is_dropped_too():
 
 
 async def test_timeouts_go_to_other_executors_then_resolve_unjudged():
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     _answer(d, "g0", TIMEOUT)
@@ -189,7 +196,7 @@ async def test_timeouts_go_to_other_executors_then_resolve_unjudged():
 
 
 async def test_three_errors_resolve_as_an_error():
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item()))
     await asyncio.sleep(0)
     for eid in ("g0", "g1"):
@@ -203,7 +210,7 @@ async def test_three_errors_resolve_as_an_error():
 async def test_an_expired_lease_strikes_and_three_strikes_quarantine():
     clock = _Clock()
     quarantined = []
-    d = _dispatcher(recheck=1.0, clock=clock, quarantined=quarantined)
+    d = await _dispatcher(recheck=1.0, clock=clock, quarantined=quarantined)
     for _ in range(3):
         asyncio.ensure_future(d.decide(_item()))
         await asyncio.sleep(0)
@@ -215,7 +222,7 @@ async def test_an_expired_lease_strikes_and_three_strikes_quarantine():
 
 async def test_an_item_whose_leases_keep_expiring_resolves_as_a_timeout():
     clock = _Clock()
-    d = _dispatcher(recheck=1.0, clock=clock)
+    d = await _dispatcher(recheck=1.0, clock=clock)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     for eid in ("g0", "g1"):
@@ -228,7 +235,7 @@ async def test_an_item_whose_leases_keep_expiring_resolves_as_a_timeout():
 
 async def test_a_late_result_is_refused_and_counts_as_an_expiry():
     clock = _Clock()
-    d = _dispatcher(recheck=1.0, clock=clock)
+    d = await _dispatcher(recheck=1.0, clock=clock)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     lease = d.claim("g0")
@@ -237,13 +244,14 @@ async def test_a_late_result_is_refused_and_counts_as_an_expiry():
         d.result("g0", lease["lease_id"], _result(REPLAY_BAD))
     assert refused.value.detail == "lease_expired"
     assert d.claim("g0") is None and not decision.done()
+    assert d._strikes["g0"] == 1                  # a late result is an expiry: struck
     _answer(d, "g1", REPLAY_OK)
     assert (await decision).graded_by == ("g1",)
 
 
 @pytest.mark.parametrize("echo", [None, "c" * 64])
 async def test_a_result_for_another_submission_is_refused_and_struck(echo):
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     lease = d.claim("g0")
@@ -262,7 +270,7 @@ async def test_a_result_for_another_submission_is_refused_and_struck(echo):
     ("replay", {"status": "ok", "submission_id": SID, "diff_applied": True, "tests_passed": True}),
 ])
 async def test_an_ok_result_without_its_mode_facts_is_refused(mode, answer):
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item(mode)))
     await asyncio.sleep(0)
     lease = d.claim("g0")
@@ -279,7 +287,7 @@ async def test_an_ok_result_without_its_mode_facts_is_refused(mode, answer):
     {"instance_id": ""},
 ])
 async def test_an_item_no_lease_can_carry_is_ungradeable_and_never_leased(oversized):
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     got = await asyncio.wait_for(d.decide(_item("replay", **oversized)), timeout=1)
     assert got.status == "ungradeable" and got.result is None and got.graded_by == ()
     assert d.claim("g0") is None and d.stats["ungradeable"] == 1
@@ -298,7 +306,7 @@ def test_a_lease_outlives_its_work():
 
 async def test_the_lease_expiry_follows_its_mode():
     clock = _Clock()
-    d = _dispatcher(clock=clock)
+    d = await _dispatcher(clock=clock)
     asyncio.ensure_future(d.decide(_item("replay")))
     asyncio.ensure_future(d.decide(_item("grade")))
     await asyncio.sleep(0)
@@ -308,7 +316,7 @@ async def test_the_lease_expiry_follows_its_mode():
 
 
 async def test_the_router_checks_scope_and_env():
-    d = _dispatcher()
+    d = await _dispatcher()
     app = FastAPI()
     app.include_router(build_grade_executor_router(d, d._directory))
     await d._directory.refresh()
@@ -324,7 +332,7 @@ async def test_the_router_checks_scope_and_env():
 
 
 async def test_the_router_serves_a_whole_lease():
-    d = _dispatcher(recheck=1.0)
+    d = await _dispatcher(recheck=1.0)
     app = FastAPI()
     app.include_router(build_grade_executor_router(d, d._directory))
     await d._directory.refresh()
@@ -369,3 +377,150 @@ async def test_a_grade_directory_refuses_a_corpus_token():
                                   scope="grade")
     await directory.refresh()
     assert directory.authenticate(TOKENS["g0"]) == (None, "wrong_scope")
+
+
+# --------------------------------------------------------------------------
+# Fix round 1: bounded waits (P16), distinct providers (P17), races
+# --------------------------------------------------------------------------
+
+
+async def test_a_disagreement_without_a_third_executor_resolves_disputed(monkeypatch):
+    warned = []
+    monkeypatch.setattr(corpus_grade_remote.logger, "warning",
+                        lambda *a, **k: warned.append(a[0] % a[1:]))
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    _answer(d, "g1", REPLAY_OK)
+    clock.now += 1799
+    for eid in ("g0", "g1"):
+        d.heartbeat(eid)                          # live, but both excluded
+    await d.sweep()
+    assert not decision.done()
+    assert d.stats["stranded"] >= 1 and any("every live grade executor" in w for w in warned)
+    clock.now += 2
+    await d.sweep()
+    got = await decision
+    assert got.status == "disputed" and got.result is None and got.graded_by == ("g0", "g1")
+    assert d.stats["disputed"] == 1 and any("disputed" in w for w in warned)
+    assert not d.quarantined                      # nobody is judged
+
+
+async def test_a_failing_replay_without_a_second_provider_resolves_disputed():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0,
+                          providers={"g0": "hetzner", "g1": "hetzner", "g2": "hetzner",
+                                     "g3": "hetzner"})
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    for eid in ("g1", "g2", "g3"):
+        assert d.claim(eid) is None               # same provider: never a second vote
+    clock.now += 1801
+    await d.sweep()
+    got = await decision
+    assert got.status == "disputed" and got.graded_by == ("g0",)
+
+
+async def test_a_drawn_recheck_without_a_second_executor_resolves_disputed():
+    clock = _Clock()
+    d = await _dispatcher(recheck=0.0, clock=clock, dispute_seconds=1800.0)
+    decision = asyncio.ensure_future(d.decide(_item()))
+    await asyncio.sleep(0)
+    _answer(d, "g0", PASS)
+    clock.now += 1801
+    await d.sweep()
+    assert (await decision).status == "disputed"
+
+
+async def test_a_same_provider_vote_never_completes_an_agreement():
+    d = await _dispatcher(recheck=0.0, providers={"g0": "a", "g1": "a", "g2": "b", "g3": "b"})
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    assert d.claim("g1") is None
+    _answer(d, "g2", REPLAY_BAD)
+    got = await decision
+    assert got.status == "ok" and got.graded_by == ("g0", "g2")
+
+
+async def test_an_executor_without_a_provider_gets_no_lease():
+    d = await _dispatcher(providers={"g0": None, "g1": "p1", "g2": "p2", "g3": "p3"})
+    asyncio.ensure_future(d.decide(_item()))
+    await asyncio.sleep(0)
+    assert d.claim("g0") is None and d.claim("g1") is not None
+
+
+def test_a_grade_executor_registers_with_its_provider(monkeypatch):
+    from reliquary.infrastructure import corpus_executor_store as executors
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+
+    monkeypatch.setattr(executors, "get_s3_client", lambda **kw: _FakeMultiObjectR2())
+    fields = dict(executor_id="g1", token_sha256="d" * 64, model_id="reliquary-swe",
+                  model_revision="b" * 40, expires_at=2e9, now=1000.0, scope="grade")
+    with pytest.raises(ValueError, match="provider_id"):
+        asyncio.run(executors.register_executor(**fields))
+    doc, _ = asyncio.run(executors.register_executor(**fields, provider_id="hetzner"))
+    assert doc["provider_id"] == "hetzner"
+
+
+def test_the_register_command_requires_a_provider(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.infrastructure import corpus_executor_store
+
+    calls = []
+
+    async def register(**kw):
+        calls.append(kw)
+        return {"executor_id": kw["executor_id"]}, True
+
+    monkeypatch.setattr(corpus_executor_store, "register_executor", register)
+    argv = ["corpus", "register-grade-executor", "--executor-id", "g1", "--env-version", "b" * 40]
+    assert CliRunner().invoke(app, argv).exit_code == 2 and calls == []
+    result = CliRunner().invoke(app, argv + ["--provider-id", "hetzner"])
+    assert result.exit_code == 0, result.output
+    assert calls[0]["provider_id"] == "hetzner"
+
+
+async def test_a_vote_is_dropped_before_the_quarantine_write_yields():
+    async def slow_write(eid, reason):
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    d = await _dispatcher(recheck=1.0, write=slow_write)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    caught = asyncio.ensure_future(d.quarantine("g0", "caught elsewhere"))
+    await asyncio.sleep(0)                        # the write is now pending
+    assert not caught.done()
+    _answer(d, "g1", REPLAY_BAD)                  # would co-sign a sanction with g0
+    assert not decision.done()
+    await caught
+    _answer(d, "g2", REPLAY_BAD)
+    got = await decision
+    assert got.graded_by == ("g1", "g2") and "g0" not in got.graded_by
+
+
+async def test_a_dissenter_is_quarantined_at_decision_time():
+    async def slow_write(eid, reason):
+        await asyncio.sleep(0)
+
+    d = await _dispatcher(recheck=1.0, write=slow_write)
+    first = asyncio.ensure_future(d.decide(_item("replay")))
+    second = asyncio.ensure_future(d.decide(_item("replay", task_index=2)))
+    await asyncio.sleep(0)
+    lease = d.claim("g0")                         # g0 works on item 1, then lies on item 2
+    _answer(d, "g0", REPLAY_BAD)
+    _answer(d, "g1", REPLAY_OK)
+    _answer(d, "g2", REPLAY_OK)                   # item 2 decided: g0 dissented
+    assert "g0" in d.quarantined                  # before any background write ran
+    assert d.claim("g0") is None
+    with pytest.raises(LeaseRefused):
+        d.result("g0", lease["lease_id"], _result(REPLAY_OK))
+    assert (await second).graded_by == ("g1", "g2")
+    assert not first.done()
