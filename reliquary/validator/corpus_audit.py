@@ -61,6 +61,28 @@ def batch_completion_hidden_states(
     return [hidden[row, n - 1 : len(tokens) - 1] for row, (tokens, n) in enumerate(sequences)]
 
 
+def check_spans(spans: Sequence[tuple[int, int]], length: int) -> None:
+    """Spans are ordered, non-empty, non-overlapping and inside the sequence,
+    and none starts at 0 (a turn always follows at least one prompt token)."""
+    previous_end = 1
+    for start, end in spans:
+        if not (previous_end <= start < end <= length):
+            raise ValueError(f"span [{start}, {end}) is malformed for a {length}-token sequence")
+        previous_end = end
+
+
+@torch.no_grad()
+def span_hidden_states(
+    model, tokens: Sequence[int], spans: Sequence[tuple[int, int]]
+) -> list[torch.Tensor]:
+    """One prefill over the whole trajectory, then for each assistant span the
+    rows that predicted its tokens: positions ``start - 1 .. end - 2``."""
+    check_spans(spans, len(tokens))
+    (rows,) = batch_completion_hidden_states(model, [(list(tokens), 1)])
+    # ``rows[i]`` is the state at position ``i`` (it predicted token ``i + 1``).
+    return [rows[start - 1 : end - 1] for start, end in spans]
+
+
 SCORE_OK = "ok"
 SCORE_PROOF_UNDECODABLE = "proof_undecodable"
 SCORE_BAD_PROOF_SHAPE = "bad_proof_shape"
