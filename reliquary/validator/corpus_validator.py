@@ -406,6 +406,10 @@ def wire_job_grader(w, *, records, judge_records, dispatcher) -> None:
                             renderer=w.episode_intake.renderer, source=w.episode_intake.source,
                             params=params, miner_states=miner_states, beacon=beacon,
                             round_at=round_at)
+    for executor_id in sorted(getattr(dispatcher, "quarantined", ()) or ()):
+        # Quarantined before this grader existed (before a restart, or before
+        # a hot add): held now, before any settlement; its first rescan regrades.
+        w.grader.hold_executor(executor_id)
 
 
 async def regrade_everywhere(graders, executor_id: str) -> list:
@@ -962,6 +966,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 executor_id, "quarantined", reason=reason, scope="grade"),
             record_heartbeat=lambda executor_id, at, detail: grade_store.record_heartbeat(
                 executor_id, at=at, detail=detail))
+        # Quarantines survive a restart: the registry's are refused and held
+        # before any grader (and so any settlement) is wired.
+        await grade_directory.refresh()
+        grade_dispatcher.load_quarantined()
     job_set: CorpusJobSet | None = None
     archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 

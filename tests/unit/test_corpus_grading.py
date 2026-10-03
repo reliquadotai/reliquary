@@ -64,11 +64,18 @@ class _Records:
     async def list_grade_ids(self, job_id):
         return sorted(self.grades)
 
-    async def write_regrade(self, job_id, sid, document):
-        if sid in self.regrades:
+    async def write_regrade(self, job_id, sid, document, generation=1):
+        # regrades[sid] is the latest generation; generations keeps them all.
+        self.generations = getattr(self, "generations", {})
+        if (sid, generation) in self.generations or (generation == 1 and sid in self.regrades):
             return False
-        self.regrades[sid] = document
+        self.generations[(sid, generation)] = document
+        if generation >= (self.regrades.get(sid) or {}).get("generation", 1):
+            self.regrades[sid] = document
         return True
+
+    async def read_regrade(self, job_id, sid):
+        return self.regrades.get(sid)
 
     async def read_voided(self, job_id, sid):
         return self.voided.get(sid)
@@ -761,7 +768,8 @@ def test_an_existing_regrade_is_not_overwritten_and_says_so(monkeypatch):
 
     asyncio.run(scenario())
     assert records.regrades[SID] == {"graded_by": ["g7"]}
-    assert any("already has a regrade" in w for w in warned)
+    # Round 3: the existing regrade (by an unquarantined executor) stands; no new dispatch.
+    assert [i["mode"] for i in grader._dispatcher.items] == ["grade", "replay"]
 
 
 def test_the_grader_reports_its_backlog():
@@ -890,3 +898,127 @@ def test_the_quarantine_listener_logs_a_grader_failure(monkeypatch):
     result = asyncio.run(corpus_validator.regrade_everywhere([_Good(), _Bad()], "g0"))
     assert result == [["x"]]
     assert any("g0" in line and "bucket down" in line for line in logged)
+
+
+# -- fix round 3: a quarantine survives a restart ----------------------------------
+
+
+def test_a_restart_before_the_regrade_write_holds_until_regraded():
+    records = _Records()
+    first, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    asyncio.run(first.grade_one(SID))                      # g0 graded alone; then g0 quarantined
+    first.hold_executor("g0")                              # ... and the process dies here
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    second, _ = _grader(records, _Sequence([regraded], [GradeDecision("ok", CERTIFIED.result,
+                                                                      ("g4",), ("p4",))]))
+    second._dispatcher.quarantined = {"g0"}                # loaded from the registry at boot
+    second.hold_executor("g0")                             # what the control does at wiring
+
+    async def scenario():
+        held = await second.ready([SID])
+        assert await second.regrade_executor("g0") == [SID]
+        return held, await second.ready([SID])
+
+    assert asyncio.run(scenario()) == (set(), {SID})
+    assert records.regrades[SID]["graded_by"] == ["g2"]
+
+
+def test_a_restart_after_the_regrade_write_releases_without_regrading():
+    records = _Records()
+    regraded = GradeDecision("ok", PASSED.result, ("g2",), ("p2",))
+    first, _ = _grader(records, _Sequence([PASSED, regraded], [CERTIFIED, CERTIFIED]))
+
+    async def before():
+        await first.grade_one(SID)
+        await first.regrade_executor("g0")
+
+    asyncio.run(before())                                  # regrade written; the process dies
+    second, _ = _grader(records, _Sequence([], []))        # any dispatch would fail
+    second._dispatcher.quarantined = {"g0"}
+    second.hold_executor("g0")
+
+    async def scenario():
+        assert await second.regrade_executor("g0") == [SID]
+        return await second.ready([SID])
+
+    assert asyncio.run(scenario()) == {SID}
+    assert second._dispatcher.items == []
+    assert records.regrades[SID]["graded_by"] == ["g2"]
+
+
+def test_a_regrade_that_voids_before_a_restart_is_voided_after_it():
+    # The regrade landed (failed by agreement) but its void did not: written on release.
+    records, states = _Records(), _States()
+    first, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+    asyncio.run(first.grade_one(SID))
+    records.regrades[SID] = {"schema": "reliquary/corpus-grade/v1", "submission_id": SID,
+                             "hotkey": "5Hot", "graded_by": ["g2"], "generation": 1,
+                             "replay": {"failed": True, "graded_by": ["g2", "g3"],
+                                        "providers": ["p2", "p3"], "replay_diff_equal": False,
+                                        "observations_compared": 1,
+                                        "observations_mismatched": [], "allowed": 5}}
+    second, voided = _grader(records, _Sequence([], []), states=states)
+    second._dispatcher.quarantined = {"g0"}
+    second.hold_executor("g0")
+    asyncio.run(second.regrade_executor("g0"))
+    assert records.voided[SID]["reason"] == "replay_failed" and voided == [SID]
+    assert states.states["5Hot"].failure_ids == [SID]
+
+
+def test_a_regrade_decided_alone_by_a_later_quarantined_executor_is_redone_once():
+    records = _Records()
+    by = lambda e: GradeDecision("ok", PASSED.result, (e,), (f"p{e}",))  # noqa: E731
+    cert = lambda e: GradeDecision("ok", CERTIFIED.result, (e,), (f"p{e}",))  # noqa: E731
+    dispatcher = _Sequence([by("g0"), by("g2"), by("g5")], [cert("g1"), cert("g3"), cert("g6")])
+    dispatcher.quarantined = set()
+    grader, _ = _grader(records, dispatcher)
+
+    async def scenario():
+        await grader.grade_one(SID)
+        dispatcher.quarantined.add("g0")
+        await grader.regrade_executor("g0")               # generation 1, by g2 alone
+        dispatcher.quarantined.add("g2")
+        first = await grader.regrade_executor("g2")        # generation 2, by g5 alone
+        again = await grader.regrade_executor("g2")        # never twice for the same executor
+        for _ in range(10):
+            await asyncio.sleep(0)
+        return first, again, await grader.ready([SID])
+
+    first, again, ready = asyncio.run(scenario())
+    assert first == [SID] and again == [] and ready == {SID}
+    assert records.regrades[SID]["generation"] == 2 and records.regrades[SID]["graded_by"] == ["g5"]
+    assert [i["mode"] for i in dispatcher.items].count("grade") == 3
+
+
+def test_regrades_stop_at_the_generation_cap():
+    from reliquary.validator.corpus_grading import MAX_REGRADE_GENERATIONS
+
+    records = _Records()
+    names = [f"g{k}" for k in range(2 * MAX_REGRADE_GENERATIONS + 4)]
+    grades = [GradeDecision("ok", PASSED.result, (e,), (f"p{e}",)) for e in names[0::2]]
+    replays = [GradeDecision("ok", CERTIFIED.result, (e,), (f"p{e}",)) for e in names[1::2]]
+    dispatcher = _Sequence(grades, replays)
+    dispatcher.quarantined = set()
+    grader, _ = _grader(records, dispatcher)
+
+    async def scenario():
+        await grader.grade_one(SID)
+        for k in range(MAX_REGRADE_GENERATIONS + 1):
+            executor = names[2 * k]
+            dispatcher.quarantined.add(executor)
+            await grader.regrade_executor(executor)
+        return await grader.ready([SID])
+
+    assert asyncio.run(scenario()) == set()                # held, an operator alert
+    assert records.regrades[SID]["generation"] == MAX_REGRADE_GENERATIONS
+
+
+def test_a_grader_wired_after_a_quarantine_holds_its_executor():
+    from reliquary.validator.corpus_validator import wire_job_grader
+
+    job = _job()
+    dispatcher = SimpleNamespace(env_pin=(job.episode.env.package, job.episode.env.version),
+                                 quarantined={"g0"})
+    w = _wired(job)
+    wire_job_grader(w, records=_Records(), judge_records=_Records(), dispatcher=dispatcher)
+    assert w.grader.status()["held_executors"] == ["g0"]  # regraded by its first rescan

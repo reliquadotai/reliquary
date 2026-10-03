@@ -602,3 +602,28 @@ async def test_a_quarantine_holds_before_any_listener_runs():
     for _ in range(5):
         await asyncio.sleep(0)
     assert seen == [("hold", "g0"), ("listener", "g0")]
+
+
+async def test_quarantines_in_the_registry_are_loaded_without_a_write():
+    written, held = [], []
+    docs = _docs()
+    docs[0]["status"] = "quarantined"
+
+    async def listed():
+        return [dict(d) for d in docs]
+
+    async def write(eid, reason):
+        written.append(eid)
+
+    directory = ExecutorDirectory(model_id=PACKAGE, model_revision=VERSION, list_documents=listed,
+                                  clock=_Clock(), scope="grade")
+    await directory.refresh()
+    d = RemoteGradeDispatcher(directory=directory, env_package=PACKAGE, env_version=VERSION,
+                              quarantine=write, clock=_Clock(), rng=_Rng(1.0))
+    d.hold_on_quarantine(held.append)
+    assert d.load_quarantined() == ["g0"] and d.load_quarantined() == []
+    asyncio.ensure_future(d.decide(_item()))
+    await asyncio.sleep(0)
+    assert d.claim("g0") is None and "g0" in d.quarantined and held == ["g0"]
+    await d.sweep()
+    assert written == []                                  # already in the registry

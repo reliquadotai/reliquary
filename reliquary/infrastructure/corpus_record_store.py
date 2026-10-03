@@ -186,13 +186,36 @@ async def list_grade_ids(job_id, **client_kwargs) -> list[str]:
     return await _list_ids(_prefix(job_id, "grades"), **client_kwargs)
 
 
-async def write_regrade(job_id, submission_id, document, **client_kwargs) -> bool:
-    """A grade redone after its only executor was quarantined; it supersedes the grade."""
-    return await _create(_key(job_id, "regrades", submission_id), document, **client_kwargs)
+# Regrades of one submission a quarantine can force, at most (corpus_grading).
+MAX_REGRADE_GENERATIONS = 3
+
+
+def _regrade_key(job_id: str, submission_id: str, generation: int) -> str:
+    if isinstance(generation, bool) or not isinstance(generation, int) \
+            or not 1 <= generation <= MAX_REGRADE_GENERATIONS:
+        raise ValueError(f"regrade generation must be in [1, {MAX_REGRADE_GENERATIONS}]")
+    if generation == 1:
+        return _key(job_id, "regrades", submission_id)
+    return f"{_prefix(job_id, 'regrades')}{_validated_id(submission_id)}.g{generation}.json"
+
+
+async def write_regrade(job_id, submission_id, document, generation: int = 1,
+                        **client_kwargs) -> bool:
+    """A grade redone after its only executor was quarantined; it supersedes the
+    grade, and each later generation the one before (create-only, each)."""
+    return await _create(_regrade_key(job_id, submission_id, generation), document,
+                         **client_kwargs)
 
 
 async def read_regrade(job_id, submission_id, **client_kwargs) -> dict | None:
-    return await _read(_key(job_id, "regrades", submission_id), **client_kwargs)
+    """The latest regrade of a submission, or None."""
+    latest = None
+    for generation in range(1, MAX_REGRADE_GENERATIONS + 1):
+        document = await _read(_regrade_key(job_id, submission_id, generation), **client_kwargs)
+        if document is None:
+            break
+        latest = document
+    return latest
 
 
 def _settlement_key(job_id: str) -> str:
@@ -308,8 +331,8 @@ class BucketRecordStore:
     async def list_grade_ids(self, job_id):
         return await list_grade_ids(job_id, **self._kw)
 
-    async def write_regrade(self, job_id, submission_id, document):
-        return await write_regrade(job_id, submission_id, document, **self._kw)
+    async def write_regrade(self, job_id, submission_id, document, generation: int = 1):
+        return await write_regrade(job_id, submission_id, document, generation, **self._kw)
 
     async def read_regrade(self, job_id, submission_id):
         return await read_regrade(job_id, submission_id, **self._kw)

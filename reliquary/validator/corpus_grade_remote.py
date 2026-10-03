@@ -174,6 +174,24 @@ class RemoteGradeDispatcher(ExecutorLeases):
         alone can be held from payment at once."""
         self._holders.append(holder)
 
+    def load_quarantined(self) -> list[str]:
+        """Quarantines the registry already holds (a restart forgets its own):
+        refused and held at once, with no new registry write. The listeners
+        hear of them like any quarantine."""
+        loaded = []
+        for executor_id in self._directory.quarantined_ids():
+            if self._mark_quarantined(executor_id, "quarantined in the registry"):
+                self._unwritten_quarantines.pop(executor_id, None)
+                loaded.append(executor_id)
+                for listener in self._listeners:
+                    self._spawn(self._notify(listener, executor_id))
+        return loaded
+
+    async def sweep(self) -> None:
+        # A quarantine written by another control (or before a restart) counts here too.
+        self.load_quarantined()
+        await self._sweep()
+
     @property
     def env_pin(self) -> tuple[str, str]:
         """The env package and commit every lease of this dispatcher runs."""
@@ -372,7 +390,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
             if id(work) not in leased:
                 self._settle(work)               # a leased one settles when its lease answers
 
-    async def sweep(self) -> None:
+    async def _sweep(self) -> None:
         await self._expire_leases()
         now = self._clock()
         live = self._live_executors()

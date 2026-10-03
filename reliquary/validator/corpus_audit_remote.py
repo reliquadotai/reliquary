@@ -163,6 +163,12 @@ class ExecutorDirectory:
     def document(self, executor_id: str) -> dict | None:
         return self._by_id.get(executor_id)
 
+    def quarantined_ids(self) -> list[str]:
+        """This scope's executors the registry, as last read, says are quarantined."""
+        return sorted(eid for eid, d in self._by_id.items()
+                      if (d.get("scope") or "corpus") == self._scope
+                      and d.get("status") == "quarantined")
+
     def is_authorized(self, executor_id: str) -> bool:
         return self._refusal(self._by_id.get(executor_id)) is None
 

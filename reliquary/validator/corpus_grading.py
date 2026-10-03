@@ -29,7 +29,7 @@ from collections.abc import Callable
 from reliquary.corpus.audit_policy import after_confirmed_failure, replay_drawn
 from reliquary.corpus.replay_compare import allowed_mismatches
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
-from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
+from reliquary.infrastructure.corpus_record_store import MAX_REGRADE_GENERATIONS, RECORD_SCHEMA_V2
 from reliquary.validator.corpus_grade_remote import replay_certified
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,10 @@ class CorpusGrader:
         self._held_executors: set[str] = set()
         self._regrades_inflight: set[str] = set()
         self._executor_regrades_inflight: set[str] = set()
+        # Every executor this grader has seen quarantined; never shrinks.
+        self._quarantined: set[str] = set()
+        # The regrade generation each submission's next regrade writes.
+        self._generation: dict[str, tuple[int, list[str]]] = {}
         # Submissions listed but without a grade, as of the last rescan.
         self._ungraded: int | None = None
 
@@ -331,26 +335,38 @@ class CorpusGrader:
                 logger.exception("void report for %s failed", submission_id[:12])
 
     async def _write(self, submission_id: str, document: dict, *, regrade: bool) -> dict:
-        writer = self._records.write_regrade if regrade else self._records.write_grade
-        written = await writer(self._job.job_id, submission_id, document)
-        if regrade and written is False:
-            logger.warning("corpus job %s: %s already has a regrade; this one (by %s) was not "
-                           "written", self._job.job_id, submission_id[:12],
-                           document.get("graded_by"))
+        if regrade:
+            generation, regraded_for = self._generation.get(submission_id, (1, []))
+            document = {**document, "generation": generation, "regraded_for": regraded_for}
+            written = await self._records.write_regrade(self._job.job_id, submission_id,
+                                                        document, generation)
+            if written is False:
+                logger.warning("corpus job %s: %s already has regrade generation %d; this one "
+                               "(by %s) was not written", self._job.job_id, submission_id[:12],
+                               generation, document.get("graded_by"))
+        else:
+            await self._records.write_grade(self._job.job_id, submission_id, document)
         self._final.add(submission_id)
-        if not regrade:
-            self._index(submission_id, document)
-            self._regrade_if_quarantined(submission_id, document)
+        # A regrade too: one decided alone by an executor quarantined later is redone.
+        self._index(submission_id, document)
+        self._regrade_if_quarantined(submission_id, document)
         return document
+
+    def _is_quarantined(self, executor_id: str) -> bool:
+        return (executor_id in self._quarantined
+                or executor_id in set(getattr(self._dispatcher, "quarantined", ()) or ()))
+
+    def _caught(self, document: dict) -> list[str]:
+        """The quarantined executors that decided part of ``document`` alone."""
+        lone = {_lone(document.get("graded_by")),
+                _lone((document.get("replay") or {}).get("graded_by"))} - {None}
+        return sorted(e for e in lone if self._is_quarantined(e))
 
     def _regrade_if_quarantined(self, submission_id: str, document: dict) -> None:
         """A decision made alone by an executor quarantined while this grade
         was in flight: the quarantine's regrade found nothing to redo yet, so
         the grade is held and redone here."""
-        quarantined = set(getattr(self._dispatcher, "quarantined", ()) or ()) | self._held_executors
-        lone = {_lone(document.get("graded_by")),
-                _lone((document.get("replay") or {}).get("graded_by"))} - {None}
-        caught = sorted(lone & quarantined)
+        caught = self._caught(document)
         if not caught:
             return
         for executor_id in caught:
@@ -374,37 +390,101 @@ class CorpusGrader:
         pending = sorted(self._unindexed)
         gate = asyncio.Semaphore(INDEX_READ_CONCURRENCY)
 
+        reader = getattr(self._records, "read_regrade", None)
+
         async def one(sid):
             async with gate:
-                return sid, await self._records.read_grade(self._job.job_id, sid)
+                grade = await self._records.read_grade(self._job.job_id, sid)
+                regrade = await reader(self._job.job_id, sid) if reader is not None else None
+                return sid, grade, regrade
 
-        for sid, document in await asyncio.gather(*(one(sid) for sid in pending)):
-            if document is not None:
-                self._index(sid, document)
+        for sid, grade, regrade in await asyncio.gather(*(one(sid) for sid in pending)):
+            # Both: ``_regrade`` decides from the latest, whichever executor it is for.
+            for document in (grade, regrade):
+                if document is not None:
+                    self._index(sid, document)
         self._unindexed -= set(pending)
 
+    async def _latest(self, submission_id: str) -> dict | None:
+        reader = getattr(self._records, "read_regrade", None)
+        latest = await reader(self._job.job_id, submission_id) if reader is not None else None
+        if latest is None:
+            latest = await self._records.read_grade(self._job.job_id, submission_id)
+        return latest
+
     async def _regrade(self, submission_id: str) -> None:
+        """Regrade until the latest document has no decision made alone by a
+        quarantined executor, decided from what is stored (so a restart
+        resumes it, and never regrades twice what a regrade already redid).
+
+        Bound: a regrade is written only for an executor that is not already
+        in the latest document's ``regraded_for`` (one redo per submission
+        per executor), and the dispatcher never leases to a quarantined
+        executor, so each generation needs a newly quarantined lone decider;
+        past ``MAX_REGRADE_GENERATIONS`` the submission stays held (never paid)
+        and an operator is alerted."""
         if submission_id in self._regrades_inflight:
             return
         self._regrades_inflight.add(submission_id)
         try:
             async with self._gated():
-                await self.grade_one(submission_id, regrade=True)
+                released = await self._regrade_until_clean(submission_id)
         except Exception:
             logger.exception("re-grading %s failed; retried on the next rescan",
                              submission_id[:12])
             self._regrade_retry.add(submission_id)
         else:
-            # Payable again (unless the regrade voided it: the settler reads voids).
             self._regrade_retry.discard(submission_id)
-            self._regrading.discard(submission_id)
+            if released:
+                # Payable again (unless voided: the settler reads voids).
+                self._regrading.discard(submission_id)
         finally:
             self._regrades_inflight.discard(submission_id)
+
+    async def _regrade_until_clean(self, submission_id: str) -> bool:
+        for _ in range(MAX_REGRADE_GENERATIONS + 1):
+            latest = await self._latest(submission_id)
+            if latest is None:
+                return True                      # nothing graded: nothing to hold
+            caught = self._caught(latest)
+            if not caught:
+                await self._settle_regrade(submission_id, latest)
+                return True
+            generation = int(latest.get("generation") or 0)
+            regraded_for = list(latest.get("regraded_for") or [])
+            if generation >= MAX_REGRADE_GENERATIONS or set(caught) <= set(regraded_for):
+                logger.error("corpus job %s: %s still decided alone by quarantined %s after "
+                             "%d regrade(s); held from payment, needs an operator",
+                             self._job.job_id, submission_id[:12], caught, generation)
+                return False
+            self._generation[submission_id] = (generation + 1,
+                                               sorted(set(regraded_for) | set(caught)))
+            try:
+                if await self.grade_one(submission_id, regrade=True) is None:
+                    return True                  # the record is gone or not an episode
+            finally:
+                self._generation.pop(submission_id, None)
+        return False
+
+    async def _settle_regrade(self, submission_id: str, latest: dict) -> None:
+        """A regrade written before a restart that its void did not follow."""
+        replay = latest.get("replay") or {}
+        if latest.get("generation") is None or not replay.get("failed"):
+            return
+        reader = getattr(self._records, "read_voided", None)
+        if reader is not None and await reader(self._job.job_id, submission_id) is not None:
+            return
+        await self._confirmed_failure(submission_id, latest["hotkey"], {
+            "graded_by": list(replay.get("graded_by") or []),
+            "providers": list(replay.get("providers") or []),
+            **{k: replay.get(k) for k in ("replay_diff_equal", "observations_compared",
+                                          "observations_mismatched", "allowed")}})
 
     def hold_executor(self, executor_id: str) -> None:
         """Synchronous, at the quarantine itself: what the executor decided
         alone stops being payable before anything awaits."""
         self._held_executors.add(executor_id)
+        self._quarantined.add(executor_id)
         self._regrading |= self._sole.get(executor_id, set())
         # A grade waiting for its draw is dropped: graded again from the start.
         for sid, state in list(self._awaiting_draw.items()):
@@ -440,4 +520,4 @@ class CorpusGrader:
         return sids
 
 
-__all__ = ["CorpusGrader", "GRADE_SCHEMA"]
+__all__ = ["CorpusGrader", "GRADE_SCHEMA", "MAX_REGRADE_GENERATIONS"]

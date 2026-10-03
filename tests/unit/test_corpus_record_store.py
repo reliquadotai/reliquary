@@ -81,3 +81,13 @@ def test_grades_and_regrades_are_written_once_under_their_own_keys(r2):
     store = records.BucketRecordStore()
     assert run(store.read_grade("math-v1", ID)) == {"status": "ok"}
     assert run(store.list_grade_ids("math-v1")) == [ID]
+
+
+def test_a_later_regrade_generation_supersedes_and_stays_bounded(r2):
+    assert run(records.write_regrade("math-v1", ID, {"generation": 1})) is True
+    assert run(records.write_regrade("math-v1", ID, {"generation": 2}, 2)) is True
+    assert run(records.write_regrade("math-v1", ID, {"generation": 9}, 2)) is False
+    assert run(records.read_regrade("math-v1", ID)) == {"generation": 2}
+    with pytest.raises(ValueError):
+        run(records.write_regrade("math-v1", ID, {}, records.MAX_REGRADE_GENERATIONS + 1))
+    assert run(records.list_grade_ids("math-v1")) == []
