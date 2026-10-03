@@ -146,21 +146,20 @@ unchanged.
 
 ### 7. Budget
 
-`total_cap` stops counting an entry whose status is `closed`. `reliquary tasks
-close --task-id X` sets it, and refuses unless:
-- the task is retired,
-- its job is drained (every verdict settled), and
-- what it can still pay is negligible: for a `period-ema-v1` task, its replayed EMA
-  is below 0.1 % of its cap (computed from the archives as the weight setter
-  would); for an older corpus task, its cap is already 0.
-
-A closed task pays nothing more and is never reopened. Its archives stay for
-history.
+A cap of 0 pays nothing and counts for nothing in `total_cap`, so freeing a
+finished task's share needs no new registry status (one an older binary could not
+read). `reliquary tasks close --task-id X` sets the cap to 0, then retires the task,
+and refuses unless:
+- its job is drained (every submission has a verdict, every verdict is settled);
+- for a `period-ema-v1` task: its replayed pay is below 0.1 % of its cap (computed
+  from its archives as the weight setter would), i.e. what it earned is paid;
+- for a task settled by RL window: `--cut-tail`, since its pay never decays by itself.
 
 ### 8. Transition: a job keeps the rule it was declared under
 
 `jobs create` writes `settlement: "period-ema-v1"` into the task entry's params for
-every new corpus or evaluation job. An entry without it is settled and replayed by
+every new corpus or evaluation job (`--settlement windows` keeps the old way).
+Order jobs declared by the admin service keep the old settlement for now. An entry without it is settled and replayed by
 today's code, unchanged. Nothing is converted:
 
 - Converting a running job's state is not exact. The old rule owes its start-up lag
@@ -168,10 +167,15 @@ today's code, unchanged. Nothing is converted:
   one archive, that would hit the per-task cap clamp. Mixing both rules on one job
   makes the clamp scale new work down to pay the old tail.
 - **The running math job** (`corpus-math-omi-v1`) finishes under the old rule.
-  When it is full, its cap is set to 0 (that ends the frozen tail), then it is
-  retired and closed.
-- **The three full jobs** (`code`, `if`, `logic`): cap 0 now ends their tail and
-  frees 0.10 once they are closed.
+  When it is full and drained, `tasks close --cut-tail` ends its frozen tail and
+  frees its share.
+- **The three full jobs** (`code`, `if`, `logic`): `tasks close --cut-tail` ends
+  their tail and frees 0.10.
+
+**Deploy order.** The corpus validator and every weight setter run this binary
+before the first `period-ema-v1` job is declared. Declared earlier, an older
+validator settles it by window and an older weight setter ignores the field: it is
+paid the old way, not lost.
 
 The settler picks its mode from the entry's params, so one validator process can
 serve old and new jobs side by side.
@@ -187,7 +191,7 @@ Evaluation jobs are corpus tasks: once this ships they are declared
 | N, α | 6, 2/7 | protocol constant |
 | replay depth K | 24 periods | protocol constant |
 | admission slack | the auditor's accept slack (420 s) | existing |
-| close threshold | EMA < 0.1 % of cap | `tasks close` |
+| close threshold | replayed pay < 0.1 % of cap | `tasks close` |
 
 ## Tests
 
@@ -205,5 +209,6 @@ Evaluation jobs are corpus tasks: once this ships they are declared
   appear in window listings or move the horizon.
 - Mode: an entry without `settlement` is settled by today's settler; `jobs create`
   writes `period-ema-v1`.
-- `tasks close`: refused while undrained or above threshold; frees its cap in
-  `validate_registry`.
+- `tasks close`: refused while undrained, above threshold, or window-settled without
+  `--cut-tail`; a real corpus entry takes cap 0 then retires; a 0 cap frees its
+  share in `total_cap`.
