@@ -43,6 +43,34 @@ def completion_rows(rows: torch.Tensor, prompt_len: int, total_len: int) -> torc
     return rows[prompt_len - 1 : expected]
 
 
+def turn_rows(rows: torch.Tensor, completion_len: int, prompt_rows: int | None = None) -> torch.Tensor:
+    """The rows that produced one completion when the prompt may have come from
+    the prefix cache.
+
+    A cached prompt contributes no rows, but vLLM always recomputes at least its
+    last token, whose row predicts the first completion token; every decode step
+    after that adds one row. So the completion's rows are the last
+    ``completion_len`` rows, after dropping the single surplus row async
+    scheduling may add. ``prompt_rows`` (the prompt tokens actually scheduled,
+    when the caller knows it) lets a surplus of more than one row -- a request
+    preempted and recomputed -- be refused instead of silently shifted.
+    """
+    if completion_len < 1:
+        raise ValueError(f"completion_len must be >= 1, got {completion_len}")
+    count = rows.shape[0]
+    if count < completion_len:
+        raise ValueError(f"{count} rows for a {completion_len}-token completion")
+    if prompt_rows is not None:
+        expected = prompt_rows + completion_len - 1
+        if count not in (expected, expected + 1):
+            raise ValueError(
+                f"{count} rows where {expected} were scheduled: the request was "
+                "recomputed or rows were attributed to the wrong request"
+            )
+        return rows[prompt_rows - 1 : prompt_rows - 1 + completion_len]
+    return rows[count - completion_len :]
+
+
 class HiddenStateCapture:
     def __init__(self) -> None:
         self._rows: dict[str, list[torch.Tensor]] = {}
