@@ -317,3 +317,11 @@ def test_forger_keys_refuse_when_no_prompt_is_free():
     with pytest.raises(SystemExit):
         pick_forger_keys(job, "honest", honest_episodes=1,
                          make_key=lambda: SimpleNamespace(ss58_address=f"key-{next(counter)}"))
+
+
+def test_audit_attention_falls_back_to_sdpa_only_without_flash_attn():
+    from scripts.agentic_corpus_e2e import audit_attention
+
+    assert audit_attention(False, {}) == "sdpa"
+    assert audit_attention(True, {}) is None
+    assert audit_attention(False, {"GRAIL_ATTN_IMPL": "eager"}) is None

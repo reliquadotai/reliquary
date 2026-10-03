@@ -308,8 +308,25 @@ def prepare(args) -> None:
                       "prompts": [args.prompt_start, args.prompt_start + args.prompt_count]}))
 
 
+def audit_attention(flash_attn_installed: bool, env: Mapping[str, str]) -> str | None:
+    """The GRAIL_ATTN_IMPL the audit must be given, or None to keep the
+    environment's. The validator defaults to flash_attention_2 and refuses to
+    load the model without the package; the test GPU box's vLLM venv has none
+    (found 2026-10-03), and gate M1 measured the 27B's TOPLOC bands with sdpa."""
+    if env.get("GRAIL_ATTN_IMPL") or flash_attn_installed:
+        return None
+    return "sdpa"
+
+
 def validator(args) -> None:
     state = Path(args.state)
+    import importlib.util
+
+    attention = audit_attention(importlib.util.find_spec("flash_attn") is not None, os.environ)
+    if attention and not args.intake_only:
+        print(f"flash_attn is not installed: the audit runs with GRAIL_ATTN_IMPL={attention}",
+              file=sys.stderr, flush=True)
+        os.environ["GRAIL_ATTN_IMPL"] = attention
     _load_env(state)
     from scripts.corpus_e2e import load_entry
     from reliquary.validator.corpus_validator import run_corpus_validator
