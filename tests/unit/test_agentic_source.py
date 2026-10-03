@@ -192,3 +192,58 @@ def test_the_renderer_pin_is_enforced(monkeypatch):
     monkeypatch.setattr(agentic_swe, "installed_env_commit", lambda: COMMIT)
     monkeypatch.setattr(agentic_swe, "_renderers_version", lambda: "0.1.10")
     assert "renderers" in agentic_swe.episode_support_refusal(_job().episode, need_verifiers=False)
+
+
+def _editable(monkeypatch, path):
+    class _Dist:
+        def read_text(self, name):
+            return json.dumps({"url": f"file://{path}", "dir_info": {"editable": True}})
+
+    monkeypatch.setattr(agentic_swe.importlib.metadata, "distribution", lambda name: _Dist())
+
+
+def test_a_dirty_editable_checkout_reports_no_commit(monkeypatch, tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+    _editable(monkeypatch, tmp_path)
+    assert agentic_swe.installed_env_commit() is not None
+    (tmp_path / "modified.py").write_text("x = 1\n")
+    assert agentic_swe.installed_env_commit() is None
+
+
+def test_a_hanging_git_reports_no_commit(monkeypatch, tmp_path):
+    _editable(monkeypatch, tmp_path)
+
+    def hang(*args, **kwargs):
+        assert kwargs.get("timeout")
+        raise agentic_swe.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(agentic_swe.subprocess, "run", hang)
+    assert agentic_swe.installed_env_commit() is None
+
+
+def test_an_eval_job_cannot_carry_the_agentic_environment(supported):
+    from reliquary.cli.main import prepare_corpus_job
+
+    with pytest.raises(ValueError, match="agentic"):
+        prepare_corpus_job(
+            job_id="eval-x", task_id=None, model="Qwen/Qwen3.8-27B", model_revision="rev1",
+            model_architecture="Qwen3_5ForConditionalGeneration", checkpoint_sha256="c" * 64,
+            from_profile=None, prompt_encoding=None, prompt_source="eval-set:s:3:" + "a" * 64,
+            prompt_count=3, prompt_start=0, renderer_id="chat-template-v1", eos_token_id=1,
+            slots_per_prompt=2, max_new_tokens=8192, cap=0.05, min_incentive_share=0.0,
+            audit_params={"audit_q": 1.0}, contract_environment=AGENTIC_SWE_ENVIRONMENT,
+        )
+
+
+def test_a_served_agentic_job_without_episode_is_refused(supported):
+    with pytest.raises(CorpusPromptSourceError, match="episode"):
+        prompt_job_for_spec(parse_job(_manifest(with_episode=False)))
+
+
+def test_a_job_with_episode_on_another_source_is_refused(supported):
+    with pytest.raises(CorpusPromptSourceError, match=AGENTIC_SWE_ENVIRONMENT):
+        prompt_job_for_spec(_job(prompt_source="openmathinstruct"))

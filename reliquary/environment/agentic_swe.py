@@ -63,10 +63,19 @@ def _dist_commit(name: str) -> str | None:
         return commit
     url = info.get("url") or ""
     if url.startswith("file://"):
-        out = subprocess.run(["git", "-c", "safe.directory=*", "-C", url[len("file://"):],
-                              "rev-parse", "HEAD"], capture_output=True, text=True)
-        if out.returncode == 0:
-            return out.stdout.strip()
+        checkout = url[len("file://"):]
+        git = ["git", "-c", "safe.directory=*", "-C", checkout]
+        try:
+            head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True,
+                                  timeout=10)
+            dirty = subprocess.run(git + ["status", "--porcelain"], capture_output=True, text=True,
+                                   timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        # An editable checkout with local changes is not the pinned code,
+        # whatever its HEAD says: report nothing rather than the commit.
+        if head.returncode == 0 and dirty.returncode == 0 and not dirty.stdout.strip():
+            return head.stdout.strip()
     return None
 
 
