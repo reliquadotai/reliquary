@@ -2240,6 +2240,79 @@ def corpus_mine(
     typer.echo(counts)
 
 
+@corpus_app.command("mine-agentic")
+def corpus_mine_agentic(
+    validator_url: str = typer.Option(..., "--validator-url"),
+    job_id: str = typer.Option(..., "--job-id", help="The episode job to mine"),
+    wallet_name: str = typer.Option("default"),
+    hotkey: str = typer.Option("default"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", "")),
+    concurrency: int = typer.Option(
+        8, "--concurrency", help="Episodes at once (spec section 9: 8 to 11 on one H100)"),
+    episodes: int = typer.Option(0, "--episodes", help="0 = until the job completes"),
+    port: int = typer.Option(8011, "--port", help="Loopback port of the generate endpoint"),
+    gpu_memory_utilization: float = typer.Option(None, "--gpu-memory-utilization"),
+) -> None:
+    """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
+    against a local vLLM with per-turn proofs. Needs Docker and the job's
+    pinned reliquary-swe, verifiers and renderers installed."""
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    if TASK_CONTRACT_ENV_VAR not in os.environ:
+        _restart_with_served_contract(validator_url, job_id)
+    import bittensor as bt
+    import httpx
+    from huggingface_hub import snapshot_download
+
+    from reliquary.corpus.encoding import checkpoint_fingerprint
+    from reliquary.corpus.job import parse_job
+    from reliquary.environment.agentic_swe import episode_support_refusal
+    from reliquary.miner.agentic_miner import Identity, run_agentic_miner
+    from reliquary.miner.corpus_miner import (
+        CorpusJobSelectionError,
+        HttpCorpusClient,
+        submits_scoped,
+    )
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
+    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.shared.modeling import load_tokenizer
+
+    proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+    if proof is None:
+        typer.echo("error: the active contract declares no toploc proof", err=True)
+        raise typer.Exit(code=4)
+    wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+    if wallet_path:
+        wallet_kwargs["path"] = wallet_path
+    wallet = bt.Wallet(**wallet_kwargs)
+    client = HttpCorpusClient(httpx.Client(base_url=validator_url, timeout=300.0), job_id=job_id)
+    try:
+        job = parse_job(client.job())
+    except CorpusJobSelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if job.episode is None:
+        typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
+        raise typer.Exit(code=2)
+    client.scoped_submit = submits_scoped(job)
+    refusal = episode_support_refusal(job.episode, need_verifiers=True)
+    if refusal:
+        typer.echo(f"error: {refusal}", err=True)
+        raise typer.Exit(code=4)
+    directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
+    if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
+        typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
+        raise typer.Exit(code=4)
+    identity = Identity(hotkey=wallet.hotkey.ss58_address,
+                        sign=lambda body: sign_corpus_submission(wallet, body),
+                        episodes=episodes or None)
+    counts = asyncio.run(run_agentic_miner(
+        job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
+        identities=[identity], client=client, concurrency=concurrency, port=port,
+        gpu_memory_utilization=gpu_memory_utilization))
+    typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
+
+
 @corpus_app.command("status")
 def corpus_status(
     validator_url: str = typer.Option(..., "--validator-url"),
