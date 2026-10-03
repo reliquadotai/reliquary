@@ -292,6 +292,14 @@ is recorded in this file before the dependent component is written.
   recorded traces: 6 of 2017 observations (0.3%), in 6 of 66 episodes. That is
   inside the tolerance, and a rule hiding that path would also hide a miner
   whose box differs for real, so no rule was added.
+  **M2 re-run (2026-10-04, `-I` replay, `scripts/agentic_rule_check.py`, data in
+  `docs/design/measurements/2026-10-04-m2-rerun-rules.json`).** 66/66
+  diffs reproduced with the tool program in isolated mode (2017 observations,
+  66 mismatched before and after, 0 errors). Tightened rules adopted: addr,
+  commit, mtime, duration (all four, scored in the order the normalizer applies
+  them); minimum spare per honest episode under the adopted set: 2 (unchanged
+  from the loose rules). Not adopted (would leave an honest episode with no
+  spare): none.
 - **M3 — audit cost.** Time the TOPLOC prefill of 40k-token trajectories on the
   27B. It sets `audit_q` for the job.
   **M3 result (2026-10-03, H100 80 GB, Qwen3.8-27B bf16 text-only, sdpa,

@@ -17,19 +17,19 @@ from dataclasses import dataclass, field
 # observed mismatches; each rule names what it hides.
 _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\r\n?"), "\n"),                                         # line endings
-    (re.compile(r"\b\d+(\.\d+)?s\b"), "<dur>"),                           # "0.75s"
-    (re.compile(r"\b\d+(\.\d+)? ?(ms|seconds?|secs?)\b"), "<dur>"),       # "12 ms"
+    (re.compile(r"(?<![\w.])\d+(?:\.\d+)? ?(?:s|ms|secs?|seconds?)(?![\w.])"), "<dur>"),  # "0.75s", "12 s"
     (re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?"), "<ts>"),  # ISO timestamps
-    (re.compile(r"\b0x[0-9a-f]{6,}\b"), "<addr>"),                       # object addresses in reprs
+    (re.compile(r"(?<=at )0x[0-9a-f]{6,}\b"), "<addr>"),                 # object addresses in reprs only
     (re.compile(r"\b[0-9a-f]{7,40}(?= base\b)"), "<commit>"),             # the box's own "base" commit
     (re.compile(r"\.g[0-9a-f]{7,40}\b"), ".g<commit>"),                  # version strings built from it
     (re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
                 r" +\d{1,2} \d{2}:\d{2}:\d{2} [A-Z]{2,5} \d{4}\b"), "<date>"),  # `date`
     (re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
                 r" +\d{1,2} \d{2}:\d{2}:\d{2} \d{4} [+-]\d{4}\b"), "<gitdate>"),   # git log/show Date:
-    (re.compile(r"(?<=commit )[0-9a-f]{40}\b"), "<commit>"),             # git log/show full hash
-    (re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} +\d{2}:\d{2}\b"),
-     "<mtime>"),                                                         # ls -l mtimes (checkout time)
+    (re.compile(r"(?m)^commit [0-9a-f]{40}\b"), "commit <commit>"),      # git log/show header hash
+    (re.compile(r"(?m)^([-dlcbps][-rwxsStT]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+\d+\s+)"
+                r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} +\d{2}:\d{2}"),
+     r"\1<mtime>"),                                                      # ls -l mtime column (checkout time)
 )
 
 

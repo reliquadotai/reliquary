@@ -142,3 +142,21 @@ def test_too_many_mismatches_or_a_different_diff_fail():
     assert within_tolerance(ReplayReport(compared=15, mismatched=list(range(5)), diff_equal=True))
     assert not within_tolerance(ReplayReport(compared=15, mismatched=[], diff_equal=False))
     assert not within_tolerance(ReplayReport(compared=100, mismatched=list(range(13)), diff_equal=True))
+
+
+def test_a_hex_literal_in_file_content_is_not_hidden():
+    assert normalize("MAGIC = 0xdeadbeef00") != normalize("MAGIC = 0xdeadbeef01")
+
+
+def test_a_duration_inside_an_identifier_is_not_hidden_but_a_spaced_one_is():
+    assert normalize("model_2.5s_v1") != normalize("model_3.5s_v1")
+    assert normalize("took 12 s") == normalize("took 13 s")
+
+
+def test_an_mtime_outside_an_ls_line_is_not_hidden():
+    assert normalize("released Oct  2 19:36") != normalize("released Oct  3 09:31")
+
+
+def test_a_hash_after_commit_mid_line_is_not_hidden():
+    a = "see commit 5b26444a37283a20ca4cef1cc14ef10498b85cb9 for details"
+    assert normalize(a) != normalize(a.replace("5b26", "6c37"))

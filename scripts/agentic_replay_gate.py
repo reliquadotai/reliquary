@@ -28,6 +28,8 @@ async def one(row, sem):
     report = compare(actions, observations, trace["info"].get("patch", ""), diff)
     return {"instance_id": iid, "actions": len(actions), "seconds": seconds,
             "diff_equal": report.diff_equal, "mismatched": report.mismatched,
+            "pairs": [[a.observation, observations[i] if i < len(observations) else None]
+                      for i, a in enumerate(actions)],
             "samples": [{"index": i, "tool": actions[i].tool, "arguments": actions[i].arguments[:300],
                          "recorded": normalize(actions[i].observation)[:600],
                          "replayed": normalize(observations[i])[:600] if i < len(observations) else None}
@@ -48,6 +50,13 @@ async def main_async(args):
         "observations_mismatched": sum(len(r["mismatched"]) for r in done),
         "replay_seconds_p50": sorted(r["seconds"] for r in done)[len(done) // 2] if done else None,
     }
+    if args.pairs_out:
+        with open(args.pairs_out, "w") as out:
+            for r in done:
+                out.write(json.dumps({"instance_id": r["instance_id"], "diff_equal": r["diff_equal"],
+                                      "pairs": r["pairs"]}) + "\n")
+    for r in results:
+        r.pop("pairs", None)
     json.dump({"summary": summary, "episodes": results}, open(args.out, "w"))
     print(json.dumps(summary))
 
@@ -57,6 +66,7 @@ def main():
     p.add_argument("--traces", nargs="+", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--pairs-out", help="write every recorded/replayed pair as JSON lines")
     asyncio.run(main_async(p.parse_args()))
 
 
