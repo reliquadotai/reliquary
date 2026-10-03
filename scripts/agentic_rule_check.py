@@ -14,16 +14,34 @@ import re
 
 from reliquary.corpus.replay_compare import _RULES, allowed_mismatches
 
+# The loose rules as plan 1 shipped them (snapshot: scoring must not depend on
+# what ``_RULES`` holds today). Tightened rules replace these, in place.
+_LOOSE = (
+    (re.compile(r"\r\n?"), "\n"),
+    (re.compile(r"\b\d+(\.\d+)?s\b"), "<dur>"),
+    (re.compile(r"\b\d+(\.\d+)? ?(ms|seconds?|secs?)\b"), "<dur>"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?"), "<ts>"),
+    (re.compile(r"\b0x[0-9a-f]{6,}\b"), "<addr>"),
+    (re.compile(r"\b[0-9a-f]{7,40}(?= base\b)"), "<commit>"),
+    (re.compile(r"\.g[0-9a-f]{7,40}\b"), ".g<commit>"),
+    (re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                r" +\d{1,2} \d{2}:\d{2}:\d{2} [A-Z]{2,5} \d{4}\b"), "<date>"),
+    (re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+                r" +\d{1,2} \d{2}:\d{2}:\d{2} \d{4} [+-]\d{4}\b"), "<gitdate>"),
+    (re.compile(r"(?<=commit )[0-9a-f]{40}\b"), "<commit>"),
+    (re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} +\d{2}:\d{2}\b"), "<mtime>"),
+)
+
 _MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 # The four tightened replacements, keyed by the loose rule they replace.
 TIGHT = {
     # Only CPython reprs ("<Foo object at 0x7f..>"), never a hex literal in a file.
     "addr": (re.compile(r"(?<=at )0x[0-9a-f]{6,}\b"), "<addr>"),
     # Only an `ls -l` line's mtime column: mode, links, owner, group, size, then the date.
-    "mtime": (re.compile(r"(?m)^([-dlcbps][-rwxsStT]{9}[.+@]?\s+\d+\s+\S+\s+\S+\s+\d+\s+)"
-                         + _MONTH + r" +\d{1,2} +\d{2}:\d{2}"), r"\1<mtime>"),
+    "mtime": (re.compile(r"(?m)^([-dlcbps][-rwxsStT]{9}[.+@]?[ \t]+\d+[ \t]+\S+[ \t]+\S+[ \t]+\d+[ \t]+)"
+                         + _MONTH + r" +\d{1,2} +\d{2}:\d{2}(?!\d)"), r"\1<mtime>"),
     # Durations that stand alone ("0.75s", "12 s", "3 ms"), never inside an identifier.
-    "duration": (re.compile(r"(?<![\w.])\d+(?:\.\d+)? ?(?:s|ms|secs?|seconds?)(?![\w.])"), "<dur>"),
+    "duration": (re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?:s| ?(?:ms|secs?|seconds?))(?![\w.])"), "<dur>"),
     # A full hash only on a `git log`/`git show` header line.
     "commit": (re.compile(r"(?m)^commit [0-9a-f]{40}\b"), "commit <commit>"),
 }
@@ -45,7 +63,7 @@ def rules_with(chosen: set[str]):
     position of the first.
     """
     out, placed = [], set()
-    for pattern, replacement in _RULES:
+    for pattern, replacement in _LOOSE:
         owner = next((n for n in chosen if pattern.pattern in REPLACES[n]), None)
         if owner is None:
             out.append((pattern, replacement))
@@ -81,6 +99,9 @@ def main():
     p.add_argument("--out", required=True)
     args = p.parse_args()
     episodes = [json.loads(line) for line in open(args.pairs)]
+    shipped = [(p.pattern, r) for p, r in _RULES]
+    assert shipped == [(p.pattern, r) for p, r in rules_with(set(TIGHT))], \
+        "the shipped _RULES differ from the all-tightened set scored here"
     result = {"current": score(episodes, rules_with(set()))}
     for name in ORDER:
         result[name] = score(episodes, rules_with({name}))
