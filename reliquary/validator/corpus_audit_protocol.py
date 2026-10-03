@@ -11,15 +11,19 @@ from __future__ import annotations
 import math
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from reliquary.protocol.toploc_wire import MAX_PROOF_B64_CHARS
 
 AUDIT_PROTOCOL = "reliquary.corpus-audit/v1"
+# Agentic trajectories: items carry their assistant spans (spec §5 N4).
+AUDIT_PROTOCOL_V2 = "reliquary.corpus-audit/v2"
+MAX_ITEM_SPANS = 64
 # Bounds of one lease: what keeps a request and a response a few megabytes.
 MAX_LEASE_ITEMS = 64
 MAX_LEASE_TOKENS = 262_144
-MAX_SEQUENCE_TOKENS = 65_536
+# A 60k-token trajectory plus its prompt (one H100 holds 60k).
+MAX_SEQUENCE_TOKENS = 131_072
 MAX_ITEM_PROOFS = 4096
 
 ITEM_OK = "ok"
@@ -39,6 +43,9 @@ class ClaimRequest(_Strict):
     executor_id: ExecutorId
     model_id: str = Field(min_length=1, max_length=256)
     model_revision: str = Field(min_length=1, max_length=256)
+    # What the executor can score; an executor that predates v2 sends none.
+    protocols: list[Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2"]] = Field(
+        default_factory=lambda: [AUDIT_PROTOCOL], min_length=1, max_length=2)
 
 
 class HeartbeatRequest(_Strict):
@@ -50,10 +57,12 @@ class AuditItem(_Strict):
     tokens: list[Annotated[int, Field(ge=0)]] = Field(min_length=2, max_length=MAX_SEQUENCE_TOKENS)
     prompt_len: int = Field(ge=1)
     proofs: list[Proof] = Field(max_length=MAX_ITEM_PROOFS)
+    # v2: assistant spans in `tokens` coordinates; `proofs` are their lists concatenated.
+    spans: list[tuple[int, int]] | None = Field(default=None, max_length=MAX_ITEM_SPANS)
 
 
 class AuditLease(_Strict):
-    protocol: Literal["reliquary.corpus-audit/v1"] = AUDIT_PROTOCOL
+    protocol: Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2"] = AUDIT_PROTOCOL
     lease_id: LeaseId
     model_id: str
     model_revision: str
@@ -61,6 +70,14 @@ class AuditLease(_Strict):
     topk: int = Field(gt=0)
     expires_at: float
     items: list[AuditItem] = Field(min_length=1, max_length=MAX_LEASE_ITEMS)
+    min_chunk_tokens: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _v2_iff_spans(self) -> "AuditLease":
+        spanned = any(item.spans is not None for item in self.items)
+        if spanned != (self.protocol == AUDIT_PROTOCOL_V2) or spanned != (self.min_chunk_tokens is not None):
+            raise ValueError("a v2 lease carries spans and min_chunk_tokens, a v1 lease neither")
+        return self
 
 
 class ItemScore(_Strict):
@@ -85,6 +102,8 @@ class AuditResult(_Strict):
 
 __all__ = [
     "AUDIT_PROTOCOL",
+    "AUDIT_PROTOCOL_V2",
+    "MAX_ITEM_SPANS",
     "AuditItem",
     "AuditLease",
     "AuditResult",

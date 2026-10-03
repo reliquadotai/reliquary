@@ -27,9 +27,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from reliquary.protocol.toploc import ChunkResult
+from reliquary.protocol.toploc import MIN_CHUNK_TOKENS, ChunkResult
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
+    AUDIT_PROTOCOL_V2,
     ITEM_ERROR,
     ITEM_OK,
     MAX_LEASE_ITEMS,
@@ -167,6 +168,7 @@ class _Work:
     future: asyncio.Future
     queued_at: float
     attempts: int = 0
+    protocol: str = AUDIT_PROTOCOL
 
 
 @dataclass
@@ -261,6 +263,7 @@ class RemoteAuditDispatcher:
         self._leases: dict[str, _Lease] = {}
         self._strikes: collections.Counter = collections.Counter()
         self._seen: dict[str, float] = {}
+        self._protocols: dict[str, tuple[str, ...]] = {}
         self._detail: dict[str, dict] = {}
         self._written: dict[str, float] = {}
         self._unwritten_quarantines: dict[str, str] = {}
@@ -280,17 +283,31 @@ class RemoteAuditDispatcher:
         return any(now - seen <= self._live and self._directory.is_authorized(eid)
                    and eid not in self.quarantined for eid, seen in self._seen.items())
 
+    def connected_for(self, protocol: str) -> bool:
+        """A live, authorised executor that last claimed with ``protocol``."""
+        now = self._clock()
+        return any(now - seen <= self._live and self._directory.is_authorized(eid)
+                   and eid not in self.quarantined
+                   and protocol in self._protocols.get(eid, (AUDIT_PROTOCOL,))
+                   for eid, seen in self._seen.items())
+
     async def score(self, items: Sequence[dict]) -> list[tuple[str, tuple, str | None]]:
         """``(status, chunks, scored_by)`` for each item (``tokens``,
         ``prompt_len``, ``proofs``); ``scored_by`` is None when the control
         computed it."""
         loop = asyncio.get_running_loop()
         units = []
-        for indexes in _lease_units(items):
-            work = _Work(id=next(self._ids), items=[items[k] for k in indexes],
-                         future=loop.create_future(), queued_at=self._clock())
-            units.append((indexes, work))
-            self._queue.append(work)
+        # Rows with spans lease apart: v1 rows never wait for a v2 executor.
+        spanned = [k for k, item in enumerate(items) if item.get("spans") is not None]
+        plain = [k for k, item in enumerate(items) if item.get("spans") is None]
+        for protocol, group in ((AUDIT_PROTOCOL, plain), (AUDIT_PROTOCOL_V2, spanned)):
+            for unit in _lease_units([items[k] for k in group]):
+                indexes = [group[k] for k in unit]
+                work = _Work(id=next(self._ids), items=[items[k] for k in indexes],
+                             future=loop.create_future(), queued_at=self._clock(),
+                             protocol=protocol)
+                units.append((indexes, work))
+                self._queue.append(work)
         scored: list = [None] * len(items)
         for indexes, work in units:
             scores, scored_by = await work.future
@@ -308,29 +325,42 @@ class RemoteAuditDispatcher:
         if detail is not None:
             self._detail[executor_id] = dict(detail)
 
-    def claim(self, executor_id: str) -> dict | None:
+    def claim(self, executor_id: str, protocols=(AUDIT_PROTOCOL,)) -> dict | None:
         self._contact(executor_id)
+        self._protocols[executor_id] = tuple(protocols)
         held = sum(1 for lease in self._leases.values() if lease.executor_id == executor_id)
         if held >= self._max_leases:
             return None
+        skipped: list[_Work] = []
+        lease_doc = None
         while self._queue:
             work = self._queue.popleft()
             if work.future.done():
+                continue
+            if work.protocol not in protocols:
+                skipped.append(work)            # left for an executor that takes it
                 continue
             lease = _Lease(lease_id=secrets.token_hex(16), work=work, executor_id=executor_id,
                            expires_at=self._clock() + self._lease_seconds)
             self._leases[lease.lease_id] = lease
             self.stats["leased"] += 1
-            return {
-                "protocol": AUDIT_PROTOCOL, "lease_id": lease.lease_id,
+            lease_doc = {
+                "protocol": work.protocol, "lease_id": lease.lease_id,
                 "model_id": self._directory.model_id,
                 "model_revision": self._directory.model_revision,
                 "chunk_tokens": self._proof.chunk_tokens, "topk": self._proof.topk,
                 "expires_at": lease.expires_at,
                 "items": [{"tokens": list(i["tokens"]), "prompt_len": int(i["prompt_len"]),
-                           "proofs": list(i["proofs"])} for i in work.items],
+                           "proofs": list(i["proofs"]),
+                           **({"spans": [list(s) for s in i["spans"]]}
+                              if i.get("spans") is not None else {})}
+                          for i in work.items],
             }
-        return None
+            if work.protocol == AUDIT_PROTOCOL_V2:
+                lease_doc["min_chunk_tokens"] = MIN_CHUNK_TOKENS
+            break
+        self._queue.extendleft(reversed(skipped))
+        return lease_doc
 
     def result(self, executor_id: str, lease_id: str, result: AuditResult) -> str:
         """Take an executor's scores for its lease; raises ``LeaseRefused``."""
@@ -453,12 +483,16 @@ class RemoteAuditDispatcher:
                 if self._strikes[lease.executor_id] >= self._strikes_limit:
                     await self.quarantine(lease.executor_id,
                                           f"{self._strikes_limit} leases expired in a row")
-        if not self.connected():
-            while self._queue:
-                self._local.append(self._queue.popleft())
-        else:
-            while self._queue and now - self._queue[0].queued_at > self._queue_wait:
-                self._local.append(self._queue.popleft())
+        # Work no connected executor can take (none at all, or none that speaks
+        # its protocol) is scored here; the rest waits its turn.
+        waiting: collections.deque[_Work] = collections.deque()
+        while self._queue:
+            work = self._queue.popleft()
+            if not self.connected_for(work.protocol) or now - work.queued_at > self._queue_wait:
+                self._local.append(work)
+            else:
+                waiting.append(work)
+        self._queue = waiting
         while self._local:
             work = self._local.popleft()
             if work.future.done():
@@ -518,7 +552,7 @@ def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
         if (body.model_id, body.model_revision) != (document["model_id"],
                                                     document["model_revision"]):
             raise HTTPException(status_code=409, detail="wrong_model")
-        lease = dispatcher.claim(document["executor_id"])
+        lease = dispatcher.claim(document["executor_id"], tuple(body.protocols))
         if lease is None:
             return Response(status_code=204)
         return lease

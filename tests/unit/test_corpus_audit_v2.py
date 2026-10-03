@@ -160,8 +160,10 @@ def test_rows_of_items_keeps_the_spans():
 
 
 class _Remote:
-    def __init__(self):
-        self.calls = 0
+    """A v2-capable remote: scores what it is sent with the real scorer."""
+
+    def __init__(self, model):
+        self.model, self.items = model, []
 
     def connected(self):
         return True
@@ -170,26 +172,30 @@ class _Remote:
         pass
 
     async def score(self, items):
-        self.calls += 1
-        raise AssertionError("a trajectory must never reach the remote executors")
+        self.items.extend(items)
+        scores, _, _ = score_sequences(self.model, rows_of_items(items),
+                                       chunk_tokens=PROOF.chunk_tokens, topk=PROOF.topk,
+                                       batch_tokens=4096)
+        return [(status, chunks, "pod-1") for status, chunks in scores]
 
 
-def test_a_trajectory_on_the_remote_branch_is_a_validator_error_not_a_verdict():
+def test_a_trajectory_on_the_remote_branch_goes_with_its_spans_and_is_judged():
     model = _tiny(0)
-    remote = _Remote()
+    remote = _Remote(model)
     records = _Records({ID: _record(model)})
     auditor = CorpusAuditor(job_id="swe-agentic-v1", records=records, model=model,
                             tokenizer=_Tokenizer(), proof=PROOF, remote=remote)
-    (outcome,) = asyncio.run(auditor._audit_outcomes([_record(model)]))
-    assert isinstance(outcome, str) and "remote" in outcome
-    assert remote.calls == 0 and records.verdicts == {}
+    verdict = asyncio.run(auditor.audit(ID))
+    assert remote.items[0]["spans"] == [(8, 48), (63, 98)]
+    assert verdict["passed"] is True, verdict
+    assert verdict["scored_by"] == ["pod-1"]
 
 
 def test_the_eval_auditor_refuses_a_trajectory_too():
     from reliquary.validator.eval_control import eval_auditor
 
     auditor = eval_auditor(job_id="order-eval-1", records=None, tokenizer=_Tokenizer(),
-                           proof=PROOF, vocab_size=1000, remote=_Remote())
+                           proof=PROOF, vocab_size=1000, remote=_Remote(None))
     with pytest.raises(RuntimeError):
         asyncio.run(auditor._forward([_record(_tiny(0))], local=True))
 

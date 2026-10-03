@@ -560,10 +560,12 @@ class CorpusAuditor:
         if not local and self._remote is not None and self._remote.connected():
             # An executor computes the chunk scores; the decision stays here.
             results, items = await self._in("codec", self._prepare, records)
-            self._refuse_trajectories(items)
+            # Trajectory rows carry their spans; the dispatcher leases them to
+            # v2 executors only, or scores them here.
             scores = await self._remote.score(
-                [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
-                 for _, _, tokens, n, proofs, _spans in items])
+                [{"tokens": tokens, "prompt_len": n, "proofs": proofs,
+                  **({"spans": spans} if spans is not None else {})}
+                 for _, _, tokens, n, proofs, spans in items])
             outcomes, scored_by = {}, {}
             for item, (status, chunks, executor) in zip(items, scores):
                 outcomes[item[0], item[1]] = self._outcome(item, status, chunks)

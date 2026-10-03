@@ -101,11 +101,18 @@ class AuditExecutor:
         self._model = await asyncio.to_thread(self._load_model, self.model_id, self.model_revision)
 
     def _score(self, lease: AuditLease) -> list[dict]:
+        from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
         from reliquary.validator.corpus_audit import score_sequences
 
         try:
+            if lease.min_chunk_tokens not in (None, MIN_CHUNK_TOKENS):
+                # The floor is the scorer's own; a lease cannot move it.
+                raise ValueError(f"lease chunking floor {lease.min_chunk_tokens} is not this build's")
             scores, _, _ = score_sequences(
-                self._model, [(i.tokens, i.prompt_len, i.proofs) for i in lease.items],
+                self._model,
+                [(i.tokens, i.prompt_len, i.proofs) if i.spans is None
+                 else (i.tokens, i.prompt_len, i.proofs, [tuple(s) for s in i.spans])
+                 for i in lease.items],
                 chunk_tokens=lease.chunk_tokens, topk=lease.topk,
                 batch_tokens=self._batch_tokens)
         except Exception as exc:
@@ -121,10 +128,12 @@ class AuditExecutor:
         """One claim; True when a lease was scored and posted."""
         if self._last_heartbeat is None or self._clock() - self._last_heartbeat >= self._heartbeat_every:
             await self.heartbeat()
-        response = await self._post(f"{self._prefix}/claim", {
-            "executor_id": self._executor_id, "model_id": self.model_id,
-            "model_revision": self.model_revision,
-        })
+        body = {"executor_id": self._executor_id, "model_id": self.model_id,
+                "model_revision": self.model_revision}
+        if self._prefix == AUDIT_PREFIX:
+            # The eval control's claim model knows no protocols field.
+            body["protocols"] = ["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2"]
+        response = await self._post(f"{self._prefix}/claim", body)
         if response.status_code == 204:
             return False
         response.raise_for_status()
