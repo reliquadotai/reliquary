@@ -38,6 +38,8 @@ MAX_RENDERED_PROMPT_CHARS = MAX_COMPLETION_TEXT_CHARS
 MAX_TRAJECTORY_TOKENS = 60000
 MAX_TRAJECTORY_TURNS = 64
 MAX_FINAL_DIFF_CHARS = 1_048_576
+# The binding writes token ids as 4 bytes.
+MAX_TOKEN_ID = 2**32 - 1
 
 
 class CorpusRejectReason(str, Enum):
@@ -120,8 +122,8 @@ class CorpusCompletion(BaseModel):
     @field_validator("tokens")
     @classmethod
     def _token_ids_are_not_negative(cls, value: list[int]) -> list[int]:
-        if any(token < 0 for token in value):
-            raise ValueError("token ids must not be negative")
+        if any(token < 0 or token > MAX_TOKEN_ID for token in value):
+            raise ValueError("token ids must fit in 32 bits and not be negative")
         return value
 
     @model_validator(mode="after")
@@ -167,9 +169,27 @@ class CorpusTrajectory(BaseModel):
     @field_validator("tokens")
     @classmethod
     def _token_ids_are_not_negative(cls, value: list[int]) -> list[int]:
-        if any(token < 0 for token in value):
-            raise ValueError("token ids must not be negative")
+        if any(token < 0 or token > MAX_TOKEN_ID for token in value):
+            raise ValueError("token ids must fit in 32 bits and not be negative")
         return value
+
+    @model_validator(mode="after")
+    def _turns_and_proofs_are_bounded_by_the_tokens(self) -> "CorpusTrajectory":
+        # `turn.end` alone bounds nothing: without these, one turn could claim
+        # a 10**9-token span and carry tens of thousands of proofs.
+        previous_end = 0
+        for turn in self.turns:
+            if turn.start < previous_end:
+                raise ValueError("turns overlap or are out of order")
+            if turn.end > len(self.tokens):
+                raise ValueError("a turn ends past the trajectory's tokens")
+            previous_end = turn.end
+        error = proof_volume_error(
+            [proof for turn in self.turns for proof in turn.proofs], len(self.tokens)
+        )
+        if error:
+            raise ValueError(error)
+        return self
 
 
 class CorpusSubmissionRequest(BaseModel):

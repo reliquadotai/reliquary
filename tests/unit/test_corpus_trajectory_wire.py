@@ -97,3 +97,30 @@ def test_a_single_turn_binding_is_unchanged():
             "checkpoint_sha256": "a" * 64, "rendered_prompt": "<prompt>",
             "completions": [{"tokens": [1, 2, 3], "text": "123", "proofs": []}], "signature": "00"}
     assert build_corpus_binding(body) == build_corpus_binding(CorpusSubmissionRequest(**body))
+
+
+def test_a_turn_past_the_end_of_the_tokens_is_refused():
+    turns = [{"start": 0, "end": 10**9, "proofs": [PROOF] * 5}]
+    with pytest.raises(ValidationError, match="past"):
+        CorpusSubmissionRequest(**_body(trajectory=_trajectory(turns=turns)))
+
+
+def test_overlapping_or_unordered_turns_are_refused():
+    turns = [{"start": 0, "end": 40, "proofs": []}, {"start": 30, "end": 60, "proofs": []}]
+    with pytest.raises(ValidationError, match="overlap"):
+        CorpusSubmissionRequest(**_body(trajectory=_trajectory(turns=turns)))
+
+
+def test_total_proof_volume_is_bounded_by_the_tokens():
+    # Each turn is within its own budget; together they are over the trajectory's.
+    big = "A" * 388
+    turns = [{"start": 0, "end": 40, "proofs": [big] * 2},
+             {"start": 40, "end": 80, "proofs": [big] * 2}]
+    with pytest.raises(ValidationError, match="exceed"):
+        CorpusSubmissionRequest(**_body(trajectory=_trajectory(turns=turns)))
+
+
+@pytest.mark.parametrize("bad", [2**32, -1])
+def test_a_token_id_must_fit_the_binding(bad):
+    with pytest.raises(ValidationError):
+        CorpusSubmissionRequest(**_body(trajectory=_trajectory(tokens=[bad] + list(range(79)))))

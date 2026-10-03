@@ -29,7 +29,7 @@ def test_the_submission_id_and_signature_input_are_the_pinned_digest():
     assert len(build_corpus_binding(BODY)) == 32   # what wallet.hotkey.sign receives
 
 
-def test_a_model_dump_with_an_unset_trajectory_binds_like_the_dict():
+def test_a_single_turn_model_binds_like_its_dict():
     from reliquary.protocol.corpus_submission import CorpusSubmissionRequest
 
     body = {**BODY, "completions": [
