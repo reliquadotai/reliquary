@@ -312,6 +312,18 @@ class QualificationStore:
         return sorted(ids)
 
 
+def lease_prompt(row: dict) -> dict:
+    """A set row as a qualify lease prompt: its user text, and its system turn
+    when it has one, rendered by the executor exactly as the job's miners do."""
+    from reliquary.eval.prompt_source import single_turn_messages
+
+    system, text = single_turn_messages(row["messages"])
+    prompt = {"problem_id": row["problem_id"], "text": text}
+    if system is not None:
+        prompt["system"] = system
+    return prompt
+
+
 EVAL_JOB_SCHEMA = "reliquary/eval-job/v1"
 # A generation order's record, in the same store: its qualification and conditions.
 ORDER_JOB_SCHEMA = "reliquary/order-job/v1"
@@ -523,8 +535,7 @@ class QualificationQueue:
                 # Only the prompts a completion is decoded for.
                 count = min(record["problems"], record["completions"], len(body.splitlines()))
                 rows = [json.loads(line) for line in head_lines(body, count).splitlines()]
-                prompts = [{"problem_id": r["problem_id"], "text": r["messages"][-1]["content"]}
-                           for r in rows]
+                prompts = [lease_prompt(r) for r in rows]
             seconds = qualify_lease_seconds(record["max_new_tokens"])
             lease = {"lease_id": secrets.token_hex(16), "expires_at": self._clock() + seconds,
                      "provider_id": executor["provider_id"], "host": executor["host"]}

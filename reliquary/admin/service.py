@@ -179,7 +179,9 @@ class GradeEvaluation(BaseModel):
     problems_per_set: dict[str, int]
     # Samples ordered per problem, indexed 0..samples-1.
     samples_per_set: dict[str, int]
-    provenance: Provenance
+    # Required for an uploads grading; a job grading takes its facts from the
+    # job and its qualification, and only checks a provenance given against them.
+    provenance: Provenance | None = None
     # Job mode: grade a job not every prompt of which holds its samples (the
     # platform, after its deadline); the report says complete=false.
     allow_incomplete: bool = False
@@ -189,6 +191,8 @@ class GradeEvaluation(BaseModel):
         if self.source == "uploads":
             if self.job_id is not None or not self.completion_keys:
                 raise ValueError("an uploads grading names completion_keys and no job_id")
+            if self.provenance is None:
+                raise ValueError("an uploads grading needs its provenance")
             missing = [k for k in ("vllm_version", "gpu", "pod_provider_id")
                        if getattr(self.provenance, k) is None]
             if missing:
@@ -395,6 +399,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
         from reliquary.eval.sets import validated_set_id
         from reliquary.eval.storage import subnet_key
+        from reliquary.protocol.external_eval import contract_environment_for
 
         if body.qualification_id is None:
             raise HTTPException(status_code=422, detail="qualification_id_required")
@@ -453,7 +458,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         return dict(
             model_revision=record["revision"], model_architecture=result["architecture"],
             checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
-            prompt_source=source.name, contract_environment=card["source"], seed=seed,
+            prompt_source=source.name, contract_environment=contract_environment_for(card),
+            seed=seed,
             toploc_thresholds=result["thresholds"], audit_params={"audit_q": 1.0},
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
             top_k=body.sampling.top_k,
@@ -910,7 +916,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                  "model_sha": job.checkpoint_revision, "sampling": sampling,
                  "thinking": CHAT_TEMPLATE_RENDERERS.get(job.renderer_id, False),
                  "max_new_tokens": job.sampling.max_new_tokens}
-        claimed = body.provenance.model_dump()
+        claimed = facts if body.provenance is None else body.provenance.model_dump()
         differs = sorted(k for k, v in facts.items()
                          if (claimed[k] if k != "sampling" else
                              {**{"top_p": 1.0, "top_k": 0}, **claimed[k]}) != v)
@@ -1011,7 +1017,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 except grading.SandboxUnavailable as exc:
                     raise HTTPException(status_code=503,
                                         detail="code_sandbox_unavailable") from exc
-                provenance = body.provenance.model_dump(exclude_none=True)
+                provenance = ({} if body.provenance is None
+                              else body.provenance.model_dump(exclude_none=True))
                 job_rows = None
                 if body.source == "job":
                     job_rows, provenance = await job_grading_source(body)
@@ -1026,6 +1033,35 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     **extra)))
         response.status_code = 202
         return {"state": "running", "eval_id": eval_id}
+
+    GRADED_FILES = ("report.json", "manifest.json", "graded.parquet")
+
+    @router.get("/evaluations/{eval_id}/files/{name}")
+    async def evaluation_file(eval_id: str, name: str) -> Response:
+        """A graded evaluation's file, as the grading wrote it to the deliveries bucket."""
+        import tempfile
+        from pathlib import Path
+
+        from reliquary.corpus.delivery import validated_delivery_id
+        from reliquary.eval.grading import evaluation_prefix
+
+        in_scope(eval_id)
+        try:
+            validated_delivery_id(eval_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if name not in GRADED_FILES:
+            raise HTTPException(status_code=422, detail=f"a graded evaluation's files are "
+                                                        f"{list(GRADED_FILES)}")
+        if deliveries is None:
+            raise HTTPException(status_code=503, detail="deliveries_not_configured")
+        with tempfile.TemporaryDirectory() as scratch:
+            local = Path(scratch) / name
+            if not await deliveries.get_file(f"{evaluation_prefix(eval_id)}/{name}", local):
+                raise HTTPException(status_code=404, detail="evaluation_file_unknown")
+            content = local.read_bytes()
+        media = "application/json" if name.endswith(".json") else "application/octet-stream"
+        return Response(content=content, media_type=media)
 
     app = FastAPI()
     app.include_router(router)

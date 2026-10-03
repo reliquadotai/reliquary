@@ -33,6 +33,8 @@ class EvalClaimRequest(_Strict):
 class QualifyPrompt(_Strict):
     problem_id: str = Field(min_length=1, max_length=256)
     text: str = Field(min_length=1)
+    # An eval set row's system turn, rendered before the user turn.
+    system: str | None = Field(default=None, min_length=1)
 
 
 class QualifyLease(_Strict):

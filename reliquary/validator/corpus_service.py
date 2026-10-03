@@ -244,8 +244,14 @@ class SingleTurnPromptJob:
         # The row's identity here is its index: fidelity compares the prompt
         # text, and carrying the environment's own id would only add a way for
         # a source to hand back something `EpisodeTask` refuses.
+        # An eval set's row may open with a system turn; only an eval set's,
+        # so no catalog row can start rendering differently.
+        from reliquary.eval.prompt_source import is_eval_source
+
+        system = problem.get("system") if is_eval_source(self._job.prompt_source) else None
         return EpisodeTask(
-            id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=()
+            id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=(),
+            metadata={"system": system} if isinstance(system, str) and system else {},
         )
 
 
@@ -273,8 +279,12 @@ class ChatTemplatePromptRenderer:
         tokenizer = self._tokenizer() if callable(self._tokenizer) and not hasattr(
             self._tokenizer, "apply_chat_template"
         ) else self._tokenizer
+        system = (getattr(task, "metadata", None) or {}).get("system")
+        messages = [{"role": "user", "content": task.prompt}]
+        if system:
+            messages.insert(0, {"role": "system", "content": system})
         return tokenizer.apply_chat_template(
-            [{"role": "user", "content": task.prompt}],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=self._thinking,

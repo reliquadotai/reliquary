@@ -958,7 +958,7 @@ def build_job_manifest(
 
 def _corpus_base_profile(
     *, task_id, from_profile, model, model_revision, model_architecture,
-    prompt_encoding, renderer_id, prompt_source,
+    prompt_encoding, renderer_id, prompt_source, external_eval=False,
 ):
     """The profile a corpus job's contract is built from: the named template, or
     one composed from the model, the ``corpus-v1`` run policy and the catalog."""
@@ -984,6 +984,7 @@ def _corpus_base_profile(
         model=ModelSpec(model, model_revision, model_architecture, prompt_encoding),
         run=RUN_POLICIES["corpus-v1"],
         environments=[prompt_source],
+        external_eval=external_eval,
     )
 
 
@@ -1002,12 +1003,14 @@ def prepare_corpus_job(
     ``contract_environment`` is the catalog environment the contract declares
     when the prompt source is not one (an eval set: its own environment);
     ``toploc_thresholds`` replaces the proof's thresholds (from qualification)."""
+    from reliquary.eval.prompt_source import is_eval_source
+
     environment = contract_environment or prompt_source
     base = _corpus_base_profile(
         task_id=task_id or job_id, from_profile=from_profile, model=model,
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-        prompt_source=environment,
+        prompt_source=environment, external_eval=is_eval_source(prompt_source),
     )
     if max_new_tokens is None:
         # The template or catalog budgets each environment; the length stays
@@ -1603,39 +1606,200 @@ app.add_typer(eval_app)
 
 @eval_app.command("build-set")
 def eval_build_set(
-    env: str = typer.Option(..., "--env", help="math, code, logic or instruction_following"),
-    count: int = typer.Option(..., "--count", min=1),
-    seed: int = typer.Option(..., "--seed"),
     out: str = typer.Option(..., "--out", help="An empty directory for the three files"),
+    preset: str | None = typer.Option(
+        None, "--preset", "--env",
+        help="A held-out preset (math, code, logic, instruction_following): the platform's sets"),
+    source: str | None = typer.Option(
+        None, "--source",
+        help="A catalog environment, or verifiers:<taskset-id> for an installed taskset"),
+    split: str | None = typer.Option(None, "--split", help="Catalog only; default train"),
+    start: int = typer.Option(0, "--start", min=0, help="First row of the range"),
+    count: int | None = typer.Option(
+        None, "--count", min=1,
+        help="Rows in the range (default: to the end); with --preset, the problems drawn"),
+    sample: int | None = typer.Option(None, "--sample", min=1,
+                                      help="Draw this many rows from the range (needs --seed)"),
+    seed: int | None = typer.Option(None, "--seed"),
+    taskset_args: str | None = typer.Option(
+        None, "--taskset-args",
+        help="Verifiers only: the taskset config as JSON, frozen into the set"),
     set_id: str | None = typer.Option(None, "--set-id"),
 ) -> None:
-    """Freeze COUNT held-out problems: prompts.jsonl, grading.jsonl, set.json."""
+    """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
+
+    Either a held-out --preset (COUNT problems drawn with SEED), or any --source
+    over [START, START+COUNT), whole or --sample'd. Overlap with training is
+    written on the card, never refused."""
     import json
 
     from reliquary.eval import sets
 
     try:
-        card = sets.build_set(env, count=count, seed=seed, out=out, set_id=set_id,
-                              open_environment=sets.open_source)
+        if (preset is None) == (source is None):
+            raise ValueError("give exactly one of --preset and --source")
+        if preset is not None:
+            if count is None or seed is None or sample is not None or start or split \
+                    or taskset_args:
+                raise ValueError("a --preset takes --count and --seed only")
+            card = sets.build_set(preset, count=count, seed=seed, out=out, set_id=set_id,
+                                  open_environment=sets.open_source)
+        else:
+            args = json.loads(taskset_args) if taskset_args else None
+            if args is not None and not isinstance(args, dict):
+                raise ValueError("--taskset-args must be a JSON object")
+            card = sets.build_source_set(source, out=out, split=split, start=start,
+                                         count=count, sample=sample, seed=seed,
+                                         set_id=set_id, taskset_args=args,
+                                         open_environment=sets.open_source)
     except (ValueError, FileExistsError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    typer.echo(json.dumps({k: card[k] for k in ("set_id", "env", "source", "split", "count",
-                                                "index_range", "prompts_sha256",
-                                                "grading_sha256")}, indent=1))
+    keys = ("set_id", "env", "source", "split", "count", "index_range", "prompts_sha256",
+            "grading_sha256", "disjointness", "taskset", "needs_runtime")
+    typer.echo(json.dumps({k: card[k] for k in keys if k in card}, indent=1))
+
+
+def _admin_client(admin_url: str):
+    from reliquary.eval.operator import AdminClient
+
+    secret = os.getenv("RELIQUARY_ADMIN_SECRET", "")
+    if len(secret) < 32:
+        raise ValueError("RELIQUARY_ADMIN_SECRET must be set: the admin service's secret")
+    return AdminClient(admin_url, secret.encode())
+
+
+_ADMIN_URL = typer.Option("http://127.0.0.1:8790", "--admin-url",
+                          help="The admin service (reliquary admin serve)")
+
+
+@eval_app.command("create")
+def eval_create(
+    set_ids: list[str] = typer.Option(..., "--set", help="A published set; repeat for several"),
+    model: str = typer.Option(..., "--model", help="repo@<40-hex commit>"),
+    samples: int = typer.Option(..., "--samples", min=1, help="Completions per problem"),
+    max_new_tokens: int = typer.Option(..., "--max-new-tokens", min=1),
+    thinking: bool = typer.Option(False, "--thinking/--no-thinking"),
+    temperature: float = typer.Option(..., "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    top_k: int = typer.Option(0, "--top-k", min=0),
+    count: int | None = typer.Option(None, "--count", min=1,
+                                     help="The set's first N problems (default: all)"),
+    cap: float | None = typer.Option(None, "--cap", help="The job's share (admin default 0.02)"),
+    seed: int | None = typer.Option(None, "--seed"),
+    job_id: str | None = typer.Option(None, "--job-id", help="With one --set only"),
+    completions: int = typer.Option(32, "--qualify-completions", min=1, max=64),
+    attempt: int = typer.Option(0, "--attempt", min=0,
+                                help="Ask for a new qualification after a failed one"),
+    poll_seconds: float = typer.Option(30.0, "--poll-seconds"),
+    admin_url: str = _ADMIN_URL,
+) -> None:
+    """Qualify MODEL on each set, wait, then declare one eval job per set.
+
+    Running it again finds the same qualification and the same job."""
+    import json
+
+    from reliquary.eval import operator
+    from reliquary.eval.prompt_source import TASK_PREFIX_ENV, DEFAULT_TASK_PREFIX
+
+    try:
+        repo, revision = operator.split_model(model)
+        client = _admin_client(admin_url)
+        cards = [operator.read_set_card(set_id) for set_id in set_ids]
+        prefix = os.environ.get(TASK_PREFIX_ENV, "").strip() or DEFAULT_TASK_PREFIX
+        created = operator.create_evaluations(
+            client, cards=cards, model=repo, revision=revision, samples=samples,
+            max_new_tokens=max_new_tokens, thinking=thinking,
+            sampling={"temperature": temperature, "top_p": top_p, "top_k": top_k},
+            count=count, cap=cap, seed=seed, job_id=job_id, completions=completions,
+            prefix=prefix, poll_seconds=poll_seconds, attempt=attempt,
+            log=lambda line: typer.echo(line, err=True))
+    except (ValueError, RuntimeError, TimeoutError, operator.AdminError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps([{k: c[k] for k in ("job_id", "set_id", "qualification_id")}
+                           for c in created], indent=1))
+
+
+@eval_app.command("status")
+def eval_status(job_id: str = typer.Option(..., "--job"), admin_url: str = _ADMIN_URL) -> None:
+    """An eval job's counts: submissions, verdicts, settled, drained."""
+    import json
+
+    from reliquary.eval import operator
+
+    try:
+        status = _admin_client(admin_url).json("GET", f"/admin/v1/jobs/{job_id}/status")
+    except (ValueError, operator.AdminError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps({k: v for k, v in status.items() if k != "manifest"}, indent=1))
+
+
+@eval_app.command("grade")
+def eval_grade(
+    job_id: str = typer.Option(..., "--job"),
+    out: str | None = typer.Option(None, "--out", help="Write report.json, manifest.json, "
+                                                       "graded.parquet here"),
+    eval_id: str | None = typer.Option(None, "--eval-id", help="Default: the job id"),
+    allow_incomplete: bool = typer.Option(False, "--allow-incomplete",
+                                          help="Grade a drained job missing samples"),
+    poll_seconds: float = typer.Option(10.0, "--poll-seconds"),
+    admin_url: str = _ADMIN_URL,
+) -> None:
+    """Grade a drained eval job on the admin host and bring its files home."""
+    import json
+
+    from reliquary.eval import operator
+
+    try:
+        answer = operator.grade_job(_admin_client(admin_url), job_id, out=out, eval_id=eval_id,
+                                    allow_incomplete=allow_incomplete,
+                                    poll_seconds=poll_seconds)
+    except (ValueError, TimeoutError, operator.AdminError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(answer, indent=1))
+
+
+@eval_app.command("compare")
+def eval_compare(
+    a: str = typer.Argument(..., help="A graded directory (eval grade --out)"),
+    b: str = typer.Argument(..., help="Another, on the same sets and conditions"),
+    allow_ungraded: bool = typer.Option(False, "--allow-ungraded",
+                                        help="Count ungraded rows as failures instead of refusing"),
+) -> None:
+    """pass@1 of two gradings and their difference, with a paired bootstrap interval."""
+    import json
+
+    from reliquary.eval.operator import compare_reports
+
+    try:
+        result = compare_reports(a, b, allow_ungraded=allow_ungraded)
+    except (ValueError, OSError, KeyError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(result, indent=1))
 
 
 @eval_app.command("publish-set")
 def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote")) -> None:
-    """Upload a set: prompts.jsonl and set.json to the platform bucket
-    (RELIQUARY_PLATFORM_*), grading.jsonl and set.json to the subnet bucket (R2_*)."""
+    """Upload a set: its three files to the subnet bucket (R2_*); a platform
+    preset's prompts.jsonl and set.json to the platform bucket too
+    (RELIQUARY_PLATFORM_*), which makes it orderable. An operator's set
+    (build-set --source) never goes there."""
     import json
+    from pathlib import Path
 
     from reliquary.corpus.delivery import R2DeliverySink
-    from reliquary.eval.storage import SetConflict, SubnetEvalStore, publish_set
+    from reliquary.eval.storage import (
+        SetConflict, SubnetEvalStore, is_operator_set, publish_set,
+    )
 
     try:
-        answer = asyncio.run(publish_set(directory, platform=R2DeliverySink.from_environment(),
+        card = json.loads((Path(directory) / "set.json").read_text())
+        platform = None if is_operator_set(card) else R2DeliverySink.from_environment()
+        answer = asyncio.run(publish_set(directory, platform=platform,
                                          subnet=SubnetEvalStore()))
     except (ValueError, OSError, RuntimeError, SetConflict) as exc:
         typer.echo(f"error: {exc}", err=True)

@@ -133,20 +133,26 @@ def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None)
     if require is None:
         from reliquary.corpus.export import require_code_sandbox as require
     for card, _ in sets.values():
+        if card.get("source_kind") == "verifiers":
+            # Its code runs, if at all, in the task's own Docker box.
+            continue
         try:
             require(ENVIRONMENT_SPECS[card["source"]])
         except ValueError as exc:
             raise SandboxUnavailable(str(exc)) from exc
 
 
-def answer_text(policy: str, completion: str) -> str:
+def answer_text(policy: str, completion: str, *, thinking: bool = False) -> str:
     """What a free-text grader reads: the part after the reasoning block. An
-    unterminated block is all reasoning, so nothing is left."""
+    unterminated block is all reasoning, so nothing is left. With thinking on,
+    the chat template opens the block in the prompt itself, so a completion cut
+    at its budget carries no tag at all: without a closing tag it is all
+    reasoning too, never an answer."""
     if policy != "text":
         return completion
     if "</think>" in completion:
         return completion.rsplit("</think>", 1)[1]
-    if "<think>" in completion:
+    if thinking or "<think>" in completion:
         return ""
     return completion
 
@@ -178,10 +184,22 @@ class _Graders:
     """One environment and its scorer per (source, split), opened on first use."""
 
     def __init__(self, open_environment: Callable[[str, str], Any],
-                 scorer_for: Callable[[Any, Any], Callable[[dict, str], float]]) -> None:
+                 scorer_for: Callable[[Any, Any], Callable[[dict, str], float]],
+                 open_taskset: Callable[[str, dict], Any] | None = None,
+                 thinking: bool = False) -> None:
+        self._thinking = thinking
         self._open = open_environment
         self._scorer_for = scorer_for
+        self._open_taskset = open_taskset
         self._opened: dict[tuple[str, str], tuple[Any, Callable]] = {}
+        self._tasksets: dict[str, Any] = {}
+        # What scored each taskset's rows here: (id, args) -> installed versions.
+        self.taskset_versions: dict[str, dict] = {}
+        self._child = None
+
+    def close(self) -> None:
+        if self._child is not None:
+            self._child.close()
 
     @staticmethod
     def spec(source: str):
@@ -189,11 +207,16 @@ class _Graders:
 
         return ENVIRONMENT_SPECS[source]
 
-    def grade(self, grading: dict, completion: str) -> tuple[float | None, str, bool]:
+    def grade(self, grading: dict, completion: str,
+              card: Mapping | None = None) -> tuple[float | None, str, bool]:
         """``(score, grader_detail, format_failure)``."""
+        from reliquary.eval import verifiers_source
+
+        if verifiers_source.is_verifiers_source(grading["source"]):
+            return self._grade_verifiers(grading, completion, card or {})
         source, split = grading["source"], grading["split"]
         spec = self.spec(source)
-        answer = answer_text(spec.final_answer_policy, completion)
+        answer = answer_text(spec.final_answer_policy, completion, thinking=self._thinking)
         failed_format = format_failed(spec.final_answer_policy, answer)
         try:
             key = (source, split)
@@ -209,6 +232,57 @@ class _Graders:
         except Exception as exc:
             return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
         return value, "format_failure" if failed_format else "", failed_format
+
+    def _grade_verifiers(self, grading: dict, completion: str,
+                         card: Mapping) -> tuple[float | None, str, bool]:
+        """A Verifiers task reads the reply as its answer, so it gets the text
+        after the reasoning block: grading the reasoning would score what the
+        model considered, not what it answered."""
+        from reliquary.eval import verifiers_source
+
+        answer = answer_text("text", completion, thinking=self._thinking)
+        failed_format = format_failed("text", answer)
+        taskset = card.get("taskset") or {}
+        try:
+            name = verifiers_source.taskset_id(grading["source"])
+            if name != taskset.get("id"):
+                raise ValueError(f"the card names taskset {taskset.get('id')!r}, not {name!r}")
+            args = dict(taskset.get("args") or {})
+            cache = json.dumps([name, args], sort_keys=True)
+            if self._open_taskset is None:
+                if self._child is None:
+                    self._child = verifiers_source.ChildScorer()
+                if cache not in self.taskset_versions:
+                    self.taskset_versions[cache] = self._child.provenance(name, args)
+                value = float(self._child.score(name, args, grading["task_key"],
+                                                grading["prompt_sha256"], answer))
+            else:
+                if cache not in self._tasksets:
+                    self._tasksets[cache] = self._open_taskset(name, args)
+                    self.taskset_versions[cache] = self._tasksets[cache].provenance()
+                value = float(verifiers_source.score_answer(
+                    self._tasksets[cache], grading["task_key"], grading["prompt_sha256"],
+                    answer))
+        except LookupError as exc:
+            if str(exc).strip("'\"") == "source_drift":
+                return None, "source_drift: the task is not the frozen prompt", failed_format
+            return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
+        except Exception as exc:
+            return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
+        return value, "format_failure" if failed_format else "", failed_format
+
+
+def _taskset_grading(card: Mapping, graders: "_Graders") -> dict:
+    """The taskset a Verifiers set was built from and the one that scored it
+    here. A reward can change between versions while every prompt still
+    matches, so a difference is reported, never silently absorbed."""
+    built = dict(card.get("taskset") or {})
+    cache = json.dumps([built.get("id"), dict(built.get("args") or {})], sort_keys=True)
+    graded = graders.taskset_versions.get(cache)
+    keys = ("package_version", "verifiers_version")
+    return {"taskset": built, "taskset_at_grading": graded,
+            "grader_version_drift": None if graded is None else any(
+                built.get(k) != graded.get(k) for k in keys)}
 
 
 def _graded_schema():
@@ -440,6 +514,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                            open_environment: Callable[[str, str], Any] = open_source,
                            scorer_for: Callable = _default_scorer,
                            require_sandbox=None,
+                           open_taskset: Callable[[str, dict], Any] | None = None,
                            work_dir: str | Path | None = None,
                            clock: Callable[[], float] = time.time,
                            bootstrap_seed: int = BOOTSTRAP_SEED) -> dict:
@@ -461,7 +536,10 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     for set_id, (card, rows) in sets.items():
         for row in rows:
             selected[row["problem_id"]] = (set_id, card, row, int(samples_per_set[set_id]))
-    graders = _Graders(open_environment, scorer_for)
+    # The order's thinking mode, from the job (or the pod's provenance): it
+    # decides whether a completion with no closing tag holds an answer at all.
+    graders = _Graders(open_environment, scorer_for, open_taskset,
+                       thinking=bool(provenance.get("thinking")))
     per_problem: dict[str, list[dict]] = defaultdict(list)
     seen: set[tuple[str, int]] = set()
     counts: Counter = Counter()
@@ -543,7 +621,15 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                               card.get("environment_manifest_sha256"),
                           "rl_disjointness": card.get("disjointness", {}).get("rl"),
                           "contamination_note":
-                              card.get("disjointness", {}).get("contamination_note")}
+                              card.get("disjointness", {}).get("contamination_note"),
+                          # Sets built by `build_source_set` say what they are,
+                          # and which training their rows overlap.
+                          **({"source_kind": card["source_kind"],
+                              "selection": card.get("selection"),
+                              "training_overlap": card.get("disjointness")}
+                             if "source_kind" in card else {}),
+                          **(_taskset_grading(card, graders)
+                             if card.get("source_kind") == "verifiers" else {})}
                          for set_id, (card, _) in sets.items()],
                 "completion_keys": keys,
                 "reliquary_version": _reliquary_version(),
@@ -560,6 +646,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
             files.append({"name": path.name, "key": key, "bytes": path.stat().st_size,
                           "sha256": digest})
     finally:
+        graders.close()
         shutil.rmtree(directory, ignore_errors=True)
     manifest = {
         "schema": REPORT_SCHEMA, "eval_id": eval_id, "created_at": report["created_at"],
@@ -581,7 +668,7 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa) -> Non
         for row, (set_id, card, grading, _) in batch:
             completion = row.get("completion")
             completion = completion if isinstance(completion, str) else ""
-            score, detail, failed_format = graders.grade(grading, completion)
+            score, detail, failed_format = graders.grade(grading, completion, card)
             out.append({
                 "env": card["env"], "set_id": set_id, "problem_id": grading["problem_id"],
                 "sample_index": int(row["sample_index"]), "completion": completion,
