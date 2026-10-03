@@ -309,3 +309,39 @@ def test_eval_grade_grades_a_served_job_here(monkeypatch, tmp_path):
                     "allow_incomplete": True}
     missing = CliRunner().invoke(app, ["eval", "grade", "--job", "eval-x"])
     assert missing.exit_code == 1 and "--out is required" in missing.output
+
+
+# --------------------------------------------------------------------------
+# the validator boots on an eval task
+# --------------------------------------------------------------------------
+
+
+def test_a_validator_boots_on_an_eval_task_with_the_external_environment(
+        bucket, registry, published):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.validator.task_config import resolve_task_config
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(app, _eval_args()).exit_code == 0
+    entry = registry["entries"]["eval-teutonic-aime26"]
+    config = resolve_task_config(dict(registry["entries"]), "eval-teutonic-aime26",
+                                 profile_id=entry.profile_id, generation_contract=entry.contract)
+    assert config.task_id == "eval-teutonic-aime26"
+
+
+def test_an_rl_task_naming_the_external_environment_never_boots():
+    from tests.unit.test_contract_startup_refusals import _contract, _entry, _profile
+
+    from reliquary.protocol.external_eval import EXTERNAL_EVAL_ENVIRONMENT
+    from reliquary.validator.task_config import TaskConfigError, resolve_task_config
+
+    profile = _profile()
+    contract = _contract(profile)
+    contract["environments"] = {**contract["environments"],
+                                EXTERNAL_EVAL_ENVIRONMENT: {"max_new_tokens": 128,
+                                                            "answer_format": "text", "bft": None}}
+    with pytest.raises(TaskConfigError, match=EXTERNAL_EVAL_ENVIRONMENT):
+        resolve_task_config({"glm-run": _entry(profile, contract=contract)}, "glm-run",
+                            profile_id=profile.profile_id, generation_contract=contract)
