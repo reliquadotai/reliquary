@@ -72,7 +72,7 @@ SEED_SLICE_IDS = 2048
 # Metadata (tail) reads in flight at once while seeding: a few KB each.
 SEED_META_CONCURRENCY = 64
 # `run()` judges at most this many due ids per pass, the earliest due first.
-RUN_BATCH_IDS = 512
+RUN_BATCH_IDS = int(os.environ.get("RELIQUARY_CORPUS_RUN_BATCH_IDS", "512"))
 # Records one pass audits at most (its own and its siblings'), and their
 # tokens: one GPU call, then the pass's verdicts are written. What is over is
 # judged in the next passes. Unbounded, the first pass after a 110k restart
@@ -1092,6 +1092,7 @@ class CorpusAuditor:
                         "siblings=%d rounds_needed=%d rounds_cached=%d/%d", self._job_id,
                         len(known), len(kept), len(waiting), sum(taken.values()), rounds_needed,
                         self._pass_rounds[1], self._pass_rounds[0])
+            reused: list[tuple[str, dict | None]] = []
             for hotkey, sids in siblings.items():
                 for sid in sids:
                     with self._timed("decide"):
@@ -1103,12 +1104,26 @@ class CorpusAuditor:
                             draws[sid] = draw
                     elif choice == "undecidable":
                         undecided.setdefault(hotkey, []).append(self._meta[sid][1])
+                    elif (choice == "pass_unaudited" and self._meta[sid][1]
+                          + self._params.hold_seconds <= hold_end[hotkey]):
+                        # Payable, and every sibling that could catch it is
+                        # decided in this pass too (its hold ends inside the
+                        # window): paid here under the same guards, not decided
+                        # again by a later pass.
+                        reused.append((sid, draw))
+            self._choices["sibling_payable"] += len(reused)
+            unaudited = unaudited + reused
 
         # The pass's budget: the oldest audits first, the rest in later passes.
         # A hotkey with a deferred audit pays nothing unaudited this pass (the
         # deferred one may be the drawn sibling that would catch it).
         audit_ids, later = self._within_budget(audit_ids, set(submission_ids))
-        deferred_hotkeys = {self._meta[sid][0] for sid in later}
+        # Per hotkey, the oldest receipt among its deferred audits: a record
+        # whose hold reaches it waits; an older one does not.
+        deferred_from: dict[str, float] = {}
+        for sid in later:
+            hotkey, received_at, _ = self._meta[sid]
+            deferred_from[hotkey] = min(deferred_from.get(hotkey, math.inf), received_at)
         for sid in later:
             self._next_due[sid] = now
             self._schedule(sid, now)
@@ -1150,7 +1165,7 @@ class CorpusAuditor:
                 if covered is not None:
                     self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
-            if hotkey in deferred_hotkeys or any(
+            if deferred_from.get(hotkey, math.inf) <= received_at + self._params.hold_seconds or any(
                     t <= received_at + self._params.hold_seconds
                     for t in undecided.get(hotkey, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
