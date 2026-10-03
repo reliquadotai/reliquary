@@ -17,6 +17,7 @@ class FakeRenderer:
 
     terminator_id = TERM
     stop_ids = frozenset({TERM, EOT})
+    turn_markup_ids = frozenset({TR, TRE})
 
     def initial_ids(self, prompt):
         return [TEXT + (ord(c) % 50) for c in prompt] + [GEN]
@@ -132,10 +133,61 @@ def test_context_length_final_calls_are_replayed_without_observations():
 
 def test_max_turns_final_calls_are_not_replayed():
     tokens, spans = build([([TEXT, CALL, TERM], ["a"]), ([TEXT, CALL, TERM], None)])
-    assert len(parse(tokens, spans, stop="max_turns").actions) == 1
+    parsed = parse_trajectory(R, prompt_ids=PROMPT, tokens=tokens, spans=spans,
+                              stop="max_turns", max_turns=2)
+    assert len(parsed.actions) == 1
 
 
 def test_a_capped_turn_is_followed_by_a_synthesized_terminator():
     tokens, spans = build([([TEXT, CALL], ["a"]), ([TEXT, TERM], None)])  # no TERM: capped
     assert tokens[spans[0][1]] == TERM                       # the bridge's own close
     assert parse(tokens, spans).actions == (Action("bash", '{"command": "c0"}', "a"),)
+
+
+def test_a_stop_token_inside_a_non_final_span_is_refused():
+    tokens, spans = build([([TEXT, CALL, TERM, TEXT, CALL, TERM], ["a"]), ([TEXT, TERM], None)])
+    with pytest.raises(TrajectoryRefused, match="bad_turns"):
+        parse(tokens, spans)
+
+
+def test_a_stop_token_inside_the_final_span_hides_nothing():
+    tokens, spans = build([([TEXT, TERM, CALL, TERM], None)])
+    with pytest.raises(TrajectoryRefused, match="bad_turns"):
+        parse(tokens, spans)
+
+
+@pytest.mark.parametrize("marker", [TR, TRE])
+def test_turn_markup_inside_a_span_is_refused(marker):
+    tokens, spans = build([([TEXT, CALL, marker, TERM], ["a"]), ([TEXT, TERM], None)])
+    with pytest.raises(TrajectoryRefused, match="bad_turns"):
+        parse(tokens, spans)
+
+
+def test_a_truncated_final_turn_under_agent_completed_is_refused():
+    tokens, spans = build([([TEXT, TEXT], None)])
+    with pytest.raises(TrajectoryRefused, match="bad_turns"):
+        parse(tokens, spans)
+
+
+def test_an_unknown_stop_is_refused():
+    tokens, spans = build([([TEXT, CALL, TERM], None)])
+    with pytest.raises(TrajectoryRefused, match="bad_stop"):
+        parse(tokens, spans, stop="bogus")
+
+
+def test_max_turns_needs_the_jobs_turn_count():
+    tokens, spans = build([([TEXT, CALL, TERM], ["a"]), ([TEXT, CALL, TERM], None)])
+    with pytest.raises(TrajectoryRefused, match="bad_stop"):   # label without the job's limit
+        parse(tokens, spans, stop="max_turns")
+    with pytest.raises(TrajectoryRefused, match="bad_stop"):   # fewer turns than the limit
+        parse_trajectory(R, prompt_ids=PROMPT, tokens=tokens, spans=spans, stop="max_turns", max_turns=5)
+    ok = parse_trajectory(R, prompt_ids=PROMPT, tokens=tokens, spans=spans, stop="max_turns", max_turns=2)
+    assert len(ok.actions) == 1
+
+
+def test_spans_out_of_order_or_bounds_are_refused():
+    tokens, spans = build([([TEXT, CALL, TERM], ["a"]), ([TEXT, TERM], None)])
+    for bad in ([(spans[0][0], spans[0][0]), spans[1]], [spans[0], (spans[1][0], len(tokens) + 3)],
+                [(spans[0][0], spans[1][1]), spans[1]]):
+        with pytest.raises(TrajectoryRefused, match="bad_turns"):
+            parse(tokens, bad)

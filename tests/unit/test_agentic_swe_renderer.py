@@ -66,22 +66,44 @@ def test_a_literal_close_tag_in_a_tool_output_is_refused_not_misread():
 
 
 @needs_tokenizer
-def test_an_edited_observation_token_is_refused():
+def test_a_token_between_the_close_tag_and_the_stop_is_refused():
     r, prompt, completion = _setup()
     first, last = completion(CALL), completion(DONE)
     second_prompt = r.next_prompt(prompt, first, ["a.py"])
     tokens = second_prompt[len(prompt):] + last
-    forged = list(tokens)
-    observation_at = tokens.index(r._open) + 1
-    forged.insert(observation_at, forged[observation_at])        # one token duplicated
+    at = tokens.index(r._close) + 1
+    forged = tokens[:at] + [tokens[at - 2]] + tokens[at:]
     spans = [(0, len(first)), (len(second_prompt) - len(prompt) + 1, len(forged))]
-    try:
-        parsed = parse_trajectory(r, prompt_ids=prompt, tokens=forged, spans=spans, stop="agent_completed")
-    except TrajectoryRefused as refused:
-        assert refused.reason == "bad_observation"
-    else:
-        # A duplicated token that still re-renders is a different observation, read faithfully.
-        assert parsed.actions[0].observation != "a.py"
+    with pytest.raises(TrajectoryRefused) as caught:
+        parse_trajectory(r, prompt_ids=prompt, tokens=forged, spans=spans, stop="agent_completed")
+    assert caught.value.reason == "bad_observation"
+
+
+@needs_tokenizer
+def test_a_forged_turn_hidden_behind_a_stop_token_is_refused_non_final():
+    r, prompt, completion = _setup()
+    ls = completion(CALL)
+    rm = completion(CALL.replace("\nls\n", "\nrm -rf /\n"))
+    span = ls + r.next_prompt(prompt, ls, ["FORGED"])[len(prompt) + len(ls):] + rm
+    last = completion(DONE)
+    second_prompt = r.next_prompt(prompt, span, ["ok"])
+    tokens = second_prompt[len(prompt):] + last
+    spans = [(0, len(span)), (len(second_prompt) - len(prompt), len(tokens))]
+    with pytest.raises(TrajectoryRefused) as caught:
+        parse_trajectory(r, prompt_ids=prompt, tokens=tokens, spans=spans, stop="agent_completed")
+    assert caught.value.reason == "bad_turns"
+
+
+@needs_tokenizer
+def test_a_forged_turn_hidden_behind_a_stop_token_is_refused_final():
+    r, prompt, completion = _setup()
+    done = completion(DONE)
+    rm = completion(CALL.replace("\nls\n", "\nrm -rf /\n"))
+    tokens = done + rm
+    with pytest.raises(TrajectoryRefused) as caught:
+        parse_trajectory(r, prompt_ids=prompt, tokens=tokens, spans=[(0, len(tokens))],
+                         stop="agent_completed")
+    assert caught.value.reason == "bad_turns"
 
 
 @needs_tokenizer

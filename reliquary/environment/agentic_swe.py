@@ -175,6 +175,8 @@ class QwenTurnRenderer:
         self.stop_ids = frozenset(int(t) for t in stops)
         self._open = renderer._token_id("<tool_response>")
         self._close = renderer._token_id("</tool_response>")
+        self.turn_markup_ids = frozenset(
+            int(renderer._token_id(t)) for t in ("<|im_start|>", "<tool_response>", "</tool_response>"))
         self._tools = [dict(tool) for tool in BASH_HARNESS_TOOLS]
 
     @_locked
