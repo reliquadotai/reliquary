@@ -160,6 +160,11 @@ RELIQUARY_EXECUTOR_TOKEN=<token> reliquary corpus grade-executor --control-url h
   replay waits `RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS` (30 min) and resolves
   `disputed`: nobody is sanctioned and nothing is certified (ruling P16). Run
   executors on at least two providers, three for arbitration.
+- **Start after the control answers, under a restart policy.** The first
+  heartbeat is not retried: an executor whose control is unreachable or has
+  not yet re-read the registry (every 30 s) exits at once (later errors are
+  retried, 401 always exits). Run it under `Restart=on-failure` with the
+  token in its unit's environment.
 - **One executor per Docker host.** At start an executor removes every
   container named `reliquary-gradebox-*` on its host (the boxes a killed
   executor left behind), so a second executor on the same host would kill the
@@ -339,7 +344,10 @@ group `kill -- -$(cat ...pid)` needs later. The same holds for every
      || { unset TOKEN_A TOKEN_B; echo "STOP: an executor got no token" >&2; }
    # The control re-reads the executor registry every 30 s: an executor that
    # starts before it does gets 401 on its first heartbeat and exits, and its
-   # token, shown once, is gone with the shell variable.
+   # token, shown once, is gone with the shell variable. Any failure of that
+   # first heartbeat is fatal (the control not answering yet included): run
+   # this only once step 2's curl answers (`curl -sf`, and test curl's status,
+   # not a pipe's). A lost token means a new --executor-id.
    sleep 35
    ssh -f -N -o ExitOnForwardFailure=yes -L 18100:127.0.0.1:8100 -p 20300 root@162.243.212.30
    ssh -f -N -o ExitOnForwardFailure=yes -R 18100:127.0.0.1:18100 root@5.161.244.56
