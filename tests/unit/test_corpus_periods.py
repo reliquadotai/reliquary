@@ -85,3 +85,133 @@ def test_a_finished_task_stops_paying_on_its_own():
     # 14 periods (17 h) after the last pay entered, under 1 % of the cap is left.
     assert sum(cp.replay(archives, 99 + 14).values()) < 0.01 * cap
     assert cp.replay(archives, 99 + cp.REPLAY_DEPTH + 1) == {}
+
+
+# --------------------------------------------------------------------------
+# the weight setter
+# --------------------------------------------------------------------------
+
+
+class _PeriodArchives:
+    def __init__(self, docs):
+        self.docs, self.reads = docs, []
+
+    async def list(self, task_id):
+        return sorted((w, e) for (t, w, e) in self.docs if t == task_id)
+
+    async def read(self, task_id, work, entry):
+        self.reads.append((task_id, work, entry))
+        return self.docs.get((task_id, work, entry))
+
+
+def _entry(cap, settlement="period-ema-v1", share=0.0):
+    params = {"cap": cap, "min_incentive_share": share, "min_incentive_ramp_start": 0.0}
+    if settlement:
+        params["settlement"] = settlement
+    return SimpleNamespace(params=params)
+
+
+def test_the_weight_setter_replays_period_tasks_on_their_own_clock():
+    import asyncio
+
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    docs = {("eval-a", 30, 31): {"rewards_by_hotkey": {"m1": 0.02}},
+            ("eval-a", 31, 32): {"rewards_by_hotkey": {"m1": 0.01, "m2": 0.01}},
+            ("eval-a", 33, 33): {"rewards_by_hotkey": {"m3": 0.02}},  # not entered yet
+            ("eval-a", 1, 2): {"rewards_by_hotkey": {"old": 0.02}}}  # beyond the depth
+    archives = _PeriodArchives(docs)
+    declared = {"eval-a": _entry(0.02), "default": _entry(0.8, settlement=None),
+                "corpus-old": _entry(0.04, settlement=None)}
+    now = GENESIS + 32 * cp.PERIOD_SECONDS + 5
+    weights = asyncio.run(WeightOnlyValidator._period_weights(
+        declared, archives=archives, now=now, genesis=GENESIS))
+    a = cp.PERIOD_ALPHA
+    assert set(weights) == {"eval-a"}
+    assert weights["eval-a"]["m1"] == pytest.approx(a * (1 - a) * 0.02 + a * 0.01)
+    assert weights["eval-a"]["m2"] == pytest.approx(a * 0.01)
+    assert ("eval-a", 1, 2) not in archives.reads  # never read past the depth
+
+
+def test_period_pay_is_capped_and_added_to_the_window_replay():
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    window = [{"task_id": "default", "window_start": 5, "rewards_by_hotkey": {"r": 0.5}}]
+    combined = WeightOnlyValidator._replay_ema(
+        window, caps={"default": 0.8, "eval-a": 0.02},
+        floors={"default": (0.0, 0.0), "eval-a": (0.0, 0.0)},
+        periods={"eval-a": {"m1": 0.05, "m2": 0.05}})
+    assert combined["m1"] == pytest.approx(0.01) and combined["m2"] == pytest.approx(0.01)
+    assert combined["r"] == pytest.approx(
+        WeightOnlyValidator._replay_ema(window, caps={"default": 0.8},
+                                        floors={"default": (0.0, 0.0)})["r"])
+
+
+def test_an_epoch_with_only_period_pay_still_submits(monkeypatch):
+    """No window archive at all (every task period-settled) is not 'nothing to pay'."""
+    import asyncio
+
+    import reliquary.validator.weight_only as wov_mod
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    async def no_windows(*, task_id=None, strict=False, **kw):
+        return []
+
+    async def tasks(*, strict=False, **kw):
+        return ["default"]
+
+    async def registry():
+        return {"eval-a": _entry(0.02)}, "etag"
+
+    async def periods(declared):
+        return {"eval-a": {"m1": 0.01}}
+
+    async def subtensor():
+        return object()
+
+    async def close(_):
+        return None
+
+    monkeypatch.setattr(wov_mod.storage, "list_task_ids", tasks)
+    monkeypatch.setattr(wov_mod.storage, "list_all_window_keys", no_windows)
+    monkeypatch.setattr(wov_mod, "read_registry", registry)
+    monkeypatch.setattr(wov_mod.chain, "get_subtensor", subtensor)
+    monkeypatch.setattr(wov_mod.chain, "close_subtensor", close)
+    wov = WeightOnlyValidator.__new__(WeightOnlyValidator)
+    wov._active_submit_epoch = None
+    monkeypatch.setattr(wov, "_period_weights", periods, raising=False)
+    submitted = {}
+
+    async def submit(sub, weights):
+        submitted.update(weights)
+        return True
+
+    wov._submit_weights = submit
+    assert asyncio.run(wov.submit_once()) is True
+    assert submitted == {"m1": pytest.approx(0.01)}
+
+
+def test_unreadable_period_pay_abstains(monkeypatch):
+    import asyncio
+
+    import reliquary.validator.weight_only as wov_mod
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    async def tasks(*, strict=False, **kw):
+        return ["default"]
+
+    async def windows(*, task_id=None, strict=False, **kw):
+        return []
+
+    async def registry():
+        return {"eval-a": _entry(0.02)}, "etag"
+
+    async def broken(declared):
+        raise ConnectionError("R2 down")
+
+    monkeypatch.setattr(wov_mod.storage, "list_task_ids", tasks)
+    monkeypatch.setattr(wov_mod.storage, "list_all_window_keys", windows)
+    monkeypatch.setattr(wov_mod, "read_registry", registry)
+    wov = WeightOnlyValidator.__new__(WeightOnlyValidator)
+    monkeypatch.setattr(wov, "_period_weights", broken, raising=False)
+    assert asyncio.run(wov.submit_once()) is False
