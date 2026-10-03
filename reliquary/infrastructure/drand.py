@@ -382,6 +382,62 @@ def get_current_chain() -> dict[str, Any]:
     return rec
 
 
+def get_agreed_beacon(round_id: int, *, agree: int = 2) -> dict[str, Any] | None:
+    """Round ``round_id`` as ``agree`` distinct relays sign it, or None.
+
+    Every relay is asked at once (v2 and v1 paths); the round is returned as
+    soon as ``agree`` relays gave the same signature for it and randomness =
+    SHA256(signature) holds, so its cost is the second-fastest relay's answer
+    (cloudflare's is ~60 ms from the corpus box). Forging it takes
+    compromising two relays, as the bittensor-drand cross-check did, without
+    that check's fetch from one fixed (slow) relay per round. None: no
+    agreement (a relay down, a lie, a disagreement); the caller falls back.
+    """
+    import hashlib
+
+    _ensure_params(refresh=False)
+    if _DRAND_CHAIN_HASH is None:
+        return None
+    rid = str(int(round_id))
+    paths = [f"/v2/chains/{_DRAND_CHAIN_HASH}/rounds/{rid}", f"/{_DRAND_CHAIN_HASH}/public/{rid}"]
+    jobs = [(base, f"{base}{path}") for base in DRAND_URLS for path in paths]
+
+    def _try(url: str) -> dict[str, Any] | None:
+        try:
+            r = _get_thread_session().get(url, timeout=(0.5, 2.0), headers=_HEADERS)
+            return r.json() if r.status_code == 200 else None
+        except Exception as e:
+            logger.debug(f"[Drand] GET {url} error: {e}")
+            return None
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs))
+    futures = {ex.submit(_try, url): base for base, url in jobs}
+    ex.shutdown(wait=False, cancel_futures=False)
+    votes: dict[str, set[str]] = {}
+    for fut in concurrent.futures.as_completed(futures):
+        try:
+            data = fut.result()
+        except concurrent.futures.CancelledError:
+            continue
+        if not isinstance(data, dict) or data.get("round") != int(round_id):
+            continue
+        sig = data.get("signature")
+        if not isinstance(sig, str):
+            continue
+        try:
+            randomness = hashlib.sha256(bytes.fromhex(sig)).hexdigest()
+        except ValueError:
+            continue
+        given = data.get("randomness")
+        if given is not None and str(given).lower() != randomness:
+            continue
+        relays = votes.setdefault(sig.lower(), set())
+        relays.add(futures[fut])
+        if len(relays) >= agree:
+            return {"round": int(round_id), "signature": sig.lower(), "randomness": randomness}
+    return None
+
+
 def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) -> dict[str, Any]:
     """
     Fetch randomness from the drand network (v2-first, v1 fallback).

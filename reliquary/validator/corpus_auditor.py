@@ -60,7 +60,7 @@ READ_CONCURRENCY = 16
 # ~1.5 s on 2026-10-02 and capped a job near 2,400 verdicts an hour.
 WRITE_CONCURRENCY = 32
 # drand rounds fetched at once when a pass needs many (one per sampled record).
-DRAND_CONCURRENCY = 16
+DRAND_CONCURRENCY = 32
 # Records read at once when a restart seeds the hold window's arrivals.
 SEED_SLICE_IDS = 2048
 # Metadata (tail) reads in flight at once while seeding: a few KB each.
@@ -713,11 +713,15 @@ class CorpusAuditor:
         """Audit, re-audit each failure alone, write the verdicts and move each
         hotkey's state. Returns the verdicts and the hotkeys with a confirmed failure."""
         outcomes = await self._audit_outcomes(records)
-        for k, outcome in enumerate(outcomes):
-            if isinstance(outcome, dict) and not outcome["passed"]:
-                # §7.2: only a failure that a second, separate audit repeats counts.
-                # Always on this GPU: an executor alone can never fail a miner.
-                outcomes[k] = (await self._audit_outcomes([records[k]], local=True))[0]
+        failing = [k for k, outcome in enumerate(outcomes)
+                   if isinstance(outcome, dict) and not outcome["passed"]]
+        if failing:
+            # §7.2: only a failure that a second, separate audit repeats counts.
+            # Always on this GPU: an executor alone can never fail a miner. One
+            # call for all of them (one each was 10-22 s a call, GPU idle).
+            again = await self._audit_outcomes([records[k] for k in failing], local=True)
+            for k, outcome in zip(failing, again):
+                outcomes[k] = outcome
 
         for submission_id, outcome in zip(ids, outcomes):
             if isinstance(outcome, dict):
@@ -1196,7 +1200,12 @@ class CorpusAuditor:
             while failed and self._params.q < 1.0:
                 # §7.2: every record of a hotkey just found cheating that has no
                 # verdict yet is audited (it is suspect now) before it can be paid.
-                pending = await self.pending_ids()
+                # From memory, never a listing (670-850 s a pass at 146k pending,
+                # 2026-10-03): every pending record this process knows -- seeded at
+                # start, enqueued since, listed every FULL_RESCAN_SECONDS. One not
+                # known yet is decided when it arrives, under the suspect state.
+                pending = [sid for sid in dict.fromkeys(
+                    (*self._meta, *self._unreadable, *self._queued)) if sid not in self._judged]
                 await self._read_all([sid for sid in pending if sid not in self._meta])
                 held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed]
                 failed = await self._judge_once(held)

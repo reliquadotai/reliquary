@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 CODEC_THREADS = 8
 # drand relay races in flight at once, across jobs: each also opens a
 # connection to every relay, so this bounds those sockets too.
-BEACON_THREADS = 16
+BEACON_THREADS = 32
 # Large records read at once across every judge (decoded on CODEC_THREADS).
 JUDGE_READS = 32
 
