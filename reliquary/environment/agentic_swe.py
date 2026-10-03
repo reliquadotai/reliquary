@@ -294,6 +294,19 @@ class QwenTurnRenderer:
         return squeeze(tail) == squeeze(expected)
 
     @_locked
+    def render_messages(self, messages) -> list[int]:
+        """A whole conversation (system, user, assistant and tool messages), as
+        the pinned template renders it with the harness tools."""
+        rendered = self._r.render(list(messages), tools=self._tools, add_generation_prompt=False)
+        return [int(t) for t in rendered.token_ids]
+
+    @_locked
+    def whitespace_free(self, ids) -> str:
+        """The decoded text with every whitespace run erased: what
+        ``span_is_canonical`` compares when the parser strips parameter values."""
+        return re.sub(r"\s+", "", self._tokenizer.decode(list(ids), skip_special_tokens=False))
+
+    @_locked
     def assistant_message(self, completion_ids) -> dict:
         parsed = self._r.parse_response(list(completion_ids), tools=self._tools)
         message = {"role": "assistant", "content": parsed.content or ""}

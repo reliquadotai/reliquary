@@ -17,7 +17,37 @@ from reliquary.corpus.job import parse_job
 from reliquary.environment.agentic_swe import BASH_SYSTEM_PROMPT, SweSource
 from tests.unit.test_corpus_grading import _record
 from tests.unit.test_corpus_job_episode import _manifest
-from tests.unit.test_trajectory_parse import R
+from tests.unit.test_trajectory_parse import FakeRenderer
+
+
+class RoundTripRenderer(FakeRenderer):
+    """The fake renderer, able to render a whole conversation back to ids: an
+    assistant message carries its span's ids (the fake parser keeps nothing
+    else), and tool messages are bridged as the turn renderer bridges them."""
+
+    def assistant_message(self, completion_ids):
+        return {**super().assistant_message(completion_ids),
+                "content": json.dumps([int(t) for t in completion_ids])}
+
+    def render_messages(self, messages):
+        ids = self.initial_ids(messages[1]["content"])
+        k = 2
+        while k < len(messages):
+            completion = json.loads(messages[k]["content"])
+            k += 1
+            observations = []
+            while k < len(messages) and messages[k]["role"] == "tool":
+                observations.append(messages[k]["content"])
+                k += 1
+            ids = (self.next_prompt(ids, completion, observations) if observations
+                   else ids + completion)
+        return ids
+
+    def whitespace_free(self, ids):
+        return tuple(ids)
+
+
+R = RoundTripRenderer()
 
 JOB = parse_job(_manifest(prompt_count=3))
 SOURCE = SweSource([("i0", "p"), ("repo__x.1", "fix it"), ("i2", "q")])
@@ -99,7 +129,7 @@ def test_rows_hold_messages_tokens_and_the_assistant_mask():
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "tool", "assistant"]
     assert messages[0]["content"] == BASH_SYSTEM_PROMPT
     assert messages[1]["content"] == SOURCE.prompt(1)
-    assert messages[3] == {"role": "tool", "tool_call_id": "call_0", "content": "a.py"}
+    assert messages[3] == {"role": "tool", "tool_call_id": "call_0_0", "content": "a.py"}
     assert row["tokens"][:len(PROMPT)] == PROMPT
     assert len(row["assistant_mask"]) == len(row["tokens"])
     spans = json.loads(row["turns"])
@@ -208,6 +238,7 @@ def cli(monkeypatch):
     monkeypatch.setattr(agentic_swe, "load_turn_renderer", lambda directory: R)
     monkeypatch.setattr(agentic_swe, "load_swe_source", lambda num_images: SOURCE)
     monkeypatch.setattr(cli_main, "_episode_tokenizer_dir", lambda job: "/nowhere")
+    _drained(monkeypatch, True)
     return cli_main.app
 
 
@@ -263,3 +294,82 @@ def test_admin_refuses_an_episode_delivery(monkeypatch, tmp_path):
     with TestClient(app) as client:
         response = client.request("POST", path, content=body, headers=headers)
     assert response.status_code == 422 and "--sft" in response.json()["detail"]
+
+
+# -- fix round 1: the messages are proven, the task cross-checked, the export says what it left out
+
+
+class _DropsAToken(RoundTripRenderer):
+    """A parser that loses a token: its messages no longer render to the tokens."""
+
+    def assistant_message(self, completion_ids):
+        return super().assistant_message(list(completion_ids)[1:])
+
+
+def test_a_row_whose_messages_do_not_render_to_its_tokens_is_skipped():
+    counts = {}
+    rows = asyncio.run(_rows_with(_DropsAToken(), counts))
+    assert rows == [] and counts["unrendered"] == 2
+
+
+async def _rows_with(renderer, counts, records=None):
+    return [row async for row in episode_rows(job=JOB, records=records or _Records(),
+                                              renderer=renderer, source=SOURCE, counts=counts,
+                                              quarantined=("q1",))]
+
+
+def test_tool_call_ids_are_qualified_by_turn():
+    rows, _ = _collect(True)
+    messages = json.loads(rows[0]["messages"])
+    assistant = [m for m in messages if m["role"] == "assistant"]
+    assert assistant[0]["tool_calls"][0]["id"] == "call_0_0"
+    assert [m["tool_call_id"] for m in messages if m["role"] == "tool"] == ["call_0_0"]
+
+
+def test_a_grade_naming_another_task_is_not_exported():
+    records = _Records()
+    records.grades[IDS["certified"]]["instance_id"] = "i2"
+    counts = {}
+    rows = asyncio.run(_rows_with(R, counts, records))
+    assert IDS["certified"] not in [r["submission_id"] for r in rows]
+    assert counts["task_mismatch"] == 1
+
+
+def _drained(monkeypatch, drained):
+    from reliquary.validator import corpus_job_status
+
+    async def stored_job_counts(records, job_id):
+        return {"drained": drained}
+
+    monkeypatch.setattr(corpus_job_status, "stored_job_counts", stored_job_counts)
+
+
+def test_cli_refuses_a_job_still_moving(cli, monkeypatch, tmp_path):
+    _drained(monkeypatch, False)
+    out = tmp_path / "sft.jsonl"
+    result = CliRunner().invoke(cli, ["jobs", "export", JOB.job_id, "--out", str(out), "--sft"])
+    assert result.exit_code != 0 and "drained" in result.output and not out.exists()
+
+
+def test_cli_exports_a_moving_job_when_told_to_and_says_so(cli, monkeypatch, tmp_path):
+    _drained(monkeypatch, False)
+    out = tmp_path / "sft.jsonl"
+    result = CliRunner().invoke(cli, ["jobs", "export", JOB.job_id, "--out", str(out), "--sft",
+                                      "--allow-incomplete"])
+    assert result.exit_code == 0, result.output
+    sidecar = json.loads((tmp_path / "sft.jsonl.counts.json").read_text())
+    assert sidecar["drained"] is False and sidecar["exported"] == 1
+
+
+def test_cli_writes_the_counts_beside_the_rows(cli, monkeypatch, tmp_path):
+    _drained(monkeypatch, True)
+    out = tmp_path / "all.jsonl"
+    result = CliRunner().invoke(cli, ["jobs", "export", JOB.job_id, "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    sidecar = json.loads((tmp_path / "all.jsonl.counts.json").read_text())
+    assert sidecar["drained"] is True and sidecar["sft_only"] is False
+    assert (sidecar["exported"], sidecar["ungraded"], sidecar["held"], sidecar["voided"],
+            sidecar["uncertified"], sidecar["unparseable"]) == (2, 1, 1, 1, 2, 0)
+    assert sidecar["quarantined_executors"] == ["q1"]
+    assert isinstance(sidecar["exported_at"], float)
+    assert sidecar["counts"]["rows"] == 2

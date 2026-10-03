@@ -47,6 +47,12 @@ class TurnRenderer(Protocol):
 
     def assistant_message(self, completion_ids: Sequence[int]) -> dict: ...
 
+    # Export only (``delivery.episode_row``): the whole conversation rendered
+    # back to ids, and ids compared with whitespace erased.
+    def render_messages(self, messages: Sequence[dict]) -> list[int]: ...
+
+    def whitespace_free(self, ids: Sequence[int]) -> object: ...
+
     def span_is_canonical(self, prompt_ids: Sequence[int], completion_ids: Sequence[int]) -> bool:
         """The message parsed from the span, re-rendered as an assistant turn
         after ``prompt_ids``, gives exactly the span's tokens, and no added

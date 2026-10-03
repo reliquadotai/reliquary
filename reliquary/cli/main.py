@@ -1474,12 +1474,18 @@ def jobs_export(
         False, "--sft",
         help="An episode job: keep the certified successes (graded_success and "
              "replay_certified), the SFT set"),
+    allow_incomplete: bool = typer.Option(
+        False, "--allow-incomplete",
+        help="An episode job: export before the job is drained (the counts file says so)"),
 ) -> None:
     """Write the verified completions of a job as JSON lines.
 
     An episode job writes one row per replay-certified trajectory (messages
     rebuilt from the proven tokens, tokens, assistant mask, grade); `--sft`
-    keeps the successes. Counts go to stderr.
+    keeps the successes. It refuses a job not yet drained unless
+    `--allow-incomplete`, and always writes `{out}.counts.json`: drained, what
+    was exported and what was left out (ungraded, held, voided, uncertified,
+    unparseable...), when, and the quarantined executors it held.
 
     Written to a temporary file beside `--out` and swapped in with
     `os.replace` only once the export completes, so a mid-stream failure (the
@@ -1504,6 +1510,15 @@ def jobs_export(
         if episode:
             from reliquary.corpus.delivery import episode_rows
             from reliquary.environment import agentic_swe
+            from reliquary.validator import corpus_job_status
+
+            drained = bool((await corpus_job_status.stored_job_counts(
+                BucketRecordStore(), job_id))["drained"])
+            if not drained and not allow_incomplete:
+                raise typer.BadParameter(
+                    f"job {job_id!r} is not drained: grades, regrades and voids may still "
+                    "change; pass --allow-incomplete to export what is final so far")
+            quarantined = await _quarantined_grade_executors()
 
             renderer = await asyncio.to_thread(agentic_swe.load_turn_renderer,
                                                await asyncio.to_thread(_episode_tokenizer_dir, job))
@@ -1512,7 +1527,7 @@ def jobs_export(
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,
-                                quarantined=await _quarantined_grade_executors())
+                                quarantined=quarantined)
         else:
             grade = _job_grader(job) if apply_filter else None
             rows = export_rows(job=job, records=BucketRecordStore(), grade=grade)
@@ -1530,6 +1545,18 @@ def jobs_export(
                     written += 1
             os.replace(temporary, out)
             if episode:
+                sidecar = {
+                    "job_id": job_id, "drained": drained, "sft_only": sft,
+                    "exported": counts.get("rows", 0),
+                    **{k: counts.get(k, 0) for k in ("ungraded", "held", "voided",
+                                                     "uncertified", "unparseable")},
+                    "counts": counts, "exported_at": _time.time(),
+                    "quarantined_executors": list(quarantined),
+                }
+                side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
+                with open(side_temporary, "w", encoding="utf-8") as handle:
+                    json.dump(sidecar, handle, sort_keys=True, indent=1)
+                os.replace(side_temporary, f"{out}.counts.json")
                 typer.echo(json.dumps(counts, sort_keys=True), err=True)
         except Exception:
             try:

@@ -42,6 +42,15 @@ _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "completion_index", "prompt",
               "completion", "completion_tokens", "accepted", "score")
 # Episode jobs (spec §5 N6): one row per certified trajectory.
+# ``tokens`` + ``assistant_mask`` are the authoritative training form: what the
+# miner proved and the replay certified. ``messages`` is the same conversation
+# parsed with the pinned renderer, proven per row to render back to ``tokens``
+# with whitespace erased, not byte for byte: the pinned parser strips the
+# whitespace around a tool-call parameter value (an ``edit``'s indented
+# ``old_str``/``new_str`` loses its leading indentation, and the template ends
+# on a newline). The stripped call is what the harness executed. Turn-by-turn,
+# ``parse_trajectory`` proves each span canonical and each tool segment the
+# exact bridge rendering.
 EPISODE_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "task_id", "messages", "tokens",
                       "assistant_mask", "final_diff", "graded_success", "replay_certified", "turns",
                       "stop")
@@ -80,6 +89,10 @@ class EpisodePromptMismatch(ValueError):
     """The record's prompt tokens are not the pinned render of its task's prompt."""
 
 
+class EpisodeUnrendered(ValueError):
+    """The rebuilt messages do not render back to the row's tokens."""
+
+
 def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, renderer,
                 user_prompt: str) -> dict:
     """The row of one graded trajectory. Messages are rebuilt from the proven
@@ -87,7 +100,8 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
     user messages must render to the record's prompt tokens, so the messages
     and the tokens are one and the same trajectory.
 
-    Raises ``TrajectoryRefused`` or ``EpisodePromptMismatch``."""
+    Raises ``TrajectoryRefused``, ``EpisodePromptMismatch`` or
+    ``EpisodeUnrendered``."""
     from reliquary.corpus.trajectory_parse import parse_trajectory
     from reliquary.environment.agentic_swe import BASH_SYSTEM_PROMPT
 
@@ -101,10 +115,18 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
                               stop=trajectory["stop"], max_turns=job.episode.max_turns)
     messages = [{"role": "system", "content": BASH_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}]
-    for (start, end), turn in zip(spans, parsed.turns):
-        messages.append(renderer.assistant_message(tokens[start:end]))
-        messages += [{"role": "tool", "tool_call_id": f"call_{k}", "content": text}
+    for t, ((start, end), turn) in enumerate(zip(spans, parsed.turns)):
+        message = renderer.assistant_message(tokens[start:end])
+        for k, call in enumerate(message.get("tool_calls") or ()):
+            call["id"] = f"call_{t}_{k}"         # unique in the conversation, not per turn
+        messages.append(message)
+        messages += [{"role": "tool", "tool_call_id": f"call_{t}_{k}", "content": text}
                      for k, text in enumerate(turn.observations)]
+    # The proof the messages are the tokens (see EPISODE_ROW_FIELDS for why
+    # whitespace is erased first).
+    if renderer.whitespace_free(renderer.render_messages(messages)) \
+            != renderer.whitespace_free(prompt + tokens):
+        raise EpisodeUnrendered(submission_id)
     mask = [0] * (len(prompt) + len(tokens))
     for start, end in spans:
         mask[len(prompt) + start:len(prompt) + end] = [1] * (end - start)
@@ -217,8 +239,8 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
     voided = set(await records.list_voided_ids(job.job_id))
     read_voided = getattr(records, "read_voided", None)
     counts.update(verdicts=len(ids), passing_submissions=0, voided=0, ungraded=0, held=0,
-                  uncertified=0, not_successful=0, missing_records=0, prompt_mismatch=0,
-                  unparseable=0, sft_rows=0, rows=0)
+                  uncertified=0, not_successful=0, missing_records=0, task_mismatch=0,
+                  prompt_mismatch=0, unparseable=0, unrendered=0, sft_rows=0, rows=0)
     gate = asyncio.Semaphore(concurrency)
     for start in range(0, len(ids), window):
         chunk = ids[start:start + window]
@@ -253,10 +275,21 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
             if record is None:
                 counts["missing_records"] += 1
                 continue
+            index = int(record["prompt_index"])
+            if document.get("instance_id") != source.instance_id(index):
+                logger.error("corpus export: %s's grade names task %r, its index %d is %r",
+                             sid[:12], document.get("instance_id"), index,
+                             source.instance_id(index))
+                counts["task_mismatch"] += 1
+                continue
             try:
                 row = await asyncio.to_thread(
                     episode_row, job=job, submission_id=sid, record=record, grade=document,
-                    renderer=renderer, user_prompt=source.prompt(int(record["prompt_index"])))
+                    renderer=renderer, user_prompt=source.prompt(index))
+            except EpisodeUnrendered:
+                logger.error("corpus export: %s's messages do not render to its tokens", sid[:12])
+                counts["unrendered"] += 1
+                continue
             except EpisodePromptMismatch:
                 logger.error("corpus export: %s's prompt tokens are not its task's", sid[:12])
                 counts["prompt_mismatch"] += 1
