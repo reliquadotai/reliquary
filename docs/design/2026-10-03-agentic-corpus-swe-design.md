@@ -105,8 +105,8 @@ New pure functions in `reliquary/corpus/checks.py`, applied when the job carries
 
 1. Spans are ordered, non-overlapping, inside `tokens`, and number at most
    `max_turns`.
-2. Each span length is at most `max_tokens_per_turn`; the total sequence is at
-   most `max_total_tokens`.
+2. Each span length is at most `max_tokens_per_turn`; the initial prompt plus
+   `tokens` is at most `max_total_tokens` (60,000, gate M3).
 3. Each span ends with the renderer's turn terminator, except a final span that
    ends with eos or hits its cap.
 4. `len(proofs) == ceil(span_length / chunk_tokens)` per span.
@@ -126,8 +126,12 @@ existing settlement (`cap × passed token share`) pays for generated tokens.
 - Scoring is one batched prefill of `prompt + tokens`, with rows gathered for the
   assistant spans only, then the existing `verify_chunk_proofs` and
   `sequence_verdict` per span; the item fails on the first failing span.
-- `MAX_SEQUENCE_TOKENS` rises from 65,536 to 131,072; `AUDIT_BATCH_TOKENS` is
-  unchanged, so a long trajectory is scored alone.
+- `MAX_SEQUENCE_TOKENS` stays at 65,536 (it bounds prompt + tokens of one item);
+  the binding cap is the job's `max_total_tokens` = 60,000 over prompt + tokens,
+  the most one 80 GB audit GPU prefills in one pass (gate M3: 71.5 GB peak at
+  60k, which leaves only about 8 GB of headroom on the card;
+  longer trajectories would need chunked prefill or a larger card).
+  `AUDIT_BATCH_TOKENS` is unchanged, so a long trajectory is scored alone.
 
 ### N5. Grade leases and CPU executors
 
@@ -181,7 +185,7 @@ unchanged):
   "verifiers": "<pinned commit>",
   "max_turns": 40,
   "max_tokens_per_turn": 8192,
-  "max_total_tokens": 65536,
+  "max_total_tokens": 60000,
   "replay_fraction_failed": 0.10
 }
 ```
@@ -225,8 +229,11 @@ is recorded in this file before the dependent component is written.
   exp <= 16; p99 = 17. The worst chunk is a 1-token span (tokens 643-644), where a
   per-chunk statistic is noisy. Control with prefix cache OFF (same script,
   `--no-prefix-cache`, 0/192 hits, `...-control-cache-off.json`): 192/192 pass,
-  identical worst (exp 60, mant 18.63), mean exp 3.24, 99.0% <= 16. The cache
-  therefore changes nothing measurable. Decision: prefix caching ON for N1, with
+  identical worst (exp 60, mant 18.63), mean exp 3.24, 99.0% <= 16. With and
+  without the cache: same pass rate, mean exp and >16 share; the runs are
+  unpaired (1,260 vs 1,499 chunks) and the tail mant is unresolved (long-span
+  tail mant mean 11.70 with the cache vs 7.23 without). Decision: prefix
+  caching ON for N1, with
   the open point that the honest band must be restated per span length (short
   spans exceed it with or without the cache); cache-off is not needed.
 - **M2 — honest replay agreement.** Replay the 66 recorded 27B trajectories.
@@ -321,12 +328,18 @@ is recorded in this file before the dependent component is written.
 
 | Miners (H100 each) | Trajectories/min | Successes/min | Grade + replay CPU | CPU executors (16 vCPU) |
 |---|---|---|---|---|
-| 10 | about 10 | about 6 | about 13 vCPU | 1 |
-| 50 | about 50 | about 30 | about 60 vCPU | 4 |
+| 10 | about 10 | about 6 | about 35 vCPU (4 grade + 31 replay) | 3 |
+| 50 | about 50 | about 30 | about 174 vCPU (21 grade + 154 replay) | 11 |
 
 Assumptions: 1 trajectory/min per H100 once concurrency is tuned to about 8-11
-episodes, 25 CPU-s per grade, 80 CPU-s per replay. Replays of failures add about
-10% more.
+episodes (assumed; measured 0.7/min at concurrency 32); 60% success (measured
+67%); 25 CPU-s per grade on every trajectory (assumed; section 3 measured 13
+CPU-s fixed plus about 5 per test run); 288 vCPU-s
+per replay (measured, gate M2) on every success plus 10% of failures; executor
+count = vCPU / 16 rounded up, at full utilisation with no headroom. At 10
+miners: grade 10 x 25 = 250 CPU-s/min, replay (6 + 0.4) x 288 = 1,843 CPU-s/min.
+At 50 miners: grade 1,250 CPU-s/min, replay (30 + 2) x 288 = 9,216 CPU-s/min.
+Replay dominates: about 88% of executor CPU.
 
 Miner requirement: H100 80 GB (27B weights 52 GB), about 16 vCPU and 150 GB disk
 for the pre-pulled SWE-smith images.
