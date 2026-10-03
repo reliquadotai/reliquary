@@ -449,6 +449,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             vocab_size=vocab_size, is_banned=getattr(served, "is_banned", None),
             registration=registration,
             seen_index=getattr(served, "seen_index", None),
+            episode_intake=getattr(served, "episode_intake", None),
         )
 
     # Miners have no registry access: each job's own task contract. With one
@@ -776,6 +777,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     tokenizer = load_tokenizer(str(directory))
     tokenizer_box["tokenizer"] = tokenizer
+    checkpoint_dir = str(directory)
     scorer = None
     if split is None:
         model = load_text_only_model(
@@ -809,6 +811,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # auditors from preparing their records all at once.
         scorer = GpuScorer(Path(split.run_dir) / GPU_SOCKET, chunk_tokens=proof.chunk_tokens,
                            topk=proof.topk, executor=judge_threads.codec)
+    if split is not None and any(w.job.episode is not None for w in wiring):
+        raise RuntimeError("episode jobs are not served by the split validator; "
+                           "unset RELIQUARY_CORPUS_SPLIT")
     remote = directory = None
     if remote_audit:
         from reliquary.infrastructure import corpus_executor_store as executor_store
@@ -841,6 +846,12 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 
     def audit_and_settle(w) -> None:
+        if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
+            from reliquary.validator.agentic_intake import build_episode_intake
+
+            w.episode_intake = build_episode_intake(
+                w.job, checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
+                vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
         link = split.links.get(str(w.job.job_id)) if split is not None else None
         if link is not None:
             wire_job_front_only(w, records=records, link=link)

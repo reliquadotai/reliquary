@@ -28,6 +28,9 @@ from reliquary.infrastructure.corpus_job_store import (
 from reliquary.infrastructure.storage import get_s3_client, off_loop
 
 _ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+# An episode job's record: one trajectory under `completions`, assistant-span
+# `token_count`, and the validator-derived `prompt_tokens` beside it.
+RECORD_SCHEMA_V2 = "reliquary/corpus-submission-record/v2"
 
 
 def _validated_id(submission_id: Any) -> str:
