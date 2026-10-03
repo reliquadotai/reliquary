@@ -751,6 +751,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if job is None:
             raise HTTPException(status_code=404, detail="job_unknown")
+        if job.episode is not None:
+            raise HTTPException(status_code=422, detail="an episode job is delivered with "
+                                "`reliquary jobs export JOB --sft` on a host with its renderer")
         running = exports.get(delivery_id)
         if running is not None and running.done():
             exports.pop(delivery_id)

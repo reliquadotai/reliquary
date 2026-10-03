@@ -17,7 +17,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,10 @@ _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "completion_index", "prompt",
               "completion", "completion_tokens", "accepted", "score")
+# Episode jobs (spec §5 N6): one row per certified trajectory.
+EPISODE_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "task_id", "messages", "tokens",
+                      "assistant_mask", "final_diff", "graded_success", "replay_certified", "turns",
+                      "stop")
 
 
 def validated_delivery_id(delivery_id: Any) -> str:
@@ -58,6 +62,83 @@ def _row_schema():
         ("prompt", pa.string()), ("completion", pa.string()),
         ("completion_tokens", pa.int32()), ("accepted", pa.bool_()), ("score", pa.float64()),
     ])
+
+
+def _episode_row_schema():
+    import pyarrow as pa
+
+    return pa.schema([
+        ("job_id", pa.string()), ("submission_id", pa.string()), ("prompt_index", pa.int64()),
+        ("task_id", pa.string()), ("messages", pa.string()), ("tokens", pa.list_(pa.int32())),
+        ("assistant_mask", pa.list_(pa.int8())), ("final_diff", pa.string()),
+        ("graded_success", pa.bool_()), ("replay_certified", pa.bool_()), ("turns", pa.string()),
+        ("stop", pa.string()),
+    ])
+
+
+class EpisodePromptMismatch(ValueError):
+    """The record's prompt tokens are not the pinned render of its task's prompt."""
+
+
+def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, renderer,
+                user_prompt: str) -> dict:
+    """The row of one graded trajectory. Messages are rebuilt from the proven
+    tokens with the pinned renderer (never from miner text), and the system and
+    user messages must render to the record's prompt tokens, so the messages
+    and the tokens are one and the same trajectory.
+
+    Raises ``TrajectoryRefused`` or ``EpisodePromptMismatch``."""
+    from reliquary.corpus.trajectory_parse import parse_trajectory
+    from reliquary.environment.agentic_swe import BASH_SYSTEM_PROMPT
+
+    trajectory = record["completions"][0]
+    prompt = [int(t) for t in trajectory["prompt_tokens"]]
+    tokens = [int(t) for t in trajectory["tokens"]]
+    spans = [(int(turn["start"]), int(turn["end"])) for turn in trajectory["turns"]]
+    if [int(t) for t in renderer.initial_ids(user_prompt)] != prompt:
+        raise EpisodePromptMismatch(submission_id)
+    parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
+                              stop=trajectory["stop"], max_turns=job.episode.max_turns)
+    messages = [{"role": "system", "content": BASH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}]
+    for (start, end), turn in zip(spans, parsed.turns):
+        messages.append(renderer.assistant_message(tokens[start:end]))
+        messages += [{"role": "tool", "tool_call_id": f"call_{k}", "content": text}
+                     for k, text in enumerate(turn.observations)]
+    mask = [0] * (len(prompt) + len(tokens))
+    for start, end in spans:
+        mask[len(prompt) + start:len(prompt) + end] = [1] * (end - start)
+    return {"job_id": job.job_id, "submission_id": submission_id,
+            "prompt_index": int(record["prompt_index"]),
+            "task_id": str(grade.get("instance_id") or ""),
+            "messages": json.dumps(messages, ensure_ascii=False), "tokens": prompt + tokens,
+            "assistant_mask": mask, "final_diff": trajectory["final_diff"],
+            "graded_success": bool(grade.get("graded_success")),
+            "replay_certified": bool(grade.get("replay_certified")),
+            "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
+
+
+def _lone(deciders) -> str | None:
+    deciders = set(deciders or ())
+    return next(iter(deciders)) if len(deciders) == 1 else None
+
+
+def held_by_quarantine(document: Mapping, quarantined: Collection[str]) -> list[str]:
+    """The quarantined executors that decided part of ``document`` alone: the
+    validator holds such a grade from payment until a regrade replaces it
+    (``CorpusGrader._caught``), and an export refuses it the same way."""
+    lone = {_lone(document.get("graded_by")),
+            _lone((document.get("replay") or {}).get("graded_by"))} - {None}
+    return sorted(e for e in lone if e in quarantined)
+
+
+def certified(document: Mapping) -> bool:
+    """An ``ok`` grade whose replay certified the episode (within tolerance).
+    Every other outcome (ungradeable, disputed, timeout, error, unparseable,
+    audit_failed, a failed or unconfirmed replay) certifies nothing."""
+    replay = document.get("replay") or {}
+    return (document.get("status") == "ok" and document.get("replay_certified") is True
+            and replay.get("status") == "ok" and replay.get("certified") is True)
 
 
 async def _bounded(calls, gate: asyncio.Semaphore) -> list:
@@ -117,11 +198,88 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
             yield row
 
 
+async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only: bool = False,
+                       quarantined: Collection[str] | None,
+                       concurrency: int = READ_CONCURRENCY,
+                       window: int = READ_WINDOW) -> AsyncIterator[dict]:
+    """One row per passing, not voided, certified trajectory, in verdict-id
+    order; ``sft_only`` keeps the certified successes (spec N6's SFT set).
+
+    The effective grade is the latest regrade, else the grade. A grade that an
+    executor of ``quarantined`` decided alone is held, as the settler holds it;
+    the caller names the registry's quarantined grade executors (None refuses:
+    an export blind to quarantines must not run)."""
+    if quarantined is None:
+        raise ValueError("an episode export needs the quarantined grade executors "
+                         "(the registry's), to hold what they decided alone")
+    quarantined = frozenset(quarantined)
+    ids = list(await records.list_verdict_ids(job.job_id))
+    voided = set(await records.list_voided_ids(job.job_id))
+    read_voided = getattr(records, "read_voided", None)
+    counts.update(verdicts=len(ids), passing_submissions=0, voided=0, ungraded=0, held=0,
+                  uncertified=0, not_successful=0, missing_records=0, prompt_mismatch=0,
+                  unparseable=0, sft_rows=0, rows=0)
+    gate = asyncio.Semaphore(concurrency)
+    for start in range(0, len(ids), window):
+        chunk = ids[start:start + window]
+        verdicts = await _bounded((records.read_verdict(job.job_id, s) for s in chunk), gate)
+        passing = [sid for sid, v in zip(chunk, verdicts) if v and v.get("passed")]
+        counts["passing_submissions"] += len(passing)
+        kept = [sid for sid in passing if sid not in voided]
+        counts["voided"] += len(passing) - len(kept)
+        regrades = await _bounded((records.read_regrade(job.job_id, s) for s in kept), gate)
+        grades = await _bounded((records.read_grade(job.job_id, s) for s in kept), gate)
+        candidates = []
+        for sid, regrade, grade in zip(kept, regrades, grades):
+            document = regrade if regrade is not None else grade
+            if document is None:
+                counts["ungraded"] += 1
+            elif held_by_quarantine(document, quarantined):
+                counts["held"] += 1
+            elif not certified(document):
+                counts["uncertified"] += 1
+            elif sft_only and document.get("graded_success") is not True:
+                counts["not_successful"] += 1
+            else:
+                candidates.append((sid, document))
+        if read_voided is not None and candidates:
+            # A void written after the listing: read before the row is built.
+            late = await _bounded((read_voided(job.job_id, s) for s, _ in candidates), gate)
+            counts["voided"] += sum(1 for v in late if v is not None)
+            candidates = [c for c, v in zip(candidates, late) if v is None]
+        found = await _bounded((records.read_submission(job.job_id, s) for s, _ in candidates),
+                               gate)
+        for (sid, document), record in zip(candidates, found):
+            if record is None:
+                counts["missing_records"] += 1
+                continue
+            try:
+                row = await asyncio.to_thread(
+                    episode_row, job=job, submission_id=sid, record=record, grade=document,
+                    renderer=renderer, user_prompt=source.prompt(int(record["prompt_index"])))
+            except EpisodePromptMismatch:
+                logger.error("corpus export: %s's prompt tokens are not its task's", sid[:12])
+                counts["prompt_mismatch"] += 1
+                continue
+            except ValueError as refused:            # TrajectoryRefused: a renderer change
+                logger.error("corpus export: %s no longer parses: %s", sid[:12], refused)
+                counts["unparseable"] += 1
+                continue
+            counts["sft_rows"] += int(row["graded_success"] and row["replay_certified"])
+            counts["rows"] += 1                      # the rows delivered
+            yield row
+
+
 def _raw_size(row: Mapping) -> int:
     """An upper bound on a row's encoded bytes before compression."""
     size = 0
     for value in row.values():
-        size += 8 + (len(value.encode()) if isinstance(value, str) else 0)
+        if isinstance(value, str):
+            size += 8 + len(value.encode())
+        elif isinstance(value, list):
+            size += 8 + 4 * len(value)
+        else:
+            size += 8
     return size
 
 
@@ -130,12 +288,12 @@ class _ShardWriter:
     each one closes."""
 
     def __init__(self, directory: Path, *, max_bytes: int, row_group_rows: int,
-                 on_close: Callable[[Path, int], Any]) -> None:
+                 on_close: Callable[[Path, int], Any], schema=None) -> None:
         self._directory = directory
         self._max = max_bytes
         self._group_rows = row_group_rows
         self._on_close = on_close
-        self._schema = _row_schema()
+        self._schema = schema if schema is not None else _row_schema()
         self._buffer: list[dict] = []
         self._buffer_bytes = 0
         self._writer = None
@@ -198,9 +356,19 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           shard_max_bytes: int = SHARD_MAX_BYTES,
                           row_group_rows: int = ROW_GROUP_ROWS,
                           concurrency: int = READ_CONCURRENCY, window: int = READ_WINDOW,
-                          clock: Callable[[], float] = time.time) -> dict:
+                          clock: Callable[[], float] = time.time, renderer=None, source=None,
+                          sft_only: bool = False,
+                          quarantined: Collection[str] | None = None) -> dict:
     """Write ``deliveries/{delivery_id}/``: the shards, ``report.json``, then
-    ``manifest.json``. A delivery whose manifest exists is returned as stored."""
+    ``manifest.json``. A delivery whose manifest exists is returned as stored.
+
+    An episode job is delivered as episode rows (``episode_rows``): it needs
+    its pinned ``renderer``, its task ``source`` and the registry's
+    ``quarantined`` grade executors."""
+    episode = getattr(job, "episode", None) is not None
+    if episode and (renderer is None or source is None or quarantined is None):
+        raise ValueError("an episode job is exported with its pinned renderer, its task source "
+                         "and the quarantined grade executors")
     delivery_id = validated_delivery_id(delivery_id)
     prefix = f"{DELIVERY_PREFIX}/{delivery_id}"
     manifest_key = f"{prefix}/manifest.json"
@@ -224,9 +392,15 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     counts: dict = {}
     try:
         writer = _ShardWriter(directory, max_bytes=shard_max_bytes,
-                              row_group_rows=row_group_rows, on_close=uploaded)
-        async for row in delivery_rows(job=job, records=records, counts=counts, grade=grade,
-                                       concurrency=concurrency, window=window):
+                              row_group_rows=row_group_rows, on_close=uploaded,
+                              schema=_episode_row_schema() if episode else None)
+        rows = (episode_rows(job=job, records=records, renderer=renderer, source=source,
+                             counts=counts, sft_only=sft_only, quarantined=quarantined,
+                             concurrency=concurrency, window=window)
+                if episode else
+                delivery_rows(job=job, records=records, counts=counts, grade=grade,
+                              concurrency=concurrency, window=window))
+        async for row in rows:
             await writer.add(row)
         await writer.close()
     finally:
@@ -234,9 +408,13 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     report = {
         "schema": DELIVERY_SCHEMA, "delivery_id": delivery_id, "job_id": job.job_id,
         "created_at": clock(), "job": job.to_contract(), "counts": counts,
-        "filter": ({"applied": True, "grader_id": job.filter.grader_id,
-                    "threshold": job.filter.threshold} if grade is not None
-                   else {"applied": False, "note": filter_note or "the job declares no filter"}),
+        "filter": (
+            {"applied": sft_only,
+             "note": ("graded_success and replay_certified" if sft_only
+                      else "every replay-certified trajectory")} if episode
+            else {"applied": True, "grader_id": job.filter.grader_id,
+                  "threshold": job.filter.threshold} if grade is not None
+            else {"applied": False, "note": filter_note or "the job declares no filter"}),
         "shards": len(shards),
     }
     report_key = f"{prefix}/report.json"
@@ -244,7 +422,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     manifest = {
         "schema": DELIVERY_SCHEMA, "delivery_id": delivery_id, "job_id": job.job_id,
         "created_at": report["created_at"], "rows": counts.get("rows", 0), "shards": shards,
-        "columns": list(ROW_FIELDS), "report": report_key,
+        "columns": list(EPISODE_ROW_FIELDS if episode else ROW_FIELDS), "report": report_key,
         "keys": [s["key"] for s in shards] + [report_key, manifest_key],
     }
     await sink.put_json(manifest_key, manifest)
@@ -376,11 +554,14 @@ class R2DeliverySink:
 
 __all__ = [
     "DELIVERY_SCHEMA",
+    "EPISODE_ROW_FIELDS",
     "LocalDirectorySink",
     "R2DeliverySink",
     "ROW_FIELDS",
     "SHARD_MAX_BYTES",
     "delivery_rows",
+    "episode_row",
+    "episode_rows",
     "export_delivery",
     "validated_delivery_id",
 ]

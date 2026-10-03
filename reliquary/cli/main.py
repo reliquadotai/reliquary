@@ -1442,14 +1442,44 @@ def _job_grader(job):
         raise typer.BadParameter(str(exc)) from exc
 
 
+# The tokenizer and chat template files of a checkpoint: what the turn
+# renderer loads, never the weights.
+_TOKENIZER_PATTERNS = ["*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken"]
+
+
+def _episode_tokenizer_dir(job) -> str:
+    """The job's pinned checkpoint, tokenizer files only."""
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision,
+                             allow_patterns=_TOKENIZER_PATTERNS)
+
+
+async def _quarantined_grade_executors() -> list[str]:
+    """The grade executors the registry says are quarantined: what one of them
+    decided alone is held until a regrade replaces it."""
+    from reliquary.infrastructure import corpus_executor_store as executor_store
+
+    return sorted(str(d.get("executor_id")) for d in await executor_store.list_executors()
+                  if executor_store.scope_of(d) == "grade" and d.get("status") == "quarantined")
+
+
 @jobs_app.command("export")
 def jobs_export(
     job_id: str = typer.Argument(...),
     out: str = typer.Option(..., "--out"),
     apply_filter: bool = typer.Option(False, "--apply-filter"),
     only_accepted: bool = typer.Option(False, "--only-accepted"),
+    sft: bool = typer.Option(
+        False, "--sft",
+        help="An episode job: keep the certified successes (graded_success and "
+             "replay_certified), the SFT set"),
 ) -> None:
     """Write the verified completions of a job as JSON lines.
+
+    An episode job writes one row per replay-certified trajectory (messages
+    rebuilt from the proven tokens, tokens, assistant mask, grade); `--sft`
+    keeps the successes. Counts go to stderr.
 
     Written to a temporary file beside `--out` and swapped in with
     `os.replace` only once the export completes, so a mid-stream failure (the
@@ -1466,19 +1496,41 @@ def jobs_export(
         job, _ = await job_store.read_job(job_id)
         if job is None:
             raise typer.BadParameter(f"no job {job_id!r}")
-        grade = _job_grader(job) if apply_filter else None
+        episode = job.episode is not None
+        if episode and (apply_filter or only_accepted):
+            raise typer.BadParameter("an episode job is filtered by its grades: use --sft")
+        if sft and not episode:
+            raise typer.BadParameter("--sft is for episode jobs; use --apply-filter")
+        if episode:
+            from reliquary.corpus.delivery import episode_rows
+            from reliquary.environment import agentic_swe
+
+            renderer = await asyncio.to_thread(agentic_swe.load_turn_renderer,
+                                               await asyncio.to_thread(_episode_tokenizer_dir, job))
+            source = await asyncio.to_thread(agentic_swe.load_swe_source,
+                                             job.episode.env.num_images)
+            counts: dict = {}
+            rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
+                                source=source, counts=counts, sft_only=sft,
+                                quarantined=await _quarantined_grade_executors())
+        else:
+            grade = _job_grader(job) if apply_filter else None
+            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade)
         temporary = f"{out}.{os.getpid()}.tmp"
         written = 0
         try:
             with open(temporary, "w", encoding="utf-8") as handle:
-                async for row in export_rows(
-                    job=job, records=BucketRecordStore(), grade=grade
-                ):
-                    if only_accepted and not row.get("accepted", True):
+                async for row in rows:
+                    if episode:
+                        row = {**row, "messages": json.loads(row["messages"]),
+                               "turns": json.loads(row["turns"])}
+                    elif only_accepted and not row.get("accepted", True):
                         continue
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     written += 1
             os.replace(temporary, out)
+            if episode:
+                typer.echo(json.dumps(counts, sort_keys=True), err=True)
         except Exception:
             try:
                 os.unlink(temporary)
