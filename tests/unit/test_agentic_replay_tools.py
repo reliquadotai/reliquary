@@ -112,10 +112,18 @@ class _FakeBox:
         return types.SimpleNamespace(stdout=f"obs{len(self.runs)}", exit_code=0)
 
 
-def _fake_verifiers(monkeypatch, box):
+def _fake_verifiers(monkeypatch, box, updates=None, update_code=0):
     @asynccontextmanager
-    async def provision_runtime(config, env):
+    async def provision_runtime(config, env, name=None):
+        box.config, box.name = config, name
         yield box
+
+    async def docker(*args):
+        if updates is not None:
+            updates.append((list(args), len(box.runs)))
+        return update_code, "" if update_code == 0 else "no such container"
+
+    monkeypatch.setattr(agentic_replay, "_docker", docker)
 
     v1 = types.ModuleType("verifiers.v1")
     v1.DockerConfig = lambda **kw: kw
@@ -164,6 +172,25 @@ def test_replay_past_its_deadline_raises_replay_timeout(monkeypatch):
     _fake_verifiers(monkeypatch, _FakeBox(delay=5.0))
     with pytest.raises(agentic_replay.ReplayTimeout, match="0 of 1 actions"):
         asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")], episode_deadline=0.2))
+
+
+def test_the_box_is_bounded_before_any_action_runs(monkeypatch):
+    box, updates = _FakeBox(), []
+    _fake_verifiers(monkeypatch, box, updates)
+    limits = agentic_replay.BoxLimits(cpu=1.5, memory_gb=2.0, pids=300)
+    asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")], limits=limits))
+    assert box.config["cpu"] == 1.5 and box.config["memory"] == 2.0
+    assert box.name.startswith(agentic_replay.BOX_NAME_PREFIX)
+    assert updates == [(["update", "--pids-limit", "300", "--memory", str(2 * 2 ** 30),
+                         "--memory-swap", str(2 * 2 ** 30), box.name], 0)]   # before any run
+
+
+def test_a_box_that_cannot_be_bounded_is_refused(monkeypatch):
+    box = _FakeBox()
+    _fake_verifiers(monkeypatch, box, update_code=1)
+    with pytest.raises(RuntimeError, match="could not limit"):
+        asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")]))
+    assert box.runs == []
 
 
 def test_default_episode_deadline_is_an_hour():

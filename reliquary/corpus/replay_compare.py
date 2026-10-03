@@ -8,7 +8,6 @@ M2 sets the rules and the tolerance, see ``within_tolerance``).
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from collections.abc import Sequence
@@ -81,36 +80,6 @@ def actions_from_trace(trace: dict) -> list[Action]:
             content = message.get("content")
             actions.append(Action(tool, arguments, content if isinstance(content, str) else str(content)))
     return actions
-
-
-# verifiers b2e4e81's bash harness (edit on, search off): each tool and the
-# argument keys its program reads. A call outside this table must be refused,
-# never replayed: a " bash" or a "command " would replay as a harmless error
-# text that the miner's recorded observation could match without the action
-# ever having run.
-HARNESS_ARGUMENTS: dict[str, frozenset[str]] = {
-    "bash": frozenset({"command"}),
-    "edit": frozenset({"path", "old_str", "new_str"}),
-}
-
-
-def harness_call_refusal(tool: str, arguments: str) -> str | None:
-    """Why a parsed tool call is not one of the harness's calls, or None: the
-    tool name must be exactly a harness tool and the arguments a JSON object
-    whose keys are exactly that tool's."""
-    keys = HARNESS_ARGUMENTS.get(tool)
-    if keys is None:
-        return f"tool {tool[:64]!r} is not a harness tool"
-    try:
-        parsed = json.loads(arguments)
-    except (TypeError, ValueError):
-        return f"{tool} arguments are not JSON"
-    if not isinstance(parsed, dict):
-        return f"{tool} arguments are not a JSON object"
-    if set(parsed) != keys:
-        found = [key[:32] for key in sorted(parsed)[:8]]
-        return f"{tool} arguments have keys {found}, the harness reads {sorted(keys)}"
-    return None
 
 
 def normalize(text: str) -> str:

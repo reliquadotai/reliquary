@@ -2,14 +2,18 @@
 
 import asyncio
 import json
+import subprocess
+import sys
+import threading
 import types
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
-from reliquary.corpus.replay_compare import Action, harness_call_refusal
-from reliquary.validator.agentic_replay import ReplayTimeout
+from reliquary.corpus.replay_compare import Action
+from reliquary.validator import corpus_grade_executor
+from reliquary.validator.agentic_replay import TOOL_PROGRAM, BoxLimits, ReplayTimeout
 from reliquary.validator.corpus_grade_executor import GradeExecutor, run_grade_item
 from reliquary.validator.corpus_grade_protocol import (
     GRADE_PROTOCOL,
@@ -42,34 +46,27 @@ def test_a_lease_holds_exactly_one_item():
         GradeResult.model_validate({"results": []})
 
 
-@pytest.mark.parametrize("tool,arguments", [
-    ("bash", '{"command": "ls"}'),
-    ("edit", '{"path": "a.py", "old_str": "x", "new_str": "y"}'),
-    ("edit", '{"new_str": "y", "path": "a.py", "old_str": "x"}'),
-])
-def test_the_harness_calls_are_accepted(tool, arguments):
-    assert harness_call_refusal(tool, arguments) is None
-    GradeAction(tool=tool, arguments=arguments, observation="x")
+def _harness(tool, arguments):
+    proc = subprocess.run([sys.executable, "-c", TOOL_PROGRAM], capture_output=True, text=True,
+                          input=json.dumps({"tool": tool, "arguments": arguments, "timeout": 30}))
+    return proc.stdout
 
 
-@pytest.mark.parametrize("tool,arguments", [
-    (" bash", '{"command": "ls"}'),                      # not the harness's tool name
-    ("bash ", '{"command": "ls"}'),
-    ("Bash", '{"command": "ls"}'),
-    ("search", '{"query": "x"}'),                         # search is off in this harness
-    ("bash", '{"command ": "ls"}'),                      # a key the harness would not read
-    ("bash", '{"cmd": "ls"}'),
-    ("bash", '{"command": "ls", "timeout": 5}'),          # an extra key
-    ("bash", "{}"),                                       # a missing key
-    ("edit", '{"path": "a.py", "old_str": "x"}'),
-    ("edit", '{"path": "a.py", "old_str": "x", "new_str": "y", "count": 2}'),
-    ("bash", '["ls"]'),                                   # not an object
-    ("bash", "not json"),
+@pytest.mark.parametrize("tool,arguments,observation", [
+    (" bash", '{"command": "ls"}', "error: unknown tool ' bash'"),   # the harness's answer
+    ("search", '{"query": "x"}', "error: unknown tool 'search'"),
+    ("bash", '{"command ": "echo hi"}', ""),                          # .get: an empty command
+    ("bash", '{"command": "echo hi", "timeout": 5}', "hi\n"),        # extra keys ignored
 ])
-def test_a_call_outside_the_harness_is_refused_not_replayed_as_an_error(tool, arguments):
-    assert harness_call_refusal(tool, arguments)
-    with pytest.raises(ValidationError, match="harness"):
-        GradeAction(tool=tool, arguments=arguments, observation="error: unknown tool")
+def test_any_call_is_leased_and_replays_as_the_harness_answers_it(tool, arguments, observation):
+    GradeAction(tool=tool, arguments=arguments, observation=observation)
+    assert _harness(tool, arguments) == observation
+
+
+def test_only_sizes_bound_an_action():
+    GradeAction(tool="", arguments="", observation=None)
+    with pytest.raises(ValidationError):
+        GradeAction(tool="x" * 1025, arguments="{}", observation=None)
 
 
 async def _report(task, patch):
@@ -85,6 +82,50 @@ async def _replay(task, actions):
 def test_grade_mode_reports_application_and_tests():
     result = asyncio.run(run_grade_item(_item(), task_for=lambda iid: iid, grade=_report))
     assert result == {"status": "ok", "diff_applied": True, "tests_passed": True}
+
+
+def test_a_scoring_timeout_is_a_timeout():
+    async def slow(task, patch):
+        raise TimeoutError
+
+    result = asyncio.run(run_grade_item(_item(), task_for=str, grade=slow))
+    assert result["status"] == "timeout"
+
+
+def test_the_task_is_built_off_the_event_loop():
+    threads = []
+
+    def task_for(instance_id):
+        threads.append(threading.current_thread())
+        return instance_id
+
+    asyncio.run(run_grade_item(_item(), task_for=task_for, grade=_report))
+    assert threads and threads[0] is not threading.main_thread()
+
+
+def test_the_default_box_work_gets_the_executor_limits(monkeypatch):
+    limits = BoxLimits(cpu=1.0, memory_gb=2.0, pids=128)
+    seen = []
+
+    async def grade(task, patch, *, limits):
+        seen.append(("grade", limits))
+        return types.SimpleNamespace(applied=False, reward=0.0)
+
+    async def replay(task, actions, *, limits):
+        seen.append(("replay", limits))
+        return ["a.py", ""], "diff --git a/x b/x\n"
+
+    monkeypatch.setattr(corpus_grade_executor, "grade_patch", grade)
+    monkeypatch.setattr(corpus_grade_executor, "replay_swe", replay)
+    asyncio.run(run_grade_item(_item(), task_for=str, limits=limits))
+    asyncio.run(run_grade_item(_item("replay"), task_for=str, limits=limits))
+    assert seen == [("grade", limits), ("replay", limits)]
+
+
+@pytest.mark.parametrize("bad", [dict(cpu=0), dict(memory_gb=0), dict(pids=0), dict(pids=-1)])
+def test_box_limits_are_never_unlimited(bad):
+    with pytest.raises(ValueError):
+        BoxLimits(**{"cpu": 2.0, "memory_gb": 6.0, "pids": 1024, **bad})
 
 
 def test_a_partial_reward_is_not_a_pass():
@@ -134,8 +175,9 @@ def test_every_result_fits_the_wire_model():
 class _Http:
     """The control, answering one lease then nothing."""
 
-    def __init__(self, env=ENV):
+    def __init__(self, env=ENV, expires_at=1e12):
         self.posts, self._lease_given, self._env = [], False, env
+        self._expires_at = expires_at
 
     async def post(self, path, json, headers, timeout):
         self.posts.append((path, json))
@@ -148,8 +190,8 @@ class _Http:
                 return httpx.Response(204, request=request)
             self._lease_given = True
             return httpx.Response(200, request=request, json={
-                "protocol": GRADE_PROTOCOL, "lease_id": "c" * 32, "expires_at": 1e12,
-                "env": self._env, "items": [_item().model_dump()]})
+                "protocol": GRADE_PROTOCOL, "lease_id": "c" * 32,
+                "expires_at": self._expires_at, "env": self._env, "items": [_item().model_dump()]})
         return httpx.Response(200, json={"outcome": "accepted"}, request=request)
 
 
@@ -161,7 +203,7 @@ def test_the_executor_claims_works_and_posts_one_result():
 
     async def go():
         executor = GradeExecutor(http=http, executor_id="g1", token="t" * 40, run_item=item,
-                                 env_check=lambda package, version: None)
+                                 env_check=lambda package, version: None, sweep=lambda: 0)
         await executor.start()
         assert await executor.step() is True
         await asyncio.gather(*executor._running)
@@ -170,9 +212,50 @@ def test_the_executor_claims_works_and_posts_one_result():
     asyncio.run(go())
     result = [(path, body) for path, body in http.posts if path.endswith("/result")]
     assert result == [(f"/corpus/internal/grade/{'c' * 32}/result",
-                       {"results": [{"status": "ok", "diff_applied": True, "tests_passed": False}]})]
+                       {"results": [{"status": "ok", "diff_applied": True, "tests_passed": False,
+                                     "submission_id": SID}]})]
+    GradeResult.model_validate(result[0][1])
     claim = next(body for path, body in http.posts if path.endswith("/claim"))
     assert claim == {"executor_id": "g1", "env_package": ENV["package"], "env_version": ENV["version"]}
+
+
+def test_an_expired_lease_is_skipped_not_worked():
+    http = _Http(expires_at=1000.0)
+    worked = []
+
+    async def item(grade_item):
+        worked.append(grade_item)
+        return {"status": "ok"}
+
+    async def go():
+        executor = GradeExecutor(http=http, executor_id="g1", token="t" * 40, run_item=item,
+                                 env_check=lambda p, v: None, sweep=lambda: 0,
+                                 wall_clock=lambda: 1000.0)
+        await executor.start()
+        assert await executor.step() is True
+        assert not executor._running
+
+    asyncio.run(go())
+    assert worked == [] and not [p for p, _ in http.posts if p.endswith("/result")]
+
+
+def test_start_sweeps_orphaned_boxes_before_any_claim():
+    http = _Http()
+    swept = []
+
+    async def go():
+        executor = GradeExecutor(http=http, executor_id="g1", token="t" * 40,
+                                 env_check=lambda p, v: None, sweep=lambda: swept.append(1) or 3)
+        await executor.start()
+
+    asyncio.run(go())
+    assert swept == [1] and not [p for p, _ in http.posts if p.endswith("/claim")]
+
+
+def test_the_executor_hands_its_limits_to_the_default_item_runner():
+    limits = BoxLimits(cpu=1.0, memory_gb=3.0, pids=256)
+    executor = GradeExecutor(http=_Http(), executor_id="g1", token="t" * 40, limits=limits)
+    assert executor._run_item.keywords == {"limits": limits}
 
 
 def test_the_executor_refuses_a_lease_for_another_env():
@@ -180,7 +263,8 @@ def test_the_executor_refuses_a_lease_for_another_env():
 
     async def go():
         executor = GradeExecutor(http=http, executor_id="g1", token="t" * 40,
-                                 run_item=lambda item: None, env_check=lambda p, v: None)
+                                 run_item=lambda item: None, env_check=lambda p, v: None,
+                                 sweep=lambda: 0)
         await executor.start()
         await executor.step()
 
@@ -200,7 +284,7 @@ def test_the_executor_holds_no_more_items_than_its_concurrency():
             return {"status": "ok"}
 
         executor = GradeExecutor(http=http, executor_id="g1", token="t" * 40, run_item=item,
-                                 concurrency=1, env_check=lambda p, v: None)
+                                 concurrency=1, env_check=lambda p, v: None, sweep=lambda: 0)
         await executor.start()
         assert await executor.step() is True
         claims = sum(1 for p, _ in http.posts if p.endswith("/claim"))
@@ -215,7 +299,8 @@ def test_the_executor_holds_no_more_items_than_its_concurrency():
 def test_an_executor_with_another_env_installed_refuses_to_start():
     async def go():
         executor = GradeExecutor(http=_Http(), executor_id="g1", token="t" * 40,
-                                 env_check=lambda package, version: "reliquary-swe is at another commit")
+                                 env_check=lambda package, version: "reliquary-swe is at another commit",
+                                 sweep=lambda: 0)
         await executor.start()
 
     with pytest.raises(RuntimeError, match="another commit"):
@@ -289,6 +374,8 @@ def test_the_grade_executor_command_needs_its_token(monkeypatch):
     result = CliRunner().invoke(app, argv)
     assert result.exit_code == 1 and "RELIQUARY_EXECUTOR_TOKEN" in result.output
     monkeypatch.setenv("RELIQUARY_EXECUTOR_TOKEN", "t" * 43)
-    result = CliRunner().invoke(app, argv + ["--concurrency", "2"])
+    result = CliRunner().invoke(app, argv + ["--concurrency", "2", "--cpus", "1.5",
+                                             "--memory-gb", "4", "--pids-limit", "512"])
     assert result.exit_code == 0, result.output
-    assert calls == [{"control_url": "https://control", "executor_id": "g1", "concurrency": 2}]
+    assert calls == [{"control_url": "https://control", "executor_id": "g1", "concurrency": 2,
+                      "limits": BoxLimits(cpu=1.5, memory_gb=4.0, pids=512)}]

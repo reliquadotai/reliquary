@@ -39,3 +39,105 @@ async def test_an_unchanged_checkout_fails_its_tests_and_a_real_action_replays()
         "final_diff": "", "actions": actions}))
     assert replayed == {"status": "ok", "replay_diff_equal": True, "observations_compared": 2,
                         "observations_mismatched": [1]}
+
+
+def _item(actions):
+    from reliquary.validator.corpus_grade_protocol import GradeItem
+
+    return GradeItem.model_validate({"submission_id": "a" * 64, "task_index": 0,
+                                     "instance_id": INSTANCE, "mode": "replay", "final_diff": "",
+                                     "actions": actions})
+
+
+async def test_calls_outside_the_harness_replay_as_the_harness_answers_them():
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    replayed = await run_grade_item(_item([
+        {"tool": " bash", "arguments": '{"command": "touch /testbed/x"}',
+         "observation": "error: unknown tool ' bash'"},
+        {"tool": "bash", "arguments": '{"command ": "touch /testbed/x"}', "observation": ""},
+        {"tool": "bash", "arguments": '{"command": "ls /testbed/x"}',
+         "observation": "ls: cannot access '/testbed/x': No such file or directory"}]))
+    assert replayed == {"status": "ok", "replay_diff_equal": True, "observations_compared": 3,
+                        "observations_mismatched": []}
+
+
+async def test_the_box_runs_under_the_executor_limits():
+    from reliquary.validator.agentic_replay import BoxLimits
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    limits = BoxLimits(cpu=1.5, memory_gb=1.0, pids=256)
+    replayed = await run_grade_item(_item([
+        {"tool": "bash", "arguments": '{"command": "cat /sys/fs/cgroup/pids.max"}', "observation": "256"},
+        {"tool": "bash", "arguments": '{"command": "cat /sys/fs/cgroup/memory.max"}',
+         "observation": str(2 ** 30)},
+        {"tool": "bash", "arguments": '{"command": "cat /sys/fs/cgroup/memory.swap.max"}',
+         "observation": "0"},
+        {"tool": "bash", "arguments": '{"command": "cat /sys/fs/cgroup/cpu.max"}',
+         "observation": "150000 100000"}]), limits=limits)
+    assert replayed["observations_mismatched"] == [], replayed
+
+
+async def test_a_memory_hog_is_contained_and_reported_as_a_mismatch():
+    from reliquary.validator.agentic_replay import BoxLimits
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    replayed = await run_grade_item(_item([
+        {"tool": "bash", "arguments": '{"command": "python3 -c \\"b = bytearray(3 * 2**30); print(1)\\""}',
+         "observation": "1"},
+        {"tool": "bash", "arguments": '{"command": "echo alive"}', "observation": "alive"}]),
+        limits=BoxLimits(cpu=1.0, memory_gb=1.0, pids=256))
+    assert replayed["status"] == "ok" and replayed["observations_mismatched"] == [0], replayed
+
+
+async def test_a_fork_bomb_is_contained_and_the_box_is_removed():
+    import subprocess
+
+    from reliquary.validator.agentic_replay import (
+        BOX_NAME_PREFIX, BoxLimits, ReplayTimeout, replay_swe, swesmith_task,
+    )
+    from reliquary.corpus.replay_compare import Action
+
+    bomb = Action("bash", '{"command": "python3 -c \\"import os\\nwhile True:\\n  os.fork()\\""}', "")
+    try:
+        observations, _ = await replay_swe(
+            swesmith_task(INSTANCE), [bomb, Action("bash", '{"command": "echo after"}', "after")],
+            command_timeout=10, episode_deadline=180, limits=BoxLimits(cpu=1.0, memory_gb=1.0, pids=128))
+    except ReplayTimeout:
+        observations = None
+    except Exception:  # the box may be too starved to finalize: an executor error, not a crash
+        observations = None
+    # The bomb starves its own box only: when the replay returns, the next
+    # action could not run there.
+    assert observations is None or observations[1].strip() != "after"
+    # The host still forks, the executor still replays, no box of ours is left.
+    assert subprocess.run(["true"]).returncode == 0
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    again = await run_grade_item(_item([{"tool": "bash", "arguments": '{"command": "echo ok"}',
+                                         "observation": "ok"}]))
+    assert again["status"] == "ok" and again["observations_mismatched"] == []
+    left = subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^{BOX_NAME_PREFIX}"],
+                          capture_output=True, text=True).stdout.split()
+    assert left == []
+
+
+def test_the_sweep_removes_orphaned_boxes_only():
+    import subprocess
+
+    from reliquary.validator.agentic_replay import BOX_NAME_PREFIX, swesmith_task, sweep_orphan_boxes
+
+    image = swesmith_task(INSTANCE).data.image
+    names = [f"{BOX_NAME_PREFIX}orphan-test", "not-ours-grade-sweep-test"]
+    for name in names:
+        subprocess.run(["docker", "run", "-d", "--rm", "--name", name, "--entrypoint", "sleep",
+                        image, "300"], check=True, capture_output=True)
+    try:
+        assert sweep_orphan_boxes() >= 1
+        alive = subprocess.run(["docker", "ps", "-aq", "--filter", f"name={names[0]}"],
+                               capture_output=True, text=True).stdout.split()
+        other = subprocess.run(["docker", "ps", "-q", "--filter", f"name={names[1]}"],
+                               capture_output=True, text=True).stdout.split()
+        assert alive == [] and len(other) == 1
+    finally:
+        subprocess.run(["docker", "rm", "-f", *names], capture_output=True)

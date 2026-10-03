@@ -5,18 +5,31 @@ It holds one secret, its token, pulls leases over HTTPS it opens itself, and
 returns facts: whether the diff applied and the tests passed, whether the
 replay reproduced the diff, which observations differed. It never decides a
 verdict. Hostile code runs here, never on the control; the boxes come from the
-task's public images pinned by digest. `verifiers` and `reliquary_swe` are
-imported here only.
+task's public images pinned by digest, each under ``BoxLimits`` (CPUs, memory
+without swap, pids). Size the host for ``concurrency * memory_gb`` plus the
+executor itself; run one executor per Docker host (``start`` removes every box
+named ``BOX_NAME_PREFIX`` it finds, the ones a killed executor left behind).
+`verifiers` and `reliquary_swe` are imported here only.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from collections.abc import Callable
 
 from reliquary.corpus.replay_compare import Action, compare
+from reliquary.validator.agentic_replay import (
+    DEFAULT_BOX_LIMITS,
+    BoxLimits,
+    ReplayTimeout,
+    bounded_box,
+    replay_swe,
+    sweep_orphan_boxes,
+    swesmith_task,
+)
 from reliquary.validator.corpus_grade_protocol import GradeItem, GradeLease
 from reliquary.validator.lease_executor import TOKEN_ENV, LeaseExecutor, serve_executor
 
@@ -28,34 +41,34 @@ IDLE_SECONDS = 5.0
 DEFAULT_SCORING_SECONDS = 1800.0
 
 
-async def grade_patch(task, patch: str):
-    """`reliquary_swe.grading.grade` in a fresh box from the task's pinned
-    image, network cut, as `SweEnv._grade` does it (one attempt: a failure
-    goes back to the control, which re-leases it)."""
-    import verifiers.v1 as vf
+async def grade_patch(task, patch: str, *, limits: BoxLimits = DEFAULT_BOX_LIMITS):
+    """`reliquary_swe.grading.grade` in a fresh bounded box from the task's
+    pinned image, network cut, as `SweEnv._grade` does it (one attempt: a
+    failure goes back to the control, which re-leases it)."""
     from reliquary_swe import grading
-    from verifiers.v1.runtimes import provision_runtime
 
-    config = vf.DockerConfig(image=task.data.image, workdir=task.data.workdir,
-                             allow=task.data.network_allow)
     async with asyncio.timeout(task.data.timeout.scoring or DEFAULT_SCORING_SECONDS):
-        async with provision_runtime(config, env=task.runtime_env()) as box:
+        async with bounded_box(task, limits) as box:
             await box.prepare_setup()
             await box.prepare_execution([])
             return await grading.grade(box, task.data, patch)
 
 
-async def run_grade_item(item: GradeItem, *, task_for=None, grade=grade_patch, replay=None) -> dict:
+async def run_grade_item(item: GradeItem, *, task_for=None, grade=None, replay=None,
+                         limits: BoxLimits = DEFAULT_BOX_LIMITS) -> dict:
     """The facts for one item, as a ``GradeItemResult`` body. ``error`` and
     ``timeout`` are this executor's, never the miner's: the control re-leases."""
-    from reliquary.validator.agentic_replay import ReplayTimeout, replay_swe, swesmith_task
-
     task_for = task_for or swesmith_task
-    replay = replay or replay_swe
+    grade = grade or functools.partial(grade_patch, limits=limits)
+    replay = replay or functools.partial(replay_swe, limits=limits)
     try:
-        task = task_for(item.instance_id)
+        # The first build loads the corpus: off the loop, which serves heartbeats.
+        task = await asyncio.to_thread(task_for, item.instance_id)
         if item.mode == "grade":
-            report = await grade(task, item.final_diff)
+            try:
+                report = await grade(task, item.final_diff)
+            except TimeoutError as exc:
+                return {"status": "timeout", "detail": f"grading exceeded its scoring timeout {exc}"[:500]}
             return {"status": "ok", "diff_applied": bool(report.applied),
                     "tests_passed": float(report.reward) >= 1.0}
         actions = [Action(a.tool, a.arguments, a.observation) for a in item.actions]
@@ -93,16 +106,21 @@ class GradeExecutor(LeaseExecutor):
     kind = "grade executor"
 
     def __init__(self, *, http, executor_id: str, token: str, concurrency: int = 4,
-                 run_item: Callable = run_grade_item,
+                 run_item: Callable | None = None, limits: BoxLimits = DEFAULT_BOX_LIMITS,
                  env_check: Callable[[str, str], str | None] | None = None,
+                 sweep: Callable[[], int] = sweep_orphan_boxes,
                  heartbeat_seconds: float = HEARTBEAT_SECONDS, idle_seconds: float = IDLE_SECONDS,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 wall_clock: Callable[[], float] = time.time) -> None:
         super().__init__(http=http, executor_id=executor_id, token=token, prefix=GRADE_PREFIX,
                          heartbeat_seconds=heartbeat_seconds, idle_seconds=idle_seconds,
                          clock=clock)
         self._concurrency = max(1, int(concurrency))
-        self._run_item = run_item
+        self._run_item = run_item or functools.partial(run_grade_item, limits=limits)
         self._env_check = env_check or installed_env_refusal
+        self._sweep = sweep
+        # Lease expiry is the control's wall time.
+        self._wall_clock = wall_clock
         self._running: set[asyncio.Task] = set()
         self.env_package: str | None = None
         self.env_version: str | None = None
@@ -118,10 +136,15 @@ class GradeExecutor(LeaseExecutor):
         refusal = self._env_check(self.env_package, self.env_version)
         if refusal:
             raise RuntimeError(refusal)
+        swept = await asyncio.to_thread(self._sweep)
+        if swept:
+            logger.warning("grade executor %s removed %d orphaned boxes", self._executor_id, swept)
 
     async def _work(self, lease: GradeLease) -> None:
         try:
-            result = await self._run_item(lease.items[0])
+            item = lease.items[0]
+            result = await self._run_item(item)
+            result = {**result, "submission_id": item.submission_id}
             await self.post_result(lease.lease_id, {"results": [result]})
         except Exception:
             # The lease expires on the control and goes to another executor.
@@ -142,15 +165,20 @@ class GradeExecutor(LeaseExecutor):
         if (lease.env.package, lease.env.version) != (self.env_package, self.env_version):
             raise RuntimeError(f"a lease for {lease.env.package}@{lease.env.version}, "
                                f"this executor grades {self.env_package}@{self.env_version}")
+        if lease.expires_at <= self._wall_clock():
+            logger.warning("grade lease %s expired before it was worked; skipped",
+                           lease.lease_id[:8])
+            return True
         task = asyncio.create_task(self._work(lease))
         self._running.add(task)
         task.add_done_callback(self._running.discard)
         return True
 
 
-def run_grade_executor(*, control_url: str, executor_id: str, concurrency: int = 4) -> None:
+def run_grade_executor(*, control_url: str, executor_id: str, concurrency: int = 4,
+                       limits: BoxLimits = DEFAULT_BOX_LIMITS) -> None:
     serve_executor(control_url, lambda **client: GradeExecutor(
-        executor_id=executor_id, concurrency=concurrency, **client))
+        executor_id=executor_id, concurrency=concurrency, limits=limits, **client))
 
 
 __all__ = ["GRADE_PREFIX", "GradeExecutor", "TOKEN_ENV", "grade_patch", "installed_env_refusal",

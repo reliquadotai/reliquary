@@ -4,22 +4,24 @@ carries the facts the executor observed. The decisions (certified, failed,
 confirmed) stay on the control.
 
 The actions a replay lease carries are the ones ``trajectory_parse`` read from
-the trajectory's proven tokens, never a miner-supplied trace; an action that
-is not exactly one of the harness's calls cannot be put in a lease at all
-(``harness_call_refusal``)."""
+the trajectory's proven tokens, never a miner-supplied trace. Any call is
+replayed as the harness would answer it (ruling P15): an unknown tool gets the
+harness's "error: unknown tool" text, extra argument keys are ignored and
+missing ones defaulted, exactly as ``agentic_replay.TOOL_PROGRAM`` does."""
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-from reliquary.corpus.replay_compare import harness_call_refusal
 from reliquary.protocol.corpus_submission import MAX_FINAL_DIFF_CHARS
 from reliquary.validator.corpus_audit_protocol import ExecutorId, LeaseId
 
 GRADE_PROTOCOL = "reliquary.corpus-grade/v1"
 MAX_ACTIONS = 4096
+# Size bounds only: any name is replayed (an unknown one as the harness's error).
+MAX_TOOL_NAME_CHARS = 1024
 MAX_ARGUMENT_CHARS = 1_048_576
 MAX_OBSERVATION_CHARS = 4_194_304
 
@@ -35,17 +37,10 @@ class GradeClaimRequest(_Strict):
 
 
 class GradeAction(_Strict):
-    tool: str = Field(min_length=1, max_length=64)
+    tool: str = Field(max_length=MAX_TOOL_NAME_CHARS)
     arguments: str = Field(max_length=MAX_ARGUMENT_CHARS)
     # None: replayed and not compared (a final turn cut by context_length).
     observation: str | None = Field(default=None, max_length=MAX_OBSERVATION_CHARS)
-
-    @model_validator(mode="after")
-    def _a_harness_call(self) -> GradeAction:
-        refusal = harness_call_refusal(self.tool, self.arguments)
-        if refusal:
-            raise ValueError(f"not a harness call: {refusal}")
-        return self
 
 
 class GradeItem(_Strict):
@@ -72,6 +67,9 @@ class GradeLease(_Strict):
 
 class GradeItemResult(_Strict):
     status: Literal["ok", "error", "timeout"]
+    # Echoed from the item, so the control can check the facts are for the
+    # trajectory it leased (defence in depth beside the lease id).
+    submission_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     diff_applied: bool | None = None
     tests_passed: bool | None = None
     replay_diff_equal: bool | None = None
@@ -84,5 +82,5 @@ class GradeResult(_Strict):
     results: list[GradeItemResult] = Field(min_length=1, max_length=1)
 
 
-__all__ = ["GRADE_PROTOCOL", "GradeAction", "GradeClaimRequest", "GradeEnv", "GradeItem",
+__all__ = ["GRADE_PROTOCOL", "MAX_TOOL_NAME_CHARS", "GradeAction", "GradeClaimRequest", "GradeEnv", "GradeItem",
            "GradeItemResult", "GradeLease", "GradeResult"]

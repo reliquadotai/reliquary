@@ -2082,19 +2082,26 @@ def corpus_grade_executor(
     control_url: str = typer.Option(..., "--control-url"),
     executor_id: str = typer.Option(..., "--executor-id"),
     concurrency: int = typer.Option(4, "--concurrency", help="Items graded or replayed at once"),
+    cpus: float = typer.Option(2.0, "--cpus", help="CPUs per box"),
+    memory_gb: float = typer.Option(
+        6.0, "--memory-gb", help="Memory per box, no swap; concurrency x this must fit the host"),
+    pids_limit: int = typer.Option(1024, "--pids-limit", help="Processes per box"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Grade and replay agentic trajectories for a corpus control. The only
     secret is the executor token, in RELIQUARY_EXECUTOR_TOKEN; boxes come from
-    public images."""
+    public images, each under --cpus/--memory-gb/--pids-limit. Run one executor
+    per Docker host: it removes leftover boxes of its own at start."""
     from reliquary.validator import corpus_grade_executor as grade
+    from reliquary.validator.agentic_replay import BoxLimits
 
     setup_logging(log_level)
     if not os.environ.get(grade.TOKEN_ENV, "").strip():
         typer.echo(f"error: {grade.TOKEN_ENV} is not set", err=True)
         raise typer.Exit(code=1)
     grade.run_grade_executor(control_url=control_url, executor_id=executor_id,
-                             concurrency=concurrency)
+                             concurrency=concurrency,
+                             limits=BoxLimits(cpu=cpus, memory_gb=memory_gb, pids=pids_limit))
 
 
 @corpus_app.command("order-control")

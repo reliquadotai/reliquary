@@ -18,6 +18,13 @@ a fresh file with an unpredictable name, deleted once read. The whole replay
 runs under a wall-clock deadline (``episode_deadline``, default 3600 s) and
 raises ``ReplayTimeout`` past it, besides each command's own timeout.
 
+Resources. Every box (replay or grade, ``bounded_box``) runs under explicit
+``BoxLimits``: CPUs and memory through verifiers' ``DockerConfig``, then, right
+after the box starts and before any replayed action, ``docker update`` sets
+its pids limit and makes memory+swap equal to memory (no swap). Boxes are named
+``BOX_NAME_PREFIX`` + a random suffix so ``sweep_orphan_boxes`` can remove
+those a killed executor left behind (SIGKILL skips verifiers' atexit backstop).
+
 Limits. This does not stop an action from replacing the interpreter or
 ``bash`` binaries themselves, or from leaving a background process that alters
 later observations; and replay cannot certify observations against
@@ -30,10 +37,15 @@ pinned-sampling question), not solved here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
+import math
 import secrets
-from collections.abc import Sequence
+import subprocess
+import threading
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 
 from reliquary.corpus.replay_compare import Action
 
@@ -101,6 +113,74 @@ _FIND_PYTHON = ["sh", "-c", "command -v python3 || command -v python"]
 DEFAULT_EPISODE_DEADLINE = 3600.0
 
 
+BOX_NAME_PREFIX = "reliquary-grade-"
+
+
+@dataclass(frozen=True)
+class BoxLimits:
+    """What one hostile box may use. Never unlimited: an executor running
+    ``concurrency`` boxes needs ``concurrency * memory_gb`` of host memory."""
+
+    cpu: float = 2.0
+    memory_gb: float = 6.0
+    pids: int = 1024
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.cpu) and self.cpu > 0):
+            raise ValueError(f"cpu must be positive, got {self.cpu}")
+        if not (math.isfinite(self.memory_gb) and self.memory_gb > 0):
+            raise ValueError(f"memory_gb must be positive, got {self.memory_gb}")
+        if isinstance(self.pids, bool) or not isinstance(self.pids, int) or self.pids < 1:
+            raise ValueError(f"pids must be a positive integer, got {self.pids}")
+
+    @property
+    def memory_bytes(self) -> int:
+        return int(self.memory_gb * 2 ** 30)
+
+
+DEFAULT_BOX_LIMITS = BoxLimits()
+
+
+async def _docker(*args: str) -> tuple[int, str]:
+    process = await asyncio.create_subprocess_exec(
+        "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await process.communicate()
+    return process.returncode, out.decode(errors="replace")
+
+
+@contextlib.asynccontextmanager
+async def bounded_box(task, limits: BoxLimits = DEFAULT_BOX_LIMITS) -> AsyncIterator:
+    """A fresh box from the task's pinned image, network cut, under ``limits``."""
+    import verifiers.v1 as vf
+    from verifiers.v1.runtimes import provision_runtime
+
+    config = vf.DockerConfig(image=task.data.image, workdir=task.data.workdir,
+                             allow=task.data.network_allow, cpu=limits.cpu,
+                             memory=limits.memory_gb)
+    name = f"{BOX_NAME_PREFIX}{secrets.token_hex(8)}"
+    async with provision_runtime(config, name=name, env=task.runtime_env()) as box:
+        # verifiers' docker run takes no pids limit; set it (and no swap)
+        # before anything untrusted runs, or refuse the box.
+        memory = str(limits.memory_bytes)
+        code, out = await _docker("update", "--pids-limit", str(limits.pids), "--memory", memory,
+                                  "--memory-swap", memory, name)
+        if code != 0:
+            raise RuntimeError(f"could not limit box {name}: {out.strip()[:300]}")
+        yield box
+
+
+def sweep_orphan_boxes() -> int:
+    """Remove every box of ours on this Docker host; the count removed. Run at
+    executor start, so one executor per Docker host."""
+    listed = subprocess.run(["docker", "ps", "-aq", "--filter", f"name=^/?{BOX_NAME_PREFIX}"],
+                            capture_output=True, text=True, timeout=60, check=True)
+    ids = listed.stdout.split()
+    if ids:
+        subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, text=True,
+                       timeout=300, check=True)
+    return len(ids)
+
+
 class ReplayTimeout(Exception):
     """The replay exceeded its wall-clock ``episode_deadline``; the executor
     reports it as such, not as a mismatch."""
@@ -130,12 +210,22 @@ async def run_action(box, python: str, action: Action, command_timeout: float) -
     return result.stdout
 
 
-@functools.cache
-def swesmith_task(instance_id: str):
+_TASK_LOCK = threading.Lock()
+
+
+@functools.lru_cache(maxsize=256)
+def _swesmith_task(instance_id: str):
     from reliquary_swe import corpus
     from reliquary_swe.taskset import task_for
 
     return task_for(corpus.swesmith_row(instance_id), 0, "train")
+
+
+def swesmith_task(instance_id: str):
+    """The task for one instance; blocking (the first call loads the corpus),
+    so callers on an event loop run it in a thread. One build at a time."""
+    with _TASK_LOCK:
+        return _swesmith_task(instance_id)
 
 
 def _trace(task):
@@ -150,17 +240,13 @@ def _trace(task):
 
 async def replay_swe(task, actions: Sequence[Action], *,
                      command_timeout: float = 3600.0,
-                     episode_deadline: float = DEFAULT_EPISODE_DEADLINE) -> tuple[list[str], str]:
-    import verifiers.v1 as vf
-    from verifiers.v1.runtimes import provision_runtime
-
+                     episode_deadline: float = DEFAULT_EPISODE_DEADLINE,
+                     limits: BoxLimits = DEFAULT_BOX_LIMITS) -> tuple[list[str], str]:
     trace = _trace(task)
-    config = vf.DockerConfig(image=task.data.image, workdir=task.data.workdir,
-                             allow=task.data.network_allow)
     observations: list[str] = []
     try:
         async with asyncio.timeout(episode_deadline):
-            async with provision_runtime(config, env=task.runtime_env()) as box:
+            async with bounded_box(task, limits) as box:
                 await box.prepare_setup()
                 await task.setup(trace, box)
                 await box.prepare_execution([])
