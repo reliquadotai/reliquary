@@ -69,6 +69,8 @@ def relays(monkeypatch):
         monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
         monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
         monkeypatch.setattr(drand, "_DRAND_PERIOD", 3)
+        # Their signatures are fakes: only agreement can vouch for them here.
+        monkeypatch.setattr(drand, "get_verified_beacon", lambda round_id: None)
         return fake
 
     return install

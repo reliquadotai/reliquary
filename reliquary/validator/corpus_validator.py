@@ -156,19 +156,24 @@ def _remember_beacon(round_number: int, randomness: str) -> None:
 
 
 def drand_beacon(round_number: int) -> str | None:
-    """A verified round, from the cache, else from two agreeing relays, else
-    through the cross-checked path below (``_drand_beacon_checked``)."""
+    """A verified round: from the cache, else the first relay whose answer
+    verifies by BLS here, else two agreeing relays, else the cross-checked
+    path below (``_drand_beacon_checked``)."""
     from reliquary.infrastructure import drand
 
     cached = _cached_beacon(round_number)
     if cached is not None:
         return cached
-    agreed = None
-    try:
-        agreed = drand.get_agreed_beacon(round_number)
-    except Exception:
-        logger.debug("drand agreement for round %d failed", round_number, exc_info=True)
-    randomness = agreed["randomness"] if agreed else _drand_beacon_checked(round_number)
+    beacon = None
+    for fetch in (drand.get_verified_beacon, drand.get_agreed_beacon):
+        try:
+            beacon = fetch(round_number)
+        except Exception:
+            logger.debug("drand %s for round %d failed", fetch.__name__, round_number,
+                         exc_info=True)
+        if beacon:
+            break
+    randomness = beacon["randomness"] if beacon else _drand_beacon_checked(round_number)
     if randomness is not None:
         _remember_beacon(round_number, randomness)
     return randomness

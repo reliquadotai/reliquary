@@ -61,6 +61,12 @@ READ_CONCURRENCY = 16
 WRITE_CONCURRENCY = 32
 # drand rounds fetched at once when a pass needs many (one per sampled record).
 DRAND_CONCURRENCY = 32
+# The background prefetch of the pending records' rounds: rounds per batch,
+# in flight at once (below the pass's, which shares the beacon threads), and
+# how long it rests once every pending round is cached.
+PREFETCH_ROUNDS = 512
+PREFETCH_CONCURRENCY = 16
+PREFETCH_IDLE_SECONDS = 5.0
 # Records read at once when a restart seeds the hold window's arrivals.
 SEED_SLICE_IDS = 2048
 # Metadata (tail) reads in flight at once while seeding: a few KB each.
@@ -131,7 +137,10 @@ class CorpusAuditor:
                  threads=None,
                  scorer: Callable | None = None,
                  vocab_size: int | None = None,
-                 arrivals_covered: Callable[[], float | None] | None = None) -> None:
+                 arrivals_covered: Callable[[], float | None] | None = None,
+                 prefetch_rounds: bool = True) -> None:
+        # Fetch, in the background, every drand round the pending records need.
+        self._prefetch = prefetch_rounds
         self._job_id = job_id
         # In a judge process: ``await scorer(rows)`` scores (tokens,
         # prompt_len, proofs) rows on the GPU process, as ``score_sequences``
@@ -204,6 +213,8 @@ class CorpusAuditor:
         # Rounds raced in the current judge_many: one race per round per pass,
         # never one per record whose draw lands on a failing round.
         self._raced: set[int] = set()
+        # This pass's rounds: [needed, found cached] (the prefetcher's hit rate).
+        self._pass_rounds = [0, 0]
         # Round -> when its fetch last failed; a negative cache, so a bad
         # round is retried at most once every NEGATIVE_BEACON_CACHE_SECONDS.
         self._failed_rounds: dict[int, float] = {}
@@ -881,8 +892,13 @@ class CorpusAuditor:
         if round_number in self._raced:
             return None  # failed already in this pass
         self._raced.add(round_number)
+        return await self._fetch_round(round_number)
+
+    async def _fetch_round(self, round_number: int, *, timed: bool = True) -> str | None:
+        """One race for a round; the randomness is cached, a failure noted."""
+        randomness = None
         try:
-            with self._timed("drand"):
+            with (self._timed("drand") if timed else contextlib.nullcontext()):
                 value = await self._in("beacon", self._beacon, round_number)
         except Exception:
             logger.warning("drand round %d unavailable; auditing", round_number, exc_info=True)
@@ -910,7 +926,7 @@ class CorpusAuditor:
         this pass (``_raced``). Returns how many rounds were raced."""
         if self._params.q >= 1.0 or self._beacon is None or self._round_at is None:
             return 0
-        rounds = set()
+        rounds, cached = set(), set()
         for sid in submission_ids:
             hotkey, received_at, _ = self._meta[sid]
             if effective_state(states[hotkey], now, self._params) != "sampled":
@@ -922,7 +938,9 @@ class CorpusAuditor:
             except Exception:
                 return 0
             failed_at = self._failed_rounds.get(round_number)
-            if (round_number not in self._randomness and round_number not in self._raced
+            if round_number in self._randomness:
+                cached.add(round_number)
+            elif (round_number not in self._raced
                     and (failed_at is None
                          or now - failed_at >= self._negative_window(round_number))):
                 rounds.add(round_number)
@@ -933,6 +951,8 @@ class CorpusAuditor:
                 await self._randomness_for(round_number)
 
         await asyncio.gather(*(one(r) for r in sorted(rounds)))
+        self._pass_rounds[0] += len(cached) + len(rounds)
+        self._pass_rounds[1] += len(cached)
         return len(rounds)
 
     async def _decide(self, submission_id: str, now: float,
@@ -1017,7 +1037,8 @@ class CorpusAuditor:
 
         if not unaudited:
             logger.info("corpus judge pass started: job=%s ids=%d payable=0 payable_waiting=0 "
-                        "siblings=0 rounds_needed=%d", self._job_id, len(known), rounds_needed)
+                        "siblings=0 rounds_needed=%d rounds_cached=%d/%d", self._job_id,
+                        len(known), rounds_needed, self._pass_rounds[1], self._pass_rounds[0])
         covered: float | None = math.inf
         if unaudited:
             # Sampled BEFORE the siblings are collected: only what was enqueued
@@ -1068,8 +1089,9 @@ class CorpusAuditor:
                 rounds_needed += await self._prefetch_rounds(
                     [sid for sids in siblings.values() for sid in sids], now, states)
             logger.info("corpus judge pass started: job=%s ids=%d payable=%d payable_waiting=%d "
-                        "siblings=%d rounds_needed=%d", self._job_id, len(known), len(kept),
-                        len(waiting), sum(taken.values()), rounds_needed)
+                        "siblings=%d rounds_needed=%d rounds_cached=%d/%d", self._job_id,
+                        len(known), len(kept), len(waiting), sum(taken.values()), rounds_needed,
+                        self._pass_rounds[1], self._pass_rounds[0])
             for hotkey, sids in siblings.items():
                 for sid in sids:
                     with self._timed("decide"):
@@ -1194,6 +1216,7 @@ class CorpusAuditor:
         self._next_due.clear()
         self._deferred = []
         self._raced = set()
+        self._pass_rounds = [0, 0]
         try:
             failed = await self._judge_once(list(submission_ids))
             # At q = 1 every held record is already being audited on arrival.
@@ -1322,9 +1345,62 @@ class CorpusAuditor:
                 await asyncio.wait_for(self._wake.wait(),
                                        timeout=min(max(wait, 0.01), self._rescan_every))
 
+    def _rounds_wanted(self, now: float) -> list[int]:
+        """Rounds the pending records' draws use, out and not cached nor
+        failed lately, oldest first (their records are judged first)."""
+        try:
+            out = int(self._round_at(now - BEACON_GRACE_SECONDS))
+            rounds = {int(self._round_at(received_at)) + 1
+                      for sid, (_, received_at, _) in list(self._meta.items())
+                      if sid not in self._judged}
+        except Exception:
+            return []
+        wanted = []
+        for round_number in sorted(rounds):
+            if round_number >= out or round_number in self._randomness:
+                continue
+            failed_at = self._failed_rounds.get(round_number)
+            if failed_at is not None and now - failed_at < self._negative_window(round_number):
+                continue
+            wanted.append(round_number)
+        return wanted
+
+    async def _prefetch_forever(self) -> None:
+        """Fill the beacon cache ahead of the passes: PREFETCH_ROUNDS at a time,
+        PREFETCH_CONCURRENCY in flight, resting once every pending round is cached."""
+        gate = asyncio.Semaphore(PREFETCH_CONCURRENCY)
+
+        async def one(round_number):
+            async with gate:
+                if round_number not in self._randomness:
+                    await self._fetch_round(round_number, timed=False)
+
+        scanned = (-1, -math.inf)
+        while True:
+            try:
+                # One scan of the pending index, then its rounds in batches; the
+                # scan again only once records arrived (or a minute passed, for
+                # rounds whose failure has aged out).
+                if (len(self._meta), ) == scanned[:1] and self._clock() - scanned[1] < 60.0:
+                    await asyncio.sleep(PREFETCH_IDLE_SECONDS)
+                    continue
+                scanned = (len(self._meta), self._clock())
+                wanted = self._rounds_wanted(self._clock())
+                for i in range(0, len(wanted), PREFETCH_ROUNDS):
+                    await asyncio.gather(*(one(r) for r in wanted[i:i + PREFETCH_ROUNDS]))
+                if wanted:
+                    logger.info("corpus job %s: drand prefetch fetched %d round(s) (%d cached)",
+                                self._job_id, len(wanted), len(self._randomness))
+            except Exception:
+                logger.exception("corpus drand prefetch failed; retrying")
+            await asyncio.sleep(PREFETCH_IDLE_SECONDS)
+
     async def run(self) -> None:
         await self._start()
         rescan = asyncio.create_task(self._rescan_forever())
+        prefetch = (asyncio.create_task(self._prefetch_forever())
+                    if self._prefetch and self._params.q < 1.0 and self._beacon is not None
+                    and self._round_at is not None else None)
         try:
             while True:
                 batch = await self._next_batch()
@@ -1349,3 +1425,5 @@ class CorpusAuditor:
                     )
         finally:
             rescan.cancel()
+            if prefetch is not None:
+                prefetch.cancel()
