@@ -59,7 +59,13 @@ def _call_fields(call: dict) -> tuple[str, str]:
 
 
 def actions_from_trace(trace: dict) -> list[Action]:
-    """Every tool call with the tool message that answered it, in order."""
+    """Every tool call with the tool message that answered it, in order.
+
+    A tool call with no answering tool message is dropped silently. That is
+    fine for gate M2 (honest traces); production must parse actions from the
+    TOPLOC-verified tokens with the pinned renderer and refuse such calls
+    (spec section 5, N5).
+    """
     actions: list[Action] = []
     pending: list[tuple[str, str]] = []
     for node in trace.get("nodes", []):

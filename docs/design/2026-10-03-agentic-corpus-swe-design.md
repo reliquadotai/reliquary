@@ -143,6 +143,11 @@ expiry, strikes, quarantine and 5% local recheck:
 - `GradeLease{lease_id, expires_at, items[]: {submission_id, task_index,
   env_pin, mode: grade|replay, final_diff, actions}}`, where `actions` are the
   tool calls parsed from the assistant spans with the pinned renderer.
+- In production both the actions and the recorded observations are parsed from
+  the TOPLOC-verified `tokens` with the pinned renderer, never from a
+  miner-supplied trace (gate M2 used `actions_from_trace` on honest traces
+  only). A tool call with no answering tool message is refused at intake, not
+  dropped (`actions_from_trace` drops it silently today).
 - `GradeResult{items[]: {status, diff_applied, tests_passed, replay_diff_equal,
   observations_compared, observations_mismatched, detail}}`.
 - The executor process (`reliquary/validator/corpus_grade_executor.py`) imports
