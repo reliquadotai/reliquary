@@ -246,7 +246,8 @@ def verify(args):
     from huggingface_hub import snapshot_download
 
     from reliquary.corpus.trajectory import BuiltTrajectory
-    from reliquary.environment.agentic_swe import load_swe_source, load_turn_renderer, network_notice
+    from reliquary.environment.agentic_swe import load_swe_source, load_turn_renderer
+    from reliquary.miner.agentic_episode import network_notice_refusal
     from reliquary.miner.agentic_miner import build_trajectory_submission, trajectory_precheck
     from reliquary.protocol.corpus_submission import CorpusSubmissionRequest
     from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
@@ -298,7 +299,7 @@ def verify(args):
                        "worst_exp": max((c.exp_mismatches for c in outcome.results), default=None),
                        "worst_mant_mean": max((c.mant_err_mean for c in outcome.results
                                                if math.isfinite(c.mant_err_mean)), default=None)})
-    print(json.dumps({"network_notice_from": network_notice()[1]}))
+    print(json.dumps({"network_notice_refusal": network_notice_refusal()}))
     print(json.dumps(report, indent=1, default=str))
     if not all(x["prompt_is_validator_render"] and x["precheck"] is None and x["intake"] == "accepted"
                and x["audit_passed"] for x in report):

@@ -80,14 +80,30 @@ def _submit(client, body: dict, counts: Counter) -> dict:
 async def _mine_identity(*, job, identity: Identity, client, engine, runner, decode,
                          slots: asyncio.Semaphore, counts: Counter, stop: asyncio.Event,
                          precheck=None) -> None:
-    async def one(cursor: int) -> None:
-        prompt_index = job_walk_index(job, identity.hotkey, cursor)
+    tasks: set[asyncio.Task] = set()
+    tag = identity.hotkey[:8]
+
+    def halt() -> None:
+        """The identity is done (job complete, retired, halted): episodes still
+        running would only submit into a refusal, so they are cancelled."""
+        stop.set()
+        current = asyncio.current_task()
+        for task in tasks:
+            if task is not current and not task.done():
+                task.cancel()
+
+    async def episode(cursor: int, prompt_index: int, sessions: list[str]) -> None:
+        deadline = getattr(runner, "deadline", None)
+        limit = deadline(prompt_index) if deadline is not None else None
         try:
-            result = await runner.run(prompt_index)
-        except Exception:
-            logger.exception("episode %d of %s crashed", prompt_index, identity.hotkey[:8])
-            counts["episode_crashed"] += 1
+            async with asyncio.timeout(limit):
+                result = await runner.run(prompt_index, on_session=sessions.append)
+        except TimeoutError:
+            counts["episode_timeout"] += 1
+            logger.warning("episode %d of %s passed its %s s deadline", prompt_index, tag, limit)
             return
+        if result.session_id:
+            sessions.append(result.session_id)
         # Taken whatever the outcome, so a failed episode's log does not linger.
         session = engine.take_session(result.session_id) if result.session_id else None
         if not result.ok or session is None:
@@ -111,7 +127,7 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             counts["precheck_refused"] += 1
             counts[f"precheck_refused:{reason}"] += 1
             logger.warning("episode %d of %s not submitted, the validator would refuse it: %s %s",
-                           prompt_index, identity.hotkey[:8], reason, detail)
+                           prompt_index, tag, reason, detail)
             return
         if identity.transform is not None:
             built = identity.transform(built, prompt_index)
@@ -122,17 +138,35 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             answer = await asyncio.to_thread(_submit, client, body, counts)
         except (CorpusJobRetired, CorpusMinerHalted) as exc:
             counts["halted"] += 1
-            logger.error("%s stops: %s", identity.hotkey[:8], exc)
-            stop.set()
+            logger.error("%s stops: %s", tag, exc)
+            halt()
             return
         reason = str(answer.get("reason"))
         counts[reason] += 1
-        logger.info("episode %d of %s: %s %s", prompt_index, identity.hotkey[:8], reason,
-                    answer.get("detail") or "")
+        logger.info("episode %d of %s: %s %s", prompt_index, tag, reason, answer.get("detail") or "")
         if reason == "job_complete" or reason in _HALT:
-            stop.set()
+            halt()
 
-    tasks: set[asyncio.Task] = set()
+    async def one(cursor: int) -> None:
+        """One episode, isolated: whatever it raises is counted and logged
+        here, and its generate sessions are dropped, never its siblings'."""
+        prompt_index = job_walk_index(job, identity.hotkey, cursor)
+        sessions: list[str] = []
+        try:
+            await episode(cursor, prompt_index, sessions)
+        except asyncio.CancelledError:
+            counts["episode_cancelled"] += 1
+            raise
+        except Exception:
+            counts["episode_crashed"] += 1
+            logger.exception("episode %d of %s crashed", prompt_index, tag)
+        finally:
+            for session_id in dict.fromkeys(sessions):
+                try:
+                    engine.drop_session(session_id)
+                except Exception:
+                    logger.exception("dropping session %s failed", session_id)
+
     cursor = 0
     while not stop.is_set() and (identity.episodes is None or cursor < identity.episodes):
         await slots.acquire()
@@ -142,7 +176,7 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
         if not getattr(engine, "healthy", True):
             # Every turn would fail fast: starting episodes would only burn boxes.
             counts["engine_unhealthy"] += 1
-            logger.error("the generate engine is unhealthy: %s stops", identity.hotkey[:8])
+            logger.error("the generate engine is unhealthy: %s stops", tag)
             stop.set()
             slots.release()
             break
@@ -150,7 +184,8 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
         task.add_done_callback(lambda _t: slots.release())
         tasks.add(task)
         cursor += 1
-    await asyncio.gather(*tasks)
+    # return_exceptions: a cancelled or crashed episode never cancels its siblings.
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def mine_agentic(*, job, identities, client, engine, runners, decode,
@@ -161,12 +196,16 @@ async def mine_agentic(*, job, identities, client, engine, runners, decode,
     slots = asyncio.Semaphore(concurrency)
     counts = {identity.hotkey: Counter() for identity in identities}
     stops = {identity.hotkey: asyncio.Event() for identity in identities}
-    await asyncio.gather(*(
+    outcomes = await asyncio.gather(*(
         _mine_identity(job=job, identity=identity, client=client, engine=engine,
                        runner=runners[harness_key(identity.harness_env)], decode=decode,
                        slots=slots, counts=counts[identity.hotkey], stop=stops[identity.hotkey],
                        precheck=precheck)
-        for identity in identities))
+        for identity in identities), return_exceptions=True)
+    for identity, outcome in zip(identities, outcomes):
+        if isinstance(outcome, BaseException):
+            counts[identity.hotkey]["identity_crashed"] += 1
+            logger.error("mining for %s stopped: %r", identity.hotkey[:8], outcome)
     return counts
 
 
@@ -192,6 +231,11 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
     """The whole miner in one process: engine thread, loopback endpoint, episodes."""
     import contextlib
 
+    from reliquary.miner import agentic_episode
+
+    refusal = agentic_episode.network_notice_refusal()
+    if refusal:
+        raise RuntimeError(f"refusing to mine: {refusal}")
     from reliquary.environment.agentic_swe import load_turn_renderer
     from reliquary.miner.agentic_episode import SweEpisodeRunner
     from reliquary.miner.corpus_generate_server import (

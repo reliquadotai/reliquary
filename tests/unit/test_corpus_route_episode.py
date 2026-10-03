@@ -19,7 +19,9 @@ from tests.unit.test_corpus_service import (  # noqa: F401  (fixtures)
 )
 from tests.unit.test_trajectory_parse import CALL, TERM, TEXT, R, build
 
-ROWS = [("repo__a.1", "fix it"), ("repo__b.2", "x"), ("repo__c.3", "y")]
+# Prompt 0 is SWE-smith sized: a real rendered prompt is ~800 tokens, ~3.3 KB.
+STATEMENT = ("Fix the issue by editing the repository's source. " * 18).strip()
+ROWS = [("repo__a.1", STATEMENT), ("repo__b.2", "x"), ("repo__c.3", "y")]
 # The validator's render of prompt 0: the task plus verifiers' network notice (ruling P13).
 PROMPT = R.initial_ids(SweSource(ROWS).prompt(0))
 
@@ -159,7 +161,9 @@ def test_a_refusal_consumes_no_slot_and_no_cursor(episode_store):
 
 def test_the_record_keeps_its_trajectory_before_the_cursor_for_the_tail_read(episode_store):
     import json
-    from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2, submission_meta
+    from reliquary.infrastructure.corpus_record_store import (
+        RECORD_SCHEMA_V2, SUBMISSION_TAIL_BYTES, submission_meta,
+    )
 
     records = _Records()
     request = _request()
@@ -168,9 +172,8 @@ def test_the_record_keeps_its_trajectory_before_the_cursor_for_the_tail_read(epi
     assert record["schema"] == RECORD_SCHEMA_V2
     stored = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
     assert stored.index(b'"completions"') < stored.index(b'"cursor"')
-    # A tail from the cursor on: the rendered prompt (now with the network
-    # notice) sorts after it and its length is the test tokenizer's business.
-    meta = submission_meta(stored[stored.index(b'"cursor"'):])
+    assert len(TOKENIZER.decode(PROMPT)) > 3000          # a realistic prompt, notice included
+    meta = submission_meta(stored[-SUBMISSION_TAIL_BYTES:])
     assert meta["hotkey"] == "5Hot" and meta["token_count"] == 30
 
 

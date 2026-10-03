@@ -33,6 +33,28 @@ def env_config(episode, *, harness_env: dict | None = None) -> dict:
     }
 
 
+def network_notice_refusal() -> str | None:
+    """Why this miner must not mine, or None: the validator renders every
+    prompt with its pinned copy of verifiers' restricted-network notice
+    (ruling P13), so an installed verifiers whose notice differs would get
+    every honest trajectory refused as ``prompt_mismatch``."""
+    from verifiers.v1.dialects.base import CAPABILITY_NOTICE
+
+    from reliquary.environment.agentic_swe import PINNED_NETWORK_NOTICE
+
+    if CAPABILITY_NOTICE != PINNED_NETWORK_NOTICE:
+        return ("the installed verifiers' network notice differs from the one the validator "
+                "renders prompts with: every trajectory would be refused as prompt_mismatch")
+    return None
+
+
+# Past the task's own phase timeouts (setup + agent + finalize + scoring),
+# verifiers itself should already have ended the episode.
+DEADLINE_MARGIN_SECONDS = 300.0
+# A phase the task leaves unbounded still gets an hour before the miner gives up.
+UNSET_PHASE_SECONDS = 3600.0
+
+
 def _errors(errors) -> str:
     return "; ".join(f"{type(e).__name__}: {getattr(e, 'message', e)}" for e in errors)
 
@@ -70,6 +92,15 @@ class SweEpisodeRunner:
         return task_for(self._rows[index], index, self._episode.env.split,
                         self._env.taskset.config.task)
 
+    def deadline(self, index: int) -> float:
+        """The miner's bound on one episode: the task's own phase timeouts
+        summed (scoring included: verifiers b2e4e81 has no switch to skip it,
+        and a scoring failure marks the trace not ok), plus a margin."""
+        timeout = self.task(index).data.timeout
+        phases = (timeout.setup, timeout.agent, timeout.finalize, timeout.scoring)
+        return sum(float(p) if p is not None else UNSET_PHASE_SECONDS for p in phases) \
+            + DEADLINE_MARGIN_SECONDS
+
     async def __aenter__(self) -> "SweEpisodeRunner":
         self._serving = self._env.serving()
         await self._serving.__aenter__()
@@ -78,8 +109,11 @@ class SweEpisodeRunner:
     async def __aexit__(self, *exc) -> None:
         await self._serving.__aexit__(*exc)
 
-    async def run(self, index: int) -> EpisodeResult:
-        episode = await self._env.run_episode(self.task(index), self._ctx)
+    async def run(self, index: int, on_session=None) -> EpisodeResult:
+        """``on_session(trace_id)`` as soon as the trace is minted, so a caller
+        that times the episode out can still drop its generate session."""
+        on_trace = (lambda trace: on_session(trace.id)) if on_session is not None else None
+        episode = await self._env.run_episode(self.task(index), self._ctx, on_trace=on_trace)
         if not episode.traces:
             return EpisodeResult(None, "", None, False, None,
                                  error=_errors(episode.errors) or "no trace")
@@ -95,4 +129,4 @@ class SweEpisodeRunner:
                                    or "episode not ok"))
 
 
-__all__ = ["EpisodeResult", "SweEpisodeRunner", "env_config"]
+__all__ = ["EpisodeResult", "SweEpisodeRunner", "env_config", "network_notice_refusal"]

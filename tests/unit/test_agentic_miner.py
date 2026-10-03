@@ -14,18 +14,26 @@ JOB = parse_job(_manifest(prompt_count=50))
 
 
 class FakeRunner:
-    def __init__(self, ok=True, stop="agent_completed"):
+    def __init__(self, ok=True, stop="agent_completed", slow=(), slow_seconds=30.0, deadline=None):
         self.ran, self._ok, self._stop = [], ok, stop
+        self._slow, self._slow_seconds, self._deadline = set(slow), slow_seconds, deadline
 
-    async def run(self, index):
+    def deadline(self, index):
+        return self._deadline
+
+    async def run(self, index, on_session=None):
         self.ran.append(index)
-        await asyncio.sleep(0.01 * (index % 3))            # finish out of order
+        if on_session is not None:
+            on_session(f"s{index}")                       # the trace id, known at mint
+        await asyncio.sleep(self._slow_seconds if index in self._slow
+                            else 0.01 * (index % 3))     # finish out of order
         return EpisodeResult(f"s{index}", f"diff {index}", self._stop, self._ok, 1.0)
 
 
 class FakeEngine:
     def __init__(self, linear=True):
         self._linear = linear
+        self.dropped = []
 
     def take_session(self, session_id):
         n = int(session_id[1:])
@@ -34,7 +42,7 @@ class FakeEngine:
         return SessionLog([first, second], self._linear)
 
     def drop_session(self, session_id):
-        pass
+        self.dropped.append(session_id)
 
 
 class FakeClient:
@@ -224,3 +232,123 @@ def test_a_real_malformed_call_trajectory_is_dropped_not_submitted():
         engine=RealEngine(), runners={harness_key(None): FakeRunner()}, decode=lambda ids: "",
         concurrency=1, precheck=trajectory_precheck(r, max_turns=JOB.episode.max_turns)))
     assert client.bodies == [] and counts["5Hot"]["precheck_refused:bad_turns"] == 1
+
+
+
+# -- fix round 2: one episode's failure never stops the miner --
+
+def _mine(runner, *, engine=None, client=None, precheck=None, decode=None, episodes=6,
+          concurrency=3, sign=None):
+    engine = engine or FakeEngine()
+    client = client or FakeClient()
+    counts = asyncio.run(mine_agentic(
+        job=JOB, identities=[Identity("5Hot", sign=sign or (lambda b: "s"), episodes=episodes)],
+        client=client, engine=engine, runners={harness_key(None): runner},
+        decode=decode or (lambda ids: ""), concurrency=concurrency, precheck=precheck))
+    return counts["5Hot"], client, engine
+
+
+def _walk(n):
+    from reliquary.corpus.walk import job_walk_index
+
+    return [job_walk_index(JOB, "5Hot", cursor) for cursor in range(n)]
+
+
+def test_a_precheck_crash_drops_that_episode_only():
+    bad = _walk(6)[2]
+
+    def precheck(built):
+        if built.final_diff == f"diff {bad}":
+            raise RuntimeError("renderer exploded")
+        return None
+
+    counts, client, engine = _mine(FakeRunner(), precheck=precheck)
+    assert counts["episode_crashed"] == 1 and counts["accepted"] == 5
+    assert sorted(b["prompt_index"] for b in client.bodies) == sorted(i for i in _walk(6) if i != bad)
+    assert f"s{bad}" in engine.dropped
+
+
+def test_a_decode_or_sign_crash_drops_that_episode_only():
+    calls = {"n": 0}
+
+    def decode(ids):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise UnicodeDecodeError("utf-8", b"", 0, 1, "boom")
+        return ""
+
+    counts, client, _ = _mine(FakeRunner(), decode=decode)
+    assert counts["episode_crashed"] == 1 and len(client.bodies) == 5
+
+    def sign(body):
+        if body["prompt_index"] == _walk(6)[0]:
+            raise ValueError("wallet locked")
+        return "s"
+
+    counts, client, _ = _mine(FakeRunner(), sign=sign)
+    assert counts["episode_crashed"] == 1 and len(client.bodies) == 5
+
+
+def test_a_non_halting_submit_error_drops_that_episode_only():
+    class Flaky(FakeClient):
+        def submit(self, body):
+            if body["prompt_index"] == _walk(6)[1]:
+                raise KeyError("reason")
+            return super().submit(body)
+
+    counts, client, _ = _mine(FakeRunner(), client=Flaky())
+    assert counts["episode_crashed"] == 1 and len(client.bodies) == 5
+
+
+def test_an_episode_past_its_deadline_is_dropped_and_its_session_too():
+    slow = _walk(4)[1]
+    runner = FakeRunner(slow={slow}, slow_seconds=30.0, deadline=0.2)
+    counts, client, engine = _mine(runner, episodes=4)
+    assert counts["episode_timeout"] == 1 and len(client.bodies) == 3
+    assert f"s{slow}" in engine.dropped
+
+
+def test_job_complete_cancels_the_episodes_still_running():
+    import time
+
+    walk = _walk(4)
+    runner = FakeRunner(slow=set(walk[1:]), slow_seconds=30.0)
+    client = FakeClient([{"reason": "job_complete", "accepted": False}])
+    started = time.monotonic()
+    counts, client, engine = _mine(runner, client=client, episodes=4, concurrency=4)
+    assert time.monotonic() - started < 10
+    assert len(client.bodies) == 1 and counts["job_complete"] == 1
+    assert counts["episode_cancelled"] == 3
+    assert {f"s{i}" for i in walk[1:]} <= set(engine.dropped)
+
+
+def test_a_notice_that_differs_from_verifiers_refuses_to_mine(monkeypatch):
+    import pytest
+
+    from reliquary.miner import agentic_episode, agentic_miner
+
+    monkeypatch.setattr(agentic_episode, "network_notice_refusal", lambda: "the notice differs")
+    with pytest.raises(RuntimeError, match="the notice differs"):
+        asyncio.run(agentic_miner.run_agentic_miner(
+            job=JOB, checkpoint_dir="/nonexistent", proof=None, tokenizer=None,
+            identities=[], client=None))
+
+
+def test_the_network_notice_check_against_the_installed_verifiers(monkeypatch):
+    import pytest
+
+    base = pytest.importorskip("verifiers.v1.dialects.base")
+    from reliquary.miner.agentic_episode import network_notice_refusal
+
+    assert network_notice_refusal() is None
+    monkeypatch.setattr(base, "CAPABILITY_NOTICE", "Network blocked, differently.")
+    assert "differs" in network_notice_refusal()
+
+
+def test_the_cli_exposes_max_num_seqs():
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    result = CliRunner().invoke(app, ["corpus", "mine-agentic", "--help"])
+    assert "--max-num-seqs" in result.output

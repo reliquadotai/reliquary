@@ -2252,6 +2252,9 @@ def corpus_mine_agentic(
     episodes: int = typer.Option(0, "--episodes", help="0 = until the job completes"),
     port: int = typer.Option(8011, "--port", help="Loopback port of the generate endpoint"),
     gpu_memory_utilization: float = typer.Option(None, "--gpu-memory-utilization"),
+    max_num_seqs: int = typer.Option(
+        16, "--max-num-seqs",
+        help="vLLM's concurrent sequences; lower it if turns fail as preempted (unprovable)"),
 ) -> None:
     """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
     against a local vLLM with per-turn proofs. Needs Docker and the job's
@@ -2309,7 +2312,7 @@ def corpus_mine_agentic(
     counts = asyncio.run(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
-        gpu_memory_utilization=gpu_memory_utilization))
+        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs))
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
 
 
