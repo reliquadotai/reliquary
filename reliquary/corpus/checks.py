@@ -37,6 +37,9 @@ REASON_MINER_BANNED = "miner_banned"
 REASON_HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
 # A skip of a prompt that still has a slot; produced by `admission.skip`.
 REASON_PROMPT_NOT_FULL = "prompt_not_full"
+# Agentic trajectories (Task 8 produces them).
+REASON_BAD_TURNS = "bad_turns"
+REASON_SHORT_TURNS = "short_turns"
 
 
 def completion_digest(prompt_index: int, tokens: Sequence[int]) -> str:

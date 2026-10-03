@@ -485,6 +485,26 @@ def verify_precommit_signature(
 
 
 CORPUS_DOMAIN = b"reliquary/corpus-submission/v1"
+# A trajectory is signed under its own domain, so its binding can never be
+# replayed as a single-turn submission's (or the other way round).
+CORPUS_TRAJECTORY_DOMAIN = b"reliquary/corpus-trajectory/v1"
+
+
+def _trajectory_parts(trajectory) -> list[bytes]:
+    """sha256 of the tokens, of the span list, of each span's proofs, of the
+    final diff, and the stop label (spec §6)."""
+    tokens = b"".join(int(t).to_bytes(4, "big", signed=False) for t in trajectory["tokens"])
+    spans = b"".join(int(turn["start"]).to_bytes(8, "big", signed=False)
+                     + int(turn["end"]).to_bytes(8, "big", signed=False)
+                     for turn in trajectory["turns"])
+    parts = [hashlib.sha256(tokens).digest(), hashlib.sha256(spans).digest()]
+    for turn in trajectory["turns"]:
+        proofs = b"".join(len(p.encode("ascii")).to_bytes(4, "big") + p.encode("ascii")
+                          for p in turn.get("proofs") or [])
+        parts.append(hashlib.sha256(proofs).digest())
+    parts.append(hashlib.sha256(str(trajectory["final_diff"]).encode("utf-8")).digest())
+    parts.append(str(trajectory["stop"]).encode("utf-8"))
+    return parts
 
 
 def _corpus_fields(request) -> dict:
@@ -514,15 +534,21 @@ def build_corpus_binding(request) -> bytes:
         str(body["checkpoint_sha256"]).encode("utf-8"),
         _sha(str(body["rendered_prompt"]).encode("utf-8")),
     ]
-    for completion in body["completions"]:
-        tokens = b"".join(int(t).to_bytes(4, "big", signed=False) for t in completion["tokens"])
-        proofs = b"".join(
-            _len_bytes(p.encode("ascii")) + p.encode("ascii")
-            for p in completion.get("proofs") or []
-        )
-        parts += [_sha(tokens), _sha(str(completion["text"]).encode("utf-8")), _sha(proofs)]
+    trajectory = body.get("trajectory")
+    if trajectory is not None:
+        domain = CORPUS_TRAJECTORY_DOMAIN
+        parts += _trajectory_parts(trajectory)
+    else:
+        domain = CORPUS_DOMAIN
+        for completion in body["completions"]:
+            tokens = b"".join(int(t).to_bytes(4, "big", signed=False) for t in completion["tokens"])
+            proofs = b"".join(
+                _len_bytes(p.encode("ascii")) + p.encode("ascii")
+                for p in completion.get("proofs") or []
+            )
+            parts += [_sha(tokens), _sha(str(completion["text"]).encode("utf-8")), _sha(proofs)]
     h = hashlib.sha256()
-    h.update(CORPUS_DOMAIN)
+    h.update(domain)
     for part in parts:
         h.update(_len_bytes(part))
         h.update(part)
