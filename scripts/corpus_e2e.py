@@ -47,7 +47,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 MINIO_CONTAINER = "corpus-e2e-minio"
-MINIO_IMAGE = "quay.io/minio/minio:latest"
+# MinIO stopped publishing images in 2025 (quay.io/minio/minio and
+# minio/minio answer "unauthorized" / "does not exist" since); Chainguard's
+# build of the same server is pulled by digest. Override with
+# RELIQUARY_E2E_MINIO_IMAGE (an image whose entrypoint is the minio binary).
+MINIO_IMAGE = os.environ.get(
+    "RELIQUARY_E2E_MINIO_IMAGE",
+    "cgr.dev/chainguard/minio@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034")
 PRODUCTION_BUCKET = "reliquary"
 
 logger = logging.getLogger("corpus_e2e")
@@ -104,7 +110,9 @@ def minio_run_command(container: str = MINIO_CONTAINER, port: int = 9000) -> lis
     reads them from its own environment, so they never appear in argv."""
     return ["docker", "run", "-d", "--name", container,
             "-e", "MINIO_ROOT_USER", "-e", "MINIO_ROOT_PASSWORD",
-            "-p", f"127.0.0.1:{port}:9000", MINIO_IMAGE, "server", "/data"]
+            # Inside the container's own filesystem: the image's /data volume
+            # makes MinIO fail its tmp renames ("Rename across devices").
+            "-p", f"127.0.0.1:{port}:9000", MINIO_IMAGE, "server", "/tmp/data"]
 
 
 def _wait_minio_live(port: int) -> None:
