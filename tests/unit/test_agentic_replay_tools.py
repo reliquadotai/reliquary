@@ -148,8 +148,8 @@ def test_replay_resolves_python_once_then_passes_the_program_by_argv(monkeypatch
     assert len(action_runs) == 2
     for run, written in zip(action_runs, box.writes):
         assert run[0] == "/opt/miniconda3/bin/python3"           # absolute, never via PATH
-        assert run[1:3] == ["-c", agentic_replay.TOOL_PROGRAM]   # program streamed per action
-        assert run[3] == written                                 # its own fresh request file
+        assert run[1:4] == ["-I", "-c", agentic_replay.TOOL_PROGRAM]  # isolated, program by argv
+        assert run[4] == written                                 # its own fresh request file
     assert len(set(box.writes)) == 2
     assert not any(w.endswith(".py") for w in box.writes)       # no program file in the box
 
@@ -170,3 +170,25 @@ def test_default_episode_deadline_is_an_hour():
     import inspect
     sig = inspect.signature(agentic_replay.replay_swe)
     assert sig.parameters["episode_deadline"].default == 3600.0
+
+
+def _shadowing_json(tmp_path):
+    (tmp_path / "json.py").write_text("raise SystemExit('shadowed json imported')\n")
+    request = tmp_path / "req.json"
+    request.write_text('{"tool": "bash", "arguments": "{\\"command\\": \\"echo hi\\"}", "timeout": 30}')
+    return request
+
+
+def test_a_planted_module_in_the_working_directory_shadows_plain_python(tmp_path):
+    # The attack the -I flag closes: without it, cwd comes first on sys.path.
+    request = _shadowing_json(tmp_path)
+    proc = subprocess.run([sys.executable, "-c", TOOL_PROGRAM, str(request)],
+                          capture_output=True, text=True, cwd=tmp_path)
+    assert "shadowed json imported" in proc.stderr
+
+
+def test_isolated_mode_ignores_a_planted_module(tmp_path):
+    request = _shadowing_json(tmp_path)
+    proc = subprocess.run([sys.executable, "-I", "-c", TOOL_PROGRAM, str(request)],
+                          capture_output=True, text=True, cwd=tmp_path)
+    assert proc.stdout == "hi\n"

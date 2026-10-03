@@ -10,8 +10,10 @@ miner's observations come back identical up to normalization.
 Hardening. The replayed commands control the box, so nothing the box holds is
 trusted after the first action runs: the interpreter's absolute path is
 resolved once, right after setup and before any action; the tool program is
-passed on every action as an argv string (``<python> -c TOOL_PROGRAM``) through
-``docker exec``, so no file in the box can substitute it; each request goes in
+passed on every action as an argv string (``<python> -I -c TOOL_PROGRAM``) through
+``docker exec``, with ``-I`` (isolated mode: neither the working directory, which
+the replayed commands own, nor ``PYTHON*`` variables nor the user site reach
+``sys.path``), so no file in the box can substitute it; each request goes in
 a fresh file with an unpredictable name, deleted once read. The whole replay
 runs under a wall-clock deadline (``episode_deadline``, default 3600 s) and
 raises ``ReplayTimeout`` past it, besides each command's own timeout.
@@ -124,7 +126,7 @@ async def run_action(box, python: str, action: Action, command_timeout: float) -
     request = json.dumps({"tool": action.tool, "arguments": action.arguments,
                           "timeout": _timeout_arg(command_timeout)})
     await box.write(request_path, request.encode())
-    result = await box.run([python, "-c", TOOL_PROGRAM, request_path], {})
+    result = await box.run([python, "-I", "-c", TOOL_PROGRAM, request_path], {})
     return result.stdout
 
 
