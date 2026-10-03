@@ -109,8 +109,11 @@ async def replay_swe(task, actions: Sequence[Action], *,
         await box.prepare_execution([])
         await box.write("/tmp/.replay_tool.py", TOOL_PROGRAM.encode())
         for action in actions:
+            # Integral timeouts go as ints so a timed-out command reproduces the
+            # harness text "... timed out after 3600 seconds", not "3600.0".
+            timeout = int(command_timeout) if float(command_timeout).is_integer() else command_timeout
             request = json.dumps({"tool": action.tool, "arguments": action.arguments,
-                                  "timeout": command_timeout})
+                                  "timeout": timeout})
             await box.write("/tmp/.replay_request.json", request.encode())
             result = await box.run(["sh", "-c", _RUN], {})
             observations.append(result.stdout)

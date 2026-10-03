@@ -8,9 +8,9 @@ import pytest
 from reliquary.validator.agentic_replay import TOOL_PROGRAM
 
 
-def _run(tmp_path, tool, arguments):
+def _run(tmp_path, tool, arguments, timeout=30):
     proc = subprocess.run([sys.executable, "-c", TOOL_PROGRAM],
-                          input=json.dumps({"tool": tool, "arguments": arguments, "timeout": 30}),
+                          input=json.dumps({"tool": tool, "arguments": arguments, "timeout": timeout}),
                           capture_output=True, text=True, cwd=tmp_path)
     return proc.stdout
 
@@ -56,3 +56,15 @@ def test_parity_with_pinned_verifiers(tmp_path):
         os.chdir(cwd)
     (tmp_path / "g.py").write_text("k = 0\n")
     assert _run(tmp_path, "edit", json.dumps({"path": "g.py", "old_str": "0", "new_str": "1"})) == want
+
+
+def test_bash_timeout_message_matches_the_pinned_harness(tmp_path):
+    command = "sleep 5"
+    out = _run(tmp_path, "bash", json.dumps({"command": command}), timeout=1)
+    assert out == f"error: Command '['bash', '-c', '{command}']' timed out after 1 seconds"
+
+
+def test_integral_timeout_is_sent_as_int():
+    import inspect
+    from reliquary.validator import agentic_replay
+    assert "int(command_timeout)" in inspect.getsource(agentic_replay.replay_swe)
