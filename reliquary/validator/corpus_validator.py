@@ -15,7 +15,7 @@ import re
 import time
 from types import SimpleNamespace
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 
 from reliquary.protocol.profiles import PROOF_SCHEME_TOPLOC
 
@@ -77,12 +77,14 @@ def multi_job_refusal(pairs, *, proof_of=_contract_toploc,
     """
     first_entry, first_job = pairs[0]
     if process_contract is not None:
+        from reliquary.eval.prompt_source import declared_environment
+
         served = process_contract.get("environments") or {}
         for entry, job in pairs:
-            own = ((getattr(entry, "contract", None) or {}).get("environments") or {}).get(
-                job.prompt_source
-            )
-            if own is None or served.get(job.prompt_source) != own:
+            contract = getattr(entry, "contract", None) or {}
+            name = declared_environment(contract, job.prompt_source) or job.prompt_source
+            own = (contract.get("environments") or {}).get(name)
+            if own is None or served.get(name) != own:
                 return (
                     f"task {entry.task_id!r}'s contract declares prompt source "
                     f"{job.prompt_source!r} differently from the contract this process runs; "
@@ -454,7 +456,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     routes = CorpusJobRoutes()
     for served in jobs:
         routes.add(str(served.entry.job_id), router_for(served),
-                   contract=contract if len(jobs) == 1 else getattr(served.entry, "contract", None))
+                   contract=contract if len(jobs) == 1 else getattr(served.entry, "contract", None),
+                   prompt_source=getattr(served.job, "prompt_source", None))
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=True))
     app.state.corpus_routes = routes
@@ -559,6 +562,22 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         if routes.default is None:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return await miner_status(routes.default, hotkey)
+
+    @app.get("/corpus/jobs/{job_id}/eval-prompts")
+    async def corpus_eval_prompts(job_id: str) -> Response:
+        """An eval job's prompt lines, byte for byte as its manifest hashes them:
+        miners cannot build a frozen set themselves."""
+        from reliquary.eval.prompt_source import (
+            is_eval_source, job_prompt_lines, parse_eval_source,
+        )
+
+        source = routes.prompt_sources.get(job_id)
+        if job_id not in routes.routers or source is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        if not is_eval_source(source):
+            raise HTTPException(status_code=404, detail="not_an_eval_job")
+        body = await asyncio.to_thread(job_prompt_lines, parse_eval_source(source))
+        return Response(content=body, media_type="application/x-ndjson")
 
     @app.get("/corpus/jobs/{job_id}/contract")
     async def corpus_job_contract(job_id: str) -> dict:

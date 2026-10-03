@@ -1927,15 +1927,20 @@ class CorpusJobRoutes:
                  default: str | None = None) -> None:
         self.routers: dict[str, APIRouter] = dict(routers or {})
         self.contracts: dict[str, Any] = {}
+        # Each job's prompt source: an eval job's names the set miners fetch.
+        self.prompt_sources: dict[str, str] = {}
         self.retired: set[str] = set()
         # Admissions (submit, skip) past the retired check and not yet returned:
         # a job is unwired only once none is left.
         self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
 
-    def add(self, job_id: str, router: APIRouter, *, contract: Any = None) -> None:
+    def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
+            prompt_source: str | None = None) -> None:
         self.routers[job_id] = router
         self.contracts[job_id] = contract
+        if prompt_source is not None:
+            self.prompt_sources[job_id] = prompt_source
         self.retired.discard(job_id)
         if self.default is None:
             self.default = job_id
@@ -1948,6 +1953,7 @@ class CorpusJobRoutes:
         self.retired.add(job_id)
         self.routers.pop(job_id, None)
         self.contracts.pop(job_id, None)
+        self.prompt_sources.pop(job_id, None)
 
     def open_jobs(self) -> list[str]:
         return sorted(j for j in self.routers if j not in self.retired)

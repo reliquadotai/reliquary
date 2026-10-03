@@ -124,6 +124,19 @@ def eval_source_for(set_id: str, prompts_body: bytes, count: int) -> EvalSource:
     return EvalSource(set_id, count, hashlib.sha256(head).hexdigest())
 
 
+def declared_environment(contract, prompt_source: str) -> str | None:
+    """The environment a job's task contract declares for its prompts.
+
+    A catalog job's is its prompt source. An eval job's prompt source names a
+    frozen set, and its contract declares the set's own environment (its
+    catalog source, or the external eval environment): the one environment
+    the contract holds. None when there is no single one to name."""
+    if not is_eval_source(prompt_source):
+        return prompt_source
+    names = list(((contract or {}).get("environments") or {}))
+    return names[0] if len(names) == 1 else None
+
+
 def single_turn_messages(messages) -> tuple[str | None, str] | None:
     """``(system, user)`` of a row's messages, or None: one user turn, optionally
     after one system turn, both non-empty text. Anything else would be dropped
@@ -270,4 +283,5 @@ __all__ = [
     "parse_eval_source",
     "register_eval_prompts",
     "single_turn_messages",
+    "declared_environment",
 ]
