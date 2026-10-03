@@ -164,7 +164,10 @@ expiry, strikes, quarantine and 5% local recheck:
     tolerance is recorded as a confirmed audit failure (void, suspect, ban), the
     same path as a TOPLOC failure. The tolerance is per episode:
     `allowed = max(5, ceil(0.12 x n))` mismatched observations out of `n`
-    (`replay_compare.within_tolerance`, derived in gate M2).
+    (`replay_compare.within_tolerance`, derived in gate M2);
+  - a replay that exceeds its wall-clock deadline (default 3600 s,
+    `ReplayTimeout`) is retried on another executor before being judged, since
+    a slow executor is not evidence against the miner.
 - Results go to `reliquary/corpus/jobs/{job}/grades/{sid}.json`. Grades never
   change payment except through the audit-failure path above.
 
