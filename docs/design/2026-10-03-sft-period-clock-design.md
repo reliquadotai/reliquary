@@ -99,8 +99,9 @@ reliquary/corpus-periods/<task_id>/<work period p>.json.gz
  "work_period": p, "entry_period": e, "rewards_by_hotkey", "tokens", "verdicts"}
 ```
 
-`entry_period` `e` is the period in which `p` was closed, the period from which its
-pay starts. The settlement state (per job, CAS-written) keeps the last closed
+`entry_period` `e` is the period after the one in which `p` was settled, the period
+from which its pay starts: written during period `c`, the archive may land after
+`c`'s weight-set, so it enters at `c + 1` and no share of it is ever skipped. The settlement state (per job, CAS-written) keeps the last closed
 period and the pending archive, so a crash delays a payment and never repeats it
 (the two-phase write is unchanged). A `period-ema-v1` job's settler never reads `other_max`: the stall rules and
 `RL_WINDOW_SECONDS` stay only for jobs settled the old way.
