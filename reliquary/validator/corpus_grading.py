@@ -94,6 +94,9 @@ class CorpusGrader:
         self._held_executors: set[str] = set()
         self._regrades_inflight: set[str] = set()
         self._executor_regrades_inflight: set[str] = set()
+        # Every task this grader starts, held until done: the loop keeps only
+        # weak references, and a collected task is a grade or regrade lost.
+        self._tasks: set[asyncio.Task] = set()
         # Every executor this grader has seen quarantined; never shrinks.
         self._quarantined: set[str] = set()
         # The regrade generation each submission's next regrade writes.
@@ -141,7 +144,7 @@ class CorpusGrader:
     def _start(self, submission_id: str) -> None:
         self._gated()
         self._inflight.add(submission_id)
-        asyncio.ensure_future(self._guarded(submission_id))
+        self._spawn(self._guarded(submission_id))
 
     async def _guarded(self, submission_id: str) -> None:
         try:
@@ -152,20 +155,37 @@ class CorpusGrader:
         finally:
             self._inflight.discard(submission_id)
 
+    def _spawn(self, coroutine) -> asyncio.Task:
+        task = asyncio.ensure_future(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def drain(self) -> None:
+        """Wait until every task this grader started (and any they started)
+        is done; their errors are theirs to log."""
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+    async def rescan_once(self) -> None:
+        """One pass of ``run``: grade what is new, relaunch what must be redone.
+        Everything it launches runs in the background (``drain`` awaits it)."""
+        await self._seed()
+        listed = await self._records.list_submission_ids(self._job.job_id)
+        for sid in listed:
+            self.enqueue(sid)
+        self._ungraded = sum(1 for sid in listed if sid not in self._final)
+        for executor_id in sorted(self._held_executors - self._executor_regrades_inflight):
+            # Its regrade could not index the grades from before boot.
+            self._spawn(self._regrade_executor_logged(executor_id))
+        for sid in sorted(self._regrade_retry - self._regrades_inflight):
+            # In the background: a slow regrade never holds the rescan.
+            self._spawn(self._regrade(sid))
+
     async def run(self) -> None:
         while True:
             try:
-                await self._seed()
-                listed = await self._records.list_submission_ids(self._job.job_id)
-                for sid in listed:
-                    self.enqueue(sid)
-                self._ungraded = sum(1 for sid in listed if sid not in self._final)
-                for executor_id in sorted(self._held_executors - self._executor_regrades_inflight):
-                    # Its regrade could not index the grades from before boot.
-                    asyncio.ensure_future(self._regrade_executor_logged(executor_id))
-                for sid in sorted(self._regrade_retry - self._regrades_inflight):
-                    # In the background: a slow regrade never holds the rescan.
-                    asyncio.ensure_future(self._regrade(sid))
+                await self.rescan_once()
             except Exception:
                 logger.exception("grader rescan of %s failed", self._job.job_id)
             await asyncio.sleep(self._rescan)
@@ -374,7 +394,7 @@ class CorpusGrader:
         self._regrading.add(submission_id)
         logger.warning("corpus job %s: %s was decided alone by quarantined executor(s) %s; "
                        "regrading it", self._job.job_id, submission_id[:12], caught)
-        asyncio.ensure_future(self._regrade(submission_id))
+        self._spawn(self._regrade(submission_id))
 
     def _index(self, submission_id: str, document: dict) -> None:
         """Each decision one executor made alone, under that executor."""

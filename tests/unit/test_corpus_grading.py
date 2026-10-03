@@ -599,8 +599,8 @@ def test_a_failed_regrade_is_retried_by_the_rescan():
         await grader.grade_one(SID)
         assert await grader.regrade_executor("g0") == [SID]
         assert SID not in records.regrades
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(grader.run(), 0.5)
+        await grader.rescan_once()
+        await grader.drain()
 
     asyncio.run(scenario())
     assert records.regrades[SID]["graded_by"] == ["g2"]
@@ -616,17 +616,32 @@ def test_the_void_document_is_the_auditors():
 
 
 class _Gated(_Sequence):
-    """Replays wait for ``release`` once ``hold_replays`` is set."""
+    """Replays wait for ``release`` once ``hold_replays`` is set; a test waits
+    for them with ``until_waiting``, never by counting loop turns (a grade
+    parses its trajectory in a worker thread, so turns prove nothing)."""
 
     def __init__(self, grades, replays):
         super().__init__(grades, replays)
         self.release = None
         self.hold_replays = False
+        self.waiting = 0
+        self._arrived = None
 
     async def decide(self, item):
         if item["mode"] == "replay" and self.hold_replays:
-            await self.release.wait()
+            self.waiting += 1
+            if self._arrived is not None:
+                self._arrived.set()
+            try:
+                await self.release.wait()
+            finally:
+                self.waiting -= 1
         return await super().decide(item)
+
+    async def until_waiting(self, count):
+        while self.waiting < count:
+            self._arrived = asyncio.Event()
+            await self._arrived.wait()
 
 
 def test_a_lone_certified_submission_is_not_paid_while_regraded():
@@ -642,8 +657,7 @@ def test_a_lone_certified_submission_is_not_paid_while_regraded():
         assert await grader.ready([SID]) == set()
         dispatcher.release, dispatcher.hold_replays = asyncio.Event(), True
         regrade = asyncio.ensure_future(grader.regrade_executor("g0"))
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await dispatcher.until_waiting(1)                  # the regrade's replay, in flight
         assert not regrade.done() and await grader.ready([SID]) == set()
         dispatcher.release.set()
         assert await regrade == [SID]
@@ -687,8 +701,8 @@ def test_a_failed_regrade_holds_payment_until_it_succeeds():
         await grader.grade_one(SID)
         await grader.regrade_executor("g0")
         held = await grader.ready([SID])
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(grader.run(), 0.5)
+        await grader.rescan_once()
+        await grader.drain()
         return held, await grader.ready([SID])
 
     assert asyncio.run(scenario()) == (set(), {SID})
@@ -723,15 +737,14 @@ def test_regrades_run_side_by_side():
         await grader.grade_one(other)
         dispatcher.release, dispatcher.hold_replays = asyncio.Event(), True
         regrade = asyncio.ensure_future(grader.regrade_executor("g0"))
-        for _ in range(10):
-            await asyncio.sleep(0)
         # Both regrades are past their grade and waiting on their replay at once.
-        replays_waiting = [i["mode"] for i in dispatcher.items].count("grade")
+        await dispatcher.until_waiting(2)
+        replays_waiting = dispatcher.waiting
         dispatcher.release.set()
         await regrade
         return replays_waiting
 
-    assert asyncio.run(scenario()) == 4
+    assert asyncio.run(scenario()) == 2
     assert set(records.regrades) == {SID, other}
 
 
@@ -781,8 +794,7 @@ def test_the_grader_reports_its_backlog():
     async def scenario():
         await grader.grade_one(SID)
         grader.enqueue = lambda sid: None                  # the rescan only counts here
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(grader.run(), 0.2)
+        await grader.rescan_once()
         return grader.status()
 
     status = asyncio.run(scenario())
@@ -823,18 +835,16 @@ def test_a_lone_decision_finished_after_the_quarantine_is_regraded(lone):
     async def scenario():
         dispatcher.release, dispatcher.hold_replays = asyncio.Event(), True
         grading = asyncio.ensure_future(grader.grade_one(SID))
-        for _ in range(5):
-            await asyncio.sleep(0)
-        assert not grading.done()                          # the replay is in flight
+        await dispatcher.until_waiting(1)                  # the replay is in flight
+        assert not grading.done()
         dispatcher.quarantined.add(lone)                   # quarantined meanwhile
         grader.hold_executor(lone)
         assert await grader.regrade_executor(lone) == []   # nothing written yet to regrade
         dispatcher.hold_replays = False
         dispatcher.release.set()
         await grading
-        held = await grader.ready([SID])                   # before the regrade task runs
-        for _ in range(20):
-            await asyncio.sleep(0)
+        held = await grader.ready([SID])                   # held from the grade write on
+        await grader.drain()                               # the regrade it scheduled
         return held, await grader.ready([SID])
 
     assert asyncio.run(scenario()) == (set(), {SID})
@@ -844,7 +854,6 @@ def test_a_lone_decision_finished_after_the_quarantine_is_regraded(lone):
 def test_an_executor_regrade_is_launched_once_while_it_runs():
     records = _Records()
     grader, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
-    grader._rescan = 0.01
     calls, gate = [], asyncio.Event()
 
     async def blocked(executor_id):
@@ -856,8 +865,12 @@ def test_an_executor_regrade_is_launched_once_while_it_runs():
     grader._held_executors.add("g9")
 
     async def scenario():
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(grader.run(), 0.3)
+        await grader.rescan_once()
+        await asyncio.sleep(0)                             # the first regrade starts, blocked
+        await grader.rescan_once()                         # it is still running: not again
+        await grader.rescan_once()
+        gate.set()
+        await grader.drain()
 
     asyncio.run(scenario())
     assert calls == ["g9"]
@@ -980,8 +993,7 @@ def test_a_regrade_decided_alone_by_a_later_quarantined_executor_is_redone_once(
         dispatcher.quarantined.add("g2")
         first = await grader.regrade_executor("g2")        # generation 2, by g5 alone
         again = await grader.regrade_executor("g2")        # never twice for the same executor
-        for _ in range(10):
-            await asyncio.sleep(0)
+        await grader.drain()
         return first, again, await grader.ready([SID])
 
     first, again, ready = asyncio.run(scenario())
@@ -1022,3 +1034,17 @@ def test_a_grader_wired_after_a_quarantine_holds_its_executor():
     w = _wired(job)
     wire_job_grader(w, records=_Records(), judge_records=_Records(), dispatcher=dispatcher)
     assert w.grader.status()["held_executors"] == ["g0"]  # regraded by its first rescan
+
+
+def test_the_grader_holds_its_background_tasks_until_done():
+    records = _Records()
+    grader, _ = _grader(records, _Dispatcher(PASSED, CERTIFIED))
+
+    async def scenario():
+        grader.enqueue(SID)
+        held = len(grader._tasks)                          # strongly referenced, not just weak
+        await grader.drain()
+        return held, len(grader._tasks)
+
+    assert asyncio.run(scenario()) == (1, 0)
+    assert SID in records.grades
