@@ -133,6 +133,22 @@ def test_the_weight_setter_replays_period_tasks_on_their_own_clock():
     assert ("eval-a", 1, 2) not in archives.reads  # never read past the depth
 
 
+def test_the_weight_setter_reads_the_clock_when_no_time_is_given(monkeypatch):
+    # Production calls _period_weights(declared) with no `now`: the wall clock
+    # path must work (a missing import made every weight setter abstain).
+    import asyncio
+    import time
+
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    now = GENESIS + 32 * cp.PERIOD_SECONDS + 5
+    monkeypatch.setattr(time, "time", lambda: now)
+    docs = {("eval-a", 31, 32): {"rewards_by_hotkey": {"m1": 0.01}}}
+    weights = asyncio.run(WeightOnlyValidator._period_weights(
+        {"eval-a": _entry(0.02)}, archives=_PeriodArchives(docs), genesis=GENESIS))
+    assert weights["eval-a"]["m1"] == pytest.approx(cp.PERIOD_ALPHA * 0.01)
+
+
 def test_period_pay_is_capped_and_added_to_the_window_replay():
     from reliquary.validator.weight_only import WeightOnlyValidator
 
