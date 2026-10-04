@@ -360,12 +360,14 @@ def test_the_network_notice_check_against_the_installed_verifiers(monkeypatch):
 
 
 def test_the_cli_exposes_max_num_seqs():
-    from typer.testing import CliRunner
+    import typer
 
     from reliquary.cli.main import app
 
-    result = CliRunner().invoke(app, ["corpus", "mine-agentic", "--help"])
-    assert "--max-num-seqs" in result.output
+    # The option list, not the help text: CI renders help with ANSI styling.
+    group = typer.main.get_command(app)
+    command = group.commands["corpus"].commands["mine-agentic"]
+    assert any("--max-num-seqs" in param.opts for param in command.params)
 
 
 def test_the_episode_line_logs_the_graded_reward(caplog):
