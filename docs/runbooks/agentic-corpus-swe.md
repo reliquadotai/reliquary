@@ -131,12 +131,64 @@ pass 8 MiB and be refused `413`. Rare on SWE-smith (English statements,
 ASCII code); a job on non-ASCII repositories needs that headroom checked
 before launch.
 
-Not supported: the split validator (`RELIQUARY_CORPUS_SPLIT`) with any
-episode job (it refuses to start); `RELIQUARY_CORPUS_INTAKE_ONLY` outside the
-end-to-end run (nothing is audited or paid); one validator grading two env
-pins. With `RELIQUARY_CORPUS_HOT_JOBS=1` an episode job joins a running
-validator only if that validator was started with an episode job of the same
-env pin (it holds the grade dispatcher); otherwise restart it.
+**The split validator** (`RELIQUARY_CORPUS_SPLIT=1`) serves an episode job in
+its front, exactly as the single process does: the front takes the
+trajectories, audits them through the GPU process (the trajectory's spans
+cross its socket; each trajectory is still prefilled alone), holds the grade
+dispatcher, serves the grade routes, grades and pays (window or period
+settler, both held until graded). Judge processes host no grader, so:
+
+- An episode job must not be in any `RELIQUARY_CORPUS_SPLIT_JUDGES` group.
+  `*` (and unset or empty, which mean `*`) leaves episode jobs in the front;
+  a group naming one, by job id or task id, is refused before any child
+  starts (`RELIQUARY_CORPUS_SPLIT_JUDGES names episode job '...', but judge
+  processes host no grader`). The supervisor's start log lists it under
+  "judged in the front".
+- The grade routes (`/corpus/internal/grade/...`) and the episode submissions
+  are the front's: the reverse proxy routes `/corpus/` to the front's
+  `--http-port` as for any corpus job, with `client_max_body_size 8m`, and
+  must not filter `/corpus/internal/grade/` out. Check from a grade executor
+  host: `curl -s -o /dev/null -w '%{http_code}' -X POST
+  https://<control>/corpus/internal/grade/claim` answers `422` (reached, body
+  missing), not `404` (not routed or no episode job served) nor `413`.
+- Deploy: stop the single process, set `RELIQUARY_CORPUS_SPLIT=1` and the
+  JUDGES groups naming only single-turn jobs (e.g. `corpus-math-omi-v1` to
+  give math its own process; the episode job and the rest stay in the
+  front), keep `--no-set-weights` and no `RELIQUARY_CORPUS_REMOTE_AUDIT`
+  (both refused by the split), start, then check the grade executors'
+  heartbeats in the job status (`dispatcher_waiting`, the executors listed)
+  before miners submit.
+
+**GPU sharing on the split.** The front sends an episode job's audits to the
+GPU process in requests of at most 65,536 tokens (`EPISODE_GPU_REQUEST_TOKENS`;
+one trajectory alone if longer), so the judges' single-turn requests
+interleave with them in its FIFO; a request refused `503` (queue full) is
+retried with backoff (1 s doubling to 10 s), never failed. Start the episode
+job with a low `audit_q` and cap, and watch the GPU process's `corpus gpu
+batch ... oldest_wait` log and the single-turn jobs' verdict latency before
+raising them.
+
+**An episode job that cannot be wired at startup is left out, alone.** If its
+renderer, ledger migration, replay-lease check, grade executor registry read
+or intake (reliquary-swe or renderers missing or at a wrong pin, the HF
+dataset, R2) fails, the control logs `EPISODE JOB <id> IS NOT SERVED: <step>
+failed: ...` at ERROR and starts with the other jobs: single-turn intake never
+goes down for it. Its routes do not exist (`/corpus/jobs` does not list it).
+Fix the cause and restart; with `RELIQUARY_CORPUS_HOT_JOBS=1` the job set also
+retries it at each refresh (a transient failure heals without a restart, as
+long as the grade executor registry was read at start). A control whose only
+job fails this way refuses to start. Grep for `IS NOT SERVED` after every
+restart of a control that serves an episode job. A front restart also drops the
+grade leases in flight; the executors claim them again.
+
+Not supported: an episode job in a split judge group (refused at startup, see
+above); `RELIQUARY_CORPUS_INTAKE_ONLY` outside the end-to-end run (nothing is
+audited or paid; refused with the split); one validator grading two env pins.
+With `RELIQUARY_CORPUS_HOT_JOBS=1` an episode job joins a running validator,
+split or not, only if that validator was started with an episode job of the
+same env pin (it holds the grade dispatcher); otherwise it is refused (logged,
+the validator keeps serving the others) and joins at the next restart. On the
+split, a hot-added job is always judged in the front.
 
 Tunables (environment of the control, bounded): `RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS`
 (1800; 60 to 86400) how long an item holding one vote waits, while no live

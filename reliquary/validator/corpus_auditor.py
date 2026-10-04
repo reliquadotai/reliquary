@@ -81,6 +81,12 @@ RUN_BATCH_IDS = int(os.environ.get("RELIQUARY_CORPUS_RUN_BATCH_IDS", "512"))
 # hour (2026-10-02 20:05).
 PASS_AUDIT_ROWS = int(os.environ.get("RELIQUARY_CORPUS_PASS_AUDIT_ROWS", "512"))
 PASS_AUDIT_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_PASS_AUDIT_TOKENS", "2000000"))
+# Trajectory rows sent to the GPU process per request (a longer one goes
+# alone): a pass of tens of 60k-token trajectories is many short requests, so
+# the other judges' requests interleave in the GPU process's FIFO instead of
+# waiting minutes behind one, and each fits its queue (never refused 503 for
+# its size alone). Single-turn rows still cross in one request.
+EPISODE_GPU_REQUEST_TOKENS = 65_536
 # Siblings one pass decides for its payable records (each may need a drand
 # round): the oldest payable records first, the rest wait for the next passes.
 # Unbounded, the first pass after a 130k restart decided thousands of siblings
@@ -644,6 +650,33 @@ class CorpusAuditor:
             with self._timed("forward"):
                 return await self._in("gpu", self._judge_many, records)
 
+    async def _score_in_requests(self, rows: list) -> tuple[list, float, float]:
+        """``self._scorer`` over ``rows``: the single-turn rows in one request
+        (as always), the trajectory rows in requests of at most
+        EPISODE_GPU_REQUEST_TOKENS (one trajectory alone if longer)."""
+        single = [k for k, row in enumerate(rows) if len(row) == 3]
+        requests = [single] if single else []
+        current, tokens = [], 0
+        for k, row in enumerate(rows):
+            if len(row) == 3:
+                continue
+            size = len(row[0])
+            if current and tokens + size > EPISODE_GPU_REQUEST_TOKENS:
+                requests.append(current)
+                current, tokens = [], 0
+            current.append(k)
+            tokens += size
+        if current:
+            requests.append(current)
+        scores: list = [None] * len(rows)
+        forward = verify = 0.0
+        for request in requests:
+            got, f, v = await self._scorer([rows[k] for k in request])
+            for k, score in zip(request, got):
+                scores[k] = score
+            forward, verify = forward + f, verify + v
+        return scores, forward, verify
+
     async def _scored(self, records: list[dict]) -> list[dict]:
         """``_judge_many`` with the forward on the GPU process: the same
         preparation and decision here, only the chunk scores cross."""
@@ -658,7 +691,7 @@ class CorpusAuditor:
             called = time.monotonic()
             if items:
                 with self._timed("forward"):
-                    scores, forward, verify = await self._scorer(
+                    scores, forward, verify = await self._score_in_requests(
                         [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
                          for _, _, tokens, n, proofs, spans in items])
             called = time.monotonic() - called

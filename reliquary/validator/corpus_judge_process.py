@@ -114,6 +114,10 @@ async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, sock
         if job is None:
             raise RuntimeError(f"task {entry.task_id!r} declares job {entry.job_id!r} "
                                "but it has no manifest")
+        if getattr(job, "episode", None) is not None:
+            # The supervisor's plan refuses it first; never paid ungraded.
+            raise RuntimeError(f"episode job {job.job_id!r} in a judge process: judge processes "
+                               "host no grader; leave it out of RELIQUARY_CORPUS_SPLIT_JUDGES")
         jobs.append((entry, cap, job))
     tokenizer = load_tokenizer(str(directory))
     vocab_size = (await read_info(run_dir))["vocab_size"]

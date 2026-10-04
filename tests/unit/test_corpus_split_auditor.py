@@ -190,3 +190,60 @@ class _CompletesMidPass:
 def test_a_listing_that_completes_mid_pass_pays_nothing_unaudited_that_pass():
     before, after = _gated_run(_CompletesMidPass())
     assert all(v["audited"] for v in after.values()) and len(after) > 50
+
+
+# -- I3: an episode pass never holds the GPU process for more than ~64k tokens ----
+
+
+def _trajectory_record(n_tokens, *, turns=3):
+    """A v2 trajectory record of about ``n_tokens`` (prompt + assistant spans)."""
+    prompt = [7] * 64
+    per = (n_tokens - len(prompt)) // turns
+    tokens = [5] * (per * turns)
+    spans = [{"start": k * per, "end": k * per + per - 4,
+              "proofs": ["A" * 8] * ((per - 4) // 32 + 1)} for k in range(turns)]
+    return {"schema": "reliquary/corpus-submission-record/v2", "hotkey": "5T",
+            "received_at": 1.0, "token_count": n_tokens,
+            "completions": [{"prompt_tokens": prompt, "tokens": tokens, "turns": spans,
+                             "final_diff": "d", "stop": "agent_completed"}]}
+
+
+def _span_scorer(calls):
+    from reliquary.protocol.toploc import MIN_CHUNK_TOKENS, span_chunk_count
+
+    async def scorer(rows):
+        calls.append([len(r[0]) for r in rows])
+        out = []
+        for row in rows:
+            if len(row) == 3:
+                out.extend(fakes.score_rows([row]))
+            else:
+                count = sum(span_chunk_count(e - s, 32, MIN_CHUNK_TOKENS) for s, e in row[3])
+                out.append(("ok", tuple(fakes.HONEST_CHUNK for _ in range(count))))
+        return out, 0.0, 0.0
+
+    return scorer
+
+
+def test_an_episode_pass_reaches_the_gpu_process_in_requests_of_64k_tokens_at_most():
+    from reliquary.validator import corpus_auditor
+
+    calls = []
+    auditor = _auditor(scorer=_span_scorer(calls), vocab_size=fakes.VOCAB)
+    records = [_trajectory_record(60_000) for _ in range(5)] + [_trajectory_record(20_000)
+                                                                for _ in range(6)]
+    judged = asyncio.run(auditor._forward(records))
+    assert all(v["passed"] for v in judged), judged
+    budget = corpus_auditor.EPISODE_GPU_REQUEST_TOKENS
+    assert budget <= 65_536
+    # Every request: one trajectory, or several whose tokens fit the budget.
+    assert all(len(c) == 1 or sum(c) <= budget for c in calls), calls
+    assert sum(len(c) for c in calls) == len(records)
+    assert len(calls) >= 5 + 2                       # the 60k ones each alone
+
+
+def test_single_turn_rows_still_cross_in_one_request():
+    calls = []
+    auditor = _auditor(scorer=_span_scorer(calls), vocab_size=fakes.VOCAB)
+    asyncio.run(auditor._forward([fakes.record(f"5{k}", float(k)) for k in range(6)]))
+    assert [len(c) for c in calls] == [6]            # unchanged for single-turn jobs

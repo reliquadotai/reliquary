@@ -863,7 +863,7 @@ def test_the_grader_reports_its_backlog():
     assert status["box_failure_votes"] == {"g0": 2}         # per executor, for the operator
 
 
-def test_the_split_refuses_an_episode_job_at_startup(monkeypatch):
+def test_the_split_refuses_an_episode_job_in_a_judge_group_at_startup(monkeypatch):
     from reliquary.infrastructure import corpus_job_store
     from reliquary.validator.corpus_validator import SPLIT_EPISODE_REFUSAL, run_corpus_validator
 
@@ -876,8 +876,9 @@ def test_the_split_refuses_an_episode_job_at_startup(monkeypatch):
     with pytest.raises(RuntimeError) as refused:
         asyncio.run(run_corpus_validator(
             wallet=None, netuid=1, signer_client=None, http_host="h", http_port=1,
-            set_weights=False, entry=entry, cap=0.1, split=SimpleNamespace(links={})))
-    assert str(refused.value) == SPLIT_EPISODE_REFUSAL
+            set_weights=False, entry=entry, cap=0.1,
+            split=SimpleNamespace(links={"swe-agentic-v1": object()})))
+    assert str(refused.value) == SPLIT_EPISODE_REFUSAL.format(job_id="swe-agentic-v1")
 
 
 # -- fix round 2: a decision finished after its executor's quarantine ------------
