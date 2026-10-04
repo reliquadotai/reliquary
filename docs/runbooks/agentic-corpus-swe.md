@@ -143,7 +143,11 @@ Tunables (environment of the control, bounded): `RELIQUARY_CORPUS_GRADE_DISPUTE_
 distinct-provider executor exists, before it resolves `disputed`;
 `RELIQUARY_CORPUS_GRADE_LEASE_SECONDS` (2400) and
 `RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS` (12000; 11000 to 28800) the lease lives (a
-replay: setup deadline + trajectory budget, see section 5, plus a margin).
+replay: setup deadline + trajectory budget, see section 5, plus a margin). The
+control refuses to start when this lease is shorter than its job task's
+replay work + 600 s (`error: ... the replay lease (... s,
+RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS) is shorter than the task's replay work
+...`).
 
 ## 3. Grade executors (CPU, Docker, about 16 vCPU and 150 GB disk each)
 

@@ -977,7 +977,13 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         from reliquary.validator.corpus_audit_remote import ExecutorDirectory
         from reliquary.validator.corpus_grade_remote import RemoteGradeDispatcher
 
+        from reliquary.validator.corpus_grade_remote import check_replay_lease
+
         (package, version), = pins
+        # Ruling P26: refuse to start with a replay lease its replays outlive.
+        for w in wiring:
+            if w.job.episode is not None:
+                await asyncio.to_thread(check_replay_lease, w.job)
         grade_directory = ExecutorDirectory(model_id=package, model_revision=version, scope="grade")
         grade_dispatcher = RemoteGradeDispatcher(
             directory=grade_directory, env_package=package, env_version=version,

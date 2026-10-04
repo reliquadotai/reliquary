@@ -309,9 +309,12 @@ def test_a_lease_outlives_its_work():
     # A replay is bounded by its setup deadline plus its trajectory budget
     # (ruling P25, SWE-smith's timeouts), a grade by its scoring timeout; each
     # lease leaves room for the box and the corpus load.
+    taskset = pytest.importorskip("reliquary_swe.taskset")
     swesmith = types.SimpleNamespace(data=types.SimpleNamespace(timeout=types.SimpleNamespace(
-        setup=900.0, agent=3600.0, finalize=900.0, scoring=1800.0)))
-    assert seconds["replay"] >= sum(replay_deadlines(swesmith)) + 300
+        setup=taskset._SETUP_TIMEOUT_SECONDS, agent=taskset._AGENT_TIMEOUT_SECONDS,
+        finalize=taskset._FINALIZE_TIMEOUT_SECONDS, scoring=taskset._SCORING_TIMEOUT_SECONDS)))
+    assert seconds["replay"] >= sum(replay_deadlines(swesmith)) + corpus_grade_remote.REPLAY_LEASE_MARGIN_SECONDS
+    assert corpus_grade_remote.replay_lease_refusal(swesmith) is None
     assert seconds["grade"] >= DEFAULT_SCORING_SECONDS + 300
 
 
@@ -930,3 +933,37 @@ async def test_fact_against_fact_dissent_is_still_quarantined():
     await asyncio.wait_for(decision, 5)
     await asyncio.sleep(0)
     assert quarantined == ["g1", "g0"]
+
+
+
+# Ruling P26: the control refuses to start with a replay lease shorter than its task's work.
+
+def _timed(setup, agent, finalize):
+    import types
+
+    return types.SimpleNamespace(data=types.SimpleNamespace(timeout=types.SimpleNamespace(
+        setup=setup, agent=agent, finalize=finalize, scoring=1800.0)))
+
+
+def test_a_replay_lease_shorter_than_the_tasks_replay_work_is_refused():
+    refusal = corpus_grade_remote.replay_lease_refusal(_timed(900.0, 7200.0, 900.0),
+                                                       lease_seconds=12000.0)
+    assert "RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS" in refusal and "17700" in refusal
+    assert corpus_grade_remote.replay_lease_refusal(_timed(900.0, 3600.0, 900.0),
+                                                    lease_seconds=12000.0) is None
+
+
+def test_the_control_checks_the_lease_against_one_of_the_jobs_tasks():
+    from reliquary.corpus.job import parse_job
+    from tests.unit.test_corpus_job_episode import _episode, _manifest
+
+    job = parse_job(_manifest(prompt_count=3, episode=_episode()))
+    asked = []
+
+    def task_for(job_, index):
+        asked.append(index)
+        return _timed(900.0, 9000.0, 900.0)
+
+    with pytest.raises(RuntimeError, match="replay lease"):
+        corpus_grade_remote.check_replay_lease(job, task_for=task_for, lease_seconds=12000.0)
+    assert asked == [0]

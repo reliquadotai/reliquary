@@ -80,6 +80,45 @@ GRADE_LEASE_SECONDS = {
     "grade": _bounded_env("RELIQUARY_CORPUS_GRADE_LEASE_SECONDS", 2400.0, 2100.0, 7200.0),
     "replay": _bounded_env("RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS", 12000.0, 11000.0, 28800.0),
 }
+# What a replay lease must leave beyond the replay's own deadlines: the box's
+# start, the corpus load and the result's post (ruling P26).
+REPLAY_LEASE_MARGIN_SECONDS = 600.0
+
+
+def replay_lease_refusal(task, lease_seconds: float | None = None) -> str | None:
+    """Why the replay lease is too short for ``task``'s replay (its setup
+    deadline + trajectory budget, ``agentic_replay.replay_deadlines``, plus
+    a margin), or None. Too short, every long honest replay expires twice
+    and resolves unjudged."""
+    from reliquary.validator.agentic_replay import replay_deadlines
+
+    lease = GRADE_LEASE_SECONDS["replay"] if lease_seconds is None else float(lease_seconds)
+    work = sum(replay_deadlines(task))
+    if lease >= work + REPLAY_LEASE_MARGIN_SECONDS:
+        return None
+    return (f"the replay lease ({lease:.0f} s, RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS) is shorter "
+            f"than the task's replay work {work:.0f} s + margin {REPLAY_LEASE_MARGIN_SECONDS:.0f} s; "
+            f"raise it to at least {work + REPLAY_LEASE_MARGIN_SECONDS:.0f}")
+
+
+def _job_task(job, index: int):
+    from reliquary.environment.agentic_swe import load_swe_source
+    from reliquary.validator.agentic_replay import swesmith_task
+
+    source = load_swe_source(job.episode.env.num_images)
+    return swesmith_task(source.instance_id(index))
+
+
+def check_replay_lease(job, *, task_for=None, lease_seconds: float | None = None) -> None:
+    """At control start (blocking: builds one of the job's tasks): raise
+    ``RuntimeError`` when the replay lease cannot cover the job's replays.
+    Every task of a task set shares its phase timeouts, so one is checked."""
+    task = (task_for or _job_task)(job, 0)
+    refusal = replay_lease_refusal(task, lease_seconds)
+    if refusal:
+        raise RuntimeError(f"job {job.job_id!r}: {refusal}")
+
+
 GRADE_RECHECK_FRACTION = 0.05
 MAX_RESULTS_PER_ITEM = 3
 MAX_TIMEOUTS = 2
@@ -557,7 +596,8 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
     return router
 
 
-__all__ = ["DISPUTED", "GRADE_CLAIM_LIVE_SECONDS", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
+__all__ = ["DISPUTED", "REPLAY_LEASE_MARGIN_SECONDS", "check_replay_lease", "replay_lease_refusal",
+           "GRADE_CLAIM_LIVE_SECONDS", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
            "TRAJECTORY_STATUSES", "UNGRADEABLE", "UNJUDGEABLE", "GradeDecision",
            "RemoteGradeDispatcher", "build_grade_executor_router", "decision_key",
            "replay_certified"]
