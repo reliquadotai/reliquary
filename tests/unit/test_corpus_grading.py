@@ -1140,3 +1140,22 @@ def test_the_grader_holds_its_background_tasks_until_done():
 
     assert asyncio.run(scenario()) == (1, 0)
     assert SID in records.grades
+
+
+@pytest.mark.parametrize("decision", [
+    GradeDecision("uncertified", _BAD_REPLAY, ("g0",), ("p0",)),
+    GradeDecision("uncertified", {"status": "box_lost"}, ("g0", "g1"), ("p0", "p1")),
+], ids=["lone-failure", "box-lost-and-failure"])
+def test_a_replay_no_vote_certifies_voids_unpaid_without_a_sanction(decision):
+    """Ruling P27: a forger whose trajectory kills boxes at random no longer
+    collects through `disputed`: no vote certifying it is enough to withhold
+    pay (never to sanction)."""
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(PASSED, decision), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["status"] == "uncertified" and doc["replay_certified"] is False
+    assert doc["replay"]["failed"] is False
+    assert records.voided[SID]["reason"] == "replay_unjudgeable"
+    assert records.voided[SID]["stage"] == "replay" and voided == [SID]
+    assert states.states == {}
+

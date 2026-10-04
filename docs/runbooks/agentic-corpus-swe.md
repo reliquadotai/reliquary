@@ -255,10 +255,14 @@ RELIQUARY_EXECUTOR_TOKEN=<token> reliquary corpus grade-executor --control-url h
   (normalized to lower case). A replay failure sanctions a miner only when
   executors of **two distinct providers** agree (ruling P17); a disagreement
   goes to a third distinct provider, and the executor that disagreed with the
-  majority is quarantined. With fewer distinct providers connected, a failing
-  replay waits `RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS` (30 min) and resolves
-  `disputed`: nobody is sanctioned and nothing is certified (ruling P16). Run
-  executors on at least two providers, three for arbitration.
+  majority is quarantined. With fewer distinct providers connected, an item
+  holding a vote waits `RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS` (30 min) of
+  no available executor. If one of its replay votes certifies it, it resolves
+  `disputed`: nobody is sanctioned, nothing is certified, and it is paid
+  (ruling P16). If no vote certifies it (failed and/or box failures), it
+  resolves `uncertified`: voided unpaid as `replay_unjudgeable`, nobody
+  sanctioned (ruling P27). Run executors on at least two providers, three
+  for arbitration.
 - **Start after the control answers, under a restart policy.** The first
   heartbeat is not retried: an executor whose control is unreachable or has
   not yet re-read the registry (every 30 s) exits at once (later errors are

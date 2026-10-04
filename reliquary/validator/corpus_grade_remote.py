@@ -137,6 +137,9 @@ DISPUTED = "disputed"
 # "ok" one; two distinct providers agreeing resolve the item UNJUDGEABLE.
 TRAJECTORY_STATUSES = frozenset({"box_lost", "box_timeout"})
 UNJUDGEABLE = "unjudgeable"
+# Ruling P27: a replay whose votes, without any agreement, include no
+# certifying one (failed and/or box failures): voided unpaid, no sanction.
+UNCERTIFIED = "uncertified"
 
 # The facts an "ok" result must carry for its mode.
 _MODE_FACTS = {"grade": ("diff_applied", "tests_passed"), "replay": ("replay_diff_equal",)}
@@ -144,8 +147,9 @@ _MODE_FACTS = {"grade": ("diff_applied", "tests_passed"), "replay": ("replay_dif
 
 @dataclass(frozen=True)
 class GradeDecision:
-    # "ok", "error", "timeout", "ungradeable", "disputed" or "unjudgeable"; only
-    # "ok" judges the miner, "unjudgeable" (two providers) voids it unpaid.
+    # "ok", "error", "timeout", "ungradeable", "disputed", "unjudgeable" or
+    # "uncertified"; only "ok" judges the miner, "unjudgeable" (two providers)
+    # and "uncertified" (a replay no vote certifies) void it unpaid.
     status: str
     result: dict | None                 # the agreed result, when "ok"
     graded_by: tuple[str, ...]
@@ -535,6 +539,22 @@ class RemoteGradeDispatcher(ExecutorLeases):
                     work.unserved += max(0.0, now - since)
                 work.swept_at = now
             if work.results and work.unserved >= self._dispute_seconds:
+                if work.mode == "replay" and not any(
+                        r.get("status") == "ok" and replay_certified(r)
+                        for r in work.results.values()):
+                    # Ruling P27: no vote certifies it. Nobody is sanctioned
+                    # (no agreement), but it is not paid as a dispute either.
+                    self.stats[UNCERTIFIED] += 1
+                    voters = tuple(sorted(work.results))
+                    logger.warning(
+                        "grade item %d (replay, submission %s) uncertified: no vote certifies it "
+                        "and no next distinct-provider executor for %.0f s (%s); void unpaid, no "
+                        "sanction", work.id, work.item["submission_id"][:12], work.unserved,
+                        {e: decision_key(work.mode, r) for e, r in sorted(work.results.items())})
+                    self._resolve(work, GradeDecision(
+                        UNCERTIFIED, dict(work.results[voters[0]]), voters,
+                        tuple(sorted(set(work.providers.values())))))
+                    continue
                 # No distinct executor came for the next vote: nobody is judged.
                 self.stats[DISPUTED] += 1
                 logger.warning(
@@ -598,6 +618,6 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
 
 __all__ = ["DISPUTED", "REPLAY_LEASE_MARGIN_SECONDS", "check_replay_lease", "replay_lease_refusal",
            "GRADE_CLAIM_LIVE_SECONDS", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
-           "TRAJECTORY_STATUSES", "UNGRADEABLE", "UNJUDGEABLE", "GradeDecision",
+           "TRAJECTORY_STATUSES", "UNCERTIFIED", "UNGRADEABLE", "UNJUDGEABLE", "GradeDecision",
            "RemoteGradeDispatcher", "build_grade_executor_router", "decision_key",
            "replay_certified"]

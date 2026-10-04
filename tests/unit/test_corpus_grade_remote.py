@@ -422,7 +422,7 @@ async def test_a_disagreement_without_a_third_executor_resolves_disputed(monkeyp
     assert not d.quarantined                      # nobody is judged
 
 
-async def test_a_failing_replay_without_a_second_provider_resolves_disputed():
+async def test_a_failing_replay_without_a_second_provider_resolves_uncertified():
     clock = _Clock()
     d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0,
                           providers={"g0": "hetzner", "g1": "hetzner", "g2": "hetzner",
@@ -435,7 +435,7 @@ async def test_a_failing_replay_without_a_second_provider_resolves_disputed():
     clock.now += 1801
     await d.sweep()
     got = await decision
-    assert got.status == "disputed" and got.graded_by == ("g0",)
+    assert got.status == "uncertified" and got.graded_by == ("g0",)
 
 
 async def test_a_drawn_recheck_without_a_second_executor_resolves_disputed():
@@ -695,7 +695,7 @@ async def test_two_boxes_dying_resolve_unjudgeable_and_the_survivor_is_not_quara
     assert not d.quarantined and quarantined == [] and d._strikes["g1"] == 0
 
 
-async def test_an_unjudgeable_outcome_without_a_second_provider_resolves_disputed():
+async def test_an_unjudgeable_outcome_without_a_second_provider_resolves_uncertified():
     clock = _Clock()
     d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0,
                           providers={"g0": "a", "g1": "a", "g2": "a", "g3": "a"})
@@ -704,7 +704,7 @@ async def test_an_unjudgeable_outcome_without_a_second_provider_resolves_dispute
     _answer(d, "g0", BOX_TIMEOUT)
     clock.now += 1801
     await d.sweep()
-    assert (await decision).status == "disputed"
+    assert (await decision).status == "uncertified"
 
 
 # F3: the dispute clock runs only while no eligible executor exists.
@@ -754,13 +754,13 @@ async def test_the_dispute_clock_counts_only_time_without_an_eligible_executor()
         d.heartbeat("g1")
         await d.sweep()
     await asyncio.sleep(0)
-    assert not voted.done() and d.stats["disputed"] == 0   # a leaseholder counts
+    assert not voted.done() and d.stats["uncertified"] == 0   # a leaseholder counts
     d.result("g1", busy["lease_id"], _result({**REPLAY_OK, "submission_id": "f" * 64}))
     for _ in range(19):                                 # g1 heartbeats only: it does not count
         clock.now += 100
         d.heartbeat("g1")
         await d.sweep()
-    assert (await asyncio.wait_for(voted, 5)).status == "disputed"
+    assert (await asyncio.wait_for(voted, 5)).status == "uncertified"
     other.cancel()
 
 
@@ -776,7 +776,7 @@ async def test_a_heartbeat_only_executor_does_not_stop_the_dispute_clock():
         clock.now += 100
         d.heartbeat("g1")                               # pinned env, eligible, never claims
         await d.sweep()
-    assert (await asyncio.wait_for(voted, 5)).status == "disputed"
+    assert (await asyncio.wait_for(voted, 5)).status == "uncertified"
     assert d.stats["stranded"] >= 1
 
 
@@ -862,7 +862,7 @@ async def test_a_live_executor_refused_for_its_env_does_not_stop_the_dispute_clo
             assert claim.status_code == 409
             await d.sweep()
     got = await asyncio.wait_for(decision, 5)
-    assert got.status == "disputed" and d.stats["stranded"] >= 1
+    assert got.status == "uncertified" and d.stats["stranded"] >= 1
 
 
 async def test_an_executor_whose_registry_env_is_not_the_controls_is_never_eligible():
@@ -877,7 +877,7 @@ async def test_an_executor_whose_registry_env_is_not_the_controls_is_never_eligi
         clock.now += 100
         d.heartbeat("g1")
         await d.sweep()
-    assert (await asyncio.wait_for(decision, 5)).status == "disputed"
+    assert (await asyncio.wait_for(decision, 5)).status == "uncertified"
 
 
 async def test_a_wrong_env_executor_that_claims_on_the_right_env_again_is_eligible():
@@ -967,3 +967,70 @@ def test_the_control_checks_the_lease_against_one_of_the_jobs_tasks():
     with pytest.raises(RuntimeError, match="replay lease"):
         corpus_grade_remote.check_replay_lease(job, task_for=task_for, lease_seconds=12000.0)
     assert asked == [0]
+
+
+# Ruling P27: a replay that no vote certifies is never "disputed" (paid).
+
+TWO = {"g0": "a", "g1": "b", "g2": "a", "g3": "b"}
+
+
+async def _votes(answers, providers=None, sweeps=19):
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0, providers=providers)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    for eid, answer in answers:
+        _answer(d, eid, answer)
+    for _ in range(sweeps):                              # the voters keep claiming: still nobody
+        clock.now += 100
+        for eid in TOKENS:
+            d.heartbeat(eid)
+            d.claim(eid)
+        await d.sweep()
+    return await asyncio.wait_for(decision, 5), d
+
+
+D, F, C = BOX_LOST, REPLAY_BAD, REPLAY_OK
+
+
+@pytest.mark.parametrize("votes,status", [
+    ([("g0", D), ("g1", D)], "unjudgeable"),             # agreed by two providers
+    ([("g0", D), ("g1", F)], "uncertified"),
+    ([("g0", F), ("g1", D)], "uncertified"),
+    ([("g0", D), ("g1", C)], "disputed"),                # a certifying vote against: paid
+    ([("g0", F), ("g1", C)], "disputed"),
+], ids=["DD", "DF", "FD", "D-C", "F-C"])
+async def test_two_providers_a_replay_no_vote_certifies_is_uncertified(votes, status):
+    got, d = await _votes(votes, providers=TWO)
+    assert got.status == status, got
+    await asyncio.sleep(0)
+    assert not d.quarantined                              # never an executor penalty
+
+
+@pytest.mark.parametrize("vote", [F, D], ids=["F", "D"])
+async def test_one_provider_a_lone_non_certifying_replay_is_uncertified(vote):
+    got, d = await _votes([("g0", vote)], providers={e: "a" for e in TOKENS})
+    assert got.status == "uncertified", got
+
+
+@pytest.mark.parametrize("votes,status", [
+    ([("g0", D), ("g1", F), ("g2", D)], "unjudgeable"),  # D agreed by two providers
+    ([("g0", F), ("g1", D), ("g2", F)], "ok"),           # F agreed: the failure path
+    ([("g0", D), ("g1", F)], None),                      # g2, g3 eligible: a third vote decides
+], ids=["D-F-D", "F-D-F", "DF-waits"])
+async def test_three_providers_resolve_by_agreement(votes, status):
+    if status is None:
+        clock = _Clock()
+        d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+        decision = asyncio.ensure_future(d.decide(_item("replay")))
+        await asyncio.sleep(0)
+        for eid, answer in votes:
+            _answer(d, eid, answer)
+        _answer(d, "g2", F)
+        got = await asyncio.wait_for(decision, 5)
+        assert got.status == "ok" and not replay_certified(got.result)
+        return
+    got, d = await _votes(votes, sweeps=0)
+    assert got.status == status
+    if status == "ok":
+        assert not replay_certified(got.result) and got.providers == ("p0", "p2")

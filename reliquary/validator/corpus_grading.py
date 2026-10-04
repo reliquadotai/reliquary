@@ -13,7 +13,9 @@ Ruling P23: every grade that is not a clean success (failing, ``timeout``,
 ``error``, ``ungradeable``, ``disputed``, ``unjudgeable``) gets the failing
 replay draw; an ``unjudgeable`` replay or grade (the trajectory's actions or
 patch lost the box or ran past its deadline, on two providers' hosts) voids
-the submission unpaid as ``replay_unjudgeable``, with no escalation. Every
+the submission unpaid as ``replay_unjudgeable``, with no escalation, and so
+does an ``uncertified`` replay (ruling P27: votes without agreement, none of
+them certifying it). Every
 other outcome -- a failing grade, a replay one executor alone failed,
 ``timeout``, ``error``, ``ungradeable``, ``disputed`` -- sanctions nobody and
 certifies nothing; it is written in the grade document as it is. Grades never
@@ -36,7 +38,7 @@ from reliquary.corpus.audit_policy import after_confirmed_failure, replay_drawn
 from reliquary.corpus.replay_compare import allowed_mismatches
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
 from reliquary.infrastructure.corpus_record_store import MAX_REGRADE_GENERATIONS, RECORD_SCHEMA_V2
-from reliquary.validator.corpus_grade_remote import UNJUDGEABLE, replay_certified
+from reliquary.validator.corpus_grade_remote import UNCERTIFIED, UNJUDGEABLE, replay_certified
 
 logger = logging.getLogger(__name__)
 
@@ -446,8 +448,11 @@ class CorpusGrader:
         compared = int(result.get("observations_compared") or 0)
         return {"drawn": True, "draw": draw, "status": decision.status, "certified": certified,
                 "failed": ok and not certified and agreed, "unconfirmed": unconfirmed,
-                "unjudgeable": decision.status == UNJUDGEABLE and agreed,
-                "detail": result.get("detail") if decision.status == UNJUDGEABLE else None,
+                # Agreed box failures (P23), or no vote certifying it (P27).
+                "unjudgeable": (decision.status == UNJUDGEABLE and agreed)
+                               or decision.status == UNCERTIFIED,
+                "detail": (result.get("detail") if decision.status in (UNJUDGEABLE, UNCERTIFIED)
+                           else None),
                 "replay_diff_equal": result.get("replay_diff_equal"),
                 "observations_compared": compared,
                 "observations_mismatched": list(result.get("observations_mismatched") or []),
