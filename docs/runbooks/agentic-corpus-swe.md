@@ -142,6 +142,35 @@ On a box with:
 - reliquary + reliquary-swe + verifiers at the pins installed (`corpus
   grade-executor` refuses at start otherwise: `RuntimeError: reliquary-swe is
   installed at ...`);
+- **Docker storage on xfs** (ruling P20). `find` and `grep -r` list a
+  directory in the order its filesystem returns. xfs keeps the image layer's
+  insertion order, the same on every xfs host. ext4 hashes names with a seed
+  of its own, so every ext4 host lists them in a different order. A replay on
+  ext4 disagrees with an xfs miner on every `find ... | head`, and no
+  normalization can fix a cut list. Check:
+
+  ```bash
+  docker info --format '{{.Driver}} {{.DockerRootDir}} {{json .DriverStatus}}'
+  stat -f -c %T "$(docker info --format '{{.DockerRootDir}}')"   # must print xfs
+  # containerd image store (DriverStatus shows io.containerd.snapshotter.v1):
+  stat -f -c %T /var/lib/containerd                               # must print xfs too
+  ```
+
+  On ext4, `stat` prints `ext2/ext3`. `corpus grade-executor` refuses to start
+  unless all of these are xfs. It exits with code 1 and prints
+  `error: Docker stores images on ext2/ext3 (/var/lib/docker), ..., not xfs`.
+  To fix it, give Docker an xfs data root (`data-root` in
+  `/etc/docker/daemon.json`, on an xfs volume), then re-pull the images.
+  `--allow-non-xfs` skips the check. **It is for tests only.**
+- **PyPI reachable from the box during setup.** Before the network cut, the
+  replay box prepares the same thing the miner's harness prepares:
+  `pip install --user uv`, then `uv sync` of the bash harness program. That
+  way `/root/.local`, `/root/.cache/pip` and `uv` in `pip list` match the
+  miner's observations. If this step fails (PyPI or astral unreachable), the
+  item fails as an executor `error`. The control re-leases it to another
+  executor, and the miner is never charged for it. The uv version is
+  whatever is latest at that moment (verifiers does not pin it). The
+  comparison hides only the version on `pip list`'s `uv` row.
 
 register it once, from a machine with bucket credentials, then run it:
 
@@ -211,6 +240,17 @@ VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_USE_V2_MODEL_RUNNER=0 \
 - Before signing, the miner runs the validator's own trajectory parse and
   drops what it would refuse (`precheck_refused:<reason>` in the counts it
   prints at the end).
+- **Strongly advised: put Docker's storage on xfs**, as executors must (see
+  section 3 for how to check). Executors replay on xfs, and the replay
+  compares your recorded observations against theirs. On ext4 your boxes list
+  directories in an order no executor reproduces. Agents open most episodes
+  with `find /testbed ... | head -50`, which then mismatches, along with
+  every cut `grep -r ... | head`. Each mismatch spends part of the episode's
+  replay tolerance (5 observations, or 12 % on long episodes). In the B1
+  measurement, an honest episode on ext4 used all of it and was voided.
+- Your miner's log line `episode N of <hotkey>: accepted (reward R)` carries
+  the graded reward. verifiers' own `rollout done: ... reward=0.000` line is
+  printed before grading and always reads 0.
 
 ## 5. Payment and watching it
 
@@ -365,10 +405,15 @@ group `kill -- -$(cat ...pid)` needs later. The same holds for every
    sleep 35
    ssh -f -N -o ExitOnForwardFailure=yes -L 18100:127.0.0.1:8100 -p 20300 root@162.243.212.30
    ssh -f -N -o ExitOnForwardFailure=yes -R 18100:127.0.0.1:18100 root@5.161.244.56
-   [ -n "$TOKEN_A" ] && printf '%s\n' "$TOKEN_A" | ssh root@5.161.244.56 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary || exit 1; setsid nohup .venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:18100 --executor-id grade-a --concurrency 4 > /root/grade-a.log 2>&1 < /dev/null & echo $! > /root/grade-a.pid'
+   [ -n "$TOKEN_A" ] && printf '%s\n' "$TOKEN_A" | ssh root@5.161.244.56 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary || exit 1; setsid nohup .venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:18100 --executor-id grade-a --concurrency 4 --allow-non-xfs > /root/grade-a.log 2>&1 < /dev/null & echo $! > /root/grade-a.pid'
    [ -n "$TOKEN_B" ] && printf '%s\n' "$TOKEN_B" | ssh -p 20300 root@162.243.212.30 'read -r RELIQUARY_EXECUTOR_TOKEN; export RELIQUARY_EXECUTOR_TOKEN; cd /opt/reliquary || exit 1; setsid nohup /opt/vllm/venv/bin/python -m reliquary.cli.main corpus grade-executor --control-url http://127.0.0.1:8100 --executor-id grade-b --concurrency 2 > /opt/agentic-e2e/grade-b.log 2>&1 < /dev/null & echo $! > /opt/agentic-e2e/grade-b.pid'
    unset TOKEN_A TOKEN_B
    ```
+
+   sandbox-dev-01 stores Docker images on ext4, so `grade-a` runs with the test-only
+   `--allow-non-xfs` (ruling P20). Its replays then mismatch the miner's xfs
+   directory order on cut `find`/`grep -r` listings. grade-b, on the GPU box's xfs,
+   does not.
 
    Both logs quiet after 30 s (no traceback, no `refused by the control`).
 4. Mine (30 to 60 minutes; poll `$S/mine.log`):
