@@ -435,11 +435,34 @@ class RemoteGradeDispatcher(ExecutorLeases):
         setattr(work, kind, count)
         limit, status = (MAX_TIMEOUTS, "timeout") if kind == "timeouts" else (MAX_ERRORS, "error")
         if count >= limit:
+            if work.mode == "replay" and not self._certifying(work):
+                # Ruling P28: out of attempts and nothing certifies it (failed
+                # or box-failure votes, or none at all when every executor
+                # raised on it): void unpaid, never an unjudged paid outcome.
+                self._uncertified(work, f"{count} {kind}")
+                return
             logger.warning("grade item %d (%s): %d %s; resolved unjudged", work.id, work.mode,
                            count, kind)
             self._resolve(work, GradeDecision(status, None, ()))
         else:
             self._requeue(work)
+
+    @staticmethod
+    def _certifying(work: _Work) -> bool:
+        return any(r.get("status") == "ok" and replay_certified(r) for r in work.results.values())
+
+    def _uncertified(self, work: _Work, why: str) -> None:
+        """Ruling P27/P28: a replay item no vote certifies, resolved without an
+        agreement; its votes (and their providers) kept, nobody penalized."""
+        self.stats[UNCERTIFIED] += 1
+        voters = tuple(sorted(work.results))
+        logger.warning("grade item %d (replay, submission %s) uncertified after %s: no vote "
+                       "certifies it (%s); void unpaid, no sanction", work.id,
+                       work.item["submission_id"][:12], why,
+                       {e: decision_key(work.mode, r) for e, r in sorted(work.results.items())})
+        self._resolve(work, GradeDecision(
+            UNCERTIFIED, dict(work.results[voters[0]]) if voters else None, voters,
+            tuple(sorted({work.providers[e] for e in voters}))))
 
     def _settle(self, work: _Work) -> None:
         if work.future.done():
@@ -548,21 +571,10 @@ class RemoteGradeDispatcher(ExecutorLeases):
                     work.unserved += max(0.0, now - since)
                 work.swept_at = now
             if work.results and work.unserved >= self._dispute_seconds:
-                if work.mode == "replay" and not any(
-                        r.get("status") == "ok" and replay_certified(r)
-                        for r in work.results.values()):
+                if work.mode == "replay" and not self._certifying(work):
                     # Ruling P27: no vote certifies it. Nobody is sanctioned
                     # (no agreement), but it is not paid as a dispute either.
-                    self.stats[UNCERTIFIED] += 1
-                    voters = tuple(sorted(work.results))
-                    logger.warning(
-                        "grade item %d (replay, submission %s) uncertified: no vote certifies it "
-                        "and no next distinct-provider executor for %.0f s (%s); void unpaid, no "
-                        "sanction", work.id, work.item["submission_id"][:12], work.unserved,
-                        {e: decision_key(work.mode, r) for e, r in sorted(work.results.items())})
-                    self._resolve(work, GradeDecision(
-                        UNCERTIFIED, dict(work.results[voters[0]]), voters,
-                        tuple(sorted(set(work.providers.values())))))
+                    self._uncertified(work, f"{work.unserved:.0f} s without a next executor")
                     continue
                 # No distinct executor came for the next vote: nobody is judged.
                 self.stats[DISPUTED] += 1

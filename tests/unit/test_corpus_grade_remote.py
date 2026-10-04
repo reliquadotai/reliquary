@@ -191,14 +191,16 @@ async def test_a_quarantined_vote_on_a_leased_item_is_dropped_too():
     assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
 
 
-async def test_timeouts_go_to_other_executors_then_resolve_unjudged():
+@pytest.mark.parametrize("mode,status", [("grade", "timeout"), ("replay", "uncertified")])
+async def test_timeouts_go_to_other_executors_then_resolve_unjudged(mode, status):
+    # A replay out of attempts with no certifying vote is uncertified (P28).
     d = await _dispatcher(recheck=1.0)
-    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    decision = asyncio.ensure_future(d.decide(_item(mode)))
     await asyncio.sleep(0)
     _answer(d, "g0", TIMEOUT)
     assert d.claim("g0") is None
     _answer(d, "g1", TIMEOUT)
-    assert (await decision).status == "timeout"
+    assert (await decision).status == status
 
 
 async def test_three_errors_resolve_as_an_error():
@@ -226,17 +228,18 @@ async def test_an_expired_lease_strikes_and_three_strikes_quarantine():
     assert "g3" in d.quarantined and quarantined == ["g3"]
 
 
-async def test_an_item_whose_leases_keep_expiring_resolves_as_a_timeout():
+@pytest.mark.parametrize("mode,status", [("grade", "timeout"), ("replay", "uncertified")])
+async def test_an_item_whose_leases_keep_expiring_resolves_as_a_timeout(mode, status):
     clock = _Clock()
     d = await _dispatcher(recheck=1.0, clock=clock)
-    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    decision = asyncio.ensure_future(d.decide(_item(mode)))
     await asyncio.sleep(0)
     for eid in ("g0", "g1"):
         assert d.claim(eid) is not None
         clock.now += 30_000
         await d.sweep()
     got = await decision
-    assert got.status == "timeout" and got.result is None
+    assert got.status == status and got.result is None
 
 
 async def test_a_late_result_is_refused_and_counts_as_an_expiry():
@@ -1065,3 +1068,70 @@ async def test_three_providers_resolve_by_agreement(votes, status):
     assert got.status == status
     if status == "ok":
         assert not replay_certified(got.result) and got.providers == ("p0", "p2")
+
+
+# Ruling P28: a replay that runs out of attempts without a certifying vote is
+# uncertified (void unpaid), never an unjudged timeout/error (paid).
+
+async def _expire_twice(d, clock, eids=("g1", "g2")):
+    for eid in eids:
+        assert d.claim(eid) is not None
+        clock.now += 30_000
+        await d.sweep()
+
+
+async def test_a_failed_vote_then_two_expiries_is_uncertified():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    await _expire_twice(d, clock)
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "uncertified" and got.graded_by == ("g0",) and got.providers == ("p0",)
+    assert not d.quarantined
+
+
+async def test_a_box_failure_then_three_errors_is_uncertified():
+    d = await _dispatcher(recheck=1.0)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", BOX_LOST)
+    for eid in ("g1", "g2", "g3"):
+        _answer(d, eid, ERROR)
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "uncertified" and got.graded_by == ("g0",)
+    assert not d.quarantined
+
+
+async def test_three_errors_without_any_vote_leave_a_replay_uncertified():
+    # A trajectory whose replay raises a generic exception on every executor.
+    d = await _dispatcher(recheck=1.0)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    for eid in ("g0", "g1", "g2"):
+        _answer(d, eid, ERROR)
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "uncertified" and got.graded_by == () and got.result is None
+
+
+async def test_a_certified_vote_then_expiries_stays_an_unjudged_timeout():
+    # Kept as before: a drawn recheck whose certifying vote finds no second
+    # executor in time resolves "timeout" (unjudged: not certified, paid).
+    clock = _Clock()
+    d = await _dispatcher(recheck=0.0, clock=clock)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_OK)
+    await _expire_twice(d, clock)
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "timeout" and got.graded_by == ()
+
+
+async def test_grade_items_out_of_attempts_are_unchanged():
+    d = await _dispatcher(recheck=1.0)
+    decision = asyncio.ensure_future(d.decide(_item("grade")))
+    await asyncio.sleep(0)
+    for eid in ("g0", "g1", "g2"):
+        _answer(d, eid, ERROR)
+    assert (await asyncio.wait_for(decision, 5)).status == "error"

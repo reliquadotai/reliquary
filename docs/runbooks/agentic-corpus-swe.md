@@ -259,7 +259,8 @@ RELIQUARY_EXECUTOR_TOKEN=<token> reliquary corpus grade-executor --control-url h
   contradicts the majority's fact; a box failure (`box_lost`/`box_timeout`)
   on either side of a split penalizes nobody (ruling P26). The job status
   route's `grading.box_failure_votes` counts box failures per executor: a
-  host whose boxes keep dying where others' do not shows there. With fewer distinct providers connected, an item
+  host whose boxes keep dying where others' do not shows there. With fewer
+  distinct providers connected, an item
   holding a vote waits `RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS` (30 min) of
   no available executor. If one of its replay votes certifies it, it resolves
   `disputed`: nobody is sanctioned, nothing is certified, and it is paid
@@ -366,7 +367,12 @@ timeout, error, disputed, unjudgeable) gets the failing replay draw
 (`replay_fraction_failed`), and a `disputed` grade is always replayed
 (ruling P27). A failure before any recorded action or before
 the patch (provisioning, setup, PyPI, the Docker daemon) stays the
-executor's `error`/`timeout` and is re-leased.
+executor's `error`/`timeout` and is re-leased. After two lease expiries
+(or executor timeouts) or three executor errors an item stops being
+re-leased: a grade then resolves `timeout`/`error` (unjudged, paid); a
+replay resolves `uncertified` (voided unpaid as `replay_unjudgeable`, no
+sanction, ruling P28) unless one of its votes certifies it, in which case
+it stays an unjudged `timeout`/`error` (not certified, paid).
 
 Replay timing (ruling P25), from the task's own timeouts: provisioning and
 setup get the setup timeout plus 600 s (SWE-smith: 1500 s; missing it is the

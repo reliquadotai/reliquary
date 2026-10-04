@@ -1174,3 +1174,15 @@ def test_a_disputed_grade_is_always_replayed():
     assert [i["mode"] for i in dispatcher.items] == ["grade", "replay"]
     assert doc["replay"]["drawn"] is True and doc["replay"]["failed"] is True
     assert records.voided[SID]["reason"] == "replay_failed"
+
+
+def test_an_uncertified_replay_without_any_vote_voids_unpaid():
+    """Ruling P28: a replay that ran out of attempts with no vote at all (every
+    executor raised on it) is voided unpaid, nobody sanctioned."""
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(PASSED, GradeDecision("uncertified", None, ())),
+                             states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["status"] == "uncertified" and doc["replay_certified"] is False
+    assert records.voided[SID]["reason"] == "replay_unjudgeable" and voided == [SID]
+    assert records.voided[SID]["graded_by"] == [] and states.states == {}
