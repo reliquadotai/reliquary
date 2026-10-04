@@ -242,3 +242,17 @@ def test_reordering_is_only_within_a_run_of_path_lines():
     assert not _same("/t/a.py:1:x\n/t/b.py:2:y", "/t/b.py:2:y\n/t/a.py:1:z")
     assert not _same("/t/a.py:1:x\n/t/b.py:2:y", "/t/b.py:2:y")
     assert not _same("/t/a.py\n/t/b.py", "/t/b.py\n/t/a.py\n/t/c.py")
+
+
+def test_normalize_hides_only_the_uv_version_of_a_pip_list_line():
+    # verifiers b2e4e81 installs the latest uv (`pip install -U --user uv`), so a
+    # replay after a uv release lists another version than the miner's box did.
+    a = "truststore              0.8.0\nurllib3                 2.1.0\nuv                      0.12.23\nwheel                   0.41.2"
+    b = "truststore              0.8.0\nurllib3                 2.1.0\nuv                      0.13.1\nwheel                   0.41.2"
+    assert normalize(a) == normalize(b)
+    assert normalize("uv                      0.12.23") == "uv                      <uv version>"
+    for line in ("uvicorn                 0.30.1", "pytest                  8.3.4",
+                 "uv                      0.12.23 extra", "  uv                    0.12.23",
+                 "uv==0.12.23", "Version: 0.12.23", "uv 0.12.23 (x86_64-unknown-linux-gnu)x"):
+        assert normalize(line) == line, line
+    assert normalize("urllib3                 2.1.0") != normalize("urllib3                 2.2.0")

@@ -41,6 +41,9 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
                 r"|Linking (?:static )?target \S+"
                 r"|Generating \S+ with a custom command(?: \(wrapped by meson to [^)\n]*\))?)$"),
      r"[\1/\2] <ninja step>"),                                            # parallel build: order of steps
+    # verifiers' bash harness installs the latest uv in the box (unpinned), so a
+    # replay after a uv release lists another version: `pip list`'s uv row only.
+    (re.compile(r"(?m)^uv( {2,})\d+(?:\.\d+)+(?:(?:a|b|rc|\.post|\.dev)\d+)?$"), r"uv\1<uv version>"),
 )
 
 # A line `grep -r`/`find` prints: a path with a directory part, then nothing,
