@@ -289,3 +289,55 @@ def test_a_request_cancelled_while_queued_does_not_kill_the_worker():
 
     scores, later = asyncio.run(scenario())
     assert len(scores) == 2 and len(later[0]) == 1
+
+
+# -- I3: an episode request is retried on 503 with backoff, and fits the queue ----
+
+
+def test_a_64k_episode_request_fits_a_queue_a_2m_one_does_not():
+    from reliquary.validator.corpus_auditor import EPISODE_GPU_REQUEST_TOKENS
+
+    async def scenario():
+        limit = 16 * 131_072
+        batcher = GpuBatcher(lambda *a: ([], 0.0, 0.0), queue_tokens_limit=limit)
+        # Single-turn judges keep about 1.9M tokens queued.
+        held = [asyncio.ensure_future(batcher.submit([([1] * 95_000, 1, ["p"])], 32, 128))
+                for _ in range(20)]
+        await asyncio.sleep(0)
+        episode = [([1] * (EPISODE_GPU_REQUEST_TOKENS - 1), 64, ["p"], [(64, 1000)])]
+        accepted = asyncio.ensure_future(batcher.submit(episode, 32, 128))
+        await asyncio.sleep(0)
+        assert not accepted.done()                     # queued, not refused
+        with pytest.raises(GpuBusy):                   # what a 2M-token pass got
+            await batcher.submit([([1] * 2_000_000, 64, ["p"], [(64, 1000)])], 32, 128)
+        for job in held + [accepted]:
+            job.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_an_episode_request_refused_503_is_retried_with_backoff():
+    import httpx
+
+    answers = [httpx.Response(503), httpx.Response(503),
+               httpx.Response(200, json={"scores": [["ok", [[0, 0.0125, 0.01]]]],
+                                         "forward_seconds": 0.5, "verify_seconds": 0.1})]
+    bodies, sleeps = [], []
+
+    class _Client:
+        async def post(self, path, content, headers):
+            bodies.append(content)
+            return answers.pop(0)
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    scorer = GpuScorer("/nonexistent", chunk_tokens=32, topk=128, retry_seconds=1.0,
+                       max_retry_seconds=10.0, sleep=sleep)
+    scorer._http = lambda: _Client()
+    rows = [([1] * 200, 64, ["p"], [(64, 120), (130, 200)])]
+    scores, forward, _ = asyncio.run(scorer(rows))
+    assert scores == [("ok", (ChunkResult(0, 0.0125, 0.01),))] and forward == 0.5
+    assert sleeps == [1.0, 2.0] and scorer.retries == 2      # backoff, never a failure
+    # Every retry carries the trajectory's spans.
+    assert all(decode_request(b)[0] == rows for b in bodies)

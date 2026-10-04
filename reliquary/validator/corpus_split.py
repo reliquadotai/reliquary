@@ -8,7 +8,8 @@ checks before loading a model, then starts (``multiprocessing``, spawn):
 - ``judge-<n>``: one per group of ``RELIQUARY_CORPUS_SPLIT_JUDGES``
   (``corpus_judge_process.run_corpus_judges``);
 - ``front``: the miner routes and the jobs in no group
-  (``corpus_validator.run_corpus_validator`` with a ``FrontSplit``).
+  (``corpus_validator.run_corpus_validator`` with a ``FrontSplit``), episode
+  jobs always among them: their grader and grade routes live there.
 
 A child that exits is started again alone, after a backoff; the others never
 notice. SIGTERM/SIGINT stop every child. Design:
@@ -50,11 +51,17 @@ def judge_socket(run_dir: str | Path, index: int) -> Path:
     return Path(run_dir) / f"judge-{index}.sock"
 
 
-def plan_groups(value: str | None, jobs) -> list[list[str]]:
+def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
     """The job ids of each judge process. ``jobs`` is ``(task_id, job_id)``
     pairs; ``value`` names jobs by job id or task id, ``,`` inside a group and
     ``;`` between groups; ``*`` gives every job no group names its own process.
-    Unset or empty means ``*``."""
+    Unset or empty means ``*``.
+
+    ``front_only`` are the job ids the front must judge itself (episode jobs:
+    their grader, grade dispatcher and grade routes live in the front, judge
+    processes host none). ``*`` leaves them there; a group naming one is
+    refused."""
+    front_only = {str(j) for j in front_only}
     value = "*" if value is None or not value.strip() else value
     by_name: dict[str, str] = {}
     for task_id, job_id in jobs:
@@ -78,6 +85,10 @@ def plan_groups(value: str | None, jobs) -> list[list[str]]:
                 raise ValueError(f"{JUDGES_ENV} names {name!r}, which this validator does not serve "
                                  f"(it serves {sorted({str(j) for _, j in jobs})})")
             job_id = by_name[name]
+            if job_id in front_only:
+                raise ValueError(f"{JUDGES_ENV} names episode job {job_id!r}, but judge processes "
+                                 "host no grader: leave it out of every group (the front audits, "
+                                 "grades and settles it)")
             if job_id in placed:
                 raise ValueError(f"{JUDGES_ENV} puts job {job_id!r} in two groups; "
                                  "a job is judged in exactly one process")
@@ -85,7 +96,8 @@ def plan_groups(value: str | None, jobs) -> list[list[str]]:
             group.append(job_id)
         groups.append(group)
     if star:
-        groups += [[str(job_id)] for _, job_id in jobs if str(job_id) not in placed]
+        groups += [[str(job_id)] for _, job_id in jobs
+                   if str(job_id) not in placed and str(job_id) not in front_only]
     return groups
 
 
@@ -197,6 +209,9 @@ async def _gpu(spec: SplitSpec) -> None:
 def child_main(role: str, index: int, spec: SplitSpec) -> None:
     """The entry point of every child (spawned: a fresh interpreter)."""
     name = role if role != "judge" else f"judge-{index}"
+    # Verified drand rounds survive a child's restart (rounds never change).
+    os.environ.setdefault("RELIQUARY_CORPUS_DRAND_CACHE",
+                          str(Path(spec.run_dir) / f"drand-rounds-{name}.jsonl"))
     if role != "gpu":
         # Never a CUDA context outside the GPU process.
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -377,7 +392,9 @@ async def preflight(served) -> SimpleNamespace:
                            proof=toploc_proof(ACTIVE_PROTOCOL_PROFILE),
                            model_id=first.checkpoint_repo,
                            model_revision=first.checkpoint_revision,
-                           jobs=[(str(e.task_id), str(j.job_id)) for e, j in manifests])
+                           jobs=[(str(e.task_id), str(j.job_id)) for e, j in manifests],
+                           episode_jobs=[str(j.job_id) for _, j in manifests
+                                         if getattr(j, "episode", None) is not None])
 
 
 async def run_corpus_split(*, served, netuid: int, http_host: str, http_port: int,
@@ -392,7 +409,9 @@ async def run_corpus_split(*, served, netuid: int, http_host: str, http_port: in
         raise RuntimeError("remote audit executors are not served by the split validator; "
                            "unset RELIQUARY_CORPUS_REMOTE_AUDIT or RELIQUARY_CORPUS_SPLIT")
     checked = await preflight(served)
-    groups = plan_groups(os.environ.get(JUDGES_ENV), checked.jobs)
+    # Before any child starts: an episode job is judged and graded in the front.
+    groups = plan_groups(os.environ.get(JUDGES_ENV), checked.jobs,
+                         front_only=checked.episode_jobs)
     run_dir = os.environ.get(DIR_ENV) or DEFAULT_RUN_DIR
     spec = SplitSpec(served=list(served), directory=checked.directory,
                      fingerprint=checked.fingerprint, proof=checked.proof, run_dir=run_dir,

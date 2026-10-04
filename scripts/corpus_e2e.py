@@ -47,7 +47,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 MINIO_CONTAINER = "corpus-e2e-minio"
-MINIO_IMAGE = "quay.io/minio/minio:latest"
+# MinIO stopped publishing images in 2025 (quay.io/minio/minio and
+# minio/minio answer "unauthorized" / "does not exist" since); Chainguard's
+# build of the same server is pulled by digest. Override with
+# RELIQUARY_E2E_MINIO_IMAGE (an image whose entrypoint is the minio binary).
+MINIO_IMAGE = os.environ.get(
+    "RELIQUARY_E2E_MINIO_IMAGE",
+    "cgr.dev/chainguard/minio@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034")
 PRODUCTION_BUCKET = "reliquary"
 
 logger = logging.getLogger("corpus_e2e")
@@ -99,35 +105,57 @@ def _snapshot(repo: str, revision: str | None) -> Path:
 # Storage: MinIO and the conditional-PUT preflight
 # --------------------------------------------------------------------------
 
-def start_minio() -> None:
-    user, password = f"e2e{secrets.token_hex(6)}", secrets.token_hex(20)
-    subprocess.run(["docker", "rm", "-f", MINIO_CONTAINER], capture_output=True)
-    subprocess.run(
-        ["docker", "run", "-d", "--name", MINIO_CONTAINER,
-         "-e", f"MINIO_ROOT_USER={user}", "-e", f"MINIO_ROOT_PASSWORD={password}",
-         "-p", "127.0.0.1:9000:9000", MINIO_IMAGE, "server", "/data"],
-        check=True, capture_output=True,
-    )
-    os.environ.update({
-        "R2_ENDPOINT_URL": "http://127.0.0.1:9000",
-        "R2_ACCESS_KEY_ID": user,
-        "R2_SECRET_ACCESS_KEY": password,
-        "R2_REGION": "us-east-1",
-    })
+def minio_run_command(container: str = MINIO_CONTAINER, port: int = 9000) -> list[str]:
+    """`docker run` for MinIO. The credentials are named, never valued: docker
+    reads them from its own environment, so they never appear in argv."""
+    return ["docker", "run", "-d", "--name", container,
+            "-e", "MINIO_ROOT_USER", "-e", "MINIO_ROOT_PASSWORD",
+            # Inside the container's own filesystem: the image's /data volume
+            # makes MinIO fail its tmp renames ("Rename across devices").
+            "-p", f"127.0.0.1:{port}:9000", MINIO_IMAGE, "server", "/tmp/data"]
+
+
+def _wait_minio_live(port: int) -> None:
     import urllib.request
 
     deadline = time.time() + 60
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen("http://127.0.0.1:9000/minio/health/live", timeout=2):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/minio/health/live", timeout=2):
                 return
         except OSError:
             time.sleep(1)
     raise RuntimeError("MinIO did not come up within 60s")
 
 
-def stop_minio() -> None:
-    subprocess.run(["docker", "rm", "-f", MINIO_CONTAINER], capture_output=True)
+def start_minio(*, container: str = MINIO_CONTAINER, credentials_from_env: bool = False,
+                port: int = 9000) -> None:
+    """A throwaway MinIO named ``container`` on 127.0.0.1:``port``, any
+    container of that name replaced. With ``credentials_from_env`` it takes
+    R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY from the environment (the caller's
+    secrets, never written anywhere); otherwise it generates them and sets
+    them there. The endpoint and region are always forced to this MinIO."""
+    if credentials_from_env:
+        user, password = os.environ.get("R2_ACCESS_KEY_ID"), os.environ.get("R2_SECRET_ACCESS_KEY")
+        if not user or not password:
+            raise RuntimeError("credentials_from_env needs R2_ACCESS_KEY_ID and "
+                               "R2_SECRET_ACCESS_KEY in the environment")
+    else:
+        user, password = f"e2e{secrets.token_hex(6)}", secrets.token_hex(20)
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+    subprocess.run(minio_run_command(container, port), check=True, capture_output=True,
+                   env={**os.environ, "MINIO_ROOT_USER": user, "MINIO_ROOT_PASSWORD": password})
+    os.environ.update({
+        "R2_ENDPOINT_URL": f"http://127.0.0.1:{port}",
+        "R2_ACCESS_KEY_ID": user,
+        "R2_SECRET_ACCESS_KEY": password,
+        "R2_REGION": "us-east-1",
+    })
+    _wait_minio_live(port)
+
+
+def stop_minio(container: str = MINIO_CONTAINER) -> None:
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
 
 
 async def ensure_bucket() -> None:

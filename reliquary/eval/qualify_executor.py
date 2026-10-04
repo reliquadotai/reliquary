@@ -40,8 +40,9 @@ def qualify_lease(lease: dict, *, tokenizer, generator, score: Callable[[list], 
 
     renderer = ChatTemplatePromptRenderer(tokenizer, thinking=bool(lease["thinking"]))
     counts = spread(int(lease["completions"]), len(lease["prompts"]))
-    prompts = [(prompt_token_ids(tokenizer, renderer.initial_text(
-        SimpleNamespace(prompt=prompt["text"]))), n)
+    prompts = [(prompt_token_ids(tokenizer, renderer.initial_text(SimpleNamespace(
+        prompt=prompt["text"],
+        metadata={"system": prompt["system"]} if prompt.get("system") else {}))), n)
         for prompt, n in zip(lease["prompts"], counts) if n > 0]
     started = clock()
     if callable(getattr(generator, "generate_many", None)):

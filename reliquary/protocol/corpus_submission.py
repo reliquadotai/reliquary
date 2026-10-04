@@ -7,7 +7,7 @@ Named ``corpus`` rather than ``batch``: ``BatchSubmissionRequest`` in
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -30,6 +30,16 @@ MAX_COMPLETIONS_PER_SUBMISSION = 64
 # The prompt the miner conditioned on. Same ceiling as one completion's text:
 # a prompt longer than a full generation would not fit the context either.
 MAX_RENDERED_PROMPT_CHARS = MAX_COMPLETION_TEXT_CHARS
+
+# One agentic trajectory (spec §6): the job's max_total_tokens is at most
+# 60,000 over prompt and tokens (gate M3), so the tokens alone stay under it.
+# Duplicated from `corpus.job` the way the reject reasons are; the wire test
+# pins them equal.
+MAX_TRAJECTORY_TOKENS = 60000
+MAX_TRAJECTORY_TURNS = 64
+MAX_FINAL_DIFF_CHARS = 1_048_576
+# The binding writes token ids as 4 bytes.
+MAX_TOKEN_ID = 2**32 - 1
 
 
 class CorpusRejectReason(str, Enum):
@@ -82,6 +92,15 @@ class CorpusRejectReason(str, Enum):
     # free-tier check over `validator/rollout_patterns.py`, and the name is
     # pinned here so the check lands under it rather than inventing a second.
     DEGENERATE = "degenerate"
+    # Agentic trajectories (spec §5 N3): turn spans malformed or too many,
+    # too many turns too short to prove, a tool segment that is not the pinned
+    # renderer's, a tool call no observation answers, a stop its tokens deny.
+    BAD_TURNS = "bad_turns"
+    SHORT_TURNS = "short_turns"
+    BAD_OBSERVATION = "bad_observation"
+    UNANSWERED_TOOL_CALL = "unanswered_tool_call"
+    TRAJECTORY_TOO_LARGE = "trajectory_too_large"
+    BAD_STOP = "bad_stop"
     BAD_PROOF_SHAPE = "bad_proof_shape"
     PROOF_FAIL = "proof_fail"
 
@@ -104,13 +123,71 @@ class CorpusCompletion(BaseModel):
     @field_validator("tokens")
     @classmethod
     def _token_ids_are_not_negative(cls, value: list[int]) -> list[int]:
-        if any(token < 0 for token in value):
-            raise ValueError("token ids must not be negative")
+        if any(token < 0 or token > MAX_TOKEN_ID for token in value):
+            raise ValueError("token ids must fit in 32 bits and not be negative")
         return value
 
     @model_validator(mode="after")
     def _proofs_fit_the_completion(self) -> "CorpusCompletion":
         error = proof_volume_error(self.proofs, len(self.tokens))
+        if error:
+            raise ValueError(error)
+        return self
+
+
+class CorpusTurn(BaseModel):
+    """One assistant span of a trajectory, in `tokens` coordinates (the first
+    turn starts at 0, right after the initial prompt), and its proofs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: int = Field(ge=0)
+    end: int = Field(ge=1)
+    proofs: list[ProofB64] = Field(default_factory=list, max_length=MAX_TRAJECTORY_TOKENS)
+
+    @model_validator(mode="after")
+    def _a_turn_has_tokens_and_fitting_proofs(self) -> "CorpusTurn":
+        if self.end <= self.start:
+            raise ValueError(f"turn [{self.start}, {self.end}) is empty")
+        error = proof_volume_error(self.proofs, self.end - self.start)
+        if error:
+            raise ValueError(error)
+        return self
+
+
+class CorpusTrajectory(BaseModel):
+    """A multi-turn episode: every token after the initial prompt, the
+    assistant spans with their proofs, the diff the env collected, and why it
+    stopped. Nothing else the miner says about it is read."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tokens: list[int] = Field(min_length=1, max_length=MAX_TRAJECTORY_TOKENS)
+    turns: list[CorpusTurn] = Field(min_length=1, max_length=MAX_TRAJECTORY_TURNS)
+    final_diff: str = Field(max_length=MAX_FINAL_DIFF_CHARS)
+    stop: Literal["agent_completed", "max_turns", "context_length"]
+
+    @field_validator("tokens")
+    @classmethod
+    def _token_ids_are_not_negative(cls, value: list[int]) -> list[int]:
+        if any(token < 0 or token > MAX_TOKEN_ID for token in value):
+            raise ValueError("token ids must fit in 32 bits and not be negative")
+        return value
+
+    @model_validator(mode="after")
+    def _turns_and_proofs_are_bounded_by_the_tokens(self) -> "CorpusTrajectory":
+        # `turn.end` alone bounds nothing: without these, one turn could claim
+        # a 10**9-token span and carry tens of thousands of proofs.
+        previous_end = 0
+        for turn in self.turns:
+            if turn.start < previous_end:
+                raise ValueError("turns overlap or are out of order")
+            if turn.end > len(self.tokens):
+                raise ValueError("a turn ends past the trajectory's tokens")
+            previous_end = turn.end
+        error = proof_volume_error(
+            [proof for turn in self.turns for proof in turn.proofs], len(self.tokens)
+        )
         if error:
             raise ValueError(error)
         return self
@@ -128,9 +205,18 @@ class CorpusSubmissionRequest(BaseModel):
     # a miner may omit is a check a miner may switch off.
     rendered_prompt: str = Field(min_length=1, max_length=MAX_RENDERED_PROMPT_CHARS)
     completions: list[CorpusCompletion] = Field(
-        min_length=1, max_length=MAX_COMPLETIONS_PER_SUBMISSION
+        default_factory=list, max_length=MAX_COMPLETIONS_PER_SUBMISSION
     )
+    # An episode job's one trajectory, instead of completions.
+    trajectory: CorpusTrajectory | None = None
     signature: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _completions_or_a_trajectory(self) -> "CorpusSubmissionRequest":
+        if (self.trajectory is None) == (not self.completions):
+            # Neither: nothing to pay. Both: two works under one signature.
+            raise ValueError("a submission carries completions or one trajectory, exactly one")
+        return self
 
 
 class CorpusSubmissionResponse(BaseModel):

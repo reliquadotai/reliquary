@@ -303,6 +303,151 @@ def build_set(env: str, *, count: int, seed: int, out: str | Path,
     return card
 
 
+INTERACTION = "single_turn"
+
+
+def select_indices(low: int, high: int, *, sample: int | None,
+                   seed: int | None) -> list[int]:
+    """The rows of ``[low, high)`` a set takes: all of them in order, or a seeded
+    sample (``random.Random(seed).sample``, the presets' rule)."""
+    if sample is None:
+        return list(range(low, high))
+    if seed is None:
+        raise ValueError("a sampled set needs a seed")
+    if sample <= 0:
+        raise ValueError("sample must be positive")
+    if sample > high - low:
+        raise ValueError(f"the range holds {high - low} rows, fewer than {sample}")
+    return random.Random(seed).sample(range(low, high), sample)
+
+
+def range_overlaps(source: str, split: str, start: int, end: int) -> dict:
+    """Who else reads rows of ``[start, end)``: RL, the prod corpus jobs and the
+    held-out regions. Recorded on the set, never a refusal: measuring on rows
+    something trained on is a question an operator may mean to ask."""
+    used = UsedRange("eval", source, split, int(start), int(end) - int(start), "this set")
+
+    def listed(ranges) -> list[dict]:
+        return [{"what": r.what, "source": r.source, "split": r.split, "start": r.start,
+                 "end": r.end} for r in ranges if overlaps(used, r)]
+
+    rl, corpus = listed(rl_ranges()), listed(CORPUS_RANGES)
+    held = listed(held.region for held in HELD_OUT.values())
+    return {"rl": rl, "corpus": corpus, "held_out": held, "disjoint": not (rl or corpus)}
+
+
+def _catalog_spec(source: str):
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+    if source not in ENVIRONMENT_CATALOG or source not in ENVIRONMENT_SPECS:
+        raise ValueError(f"{source!r} is not a catalog environment")
+    spec = ENVIRONMENT_SPECS[source]
+    if getattr(spec, "interaction_mode", None) != INTERACTION:
+        raise ValueError(f"{source!r} is {spec.interaction_mode!r}: a set holds "
+                         "single-turn problems only")
+    return spec
+
+
+def _source_set_id(source: str, split: str, low: int, count: int,
+                   sample: int | None, seed: int | None) -> str:
+    base = f"{source.replace(':', '-')}-{split}-r{low}-n{count}"
+    return base if sample is None else f"{base}-k{sample}-s{seed}"
+
+
+def _write_set(directory: Path, prompts: list[dict], grading: list[dict], card: dict) -> dict:
+    prompts_body, grading_body = _jsonl(prompts), _jsonl(grading)
+    card = {**card, "prompts_sha256": hashlib.sha256(prompts_body).hexdigest(),
+            "grading_sha256": hashlib.sha256(grading_body).hexdigest()}
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "prompts.jsonl").write_bytes(prompts_body)
+    (directory / "grading.jsonl").write_bytes(grading_body)
+    (directory / "set.json").write_text(json.dumps(card, sort_keys=True, indent=1))
+    return card
+
+
+def _empty_directory(out: str | Path) -> Path:
+    directory = Path(out)
+    if directory.exists() and any(directory.iterdir()):
+        raise FileExistsError(f"{directory} is not empty: a set is frozen once")
+    return directory
+
+
+def build_source_set(source: str, *, out: str | Path, split: str | None = None,
+                     start: int = 0, count: int | None = None, sample: int | None = None,
+                     seed: int | None = None, set_id: str | None = None,
+                     taskset_args: dict | None = None,
+                     open_environment: Callable[[str, str], Any] = open_source,
+                     open_taskset: Callable[..., Any] | None = None,
+                     clock: Callable[[], float] = time.time) -> dict:
+    """Freeze rows ``[start, start + count)`` of any source, whole or sampled.
+
+    A catalog environment at any split, or ``verifiers:<taskset-id>``: an
+    installed single-turn Verifiers taskset under ``taskset_args``. The four
+    held-out presets keep `build_set`, whose sets the platform already holds."""
+    from reliquary.eval import verifiers_source
+
+    if start < 0 or (count is not None and count <= 0):
+        raise ValueError("start must be >= 0 and count positive")
+    if verifiers_source.is_verifiers_source(source):
+        if split is not None:
+            raise ValueError("a Verifiers source has no split: its taskset args choose the rows")
+        return verifiers_source.build_set(
+            source, out=out, start=start, count=count, sample=sample, seed=seed,
+            set_id=set_id, taskset_args=dict(taskset_args or {}),
+            open_taskset=open_taskset or verifiers_source.open_taskset, clock=clock)
+    if taskset_args:
+        raise ValueError("taskset args belong to a Verifiers source")
+    from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+    _catalog_spec(source)
+    split = split or RL_SPLIT
+    directory = _empty_directory(out)
+    environment = open_environment(source, split)
+    length = len(environment)
+    high = length if count is None else start + count
+    if high > length:
+        raise ValueError(f"[{start}, {high}) runs past {source!r}:{split} ({length} rows)")
+    if start >= high:
+        raise ValueError(f"{source!r}:{split} holds no row from {start}")
+    indices = select_indices(start, high, sample=sample, seed=seed)
+    set_id = validated_set_id(set_id or _source_set_id(source, split, start, high - start,
+                                                       sample, seed))
+    prompts, grading = [], []
+    for ordinal, index in enumerate(indices):
+        problem = environment.get_problem(index)
+        prompt = problem.get("prompt") if isinstance(problem, dict) else None
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError(f"{source!r} row {index} has no prompt")
+        problem_id = f"{set_id}-{ordinal:06d}"
+        prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
+                        "interaction": INTERACTION,
+                        "messages": [{"role": "user", "content": prompt}]})
+        grading.append({"problem_id": problem_id, "source": source, "split": split,
+                        "source_index": index, "prompt_sha256": prompt_sha256(prompt)})
+    overlap = range_overlaps(source, split, start, high)
+    overlap["note"] = (None if overlap["disjoint"] else
+                       "rows of this set were eligible for training (see rl and corpus): "
+                       "scores of models Reliquary trained on them may be inflated")
+    profile = ENVIRONMENT_CATALOG[source]
+    card = {
+        "schema": SET_SCHEMA, "set_id": set_id, "env": source, "source": source,
+        "source_kind": "catalog", "interaction": INTERACTION, "split": split,
+        "index_range": [start, high], "source_length": length, "count": len(indices),
+        "seed": seed, "selection": {"start": start, "count": count, "sample": sample,
+                                    "seed": seed},
+        "order": ("the range in order" if sample is None else
+                  "random.Random(seed).sample(index_range, sample); an order of N "
+                  "problems takes the first N"),
+        "created_at": clock(),
+        "prompt_template_id": getattr(profile.prompt_template, "template_id", None),
+        "default_max_new_tokens": profile.max_new_tokens,
+        "environment_manifest_sha256": getattr(profile, "environment_manifest_sha256", None),
+        "disjointness": overlap,
+    }
+    return _write_set(directory, prompts, grading, card)
+
+
 __all__ = [
     "CORPUS_RANGES",
     "HELD_OUT",
@@ -314,6 +459,9 @@ __all__ = [
     "SET_SCHEMA",
     "UsedRange",
     "build_set",
+    "build_source_set",
+    "range_overlaps",
+    "select_indices",
     "open_source",
     "overlaps",
     "prompt_sha256",

@@ -9,7 +9,7 @@ alive. Settlement is two-phase so a crash can delay a payment, never repeat it.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 import logging
 import os
 import time
@@ -71,7 +71,12 @@ class CorpusSettler:
                  stall_seconds: float = 3 * RL_WINDOW_SECONDS,
                  advance_every_seconds: float = RL_WINDOW_SECONDS, clock=time.time,
                  on_settled=None, full_list_every_seconds: float | None = None,
-                 executor=None) -> None:
+                 executor=None,
+                 ready: Callable[[list[str]], Awaitable[set[str]]] | None = None) -> None:
+        # ``ready(ids)`` answers which of ``ids`` may be paid now; an episode
+        # job's grader answers those already graded, so a replay that voids a
+        # submission lands before its payment. None pays every verdict as before.
+        self._ready = ready
         # Whose threads build the settled sets (the judges', so never the route's).
         self._executor = executor
         self._task_id = task_id
@@ -235,6 +240,9 @@ class CorpusSettler:
         # 300k+ ids on a long job: built off the serving loop.
         settled = await self._off(set, state["settled"])
         new_ids = await self._verdict_ids(settled)
+        if self._ready is not None and new_ids:
+            payable = await self._ready(new_ids)
+            new_ids = [sid for sid in new_ids if sid in payable]
         window = choose_window(last_window=state["last_window"], other_max=other_max,
                                other_max_seen_at=state["other_max_seen_at"], now=now,
                                stall_seconds=self._stall, last_advanced_at=state["advanced_at"],
@@ -333,20 +341,23 @@ class R2Archives:
                 best = max(best or 0, window)
         return best
 
-    async def write(self, task_id: str, window: int, data: dict) -> None:
+    def refuse_unserved(self, task_id: str) -> None:
+        """The corpus validator runs under its own task id(s), so it refuses to
+        write under any task RELIQUARY_TASK_ID (or its hot set) does not name.
+        Unset is refused as before, never read as the legacy task."""
         import os
-
-        from reliquary.infrastructure import storage
 
         from reliquary.shared.task_id import parse_task_ids
 
-        # The corpus validator runs under its own task id(s), so refuse to
-        # write under any task RELIQUARY_TASK_ID does not name.
-        # Unset is refused as before, never read as the legacy task.
         served = os.getenv("RELIQUARY_TASK_ID")
         hot = set(self._served()) if self._served is not None else set()
         if not served or (task_id not in parse_task_ids(served) and task_id not in hot):
             raise RuntimeError(f"RELIQUARY_TASK_ID does not name {task_id!r}; refusing to archive")
+
+    async def write(self, task_id: str, window: int, data: dict) -> None:
+        from reliquary.infrastructure import storage
+
+        self.refuse_unserved(task_id)
         await storage.upload_window_dataset(window, data, task_id=task_id)
         if self._max is not None:
             # Seen at once by the other jobs' settlers, without a listing.

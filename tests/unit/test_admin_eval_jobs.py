@@ -98,6 +98,7 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
         return client.request(method, path, content=data, headers=headers)
 
     call.registry, call.bucket, call.records, call.root = registry, fake, records, tmp_path
+    call.app, call.client = app, client
     call.facts = facts
     yield call
     client.__exit__(None, None, None)

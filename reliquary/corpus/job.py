@@ -58,10 +58,24 @@ _JOB_FIELDS = (
 # manifest that predates it stores and hashes byte-identically. A binary that
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
-_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit")
+_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode")
 # The one value of `submit`: submissions go to the job's own scoped route
 # (order jobs, on the order control); absent, to the legacy `/corpus/submit`.
 SUBMIT_SCOPED = "scoped"
+
+# An agentic (multi-turn) job: what one episode is and how it is bounded
+# (spec §6). Gate M3 measured 60,000 tokens of prompt + trajectory as the most
+# one 80 GB audit GPU prefills in one pass.
+MAX_EPISODE_TOTAL_TOKENS = 60000
+MAX_EPISODE_TURNS = 64
+EPISODE_STOPS = ("agent_completed", "max_turns", "context_length")
+EPISODE_ENV_PACKAGES = frozenset({"reliquary-swe"})
+EPISODE_HARNESSES = frozenset({"bash"})
+_EPISODE_FIELDS = ("env", "harness", "renderer", "verifiers", "max_turns",
+                   "max_tokens_per_turn", "max_total_tokens", "replay_fraction_failed")
+_EPISODE_ENV_FIELDS = ("package", "version", "split", "num_images")
+_COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 
 
 class JobError(ValueError):
@@ -97,6 +111,42 @@ class Filter:
 
 
 @dataclass(frozen=True, slots=True)
+class EpisodeEnv:
+    """The environment package an episode runs in, pinned by commit."""
+
+    package: str
+    version: str
+    split: str
+    num_images: int
+
+    def to_contract(self) -> dict[str, Any]:
+        return {"package": self.package, "version": self.version, "split": self.split,
+                "num_images": self.num_images}
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeSpec:
+    """One agentic episode: the env, the harness and renderer that drive it,
+    and its bounds. Only multi-turn jobs carry it."""
+
+    env: EpisodeEnv
+    harness: str
+    renderer: str
+    verifiers: str
+    max_turns: int
+    max_tokens_per_turn: int
+    max_total_tokens: int
+    replay_fraction_failed: float
+
+    def to_contract(self) -> dict[str, Any]:
+        return {"env": self.env.to_contract(), "harness": self.harness,
+                "renderer": self.renderer, "verifiers": self.verifiers,
+                "max_turns": self.max_turns, "max_tokens_per_turn": self.max_tokens_per_turn,
+                "max_total_tokens": self.max_total_tokens,
+                "replay_fraction_failed": self.replay_fraction_failed}
+
+
+@dataclass(frozen=True, slots=True)
 class JobSpec:
     job_id: str
     checkpoint_repo: str
@@ -119,6 +169,8 @@ class JobSpec:
     seed: int | None = None
     # "scoped" (order jobs only): miners submit on /corpus/jobs/{job_id}/submit.
     submit: str | None = None
+    # Multi-turn agentic jobs only (spec §6); absent on every other job.
+    episode: EpisodeSpec | None = None
 
     @property
     def prompt_end(self) -> int:
@@ -171,6 +223,7 @@ class JobSpec:
             **({"prompt_start": self.prompt_start} if self.prompt_start else {}),
             **({"seed": self.seed} if self.seed is not None else {}),
             **({"submit": self.submit} if self.submit is not None else {}),
+            **({"episode": self.episode.to_contract()} if self.episode is not None else {}),
         }
 
 
@@ -271,6 +324,73 @@ def _parse_filter(raw: Any) -> Filter | None:
     )
 
 
+def _fields(raw: Any, allowed: tuple[str, ...], label: str) -> Mapping[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise JobError(f"{label} must be an object")
+    unknown = set(raw) - set(allowed)
+    if unknown:
+        raise JobError(f"{label} has unknown fields: {sorted(unknown)}")
+    missing = [f for f in allowed if f not in raw]
+    if missing:
+        raise JobError(f"{label} is missing: {', '.join(missing)}")
+    return raw
+
+
+def _bounded_int(raw: Mapping[str, Any], field: str, low: int, high: int, label: str) -> int:
+    value = raw[field]
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise JobError(f"{label}.{field} must be a whole number in [{low}, {high}], got {value!r}")
+    return value
+
+
+def _parse_episode(raw: Any) -> EpisodeSpec:
+    raw = _fields(raw, _EPISODE_FIELDS, "episode")
+    env = _fields(raw["env"], _EPISODE_ENV_FIELDS, "episode.env")
+    if env["package"] not in EPISODE_ENV_PACKAGES:
+        raise JobError(f"episode.env.package must be one of {sorted(EPISODE_ENV_PACKAGES)}")
+    if not isinstance(env["version"], str) or not _COMMIT_RE.match(env["version"]):
+        raise JobError("episode.env.version must be the environment repository's 40-hex commit")
+    if env["split"] != "train":
+        raise JobError(f"episode.env.split must be 'train', got {env['split']!r}")
+    if raw["harness"] not in EPISODE_HARNESSES:
+        raise JobError(f"episode.harness must be one of {sorted(EPISODE_HARNESSES)}")
+    if not isinstance(raw["renderer"], str) or not _RENDERER_RE.match(raw["renderer"]):
+        raise JobError(f"episode.renderer must read renderers:<name>@<version>, got {raw['renderer']!r}")
+    if not isinstance(raw["verifiers"], str) or not _COMMIT_RE.match(raw["verifiers"]):
+        raise JobError("episode.verifiers must be a 40-hex commit")
+    max_total = _bounded_int(raw, "max_total_tokens", 1, MAX_EPISODE_TOTAL_TOKENS, "episode")
+    fraction = raw["replay_fraction_failed"]
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0.0 <= fraction <= 1.0:
+        raise JobError(f"episode.replay_fraction_failed must be in [0, 1], got {fraction!r}")
+    episode = EpisodeSpec(
+        env=EpisodeEnv(package=env["package"], version=env["version"], split=env["split"],
+                       num_images=_bounded_int(env, "num_images", 1, 1000, "episode.env")),
+        harness=raw["harness"], renderer=raw["renderer"], verifiers=raw["verifiers"],
+        max_turns=_bounded_int(raw, "max_turns", 1, MAX_EPISODE_TURNS, "episode"),
+        max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1, max_total, "episode"),
+        max_total_tokens=max_total,
+        replay_fraction_failed=float(fraction),
+    )
+    return episode
+
+
+def _check_episode_job(job: JobSpec) -> None:
+    """The rules that bind the rest of a manifest once it carries `episode`."""
+    episode = job.episode
+    if job.sampling.n != 1:
+        raise JobError("an episode job submits one trajectory per slot: sampling.n must be 1")
+    if job.slots_per_prompt < 2:
+        raise JobError("an episode job needs slots_per_prompt >= 2 (spec §6)")
+    if job.filter is not None:
+        raise JobError("an episode job is graded by its grade executors, not by a filter")
+    if job.prompt_order != PROMPT_ORDER_FREE:
+        raise JobError("an episode job runs episodes concurrently: prompt_order must be 'free'")
+    if job.sampling.max_new_tokens != episode.max_tokens_per_turn:
+        raise JobError("sampling.max_new_tokens must equal episode.max_tokens_per_turn")
+    if job.renderer_id != episode.renderer:
+        raise JobError("renderer_id must equal episode.renderer")
+
+
 def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     """Read one manifest, or refuse it naming exactly what is wrong."""
     if not isinstance(raw, Mapping):
@@ -304,7 +424,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     ):
         raise JobError(f"deadline_round must be a non-negative round or null, got {deadline_round!r}")
 
-    return JobSpec(
+    job = JobSpec(
         job_id=job_id,
         checkpoint_repo=_text(raw, "checkpoint_repo"),
         checkpoint_revision=_text(raw, "checkpoint_revision"),
@@ -323,4 +443,8 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
         submit=_submit(raw),
+        episode=_parse_episode(raw["episode"]) if "episode" in raw else None,
     )
+    if job.episode is not None:
+        _check_episode_job(job)
+    return job

@@ -10,6 +10,7 @@ from reliquary.miner.vllm_hidden_capture import (
     attribute_rows,
     capture_hidden_states,
     completion_rows,
+    turn_rows,
 )
 
 
@@ -99,3 +100,55 @@ def test_pop_returns_and_forgets_the_request(monkeypatch):
             capture.pop("0")
         # The other request is untouched by popping the first.
         assert capture.for_request("1").flatten().tolist() == [3.0]
+
+
+def test_turn_rows_take_the_last_rows_when_the_prompt_was_cached():
+    # 40-token prompt, 37 served from cache: 3 prompt rows + 5 completion tokens
+    # -> 3 + (5 - 1) = 7 rows; the completion's rows start at the last prompt row.
+    rows = torch.arange(7).float().unsqueeze(1)
+    assert turn_rows(rows, 5, prompt_rows=3).flatten().tolist() == [2, 3, 4, 5, 6]
+
+
+def test_turn_rows_with_only_the_last_prompt_token_recomputed():
+    rows = torch.arange(5).float().unsqueeze(1)     # 1 prompt row + 4 decode rows
+    assert turn_rows(rows, 5, prompt_rows=1).flatten().tolist() == [0, 1, 2, 3, 4]
+
+
+def test_turn_rows_drop_one_surplus_async_row():
+    rows = torch.arange(8).float().unsqueeze(1)     # 7 expected + 1 extra step
+    assert turn_rows(rows, 5, prompt_rows=3).flatten().tolist() == [2, 3, 4, 5, 6]
+
+
+def test_turn_rows_refuse_too_few_rows():
+    with pytest.raises(ValueError, match="rows"):
+        turn_rows(torch.zeros(4, 1), 5, prompt_rows=1)
+
+
+def test_turn_rows_refuse_more_than_one_surplus_row():
+    # Preemption recomputes a request: the rows no longer line up with tokens.
+    with pytest.raises(ValueError, match="recomputed"):
+        turn_rows(torch.zeros(10, 1), 5, prompt_rows=3)
+
+
+def test_turn_rows_with_prompt_rows_from_the_cache_count():
+    prompt_len, cached, completion_len = 40, 37, 5
+    rows = torch.arange((prompt_len - cached) + completion_len - 1).float().unsqueeze(1)
+    got = turn_rows(rows, completion_len, prompt_rows=prompt_len - cached)
+    assert got.flatten().tolist() == [2, 3, 4, 5, 6]
+
+
+@pytest.mark.parametrize("prompt_rows", [0, -1, None, 2.0, True])
+def test_turn_rows_require_at_least_one_scheduled_prompt_row(prompt_rows):
+    with pytest.raises(ValueError, match="prompt_rows"):
+        turn_rows(torch.arange(6).float().unsqueeze(1), 5, prompt_rows=prompt_rows)
+
+
+def test_turn_rows_keep_the_first_real_row_when_an_async_row_trails():
+    # 1 prompt row + 4 decode rows + 1 async surplus: the surplus is the one dropped.
+    rows = torch.arange(6).float().unsqueeze(1)
+    assert turn_rows(rows, 5, prompt_rows=1).flatten().tolist() == [0, 1, 2, 3, 4]
+
+
+def test_turn_rows_need_prompt_rows():
+    with pytest.raises(TypeError):
+        turn_rows(torch.zeros(5, 1), 5)

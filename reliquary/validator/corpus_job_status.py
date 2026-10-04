@@ -119,7 +119,8 @@ async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
     return {
         "submissions": len(submissions), "verdicts": len(verdicts), "unaudited": unaudited,
         "settled": len(settled), "unsettled": unsettled,
-        "pending_window": pending["window"] if pending else None,
+        "pending_window": (pending.get("window", pending.get("work_period"))
+                           if pending else None),
         "last_window": state.get("last_window"),
         "drained": unaudited == 0 and unsettled == 0 and pending is None,
     }

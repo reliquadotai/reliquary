@@ -675,6 +675,29 @@ _SPEC_VALUES = (
         external_artifact_resource="reliquary_dapo_math/artifact.json",
     ),
     EnvironmentSpec(
+        # Science problems whose reference is one number, graded by the
+        # package on a binary lattice: the last boxed number within 2% of the
+        # reference, its unit read past. `boxed` switches on the same integrity
+        # check as the maths sibling. The corpus is fetched from the Hub at a
+        # pinned revision and checked against its digest on first use.
+        name="reliquary_science_v1",
+        factory_path="reliquary_science:ScienceEnvironment",
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="boxed",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/boxed-answer/v1",
+        environment_manifest_sha256=(
+            "eca7e0cc921202d4eafc640a35388328"
+            "21839ed912b76f71fe7fe6112f291473"
+        ),
+        external_distribution="reliquary-science",
+        external_artifact_resource="reliquary_science/artifact.json",
+    ),
+    EnvironmentSpec(
         # Constraints checked by deterministic verifiers against the whole
         # completion. Binary — every constraint or nothing — so the package
         # grades and the reward is bounded. `text` because there is no answer

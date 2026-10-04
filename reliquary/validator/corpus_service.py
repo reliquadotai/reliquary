@@ -29,7 +29,9 @@ import re
 import time
 from typing import Any, NamedTuple, Protocol
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
 from reliquary.corpus.admission import (
     Verdict,
@@ -50,12 +52,15 @@ from reliquary.infrastructure.corpus_job_store import (
     CorpusStoreConflict,
 )
 from reliquary.protocol.corpus_submission import (
+    MAX_RENDERED_PROMPT_CHARS,
     CorpusRejectReason,
     CorpusSkipRequest,
     CorpusSkipResponse,
     CorpusSubmissionRequest,
     CorpusSubmissionResponse,
 )
+from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
+from reliquary.validator.agentic_intake import IntakeFacts
 from reliquary.validator.corpus_text import (
     Renderer,
     check_prompt_fidelity,
@@ -81,6 +86,12 @@ SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
 # The record's own schema tag, so a reader of the bucket can tell what shape
 # to expect before it parses the rest of the document.
 RECORD_SCHEMA = "reliquary/corpus-submission-record/v1"
+
+# Rulings P9/P10: a corpus submission body is refused past a cap, before it is
+# parsed; the cap is the job's `worst_case_body`, never below this. A 60k-token
+# trajectory is < 1 MB of ids, ~0.7 MB of proofs, a 1 MiB rendered prompt and a
+# diff: about 3x headroom for an episode job.
+MIN_SUBMIT_BODY_BYTES = 8 * 1024 * 1024
 # Mirrors `DEFAULT_WRITE_ATTEMPTS` below: a handful of rounds against a
 # transient bucket fault, not a queue a miner's request should block behind.
 RECORD_WRITE_ATTEMPTS = 3
@@ -244,8 +255,14 @@ class SingleTurnPromptJob:
         # The row's identity here is its index: fidelity compares the prompt
         # text, and carrying the environment's own id would only add a way for
         # a source to hand back something `EpisodeTask` refuses.
+        # An eval set's row may open with a system turn; only an eval set's,
+        # so no catalog row can start rendering differently.
+        from reliquary.eval.prompt_source import is_eval_source
+
+        system = problem.get("system") if is_eval_source(self._job.prompt_source) else None
         return EpisodeTask(
-            id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=()
+            id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=(),
+            metadata={"system": system} if isinstance(system, str) and system else {},
         )
 
 
@@ -273,8 +290,12 @@ class ChatTemplatePromptRenderer:
         tokenizer = self._tokenizer() if callable(self._tokenizer) and not hasattr(
             self._tokenizer, "apply_chat_template"
         ) else self._tokenizer
+        system = (getattr(task, "metadata", None) or {}).get("system")
+        messages = [{"role": "user", "content": task.prompt}]
+        if system:
+            messages.insert(0, {"role": "system", "content": system})
         return tokenizer.apply_chat_template(
-            [{"role": "user", "content": task.prompt}],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=self._thinking,
@@ -292,6 +313,69 @@ class SingleTurnPromptRenderer:
     @staticmethod
     def initial_text(task: EpisodeTask) -> str:
         return task.prompt
+
+
+class AgenticSourceSpec:
+    """What `resolve_prompt_source` returns for the agentic contract
+    environment: the job's `episode`, buildable into its SWE-smith rows."""
+
+    interaction_mode = "agentic"
+
+    def __init__(self, episode: Any) -> None:
+        self.episode = episode
+
+    def create(self):
+        from reliquary.environment import agentic_swe
+
+        return agentic_swe.load_swe_source(self.episode.env.num_images)
+
+
+class AgenticPromptJob:
+    """The rows of an episode job, bounded to the ones it owns."""
+
+    __slots__ = ("_job", "_source")
+
+    def __init__(self, job: JobSpec, source: Any) -> None:
+        self._job = job
+        self._source = source
+
+    @property
+    def source(self):
+        return self._source
+
+    def task_for(self, prompt_index: int) -> EpisodeTask:
+        return self._source.task_for(_owned_position(self._job, prompt_index))
+
+
+class EpisodePromptRenderer:
+    """An episode job's prompt is checked as token ids by its episode intake
+    (`validator/agentic_intake.py`), never by the text fidelity check."""
+
+    @staticmethod
+    def initial_text(task: EpisodeTask) -> str:
+        raise CorpusPromptSourceError(
+            "an episode job's prompt is checked by its episode intake, not rendered as text")
+
+
+def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
+    from reliquary.environment import agentic_swe
+    from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
+
+    if episode is None:
+        raise CorpusPromptSourceError(
+            f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "
+            "must declare `episode`")
+    if prompt_source != AGENTIC_SWE_ENVIRONMENT:
+        raise CorpusPromptSourceError(
+            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r}, "
+            f"not {prompt_source!r}")
+    if renderer_id is not None and renderer_id != episode.renderer:
+        raise CorpusPromptSourceError(
+            f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
+    refusal = agentic_swe.episode_support_refusal(episode, need_verifiers=False)
+    if refusal:
+        raise CorpusPromptSourceError(refusal)
+    return AgenticSourceSpec(episode)
 
 
 def _owned_position(job: JobSpec, prompt_index: int) -> int:
@@ -353,6 +437,7 @@ def resolve_prompt_source(
     environments: Mapping[str, Any] | None = None,
     renderer_id: str | None = None,
     profile: Any | None = None,
+    episode: Any | None = None,
 ) -> Any:
     """The environment spec a prompt source names, or a named refusal.
 
@@ -372,7 +457,10 @@ def resolve_prompt_source(
     miner was asked cannot be left to agree by construction.
     """
     from reliquary.eval.prompt_source import EvalSetSpec, is_eval_source
+    from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
+    if prompt_source == AGENTIC_SWE_ENVIRONMENT or episode is not None:
+        return _resolve_agentic(prompt_source, renderer_id, episode)
     if is_eval_source(prompt_source):
         # An eval set's rows are already rendered by its catalog template; only
         # the model's own chat template wraps them.
@@ -446,7 +534,10 @@ def renderer_for_job(
         environments=environments,
         renderer_id=job.renderer_id,
         profile=profile,
+        episode=job.episode,
     )
+    if getattr(spec, "interaction_mode", None) == "agentic":
+        return EpisodePromptRenderer()
     if getattr(spec, "interaction_mode", None) == "episode":
         return renderer_for(job.renderer_id, encode)
     if job.renderer_id in CHAT_TEMPLATE_RENDERERS:
@@ -466,7 +557,7 @@ def prompt_job_for_spec(
     *,
     environments: Mapping[str, Any] | None = None,
     profile: Any | None = None,
-) -> EnvironmentPromptJob | SingleTurnPromptJob:
+) -> EnvironmentPromptJob | SingleTurnPromptJob | AgenticPromptJob:
     """Resolve a job's prompt source to the rows a fidelity check needs.
 
     Builds the environment, which for a real source reads a dataset — so
@@ -477,6 +568,7 @@ def prompt_job_for_spec(
         environments=environments,
         renderer_id=job.renderer_id,
         profile=profile,
+        episode=job.episode,
     )
     try:
         environment = spec.create()
@@ -498,6 +590,8 @@ def prompt_job_for_spec(
                if job.prompt_start else "")
             + f" but {job.prompt_source!r} has {rows}"
         )
+    if getattr(spec, "interaction_mode", None) == "agentic":
+        return AgenticPromptJob(job, environment)
     if getattr(spec, "interaction_mode", None) == "episode":
         return EnvironmentPromptJob(job, environment)
     return SingleTurnPromptJob(job, environment)
@@ -1200,6 +1294,63 @@ def _skip_refused(verdict: Verdict) -> CorpusSkipResponse:
     )
 
 
+def worst_case_body(job: JobSpec) -> int:
+    """The largest honest submission body for ``job``, never below
+    ``MIN_SUBMIT_BODY_BYTES`` (ruling P10). A single-turn job's is its n
+    completions at about 24 JSON bytes a token, plus the rendered prompt and
+    slack; an episode job's trajectory is bounded by the minimum."""
+    if job.episode is not None:
+        return MIN_SUBMIT_BODY_BYTES
+    sampling = job.sampling
+    return max(MIN_SUBMIT_BODY_BYTES,
+               sampling.n * sampling.max_new_tokens * 24 + MAX_RENDERED_PROMPT_CHARS + 64 * 1024)
+
+
+def _capped_route(cap_for: Callable[[Request], int]) -> type[APIRoute]:
+    """A route class whose ``.../submit`` routes refuse a body over
+    ``cap_for(request)`` (413) before FastAPI parses it: by the declared
+    length, and by counting a chunked body as it streams."""
+
+    class CappedSubmitRoute(APIRoute):
+        def get_route_handler(self):
+            handler = super().get_route_handler()
+            if not self.path.endswith("/submit"):
+                return handler
+
+            async def capped(request: Request) -> Response:
+                cap = cap_for(request)
+                declared = request.headers.get("content-length")
+                if declared is not None and declared.isdigit() and int(declared) > cap:
+                    return _body_too_large()
+                chunks: list[bytes] = []
+                received = 0
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > cap:
+                        return _body_too_large()
+                    chunks.append(chunk)
+                # Replay the chunks as received, held once; an empty final
+                # message ends the body.
+                pending = iter(chunks)
+
+                async def feed() -> dict:
+                    chunk = next(pending, None)
+                    if chunk is None:
+                        return {"type": "http.request", "body": b"", "more_body": False}
+                    return {"type": "http.request", "body": chunk, "more_body": True}
+
+                return await handler(Request(request.scope, feed))
+
+            return capped
+
+    return CappedSubmitRoute
+
+
+def _body_too_large() -> JSONResponse:
+    return JSONResponse(status_code=413, content={"detail": "corpus_body_too_large"},
+                        headers={"Connection": "close"})
+
+
 def build_corpus_router(
     *,
     job_id: str,
@@ -1221,6 +1372,8 @@ def build_corpus_router(
     segment_max: int = SEGMENT_MAX,
     seen_index: SeenIndex | None = None,
     ledger_batch_max: int = LEDGER_BATCH_MAX,
+    episode_intake=None,
+    job: JobSpec | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1235,9 +1388,15 @@ def build_corpus_router(
     subnet, else ``corpus_registration.NOT_REGISTERED`` or ``UNAVAILABLE``.
     ``verify_skip_signature`` checks a skip's own binding; without one every
     skip is refused ``signature_unverifiable`` and miners generate as before.
+    ``episode_intake`` checks an episode job's trajectories
+    (``agentic_intake.EpisodeIntake``); an episode job without one answers 500.
+    ``job`` (the spec this router serves, when the caller has it) sets the
+    submit body cap, ``router.body_cap``; without it the minimum applies.
     """
 
-    router = APIRouter()
+    body_cap = worst_case_body(job) if job is not None else MIN_SUBMIT_BODY_BYTES
+    router = APIRouter(route_class=_capped_route(lambda request: body_cap))
+    router.body_cap = body_cap
     prompt_fidelity = PromptFidelity(renderer=renderer, prompt_job_for=prompt_job_for)
     # This process's submissions take turns on the ledger: interleaved, each
     # would read the same ETag and all but one would lose the compare-and-swap.
@@ -1264,7 +1423,8 @@ def build_corpus_router(
     # Also exposed, so the mount can reach the check without the handler.
     router.prompt_fidelity = prompt_fidelity
 
-    async def _record_accepted(request: CorpusSubmissionRequest, served: str) -> None:
+    async def _record_accepted(request: CorpusSubmissionRequest, served: str,
+                               episode_facts: IntakeFacts | None = None) -> None:
         # After the ledger write, never before: a record without its slot would
         # be paid for work the ledgers say never happened.
         if records is None:
@@ -1272,8 +1432,18 @@ def build_corpus_router(
         from reliquary.protocol.signatures import corpus_submission_id
 
         submission_id = corpus_submission_id(request)
+        if episode_facts is not None:
+            trajectory = request.trajectory.model_dump()
+            # The prompt the audit prefills is the validator's own render,
+            # never the miner's.
+            trajectory["prompt_tokens"] = list(episode_facts.prompt_ids)
+            schema, token_count, completions = RECORD_SCHEMA_V2, episode_facts.token_count, [trajectory]
+        else:
+            schema = RECORD_SCHEMA
+            token_count = sum(len(c.tokens) for c in request.completions)
+            completions = [c.model_dump() for c in request.completions]
         record = {
-            "schema": RECORD_SCHEMA,
+            "schema": schema,
             "submission_id": submission_id,
             "job_id": served,
             "hotkey": request.miner_hotkey,
@@ -1281,8 +1451,8 @@ def build_corpus_router(
             "prompt_index": request.prompt_index,
             "rendered_prompt": request.rendered_prompt,
             "received_at": time.time(),
-            "token_count": sum(len(c.tokens) for c in request.completions),
-            "completions": [c.model_dump() for c in request.completions],
+            "token_count": token_count,
+            "completions": completions,
         }
         written = False
         for attempt in range(RECORD_WRITE_ATTEMPTS):
@@ -1410,52 +1580,75 @@ def build_corpus_router(
                 CorpusRejectReason.PROMPT_MISMATCH,
                 out_of_range_detail(job, request.prompt_index),
             )
-        try:
-            fidelity = await prompt_fidelity(
-                request.rendered_prompt, job=job, prompt_index=request.prompt_index
-            )
-        except CorpusPromptSourceError as exc:
-            # The manifest names a source this binary cannot serve, so every
-            # submission to this job fails identically. `jobs create` refuses
-            # such a source, so reaching here means this validator does not
-            # have the environments the declaring operator had.
-            logger.error(
-                "corpus job %s has an unusable prompt source: %s", job_id, exc
-            )
-            raise HTTPException(
-                status_code=500, detail="corpus_prompt_source_unusable"
-            ) from exc
-        if not fidelity.ok:
-            return _refuse(CorpusRejectReason(fidelity.reason), fidelity.detail)
+        episode_facts: IntakeFacts | None = None
+        if job.episode is None and request.trajectory is not None:
+            return _refuse(CorpusRejectReason.MALFORMED_SUBMISSION,
+                           {"trajectory": "this job takes completions, not a trajectory"})
+        if job.episode is not None:
+            if episode_intake is None:
+                logger.error("corpus job %s is an episode job but has no episode intake", job_id)
+                raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
+            # Every refusal here precedes any slot or cursor consumption.
+            outcome = await asyncio.to_thread(episode_intake.check, request)
+            if not isinstance(outcome, IntakeFacts):
+                try:
+                    reason = CorpusRejectReason(outcome.reason)
+                except ValueError:
+                    # A validator bug, not the miner's fault.
+                    logger.error("episode intake refused with unknown reason %r", outcome.reason)
+                    raise HTTPException(status_code=500, detail="corpus_episode_intake_reason") from None
+                return _refuse(reason, outcome.detail)
+            episode_facts = outcome
+            token_counts = [outcome.token_count]
+            last_token_ids = [outcome.last_token_id]
+            digests = [outcome.digest]
+        else:
+            try:
+                fidelity = await prompt_fidelity(
+                    request.rendered_prompt, job=job, prompt_index=request.prompt_index
+                )
+            except CorpusPromptSourceError as exc:
+                # The manifest names a source this binary cannot serve, so every
+                # submission to this job fails identically. `jobs create` refuses
+                # such a source, so reaching here means this validator does not
+                # have the environments the declaring operator had.
+                logger.error(
+                    "corpus job %s has an unusable prompt source: %s", job_id, exc
+                )
+                raise HTTPException(
+                    status_code=500, detail="corpus_prompt_source_unusable"
+                ) from exc
+            if not fidelity.ok:
+                return _refuse(CorpusRejectReason(fidelity.reason), fidelity.detail)
 
-        # Derived here, from the tokens alone. See this module's docstring.
-        arrays = [completion.tokens for completion in request.completions]
-        token_counts = [len(tokens) for tokens in arrays]
-        last_token_ids = [tokens[-1] for tokens in arrays]
-        digests = [
-            completion_digest(request.prompt_index, tokens) for tokens in arrays
-        ]
+            # Derived here, from the tokens alone. See this module's docstring.
+            arrays = [completion.tokens for completion in request.completions]
+            token_counts = [len(tokens) for tokens in arrays]
+            last_token_ids = [tokens[-1] for tokens in arrays]
+            digests = [
+                completion_digest(request.prompt_index, tokens) for tokens in arrays
+            ]
 
-        if vocab_size is not None:
-            # Before the text check, which cannot see these (decode drops
-            # unknown ids), and before any write: the auditor's prefill would
-            # otherwise be the first thing to trip on them.
-            for index, tokens in enumerate(arrays):
-                if max(tokens) >= vocab_size:
-                    return _refuse(
-                        CorpusRejectReason.TOKEN_OUT_OF_VOCAB,
-                        {"completion": index, "vocab_size": vocab_size},
-                    )
+            if vocab_size is not None:
+                # Before the text check, which cannot see these (decode drops
+                # unknown ids), and before any write: the auditor's prefill would
+                # otherwise be the first thing to trip on them.
+                for index, tokens in enumerate(arrays):
+                    if max(tokens) >= vocab_size:
+                        return _refuse(
+                            CorpusRejectReason.TOKEN_OUT_OF_VOCAB,
+                            {"completion": index, "vocab_size": vocab_size},
+                        )
 
-        for completion in request.completions:
-            text = check_text_matches_tokens(
-                completion.tokens,
-                completion.text,
-                tokenizer=tokenizer,
-                eos_token_id=job.eos_token_id,
-            )
-            if not text.ok:
-                return _refuse(CorpusRejectReason(text.reason), text.detail)
+            for completion in request.completions:
+                text = check_text_matches_tokens(
+                    completion.tokens,
+                    completion.text,
+                    tokenizer=tokenizer,
+                    eos_token_id=job.eos_token_id,
+                )
+                if not text.ok:
+                    return _refuse(CorpusRejectReason(text.reason), text.detail)
 
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
@@ -1474,8 +1667,10 @@ def build_corpus_router(
                 slots=slots,
                 cursors=cursors,
                 seen=seen,
-                proof_counts=[len(c.proofs) for c in request.completions],
-                proof_chunk_tokens=proof_chunk_tokens,
+                proof_counts=(None if episode_facts is not None
+                              else [len(c.proofs) for c in request.completions]),
+                proof_chunk_tokens=None if episode_facts is not None else proof_chunk_tokens,
+                episode_checked=episode_facts is not None,
             )
 
         async def settled(turn: _TurnResult) -> None:
@@ -1486,7 +1681,7 @@ def build_corpus_router(
                 return
             timing.update(turn.timing)
             mark = time.perf_counter()
-            await _record_accepted(request, job_id)
+            await _record_accepted(request, job_id, episode_facts)
             timing["record_write"] = time.perf_counter() - mark
             timing["total"] = time.perf_counter() - started
             logger.info(
@@ -1917,15 +2112,20 @@ class CorpusJobRoutes:
                  default: str | None = None) -> None:
         self.routers: dict[str, APIRouter] = dict(routers or {})
         self.contracts: dict[str, Any] = {}
+        # Each job's prompt source: an eval job's names the set miners fetch.
+        self.prompt_sources: dict[str, str] = {}
         self.retired: set[str] = set()
         # Admissions (submit, skip) past the retired check and not yet returned:
         # a job is unwired only once none is left.
         self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
 
-    def add(self, job_id: str, router: APIRouter, *, contract: Any = None) -> None:
+    def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
+            prompt_source: str | None = None) -> None:
         self.routers[job_id] = router
         self.contracts[job_id] = contract
+        if prompt_source is not None:
+            self.prompt_sources[job_id] = prompt_source
         self.retired.discard(job_id)
         if self.default is None:
             self.default = job_id
@@ -1938,6 +2138,7 @@ class CorpusJobRoutes:
         self.retired.add(job_id)
         self.routers.pop(job_id, None)
         self.contracts.pop(job_id, None)
+        self.prompt_sources.pop(job_id, None)
 
     def open_jobs(self) -> list[str]:
         return sorted(j for j in self.routers if j not in self.retired)
@@ -1975,7 +2176,17 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     routes = routers if isinstance(routers, CorpusJobRoutes) else CorpusJobRoutes(routers)
     if legacy is None:
         legacy = len(routes.routers) > 1
-    router = APIRouter()
+
+    def _cap_for(request: Request) -> int:
+        # Read per request, so a hot-added job is covered at once: a scoped
+        # path by its own job's cap, the legacy path by the largest served.
+        served = routes.routers.get(request.path_params.get("job_id"))
+        if served is not None:
+            return getattr(served, "body_cap", MIN_SUBMIT_BODY_BYTES)
+        return max([getattr(r, "body_cap", MIN_SUBMIT_BODY_BYTES) for r in routes.routers.values()]
+                   + [MIN_SUBMIT_BODY_BYTES])
+
+    router = APIRouter(route_class=_capped_route(_cap_for))
 
     def _served(job_id: str) -> APIRouter:
         served = routes.routers.get(job_id)

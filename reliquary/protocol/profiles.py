@@ -1281,6 +1281,24 @@ _PROFILE_VALUES = (
                 # One pass through the 13,931-problem train split at 8 a window.
                 prompt_cooldown_windows=1741,
             ),
+            "reliquary_science_v1": EnvironmentProfile(
+                # The maths sibling's budget, not yet measured on this policy:
+                # a derivation cut before its box scores zero for a reason that
+                # has nothing to do with the problem.
+                max_new_tokens=32768,
+                bft=None,
+                answer_format="boxed",
+                batch_target=8,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/boxed-answer/v1",
+                environment_manifest_sha256=(
+                    "eca7e0cc921202d4eafc640a3538832821839ed912b76f71fe7fe6112f291473"
+                ),
+                # One pass through the 10,871-problem train split at 8 a window.
+                prompt_cooldown_windows=1359,
+            ),
             "reliquary_instruction_following_v1": EnvironmentProfile(
                 max_new_tokens=8192,
                 bft=None,

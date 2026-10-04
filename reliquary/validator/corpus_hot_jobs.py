@@ -87,7 +87,10 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     refusal = startup_refusal(entry, job, own, fingerprint)
     if refusal:
         return REFUSED, refusal
-    source = job.prompt_source
+    from reliquary.eval.prompt_source import declared_environment
+
+    # An eval job reads a frozen set; its contract declares the set's environment.
+    source = declared_environment(entry.contract, job.prompt_source) or job.prompt_source
     declared = (entry.contract.get("environments") or {}).get(source)
     served = (process_contract.get("environments") or {}).get(source)
     if declared is None or declared != served:
@@ -340,7 +343,8 @@ class CorpusJobSet:
                        task_id, job_id, failures, exc_info=True)
             return
         self._wire_failures.pop(task_id, None)
-        self._routes.add(job_id, router, contract=entry.contract)
+        self._routes.add(job_id, router, contract=entry.contract,
+                         prompt_source=job.prompt_source)
         if entry.status != "active":
             # Wired only to finish its audits and settlement: no admission.
             self._routes.retire(job_id)
@@ -416,9 +420,14 @@ class CorpusJobSet:
                 raise RuntimeError(f"the judge of {job_id} does not serve it")
             stats = JudgedStats(wiring.stats, judged["unsettled"])
             settled, totals = judged["settled_count"], judged["totals"]
-        return job_status(job_id=job_id, job=job or wiring.job, slots=state.slots,
-                          stats=stats, settled=settled, totals=totals,
-                          retired=self.is_retired(job_id), drained=drained)
+        status = job_status(job_id=job_id, job=job or wiring.job, slots=state.slots,
+                            stats=stats, settled=settled, totals=totals,
+                            retired=self.is_retired(job_id), drained=drained)
+        grader = getattr(wiring, "grader", None)
+        if grader is not None:
+            # An episode job: grading holds payment, so its backlog is public.
+            status = {**status, "grading": grader.status()}
+        return status
 
     async def status(self, job_id: str) -> dict | None:
         """The public status of a served or drained job, recomputed at most once

@@ -19,9 +19,10 @@ def test_the_profile_speaks_to_an_instruct_policy() -> None:
     assert len(PROFILE.model_revision) == 40
 
 
-def test_it_declares_exactly_the_four_packaged_environments() -> None:
+def test_it_declares_exactly_the_five_packaged_environments() -> None:
     assert set(PROFILE.environments) == {
         "reliquary_dapo_math_v1",
+        "reliquary_science_v1",
         "reliquary_instruction_following_v1",
         "reliquary_code_v1",
         "reliquary_telecom_solo_v1",
@@ -44,6 +45,8 @@ def test_only_instruction_following_runs_direct() -> None:
 def test_the_measured_budgets() -> None:
     envs = PROFILE.environments
     assert envs["reliquary_dapo_math_v1"].max_new_tokens == 32768
+    # Not measured: the maths sibling's budget until a probe says otherwise.
+    assert envs["reliquary_science_v1"].max_new_tokens == 32768
     assert envs["reliquary_instruction_following_v1"].max_new_tokens == 8192
     assert envs["reliquary_code_v1"].max_new_tokens == 8192
 

@@ -124,6 +124,36 @@ def eval_source_for(set_id: str, prompts_body: bytes, count: int) -> EvalSource:
     return EvalSource(set_id, count, hashlib.sha256(head).hexdigest())
 
 
+def declared_environment(contract, prompt_source: str) -> str | None:
+    """The environment a job's task contract declares for its prompts.
+
+    A catalog job's is its prompt source. An eval job's prompt source names a
+    frozen set, and its contract declares the set's own environment (its
+    catalog source, or the external eval environment): the one environment
+    the contract holds. None when there is no single one to name."""
+    if not is_eval_source(prompt_source):
+        return prompt_source
+    names = list(((contract or {}).get("environments") or {}))
+    return names[0] if len(names) == 1 else None
+
+
+def single_turn_messages(messages) -> tuple[str | None, str] | None:
+    """``(system, user)`` of a row's messages, or None: one user turn, optionally
+    after one system turn, both non-empty text. Anything else would be dropped
+    or reordered silently by whoever renders it."""
+    if not isinstance(messages, list) or not 1 <= len(messages) <= 2:
+        return None
+    if not all(isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"]
+               for m in messages):
+        return None
+    roles = [m.get("role") for m in messages]
+    if roles == ["user"]:
+        return None, messages[0]["content"]
+    if roles == ["system", "user"]:
+        return messages[0]["content"], messages[1]["content"]
+    return None
+
+
 def register_eval_prompts(source: EvalSource, body: bytes) -> tuple[dict, ...]:
     """Check ``body`` (the job's lines, or the whole set's) against the source
     and keep the rows."""
@@ -132,12 +162,9 @@ def register_eval_prompts(source: EvalSource, body: bytes) -> tuple[dict, ...]:
         raise ValueError(f"the prompts of {source.set_id!r} do not hash to the job's sha256")
     rows = tuple(json.loads(line) for line in head.splitlines())
     for row in rows:
-        messages = row.get("messages")
-        # Exactly one user turn: anything else would be dropped silently.
-        if not (isinstance(messages, list) and len(messages) == 1
-                and messages[0].get("role") == "user"
-                and isinstance(messages[0].get("content"), str)):
-            raise ValueError(f"problem {row.get('problem_id')!r} is not one user turn")
+        if single_turn_messages(row.get("messages")) is None:
+            raise ValueError(f"problem {row.get('problem_id')!r} is not one user turn, "
+                             "optionally after one system turn")
     with _lock:
         _loaded[(source.set_id, source.count, source.sha256)] = (rows, head)
     return rows
@@ -211,8 +238,11 @@ class EvalSetEnvironment:
 
     def get_problem(self, index: int) -> dict:
         row = self._rows[int(index)]
-        return {"prompt": row["messages"][-1]["content"], "id": row["problem_id"],
-                "problem_id": row["problem_id"]}
+        system, prompt = single_turn_messages(row["messages"])
+        problem = {"prompt": prompt, "id": row["problem_id"], "problem_id": row["problem_id"]}
+        if system is not None:
+            problem["system"] = system
+        return problem
 
     def problem_id(self, index: int) -> str:
         return self._rows[int(index)]["problem_id"]
@@ -252,4 +282,6 @@ __all__ = [
     "load_eval_rows",
     "parse_eval_source",
     "register_eval_prompts",
+    "single_turn_messages",
+    "declared_environment",
 ]

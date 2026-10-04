@@ -310,3 +310,50 @@ def test_the_solo_retries_run_after_the_failed_batchs_exception_is_forgotten(mon
     # traceback) referenced anywhere once it has recorded the failure as a
     # plain message.
     assert solo_exc_ref and solo_exc_ref[0]() is None
+
+
+def test_a_verdict_carries_when_its_submission_was_received():
+    model = _tiny(0)
+    record = {**_record(model), "received_at": 1_700_000_123.5}
+    records = _Records({ID: record})
+    asyncio.run(_auditor(model, records).audit(ID))
+    assert records.verdicts[ID]["received_at"] == 1_700_000_123.5
+
+
+def test_the_oldest_pending_arrival_comes_from_memory():
+    from reliquary.validator.corpus_auditor import ACCEPT_SLACK_SECONDS as SLACK
+
+    model = _tiny(0)
+    now = [100.0]
+    auditor = CorpusAuditor(job_id="math-v1", records=_Records({}), model=model,
+                            tokenizer=_Tokenizer(), proof=PROOF, clock=lambda: now[0])
+    with pytest.raises(LookupError):
+        auditor.oldest_pending_received_at()  # an unseeded backlog may hold anything
+    auditor._seeded = True
+    assert auditor.oldest_pending_received_at() is None
+    auditor._remember("a" * 64, {"hotkey": "h", "received_at": 50.0, "token_count": 3})
+    now[0] = 1000.0
+    auditor.enqueue("b" * 64)  # admitted live: stamped before a write of up to SLACK
+    assert auditor.oldest_pending_received_at() == 50.0
+    auditor._mark_judged("a" * 64)
+    assert auditor.oldest_pending_received_at() == 1000.0 - SLACK
+    # Found by a listing, not read yet: it may be old, so it holds everything...
+    auditor.enqueue("c" * 64, live=False)
+    assert auditor.oldest_pending_received_at() == -float("inf")
+    # ...but not for ever: unreadable for two periods, it is left out, loudly.
+    now[0] += 2 * 4320 + 1
+    assert auditor.oldest_pending_received_at() == 1000.0 - SLACK
+
+
+def test_a_split_judge_never_closes_past_its_feed():
+    from reliquary.validator.corpus_auditor import ACCEPT_SLACK_SECONDS as SLACK
+
+    covered = [5000.0]
+    auditor = CorpusAuditor(job_id="math-v1", records=_Records({}), model=_tiny(0),
+                            tokenizer=_Tokenizer(), proof=PROOF, clock=lambda: 9000.0,
+                            arrivals_covered=lambda: covered[0])
+    auditor._seeded = True
+    assert auditor.oldest_pending_received_at() == 5000.0 - SLACK
+    covered[0] = None
+    with pytest.raises(LookupError):
+        auditor.oldest_pending_received_at()
