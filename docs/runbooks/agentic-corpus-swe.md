@@ -187,7 +187,10 @@ On a box with:
   --disk-gb 10` (the default) refuses to start unless the driver is overlay2
   and a probe box (`--disk-probe-image`, default `alpine:3.22`) reads `/` at
   most 10 GiB, and every box is checked again (`df -Pk /`) before its first
-  action. Keep `--disk-gb` equal to the daemon's `overlay2.size`. 10 GiB is
+  action. Keep `--disk-gb` equal to the daemon's `overlay2.size`. A box
+  with any mount (an image that declares a `VOLUME`, which lives outside the
+  quota) is refused at start as an executor error; the 20 pinned SWE-smith
+  images declare none (checked 2026-10-04). 10 GiB is
   ample: the measured writable layer of an honest SWE-smith grade or replay
   is at most about 250 MB (measured 2026-10-04 on the four pulled SWE-smith
   images: gold grade 4-52 MB, replay with the harness footprint 136-246 MB). A trajectory that fills its box loses it (`box_lost`, see

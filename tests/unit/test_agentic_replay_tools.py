@@ -116,13 +116,16 @@ class _FakeBox:
         return types.SimpleNamespace(stdout=f"obs{len(self.runs)}", exit_code=0)
 
 
-def _fake_verifiers(monkeypatch, box, updates=None, update_code=0):
+def _fake_verifiers(monkeypatch, box, updates=None, update_code=0, mounts="[]"):
     @asynccontextmanager
     async def provision_runtime(config, env, name=None):
         box.config, box.name = config, name
         yield box
 
     async def docker(*args):
+        if args[0] == "inspect":
+            box.inspects = getattr(box, "inspects", []) + [list(args)]
+            return 0, mounts
         if updates is not None:
             updates.append((list(args), len(box.runs)))
         return update_code, "" if update_code == 0 else "no such container"
@@ -446,3 +449,19 @@ def test_finalize_gets_the_very_box_setup_got(monkeypatch):
     asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")]))
     assert seen[0] is seen[1] is box
     assert "run" not in vars(box)                        # the bound is lifted after finalize
+
+
+
+def test_a_box_whose_image_declares_volumes_is_refused_before_any_action(monkeypatch):
+    """Ruling P25: a volume is outside the box's quota'd root (``df /`` would
+    not see it), so a box with any mount is refused before anything runs."""
+    box = _FakeBox()
+    mounts = '[{"Type": "volume", "Name": "abc", "Destination": "/data"}]'
+    _fake_verifiers(monkeypatch, box, mounts=mounts)
+    with pytest.raises(RuntimeError, match="volume"):
+        asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")]))
+    assert box.runs == []
+    clean = _FakeBox()
+    _fake_verifiers(monkeypatch, clean, mounts="[]")
+    asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")]))
+    assert clean.inspects == [["inspect", "--format", "{{json .Mounts}}", clean.name]]

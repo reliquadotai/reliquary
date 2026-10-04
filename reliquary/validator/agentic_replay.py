@@ -214,9 +214,28 @@ async def bounded_box(task, limits: BoxLimits = DEFAULT_BOX_LIMITS) -> AsyncIter
                                   "--memory-swap", memory, name)
         if code != 0:
             raise RuntimeError(f"could not limit box {name}: {out.strip()[:300]}")
+        await refuse_mounts(name)
         if limits.disk_gb is not None:
             await check_box_disk(box, limits.disk_gb)
         yield box
+
+
+async def refuse_mounts(name: str) -> None:
+    """Refuse a box with any mount (an image's declared VOLUME becomes one):
+    a volume lives outside the box's quota'd root, where ``df /`` and
+    ``overlay2.size`` do not reach (ruling P25). The pinned SWE-smith images
+    declare none (checked 2026-10-04)."""
+    code, out = await _docker("inspect", "--format", "{{json .Mounts}}", name)
+    try:
+        mounts = json.loads(out) if code == 0 else None
+    except ValueError:
+        mounts = None
+    if mounts is None:
+        raise RuntimeError(f"could not read box {name}'s mounts: {out.strip()[:300]}")
+    if mounts:
+        where = [m.get("Destination") for m in mounts if isinstance(m, dict)]
+        raise RuntimeError(f"box {name} has volume mounts {where[:5]} outside its disk limit: "
+                           f"its image declares volumes; refused")
 
 
 # A quota reads a little over its nominal size on some kernels.

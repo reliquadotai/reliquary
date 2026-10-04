@@ -255,3 +255,32 @@ async def test_a_setup_slower_than_its_deadline_is_the_executors_timeout():
     replayed = await run_grade_item(_commands("echo first"),
                                     replay=functools.partial(replay_swe, setup_deadline=3))
     assert replayed["status"] == "timeout" and "setup deadline" in replayed["detail"], replayed
+
+
+async def test_a_box_whose_image_declares_a_volume_is_refused_as_the_executors_error():
+    """Ruling P25: a VOLUME escapes the box's disk limit; such an image is
+    refused at box start (before any action), an executor error."""
+    import subprocess
+
+    from reliquary.validator.agentic_replay import swesmith_task
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    task = swesmith_task(INSTANCE)
+    tag = "reliquary-test/volume-image:1"
+    subprocess.run(["docker", "build", "-q", "-t", tag, "-"], check=True, capture_output=True,
+                   input=f"FROM {task.data.image}\nVOLUME /data\n".encode())
+
+    class WithVolume:
+        def __init__(self):
+            self.data = task.data.model_copy(update={"image": tag})
+
+        def __getattr__(self, name):
+            return getattr(task, name)
+
+    try:
+        replayed = await run_grade_item(_commands("echo hi"), task_for=lambda _: WithVolume())
+        assert replayed["status"] == "error" and "volume" in replayed["detail"], replayed
+        clean = await run_grade_item(_commands("echo hi"))
+        assert clean["status"] == "ok"
+    finally:
+        subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
