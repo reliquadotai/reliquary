@@ -2168,6 +2168,10 @@ def corpus_grade_executor(
     memory_gb: float = typer.Option(
         6.0, "--memory-gb", help="Memory per box, no swap; concurrency x this must fit the host"),
     pids_limit: int = typer.Option(1024, "--pids-limit", help="Processes per box"),
+    allow_non_xfs: bool = typer.Option(
+        False, "--allow-non-xfs",
+        help="TESTS ONLY: start although Docker's storage is not on xfs (replays then disagree "
+             "with honest miners on directory order)"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Grade and replay agentic trajectories for a corpus control. The only
@@ -2185,6 +2189,13 @@ def corpus_grade_executor(
         limits = BoxLimits(cpu=cpus, memory_gb=memory_gb, pids=pids_limit)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    refusal = grade.docker_storage_refusal()
+    if refusal and not allow_non_xfs:
+        typer.echo(f"error: {refusal}. Put Docker's data root on xfs "
+                   "(--allow-non-xfs is for tests only)", err=True)
+        raise typer.Exit(code=1)
+    if refusal:
+        typer.echo(f"warning: --allow-non-xfs (tests only): {refusal}", err=True)
     grade.run_grade_executor(control_url=control_url, executor_id=executor_id,
                              concurrency=concurrency, limits=limits)
 

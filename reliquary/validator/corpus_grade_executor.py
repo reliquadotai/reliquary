@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
+import subprocess
 import time
 from collections.abc import Callable
 
@@ -102,6 +104,58 @@ def installed_env_refusal(package: str, version: str) -> str | None:
     return None
 
 
+# Ruling P20. `find`/`grep -r` list a directory in the order the host's Docker
+# backing filesystem returns it: xfs keeps the image layer's insertion order,
+# the same on every xfs host; ext4 hashes names with a per-filesystem seed, so
+# every ext4 host has its own order. A `find | head` cut cannot be normalized,
+# so a replay must run where that order is the one miners are told to use.
+REQUIRED_FS = "xfs"
+CONTAINERD_ROOT = "/var/lib/containerd"
+_CONTAINERD_SNAPSHOTTER = "io.containerd.snapshotter.v1"
+
+
+def docker_info() -> dict:
+    out = subprocess.run(["docker", "info", "--format", "{{json .}}"], capture_output=True,
+                         text=True, timeout=60, check=False)
+    if out.returncode != 0:
+        raise RuntimeError(f"docker info failed ({out.returncode}): {(out.stderr or '').strip()[:300]}")
+    return json.loads(out.stdout)
+
+
+def path_fs_type(path: str) -> str:
+    out = subprocess.run(["stat", "-f", "-c", "%T", path], capture_output=True, text=True,
+                         timeout=30, check=False)
+    if out.returncode != 0:
+        raise RuntimeError(f"stat -f {path} failed: {(out.stderr or '').strip()[:300]}")
+    return out.stdout.strip()
+
+
+def docker_storage_refusal(*, info: dict | None = None, probe: Callable[[], dict] = docker_info,
+                           fs_type: Callable[[str], str] = path_fs_type) -> str | None:
+    """Why this host must not replay (its image layers are not on xfs), or None.
+
+    Checks the filesystem of Docker's data root, overlay2's reported backing
+    filesystem, and, with the containerd image store, containerd's root (where
+    the layers then live)."""
+    try:
+        info = info if info is not None else probe()
+        status = {str(k): str(v) for k, v in (info.get("DriverStatus") or [])}
+        found: list[tuple[str, str]] = []
+        root = str(info.get("DockerRootDir") or "/var/lib/docker")
+        found.append((root, fs_type(root)))
+        if status.get("driver-type") == _CONTAINERD_SNAPSHOTTER:
+            found.append((CONTAINERD_ROOT, fs_type(CONTAINERD_ROOT)))
+        if "Backing Filesystem" in status:
+            found.append((f"{info.get('Driver')} backing filesystem", status["Backing Filesystem"]))
+    except Exception as exc:  # noqa: BLE001 - any failure to look is a refusal
+        return f"could not check Docker's storage filesystem: {exc}"
+    wrong = [f"{fs} ({where})" for where, fs in found if fs != REQUIRED_FS]
+    if not wrong:
+        return None
+    return (f"Docker stores images on {', '.join(wrong)}, not {REQUIRED_FS}: directory order "
+            f"would differ from miners' and void honest replays (ruling P20)")
+
+
 class GradeExecutor(LeaseExecutor):
     kind = "grade executor"
 
@@ -181,5 +235,6 @@ def run_grade_executor(*, control_url: str, executor_id: str, concurrency: int =
         executor_id=executor_id, concurrency=concurrency, limits=limits, **client))
 
 
-__all__ = ["GRADE_PREFIX", "GradeExecutor", "TOKEN_ENV", "grade_patch", "installed_env_refusal",
+__all__ = ["GRADE_PREFIX", "GradeExecutor", "TOKEN_ENV", "docker_storage_refusal", "grade_patch",
+           "installed_env_refusal",
            "run_grade_executor", "run_grade_item"]

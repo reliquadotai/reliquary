@@ -369,6 +369,7 @@ def test_the_grade_executor_command_needs_its_token(monkeypatch):
 
     calls = []
     monkeypatch.setattr(corpus_grade_executor, "run_grade_executor", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(corpus_grade_executor, "docker_storage_refusal", lambda: None)
     monkeypatch.delenv("RELIQUARY_EXECUTOR_TOKEN", raising=False)
     argv = ["corpus", "grade-executor", "--control-url", "https://control", "--executor-id", "g1"]
     result = CliRunner().invoke(app, argv)
@@ -388,6 +389,7 @@ def test_the_grade_executor_command_refuses_bad_box_limits_cleanly(monkeypatch):
 
     calls = []
     monkeypatch.setattr(corpus_grade_executor, "run_grade_executor", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(corpus_grade_executor, "docker_storage_refusal", lambda: None)
     monkeypatch.setenv("RELIQUARY_EXECUTOR_TOKEN", "t" * 43)
     argv = ["corpus", "grade-executor", "--control-url", "https://control", "--executor-id", "g1"]
     for bad in (["--cpus", "0"], ["--memory-gb", "-1"], ["--pids-limit", "0"], ["--cpus", "nan"]):
@@ -444,3 +446,71 @@ def test_the_orphan_sweep_never_stops_the_executor(monkeypatch):
 
     monkeypatch.setattr(agentic_replay.subprocess, "run", removed)
     assert agentic_replay.sweep_orphan_boxes() == 2
+
+
+# --- ruling P20: replays need an xfs Docker root (directory order) ---------
+
+_OVERLAY2_XFS = {"DockerRootDir": "/var/lib/docker", "Driver": "overlay2",
+                 "DriverStatus": [["Backing Filesystem", "xfs"], ["Supports d_type", "true"]]}
+_CONTAINERD = {"DockerRootDir": "/var/lib/docker", "Driver": "overlayfs",
+               "DriverStatus": [["driver-type", "io.containerd.snapshotter.v1"]]}
+
+
+def _fs(types):
+    return lambda path: types[path]
+
+
+def test_an_overlay2_root_on_xfs_is_accepted():
+    refusal = corpus_grade_executor.docker_storage_refusal(
+        info=_OVERLAY2_XFS, fs_type=_fs({"/var/lib/docker": "xfs"}))
+    assert refusal is None
+
+
+def test_a_docker_root_on_ext4_is_refused_naming_the_filesystem():
+    refusal = corpus_grade_executor.docker_storage_refusal(
+        info={**_OVERLAY2_XFS, "DriverStatus": [["Backing Filesystem", "extfs"]]},
+        fs_type=_fs({"/var/lib/docker": "ext2/ext3"}))
+    assert "ext2/ext3" in refusal and "/var/lib/docker" in refusal and "xfs" in refusal
+
+
+def test_overlay2_backing_filesystem_must_be_xfs_too():
+    refusal = corpus_grade_executor.docker_storage_refusal(
+        info={**_OVERLAY2_XFS, "DriverStatus": [["Backing Filesystem", "extfs"]]},
+        fs_type=_fs({"/var/lib/docker": "xfs"}))
+    assert "extfs" in refusal
+
+
+def test_the_containerd_snapshotter_root_is_checked_too():
+    # sandbox-dev-01's shape: image layers live under /var/lib/containerd.
+    refusal = corpus_grade_executor.docker_storage_refusal(
+        info=_CONTAINERD, fs_type=_fs({"/var/lib/docker": "xfs", "/var/lib/containerd": "ext2/ext3"}))
+    assert "ext2/ext3" in refusal and "/var/lib/containerd" in refusal
+    assert corpus_grade_executor.docker_storage_refusal(
+        info=_CONTAINERD, fs_type=_fs({"/var/lib/docker": "xfs", "/var/lib/containerd": "xfs"})) is None
+
+
+def test_unreadable_docker_info_is_a_refusal():
+    def broken():
+        raise RuntimeError("docker info failed (1): Cannot connect")
+    refusal = corpus_grade_executor.docker_storage_refusal(probe=broken, fs_type=_fs({}))
+    assert "Cannot connect" in refusal
+
+
+def test_the_grade_executor_command_refuses_a_non_xfs_docker_root(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    calls = []
+    monkeypatch.setattr(corpus_grade_executor, "run_grade_executor", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(corpus_grade_executor, "docker_storage_refusal",
+                        lambda: "Docker stores images on ext2/ext3 (/var/lib/docker), not xfs")
+    monkeypatch.setenv("RELIQUARY_EXECUTOR_TOKEN", "t" * 43)
+    argv = ["corpus", "grade-executor", "--control-url", "https://control", "--executor-id", "g1"]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 1 and "ext2/ext3" in result.output and "--allow-non-xfs" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert calls == []
+    result = CliRunner().invoke(app, argv + ["--allow-non-xfs"])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
