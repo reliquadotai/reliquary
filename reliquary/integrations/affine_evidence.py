@@ -61,6 +61,24 @@ def _sampling_policy(manifest):
             "source_hash": manifest["sampling_source_hash"]}
 
 
+def _require_sampling_report(manifest, audit):
+    if _sampling_policy(manifest) is None:
+        return
+    contract = manifest["sampling_contract"]
+    context = dict(contract=contract, epoch=manifest["epoch"], checkpoint=manifest["checkpoint"]["id"])
+    binding = hashlib.sha256(canonical(context)).hexdigest()
+    require(audit.get("sampling_assurance") == dict(
+        sampling_required=True, scope="fully-audited-rollouts-only", version=contract["version"],
+        binding_sha256=binding, verification=contract["verification"], historical_execution_proven=False),
+        "audit_sampling_assurance")
+    for batch in audit["accepted"]:
+        for rollout in batch["rollouts"]:
+            attempt = rollout.get("seed")
+            require(type(attempt) is int and 0 <= attempt < contract["max_attempts"], "rollout_sampling_attempt")
+            require(rollout.get("sampling") == dict(version=contract["version"], binding_sha256=binding,
+                                                   attempt=attempt), "rollout_sampling_binding")
+
+
 def verify_bundle(bundle, signed, expected_bindings=None):
     """Validate native envelopes with the approved upstream signature verifier.
 
@@ -111,6 +129,7 @@ def verify_bundle(bundle, signed, expected_bindings=None):
     audit = documents["audit"]
     require(audit["epoch"] == epoch and audit["submission_sha256"] == expected, "audit_binding")
     require("audit_seed" not in audit or audit["audit_seed"] == challenge["seed"], "audit_seed_binding")
+    _require_sampling_report(manifest, audit)
     accepted = audit["accepted"]
     pair_hashes, batch_keys = {}, set()
     for batch in accepted:
@@ -143,10 +162,38 @@ def verify_bundle(bundle, signed, expected_bindings=None):
     require(training["source_epoch"] == epoch and training.get("input_checkpoint") == checkpoint["id"], "training_input_binding")
     require(type(training["steps"]) is int and training["steps"] > 0 and training["checkpoint"] != checkpoint["id"], "training_update_binding")
     consumed = set()
-    for update in training.get("updates", []):
-        key = (update.get("env_id"), update.get("index"))
-        if key in pair_hashes and pair_hashes[key] == (update.get("positive_rollout_sha256"), update.get("negative_rollout_sha256")):
-            consumed.add(key)
+    covered = manifest.get("training_policy") == "bf16-full-adamw-covered-fixed-reference-v3"
+    if covered:
+        require(training.get("training_policy") == manifest["training_policy"]
+                and training.get("full_model_finetune") is True and training["steps"] <= 32,
+                "covered_training_policy")
+        require(isinstance(challenge.get("seed"), str) and re.fullmatch("[0-9a-f]{64}", challenge["seed"]),
+                "covered_training_seed")
+        require(training.get("training_coverage") == dict(
+            version="frozen-verified-pairs-v1", epoch=epoch, checkpoint=checkpoint["id"], seed=challenge["seed"],
+            receipts_sha256=hashlib.sha256(canonical(scores["receipts"])).hexdigest(),
+            generated_after_freeze_at=challenge["generated_after_freeze_at"]), "covered_training_context")
+        require(isinstance(training.get("updates"), list) and len(training["updates"]) == training["steps"],
+                "covered_training_steps")
+    for step, update in enumerate(training.get("updates", []), 1):
+        attributions = [update]
+        if covered:
+            require(isinstance(update, dict) and type(update.get("optimizer_step")) is int and update["optimizer_step"] == step
+                    and type(update.get("steps")) is int and update["steps"] == 1
+                    and update.get("training_policy") == manifest["training_policy"]
+                    and update.get("full_model_finetune") is True, "covered_optimizer_step")
+            attributions = update.get("pairs")
+            require(isinstance(attributions, list) and bool(attributions)
+                    and type(update.get("gradient_pairs")) is int and update["gradient_pairs"] == len(attributions),
+                    "covered_gradient_pairs")
+        for pair in attributions:
+            if covered:
+                require(isinstance(pair, dict) and type(pair.get("optimizer_step")) is int and pair["optimizer_step"] == step
+                        and type(pair.get("index")) is int
+                        and pair.get("attribution_revision") == "verified-pair-v1", "covered_pair_step")
+            key = (pair.get("env_id"), pair.get("index"))
+            if key in pair_hashes and pair_hashes[key] == (pair.get("positive_rollout_sha256"), pair.get("negative_rollout_sha256")):
+                consumed.add(key)
     result.update(stage="training_reported", output_checkpoint=training["checkpoint"],
                   consumed_batches=len(consumed), training_steps=training["steps"])
     if "checkpoint_descriptor" not in documents:
@@ -342,6 +389,9 @@ def _inspect(request):
         checks["frozen_sha256"] = digest
         envelopes["audit"] = document(row["audits"][miner])
         audit = signed(native_json(envelopes["audit"]), authority)
+        if manifest.get("sampling_contract") is not None:
+            from subnet.forced_sampling import require_report
+            require_report(manifest, audit)
         require(all(any(batch == candidate for candidate in frozen_batches) for batch in audit["accepted"]), "frozen_accepted_binding")
     try:
         envelopes["training"] = document(row["objects"]["training"])

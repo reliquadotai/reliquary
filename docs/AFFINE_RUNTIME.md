@@ -26,6 +26,11 @@ changed checkpoint bytes and signed successor checkpoint before `cycle_verified`
 Accepted, scored and consumed counts are independent. Neither a payment nor an
 independent GPU replay is inferred from signed reports.
 
+Forced-sampling epochs require the native audit assurance and per-rollout sampler
+receipts bound to the exact epoch and checkpoint. Covered full-model training
+requires the frozen-population context and exact pair hashes within each optimizer
+step. Aggregate training counts cannot establish that the submitted pair was used.
+
 An owner-only `manifest_snapshot_file` selects the pinned-epoch launcher. It
 authenticates the original envelopes, invokes native source admission and asset
 hydration, and starts a fresh isolated native CLI with that original manifest.

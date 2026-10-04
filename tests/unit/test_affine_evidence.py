@@ -40,7 +40,10 @@ class EvidenceCheck(unittest.TestCase):
                         start=1, deadline=2, payable=False, transport_policy="direct-r2-v1", K=1, L=1,
                         sampling_contract=sampling, sampling_source_hash=sha(b"sampling source"),
                         environments=[dict(env_id="math", indices=[1, 2], spec={"version": "v1"}, harness={})])
+        sampling_binding = sha(canonical(dict(contract=sampling, epoch=manifest["epoch"], checkpoint=checkpoint["id"])))
         rolls = [dict(env_id="math", index=1, classification=kind,
+                      seed=number, sampling=dict(version=sampling["version"], binding_sha256=sampling_binding,
+                                                 attempt=number),
                       turns=[dict(prompt=[1], output=[number])])
                  for number, kind in enumerate(("positive", "negative"), 2)]
         batch = dict(epoch=manifest["epoch"], checkpoint=checkpoint["id"], env_id="math",
@@ -50,6 +53,9 @@ class EvidenceCheck(unittest.TestCase):
         scores = dict(epoch_id=manifest["epoch"], checkpoint=checkpoint["id"], finalized_at=3,
                       payable=False, receipts=receipts, total=0, weights={}, points={miner: 0})
         audit = dict(epoch=manifest["epoch"], submission_sha256=frozen_sha, accepted=[batch],
+                     sampling_assurance=dict(sampling_required=True, scope="fully-audited-rollouts-only",
+                                             version=sampling["version"], binding_sha256=sampling_binding,
+                                             verification=sampling["verification"], historical_execution_proven=False),
                      outcomes=[dict(env_id="math", index=1, valid=True, fully_audited=True)])
         training = dict(source_epoch=manifest["epoch"], input_checkpoint=checkpoint["id"],
                         checkpoint=successor["id"], steps=1, weights_changed=True,
@@ -145,12 +151,79 @@ class EvidenceCheck(unittest.TestCase):
                 elif changed in ("version", "generation", "verification", "randomness", "extra_field"):
                     payload["sampling_contract"][changed] = "changed"
                 altered["envelopes"][name] = envelope(payload)
-                checked = verify_bundle(altered, signed)
                 with self.subTest(sampling=name, changed=changed):
+                    if name == "manifest" and changed not in ("legacy", "source"):
+                        with self.assertRaises(ValueError):
+                            verify_bundle(altered, signed)
+                        continue
+                    checked = verify_bundle(altered, signed)
                     self.assertEqual(checked["stage"], "cycle_verified")
                     self.assertTrue(checked["handover_verified"])
                     self.assertFalse(checked["qualified_successor"])
                     self.assertNotIn("next_bindings", checked)
+        for changed in ("missing_assurance", "assurance_binding", "sampling_receipt", "attempt", "bool_attempt"):
+            altered = copy.deepcopy(bundle)
+            report = copy.deepcopy(audit)
+            if changed == "missing_assurance":
+                report.pop("sampling_assurance")
+            elif changed == "assurance_binding":
+                report["sampling_assurance"]["binding_sha256"] = sha(b"another checkpoint")
+            elif changed == "sampling_receipt":
+                report["accepted"][0]["rollouts"][0]["sampling"]["binding_sha256"] = sha(b"another epoch")
+            else:
+                report["accepted"][0]["rollouts"][0]["seed"] = True if changed == "bool_attempt" else 128
+            altered["envelopes"]["audit"] = envelope(report)
+            with self.subTest(audit_sampling=changed), self.assertRaises(ValueError):
+                verify_bundle(altered, signed)
+
+        covered = copy.deepcopy(bundle)
+        policy = "bf16-full-adamw-covered-fixed-reference-v3"
+        for name in ("manifest", "next_manifest"):
+            covered["envelopes"][name] = envelope(dict(payloads[name], training_policy=policy))
+        challenge = dict(payloads["audit_challenge"], seed=sha(b"post-freeze coverage"))
+        covered["envelopes"]["audit_challenge"] = envelope(challenge)
+        coverage = dict(version="frozen-verified-pairs-v1", epoch=manifest["epoch"], checkpoint=checkpoint["id"],
+                        seed=challenge["seed"], receipts_sha256=sha(canonical(receipts)), generated_after_freeze_at=3)
+        updates = [dict(steps=1, optimizer_step=step, training_policy=policy, full_model_finetune=True,
+                        gradient_pairs=1, pairs=[dict(training["updates"][0], optimizer_step=step,
+                                                      attribution_revision="verified-pair-v1")])
+                   for step in (1, 2, 3)]
+        covered_training = dict(training, steps=3, updates=updates, training_policy=policy,
+                                full_model_finetune=True, training_coverage=coverage, input_pairs=1)
+        covered["envelopes"]["training"] = envelope(covered_training)
+        checked = verify_bundle(covered, signed)
+        self.assertEqual((checked["stage"], checked["consumed_batches"]), ("cycle_verified", 1))
+        self.assertTrue(checked["qualified_successor"])
+        foreign = copy.deepcopy(covered_training)
+        for update in foreign["updates"]:
+            update["pairs"][0]["positive_rollout_sha256"] = sha(b"foreign pair")
+        unconsumed = copy.deepcopy(covered)
+        unconsumed["envelopes"]["training"] = envelope(foreign)
+        checked = verify_bundle(unconsumed, signed)
+        self.assertEqual(checked["consumed_batches"], 0)
+        self.assertFalse(checked["handover_verified"] or checked["qualified_successor"])
+        for changed in ("policy", "coverage", "steps", "outer_step", "inner_step", "revision", "gradient_pairs", "flat_only"):
+            altered = copy.deepcopy(covered)
+            report = copy.deepcopy(covered_training)
+            if changed == "policy":
+                report["training_policy"] = "bf16-full-adamw-fixed-epoch-reference-v2"
+            elif changed == "coverage":
+                report["training_coverage"]["receipts_sha256"] = sha(b"other receipt population")
+            elif changed == "steps":
+                report["steps"] = 2
+            elif changed == "outer_step":
+                report["updates"][0]["optimizer_step"] = 2
+            elif changed == "inner_step":
+                report["updates"][0]["pairs"][0]["optimizer_step"] = 2
+            elif changed == "revision":
+                report["updates"][0]["pairs"][0]["attribution_revision"] = "unknown"
+            elif changed == "gradient_pairs":
+                report["updates"][0]["gradient_pairs"] = 2
+            else:
+                report["updates"] = [training["updates"][0]] * 3
+            altered["envelopes"]["training"] = envelope(report)
+            with self.subTest(covered_training=changed), self.assertRaises(ValueError):
+                verify_bundle(altered, signed)
         missing = copy.deepcopy(bundle)
         missing["envelopes"]["scores"] = envelope(dict(scores, receipts={}))
         missing["envelopes"]["audit_challenge"] = envelope(dict(payloads["audit_challenge"], receipts={}))
