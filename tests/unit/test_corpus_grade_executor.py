@@ -510,6 +510,7 @@ def test_the_grade_executor_command_needs_its_token(monkeypatch):
     calls = []
     monkeypatch.setattr(corpus_grade_executor, "run_grade_executor", lambda **kw: calls.append(kw))
     monkeypatch.setattr(corpus_grade_executor, "docker_storage_refusal", lambda: None)
+    monkeypatch.setattr(corpus_grade_executor, "docker_disk_refusal", lambda disk_gb, **kw: None)
     monkeypatch.delenv("RELIQUARY_EXECUTOR_TOKEN", raising=False)
     argv = ["corpus", "grade-executor", "--control-url", "https://control", "--executor-id", "g1"]
     result = CliRunner().invoke(app, argv)
@@ -519,7 +520,7 @@ def test_the_grade_executor_command_needs_its_token(monkeypatch):
                                              "--memory-gb", "4", "--pids-limit", "512"])
     assert result.exit_code == 0, result.output
     assert calls == [{"control_url": "https://control", "executor_id": "g1", "concurrency": 2,
-                      "limits": BoxLimits(cpu=1.5, memory_gb=4.0, pids=512)}]
+                      "limits": BoxLimits(cpu=1.5, memory_gb=4.0, pids=512, disk_gb=10.0)}]
 
 
 def test_the_grade_executor_command_refuses_bad_box_limits_cleanly(monkeypatch):
@@ -530,9 +531,11 @@ def test_the_grade_executor_command_refuses_bad_box_limits_cleanly(monkeypatch):
     calls = []
     monkeypatch.setattr(corpus_grade_executor, "run_grade_executor", lambda **kw: calls.append(kw))
     monkeypatch.setattr(corpus_grade_executor, "docker_storage_refusal", lambda: None)
+    monkeypatch.setattr(corpus_grade_executor, "docker_disk_refusal", lambda disk_gb, **kw: None)
     monkeypatch.setenv("RELIQUARY_EXECUTOR_TOKEN", "t" * 43)
     argv = ["corpus", "grade-executor", "--control-url", "https://control", "--executor-id", "g1"]
-    for bad in (["--cpus", "0"], ["--memory-gb", "-1"], ["--pids-limit", "0"], ["--cpus", "nan"]):
+    for bad in (["--cpus", "0"], ["--memory-gb", "-1"], ["--pids-limit", "0"], ["--cpus", "nan"],
+                ["--disk-gb", "0"]):
         result = CliRunner().invoke(app, argv + bad)
         assert result.exit_code == 2, (bad, result.output)
         assert result.exception is None or isinstance(result.exception, SystemExit), bad
@@ -654,3 +657,57 @@ def test_the_grade_executor_command_refuses_a_non_xfs_docker_root(monkeypatch):
     result = CliRunner().invoke(app, argv + ["--allow-non-xfs"])
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
+
+
+# --- ruling P24: each box's writable layer is bounded (xfs pquota) ----------
+
+def _probe(kib):
+    return lambda image: f"Filesystem 1024-blocks Used Available Capacity Mounted on\noverlay {kib} 8 1 1% /\n"
+
+
+def test_a_daemon_default_box_size_within_the_limit_is_accepted():
+    assert corpus_grade_executor.docker_disk_refusal(
+        10.0, info=_OVERLAY2_XFS, run_probe=_probe(10 * 2 ** 20)) is None
+
+
+def test_a_box_without_a_size_limit_is_refused():
+    refusal = corpus_grade_executor.docker_disk_refusal(
+        10.0, info=_OVERLAY2_XFS, run_probe=_probe(300 * 2 ** 20))
+    assert "overlay2.size" in refusal and "pquota" in refusal
+
+
+def test_the_containerd_image_store_cannot_bound_a_box():
+    refusal = corpus_grade_executor.docker_disk_refusal(10.0, info=_CONTAINERD,
+                                                        run_probe=_probe(10 * 2 ** 20))
+    assert "overlay2" in refusal and "containerd-snapshotter" in refusal
+
+
+def test_a_failing_disk_probe_is_a_refusal():
+    def broken(image):
+        raise RuntimeError("docker run failed: no such image")
+    refusal = corpus_grade_executor.docker_disk_refusal(10.0, info=_OVERLAY2_XFS, run_probe=broken)
+    assert "no such image" in refusal
+
+
+def test_the_grade_executor_command_refuses_unbounded_box_disks(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    calls, asked = [], []
+    monkeypatch.setattr(corpus_grade_executor, "run_grade_executor", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(corpus_grade_executor, "docker_storage_refusal", lambda: None)
+
+    def disk(disk_gb, **kw):
+        asked.append((disk_gb, kw))
+        return "a box's / reads 300 GB: set overlay2.size"
+    monkeypatch.setattr(corpus_grade_executor, "docker_disk_refusal", disk)
+    monkeypatch.setenv("RELIQUARY_EXECUTOR_TOKEN", "t" * 43)
+    argv = ["corpus", "grade-executor", "--control-url", "https://control", "--executor-id", "g1",
+            "--disk-gb", "12"]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 1 and "overlay2.size" in result.output and calls == []
+    assert asked[0][0] == 12.0
+    result = CliRunner().invoke(app, argv + ["--allow-non-xfs"])        # tests only: unchecked
+    assert result.exit_code == 0, result.output
+    assert calls[0]["limits"].disk_gb is None

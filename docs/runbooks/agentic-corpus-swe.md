@@ -119,8 +119,8 @@ validator only if that validator was started with an episode job of the same
 env pin (it holds the grade dispatcher); otherwise restart it.
 
 Tunables (environment of the control, bounded): `RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS`
-(1800; 60 to 86400) how long an item holding one vote waits for a next
-distinct-provider executor before it resolves `disputed`;
+(1800; 60 to 86400) how long an item holding one vote waits, while no live
+distinct-provider executor exists, before it resolves `disputed`;
 `RELIQUARY_CORPUS_GRADE_LEASE_SECONDS` (2400) and
 `RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS` (4200) the lease lives.
 
@@ -136,7 +136,47 @@ On a box with:
 - Docker, usable by the executor's user, with cgroup v2 limits working: each
   box is capped right after it starts with `docker update --pids-limit
   --memory --memory-swap` (swap off); a failed update refuses the box (an
-  executor error, re-leased elsewhere). No daemon configuration is needed.
+  executor error, re-leased elsewhere).
+- **A disk limit per box** (ruling P24). A replayed `dd if=/dev/zero of=/x`
+  must fill its own box, not the host. verifiers' `docker run` takes no
+  `--storage-opt`, so the limit is the daemon's default `overlay2.size`,
+  which only the overlay2 graph driver (not the containerd image store)
+  honours, and only on xfs mounted with project quotas. Mount Docker's data
+  root on xfs with `pquota`, then configure the daemon:
+
+  ```bash
+  # a dedicated xfs volume for Docker (here /dev/sdb), with project quotas
+  mkfs.xfs /dev/sdb
+  echo '/dev/sdb /var/lib/docker xfs defaults,pquota 0 0' >> /etc/fstab
+  systemctl stop docker containerd && mount /var/lib/docker
+  mount | grep /var/lib/docker                       # must show prjquota
+  cat > /etc/docker/daemon.json <<'EOF'
+  {"storage-driver": "overlay2", "storage-opts": ["overlay2.size=10G"],
+   "features": {"containerd-snapshotter": false}}
+  EOF
+  systemctl start containerd docker
+  docker info --format '{{.Driver}} {{json .DriverStatus}}'   # overlay2 [["Backing Filesystem","xfs"],...]
+  docker run --rm --entrypoint df alpine:3.22 -Pk /           # 1024-blocks column: 10485760
+  ```
+
+  (`pquota` cannot be added by `remount` to a mounted root filesystem; for
+  `/` itself it goes in the kernel command line as `rootflags=pquota`. A
+  dedicated volume is simpler.) Then pull the images again: the overlay2
+  driver does not see the containerd store's images. `corpus grade-executor
+  --disk-gb 10` (the default) refuses to start unless the driver is overlay2
+  and a probe box (`--disk-probe-image`, default `alpine:3.22`) reads `/` at
+  most 10 GiB, and every box is checked again (`df -Pk /`) before its first
+  action. Keep `--disk-gb` equal to the daemon's `overlay2.size`. 10 GiB is
+  ample: the measured writable layer of an honest SWE-smith grade or replay
+  is at most about 250 MB (measured 2026-10-04 on the four pulled SWE-smith
+  images: gold grade 4-52 MB, replay with the harness footprint 136-246 MB). A trajectory that fills its box loses it (`box_lost`, see
+  below); the host's free space is untouched. Size the host's Docker volume
+  for the pulled images plus `--concurrency x --disk-gb`.
+- **Output read back is bounded** (ruling P24): each replayed observation is
+  read up to one character past the longest a lease carries (4 MiB), and
+  anything longer is cut there (so it mismatches its recorded observation);
+  finalize's output stops past 4 MiB + 1 MiB, a grade's test output past 256
+  MiB. The executor's memory stays bounded by `--concurrency`.
 - the pinned images pulled (`docker pull` of every digest in
   `reliquary_swe/swesmith_digests.json`, as many as the job's `num_images`);
 - reliquary + reliquary-swe + verifiers at the pins installed (`corpus
@@ -160,8 +200,10 @@ On a box with:
   unless all of these are xfs. It exits with code 1 and prints
   `error: Docker stores images on ext2/ext3 (/var/lib/docker), ..., not xfs`.
   To fix it, give Docker an xfs data root (`data-root` in
-  `/etc/docker/daemon.json`, on an xfs volume), then re-pull the images.
-  `--allow-non-xfs` skips the check. **It is for tests only.**
+  `/etc/docker/daemon.json`, on an xfs volume, mounted with `pquota` as
+  above), then re-pull the images.
+  `--allow-non-xfs` skips this check and the disk-limit check. **It is for
+  tests only.**
 - **PyPI reachable from the box during setup.** Before the network cut, the
   replay box prepares the same thing the miner's harness prepares:
   `pip install --user uv`, then `uv sync` of the bash harness program. That
@@ -178,7 +220,7 @@ register it once, from a machine with bucket credentials, then run it:
 reliquary corpus register-grade-executor --executor-id grade-01 --env-version <ENV_COMMIT> \
   --provider-id hetzner                       # prints {"token": ...} once; created=false prints none
 RELIQUARY_EXECUTOR_TOKEN=<token> reliquary corpus grade-executor --control-url https://<control> \
-  --executor-id grade-01 --concurrency 4 --cpus 2 --memory-gb 6 --pids-limit 1024
+  --executor-id grade-01 --concurrency 4 --cpus 2 --memory-gb 6 --pids-limit 1024 --disk-gb 10
 ```
 
 - **Providers.** `--provider-id` is required and names who runs the box
@@ -274,13 +316,35 @@ curl -s https://<control>/corpus/jobs/swe-agentic-v1/status | python -m json.too
   (`unindexed` counts what is left to read) and graded again into
   `regrades/`. Nothing it decided alone is paid meanwhile.
 
+Outcomes a trajectory causes in its box (ruling P23): once its recorded
+actions (replay) or its applied patch (grade) run, a box that dies, cannot
+take the next command, or runs past its deadline (replay 3600 s, grade the
+task's scoring timeout) is reported `box_lost` / `box_timeout`, a vote like
+any fact. Two distinct providers agreeing void the submission **unpaid**
+with reason `replay_unjudgeable` (`stage` `grade` or `replay`) and **no**
+escalation of the miner. Every grade that is not a clean success (failing,
+timeout, error, disputed, unjudgeable) gets the failing replay draw
+(`replay_fraction_failed`). A failure before any recorded action or before
+the patch (provisioning, setup, PyPI, the Docker daemon) stays the
+executor's `error`/`timeout` and is re-leased. A trajectory whose text a
+lease cannot carry (4096 actions, 4 MiB per observation or argument, 16 MiB
+in all) is refused at intake as `trajectory_too_large`; the miner checks the
+same bound before signing.
+
+The dispute clock (`RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS`) counts only the
+time during which no live executor of another provider could take the next
+vote, and an item holding a vote is leased before any new item: a grading
+backlog never resolves a failing replay as `disputed`.
+
 In the bucket, `grades/`, `regrades/` and `voided/` sit beside `submissions/`
 and `verdicts/` in the job's prefix; a `voided/{sid}.json` with reason
 `replay_failed` is a confirmed replay failure (it carries `graded_by` and
-`providers`). `reliquary jobs status swe-agentic-v1` prints how far the job is
+`providers`), one with `replay_unjudgeable` an unpaid trajectory no box
+could judge. `reliquary jobs status swe-agentic-v1` prints how far the job is
 from drained. In the control's log: `grade executor <id> quarantined: ...`,
-`voided, replay failed`, `disputed: no distinct-provider executor voted within
-... s`, `waits: every live grade executor is excluded`, and `grade items wait
+`voided, replay failed`, `voided unpaid, its <stage> could not be judged on two
+providers' boxes`,
+`disputed: no distinct-provider executor was available for ... s`, `waits: every live grade executor is excluded`, and `grade items wait
 and no grade executor is connected`.
 
 ## 6. Export

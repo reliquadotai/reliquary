@@ -2219,10 +2219,16 @@ def corpus_grade_executor(
     memory_gb: float = typer.Option(
         6.0, "--memory-gb", help="Memory per box, no swap; concurrency x this must fit the host"),
     pids_limit: int = typer.Option(1024, "--pids-limit", help="Processes per box"),
+    disk_gb: float = typer.Option(
+        10.0, "--disk-gb",
+        help="Writable layer per box: the Docker daemon's default overlay2.size (xfs, pquota), "
+             "checked at start and in every box"),
+    disk_probe_image: str = typer.Option(
+        "alpine:3.22", "--disk-probe-image", help="Image of the start-up disk-limit probe box"),
     allow_non_xfs: bool = typer.Option(
         False, "--allow-non-xfs",
         help="TESTS ONLY: start although Docker's storage is not on xfs (replays then disagree "
-             "with honest miners on directory order)"),
+             "with honest miners on directory order) and box disks are not bounded"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Grade and replay agentic trajectories for a corpus control. The only
@@ -2237,7 +2243,9 @@ def corpus_grade_executor(
         typer.echo(f"error: {grade.TOKEN_ENV} is not set", err=True)
         raise typer.Exit(code=1)
     try:
-        limits = BoxLimits(cpu=cpus, memory_gb=memory_gb, pids=pids_limit)
+        limits = BoxLimits(cpu=cpus, memory_gb=memory_gb, pids=pids_limit,
+                           disk_gb=None if allow_non_xfs else disk_gb)
+        BoxLimits(disk_gb=disk_gb)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     refusal = grade.docker_storage_refusal()
@@ -2247,6 +2255,13 @@ def corpus_grade_executor(
         raise typer.Exit(code=1)
     if refusal:
         typer.echo(f"warning: --allow-non-xfs (tests only): {refusal}", err=True)
+    if allow_non_xfs:
+        typer.echo("warning: --allow-non-xfs (tests only): box disks are not checked", err=True)
+    else:
+        refusal = grade.docker_disk_refusal(disk_gb, image=disk_probe_image)
+        if refusal:
+            typer.echo(f"error: {refusal} (--allow-non-xfs is for tests only)", err=True)
+            raise typer.Exit(code=1)
     grade.run_grade_executor(control_url=control_url, executor_id=executor_id,
                              concurrency=concurrency, limits=limits)
 

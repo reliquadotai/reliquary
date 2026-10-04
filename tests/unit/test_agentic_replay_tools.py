@@ -314,3 +314,110 @@ def test_a_deadline_hit_by_the_actions_is_the_trajectorys_and_by_setup_the_execu
     with pytest.raises(agentic_replay.ReplayTimeout) as caught:
         asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")], episode_deadline=0.2))
     assert caught.value.trajectory_caused is False
+
+
+# --- F4 (ruling P24): what a box hands back is bounded, its disk too ---------
+
+def test_the_tool_program_truncates_its_output_to_the_requested_chars(tmp_path):
+    proc = subprocess.run([sys.executable, "-c", TOOL_PROGRAM], cwd=tmp_path, capture_output=True,
+                          text=True, input=json.dumps({
+                              "tool": "bash", "arguments": json.dumps({"command": "yes | head -c 100000"}),
+                              "timeout": 30, "max_chars": 1001}))
+    assert len(proc.stdout) == 1001
+
+
+def test_capped_exec_stops_reading_past_its_cap_and_ends_the_process():
+    import time
+
+    started = time.monotonic()
+    code, out, err, truncated = asyncio.run(agentic_replay.capped_exec(
+        [sys.executable, "-c", "import sys\nwhile True: sys.stdout.write('x' * 65536)"], max_bytes=100_000))
+    assert truncated and len(out) == 100_000 and time.monotonic() - started < 30
+    code, out, err, truncated = asyncio.run(agentic_replay.capped_exec(
+        [sys.executable, "-c", "import sys; print('hi'); print('e', file=sys.stderr); sys.exit(3)"],
+        max_bytes=100))
+    assert (code, out, err, truncated) == (3, b"hi\n", b"e\n", False)
+
+
+def test_an_observation_is_never_longer_than_a_lease_can_compare(monkeypatch):
+    class Loud(_FakeBox):
+        async def run(self, argv, env):
+            self.runs.append(list(argv))
+            return types.SimpleNamespace(stdout="y" * 5000, exit_code=0)
+
+    monkeypatch.setattr(agentic_replay, "MAX_OBSERVATION_CHARS", 100)
+    observation = asyncio.run(agentic_replay.run_action(Loud(), "/usr/bin/python3",
+                                                       Action("bash", "{}", ""), 30))
+    assert observation == "y" * 101                     # one past the bound: never equal to one within it
+
+
+def test_the_bounded_exec_argv_is_verifiers_own(monkeypatch):
+    """The bounded read runs exactly the `docker exec` verifiers' DockerRuntime.run runs
+    (same env, workdir, container), so observations do not change."""
+    docker_mod = pytest.importorskip("verifiers.v1.runtimes.docker")
+    import verifiers.v1 as vf
+
+    seen = []
+
+    async def fake_docker(*args):
+        seen.append(list(args))
+        return types.SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_mod, "docker", fake_docker)
+    box = docker_mod.DockerRuntime(vf.DockerConfig(image="img", workdir="/testbed"), name="reliquary-gradebox-x")
+    box._container = "reliquary-gradebox-x"
+    box.env = {"A": "1"}
+    for cut in (False, True):
+        box._cut = cut
+        if cut:
+            box._proxy_env = lambda: {"HTTP_PROXY": "http://p"}
+        seen.clear()
+        asyncio.run(box.run(["python3", "-I", "-c", "x"], {"B": "2"}))
+        assert agentic_replay.docker_exec_argv(box, ["python3", "-I", "-c", "x"], {"B": "2"}) == \
+            ["docker", *seen[0]]
+
+
+def test_the_box_disk_is_checked_before_any_action(monkeypatch):
+    class Disk(_FakeBox):
+        def __init__(self, kib):
+            super().__init__()
+            self.kib = kib
+
+        async def run(self, argv, env):
+            if argv[:2] == ["df", "-Pk"]:
+                self.runs.append(list(argv))
+                return types.SimpleNamespace(
+                    stdout=f"Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                           f"overlay {self.kib} 8 {self.kib - 8} 1% /\n", exit_code=0)
+            return await super().run(argv, env)
+
+    limits = agentic_replay.BoxLimits(disk_gb=2.0)
+    bounded = Disk(2 * 2 ** 20)
+    _fake_verifiers(monkeypatch, bounded)
+    asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")], limits=limits))
+    assert bounded.runs[0][:2] == ["df", "-Pk"]          # before the python lookup and any action
+    unbounded = Disk(300 * 2 ** 20)                      # the host's 300 GB: no quota
+    _fake_verifiers(monkeypatch, unbounded)
+    with pytest.raises(RuntimeError, match="disk"):
+        asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")], limits=limits))
+    assert len(unbounded.runs) == 1                      # nothing ran after the check
+    with pytest.raises(ValueError):
+        agentic_replay.BoxLimits(disk_gb=0)
+
+
+def test_finalize_gets_the_very_box_setup_got(monkeypatch):
+    # reliquary-swe's finalize finds setup's base commit by id(runtime).
+    box, seen = _FakeBox(), []
+    task = _task()
+
+    async def setup(trace, runtime):
+        seen.append(runtime)
+
+    async def finalize(trace, runtime):
+        seen.append(runtime)
+        await runtime.run(["sh", "-c", "git diff"], {})
+    task.setup, task.finalize = setup, finalize
+    _fake_verifiers(monkeypatch, box)
+    asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")]))
+    assert seen[0] is seen[1] is box
+    assert "run" not in vars(box)                        # the bound is lifted after finalize

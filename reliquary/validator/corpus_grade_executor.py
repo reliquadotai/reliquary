@@ -25,10 +25,14 @@ from collections.abc import Callable
 from reliquary.corpus.replay_compare import Action, compare
 from reliquary.validator.agentic_replay import (
     DEFAULT_BOX_LIMITS,
+    DISK_TOLERANCE,
+    GRADE_OUTPUT_BYTES,
     BoxLimits,
     BoxLost,
     ReplayTimeout,
     bounded_box,
+    output_bounded,
+    root_size_bytes,
     replay_swe,
     sweep_orphan_boxes,
     swesmith_task,
@@ -60,20 +64,15 @@ class GradeTimeout(Exception):
 
 
 class _PatchWatch:
-    """The grade box, noting when ``reliquary_swe.grading.grade`` applies the
-    patch (its ``git apply``): from then on the box runs the miner's code."""
+    """Notes when ``reliquary_swe.grading.grade`` applies the patch (its
+    ``git apply``): from then on the box runs the miner's code."""
 
-    def __init__(self, box) -> None:
-        self._box = box
+    def __init__(self) -> None:
         self.applied = False
 
-    def __getattr__(self, name):
-        return getattr(self._box, name)
-
-    async def run(self, argv, env):
+    def __call__(self, argv) -> None:
         if list(argv[:2]) == ["git", "apply"]:
             self.applied = True
-        return await self._box.run(argv, env)
 
 
 async def grade_patch(task, patch: str, *, limits: BoxLimits = DEFAULT_BOX_LIMITS):
@@ -94,9 +93,11 @@ async def grade_patch(task, patch: str, *, limits: BoxLimits = DEFAULT_BOX_LIMIT
             async with bounded_box(task, limits) as box:
                 await box.prepare_setup()
                 await box.prepare_execution([])
-                watch = _PatchWatch(box)
+                watch = _PatchWatch()
                 try:
-                    report = await grading.grade(watch, task.data, patch)
+                    # What it reads back is bounded (ruling P24): the tests run patched code.
+                    with output_bounded(box, GRADE_OUTPUT_BYTES, on_run=watch):
+                        report = await grading.grade(box, task.data, patch)
                 except Exception as e:
                     if not watch.applied:
                         raise
@@ -227,6 +228,46 @@ def docker_storage_refusal(*, info: dict | None = None, probe: Callable[[], dict
             f"would differ from miners' and void honest replays (ruling P20)")
 
 
+# Ruling P24: a replayed `dd if=/dev/zero of=/x` must fill its own box, not the
+# host's Docker storage. verifiers' `docker run` takes no `--storage-opt`, so
+# the bound is the daemon's default `overlay2.size`, which overlay2 (the graph
+# driver, not the containerd image store) honours on xfs mounted with pquota.
+DISK_PROBE_IMAGE = "alpine:3.22"
+
+
+def run_disk_probe(image: str) -> str:
+    """``df -Pk /`` in a throwaway box from ``image`` (pulled if missing)."""
+    out = subprocess.run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "df",
+                          image, "-Pk", "/"], capture_output=True, text=True, timeout=600, check=False)
+    if out.returncode != 0:
+        raise RuntimeError(f"disk probe box failed ({out.returncode}): "
+                           f"{(out.stderr or out.stdout).strip()[:300]}")
+    return out.stdout
+
+
+def docker_disk_refusal(disk_gb: float, *, info: dict | None = None,
+                        probe: Callable[[], dict] = docker_info,
+                        run_probe: Callable[[str], str] = run_disk_probe,
+                        image: str = DISK_PROBE_IMAGE) -> str | None:
+    """Why this host's boxes are not bounded to ``disk_gb`` of writable layer,
+    or None. Every box is checked again before its first action
+    (``agentic_replay.check_box_disk``)."""
+    try:
+        info = info if info is not None else probe()
+        if info.get("Driver") != "overlay2":
+            return (f"Docker's storage driver is {info.get('Driver')!r}, not overlay2: a box's disk "
+                    f"cannot be bounded (set \"storage-driver\": \"overlay2\" and \"features\": "
+                    f"{{\"containerd-snapshotter\": false}} in daemon.json; ruling P24)")
+        size = root_size_bytes(run_probe(image))
+    except Exception as exc:  # noqa: BLE001 - any failure to look is a refusal
+        return f"could not check a box's disk limit: {exc}"
+    if size is None or size > disk_gb * 2 ** 30 * DISK_TOLERANCE:
+        return (f"a box's / reads {size} bytes, more than --disk-gb {disk_gb}: set the daemon's "
+                f"\"storage-opts\": [\"overlay2.size={disk_gb:g}G\"] with /var/lib/docker on xfs "
+                f"mounted with pquota (ruling P24)")
+    return None
+
+
 class GradeExecutor(LeaseExecutor):
     kind = "grade executor"
 
@@ -306,6 +347,6 @@ def run_grade_executor(*, control_url: str, executor_id: str, concurrency: int =
         executor_id=executor_id, concurrency=concurrency, limits=limits, **client))
 
 
-__all__ = ["BOX_LOST", "BOX_TIMEOUT", "GRADE_PREFIX", "GradeExecutor", "GradeTimeout", "TOKEN_ENV", "docker_storage_refusal", "grade_patch",
+__all__ = ["BOX_LOST", "BOX_TIMEOUT", "DISK_PROBE_IMAGE", "GRADE_PREFIX", "docker_disk_refusal", "GradeExecutor", "GradeTimeout", "TOKEN_ENV", "docker_storage_refusal", "grade_patch",
            "installed_env_refusal",
            "run_grade_executor", "run_grade_item"]

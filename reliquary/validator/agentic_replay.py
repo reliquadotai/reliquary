@@ -49,8 +49,20 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
 from reliquary.corpus.replay_compare import Action
+from reliquary.protocol.corpus_submission import MAX_FINAL_DIFF_CHARS
+from reliquary.validator.corpus_grade_protocol import MAX_OBSERVATION_CHARS
 
 logger = logging.getLogger(__name__)
+
+# What the executor reads back from a hostile box (ruling P24): a replayed
+# observation longer than any recorded one can be compared to is cut there
+# (and then mismatches); finalize's output past the largest diff a submission
+# carries likewise; a grade's test output gets a generous cap. Bytes, for
+# UTF-8's worst case of 4 per char.
+_UTF8 = 4
+FINALIZE_OUTPUT_BYTES = _UTF8 * MAX_FINAL_DIFF_CHARS + 2 ** 20
+GRADE_OUTPUT_BYTES = 256 * 2 ** 20
+_READ_CHUNK = 65536
 
 TOOL_PROGRAM = r'''
 import json, subprocess, sys
@@ -108,6 +120,8 @@ else:
         out = run_edit(args.get("path"), args.get("old_str"), args.get("new_str"))
     else:
         out = f"error: unknown tool {req['tool']!r}"
+if req.get("max_chars"):
+    out = out[:req["max_chars"]]
 sys.stdout.write(out)
 '''
 
@@ -129,8 +143,14 @@ class BoxLimits:
     cpu: float = 2.0
     memory_gb: float = 6.0
     pids: int = 1024
+    # The box's writable layer (ruling P24): Docker's daemon default
+    # ``overlay2.size`` on xfs with project quotas, checked in each box (``df``)
+    # before any action. None: unchecked (tests; ``--allow-non-xfs`` only).
+    disk_gb: float | None = None
 
     def __post_init__(self) -> None:
+        if self.disk_gb is not None and not (math.isfinite(self.disk_gb) and self.disk_gb > 0):
+            raise ValueError(f"disk_gb must be positive, got {self.disk_gb}")
         if not (math.isfinite(self.cpu) and self.cpu > 0):
             raise ValueError(f"cpu must be positive, got {self.cpu}")
         if not (math.isfinite(self.memory_gb) and self.memory_gb > 0):
@@ -171,7 +191,128 @@ async def bounded_box(task, limits: BoxLimits = DEFAULT_BOX_LIMITS) -> AsyncIter
                                   "--memory-swap", memory, name)
         if code != 0:
             raise RuntimeError(f"could not limit box {name}: {out.strip()[:300]}")
+        if limits.disk_gb is not None:
+            await check_box_disk(box, limits.disk_gb)
         yield box
+
+
+# A quota reads a little over its nominal size on some kernels.
+DISK_TOLERANCE = 1.02
+
+
+def root_size_bytes(df_output: str) -> int | None:
+    """The size of ``/`` from ``df -Pk /`` (POSIX output, GNU and busybox)."""
+    lines = [line.split() for line in df_output.strip().splitlines()]
+    if len(lines) < 2 or len(lines[-1]) < 6 or not lines[-1][1].isdigit():
+        return None
+    return int(lines[-1][1]) * 1024
+
+
+async def check_box_disk(box, disk_gb: float) -> None:
+    """Refuse a box whose root filesystem is not bounded by ``disk_gb`` (the
+    daemon's ``overlay2.size``); run before anything untrusted, so the
+    image's own ``df`` still answers truthfully."""
+    result = await box.run(["df", "-Pk", "/"], {})
+    size = root_size_bytes(result.stdout or "")
+    limit = disk_gb * 2 ** 30
+    if size is None or size > limit * DISK_TOLERANCE:
+        raise RuntimeError(
+            f"box disk is not bounded to {disk_gb} GB (its / reads {size} bytes): set the Docker "
+            f"daemon's storage-opts overlay2.size on xfs with pquota (ruling P24)")
+
+
+async def capped_exec(argv: Sequence[str], *, max_bytes: int) -> tuple[int, bytes, bytes, bool]:
+    """Run ``argv`` on the host, reading at most ``max_bytes`` from each of
+    stdout and stderr; past that the process is killed. Returns
+    ``(exit code, stdout, stderr, truncated)``."""
+    process = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    truncated = False
+
+    def stop() -> None:
+        nonlocal truncated
+        truncated = True
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+
+    async def read(stream) -> bytes:
+        data = bytearray()
+        while True:
+            chunk = await stream.read(_READ_CHUNK)
+            if not chunk:
+                return bytes(data)
+            room = max_bytes - len(data)
+            data += chunk[:room]
+            if len(chunk) > room:
+                stop()
+                return bytes(data)
+
+    try:
+        out, err = await asyncio.gather(read(process.stdout), read(process.stderr))
+        code = await process.wait()
+    except BaseException:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        with contextlib.suppress(Exception):
+            await process.wait()
+        raise
+    return code, out, err, truncated
+
+
+def docker_exec_argv(box, argv: Sequence[str], env: dict) -> list[str] | None:
+    """The ``docker exec`` verifiers b2e4e81's ``DockerRuntime.run`` runs for
+    ``argv`` (same env, proxy env once cut, workdir, container), or None for
+    any other runtime. A parity test pins it to verifiers' own."""
+    try:
+        from verifiers.v1.runtimes.docker import DockerRuntime
+    except ImportError:
+        return None
+    if not isinstance(box, DockerRuntime) or not box._container:
+        return None
+    merged = {**box.process_env(env), **(box._proxy_env() if box._cut else {})}
+    env_args = [arg for k, v in merged.items() for arg in ("--env", f"{k}={v}")]
+    return ["docker", "exec", *env_args, "--workdir", box.config.workdir, box._container, *argv]
+
+
+async def bounded_run(box, argv: Sequence[str], env: dict, *, max_bytes: int, fallback=None):
+    """``box.run`` with stdout and stderr each read up to ``max_bytes``
+    (``fallback``, default ``box.run``, for a runtime other than Docker's)."""
+    command = docker_exec_argv(box, argv, env)
+    if command is None:
+        return await (fallback or box.run)(list(argv), env)
+    code, out, err, truncated = await capped_exec(command, max_bytes=max_bytes)
+    if truncated:
+        logger.warning("box output past %d bytes was cut (%s)", max_bytes, list(argv)[:1])
+    from verifiers.v1.runtimes.base import ProgramResult
+
+    return ProgramResult(exit_code=code, stdout=out.decode(errors="replace"),
+                         stderr=err.decode(errors="replace"))
+
+
+@contextlib.contextmanager
+def output_bounded(box, max_bytes: int, *, on_run=None):
+    """While open, ``box.run`` reads at most ``max_bytes`` per stream: for what
+    untrusted code ran in (a replayed repo's finalize, a patched repo's tests).
+    The box object stays the same one (reliquary-swe's finalize finds its
+    setup state by ``id(runtime)``); ``on_run(argv)`` sees each call first."""
+    original = box.run
+    own = "run" in vars(box)
+
+    async def run(argv, env):
+        if on_run is not None:
+            on_run(argv)
+        return await bounded_run(box, argv, env, max_bytes=max_bytes, fallback=original)
+
+    box.run = run
+    try:
+        yield box
+    finally:
+        if own:
+            box.run = original
+        else:
+            del box.run
 
 
 def sweep_orphan_boxes() -> int:
@@ -235,13 +376,19 @@ def _timeout_arg(command_timeout: float) -> int | float:
 
 
 async def run_action(box, python: str, action: Action, command_timeout: float) -> str:
-    """One recorded tool call, with the program passed afresh by argv."""
+    """One recorded tool call, with the program passed afresh by argv. The
+    output is cut one char past the longest observation a lease carries
+    (ruling P24): longer cannot match a recorded one anyway."""
+    keep = MAX_OBSERVATION_CHARS + 1
     request_path = f"/tmp/.replay_request_{secrets.token_hex(16)}.json"
     request = json.dumps({"tool": action.tool, "arguments": action.arguments,
-                          "timeout": _timeout_arg(command_timeout)})
+                          "timeout": _timeout_arg(command_timeout), "max_chars": keep})
     await box.write(request_path, request.encode())
-    result = await box.run([python, "-I", "-c", TOOL_PROGRAM, request_path], {})
-    return result.stdout
+    # The program truncates; the read is bounded as well, since the command
+    # can write to the exec's own stdout behind the program's back.
+    result = await bounded_run(box, [python, "-I", "-c", TOOL_PROGRAM, request_path], {},
+                               max_bytes=_UTF8 * keep)
+    return (result.stdout or "")[:keep]
 
 
 _TASK_LOCK = threading.Lock()
@@ -311,7 +458,8 @@ async def replay_swe(task, actions: Sequence[Action], *,
                 try:
                     for action in actions:
                         observations.append(await run_action(box, python, action, command_timeout))
-                    await task.finalize(trace, box)
+                    with output_bounded(box, FINALIZE_OUTPUT_BYTES):
+                        await task.finalize(trace, box)
                 except Exception as e:
                     if not started:
                         raise
