@@ -192,6 +192,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
         self._dispute_seconds = float(dispute_seconds)
         self._queue: collections.deque[_Work] = collections.deque()
         self._holders: list[Callable[[str], Any]] = []
+        # Executors whose last claim was refused 409 wrong_env: live by their
+        # heartbeats, but they never take a lease, so never eligible (N2).
+        self._wrong_env: set[str] = set()
 
     def hold_on_quarantine(self, holder: Callable[[str], Any]) -> None:
         """``holder(executor_id)`` runs synchronously the moment an executor is
@@ -243,8 +246,14 @@ class RemoteGradeDispatcher(ExecutorLeases):
 
     # -- the executor's side ----------------------------------------------------
 
+    def refused_env(self, executor_id: str) -> None:
+        """A claim of ``executor_id`` was refused for its env (409): it
+        counts for no item until it claims on this control's env again."""
+        self._wrong_env.add(executor_id)
+
     def claim(self, executor_id: str) -> dict | None:
         self._contact(executor_id)
+        self._wrong_env.discard(executor_id)          # it claims on this control's env
         if executor_id in self.quarantined or self._held(executor_id) >= self._max_leases:
             return None
         if self._provider(executor_id) is None:
@@ -272,10 +281,20 @@ class RemoteGradeDispatcher(ExecutorLeases):
         provider = str(provider).strip().lower() if provider else ""
         return provider or None
 
+    def _on_pinned_env(self, executor_id: str) -> bool:
+        document = self._directory.document(executor_id) or {}
+        return ((document.get("model_id"), document.get("model_revision"))
+                == (self._env["package"], self._env["version"])
+                and executor_id not in self._wrong_env)
+
     def _eligible(self, executor_id: str, work: _Work) -> bool:
+        """It may take ``work``'s next vote: registered for this control's
+        env and not refused for it (N2), not excluded, of a provider that has
+        not voted on it."""
         provider = self._provider(executor_id)
         return (executor_id not in work.excluded and provider is not None
-                and provider not in work.providers.values())
+                and provider not in work.providers.values()
+                and self._on_pinned_env(executor_id))
 
     @staticmethod
     def _misfit(work: _Work, answer: GradeItemResult) -> str | None:
@@ -469,7 +488,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
             if live and not served:
                 self.stats["stranded"] += 1
                 logger.warning("grade item %d (%s) waits: every live grade executor is excluded "
-                               "from it (voted, failed it, or same provider as a voter)",
+                               "from it (voted, failed it, same provider as a voter, or not on "
+                               "this control's env)",
                                work.id, work.mode)
         self.stats["waiting"] = waiting
         if waiting and not live:
@@ -489,6 +509,7 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
     async def claim(body: GradeClaimRequest, request: Request):
         document = _authenticated(request, body.executor_id)
         if (body.env_package, body.env_version) != (document["model_id"], document["model_revision"]):
+            dispatcher.refused_env(document["executor_id"])
             raise HTTPException(status_code=409, detail="wrong_env")
         lease = dispatcher.claim(document["executor_id"])
         if lease is None:

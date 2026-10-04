@@ -781,3 +781,58 @@ async def test_a_replay_result_that_does_not_fit_its_lease_is_refused_and_struck
     assert d._strikes["g0"] == 1
     _answer(d, "g1", {**REPLAY_OK, "observations_compared": 2, "observations_mismatched": [1]})
     assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
+
+
+# N2 (ruling P25): eligibility = live AND on the control's pinned env.
+
+async def test_a_live_executor_refused_for_its_env_does_not_stop_the_dispute_clock():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    app = FastAPI()
+    app.include_router(build_grade_executor_router(d, d._directory))
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://control") as http:
+        auth = {"Authorization": f"Bearer {TOKENS['g1']}"}
+        wrong = {"executor_id": "g1", "env_package": PACKAGE, "env_version": "c" * 40}
+        for _ in range(20):                                   # 2000 s: heartbeating, claims refused
+            clock.now += 100
+            beat = await http.post("/corpus/internal/grade/heartbeat",
+                                   json={"executor_id": "g1", "detail": {}}, headers=auth)
+            assert beat.status_code == 200
+            claim = await http.post("/corpus/internal/grade/claim", json=wrong, headers=auth)
+            assert claim.status_code == 409
+            await d.sweep()
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "disputed" and d.stats["stranded"] >= 1
+
+
+async def test_an_executor_whose_registry_env_is_not_the_controls_is_never_eligible():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    d._directory._by_id["g1"] = {**d._directory._by_id["g1"], "model_revision": "c" * 40}
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    assert d.claim("g1") is None                              # never a second lease
+    for _ in range(20):
+        clock.now += 100
+        d.heartbeat("g1")
+        await d.sweep()
+    assert (await asyncio.wait_for(decision, 5)).status == "disputed"
+
+
+async def test_a_wrong_env_executor_that_claims_on_the_right_env_again_is_eligible():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    d.refused_env("g1")
+    clock.now += 100
+    d.heartbeat("g1")
+    await d.sweep()
+    _answer(d, "g1", REPLAY_BAD)                              # a right-env claim clears it
+    assert (await asyncio.wait_for(decision, 5)).status == "ok"
