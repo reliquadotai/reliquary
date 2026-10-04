@@ -9,6 +9,9 @@ stands, and each executor that disagreed with it is quarantined. An executor
 alone can never fail a miner. Timeouts, executor errors and expired leases
 re-lease the item elsewhere and never judge anyone: two timeouts (an expired
 lease counts as one) resolve as ``timeout``, three errors as ``error``.
+A box the trajectory itself lost or ran past its deadline (``box_lost``,
+``box_timeout``, ruling P23) is a vote, not an error: it needs a second
+distinct provider, and two agreeing resolve the item ``unjudgeable``.
 
 Executors count by provider (ruling P17): each grade executor registers its
 ``provider_id``, an item is never leased to a provider that already voted on
@@ -20,7 +23,9 @@ resolves ``disputed``, which sanctions nobody and certifies nothing.
 An item no lease can carry (actions or observations beyond the
 ``GradeLease`` bounds) is never leased: every executor would refuse the lease
 and it would cycle forever. It resolves at once as ``ungradeable``, the
-validator's own limit, never evidence against the miner.
+validator's own limit, never evidence against the miner. Since ruling P23 the
+intake (and the miner's precheck) refuse such a trajectory before it takes a
+slot (``grade_item_bounds_refusal``), so this outcome is only defensive.
 
 Executor liveness, lease caps, expiry strikes, quarantine and heartbeat writes
 are the audit dispatcher's (``ExecutorLeases``).
@@ -79,6 +84,11 @@ MAX_LEASES_PER_EXECUTOR = 8
 GRADE_DISPUTE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS", 1800.0, 60.0, 86400.0)
 UNGRADEABLE = "ungradeable"
 DISPUTED = "disputed"
+# Ruling P23: the box failed or the deadline passed once the trajectory's
+# actions (or its applied patch) ran. Each such result is a vote like an
+# "ok" one; two distinct providers agreeing resolve the item UNJUDGEABLE.
+TRAJECTORY_STATUSES = frozenset({"box_lost", "box_timeout"})
+UNJUDGEABLE = "unjudgeable"
 
 # The facts an "ok" result must carry for its mode.
 _MODE_FACTS = {"grade": ("diff_applied", "tests_passed"), "replay": ("replay_diff_equal",)}
@@ -86,7 +96,8 @@ _MODE_FACTS = {"grade": ("diff_applied", "tests_passed"), "replay": ("replay_dif
 
 @dataclass(frozen=True)
 class GradeDecision:
-    # "ok", "error", "timeout", "ungradeable" or "disputed"; only "ok" judges the miner.
+    # "ok", "error", "timeout", "ungradeable", "disputed" or "unjudgeable"; only
+    # "ok" judges the miner, "unjudgeable" (two providers) voids it unpaid.
     status: str
     result: dict | None                 # the agreed result, when "ok"
     graded_by: tuple[str, ...]
@@ -103,7 +114,10 @@ def replay_certified(result: dict) -> bool:
 
 
 def decision_key(mode: str, result: dict) -> tuple:
-    """What two executors must agree on: the facts the control decides from."""
+    """What two executors must agree on: the facts the control decides from.
+    A box lost and a box timed out are one outcome: the trajectory's."""
+    if result.get("status") in TRAJECTORY_STATUSES:
+        return (UNJUDGEABLE,)
     if mode == "grade":
         return (result.get("diff_applied"), result.get("tests_passed"))
     return (result.get("replay_diff_equal"), replay_certified(result))
@@ -128,9 +142,10 @@ class _Work:
 
     @property
     def agree_needed(self) -> int:
+        unjudgeable = any(r.get("status") in TRAJECTORY_STATUSES for r in self.results.values())
         failing = self.mode == "replay" and any(
             not replay_certified(r) for r in self.results.values())
-        return 2 if self.drawn or failing else 1
+        return 2 if self.drawn or failing or unjudgeable else 1
 
 
 @dataclass
@@ -338,10 +353,17 @@ class RemoteGradeDispatcher(ExecutorLeases):
                           key=lambda kv: len({work.providers[e] for e in kv[1]}))
         if len({work.providers[e] for e in voters}) >= work.agree_needed:
             agreeing = tuple(sorted(voters))
+            status = UNJUDGEABLE if key == (UNJUDGEABLE,) else "ok"
             self._resolve(work, GradeDecision(
-                "ok", dict(work.results[agreeing[0]]), agreeing,
+                status, dict(work.results[agreeing[0]]), agreeing,
                 tuple(sorted({work.providers[e] for e in agreeing}))))
+            if status == UNJUDGEABLE:
+                self.stats[UNJUDGEABLE] += 1
             for dissenter in sorted(set(work.results) - set(agreeing)):
+                if work.results[dissenter].get("status") in TRAJECTORY_STATUSES:
+                    # Its box failed where others' did not: host noise as
+                    # likely as a lie, and it claimed no fact. Never quarantined.
+                    continue
                 # Refused at once; the registry write and listeners follow.
                 if self._mark_quarantined(dissenter, f"grade item {work.id} ({work.mode}) "
                                                      f"disagreed with {list(agreeing)}"):
@@ -459,6 +481,6 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
 
 
 __all__ = ["DISPUTED", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
-           "UNGRADEABLE", "GradeDecision",
+           "TRAJECTORY_STATUSES", "UNGRADEABLE", "UNJUDGEABLE", "GradeDecision",
            "RemoteGradeDispatcher", "build_grade_executor_router", "decision_key",
            "replay_certified"]

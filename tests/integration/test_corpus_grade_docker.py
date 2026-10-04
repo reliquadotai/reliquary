@@ -165,3 +165,80 @@ async def test_a_max_turns_final_call_replays_into_the_recorded_diff():
                         "observations_mismatched": []}, replayed
     without = await run_grade_item(_item([first]).model_copy(update={"final_diff": recorded}))
     assert without["replay_diff_equal"] is False           # what dropping it did before F1
+
+
+# F2 (ruling P23): the routes a fabricated trajectory could use to keep a box
+# from judging it, on a real box. Each is now a fact the trajectory caused
+# (box_lost / box_timeout, two providers void it unpaid) or a plain mismatch.
+
+def _commands(*commands, final_diff=""):
+    import json
+
+    from reliquary.validator.corpus_grade_protocol import GradeItem
+
+    return GradeItem.model_validate({
+        "submission_id": "a" * 64, "task_index": 0, "instance_id": INSTANCE, "mode": "replay",
+        "final_diff": final_diff,
+        "actions": [{"tool": "bash", "arguments": json.dumps({"command": c}), "observation": ""}
+                    for c in commands]})
+
+
+async def test_kill_9_of_pid_1_does_not_kill_the_box():
+    # The kernel protects a namespace's init from its own namespace's signals.
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    replayed = await run_grade_item(_commands("kill -9 1", "kill -9 -1", "echo after"))
+    assert replayed["status"] == "ok" and replayed["observations_mismatched"] == [2]
+
+
+async def test_rm_rf_git_leaves_an_empty_diff_that_mismatches_a_claimed_one():
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    replayed = await run_grade_item(_commands("rm -rf .git", final_diff="diff --git a/x b/x\n"))
+    assert replayed["status"] == "ok" and replayed["replay_diff_equal"] is False
+
+
+async def test_an_action_that_breaks_the_box_is_box_lost():
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    replayed = await run_grade_item(_commands("rm -f /bin/sh /usr/bin/sh /bin/dash /usr/bin/dash",
+                                              "echo after"))
+    assert replayed["status"] == "box_lost", replayed
+
+
+async def test_a_long_sleep_spends_the_deadline_as_the_trajectorys_box_timeout():
+    import functools
+
+    from reliquary.validator.agentic_replay import replay_swe
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    replayed = await run_grade_item(_commands("echo first", "sleep 99999"),
+                                    replay=functools.partial(replay_swe, episode_deadline=60))
+    assert replayed["status"] == "box_timeout", replayed
+
+
+class _ShortScoring:
+    def __init__(self, task, seconds):
+        self._task = task
+        self.data = task.data.model_copy(update={
+            "timeout": task.data.timeout.model_copy(update={"scoring": seconds})})
+
+    def __getattr__(self, name):
+        return getattr(self._task, name)
+
+
+async def test_hanging_tests_after_the_patch_are_the_trajectorys_box_timeout():
+    from reliquary.validator.agentic_replay import swesmith_task
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+    from reliquary.validator.corpus_grade_protocol import GradeItem
+
+    # Source the tests import (a root conftest.py is cleaned by the test restoration).
+    hang = ("diff --git a/src/docx/__init__.py b/src/docx/__init__.py\n"
+            "index 2052210..fb6c683 100644\n--- a/src/docx/__init__.py\n+++ b/src/docx/__init__.py\n"
+            "@@ -60,3 +60,5 @@ del (\n     StylesPart,\n     part_class_selector,\n )\n"
+            "+import time\n+time.sleep(99999)\n")
+    task = _ShortScoring(swesmith_task(INSTANCE), 90)
+    graded = await run_grade_item(
+        GradeItem(submission_id="a" * 64, task_index=0, instance_id=INSTANCE, mode="grade",
+                  final_diff=hang), task_for=lambda _: task)
+    assert graded["status"] == "box_timeout", graded

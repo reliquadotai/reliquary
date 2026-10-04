@@ -26,6 +26,7 @@ from reliquary.corpus.replay_compare import Action, compare
 from reliquary.validator.agentic_replay import (
     DEFAULT_BOX_LIMITS,
     BoxLimits,
+    BoxLost,
     ReplayTimeout,
     bounded_box,
     replay_swe,
@@ -43,23 +44,85 @@ IDLE_SECONDS = 5.0
 DEFAULT_SCORING_SECONDS = 1800.0
 
 
+# What a trajectory itself caused (ruling P23): reported as facts, decided on
+# by two distinct providers like any other, never as this executor's fault.
+BOX_LOST = "box_lost"
+BOX_TIMEOUT = "box_timeout"
+
+
+class GradeTimeout(Exception):
+    """Grading exceeded the task's scoring timeout. ``trajectory_caused``: the
+    miner's patch was applied by then, so its code (run by the tests) spent it."""
+
+    def __init__(self, message: str, *, trajectory_caused: bool = False) -> None:
+        super().__init__(message)
+        self.trajectory_caused = trajectory_caused
+
+
+class _PatchWatch:
+    """The grade box, noting when ``reliquary_swe.grading.grade`` applies the
+    patch (its ``git apply``): from then on the box runs the miner's code."""
+
+    def __init__(self, box) -> None:
+        self._box = box
+        self.applied = False
+
+    def __getattr__(self, name):
+        return getattr(self._box, name)
+
+    async def run(self, argv, env):
+        if list(argv[:2]) == ["git", "apply"]:
+            self.applied = True
+        return await self._box.run(argv, env)
+
+
 async def grade_patch(task, patch: str, *, limits: BoxLimits = DEFAULT_BOX_LIMITS):
     """`reliquary_swe.grading.grade` in a fresh bounded box from the task's
     pinned image, network cut, as `SweEnv._grade` does it (one attempt: a
-    failure goes back to the control, which re-leases it)."""
+    failure goes back to the control, which re-leases it).
+
+    Raises ``BoxLost`` when the box fails once the patch is applied and
+    ``GradeTimeout`` past the scoring timeout (``trajectory_caused`` once the
+    patch is applied); a failure before that is the executor's."""
     from reliquary_swe import grading
 
-    async with asyncio.timeout(task.data.timeout.scoring or DEFAULT_SCORING_SECONDS):
-        async with bounded_box(task, limits) as box:
-            await box.prepare_setup()
-            await box.prepare_execution([])
-            return await grading.grade(box, task.data, patch)
+    deadline = task.data.timeout.scoring or DEFAULT_SCORING_SECONDS
+    watch: _PatchWatch | None = None
+    report = None
+    try:
+        async with asyncio.timeout(deadline):
+            async with bounded_box(task, limits) as box:
+                await box.prepare_setup()
+                await box.prepare_execution([])
+                watch = _PatchWatch(box)
+                try:
+                    report = await grading.grade(watch, task.data, patch)
+                except Exception as e:
+                    if not watch.applied:
+                        raise
+                    raise BoxLost(f"the grade box failed after the patch was applied: "
+                                  f"{type(e).__name__}: {e}"[:400]) from e
+    except TimeoutError as e:
+        if report is None:
+            raise GradeTimeout(f"grading exceeded its scoring timeout {deadline} s",
+                               trajectory_caused=bool(watch and watch.applied)) from e
+        logger.warning("grade box removal outlived the deadline; the grade itself finished")
+    except BoxLost:
+        raise
+    except Exception:
+        if report is None:
+            raise
+        logger.exception("grade box removal failed after the grade finished")
+    return report
 
 
 async def run_grade_item(item: GradeItem, *, task_for=None, grade=None, replay=None,
                          limits: BoxLimits = DEFAULT_BOX_LIMITS) -> dict:
     """The facts for one item, as a ``GradeItemResult`` body. ``error`` and
-    ``timeout`` are this executor's, never the miner's: the control re-leases."""
+    ``timeout`` are this executor's, never the miner's: the control re-leases.
+    ``box_lost`` and ``box_timeout`` are the trajectory's (ruling P23): the box
+    failed, or the deadline passed, once the recorded actions or the applied
+    patch ran in it."""
     task_for = task_for or swesmith_task
     grade = grade or functools.partial(grade_patch, limits=limits)
     replay = replay or functools.partial(replay_swe, limits=limits)
@@ -69,6 +132,9 @@ async def run_grade_item(item: GradeItem, *, task_for=None, grade=None, replay=N
         if item.mode == "grade":
             try:
                 report = await grade(task, item.final_diff)
+            except GradeTimeout as exc:
+                return {"status": BOX_TIMEOUT if exc.trajectory_caused else "timeout",
+                        "detail": str(exc)[:500]}
             except TimeoutError as exc:
                 return {"status": "timeout", "detail": f"grading exceeded its scoring timeout {exc}"[:500]}
             return {"status": "ok", "diff_applied": bool(report.applied),
@@ -80,8 +146,13 @@ async def run_grade_item(item: GradeItem, *, task_for=None, grade=None, replay=N
         return {"status": "ok", "replay_diff_equal": report.diff_equal,
                 "observations_compared": report.compared,
                 "observations_mismatched": list(report.mismatched)}
+    except BoxLost as exc:
+        logger.warning("grade item %s (%s): the trajectory lost its box: %s",
+                       item.submission_id[:12], item.mode, exc)
+        return {"status": BOX_LOST, "detail": str(exc)[:500]}
     except ReplayTimeout as exc:
-        return {"status": "timeout", "detail": str(exc)[:500]}
+        return {"status": BOX_TIMEOUT if exc.trajectory_caused else "timeout",
+                "detail": str(exc)[:500]}
     except Exception as exc:  # ours, not the miner's: the control re-leases it
         logger.exception("grade item %s (%s) failed", item.submission_id[:12], item.mode)
         return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"[:500]}
@@ -235,6 +306,6 @@ def run_grade_executor(*, control_url: str, executor_id: str, concurrency: int =
         executor_id=executor_id, concurrency=concurrency, limits=limits, **client))
 
 
-__all__ = ["GRADE_PREFIX", "GradeExecutor", "TOKEN_ENV", "docker_storage_refusal", "grade_patch",
+__all__ = ["BOX_LOST", "BOX_TIMEOUT", "GRADE_PREFIX", "GradeExecutor", "GradeTimeout", "TOKEN_ENV", "docker_storage_refusal", "grade_patch",
            "installed_env_refusal",
            "run_grade_executor", "run_grade_item"]

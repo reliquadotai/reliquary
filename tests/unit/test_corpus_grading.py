@@ -233,14 +233,73 @@ def test_a_failing_grade_by_one_undrawn_executor_never_sanctions(grade):
 def test_a_grade_without_a_decision_judges_nobody_and_certifies_nothing(status):
     records, states = _Records(), _States()
     dispatcher = _Dispatcher(GradeDecision(status, None, ()), FORGED)
-    grader, voided = _grader(records, dispatcher, states=states)
+    grader, voided = _grader(records, dispatcher, job=_job(fraction=0.0), states=states)
     doc = asyncio.run(grader.grade_one(SID))
     assert doc["status"] == status                         # its own outcome, on record
-    assert doc["graded_success"] is False and doc["replay"] is None
+    assert doc["graded_success"] is False and doc["replay"]["drawn"] is False
     assert doc["replay_certified"] is False
     assert [i["mode"] for i in dispatcher.items] == ["grade"]
     assert records.voided == {} and states.states == {} and voided == []
     assert records.grades[SID] == doc
+
+
+@pytest.mark.parametrize("status", ["timeout", "error", "ungradeable", "disputed", "unjudgeable"])
+def test_a_grade_that_is_not_a_clean_success_gets_the_failing_replay_draw(status):
+    """F2 (ruling P23 a): a forger who makes the grade fail to decide (its
+    patch kills the box, its tests sleep) is still replayed when drawn, and a
+    replay two providers fail sanctions it."""
+    records, states = _Records(), _States()
+    grade = GradeDecision(status, {"status": "box_lost"} if status == "unjudgeable" else None,
+                          ("g0", "g1"), ("p0", "p1"))
+    dispatcher = _Dispatcher(grade, FORGED)
+    grader, voided = _grader(records, dispatcher, job=_job(fraction=1.0), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert [i["mode"] for i in dispatcher.items] == ["grade", "replay"]
+    assert doc["status"] == status and doc["replay"]["failed"] is True
+    assert records.voided[SID]["reason"] == "replay_failed" and voided == [SID]
+    assert states.states["5Hot"].failure_ids == [SID]
+
+
+UNJUDGEABLE_REPLAY = GradeDecision("unjudgeable", {"status": "box_lost", "detail": "kill -9 1"},
+                                   ("g0", "g1"), ("p0", "p1"))
+
+
+@pytest.mark.parametrize("grade", [PASSED, FAILED], ids=["passing-grade", "failing-grade"])
+def test_an_agreed_unjudgeable_replay_voids_unpaid_without_escalation(grade):
+    """F2 (ruling P23 c): `kill -9 1`, `rm -rf .git`, `sleep 99999` as the last
+    action: two providers agree the replay could not judge the trajectory.
+    Unpaid, never certified, and no sanction (honest infra noise must not ban)."""
+    records, states = _Records(), _States()
+    grader, voided = _grader(records, _Dispatcher(grade, UNJUDGEABLE_REPLAY), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["status"] == "unjudgeable" and doc["replay"]["unjudgeable"] is True
+    assert doc["replay"]["failed"] is False and doc["replay_certified"] is False
+    void = records.voided[SID]
+    assert void["reason"] == "replay_unjudgeable" and void["stage"] == "replay"
+    assert void["providers"] == ["p0", "p1"] and voided == [SID]
+    assert states.states == {}                              # no suspect, no ban
+
+
+def test_an_unjudgeable_replay_one_provider_claims_voids_nothing():
+    records, states = _Records(), _States()
+    lone = GradeDecision("unjudgeable", {"status": "box_lost"}, ("g0", "g1"), ("p0",))
+    grader, voided = _grader(records, _Dispatcher(PASSED, lone), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert doc["replay"]["unjudgeable"] is False and doc["replay_certified"] is False
+    assert records.voided == {} and voided == [] and states.states == {}
+
+
+def test_an_agreed_unjudgeable_grade_voids_unpaid_when_the_replay_does_not_sanction():
+    records, states = _Records(), _States()
+    grade = GradeDecision("unjudgeable", {"status": "box_timeout"}, ("g0", "g2"), ("p0", "p2"))
+    for job, replay in ((_job(fraction=0.0), CERTIFIED), (_job(fraction=1.0), CERTIFIED)):
+        records = _Records()
+        grader, voided = _grader(records, _Dispatcher(grade, replay), job=job, states=states)
+        doc = asyncio.run(grader.grade_one(SID))
+        assert doc["graded_success"] is False and doc["status"] == "unjudgeable"
+        assert records.voided[SID]["reason"] == "replay_unjudgeable"
+        assert records.voided[SID]["stage"] == "grade" and voided == [SID]
+    assert states.states == {}
 
 
 @pytest.mark.parametrize("status", ["timeout", "error", "ungradeable", "disputed"])

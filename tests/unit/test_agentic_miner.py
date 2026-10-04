@@ -197,6 +197,20 @@ def test_trajectory_precheck_is_the_validators_parse_and_span_check():
     assert trajectory_precheck(FakeRenderer(), max_turns=1)(honest)[0] == "bad_turns"
 
 
+def test_trajectory_precheck_applies_the_lease_bounds_like_the_intake(monkeypatch):
+    """F2 (ruling P23 d): the intake refuses what no grade lease can carry; the
+    miner runs the same bound so an honest miner never loses a slot to it."""
+    from reliquary.miner.agentic_miner import trajectory_precheck
+    from reliquary.validator import corpus_grade_protocol
+    from tests.unit.test_trajectory_parse import CALL, TERM, TEXT, FakeRenderer
+
+    honest = _fake_built([([TEXT, CALL, TERM], ["a long output"]), ([TEXT, TERM], None)])
+    assert trajectory_precheck(FakeRenderer(), max_turns=40)(honest) is None
+    monkeypatch.setattr(corpus_grade_protocol, "MAX_OBSERVATION_CHARS", 5)
+    reason, detail = trajectory_precheck(FakeRenderer(), max_turns=40)(honest)
+    assert reason == "trajectory_too_large" and detail["why"] == "observation"
+
+
 def test_a_real_malformed_call_trajectory_is_dropped_not_submitted():
     import os
 

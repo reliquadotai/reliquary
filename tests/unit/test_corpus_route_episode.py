@@ -115,6 +115,42 @@ def test_the_same_trajectory_twice_is_a_duplicate(episode_store):
     assert _post(client, _request(final_diff="other"))["reason"] == "hash_duplicate"
 
 
+@pytest.mark.parametrize("bound,value,why", [
+    ("MAX_OBSERVATION_CHARS", 3, "observation"),        # "a.py" is 4 chars
+    ("MAX_ARGUMENT_CHARS", 5, "arguments"),
+    ("MAX_ACTIONS", 1, "actions"),
+    ("MAX_GRADE_ITEM_CHARS", 40, "total"),
+])
+def test_a_trajectory_no_grade_lease_can_carry_is_refused_at_intake(episode_store, monkeypatch,
+                                                                     bound, value, why):
+    """F2 (ruling P23 d): refused before it takes a slot (unpaid, no sanction),
+    never accepted and then resolved ``ungradeable`` (paid, never judged)."""
+    from reliquary.validator import corpus_grade_protocol
+
+    monkeypatch.setattr(corpus_grade_protocol, bound, value)
+    records, accepted = _Records(), []
+    body = _post(_client(episode_store, records, accepted), _request())
+    assert (body["accepted"], body["reason"]) == (False, "trajectory_too_large"), body
+    assert records.written == {} and accepted == []
+
+
+def test_the_lease_bounds_check_matches_the_lease_model():
+    from reliquary.corpus.replay_compare import Action
+    from reliquary.validator.corpus_grade_protocol import (
+        MAX_GRADE_ITEM_CHARS, MAX_OBSERVATION_CHARS, GradeItem, grade_item_bounds_refusal,
+    )
+
+    item = {"submission_id": "a" * 64, "task_index": 0, "instance_id": "i", "mode": "replay"}
+    big = Action("bash", "{}", "x" * (MAX_OBSERVATION_CHARS + 1))
+    assert grade_item_bounds_refusal([big], "")["why"] == "observation"
+    halves = [Action("bash", "{}", "x" * (MAX_GRADE_ITEM_CHARS // 4))] * 5
+    assert grade_item_bounds_refusal(halves, "")["why"] == "total"
+    with pytest.raises(Exception):
+        GradeItem.model_validate({**item, "final_diff": "", "actions": [
+            {"tool": a.tool, "arguments": a.arguments, "observation": a.observation} for a in halves]})
+    assert grade_item_bounds_refusal([Action("bash", "{}", "ok")], "d") is None
+
+
 def test_an_episode_job_without_an_intake_is_a_server_error(episode_store):
     response = _client(episode_store, _Records(), [], intake=False).post(
         "/corpus/submit", json=_request().model_dump())

@@ -9,7 +9,12 @@ proven tokens (``trajectory_parse``, under the job's turn limit).
 Only one outcome sanctions: an ``ok`` replay decision that does not certify
 the episode, agreed by executors of two distinct providers (rulings P16/P17).
 It is the TOPLOC failure's path: escalation of the miner's state, then a void.
-Every other outcome -- a failing grade, a replay one executor alone failed,
+Ruling P23: every grade that is not a clean success (failing, ``timeout``,
+``error``, ``ungradeable``, ``disputed``, ``unjudgeable``) gets the failing
+replay draw; an ``unjudgeable`` replay or grade (the trajectory's actions or
+patch lost the box or ran past its deadline, on two providers' hosts) voids
+the submission unpaid as ``replay_unjudgeable``, with no escalation. Every
+other outcome -- a failing grade, a replay one executor alone failed,
 ``timeout``, ``error``, ``ungradeable``, ``disputed`` -- sanctions nobody and
 certifies nothing; it is written in the grade document as it is. Grades never
 change payment otherwise; the settler waits for a submission's grade so a
@@ -31,7 +36,7 @@ from reliquary.corpus.audit_policy import after_confirmed_failure, replay_drawn
 from reliquary.corpus.replay_compare import allowed_mismatches
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
 from reliquary.infrastructure.corpus_record_store import MAX_REGRADE_GENERATIONS, RECORD_SCHEMA_V2
-from reliquary.validator.corpus_grade_remote import replay_certified
+from reliquary.validator.corpus_grade_remote import UNJUDGEABLE, replay_certified
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +47,11 @@ GRADE_CONCURRENCY = 64
 RESCAN_SECONDS = 60.0
 # Grade documents read at once when a quarantine needs those written before boot.
 INDEX_READ_CONCURRENCY = 16
-# Distinct providers a failed replay needs before it sanctions anyone.
+# Distinct providers a failed replay needs before it sanctions anyone (and an
+# unjudgeable outcome before it voids anything).
 SANCTION_PROVIDERS = 2
+# The void reason of a trajectory no box could judge (ruling P23): unpaid, no sanction.
+REPLAY_UNJUDGEABLE = "replay_unjudgeable"
 # The auditor's (corpus_auditor): the route stamps a submission's arrival up to
 # this long before the record is written and the submission enqueued.
 ACCEPT_SLACK_SECONDS = 420.0
@@ -348,34 +356,46 @@ class CorpusGrader:
         # Only an ok decision is a grade; a single executor's failing grade is
         # no evidence against anyone, only "not a certified success".
         graded_success = graded.status == "ok" and bool((graded.result or {}).get("tests_passed"))
-        replay = None
-        if graded.status == "ok":
-            draw = None
-            if not graded_success:
-                draw = await self._draw(submission_id, state["received_at"])
-                if draw is None and regrade:
-                    # A regrade has no rescan to wait on: check rather than skip.
-                    draw = {"fraction": self._job.episode.replay_fraction_failed, "drawn": True,
-                            "why": "round unpublished at regrade"}
-                if draw is None:
-                    self._awaiting_draw[submission_id] = state
-                    return None              # the round is not out yet: the next rescan
-            self._awaiting_draw.pop(submission_id, None)
-            if graded_success or draw["drawn"]:
-                voided = await self._replay_void(submission_id)
-                if voided is not None:
-                    # Voided by a replay before a crash kept its grade from
-                    # being written: the grade is that replay, never a new one.
-                    replay = self._replay_from_void(voided, draw)
-                else:
-                    replayed = await self._dispatcher.decide(
-                        {**state["item"], "mode": "replay", "actions": state["actions"]})
-                    replay = self._replay_document(submission_id, replayed, draw)
-                    if replay["failed"]:
-                        await self._confirmed_failure(submission_id, state["base"]["hotkey"],
-                                                      replay)
+        # Every grade that is not a clean success gets the failing draw (ruling
+        # P23 a): a grade a trajectory kept from deciding (its patch killed the
+        # box, its tests outlived the deadline) must not shield it from replay.
+        draw = None
+        if not graded_success:
+            draw = await self._draw(submission_id, state["received_at"])
+            if draw is None and regrade:
+                # A regrade has no rescan to wait on: check rather than skip.
+                draw = {"fraction": self._job.episode.replay_fraction_failed, "drawn": True,
+                        "why": "round unpublished at regrade"}
+            if draw is None:
+                self._awaiting_draw[submission_id] = state
+                return None              # the round is not out yet: the next rescan
+        self._awaiting_draw.pop(submission_id, None)
+        if graded_success or draw["drawn"]:
+            voided = await self._replay_void(submission_id)
+            if voided is not None:
+                # Voided by a replay before a crash kept its grade from
+                # being written: the grade is that replay, never a new one.
+                replay = self._replay_from_void(voided, draw)
             else:
-                replay = {"drawn": False, "draw": draw}
+                replayed = await self._dispatcher.decide(
+                    {**state["item"], "mode": "replay", "actions": state["actions"]})
+                replay = self._replay_document(submission_id, replayed, draw)
+                if replay["failed"]:
+                    await self._confirmed_failure(submission_id, state["base"]["hotkey"],
+                                                  replay)
+        else:
+            replay = {"drawn": False, "draw": draw}
+        if not replay.get("failed"):
+            # Ruling P23 c: an outcome the trajectory caused, agreed by two
+            # providers, voids it unpaid; nobody is sanctioned for it.
+            if replay.get("unjudgeable"):
+                await self._unjudgeable(submission_id, state["base"]["hotkey"], "replay",
+                                        replay["graded_by"], replay["providers"],
+                                        replay.get("detail"))
+            elif graded.status == UNJUDGEABLE and self._agreed(graded):
+                await self._unjudgeable(submission_id, state["base"]["hotkey"], "grade",
+                                        list(graded.graded_by), list(graded.providers),
+                                        (graded.result or {}).get("detail"))
         document = {**state["base"], "status": graded.status, "instance_id": state["instance_id"],
                     "graded_success": graded_success, "grade": graded.result,
                     "graded_by": list(graded.graded_by), "replay": replay,
@@ -404,14 +424,18 @@ class CorpusGrader:
                 "providers": list(voided.get("providers") or [])}
 
     @staticmethod
-    def _replay_document(submission_id: str, decision, draw) -> dict:
+    def _agreed(decision) -> bool:
+        """Two executors of two distinct providers decided it, whatever the
+        dispatcher promised: checked here again, never taken on trust."""
+        return (len(set(decision.graded_by)) >= SANCTION_PROVIDERS
+                and len(set(getattr(decision, "providers", ()) or ())) >= SANCTION_PROVIDERS)
+
+    @classmethod
+    def _replay_document(cls, submission_id: str, decision, draw) -> dict:
         result = decision.result or {}
         ok = decision.status == "ok"
         certified = ok and replay_certified(result)
-        # A sanction needs agreement across providers, whatever the dispatcher
-        # promised: checked here again, never taken on trust.
-        agreed = (len(set(decision.graded_by)) >= SANCTION_PROVIDERS
-                  and len(set(getattr(decision, "providers", ()) or ())) >= SANCTION_PROVIDERS)
+        agreed = cls._agreed(decision)
         unconfirmed = ok and not certified and not agreed
         if unconfirmed:
             logger.error("replay of %s failed without two providers agreeing (%s, providers %s); "
@@ -420,6 +444,8 @@ class CorpusGrader:
         compared = int(result.get("observations_compared") or 0)
         return {"drawn": True, "draw": draw, "status": decision.status, "certified": certified,
                 "failed": ok and not certified and agreed, "unconfirmed": unconfirmed,
+                "unjudgeable": decision.status == UNJUDGEABLE and agreed,
+                "detail": result.get("detail") if decision.status == UNJUDGEABLE else None,
                 "replay_diff_equal": result.get("replay_diff_equal"),
                 "observations_compared": compared,
                 "observations_mismatched": list(result.get("observations_mismatched") or []),
@@ -458,6 +484,25 @@ class CorpusGrader:
         written = await self._records.write_voided(self._job.job_id, submission_id, document)
         logger.warning("corpus job %s: %s voided, replay failed (%s)", self._job.job_id,
                        submission_id[:12], document["replay"])
+        if written and self.on_voided is not None:
+            try:
+                self.on_voided(submission_id, document)
+            except Exception:
+                logger.exception("void report for %s failed", submission_id[:12])
+
+    async def _unjudgeable(self, submission_id: str, hotkey: str, stage: str,
+                           graded_by: list, providers: list, detail) -> None:
+        """Ruling P23 c: void unpaid (create-only), with no escalation: the
+        same box failure on two providers' hosts is the trajectory's doing,
+        but honest infrastructure noise must never ban anyone."""
+        document = {"schema": VOIDED_SCHEMA, "submission_id": submission_id, "hotkey": hotkey,
+                    "reason": REPLAY_UNJUDGEABLE, "stage": stage, "voided_at": self._clock(),
+                    "graded_by": list(graded_by), "providers": list(providers),
+                    "detail": (str(detail)[:500] if detail else None)}
+        written = await self._records.write_voided(self._job.job_id, submission_id, document)
+        logger.warning("corpus job %s: %s voided unpaid, its %s could not be judged on two "
+                       "providers' boxes (%s)", self._job.job_id, submission_id[:12], stage,
+                       document["detail"])
         if written and self.on_voided is not None:
             try:
                 self.on_voided(submission_id, document)

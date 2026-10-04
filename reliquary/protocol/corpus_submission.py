@@ -99,6 +99,7 @@ class CorpusRejectReason(str, Enum):
     SHORT_TURNS = "short_turns"
     BAD_OBSERVATION = "bad_observation"
     UNANSWERED_TOOL_CALL = "unanswered_tool_call"
+    TRAJECTORY_TOO_LARGE = "trajectory_too_large"
     BAD_STOP = "bad_stop"
     BAD_PROOF_SHAPE = "bad_proof_shape"
     PROOF_FAIL = "proof_fail"

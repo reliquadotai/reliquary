@@ -192,6 +192,116 @@ def test_a_replay_past_its_deadline_is_a_timeout_and_a_crash_is_an_error():
     assert asyncio.run(run_grade_item(_item("replay"), task_for=str, replay=broken))["status"] == "error"
 
 
+def test_outcomes_the_trajectory_caused_are_reported_as_its_own():
+    """Ruling P23: a box lost or a deadline spent once the recorded actions ran
+    is the trajectory's outcome (box_lost / box_timeout), every executor gets
+    it, and it is reported as a fact, not as this executor's error."""
+    from reliquary.validator.agentic_replay import BoxLost
+    from reliquary.validator.corpus_grade_executor import GradeTimeout
+
+    async def lost(task, actions):
+        raise BoxLost("the box failed in an action after 1 of 2 actions")
+
+    async def spent(task, actions):
+        raise ReplayTimeout("replay exceeded 3600 s after 1 of 2 actions", trajectory_caused=True)
+
+    async def lost_grade(task, patch):
+        raise BoxLost("the box failed after the patch was applied")
+
+    async def spent_grade(task, patch):
+        raise GradeTimeout("grading exceeded 1800 s", trajectory_caused=True)
+
+    async def slow_setup(task, patch):
+        raise GradeTimeout("grading exceeded 1800 s", trajectory_caused=False)
+
+    run = lambda item, **kw: asyncio.run(run_grade_item(item, task_for=str, **kw))  # noqa: E731
+    replayed = run(_item("replay"), replay=lost)
+    assert replayed["status"] == "box_lost" and "1 of 2" in replayed["detail"]
+    assert run(_item("replay"), replay=spent)["status"] == "box_timeout"
+    assert run(_item(), grade=lost_grade)["status"] == "box_lost"
+    assert run(_item(), grade=spent_grade)["status"] == "box_timeout"
+    assert run(_item(), grade=slow_setup)["status"] == "timeout"
+    for result in (replayed, run(_item(), grade=spent_grade)):
+        GradeResult.model_validate({"results": [{**result, "submission_id": SID}]})
+
+
+class _GradeBox:
+    def __init__(self):
+        self.runs = []
+
+    async def prepare_setup(self):
+        pass
+
+    async def prepare_execution(self, routes):
+        pass
+
+    async def run(self, argv, env):
+        self.runs.append(list(argv))
+        return types.SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+
+def _fake_grading(monkeypatch, grade):
+    from contextlib import asynccontextmanager
+
+    box = _GradeBox()
+
+    @asynccontextmanager
+    async def bounded_box(task, limits):
+        yield box
+
+    monkeypatch.setattr(corpus_grade_executor, "bounded_box", bounded_box)
+    package = types.ModuleType("reliquary_swe")
+    package.grading = types.SimpleNamespace(grade=grade)
+    monkeypatch.setitem(sys.modules, "reliquary_swe", package)
+    return box
+
+
+def _grade_task(scoring=None):
+    return types.SimpleNamespace(data=types.SimpleNamespace(
+        timeout=types.SimpleNamespace(scoring=scoring)))
+
+
+def test_a_grade_box_failing_after_the_patch_is_applied_is_box_lost(monkeypatch):
+    from reliquary.validator.agentic_replay import BoxLost
+
+    async def grade(runtime, data, patch):
+        await runtime.run(["git", "checkout", "-q", "--detach", "base"], {})
+        await runtime.run(["git", "apply", "-v", "/tmp/agent.diff"], {})
+        raise RuntimeError("docker exec: container is not running")   # conftest killed pid 1
+
+    _fake_grading(monkeypatch, grade)
+    with pytest.raises(BoxLost):
+        asyncio.run(corpus_grade_executor.grade_patch(_grade_task(), "D"))
+
+
+def test_a_grade_box_failing_before_the_patch_is_the_executors(monkeypatch):
+    from reliquary.validator.agentic_replay import BoxLost
+
+    async def grade(runtime, data, patch):
+        await runtime.run(["git", "checkout", "-q", "--detach", "base"], {})
+        raise RuntimeError("could not check out base")
+
+    _fake_grading(monkeypatch, grade)
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(corpus_grade_executor.grade_patch(_grade_task(), "D"))
+    assert not isinstance(caught.value, BoxLost)
+
+
+@pytest.mark.parametrize("apply_first,caused", [(True, True), (False, False)])
+def test_a_grade_deadline_is_the_trajectorys_once_the_patch_is_applied(monkeypatch, apply_first, caused):
+    from reliquary.validator.corpus_grade_executor import GradeTimeout
+
+    async def grade(runtime, data, patch):
+        if apply_first:
+            await runtime.run(["git", "apply", "-v", "/tmp/agent.diff"], {})
+        await asyncio.sleep(5)                                         # a test that sleeps forever
+
+    _fake_grading(monkeypatch, grade)
+    with pytest.raises(GradeTimeout) as caught:
+        asyncio.run(corpus_grade_executor.grade_patch(_grade_task(scoring=0.2), "D"))
+    assert caught.value.trajectory_caused is caused
+
+
 def test_every_result_fits_the_wire_model():
     async def broken(task, actions):
         raise RuntimeError("x" * 5000)

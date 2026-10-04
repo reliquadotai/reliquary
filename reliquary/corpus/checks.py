@@ -40,6 +40,8 @@ REASON_PROMPT_NOT_FULL = "prompt_not_full"
 # Agentic trajectories (Task 8 produces them).
 REASON_BAD_TURNS = "bad_turns"
 REASON_SHORT_TURNS = "short_turns"
+# More text than one grade lease carries (``corpus_grade_protocol`` bounds).
+REASON_TRAJECTORY_TOO_LARGE = "trajectory_too_large"
 
 
 def completion_digest(prompt_index: int, tokens: Sequence[int]) -> str:

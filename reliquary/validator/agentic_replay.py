@@ -202,7 +202,22 @@ def sweep_orphan_boxes() -> int:
 
 class ReplayTimeout(Exception):
     """The replay exceeded its wall-clock ``episode_deadline``; the executor
-    reports it as such, not as a mismatch."""
+    reports it as such, not as a mismatch. ``trajectory_caused``: the deadline
+    passed while the recorded actions (or the finalize after them) ran, so the
+    trajectory's own commands spent it (ruling P23); before that, the box's
+    setup did, which is the executor's."""
+
+    def __init__(self, message: str, *, trajectory_caused: bool = False) -> None:
+        super().__init__(message)
+        self.trajectory_caused = trajectory_caused
+
+
+class BoxLost(Exception):
+    """The box failed while or after running the recorded actions: it died,
+    an exec into it failed, or finalize could not read a diff from the repo
+    they left (ruling P23). The trajectory's outcome, never the executor's:
+    the same actions do it on every executor. Failures before the first
+    recorded action (provisioning, setup, the Docker daemon) are not this."""
 
 
 async def resolve_python(box) -> str:
@@ -273,8 +288,17 @@ async def replay_swe(task, actions: Sequence[Action], *,
                      command_timeout: float = 3600.0,
                      episode_deadline: float = DEFAULT_EPISODE_DEADLINE,
                      limits: BoxLimits = DEFAULT_BOX_LIMITS) -> tuple[list[str], str]:
+    """The replayed observations and the diff finalize collected.
+
+    Raises ``ReplayTimeout`` past ``episode_deadline`` and ``BoxLost`` when
+    the box fails once the first recorded action started (ruling P23: the
+    trajectory's outcome); anything else is the executor's. With no action
+    to replay nothing the trajectory controls ever ran, so every failure is
+    the executor's."""
     trace = _trace(task)
     observations: list[str] = []
+    started = False                      # a recorded action was sent into the box
+    finished = False                     # every action ran and finalize read the diff
     try:
         async with asyncio.timeout(episode_deadline):
             async with bounded_box(task, limits) as box:
@@ -283,11 +307,31 @@ async def replay_swe(task, actions: Sequence[Action], *,
                 await prepare_harness_footprint(box)
                 await box.prepare_execution([])
                 python = await resolve_python(box)
-                for action in actions:
-                    observations.append(await run_action(box, python, action, command_timeout))
-                await task.finalize(trace, box)
+                started = bool(actions)
+                try:
+                    for action in actions:
+                        observations.append(await run_action(box, python, action, command_timeout))
+                    await task.finalize(trace, box)
+                except Exception as e:
+                    if not started:
+                        raise
+                    where = "finalize" if len(observations) == len(actions) else "an action"
+                    raise BoxLost(f"the box failed in {where} after {len(observations)} of "
+                                  f"{len(actions)} actions: {type(e).__name__}: {e}"[:400]) from e
+                finished = True
     except TimeoutError as e:
-        raise ReplayTimeout(
-            f"replay exceeded {episode_deadline} s after {len(observations)} of {len(actions)} actions"
-        ) from e
+        if not finished:
+            raise ReplayTimeout(
+                f"replay exceeded {episode_deadline} s after {len(observations)} of {len(actions)} actions",
+                trajectory_caused=started) from e
+        # Only the box's removal ran late: the facts are complete.
+        logger.warning("replay box removal outlived the deadline; the replay itself finished")
+    except BoxLost:
+        raise
+    except Exception:
+        if not finished:
+            raise
+        # The box's removal failed after the facts were in (the orphan sweep
+        # removes what is left): the replay itself is complete.
+        logger.exception("replay box removal failed after the replay finished")
     return observations, trace.info.get("patch", "")

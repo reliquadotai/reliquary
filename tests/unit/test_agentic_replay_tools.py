@@ -246,3 +246,71 @@ def test_isolated_mode_ignores_a_planted_module(tmp_path):
     proc = subprocess.run([sys.executable, "-I", "-c", TOOL_PROGRAM, str(request)],
                           capture_output=True, text=True, cwd=tmp_path)
     assert proc.stdout == "hi\n"
+
+
+# F2 (ruling P23): what fails after the first recorded action started is the
+# trajectory's doing, not the executor's; what fails before it is the executor's.
+
+class _DyingBox(_FakeBox):
+    def __init__(self, die_at_run, **kw):
+        super().__init__(**kw)
+        self._die_at = die_at_run
+
+    async def run(self, argv, env):
+        if len(self.runs) + 1 == self._die_at:
+            self.runs.append(list(argv))
+            raise RuntimeError("docker exec: container is not running")
+        return await super().run(argv, env)
+
+
+def test_a_box_that_dies_while_running_recorded_actions_is_box_lost(monkeypatch):
+    _fake_verifiers(monkeypatch, _DyingBox(die_at_run=3))      # resolve, action 1, then dies
+    actions = [Action("bash", '{"command": "kill -9 1"}', ""), Action("bash", "{}", "")]
+    with pytest.raises(agentic_replay.BoxLost, match="after 1 of 2 actions"):
+        asyncio.run(agentic_replay.replay_swe(_task(), actions))
+
+
+def test_a_finalize_that_fails_after_the_actions_is_box_lost(monkeypatch):
+    _fake_verifiers(monkeypatch, _FakeBox())
+    task = _task()
+
+    async def finalize(trace, box):
+        raise RuntimeError("git diff: not a git repository")
+    task.finalize = finalize
+    with pytest.raises(agentic_replay.BoxLost, match="finalize"):
+        asyncio.run(agentic_replay.replay_swe(task, [Action("bash", '{"command": "rm -rf .git"}', "")]))
+
+
+def test_failures_before_any_recorded_action_stay_the_executors(monkeypatch):
+    _fake_verifiers(monkeypatch, _FakeBox())
+    task = _task()
+
+    async def finalize(trace, box):
+        raise RuntimeError("finalize broke on an untouched box")
+    task.finalize = finalize
+    with pytest.raises(RuntimeError) as caught:                 # no action ran: infrastructure
+        asyncio.run(agentic_replay.replay_swe(task, []))
+    assert not isinstance(caught.value, agentic_replay.BoxLost)
+
+    _fake_verifiers(monkeypatch, _DyingBox(die_at_run=1))       # the python lookup itself
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")]))
+    assert not isinstance(caught.value, agentic_replay.BoxLost)
+
+
+def test_a_deadline_hit_by_the_actions_is_the_trajectorys_and_by_setup_the_executors(monkeypatch):
+    _fake_verifiers(monkeypatch, _FakeBox(delay=5.0))
+    with pytest.raises(agentic_replay.ReplayTimeout) as caught:
+        asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", '{"command": "sleep 99999"}', "")],
+                                              episode_deadline=0.2))
+    assert caught.value.trajectory_caused is True
+
+    _fake_verifiers(monkeypatch, _FakeBox())
+    task = _task()
+
+    async def slow_setup(trace, box):
+        await asyncio.sleep(5.0)
+    task.setup = slow_setup
+    with pytest.raises(agentic_replay.ReplayTimeout) as caught:
+        asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")], episode_deadline=0.2))
+    assert caught.value.trajectory_caused is False

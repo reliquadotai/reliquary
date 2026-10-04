@@ -10,6 +10,7 @@ import threading
 from dataclasses import dataclass, field
 
 from reliquary.corpus.checks import (
+    REASON_TRAJECTORY_TOO_LARGE,
     check_short_turns,
     check_turn_budget,
     check_turn_proof_shape,
@@ -19,6 +20,7 @@ from reliquary.corpus.checks import (
 )
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
 from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
+from reliquary.validator.corpus_grade_protocol import grade_item_bounds_refusal
 from reliquary.validator.corpus_text import REASON_PROMPT_MISMATCH, REASON_TOKEN_OUT_OF_VOCAB
 
 
@@ -90,10 +92,14 @@ class EpisodeIntake:
         if not refusal.ok:
             return IntakeRefusal(refusal.reason or "", dict(refusal.detail))
         try:
-            parse_trajectory(self._renderer, prompt_ids=prompt_ids, tokens=tokens, spans=spans,
-                             stop=trajectory.stop, max_turns=episode.max_turns)
+            parsed = parse_trajectory(self._renderer, prompt_ids=prompt_ids, tokens=tokens,
+                                      spans=spans, stop=trajectory.stop, max_turns=episode.max_turns)
         except TrajectoryRefused as refused:
             return IntakeRefusal(refused.reason, refused.detail)
+        # What no grade lease can carry would never be judged (ruling P23 d).
+        too_large = grade_item_bounds_refusal(parsed.actions, trajectory.final_diff)
+        if too_large is not None:
+            return IntakeRefusal(REASON_TRAJECTORY_TOO_LARGE, too_large)
         # Only after the spans are known sound: termination indexes them.
         checks = (
             lambda: check_short_turns(spans, self._min_chunk),

@@ -627,3 +627,50 @@ async def test_quarantines_in_the_registry_are_loaded_without_a_write():
     assert d.claim("g0") is None and "g0" in d.quarantined and held == ["g0"]
     await d.sweep()
     assert written == []                                  # already in the registry
+
+
+# F2 (ruling P23): outcomes a trajectory causes are votes, decided by two providers.
+BOX_LOST = {"status": "box_lost", "submission_id": SID, "detail": "the box failed in an action"}
+BOX_TIMEOUT = {"status": "box_timeout", "submission_id": SID, "detail": "replay exceeded 3600 s"}
+
+
+@pytest.mark.parametrize("mode", ["grade", "replay"])
+async def test_one_executors_unjudgeable_outcome_goes_to_a_second_provider(mode):
+    d = await _dispatcher(recheck=1.0)                      # not drawn: only the outcome asks for two
+    decision = asyncio.ensure_future(d.decide(_item(mode)))
+    await asyncio.sleep(0)
+    assert _answer(d, "g0", BOX_LOST) == "accepted"         # a vote, not this executor's error
+    await asyncio.sleep(0)
+    assert not decision.done() and d.stats["executor_errors"] == 0
+    _answer(d, "g1", BOX_TIMEOUT)                           # lost or timed out: both the trajectory's
+    got = await decision
+    assert got.status == "unjudgeable" and got.graded_by == ("g0", "g1")
+    assert got.providers == ("p0", "p1") and got.result["status"] == "box_lost"
+    assert not d.quarantined
+
+
+async def test_an_unjudgeable_vote_outvoted_is_not_quarantined():
+    quarantined = []
+    d = await _dispatcher(recheck=1.0, quarantined=quarantined)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", BOX_LOST)                 # its box died (host noise, say)
+    _answer(d, "g1", REPLAY_OK)
+    assert not decision.done()
+    _answer(d, "g2", REPLAY_OK)
+    got = await decision
+    await asyncio.sleep(0)
+    assert got.status == "ok" and got.graded_by == ("g1", "g2")
+    assert not d.quarantined and quarantined == []
+
+
+async def test_an_unjudgeable_outcome_without_a_second_provider_resolves_disputed():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0,
+                          providers={"g0": "a", "g1": "a", "g2": "a", "g3": "a"})
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", BOX_TIMEOUT)
+    clock.now += 1801
+    await d.sweep()
+    assert (await decision).status == "disputed"

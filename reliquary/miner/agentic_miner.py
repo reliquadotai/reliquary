@@ -52,10 +52,12 @@ def build_trajectory_submission(*, job, hotkey, cursor, prompt_index, rendered_p
 
 def trajectory_precheck(renderer, *, max_turns: int) -> Callable[[BuiltTrajectory], tuple[str, dict] | None]:
     """The validator's own refusals, run on a built trajectory before it is
-    signed (ruling P14): its span check and ``parse_trajectory`` through the
-    same pinned renderer. Returns ``(reason, detail)`` or None."""
-    from reliquary.corpus.checks import check_turn_spans
+    signed (ruling P14): its span check, ``parse_trajectory`` through the
+    same pinned renderer and the grade lease bounds (ruling P23). Returns
+    ``(reason, detail)`` or None."""
+    from reliquary.corpus.checks import REASON_TRAJECTORY_TOO_LARGE, check_turn_spans
     from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
+    from reliquary.validator.corpus_grade_protocol import grade_item_bounds_refusal
 
     def precheck(built: BuiltTrajectory) -> tuple[str, dict] | None:
         spans = [tuple(span) for span in built.spans]
@@ -63,10 +65,15 @@ def trajectory_precheck(renderer, *, max_turns: int) -> Callable[[BuiltTrajector
         if not result.ok:
             return result.reason or "bad_turns", dict(result.detail)
         try:
-            parse_trajectory(renderer, prompt_ids=list(built.prompt_ids), tokens=list(built.tokens),
-                             spans=spans, stop=built.stop, max_turns=max_turns)
+            parsed = parse_trajectory(renderer, prompt_ids=list(built.prompt_ids),
+                                      tokens=list(built.tokens), spans=spans, stop=built.stop,
+                                      max_turns=max_turns)
         except TrajectoryRefused as refused:
             return refused.reason, dict(refused.detail)
+        # The intake's lease bounds (ruling P23 d), so no slot is lost to them.
+        too_large = grade_item_bounds_refusal(parsed.actions, built.final_diff)
+        if too_large is not None:
+            return REASON_TRAJECTORY_TOO_LARGE, too_large
         return None
 
     return precheck
