@@ -370,9 +370,12 @@ the patch (provisioning, setup, PyPI, the Docker daemon) stays the
 executor's `error`/`timeout` and is re-leased. After two lease expiries
 (or executor timeouts) or three executor errors an item stops being
 re-leased: a grade then resolves `timeout`/`error` (unjudged, paid); a
-replay resolves `uncertified` (voided unpaid as `replay_unjudgeable`, no
-sanction, ruling P28) unless one of its votes certifies it, in which case
-it stays an unjudged `timeout`/`error` (not certified, paid).
+replay holding at least one vote, none certifying it, resolves
+`uncertified` (voided unpaid as `replay_unjudgeable`, no sanction, ruling
+P28); a replay with no vote at all (only executor failures, which happen
+before any recorded action: a failure after it is a `box_lost`/`box_timeout`
+vote) or with a certifying vote stays an unjudged `timeout`/`error`: paid,
+not certified, not exported (ruling P28b).
 
 Replay timing (ruling P25), from the task's own timeouts: provisioning and
 setup get the setup timeout plus 600 s (SWE-smith: 1500 s; missing it is the

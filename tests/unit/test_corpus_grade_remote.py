@@ -191,9 +191,9 @@ async def test_a_quarantined_vote_on_a_leased_item_is_dropped_too():
     assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
 
 
-@pytest.mark.parametrize("mode,status", [("grade", "timeout"), ("replay", "uncertified")])
+@pytest.mark.parametrize("mode,status", [("grade", "timeout"), ("replay", "timeout")])
 async def test_timeouts_go_to_other_executors_then_resolve_unjudged(mode, status):
-    # A replay out of attempts with no certifying vote is uncertified (P28).
+    # Without any vote, a replay out of attempts stays unjudged too (P28b).
     d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item(mode)))
     await asyncio.sleep(0)
@@ -228,7 +228,7 @@ async def test_an_expired_lease_strikes_and_three_strikes_quarantine():
     assert "g3" in d.quarantined and quarantined == ["g3"]
 
 
-@pytest.mark.parametrize("mode,status", [("grade", "timeout"), ("replay", "uncertified")])
+@pytest.mark.parametrize("mode,status", [("grade", "timeout"), ("replay", "timeout")])
 async def test_an_item_whose_leases_keep_expiring_resolves_as_a_timeout(mode, status):
     clock = _Clock()
     d = await _dispatcher(recheck=1.0, clock=clock)
@@ -1104,15 +1104,18 @@ async def test_a_box_failure_then_three_errors_is_uncertified():
     assert not d.quarantined
 
 
-async def test_three_errors_without_any_vote_leave_a_replay_uncertified():
-    # A trajectory whose replay raises a generic exception on every executor.
+@pytest.mark.parametrize("answer,status", [(ERROR, "error"), (TIMEOUT, "timeout")])
+async def test_attempts_run_out_without_any_vote_keep_the_unjudged_outcome(answer, status):
+    """Ruling P28b: with zero votes only the executors failed (setup-phase
+    infrastructure: a failure once the trajectory runs is a box vote), so the
+    replay stays unjudged: paid, not certified, not exported."""
     d = await _dispatcher(recheck=1.0)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
-    for eid in ("g0", "g1", "g2"):
-        _answer(d, eid, ERROR)
+    for eid in ("g0", "g1", "g2")[:3 if status == "error" else 2]:
+        _answer(d, eid, answer)
     got = await asyncio.wait_for(decision, 5)
-    assert got.status == "uncertified" and got.graded_by == () and got.result is None
+    assert got.status == status and got.graded_by == () and got.result is None
 
 
 async def test_a_certified_vote_then_expiries_stays_an_unjudged_timeout():

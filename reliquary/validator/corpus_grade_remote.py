@@ -435,10 +435,11 @@ class RemoteGradeDispatcher(ExecutorLeases):
         setattr(work, kind, count)
         limit, status = (MAX_TIMEOUTS, "timeout") if kind == "timeouts" else (MAX_ERRORS, "error")
         if count >= limit:
-            if work.mode == "replay" and not self._certifying(work):
-                # Ruling P28: out of attempts and nothing certifies it (failed
-                # or box-failure votes, or none at all when every executor
-                # raised on it): void unpaid, never an unjudged paid outcome.
+            if work.mode == "replay" and work.results and not self._certifying(work):
+                # Ruling P28/P28b: out of attempts while holding votes, none
+                # certifying it (failed or box failures): void unpaid. With
+                # no vote at all only executors failed, before any recorded
+                # action (a failure after it is a box vote): unjudged, as before.
                 self._uncertified(work, f"{count} {kind}")
                 return
             logger.warning("grade item %d (%s): %d %s; resolved unjudged", work.id, work.mode,
