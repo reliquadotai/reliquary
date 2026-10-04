@@ -143,7 +143,10 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             return
         reason = str(answer.get("reason"))
         counts[reason] += 1
-        logger.info("episode %d of %s: %s %s", prompt_index, tag, reason, answer.get("detail") or "")
+        # The reward SweEnv.finalize graded after the rollout; verifiers' own
+        # "rollout done: reward=..." line is logged before that grading.
+        logger.info("episode %d of %s: %s %s(reward %s)", prompt_index, tag, reason,
+                    f"{answer['detail']} " if answer.get("detail") else "", result.reward)
         if reason == "job_complete" or reason in _HALT:
             halt()
 

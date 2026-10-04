@@ -352,3 +352,14 @@ def test_the_cli_exposes_max_num_seqs():
 
     result = CliRunner().invoke(app, ["corpus", "mine-agentic", "--help"])
     assert "--max-num-seqs" in result.output
+
+
+def test_the_episode_line_logs_the_graded_reward(caplog):
+    # verifiers logs "rollout done: reward=0.000" before SweEnv.finalize grades
+    # the patch; the miner's own line must carry the graded reward.
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="reliquary.miner.agentic_miner"):
+        _run([Identity("5Hot", sign=lambda b: "s", episodes=1)])
+    lines = [r.getMessage() for r in caplog.records if "accepted" in r.getMessage()]
+    assert lines and all("reward 1.0" in line for line in lines)
