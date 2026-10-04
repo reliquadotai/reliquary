@@ -403,6 +403,36 @@ def judge_jobs(w, *, intake_only: bool, settle_every_seconds: float, settle=None
     return jobs
 
 
+def grade_refusal(job, dispatcher) -> None:
+    """``ValueError`` (permanent until a restart) for an episode job that
+    ``dispatcher`` cannot grade: none (the process started without an episode
+    job), or another env pin."""
+    pin = (job.episode.env.package, job.episode.env.version)
+    if dispatcher is None:
+        raise ValueError(f"episode job {job.job_id!r} joined a validator started without "
+                         "one; restart it to grade the job")
+    if tuple(dispatcher.env_pin) != pin:
+        raise ValueError(f"this validator grades {tuple(dispatcher.env_pin)}, episode job "
+                         f"{job.job_id!r} pins {pin}; restart it to grade the job")
+
+
+async def warm_drand_chain(executor) -> None:
+    """Resolve and cache the drand chain's genesis and period on ``executor``
+    (blocking HTTP), never the loop. A failure is left to first use, as before."""
+    from reliquary.validator.corpus_judge_threads import run_in
+
+    def resolve() -> None:
+        from reliquary.infrastructure import drand
+
+        drand.get_current_chain()
+
+    try:
+        await run_in(executor, resolve)
+    except Exception:  # noqa: BLE001
+        logger.warning("drand chain not resolved at start; resolved at first use",
+                       exc_info=True)
+
+
 def wire_job_grader(w, *, records, judge_records, dispatcher, parse_executor=None,
                     beacon_executor=None) -> None:
     """An episode job's grader, on ``w`` (which carries ``entry``, ``job`` and
@@ -415,13 +445,7 @@ def wire_job_grader(w, *, records, judge_records, dispatcher, parse_executor=Non
     in a process serving submit routes, never their default executor."""
     if w.job.episode is None or getattr(w, "grader", None) is not None:
         return
-    pin = (w.job.episode.env.package, w.job.episode.env.version)
-    if dispatcher is None:
-        raise ValueError(f"episode job {w.job.job_id!r} joined a validator started without "
-                         "one; restart it to grade the job")
-    if tuple(dispatcher.env_pin) != pin:
-        raise ValueError(f"this validator grades {tuple(dispatcher.env_pin)}, episode job "
-                         f"{w.job.job_id!r} pins {pin}; restart it to grade the job")
+    grade_refusal(w.job, dispatcher)
     from reliquary.validator.corpus_grading import CorpusGrader
 
     params, miner_states, _, beacon, round_at = build_corpus_audit_wiring(
@@ -1104,6 +1128,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     if not wiring:
         raise RuntimeError("no corpus job left to serve: " + "; ".join(
             f"{task}: {why}" for task, why in sorted(unserved.items())))
+    if any(w.job.episode is not None for w in wiring):
+        # The drand chain once, off the loop: an episode job's auditor and
+        # grader here would otherwise resolve it on the loop at first use.
+        await warm_drand_chain(judge_threads.beacon)
 
     app = build_corpus_jobs_app(jobs=wiring, store=store, records=records, tokenizer=tokenizer,
                                 verify_signature=verify_corpus_signature,
@@ -1121,10 +1149,15 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # The renderer first: a job refused for it leaves its ledger untouched.
         own_profile = _entry_profile(task_entry)
         renderer = build_renderer(job, own_profile)
+        if job.episode is not None:
+            # Before its intake (a task set download): a job this process
+            # cannot grade is refused for nothing.
+            grade_refusal(job, grade_dispatcher)
         seen_index = await migrate_ledgers_at_startup(store, job)
         w = prepared(task_entry, task_cap, job, own_profile, renderer, seen_index)
         if job.episode is not None:
             w.episode_intake = await asyncio.to_thread(episode_intake_for, w)
+            await warm_drand_chain(judge_threads.beacon)
         audit_and_settle(w)
         return w
 

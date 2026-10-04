@@ -423,3 +423,100 @@ def test_a_hot_episode_job_on_another_pin_is_passed_over_by_the_job_set(front):
     asyncio.run(started.job_set._consider(entry))       # never raises
     assert "swe-agentic-other" not in started.job_set.served
     assert "corpus-swe-3" in started.job_set._passed_over
+
+
+# -- review minors -----------------------------------------------------------------
+
+
+def test_the_production_judges_plan_is_unchanged_with_an_episode_job():
+    """corpus-01's string (2026-10-03, code-v2 added): judge-0 math, judge-1 the
+    rest; the SWE episode job, named nowhere, stays in the front."""
+    production = ("math-omi-qwen38-27b-v1;code-qwen38-27b-v1,if-qwen38-27b-v1,"
+                  "logic-qwen38-27b-v1,code-qwen38-27b-v2")
+    jobs = [("corpus-math-omi-v1", "math-omi-qwen38-27b-v1"),
+            ("corpus-code-v1", "code-qwen38-27b-v1"), ("corpus-if-v1", "if-qwen38-27b-v1"),
+            ("corpus-logic-v1", "logic-qwen38-27b-v1"), ("corpus-code-v2", "code-qwen38-27b-v2")]
+    expected = [["math-omi-qwen38-27b-v1"],
+                ["code-qwen38-27b-v1", "if-qwen38-27b-v1", "logic-qwen38-27b-v1",
+                 "code-qwen38-27b-v2"]]
+    assert plan_groups(production, jobs) == expected
+    assert plan_groups(production, jobs + [(EPISODE_TASK, EPISODE_ID)],
+                       front_only={EPISODE_ID}) == expected
+    with pytest.raises(ValueError, match="judge processes host no grader"):
+        plan_groups(production + f",{EPISODE_ID}", jobs + [(EPISODE_TASK, EPISODE_ID)],
+                    front_only={EPISODE_ID})
+
+
+def _drand_threads(monkeypatch):
+    from reliquary.infrastructure import drand
+
+    seen = []
+
+    def chain():
+        import threading
+
+        seen.append(threading.current_thread().name)
+        return {"genesis_time": 1_692_803_367, "period": 3}
+
+    monkeypatch.setattr(drand, "get_current_chain", chain)
+    return seen
+
+
+def test_the_front_resolves_the_drand_chain_off_the_loop_for_an_episode_job(front, monkeypatch):
+    seen = _drand_threads(monkeypatch)
+    front.start([SINGLE_ID, EPISODE_ID], linked_ids=[SINGLE_ID])
+    assert seen and all(name.startswith("corpus-judge-drand") for name in seen), seen
+
+
+def test_a_front_without_an_episode_job_never_reads_the_drand_chain_at_start(front, monkeypatch):
+    seen = _drand_threads(monkeypatch)
+    front.start([SINGLE_ID], linked_ids=[SINGLE_ID])
+    assert seen == []                                   # single-turn: unchanged
+
+
+def test_a_hot_episode_job_a_front_cannot_grade_is_refused_before_its_intake(front):
+    started = front.start([SINGLE_ID], linked_ids=[SINGLE_ID])
+    with pytest.raises(ValueError, match="started without one"):
+        asyncio.run(started.job_set._wire(_entry(EPISODE_TASK, EPISODE_ID), 0.1,
+                                          front.jobs[EPISODE_ID]))
+    assert front.calls.intakes == []                    # no HF download for nothing
+    other = front.start([EPISODE_ID])
+    front.calls.intakes.clear()
+    with pytest.raises(ValueError, match="restart it to grade the job"):
+        asyncio.run(other.job_set._wire(_entry("corpus-swe-3", "swe-agentic-other"), 0.1,
+                                        front.jobs["swe-agentic-other"]))
+    assert front.calls.intakes == []
+
+
+def test_the_task_set_is_loaded_once_for_the_lease_check_and_the_intake(monkeypatch):
+    import sys
+    import types
+
+    from reliquary.environment import agentic_swe
+    from reliquary.validator import agentic_intake, agentic_replay, corpus_grade_remote
+
+    loads = []
+    corpus = types.ModuleType("reliquary_swe.corpus")
+    corpus.load_swesmith_rows = lambda n: loads.append(n) or [SimpleNamespace(
+        instance_id=f"i{k}", workdir="/w", problem_statement="p") for k in range(3)]
+    taskset = types.ModuleType("reliquary_swe.taskset")
+    taskset.PROMPT = "{workdir} {problem_statement}"
+    package = types.ModuleType("reliquary_swe")
+    package.corpus, package.taskset = corpus, taskset
+    monkeypatch.setitem(sys.modules, "reliquary_swe", package)
+    monkeypatch.setitem(sys.modules, "reliquary_swe.corpus", corpus)
+    monkeypatch.setitem(sys.modules, "reliquary_swe.taskset", taskset)
+    agentic_swe.load_swe_source.cache_clear()
+    monkeypatch.setattr(agentic_replay, "swesmith_task", lambda instance_id: instance_id)
+    monkeypatch.setattr(agentic_swe, "episode_support_refusal", lambda *a, **kw: None)
+    monkeypatch.setattr(agentic_swe, "load_turn_renderer", lambda d: R)
+    job = _episode_job()
+    try:
+        assert corpus_grade_remote._job_task(job, 0) == "i0"
+        intake = agentic_intake.build_episode_intake(job, checkpoint_dir="/x",
+                                                     tokenizer=fakes.Tokenizer(),
+                                                     vocab_size=fakes.VOCAB, chunk_tokens=32)
+        assert intake.source.instance_id(1) == "i1"
+    finally:
+        agentic_swe.load_swe_source.cache_clear()
+    assert loads == [job.episode.env.num_images]        # once, not once per caller
