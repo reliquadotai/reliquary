@@ -195,6 +195,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
         # Executors whose last claim was refused 409 wrong_env: live by their
         # heartbeats, but they never take a lease, so never eligible (N2).
         self._wrong_env: set[str] = set()
+        # Times each executor was outvoted with a box_lost/box_timeout vote
+        # (N3): never reset by a good result; quarantined at the strike limit.
+        self._dissents: collections.Counter[str] = collections.Counter()
 
     def hold_on_quarantine(self, holder: Callable[[str], Any]) -> None:
         """``holder(executor_id)`` runs synchronously the moment an executor is
@@ -401,9 +404,15 @@ class RemoteGradeDispatcher(ExecutorLeases):
                 self.stats[UNJUDGEABLE] += 1
             for dissenter in sorted(set(work.results) - set(agreeing)):
                 if work.results[dissenter].get("status") in TRAJECTORY_STATUSES:
-                    # Its box failed where others' did not: host noise as
-                    # likely as a lie, and it claimed no fact. Never quarantined.
-                    continue
+                    # Its box failed where others' did not: once is host
+                    # noise as likely as a lie, so it is struck; at the strike
+                    # limit it is quarantined like any dissenter (N3).
+                    self._dissents[dissenter] += 1
+                    if self._dissents[dissenter] < self._strikes_limit:
+                        logger.warning("grade executor %s outvoted on a box failure (item %d, %d "
+                                       "of %d)", dissenter, work.id, self._dissents[dissenter],
+                                       self._strikes_limit)
+                        continue
                 # Refused at once; the registry write and listeners follow.
                 if self._mark_quarantined(dissenter, f"grade item {work.id} ({work.mode}) "
                                                      f"disagreed with {list(agreeing)}"):

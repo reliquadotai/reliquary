@@ -660,7 +660,7 @@ async def test_one_executors_unjudgeable_outcome_goes_to_a_second_provider(mode)
     assert not d.quarantined
 
 
-async def test_an_unjudgeable_vote_outvoted_is_not_quarantined():
+async def test_an_unjudgeable_vote_outvoted_once_is_struck_not_quarantined():
     quarantined = []
     d = await _dispatcher(recheck=1.0, quarantined=quarantined)
     decision = asyncio.ensure_future(d.decide(_item("replay")))
@@ -673,6 +673,7 @@ async def test_an_unjudgeable_vote_outvoted_is_not_quarantined():
     await asyncio.sleep(0)
     assert got.status == "ok" and got.graded_by == ("g1", "g2")
     assert not d.quarantined and quarantined == []
+    assert d._dissents["g0"] == 1
 
 
 async def test_an_unjudgeable_outcome_without_a_second_provider_resolves_disputed():
@@ -836,3 +837,23 @@ async def test_a_wrong_env_executor_that_claims_on_the_right_env_again_is_eligib
     await d.sweep()
     _answer(d, "g1", REPLAY_BAD)                              # a right-env claim clears it
     assert (await asyncio.wait_for(decision, 5)).status == "ok"
+
+
+# N3 (ruling P25): an executor outvoted on trajectory-status votes is struck
+# each time and quarantined at the strike limit.
+
+async def test_an_executor_repeatedly_outvoted_on_box_failures_is_quarantined():
+    quarantined = []
+    d = await _dispatcher(recheck=1.0, quarantined=quarantined)
+    limit = corpus_grade_remote.LEASE_EXPIRY_STRIKES
+    for k in range(limit):
+        sid = f"{k + 1:064x}"
+        decision = asyncio.ensure_future(d.decide(_item("replay", submission_id=sid)))
+        await asyncio.sleep(0)
+        _answer(d, "g0", {**BOX_LOST, "submission_id": sid})      # its box "dies" every time
+        _answer(d, "g1", {**REPLAY_OK, "submission_id": sid})
+        _answer(d, "g2", {**REPLAY_OK, "submission_id": sid})
+        assert (await asyncio.wait_for(decision, 5)).status == "ok"
+        await asyncio.sleep(0)
+        assert ("g0" in d.quarantined) is (k + 1 >= limit), k
+    assert quarantined == ["g0"]
