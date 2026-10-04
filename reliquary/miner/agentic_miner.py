@@ -79,6 +79,21 @@ def trajectory_precheck(renderer, *, max_turns: int) -> Callable[[BuiltTrajector
     return precheck
 
 
+def docker_storage_warning(*, refusal: Callable[[], str | None] | None = None) -> str | None:
+    """A startup warning when this miner's Docker storage is not on xfs (F6
+    M3, ruling P20): executors replay on xfs, so an ext4 directory order
+    mismatches every cut ``find``/``grep -r`` listing and spends the
+    episode's replay tolerance. A warning, never a refusal."""
+    if refusal is None:
+        from reliquary.validator.corpus_grade_executor import docker_storage_refusal as refusal
+    why = refusal()
+    if why is None:
+        return None
+    return (f"warning: {why}. Grade executors replay on xfs: on this storage your cut "
+            f"`find`/`grep -r` listings mismatch theirs and spend each episode's replay "
+            f"tolerance (honest episodes can be voided). Put Docker's storage on xfs.")
+
+
 def _submit(client, body: dict, counts: Counter) -> dict:
     return _retry(lambda: client.submit(body), sleep=time.sleep, counts=counts,
                   max_consecutive_failures=5)

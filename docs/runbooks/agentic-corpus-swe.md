@@ -122,7 +122,14 @@ It serves `/corpus/internal/grade/{claim,heartbeat,<lease>/result}` for grade
 executors, authenticated by each executor's token. A trajectory submission is
 up to about 2 MB of JSON and the route caps an episode job's body at 8 MiB: a
 reverse proxy in front needs `client_max_body_size 8m` (nginx), and must
-route `/corpus/internal/grade/` to the control too.
+route `/corpus/internal/grade/` to the control too. The 8 MiB counts the
+body's bytes as sent, not characters: httpx 0.28 (the miner's client) sends
+UTF-8, up to 4 bytes per non-ASCII character, and an older httpx escapes each
+as `\uXXXX` (6 bytes, 12 outside the BMP). A trajectory whose `final_diff`
+(up to 1 Mi chars) and rendered prompt are mostly non-ASCII can therefore
+pass 8 MiB and be refused `413`. Rare on SWE-smith (English statements,
+ASCII code); a job on non-ASCII repositories needs that headroom checked
+before launch.
 
 Not supported: the split validator (`RELIQUARY_CORPUS_SPLIT`) with any
 episode job (it refuses to start); `RELIQUARY_CORPUS_INTAKE_ONLY` outside the

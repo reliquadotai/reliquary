@@ -123,7 +123,9 @@ def decision_key(mode: str, result: dict) -> tuple:
         return (UNJUDGEABLE,)
     if mode == "grade":
         return (result.get("diff_applied"), result.get("tests_passed"))
-    return (result.get("replay_diff_equal"), replay_certified(result))
+    # Whether it certifies, only (M2): two executors that both fail an episode
+    # agree, even if one saw another diff; the diff stays in the document.
+    return (replay_certified(result),)
 
 
 @dataclass
@@ -281,6 +283,17 @@ class RemoteGradeDispatcher(ExecutorLeases):
         if answer.status == "ok" and any(getattr(answer, fact) is None
                                          for fact in _MODE_FACTS[work.mode]):
             return f"an ok {work.mode} result without {_MODE_FACTS[work.mode]}"
+        if answer.status == "ok" and work.mode == "replay":
+            # M1: the counts must be the lease's own: every action with an
+            # observation compared, mismatches only among those, once each.
+            compared = {i for i, action in enumerate(work.item["actions"])
+                        if action.get("observation") is not None}
+            mismatched = answer.observations_mismatched
+            if answer.observations_compared != len(compared):
+                return (f"a replay comparing {answer.observations_compared} observations "
+                        f"where the lease has {len(compared)}")
+            if len(set(mismatched)) != len(mismatched) or not set(mismatched) <= compared:
+                return "a replay whose mismatched indices are not the lease's compared ones"
         return None
 
     def result(self, executor_id: str, lease_id: str, result: GradeResult) -> str:

@@ -377,3 +377,14 @@ def test_the_episode_line_logs_the_graded_reward(caplog):
         _run([Identity("5Hot", sign=lambda b: "s", episodes=1)])
     lines = [r.getMessage() for r in caplog.records if "accepted" in r.getMessage()]
     assert lines and all("reward 1.0" in line for line in lines)
+
+
+
+def test_a_miner_on_non_xfs_docker_storage_is_warned_not_refused():
+    """F6 M3: executors replay on xfs; a miner's ext4 order spends tolerance."""
+    from reliquary.miner.agentic_miner import docker_storage_warning
+
+    warning = docker_storage_warning(refusal=lambda: "Docker stores images on ext2/ext3 "
+                                                     "(/var/lib/docker), not xfs")
+    assert "ext2/ext3" in warning and "tolerance" in warning
+    assert docker_storage_warning(refusal=lambda: None) is None

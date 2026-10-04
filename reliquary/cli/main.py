@@ -2517,6 +2517,11 @@ def corpus_mine_agentic(
     if refusal:
         typer.echo(f"error: {refusal}", err=True)
         raise typer.Exit(code=4)
+    from reliquary.miner.agentic_miner import docker_storage_warning
+
+    warning = docker_storage_warning()
+    if warning:
+        typer.echo(warning, err=True)
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
     if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
         typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)

@@ -66,9 +66,13 @@ async def _dispatcher(recheck=1.0, clock=None, quarantined=None, providers=None,
                                  quarantine=quarantine, clock=clock, rng=_Rng(recheck), **kw)
 
 
+# A replay lease's ten recorded observations, as REPLAY_OK/REPLAY_BAD compare (M1).
+TEN_ACTIONS = [{"tool": "bash", "arguments": "{}", "observation": f"o{k}"} for k in range(10)]
+
+
 def _item(mode="grade", **kw):
     return {"submission_id": SID, "task_index": 1, "instance_id": "repo__x.1", "mode": mode,
-            "final_diff": "d", "actions": [], **kw}
+            "final_diff": "d", "actions": TEN_ACTIONS if mode == "replay" else [], **kw}
 
 
 # Every executor result echoes the leased submission id (corpus_grade_executor._work).
@@ -93,10 +97,12 @@ def _answer(d, eid, result):
 
 def test_decision_keys():
     assert decision_key("grade", PASS) == (True, True)
-    assert decision_key("replay", REPLAY_OK) == (True, True)
-    assert decision_key("replay", REPLAY_BAD) == (False, False)
+    # M2: a replay's key is whether it certifies; the diff stays in the document.
+    assert decision_key("replay", REPLAY_OK) == (True,)
+    assert decision_key("replay", REPLAY_BAD) == (False,)
     over = {**REPLAY_OK, "observations_mismatched": list(range(6))}
-    assert decision_key("replay", over) == (True, False)
+    assert decision_key("replay", over) == (False,)
+    assert decision_key("replay", over) == decision_key("replay", REPLAY_BAD)
     assert replay_certified(REPLAY_OK) and not replay_certified(over)
 
 
@@ -182,7 +188,7 @@ async def test_a_quarantined_vote_on_a_leased_item_is_dropped_too():
     await d.quarantine("g0", "caught elsewhere")
     assert d.claim("g2") is None                 # never leased twice at once
     d.result("g1", lease["lease_id"], _result(REPLAY_OK))
-    assert (await decision).graded_by == ("g1",)
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
 
 
 async def test_timeouts_go_to_other_executors_then_resolve_unjudged():
@@ -246,7 +252,7 @@ async def test_a_late_result_is_refused_and_counts_as_an_expiry():
     assert d.claim("g0") is None and not decision.done()
     assert d._strikes["g0"] == 1                  # a late result is an expiry: struck
     _answer(d, "g1", REPLAY_OK)
-    assert (await decision).graded_by == ("g1",)
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
 
 
 @pytest.mark.parametrize("echo", [None, "c" * 64])
@@ -261,7 +267,7 @@ async def test_a_result_for_another_submission_is_refused_and_struck(echo):
     assert refused.value.status == 422 and refused.value.detail == "result_does_not_fit_the_lease"
     assert d._strikes["g0"] == 1 and d.claim("g0") is None and not decision.done()
     _answer(d, "g1", REPLAY_OK)
-    assert (await decision).graded_by == ("g1",)
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
 
 
 @pytest.mark.parametrize("mode,answer", [
@@ -357,7 +363,7 @@ async def test_the_router_serves_a_whole_lease():
         url = f"/corpus/internal/grade/{lease['lease_id']}/result"
         answered = await http.post(url, json={"results": [PASS]}, headers=other)
         assert answered.json() == {"lease_id": lease["lease_id"], "outcome": "accepted"}
-    assert (await decision).graded_by == ("g1",)
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
 
 
 async def test_a_corpus_directory_refuses_a_grade_token():
@@ -552,7 +558,7 @@ async def test_a_result_from_an_executor_that_lost_its_provider_is_refused():
     assert refused.value.status == 403
     assert not decision.done()                   # its answer never counted, not even as g0
     _answer(d, "g1", REPLAY_OK)
-    assert (await decision).graded_by == ("g1",)
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
 
 
 async def test_providers_count_once_whatever_their_spelling():
@@ -727,3 +733,46 @@ async def test_the_dispute_clock_counts_only_time_without_an_eligible_executor()
         clock.now += 100
         await d.sweep()
     assert (await voted).status == "disputed"
+
+
+
+# F6 M2: two executors that both fail a replay agree, whatever their diffs.
+
+async def test_two_failing_replays_agree_although_their_reasons_differ():
+    quarantined = []
+    d = await _dispatcher(recheck=1.0, quarantined=quarantined)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)                                       # the diff differs
+    _answer(d, "g1", {**REPLAY_OK, "observations_mismatched": list(range(6))})  # too many mismatches
+    got = await asyncio.wait_for(decision, 5)
+    await asyncio.sleep(0)
+    assert got.status == "ok" and got.graded_by == ("g0", "g1") and quarantined == []
+
+
+# F6 M1: the control checks a replay's counts against the lease it handed out.
+
+def _replay_item():
+    actions = [{"tool": "bash", "arguments": "{}", "observation": "a"},
+               {"tool": "bash", "arguments": "{}", "observation": "b"},
+               {"tool": "bash", "arguments": "{}", "observation": None}]
+    return _item("replay", actions=actions)
+
+
+@pytest.mark.parametrize("answer", [
+    {**REPLAY_OK, "observations_compared": 10, "observations_mismatched": []},   # leased 2
+    {**REPLAY_OK, "observations_compared": 2, "observations_mismatched": [5]},   # out of range
+    {**REPLAY_OK, "observations_compared": 2, "observations_mismatched": [2]},   # not compared
+    {**REPLAY_OK, "observations_compared": 2, "observations_mismatched": [0, 0]},
+], ids=["count", "out-of-range", "uncompared", "duplicate"])
+async def test_a_replay_result_that_does_not_fit_its_lease_is_refused_and_struck(answer):
+    d = await _dispatcher(recheck=1.0)
+    decision = asyncio.ensure_future(d.decide(_replay_item()))
+    await asyncio.sleep(0)
+    lease = d.claim("g0")
+    with pytest.raises(LeaseRefused) as refused:
+        d.result("g0", lease["lease_id"], _result(answer))
+    assert refused.value.status == 422 and d.stats["misfit_results"] == 1
+    assert d._strikes["g0"] == 1
+    _answer(d, "g1", {**REPLAY_OK, "observations_compared": 2, "observations_mismatched": [1]})
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g1",)
