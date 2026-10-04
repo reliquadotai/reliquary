@@ -38,7 +38,12 @@ from reliquary.corpus.audit_policy import after_confirmed_failure, replay_drawn
 from reliquary.corpus.replay_compare import allowed_mismatches
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
 from reliquary.infrastructure.corpus_record_store import MAX_REGRADE_GENERATIONS, RECORD_SCHEMA_V2
-from reliquary.validator.corpus_grade_remote import UNCERTIFIED, UNJUDGEABLE, replay_certified
+from reliquary.validator.corpus_grade_remote import (
+    DISPUTED,
+    UNCERTIFIED,
+    UNJUDGEABLE,
+    replay_certified,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -364,7 +369,12 @@ class CorpusGrader:
         # P23 a): a grade a trajectory kept from deciding (its patch killed the
         # box, its tests outlived the deadline) must not shield it from replay.
         draw = None
-        if not graded_success:
+        if graded.status == DISPUTED:
+            # Ruling P27: executors could not agree on the grade (a box that
+            # died against a pass): its replay is always drawn.
+            draw = {"fraction": self._job.episode.replay_fraction_failed, "drawn": True,
+                    "why": "disputed grade"}
+        elif not graded_success:
             draw = await self._draw(submission_id, state["received_at"])
             if draw is None and regrade:
                 # A regrade has no rescan to wait on: check rather than skip.

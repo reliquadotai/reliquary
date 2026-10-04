@@ -359,7 +359,8 @@ majority and penalizes no executor on either side (ruling P26: a trajectory
 can kill boxes at random); only fact-against-fact dissent quarantines.
 Every grade that is not a clean success (failing,
 timeout, error, disputed, unjudgeable) gets the failing replay draw
-(`replay_fraction_failed`). A failure before any recorded action or before
+(`replay_fraction_failed`), and a `disputed` grade is always replayed
+(ruling P27). A failure before any recorded action or before
 the patch (provisioning, setup, PyPI, the Docker daemon) stays the
 executor's `error`/`timeout` and is re-leased.
 

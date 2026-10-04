@@ -229,7 +229,7 @@ def test_a_failing_grade_by_one_undrawn_executor_never_sanctions(grade):
     assert records.voided == {} and states.states == {} and voided == []
 
 
-@pytest.mark.parametrize("status", ["timeout", "error", "ungradeable", "disputed"])
+@pytest.mark.parametrize("status", ["timeout", "error", "ungradeable"])
 def test_a_grade_without_a_decision_judges_nobody_and_certifies_nothing(status):
     records, states = _Records(), _States()
     dispatcher = _Dispatcher(GradeDecision(status, None, ()), FORGED)
@@ -1159,3 +1159,16 @@ def test_a_replay_no_vote_certifies_voids_unpaid_without_a_sanction(decision):
     assert records.voided[SID]["stage"] == "replay" and voided == [SID]
     assert states.states == {}
 
+
+
+def test_a_disputed_grade_is_always_replayed():
+    """Ruling P27: a grade the executors could not agree on (a box that died
+    against a pass) is no clean success; its replay is drawn whatever the
+    failing fraction."""
+    records, states = _Records(), _States()
+    dispatcher = _Dispatcher(GradeDecision("disputed", None, ("g0", "g1")), FORGED)
+    grader, voided = _grader(records, dispatcher, job=_job(fraction=0.0), states=states)
+    doc = asyncio.run(grader.grade_one(SID))
+    assert [i["mode"] for i in dispatcher.items] == ["grade", "replay"]
+    assert doc["replay"]["drawn"] is True and doc["replay"]["failed"] is True
+    assert records.voided[SID]["reason"] == "replay_failed"
