@@ -257,6 +257,18 @@ def _trace(task):
     )
 
 
+async def prepare_harness_footprint(box) -> None:
+    """What verifiers' bash harness setup leaves in the miner's box, made here
+    the same way and at the same point (after task setup, before the network
+    cut): ``pip install --user uv`` and ``uv sync`` of the harness program.
+    Honest observations show it (``/root/.local`` on ``sys.path``,
+    ``/root/.cache/pip``, ``uv`` in ``pip list``); a replay box without it
+    disagrees with every one of them. The program itself is never run here."""
+    from verifiers.v1.harnesses.bash.harness import PROGRAM_SOURCE
+
+    await box.prepare_uv_script(PROGRAM_SOURCE, {})
+
+
 async def replay_swe(task, actions: Sequence[Action], *,
                      command_timeout: float = 3600.0,
                      episode_deadline: float = DEFAULT_EPISODE_DEADLINE,
@@ -268,6 +280,7 @@ async def replay_swe(task, actions: Sequence[Action], *,
             async with bounded_box(task, limits) as box:
                 await box.prepare_setup()
                 await task.setup(trace, box)
+                await prepare_harness_footprint(box)
                 await box.prepare_execution([])
                 python = await resolve_python(box)
                 for action in actions:

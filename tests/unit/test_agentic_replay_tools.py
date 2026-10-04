@@ -93,13 +93,17 @@ from reliquary.validator import agentic_replay  # noqa: E402
 class _FakeBox:
     def __init__(self, python="/opt/miniconda3/bin/python3", delay=0.0):
         self.python, self.delay = python, delay
-        self.writes, self.runs = [], []
+        self.writes, self.runs, self.events = [], [], []
 
     async def prepare_setup(self):
-        pass
+        self.events.append("prepare_setup")
 
-    async def prepare_execution(self, _):
-        pass
+    async def prepare_execution(self, routes):
+        self.events.append(("prepare_execution", routes))
+
+    async def prepare_uv_script(self, script, env=None, *, activate=True):
+        self.events.append(("uv_script", script, env))
+        return ["/root/.cache/uv/python", "/tmp/vf-scripts/x.py"]
 
     async def write(self, path, data):
         self.writes.append(path)
@@ -134,6 +138,11 @@ def _fake_verifiers(monkeypatch, box, updates=None, update_code=0):
     monkeypatch.setitem(sys.modules, "verifiers", types.ModuleType("verifiers"))
     monkeypatch.setitem(sys.modules, "verifiers.v1", v1)
     monkeypatch.setitem(sys.modules, "verifiers.v1.runtimes", runtimes)
+    bash = types.ModuleType("verifiers.v1.harnesses.bash.harness")
+    bash.PROGRAM_SOURCE = "THE BASH HARNESS PROGRAM"
+    for name in ("verifiers.v1.harnesses", "verifiers.v1.harnesses.bash"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "verifiers.v1.harnesses.bash.harness", bash)
 
 
 def _task():
@@ -160,6 +169,24 @@ def test_replay_resolves_python_once_then_passes_the_program_by_argv(monkeypatch
         assert run[4] == written                                 # its own fresh request file
     assert len(set(box.writes)) == 2
     assert not any(w.endswith(".py") for w in box.writes)       # no program file in the box
+
+
+def test_replay_prepares_the_bash_harness_like_the_miner_before_the_network_cut(monkeypatch):
+    # The miner's box runs verifiers' bash harness setup (pip install --user uv,
+    # uv sync of its program) after task setup and before the cut: it leaves
+    # /root/.local (on sys.path), /root/.cache/pip and uv in `pip list`, which
+    # honest observations show. The replay box must carry the same footprint.
+    box = _FakeBox()
+
+    async def setup(trace, runtime):
+        box.events.append("task_setup")
+    task = _task()
+    task.setup = setup
+    _fake_verifiers(monkeypatch, box)
+    asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")]))
+    assert box.events == ["prepare_setup", "task_setup",
+                          ("uv_script", "THE BASH HARNESS PROGRAM", {}),
+                          ("prepare_execution", [])]
 
 
 def test_replay_refuses_a_box_without_an_absolute_python(monkeypatch):
