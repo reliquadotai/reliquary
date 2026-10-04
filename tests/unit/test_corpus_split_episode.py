@@ -288,3 +288,42 @@ def test_a_hot_episode_job_on_a_front_without_one_is_refused_not_crashing(front)
     assert split_episode_refusal(started.split, front.jobs[EPISODE_ID]) is None
     with pytest.raises(ValueError, match="started without one"):
         asyncio.run(started.job_set._wire(entry, 0.1, front.jobs[EPISODE_ID]))
+
+
+# -- the supervisor: the plan refuses before any child starts --------------------
+
+
+@pytest.mark.parametrize("judges,groups", [(EPISODE_TASK, None), ("*", [[SINGLE_ID]]),
+                                           (None, [[SINGLE_ID]])])
+def test_the_supervisor_plans_episode_jobs_into_the_front(monkeypatch, judges, groups):
+    from reliquary.validator import corpus_split
+
+    async def preflight(served):
+        return SimpleNamespace(directory="/x", fingerprint="c" * 64, proof=fakes.PROOF,
+                               model_id="m", model_revision="r", jobs=JOBS,
+                               episode_jobs=[EPISODE_ID])
+
+    started = []
+
+    class _Supervisor:
+        def __init__(self, spec):
+            started.append(spec)
+
+        async def run(self):
+            return None
+
+    monkeypatch.setattr(corpus_split, "preflight", preflight)
+    monkeypatch.setattr(corpus_split, "Supervisor", _Supervisor)
+    if judges is None:
+        monkeypatch.delenv(corpus_split.JUDGES_ENV, raising=False)
+    else:
+        monkeypatch.setenv(corpus_split.JUDGES_ENV, judges)
+    run = corpus_split.run_corpus_split(served=[], netuid=81, http_host="h", http_port=1,
+                                        set_weights=False)
+    if groups is None:
+        with pytest.raises(ValueError, match="judge processes host no grader"):
+            asyncio.run(run)
+        assert started == []                                # no child started
+    else:
+        asyncio.run(run)
+        assert started[0].groups == groups and started[0].group_of(EPISODE_ID) is None
