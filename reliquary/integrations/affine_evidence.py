@@ -235,10 +235,11 @@ def verify_bundle(bundle, signed, expected_bindings=None):
 
 
 def _worker(config, request):
-    from .affine import validate_config, verify_checkout
+    from .affine import _directory, validate_config, verify_checkout
 
     validate_config(config)
     verify_checkout(config)
+    _directory(Path(config.state_dir))
     request.update(upstream_checkout=str(config.upstream_checkout), authority=config.authority,
                    current_url=config.current_url, state_dir=str(config.state_dir), env_id=config.env_id,
                    requested_indices=list(config.indices) if config.indices is not None else None)
@@ -263,10 +264,53 @@ def _worker(config, request):
     return result
 
 
-def inspect_bootstrap(config):
+def inspect_bootstrap(config, *, allow_closed=False):
     """Return a PRIVATE authenticated snapshot; callers must redact its contents."""
     return _worker(config, dict(operation="bootstrap", key_file=str(config.key_file) if config.key_file else None,
-                                cap_file=str(config.cap_file) if config.cap_file else None))
+                                cap_file=str(config.cap_file) if config.cap_file else None,
+                                allow_closed=allow_closed))
+
+
+def inspect_delegation(config):
+    """Return PRIVATE native decrypted capability data for a local client key."""
+    require(config.key_file is not None and config.cap_file is None, "delegation_local_key_required")
+    return _worker(config, dict(operation="delegate", key_file=str(config.key_file)))
+
+
+def bootstrap_readiness(config, snapshot):
+    """Describe the authenticated challenge without publishing native credentials."""
+    import time
+
+    manifest = snapshot["manifest"]
+    selected = config.env_id or manifest["environments"][0]["env_id"]
+    definition = next(row for row in manifest["environments"] if row["env_id"] == selected)
+    authorized = definition["indices"]
+    require(isinstance(authorized, list) and 0 < len(authorized) <= 10000
+            and all(type(index) is int and index >= 0 for index in authorized)
+            and len(set(authorized)) == len(authorized), "bootstrap_task_pool")
+    maximum = manifest.get("max_batches", 4)
+    require(type(maximum) is int and 0 < maximum <= 10000, "bootstrap_batch_limit")
+    sampling = _sampling_policy(manifest)
+    attempts = sampling["max_attempts"] if sampling else 128
+    budget = snapshot["artifact_budget"]
+    return dict(schema="affine-readiness/v1", bootstrap_verified=True,
+                epoch_open=manifest["deadline"] > time.time(), deadline_epoch=manifest["deadline"],
+                credential_mode="delegated_capability" if config.cap_file else "local_key",
+                bindings=snapshot["bindings"], hardware_qualified=False, paid=False,
+                uploaded=None, accepted=None, trained=None,
+                constraints=dict(env_id=selected, authorized_indices=definition["indices"],
+                                 requested_indices=list(config.indices) if config.indices is not None else None,
+                                 K=manifest["K"], L=manifest["L"], max_batches=maximum,
+                                 effective_max_batches=min(config.max_batches, maximum,
+                                                           len(config.indices or definition["indices"])),
+                                 signed_max_attempts=sampling["max_attempts"] if sampling else None,
+                                 search_budget=min(config.search_budget, attempts),
+                                 artifact_budget=dict(compressed_bytes=budget["compressed_bytes"],
+                                                      raw_bytes=budget["raw_bytes"],
+                                                      tensor_rows_per_array=budget["tensor_rows"]),
+                                 harness=definition["harness"], audit_policy=manifest.get("audit_policy", {"mode": "full"}),
+                                 numerical_policy=manifest.get("numerical_policy"),
+                                 backend_profile=manifest.get("backend_profile")))
 
 
 def inspect_evidence(config, epoch_id, miner_id, submission_sha256=None, expected_bindings=None):
@@ -330,26 +374,57 @@ def _inspect(request):
     current_envelope = document(current["manifest_url"])
     current_manifest = signed(native_json(current_envelope), authority)
     require(current_manifest["epoch"] == current["epoch"], "discovery_epoch")
-    if request.get("operation") == "bootstrap":
+    if request.get("operation") in ("bootstrap", "delegate"):
         import time
+        deadline = current_manifest.get("deadline")
         require(current_manifest.get("transport_policy") == "direct-r2-v1"
-                and current_manifest["deadline"] > time.time(), "bootstrap_closed")
+                and type(deadline) in (int, float) and math.isfinite(deadline), "bootstrap_deadline")
+        require(request.get("allow_closed") or deadline > time.time(), "bootstrap_closed")
         if request.get("key_file"):
             from subnet.storage import Identity
-            miner = Identity(bytes.fromhex(Path(request["key_file"]).read_text().strip())).id
+            key_path = Path(request["key_file"])
+            require(key_path.stat().st_size <= 128, "local_identity_key_size")
+            seed = key_path.read_text().strip()
+            require(re.fullmatch("[0-9a-fA-F]{64}", seed), "local_identity_key_format")
+            identity = Identity(bytes.fromhex(seed))
+            miner = identity.id
+            capability = None
         else:
-            capability = json.loads(Path(request["cap_file"]).read_text())
-            require(capability["epoch"] == current_manifest["epoch"], "delegated_epoch")
+            cap_path = Path(request["cap_file"])
+            require(cap_path.stat().st_size <= 65536, "delegated_capability_size")
+            capability = json.loads(cap_path.read_text())
+            require(isinstance(capability, dict) and capability.get("epoch") == current_manifest["epoch"], "delegated_epoch")
             miner = capability["identity"]
         require(re.fullmatch("[0-9a-f]{64}", miner or "") and miner in current_manifest["capabilities"], "bootstrap_identity")
+        if request.get("operation") == "delegate":
+            require(request.get("key_file"), "delegation_local_key_required")
+            decrypted = identity.decrypt(current_manifest["capabilities"][miner])
+            require(isinstance(decrypted, dict), "delegated_capability_fields")
+            capability = {name: decrypted.get(name) for name in ("transport", "put_url", "headers", "deadline")}
+            capability.update(epoch=current_manifest["epoch"], identity=miner)
+            require(len(canonical(capability)) <= 65536, "delegated_capability_size")
+        if capability is not None:
+            require(capability.get("transport") == "direct-r2-v1"
+                    and type(capability.get("deadline")) is int and capability["deadline"] == deadline
+                    and capability.get("headers") == {"Content-Type": "application/octet-stream"},
+                    "delegated_transport")
+            from urllib.parse import urlsplit, unquote
+            route = r2_url(capability.get("put_url"))
+            require(unquote(urlsplit(route).path).endswith(
+                "/private/" + current_manifest["epoch"] + "/staging/" + str(miner) + ".zip"),
+                "delegated_upload_object")
         bindings = manifest_bindings(current_manifest, request.get("env_id"))
         selected = request.get("env_id") or current_manifest["environments"][0]["env_id"]
         definition = next(row for row in current_manifest["environments"] if row["env_id"] == selected)
         indices = request.get("requested_indices")
         require(indices is None or set(indices) <= set(definition["indices"]), "bootstrap_task_scope")
-        return dict(schema="affine-bootstrap-snapshot/v1", manifest=current_manifest, miner_id=miner,
-                    bindings=bindings, current_envelope=current_pointer_envelope,
-                    manifest_envelope=current_envelope, paid=False, hardware_qualified=False)
+        snapshot = dict(schema="affine-bootstrap-snapshot/v1", manifest=current_manifest, miner_id=miner,
+                        bindings=bindings, current_envelope=current_pointer_envelope,
+                        manifest_envelope=current_envelope, artifact_budget=for_manifest(current_manifest),
+                        paid=False, hardware_qualified=False)
+        if request.get("operation") == "delegate":
+            snapshot["capability"] = capability
+        return snapshot
     history = signed(native_json(document(current["history_url"])), authority)
     require(history.get("authority") == authority and history.get("version") == 1, "history_authority")
     rows = [r for r in history["epochs"] if r["epoch_id"] == request["epoch_id"]]

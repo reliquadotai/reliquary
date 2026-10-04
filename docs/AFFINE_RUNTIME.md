@@ -1,9 +1,10 @@
 # Optional native runtime
 
-The `affine-runtime` entry point supervises an explicitly pinned upstream checkout
-and interpreter. It does not import or change the SN81 model, optimizer, validator
-or payment path. The upstream runtime owns generation, full-vocabulary tensors,
-proofs and cumulative submission serialization.
+`reliquary affine` forwards to the `affine-runtime` entry point, which supervises
+an explicitly pinned upstream checkout and interpreter. The upstream runtime owns
+generation, full-vocabulary tensors, proofs and cumulative submission serialization.
+It runs as a separate operator task; the SN81 model, optimizer, validator and
+payment path remain independent.
 
 The operator configuration is an owner-only JSON file outside repositories. It
 specifies `upstream_checkout`, immutable `upstream_revision`, `python`, trusted
@@ -13,14 +14,61 @@ environment, unique task indices, search/batch limits, process timeout, retries
 and log bounds constrain execution. No credential is created automatically.
 
 ```sh
-affine-runtime check --config "$PRIVATE_RUNTIME_CONFIG"
-affine-runtime run --config "$PRIVATE_RUNTIME_CONFIG" --max-seconds 3600
-affine-runtime evidence --config "$PRIVATE_RUNTIME_CONFIG" --epoch "$PRIVATE_EPOCH" --miner "$PRIVATE_IDENTITY"
+reliquary affine check --config "$PRIVATE_RUNTIME_CONFIG"
+reliquary affine prepare --config "$PRIVATE_RUNTIME_CONFIG" --out "$PRIVATE_PREPARED_CONFIG"
 ```
 
-`check` authenticates discovery and the selected manifest; it does not qualify
-hardware. A zero child exit records `bootstrap_completed`, with upload, acceptance
-and training unset. Evidence checks require the signed frozen receipt, exact
+For delegated work, the client keeps its registered identity key locally. On that
+machine, an existing private configuration with `key_file` can export the signed
+open epoch's sealed upload capability:
+
+```sh
+reliquary affine delegate --config "$PRIVATE_CLIENT_CONFIG" --out "$PRIVATE_CAPABILITY_FILE"
+```
+
+`delegate` authenticates the configured authority and manifest and reuses native
+`Identity.decrypt`. It writes a new owner-only capability file; it performs no
+upload or registration and never includes the key in its output. Transfer only
+that epoch capability through an approved private channel. The operator's separate
+configuration uses `cap_file` and omits `key_file`. It contains native `epoch`,
+`identity`, `transport`, `put_url`, `headers` and `deadline` fields. Checks validate its
+identity membership, epoch, deadline, transport, headers and upload object against
+the authenticated challenge. A capability authorizes that identity's submission;
+it does not create a separate registration. Use one cumulative uploader per identity.
+
+`check` authenticates discovery and the selected manifest and reports the deadline,
+authorized indices, requested subset, pair quota, search bound, artifact limits,
+harness and audit/runtime policies. It also describes a closed epoch with
+`epoch_open: false`. Successful metadata inspection leaves `hardware_qualified`
+and `paid` false, with upload, acceptance and training unset.
+
+`prepare` writes three new owner-only files outside Git: the requested runtime
+configuration, original signed snapshot and an `affine-native-task/v1` descriptor.
+The descriptor contains private native identity/epoch bindings, config/snapshot
+digests and the safe readiness metadata for operator queue import. Preparation
+pins the selected environment, clamps search and batch limits and refuses to
+overwrite files or replace unresolved running state. When no environment is
+selected, it pins the first signed environment. Every exported descriptor has
+`runnable: false`; this is a staged request awaiting operator qualification.
+A closed epoch can be staged from an existing capability, but must be prepared
+again from a fresh open epoch and matching capability before activation.
+Delegation exports require an open epoch.
+
+After qualifying the approved GPU/runtime, isolation, cancellation and whole-task
+budget, run the prepared configuration and inspect its subsequent evidence:
+
+```sh
+reliquary affine run --config "$PRIVATE_PREPARED_CONFIG" --max-seconds 3600
+reliquary affine evidence --config "$PRIVATE_PREPARED_CONFIG" --epoch "$PRIVATE_EPOCH" --miner "$PRIVATE_IDENTITY"
+```
+
+This command surface does not register an SN81 corpus/SFT job, change its emissions
+or distribute native Affine execution to ordinary SN81 miners. That requires a
+separate task mechanism and qualified worker distribution. Platform execution
+uses its own approved profile, private account/task binding and allocation path.
+
+A zero child exit records `bootstrap_completed`, with upload, acceptance and
+training unset. Evidence checks require the signed frozen receipt, exact
 submission bytes, fully audited accepted pairs, exact own-pair training attribution,
 changed checkpoint bytes and signed successor checkpoint before `cycle_verified`.
 Accepted, scored and consumed counts are independent. Neither a payment nor an
@@ -55,7 +103,7 @@ host deadline. Publish an approved profile only after real operator qualificatio
 CPU checks:
 
 ```sh
-python -m unittest tests.unit.test_affine_runtime tests.unit.test_affine_evidence
+python -m unittest tests.unit.test_affine_runtime tests.unit.test_affine_evidence tests.unit.test_affine_prepare tests.unit.test_affine_cli_alias
 ```
 
 These checks use synthetic signatures and harmless subprocesses. They do not run

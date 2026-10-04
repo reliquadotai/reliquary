@@ -7,7 +7,7 @@ proofs and uploads. A successful child exit is not an acceptance or training rec
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 import fcntl
 import hashlib
 import json
@@ -285,6 +285,85 @@ def _write_journal(state: Path, document: dict) -> None:
                 Path(name).unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def delegate_capability(config: AffineConfig, output: str | Path) -> dict:
+    """Decrypt one signed epoch upload capability locally; never export its key."""
+    from .affine_evidence import canonical, inspect_delegation
+
+    validate_config(config)
+    if config.key_file is None:
+        raise AffineRuntimeError("delegation requires a local key configuration")
+    output = _path(output, "delegated capability")
+    _private_path(output)
+    if output.exists() or output.is_symlink():
+        raise AffineRuntimeError("delegated capability must use a new private path")
+    snapshot = inspect_delegation(config)
+    _directory(output.parent)
+    if snapshot["manifest"]["deadline"] <= time.time():
+        raise AffineRuntimeError("delegation requires a current open epoch")
+    fd = _private_open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(canonical(snapshot["capability"]))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        output.unlink()
+        raise
+    return dict(schema="affine-delegation/v1", stage="delegated", bootstrap_verified=True,
+                epoch_open=True, deadline_epoch=snapshot["manifest"]["deadline"], bindings=snapshot["bindings"],
+                hardware_qualified=False, paid=False)
+
+
+def prepare_runtime(config: AffineConfig, output: str | Path) -> dict:
+    """Export a private pinned draft; no source install, model or upload occurs."""
+    from .affine_evidence import bootstrap_readiness, canonical, inspect_bootstrap
+
+    validate_config(config)
+    output = _path(output, "prepared config")
+    snapshot_path = output.with_name(output.stem + "-snapshot.affine-private.json")
+    task_path = output.with_name(output.stem + "-task.affine-private.json")
+    paths = (snapshot_path, output, task_path)
+    for path in paths:
+        _private_path(path)
+        if path.exists() or path.is_symlink():
+            raise AffineRuntimeError("prepared files must use new private paths")
+    snapshot = inspect_bootstrap(config, allow_closed=True)
+    readiness = bootstrap_readiness(config, snapshot)
+    _directory(output.parent)
+    _directory(Path(config.state_dir))
+    with _lock(Path(config.state_dir)):
+        previous = _read_journal(Path(config.state_dir))
+        if previous is not None and previous["stage"] == "running":
+            raise AffineRuntimeError("previous running state is unresolved; explicit reconciliation is required")
+        pinned = replace(config, manifest_snapshot_file=snapshot_path,
+                         env_id=readiness["constraints"]["env_id"],
+                         search_budget=readiness["constraints"]["search_budget"],
+                         max_batches=readiness["constraints"]["effective_max_batches"])
+        document = {name: str(value) if isinstance(value, Path) else value
+                    for name, value in asdict(pinned).items()}
+        snapshot_data = canonical({name: snapshot[name] for name in ("current_envelope", "manifest_envelope")})
+        config_data = canonical(document)
+        task_data = canonical(dict(schema="affine-native-task/v1", runnable=False,
+                                   runtime_config=str(output), runtime_config_sha256=hashlib.sha256(config_data).hexdigest(),
+                                   snapshot_file=str(snapshot_path), snapshot_sha256=hashlib.sha256(snapshot_data).hexdigest(),
+                                   epoch_id=snapshot["manifest"]["epoch"], miner_id=snapshot["miner_id"],
+                                   readiness=readiness))
+        created = []
+        try:
+            for path, data in zip(paths, (snapshot_data, config_data, task_data)):
+                fd = _private_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                created.append(path)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        except Exception:
+            for path in created:
+                path.unlink()
+            raise
+    return dict(readiness, stage="prepared", runnable=False)
 
 
 def reconcile_state(config: AffineConfig) -> dict:

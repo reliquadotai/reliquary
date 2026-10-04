@@ -2,25 +2,31 @@
 import argparse
 import json
 
-from .affine import AffineRunner, load_config, reconcile_state, verify_checkout
-from .affine_evidence import inspect_bootstrap, inspect_evidence
+from .affine import AffineRunner, delegate_capability, load_config, prepare_runtime, reconcile_state
+from .affine_evidence import bootstrap_readiness, inspect_bootstrap, inspect_evidence
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "run", "evidence", "reconcile"))
+    parser.add_argument("command", choices=("check", "delegate", "prepare", "run", "evidence", "reconcile"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--epoch")
     parser.add_argument("--miner")
     parser.add_argument("--max-seconds", type=float)
-    args = parser.parse_args()
+    parser.add_argument("--out", help="New owner-private capability or prepared config outside Git")
+    args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
         if args.command == "check":
-            verify_checkout(config)
-            snapshot = inspect_bootstrap(config)
-            result = {"schema": "affine-readiness/v1", "bootstrap_verified": True,
-                      "bindings": snapshot["bindings"], "hardware_qualified": False, "paid": False}
+            result = bootstrap_readiness(config, inspect_bootstrap(config, allow_closed=True))
+        elif args.command == "delegate":
+            if not args.out:
+                parser.error("delegate requires --out")
+            result = delegate_capability(config, args.out)
+        elif args.command == "prepare":
+            if not args.out:
+                parser.error("prepare requires --out")
+            result = prepare_runtime(config, args.out)
         elif args.command == "run":
             result = AffineRunner(config).run(max_seconds=args.max_seconds)
         elif args.command == "reconcile":
