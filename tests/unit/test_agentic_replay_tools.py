@@ -195,10 +195,11 @@ def test_replay_refuses_a_box_without_an_absolute_python(monkeypatch):
         asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")]))
 
 
-def test_replay_past_its_deadline_raises_replay_timeout(monkeypatch):
+def test_replay_past_its_trajectory_budget_raises_replay_timeout(monkeypatch):
     _fake_verifiers(monkeypatch, _FakeBox(delay=5.0))
     with pytest.raises(agentic_replay.ReplayTimeout, match="0 of 1 actions"):
-        asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")], episode_deadline=0.2))
+        asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", "{}", "")],
+                                              trajectory_budget=0.2))
 
 
 def test_the_box_is_bounded_before_any_action_runs(monkeypatch):
@@ -220,10 +221,33 @@ def test_a_box_that_cannot_be_bounded_is_refused(monkeypatch):
     assert box.runs == []
 
 
-def test_default_episode_deadline_is_an_hour():
-    import inspect
-    sig = inspect.signature(agentic_replay.replay_swe)
-    assert sig.parameters["episode_deadline"].default == 3600.0
+def _timed_task(setup=900.0, agent=3600.0, finalize=900.0):
+    task = _task()
+    task.data.timeout = types.SimpleNamespace(setup=setup, agent=agent, finalize=finalize,
+                                              scoring=1800.0)
+    return task
+
+
+def test_replay_deadlines_follow_the_tasks_own_timeouts():
+    """Ruling P25: setup gets the task's setup timeout plus a margin (the
+    executor's), the trajectory twice the miner's agent + finalize budget."""
+    setup, budget = agentic_replay.replay_deadlines(_timed_task())
+    assert setup == 900.0 + agentic_replay.SETUP_MARGIN_SECONDS
+    assert budget == 9000.0                                      # SWE-smith: 2 x (3600 + 900)
+    assert agentic_replay.replay_deadlines(_task()) == (           # unset phases: an hour each
+        3600.0 + agentic_replay.SETUP_MARGIN_SECONDS, 2 * (3600.0 + 3600.0))
+    # An honest miner's 3000 s of actions sits far inside the budget.
+    assert budget > 3000.0 * 2
+
+
+def test_actions_outlasting_the_setup_deadline_are_never_a_timeout(monkeypatch):
+    # The two clocks are separate: 0.6 s of actions past a 0.2 s setup deadline
+    # (the scaled image of an honest 3000 s episode) is within its own budget.
+    _fake_verifiers(monkeypatch, _FakeBox(delay=0.3))
+    observations, _ = asyncio.run(agentic_replay.replay_swe(
+        _task(), [Action("bash", "{}", ""), Action("bash", "{}", "")],
+        setup_deadline=0.2, trajectory_budget=2.0))
+    assert len(observations) == 2
 
 
 def _shadowing_json(tmp_path):
@@ -302,7 +326,7 @@ def test_a_deadline_hit_by_the_actions_is_the_trajectorys_and_by_setup_the_execu
     _fake_verifiers(monkeypatch, _FakeBox(delay=5.0))
     with pytest.raises(agentic_replay.ReplayTimeout) as caught:
         asyncio.run(agentic_replay.replay_swe(_task(), [Action("bash", '{"command": "sleep 99999"}', "")],
-                                              episode_deadline=0.2))
+                                              setup_deadline=10.0, trajectory_budget=0.2))
     assert caught.value.trajectory_caused is True
 
     _fake_verifiers(monkeypatch, _FakeBox())
@@ -312,8 +336,9 @@ def test_a_deadline_hit_by_the_actions_is_the_trajectorys_and_by_setup_the_execu
         await asyncio.sleep(5.0)
     task.setup = slow_setup
     with pytest.raises(agentic_replay.ReplayTimeout) as caught:
-        asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")], episode_deadline=0.2))
-    assert caught.value.trajectory_caused is False
+        asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")],
+                                              setup_deadline=0.2, trajectory_budget=60.0))
+    assert caught.value.trajectory_caused is False             # slow setup: the executor's
 
 
 # --- F4 (ruling P24): what a box hands back is bounded, its disk too ---------

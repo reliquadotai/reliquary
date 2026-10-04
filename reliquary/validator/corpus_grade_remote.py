@@ -72,11 +72,12 @@ logger = logging.getLogger(__name__)
 GRADE_PREFIX = "/corpus/internal/grade"
 # A lease's life per mode. The executor does not renew a lease while it works,
 # so each covers the work's own bound plus the box's start and the corpus
-# load: a grade runs under its 1800 s scoring timeout, a replay under its
-# 3600 s episode deadline.
+# load: a grade runs under its 1800 s scoring timeout; a replay under its
+# setup deadline (SWE-smith: 900 + 600 s) then its trajectory budget
+# (2 x (3600 + 900) = 9000 s, ruling P25), 10 500 s, plus a margin.
 GRADE_LEASE_SECONDS = {
     "grade": _bounded_env("RELIQUARY_CORPUS_GRADE_LEASE_SECONDS", 2400.0, 2100.0, 7200.0),
-    "replay": _bounded_env("RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS", 4200.0, 3900.0, 10800.0),
+    "replay": _bounded_env("RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS", 12000.0, 11000.0, 28800.0),
 }
 GRADE_RECHECK_FRACTION = 0.05
 MAX_RESULTS_PER_ITEM = 3

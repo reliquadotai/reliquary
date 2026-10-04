@@ -102,7 +102,7 @@ async def test_a_fork_bomb_is_contained_and_the_box_is_removed():
     try:
         observations, _ = await replay_swe(
             swesmith_task(INSTANCE), [bomb, Action("bash", '{"command": "echo after"}', "after")],
-            command_timeout=10, episode_deadline=180, limits=BoxLimits(cpu=1.0, memory_gb=1.0, pids=128))
+            command_timeout=10, trajectory_budget=180, limits=BoxLimits(cpu=1.0, memory_gb=1.0, pids=128))
     except ReplayTimeout:
         observations = None
     except Exception:  # the box may be too starved to finalize: an executor error, not a crash
@@ -213,7 +213,7 @@ async def test_a_long_sleep_spends_the_deadline_as_the_trajectorys_box_timeout()
     from reliquary.validator.corpus_grade_executor import run_grade_item
 
     replayed = await run_grade_item(_commands("echo first", "sleep 99999"),
-                                    replay=functools.partial(replay_swe, episode_deadline=60))
+                                    replay=functools.partial(replay_swe, trajectory_budget=60))
     assert replayed["status"] == "box_timeout", replayed
 
 
@@ -242,3 +242,16 @@ async def test_hanging_tests_after_the_patch_are_the_trajectorys_box_timeout():
         GradeItem(submission_id="a" * 64, task_index=0, instance_id=INSTANCE, mode="grade",
                   final_diff=hang), task_for=lambda _: task)
     assert graded["status"] == "box_timeout", graded
+
+
+async def test_a_setup_slower_than_its_deadline_is_the_executors_timeout():
+    """Ruling P25: provisioning and setup (pip install uv, uv sync) run under
+    their own deadline; missing it is re-leased, never the trajectory's."""
+    import functools
+
+    from reliquary.validator.agentic_replay import replay_swe
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    replayed = await run_grade_item(_commands("echo first"),
+                                    replay=functools.partial(replay_swe, setup_deadline=3))
+    assert replayed["status"] == "timeout" and "setup deadline" in replayed["detail"], replayed

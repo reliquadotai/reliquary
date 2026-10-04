@@ -233,7 +233,7 @@ async def test_an_item_whose_leases_keep_expiring_resolves_as_a_timeout():
     await asyncio.sleep(0)
     for eid in ("g0", "g1"):
         assert d.claim(eid) is not None
-        clock.now += 10_000
+        clock.now += 30_000
         await d.sweep()
     got = await decision
     assert got.status == "timeout" and got.result is None
@@ -245,7 +245,7 @@ async def test_a_late_result_is_refused_and_counts_as_an_expiry():
     decision = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
     lease = d.claim("g0")
-    clock.now += 10_000
+    clock.now += 30_000
     with pytest.raises(LeaseRefused) as refused:
         d.result("g0", lease["lease_id"], _result(REPLAY_BAD))
     assert refused.value.detail == "lease_expired"
@@ -300,13 +300,18 @@ async def test_an_item_no_lease_can_carry_is_ungradeable_and_never_leased(oversi
 
 
 def test_a_lease_outlives_its_work():
-    from reliquary.validator.agentic_replay import DEFAULT_EPISODE_DEADLINE
+    import types
+
+    from reliquary.validator.agentic_replay import replay_deadlines
     from reliquary.validator.corpus_grade_executor import DEFAULT_SCORING_SECONDS
 
     seconds = corpus_grade_remote.GRADE_LEASE_SECONDS
-    # A replay is bounded by its episode deadline, a grade by its scoring
-    # timeout; each lease leaves room for the box and the corpus load.
-    assert seconds["replay"] >= DEFAULT_EPISODE_DEADLINE + 300
+    # A replay is bounded by its setup deadline plus its trajectory budget
+    # (ruling P25, SWE-smith's timeouts), a grade by its scoring timeout; each
+    # lease leaves room for the box and the corpus load.
+    swesmith = types.SimpleNamespace(data=types.SimpleNamespace(timeout=types.SimpleNamespace(
+        setup=900.0, agent=3600.0, finalize=900.0, scoring=1800.0)))
+    assert seconds["replay"] >= sum(replay_deadlines(swesmith)) + 300
     assert seconds["grade"] >= DEFAULT_SCORING_SECONDS + 300
 
 

@@ -142,7 +142,8 @@ Tunables (environment of the control, bounded): `RELIQUARY_CORPUS_GRADE_DISPUTE_
 (1800; 60 to 86400) how long an item holding one vote waits, while no live
 distinct-provider executor exists, before it resolves `disputed`;
 `RELIQUARY_CORPUS_GRADE_LEASE_SECONDS` (2400) and
-`RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS` (4200) the lease lives.
+`RELIQUARY_CORPUS_REPLAY_LEASE_SECONDS` (12000; 11000 to 28800) the lease lives (a
+replay: setup deadline + trajectory budget, see section 5, plus a margin).
 
 ## 3. Grade executors (CPU, Docker, about 16 vCPU and 150 GB disk each)
 
@@ -338,7 +339,7 @@ curl -s https://<control>/corpus/jobs/swe-agentic-v1/status | python -m json.too
 
 Outcomes a trajectory causes in its box (ruling P23): once its recorded
 actions (replay) or its applied patch (grade) run, a box that dies, cannot
-take the next command, or runs past its deadline (replay 3600 s, grade the
+take the next command, or runs past its deadline (replay: its trajectory budget, grade the
 task's scoring timeout) is reported `box_lost` / `box_timeout`, a vote like
 any fact. Two distinct providers agreeing void the submission **unpaid**
 with reason `replay_unjudgeable` (`stage` `grade` or `replay`) and **no**
@@ -346,7 +347,16 @@ escalation of the miner. Every grade that is not a clean success (failing,
 timeout, error, disputed, unjudgeable) gets the failing replay draw
 (`replay_fraction_failed`). A failure before any recorded action or before
 the patch (provisioning, setup, PyPI, the Docker daemon) stays the
-executor's `error`/`timeout` and is re-leased. A trajectory whose text a
+executor's `error`/`timeout` and is re-leased.
+
+Replay timing (ruling P25), from the task's own timeouts: provisioning and
+setup get the setup timeout plus 600 s (SWE-smith: 1500 s; missing it is the
+executor's `timeout`); the trajectory's clock starts at its first action with
+twice the miner's agent + finalize budget (SWE-smith: 2 x (3600 + 900) =
+9000 s), so only a trajectory far past any honest episode is `box_timeout`.
+Capacity: a forger whose last action sleeps forever holds an executor slot
+up to about 2.5 h (setup + budget) per replay it gets; it holds at most as
+many replays as it has accepted slots, and each costs it its own slot. A trajectory whose text a
 lease cannot carry (4096 actions, 4 MiB per observation or argument, 16 MiB
 in all) is refused at intake as `trajectory_too_large`; the miner checks the
 same bound before signing.

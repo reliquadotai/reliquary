@@ -14,9 +14,12 @@ passed on every action as an argv string (``<python> -I -c TOOL_PROGRAM``) throu
 ``docker exec``, with ``-I`` (isolated mode: neither the working directory, which
 the replayed commands own, nor ``PYTHON*`` variables nor the user site reach
 ``sys.path``), so no file in the box can substitute it; each request goes in
-a fresh file with an unpredictable name, deleted once read. The whole replay
-runs under a wall-clock deadline (``episode_deadline``, default 3600 s) and
-raises ``ReplayTimeout`` past it, besides each command's own timeout.
+a fresh file with an unpredictable name, deleted once read. The replay runs
+under two wall-clock clocks (ruling P25): provisioning and setup under the
+task's setup timeout plus a margin (the executor's to meet), then the
+recorded actions and finalize under twice the miner's own agent + finalize
+budget (9000 s on SWE-smith); past either it raises ``ReplayTimeout``, only
+the second being the trajectory's. Each command also keeps its own timeout.
 
 Resources. Every box (replay or grade, ``bounded_box``) runs under explicit
 ``BoxLimits``: CPUs and memory through verifiers' ``DockerConfig``, then, right
@@ -127,7 +130,27 @@ sys.stdout.write(out)
 
 # Resolved once, after setup and before any replayed action can touch PATH.
 _FIND_PYTHON = ["sh", "-c", "command -v python3 || command -v python"]
-DEFAULT_EPISODE_DEADLINE = 3600.0
+# Ruling P25. A phase the task leaves unbounded counts an hour (the miner's
+# own UNSET_PHASE_SECONDS); setup gets a margin over the task's setup
+# timeout for provisioning and the harness footprint (pip install uv, uv sync);
+# the trajectory twice the miner's agent + finalize budget, so only a
+# trajectory far past anything an honest miner ran is its timeout.
+UNSET_PHASE_SECONDS = 3600.0
+SETUP_MARGIN_SECONDS = 600.0
+TRAJECTORY_BUDGET_FACTOR = 2.0
+
+
+def _phase(timeout, name: str) -> float:
+    value = getattr(timeout, name, None) if timeout is not None else None
+    return float(value) if value else UNSET_PHASE_SECONDS
+
+
+def replay_deadlines(task) -> tuple[float, float]:
+    """``(setup deadline, trajectory budget)`` in seconds from the task's own
+    timeouts: setup + margin, and 2 x (agent + finalize)."""
+    timeout = getattr(task.data, "timeout", None)
+    return (_phase(timeout, "setup") + SETUP_MARGIN_SECONDS,
+            TRAJECTORY_BUDGET_FACTOR * (_phase(timeout, "agent") + _phase(timeout, "finalize")))
 
 
 # Distinct from any role container's name (e.g. "reliquary-grade-executor"),
@@ -342,11 +365,11 @@ def sweep_orphan_boxes() -> int:
 
 
 class ReplayTimeout(Exception):
-    """The replay exceeded its wall-clock ``episode_deadline``; the executor
-    reports it as such, not as a mismatch. ``trajectory_caused``: the deadline
-    passed while the recorded actions (or the finalize after them) ran, so the
-    trajectory's own commands spent it (ruling P23); before that, the box's
-    setup did, which is the executor's."""
+    """The replay exceeded a wall-clock deadline; the executor reports it as
+    such, not as a mismatch. ``trajectory_caused``: the trajectory budget ran
+    out while the recorded actions (or the finalize after them) ran, so the
+    trajectory's own commands spent it (rulings P23, P25); otherwise the setup
+    deadline passed, which is the executor's."""
 
     def __init__(self, message: str, *, trajectory_caused: bool = False) -> None:
         super().__init__(message)
@@ -433,11 +456,13 @@ async def prepare_harness_footprint(box) -> None:
 
 async def replay_swe(task, actions: Sequence[Action], *,
                      command_timeout: float = 3600.0,
-                     episode_deadline: float = DEFAULT_EPISODE_DEADLINE,
+                     setup_deadline: float | None = None,
+                     trajectory_budget: float | None = None,
                      limits: BoxLimits = DEFAULT_BOX_LIMITS) -> tuple[list[str], str]:
     """The replayed observations and the diff finalize collected.
 
-    Raises ``ReplayTimeout`` past ``episode_deadline`` and ``BoxLost`` when
+    ``setup_deadline`` and ``trajectory_budget`` default to
+    ``replay_deadlines(task)``. Raises ``ReplayTimeout`` past either and ``BoxLost`` when
     the box fails once the first recorded action started (ruling P23: the
     trajectory's outcome); anything else is the executor's. With no action
     to replay nothing the trajectory controls ever ran, so every failure is
@@ -446,14 +471,20 @@ async def replay_swe(task, actions: Sequence[Action], *,
     observations: list[str] = []
     started = False                      # a recorded action was sent into the box
     finished = False                     # every action ran and finalize read the diff
+    default_setup, default_budget = replay_deadlines(task)
+    setup_deadline = default_setup if setup_deadline is None else setup_deadline
+    trajectory_budget = default_budget if trajectory_budget is None else trajectory_budget
+    loop = asyncio.get_running_loop()
     try:
-        async with asyncio.timeout(episode_deadline):
+        async with asyncio.timeout(setup_deadline) as clock:
             async with bounded_box(task, limits) as box:
                 await box.prepare_setup()
                 await task.setup(trace, box)
                 await prepare_harness_footprint(box)
                 await box.prepare_execution([])
                 python = await resolve_python(box)
+                # The trajectory's own clock starts at its first action.
+                clock.reschedule(loop.time() + trajectory_budget)
                 started = bool(actions)
                 try:
                     for action in actions:
@@ -469,8 +500,10 @@ async def replay_swe(task, actions: Sequence[Action], *,
                 finished = True
     except TimeoutError as e:
         if not finished:
+            spent = (f"its trajectory budget {trajectory_budget} s" if started
+                     else f"its setup deadline {setup_deadline} s")
             raise ReplayTimeout(
-                f"replay exceeded {episode_deadline} s after {len(observations)} of {len(actions)} actions",
+                f"replay exceeded {spent} after {len(observations)} of {len(actions)} actions",
                 trajectory_caused=started) from e
         # Only the box's removal ran late: the facts are complete.
         logger.warning("replay box removal outlived the deadline; the replay itself finished")
