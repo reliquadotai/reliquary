@@ -674,3 +674,56 @@ async def test_an_unjudgeable_outcome_without_a_second_provider_resolves_dispute
     clock.now += 1801
     await d.sweep()
     assert (await decision).status == "disputed"
+
+
+# F3: the dispute clock runs only while no eligible executor exists.
+
+async def test_a_backlog_longer_than_the_dispute_window_never_disputes_a_voted_item():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0,
+                          max_leases_per_executor=1)
+    voted = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    first = d.claim("g0")
+    backlog = [asyncio.ensure_future(d.decide(_item("replay", submission_id=f"{k:064x}")))
+               for k in range(1, 6)]
+    await asyncio.sleep(0)
+    busy = d.claim("g2")                                # g2: live, eligible, busy with the backlog
+    assert busy["items"][0]["submission_id"] != SID
+    d.result("g0", first["lease_id"], _result(REPLAY_BAD))   # one vote: waits for a second provider
+    for _ in range(40):                                 # 4000 s of backlog, g2 heartbeating
+        clock.now += 100
+        d.heartbeat("g2")
+        await d.sweep()
+    assert not voted.done() and d.stats["disputed"] == 0
+    d.result("g2", busy["lease_id"], _result({**REPLAY_OK, "submission_id": busy["items"][0]["submission_id"]}))
+    nxt = d.claim("g2")
+    assert nxt["items"][0]["submission_id"] == SID      # a voted item goes to the front
+    d.result("g2", nxt["lease_id"], _result(REPLAY_BAD))
+    got = await voted
+    assert got.status == "ok" and got.graded_by == ("g0", "g2")
+    for future in backlog:
+        future.cancel()
+
+
+async def test_the_dispute_clock_counts_only_time_without_an_eligible_executor():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    voted = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    for _ in range(10):                                 # 1000 s with nobody eligible
+        clock.now += 100
+        await d.sweep()
+    for _ in range(10):                                 # 1000 s with g1 live (it does not claim yet)
+        clock.now += 100
+        d.heartbeat("g1")
+        await d.sweep()
+    await asyncio.sleep(0)
+    assert not voted.done() and d.stats["disputed"] == 0   # 1000 s counted, not 2000
+    clock.now += 61 + d._live                           # g1 is gone: the clock runs again
+    await d.sweep()
+    for _ in range(8):
+        clock.now += 100
+        await d.sweep()
+    assert (await voted).status == "disputed"

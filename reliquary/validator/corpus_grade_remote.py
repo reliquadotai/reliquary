@@ -18,7 +18,10 @@ Executors count by provider (ruling P17): each grade executor registers its
 it, and agreement counts distinct providers, so one operator's boxes are one
 vote. Every wait for a next distinct executor is bounded (ruling P16): an item
 that holds a vote and finds no further executor within ``dispute_seconds``
-resolves ``disputed``, which sanctions nobody and certifies nothing.
+resolves ``disputed``, which sanctions nobody and certifies nothing. That
+clock runs only while no live eligible executor exists (F3), and an item
+holding a vote goes back to the front of the queue, so a grading backlog
+never turns a failing replay into a dispute.
 
 An item no lease can carry (actions or observations beyond the
 ``GradeLease`` bounds) is never leased: every executor would refuse the lease
@@ -135,6 +138,10 @@ class _Work:
     drawn: bool | None = None           # recheck draw, made at the first result
     timeouts: int = 0
     errors: int = 0
+    # The dispute clock (F3): seconds this voted item spent queued while no
+    # live eligible executor existed, as of the sweep at ``swept_at``.
+    unserved: float = 0.0
+    swept_at: float | None = None
 
     @property
     def mode(self) -> str:
@@ -381,7 +388,13 @@ class RemoteGradeDispatcher(ExecutorLeases):
     def _requeue(self, work: _Work) -> None:
         if not work.future.done() and work not in self._queue:
             work.queued_at = self._clock()
-            self._queue.append(work)
+            work.swept_at = work.queued_at
+            if work.results:
+                # It holds a vote and waits for the next one: before any new
+                # item, so a backlog never runs out its dispute clock.
+                self._queue.appendleft(work)
+            else:
+                self._queue.append(work)
 
     def _take_back(self, lease: _Lease, *, expired: bool) -> None:
         lease.work.excluded.add(lease.executor_id)
@@ -420,18 +433,26 @@ class RemoteGradeDispatcher(ExecutorLeases):
         for work in list(self._queue):
             if work.future.done():
                 continue
-            if work.results and now - work.queued_at >= self._dispute_seconds:
+            served = any(self._eligible(eid, work) for eid in live)
+            if work.results:
+                # Only time with no live eligible executor counts (F3): one that
+                # is merely busy takes this item next (voted items go first).
+                since = work.swept_at if work.swept_at is not None else now
+                if not served:
+                    work.unserved += max(0.0, now - since)
+                work.swept_at = now
+            if work.results and work.unserved >= self._dispute_seconds:
                 # No distinct executor came for the next vote: nobody is judged.
                 self.stats[DISPUTED] += 1
                 logger.warning(
                     "grade item %d (%s, submission %s) disputed: no distinct-provider executor "
-                    "voted within %.0f s after %s; no sanction, not certified", work.id,
-                    work.mode, work.item["submission_id"][:12], self._dispute_seconds,
+                    "was available for %.0f s after %s; no sanction, not certified", work.id,
+                    work.mode, work.item["submission_id"][:12], work.unserved,
                     {e: decision_key(work.mode, r) for e, r in sorted(work.results.items())})
                 self._resolve(work, GradeDecision(DISPUTED, None, tuple(sorted(work.results))))
                 continue
             waiting += 1
-            if live and not any(self._eligible(eid, work) for eid in live):
+            if live and not served:
                 self.stats["stranded"] += 1
                 logger.warning("grade item %d (%s) waits: every live grade executor is excluded "
                                "from it (voted, failed it, or same provider as a voter)",
