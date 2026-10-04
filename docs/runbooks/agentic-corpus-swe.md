@@ -159,6 +159,15 @@ settler, both held until graded). Judge processes host no grader, so:
   heartbeats in the job status (`dispatcher_waiting`, the executors listed)
   before miners submit.
 
+**GPU sharing on the split.** The front sends an episode job's audits to the
+GPU process in requests of at most 65,536 tokens (`EPISODE_GPU_REQUEST_TOKENS`;
+one trajectory alone if longer), so the judges' single-turn requests
+interleave with them in its FIFO; a request refused `503` (queue full) is
+retried with backoff (1 s doubling to 10 s), never failed. Start the episode
+job with a low `audit_q` and cap, and watch the GPU process's `corpus gpu
+batch ... oldest_wait` log and the single-turn jobs' verdict latency before
+raising them.
+
 **An episode job that cannot be wired at startup is left out, alone.** If its
 renderer, ledger migration, replay-lease check, grade executor registry read
 or intake (reliquary-swe or renderers missing or at a wrong pin, the HF
