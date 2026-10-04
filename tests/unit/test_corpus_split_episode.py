@@ -159,6 +159,13 @@ def front(monkeypatch, tmp_path):
     monkeypatch.setattr(modeling, "load_tokenizer", lambda path: fakes.Tokenizer())
     monkeypatch.setattr(corpus_gpu, "read_info", info)
     monkeypatch.setattr(agentic_intake, "build_episode_intake", intake)
+    grade_renderers = []
+
+    def grade_renderer(job, **kw):
+        grade_renderers.append(SimpleNamespace(job=str(job.job_id)))
+        return grade_renderers[-1]
+
+    monkeypatch.setattr(agentic_intake, "build_grade_renderer", grade_renderer)
     def lease(job, **kw):
         maybe_fail("lease")
         calls.leases.append(str(job.job_id))
@@ -231,6 +238,9 @@ def test_the_front_serves_an_episode_job_no_group_names(front):
     assert isinstance(w.grader, CorpusGrader)
     assert w.grader._dispatcher is started.app.state.corpus_grade_remote
     assert w.settler._ready == w.grader.ready
+    # I2: its own renderer and threads, never the intake's lock or the default executor.
+    assert w.grader._renderer is w.grade_renderer and w.grade_renderer is not w.episode_intake.renderer
+    assert w.grader._parse_executor is not None and w.grader._beacon_executor is not None
     assert front.calls.leases == [EPISODE_ID]
     # The grade executors reach the front: its routes are mounted.
     claim = {"executor_id": "g0", "env_package": "reliquary-swe", "env_version": "0" * 40}

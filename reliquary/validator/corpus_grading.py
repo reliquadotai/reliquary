@@ -29,6 +29,7 @@ executor is quarantined (``regrade_executor``).
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
 import time
@@ -38,6 +39,7 @@ from reliquary.corpus.audit_policy import after_confirmed_failure, replay_drawn
 from reliquary.corpus.replay_compare import allowed_mismatches
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
 from reliquary.infrastructure.corpus_record_store import MAX_REGRADE_GENERATIONS, RECORD_SCHEMA_V2
+from reliquary.validator.corpus_judge_threads import run_in
 from reliquary.validator.corpus_grade_remote import (
     DISPUTED,
     UNCERTIFIED,
@@ -51,6 +53,10 @@ GRADE_SCHEMA = "reliquary/corpus-grade/v1"
 # The auditor's (corpus_auditor imports torch; this module must not).
 VOIDED_SCHEMA = "reliquary/corpus-voided/v1"
 GRADE_CONCURRENCY = 64
+# Trajectory parses at once (pure Python under the GIL, a renderer lock):
+# grades wait for the executors, not for the parse, so two keep up.
+GRADE_PARSE_CONCURRENCY = 2
+GRADE_PARSE_THREADS = 2
 RESCAN_SECONDS = 60.0
 # Grade documents read at once when a quarantine needs those written before boot.
 INDEX_READ_CONCURRENCY = 16
@@ -82,8 +88,17 @@ class CorpusGrader:
                  on_voided: Callable[[str, dict], None] | None = None,
                  clock: Callable[[], float] = time.time, concurrency: int = GRADE_CONCURRENCY,
                  rescan_seconds: float = RESCAN_SECONDS,
-                 accept_slack_seconds: float = ACCEPT_SLACK_SECONDS) -> None:
+                 accept_slack_seconds: float = ACCEPT_SLACK_SECONDS,
+                 parse_executor=None, beacon_executor=None,
+                 parse_concurrency: int = GRADE_PARSE_CONCURRENCY) -> None:
         self._job = job
+        # Where the parses and the drand calls run: in a process that serves
+        # submit routes, bounded pools of their own, never the loop's default
+        # executor the routes' ledger turns use (None: the default one).
+        self._parse_executor = parse_executor
+        self._beacon_executor = beacon_executor
+        self._parse_concurrency = max(1, int(parse_concurrency))
+        self._parse_gate: asyncio.Semaphore | None = None
         self._records = records
         self._dispatcher = dispatcher
         self._renderer = renderer
@@ -341,12 +356,15 @@ class CorpusGrader:
                 **base, "status": "audit_failed", "graded_success": False, "replay": None,
                 "replay_certified": False, "graded_at": self._clock()}, regrade=regrade)
         trajectory = record["completions"][0]
+        if self._parse_gate is None:
+            self._parse_gate = asyncio.Semaphore(self._parse_concurrency)
         try:
-            parsed = await asyncio.to_thread(
-                parse_trajectory, self._renderer, prompt_ids=trajectory["prompt_tokens"],
-                tokens=trajectory["tokens"],
-                spans=[(turn["start"], turn["end"]) for turn in trajectory["turns"]],
-                stop=trajectory["stop"], max_turns=self._job.episode.max_turns)
+            async with self._parse_gate:
+                parsed = await run_in(self._parse_executor, functools.partial(
+                    parse_trajectory, self._renderer, prompt_ids=trajectory["prompt_tokens"],
+                    tokens=trajectory["tokens"],
+                    spans=[(turn["start"], turn["end"]) for turn in trajectory["turns"]],
+                    stop=trajectory["stop"], max_turns=self._job.episode.max_turns))
         except TrajectoryRefused as refused:
             # Intake parsed it already: only a renderer change can land here.
             logger.error("accepted trajectory %s no longer parses: %s", submission_id[:12], refused)
@@ -480,15 +498,23 @@ class CorpusGrader:
         if self._beacon is None or self._round_at is None or received_at is None:
             # No way to draw: check rather than skip (a replay alone sanctions nobody).
             return {"fraction": fraction, "drawn": True, "why": "no beacon"}
-        try:
-            round_number = int(self._round_at(float(received_at))) + 1
-        except Exception:
+        # The round (a first call resolves the drand chain over HTTP) and the
+        # beacon, both off the loop.
+        round_number, randomness = await run_in(self._beacon_executor, self._round_and_beacon,
+                                                received_at)
+        if round_number is None:
             return {"fraction": fraction, "drawn": True, "why": "round unknown"}
-        randomness = await asyncio.to_thread(self._beacon, round_number)
         if randomness is None:
             return None
         return {"round": round_number, "fraction": fraction,
                 "drawn": replay_drawn(randomness, submission_id, fraction)}
+
+    def _round_and_beacon(self, received_at) -> tuple[int | None, str | None]:
+        try:
+            round_number = int(self._round_at(float(received_at))) + 1
+        except Exception:
+            return None, None
+        return round_number, self._beacon(round_number)
 
     async def _confirmed_failure(self, submission_id: str, hotkey: str, replay: dict) -> None:
         """The TOPLOC failure's path: escalate first (idempotent by id), then

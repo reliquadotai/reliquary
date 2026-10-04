@@ -82,6 +82,13 @@ def install() -> None:
 
     agentic_intake.build_episode_intake = build_episode_intake
 
+    def build_grade_renderer(job, *, checkpoint_dir):
+        from tests.unit.test_trajectory_parse import R
+
+        return R
+
+    agentic_intake.build_grade_renderer = build_grade_renderer
+
 
 def seed_episode(root: Path, *, hotkeys) -> None:
     """The episode job's manifest, its miners, and two grade executors on two

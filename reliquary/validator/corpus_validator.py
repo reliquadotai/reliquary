@@ -403,11 +403,16 @@ def judge_jobs(w, *, intake_only: bool, settle_every_seconds: float, settle=None
     return jobs
 
 
-def wire_job_grader(w, *, records, judge_records, dispatcher) -> None:
+def wire_job_grader(w, *, records, judge_records, dispatcher, parse_executor=None,
+                    beacon_executor=None) -> None:
     """An episode job's grader, on ``w`` (which carries ``entry``, ``job`` and
     ``episode_intake``), leasing to ``dispatcher``; once per job. A job this
     process cannot grade (no dispatcher, another env pin) is refused with a
-    ``ValueError``, which the job set takes as permanent until a restart."""
+    ``ValueError``, which the job set takes as permanent until a restart.
+
+    The grader parses with ``w.grade_renderer`` when set (its own lock, never
+    the intake's) on ``parse_executor``, and reads drand on ``beacon_executor``:
+    in a process serving submit routes, never their default executor."""
     if w.job.episode is None or getattr(w, "grader", None) is not None:
         return
     pin = (w.job.episode.env.package, w.job.episode.env.version)
@@ -422,9 +427,12 @@ def wire_job_grader(w, *, records, judge_records, dispatcher) -> None:
     params, miner_states, _, beacon, round_at = build_corpus_audit_wiring(
         entry=w.entry, job=w.job, records=records)
     w.grader = CorpusGrader(job=w.job, records=judge_records, dispatcher=dispatcher,
-                            renderer=w.episode_intake.renderer, source=w.episode_intake.source,
+                            renderer=(getattr(w, "grade_renderer", None)
+                                      or w.episode_intake.renderer),
+                            source=w.episode_intake.source,
                             params=params, miner_states=miner_states, beacon=beacon,
-                            round_at=round_at)
+                            round_at=round_at, parse_executor=parse_executor,
+                            beacon_executor=beacon_executor)
     for executor_id in sorted(getattr(dispatcher, "quarantined", ()) or ()):
         # Quarantined before this grader existed (before a restart, or before
         # a hot add): held now, before any settlement; its first rescan regrades.
@@ -1037,17 +1045,30 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             grade_dispatcher = grade_directory = None
         else:
             grade_dispatcher.load_quarantined()
+    # Every grader's trajectory parses, on threads of their own (bounded):
+    # never the default executor the submit routes' ledger turns run on.
+    grade_parse_threads = None
+    if grade_dispatcher is not None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        from reliquary.validator.corpus_grading import GRADE_PARSE_THREADS
+
+        grade_parse_threads = ThreadPoolExecutor(GRADE_PARSE_THREADS,
+                                                 thread_name_prefix="corpus-grade-parse")
     job_set: CorpusJobSet | None = None
     archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 
     def episode_intake_for(w):
-        # Loads the task set and the renderer: blocking, so a hot-added job
-        # builds it off the event loop (`wire_hot`).
+        # Loads the task set and the renderers: blocking, so a hot-added job
+        # builds it off the event loop (`wire_hot`). The grader gets its own
+        # renderer: its parses never queue on the intake's renderer lock.
         from reliquary.validator import agentic_intake
 
-        return agentic_intake.build_episode_intake(
+        intake = agentic_intake.build_episode_intake(
             w.job, checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
             vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
+        w.grade_renderer = agentic_intake.build_grade_renderer(w.job, checkpoint_dir=checkpoint_dir)
+        return intake
 
     def audit_and_settle(w) -> None:
         refusal = split_episode_refusal(split, w.job)
@@ -1057,7 +1078,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             w.episode_intake = episode_intake_for(w)
         if w.job.episode is not None:
             wire_job_grader(w, records=records, judge_records=judge_records,
-                            dispatcher=grade_dispatcher)
+                            dispatcher=grade_dispatcher, parse_executor=grade_parse_threads,
+                            beacon_executor=judge_threads.beacon)
             graders[str(w.job.job_id)] = w.grader
         link = split.links.get(str(w.job.job_id)) if split is not None else None
         if link is not None:

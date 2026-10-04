@@ -137,4 +137,13 @@ def build_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_size: int
                          tokenizer=tokenizer, vocab_size=vocab_size, chunk_tokens=chunk_tokens)
 
 
-__all__ = ["EpisodeIntake", "IntakeFacts", "IntakeRefusal", "build_episode_intake"]
+def build_grade_renderer(job, *, checkpoint_dir: str):
+    """A turn renderer for the job's grader, separate from the intake's: its
+    own tokenizer and lock, so a grading burst never queues intake parsing."""
+    from reliquary.environment import agentic_swe
+
+    return agentic_swe.load_turn_renderer(checkpoint_dir)
+
+
+__all__ = ["EpisodeIntake", "IntakeFacts", "IntakeRefusal", "build_episode_intake",
+           "build_grade_renderer"]
