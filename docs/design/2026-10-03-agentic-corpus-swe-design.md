@@ -86,7 +86,7 @@ it (body `{model, token_ids, sampling_params}`; response
 ### N2. Trajectory builder
 
 `reliquary/corpus/trajectory.py` (pure) builds a `CorpusTrajectory` from a
-verifiers `Trace` produced with the train client:
+verifiers `Trace` produced with the train client. The trajectory is sourced from the miner's generate endpoint session log, keyed by the trace's X-Session-ID header:
 
 - `tokens`: the interleaved token sequence after the initial prompt (assistant
   turns, tool observations, turn scaffolding), exactly as rendered.
@@ -115,6 +115,8 @@ New pure functions in `reliquary/corpus/checks.py`, applied when the job carries
 6. Every non-assistant segment decodes to a well-formed tool-response block of
    the pinned renderer, at most the env's `max_observation_bytes`.
 7. Duplicate digest over the full `tokens`.
+
+Ruling P8: the implementation accepts a capped (length-limited) turn that is not the last one, so check 3 reads "a non-final span ends with the terminator or at its cap".
 
 `token_count` stored in the record counts assistant-span tokens only, so the
 existing settlement (`cap × passed token share`) pays for generated tokens.
@@ -292,6 +294,14 @@ is recorded in this file before the dependent component is written.
   recorded traces: 6 of 2017 observations (0.3%), in 6 of 66 episodes. That is
   inside the tolerance, and a rule hiding that path would also hide a miner
   whose box differs for real, so no rule was added.
+  **M2 re-run (2026-10-04, `-I` replay, `scripts/agentic_rule_check.py`, data in
+  `docs/design/measurements/2026-10-04-m2-rerun-rules.json`).** 66/66
+  diffs reproduced with the tool program in isolated mode (2017 observations,
+  66 mismatched before and after, 0 errors). Tightened rules adopted: addr,
+  commit, mtime, duration (all four, scored in the order the normalizer applies
+  them); minimum spare per honest episode under the adopted set: 2 (unchanged
+  from the loose rules). Not adopted (would leave an honest episode with no
+  spare): none.
 - **M3 — audit cost.** Time the TOPLOC prefill of 40k-token trajectories on the
   27B. It sets `audit_q` for the job.
   **M3 result (2026-10-03, H100 80 GB, Qwen3.8-27B bf16 text-only, sdpa,
@@ -362,3 +372,87 @@ for the pre-pulled SWE-smith images.
   corpus validator, one grade executor on `sandbox-dev-01`, through submission,
   verdict, grade, replay and export; plus a forged `final_diff` and a forged
   observation, both of which must end as confirmed audit failures.
+
+## 11. End-to-end result (2026-10-04)
+
+Run with `scripts/agentic_corpus_e2e.py` and the runbook's "End-to-end run"
+on 2026-10-03 23:25 to 23:56 UTC; summary in
+`docs/design/measurements/2026-10-04-agentic-e2e.json` (`check` exit 0,
+`failures` and `inconclusive` empty).
+
+- **Job:** `agentic-e2e`, Qwen3.8-27B, reliquary-swe `a48102f0`, the 4-image
+  SWE-smith set, 8 prompts (source rows 16 to 23, all python-docx), 2 slots
+  each, `replay_fraction_failed` 1.0, max 40 turns, 8192 tokens per turn,
+  60,000 per trajectory.
+- **Topology:** GPU box (H100; DigitalOcean): MinIO, the control (intake-only,
+  then full), the miner (8 episodes at once, prefix caching on) and grade
+  executor `grade-b` (provider `digitalocean`, concurrency 2); sandbox-dev-01
+  (Hetzner): `grade-a` (provider `hetzner`, concurrency 4) through two SSH
+  tunnels from the VPS.
+- **Mining** (`mine.json`): honest 6 accepted, `forge_diff` 1 accepted,
+  `forge_obs` 1 accepted; 8 trajectories, 18 to 33 turns (214 in all),
+  200,010 tokens (86,073 assistant tokens paid on), 10.5 min from start to the
+  last submission (1.5 min of it loading the model).
+- **Honest:** 6 accepted, 6 TOPLOC-passed (worst exponent 14 to 21, worst
+  mantissa mean 4.6 to 7.0), 6 graded successes, 6 replay-certified, 0 voided,
+  0 confirmed failures. Replay mismatches per honest trajectory: 0, 1, 1, 2, 5
+  (of 28, tolerance 5) and 5 (of 50, tolerance 6).
+- **Forged diff** (gold patch + a new file): TOPLOC passed, graded successful,
+  replay failed on both `grade-a` and `grade-b` (providers `hetzner` and
+  `digitalocean`), replayed diff unequal, 6 of 43 observations mismatched;
+  voided `replay_failed` 88 s after submission; 1 confirmed failure on its
+  hotkey.
+- **Forged observations** (`BASH_ENV=/etc/hostname` in the episode box):
+  TOPLOC passed, graded successful, replay failed on both executors of both
+  providers with 33 of 34 observations mismatched (33 bash observations);
+  voided `replay_failed` 89 s after submission; 1 confirmed failure.
+- **Export:** `jobs export --sft --allow-incomplete` wrote 6 rows (the 6
+  honest submissions), the plain export the same 6; counts sidecar:
+  `passing_submissions` 8 = 6 rows + 2 `voided`, every other exclusion 0,
+  `drained` false (the run never settles).
+- **Wall-clock:** prepare 1 min; control up 1 min; mining 10.5 min; grading
+  kept up with mining (every grade and replay written within 2 min of its
+  submission; the last at 23:40:43); full control load about 1.5 min; audit
+  one batch of 8 trajectories each prefilled alone, 50.3 s (49.4 s forward,
+  3,973 tokens/s, sdpa). Grading load on sandbox-dev-01: about 2.5 % of 16
+  vCPU and +225 MB of memory averaged over the 10-minute sar window that held
+  it.
+
+Two earlier runs that day found the forgeries not exercising their paths (a
+`BASH_ENV` naming a missing file, which bash ignores; a forger's prompt filled
+by the honest walk) and were fixed before this one; the runbook records the
+operator-side fixes.
+
+**Addendum: TOPLOC bands under flash-attention-2 (2026-10-04).** Production
+audits with flash-attention-2: the validator image (root `Dockerfile`) sets
+`GRAIL_ATTN_IMPL=flash_attention_2` and ships torch 2.7.0+cu128, flash_attn
+2.8.3, flash-linear-attention 0.5.0, causal_conv1d 1.5.2 and transformers
+5.10.4. The corpus control (`corpus_validator`, `corpus_gpu`,
+`corpus_audit_executor`) loads the model with `ATTN_IMPLEMENTATION`, whose
+default is flash_attention_2. M1 and the run above audited with sdpa in the
+vLLM venv (torch 2.13, transformers 5.18, no fla and no causal_conv1d, so
+GatedDeltaNet ran on the torch reference path). The bands were re-measured on
+the same trajectories in a fresh venv with the image's stack, under sdpa and
+then FA2 (`scripts/agentic_attention_bands.py`, data in
+`docs/design/measurements/2026-10-04-toploc-27b-fa2-bands.json`). The data:
+the Task 14 smoke (8 real SWE-smith episodes, 96 spans, 1,173 chunks, up to
+14,144 tokens, production audit path) and M1 (64 trajectories, 2,759 chunks).
+The miner proofs were made by vLLM. Per chunk:
+
+| stack, attention | smoke exp mean / p99 / max | smoke mant mean p99 / max | M1 judged exp p99 / max | M1 judged mant p99 / max | trajectories passed |
+|---|---|---|---|---|---|
+| vLLM venv, sdpa (as M1/e2e) | 3.39 / 16 / 20 | 4.38 / 5.59 | 13 / 25 | 4.35 / 11.70 | 72/72 |
+| image stack, sdpa | 3.34 / 15 / 21 | 4.30 / 6.49 | 14 / 28 | 4.47 / 11.04 | 72/72 |
+| image stack, FA2 | 3.35 / 15 / 25 | 4.31 / 5.81 | 13 / 28 | 4.33 / 11.13 | 72/72 |
+
+Thresholds are 60/40/40, and no judged chunk exceeds one under any setting.
+Per honest smoke trajectory, the worst exponent under FA2 is 13 to 25 (sdpa:
+12 to 21). The two kernels agree on the same chunks: the mean FA2 minus sdpa
+exponent is +0.01, and the mean absolute gap is 1.05. That gap is no bigger
+than the one between the two sdpa stacks (1.14). Cross-check: proofs built
+from the validator's own sdpa activations, verified under FA2, give exp p99 11
+and max 19 (smoke). On M1's judged spans they give exp max 19 and mant 5.9.
+The only chunk over a threshold anywhere is M1's 1-token span (exp 64 under
+image-stack sdpa, 60 under FA2), which production does not judge (under 8
+tokens). Verdict: FA2 is safe at 60/40/40, and the honest band does not
+depend on the attention kernel. Not covered: 40k to 60k contexts under FA2.

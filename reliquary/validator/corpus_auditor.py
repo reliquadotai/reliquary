@@ -36,7 +36,8 @@ from reliquary.corpus.audit_policy import (
 )
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.protocol.profiles import ProofProfile
-from reliquary.validator.corpus_audit import outcome_from_scores, score_sequences
+from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
+from reliquary.validator.corpus_audit import check_spans, outcome_from_scores, score_sequences, trajectory_outcome
 from reliquary.validator.corpus_text import REASON_TOKEN_OUT_OF_VOCAB
 
 logger = logging.getLogger(__name__)
@@ -422,13 +423,20 @@ class CorpusAuditor:
 
     def _prepare(self, records: list[dict]) -> tuple[list[dict | None], list[tuple]]:
         """The records failed before any forward pass, and every completion the
-        rest need scored as ``(record, completion, tokens, prompt_len, proofs)``."""
+        rest need scored as ``(record, completion, tokens, prompt_len, proofs, spans)``."""
         worst_zero = _WORST_ZERO
         results: list[dict | None] = [None] * len(records)
         vocabulary = (self._vocab_size if self._vocab_size is not None
                       else self._model.get_input_embeddings().num_embeddings)
         items = []
         for i, record in enumerate(records):
+            if record.get("schema") == RECORD_SCHEMA_V2:
+                item = self._prepare_trajectory(record)
+                if min(item[1]) < 0 or max(item[1]) >= vocabulary:
+                    results[i] = {"passed": False, "reason": REASON_TOKEN_OUT_OF_VOCAB, **worst_zero}
+                else:
+                    items.append((i, *item))
+                continue
             if not record["completions"]:
                 # Fail closed like sequence_verdict does for an empty chunk sequence:
                 # no completions must never read as a vacuous pass paid like honest work.
@@ -448,7 +456,7 @@ class CorpusAuditor:
             prompt = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
             for c_idx, completion in enumerate(record["completions"]):
                 items.append((i, c_idx, prompt + list(completion["tokens"]), len(prompt),
-                              completion["proofs"]))
+                              completion["proofs"], None))
         return results, items
 
     def _aggregate(self, records: list[dict], results: list[dict | None],
@@ -471,18 +479,52 @@ class CorpusAuditor:
             results[i] = {"passed": passed, "reason": reason, **worst}
         return results
 
+    @staticmethod
+    def _prepare_trajectory(record: dict) -> tuple:
+        """``(0, tokens, prompt_len, proofs, spans)`` of a stored v2 record. The
+        record was written by this validator's intake, so a malformed one is
+        our fault: a ValueError (a validator-side error, no miner verdict)."""
+        try:
+            (trajectory,) = record["completions"]
+            prompt = [int(t) for t in trajectory["prompt_tokens"]]
+            tokens = [int(t) for t in trajectory["tokens"]]
+            turns = trajectory["turns"]
+            spans = [(len(prompt) + int(t["start"]), len(prompt) + int(t["end"])) for t in turns]
+            proofs = [p for t in turns for p in t["proofs"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"malformed trajectory record: {exc!r}") from None
+        check_spans(spans, len(prompt) + len(tokens))
+        if not tokens:
+            raise ValueError("malformed trajectory record: no tokens")
+        return 0, prompt + tokens, len(prompt), proofs, spans
+
+    @staticmethod
+    def _refuse_trajectories(items: list[tuple]) -> None:
+        """For the eval auditor only: eval jobs never carry trajectories, and
+        the eval executors speak v1, so a trajectory there is a validator-side
+        error (no miner verdict)."""
+        if any(item[5] is not None for item in items):
+            raise RuntimeError("trajectory audit is not available on remote executors")
+
+    def _outcome(self, item: tuple, status: str, chunks):
+        spans = item[5]
+        if spans is None:
+            return outcome_from_scores(status, chunks, self._proof)
+        return trajectory_outcome(status, chunks, [end - start for start, end in spans], self._proof)
+
     def _judge_many(self, records: list[dict]) -> list[dict]:
         """Judge several records at once: every completion of every record that
         needs the GPU is packed, sorted by length, into shared forward passes."""
         results, items = self._prepare(records)
         scores, forward_seconds, verify_seconds = score_sequences(
-            self._model, [(tokens, n, proofs) for _, _, tokens, n, proofs in items],
+            self._model, [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
+             for _, _, tokens, n, proofs, spans in items],
             chunk_tokens=self._proof.chunk_tokens, topk=self._proof.topk,
             batch_tokens=AUDIT_BATCH_TOKENS)
-        outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
-                    for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
+        outcomes = {(item[0], item[1]): self._outcome(item, status, chunks)
+                    for item, (status, chunks) in zip(items, scores)}
         self._aggregate(records, results, outcomes)
-        self._log_batch(records, [(len(t), i, c) for i, c, t, _, _ in items],
+        self._log_batch(records, [(len(item[2]), item[0], item[1]) for item in items],
                         forward_seconds, verify_seconds)
         return results
 
@@ -578,14 +620,17 @@ class CorpusAuditor:
         if not local and self._remote is not None and self._remote.connected():
             # An executor computes the chunk scores; the decision stays here.
             results, items = await self._in("codec", self._prepare, records)
+            # Trajectory rows carry their spans; the dispatcher leases them to
+            # v2 executors only, or scores them here.
             scores = await self._remote.score(
-                [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
-                 for _, _, tokens, n, proofs in items])
+                [{"tokens": tokens, "prompt_len": n, "proofs": proofs,
+                  **({"spans": spans} if spans is not None else {})}
+                 for _, _, tokens, n, proofs, spans in items])
             outcomes, scored_by = {}, {}
-            for (i, c_idx, *_), (status, chunks, executor) in zip(items, scores):
-                outcomes[i, c_idx] = outcome_from_scores(status, chunks, self._proof)
+            for item, (status, chunks, executor) in zip(items, scores):
+                outcomes[item[0], item[1]] = self._outcome(item, status, chunks)
                 if executor is not None:
-                    scored_by.setdefault(i, set()).add(executor)
+                    scored_by.setdefault(item[0], set()).add(executor)
             judged = self._aggregate(records, results, outcomes)
             for i, executors in scored_by.items():
                 judged[i] = {**judged[i], "scored_by": sorted(executors)}
@@ -614,12 +659,13 @@ class CorpusAuditor:
             if items:
                 with self._timed("forward"):
                     scores, forward, verify = await self._scorer(
-                        [(tokens, n, proofs) for _, _, tokens, n, proofs in items])
+                        [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
+                         for _, _, tokens, n, proofs, spans in items])
             called = time.monotonic() - called
-        outcomes = {(i, c_idx): outcome_from_scores(status, chunks, self._proof)
-                    for (i, c_idx, *_), (status, chunks) in zip(items, scores)}
+        outcomes = {(item[0], item[1]): self._outcome(item, status, chunks)
+                    for item, (status, chunks) in zip(items, scores)}
         self._aggregate(records, results, outcomes)
-        self._log_batch(records, [(len(t), i, c) for i, c, t, _, _ in items], forward, verify,
+        self._log_batch(records, [(len(item[2]), item[0], item[1]) for item in items], forward, verify,
                         called)
         return results
 

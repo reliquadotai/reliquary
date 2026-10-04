@@ -903,6 +903,7 @@ def build_job_manifest(
     prompt_start=0,
     seed=None,
     submit=None,
+    episode=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -963,6 +964,8 @@ def build_job_manifest(
         manifest["seed"] = seed
     if submit is not None:
         manifest["submit"] = submit
+    if episode is not None:
+        manifest["episode"] = episode
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
     # time: an unrenderable source fails fidelity forever, and a range
@@ -980,6 +983,7 @@ def build_job_manifest(
 def _corpus_base_profile(
     *, task_id, from_profile, model, model_revision, model_architecture,
     prompt_encoding, renderer_id, prompt_source, external_eval=False,
+    agentic=False,
 ):
     """The profile a corpus job's contract is built from: the named template, or
     one composed from the model, the ``corpus-v1`` run policy and the catalog."""
@@ -1006,6 +1010,7 @@ def _corpus_base_profile(
         run=RUN_POLICIES["corpus-v1"],
         environments=[prompt_source],
         external_eval=external_eval,
+        agentic=agentic,
     )
 
 
@@ -1016,7 +1021,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None,
+    submit=None, episode=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1031,7 +1036,7 @@ def prepare_corpus_job(
         task_id=task_id or job_id, from_profile=from_profile, model=model,
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-        prompt_source=environment, external_eval=is_eval_source(prompt_source),
+        prompt_source=environment, external_eval=is_eval_source(prompt_source), agentic=episode is not None,
     )
     if max_new_tokens is None:
         # The template or catalog budgets each environment; the length stays
@@ -1073,6 +1078,7 @@ def prepare_corpus_job(
         deadline_round=deadline_round,
         seed=seed,
         submit=submit,
+        episode=episode,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -1267,6 +1273,12 @@ def jobs_create(
             "validator derive it from its own card."
         ),
     ),
+    episode_file: str = typer.Option(
+        None,
+        "--episode-file",
+        help="An agentic job: a JSON file holding the manifest's `episode` object "
+        "(spec section 6). Its prompt source is reliquary_agentic_swe_v1",
+    ),
     settlement: str = typer.Option(
         "period-ema-v1",
         "--settlement",
@@ -1316,7 +1328,7 @@ def jobs_create(
     overrides = {
         k: v for k, v in (("start", start), ("decay", decay)) if v is not None
     }
-    contract_environment = seed = None
+    contract_environment = seed = episode = None
     try:
         if (prompt_source is None) == (eval_set is None):
             raise ValueError("give exactly one of --prompt-source and --eval-set")
@@ -1327,7 +1339,12 @@ def jobs_create(
                 grader_id=grader_id, threshold=threshold, from_profile=from_profile)
         elif prompt_count is None:
             raise ValueError("--prompt-count is required with --prompt-source")
-    except ValueError as exc:
+        if episode_file is not None:
+            import json
+
+            with open(episode_file, encoding="utf-8") as handle:
+                episode = json.load(handle)
+    except (OSError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     try:
@@ -1351,7 +1368,7 @@ def jobs_create(
             min_new_tokens=min_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
             n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
             deadline_round=deadline_round, overrides=overrides, verification=verification,
-            contract_environment=contract_environment, seed=seed,
+            contract_environment=contract_environment, seed=seed, episode=episode,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -1476,14 +1493,50 @@ def _job_grader(job):
         raise typer.BadParameter(str(exc)) from exc
 
 
+# The tokenizer and chat template files of a checkpoint: what the turn
+# renderer loads, never the weights.
+_TOKENIZER_PATTERNS = ["*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken"]
+
+
+def _episode_tokenizer_dir(job) -> str:
+    """The job's pinned checkpoint, tokenizer files only."""
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision,
+                             allow_patterns=_TOKENIZER_PATTERNS)
+
+
+async def _quarantined_grade_executors() -> list[str]:
+    """The grade executors the registry says are quarantined: what one of them
+    decided alone is held until a regrade replaces it."""
+    from reliquary.infrastructure import corpus_executor_store as executor_store
+
+    return sorted(str(d.get("executor_id")) for d in await executor_store.list_executors()
+                  if executor_store.scope_of(d) == "grade" and d.get("status") == "quarantined")
+
+
 @jobs_app.command("export")
 def jobs_export(
     job_id: str = typer.Argument(...),
     out: str = typer.Option(..., "--out"),
     apply_filter: bool = typer.Option(False, "--apply-filter"),
     only_accepted: bool = typer.Option(False, "--only-accepted"),
+    sft: bool = typer.Option(
+        False, "--sft",
+        help="An episode job: keep the certified successes (graded_success and "
+             "replay_certified), the SFT set"),
+    allow_incomplete: bool = typer.Option(
+        False, "--allow-incomplete",
+        help="An episode job: export before the job is drained (the counts file says so)"),
 ) -> None:
     """Write the verified completions of a job as JSON lines.
+
+    An episode job writes one row per replay-certified trajectory (messages
+    rebuilt from the proven tokens, tokens, assistant mask, grade); `--sft`
+    keeps the successes. It refuses a job not yet drained unless
+    `--allow-incomplete`, and always writes `{out}.counts.json`: drained, what
+    was exported and what was left out (ungraded, held, voided, uncertified,
+    unparseable...), when, and the quarantined executors it held.
 
     Written to a temporary file beside `--out` and swapped in with
     `os.replace` only once the export completes, so a mid-stream failure (the
@@ -1500,19 +1553,62 @@ def jobs_export(
         job, _ = await job_store.read_job(job_id)
         if job is None:
             raise typer.BadParameter(f"no job {job_id!r}")
-        grade = _job_grader(job) if apply_filter else None
+        episode = job.episode is not None
+        if episode and (apply_filter or only_accepted):
+            raise typer.BadParameter("an episode job is filtered by its grades: use --sft")
+        if sft and not episode:
+            raise typer.BadParameter("--sft is for episode jobs; use --apply-filter")
+        if episode:
+            from reliquary.corpus.delivery import episode_rows
+            from reliquary.environment import agentic_swe
+            from reliquary.validator import corpus_job_status
+
+            drained = bool((await corpus_job_status.stored_job_counts(
+                BucketRecordStore(), job_id))["drained"])
+            if not drained and not allow_incomplete:
+                raise typer.BadParameter(
+                    f"job {job_id!r} is not drained: grades, regrades and voids may still "
+                    "change; pass --allow-incomplete to export what is final so far")
+            quarantined = await _quarantined_grade_executors()
+
+            renderer = await asyncio.to_thread(agentic_swe.load_turn_renderer,
+                                               await asyncio.to_thread(_episode_tokenizer_dir, job))
+            source = await asyncio.to_thread(agentic_swe.load_swe_source,
+                                             job.episode.env.num_images)
+            counts: dict = {}
+            rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
+                                source=source, counts=counts, sft_only=sft,
+                                quarantined=quarantined)
+        else:
+            grade = _job_grader(job) if apply_filter else None
+            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade)
         temporary = f"{out}.{os.getpid()}.tmp"
         written = 0
         try:
             with open(temporary, "w", encoding="utf-8") as handle:
-                async for row in export_rows(
-                    job=job, records=BucketRecordStore(), grade=grade
-                ):
-                    if only_accepted and not row.get("accepted", True):
+                async for row in rows:
+                    if episode:
+                        row = {**row, "messages": json.loads(row["messages"]),
+                               "turns": json.loads(row["turns"])}
+                    elif only_accepted and not row.get("accepted", True):
                         continue
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     written += 1
             os.replace(temporary, out)
+            if episode:
+                sidecar = {
+                    "job_id": job_id, "drained": drained, "sft_only": sft,
+                    "exported": counts.get("rows", 0),
+                    **{k: counts.get(k, 0) for k in ("ungraded", "held", "voided",
+                                                     "uncertified", "unparseable")},
+                    "counts": counts, "exported_at": _time.time(),
+                    "quarantined_executors": list(quarantined),
+                }
+                side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
+                with open(side_temporary, "w", encoding="utf-8") as handle:
+                    json.dump(sidecar, handle, sort_keys=True, indent=1)
+                os.replace(side_temporary, f"{out}.counts.json")
+                typer.echo(json.dumps(counts, sort_keys=True), err=True)
         except Exception:
             try:
                 os.unlink(temporary)
@@ -2085,6 +2181,91 @@ def corpus_audit_executor(
                        model_revision=model_revision, **route)
 
 
+@corpus_app.command("register-grade-executor")
+def corpus_register_grade_executor(
+    executor_id: str = typer.Option(..., "--executor-id"),
+    env_version: str = typer.Option(
+        ..., "--env-version", help="reliquary-environments commit the job pins"),
+    provider_id: str = typer.Option(
+        ..., "--provider-id",
+        help="Who runs the box (e.g. hetzner); agreement counts distinct providers only"),
+    env_package: str = typer.Option("reliquary-swe", "--env-package"),
+    days: float = typer.Option(30.0, "--days"),
+) -> None:
+    """Register a grade executor in the bucket and print its token once."""
+    import hashlib
+    import json
+    import secrets
+    import time
+
+    from reliquary.infrastructure import corpus_executor_store
+
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    document, created = asyncio.run(corpus_executor_store.register_executor(
+        executor_id=executor_id, token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+        model_id=env_package, model_revision=env_version, expires_at=now + days * 86400.0,
+        now=now, provider_id=provider_id, scope="grade"))
+    typer.echo(json.dumps({"executor_id": document["executor_id"], "created": created,
+                           "token": token if created else None}))
+
+
+@corpus_app.command("grade-executor")
+def corpus_grade_executor(
+    control_url: str = typer.Option(..., "--control-url"),
+    executor_id: str = typer.Option(..., "--executor-id"),
+    concurrency: int = typer.Option(4, "--concurrency", help="Items graded or replayed at once"),
+    cpus: float = typer.Option(2.0, "--cpus", help="CPUs per box"),
+    memory_gb: float = typer.Option(
+        6.0, "--memory-gb", help="Memory per box, no swap; concurrency x this must fit the host"),
+    pids_limit: int = typer.Option(1024, "--pids-limit", help="Processes per box"),
+    disk_gb: float = typer.Option(
+        10.0, "--disk-gb",
+        help="Writable layer per box: the Docker daemon's default overlay2.size (xfs, pquota), "
+             "checked at start and in every box"),
+    disk_probe_image: str = typer.Option(
+        "alpine:3.22", "--disk-probe-image", help="Image of the start-up disk-limit probe box"),
+    allow_non_xfs: bool = typer.Option(
+        False, "--allow-non-xfs",
+        help="TESTS ONLY: start although Docker's storage is not on xfs (replays then disagree "
+             "with honest miners on directory order) and box disks are not bounded"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Grade and replay agentic trajectories for a corpus control. The only
+    secret is the executor token, in RELIQUARY_EXECUTOR_TOKEN; boxes come from
+    public images, each under --cpus/--memory-gb/--pids-limit. Run one executor
+    per Docker host: it removes leftover boxes of its own at start."""
+    from reliquary.validator import corpus_grade_executor as grade
+    from reliquary.validator.agentic_replay import BoxLimits
+
+    setup_logging(log_level)
+    if not os.environ.get(grade.TOKEN_ENV, "").strip():
+        typer.echo(f"error: {grade.TOKEN_ENV} is not set", err=True)
+        raise typer.Exit(code=1)
+    try:
+        limits = BoxLimits(cpu=cpus, memory_gb=memory_gb, pids=pids_limit,
+                           disk_gb=None if allow_non_xfs else disk_gb)
+        BoxLimits(disk_gb=disk_gb)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    refusal = grade.docker_storage_refusal()
+    if refusal and not allow_non_xfs:
+        typer.echo(f"error: {refusal}. Put Docker's data root on xfs "
+                   "(--allow-non-xfs is for tests only)", err=True)
+        raise typer.Exit(code=1)
+    if refusal:
+        typer.echo(f"warning: --allow-non-xfs (tests only): {refusal}", err=True)
+    if allow_non_xfs:
+        typer.echo("warning: --allow-non-xfs (tests only): box disks are not checked", err=True)
+    else:
+        refusal = grade.docker_disk_refusal(disk_gb, image=disk_probe_image)
+        if refusal:
+            typer.echo(f"error: {refusal} (--allow-non-xfs is for tests only)", err=True)
+            raise typer.Exit(code=1)
+    grade.run_grade_executor(control_url=control_url, executor_id=executor_id,
+                             concurrency=concurrency, limits=limits)
+
+
 @corpus_app.command("order-control")
 def corpus_order_control(
     netuid: int = typer.Option(81, "--netuid"),
@@ -2272,6 +2453,87 @@ def corpus_mine(
         typer.echo(dict(exc.counts))
         raise typer.Exit(code=1) from exc
     typer.echo(counts)
+
+
+@corpus_app.command("mine-agentic")
+def corpus_mine_agentic(
+    validator_url: str = typer.Option(..., "--validator-url"),
+    job_id: str = typer.Option(..., "--job-id", help="The episode job to mine"),
+    wallet_name: str = typer.Option("default"),
+    hotkey: str = typer.Option("default"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", "")),
+    concurrency: int = typer.Option(
+        8, "--concurrency", help="Episodes at once (spec section 9: 8 to 11 on one H100)"),
+    episodes: int = typer.Option(0, "--episodes", help="0 = until the job completes"),
+    port: int = typer.Option(8011, "--port", help="Loopback port of the generate endpoint"),
+    gpu_memory_utilization: float = typer.Option(None, "--gpu-memory-utilization"),
+    max_num_seqs: int = typer.Option(
+        16, "--max-num-seqs",
+        help="vLLM's concurrent sequences; lower it if turns fail as preempted (unprovable)"),
+) -> None:
+    """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
+    against a local vLLM with per-turn proofs. Needs Docker and the job's
+    pinned reliquary-swe, verifiers and renderers installed."""
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    if TASK_CONTRACT_ENV_VAR not in os.environ:
+        _restart_with_served_contract(validator_url, job_id)
+    import bittensor as bt
+    import httpx
+    from huggingface_hub import snapshot_download
+
+    from reliquary.corpus.encoding import checkpoint_fingerprint
+    from reliquary.corpus.job import parse_job
+    from reliquary.environment.agentic_swe import episode_support_refusal
+    from reliquary.miner.agentic_miner import Identity, run_agentic_miner
+    from reliquary.miner.corpus_miner import (
+        CorpusJobSelectionError,
+        HttpCorpusClient,
+        submits_scoped,
+    )
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
+    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.shared.modeling import load_tokenizer
+
+    proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+    if proof is None:
+        typer.echo("error: the active contract declares no toploc proof", err=True)
+        raise typer.Exit(code=4)
+    wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+    if wallet_path:
+        wallet_kwargs["path"] = wallet_path
+    wallet = bt.Wallet(**wallet_kwargs)
+    client = HttpCorpusClient(httpx.Client(base_url=validator_url, timeout=300.0), job_id=job_id)
+    try:
+        job = parse_job(client.job())
+    except CorpusJobSelectionError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if job.episode is None:
+        typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
+        raise typer.Exit(code=2)
+    client.scoped_submit = submits_scoped(job)
+    refusal = episode_support_refusal(job.episode, need_verifiers=True)
+    if refusal:
+        typer.echo(f"error: {refusal}", err=True)
+        raise typer.Exit(code=4)
+    from reliquary.miner.agentic_miner import docker_storage_warning
+
+    warning = docker_storage_warning()
+    if warning:
+        typer.echo(warning, err=True)
+    directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
+    if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
+        typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
+        raise typer.Exit(code=4)
+    identity = Identity(hotkey=wallet.hotkey.ss58_address,
+                        sign=lambda body: sign_corpus_submission(wallet, body),
+                        episodes=episodes or None)
+    counts = asyncio.run(run_agentic_miner(
+        job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
+        identities=[identity], client=client, concurrency=concurrency, port=port,
+        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs))
+    typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
 
 
 @corpus_app.command("status")
@@ -2511,6 +2773,11 @@ async def _run_corpus(*, jobs, wallet, netuid, signer_client, http_host, http_po
     (``RELIQUARY_CORPUS_SPLIT_JUDGES`` says which jobs leave the front)."""
     read_registry = _corpus_hot_registry_reader()
     remote = _corpus_remote_audit_options()
+    # Intake and grading only, no model and no audit (the end-to-end run).
+    intake_only = _env_flag("RELIQUARY_CORPUS_INTAKE_ONLY")
+    if intake_only and _env_flag("RELIQUARY_CORPUS_SPLIT"):
+        raise RuntimeError("RELIQUARY_CORPUS_INTAKE_ONLY serves no audit: the split validator "
+                           "is not intake-only; unset RELIQUARY_CORPUS_SPLIT")
     if _env_flag("RELIQUARY_CORPUS_SPLIT"):
         from reliquary.validator.corpus_split import run_corpus_split
 
@@ -2527,13 +2794,13 @@ async def _run_corpus(*, jobs, wallet, netuid, signer_client, http_host, http_po
         await run_corpus_validator(
             entry=entry, cap=cap, wallet=wallet, netuid=netuid, signer_client=signer_client,
             http_host=http_host, http_port=http_port, set_weights=set_weights,
-            read_registry=read_registry, **remote,
+            read_registry=read_registry, intake_only=intake_only, **remote,
         )
         return
     await run_corpus_validator(
         jobs=jobs, wallet=wallet, netuid=netuid, signer_client=signer_client,
         http_host=http_host, http_port=http_port, set_weights=set_weights,
-        read_registry=read_registry, **remote,
+        read_registry=read_registry, intake_only=intake_only, **remote,
     )
 
 
@@ -2992,6 +3259,7 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         renderer=renderer_for_job(job, encode, tokenizer=tokenizer),
         verify_signature=verify_signature,
         seen_index=seen_index,
+        job=job,
     )
     if not mounted:
         # The server applies the same rule to the same entry, so a refusal

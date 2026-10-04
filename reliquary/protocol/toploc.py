@@ -26,6 +26,31 @@ def expected_chunks(completion_tokens: int, chunk_tokens: int) -> int:
     return math.ceil(completion_tokens / chunk_tokens)
 
 
+# A chunk this short is never judged alone (spec §7 M1: every honest chunk
+# above the full-chunk band is 1 to 5 tokens long): within a span, a shorter
+# trailing chunk is merged into the previous one.
+MIN_CHUNK_TOKENS = 8
+
+
+def span_chunk_bounds(length: int, chunk_tokens: int,
+                      min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> list[tuple[int, int]]:
+    """Row bounds of each proof chunk of a span of ``length`` tokens."""
+    if length < 1 or chunk_tokens < 1:
+        raise ValueError(f"a span needs tokens and a chunk size, got {length}, {chunk_tokens}")
+    if not 1 <= min_chunk_tokens <= chunk_tokens:
+        raise ValueError(f"min_chunk_tokens must be in [1, {chunk_tokens}], got {min_chunk_tokens}")
+    bounds = [(s, min(s + chunk_tokens, length)) for s in range(0, length, chunk_tokens)]
+    if len(bounds) > 1 and bounds[-1][1] - bounds[-1][0] < min_chunk_tokens:
+        _, end = bounds.pop()
+        bounds[-1] = (bounds[-1][0], end)
+    return bounds
+
+
+def span_chunk_count(length: int, chunk_tokens: int,
+                     min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> int:
+    return len(span_chunk_bounds(length, chunk_tokens, min_chunk_tokens))
+
+
 def injective_modulus(xs: Sequence[int]) -> int:
     """The largest modulus <= MOD_N under which the points stay distinct."""
     values = [int(x) for x in xs]

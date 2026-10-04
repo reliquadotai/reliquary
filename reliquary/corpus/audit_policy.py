@@ -117,6 +117,21 @@ def drawn(randomness_hex: str, submission_id: str, q: float) -> bool:
     return int.from_bytes(digest, "big") < int(q * 2**256)
 
 
+# Its own domain: the replay draw of a failing trajectory must not be the
+# audit draw of the same submission read at another threshold.
+REPLAY_DRAW_DOMAIN = b"reliquary/corpus-replay-draw/v1"
+
+
+def replay_drawn(randomness_hex: str, submission_id: str, fraction: float) -> bool:
+    if fraction >= 1.0:
+        return True
+    if fraction <= 0.0:
+        return False
+    digest = hashlib.sha256(REPLAY_DRAW_DOMAIN + _require_hex64(randomness_hex, "randomness_hex")
+                            + _require_hex64(submission_id, "submission_id")).digest()
+    return int.from_bytes(digest, "big") < int(fraction * 2**256)
+
+
 def decision(m, *, params, now, received_at, recent_submissions, randomness_hex,
              submission_id: str, slack_seconds: float = 0.0) -> str:
     state = effective_state(m, now, params)

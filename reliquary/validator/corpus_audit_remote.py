@@ -27,9 +27,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from reliquary.protocol.toploc import ChunkResult
+from reliquary.protocol.toploc import MIN_CHUNK_TOKENS, ChunkResult
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
+    AUDIT_PROTOCOL_V2,
     ITEM_ERROR,
     ITEM_OK,
     MAX_LEASE_ITEMS,
@@ -95,12 +96,14 @@ class ExecutorDirectory:
     def __init__(self, *, model_id: str, model_revision: str,
                  list_documents: Callable[[], Awaitable[list[dict]]] | None = None,
                  clock: Callable[[], float] = time.time,
-                 refresh_seconds: float = REGISTRY_REFRESH_SECONDS) -> None:
+                 refresh_seconds: float = REGISTRY_REFRESH_SECONDS,
+                 scope: str = "corpus") -> None:
         if list_documents is None:
             from reliquary.infrastructure.corpus_executor_store import list_executors
 
             list_documents = list_executors
         self.model_id, self.model_revision = model_id, model_revision
+        self._scope = scope
         self._list = list_documents
         self._clock = clock
         self._refresh_every = refresh_seconds
@@ -128,8 +131,9 @@ class ExecutorDirectory:
     def _refusal(self, document: dict | None) -> str | None:
         if document is None:
             return "unknown_token"
-        if (document.get("scope") or "corpus") != "corpus":
-            # An eval executor serves the eval control, never this one.
+        if (document.get("scope") or "corpus") != self._scope:
+            # An executor of another scope serves another control (or the
+            # grade leases), never this one.
             return "wrong_scope"
         if document.get("status") != "active" or document["executor_id"] in self._revoked:
             return "revoked"
@@ -156,6 +160,15 @@ class ExecutorDirectory:
             return None, "wrong_executor"
         return document, None
 
+    def document(self, executor_id: str) -> dict | None:
+        return self._by_id.get(executor_id)
+
+    def quarantined_ids(self) -> list[str]:
+        """This scope's executors the registry, as last read, says are quarantined."""
+        return sorted(eid for eid, d in self._by_id.items()
+                      if (d.get("scope") or "corpus") == self._scope
+                      and d.get("status") == "quarantined")
+
     def is_authorized(self, executor_id: str) -> bool:
         return self._refusal(self._by_id.get(executor_id)) is None
 
@@ -167,6 +180,7 @@ class _Work:
     future: asyncio.Future
     queued_at: float
     attempts: int = 0
+    protocol: str = AUDIT_PROTOCOL
 
 
 @dataclass
@@ -222,43 +236,29 @@ def scores_agree(remote: Sequence[Score], local: Sequence[Score], proof, *,
     return True
 
 
-class RemoteAuditDispatcher:
-    """Batches the auditors hand over, leased to executors or scored locally.
+class ExecutorLeases:
+    """What every control-side lease dispatcher shares, whatever its executors
+    compute: executor liveness, the per-executor lease cap, lease expiry
+    strikes, quarantine (written to the registry until it lands, then announced
+    to listeners) and heartbeat writes. A subclass leases its own work and
+    says, in ``_take_back``, what becomes of a lease it loses."""
 
-    ``local_scores(items)`` is the trusted verifier (the control's GPU), used
-    for rechecks and whenever no executor will take the work; ``quarantine``
-    and ``record_heartbeat`` write the executor registry. ``score`` answers,
-    per item, the scores and the executor that computed them (None: here).
-    """
+    kind = "executor"
 
-    def __init__(self, *, directory: ExecutorDirectory, proof, local_scores,
-                 quarantine: Callable[[str, str], Awaitable[Any]] | None = None,
-                 record_heartbeat: Callable[[str, float, dict], Awaitable[Any]] | None = None,
-                 clock: Callable[[], float] = time.time, rng: random.Random | None = None,
-                 recheck_fraction: float = RECHECK_FRACTION,
-                 lease_seconds: float = AUDIT_LEASE_SECONDS,
-                 live_seconds: float = EXECUTOR_LIVE_SECONDS,
-                 queue_wait_seconds: float = QUEUE_WAIT_SECONDS,
-                 max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
-                 expiry_strikes: int = LEASE_EXPIRY_STRIKES) -> None:
+    def __init__(self, *, directory: ExecutorDirectory,
+                 quarantine: Callable[[str, str], Awaitable[Any]] | None,
+                 record_heartbeat: Callable[[str, float, dict], Awaitable[Any]] | None,
+                 clock: Callable[[], float], live_seconds: float,
+                 max_leases_per_executor: int, expiry_strikes: int) -> None:
         self._directory = directory
-        self._proof = proof
-        self._local_scores = local_scores
         self._quarantine_write = quarantine
         self._heartbeat_write = record_heartbeat
         self._clock = clock
-        # Each batch is drawn on its own, from the OS: an executor cannot predict it.
-        self._rng = rng or secrets.SystemRandom()
-        self._fraction = recheck_fraction
-        self._lease_seconds = lease_seconds
         self._live = live_seconds
-        self._queue_wait = queue_wait_seconds
         self._max_leases = max_leases_per_executor
         self._strikes_limit = expiry_strikes
         self._ids = itertools.count()
-        self._queue: collections.deque[_Work] = collections.deque()
-        self._local: collections.deque[_Work] = collections.deque()
-        self._leases: dict[str, _Lease] = {}
+        self._leases: dict[str, Any] = {}
         self._strikes: collections.Counter = collections.Counter()
         self._seen: dict[str, float] = {}
         self._detail: dict[str, dict] = {}
@@ -273,32 +273,14 @@ class RemoteAuditDispatcher:
         """``listener(executor_id)`` runs when an executor is quarantined."""
         self._listeners.append(listener)
 
-    # -- the auditor's side ------------------------------------------------
+    def _live_executors(self):
+        now = self._clock()
+        return [eid for eid, seen in self._seen.items()
+                if now - seen <= self._live and self._directory.is_authorized(eid)
+                and eid not in self.quarantined]
 
     def connected(self) -> bool:
-        now = self._clock()
-        return any(now - seen <= self._live and self._directory.is_authorized(eid)
-                   and eid not in self.quarantined for eid, seen in self._seen.items())
-
-    async def score(self, items: Sequence[dict]) -> list[tuple[str, tuple, str | None]]:
-        """``(status, chunks, scored_by)`` for each item (``tokens``,
-        ``prompt_len``, ``proofs``); ``scored_by`` is None when the control
-        computed it."""
-        loop = asyncio.get_running_loop()
-        units = []
-        for indexes in _lease_units(items):
-            work = _Work(id=next(self._ids), items=[items[k] for k in indexes],
-                         future=loop.create_future(), queued_at=self._clock())
-            units.append((indexes, work))
-            self._queue.append(work)
-        scored: list = [None] * len(items)
-        for indexes, work in units:
-            scores, scored_by = await work.future
-            for k, (status, chunks) in zip(indexes, scores):
-                scored[k] = (status, chunks, scored_by)
-        return scored
-
-    # -- the executor's side -----------------------------------------------
+        return bool(self._live_executors())
 
     def _contact(self, executor_id: str) -> None:
         self._seen[executor_id] = self._clock()
@@ -308,29 +290,225 @@ class RemoteAuditDispatcher:
         if detail is not None:
             self._detail[executor_id] = dict(detail)
 
-    def claim(self, executor_id: str) -> dict | None:
+    def _held(self, executor_id: str) -> int:
+        return sum(1 for lease in self._leases.values() if lease.executor_id == executor_id)
+
+    def _spawn(self, coroutine) -> None:
+        task = asyncio.ensure_future(coroutine)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def _take_back(self, lease, *, expired: bool) -> None:
+        """The lease is gone (expired, or its executor quarantined): its work
+        goes back to be leased again, or is resolved."""
+        raise NotImplementedError
+
+    def _strike(self, executor_id: str) -> bool:
+        """One more strike; True when it reaches the quarantine limit."""
+        self._strikes[executor_id] += 1
+        return self._strikes[executor_id] >= self._strikes_limit
+
+    async def _expire_leases(self) -> None:
+        now = self._clock()
+        for lease_id, lease in list(self._leases.items()):
+            if lease.expires_at <= now:
+                del self._leases[lease_id]
+                logger.warning("%s lease %s of %s expired; re-queued", self.kind, lease_id[:8],
+                               lease.executor_id)
+                self._take_back(lease, expired=True)
+                if self._strike(lease.executor_id):
+                    await self.quarantine(lease.executor_id,
+                                          f"{self._strikes_limit} leases expired in a row")
+
+    def _on_quarantined(self, executor_id: str) -> None:
+        """Called synchronously as an executor is quarantined, before any await:
+        a subclass drops what it must no longer count from that executor."""
+
+    def _mark_quarantined(self, executor_id: str, reason: str) -> bool:
+        """The synchronous half of a quarantine: refused from now on, its
+        leases taken back. False when it already was."""
+        if executor_id in self.quarantined:
+            return False
+        logger.error("%s %s quarantined: %s", self.kind, executor_id, reason)
+        self.quarantined.add(executor_id)
+        self._directory.revoke_locally(executor_id)
+        self.stats["quarantined"] += 1
+        for lease_id, lease in list(self._leases.items()):
+            if lease.executor_id == executor_id:
+                del self._leases[lease_id]
+                self._take_back(lease, expired=False)
+        self._on_quarantined(executor_id)
+        self._unwritten_quarantines[executor_id] = reason
+        return True
+
+    async def _publish_quarantine(self, executor_id: str) -> None:
+        await self._write_quarantines()
+        for listener in self._listeners:
+            self._spawn(self._notify(listener, executor_id))
+
+    async def quarantine(self, executor_id: str, reason: str) -> None:
+        """Refuse the executor from now on, take back its leases, and tell the
+        listeners (who re-check what it computed)."""
+        if self._mark_quarantined(executor_id, reason):
+            await self._publish_quarantine(executor_id)
+
+    @staticmethod
+    async def _notify(listener, executor_id: str) -> None:
+        try:
+            await listener(executor_id)
+        except Exception:
+            logger.exception("re-check after quarantining %s failed", executor_id)
+
+    async def _write_quarantines(self) -> None:
+        # Retried every sweep until it lands, so a restart cannot forget it.
+        if self._quarantine_write is None:
+            self._unwritten_quarantines.clear()
+            return
+        for executor_id, reason in list(self._unwritten_quarantines.items()):
+            try:
+                await self._quarantine_write(executor_id, reason)
+                del self._unwritten_quarantines[executor_id]
+            except Exception:
+                logger.exception("executor %s quarantine not written yet; retrying", executor_id)
+
+    async def write_heartbeats(self) -> None:
+        if self._heartbeat_write is None:
+            return
+        for executor_id, seen in list(self._seen.items()):
+            if self._written.get(executor_id) == seen:
+                continue
+            if seen - self._written.get(executor_id, float("-inf")) < HEARTBEAT_WRITE_SECONDS \
+                    and executor_id in self._written:
+                continue
+            try:
+                await self._heartbeat_write(executor_id, seen, self._detail.get(executor_id, {}))
+                self._written[executor_id] = seen
+            except Exception:
+                logger.exception("heartbeat of executor %s not written", executor_id)
+
+    async def sweep(self) -> None:
+        raise NotImplementedError
+
+    async def run(self, *, sweep_seconds: float = SWEEP_SECONDS) -> None:
+        while True:
+            try:
+                await self._directory.maybe_refresh()
+                await self.sweep()
+                await self.write_heartbeats()
+            except Exception:
+                logger.exception("%s dispatcher sweep failed; retrying", self.kind)
+            await asyncio.sleep(sweep_seconds)
+
+
+class RemoteAuditDispatcher(ExecutorLeases):
+    """Batches the auditors hand over, leased to executors or scored locally.
+
+    ``local_scores(items)`` is the trusted verifier (the control's GPU), used
+    for rechecks and whenever no executor will take the work; ``quarantine``
+    and ``record_heartbeat`` write the executor registry. ``score`` answers,
+    per item, the scores and the executor that computed them (None: here).
+    """
+
+    kind = "corpus audit executor"
+
+    def __init__(self, *, directory: ExecutorDirectory, proof, local_scores,
+                 quarantine: Callable[[str, str], Awaitable[Any]] | None = None,
+                 record_heartbeat: Callable[[str, float, dict], Awaitable[Any]] | None = None,
+                 clock: Callable[[], float] = time.time, rng: random.Random | None = None,
+                 recheck_fraction: float = RECHECK_FRACTION,
+                 lease_seconds: float = AUDIT_LEASE_SECONDS,
+                 live_seconds: float = EXECUTOR_LIVE_SECONDS,
+                 queue_wait_seconds: float = QUEUE_WAIT_SECONDS,
+                 max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
+                 expiry_strikes: int = LEASE_EXPIRY_STRIKES) -> None:
+        super().__init__(directory=directory, quarantine=quarantine,
+                         record_heartbeat=record_heartbeat, clock=clock,
+                         live_seconds=live_seconds,
+                         max_leases_per_executor=max_leases_per_executor,
+                         expiry_strikes=expiry_strikes)
+        self._proof = proof
+        self._local_scores = local_scores
+        # Each batch is drawn on its own, from the OS: an executor cannot predict it.
+        self._rng = rng or secrets.SystemRandom()
+        self._fraction = recheck_fraction
+        self._lease_seconds = lease_seconds
+        self._queue_wait = queue_wait_seconds
+        self._queue: collections.deque[_Work] = collections.deque()
+        self._local: collections.deque[_Work] = collections.deque()
+        self._protocols: dict[str, tuple[str, ...]] = {}
+
+    # -- the auditor's side ------------------------------------------------
+
+    def connected_for(self, protocol: str) -> bool:
+        """A live, authorised executor that last claimed with ``protocol``."""
+        return any(protocol in self._protocols.get(eid, (AUDIT_PROTOCOL,))
+                   for eid in self._live_executors())
+
+    async def score(self, items: Sequence[dict]) -> list[tuple[str, tuple, str | None]]:
+        """``(status, chunks, scored_by)`` for each item (``tokens``,
+        ``prompt_len``, ``proofs``); ``scored_by`` is None when the control
+        computed it."""
+        loop = asyncio.get_running_loop()
+        units = []
+        # Rows with spans lease apart: v1 rows never wait for a v2 executor.
+        spanned = [k for k, item in enumerate(items) if item.get("spans") is not None]
+        plain = [k for k, item in enumerate(items) if item.get("spans") is None]
+        for protocol, group in ((AUDIT_PROTOCOL, plain), (AUDIT_PROTOCOL_V2, spanned)):
+            # One trajectory per v2 lease: a 60k prefill takes ~16 s (M3), and
+            # several would outrun the lease and strike an honest executor.
+            grouped = ([[k] for k in range(len(group))] if protocol == AUDIT_PROTOCOL_V2
+                       else _lease_units([items[k] for k in group]))
+            for unit in grouped:
+                indexes = [group[k] for k in unit]
+                work = _Work(id=next(self._ids), items=[items[k] for k in indexes],
+                             future=loop.create_future(), queued_at=self._clock(),
+                             protocol=protocol)
+                units.append((indexes, work))
+                self._queue.append(work)
+        scored: list = [None] * len(items)
+        for indexes, work in units:
+            scores, scored_by = await work.future
+            for k, (status, chunks) in zip(indexes, scores):
+                scored[k] = (status, chunks, scored_by)
+        return scored
+
+    # -- the executor's side -----------------------------------------------
+
+    def claim(self, executor_id: str, protocols=(AUDIT_PROTOCOL,)) -> dict | None:
         self._contact(executor_id)
-        held = sum(1 for lease in self._leases.values() if lease.executor_id == executor_id)
-        if held >= self._max_leases:
+        self._protocols[executor_id] = tuple(protocols)
+        if self._held(executor_id) >= self._max_leases:
             return None
+        skipped: list[_Work] = []
+        lease_doc = None
         while self._queue:
             work = self._queue.popleft()
             if work.future.done():
+                continue
+            if work.protocol not in protocols:
+                skipped.append(work)            # left for an executor that takes it
                 continue
             lease = _Lease(lease_id=secrets.token_hex(16), work=work, executor_id=executor_id,
                            expires_at=self._clock() + self._lease_seconds)
             self._leases[lease.lease_id] = lease
             self.stats["leased"] += 1
-            return {
-                "protocol": AUDIT_PROTOCOL, "lease_id": lease.lease_id,
+            lease_doc = {
+                "protocol": work.protocol, "lease_id": lease.lease_id,
                 "model_id": self._directory.model_id,
                 "model_revision": self._directory.model_revision,
                 "chunk_tokens": self._proof.chunk_tokens, "topk": self._proof.topk,
                 "expires_at": lease.expires_at,
                 "items": [{"tokens": list(i["tokens"]), "prompt_len": int(i["prompt_len"]),
-                           "proofs": list(i["proofs"])} for i in work.items],
+                           "proofs": list(i["proofs"]),
+                           **({"spans": [list(s) for s in i["spans"]]}
+                              if i.get("spans") is not None else {})}
+                          for i in work.items],
             }
-        return None
+            if work.protocol == AUDIT_PROTOCOL_V2:
+                lease_doc["min_chunk_tokens"] = MIN_CHUNK_TOKENS
+            break
+        self._queue.extendleft(reversed(skipped))
+        return lease_doc
 
     def result(self, executor_id: str, lease_id: str, result: AuditResult) -> str:
         """Take an executor's scores for its lease; raises ``LeaseRefused``."""
@@ -367,11 +545,6 @@ class RemoteAuditDispatcher:
 
     # -- rechecks, expiry, fallback ------------------------------------------
 
-    def _spawn(self, coroutine) -> None:
-        task = asyncio.ensure_future(coroutine)
-        self._background.add(task)
-        task.add_done_callback(self._background.discard)
-
     def _requeue(self, work: _Work) -> None:
         if work.future.done():
             return
@@ -382,6 +555,9 @@ class RemoteAuditDispatcher:
             # Its wait for an executor starts over.
             work.queued_at = self._clock()
             self._queue.appendleft(work)
+
+    def _take_back(self, lease: _Lease, *, expired: bool) -> None:
+        self._requeue(lease.work)
 
     @staticmethod
     def _resolve(work: _Work, scores: list[Score], scored_by: str | None) -> None:
@@ -402,63 +578,21 @@ class RemoteAuditDispatcher:
             await self.quarantine(
                 executor_id, f"recheck of batch {work.id} disagreed beyond the drift tolerance")
 
-    async def quarantine(self, executor_id: str, reason: str) -> None:
-        """Refuse the executor from now on, take back its leases, and have every
-        auditor re-audit locally what it scored."""
-        if executor_id in self.quarantined:
-            return
-        logger.error("corpus audit executor %s quarantined: %s", executor_id, reason)
-        self.quarantined.add(executor_id)
-        self._directory.revoke_locally(executor_id)
-        self.stats["quarantined"] += 1
-        for lease_id, lease in list(self._leases.items()):
-            if lease.executor_id == executor_id:
-                del self._leases[lease_id]
-                self._requeue(lease.work)
-        self._unwritten_quarantines[executor_id] = reason
-        await self._write_quarantines()
-        for listener in self._listeners:
-            self._spawn(self._notify(listener, executor_id))
-
-    @staticmethod
-    async def _notify(listener, executor_id: str) -> None:
-        try:
-            await listener(executor_id)
-        except Exception:
-            logger.exception("re-audit after quarantining %s failed", executor_id)
-
-    async def _write_quarantines(self) -> None:
-        # Retried every sweep until it lands, so a restart cannot forget it.
-        if self._quarantine_write is None:
-            self._unwritten_quarantines.clear()
-            return
-        for executor_id, reason in list(self._unwritten_quarantines.items()):
-            try:
-                await self._quarantine_write(executor_id, reason)
-                del self._unwritten_quarantines[executor_id]
-            except Exception:
-                logger.exception("executor %s quarantine not written yet; retrying", executor_id)
-
     async def sweep(self) -> None:
         """One pass: expire leases (striking their executor), score locally what
         no executor will take, write pending quarantines."""
+        await self._expire_leases()
         now = self._clock()
-        for lease_id, lease in list(self._leases.items()):
-            if lease.expires_at <= now:
-                del self._leases[lease_id]
-                logger.warning("corpus audit lease %s of executor %s expired; re-queued",
-                               lease_id[:8], lease.executor_id)
-                self._requeue(lease.work)
-                self._strikes[lease.executor_id] += 1
-                if self._strikes[lease.executor_id] >= self._strikes_limit:
-                    await self.quarantine(lease.executor_id,
-                                          f"{self._strikes_limit} leases expired in a row")
-        if not self.connected():
-            while self._queue:
-                self._local.append(self._queue.popleft())
-        else:
-            while self._queue and now - self._queue[0].queued_at > self._queue_wait:
-                self._local.append(self._queue.popleft())
+        # Work no connected executor can take (none at all, or none that speaks
+        # its protocol) is scored here; the rest waits its turn.
+        waiting: collections.deque[_Work] = collections.deque()
+        while self._queue:
+            work = self._queue.popleft()
+            if not self.connected_for(work.protocol) or now - work.queued_at > self._queue_wait:
+                self._local.append(work)
+            else:
+                waiting.append(work)
+        self._queue = waiting
         while self._local:
             work = self._local.popleft()
             if work.future.done():
@@ -472,39 +606,12 @@ class RemoteAuditDispatcher:
         if self._unwritten_quarantines:
             await self._write_quarantines()
 
-    async def write_heartbeats(self) -> None:
-        if self._heartbeat_write is None:
-            return
-        for executor_id, seen in list(self._seen.items()):
-            if self._written.get(executor_id) == seen:
-                continue
-            if seen - self._written.get(executor_id, float("-inf")) < HEARTBEAT_WRITE_SECONDS \
-                    and executor_id in self._written:
-                continue
-            try:
-                await self._heartbeat_write(executor_id, seen, self._detail.get(executor_id, {}))
-                self._written[executor_id] = seen
-            except Exception:
-                logger.exception("heartbeat of executor %s not written", executor_id)
 
-    async def run(self, *, sweep_seconds: float = SWEEP_SECONDS) -> None:
-        while True:
-            try:
-                await self._directory.maybe_refresh()
-                await self.sweep()
-                await self.write_heartbeats()
-            except Exception:
-                logger.exception("corpus audit dispatcher sweep failed; retrying")
-            await asyncio.sleep(sweep_seconds)
+def bearer_authenticator(directory: ExecutorDirectory) -> Callable[..., dict]:
+    """``authenticated(request, executor_id=None)``: the registration behind
+    ``Authorization: Bearer <executor token>``, or a 401 naming the refusal."""
 
-
-def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
-                                directory: ExecutorDirectory) -> APIRouter:
-    """``/corpus/internal/audit/...``: claim, result, heartbeat, each behind
-    ``Authorization: Bearer <executor token>``."""
-    router = APIRouter()
-
-    def _authenticated(request: Request, executor_id: str | None = None) -> dict:
+    def authenticated(request: Request, executor_id: str | None = None) -> dict:
         header = request.headers.get("authorization", "")
         token = header[len("Bearer "):] if header.startswith("Bearer ") else None
         document, refusal = directory.authenticate(token, executor_id)
@@ -512,13 +619,23 @@ def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
             raise HTTPException(status_code=401, detail=refusal)
         return document
 
+    return authenticated
+
+
+def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
+                                directory: ExecutorDirectory) -> APIRouter:
+    """``/corpus/internal/audit/...``: claim, result, heartbeat, each behind
+    ``Authorization: Bearer <executor token>``."""
+    router = APIRouter()
+    _authenticated = bearer_authenticator(directory)
+
     @router.post("/corpus/internal/audit/claim")
     async def claim(body: ClaimRequest, request: Request):
         document = _authenticated(request, body.executor_id)
         if (body.model_id, body.model_revision) != (document["model_id"],
                                                     document["model_revision"]):
             raise HTTPException(status_code=409, detail="wrong_model")
-        lease = dispatcher.claim(document["executor_id"])
+        lease = dispatcher.claim(document["executor_id"], tuple(body.protocols))
         if lease is None:
             return Response(status_code=204)
         return lease
@@ -549,9 +666,11 @@ __all__ = [
     "RECHECK_EXP_DRIFT",
     "RECHECK_MANT_DRIFT_FRACTION",
     "ExecutorDirectory",
+    "ExecutorLeases",
     "LeaseRefused",
     "RECHECK_FRACTION",
     "RemoteAuditDispatcher",
+    "bearer_authenticator",
     "build_audit_executor_router",
     "scores_agree",
     "token_sha256",

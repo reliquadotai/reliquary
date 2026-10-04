@@ -48,6 +48,7 @@ def admit(
     seen: AbstractSet[str],
     proof_counts: Sequence[int] | None = None,
     proof_chunk_tokens: int | None = None,
+    episode_checked: bool = False,
 ) -> Verdict:
     """Decide one submission, consuming a slot and a cursor step when earned.
 
@@ -62,6 +63,10 @@ def admit(
     ``check_termination`` derives the label from ``last_token_ids`` and the
     job's ``eos_token_id``. ``proof_counts`` must likewise be the lengths of the
     received proof lists, counted by the validator.
+
+    An episode job's trajectory is checked by the caller (``checks.check_turn_*``,
+    the intake's parse) before admission; ``episode_checked`` says so, and the
+    single-completion checks do not apply to it.
     """
     # The three sequences describe the same completions, so a disagreement in
     # length means some completion would be paid for without ever being checked.
@@ -93,24 +98,32 @@ def admit(
     elif not job.owns(prompt_index):
         return Verdict(False, "prompt_mismatch", detail=out_of_range_detail(job, prompt_index))
 
+    if job.episode is not None:
+        if not episode_checked:
+            # The per-turn checks live in the intake; admitting without them
+            # would pay a trajectory nothing has looked at.
+            return Verdict(False, "malformed_submission", detail={"episode_checked": False})
+        checks = (lambda: check_duplicates(digests, seen),)
+    else:
+        checks = (
+            lambda: check_completion_count(len(token_counts), job.sampling),
+            lambda: check_token_budget(token_counts, job.sampling),
+            lambda: check_termination(
+                token_counts,
+                last_token_ids,
+                sampling=job.sampling,
+                eos_token_id=job.eos_token_id,
+            ),
+            lambda: check_duplicates(digests, seen),
+            lambda: (
+                check_proof_shape(token_counts, proof_counts, proof_chunk_tokens)
+                if proof_chunk_tokens is not None
+                else CheckResult(ok=True)
+            ),
+        )
     # Callables, not results: a junk submission is refused on its first failing
     # check rather than walked once per check.
-    for check in (
-        lambda: check_completion_count(len(token_counts), job.sampling),
-        lambda: check_token_budget(token_counts, job.sampling),
-        lambda: check_termination(
-            token_counts,
-            last_token_ids,
-            sampling=job.sampling,
-            eos_token_id=job.eos_token_id,
-        ),
-        lambda: check_duplicates(digests, seen),
-        lambda: (
-            check_proof_shape(token_counts, proof_counts, proof_chunk_tokens)
-            if proof_chunk_tokens is not None
-            else CheckResult(ok=True)
-        ),
-    ):
+    for check in checks:
         result = check()
         if not result.ok:
             return Verdict(False, result.reason or "", detail=dict(result.detail))

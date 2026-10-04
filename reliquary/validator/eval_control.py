@@ -564,9 +564,10 @@ def eval_auditor(**kwargs):
 
         async def _forward(self, records, *, local: bool = False):
             results, items = await asyncio.to_thread(self._prepare, records)
+            self._refuse_trajectories(items)
             scores = await self._remote.score(
                 [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
-                 for _, _, tokens, n, proofs in items])
+                 for _, _, tokens, n, proofs, _spans in items])
             outcomes, scored_by = {}, {}
             for (i, c_idx, *_), (status, chunks, executors) in zip(items, scores):
                 outcomes[i, c_idx] = outcome_from_scores(status, chunks, self._proof)
@@ -1051,7 +1052,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             verify_skip_signature=verify_skip_signature, prompt_job_for=w.prompt_job_for,
             records=records, on_accepted=w.on_accepted,
             proof_chunk_tokens=w.proof.chunk_tokens, vocab_size=w.vocab_size,
-            is_banned=w.is_banned, registration=registration, seen_index=w.seen_index)
+            is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
+            job=getattr(w, "job", None))
 
     async def wire(entry, cap, job):
         from reliquary.eval.prompt_source import is_eval_source

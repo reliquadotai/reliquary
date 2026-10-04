@@ -142,8 +142,10 @@ class RegisterExecutor(BaseModel):
     # Where it runs: the eval control pairs executors on distinct ones.
     provider_id: str | None = Field(default=None, min_length=1, max_length=256)
     host: str | None = Field(default=None, min_length=1, max_length=256)
-    # "eval" executors serve the eval control only (provider_id and host required).
-    scope: Literal["corpus", "eval"] = "corpus"
+    # "eval" executors serve the eval control only (provider_id and host required);
+    # "grade" executors (provider_id required) grade and replay for the corpus control, bound to an env
+    # pin (model_id = env package, model_revision = env commit).
+    scope: Literal["corpus", "eval", "grade"] = "corpus"
 
 
 class CreateDelivery(BaseModel):
@@ -749,6 +751,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if job is None:
             raise HTTPException(status_code=404, detail="job_unknown")
+        if job.episode is not None:
+            raise HTTPException(status_code=422, detail="an episode job is delivered with "
+                                "`reliquary jobs export JOB --sft` on a host with its renderer")
         running = exports.get(delivery_id)
         if running is not None and running.done():
             exports.pop(delivery_id)

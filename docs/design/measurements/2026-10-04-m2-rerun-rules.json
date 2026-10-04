@@ -1,0 +1,49 @@
+{
+ "current": {
+  "episodes": 66,
+  "min_spare": 2,
+  "mismatched_total": 66
+ },
+ "addr": {
+  "episodes": 66,
+  "min_spare": 2,
+  "mismatched_total": 66
+ },
+ "commit": {
+  "episodes": 66,
+  "min_spare": 2,
+  "mismatched_total": 66
+ },
+ "mtime": {
+  "episodes": 66,
+  "min_spare": 2,
+  "mismatched_total": 66
+ },
+ "duration": {
+  "episodes": 66,
+  "min_spare": 2,
+  "mismatched_total": 66
+ },
+ "adoptable": [
+  "addr",
+  "commit",
+  "mtime",
+  "duration"
+ ],
+ "all_adoptable_together": {
+  "episodes": 66,
+  "min_spare": 2,
+  "mismatched_total": 66
+ },
+ "adopted": [
+  "addr",
+  "commit",
+  "mtime",
+  "duration"
+ ],
+ "adopted_score": {
+  "episodes": 66,
+  "min_spare": 2,
+  "mismatched_total": 66
+ }
+}

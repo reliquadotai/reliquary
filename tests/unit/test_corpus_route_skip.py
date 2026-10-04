@@ -519,7 +519,7 @@ def test_a_submission_signature_is_refused_as_a_skip_and_vice_versa(fake_r2, see
 def test_the_submit_wire_is_unchanged_for_miners_that_never_skip(walk, fake_r2, seeded_job):
     assert set(CorpusSubmissionRequest.model_fields) == {
         "job_id", "miner_hotkey", "cursor", "prompt_index", "checkpoint_sha256",
-        "rendered_prompt", "completions", "signature"}
+        "rendered_prompt", "completions", "trajectory", "signature"}  # trajectory: optional, episode jobs
     index = job_walk_index(walk, HOTKEY, 0)
     _seed(fake_r2, JOB, slots={index: 1})
     client = _client(_router(seeded_job))

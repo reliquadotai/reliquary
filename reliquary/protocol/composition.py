@@ -209,11 +209,14 @@ def compose_profile(
     overrides: Mapping[str, Mapping[str, object]] | None = None,
     catalog: Mapping[str, EnvironmentProfile] = ENVIRONMENT_CATALOG,
     external_eval: bool = False,
+    agentic: bool = False,
 ) -> ProtocolProfile:
     """An ordinary profile from its parts, or a ``ValueError`` naming the part.
 
     ``external_eval`` admits the external eval environment: only a job that
-    draws its prompts from an eval set may declare it, never an RL task."""
+    draws its prompts from an eval set may declare it, never an RL task.
+    ``agentic`` admits the agentic contract environment: only a corpus job with
+    ``episode`` may declare it."""
     names = list(environments)
     if not names:
         raise ValueError("at least one environment must be selected")
@@ -223,10 +226,19 @@ def compose_profile(
     unselected = sorted(set(overrides) - set(names))
     if unselected:
         raise ValueError(f"overrides name environments not selected: {', '.join(unselected)}")
+    from reliquary.protocol.agentic_source import AGENTIC_BODIES
     from reliquary.protocol.external_eval import EXTERNAL_BODIES
 
     bodies = {}
     for name in sorted(names):
+        if name in AGENTIC_BODIES:
+            if not agentic:
+                raise ValueError(
+                    f"environment {name!r} is declared only by an agentic corpus job (episode)")
+            if overrides.get(name):
+                raise ValueError(f"environment {name!r} takes no overrides")
+            bodies[name] = AGENTIC_BODIES[name]
+            continue
         if name in EXTERNAL_BODIES:
             # An external eval set's statement, not an installed package: there
             # is no spec to check it against, and nothing to tune.

@@ -14,6 +14,7 @@ from collections.abc import Sequence
 import torch
 
 from reliquary.protocol.toploc import (
+    MIN_CHUNK_TOKENS,
     NO_MANTISSA,
     ChunkProof,
     ChunkResult,
@@ -21,12 +22,16 @@ from reliquary.protocol.toploc import (
     evaluate_batch,
     injective_modulus,
     newton_coefficients_batch,
+    span_chunk_bounds,
+    span_chunk_count,
 )
 
 
-def _chunk_tops(
-    hidden: torch.Tensor, chunk_tokens: int, topk: int
-) -> tuple[list[list[int]], list[list[int]]]:
+def _fixed_bounds(rows: int, chunk_tokens: int) -> list[tuple[int, int]]:
+    return [(s, min(s + chunk_tokens, rows)) for s in range(0, rows, chunk_tokens)]
+
+
+def _tops(hidden: torch.Tensor, bounds, topk: int) -> tuple[list[list[int]], list[list[int]]]:
     """Each chunk's top-k indices by magnitude and the bf16 bits there."""
     if hidden.dim() != 2 or hidden.shape[0] == 0:
         raise ValueError(f"expected [rows, width] activations, got {tuple(hidden.shape)}")
@@ -34,39 +39,31 @@ def _chunk_tops(
     # One abs over the whole tensor: per chunk it cost ~60x more on CPU.
     magnitude = hidden.abs()
     all_indices, all_bits = [], []
-    for start in range(0, hidden.shape[0], chunk_tokens):
-        flat = hidden[start : start + chunk_tokens].reshape(-1)
+    for start, end in bounds:
+        flat = hidden[start:end].reshape(-1)
         if flat.numel() < topk:
             raise ValueError(f"a chunk of {flat.numel()} activations cannot yield top-{topk}")
-        indices = magnitude[start : start + chunk_tokens].reshape(-1).topk(topk).indices
+        indices = magnitude[start:end].reshape(-1).topk(topk).indices
         values = flat[indices].detach().to("cpu").contiguous()
         all_bits.append((values.view(torch.int16).to(torch.int32) & 0xFFFF).tolist())
         all_indices.append(indices.to("cpu").tolist())
     return all_indices, all_bits
 
 
-def build_chunk_proofs(
-    hidden: torch.Tensor, *, chunk_tokens: int, topk: int
-) -> list[bytes]:
-    all_indices, all_bits = _chunk_tops(hidden, chunk_tokens, topk)
+def _chunk_tops(hidden: torch.Tensor, chunk_tokens: int, topk: int):
+    if hidden.dim() != 2 or hidden.shape[0] == 0:
+        raise ValueError(f"expected [rows, width] activations, got {tuple(hidden.shape)}")
+    return _tops(hidden, _fixed_bounds(hidden.shape[0], chunk_tokens), topk)
+
+
+def _proofs_from_tops(all_indices, all_bits) -> list[bytes]:
     moduli = [injective_modulus(indices) for indices in all_indices]
     reduced = [[i % m for i in indices] for indices, m in zip(all_indices, moduli)]
     coeffs = newton_coefficients_batch(reduced, all_bits)
-    return [
-        ChunkProof(m, tuple(int(c) for c in row)).to_bytes()
-        for m, row in zip(moduli, coeffs)
-    ]
+    return [ChunkProof(m, tuple(int(c) for c in row)).to_bytes() for m, row in zip(moduli, coeffs)]
 
 
-def verify_chunk_proofs(
-    hidden: torch.Tensor,
-    proofs: Sequence[bytes],
-    *,
-    chunk_tokens: int,
-    topk: int,
-) -> list[ChunkResult]:
-    """One result per chunk; an unreadable proof is a failing result, not an error."""
-    all_indices, all_bits = _chunk_tops(hidden, chunk_tokens, topk)
+def _verify_tops(all_indices, all_bits, proofs: Sequence[bytes], topk: int) -> list[ChunkResult]:
     if len(all_indices) != len(proofs):
         raise ValueError(f"{len(proofs)} proofs for {len(all_indices)} chunks")
     parsed: dict[int, ChunkProof] = {}
@@ -95,6 +92,36 @@ def verify_chunk_proofs(
         else ChunkResult(topk, NO_MANTISSA, NO_MANTISSA)
         for c in range(len(proofs))
     ]
+
+
+def build_chunk_proofs(hidden: torch.Tensor, *, chunk_tokens: int, topk: int) -> list[bytes]:
+    return _proofs_from_tops(*_chunk_tops(hidden, chunk_tokens, topk))
+
+
+def verify_chunk_proofs(hidden: torch.Tensor, proofs: Sequence[bytes], *, chunk_tokens: int,
+                        topk: int) -> list[ChunkResult]:
+    """One result per chunk; an unreadable proof is a failing result, not an error."""
+    all_indices, all_bits = _chunk_tops(hidden, chunk_tokens, topk)
+    return _verify_tops(all_indices, all_bits, proofs, topk)
+
+
+def build_span_proofs(hidden: torch.Tensor, *, chunk_tokens: int, topk: int,
+                      min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> list[bytes]:
+    """The proofs of one assistant span: ``build_chunk_proofs`` over
+    ``span_chunk_bounds``, so a short trailing chunk is merged."""
+    if hidden.dim() != 2 or hidden.shape[0] == 0:
+        raise ValueError(f"expected [rows, width] activations, got {tuple(hidden.shape)}")
+    bounds = span_chunk_bounds(hidden.shape[0], chunk_tokens, min_chunk_tokens)
+    return _proofs_from_tops(*_tops(hidden, bounds, topk))
+
+
+def verify_span_proofs(hidden: torch.Tensor, proofs: Sequence[bytes], *, chunk_tokens: int,
+                       topk: int, min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> list[ChunkResult]:
+    if hidden.dim() != 2 or hidden.shape[0] == 0:
+        raise ValueError(f"expected [rows, width] activations, got {tuple(hidden.shape)}")
+    bounds = span_chunk_bounds(hidden.shape[0], chunk_tokens, min_chunk_tokens)
+    all_indices, all_bits = _tops(hidden, bounds, topk)
+    return _verify_tops(all_indices, all_bits, proofs, topk)
 
 
 def completion_proofs_b64(
