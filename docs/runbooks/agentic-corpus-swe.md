@@ -346,8 +346,9 @@ take the next command, or runs past its deadline (replay: its trajectory budget,
 task's scoring timeout) is reported `box_lost` / `box_timeout`, a vote like
 any fact. Two distinct providers agreeing void the submission **unpaid**
 with reason `replay_unjudgeable` (`stage` `grade` or `replay`) and **no**
-escalation of the miner. An executor outvoted with a `box_lost`/`box_timeout`
-vote is struck each time (never reset) and quarantined at the third.
+escalation of the miner. A split between box failures and facts is decided by
+majority and penalizes no executor on either side (ruling P26: a trajectory
+can kill boxes at random); only fact-against-fact dissent quarantines.
 Every grade that is not a clean success (failing,
 timeout, error, disputed, unjudgeable) gets the failing replay draw
 (`replay_fraction_failed`). A failure before any recorded action or before
