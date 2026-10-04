@@ -116,23 +116,23 @@ def test_every_honest_m2_episode_is_within_tolerance_with_two_to_spare():
         assert allowed_mismatches(e["actions"]) - len(e["mismatched"]) >= 2
 
 
-def test_real_m2_pairs_compare_as_mismatched_and_stay_within_tolerance():
-    # The worst share in M2: 3 of 15 observations differ (20 %).
+def test_real_m2_worst_pairs_are_timing_only_and_stay_within_tolerance():
+    # The worst share in M2: 3 of 15 observations differ (20 %). Its visible
+    # differences are pytest timing (the --durations listing, the clock of a
+    # long run), which the B1 rules hide; the samples are truncated, so the
+    # third pair's difference lies past the cut.
     worst = max(_m2_episodes(), key=lambda e: len(e["mismatched"]) / e["actions"])
     assert (len(worst["mismatched"]), worst["actions"]) == (3, 15)
     samples = {s["index"]: s for s in worst["samples"]}
+    raw = [i for i, x in samples.items() if x["recorded"] != x["replayed"]]
+    assert raw == [12, 13]
     recorded, replayed = [], []
     for i in range(worst["actions"]):
         s = samples.get(i)
         recorded.append(Action("bash", s["arguments"] if s else "{}", s["recorded"] if s else f"o{i}"))
         replayed.append(s["replayed"] if s else f"o{i}")
     report = compare(recorded, replayed, "diff", "diff")
-    # The JSON's samples are truncated, so a pair whose difference lies past the
-    # cut compares equal here; the visible ones must still be caught.
-    visible = [i for i, x in samples.items() if normalize(x["recorded"]) != normalize(x["replayed"])]
-    assert len(visible) >= 2
-    assert report.mismatched == sorted(visible)
-    assert within_tolerance(report)
+    assert report.mismatched == []
     assert within_tolerance(ReplayReport(compared=worst["actions"], mismatched=list(worst["mismatched"]),
                                          diff_equal=True))
 
@@ -177,3 +177,68 @@ def test_an_action_without_a_recorded_observation_is_replayed_but_not_compared()
 
     report = compare([Action("bash", "{}", "x"), Action("bash", "{}", None)], ["x", "y"], "d", "d")
     assert report.compared == 1 and report.mismatched == [] and report.diff_equal
+
+
+# --- B1 (2026-10-04): honest 27B mismatches measured on e2e + M2 episodes ---
+
+def _same(recorded: str, replayed: str) -> bool:
+    return compare([Action("bash", "{}", recorded)], [replayed], "d", "d").mismatched == []
+
+
+def test_normalize_hides_the_behave_run_time_only():
+    assert normalize("5 features passed\nTook 0m1.753s") == normalize("5 features passed\nTook 0m1.344s")
+    assert normalize("Took 2m0.078s") == "Took <dur>"
+    assert normalize("Took 3 apples") == "Took 3 apples"
+    assert normalize("x Took 0m1.7s") != normalize("x Took 0m1.3s")       # line-anchored
+
+
+def test_normalize_hides_pytest_clock_suffix_of_long_runs():
+    a = "1670 passed, 21 skipped in 70.12s (0:01:10)"
+    b = "1670 passed, 21 skipped in 71.40s (0:01:11)"
+    assert normalize(a) == normalize(b) == "1670 passed, 21 skipped in <dur>"
+    assert normalize("1670 passed (0:01:10)") == "1670 passed (0:01:10)"   # only after a duration
+
+
+def test_normalize_hides_pytest_slowest_durations_entries_and_hidden_count():
+    a = ("0.31s teardown pandas/tests/test_a.py::test_x\n0.20s call     pandas/tests/test_b.py::test_y[int]\n\n"
+         "(14 durations < 0.005s hidden.  Use -vv to show these durations.)\n1413 passed in 9.10s")
+    b = ("0.41s call     pandas/tests/test_c.py::test_z[a-b c]\n0.25s setup    pandas/tests/test_d.py::test_w\n\n"
+         "(13 durations < 0.005s hidden.  Use -vv to show these durations.)\n1413 passed in 9.80s")
+    assert normalize(a) == normalize(b)
+    assert normalize("1413 passed in 9.10s") != normalize("1412 passed in 9.10s")
+    # Only the slowest-durations entry shape: a phase word and a test id.
+    assert normalize("0.31s call test_a.py::t FAILED") != normalize("0.31s call test_a.py::t PASSED")
+
+
+def test_normalize_hides_ninja_step_targets_but_not_other_lines():
+    a = "[143/152] Compiling C object pandas/_libs/join.so.p/join.pyx.c.o\n[144/152] Linking target pandas/_libs/join.so"
+    b = "[143/152] Linking target pandas/_libs/interval.so\n[144/152] Compiling C++ object pandas/_libs/w.so.p/a.cpp.o"
+    assert normalize(a) == normalize(b)
+    assert normalize("[15/152] Generating pandas/_libs/algos_pxi with a custom command") == \
+        normalize("[15/152] Generating pandas/_libs/index_pxi with a custom command")
+    assert normalize("[1/2] Linking target a.so") != normalize("[2/2] Linking target a.so")   # step kept
+    assert normalize("[1/2] Linking target a.so ALL TESTS PASS") != normalize("[1/2] Linking target b.so")
+    assert normalize("[1/2] FAILED: a.o") != normalize("[1/2] FAILED: b.o")
+
+
+def test_reordered_grep_and_find_lines_compare_equal():
+    # Directory order is the host filesystem's (xfs keeps insertion order,
+    # ext4 hashes with a per-filesystem seed), so `grep -r` / `find` list the
+    # same hits in another order on another host.
+    rec = ("/testbed/src/a.py:73:    def f(self):\n/testbed/src/b/c.py:263:    def g():\n---\n"
+           "src/docx/x.py\nsrc/docx/oxml/y.py")
+    rep = ("/testbed/src/b/c.py:263:    def g():\n/testbed/src/a.py:73:    def f(self):\n---\n"
+           "src/docx/oxml/y.py\nsrc/docx/x.py")
+    assert _same(rec, rep)
+
+
+def test_reordering_is_only_within_a_run_of_path_lines():
+    # Not across a separator,
+    assert not _same("/t/a.py:1:x\n---\n/t/b.py:2:y", "/t/b.py:2:y\n---\n/t/a.py:1:x")
+    # not for other lines (file contents),
+    assert not _same("import os\nimport sys\nx = a/b", "import sys\nimport os\nx = a/b")
+    assert not _same("    return a/b\n    x = 1", "    x = 1\n    return a/b")
+    # and never a changed, added or dropped hit.
+    assert not _same("/t/a.py:1:x\n/t/b.py:2:y", "/t/b.py:2:y\n/t/a.py:1:z")
+    assert not _same("/t/a.py:1:x\n/t/b.py:2:y", "/t/b.py:2:y")
+    assert not _same("/t/a.py\n/t/b.py", "/t/b.py\n/t/a.py\n/t/c.py")

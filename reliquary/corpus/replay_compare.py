@@ -30,7 +30,24 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?m)^([-dlcbps][-rwxsStT]{9}[.+@]?[ \t]+\d+[ \t]+\S+[ \t]+\S+[ \t]+\d+[ \t]+)"
                 r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +\d{1,2} +\d{2}:\d{2}(?!\d)"),
      r"\1<mtime>"),                                                      # ls -l mtime column (checkout time)
+    # B1 (2026-10-04), from honest 27B mismatches replayed twice on one host:
+    (re.compile(r"(?m)^Took \d+m\d+(?:\.\d+)?s$"), "Took <dur>"),        # behave's run time
+    (re.compile(r"(?<=<dur>) \(\d+:\d{2}:\d{2}\)"), ""),                  # pytest's clock past 60 s
+    (re.compile(r"(?m)^<dur> (?:call|setup|teardown) +\S+\.py::\S*?(?:\[[^\]\n]*\])?$"),
+     "<dur> <slowest test>"),                                            # pytest --durations entries
+    (re.compile(r"(?m)^\(\d+ durations < <dur> hidden\.  Use -vv to show these durations\.\)$"),
+     "(<n> durations < <dur> hidden.  Use -vv to show these durations.)"),  # ...and how many it hid
+    (re.compile(r"(?m)^\[(\d+)/(\d+)\] (?:Compiling (?:C|C\+\+|Cython|Fortran) (?:object|source) \S+"
+                r"|Linking (?:static )?target \S+"
+                r"|Generating \S+ with a custom command(?: \(wrapped by meson to [^)\n]*\))?)$"),
+     r"[\1/\2] <ninja step>"),                                            # parallel build: order of steps
 )
+
+# A line `grep -r`/`find` prints: a path with a directory part, then nothing,
+# or a `:`/`-` field (line number, matched text). Directory order is the host
+# filesystem's (xfs keeps insertion order, ext4 hashes with a per-filesystem
+# seed), so another host lists the same hits in another order.
+_PATH_LINE = re.compile(r"(?:\.{1,2}/|/)?[\w.@+-]+(?:/[\w.@+-]+)+/?(?:[:-].*)?")
 
 
 @dataclass(frozen=True)
@@ -88,6 +105,24 @@ def normalize(text: str) -> str:
     return text
 
 
+def canonical(text: str) -> str:
+    """``normalize``, then each maximal run of consecutive path lines sorted:
+    hits may move within their run, never across another line, and none may
+    change, appear or vanish."""
+    lines = normalize(text).split("\n")
+    out: list[str] = []
+    run: list[str] = []
+    for line in lines:
+        if _PATH_LINE.fullmatch(line):
+            run.append(line)
+            continue
+        out.extend(sorted(run))
+        run = []
+        out.append(line)
+    out.extend(sorted(run))
+    return "\n".join(out)
+
+
 # Per-episode replay tolerance, derived from gate M2's 66 honest episodes
 # (docs/design/measurements/2026-10-03-m2-replay-agreement.json): at most 4
 # mismatched observations in any episode, at most 20 % (3 of 15) in a short
@@ -115,7 +150,7 @@ def compare(recorded: Sequence[Action], replayed: Sequence[str],
     compared = [i for i, action in enumerate(recorded) if action.observation is not None]
     mismatched = [
         i for i in compared
-        if i >= len(replayed) or normalize(recorded[i].observation) != normalize(replayed[i])
+        if i >= len(replayed) or canonical(recorded[i].observation) != canonical(replayed[i])
     ]
     return ReplayReport(compared=len(compared), mismatched=mismatched,
                         diff_equal=recorded_diff == replayed_diff)
