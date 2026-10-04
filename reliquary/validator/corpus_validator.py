@@ -497,18 +497,23 @@ def wire_job_front_only(w, *, records, link) -> None:
     w.on_accepted = on_accepted
 
 
-SPLIT_EPISODE_REFUSAL = ("episode jobs are not served by the split validator; "
-                         "unset RELIQUARY_CORPUS_SPLIT")
+SPLIT_EPISODE_REFUSAL = ("episode job {job_id!r} is in a split judge group, but judge processes "
+                         "host no grader; leave it out of RELIQUARY_CORPUS_SPLIT_JUDGES (the front "
+                         "audits, grades and settles it)")
 
 
 def split_episode_refusal(split, job):
-    """``(REFUSED, why)`` for an episode job a split validator cannot serve,
-    else None. A permanent refusal, not a transient one to retry."""
+    """``(REFUSED, why)`` for an episode job a split validator cannot serve
+    (one a judge process would judge: judge processes host no grader), else
+    None. The front serves every other episode job as the single process does.
+    A permanent refusal, not a transient one to retry."""
     if split is None or getattr(job, "episode", None) is None:
+        return None
+    if str(job.job_id) not in getattr(split, "links", {}):
         return None
     from reliquary.validator.corpus_hot_jobs import REFUSED
 
-    return REFUSED, SPLIT_EPISODE_REFUSAL
+    return REFUSED, SPLIT_EPISODE_REFUSAL.format(job_id=str(job.job_id))
 
 
 def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_signature,
@@ -730,7 +735,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     With ``split`` (``corpus_split.FrontSplit``) this is the front of the split
     validator: no model is loaded (the supervisor checked the checkpoint and
     the GPU process scores), the jobs in ``split.links`` are judged in their
-    own processes and every other job here, scoring on the GPU process.
+    own processes and every other job here, scoring on the GPU process. An
+    episode job is served here exactly as by the single process (intake, audit
+    v2 with its spans on the GPU process's wire, grader, grade routes, payment
+    gate); one in ``split.links`` is refused (judge processes host no grader).
 
     With ``intake_only`` no model is loaded and nothing is audited or settled:
     the route takes submissions and episode jobs are graded (the end-to-end
@@ -805,9 +813,11 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 f"task {task_entry.task_id!r} declares job {task_entry.job_id!r} but it has no manifest"
             )
         manifests.append((task_entry, task_cap, job))
-    if split is not None and any(job.episode is not None for _, _, job in manifests):
-        # Before any download or ledger migration: the split cannot grade.
-        raise RuntimeError(SPLIT_EPISODE_REFUSAL)
+    for _, _, job in manifests:
+        # Before any download or ledger migration: a judge process cannot grade.
+        refusal = split_episode_refusal(split, job)
+        if refusal is not None:
+            raise RuntimeError(refusal[1])
 
     if several:
         # Before any ledger is migrated: a start that refuses touches nothing.
@@ -935,8 +945,6 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # auditors from preparing their records all at once.
         scorer = GpuScorer(Path(split.run_dir) / GPU_SOCKET, chunk_tokens=proof.chunk_tokens,
                            topk=proof.topk, executor=judge_threads.codec)
-    if split is not None and any(w.job.episode is not None for w in wiring):
-        raise RuntimeError(SPLIT_EPISODE_REFUSAL)
     remote = directory = None
     if remote_audit:
         from reliquary.infrastructure import corpus_executor_store as executor_store
@@ -1010,8 +1018,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     def audit_and_settle(w) -> None:
         if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
             w.episode_intake = episode_intake_for(w)
-        if split is not None and w.job.episode is not None:
-            raise RuntimeError(SPLIT_EPISODE_REFUSAL)          # never graded half-wired
+        refusal = split_episode_refusal(split, w.job)
+        if refusal is not None:
+            raise ValueError(refusal[1])                       # never paid ungraded
         if w.job.episode is not None:
             wire_job_grader(w, records=records, judge_records=judge_records,
                             dispatcher=grade_dispatcher)
@@ -1038,9 +1047,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
 
     async def wire_hot(task_entry, task_cap, job):
-        if split_episode_refusal(split, job) is not None:
+        refusal = split_episode_refusal(split, job)
+        if refusal is not None:
             # Backstop: `admit` refuses it first, for good; a ValueError is permanent.
-            raise ValueError(SPLIT_EPISODE_REFUSAL)
+            raise ValueError(refusal[1])
         # The renderer first: a job refused for it leaves its ledger untouched.
         own_profile = _entry_profile(task_entry)
         renderer = build_renderer(job, own_profile)

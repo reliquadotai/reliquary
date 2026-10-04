@@ -54,12 +54,17 @@ def test_the_single_job_server_mount_carries_its_jobs_cap():
     assert TestClient(holder.app).post("/corpus/submit", content=junk).status_code == 422
 
 
-def test_a_hot_episode_job_under_the_split_validator_is_refused_for_good():
+def test_a_hot_episode_job_in_a_split_judge_group_is_refused_for_good():
+    from types import SimpleNamespace
+
     from reliquary.validator.corpus_hot_jobs import REFUSED
     from reliquary.validator.corpus_validator import split_episode_refusal
 
     episode, single = parse_job(_manifest(prompt_count=3)), parse_job(_manifest(with_episode=False))
+    linked = SimpleNamespace(links={str(episode.job_id): object()})
     assert split_episode_refusal(None, episode) is None
-    assert split_episode_refusal(object(), single) is None
-    kind, why = split_episode_refusal(object(), episode)
-    assert kind == REFUSED and "split" in why
+    assert split_episode_refusal(linked, single) is None
+    # The front serves an episode job no judge group names.
+    assert split_episode_refusal(SimpleNamespace(links={}), episode) is None
+    kind, why = split_episode_refusal(linked, episode)
+    assert kind == REFUSED and "judge" in why
