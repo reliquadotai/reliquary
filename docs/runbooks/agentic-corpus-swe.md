@@ -368,8 +368,10 @@ in all) is refused at intake as `trajectory_too_large`; the miner checks the
 same bound before signing.
 
 The dispute clock (`RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS`) counts only the
-time during which no live executor of another provider could take the next
-vote, and an item holding a vote is leased before any new item: a grading
+time during which no executor of another provider, on the pinned env and
+working (a claim request in the last `RELIQUARY_CORPUS_GRADE_CLAIM_LIVE_SECONDS`,
+120 s, 30 to 3600, or a lease held; heartbeats alone do not count), could
+take the next vote, and an item holding a vote is leased before any new item: a grading
 backlog never resolves a failing replay as `disputed`.
 
 In the bucket, `grades/`, `regrades/` and `voided/` sit beside `submissions/`

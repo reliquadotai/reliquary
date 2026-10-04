@@ -736,26 +736,62 @@ async def test_a_backlog_longer_than_the_dispute_window_never_disputes_a_voted_i
 
 async def test_the_dispute_clock_counts_only_time_without_an_eligible_executor():
     clock = _Clock()
-    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0,
+                          max_leases_per_executor=1)
     voted = asyncio.ensure_future(d.decide(_item("replay")))
     await asyncio.sleep(0)
-    _answer(d, "g0", REPLAY_BAD)
-    for _ in range(10):                                 # 1000 s with nobody eligible
-        clock.now += 100
-        await d.sweep()
-    for _ in range(10):                                 # 1000 s with g1 live (it does not claim yet)
+    first = d.claim("g0")
+    other = asyncio.ensure_future(d.decide(_item("replay", submission_id="f" * 64)))
+    await asyncio.sleep(0)
+    busy = d.claim("g1")                                # g1 at its cap, holding a lease
+    assert busy["items"][0]["submission_id"] == "f" * 64
+    d.result("g0", first["lease_id"], _result(REPLAY_BAD))
+    for _ in range(10):                                 # 1000 s: g1 works its lease, claims nothing
         clock.now += 100
         d.heartbeat("g1")
         await d.sweep()
     await asyncio.sleep(0)
-    assert not voted.done() and d.stats["disputed"] == 0   # 1000 s counted, not 2000
-    clock.now += 61 + d._live                           # g1 is gone: the clock runs again
-    await d.sweep()
-    for _ in range(8):
+    assert not voted.done() and d.stats["disputed"] == 0   # a leaseholder counts
+    d.result("g1", busy["lease_id"], _result({**REPLAY_OK, "submission_id": "f" * 64}))
+    for _ in range(19):                                 # g1 heartbeats only: it does not count
         clock.now += 100
+        d.heartbeat("g1")
         await d.sweep()
-    assert (await voted).status == "disputed"
+    assert (await asyncio.wait_for(voted, 5)).status == "disputed"
+    other.cancel()
 
+
+async def test_a_heartbeat_only_executor_does_not_stop_the_dispute_clock():
+    """Ruling P26: liveness for the dispute clock needs a claim request in the
+    last GRADE_CLAIM_LIVE_SECONDS or a held lease; heartbeats alone do not."""
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    voted = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    for _ in range(19):
+        clock.now += 100
+        d.heartbeat("g1")                               # pinned env, eligible, never claims
+        await d.sweep()
+    assert (await asyncio.wait_for(voted, 5)).status == "disputed"
+    assert d.stats["stranded"] >= 1
+
+
+async def test_a_recently_claiming_executor_stops_the_dispute_clock():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0)
+    voted = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    d._claimed_at["g1"] = clock.now                     # claimed (got nothing back) just now
+    for _ in range(25):                                 # it keeps claiming every 100 s
+        clock.now += 100
+        d._claimed_at["g1"] = clock.now
+        d.heartbeat("g1")
+        await d.sweep()
+    await asyncio.sleep(0)
+    assert not voted.done() and d.stats["disputed"] == 0
+    voted.cancel()
 
 
 # F6 M2: two executors that both fail a replay agree, whatever their diffs.

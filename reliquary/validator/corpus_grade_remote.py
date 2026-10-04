@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -86,6 +87,10 @@ MAX_ERRORS = 3
 MAX_LEASES_PER_EXECUTOR = 8
 # How long an item holding a vote waits for a next distinct-provider executor.
 GRADE_DISPUTE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS", 1800.0, 60.0, 86400.0)
+# Ruling P26: an executor serves the dispute clock only while it claims (a
+# claim request this recent) or holds a lease; heartbeats alone do not.
+GRADE_CLAIM_LIVE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_CLAIM_LIVE_SECONDS",
+                                        120.0, 30.0, 3600.0)
 UNGRADEABLE = "ungradeable"
 DISPUTED = "disputed"
 # Ruling P23: the box failed or the deadline passed once the trajectory's
@@ -178,7 +183,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
                  max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
                  expiry_strikes: int = LEASE_EXPIRY_STRIKES,
                  lease_seconds: dict[str, float] | None = None,
-                 dispute_seconds: float = GRADE_DISPUTE_SECONDS) -> None:
+                 dispute_seconds: float = GRADE_DISPUTE_SECONDS,
+                 claim_live_seconds: float = GRADE_CLAIM_LIVE_SECONDS) -> None:
         super().__init__(directory=directory, quarantine=quarantine,
                          record_heartbeat=record_heartbeat, clock=clock,
                          live_seconds=live_seconds,
@@ -195,6 +201,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
         # Executors whose last claim was refused 409 wrong_env: live by their
         # heartbeats, but they never take a lease, so never eligible (N2).
         self._wrong_env: set[str] = set()
+        # When each executor last asked for a lease (ruling P26).
+        self._claimed_at: dict[str, float] = {}
+        self._claim_live = float(claim_live_seconds)
 
     def hold_on_quarantine(self, holder: Callable[[str], Any]) -> None:
         """``holder(executor_id)`` runs synchronously the moment an executor is
@@ -253,6 +262,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
 
     def claim(self, executor_id: str) -> dict | None:
         self._contact(executor_id)
+        self._claimed_at[executor_id] = self._clock()
         self._wrong_env.discard(executor_id)          # it claims on this control's env
         if executor_id in self.quarantined or self._held(executor_id) >= self._max_leases:
             return None
@@ -469,11 +479,15 @@ class RemoteGradeDispatcher(ExecutorLeases):
         await self._expire_leases()
         now = self._clock()
         live = self._live_executors()
+        # Who can actually take a next vote: claiming lately, or busy with a lease.
+        working = [eid for eid in live
+                   if now - self._claimed_at.get(eid, -math.inf) <= self._claim_live
+                   or self._held(eid) > 0]
         waiting = 0
         for work in list(self._queue):
             if work.future.done():
                 continue
-            served = any(self._eligible(eid, work) for eid in live)
+            served = any(self._eligible(eid, work) for eid in working)
             if work.results:
                 # Only time with no live eligible executor counts (F3): one that
                 # is merely busy takes this item next (voted items go first).
@@ -495,8 +509,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
             if live and not served:
                 self.stats["stranded"] += 1
                 logger.warning("grade item %d (%s) waits: every live grade executor is excluded "
-                               "from it (voted, failed it, same provider as a voter, or not on "
-                               "this control's env)",
+                               "from it (voted, failed it, same provider as a voter, not on "
+                               "this control's env, or neither claiming nor holding a lease)",
                                work.id, work.mode)
         self.stats["waiting"] = waiting
         if waiting and not live:
@@ -543,7 +557,7 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
     return router
 
 
-__all__ = ["DISPUTED", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
+__all__ = ["DISPUTED", "GRADE_CLAIM_LIVE_SECONDS", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
            "TRAJECTORY_STATUSES", "UNGRADEABLE", "UNJUDGEABLE", "GradeDecision",
            "RemoteGradeDispatcher", "build_grade_executor_router", "decision_key",
            "replay_certified"]
