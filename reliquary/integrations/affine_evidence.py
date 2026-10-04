@@ -42,6 +42,25 @@ def manifest_bindings(manifest, env_id=None):
                 sourceBundleDigest=hashlib.sha256(canonical(manifest["source_bundle"])).hexdigest())
 
 
+def _sampling_policy(manifest):
+    if "sampling_contract" not in manifest and "sampling_source_hash" not in manifest:
+        return None
+    contract = manifest.get("sampling_contract")
+    require(isinstance(contract, dict) and set(contract) == {
+        "version", "generation", "verification", "max_attempts", "randomness"}, "sampling_contract_fields")
+    require(contract["version"] == "forced-inverse-cdf-replay-v1"
+            and contract["generation"] == "uncached-eager-inverse-cdf"
+            and contract["verification"] == "exact-token-replay"
+            and type(contract["max_attempts"]) is int and 2 <= contract["max_attempts"] <= 128,
+            "sampling_contract_policy")
+    require(all(isinstance(value, str) and re.fullmatch("[0-9a-f]{64}", value)
+                for value in (contract["randomness"], manifest.get("sampling_source_hash"))),
+            "sampling_contract_binding")
+    # Public randomness changes each epoch; sampler semantics and source must not.
+    return {**{name: value for name, value in contract.items() if name != "randomness"},
+            "source_hash": manifest["sampling_source_hash"]}
+
+
 def verify_bundle(bundle, signed, expected_bindings=None):
     """Validate native envelopes with the approved upstream signature verifier.
 
@@ -152,13 +171,15 @@ def verify_bundle(bundle, signed, expected_bindings=None):
             # it does not establish model quality or a changed runtime's fitness.
             try:
                 next_bindings = manifest_bindings(successor, selected)
+                sampling_compatible = _sampling_policy(manifest) == _sampling_policy(successor)
             except (KeyError, TypeError, ValueError):
                 next_bindings = None
             policies = ("runtime_profile", "model_runtime_revision", "numerical_policy", "backend_profile",
                         "model_id", "artifact_policy", "audit_policy", "training_policy",
                         "environment_revision", "harness_source_hash", "tokenizer_binding",
                         "K", "L", "max_batches", "transport_policy")
-            if next_bindings is not None and successor.get("source_bundle", {}).get("sha256") == bundle["source_sha256"] \
+            if next_bindings is not None and sampling_compatible \
+                    and successor.get("source_bundle", {}).get("sha256") == bundle["source_sha256"] \
                     and next_bindings["environmentDigest"] == bindings["environmentDigest"] \
                     and next_bindings["harnessDigest"] == bindings["harnessDigest"] \
                     and all(successor.get(name) == manifest.get(name) for name in policies):

@@ -38,8 +38,11 @@ process-group cleanup. A crashed running journal blocks replacement work.
 it never kills an unidentified process.
 
 A verified handover exposes successor bindings only when source content,
-environment, harness and numerical/runtime policies remain compatible. Those
-bindings support qualification of the next open epoch; they do not replace
+environment, harness and numerical/runtime policies remain compatible. Checks
+include the forced sampler's source and stable contract fields. Valid
+per-epoch public randomness may change; adding, removing or changing the sampler
+policy requires fresh qualification.
+Successor bindings support qualification of the next open epoch; they do not replace
 hardware, isolation, cancellation or budget qualification. Execution through the
 Platform additionally uses its existing private Docker allocation and independent
 host deadline. Publish an approved profile only after real operator qualification.

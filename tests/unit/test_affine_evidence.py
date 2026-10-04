@@ -34,8 +34,11 @@ class EvidenceCheck(unittest.TestCase):
         checkpoint = dict(id=sha(canonical(old)), files=old)
         successor = dict(id=sha(canonical(new)), files=new)
         source = dict(sha256=sha(b"source"), size=6, key="public/source.tar.gz")
+        sampling = dict(version="forced-inverse-cdf-replay-v1", generation="uncached-eager-inverse-cdf",
+                        verification="exact-token-replay", max_attempts=128, randomness=sha(b"epoch zero"))
         manifest = dict(epoch="nonpayable-fixture-0", checkpoint=checkpoint, source_bundle=source,
                         start=1, deadline=2, payable=False, transport_policy="direct-r2-v1", K=1, L=1,
+                        sampling_contract=sampling, sampling_source_hash=sha(b"sampling source"),
                         environments=[dict(env_id="math", indices=[1, 2], spec={"version": "v1"}, harness={})])
         rolls = [dict(env_id="math", index=1, classification=kind,
                       turns=[dict(prompt=[1], output=[number])])
@@ -56,7 +59,8 @@ class EvidenceCheck(unittest.TestCase):
         payloads = dict(manifest=manifest, scores=scores, audit=audit,
                         audit_challenge=dict(generated_after_freeze_at=3, receipts=receipts, seed="fixture"),
                         training=training, checkpoint_descriptor=successor,
-                        next_manifest=dict(manifest, epoch="nonpayable-fixture-1", start=4, checkpoint=successor))
+                        next_manifest=dict(manifest, epoch="nonpayable-fixture-1", start=4, checkpoint=successor,
+                                           sampling_contract=dict(sampling, randomness=sha(b"epoch one"))))
         bundle = dict(schema="affine-evidence-bundle/v1", authority=authority,
                       epoch_id=manifest["epoch"], miner_id=miner, submission_sha256=frozen_sha,
                       source_sha256=source["sha256"], env_id="math", requested_indices=[1],
@@ -116,6 +120,37 @@ class EvidenceCheck(unittest.TestCase):
                 self.assertTrue(checked["handover_verified"])
                 self.assertFalse(checked["qualified_successor"])
                 self.assertNotIn("next_bindings", checked)
+        legacy = copy.deepcopy(bundle)
+        for name in ("manifest", "next_manifest"):
+            legacy_payload = copy.deepcopy(payloads[name])
+            legacy_payload.pop("sampling_contract")
+            legacy_payload.pop("sampling_source_hash")
+            legacy["envelopes"][name] = envelope(legacy_payload)
+        self.assertTrue(verify_bundle(legacy, signed)["qualified_successor"])
+        for name in ("manifest", "next_manifest"):
+            for changed in ("missing_contract", "missing_source", "legacy", "source", "version", "generation",
+                            "verification", "max_attempts", "bool_attempts", "randomness", "extra_field"):
+                altered = copy.deepcopy(bundle)
+                payload = copy.deepcopy(payloads[name])
+                if changed in ("missing_contract", "legacy"):
+                    payload.pop("sampling_contract")
+                if changed in ("missing_source", "legacy"):
+                    payload.pop("sampling_source_hash")
+                if changed == "source":
+                    payload["sampling_source_hash"] = sha(b"changed sampler")
+                elif changed == "max_attempts":
+                    payload["sampling_contract"][changed] = 64
+                elif changed == "bool_attempts":
+                    payload["sampling_contract"]["max_attempts"] = True
+                elif changed in ("version", "generation", "verification", "randomness", "extra_field"):
+                    payload["sampling_contract"][changed] = "changed"
+                altered["envelopes"][name] = envelope(payload)
+                checked = verify_bundle(altered, signed)
+                with self.subTest(sampling=name, changed=changed):
+                    self.assertEqual(checked["stage"], "cycle_verified")
+                    self.assertTrue(checked["handover_verified"])
+                    self.assertFalse(checked["qualified_successor"])
+                    self.assertNotIn("next_bindings", checked)
         missing = copy.deepcopy(bundle)
         missing["envelopes"]["scores"] = envelope(dict(scores, receipts={}))
         missing["envelopes"]["audit_challenge"] = envelope(dict(payloads["audit_challenge"], receipts={}))
