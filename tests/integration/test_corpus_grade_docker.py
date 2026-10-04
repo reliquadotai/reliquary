@@ -141,3 +141,27 @@ def test_the_sweep_removes_orphaned_boxes_only():
         assert alive == [] and len(other) == 1
     finally:
         subprocess.run(["docker", "rm", "-f", *names], capture_output=True)
+
+
+async def test_a_max_turns_final_call_replays_into_the_recorded_diff():
+    """F1, the shape probed with a real verifiers max_turns=2 episode on this
+    host: the harness ran the final turn's call (no observation rendered) and
+    the recorded diff holds its file, so the replay runs it too."""
+    from reliquary.validator.corpus_grade_executor import run_grade_item
+
+    recorded = ("diff --git a/reliquary_probe_one.txt b/reliquary_probe_one.txt\n"
+                "new file mode 100644\nindex 0000000..3815b40\n--- /dev/null\n"
+                "+++ b/reliquary_probe_one.txt\n@@ -0,0 +1 @@\n+probe-one\n"
+                "diff --git a/reliquary_probe_two.txt b/reliquary_probe_two.txt\n"
+                "new file mode 100644\nindex 0000000..6d9bb00\n--- /dev/null\n"
+                "+++ b/reliquary_probe_two.txt\n@@ -0,0 +1 @@\n+probe-two\n")
+    first = {"tool": "bash", "arguments": '{"command": "echo probe-one > reliquary_probe_one.txt"}',
+             "observation": ""}
+    final = {"tool": "bash", "arguments": '{"command": "echo probe-two > reliquary_probe_two.txt"}',
+             "observation": None}
+    item = _item([first, final]).model_copy(update={"final_diff": recorded})
+    replayed = await run_grade_item(item)
+    assert replayed == {"status": "ok", "replay_diff_equal": True, "observations_compared": 1,
+                        "observations_mismatched": []}, replayed
+    without = await run_grade_item(_item([first]).model_copy(update={"final_diff": recorded}))
+    assert without["replay_diff_equal"] is False           # what dropping it did before F1

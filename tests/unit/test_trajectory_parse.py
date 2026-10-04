@@ -139,11 +139,15 @@ def test_context_length_final_calls_are_replayed_without_observations():
     assert parsed.actions[-1] == Action("bash", '{"command": "c0"}', None)
 
 
-def test_max_turns_final_calls_are_not_replayed():
+def test_max_turns_final_calls_are_replayed_without_observations():
+    # verifiers b2e4e81 checks max_turns before each model call only: the
+    # harness runs every call of the turn that reached the limit, and the diff
+    # it collects holds what they did (verified on sandbox-dev-01, F1).
     tokens, spans = build([([TEXT, CALL, TERM], ["a"]), ([TEXT, CALL, TERM], None)])
     parsed = parse_trajectory(R, prompt_ids=PROMPT, tokens=tokens, spans=spans,
                               stop="max_turns", max_turns=2)
-    assert len(parsed.actions) == 1
+    assert parsed.actions == (Action("bash", '{"command": "c0"}', "a"),
+                              Action("bash", '{"command": "c0"}', None))
 
 
 def test_a_capped_turn_is_followed_by_a_synthesized_terminator():
@@ -190,7 +194,7 @@ def test_max_turns_needs_the_jobs_turn_count():
     with pytest.raises(TrajectoryRefused, match="bad_stop"):   # fewer turns than the limit
         parse_trajectory(R, prompt_ids=PROMPT, tokens=tokens, spans=spans, stop="max_turns", max_turns=5)
     ok = parse_trajectory(R, prompt_ids=PROMPT, tokens=tokens, spans=spans, stop="max_turns", max_turns=2)
-    assert len(ok.actions) == 1
+    assert len(ok.actions) == 2 and ok.actions[-1].observation is None
 
 
 def test_spans_out_of_order_or_bounds_are_refused():

@@ -111,8 +111,8 @@ def parse_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
     if not spans:
         raise TrajectoryRefused(REASON_BAD_TURNS, {"turns": 0})
     if stop == "max_turns" and len(spans) != max_turns:
-        # Without the job's limit a miner could label any trajectory max_turns
-        # to keep its final call out of the replay.
+        # max_turns is what the harness reports after serving exactly the
+        # job's limit of turns; any other count is a mislabelled trajectory.
         raise TrajectoryRefused(REASON_BAD_STOP, {"stop": stop, "turns": len(spans), "max_turns": max_turns})
     _check_spans(renderer, tokens, spans, stop)
     full = list(prompt_ids) + list(tokens)
@@ -133,7 +133,12 @@ def parse_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
                 raise TrajectoryRefused(REASON_BAD_TURNS, {"trailing_tokens": len(tokens) - end})
             if stop == "agent_completed" and calls:
                 raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "calls": len(calls)})
-            if stop == "context_length":
+            if stop in ("context_length", "max_turns"):
+                # The harness ran these calls in the miner's box (verifiers
+                # b2e4e81 checks its limits before each model call only, so
+                # the turn that reached max_turns has its calls executed) and
+                # the recorded diff holds what they did, but no observation
+                # was rendered: replayed, never compared.
                 actions += [Action(name, arguments, None) for name, arguments in calls]
             turns.append(ParsedTurn(calls, ()))
             continue

@@ -57,8 +57,8 @@ _PATH_LINE = re.compile(r"(?:\.{1,2}/|/)?[\w.@+-]+(?:/[\w.@+-]+)+/?(?:[:-].*)?")
 class Action:
     tool: str
     arguments: str
-    # None: executed in the box but never answered in the tokens (a final
-    # turn cut by context_length), so replayed and not compared.
+    # None: executed in the box but never answered in the tokens (the final
+    # turn of a context_length or max_turns stop), so replayed and not compared.
     observation: str | None
 
 

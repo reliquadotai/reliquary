@@ -151,6 +151,36 @@ def test_replay_mode_reports_mismatches_and_a_different_diff():
                       "observations_mismatched": [0]}
 
 
+def test_an_honest_max_turns_episode_whose_last_turn_writes_replays_to_its_diff():
+    """F1: verifiers runs the calls of the turn that reached max_turns (the
+    limit is checked before the next model call only), so the recorded diff
+    holds what they wrote; the replay must run them too."""
+    from reliquary.corpus.trajectory_parse import parse_trajectory
+    from tests.unit.test_trajectory_parse import CALL, PROMPT, TERM, TEXT, R, build
+
+    def harness(commands):
+        return "".join(f"+{command}\n" for command in commands)   # each call writes one line
+
+    turns = [([TEXT, CALL, TERM], ["a"]), ([TEXT, CALL, CALL, TERM], None)]
+    tokens, spans = build(turns)
+    served = [json.loads(arguments)["command"] for completion, _ in turns
+              for arguments in [a for _, a in R.tool_calls(completion)]]
+    recorded_diff = harness(served)                                  # the miner's box ran all three
+    parsed = parse_trajectory(R, prompt_ids=PROMPT, tokens=tokens, spans=spans,
+                              stop="max_turns", max_turns=2)
+
+    async def box(task, actions):
+        return ["a" if a.observation is not None else "" for a in actions], \
+            harness(json.loads(a.arguments)["command"] for a in actions)
+
+    item = _item("replay", final_diff=recorded_diff, actions=[
+        {"tool": a.tool, "arguments": a.arguments, "observation": a.observation}
+        for a in parsed.actions])
+    result = asyncio.run(run_grade_item(item, task_for=str, replay=box))
+    assert result == {"status": "ok", "replay_diff_equal": True, "observations_compared": 1,
+                      "observations_mismatched": []}
+
+
 def test_a_replay_past_its_deadline_is_a_timeout_and_a_crash_is_an_error():
     async def slow(task, actions):
         raise ReplayTimeout("replay exceeded 3600 s after 2 of 9 actions")

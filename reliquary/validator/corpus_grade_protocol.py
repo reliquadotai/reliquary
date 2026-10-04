@@ -39,7 +39,7 @@ class GradeClaimRequest(_Strict):
 class GradeAction(_Strict):
     tool: str = Field(max_length=MAX_TOOL_NAME_CHARS)
     arguments: str = Field(max_length=MAX_ARGUMENT_CHARS)
-    # None: replayed and not compared (a final turn cut by context_length).
+    # None: replayed and not compared (the final turn of a context_length or max_turns stop).
     observation: str | None = Field(default=None, max_length=MAX_OBSERVATION_CHARS)
 
 
