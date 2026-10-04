@@ -1,0 +1,3096 @@
+{
+ "measurement": "TOPLOC per-span audit bands of Qwen/Qwen3.8-27B under flash_attention_2 vs sdpa",
+ "date": "2026-10-04",
+ "script": "scripts/agentic_attention_bands.py",
+ "gpu": "NVIDIA H100 80GB HBM3",
+ "thresholds": {
+  "exp": 60,
+  "mant_mean": 40.0,
+  "mant_median": 40.0
+ },
+ "proof": {
+  "chunk_tokens": 32,
+  "topk": 128,
+  "min_chunk_tokens": 8
+ },
+ "data": {
+  "smoke": "/opt/smoke.json (Task 14 smoke: 8 real SWE-smith episodes, 12 turns each, 7,953-14,144 tokens, proofs from the miner's span builder, vLLM 0.30, prefix cache on); production path span_hidden_states + trajectory_chunk_scores + trajectory_outcome",
+  "m1": "/opt/m1-27b.json + /opt/m1-27b-off.json (gate M1: 64 synthetic trajectories x 6 turns, cache on/off, proofs from build_chunk_proofs); gate path verify_chunk_proofs per span + sequence_verdict; 'judged_spans' = spans >= 8 tokens, the ones production judges"
+ },
+ "configs": {
+  "vllm-venv-sdpa": "the stack M1 and the e2e measured with: /opt/vllm/venv, torch 2.13 cu130, transformers 5.18.0, no flash_attn, no fla, no causal_conv1d (GatedDeltaNet on the torch reference path)",
+  "prod-stack-sdpa": "fresh /opt/fa2-venv with the validator image's stack (root Dockerfile): python 3.12, torch 2.7.0+cu128, flash_attn 2.8.3, flash-linear-attention 0.5.0, causal_conv1d 1.5.2, transformers 5.10.4 (pyproject pin); attention sdpa",
+  "prod-stack-fa2": "same venv, attention flash_attention_2 = what production runs (GRAIL_ATTN_IMPL default)"
+ },
+ "versions": {
+  "vllm-sdpa": {
+   "python": "3.12.3",
+   "torch": "2.13.0+cu130",
+   "transformers": "5.18.0",
+   "flash_attn": "absent (ModuleNotFoundError)",
+   "fla": "absent (ModuleNotFoundError)",
+   "causal_conv1d": "absent (ModuleNotFoundError)",
+   "triton": "3.7.1"
+  },
+  "prod-sdpa": {
+   "python": "3.12.3",
+   "torch": "2.7.0+cu128",
+   "transformers": "5.10.4",
+   "flash_attn": "2.8.3",
+   "fla": "0.5.0",
+   "causal_conv1d": "1.5.2",
+   "triton": "3.3.0"
+  },
+  "prod-fa2": {
+   "python": "3.12.3",
+   "torch": "2.7.0+cu128",
+   "transformers": "5.10.4",
+   "flash_attn": "2.8.3",
+   "fla": "0.5.0",
+   "causal_conv1d": "1.5.2",
+   "triton": "3.3.0"
+  }
+ },
+ "summary": [
+  {
+   "file": "vllm-sdpa.json",
+   "label": "vllm-venv-sdpa",
+   "attn": "sdpa",
+   "versions": {
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.18.0",
+    "flash_attn": "absent (ModuleNotFoundError)",
+    "fla": "absent (ModuleNotFoundError)",
+    "causal_conv1d": "absent (ModuleNotFoundError)",
+    "triton": "3.7.1"
+   },
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "thresholds": {
+    "exp": 60,
+    "mant_mean": 40.0,
+    "mant_median": 40.0
+   },
+   "smoke": {
+    "miner_vllm_proofs": {
+     "trajectories": 8,
+     "trajectories_passed": 8,
+     "spans": 96,
+     "chunks": 1173,
+     "exp": {
+      "n": 1173,
+      "mean": 3.386,
+      "p50": 3,
+      "p99": 16,
+      "max": 20
+     },
+     "mant_mean": {
+      "n": 1173,
+      "mean": 1.28,
+      "p50": 1.0078125,
+      "p99": 4.380165289256198,
+      "max": 5.594594594594595
+     },
+     "mant_median": {
+      "n": 1173,
+      "mean": 1.033,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 4.0
+     },
+     "chunks_over_threshold": 0
+    }
+   },
+   "m1": {
+    "miner_vllm_proofs": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 384,
+     "chunks": 2759,
+     "exp": {
+      "n": 2759,
+      "mean": 3.221,
+      "p50": 2,
+      "p99": 17,
+      "max": 60
+     },
+     "mant_mean": {
+      "n": 2759,
+      "mean": 1.221,
+      "p50": 0.8492063492063492,
+      "p99": 5.422018348623853,
+      "max": 18.63235294117647
+     },
+     "mant_median": {
+      "n": 2759,
+      "mean": 1.042,
+      "p50": 1.0,
+      "p99": 3.0,
+      "max": 14.0
+     },
+     "chunks_over_threshold": 0
+    },
+    "miner_vllm_proofs_judged_spans": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 240,
+     "chunks": 2615,
+     "exp": {
+      "n": 2615,
+      "mean": 2.907,
+      "p50": 2,
+      "p99": 13,
+      "max": 25
+     },
+     "mant_mean": {
+      "n": 2615,
+      "mean": 1.104,
+      "p50": 0.824,
+      "p99": 4.35042735042735,
+      "max": 11.701923076923077
+     },
+     "mant_median": {
+      "n": 2615,
+      "mean": 0.963,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 6.0
+     },
+     "chunks_over_threshold": 0
+    }
+   }
+  },
+  {
+   "file": "prod-sdpa.json",
+   "label": "prod-stack-sdpa",
+   "attn": "sdpa",
+   "versions": {
+    "python": "3.12.3",
+    "torch": "2.7.0+cu128",
+    "transformers": "5.10.4",
+    "flash_attn": "2.8.3",
+    "fla": "0.5.0",
+    "causal_conv1d": "1.5.2",
+    "triton": "3.3.0"
+   },
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "thresholds": {
+    "exp": 60,
+    "mant_mean": 40.0,
+    "mant_median": 40.0
+   },
+   "smoke": {
+    "miner_vllm_proofs": {
+     "trajectories": 8,
+     "trajectories_passed": 8,
+     "spans": 96,
+     "chunks": 1173,
+     "exp": {
+      "n": 1173,
+      "mean": 3.344,
+      "p50": 3,
+      "p99": 15,
+      "max": 21
+     },
+     "mant_mean": {
+      "n": 1173,
+      "mean": 1.281,
+      "p50": 1.0,
+      "p99": 4.3,
+      "max": 6.486238532110092
+     },
+     "mant_median": {
+      "n": 1173,
+      "mean": 1.045,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 4.0
+     },
+     "chunks_over_threshold": 0
+    }
+   },
+   "m1": {
+    "miner_vllm_proofs": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 384,
+     "chunks": 2759,
+     "exp": {
+      "n": 2759,
+      "mean": 3.241,
+      "p50": 2,
+      "p99": 17,
+      "max": 64
+     },
+     "mant_mean": {
+      "n": 2759,
+      "mean": 1.213,
+      "p50": 0.856,
+      "p99": 5.58252427184466,
+      "max": 19.421875
+     },
+     "mant_median": {
+      "n": 2759,
+      "mean": 1.041,
+      "p50": 1.0,
+      "p99": 3.0,
+      "max": 16.0
+     },
+     "chunks_over_threshold": 2
+    },
+    "miner_vllm_proofs_judged_spans": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 240,
+     "chunks": 2615,
+     "exp": {
+      "n": 2615,
+      "mean": 2.943,
+      "p50": 2,
+      "p99": 14,
+      "max": 28
+     },
+     "mant_mean": {
+      "n": 2615,
+      "mean": 1.108,
+      "p50": 0.8267716535433071,
+      "p99": 4.474137931034483,
+      "max": 11.036363636363637
+     },
+     "mant_median": {
+      "n": 2615,
+      "mean": 0.966,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 7.0
+     },
+     "chunks_over_threshold": 0
+    }
+   }
+  },
+  {
+   "file": "prod-fa2.json",
+   "label": "prod-stack-fa2",
+   "attn": "flash_attention_2",
+   "versions": {
+    "python": "3.12.3",
+    "torch": "2.7.0+cu128",
+    "transformers": "5.10.4",
+    "flash_attn": "2.8.3",
+    "fla": "0.5.0",
+    "causal_conv1d": "1.5.2",
+    "triton": "3.3.0"
+   },
+   "gpu": "NVIDIA H100 80GB HBM3",
+   "thresholds": {
+    "exp": 60,
+    "mant_mean": 40.0,
+    "mant_median": 40.0
+   },
+   "smoke": {
+    "miner_vllm_proofs": {
+     "trajectories": 8,
+     "trajectories_passed": 8,
+     "spans": 96,
+     "chunks": 1173,
+     "exp": {
+      "n": 1173,
+      "mean": 3.354,
+      "p50": 3,
+      "p99": 15,
+      "max": 25
+     },
+     "mant_mean": {
+      "n": 1173,
+      "mean": 1.276,
+      "p50": 1.0,
+      "p99": 4.313559322033898,
+      "max": 5.80672268907563
+     },
+     "mant_median": {
+      "n": 1173,
+      "mean": 1.035,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 4.0
+     },
+     "chunks_over_threshold": 0
+    },
+    "cross_validator_proofs": {
+     "trajectories": 8,
+     "trajectories_passed": 8,
+     "spans": 96,
+     "chunks": 1173,
+     "exp": {
+      "n": 1173,
+      "mean": 2.728,
+      "p50": 2,
+      "p99": 11,
+      "max": 19
+     },
+     "mant_mean": {
+      "n": 1173,
+      "mean": 1.096,
+      "p50": 0.889763779527559,
+      "p99": 3.3306451612903225,
+      "max": 5.0
+     },
+     "mant_median": {
+      "n": 1173,
+      "mean": 0.935,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 3.0
+     },
+     "chunks_over_threshold": 0
+    }
+   },
+   "m1": {
+    "miner_vllm_proofs": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 384,
+     "chunks": 2759,
+     "exp": {
+      "n": 2759,
+      "mean": 3.236,
+      "p50": 2,
+      "p99": 16,
+      "max": 60
+     },
+     "mant_mean": {
+      "n": 2759,
+      "mean": 1.201,
+      "p50": 0.856,
+      "p99": 5.163636363636364,
+      "max": 18.720588235294116
+     },
+     "mant_median": {
+      "n": 2759,
+      "mean": 1.027,
+      "p50": 1.0,
+      "p99": 4.0,
+      "max": 15.0
+     },
+     "chunks_over_threshold": 0
+    },
+    "miner_vllm_proofs_judged_spans": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 240,
+     "chunks": 2615,
+     "exp": {
+      "n": 2615,
+      "mean": 2.937,
+      "p50": 2,
+      "p99": 13,
+      "max": 28
+     },
+     "mant_mean": {
+      "n": 2615,
+      "mean": 1.092,
+      "p50": 0.8267716535433071,
+      "p99": 4.3304347826086955,
+      "max": 11.132743362831858
+     },
+     "mant_median": {
+      "n": 2615,
+      "mean": 0.951,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 7.0
+     },
+     "chunks_over_threshold": 0
+    },
+    "cross_validator_proofs": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 384,
+     "chunks": 2759,
+     "exp": {
+      "n": 2759,
+      "mean": 2.554,
+      "p50": 2,
+      "p99": 12,
+      "max": 26
+     },
+     "mant_mean": {
+      "n": 2759,
+      "mean": 1.01,
+      "p50": 0.7804878048780488,
+      "p99": 4.0256410256410255,
+      "max": 8.441176470588236
+     },
+     "mant_median": {
+      "n": 2759,
+      "mean": 0.843,
+      "p50": 1.0,
+      "p99": 3.0,
+      "max": 7.0
+     },
+     "chunks_over_threshold": 0
+    },
+    "cross_validator_proofs_judged_spans": {
+     "trajectories": 64,
+     "trajectories_passed": 64,
+     "spans": 240,
+     "chunks": 2615,
+     "exp": {
+      "n": 2615,
+      "mean": 2.364,
+      "p50": 2,
+      "p99": 10,
+      "max": 19
+     },
+     "mant_mean": {
+      "n": 2615,
+      "mean": 0.932,
+      "p50": 0.7619047619047619,
+      "p99": 3.360655737704918,
+      "max": 5.893805309734513
+     },
+     "mant_median": {
+      "n": 2615,
+      "mean": 0.79,
+      "p50": 1.0,
+      "p99": 2.0,
+      "max": 4.0
+     },
+     "chunks_over_threshold": 0
+    }
+   }
+  }
+ ],
+ "paired_per_chunk": {
+  "smoke": {
+   "chunks": 1173,
+   "fa2_minus_sdpa_exp_mean": 0.01,
+   "fa2_vs_sdpa_exp_mean_abs": 1.049,
+   "fa2_minus_sdpa_exp_range": [
+    -12,
+    8
+   ],
+   "fa2_minus_sdpa_mant_mean_mean": -0.005,
+   "prod_stack_vs_vllm_venv_sdpa_exp_mean_abs": 1.136
+  },
+  "m1": {
+   "chunks": 2759,
+   "fa2_minus_sdpa_exp_mean": -0.004,
+   "fa2_vs_sdpa_exp_mean_abs": 1.088,
+   "fa2_minus_sdpa_exp_range": [
+    -15,
+    22
+   ],
+   "fa2_minus_sdpa_mant_mean_mean": -0.012,
+   "prod_stack_vs_vllm_venv_sdpa_exp_mean_abs": 1.182
+  }
+ },
+ "cross_check": "prod-stack-fa2 'miner_vllm_proofs' = proofs made by the miner's vLLM verified by the validator under FA2; 'cross_validator_proofs' = proofs built from the validator's own sdpa activations (prod stack) verified under FA2",
+ "per_trajectory": {
+  "vllm-sdpa": {
+   "smoke:0": {
+    "passed": true,
+    "tokens": 9641,
+    "spans": 12,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.595,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.595
+   },
+   "smoke:1": {
+    "passed": true,
+    "tokens": 8796,
+    "spans": 12,
+    "worst_exp": 19,
+    "worst_mant_mean": 4.339,
+    "worst_exp_judged": 19,
+    "worst_mant_mean_judged": 4.339
+   },
+   "smoke:2": {
+    "passed": true,
+    "tokens": 8215,
+    "spans": 12,
+    "worst_exp": 18,
+    "worst_mant_mean": 5.545,
+    "worst_exp_judged": 18,
+    "worst_mant_mean_judged": 5.545
+   },
+   "smoke:3": {
+    "passed": true,
+    "tokens": 7953,
+    "spans": 12,
+    "worst_exp": 18,
+    "worst_mant_mean": 5.308,
+    "worst_exp_judged": 18,
+    "worst_mant_mean_judged": 5.308
+   },
+   "smoke:4": {
+    "passed": true,
+    "tokens": 10970,
+    "spans": 12,
+    "worst_exp": 13,
+    "worst_mant_mean": 4.231,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 4.231
+   },
+   "smoke:5": {
+    "passed": true,
+    "tokens": 10777,
+    "spans": 12,
+    "worst_exp": 13,
+    "worst_mant_mean": 4.366,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 4.366
+   },
+   "smoke:6": {
+    "passed": true,
+    "tokens": 11569,
+    "spans": 12,
+    "worst_exp": 20,
+    "worst_mant_mean": 5.287,
+    "worst_exp_judged": 20,
+    "worst_mant_mean_judged": 5.287
+   },
+   "smoke:7": {
+    "passed": true,
+    "tokens": 14144,
+    "spans": 12,
+    "worst_exp": 20,
+    "worst_mant_mean": 5.595,
+    "worst_exp_judged": 20,
+    "worst_mant_mean_judged": 5.595
+   },
+   "m1-27b.json:0": {
+    "passed": true,
+    "tokens": 768,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 6.492,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 3.376
+   },
+   "m1-27b.json:1": {
+    "passed": true,
+    "tokens": 1119,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 1.784,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.131
+   },
+   "m1-27b.json:2": {
+    "passed": true,
+    "tokens": 1425,
+    "spans": 6,
+    "worst_exp": 4,
+    "worst_mant_mean": 1.202,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.202
+   },
+   "m1-27b.json:3": {
+    "passed": true,
+    "tokens": 888,
+    "spans": 6,
+    "worst_exp": 40,
+    "worst_mant_mean": 12.068,
+    "worst_exp_judged": 24,
+    "worst_mant_mean_judged": 11.702
+   },
+   "m1-27b.json:4": {
+    "passed": true,
+    "tokens": 873,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 3.724,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 3.607
+   },
+   "m1-27b.json:5": {
+    "passed": true,
+    "tokens": 2080,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 2.056,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 2.056
+   },
+   "m1-27b.json:6": {
+    "passed": true,
+    "tokens": 1205,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.116,
+    "worst_exp_judged": 3,
+    "worst_mant_mean_judged": 1.31
+   },
+   "m1-27b.json:7": {
+    "passed": true,
+    "tokens": 1217,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 4.465,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 4.465
+   },
+   "m1-27b.json:8": {
+    "passed": true,
+    "tokens": 587,
+    "spans": 6,
+    "worst_exp": 19,
+    "worst_mant_mean": 4.295,
+    "worst_exp_judged": 19,
+    "worst_mant_mean_judged": 4.295
+   },
+   "m1-27b.json:9": {
+    "passed": true,
+    "tokens": 802,
+    "spans": 6,
+    "worst_exp": 15,
+    "worst_mant_mean": 4.0,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.252
+   },
+   "m1-27b.json:10": {
+    "passed": true,
+    "tokens": 790,
+    "spans": 6,
+    "worst_exp": 23,
+    "worst_mant_mean": 7.838,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.661
+   },
+   "m1-27b.json:11": {
+    "passed": true,
+    "tokens": 1244,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 2.117,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.355
+   },
+   "m1-27b.json:12": {
+    "passed": true,
+    "tokens": 1336,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 5.059,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 5.059
+   },
+   "m1-27b.json:13": {
+    "passed": true,
+    "tokens": 935,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 2.276,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.27
+   },
+   "m1-27b.json:14": {
+    "passed": true,
+    "tokens": 2201,
+    "spans": 6,
+    "worst_exp": 5,
+    "worst_mant_mean": 2.12,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.095
+   },
+   "m1-27b.json:15": {
+    "passed": true,
+    "tokens": 1096,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 2.669,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 2.317
+   },
+   "m1-27b.json:16": {
+    "passed": true,
+    "tokens": 2838,
+    "spans": 6,
+    "worst_exp": 18,
+    "worst_mant_mean": 6.336,
+    "worst_exp_judged": 18,
+    "worst_mant_mean_judged": 6.336
+   },
+   "m1-27b.json:17": {
+    "passed": true,
+    "tokens": 957,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 3.888,
+    "worst_exp_judged": 12,
+    "worst_mant_mean_judged": 3.888
+   },
+   "m1-27b.json:18": {
+    "passed": true,
+    "tokens": 662,
+    "spans": 6,
+    "worst_exp": 60,
+    "worst_mant_mean": 18.632,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.288
+   },
+   "m1-27b.json:19": {
+    "passed": true,
+    "tokens": 926,
+    "spans": 6,
+    "worst_exp": 29,
+    "worst_mant_mean": 11.283,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.323
+   },
+   "m1-27b.json:20": {
+    "passed": true,
+    "tokens": 1563,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 4.075,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 4.075
+   },
+   "m1-27b.json:21": {
+    "passed": true,
+    "tokens": 741,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 3.115,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.904
+   },
+   "m1-27b.json:22": {
+    "passed": true,
+    "tokens": 2392,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 1.752,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.752
+   },
+   "m1-27b.json:23": {
+    "passed": true,
+    "tokens": 352,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 3.924,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 0.944
+   },
+   "m1-27b.json:24": {
+    "passed": true,
+    "tokens": 994,
+    "spans": 6,
+    "worst_exp": 19,
+    "worst_mant_mean": 4.815,
+    "worst_exp_judged": 19,
+    "worst_mant_mean_judged": 4.815
+   },
+   "m1-27b.json:25": {
+    "passed": true,
+    "tokens": 1159,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 1.813,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.3
+   },
+   "m1-27b.json:26": {
+    "passed": true,
+    "tokens": 3128,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 5.229,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 5.229
+   },
+   "m1-27b.json:27": {
+    "passed": true,
+    "tokens": 725,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 5.215,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.693
+   },
+   "m1-27b.json:28": {
+    "passed": true,
+    "tokens": 659,
+    "spans": 6,
+    "worst_exp": 38,
+    "worst_mant_mean": 9.443,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 2.624
+   },
+   "m1-27b.json:29": {
+    "passed": true,
+    "tokens": 1729,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 4.356,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 4.356
+   },
+   "m1-27b.json:30": {
+    "passed": true,
+    "tokens": 2158,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 2.785,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.19
+   },
+   "m1-27b.json:31": {
+    "passed": true,
+    "tokens": 1633,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 3.0,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 3.0
+   },
+   "m1-27b-off.json:0": {
+    "passed": true,
+    "tokens": 741,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 3.376,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 3.376
+   },
+   "m1-27b-off.json:1": {
+    "passed": true,
+    "tokens": 1042,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 2.226,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.158
+   },
+   "m1-27b-off.json:2": {
+    "passed": true,
+    "tokens": 3201,
+    "spans": 6,
+    "worst_exp": 24,
+    "worst_mant_mean": 7.231,
+    "worst_exp_judged": 24,
+    "worst_mant_mean_judged": 7.231
+   },
+   "m1-27b-off.json:3": {
+    "passed": true,
+    "tokens": 932,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.271,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.271
+   },
+   "m1-27b-off.json:4": {
+    "passed": true,
+    "tokens": 1638,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 4.746,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 4.193
+   },
+   "m1-27b-off.json:5": {
+    "passed": true,
+    "tokens": 2717,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 1.536,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.536
+   },
+   "m1-27b-off.json:6": {
+    "passed": true,
+    "tokens": 1490,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 2.21,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.549
+   },
+   "m1-27b-off.json:7": {
+    "passed": true,
+    "tokens": 1535,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.402,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.402
+   },
+   "m1-27b-off.json:8": {
+    "passed": true,
+    "tokens": 588,
+    "spans": 6,
+    "worst_exp": 16,
+    "worst_mant_mean": 4.043,
+    "worst_exp_judged": 16,
+    "worst_mant_mean_judged": 4.043
+   },
+   "m1-27b-off.json:9": {
+    "passed": true,
+    "tokens": 1168,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 3.648,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.872
+   },
+   "m1-27b-off.json:10": {
+    "passed": true,
+    "tokens": 1033,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 4.949,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.127
+   },
+   "m1-27b-off.json:11": {
+    "passed": true,
+    "tokens": 2862,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 1.296,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.296
+   },
+   "m1-27b-off.json:12": {
+    "passed": true,
+    "tokens": 3201,
+    "spans": 6,
+    "worst_exp": 25,
+    "worst_mant_mean": 7.0,
+    "worst_exp_judged": 25,
+    "worst_mant_mean_judged": 7.0
+   },
+   "m1-27b-off.json:13": {
+    "passed": true,
+    "tokens": 2999,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 4.56,
+    "worst_exp_judged": 12,
+    "worst_mant_mean_judged": 4.56
+   },
+   "m1-27b-off.json:14": {
+    "passed": true,
+    "tokens": 1508,
+    "spans": 6,
+    "worst_exp": 5,
+    "worst_mant_mean": 3.04,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.294
+   },
+   "m1-27b-off.json:15": {
+    "passed": true,
+    "tokens": 1102,
+    "spans": 6,
+    "worst_exp": 15,
+    "worst_mant_mean": 6.752,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 1.731
+   },
+   "m1-27b-off.json:16": {
+    "passed": true,
+    "tokens": 1251,
+    "spans": 6,
+    "worst_exp": 19,
+    "worst_mant_mean": 4.615,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 4.35
+   },
+   "m1-27b-off.json:17": {
+    "passed": true,
+    "tokens": 994,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 4.863,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 4.863
+   },
+   "m1-27b-off.json:18": {
+    "passed": true,
+    "tokens": 662,
+    "spans": 6,
+    "worst_exp": 60,
+    "worst_mant_mean": 18.632,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.288
+   },
+   "m1-27b-off.json:19": {
+    "passed": true,
+    "tokens": 3165,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 1.867,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.867
+   },
+   "m1-27b-off.json:20": {
+    "passed": true,
+    "tokens": 970,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 3.795,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 3.795
+   },
+   "m1-27b-off.json:21": {
+    "passed": true,
+    "tokens": 785,
+    "spans": 6,
+    "worst_exp": 28,
+    "worst_mant_mean": 8.14,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 1.904
+   },
+   "m1-27b-off.json:22": {
+    "passed": true,
+    "tokens": 2523,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 3.848,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.752
+   },
+   "m1-27b-off.json:23": {
+    "passed": true,
+    "tokens": 356,
+    "spans": 6,
+    "worst_exp": 5,
+    "worst_mant_mean": 1.694,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 0.944
+   },
+   "m1-27b-off.json:24": {
+    "passed": true,
+    "tokens": 860,
+    "spans": 6,
+    "worst_exp": 19,
+    "worst_mant_mean": 6.439,
+    "worst_exp_judged": 19,
+    "worst_mant_mean_judged": 6.439
+   },
+   "m1-27b-off.json:25": {
+    "passed": true,
+    "tokens": 847,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.355,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.369
+   },
+   "m1-27b-off.json:26": {
+    "passed": true,
+    "tokens": 1821,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 4.0,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 4.0
+   },
+   "m1-27b-off.json:27": {
+    "passed": true,
+    "tokens": 729,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 3.719,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.57
+   },
+   "m1-27b-off.json:28": {
+    "passed": true,
+    "tokens": 659,
+    "spans": 6,
+    "worst_exp": 38,
+    "worst_mant_mean": 9.443,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 2.624
+   },
+   "m1-27b-off.json:29": {
+    "passed": true,
+    "tokens": 3163,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 2.617,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 2.617
+   },
+   "m1-27b-off.json:30": {
+    "passed": true,
+    "tokens": 2040,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 2.492,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 2.211
+   },
+   "m1-27b-off.json:31": {
+    "passed": true,
+    "tokens": 654,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 4.1,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.702
+   }
+  },
+  "prod-sdpa": {
+   "smoke:0": {
+    "passed": true,
+    "tokens": 9641,
+    "spans": 12,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.348,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.348
+   },
+   "smoke:1": {
+    "passed": true,
+    "tokens": 8796,
+    "spans": 12,
+    "worst_exp": 15,
+    "worst_mant_mean": 4.912,
+    "worst_exp_judged": 15,
+    "worst_mant_mean_judged": 4.912
+   },
+   "smoke:2": {
+    "passed": true,
+    "tokens": 8215,
+    "spans": 12,
+    "worst_exp": 13,
+    "worst_mant_mean": 4.296,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 4.296
+   },
+   "smoke:3": {
+    "passed": true,
+    "tokens": 7953,
+    "spans": 12,
+    "worst_exp": 19,
+    "worst_mant_mean": 5.603,
+    "worst_exp_judged": 19,
+    "worst_mant_mean_judged": 5.603
+   },
+   "smoke:4": {
+    "passed": true,
+    "tokens": 10970,
+    "spans": 12,
+    "worst_exp": 12,
+    "worst_mant_mean": 4.467,
+    "worst_exp_judged": 12,
+    "worst_mant_mean_judged": 4.467
+   },
+   "smoke:5": {
+    "passed": true,
+    "tokens": 10777,
+    "spans": 12,
+    "worst_exp": 15,
+    "worst_mant_mean": 6.274,
+    "worst_exp_judged": 15,
+    "worst_mant_mean_judged": 6.274
+   },
+   "smoke:6": {
+    "passed": true,
+    "tokens": 11569,
+    "spans": 12,
+    "worst_exp": 21,
+    "worst_mant_mean": 5.282,
+    "worst_exp_judged": 21,
+    "worst_mant_mean_judged": 5.282
+   },
+   "smoke:7": {
+    "passed": true,
+    "tokens": 14144,
+    "spans": 12,
+    "worst_exp": 21,
+    "worst_mant_mean": 6.486,
+    "worst_exp_judged": 21,
+    "worst_mant_mean_judged": 6.486
+   },
+   "m1-27b.json:0": {
+    "passed": true,
+    "tokens": 768,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 6.319,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 3.688
+   },
+   "m1-27b.json:1": {
+    "passed": true,
+    "tokens": 1119,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 2.323,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.524
+   },
+   "m1-27b.json:2": {
+    "passed": true,
+    "tokens": 1425,
+    "spans": 6,
+    "worst_exp": 4,
+    "worst_mant_mean": 0.927,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 0.927
+   },
+   "m1-27b.json:3": {
+    "passed": true,
+    "tokens": 888,
+    "spans": 6,
+    "worst_exp": 25,
+    "worst_mant_mean": 7.779,
+    "worst_exp_judged": 24,
+    "worst_mant_mean_judged": 7.779
+   },
+   "m1-27b.json:4": {
+    "passed": true,
+    "tokens": 873,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 3.615,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 2.472
+   },
+   "m1-27b.json:5": {
+    "passed": true,
+    "tokens": 2080,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 1.483,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 1.483
+   },
+   "m1-27b.json:6": {
+    "passed": true,
+    "tokens": 1205,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 2.424,
+    "worst_exp_judged": 3,
+    "worst_mant_mean_judged": 1.102
+   },
+   "m1-27b.json:7": {
+    "passed": true,
+    "tokens": 1217,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 4.675,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 4.675
+   },
+   "m1-27b.json:8": {
+    "passed": true,
+    "tokens": 587,
+    "spans": 6,
+    "worst_exp": 23,
+    "worst_mant_mean": 5.657,
+    "worst_exp_judged": 23,
+    "worst_mant_mean_judged": 5.657
+   },
+   "m1-27b.json:9": {
+    "passed": true,
+    "tokens": 802,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.126,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.246
+   },
+   "m1-27b.json:10": {
+    "passed": true,
+    "tokens": 790,
+    "spans": 6,
+    "worst_exp": 26,
+    "worst_mant_mean": 7.373,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.145
+   },
+   "m1-27b.json:11": {
+    "passed": true,
+    "tokens": 1244,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 1.992,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 1.992
+   },
+   "m1-27b.json:12": {
+    "passed": true,
+    "tokens": 1336,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 3.653,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 3.653
+   },
+   "m1-27b.json:13": {
+    "passed": true,
+    "tokens": 935,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 1.862,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.153
+   },
+   "m1-27b.json:14": {
+    "passed": true,
+    "tokens": 2201,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 2.384,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.352
+   },
+   "m1-27b.json:15": {
+    "passed": true,
+    "tokens": 1096,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 3.144,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 3.144
+   },
+   "m1-27b.json:16": {
+    "passed": true,
+    "tokens": 2838,
+    "spans": 6,
+    "worst_exp": 19,
+    "worst_mant_mean": 7.0,
+    "worst_exp_judged": 19,
+    "worst_mant_mean_judged": 7.0
+   },
+   "m1-27b.json:17": {
+    "passed": true,
+    "tokens": 957,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 4.157,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 4.157
+   },
+   "m1-27b.json:18": {
+    "passed": true,
+    "tokens": 662,
+    "spans": 6,
+    "worst_exp": 64,
+    "worst_mant_mean": 19.422,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.016
+   },
+   "m1-27b.json:19": {
+    "passed": true,
+    "tokens": 926,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 3.382,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.024
+   },
+   "m1-27b.json:20": {
+    "passed": true,
+    "tokens": 1563,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 3.786,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 3.786
+   },
+   "m1-27b.json:21": {
+    "passed": true,
+    "tokens": 741,
+    "spans": 6,
+    "worst_exp": 18,
+    "worst_mant_mean": 5.209,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 2.659
+   },
+   "m1-27b.json:22": {
+    "passed": true,
+    "tokens": 2392,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 1.915,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 1.915
+   },
+   "m1-27b.json:23": {
+    "passed": true,
+    "tokens": 352,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 2.767,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 0.968
+   },
+   "m1-27b.json:24": {
+    "passed": true,
+    "tokens": 994,
+    "spans": 6,
+    "worst_exp": 28,
+    "worst_mant_mean": 6.791,
+    "worst_exp_judged": 28,
+    "worst_mant_mean_judged": 6.791
+   },
+   "m1-27b.json:25": {
+    "passed": true,
+    "tokens": 1159,
+    "spans": 6,
+    "worst_exp": 5,
+    "worst_mant_mean": 2.427,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 2.427
+   },
+   "m1-27b.json:26": {
+    "passed": true,
+    "tokens": 3128,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 5.033,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 5.033
+   },
+   "m1-27b.json:27": {
+    "passed": true,
+    "tokens": 725,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 3.667,
+    "worst_exp_judged": 3,
+    "worst_mant_mean_judged": 1.151
+   },
+   "m1-27b.json:28": {
+    "passed": true,
+    "tokens": 659,
+    "spans": 6,
+    "worst_exp": 28,
+    "worst_mant_mean": 6.39,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 2.685
+   },
+   "m1-27b.json:29": {
+    "passed": true,
+    "tokens": 1729,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 2.158,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 2.158
+   },
+   "m1-27b.json:30": {
+    "passed": true,
+    "tokens": 2158,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 2.455,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.516
+   },
+   "m1-27b.json:31": {
+    "passed": true,
+    "tokens": 1633,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 2.983,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 2.983
+   },
+   "m1-27b-off.json:0": {
+    "passed": true,
+    "tokens": 741,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 3.688,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 3.688
+   },
+   "m1-27b-off.json:1": {
+    "passed": true,
+    "tokens": 1042,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 2.504,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.287
+   },
+   "m1-27b-off.json:2": {
+    "passed": true,
+    "tokens": 3201,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 7.279,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 7.279
+   },
+   "m1-27b-off.json:3": {
+    "passed": true,
+    "tokens": 932,
+    "spans": 6,
+    "worst_exp": 15,
+    "worst_mant_mean": 4.424,
+    "worst_exp_judged": 15,
+    "worst_mant_mean_judged": 4.424
+   },
+   "m1-27b-off.json:4": {
+    "passed": true,
+    "tokens": 1638,
+    "spans": 6,
+    "worst_exp": 16,
+    "worst_mant_mean": 4.741,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 4.419
+   },
+   "m1-27b-off.json:5": {
+    "passed": true,
+    "tokens": 2717,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 1.68,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 1.68
+   },
+   "m1-27b-off.json:6": {
+    "passed": true,
+    "tokens": 1490,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 2.776,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.463
+   },
+   "m1-27b-off.json:7": {
+    "passed": true,
+    "tokens": 1535,
+    "spans": 6,
+    "worst_exp": 20,
+    "worst_mant_mean": 6.296,
+    "worst_exp_judged": 20,
+    "worst_mant_mean_judged": 6.296
+   },
+   "m1-27b-off.json:8": {
+    "passed": true,
+    "tokens": 588,
+    "spans": 6,
+    "worst_exp": 18,
+    "worst_mant_mean": 4.557,
+    "worst_exp_judged": 18,
+    "worst_mant_mean_judged": 4.557
+   },
+   "m1-27b-off.json:9": {
+    "passed": true,
+    "tokens": 1168,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.664,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.75
+   },
+   "m1-27b-off.json:10": {
+    "passed": true,
+    "tokens": 1033,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 5.148,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.833
+   },
+   "m1-27b-off.json:11": {
+    "passed": true,
+    "tokens": 2862,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.468,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 2.468
+   },
+   "m1-27b-off.json:12": {
+    "passed": true,
+    "tokens": 3201,
+    "spans": 6,
+    "worst_exp": 25,
+    "worst_mant_mean": 6.194,
+    "worst_exp_judged": 25,
+    "worst_mant_mean_judged": 6.194
+   },
+   "m1-27b-off.json:13": {
+    "passed": true,
+    "tokens": 2999,
+    "spans": 6,
+    "worst_exp": 15,
+    "worst_mant_mean": 3.735,
+    "worst_exp_judged": 15,
+    "worst_mant_mean_judged": 3.735
+   },
+   "m1-27b-off.json:14": {
+    "passed": true,
+    "tokens": 1508,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 4.032,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.434
+   },
+   "m1-27b-off.json:15": {
+    "passed": true,
+    "tokens": 1102,
+    "spans": 6,
+    "worst_exp": 16,
+    "worst_mant_mean": 6.205,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.48
+   },
+   "m1-27b-off.json:16": {
+    "passed": true,
+    "tokens": 1251,
+    "spans": 6,
+    "worst_exp": 24,
+    "worst_mant_mean": 5.85,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 4.095
+   },
+   "m1-27b-off.json:17": {
+    "passed": true,
+    "tokens": 994,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 6.387,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 6.387
+   },
+   "m1-27b-off.json:18": {
+    "passed": true,
+    "tokens": 662,
+    "spans": 6,
+    "worst_exp": 64,
+    "worst_mant_mean": 19.422,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.016
+   },
+   "m1-27b-off.json:19": {
+    "passed": true,
+    "tokens": 3165,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 2.228,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 2.228
+   },
+   "m1-27b-off.json:20": {
+    "passed": true,
+    "tokens": 970,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 5.583,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 5.583
+   },
+   "m1-27b-off.json:21": {
+    "passed": true,
+    "tokens": 785,
+    "spans": 6,
+    "worst_exp": 26,
+    "worst_mant_mean": 5.108,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 2.659
+   },
+   "m1-27b-off.json:22": {
+    "passed": true,
+    "tokens": 2523,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 3.569,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.598
+   },
+   "m1-27b-off.json:23": {
+    "passed": true,
+    "tokens": 356,
+    "spans": 6,
+    "worst_exp": 4,
+    "worst_mant_mean": 1.23,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 0.968
+   },
+   "m1-27b-off.json:24": {
+    "passed": true,
+    "tokens": 860,
+    "spans": 6,
+    "worst_exp": 25,
+    "worst_mant_mean": 11.036,
+    "worst_exp_judged": 25,
+    "worst_mant_mean_judged": 11.036
+   },
+   "m1-27b-off.json:25": {
+    "passed": true,
+    "tokens": 847,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.306,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.36
+   },
+   "m1-27b-off.json:26": {
+    "passed": true,
+    "tokens": 1821,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 3.79,
+    "worst_exp_judged": 12,
+    "worst_mant_mean_judged": 3.79
+   },
+   "m1-27b-off.json:27": {
+    "passed": true,
+    "tokens": 729,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 4.025,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.135
+   },
+   "m1-27b-off.json:28": {
+    "passed": true,
+    "tokens": 659,
+    "spans": 6,
+    "worst_exp": 28,
+    "worst_mant_mean": 6.39,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 2.685
+   },
+   "m1-27b-off.json:29": {
+    "passed": true,
+    "tokens": 3163,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 2.457,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 2.457
+   },
+   "m1-27b-off.json:30": {
+    "passed": true,
+    "tokens": 2040,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 2.815,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.795
+   },
+   "m1-27b-off.json:31": {
+    "passed": true,
+    "tokens": 654,
+    "spans": 6,
+    "worst_exp": 20,
+    "worst_mant_mean": 11.833,
+    "worst_exp_judged": 3,
+    "worst_mant_mean_judged": 1.056
+   }
+  },
+  "prod-fa2": {
+   "smoke:0": {
+    "passed": true,
+    "tokens": 9641,
+    "spans": 12,
+    "worst_exp": 21,
+    "worst_mant_mean": 5.037,
+    "worst_exp_judged": 21,
+    "worst_mant_mean_judged": 5.037
+   },
+   "smoke:1": {
+    "passed": true,
+    "tokens": 8796,
+    "spans": 12,
+    "worst_exp": 18,
+    "worst_mant_mean": 5.455,
+    "worst_exp_judged": 18,
+    "worst_mant_mean_judged": 5.455
+   },
+   "smoke:2": {
+    "passed": true,
+    "tokens": 8215,
+    "spans": 12,
+    "worst_exp": 13,
+    "worst_mant_mean": 3.878,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 3.878
+   },
+   "smoke:3": {
+    "passed": true,
+    "tokens": 7953,
+    "spans": 12,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.94,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.94
+   },
+   "smoke:4": {
+    "passed": true,
+    "tokens": 10970,
+    "spans": 12,
+    "worst_exp": 16,
+    "worst_mant_mean": 4.487,
+    "worst_exp_judged": 16,
+    "worst_mant_mean_judged": 4.487
+   },
+   "smoke:5": {
+    "passed": true,
+    "tokens": 10777,
+    "spans": 12,
+    "worst_exp": 15,
+    "worst_mant_mean": 5.195,
+    "worst_exp_judged": 15,
+    "worst_mant_mean_judged": 5.195
+   },
+   "smoke:6": {
+    "passed": true,
+    "tokens": 11569,
+    "spans": 12,
+    "worst_exp": 20,
+    "worst_mant_mean": 4.935,
+    "worst_exp_judged": 20,
+    "worst_mant_mean_judged": 4.935
+   },
+   "smoke:7": {
+    "passed": true,
+    "tokens": 14144,
+    "spans": 12,
+    "worst_exp": 25,
+    "worst_mant_mean": 5.807,
+    "worst_exp_judged": 25,
+    "worst_mant_mean_judged": 5.807
+   },
+   "m1-27b.json:0": {
+    "passed": true,
+    "tokens": 768,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 4.262,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 3.194
+   },
+   "m1-27b.json:1": {
+    "passed": true,
+    "tokens": 1119,
+    "spans": 6,
+    "worst_exp": 5,
+    "worst_mant_mean": 1.984,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.394
+   },
+   "m1-27b.json:2": {
+    "passed": true,
+    "tokens": 1425,
+    "spans": 6,
+    "worst_exp": 4,
+    "worst_mant_mean": 0.811,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 0.811
+   },
+   "m1-27b.json:3": {
+    "passed": true,
+    "tokens": 888,
+    "spans": 6,
+    "worst_exp": 27,
+    "worst_mant_mean": 6.98,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 6.035
+   },
+   "m1-27b.json:4": {
+    "passed": true,
+    "tokens": 873,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 4.096,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 2.504
+   },
+   "m1-27b.json:5": {
+    "passed": true,
+    "tokens": 2080,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 1.451,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.451
+   },
+   "m1-27b.json:6": {
+    "passed": true,
+    "tokens": 1205,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 2.793,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.24
+   },
+   "m1-27b.json:7": {
+    "passed": true,
+    "tokens": 1217,
+    "spans": 6,
+    "worst_exp": 16,
+    "worst_mant_mean": 4.849,
+    "worst_exp_judged": 16,
+    "worst_mant_mean_judged": 4.849
+   },
+   "m1-27b.json:8": {
+    "passed": true,
+    "tokens": 587,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.279,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.279
+   },
+   "m1-27b.json:9": {
+    "passed": true,
+    "tokens": 802,
+    "spans": 6,
+    "worst_exp": 18,
+    "worst_mant_mean": 5.109,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 1.208
+   },
+   "m1-27b.json:10": {
+    "passed": true,
+    "tokens": 790,
+    "spans": 6,
+    "worst_exp": 26,
+    "worst_mant_mean": 8.667,
+    "worst_exp_judged": 3,
+    "worst_mant_mean_judged": 1.214
+   },
+   "m1-27b.json:11": {
+    "passed": true,
+    "tokens": 1244,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 1.776,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.776
+   },
+   "m1-27b.json:12": {
+    "passed": true,
+    "tokens": 1336,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 5.102,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 5.102
+   },
+   "m1-27b.json:13": {
+    "passed": true,
+    "tokens": 935,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 2.098,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.415
+   },
+   "m1-27b.json:14": {
+    "passed": true,
+    "tokens": 2201,
+    "spans": 6,
+    "worst_exp": 4,
+    "worst_mant_mean": 2.464,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.173
+   },
+   "m1-27b.json:15": {
+    "passed": true,
+    "tokens": 1096,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.639,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.884
+   },
+   "m1-27b.json:16": {
+    "passed": true,
+    "tokens": 2838,
+    "spans": 6,
+    "worst_exp": 15,
+    "worst_mant_mean": 5.442,
+    "worst_exp_judged": 15,
+    "worst_mant_mean_judged": 5.442
+   },
+   "m1-27b.json:17": {
+    "passed": true,
+    "tokens": 957,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 3.807,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 3.807
+   },
+   "m1-27b.json:18": {
+    "passed": true,
+    "tokens": 662,
+    "spans": 6,
+    "worst_exp": 60,
+    "worst_mant_mean": 18.721,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.056
+   },
+   "m1-27b.json:19": {
+    "passed": true,
+    "tokens": 926,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 8.108,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.685
+   },
+   "m1-27b.json:20": {
+    "passed": true,
+    "tokens": 1563,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 3.752,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 3.752
+   },
+   "m1-27b.json:21": {
+    "passed": true,
+    "tokens": 741,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 5.017,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.382
+   },
+   "m1-27b.json:22": {
+    "passed": true,
+    "tokens": 2392,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.19,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 2.19
+   },
+   "m1-27b.json:23": {
+    "passed": true,
+    "tokens": 352,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 3.7,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 0.881
+   },
+   "m1-27b.json:24": {
+    "passed": true,
+    "tokens": 994,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 5.139,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.931
+   },
+   "m1-27b.json:25": {
+    "passed": true,
+    "tokens": 1159,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 2.864,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 2.104
+   },
+   "m1-27b.json:26": {
+    "passed": true,
+    "tokens": 3128,
+    "spans": 6,
+    "worst_exp": 15,
+    "worst_mant_mean": 4.76,
+    "worst_exp_judged": 15,
+    "worst_mant_mean_judged": 4.76
+   },
+   "m1-27b.json:27": {
+    "passed": true,
+    "tokens": 725,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 3.041,
+    "worst_exp_judged": 3,
+    "worst_mant_mean_judged": 1.016
+   },
+   "m1-27b.json:28": {
+    "passed": true,
+    "tokens": 659,
+    "spans": 6,
+    "worst_exp": 31,
+    "worst_mant_mean": 9.268,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 2.136
+   },
+   "m1-27b.json:29": {
+    "passed": true,
+    "tokens": 1729,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 2.759,
+    "worst_exp_judged": 12,
+    "worst_mant_mean_judged": 2.759
+   },
+   "m1-27b.json:30": {
+    "passed": true,
+    "tokens": 2158,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.463,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.4
+   },
+   "m1-27b.json:31": {
+    "passed": true,
+    "tokens": 1633,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 3.041,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 3.041
+   },
+   "m1-27b-off.json:0": {
+    "passed": true,
+    "tokens": 741,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 3.194,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 3.194
+   },
+   "m1-27b-off.json:1": {
+    "passed": true,
+    "tokens": 1042,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 3.203,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.317
+   },
+   "m1-27b-off.json:2": {
+    "passed": true,
+    "tokens": 3201,
+    "spans": 6,
+    "worst_exp": 18,
+    "worst_mant_mean": 7.383,
+    "worst_exp_judged": 18,
+    "worst_mant_mean_judged": 7.383
+   },
+   "m1-27b-off.json:3": {
+    "passed": true,
+    "tokens": 932,
+    "spans": 6,
+    "worst_exp": 13,
+    "worst_mant_mean": 4.252,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 3.592
+   },
+   "m1-27b-off.json:4": {
+    "passed": true,
+    "tokens": 1638,
+    "spans": 6,
+    "worst_exp": 20,
+    "worst_mant_mean": 5.444,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 4.4
+   },
+   "m1-27b-off.json:5": {
+    "passed": true,
+    "tokens": 2717,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 1.556,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.556
+   },
+   "m1-27b-off.json:6": {
+    "passed": true,
+    "tokens": 1490,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 2.872,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 1.659
+   },
+   "m1-27b-off.json:7": {
+    "passed": true,
+    "tokens": 1535,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 4.983,
+    "worst_exp_judged": 17,
+    "worst_mant_mean_judged": 4.983
+   },
+   "m1-27b-off.json:8": {
+    "passed": true,
+    "tokens": 588,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 3.72,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 3.72
+   },
+   "m1-27b-off.json:9": {
+    "passed": true,
+    "tokens": 1168,
+    "spans": 6,
+    "worst_exp": 9,
+    "worst_mant_mean": 2.608,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 2.325
+   },
+   "m1-27b-off.json:10": {
+    "passed": true,
+    "tokens": 1033,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 3.822,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.48
+   },
+   "m1-27b-off.json:11": {
+    "passed": true,
+    "tokens": 2862,
+    "spans": 6,
+    "worst_exp": 6,
+    "worst_mant_mean": 1.28,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.28
+   },
+   "m1-27b-off.json:12": {
+    "passed": true,
+    "tokens": 3201,
+    "spans": 6,
+    "worst_exp": 28,
+    "worst_mant_mean": 6.061,
+    "worst_exp_judged": 28,
+    "worst_mant_mean_judged": 6.061
+   },
+   "m1-27b-off.json:13": {
+    "passed": true,
+    "tokens": 2999,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 3.915,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 3.915
+   },
+   "m1-27b-off.json:14": {
+    "passed": true,
+    "tokens": 1508,
+    "spans": 6,
+    "worst_exp": 5,
+    "worst_mant_mean": 3.258,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.895
+   },
+   "m1-27b-off.json:15": {
+    "passed": true,
+    "tokens": 1102,
+    "spans": 6,
+    "worst_exp": 24,
+    "worst_mant_mean": 7.423,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.352
+   },
+   "m1-27b-off.json:16": {
+    "passed": true,
+    "tokens": 1251,
+    "spans": 6,
+    "worst_exp": 25,
+    "worst_mant_mean": 6.854,
+    "worst_exp_judged": 13,
+    "worst_mant_mean_judged": 5.79
+   },
+   "m1-27b-off.json:17": {
+    "passed": true,
+    "tokens": 994,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 6.192,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 6.192
+   },
+   "m1-27b-off.json:18": {
+    "passed": true,
+    "tokens": 662,
+    "spans": 6,
+    "worst_exp": 60,
+    "worst_mant_mean": 18.721,
+    "worst_exp_judged": 4,
+    "worst_mant_mean_judged": 1.056
+   },
+   "m1-27b-off.json:19": {
+    "passed": true,
+    "tokens": 3165,
+    "spans": 6,
+    "worst_exp": 10,
+    "worst_mant_mean": 2.424,
+    "worst_exp_judged": 10,
+    "worst_mant_mean_judged": 2.424
+   },
+   "m1-27b-off.json:20": {
+    "passed": true,
+    "tokens": 970,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 5.222,
+    "worst_exp_judged": 11,
+    "worst_mant_mean_judged": 5.222
+   },
+   "m1-27b-off.json:21": {
+    "passed": true,
+    "tokens": 785,
+    "spans": 6,
+    "worst_exp": 25,
+    "worst_mant_mean": 7.873,
+    "worst_exp_judged": 9,
+    "worst_mant_mean_judged": 1.983
+   },
+   "m1-27b-off.json:22": {
+    "passed": true,
+    "tokens": 2523,
+    "spans": 6,
+    "worst_exp": 8,
+    "worst_mant_mean": 3.073,
+    "worst_exp_judged": 8,
+    "worst_mant_mean_judged": 2.19
+   },
+   "m1-27b-off.json:23": {
+    "passed": true,
+    "tokens": 356,
+    "spans": 6,
+    "worst_exp": 5,
+    "worst_mant_mean": 2.54,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 0.881
+   },
+   "m1-27b-off.json:24": {
+    "passed": true,
+    "tokens": 860,
+    "spans": 6,
+    "worst_exp": 23,
+    "worst_mant_mean": 11.133,
+    "worst_exp_judged": 23,
+    "worst_mant_mean_judged": 11.133
+   },
+   "m1-27b-off.json:25": {
+    "passed": true,
+    "tokens": 847,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 3.016,
+    "worst_exp_judged": 6,
+    "worst_mant_mean_judged": 1.432
+   },
+   "m1-27b-off.json:26": {
+    "passed": true,
+    "tokens": 1821,
+    "spans": 6,
+    "worst_exp": 12,
+    "worst_mant_mean": 3.658,
+    "worst_exp_judged": 12,
+    "worst_mant_mean_judged": 3.658
+   },
+   "m1-27b-off.json:27": {
+    "passed": true,
+    "tokens": 729,
+    "spans": 6,
+    "worst_exp": 7,
+    "worst_mant_mean": 3.727,
+    "worst_exp_judged": 3,
+    "worst_mant_mean_judged": 0.96
+   },
+   "m1-27b-off.json:28": {
+    "passed": true,
+    "tokens": 659,
+    "spans": 6,
+    "worst_exp": 31,
+    "worst_mant_mean": 9.268,
+    "worst_exp_judged": 7,
+    "worst_mant_mean_judged": 2.136
+   },
+   "m1-27b-off.json:29": {
+    "passed": true,
+    "tokens": 3163,
+    "spans": 6,
+    "worst_exp": 14,
+    "worst_mant_mean": 2.781,
+    "worst_exp_judged": 14,
+    "worst_mant_mean_judged": 2.781
+   },
+   "m1-27b-off.json:30": {
+    "passed": true,
+    "tokens": 2040,
+    "spans": 6,
+    "worst_exp": 11,
+    "worst_mant_mean": 2.902,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.967
+   },
+   "m1-27b-off.json:31": {
+    "passed": true,
+    "tokens": 654,
+    "spans": 6,
+    "worst_exp": 17,
+    "worst_mant_mean": 9.045,
+    "worst_exp_judged": 5,
+    "worst_mant_mean_judged": 1.197
+   }
+  }
+ },
+ "per_trajectory_cross_fa2": {
+  "smoke:0": {
+   "passed": true,
+   "tokens": 9641,
+   "spans": 12,
+   "worst_exp": 14,
+   "worst_mant_mean": 4.711,
+   "worst_exp_judged": 14,
+   "worst_mant_mean_judged": 4.711
+  },
+  "smoke:1": {
+   "passed": true,
+   "tokens": 8796,
+   "spans": 12,
+   "worst_exp": 13,
+   "worst_mant_mean": 3.548,
+   "worst_exp_judged": 13,
+   "worst_mant_mean_judged": 3.548
+  },
+  "smoke:2": {
+   "passed": true,
+   "tokens": 8215,
+   "spans": 12,
+   "worst_exp": 11,
+   "worst_mant_mean": 3.393,
+   "worst_exp_judged": 11,
+   "worst_mant_mean_judged": 3.393
+  },
+  "smoke:3": {
+   "passed": true,
+   "tokens": 7953,
+   "spans": 12,
+   "worst_exp": 13,
+   "worst_mant_mean": 5.0,
+   "worst_exp_judged": 13,
+   "worst_mant_mean_judged": 5.0
+  },
+  "smoke:4": {
+   "passed": true,
+   "tokens": 10970,
+   "spans": 12,
+   "worst_exp": 12,
+   "worst_mant_mean": 3.081,
+   "worst_exp_judged": 12,
+   "worst_mant_mean_judged": 3.081
+  },
+  "smoke:5": {
+   "passed": true,
+   "tokens": 10777,
+   "spans": 12,
+   "worst_exp": 9,
+   "worst_mant_mean": 3.866,
+   "worst_exp_judged": 9,
+   "worst_mant_mean_judged": 3.866
+  },
+  "smoke:6": {
+   "passed": true,
+   "tokens": 11569,
+   "spans": 12,
+   "worst_exp": 17,
+   "worst_mant_mean": 2.929,
+   "worst_exp_judged": 17,
+   "worst_mant_mean_judged": 2.929
+  },
+  "smoke:7": {
+   "passed": true,
+   "tokens": 14144,
+   "spans": 12,
+   "worst_exp": 19,
+   "worst_mant_mean": 4.774,
+   "worst_exp_judged": 19,
+   "worst_mant_mean_judged": 4.774
+  },
+  "m1-27b.json:0": {
+   "passed": true,
+   "tokens": 768,
+   "spans": 6,
+   "worst_exp": 12,
+   "worst_mant_mean": 4.741,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.738
+  },
+  "m1-27b.json:1": {
+   "passed": true,
+   "tokens": 1119,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 1.6,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.128
+  },
+  "m1-27b.json:2": {
+   "passed": true,
+   "tokens": 1425,
+   "spans": 6,
+   "worst_exp": 3,
+   "worst_mant_mean": 0.794,
+   "worst_exp_judged": 3,
+   "worst_mant_mean_judged": 0.794
+  },
+  "m1-27b.json:3": {
+   "passed": true,
+   "tokens": 888,
+   "spans": 6,
+   "worst_exp": 15,
+   "worst_mant_mean": 5.894,
+   "worst_exp_judged": 15,
+   "worst_mant_mean_judged": 5.894
+  },
+  "m1-27b.json:4": {
+   "passed": true,
+   "tokens": 873,
+   "spans": 6,
+   "worst_exp": 13,
+   "worst_mant_mean": 3.185,
+   "worst_exp_judged": 5,
+   "worst_mant_mean_judged": 1.629
+  },
+  "m1-27b.json:5": {
+   "passed": true,
+   "tokens": 2080,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 1.266,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.266
+  },
+  "m1-27b.json:6": {
+   "passed": true,
+   "tokens": 1205,
+   "spans": 6,
+   "worst_exp": 4,
+   "worst_mant_mean": 2.556,
+   "worst_exp_judged": 4,
+   "worst_mant_mean_judged": 0.984
+  },
+  "m1-27b.json:7": {
+   "passed": true,
+   "tokens": 1217,
+   "spans": 6,
+   "worst_exp": 11,
+   "worst_mant_mean": 2.991,
+   "worst_exp_judged": 11,
+   "worst_mant_mean_judged": 2.991
+  },
+  "m1-27b.json:8": {
+   "passed": true,
+   "tokens": 587,
+   "spans": 6,
+   "worst_exp": 14,
+   "worst_mant_mean": 3.14,
+   "worst_exp_judged": 14,
+   "worst_mant_mean_judged": 3.14
+  },
+  "m1-27b.json:9": {
+   "passed": true,
+   "tokens": 802,
+   "spans": 6,
+   "worst_exp": 10,
+   "worst_mant_mean": 3.195,
+   "worst_exp_judged": 7,
+   "worst_mant_mean_judged": 2.182
+  },
+  "m1-27b.json:10": {
+   "passed": true,
+   "tokens": 790,
+   "spans": 6,
+   "worst_exp": 11,
+   "worst_mant_mean": 3.183,
+   "worst_exp_judged": 5,
+   "worst_mant_mean_judged": 0.852
+  },
+  "m1-27b.json:11": {
+   "passed": true,
+   "tokens": 1244,
+   "spans": 6,
+   "worst_exp": 10,
+   "worst_mant_mean": 1.576,
+   "worst_exp_judged": 10,
+   "worst_mant_mean_judged": 1.576
+  },
+  "m1-27b.json:12": {
+   "passed": true,
+   "tokens": 1336,
+   "spans": 6,
+   "worst_exp": 13,
+   "worst_mant_mean": 3.793,
+   "worst_exp_judged": 13,
+   "worst_mant_mean_judged": 3.793
+  },
+  "m1-27b.json:13": {
+   "passed": true,
+   "tokens": 935,
+   "spans": 6,
+   "worst_exp": 5,
+   "worst_mant_mean": 1.758,
+   "worst_exp_judged": 5,
+   "worst_mant_mean_judged": 1.122
+  },
+  "m1-27b.json:14": {
+   "passed": true,
+   "tokens": 2201,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 1.417,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.26
+  },
+  "m1-27b.json:15": {
+   "passed": true,
+   "tokens": 1096,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.667,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.959
+  },
+  "m1-27b.json:16": {
+   "passed": true,
+   "tokens": 2838,
+   "spans": 6,
+   "worst_exp": 16,
+   "worst_mant_mean": 5.875,
+   "worst_exp_judged": 16,
+   "worst_mant_mean_judged": 5.875
+  },
+  "m1-27b.json:17": {
+   "passed": true,
+   "tokens": 957,
+   "spans": 6,
+   "worst_exp": 9,
+   "worst_mant_mean": 3.21,
+   "worst_exp_judged": 9,
+   "worst_mant_mean_judged": 3.21
+  },
+  "m1-27b.json:18": {
+   "passed": true,
+   "tokens": 662,
+   "spans": 6,
+   "worst_exp": 14,
+   "worst_mant_mean": 6.728,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.795
+  },
+  "m1-27b.json:19": {
+   "passed": true,
+   "tokens": 926,
+   "spans": 6,
+   "worst_exp": 12,
+   "worst_mant_mean": 6.043,
+   "worst_exp_judged": 4,
+   "worst_mant_mean_judged": 1.323
+  },
+  "m1-27b.json:20": {
+   "passed": true,
+   "tokens": 1563,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 2.656,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 2.656
+  },
+  "m1-27b.json:21": {
+   "passed": true,
+   "tokens": 741,
+   "spans": 6,
+   "worst_exp": 10,
+   "worst_mant_mean": 2.975,
+   "worst_exp_judged": 7,
+   "worst_mant_mean_judged": 2.975
+  },
+  "m1-27b.json:22": {
+   "passed": true,
+   "tokens": 2392,
+   "spans": 6,
+   "worst_exp": 9,
+   "worst_mant_mean": 1.84,
+   "worst_exp_judged": 9,
+   "worst_mant_mean_judged": 1.84
+  },
+  "m1-27b.json:23": {
+   "passed": true,
+   "tokens": 352,
+   "spans": 6,
+   "worst_exp": 9,
+   "worst_mant_mean": 3.777,
+   "worst_exp_judged": 3,
+   "worst_mant_mean_judged": 0.802
+  },
+  "m1-27b.json:24": {
+   "passed": true,
+   "tokens": 994,
+   "spans": 6,
+   "worst_exp": 18,
+   "worst_mant_mean": 5.655,
+   "worst_exp_judged": 18,
+   "worst_mant_mean_judged": 5.655
+  },
+  "m1-27b.json:25": {
+   "passed": true,
+   "tokens": 1159,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.842,
+   "worst_exp_judged": 5,
+   "worst_mant_mean_judged": 1.6
+  },
+  "m1-27b.json:26": {
+   "passed": true,
+   "tokens": 3128,
+   "spans": 6,
+   "worst_exp": 10,
+   "worst_mant_mean": 4.074,
+   "worst_exp_judged": 10,
+   "worst_mant_mean_judged": 4.074
+  },
+  "m1-27b.json:27": {
+   "passed": true,
+   "tokens": 725,
+   "spans": 6,
+   "worst_exp": 9,
+   "worst_mant_mean": 3.073,
+   "worst_exp_judged": 4,
+   "worst_mant_mean_judged": 0.879
+  },
+  "m1-27b.json:28": {
+   "passed": true,
+   "tokens": 659,
+   "spans": 6,
+   "worst_exp": 26,
+   "worst_mant_mean": 8.441,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.776
+  },
+  "m1-27b.json:29": {
+   "passed": true,
+   "tokens": 1729,
+   "spans": 6,
+   "worst_exp": 13,
+   "worst_mant_mean": 2.293,
+   "worst_exp_judged": 13,
+   "worst_mant_mean_judged": 2.293
+  },
+  "m1-27b.json:30": {
+   "passed": true,
+   "tokens": 2158,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.492,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.172
+  },
+  "m1-27b.json:31": {
+   "passed": true,
+   "tokens": 1633,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.6,
+   "worst_exp_judged": 8,
+   "worst_mant_mean_judged": 2.6
+  },
+  "m1-27b-off.json:0": {
+   "passed": true,
+   "tokens": 741,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.192,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.738
+  },
+  "m1-27b-off.json:1": {
+   "passed": true,
+   "tokens": 1042,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.308,
+   "worst_exp_judged": 4,
+   "worst_mant_mean_judged": 0.952
+  },
+  "m1-27b-off.json:2": {
+   "passed": true,
+   "tokens": 3201,
+   "spans": 6,
+   "worst_exp": 15,
+   "worst_mant_mean": 5.791,
+   "worst_exp_judged": 15,
+   "worst_mant_mean_judged": 5.791
+  },
+  "m1-27b-off.json:3": {
+   "passed": true,
+   "tokens": 932,
+   "spans": 6,
+   "worst_exp": 12,
+   "worst_mant_mean": 5.441,
+   "worst_exp_judged": 12,
+   "worst_mant_mean_judged": 3.361
+  },
+  "m1-27b-off.json:4": {
+   "passed": true,
+   "tokens": 1638,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 3.025,
+   "worst_exp_judged": 7,
+   "worst_mant_mean_judged": 2.161
+  },
+  "m1-27b-off.json:5": {
+   "passed": true,
+   "tokens": 2717,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 1.472,
+   "worst_exp_judged": 8,
+   "worst_mant_mean_judged": 1.472
+  },
+  "m1-27b-off.json:6": {
+   "passed": true,
+   "tokens": 1490,
+   "spans": 6,
+   "worst_exp": 5,
+   "worst_mant_mean": 1.795,
+   "worst_exp_judged": 5,
+   "worst_mant_mean_judged": 1.675
+  },
+  "m1-27b-off.json:7": {
+   "passed": true,
+   "tokens": 1535,
+   "spans": 6,
+   "worst_exp": 17,
+   "worst_mant_mean": 5.234,
+   "worst_exp_judged": 17,
+   "worst_mant_mean_judged": 5.234
+  },
+  "m1-27b-off.json:8": {
+   "passed": true,
+   "tokens": 588,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.992,
+   "worst_exp_judged": 8,
+   "worst_mant_mean_judged": 2.992
+  },
+  "m1-27b-off.json:9": {
+   "passed": true,
+   "tokens": 1168,
+   "spans": 6,
+   "worst_exp": 7,
+   "worst_mant_mean": 1.865,
+   "worst_exp_judged": 7,
+   "worst_mant_mean_judged": 1.302
+  },
+  "m1-27b-off.json:10": {
+   "passed": true,
+   "tokens": 1033,
+   "spans": 6,
+   "worst_exp": 11,
+   "worst_mant_mean": 3.563,
+   "worst_exp_judged": 3,
+   "worst_mant_mean_judged": 1.4
+  },
+  "m1-27b-off.json:11": {
+   "passed": true,
+   "tokens": 2862,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 1.637,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.637
+  },
+  "m1-27b-off.json:12": {
+   "passed": true,
+   "tokens": 3201,
+   "spans": 6,
+   "worst_exp": 13,
+   "worst_mant_mean": 3.765,
+   "worst_exp_judged": 13,
+   "worst_mant_mean_judged": 3.765
+  },
+  "m1-27b-off.json:13": {
+   "passed": true,
+   "tokens": 2999,
+   "spans": 6,
+   "worst_exp": 11,
+   "worst_mant_mean": 3.521,
+   "worst_exp_judged": 11,
+   "worst_mant_mean_judged": 3.521
+  },
+  "m1-27b-off.json:14": {
+   "passed": true,
+   "tokens": 1508,
+   "spans": 6,
+   "worst_exp": 7,
+   "worst_mant_mean": 4.38,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.587
+  },
+  "m1-27b-off.json:15": {
+   "passed": true,
+   "tokens": 1102,
+   "spans": 6,
+   "worst_exp": 10,
+   "worst_mant_mean": 3.655,
+   "worst_exp_judged": 10,
+   "worst_mant_mean_judged": 1.317
+  },
+  "m1-27b-off.json:16": {
+   "passed": true,
+   "tokens": 1251,
+   "spans": 6,
+   "worst_exp": 10,
+   "worst_mant_mean": 4.843,
+   "worst_exp_judged": 10,
+   "worst_mant_mean_judged": 4.843
+  },
+  "m1-27b-off.json:17": {
+   "passed": true,
+   "tokens": 994,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 5.65,
+   "worst_exp_judged": 8,
+   "worst_mant_mean_judged": 5.65
+  },
+  "m1-27b-off.json:18": {
+   "passed": true,
+   "tokens": 662,
+   "spans": 6,
+   "worst_exp": 14,
+   "worst_mant_mean": 6.728,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.795
+  },
+  "m1-27b-off.json:19": {
+   "passed": true,
+   "tokens": 3165,
+   "spans": 6,
+   "worst_exp": 11,
+   "worst_mant_mean": 2.358,
+   "worst_exp_judged": 11,
+   "worst_mant_mean_judged": 2.358
+  },
+  "m1-27b-off.json:20": {
+   "passed": true,
+   "tokens": 970,
+   "spans": 6,
+   "worst_exp": 7,
+   "worst_mant_mean": 1.901,
+   "worst_exp_judged": 7,
+   "worst_mant_mean_judged": 1.901
+  },
+  "m1-27b-off.json:21": {
+   "passed": true,
+   "tokens": 785,
+   "spans": 6,
+   "worst_exp": 23,
+   "worst_mant_mean": 7.714,
+   "worst_exp_judged": 8,
+   "worst_mant_mean_judged": 2.975
+  },
+  "m1-27b-off.json:22": {
+   "passed": true,
+   "tokens": 2523,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 3.548,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.315
+  },
+  "m1-27b-off.json:23": {
+   "passed": true,
+   "tokens": 356,
+   "spans": 6,
+   "worst_exp": 3,
+   "worst_mant_mean": 2.071,
+   "worst_exp_judged": 3,
+   "worst_mant_mean_judged": 0.802
+  },
+  "m1-27b-off.json:24": {
+   "passed": true,
+   "tokens": 860,
+   "spans": 6,
+   "worst_exp": 19,
+   "worst_mant_mean": 4.963,
+   "worst_exp_judged": 19,
+   "worst_mant_mean_judged": 4.963
+  },
+  "m1-27b-off.json:25": {
+   "passed": true,
+   "tokens": 847,
+   "spans": 6,
+   "worst_exp": 5,
+   "worst_mant_mean": 2.039,
+   "worst_exp_judged": 5,
+   "worst_mant_mean_judged": 1.23
+  },
+  "m1-27b-off.json:26": {
+   "passed": true,
+   "tokens": 1821,
+   "spans": 6,
+   "worst_exp": 9,
+   "worst_mant_mean": 3.765,
+   "worst_exp_judged": 9,
+   "worst_mant_mean_judged": 3.765
+  },
+  "m1-27b-off.json:27": {
+   "passed": true,
+   "tokens": 729,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 3.146,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 0.874
+  },
+  "m1-27b-off.json:28": {
+   "passed": true,
+   "tokens": 659,
+   "spans": 6,
+   "worst_exp": 26,
+   "worst_mant_mean": 8.441,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.776
+  },
+  "m1-27b-off.json:29": {
+   "passed": true,
+   "tokens": 3163,
+   "spans": 6,
+   "worst_exp": 8,
+   "worst_mant_mean": 2.339,
+   "worst_exp_judged": 8,
+   "worst_mant_mean_judged": 2.339
+  },
+  "m1-27b-off.json:30": {
+   "passed": true,
+   "tokens": 2040,
+   "spans": 6,
+   "worst_exp": 6,
+   "worst_mant_mean": 2.089,
+   "worst_exp_judged": 6,
+   "worst_mant_mean_judged": 1.172
+  },
+  "m1-27b-off.json:31": {
+   "passed": true,
+   "tokens": 654,
+   "spans": 6,
+   "worst_exp": 10,
+   "worst_mant_mean": 4.228,
+   "worst_exp_judged": 3,
+   "worst_mant_mean_judged": 0.936
+  }
+ },
+ "notes": [
+  "All 8 smoke and 64 M1 trajectories pass under every config; no judged chunk exceeds any threshold.",
+  "The only chunks over a threshold anywhere are the 1-token span m1-27b*.json:18 (exp 64 under prod-stack sdpa; 60 under FA2 and vLLM-venv sdpa); production does not judge spans under 8 tokens.",
+  "Coverage: real trajectories up to 14,144 tokens only; 40-60k contexts not measured under FA2."
+ ]
+}

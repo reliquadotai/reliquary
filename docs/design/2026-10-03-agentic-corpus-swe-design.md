@@ -422,3 +422,37 @@ Two earlier runs that day found the forgeries not exercising their paths (a
 `BASH_ENV` naming a missing file, which bash ignores; a forger's prompt filled
 by the honest walk) and were fixed before this one; the runbook records the
 operator-side fixes.
+
+**Addendum: TOPLOC bands under flash-attention-2 (2026-10-04).** Production
+audits with flash-attention-2: the validator image (root `Dockerfile`) sets
+`GRAIL_ATTN_IMPL=flash_attention_2` and ships torch 2.7.0+cu128, flash_attn
+2.8.3, flash-linear-attention 0.5.0, causal_conv1d 1.5.2 and transformers
+5.10.4. The corpus control (`corpus_validator`, `corpus_gpu`,
+`corpus_audit_executor`) loads the model with `ATTN_IMPLEMENTATION`, whose
+default is flash_attention_2. M1 and the run above audited with sdpa in the
+vLLM venv (torch 2.13, transformers 5.18, no fla and no causal_conv1d, so
+GatedDeltaNet ran on the torch reference path). The bands were re-measured on
+the same trajectories in a fresh venv with the image's stack, under sdpa and
+then FA2 (`scripts/agentic_attention_bands.py`, data in
+`docs/design/measurements/2026-10-04-toploc-27b-fa2-bands.json`). The data:
+the Task 14 smoke (8 real SWE-smith episodes, 96 spans, 1,173 chunks, up to
+14,144 tokens, production audit path) and M1 (64 trajectories, 2,759 chunks).
+The miner proofs were made by vLLM. Per chunk:
+
+| stack, attention | smoke exp mean / p99 / max | smoke mant mean p99 / max | M1 judged exp p99 / max | M1 judged mant p99 / max | trajectories passed |
+|---|---|---|---|---|---|
+| vLLM venv, sdpa (as M1/e2e) | 3.39 / 16 / 20 | 4.38 / 5.59 | 13 / 25 | 4.35 / 11.70 | 72/72 |
+| image stack, sdpa | 3.34 / 15 / 21 | 4.30 / 6.49 | 14 / 28 | 4.47 / 11.04 | 72/72 |
+| image stack, FA2 | 3.35 / 15 / 25 | 4.31 / 5.81 | 13 / 28 | 4.33 / 11.13 | 72/72 |
+
+Thresholds are 60/40/40, and no judged chunk exceeds one under any setting.
+Per honest smoke trajectory, the worst exponent under FA2 is 13 to 25 (sdpa:
+12 to 21). The two kernels agree on the same chunks: the mean FA2 minus sdpa
+exponent is +0.01, and the mean absolute gap is 1.05. That gap is no bigger
+than the one between the two sdpa stacks (1.14). Cross-check: proofs built
+from the validator's own sdpa activations, verified under FA2, give exp p99 11
+and max 19 (smoke). On M1's judged spans they give exp max 19 and mant 5.9.
+The only chunk over a threshold anywhere is M1's 1-token span (exp 64 under
+image-stack sdpa, 60 under FA2), which production does not judge (under 8
+tokens). Verdict: FA2 is safe at 60/40/40, and the honest band does not
+depend on the attention kernel. Not covered: 40k to 60k contexts under FA2.
