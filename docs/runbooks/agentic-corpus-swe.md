@@ -275,6 +275,20 @@ two executors of two providers with a confirmed failure on their hotkey, and
 the honest hotkey is never voided or charged; 2 (inconclusive) when a forgery
 did not exercise its path; 1 otherwise. Never on a production box.
 
+Before the run (GPU box): stop the serving vLLM by its process group
+(`kill -TERM -- -<pgid of "vllm serve">`, from `ps -eo pid,pgid,args`; never
+`pkill -f`). Its reliquary-swe is an editable install of `/opt/env-pinned`,
+which other work keeps at `main`: `git -C /opt/env-pinned checkout --detach
+<ENV_COMMIT>` (the commit is in that clone; no remote), and check the pin line
+above prints `<ENV_COMMIT>`; check it out back afterwards. The GPU box's
+24 GB free do not hold the 4 images: the default prompts (`--prompt-start` 0,
+8 or 16, 8 prompts) are all python-docx instances in the 4-image set, so only
+that image (5 GB) is needed there (`docker pull` its pinned digest); the
+Hugging Face cache of `Qwen/Qwen3-4B-Instruct-2507` under `/opt/hf` (8 GB,
+unused) may go. The full control loads the 27B with `GRAIL_ATTN_IMPL`
+(flash_attention_2 by default); that venv has no flash_attn, so the script
+falls back to sdpa (gate M1's setting) and says so.
+
 Topology:
 
 | box | runs |
@@ -372,5 +386,10 @@ group `kill -- -$(cat ...pid)` needs later. The same holds for every
    (the run never settles, so `drained` is false in its counts file).
 8. Clean up: `kill -- -$(cat <pidfile>)` for the control, `grade-b` and
    `grade-a`; `docker rm -f agentic-e2e-minio`; the two tunnels on the VPS
-   (`kill $(pgrep -f 'ExitOnForwardFailure=yes -[LR] 18100')`); restart the
-   GPU box's serving vLLM with the command recorded in `/opt/vllm/serve.sh` usage.
+   (`kill $(pgrep -f 'ExitOnForwardFailure=yes -[LR] 18100')`); put the GPU
+   box's reliquary-swe checkout back where it was (see "Before the run"); restart
+   the GPU box's serving vLLM as it ran before (on 2026-10-03):
+
+   ```bash
+   ssh -p 20300 root@162.243.212.30 'cd /opt/vllm || exit 1; setsid nohup /opt/vllm/serve.sh Qwen/Qwen3.8-27B 65536 --tool-call-parser qwen3_coder --reasoning-parser qwen3 --max-num-seqs 256 --limit-mm-per-prompt "{\"image\":0,\"video\":0}" > /opt/vllm/qwen38-27b.log 2>&1 < /dev/null & echo $! > /opt/vllm/serve.pid' </dev/null
+   ```

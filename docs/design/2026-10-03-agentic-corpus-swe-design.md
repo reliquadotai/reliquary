@@ -372,3 +372,53 @@ for the pre-pulled SWE-smith images.
   corpus validator, one grade executor on `sandbox-dev-01`, through submission,
   verdict, grade, replay and export; plus a forged `final_diff` and a forged
   observation, both of which must end as confirmed audit failures.
+
+## 11. End-to-end result (2026-10-04)
+
+Run with `scripts/agentic_corpus_e2e.py` and the runbook's "End-to-end run"
+on 2026-10-03 23:25 to 23:56 UTC; summary in
+`docs/design/measurements/2026-10-04-agentic-e2e.json` (`check` exit 0,
+`failures` and `inconclusive` empty).
+
+- **Job:** `agentic-e2e`, Qwen3.8-27B, reliquary-swe `a48102f0`, the 4-image
+  SWE-smith set, 8 prompts (source rows 16 to 23, all python-docx), 2 slots
+  each, `replay_fraction_failed` 1.0, max 40 turns, 8192 tokens per turn,
+  60,000 per trajectory.
+- **Topology:** GPU box (H100; DigitalOcean): MinIO, the control (intake-only,
+  then full), the miner (8 episodes at once, prefix caching on) and grade
+  executor `grade-b` (provider `digitalocean`, concurrency 2); sandbox-dev-01
+  (Hetzner): `grade-a` (provider `hetzner`, concurrency 4) through two SSH
+  tunnels from the VPS.
+- **Mining** (`mine.json`): honest 6 accepted, `forge_diff` 1 accepted,
+  `forge_obs` 1 accepted; 8 trajectories, 13 to 33 turns (214 in all),
+  200,010 tokens (86,073 assistant tokens paid on), 10.5 min from start to the
+  last submission (1.5 min of it loading the model).
+- **Honest:** 6 accepted, 6 TOPLOC-passed (worst exponent 14 to 21, worst
+  mantissa mean 4.6 to 7.0), 6 graded successes, 6 replay-certified, 0 voided,
+  0 confirmed failures. Replay mismatches per honest trajectory: 0, 1, 1, 2, 5
+  (of 28, tolerance 5) and 5 (of 46, tolerance 6).
+- **Forged diff** (gold patch + a new file): TOPLOC passed, graded successful,
+  replay failed on both `grade-a` and `grade-b` (providers `hetzner` and
+  `digitalocean`), replayed diff unequal, 6 of 43 observations mismatched;
+  voided `replay_failed` 88 s after submission; 1 confirmed failure on its
+  hotkey.
+- **Forged observations** (`BASH_ENV=/etc/hostname` in the episode box):
+  TOPLOC passed, graded successful, replay failed on both executors of both
+  providers with 33 of 34 observations mismatched (33 bash observations);
+  voided `replay_failed` 89 s after submission; 1 confirmed failure.
+- **Export:** `jobs export --sft --allow-incomplete` wrote 6 rows (the 6
+  honest submissions), the plain export the same 6; counts sidecar:
+  `passing_submissions` 8 = 6 rows + 2 `voided`, every other exclusion 0,
+  `drained` false (the run never settles).
+- **Wall-clock:** prepare 1 min; control up 1 min; mining 10.5 min; grading
+  kept up with mining (every grade and replay written within 2 min of its
+  submission; the last at 23:40:43); full control load about 1.5 min; audit
+  one batch of 8 trajectories each prefilled alone, 50.3 s (49.4 s forward,
+  3,973 tokens/s, sdpa). Grading load on sandbox-dev-01: about 2.5 % of 16
+  vCPU and +225 MB of memory averaged over the 10-minute sar window that held
+  it.
+
+Two earlier runs that day found the forgeries not exercising their paths (a
+`BASH_ENV` naming a missing file, which bash ignores; a forger's prompt filled
+by the honest walk) and were fixed before this one; the runbook records the
+operator-side fixes.
