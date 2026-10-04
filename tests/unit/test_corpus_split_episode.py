@@ -115,21 +115,31 @@ def front(monkeypatch, tmp_path):
     jobs = {EPISODE_ID: _episode_job(), SINGLE_ID: _single_job(),
             "swe-agentic-v2": _episode_job("swe-agentic-v2"),
             "swe-agentic-other": _episode_job("swe-agentic-other", version="e" * 40)}
-    calls = SimpleNamespace(migrated=[], intakes=[], leases=[])
+    # ``fail``: step name -> exceptions to raise there, one per call, in order.
+    calls = SimpleNamespace(migrated=[], intakes=[], leases=[], fail={})
+
+    def maybe_fail(step):
+        pending = calls.fail.get(step)
+        if pending:
+            raise pending.pop(0)
 
     class _Store:
         async def read_job(self, job_id):
             return jobs.get(job_id), None
 
     async def migrate(store, job):
+        if job.episode is not None:
+            maybe_fail("migrate")
         calls.migrated.append(str(job.job_id))
         return None
 
     def intake(job, **kw):
+        maybe_fail("intake")
         calls.intakes.append((str(job.job_id), kw))
         return SimpleNamespace(renderer=R, source=SweSource([("i0", "p"), ("i1", "q")]))
 
     async def no_executors(**kw):
+        maybe_fail("registry")
         return []
 
     async def info(run_dir, **kw):
@@ -149,8 +159,15 @@ def front(monkeypatch, tmp_path):
     monkeypatch.setattr(modeling, "load_tokenizer", lambda path: fakes.Tokenizer())
     monkeypatch.setattr(corpus_gpu, "read_info", info)
     monkeypatch.setattr(agentic_intake, "build_episode_intake", intake)
-    monkeypatch.setattr(corpus_grade_remote, "check_replay_lease",
-                        lambda job, **kw: calls.leases.append(str(job.job_id)))
+    def lease(job, **kw):
+        maybe_fail("lease")
+        calls.leases.append(str(job.job_id))
+
+    monkeypatch.setattr(corpus_grade_remote, "check_replay_lease", lease)
+    # Hot adds go through the real job set; the contract check is not under test here.
+    from reliquary.validator import corpus_hot_jobs
+
+    monkeypatch.setattr(corpus_hot_jobs, "hot_job_refusal", lambda *a, **kw: None)
     monkeypatch.setattr(corpus_executor_store, "list_executors", no_executors)
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
     monkeypatch.setattr(corpus_grading.CorpusGrader, "run", idle)
@@ -327,3 +344,72 @@ def test_the_supervisor_plans_episode_jobs_into_the_front(monkeypatch, judges, g
     else:
         asyncio.run(run)
         assert started[0].groups == groups and started[0].group_of(EPISODE_ID) is None
+
+
+# -- I1: an episode job that cannot be wired at startup is left out, alone --------
+
+
+def _listed_jobs(app):
+    from fastapi.testclient import TestClient
+
+    return TestClient(app).get("/corpus/jobs").json()["jobs"]
+
+
+@pytest.mark.parametrize("step,exc", [
+    ("intake", RuntimeError("reliquary-swe is not installed at the pin")),
+    ("intake", OSError("HF Hub unreachable")),
+    ("lease", RuntimeError("the replay lease is shorter than the task's replay work")),
+    ("registry", OSError("R2 unreachable")),
+    ("migrate", OSError("R2 unreachable")),
+])
+def test_an_episode_job_that_fails_to_wire_leaves_the_others_served(front, step, exc,
+                                                                    monkeypatch):
+    from reliquary.validator import corpus_validator
+
+    errors = []
+    monkeypatch.setattr(corpus_validator.logger, "error",
+                        lambda msg, *a, **kw: errors.append(msg % a))
+    front.calls.fail[step] = [exc]
+    started = front.start([SINGLE_ID, EPISODE_ID], linked_ids=[SINGLE_ID])
+    # The front is up and the single-turn job served, as before.
+    assert set(started.served) == {SINGLE_ID}
+    assert started.served[SINGLE_ID].judge_link is started.link
+    # The episode job is not served (no route), and says so loudly.
+    assert _listed_jobs(started.app) == [SINGLE_ID]
+    assert EPISODE_TASK in started.app.state.corpus_unserved
+    assert any("EPISODE JOB swe-agentic-v1 IS NOT SERVED" in m and str(exc) in m
+               for m in errors), errors
+
+
+def test_a_front_whose_only_job_fails_to_wire_refuses_to_start(front):
+    from reliquary.validator import corpus_validator
+    from reliquary.validator.corpus_split import FrontSplit
+
+    front.calls.fail["intake"] = [RuntimeError("reliquary-swe is not installed at the pin")]
+    with pytest.raises(RuntimeError, match="no corpus job left to serve"):
+        asyncio.run(corpus_validator.run_corpus_validator(
+            jobs=[(_entry(EPISODE_TASK, EPISODE_ID), 0.1)], wallet=None, netuid=81,
+            signer_client=None, http_host="127.0.0.1", http_port=0, set_weights=False,
+            registration_gate=False,
+            split=FrontSplit(directory="/x", fingerprint="c" * 64, proof=fakes.PROOF,
+                             run_dir="/x", links={})))
+
+
+def test_an_episode_job_left_out_at_start_is_wired_by_a_later_refresh(front):
+    """A transient failure (the HF Hub down at the front's start): the hot job
+    set retries the job at its refresh, through the real job set."""
+    front.calls.fail["intake"] = [OSError("HF Hub unreachable")]
+    started = front.start([SINGLE_ID, EPISODE_ID], linked_ids=[SINGLE_ID])
+    assert EPISODE_ID not in started.served
+    entry = _entry(EPISODE_TASK, EPISODE_ID)
+    asyncio.run(started.job_set._consider(entry))
+    w = started.job_set.served[EPISODE_ID]
+    assert w.grader._dispatcher is started.app.state.corpus_grade_remote
+
+
+def test_a_hot_episode_job_on_another_pin_is_passed_over_by_the_job_set(front):
+    started = front.start([EPISODE_ID])
+    entry = _entry("corpus-swe-3", "swe-agentic-other")
+    asyncio.run(started.job_set._consider(entry))       # never raises
+    assert "swe-agentic-other" not in started.job_set.served
+    assert "corpus-swe-3" in started.job_set._passed_over

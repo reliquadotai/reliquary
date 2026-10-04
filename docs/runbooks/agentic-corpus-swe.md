@@ -159,6 +159,19 @@ settler, both held until graded). Judge processes host no grader, so:
   heartbeats in the job status (`dispatcher_waiting`, the executors listed)
   before miners submit.
 
+**An episode job that cannot be wired at startup is left out, alone.** If its
+renderer, ledger migration, replay-lease check, grade executor registry read
+or intake (reliquary-swe or renderers missing or at a wrong pin, the HF
+dataset, R2) fails, the control logs `EPISODE JOB <id> IS NOT SERVED: <step>
+failed: ...` at ERROR and starts with the other jobs: single-turn intake never
+goes down for it. Its routes do not exist (`/corpus/jobs` does not list it).
+Fix the cause and restart; with `RELIQUARY_CORPUS_HOT_JOBS=1` the job set also
+retries it at each refresh (a transient failure heals without a restart, as
+long as the grade executor registry was read at start). A control whose only
+job fails this way refuses to start. Grep for `IS NOT SERVED` after every
+restart of a control that serves an episode job. A front restart also drops the
+grade leases in flight; the executors claim them again.
+
 Not supported: an episode job in a split judge group (refused at startup, see
 above); `RELIQUARY_CORPUS_INTAKE_ONLY` outside the end-to-end run (nothing is
 audited or paid; refused with the split); one validator grading two env pins.

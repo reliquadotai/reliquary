@@ -856,7 +856,31 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         return w
 
     wiring = []
+    # Episode jobs that failed to wire at startup, by task id: logged, left
+    # unserved, and the others start (one job's environment never takes every
+    # job's intake down). A hot job set retries them at its refresh.
+    unserved: dict[str, str] = {}
+
+    def not_served(task_entry, job, step: str, exc: BaseException) -> None:
+        why = f"{step} failed: {type(exc).__name__}: {exc}"
+        unserved[str(task_entry.task_id)] = why
+        logger.error("corpus task %s: EPISODE JOB %s IS NOT SERVED: %s. The other jobs are "
+                     "served; fix it and restart%s", task_entry.task_id, job.job_id, why,
+                     " (the hot job set retries it at each refresh)" if read_registry else "",
+                     exc_info=(type(exc), exc, exc.__traceback__))
+
     for task_entry, task_cap, job in manifests:
+        if job.episode is not None:
+            try:
+                own_profile = (_entry_profile(task_entry) if several
+                               and getattr(task_entry, "contract", None) is not None else None)
+                renderer = build_renderer(job, own_profile)
+                seen_index = await migrate_ledgers_at_startup(store, job)
+            except Exception as exc:  # noqa: BLE001 - isolated: the others still start
+                not_served(task_entry, job, "its renderer or ledger migration", exc)
+                continue
+            wiring.append(prepared(task_entry, task_cap, job, own_profile, renderer, seen_index))
+            continue
         # Before anything serves: the route would otherwise seal a v1 seen set
         # inside its first submission's ledger turn. One ledger, one index, per job.
         seen_index = await migrate_ledgers_at_startup(store, job)
@@ -988,10 +1012,13 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         from reliquary.validator.corpus_grade_remote import check_replay_lease
 
         (package, version), = pins
-        # Ruling P26: refuse to start with a replay lease its replays outlive.
-        for w in wiring:
-            if w.job.episode is not None:
+        # Ruling P26: never serve a job whose replays outlive the replay lease.
+        for w in [w for w in wiring if w.job.episode is not None]:
+            try:
                 await asyncio.to_thread(check_replay_lease, w.job)
+            except Exception as exc:  # noqa: BLE001 - isolated: the others still start
+                not_served(w.entry, w.job, "its replay lease check", exc)
+                wiring.remove(w)
         grade_directory = ExecutorDirectory(model_id=package, model_revision=version, scope="grade")
         grade_dispatcher = RemoteGradeDispatcher(
             directory=grade_directory, env_package=package, env_version=version,
@@ -1001,26 +1028,33 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 executor_id, at=at, detail=detail))
         # Quarantines survive a restart: the registry's are refused and held
         # before any grader (and so any settlement) is wired.
-        await grade_directory.refresh()
-        grade_dispatcher.load_quarantined()
+        try:
+            await grade_directory.refresh()
+        except Exception as exc:  # noqa: BLE001 - no grader without the quarantines
+            for w in [w for w in wiring if w.job.episode is not None]:
+                not_served(w.entry, w.job, "reading the grade executor registry", exc)
+                wiring.remove(w)
+            grade_dispatcher = grade_directory = None
+        else:
+            grade_dispatcher.load_quarantined()
     job_set: CorpusJobSet | None = None
     archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
 
     def episode_intake_for(w):
         # Loads the task set and the renderer: blocking, so a hot-added job
         # builds it off the event loop (`wire_hot`).
-        from reliquary.validator.agentic_intake import build_episode_intake
+        from reliquary.validator import agentic_intake
 
-        return build_episode_intake(
+        return agentic_intake.build_episode_intake(
             w.job, checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
             vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
 
     def audit_and_settle(w) -> None:
-        if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
-            w.episode_intake = episode_intake_for(w)
         refusal = split_episode_refusal(split, w.job)
         if refusal is not None:
             raise ValueError(refusal[1])                       # never paid ungraded
+        if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
+            w.episode_intake = episode_intake_for(w)
         if w.job.episode is not None:
             wire_job_grader(w, records=records, judge_records=judge_records,
                             dispatcher=grade_dispatcher)
@@ -1035,8 +1069,19 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                        scorer=scorer, vocab_size=vocab_size if split is not None else None,
                        auditor_kwargs=auditor_kwargs)
 
-    for w in wiring:
-        audit_and_settle(w)
+    for w in list(wiring):
+        if w.job.episode is None:
+            audit_and_settle(w)
+            continue
+        try:
+            audit_and_settle(w)
+        except Exception as exc:  # noqa: BLE001 - isolated: the others still start
+            not_served(w.entry, w.job, "its intake, grader or auditor wiring", exc)
+            graders.pop(str(w.job.job_id), None)
+            wiring.remove(w)
+    if not wiring:
+        raise RuntimeError("no corpus job left to serve: " + "; ".join(
+            f"{task}: {why}" for task, why in sorted(unserved.items())))
 
     app = build_corpus_jobs_app(jobs=wiring, store=store, records=records, tokenizer=tokenizer,
                                 verify_signature=verify_corpus_signature,
@@ -1085,6 +1130,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                else JOB_REFRESH_SECONDS),
     )
     app.state.corpus_jobs = job_set
+    app.state.corpus_unserved = unserved
     for w in wiring:
         job_set.adopt(w)
 
