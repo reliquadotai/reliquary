@@ -66,9 +66,22 @@ reliquary jobs create --job-id swe-agentic-v1 --model Qwen/Qwen3.8-27B \
   --prompt-source reliquary_agentic_swe_v1 --prompt-count <COUNT> \
   --renderer-id renderers:qwen38@0.1.11 --eos-token-id <EOS> --slots-per-prompt 2 \
   --max-new-tokens 8192 --prompt-order free --cap <CAP> --audit-q <Q> \
-  --episode-file episode.json --fleet-knows-corpus-generation
+  --episode-file episode.json --fleet-knows-corpus-generation \
+  --settlement period-ema-v1 --fleet-knows-period-settlement
 reliquary tasks contract --task-id swe-agentic-v1 > swe-agentic-v1.contract.json
 ```
+
+- **Settlement.** `--settlement period-ema-v1` is the default and is paid by
+  the task's own 72-minute drand periods; `jobs create` refuses it (exit 1,
+  `error: a period-ema-v1 job needs every validator to know it`) without
+  `--fleet-knows-period-settlement`, which you pass only once the corpus
+  validator serving the job and every weight setter run a binary that settles
+  and replays period-ema-v1. Otherwise pass `--settlement windows` (paid by
+  the RL window index). Either way an episode is paid only once graded, and a
+  period closes only when everything received in it is graded (ruling P21).
+  A submission whose regrades (after executor quarantines) pass
+  `MAX_REGRADE_GENERATIONS` resolves `regrade_exhausted`: voided unpaid, an
+  error in the control's log, and it stops holding its period (ruling P22).
 
 - `<Q>` comes from spec §7 M3's table for the expected miner count and median
   length (one audit GPU: 1.0 at 10 miners and 20k tokens; lower beyond, or add

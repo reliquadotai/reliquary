@@ -1080,8 +1080,41 @@ def test_regrades_stop_at_the_generation_cap():
             await grader.regrade_executor(executor)
         return await grader.ready([SID])
 
-    assert asyncio.run(scenario()) == set()                # held, an operator alert
+    # Ruling P22: past the cap it resolves regrade_exhausted, unpaid (a void
+    # without escalation) and no longer held: one stuck submission never
+    # freezes a task's pay.
+    assert asyncio.run(scenario()) == {SID}
     assert records.regrades[SID]["generation"] == MAX_REGRADE_GENERATIONS
+    void = records.voided[SID]
+    assert void["reason"] == "regrade_exhausted" and void["hotkey"] == "5Hot"
+    assert grader.status()["regrading"] == 0
+
+
+def test_an_exhausted_regrade_logs_an_operator_error_and_never_escalates(monkeypatch):
+    from reliquary.validator import corpus_grading
+    from reliquary.validator.corpus_grading import MAX_REGRADE_GENERATIONS
+
+    errors = []
+    monkeypatch.setattr(corpus_grading.logger, "error", lambda *a, **k: errors.append(a[0] % a[1:]))
+    records, states = _Records(), _States()
+    names = [f"g{k}" for k in range(2 * MAX_REGRADE_GENERATIONS + 4)]
+    grades = [GradeDecision("ok", PASSED.result, (e,), (f"p{e}",)) for e in names[0::2]]
+    replays = [GradeDecision("ok", CERTIFIED.result, (e,), (f"p{e}",)) for e in names[1::2]]
+    dispatcher = _Sequence(grades, replays)
+    dispatcher.quarantined = set()
+    grader, voided = _grader(records, dispatcher, states=states)
+
+    async def scenario():
+        await grader.grade_one(SID)
+        for k in range(MAX_REGRADE_GENERATIONS + 1):
+            dispatcher.quarantined.add(names[2 * k])
+            await grader.regrade_executor(names[2 * k])
+        grader._listed = set()
+        return grader.oldest_unready_received_at()
+
+    assert asyncio.run(scenario()) is None                 # no longer holds any period
+    assert any("regrade_exhausted" in e for e in errors)
+    assert states.states == {} and voided == [SID]
 
 
 def test_a_grader_wired_after_a_quarantine_holds_its_executor():

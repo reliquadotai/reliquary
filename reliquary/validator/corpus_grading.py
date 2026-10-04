@@ -52,6 +52,8 @@ INDEX_READ_CONCURRENCY = 16
 SANCTION_PROVIDERS = 2
 # The void reason of a trajectory no box could judge (ruling P23): unpaid, no sanction.
 REPLAY_UNJUDGEABLE = "replay_unjudgeable"
+# The void reason of a submission regraded past MAX_REGRADE_GENERATIONS (ruling P22).
+REGRADE_EXHAUSTED = "regrade_exhausted"
 # The auditor's (corpus_auditor): the route stamps a submission's arrival up to
 # this long before the record is written and the submission enqueued.
 ACCEPT_SLACK_SECONDS = 420.0
@@ -597,8 +599,9 @@ class CorpusGrader:
         in the latest document's ``regraded_for`` (one redo per submission
         per executor), and the dispatcher never leases to a quarantined
         executor, so each generation needs a newly quarantined lone decider;
-        past ``MAX_REGRADE_GENERATIONS`` the submission stays held (never paid)
-        and an operator is alerted."""
+        past ``MAX_REGRADE_GENERATIONS`` the submission resolves
+        ``regrade_exhausted`` (voided unpaid, released; ruling P22) and an
+        operator is alerted."""
         if submission_id in self._regrades_inflight:
             return
         self._regrades_inflight.add(submission_id)
@@ -630,10 +633,8 @@ class CorpusGrader:
             generation = int(latest.get("generation") or 0)
             regraded_for = list(latest.get("regraded_for") or [])
             if generation >= MAX_REGRADE_GENERATIONS or set(caught) <= set(regraded_for):
-                logger.error("corpus job %s: %s still decided alone by quarantined %s after "
-                             "%d regrade(s); held from payment, needs an operator",
-                             self._job.job_id, submission_id[:12], caught, generation)
-                return False
+                await self._regrade_exhausted(submission_id, latest, caught, generation)
+                return True
             self._generation[submission_id] = (generation + 1,
                                                sorted(set(regraded_for) | set(caught)))
             try:
@@ -641,7 +642,31 @@ class CorpusGrader:
                     return True                  # the record is gone or not an episode
             finally:
                 self._generation.pop(submission_id, None)
-        return False
+        latest = await self._latest(submission_id) or {}
+        await self._regrade_exhausted(submission_id, latest, self._caught(latest),
+                                      int(latest.get("generation") or 0))
+        return True
+
+    async def _regrade_exhausted(self, submission_id: str, latest: dict, caught: list[str],
+                                 generation: int) -> None:
+        """Ruling P22: past ``MAX_REGRADE_GENERATIONS`` the submission resolves
+        ``regrade_exhausted``: voided unpaid (create-only, no escalation: the
+        executors failed, not the miner) and released, so it no longer holds
+        its period or its window. An operator is alerted."""
+        document = {"schema": VOIDED_SCHEMA, "submission_id": submission_id,
+                    "hotkey": latest.get("hotkey"), "reason": REGRADE_EXHAUSTED,
+                    "voided_at": self._clock(), "generation": generation, "caught": list(caught),
+                    "graded_by": list(latest.get("graded_by") or []),
+                    "replay_graded_by": list((latest.get("replay") or {}).get("graded_by") or [])}
+        written = await self._records.write_voided(self._job.job_id, submission_id, document)
+        logger.error("corpus job %s: %s still decided alone by quarantined %s after %d "
+                     "regrade(s); resolved regrade_exhausted, unpaid; needs an operator",
+                     self._job.job_id, submission_id[:12], caught, generation)
+        if written and self.on_voided is not None:
+            try:
+                self.on_voided(submission_id, document)
+            except Exception:
+                logger.exception("void report for %s failed", submission_id[:12])
 
     async def _settle_regrade(self, submission_id: str, latest: dict) -> None:
         """A regrade written before a restart that its void did not follow."""
