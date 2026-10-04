@@ -893,12 +893,16 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     # job's intake down). A hot job set retries them at its refresh.
     unserved: dict[str, str] = {}
 
-    def not_served(task_entry, job, step: str, exc: BaseException) -> None:
+    def not_served(task_entry, job, step: str, exc: BaseException, *,
+                   retried: bool = True) -> None:
+        # ``retried``: a hot job set wires it again at its refresh (a transient
+        # failure); a lease refusal or no grade dispatcher is permanent until a restart.
         why = f"{step} failed: {type(exc).__name__}: {exc}"
         unserved[str(task_entry.task_id)] = why
         logger.error("corpus task %s: EPISODE JOB %s IS NOT SERVED: %s. The other jobs are "
                      "served; fix it and restart%s", task_entry.task_id, job.job_id, why,
-                     " (the hot job set retries it at each refresh)" if read_registry else "",
+                     " (the hot job set retries it at each refresh)"
+                     if read_registry and retried and not isinstance(exc, ValueError) else "",
                      exc_info=(type(exc), exc, exc.__traceback__))
 
     for task_entry, task_cap, job in manifests:
@@ -1029,6 +1033,17 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             record_heartbeat=lambda executor_id, at, detail: executor_store.record_heartbeat(
                 executor_id, at=at, detail=detail),
         )
+    async def lease_checked(job) -> None:
+        """Ruling P26, at start and on every hot add: a refusal is a
+        ``ValueError`` (permanent until a restart), a transient fault (the HF
+        Hub) stays itself (retried)."""
+        from reliquary.validator import corpus_grade_remote
+
+        try:
+            await asyncio.to_thread(corpus_grade_remote.check_replay_lease, job)
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+
     # One grade dispatcher for every episode job: one env pin per validator.
     grade_dispatcher = grade_directory = None
     graders: dict[str, object] = {}
@@ -1041,13 +1056,11 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         from reliquary.validator.corpus_audit_remote import ExecutorDirectory
         from reliquary.validator.corpus_grade_remote import RemoteGradeDispatcher
 
-        from reliquary.validator.corpus_grade_remote import check_replay_lease
-
         (package, version), = pins
         # Ruling P26: never serve a job whose replays outlive the replay lease.
         for w in [w for w in wiring if w.job.episode is not None]:
             try:
-                await asyncio.to_thread(check_replay_lease, w.job)
+                await lease_checked(w.job)
             except Exception as exc:  # noqa: BLE001 - isolated: the others still start
                 not_served(w.entry, w.job, "its replay lease check", exc)
                 wiring.remove(w)
@@ -1064,7 +1077,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             await grade_directory.refresh()
         except Exception as exc:  # noqa: BLE001 - no grader without the quarantines
             for w in [w for w in wiring if w.job.episode is not None]:
-                not_served(w.entry, w.job, "reading the grade executor registry", exc)
+                not_served(w.entry, w.job, "reading the grade executor registry", exc,
+                           retried=False)
                 wiring.remove(w)
             grade_dispatcher = grade_directory = None
         else:
@@ -1153,12 +1167,14 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             # Before its intake (a task set download): a job this process
             # cannot grade is refused for nothing.
             grade_refusal(job, grade_dispatcher)
+            await lease_checked(job)
         seen_index = await migrate_ledgers_at_startup(store, job)
         w = prepared(task_entry, task_cap, job, own_profile, renderer, seen_index)
         if job.episode is not None:
             w.episode_intake = await asyncio.to_thread(episode_intake_for, w)
             await warm_drand_chain(judge_threads.beacon)
         audit_and_settle(w)
+        unserved.pop(str(task_entry.task_id), None)       # served now
         return w
 
     async def read_job(job_id):

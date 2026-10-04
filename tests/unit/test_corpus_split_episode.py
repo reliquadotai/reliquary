@@ -183,6 +183,9 @@ def front(monkeypatch, tmp_path):
     monkeypatch.setattr(corpus_validator, "_entry_profile", lambda entry: None)
     built = {}
 
+    async def no_entries():
+        return {}
+
     class _Server:
         def __init__(self, config):
             built["app"] = config.app
@@ -190,7 +193,7 @@ def front(monkeypatch, tmp_path):
 
     monkeypatch.setattr(uvicorn, "Server", _Server)
 
-    def start(served_ids, linked_ids=()):
+    def start(served_ids, linked_ids=(), hot=False):
         from reliquary.validator.corpus_split import FrontSplit
 
         tasks = {EPISODE_ID: EPISODE_TASK, SINGLE_ID: SINGLE_TASK,
@@ -202,7 +205,8 @@ def front(monkeypatch, tmp_path):
             asyncio.run(corpus_validator.run_corpus_validator(
                 jobs=[(_entry(tasks[j], j), 0.1) for j in served_ids], wallet=None, netuid=81,
                 signer_client=None, http_host="127.0.0.1", http_port=0, set_weights=False,
-                registration_gate=False, split=split))
+                registration_gate=False, split=split,
+                read_registry=no_entries if hot else None))
         app = built["app"]
         return SimpleNamespace(app=app, served=app.state.corpus_jobs.served, link=link,
                                job_set=app.state.corpus_jobs, split=split)
@@ -415,6 +419,68 @@ def test_an_episode_job_left_out_at_start_is_wired_by_a_later_refresh(front):
     asyncio.run(started.job_set._consider(entry))
     w = started.job_set.served[EPISODE_ID]
     assert w.grader._dispatcher is started.app.state.corpus_grade_remote
+    # Served now: no longer listed as not served.
+    assert EPISODE_TASK not in started.app.state.corpus_unserved
+
+
+def test_a_job_the_lease_check_refuses_at_start_is_never_wired_by_a_refresh(front):
+    """P26: a refresh retries the job, but the lease check is run again first
+    and its refusal is permanent."""
+    refusal = RuntimeError("the replay lease is shorter than the task's replay work")
+    front.calls.fail["lease"] = [refusal, RuntimeError(str(refusal))]
+    started = front.start([SINGLE_ID, EPISODE_ID], linked_ids=[SINGLE_ID], hot=True)
+    assert EPISODE_ID not in started.served
+    asyncio.run(started.job_set._consider(_entry(EPISODE_TASK, EPISODE_ID)))
+    assert EPISODE_ID not in started.job_set.served
+    assert EPISODE_TASK in started.job_set._passed_over          # refused for good
+    assert front.calls.intakes == []                             # before any intake
+
+
+def test_a_second_hot_job_on_the_pin_is_lease_checked_too(front):
+    started = front.start([EPISODE_ID], hot=True)
+    front.calls.fail["lease"] = [RuntimeError("the replay lease is shorter ...")]
+    front.calls.intakes.clear()
+    with pytest.raises(ValueError, match="replay lease"):
+        asyncio.run(started.job_set._wire(_entry("corpus-swe-2", "swe-agentic-v2"), 0.1,
+                                          front.jobs["swe-agentic-v2"]))
+    assert front.calls.intakes == []
+    assert front.calls.leases == [EPISODE_ID]                    # the refused one not listed
+
+
+def test_a_transient_lease_check_failure_stays_retried(front):
+    started = front.start([EPISODE_ID], hot=True)
+    front.calls.fail["lease"] = [OSError("HF Hub unreachable")]
+    with pytest.raises(OSError):
+        asyncio.run(started.job_set._wire(_entry("corpus-swe-2", "swe-agentic-v2"), 0.1,
+                                          front.jobs["swe-agentic-v2"]))
+
+
+def test_a_pin_this_binary_does_not_have_is_refused_for_good(monkeypatch):
+    from reliquary.environment import agentic_swe
+    from reliquary.validator import agentic_intake
+
+    monkeypatch.setattr(agentic_swe, "episode_support_refusal",
+                        lambda *a, **kw: "reliquary-swe is installed at another commit")
+    with pytest.raises(ValueError, match="another commit"):
+        agentic_intake.build_episode_intake(_episode_job(), checkpoint_dir="/x",
+                                            tokenizer=fakes.Tokenizer(),
+                                            vocab_size=fakes.VOCAB, chunk_tokens=32)
+
+
+@pytest.mark.parametrize("step,retried", [("intake", True), ("registry", False),
+                                          ("lease", False)])
+def test_the_not_served_log_promises_a_retry_only_when_there_is_one(front, monkeypatch,
+                                                                    step, retried):
+    from reliquary.validator import corpus_validator
+
+    errors = []
+    monkeypatch.setattr(corpus_validator.logger, "error",
+                        lambda msg, *a, **kw: errors.append(msg % a))
+    front.calls.fail[step] = [RuntimeError("boom")]
+    front.start([SINGLE_ID, EPISODE_ID], linked_ids=[SINGLE_ID], hot=True)
+    (message,) = [m for m in errors if "IS NOT SERVED" in m]
+    assert ("retries it at each refresh" in message) is retried, message
+    assert ("restart" in message), message
 
 
 def test_a_hot_episode_job_on_another_pin_is_passed_over_by_the_job_set(front):
