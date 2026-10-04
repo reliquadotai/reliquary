@@ -390,13 +390,13 @@ on 2026-10-03 23:25 to 23:56 UTC; summary in
   (Hetzner): `grade-a` (provider `hetzner`, concurrency 4) through two SSH
   tunnels from the VPS.
 - **Mining** (`mine.json`): honest 6 accepted, `forge_diff` 1 accepted,
-  `forge_obs` 1 accepted; 8 trajectories, 13 to 33 turns (214 in all),
+  `forge_obs` 1 accepted; 8 trajectories, 18 to 33 turns (214 in all),
   200,010 tokens (86,073 assistant tokens paid on), 10.5 min from start to the
   last submission (1.5 min of it loading the model).
 - **Honest:** 6 accepted, 6 TOPLOC-passed (worst exponent 14 to 21, worst
   mantissa mean 4.6 to 7.0), 6 graded successes, 6 replay-certified, 0 voided,
   0 confirmed failures. Replay mismatches per honest trajectory: 0, 1, 1, 2, 5
-  (of 28, tolerance 5) and 5 (of 46, tolerance 6).
+  (of 28, tolerance 5) and 5 (of 50, tolerance 6).
 - **Forged diff** (gold patch + a new file): TOPLOC passed, graded successful,
   replay failed on both `grade-a` and `grade-b` (providers `hetzner` and
   `digitalocean`), replayed diff unequal, 6 of 43 observations mismatched;
