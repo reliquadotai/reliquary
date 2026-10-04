@@ -365,8 +365,11 @@ executor's `timeout`); the trajectory's clock starts at its first action with
 twice the miner's agent + finalize budget (SWE-smith: 2 x (3600 + 900) =
 9000 s), so only a trajectory far past any honest episode is `box_timeout`.
 Capacity: a forger whose last action sleeps forever holds an executor slot
-up to about 2.5 h (setup + budget) per replay it gets; it holds at most as
-many replays as it has accepted slots, and each costs it its own slot. A trajectory whose text a
+up to about 2.9 h per replay it gets (setup 1500 s + budget 9000 s =
+10 500 s at most; the 12 000 s lease bounds it in any case); it holds at most as
+many replays as it has accepted slots, and each costs it its own slot.
+
+A trajectory whose text a
 lease cannot carry (4096 actions, 4 MiB per observation or argument, 16 MiB
 in all) is refused at intake as `trajectory_too_large`; the miner checks the
 same bound before signing.
