@@ -39,7 +39,7 @@ async def close_task(task_id: str, *, cut_tail: bool = False,
                      set_cap: Callable[..., Awaitable] | None = None,
                      retire: Callable[..., Awaitable] | None = None,
                      drand_round: Callable[[], int] = current_drand_round) -> str:
-    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION, MECHANISM_NATIVE_AFFINE_POINTS
     from reliquary.validator import corpus_periods as cp
     from reliquary.validator.corpus_job_status import stored_job_counts
 
@@ -50,10 +50,6 @@ async def close_task(task_id: str, *, cut_tail: bool = False,
 
         set_cap = set_cap or store.set_task_cap
         retire = retire or store.retire_task_entry
-    if records is None:
-        from reliquary.infrastructure.corpus_record_store import BucketRecordStore
-
-        records = BucketRecordStore()
     if period_weights is None:
         from reliquary.validator.weight_only import WeightOnlyValidator
 
@@ -63,12 +59,22 @@ async def close_task(task_id: str, *, cut_tail: bool = False,
     entry = entries.get(task_id)
     if entry is None:
         raise TaskNotClosable(f"no task {task_id!r} in the registry")
-    if entry.mechanism != MECHANISM_CORPUS_GENERATION:
-        raise TaskNotClosable(f"{task_id} is {entry.mechanism!r}: only a corpus task closes")
+    if entry.mechanism not in {MECHANISM_CORPUS_GENERATION, MECHANISM_NATIVE_AFFINE_POINTS}:
+        raise TaskNotClosable(f"{task_id} is {entry.mechanism!r}: only a corpus task or native Affine task closes")
     cap = float(entry.params.get("cap", 0.0))
-    if not (await stored_job_counts(records, entry.job_id))["drained"]:
-        raise TaskNotClosable(f"job {entry.job_id} is not drained: every submission must be "
-                              "audited and settled first (reliquary jobs status)")
+    if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS:
+        from reliquary.integrations.affine_competition import read_archive
+
+        if await read_archive(entry) is None:
+            raise TaskNotClosable("native Affine task has no finalized settlement archive")
+    else:
+        if records is None:
+            from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+
+            records = BucketRecordStore()
+        if not (await stored_job_counts(records, entry.job_id))["drained"]:
+            raise TaskNotClosable(f"job {entry.job_id} is not drained: every submission must be "
+                                  "audited and settled first (reliquary jobs status)")
     if cp.is_period_task(entry):
         paying = sum((await period_weights({task_id: entry})).get(task_id, {}).values())
         if cap > 0 and paying >= cp.CLOSE_THRESHOLD * cap:

@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import secrets
 import signal
 import stat
 import subprocess
@@ -400,14 +401,21 @@ class AffineRunner:
 
     def _command(self) -> list[str]:
         c = self.config
+        # -B stops writes but still reads stale cached bytecode. An absent,
+        # per-child private prefix makes the authenticated source the input.
+        cache_prefix = Path(c.state_dir) / ("pycache-" + secrets.token_hex(16))
+        _private_path(cache_prefix)
+        if cache_prefix.exists():
+            raise AffineRuntimeError("native child cache prefix must be absent")
+        interpreter = [str(c.python), "-I", "-X", "pycache_prefix=" + str(cache_prefix), "-B"]
         if c.manifest_snapshot_file is None:
-            command = [str(c.python), "-I", "-B", str(Path(c.upstream_checkout) / "subnet/source_bootstrap.py"),
+            command = [*interpreter, str(Path(c.upstream_checkout) / "subnet/source_bootstrap.py"),
                        "--current-url", c.current_url]
         else:
             fd = _private_open(Path(c.manifest_snapshot_file), os.O_RDONLY)
             with os.fdopen(fd, "rb") as snapshot:
                 digest = hashlib.file_digest(snapshot, "sha256").hexdigest()
-            command = [str(c.python), "-I", "-B", str(Path(__file__).with_name("affine_epoch.py")),
+            command = [*interpreter, str(Path(__file__).with_name("affine_epoch.py")),
                        "--upstream-checkout", str(c.upstream_checkout),
                        "--snapshot-file", str(c.manifest_snapshot_file), "--snapshot-sha256", digest]
         command += ["--authority", c.authority,

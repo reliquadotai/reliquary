@@ -76,6 +76,12 @@ print(sys.argv[sys.argv.index('--current-url') + 1])
         self.assertEqual(args[args.index("--indices") + 1:], ["2", "7"])
         self.assertEqual((config.state_dir / "runtime.log").stat().st_mode & 0o777, 0o600)
         self.assertFalse(list(self.checkout.rglob("__pycache__")))
+        first, second = AffineRunner(config)._command(), AffineRunner(config)._command()
+        caches = [command[command.index("-X") + 1] for command in (first, second)]
+        self.assertNotEqual(*caches)
+        for prefix in caches:
+            self.assertTrue(prefix.startswith("pycache_prefix=" + str(config.state_dir)))
+            self.assertFalse(Path(prefix.split("=", 1)[1]).exists())
 
     def test_refuses_dirty_checkout_untrusted_paths_and_ambiguous_config(self):
         config = self.config("pass\n")

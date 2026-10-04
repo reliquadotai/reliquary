@@ -425,7 +425,8 @@ def _inspect(request):
         if request.get("operation") == "delegate":
             snapshot["capability"] = capability
         return snapshot
-    history = signed(native_json(document(current["history_url"])), authority)
+    history_envelope = document(current["history_url"])
+    history = signed(native_json(history_envelope), authority)
     require(history.get("authority") == authority and history.get("version") == 1, "history_authority")
     rows = [r for r in history["epochs"] if r["epoch_id"] == request["epoch_id"]]
     require(len(rows) <= 1, "duplicate_history_epoch")
@@ -434,6 +435,7 @@ def _inspect(request):
                     authoritative_acceptance=False, paid=False, inference_recomputed=False,
                     model_execution_verified=False, handover_verified=False, qualified_successor=False)
     row = rows[0]
+    envelopes["history"] = history_envelope
     envelopes["manifest"] = document(row["objects"]["manifest"])
     manifest = signed(native_json(envelopes["manifest"]), authority)
     source = row["source_bundle"]

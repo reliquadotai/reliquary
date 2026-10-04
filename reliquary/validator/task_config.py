@@ -60,6 +60,10 @@ def resolve_task_config(
         )
     if entry.status != "active":
         raise TaskConfigError(f"task {task_id!r} is {entry.status}, not active")
+    from reliquary.shared.task_registry import MECHANISM_NATIVE_AFFINE_POINTS
+
+    if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS:
+        raise TaskConfigError("native Affine tasks run with 'reliquary affine competition', not the generation validator")
     if entry.profile_id != profile_id:
         raise TaskConfigError(
             f"task {task_id!r} declares profile {entry.profile_id!r} but this "

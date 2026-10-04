@@ -275,7 +275,8 @@ class WeightOnlyValidator:
     @staticmethod
     async def _period_weights(declared: Mapping[str, Any], *, archives=None,
                               now: float | None = None,
-                              genesis: float | None = None) -> dict[str, dict[str, float]]:
+                              genesis: float | None = None,
+                              native_archive_reader=None) -> dict[str, dict[str, float]]:
         """Each period-settled task's weights at the current drand period: its
         archives that entered within the replay depth, decayed once per period
         (design 2026-10-03). Window archives never hold these tasks' pay."""
@@ -295,6 +296,18 @@ class WeightOnlyValidator:
         current = cp.period_of(time.time() if now is None else now, genesis)
         weights: dict[str, dict[str, float]] = {}
         for task_id in tasks:
+            from reliquary.shared.task_registry import MECHANISM_NATIVE_AFFINE_POINTS
+
+            if getattr(declared[task_id], "mechanism", None) == MECHANISM_NATIVE_AFFINE_POINTS:
+                if native_archive_reader is None:
+                    from reliquary.integrations.affine_competition import read_archive
+
+                    native_archive_reader = read_archive
+                document = await native_archive_reader(declared[task_id])
+                replayed = cp.replay([document] if document is not None else [], current)
+                if replayed:
+                    weights[task_id] = replayed
+                continue
             keys = [(work, entry) for work, entry in await archives.list(task_id)
                     if 0 <= current - entry <= cp.REPLAY_DEPTH]
             docs = []
