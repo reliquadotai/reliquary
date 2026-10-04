@@ -254,8 +254,12 @@ RELIQUARY_EXECUTOR_TOKEN=<token> reliquary corpus grade-executor --control-url h
 - **Providers.** `--provider-id` is required and names who runs the box
   (normalized to lower case). A replay failure sanctions a miner only when
   executors of **two distinct providers** agree (ruling P17); a disagreement
-  goes to a third distinct provider, and the executor that disagreed with the
-  majority is quarantined. With fewer distinct providers connected, an item
+  goes to a third distinct provider. An executor is quarantined only when the
+  fact it reported (a replay certified or not, a grade's applied/passed)
+  contradicts the majority's fact; a box failure (`box_lost`/`box_timeout`)
+  on either side of a split penalizes nobody (ruling P26). The job status
+  route's `grading.box_failure_votes` counts box failures per executor: a
+  host whose boxes keep dying where others' do not shows there. With fewer distinct providers connected, an item
   holding a vote waits `RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS` (30 min) of
   no available executor. If one of its replay votes certifies it, it resolves
   `disputed`: nobody is sanctioned, nothing is certified, and it is paid
@@ -382,7 +386,7 @@ same bound before signing.
 The dispute clock (`RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS`) counts only the
 time during which no executor of another provider, on the pinned env and
 working (a claim request in the last `RELIQUARY_CORPUS_GRADE_CLAIM_LIVE_SECONDS`,
-120 s, 30 to 3600, or a lease held; heartbeats alone do not count), could
+260 s, 30 to 3600, or a lease held; heartbeats alone do not count), could
 take the next vote, and an item holding a vote is leased before any new item: a grading
 backlog never resolves a failing replay as `disputed`.
 

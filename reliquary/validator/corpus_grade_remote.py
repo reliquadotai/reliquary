@@ -67,6 +67,7 @@ from reliquary.validator.corpus_grade_protocol import (
     GradeItemResult,
     GradeResult,
 )
+from reliquary.validator.lease_executor import ERROR_BACKOFF_SECONDS, REQUEST_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +128,12 @@ MAX_LEASES_PER_EXECUTOR = 8
 # How long an item holding a vote waits for a next distinct-provider executor.
 GRADE_DISPUTE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS", 1800.0, 60.0, 86400.0)
 # Ruling P26: an executor serves the dispute clock only while it claims (a
-# claim request this recent) or holds a lease; heartbeats alone do not.
+# claim request this recent) or holds a lease; heartbeats alone do not. The
+# default outlasts two of an executor's slowest claim cycles (a request that
+# times out, then the error backoff; ruling P27): 260 s.
 GRADE_CLAIM_LIVE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_CLAIM_LIVE_SECONDS",
-                                        120.0, 30.0, 3600.0)
+                                        2 * (REQUEST_TIMEOUT_SECONDS + ERROR_BACKOFF_SECONDS),
+                                        30.0, 3600.0)
 UNGRADEABLE = "ungradeable"
 DISPUTED = "disputed"
 # Ruling P23: the box failed or the deadline passed once the trajectory's
@@ -244,6 +248,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
         # Executors whose last claim was refused 409 wrong_env: live by their
         # heartbeats, but they never take a lease, so never eligible (N2).
         self._wrong_env: set[str] = set()
+        # Box failures (box_lost/box_timeout) each executor reported: never a
+        # penalty (ruling P26), shown on the status route for the operator.
+        self.box_failure_votes: collections.Counter[str] = collections.Counter()
         # When each executor last asked for a lease (ruling P26).
         self._claimed_at: dict[str, float] = {}
         self._claim_live = float(claim_live_seconds)
@@ -412,6 +419,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
             self.stats[f"executor_{answer.status}s"] += 1
             self._failed_attempt(work, f"{answer.status}s")
             return "requeued"
+        if answer.status in TRAJECTORY_STATUSES:
+            self.box_failure_votes[executor_id] += 1
         if work.drawn is None:
             work.drawn = self._rng.random() < self._fraction
         work.results[executor_id] = answer.model_dump()

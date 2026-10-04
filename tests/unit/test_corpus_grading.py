@@ -856,9 +856,11 @@ def test_the_grader_reports_its_backlog():
         await grader.rescan_once()
         return grader.status()
 
+    grader._dispatcher.box_failure_votes = {"g0": 2}
     status = asyncio.run(scenario())
     assert status["graded"] == 1 and status["ungraded"] == 1 and status["regrading"] == 0
     assert "dispatcher_waiting" in status
+    assert status["box_failure_votes"] == {"g0": 2}         # per executor, for the operator
 
 
 def test_the_split_refuses_an_episode_job_at_startup(monkeypatch):

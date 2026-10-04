@@ -299,23 +299,54 @@ async def test_an_item_no_lease_can_carry_is_ungradeable_and_never_leased(oversi
     assert d.claim("g0") is None and d.stats["ungradeable"] == 1
 
 
-def test_a_lease_outlives_its_work():
+def _swesmith_timeouts(setup, agent, finalize, scoring):
     import types
 
+    return types.SimpleNamespace(data=types.SimpleNamespace(timeout=types.SimpleNamespace(
+        setup=setup, agent=agent, finalize=finalize, scoring=scoring)))
+
+
+def test_a_lease_outlives_its_work():
+    """Runs without reliquary_swe (CI): SWE-smith's timeouts as pinned in
+    reliquary-swe's taskset at the job's commit (900/3600/900/1800)."""
     from reliquary.validator.agentic_replay import replay_deadlines
     from reliquary.validator.corpus_grade_executor import DEFAULT_SCORING_SECONDS
 
     seconds = corpus_grade_remote.GRADE_LEASE_SECONDS
     # A replay is bounded by its setup deadline plus its trajectory budget
-    # (ruling P25, SWE-smith's timeouts), a grade by its scoring timeout; each
-    # lease leaves room for the box and the corpus load.
-    taskset = pytest.importorskip("reliquary_swe.taskset")
-    swesmith = types.SimpleNamespace(data=types.SimpleNamespace(timeout=types.SimpleNamespace(
-        setup=taskset._SETUP_TIMEOUT_SECONDS, agent=taskset._AGENT_TIMEOUT_SECONDS,
-        finalize=taskset._FINALIZE_TIMEOUT_SECONDS, scoring=taskset._SCORING_TIMEOUT_SECONDS)))
+    # (ruling P25), a grade by its scoring timeout; each lease leaves room
+    # for the box and the corpus load.
+    swesmith = _swesmith_timeouts(900.0, 3600.0, 900.0, 1800.0)
     assert seconds["replay"] >= sum(replay_deadlines(swesmith)) + corpus_grade_remote.REPLAY_LEASE_MARGIN_SECONDS
     assert corpus_grade_remote.replay_lease_refusal(swesmith) is None
     assert seconds["grade"] >= DEFAULT_SCORING_SECONDS + 300
+
+
+def test_the_pinned_taskset_timeouts_are_the_ones_the_lease_is_sized_for():
+    taskset = pytest.importorskip("reliquary_swe.taskset")
+    assert (taskset._SETUP_TIMEOUT_SECONDS, taskset._AGENT_TIMEOUT_SECONDS,
+            taskset._FINALIZE_TIMEOUT_SECONDS, taskset._SCORING_TIMEOUT_SECONDS) == \
+        (900.0, 3600.0, 900.0, 1800.0)
+    assert corpus_grade_remote.replay_lease_refusal(_swesmith_timeouts(
+        taskset._SETUP_TIMEOUT_SECONDS, taskset._AGENT_TIMEOUT_SECONDS,
+        taskset._FINALIZE_TIMEOUT_SECONDS, taskset._SCORING_TIMEOUT_SECONDS)) is None
+
+
+def test_the_claim_window_outlasts_an_executors_slowest_claim_cycle():
+    from reliquary.validator.lease_executor import ERROR_BACKOFF_SECONDS, REQUEST_TIMEOUT_SECONDS
+
+    assert corpus_grade_remote.GRADE_CLAIM_LIVE_SECONDS == \
+        2 * (REQUEST_TIMEOUT_SECONDS + ERROR_BACKOFF_SECONDS)
+
+
+async def test_box_failure_votes_are_counted_per_executor():
+    d = await _dispatcher(recheck=1.0)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", BOX_LOST)
+    _answer(d, "g1", BOX_TIMEOUT)
+    await asyncio.wait_for(decision, 5)
+    assert d.box_failure_votes == {"g0": 1, "g1": 1}
 
 
 async def test_the_lease_expiry_follows_its_mode():

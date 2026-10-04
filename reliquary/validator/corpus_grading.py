@@ -245,7 +245,11 @@ class CorpusGrader:
                 # Non-empty: every grade from before boot is held (job-wide).
                 "held_executors": sorted(self._held_executors),
                 "unindexed": len(self._unindexed),
-                "dispatcher_waiting": stats.get("waiting")}
+                "dispatcher_waiting": stats.get("waiting"),
+                # Per executor, box failures it reported (ruling P27): never a
+                # penalty, but a host whose boxes keep dying shows here.
+                "box_failure_votes": dict(getattr(self._dispatcher, "box_failure_votes", None)
+                                          or {})}
 
     def _gated(self):
         if self._gate is None:
