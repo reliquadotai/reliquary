@@ -189,8 +189,10 @@ def front(monkeypatch, tmp_path):
 def _post(app, path, body):
     from fastapi.testclient import TestClient
 
-    return TestClient(app).post(path, json=body,
-                                headers={"Authorization": "Bearer nope"}).status_code
+    client = TestClient(app)
+    if body is None:
+        return client.post(path).status_code
+    return client.post(path, json=body, headers={"Authorization": "Bearer nope"}).status_code
 
 
 def test_the_front_serves_an_episode_job_no_group_names(front):
@@ -216,6 +218,8 @@ def test_the_front_serves_an_episode_job_no_group_names(front):
     # The grade executors reach the front: its routes are mounted.
     claim = {"executor_id": "g0", "env_package": "reliquary-swe", "env_version": "0" * 40}
     assert _post(started.app, "/corpus/internal/grade/claim", claim) == 401     # mounted, gated
+    # The runbook's reachability probe: a bare POST is 422 (routed), never 404.
+    assert _post(started.app, "/corpus/internal/grade/claim", None) == 422
     # The single-turn job still goes to its judge process, as before.
     single = started.served[SINGLE_ID]
     assert single.judge_link is started.link and getattr(single, "grader", None) is None
@@ -226,6 +230,7 @@ def test_single_turn_jobs_alone_mount_no_grade_route(front):
     assert not hasattr(started.app.state, "corpus_grade_remote")
     claim = {"executor_id": "g0", "env_package": "reliquary-swe", "env_version": "0" * 40}
     assert _post(started.app, "/corpus/internal/grade/claim", claim) == 404
+    assert _post(started.app, "/corpus/internal/grade/claim", None) == 404
     assert front.calls.intakes == [] and front.calls.leases == []
 
 
