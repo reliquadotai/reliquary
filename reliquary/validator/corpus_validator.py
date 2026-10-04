@@ -340,26 +340,30 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     # Fed by the auditor: the store is listed only as the net.
     from reliquary.validator.corpus_periods import is_period_task
 
+    grader = getattr(w, "grader", None)
     if is_period_task(w.entry):
         # Paid on its own clock (design 2026-10-03): closes a period when the
-        # auditor holds nothing undecided received in it.
+        # auditor holds nothing undecided received in it -- and, for an episode
+        # job, its grader nothing ungraded or held (ruling P21).
         from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
-        from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+        from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
 
+        sources = [lambda: w.auditor.oldest_pending_received_at()]
+        if grader is not None:
+            sources.append(lambda: grader.oldest_unready_received_at())
         w.settler = CorpusPeriodSettler(
             task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap, records=judge_records,
-            archives=R2PeriodArchives(guard=archives),
-            oldest_pending=lambda: w.auditor.oldest_pending_received_at(),
+            archives=R2PeriodArchives(guard=archives), oldest_pending=oldest_of(*sources),
             on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-            executor=judge_threads.codec)
+            executor=judge_threads.codec,
+            ready=grader.ready if grader is not None else None)
     else:
         w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
                                   records=judge_records, archives=archives,
                                   on_settled=on_settled,
                                   full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
                                   executor=judge_threads.codec,
-                                  ready=(w.grader.ready if getattr(w, "grader", None) is not None
-                                         else None))
+                                  ready=grader.ready if grader is not None else None)
     w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                               tokenizer=tokenizer, proof=proof, params=params,
                               miner_states=MinerStates(judge_records, w.job.job_id),

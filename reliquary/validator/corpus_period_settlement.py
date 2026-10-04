@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 
 from reliquary.validator import corpus_periods as cp
 from reliquary.validator.corpus_settlement import (
@@ -38,19 +38,39 @@ def _drand_genesis() -> float:
     return cp.PERIOD_EPOCH
 
 
+def oldest_of(*sources: Callable[[], float | None]) -> Callable[[], float | None]:
+    """One ``oldest_pending`` from several: the earliest instant any of them
+    holds, None when none holds anything. A ``LookupError`` from any of them
+    (it cannot tell yet) propagates, so the period waits."""
+
+    def oldest() -> float | None:
+        held = [at for at in (source() for source in sources) if at is not None]
+        return min(held) if held else None
+
+    return oldest
+
+
 class CorpusPeriodSettler:
     """Same surface as ``CorpusSettler`` (observe, settle_once, set_cap,
     settled_count, totals, on_settled, on_window) on the period clock.
 
     ``oldest_pending`` is the auditor's ``oldest_pending_received_at``: it
     returns when the oldest undecided submission was received (None if none) and
-    raises ``LookupError`` while it cannot know."""
+    raises ``LookupError`` while it cannot know. An episode job composes it with
+    its grader's ``oldest_unready_received_at`` (``oldest_of``), so a period
+    closes only once everything received in it is graded (ruling P21).
+
+    ``ready(ids)``, as ``CorpusSettler``'s: which of ``ids`` may be paid now
+    (an episode job's grader answers the graded ones); the others are left
+    for a later call, never paid ungraded. None pays every verdict."""
 
     def __init__(self, *, task_id, job_id, cap, records, archives,
                  oldest_pending: Callable[[], float | None],
                  genesis: Callable[[], float] = _drand_genesis, clock=time.time,
                  slack_seconds: float = ADMISSION_SLACK_SECONDS, on_settled=None,
-                 full_list_every_seconds: float | None = None, executor=None) -> None:
+                 full_list_every_seconds: float | None = None, executor=None,
+                 ready: Callable[[list[str]], Awaitable[set[str]]] | None = None) -> None:
+        self._ready = ready
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
@@ -197,6 +217,13 @@ class CorpusPeriodSettler:
             oldest = self._oldest_pending()
         except LookupError:
             return None  # the auditor cannot tell yet what is still undecided
+        if self._ready is not None:
+            # Read after the close bound: a grade landing in between only
+            # makes a submission payable that its period already waited for.
+            payable = await self._ready(new_ids)
+            new_ids = [sid for sid in new_ids if sid in payable]
+            if not new_ids:
+                return None
         genesis = self._genesis()
         now = self._clock()
         closed = cp.closed_through(now=now, oldest_pending=oldest, genesis=genesis,
@@ -260,4 +287,5 @@ __all__ = [
     "CorpusPeriodSettler",
     "PERIOD_ARCHIVE_SCHEMA",
     "PERIOD_SETTLEMENT_SCHEMA",
+    "oldest_of",
 ]

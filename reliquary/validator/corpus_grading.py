@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable
 
@@ -43,6 +44,12 @@ RESCAN_SECONDS = 60.0
 INDEX_READ_CONCURRENCY = 16
 # Distinct providers a failed replay needs before it sanctions anyone.
 SANCTION_PROVIDERS = 2
+# The auditor's (corpus_auditor): the route stamps a submission's arrival up to
+# this long before the record is written and the submission enqueued.
+ACCEPT_SLACK_SECONDS = 420.0
+# A listed submission whose arrival cannot be read holds every period this
+# long, then is logged and left out (the auditor's bound: two periods).
+UNKNOWN_ARRIVAL_GIVE_UP_SECONDS = 2 * 4320.0
 
 
 def _lone(decision_by) -> str | None:
@@ -57,7 +64,8 @@ class CorpusGrader:
                  round_at: Callable[[float], int] | None = None,
                  on_voided: Callable[[str, dict], None] | None = None,
                  clock: Callable[[], float] = time.time, concurrency: int = GRADE_CONCURRENCY,
-                 rescan_seconds: float = RESCAN_SECONDS) -> None:
+                 rescan_seconds: float = RESCAN_SECONDS,
+                 accept_slack_seconds: float = ACCEPT_SLACK_SECONDS) -> None:
         self._job = job
         self._records = records
         self._dispatcher = dispatcher
@@ -103,6 +111,15 @@ class CorpusGrader:
         self._generation: dict[str, tuple[int, list[str]]] = {}
         # Submissions listed but without a grade, as of the last rescan.
         self._ungraded: int | None = None
+        # What a period settler waits for (``oldest_unready_received_at``):
+        # the ungraded submissions listed by the last rescan (None before the first),
+        # the arrival of each not yet payable, and when a live one was enqueued.
+        self._accept_slack = float(accept_slack_seconds)
+        self._listed: set[str] | None = None
+        self._arrival: dict[str, float] = {}
+        self._enqueued_at: dict[str, float] = {}
+        self._unknown_since: dict[str, float] = {}
+        self._given_up: set[str] = set()
 
     # -- what the settler and the route see -----------------------------------
 
@@ -121,6 +138,87 @@ class CorpusGrader:
         return {sid for sid in ids
                 if sid in self._final and sid not in self._regrading and sid not in held}
 
+    def _unready(self) -> set[str]:
+        held = self._unindexed if self._held_executors else set()
+        listed = self._listed or set()
+        return ({sid for sid in (*listed, *self._enqueued_at) if sid not in self._final}
+                | self._inflight | set(self._awaiting_draw) | self._regrading
+                | self._regrade_retry | self._regrades_inflight | held)
+
+    def oldest_unready_received_at(self) -> float | None:
+        """For a period settler (ruling P21): the earliest arrival among the
+        submissions of the job ``ready`` would not pay yet -- ungraded, in
+        flight, waiting for their draw, held or being regraded -- or None
+        when there are none. A period ending before it can be paid in full.
+
+        - arrival read (record or its metadata): that instant;
+        - enqueued live, record not read yet: when it was enqueued, less the
+          accept slack;
+        - arrival unreadable: every period is held (-inf);
+        either of the last two for ``UNKNOWN_ARRIVAL_GIVE_UP_SECONDS`` at most,
+        then it is logged and left out (one corrupt record never freezes a
+        task's pay; if it is graded later, its verdict is paid late).
+
+        Raises ``LookupError`` until a rescan has listed the job's submissions
+        (after a restart nothing is known of what is ungraded), and while a
+        quarantine holds grades from before boot that are not indexed yet."""
+        if not self._seeded or self._listed is None:
+            raise LookupError("the grader has not listed the job's submissions yet")
+        if self._held_executors and self._unindexed:
+            raise LookupError("grades from before boot are held until they are indexed")
+        now = self._clock()
+        oldest = None
+        for sid in self._unready():
+            if sid in self._arrival:
+                at = self._arrival[sid]
+            else:
+                if sid in self._enqueued_at:
+                    first = self._enqueued_at[sid]
+                    at = first - self._accept_slack
+                else:
+                    first = self._unknown_since.setdefault(sid, now)
+                    at = -math.inf
+                if now - first > UNKNOWN_ARRIVAL_GIVE_UP_SECONDS:
+                    if sid not in self._given_up:
+                        self._given_up.add(sid)
+                        logger.error("corpus job %s: ungraded %s has had no readable arrival "
+                                     "for %.0f s; periods close without it", self._job.job_id,
+                                     sid[:12], now - first)
+                    continue
+            oldest = at if oldest is None else min(oldest, at)
+        return oldest
+
+    def _learn_arrival(self, submission_id: str, received_at) -> None:
+        if received_at is not None:
+            self._arrival[submission_id] = float(received_at)
+            self._enqueued_at.pop(submission_id, None)
+            self._unknown_since.pop(submission_id, None)
+
+    def _forget_arrival(self, submission_id: str) -> None:
+        """Payable now: its arrival no longer holds any period."""
+        if submission_id not in self._regrading:
+            self._arrival.pop(submission_id, None)
+            self._enqueued_at.pop(submission_id, None)
+
+    async def _learn_arrivals(self, sids) -> None:
+        """The arrival of each of ``sids`` not known yet, from the record's
+        metadata (one ranged read) when the store has it."""
+        missing = sorted(sid for sid in sids if sid not in self._arrival)
+        if not missing:
+            return
+        reader = getattr(self._records, "read_submission_meta", None)
+        if reader is None:
+            reader = self._records.read_submission
+        gate = asyncio.Semaphore(INDEX_READ_CONCURRENCY)
+
+        async def one(sid):
+            async with gate:
+                return sid, await reader(self._job.job_id, sid)
+
+        for sid, meta in await asyncio.gather(*(one(sid) for sid in missing)):
+            if meta is not None:
+                self._learn_arrival(sid, meta.get("received_at"))
+
     def status(self) -> dict:
         """For the job status route."""
         stats = getattr(self._dispatcher, "stats", None) or {}
@@ -138,6 +236,12 @@ class CorpusGrader:
         return self._gate
 
     def enqueue(self, submission_id: str) -> None:
+        """A submission accepted live: its record is written, not read yet."""
+        if submission_id not in self._final and submission_id not in self._arrival:
+            self._enqueued_at.setdefault(submission_id, self._clock())
+        self._enqueue(submission_id)
+
+    def _enqueue(self, submission_id: str) -> None:
         if submission_id not in self._final and submission_id not in self._inflight:
             self._start(submission_id)
 
@@ -172,8 +276,13 @@ class CorpusGrader:
         Everything it launches runs in the background (``drain`` awaits it)."""
         await self._seed()
         listed = await self._records.list_submission_ids(self._job.job_id)
+        # Their arrivals before the listing counts: a period settler never sees
+        # an ungraded submission it cannot date.
+        await self._learn_arrivals(sid for sid in listed if sid not in self._final)
+        await self._learn_arrivals(self._regrading | self._regrade_retry)
+        self._listed = {sid for sid in listed if sid not in self._final}
         for sid in listed:
-            self.enqueue(sid)
+            self._enqueue(sid)
         self._ungraded = sum(1 for sid in listed if sid not in self._final)
         for executor_id in sorted(self._held_executors - self._executor_regrades_inflight):
             # Its regrade could not index the grades from before boot.
@@ -202,6 +311,7 @@ class CorpusGrader:
         record = await self._records.read_submission(job_id, submission_id)
         if record is None or record.get("schema") != RECORD_SCHEMA_V2:
             return None
+        self._learn_arrival(submission_id, record.get("received_at"))
         base = {"schema": GRADE_SCHEMA, "submission_id": submission_id, "hotkey": record["hotkey"],
                 "prompt_index": record["prompt_index"]}
         verdict = await self._records.read_verdict(job_id, submission_id)
@@ -370,6 +480,7 @@ class CorpusGrader:
         # A regrade too: one decided alone by an executor quarantined later is redone.
         self._index(submission_id, document)
         self._regrade_if_quarantined(submission_id, document)
+        self._forget_arrival(submission_id)
         return document
 
     def _is_quarantined(self, executor_id: str) -> bool:
@@ -458,6 +569,7 @@ class CorpusGrader:
             if released:
                 # Payable again (unless voided: the settler reads voids).
                 self._regrading.discard(submission_id)
+                self._forget_arrival(submission_id)
         finally:
             self._regrades_inflight.discard(submission_id)
 
