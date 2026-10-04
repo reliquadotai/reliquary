@@ -37,6 +37,7 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         # artifact digest committed in their source. Inert until a profile
         # names them: no live profile does.
         "reliquary_dapo_math_v1",
+        "reliquary_science_v1",
         "reliquary_instruction_following_v1",
         "reliquary_code_v1",
         "reliquary_telecom_solo_v1",

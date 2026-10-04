@@ -1,0 +1,94 @@
+"""Corpus tasks paid on their own clock (design 2026-10-03-sft-period-clock).
+
+A task declared with ``params["settlement"] == "period-ema-v1"`` is paid by
+period of drand time, not by RL window:
+
+- a token belongs to the period its submission was received in;
+- a period is settled once nothing received in it is still undecided, and its
+  pay enters the weights from the period it was settled in (its entry period);
+- the weights replay an EMA that decays every period, a period with no pay
+  counting as zero, so each hotkey is paid in total what its tokens earned and
+  a finished task stops paying on its own.
+
+Everything here is pure: the clock is passed in.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterable, Mapping
+
+SETTLEMENT_PERIOD_EMA = "period-ema-v1"
+# Where period 0 starts: drand quicknet's genesis. A protocol constant rather
+# than a fetched value, so the settler and every weight setter count the same
+# periods with no network (any fixed origin would do; it must only be shared).
+PERIOD_EPOCH = 1692803367.0
+# One Bittensor epoch: the rate weights are set at.
+PERIOD_SECONDS = 4320
+PERIOD_EMA_N = 6
+PERIOD_ALPHA = 2.0 / (PERIOD_EMA_N + 1)
+# Periods replayed back from the current one: (1 - alpha)^24 ~ 0.03 % never paid.
+REPLAY_DEPTH = 24
+# A pay below this fraction of its cap counts as finished (``tasks close``).
+CLOSE_THRESHOLD = 0.001
+
+
+def is_period_task(entry) -> bool:
+    params = getattr(entry, "params", None)
+    return isinstance(params, Mapping) and params.get("settlement") == SETTLEMENT_PERIOD_EMA
+
+
+def period_of(t: float, genesis: float = PERIOD_EPOCH) -> int:
+    """The period holding instant ``t`` (seconds), counted from drand genesis."""
+    return math.floor((float(t) - float(genesis)) / PERIOD_SECONDS)
+
+
+def period_end(period: int, genesis: float = PERIOD_EPOCH) -> float:
+    return float(genesis) + (int(period) + 1) * PERIOD_SECONDS
+
+
+def closed_through(*, now: float, oldest_pending: float | None, genesis: float,
+                   slack: float) -> int:
+    """The last period nothing can still be added to.
+
+    A period is closed when it ended before the oldest submission still
+    undecided was received, and long enough ago (``slack``) that a submission
+    received at its very end has reached the store."""
+    bound = float(now) - float(slack)
+    if oldest_pending is not None:
+        bound = min(bound, float(oldest_pending))
+    # The period holding `bound` may still gain work; the one before cannot.
+    return period_of(bound, genesis) - 1
+
+
+def replay(archives: Iterable[Mapping], current_period: int, *,
+           alpha: float = PERIOD_ALPHA, depth: int = REPLAY_DEPTH) -> dict[str, float]:
+    """One task's weights at ``current_period``: every archive's rewards, from
+    its entry period on, decayed once per period whether or not anything was paid
+    since. Archives that have not entered yet, or entered more than ``depth``
+    periods ago, add nothing."""
+    weights: dict[str, float] = {}
+    for archive in archives:
+        age = int(current_period) - int(archive["entry_period"])
+        if age < 0 or age > depth:
+            continue
+        factor = alpha * (1.0 - alpha) ** age
+        for hotkey, reward in (archive.get("rewards_by_hotkey") or {}).items():
+            weights[hotkey] = weights.get(hotkey, 0.0) + factor * float(reward)
+    return {hk: v for hk, v in weights.items() if v > 1e-9}
+
+
+__all__ = [
+    "CLOSE_THRESHOLD",
+    "PERIOD_ALPHA",
+    "PERIOD_EPOCH",
+    "PERIOD_EMA_N",
+    "PERIOD_SECONDS",
+    "REPLAY_DEPTH",
+    "SETTLEMENT_PERIOD_EMA",
+    "closed_through",
+    "is_period_task",
+    "period_end",
+    "period_of",
+    "replay",
+]

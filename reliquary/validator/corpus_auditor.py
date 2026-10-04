@@ -109,6 +109,9 @@ OLD_ROUND_ROUNDS = 200
 # connect + 30 s read: 405 s. An unaudited pass waits this long past the hold,
 # so every sibling received inside that hold is visible before it is paid.
 ACCEPT_SLACK_SECONDS = 420.0
+# How long a pending id whose arrival cannot be read holds a period-settled
+# task's periods open: two periods.
+UNKNOWN_ARRIVAL_GIVE_UP_SECONDS = 2 * 4320.0
 # How much of the accept slack is margin over the route's record-write bound
 # (420 - 405): a sibling received inside a record's hold was handed over by
 # its receipt + hold + (slack - this margin).
@@ -210,6 +213,13 @@ class CorpusAuditor:
         # Pending records are read once per process to seed `_arrivals`; judged
         # ones are not re-read, so `recent` can only undercount (more audits).
         self._seeded = False
+        # When this process first heard of each id (enqueued or seeded): the
+        # arrival bound of a pending id whose record is not read yet.
+        self._seen_at: dict[str, float] = {}
+        # Pending ids with no known arrival (found by a listing, unreadable):
+        # when this process first counted them, and those given up on.
+        self._unknown_since: dict[str, float] = {}
+        self._given_up: set[str] = set()
         self._randomness: dict[int, str] = {}
         # Rounds raced in the current judge_many: one race per round per pass,
         # never one per record whose draw lands on a failing round.
@@ -256,10 +266,16 @@ class CorpusAuditor:
             n += 1
         return n
 
-    def enqueue(self, submission_id: str) -> None:
-        """Judge ``submission_id`` now, unless it is already scheduled."""
+    def enqueue(self, submission_id: str, *, live: bool = True) -> None:
+        """Judge ``submission_id`` now, unless it is already scheduled.
+
+        ``live``: it was just admitted, so it was received no later than now. A
+        record found by a listing (start, rescan) may be old: it bounds nothing
+        until its own arrival time is read."""
         if submission_id in self._queued or submission_id in self._judged:
             return
+        if live:
+            self._seen_at.setdefault(submission_id, self._clock())
         self._schedule(submission_id, self._clock())
 
     def _schedule(self, submission_id: str, at: float) -> None:
@@ -336,6 +352,50 @@ class CorpusAuditor:
         if not self._enough or seen < self._enough:
             return math.inf
         return arrivals[seen - self._enough] + self._params.hold_seconds + WINDOW_EPSILON_SECONDS
+
+    def oldest_pending_received_at(self) -> float | None:
+        """The earliest instant a submission still undecided may have been
+        received, from memory; None when nothing is pending and nothing can
+        still arrive unseen. A period ending before it can gain no more work.
+
+        - read: its own arrival time;
+        - admitted live, not read yet: when it was enqueued, less the accept
+          slack (the route stamps the arrival before a write that can take that
+          long);
+        - fed by a front (a split judge): never later than the feed's coverage,
+          less the slack;
+        - found by a listing and never readable: it holds every period open for
+          ``UNKNOWN_ARRIVAL_GIVE_UP_SECONDS``, then is logged and left out, so one
+          corrupt record cannot freeze a task's pay for ever.
+
+        Raises ``LookupError`` before the seed, or while the feed's coverage is
+        unreadable: until then an unknown backlog may hold anything."""
+        if not self._seeded:
+            raise LookupError("the pending records are not seeded yet")
+        covered = self._covered()
+        if covered is None:
+            raise LookupError("the arrival feed's coverage is unreadable")
+        oldest = None if covered == math.inf else covered - self._accept_slack
+        now = self._clock()
+        for sid in dict.fromkeys((*self._meta, *self._unreadable, *self._queued)):
+            if sid in self._judged:
+                continue
+            if sid in self._meta:
+                at = self._meta[sid][1]
+            elif sid in self._seen_at:
+                at = self._seen_at[sid] - self._accept_slack
+            else:
+                first = self._unknown_since.setdefault(sid, now)
+                if now - first > UNKNOWN_ARRIVAL_GIVE_UP_SECONDS:
+                    if sid not in self._given_up:
+                        self._given_up.add(sid)
+                        logger.error("corpus job %s: pending %s has had no readable arrival "
+                                     "for %.0f s; periods close without it (its verdict, if "
+                                     "one comes, is paid late)", self._job_id, sid, now - first)
+                    continue
+                at = -math.inf
+            oldest = at if oldest is None else min(oldest, at)
+        return oldest
 
     async def pending_ids(self) -> list[str]:
         with self._timed("list"):
@@ -656,6 +716,10 @@ class CorpusAuditor:
             "audited_at": self._clock(),
             **outcome,
         }
+        if submission_id in self._meta:
+            # The work's own time: a period-settled task pays it in the period
+            # it was submitted in, not the one its verdict landed in.
+            verdict["received_at"] = float(self._meta[submission_id][1])
         if draw is not None:
             verdict["draw"] = draw
         return verdict
@@ -1329,7 +1393,7 @@ class CorpusAuditor:
         # Only what is not scheduled yet: a record waiting out its hold keeps its time.
         pending = await self.pending_ids() if full else self._known_pending()
         for submission_id in pending:
-            self.enqueue(submission_id)
+            self.enqueue(submission_id, live=False)
         lag = self.queue_lag(pending)
         # An undrawn record waits one hold plus the accept slack by design;
         # far beyond that, the auditor is not keeping up with the traffic.
@@ -1391,7 +1455,7 @@ class CorpusAuditor:
         pending = await self.pending_ids()
         await self._seed(pending)
         for submission_id in pending:
-            self.enqueue(submission_id)
+            self.enqueue(submission_id, live=False)
 
     async def _next_batch(self) -> list[str]:
         """The due ids, at most RUN_BATCH_IDS, once at least one is due."""

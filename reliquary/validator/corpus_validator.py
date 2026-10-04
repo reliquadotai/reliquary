@@ -338,13 +338,28 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in
     # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
     # Fed by the auditor: the store is listed only as the net.
-    w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
-                              records=judge_records, archives=archives,
-                              on_settled=on_settled,
-                              full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-                              executor=judge_threads.codec,
-                              ready=(w.grader.ready if getattr(w, "grader", None) is not None
-                                     else None))
+    from reliquary.validator.corpus_periods import is_period_task
+
+    if is_period_task(w.entry):
+        # Paid on its own clock (design 2026-10-03): closes a period when the
+        # auditor holds nothing undecided received in it.
+        from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+        from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+
+        w.settler = CorpusPeriodSettler(
+            task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap, records=judge_records,
+            archives=R2PeriodArchives(guard=archives),
+            oldest_pending=lambda: w.auditor.oldest_pending_received_at(),
+            on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
+            executor=judge_threads.codec)
+    else:
+        w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
+                                  records=judge_records, archives=archives,
+                                  on_settled=on_settled,
+                                  full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
+                                  executor=judge_threads.codec,
+                                  ready=(w.grader.ready if getattr(w, "grader", None) is not None
+                                         else None))
     w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                               tokenizer=tokenizer, proof=proof, params=params,
                               miner_states=MinerStates(judge_records, w.job.job_id),

@@ -161,6 +161,7 @@ def registry(monkeypatch):
 
 
 ACK = "--fleet-knows-corpus-generation"
+PERIOD_ACK = "--fleet-knows-period-settlement"
 
 
 def _create_args(**overrides) -> list[str]:
@@ -182,7 +183,7 @@ def _create_args(**overrides) -> list[str]:
         "--cap": "0.30",
     }
     options.update(overrides)
-    argv = ["jobs", "create", ACK]
+    argv = ["jobs", "create", ACK, PERIOD_ACK]
     for flag, value in options.items():
         argv += [flag, value]
     return argv
