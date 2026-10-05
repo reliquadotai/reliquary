@@ -23,8 +23,10 @@ MECHANISM_RL_DISCOVERED_PRICE = "rl-discovered-price"
 # Corpus generation on a frozen checkpoint: paid per verified token, with the
 # price pinned by declaring floor == cap.
 MECHANISM_CORPUS_GENERATION = "corpus-generation"
+MECHANISM_NATIVE_AFFINE_POINTS = "native-affine-points"
 KNOWN_MECHANISMS = frozenset(
-    {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION}
+    {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION,
+     MECHANISM_NATIVE_AFFINE_POINTS}
 )
 # What a task may pin as the way its rollouts are verified. Declaring one makes every validator
 # run the same path whatever its card; declaring none lets each derive it, which is the default.
@@ -188,6 +190,29 @@ def validate_entry(entry: TaskEntry) -> None:
             f"task {entry.task_id!r} names a job but its mechanism is "
             f"{entry.mechanism!r}, which does not run one"
         )
+    if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS:
+        import re
+
+        contract = entry.contract
+        fields = {"schema", "authority", "epoch_digest", "manifest_digest", "bindings",
+                  "start", "deadline", "reward_basis", "enrollment_digest"}
+        if not isinstance(contract, Mapping) or set(contract) != fields:
+            raise RegistryError("native Affine task requires its exact competition contract")
+        if contract["schema"] != "affine-native-competition/v1" \
+                or contract["reward_basis"] != "native-finalized-observed-subset-weight" \
+                or entry.params.get("settlement") != "period-ema-v1" \
+                or floor != cap or entry.verification is not None or entry.env_split is not None:
+            raise RegistryError("native Affine task requires pinned cap and native period settlement")
+        if any(not isinstance(contract[name], str) or not re.fullmatch("[0-9a-f]{64}", contract[name])
+               for name in ("authority", "epoch_digest", "manifest_digest", "enrollment_digest")):
+            raise RegistryError("native Affine competition bindings must be SHA256/public-key hex")
+        bindings = contract["bindings"]
+        if not isinstance(bindings, Mapping) or set(bindings) != {
+            "bootstrapDigest", "checkpointDigest", "environmentDigest", "harnessDigest", "sourceBundleDigest"
+        } or any(not isinstance(v, str) or not re.fullmatch("[0-9a-f]{64}", v) for v in bindings.values()):
+            raise RegistryError("native Affine task requires exact runtime bindings")
+        if _number(contract["start"], "native start") >= _number(contract["deadline"], "native deadline"):
+            raise RegistryError("native Affine deadline must follow start")
     if entry.env_split is not None:
         if not isinstance(entry.env_split, Mapping) or not entry.env_split:
             raise RegistryError("env_split must be a non-empty object")
@@ -249,7 +274,13 @@ def validate_registry(entries: Mapping[str, TaskEntry]) -> None:
     # double-pay for one, and counting them would make a cancelled job
     # undeclarable forever. Their cap stays guarded by the sum above.
     claimed: dict[str, str] = {}
+    native_epochs: set[str] = set()
     for task_id, entry in sorted(entries.items()):
+        if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS:
+            epoch = entry.contract["epoch_digest"]
+            if epoch in native_epochs:
+                raise RegistryError("one native Affine epoch is paid by one task")
+            native_epochs.add(epoch)
         if not entry.job_id or entry.status != "active":
             continue
         if entry.job_id in claimed:
@@ -318,6 +349,12 @@ def require_fleet_knows_corpus_generation(
     )
 
 
+def require_fleet_knows_native_affine_points(entry: TaskEntry, *, acknowledged: bool) -> None:
+    """An unknown native mechanism invalidates the whole registry on old readers."""
+    if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS and not acknowledged:
+        raise RegistryError("every validator must know native-affine-points before declaration")
+
+
 def retire_task(
     entries: Mapping[str, TaskEntry], task_id: str, retired_at: int
 ) -> dict[str, TaskEntry]:
@@ -367,7 +404,7 @@ def set_cap(
     params = {**entry.params, "cap": float(cap)}
     if floor is not None:
         params["floor"] = float(floor)
-    elif entry.mechanism == MECHANISM_CORPUS_GENERATION:
+    elif entry.mechanism in {MECHANISM_CORPUS_GENERATION, MECHANISM_NATIVE_AFFINE_POINTS}:
         params["floor"] = float(cap)
     if min_incentive_share is not None:
         params["min_incentive_share"] = float(min_incentive_share)

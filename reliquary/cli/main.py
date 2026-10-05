@@ -42,6 +42,16 @@ _DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 
+
+@app.command("affine", context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+             add_help_option=False)
+def affine_command(context: typer.Context) -> None:
+    """Prepare and supervise the separate native operator runtime."""
+    from reliquary.integrations.affine_cli import main
+
+    raise typer.Exit(main(context.args))
+
+
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
