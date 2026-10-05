@@ -115,6 +115,7 @@ def _release_state_mismatch_reason(
             "protocol_version",
             "generation_profile_id",
             "generation_contract",
+            "service_policy",
         )
     ):
         return "contract_changed"
@@ -397,7 +398,7 @@ def _current_drand_round_at_send() -> int:
 def _bft_assemble_rollouts(
     *, model, phase1_tensor, prompt_tokens, think_close_ids, force_ids,
     eos_ids, answer_budget, randomness, hotkey, prompt_idx, checkpoint_hash,
-    gen_kwargs=None,
+    gen_kwargs=None, seed_pool=None, candidate_id=None,
 ):
     """Budget-Forced Termination assembly.
 
@@ -466,6 +467,7 @@ def _bft_assemble_rollouts(
                 [len(p) for p in unfinished_primed], plen,
             ),
             start_len=width,
+            seed_pool=seed_pool, candidate_id=candidate_id,
         )
         ans = model.generate(
             torch.tensor(rows, device=device),
@@ -581,6 +583,7 @@ class MiningEngine:
         window_number: int,
         checkpoint_revision: str,
         runtime_fingerprint=None,
+        service_binding=None,
     ):
         """Turn backend-produced token sequences into a protocol request.
 
@@ -595,6 +598,13 @@ class MiningEngine:
             raise ValueError(
                 f"expected {M_ROLLOUTS} generations, got {len(generations)}"
             )
+        if service_binding is not None:
+            from reliquary.protocol.service_submission import ServiceBinding
+            binding = ServiceBinding.from_dict(service_binding)
+            generations = [dict(generation, service_binding=binding.rollout_binding(index))
+                           for index, generation in enumerate(generations)]
+        elif any(generation.get("service_binding") is not None for generation in generations):
+            raise ValueError("service rollout binding requires its envelope intent")
         rollouts = [
             self._build_rollout_submission(
                 generation,
@@ -604,6 +614,15 @@ class MiningEngine:
             )
             for generation in generations
         ]
+        pool_bindings = [generation.get("seed_pool") for generation in generations]
+        pool_selection = None
+        if any(binding is not None for binding in pool_bindings):
+            from reliquary.protocol.seed_pool import parse_rollout_binding
+            for index, binding in enumerate(pool_bindings):
+                selection, original_index = parse_rollout_binding(binding)
+                if original_index != index or pool_selection is not None and selection.to_dict() != pool_selection:
+                    raise ValueError("candidate rollouts must preserve their complete group identity")
+                pool_selection = selection.to_dict()
         return BatchSubmissionRequest(
             miner_hotkey=self.wallet.hotkey.ss58_address,
             prompt_idx=prompt_idx,
@@ -619,6 +638,8 @@ class MiningEngine:
                 if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
                 else ""
             ),
+            pool_selection=pool_selection,
+            service_binding=service_binding,
         )
 
     async def mine_window(
@@ -947,12 +968,29 @@ class MiningEngine:
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
                 environment_spec = get_environment_spec(env_name)
+                service_policy = getattr(state, "service_policy", None)
+                policy_value = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
+                from reliquary.protocol.seed_pool import pool_from_service_policy
+                seed_pool = pool_from_service_policy(
+                    service_policy,
+                    prompt_idx=prompt_idx, checkpoint_hash=local_hash,
+                )
                 if environment_spec.interaction_mode == "episode":
+                    if service_policy is not None:
+                        raise ValueError("service group proofs are single-turn only")
                     generations = self._generate_m_episode_rollouts(
                         env,
                         randomness,
                         prompt_idx=prompt_idx,
                         checkpoint_hash=local_hash,
+                    )
+                elif seed_pool is not None:
+                    if policy_value["contract"]["scoring"]["weights_bps"] != {"reward": 10000}:
+                        raise ValueError("public pool selection requires a qualified reward-only grader")
+                    generations = self._generate_public_pool_rollouts(
+                        problem, randomness, env=env, prompt_idx=prompt_idx,
+                        checkpoint_hash=local_hash, seed_pool=seed_pool,
+                        max_exploration_tokens=policy_value["contract"]["limits"]["max_tokens"],
                     )
                 else:
                     generations = self._generate_m_rollouts(
@@ -975,6 +1013,9 @@ class MiningEngine:
                     window_number=state.window_n,
                     checkpoint_revision=local_hash,
                     runtime_fingerprint=runtime_fingerprint,
+                    service_binding=(self._service_submission_binding(
+                        policy_value, generations, problem, env,
+                    ) if policy_value is not None else None),
                 )
 
                 # Generation and proof construction can span a state
@@ -1177,7 +1218,7 @@ class MiningEngine:
 
     def _generate_m_rollouts(
         self, problem, randomness, *, env_name: str | None = None,
-        prompt_idx: int, checkpoint_hash: str,
+        prompt_idx: int, checkpoint_hash: str, seed_pool=None, candidate_id=None,
     ) -> list[dict]:
         """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
 
@@ -1213,6 +1254,12 @@ class MiningEngine:
         )
 
         hotkey = self.wallet.hotkey.ss58_address
+        if seed_pool is not None:
+            seed_pool.validate_selection(seed_pool.selection(candidate_id), rollout_count=M_ROLLOUTS)
+            if seed_pool.prompt_idx != prompt_idx or seed_pool.checkpoint_hash != checkpoint_hash:
+                raise ValueError("public pool does not match generation context")
+            if env_name is None or get_environment_spec(env_name).interaction_mode != "single_turn":
+                raise ValueError("public group pools are single-turn only")
         # Resolved before the prompt is encoded: whether the template opens a
         # reasoning block is per environment, and the validator renders this
         # same prompt with the same lookup.
@@ -1260,14 +1307,16 @@ class MiningEngine:
                 rollouts=M_ROLLOUTS,
                 max_new_tokens=environment_cap,
                 eos_ids=sorted(eos_ids),
+                **({"seed_pool": seed_pool, "candidate_id": candidate_id} if seed_pool is not None else {}),
             )
             return [
                 {
                     "tokens": prompt_tokens + list(completion),
                     "prompt_length": prompt_length,
                     "forced": False,
+                    **({"seed_pool": seed_pool.selection(candidate_id).rollout_binding(index)} if seed_pool is not None else {}),
                 }
-                for completion in completions
+                for index, completion in enumerate(completions)
             ]
 
         with torch.no_grad():
@@ -1296,6 +1345,7 @@ class MiningEngine:
                 checkpoint_hash=checkpoint_hash,
                 rollout_indices=list(range(M_ROLLOUTS)),
                 base_offsets=[0] * M_ROLLOUTS, start_len=prompt_length,
+                seed_pool=seed_pool, candidate_id=candidate_id,
             )
             outputs = self.vllm_model.generate(
                 input_tensor,
@@ -1311,7 +1361,7 @@ class MiningEngine:
                 phase2_kwargs = {"pad_token_id": pad_token_id}
                 if eos_ids:
                     phase2_kwargs["eos_token_id"] = sorted(eos_ids)
-                return _bft_assemble_rollouts(
+                assembled = _bft_assemble_rollouts(
                     model=self.vllm_model,
                     phase1_tensor=outputs,
                     prompt_tokens=prompt_tokens,
@@ -1322,7 +1372,12 @@ class MiningEngine:
                     randomness=randomness, hotkey=hotkey, prompt_idx=prompt_idx,
                     checkpoint_hash=checkpoint_hash,
                     gen_kwargs=phase2_kwargs,
+                    seed_pool=seed_pool, candidate_id=candidate_id,
                 )
+                if seed_pool is not None:
+                    for index, generation in enumerate(assembled):
+                        generation["seed_pool"] = seed_pool.selection(candidate_id).rollout_binding(index)
+                return assembled
         rollouts = []
         for i in range(M_ROLLOUTS):
             seq = outputs[i].tolist()
@@ -1335,7 +1390,86 @@ class MiningEngine:
                 "prompt_length": prompt_length,
                 "forced": False,
             })
+        if seed_pool is not None:
+            for index, generation in enumerate(rollouts):
+                generation["seed_pool"] = seed_pool.selection(candidate_id).rollout_binding(index)
         return rollouts
+
+    def _generate_public_pool_rollouts(
+        self, problem, randomness, *, env, prompt_idx: int, checkpoint_hash: str,
+        seed_pool, max_exploration_tokens: int,
+    ) -> list[dict]:
+        """Explore complete candidate groups; submit one with original IDs."""
+        from statistics import pvariance
+        from reliquary.constants import max_new_tokens_for_environment
+
+        seed_pool.validate_selection(seed_pool.selection(0), rollout_count=M_ROLLOUTS)
+        if type(max_exploration_tokens) is not int or max_exploration_tokens < 1:
+            raise ValueError("positive exploration token budget required")
+        best_group = None
+        best_variance = -1.0
+        used_tokens = 0
+        for candidate_id in range(seed_pool.pool_groups):
+            # Includes forced-answer tokens and injected terminators on BFT
+            # profiles, which can exceed the caller's phase-1 token setting.
+            cap = max_new_tokens_for_environment(env.name)
+            if used_tokens + seed_pool.group_size * cap > max_exploration_tokens:
+                if best_group is None:
+                    raise ValueError("exploration budget cannot cover one candidate group")
+                break
+            group = self._generate_m_rollouts(
+                problem, randomness, env_name=env.name, prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash, seed_pool=seed_pool,
+                candidate_id=candidate_id,
+            )
+            selection = seed_pool.selection(candidate_id)
+            seed_pool.validate_selection(selection, rollout_count=len(group))
+            for index, generation in enumerate(group):
+                seed_pool.validate_rollout_binding(generation.get("seed_pool"), selection, index)
+            used_tokens += sum(len(g["tokens"]) - g["prompt_length"] for g in group)
+            rewards = self._local_group_rewards(group, problem, env)
+            if any(reward is None for reward in rewards):
+                raise ValueError("candidate grader returned an unknown reward")
+            variance = pvariance(rewards)
+            if variance > best_variance:
+                best_group, best_variance = group, variance
+        if best_group is None:
+            raise ValueError("public pool has no generated candidate")
+        return best_group
+
+    def _local_group_rewards(self, generations, problem, env) -> list[float | None]:
+        import math
+
+        rewards = []
+        for generation in generations:
+            completion = self.tokenizer.decode(generation["tokens"][generation["prompt_length"]:])
+            try:
+                reward = env.compute_reward(problem, completion)
+            except Exception:
+                reward = None
+            if reward is not None and (isinstance(reward, bool) or not isinstance(reward, (int, float))
+                                       or not math.isfinite(reward) or not 0 <= reward <= 1):
+                raise ValueError("candidate grader returned an invalid reward")
+            rewards.append(float(reward) if reward is not None else None)
+        return rewards
+
+    def _service_submission_binding(self, policy, generations, problem, env) -> dict:
+        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_submission import ServiceBinding
+        from reliquary.services.scoring import classify_signal
+
+        contract = ServiceContract.from_dict(policy["contract"])
+        value = contract.to_dict()
+        rewards = (self._local_group_rewards(generations, problem, env)
+                   if value["scoring"]["weights_bps"] == {"reward": 10000}
+                   else [None] * len(generations))
+        signal = classify_signal(rewards, expected=M_ROLLOUTS,
+                                 sigma_min_bps=value["scoring"]["sigma_min_bps"])
+        purpose = "training"
+        if (value["policies"]["reward"]["kind"] == "exploration-discount/v1"
+                and signal.category in ("uniform-low", "uniform-high", "uniform-intermediate")):
+            purpose = "exploration"
+        return ServiceBinding(contract.sha256, purpose).to_dict()
 
     def _generate_m_episode_rollouts(
         self,
@@ -1445,6 +1579,8 @@ class MiningEngine:
         from reliquary.protocol.signatures import (
             sign_commit_binding,
             sign_episode_commit_binding,
+            sign_public_group_commit_binding,
+            sign_service_commit_binding,
         )
         from reliquary.shared.forward import forward_single_layer
 
@@ -1484,6 +1620,16 @@ class MiningEngine:
 
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
         rollout_metadata = _rollout_metadata(generation, token_logprobs)
+        pool_binding = generation.get("seed_pool")
+        service_binding = generation.get("service_binding")
+        if service_binding is not None:
+            if trace is not None:
+                raise ValueError("service group proofs do not support episodes")
+            rollout_metadata["service_binding"] = service_binding
+        if pool_binding is not None:
+            if trace is not None:
+                raise ValueError("public group proofs do not support episodes")
+            rollout_metadata["seed_pool"] = pool_binding
         if trace is not None:
             reward = trace.reward
             if reward is None:
@@ -1513,6 +1659,21 @@ class MiningEngine:
                 self.wallet,
             )
             proof_version = GRAIL_EPISODE_PROOF_VERSION
+        elif service_binding is not None:
+            from reliquary.protocol.service_submission import PROOF_VERSION as SERVICE_PROOF_VERSION
+            from reliquary.protocol.seed_pool import PROOF_VERSION as POOL_PROOF_VERSION
+            signature = sign_service_commit_binding(
+                all_tokens, randomness, model_name, LAYER_INDEX, commitments,
+                service_binding, self.wallet, seed_pool=pool_binding,
+            )
+            proof_version = POOL_PROOF_VERSION if pool_binding is not None else SERVICE_PROOF_VERSION
+        elif pool_binding is not None:
+            from reliquary.protocol.seed_pool import PROOF_VERSION
+            signature = sign_public_group_commit_binding(
+                all_tokens, randomness, model_name, LAYER_INDEX,
+                commitments, pool_binding, self.wallet,
+            )
+            proof_version = PROOF_VERSION
         else:
             signature = sign_commit_binding(
                 all_tokens, randomness, model_name, LAYER_INDEX,
