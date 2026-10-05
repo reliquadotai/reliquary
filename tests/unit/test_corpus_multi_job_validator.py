@@ -161,6 +161,11 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
 
         async def serve(self):
             await asyncio.sleep(0.05)
+            import httpx
+
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=built["app"]),
+                                         base_url="http://corpus") as client:
+                built["runtime_at_start"] = (await client.get("/corpus/runtime-contract")).json()
             raise _Stop()
 
     monkeypatch.setattr(uvicorn, "Server", _Server)
@@ -177,6 +182,21 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
 
 def test_the_model_is_loaded_once_for_both_jobs(booted):
     assert booted.loads == {"snapshot": 1, "model": 1, "tokenizer": 1}
+
+
+def test_runtime_contract_attests_the_loaded_checkpoint_and_wired_jobs(booted):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    runtime = TestClient(booted.app).get("/corpus/runtime-contract")
+    assert runtime.status_code == 200
+    document = runtime.json()
+    assert document["ready"] is False  # The test's server has stopped.
+    assert booted.runtime_at_start["ready"] is True
+    assert booted.runtime_at_start["audit_ready"] is True
+    assert document["checkpoint_sha256"] == CHECKPOINT
+    assert document["contract_sha256"] == canonical_sha256(document["contract"])
+    assert document["registry_refresh_enabled"] is False
+    assert sorted(document["jobs"]) == ["swe-v1", "swe-v2"]
 
 
 def test_each_job_gets_its_own_auditor_on_one_shared_gpu_lock(booted):

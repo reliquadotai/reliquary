@@ -200,6 +200,7 @@ class CorpusJobSet:
         # Task ids already decided against (ignored or refused): logged once.
         self._passed_over: set[str] = set()
         self._failure: asyncio.Future | None = None
+        self.running = False
         # One refresh at a time: two interleaved would wire one entry twice.
         self._refresh_lock = asyncio.Lock()
         # Jobs retired as of the end of the last refresh: only those may be unwired.
@@ -511,6 +512,7 @@ class CorpusJobSet:
         """Refresh forever (when a registry reader is given) and raise the first
         background task failure."""
         self._failure = asyncio.get_running_loop().create_future()
+        self.running = True
         for tasks in self._tasks.values():
             for task in tasks:
                 if task.done():
@@ -523,6 +525,7 @@ class CorpusJobSet:
                 if done:
                     self._failure.result()
         finally:
+            self.running = False
             for tasks in self._tasks.values():
                 for task in tasks:
                     task.cancel()

@@ -37,6 +37,8 @@ reliquary-infra/inventory/known_hosts
 /docs/superpowers/
 /docs/evidence/
 /.private-research/
+/private-subnet-integration/
+*.integration-private.*
 /reports/private/
 
 # Generated ML and research artifacts

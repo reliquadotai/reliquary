@@ -340,9 +340,13 @@ class _ShardWriter:
         self.index = 0
 
     async def add(self, row: dict) -> None:
+        raw_bytes = _raw_size(row)
+        group_budget = min(ROW_GROUP_MAX_BYTES, max(1, self._max // 2))
+        if self._buffer and self._buffer_bytes + raw_bytes > group_budget:
+            await self._flush()
         self._buffer.append(row)
-        self._buffer_bytes += _raw_size(row)
-        if len(self._buffer) >= self._group_rows or self._buffer_bytes >= ROW_GROUP_MAX_BYTES:
+        self._buffer_bytes += raw_bytes
+        if len(self._buffer) >= self._group_rows or self._buffer_bytes >= group_budget:
             await self._flush()
 
     async def _flush(self) -> None:
@@ -476,7 +480,21 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     manifest_key = f"{prefix}/manifest.json"
     stored = await sink.get_json(manifest_key)
     if stored is not None:
+        if stored.get("job_id") != job.job_id:
+            raise ValueError("delivery belongs to another job")
         return stored
+    report_key = f"{prefix}/report.json"
+    stored_report = await sink.get_json(report_key)
+    if stored_report is not None:
+        if (stored_report.get("job_id") != job.job_id
+                or stored_report.get("delivery_id") != delivery_id
+                or stored_report.get("job") != job.to_contract()):
+            raise ValueError("delivery report belongs to another job contract")
+        stamp = stored_report.get("created_at")
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+            raise ValueError("delivery report has no creation timestamp")
+    else:
+        stamp = clock()
     root = Path(work_dir) if work_dir is not None else Path(tempfile.gettempdir())
     root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=f"delivery-{delivery_id}-", dir=root))
@@ -515,6 +533,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
 
     counts: dict = {}
     try:
+        shard_max_bytes = min(shard_max_bytes, getattr(sink, "max_file_bytes", shard_max_bytes))
         writer = _ShardWriter(directory, max_bytes=shard_max_bytes,
                               row_group_rows=row_group_rows, on_close=uploaded,
                               schema=_episode_row_schema() if episode else None)
@@ -554,7 +573,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
         shutil.rmtree(directory, ignore_errors=True)
     report = {
         "schema": DELIVERY_SCHEMA, "delivery_id": delivery_id, "job_id": job.job_id,
-        "created_at": clock(), "job": job.to_contract(), "counts": counts,
+        "created_at": stamp, "job": job.to_contract(), "counts": counts,
         "filter": (
             {"applied": sft_only,
              "note": ("graded_success and replay_certified" if sft_only
@@ -567,10 +586,12 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
         "shards": len(shards),
         "instruction": instruction,
     }
-    report_key = f"{prefix}/report.json"
     await sink.put_json(report_key, report)
+    from reliquary.protocol.release_contract import canonical_sha256
+
     manifest = {
         "schema": DELIVERY_SCHEMA, "delivery_id": delivery_id, "job_id": job.job_id,
+        "job_manifest_sha256": canonical_sha256(job.to_contract()),
         "created_at": report["created_at"], "rows": counts.get("rows", 0), "shards": shards,
         "instruction_shards": instruction_shards, "instruction": instruction,
         "columns": list(EPISODE_ROW_FIELDS if episode else ROW_FIELDS), "report": report_key,
@@ -653,15 +674,17 @@ class R2DeliverySink:
     async def put_file(self, key: str, path: Path) -> None:
         from boto3.s3.transfer import TransferConfig
 
+        digest = await asyncio.to_thread(_sha256, path)
         config = TransferConfig(multipart_threshold=32 * 1024 * 1024,
                                 multipart_chunksize=32 * 1024 * 1024, max_concurrency=8)
         await asyncio.to_thread(self._client.upload_file, str(path), self._bucket, key,
-                                Config=config)
+                                Config=config, ExtraArgs={"Metadata": {"sha256": digest}})
 
     async def put_json(self, key: str, document: Mapping) -> None:
         body = json.dumps(document, sort_keys=True).encode()
         await asyncio.to_thread(self._client.put_object, Bucket=self._bucket, Key=key,
-                                Body=body, ContentType="application/json")
+                                Body=body, ContentType="application/json",
+                                Metadata={"sha256": hashlib.sha256(body).hexdigest()})
 
     async def get_json(self, key: str) -> dict | None:
         from botocore.exceptions import ClientError
@@ -703,10 +726,114 @@ class R2DeliverySink:
         return True
 
 
+class HTTPDeliverySink:
+    """Immutable bounded subnet-run uploads to one configured HTTPS origin."""
+
+    max_file_bytes = 64 * 1024 * 1024
+    max_json_bytes = 1024 * 1024
+    evaluation_supported = False
+    _key = re.compile(r"^deliveries/subnet-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                      r"[89ab][0-9a-f]{3}-[0-9a-f]{12})/([A-Za-z0-9_.()-]{1,100})$")
+
+    def __init__(self, *, url: str, secret: str) -> None:
+        from urllib.parse import urlsplit
+
+        origin = urlsplit(url)
+        if (origin.scheme != "https" or not origin.hostname or origin.username is not None
+                or origin.password is not None or origin.path not in ("", "/")
+                or origin.query or origin.fragment):
+            raise ValueError("platform delivery URL must be an HTTPS origin")
+        if len(secret) < 32 or not secret.isascii() or any(ord(c) < 33 or ord(c) == 127
+                                                        for c in secret):
+            raise ValueError("platform delivery secret must be at least 32 header-safe characters")
+        self._host, self._port, self._secret = origin.hostname, origin.port or 443, secret
+
+    @classmethod
+    def from_environment(cls) -> "HTTPDeliverySink":
+        return cls(url=os.getenv("RELIQUARY_PLATFORM_DELIVERY_URL", "").strip(),
+                   secret=os.getenv("RELIQUARY_PLATFORM_DELIVERY_SECRET", ""))
+
+    def _route(self, key: str) -> str:
+        match = self._key.fullmatch(key)
+        if match is None:
+            raise ValueError("HTTP delivery sink only accepts subnet-run delivery keys")
+        return f"/api/internal/subnet/tasks/{match[1]}/deliveries/{match[2]}"
+
+    def accepts_delivery_id(self, delivery_id: str) -> bool:
+        return self._key.fullmatch(f"deliveries/{delivery_id}/manifest.json") is not None
+
+    def _connection(self):
+        from http.client import HTTPSConnection
+
+        return HTTPSConnection(self._host, self._port, timeout=60)
+
+    def _put(self, key: str, *, size: int, digest: str, body=None, path=None) -> None:
+        route = self._route(key)
+        limit = self.max_json_bytes if key.endswith(".json") else self.max_file_bytes
+        if size < 1 or size > limit:
+            raise ValueError("HTTP delivery object exceeds its size limit")
+        conn = self._connection()
+        try:
+            conn.putrequest("PUT", route)
+            conn.putheader("Authorization", "Bearer " + self._secret)
+            conn.putheader("Content-Length", str(size))
+            conn.putheader("X-Content-SHA256", digest)
+            conn.putheader("Content-Type", "application/json" if key.endswith(".json")
+                           else "application/octet-stream")
+            conn.endheaders()
+            if path is not None:
+                with Path(path).open("rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        conn.send(block)
+            else:
+                conn.send(body)
+            response = conn.getresponse()
+            if response.status not in (200, 201, 204):
+                raise RuntimeError(f"platform delivery upload refused ({response.status})")
+            response.read(self.max_json_bytes + 1)
+        finally:
+            conn.close()
+
+    async def put_file(self, key: str, path: Path) -> None:
+        digest = await asyncio.to_thread(_sha256, path)
+        await asyncio.to_thread(self._put, key, size=path.stat().st_size, digest=digest, path=path)
+
+    async def put_json(self, key: str, document: Mapping) -> None:
+        body = json.dumps(document, sort_keys=True).encode()
+        await asyncio.to_thread(self._put, key, size=len(body),
+                                digest=hashlib.sha256(body).hexdigest(), body=body)
+
+    def _get_json(self, key: str) -> dict | None:
+        route = self._route(key)
+        if key.rsplit("/", 1)[1] not in ("manifest.json", "report.json"):
+            raise ValueError("HTTP delivery reads only allow its manifest and report")
+        conn = self._connection()
+        try:
+            conn.request("GET", route, headers={"Authorization": "Bearer " + self._secret})
+            response = conn.getresponse()
+            if response.status == 404:
+                return None
+            if response.status != 200:
+                raise RuntimeError(f"platform delivery read refused ({response.status})")
+            body = response.read(self.max_json_bytes + 1)
+            if len(body) > self.max_json_bytes:
+                raise ValueError("HTTP delivery JSON exceeds its size limit")
+            document = json.loads(body)
+            if not isinstance(document, dict):
+                raise ValueError("HTTP delivery JSON must be an object")
+            return document
+        finally:
+            conn.close()
+
+    async def get_json(self, key: str) -> dict | None:
+        return await asyncio.to_thread(self._get_json, key)
+
+
 __all__ = [
     "DELIVERY_SCHEMA",
     "EPISODE_ROW_FIELDS",
     "LocalDirectorySink",
+    "HTTPDeliverySink",
     "R2DeliverySink",
     "ROW_FIELDS",
     "SHARD_MAX_BYTES",

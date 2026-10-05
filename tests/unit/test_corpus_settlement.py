@@ -90,6 +90,16 @@ def _v(hk, n, ok=True):
     return {"hotkey": hk, "token_count": n, "passed": ok}
 
 
+def test_a_zero_cap_job_still_archives_and_settles_verified_work():
+    sid = "1" * 64
+    records, archives = _Records({sid: _v("A", 10)}), _Archives(46000)
+    settler = _settler(records, archives)
+    settler.set_cap(0.0)
+    assert asyncio.run(settler.settle_once()) == 46000
+    assert archives.written[46000]["rewards_by_hotkey"] == {"A": 0.0}
+    assert records.state["settled"] == [sid]
+
+
 def test_a_settlement_writes_one_archive_and_marks_its_verdicts():
     records = _Records({"1" * 64: _v("A", 10), "2" * 64: _v("B", 30)})
     archives = _Archives(46000)
