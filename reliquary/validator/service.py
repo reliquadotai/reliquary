@@ -106,6 +106,7 @@ from reliquary.constants import (
     prompt_cooldown_windows_for_environment,
     thinking_for_environment,
 )
+from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
@@ -277,25 +278,33 @@ FILL_CLOSED_ROTATION_POLL_SECONDS = 2.0
 
 def _cooldown_snapshot_key(run_id: str) -> str:
     """R2 key for the run-keyed cooldown snapshot."""
+    namespace = active_checkpoint_namespace()
+    if namespace.scoped:
+        return f"{namespace.prefix}/cooldown_snapshots/{run_id}.json"
     return f"cooldown_snapshots/{run_id}.json"
 
 
-def _cooldown_local_path(run_id: str) -> Path:
-    state_dir = Path(
+def _validator_state_dir() -> Path:
+    return active_checkpoint_namespace().local_path(
         os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
     )
+
+
+def _cooldown_local_path(run_id: str) -> Path:
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     return state_dir / "cooldown" / f"{safe_run_id}.json.gz"
 
 
 def _content_cooldown_snapshot_key(run_id: str) -> str:
+    namespace = active_checkpoint_namespace()
+    if namespace.scoped:
+        return f"{namespace.prefix}/content_cooldown_snapshots/{run_id}.json.gz"
     return f"content_cooldown_snapshots/{run_id}.json.gz"
 
 
 def _content_cooldown_local_path(run_id: str) -> Path:
-    state_dir = Path(
-        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-    )
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     return state_dir / "content_cooldown" / f"{safe_run_id}.json.gz"
 
@@ -306,9 +315,7 @@ def _prompt_mismatch_circuit_local_path(
     netuid: int,
     validator_hotkey: str,
 ) -> Path:
-    state_dir = Path(
-        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-    )
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     validator_tag = hashlib.sha256(
         str(validator_hotkey).encode("utf-8")
@@ -326,9 +333,7 @@ def _no_reveal_circuit_local_path(
     netuid: int,
     validator_hotkey: str,
 ) -> Path:
-    state_dir = Path(
-        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-    )
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     validator_tag = hashlib.sha256(
         str(validator_hotkey).encode("utf-8")
@@ -787,6 +792,10 @@ class ValidationService:
         proof_worker_pool: Any = None,
         signer_client: Any | None = None,
     ) -> None:
+        from reliquary.constants import DETACHED_TRAINER
+
+        if active_checkpoint_namespace().scoped and not DETACHED_TRAINER:
+            raise ValueError("task-scoped checkpoints require the detached trainer")
         self.wallet = wallet
         self._signer_client = signer_client
         self._network_proof = getattr(proof_worker_pool, "is_remote", False) is True
@@ -1767,9 +1776,7 @@ class ValidationService:
             FillClosedRotationStore,
         )
 
-        state_dir = Path(
-            os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-        )
+        state_dir = _validator_state_dir()
         recovery = FillClosedRecoveryStore(state_dir)
         queue_dir = getattr(getattr(self, "_training_payload_queue", None), "queue_dir", Path(_default_queue_dir()))
         recovery.quarantine_uncommitted(Path(queue_dir))
@@ -2326,6 +2333,24 @@ class ValidationService:
             parse_resume_source,
             resolve_resume_source,
         )
+
+        if active_checkpoint_namespace().scoped:
+            source = parse_resume_source(self._resume_from)
+            if not isinstance(source, ShaSource):
+                raise ValueError("scoped checkpoint resume requires a published immutable SHA")
+            intake = self._detached_intake_ref()
+            candidate = await asyncio.to_thread(intake.poll, include_installed=True)
+            if candidate is None or candidate.get("revision") != source.sha:
+                raise ValueError("scoped resume must match its published candidate")
+            if not await asyncio.to_thread(intake.stage, candidate):
+                raise RuntimeError("scoped resume staging failed: " + str(intake.last_error))
+            await self._swap_staged_checkpoint(self._window_n)
+            installed = self._checkpoint_store.current_manifest()
+            if installed is None or (installed.checkpoint_n, installed.repo_id, installed.revision) != (
+                candidate["checkpoint_n"], candidate["repo_id"], candidate["revision"],
+            ):
+                raise RuntimeError("scoped resume checkpoint was not adopted")
+            return
 
         def _commit_title(repo_id, revision):
             from huggingface_hub import HfApi
@@ -6124,11 +6149,9 @@ class ValidationService:
             finally:
                 logger.info("startup_stage=%s elapsed_seconds=%.3f", name, time.monotonic() - started)
 
-        self.server.configure_final_verdict_store(
-            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-        )
+        self.server.configure_final_verdict_store(str(_validator_state_dir()))
         self._control_store = ControlStore(
-            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state"),
+            _validator_state_dir(),
             start_closed=os.getenv("RELIQUARY_CONTROL_START_CLOSED", "0").lower()
             in {"1", "true", "yes", "on"},
         )
@@ -6751,6 +6774,19 @@ class ValidationService:
         self._cooldown_durable_window = self._window_n
 
         # 2. checkpoint_n + revision from HF commit history.
+        # Scoped trainers resume only their candidate, never another run's
+        # numerically larger checkpoint in the repository's shared history.
+        if active_checkpoint_namespace().scoped:
+            intake = self._detached_intake_ref()
+            candidate = await asyncio.to_thread(intake.poll, include_installed=True)
+            if candidate is None:
+                if intake.last_error:
+                    raise RuntimeError("scoped checkpoint bootstrap failed: " + intake.last_error)
+                return
+            if candidate["checkpoint_n"] > self._checkpoint_n:
+                self._resume_from = f"sha:{candidate['revision']}"
+                await self._apply_resume_from()
+            return
         #
         # Auto-resume to the latest published "checkpoint N" commit. This
         # replaces the previous count-only logic, which left
@@ -6852,6 +6888,7 @@ class ValidationService:
             raise ValueError("unsupported cooldown snapshot schema")
         if schema_version == 2 and snapshot.get("complete") is not True:
             raise ValueError("cooldown snapshot is incomplete")
+        active_checkpoint_namespace().require_identity(snapshot)
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("cooldown run id mismatch")
         snapshot_window = snapshot.get("snapshot_window")
@@ -7147,6 +7184,7 @@ class ValidationService:
             def _build() -> dict:
                 return {
                     "schema_version": 2,
+                    **active_checkpoint_namespace().identity,
                     "run_id": TRAINING_RUN_ID,
                     "snapshot_window": window,
                     "complete": True,
@@ -7230,6 +7268,7 @@ class ValidationService:
         schema_version = snapshot.get("schema_version")
         if type(schema_version) is not int or schema_version != 1:
             raise ValueError("unsupported content cooldown snapshot schema")
+        active_checkpoint_namespace().require_identity(snapshot)
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("content cooldown run id mismatch")
         if snapshot.get("complete") is not True:
@@ -7448,6 +7487,7 @@ class ValidationService:
         def _build() -> dict[str, Any]:
             return {
                 "schema_version": 1,
+                **active_checkpoint_namespace().identity,
                 "run_id": TRAINING_RUN_ID,
                 "snapshot_window": window,
                 "complete": True,
@@ -7519,6 +7559,7 @@ class ValidationService:
 
     def _hash_snapshot_identity(self) -> dict:
         return {"schema_version": 1, "run_id": TRAINING_RUN_ID,
+                **active_checkpoint_namespace().identity,
                 "profile_id": PROTOCOL_PROFILE_ID, "repo_id": self.hf_repo_id,
                 "bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
                 "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),

@@ -198,6 +198,15 @@ async def maybe_pull_checkpoint(
     update is needed (remote is older, identities match, or the remote snapshot
     is not published yet), returns inputs unchanged.
     """
+    from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
+
+    service_policy = getattr(state, "service_policy", None)
+    if service_policy is not None:
+        from reliquary.protocol.service_contract import ServiceContract
+
+        policy = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
+        contract = ServiceContract.from_dict(policy["contract"])
+        active_checkpoint_namespace().require_policy(contract.to_dict()["policies"]["checkpoint"])
     remote_identity = checkpoint_identity_from_state(state)
     if remote_identity is None:
         return local_n, local_repo_id, local_hash, local_model
@@ -214,6 +223,13 @@ async def maybe_pull_checkpoint(
                 "checkpoint number was rebound to a different repository or revision"
             )
     local_path = await download_fn(remote_identity.repo_id, remote_identity.oid)
+    from reliquary.validator.checkpoint_profile import validate_checkpoint_profile
+
+    # Scoped snapshots must agree with this runtime before either model is
+    # touched. Optional legacy metadata also exposes a requested mode mismatch.
+    validate_checkpoint_profile(
+        local_path, required=active_checkpoint_namespace().scoped,
+    )
     new_model = await asyncio.to_thread(load_fn, local_path)
     if new_model is None:
         raise RuntimeError("checkpoint loader returned no activated model")
@@ -230,12 +246,18 @@ async def _hf_download(repo_id: str, revision: str) -> str:
     import asyncio
     from huggingface_hub import snapshot_download
     from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
+    from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
+    from reliquary.validator.checkpoint_profile import CHECKPOINT_PROFILE_NAME
+
+    patterns = MODEL_SNAPSHOT_ALLOW_PATTERNS
+    if active_checkpoint_namespace().scoped:
+        patterns = [*patterns, CHECKPOINT_PROFILE_NAME]
 
     return await asyncio.to_thread(
         snapshot_download,
         repo_id=repo_id,
         revision=revision,
-        allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+        allow_patterns=patterns,
     )
 
 

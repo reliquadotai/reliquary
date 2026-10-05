@@ -28,14 +28,16 @@ from reliquary.shared.checkpoint_identity import (
     require_immutable_checkpoint_revision,
 )
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.checkpoint_namespace import (
+    CheckpointNamespace, active_checkpoint_namespace,
+    LEGACY_CANDIDATE_MANIFEST_KEY, LEGACY_CHECKPOINT_PREFIX,
+)
 from reliquary.trainer.storage_guard import HfStorageGuard
 from reliquary.validator.control import write_json
 
 logger = logging.getLogger(__name__)
-# Knowingly NOT task-scoped: it sits on the live checkpoint-adoption path and
-# cannot collide until a second task runs a trainer. Scope it before one does.
-CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
-R2_CHECKPOINT_PREFIX = "reliquary/checkpoints"
+CANDIDATE_MANIFEST_KEY = LEGACY_CANDIDATE_MANIFEST_KEY
+R2_CHECKPOINT_PREFIX = LEGACY_CHECKPOINT_PREFIX
 PUBLICATION_RECEIPT = "reliquary_publication.json"
 PENDING_PUBLICATION = "publication.json"
 WEIGHT_PATTERNS = (
@@ -48,7 +50,7 @@ class PublicationConflict(RuntimeError):
     """Local or remote state cannot be attributed to this publication."""
 
 
-def checkpoint_key(revision: str, filename: str) -> str:
+def checkpoint_key(revision: str, filename: str, *, namespace: CheckpointNamespace | None = None) -> str:
     revision = require_immutable_checkpoint_revision(revision)
     if (
         not isinstance(filename, str)
@@ -59,7 +61,8 @@ def checkpoint_key(revision: str, filename: str) -> str:
         or Path(filename).name != filename
     ):
         raise ValueError("checkpoint filename must be a single path component")
-    return f"{R2_CHECKPOINT_PREFIX}/{revision}/{filename}"
+    namespace = namespace or active_checkpoint_namespace()
+    return f"{namespace.checkpoint_prefix}/{revision}/{filename}"
 
 
 def _multipart_transfer_config():
@@ -170,11 +173,13 @@ class TrainerPublisher:
         storage_guard: HfStorageGuard | None = None,
         hf_head_fn: Callable | None = None,
         hf_verify_fn: Callable | None = None,
+        namespace: CheckpointNamespace | None = None,
     ) -> None:
         from reliquary.validator.checkpoint import _default_save_hf_format
 
         self.repo_id = require_checkpoint_repository(repo_id)
-        self.staging_dir = Path(staging_dir)
+        self.namespace = namespace or active_checkpoint_namespace()
+        self.staging_dir = self.namespace.local_path(staging_dir)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         _fsync_directory(self.staging_dir.parent)
         self.tokenizer, self._r2, self._bucket = tokenizer, r2_client, bucket
@@ -191,12 +196,12 @@ class TrainerPublisher:
             if checkpoint_number_floor is not None
             else None
         )
-        self._pending = self.staging_dir / PENDING_PUBLICATION
+        self._pending = self.namespace.child_path(self.staging_dir, PENDING_PUBLICATION)
 
     @contextmanager
     def _lock(self):
         # The persistent inode must never be unlinked while another process waits.
-        with (self.staging_dir / ".publication.lock").open("a") as handle:
+        with self.namespace.child_path(self.staging_dir, ".publication.lock").open("a") as handle:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
@@ -209,7 +214,9 @@ class TrainerPublisher:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
     def _snapshot(self, transaction: dict) -> Path:
-        return self.staging_dir / f"ckpt_{transaction['manifest']['checkpoint_n']}"
+        return self.namespace.child_path(
+            self.staging_dir, f"ckpt_{transaction['manifest']['checkpoint_n']}",
+        )
 
     def has_pending(self) -> bool:
         return self._pending.exists()
@@ -219,7 +226,7 @@ class TrainerPublisher:
 
         try:
             response = self._r2.get_object(
-                Bucket=self._bucket, Key=CANDIDATE_MANIFEST_KEY
+                Bucket=self._bucket, Key=self.namespace.candidate_manifest_key
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") in {
@@ -239,6 +246,7 @@ class TrainerPublisher:
         manifest = strict_json_loads(raw)
         if not isinstance(manifest, dict):
             raise PublicationConflict("candidate manifest must be an object")
+        self.namespace.require_identity(manifest)
         canonical_checkpoint_identity(
             manifest.get("checkpoint_n"),
             manifest.get("repo_id"),
@@ -275,12 +283,15 @@ class TrainerPublisher:
         if (
             transaction["bucket"] != self._bucket
             or manifest["repo_id"] != self.repo_id
-            or any(manifest.get(k) != v for k, v in active_training_identity().items())
+            or any(manifest.get(k) != v for k, v in {
+                **active_training_identity(), **self.namespace.identity,
+            }.items())
             or manifest.get("journal_key_space") != active_journal_key_space()
         ):
             raise PublicationConflict(
                 "pending publication belongs to another repository/profile/run"
             )
+        self.namespace.require_identity(manifest)
         require_checkpoint_number(manifest["checkpoint_n"])
         require_checkpoint_number(manifest["trained_window_cursor"])
         require_immutable_checkpoint_revision(transaction["parent_revision"])
@@ -354,6 +365,7 @@ class TrainerPublisher:
                 )
             manifest = {
                 **active_training_identity(),
+                **self.namespace.identity,
                 "checkpoint_n": checkpoint_n,
                 "repo_id": self.repo_id,
                 "trained_window_cursor": trained_window_cursor,
@@ -387,7 +399,7 @@ class TrainerPublisher:
             }
             if lr_schedule_step is not None:
                 extra["lr_schedule_step"] = lr_schedule_step
-            write_checkpoint_profile(snapshot, extra=extra)
+            write_checkpoint_profile(snapshot, extra=extra, namespace=self.namespace)
             files = {
                 path.name: await asyncio.to_thread(_file_identity, path)
                 for path in sorted(snapshot.iterdir())
@@ -436,7 +448,7 @@ class TrainerPublisher:
                     "pending publication lacks its snapshot receipt"
                 )
             for name, expected in transaction["files"].items():
-                checkpoint_key(transaction["parent_revision"], name)
+                checkpoint_key(transaction["parent_revision"], name, namespace=self.namespace)
                 if await asyncio.to_thread(_file_identity, snapshot / name) != expected:
                     raise PublicationConflict(
                         f"local publication content changed: {name}"
@@ -527,7 +539,7 @@ class TrainerPublisher:
                     self._r2.upload_file,
                     str(snapshot / name),
                     self._bucket,
-                    checkpoint_key(revision, name),
+                    checkpoint_key(revision, name, namespace=self.namespace),
                     Config=config,
                 )
             if await asyncio.to_thread(self._hf_head, self.repo_id) != revision:
@@ -536,7 +548,7 @@ class TrainerPublisher:
             await asyncio.to_thread(
                 self._r2.put_object,
                 Bucket=self._bucket,
-                Key=CANDIDATE_MANIFEST_KEY,
+                Key=self.namespace.candidate_manifest_key,
                 Body=json.dumps(manifest, sort_keys=True).encode(),
                 **condition,
             )
@@ -566,13 +578,13 @@ class TrainerPublisher:
         # new mirror can never be deleted by an old or recovering process.
         try:
             response = self._r2.list_objects_v2(
-                Bucket=self._bucket, Prefix=f"{R2_CHECKPOINT_PREFIX}/", Delimiter="/"
+                Bucket=self._bucket, Prefix=f"{self.namespace.checkpoint_prefix}/", Delimiter="/"
             )
             return [
-                entry["Prefix"].removeprefix(f"{R2_CHECKPOINT_PREFIX}/").rstrip("/")
+                entry["Prefix"].removeprefix(f"{self.namespace.checkpoint_prefix}/").rstrip("/")
                 for entry in response.get("CommonPrefixes", [])
                 if re.fullmatch(
-                    f"{R2_CHECKPOINT_PREFIX}/[0-9a-f]{{40}}/", entry["Prefix"]
+                    re.escape(self.namespace.checkpoint_prefix) + r"/[0-9a-f]{40}/", entry["Prefix"]
                 )
             ]
         except Exception:
@@ -585,7 +597,7 @@ class TrainerPublisher:
                 require_immutable_checkpoint_revision(revision)
                 if revision in keep:
                     continue
-                prefix = f"{R2_CHECKPOINT_PREFIX}/{revision}/"
+                prefix = f"{self.namespace.checkpoint_prefix}/{revision}/"
                 response = self._r2.list_objects_v2(Bucket=self._bucket, Prefix=prefix)
                 for item in response.get("Contents", []):
                     if item["Key"].startswith(prefix):

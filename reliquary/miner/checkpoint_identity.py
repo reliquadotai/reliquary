@@ -14,6 +14,7 @@ from reliquary.shared.checkpoint_identity import (
     require_checkpoint_repository,
     require_immutable_checkpoint_revision,
 )
+from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
 
 
 _SCHEMA_VERSION = 1
@@ -116,6 +117,7 @@ def default_checkpoint_identity_path(wallet_address: str) -> Path:
         os.environ.get("RELIQUARY_MINER_STATE_DIR")
         or os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
     )
+    state_root = active_checkpoint_namespace().local_path(state_root)
     netuid = os.environ.get("NETUID", "unknown")
     network = os.environ.get("BT_NETWORK", "unknown")
     scope = hashlib.sha256(

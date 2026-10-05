@@ -16,6 +16,7 @@ from reliquary.constants import (
     TRAINING_RUN_ID,
 )
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.checkpoint_namespace import CheckpointNamespace, active_checkpoint_namespace
 
 
 CHECKPOINT_PROFILE_NAME = "reliquary_protocol_profile.json"
@@ -25,20 +26,19 @@ class CheckpointProfileMismatch(RuntimeError):
     pass
 
 
-def active_checkpoint_profile() -> dict[str, Any]:
+def active_checkpoint_profile(*, namespace: CheckpointNamespace | None = None) -> dict[str, Any]:
+    namespace = namespace or active_checkpoint_namespace()
     profile = {
         "schema_version": 2 if PROTOCOL_VERSION >= 5 else 1,
         "profile_id": PROTOCOL_PROFILE_ID,
         "protocol_version": PROTOCOL_VERSION,
         "base_model_id": PROTOCOL_MODEL_ID,
         "base_model_revision": PROTOCOL_MODEL_REVISION,
-        # Run identity, NOT validated as lineage (absent on historical
-        # checkpoints): read at resume to decide whether the LR schedule
-        # position may be reconstructed (same run) or the full warmup must
-        # replay (new run id on old weights).
+        # Legacy run identity is informational. Scoped profiles bind the run
+        # exactly before any cursor or LR schedule state is restored.
         "training_run_id": TRAINING_RUN_ID,
     }
-    if PROTOCOL_VERSION >= 5:
+    if PROTOCOL_VERSION >= 5 or namespace.scoped:
         # Profile IDs are immutable by convention; the canonical contract hash
         # makes that convention fail-closed for v5 prompt text and every other
         # generation field even if an ID were accidentally reused.
@@ -49,20 +49,24 @@ def active_checkpoint_profile() -> dict[str, Any]:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+    if namespace.scoped:
+        profile.update(namespace.identity)
+        profile["schema_version"] = 3
     return profile
 
 
 def write_checkpoint_profile(
-    path: str | Path, extra: Mapping[str, Any] | None = None
+    path: str | Path, extra: Mapping[str, Any] | None = None,
+    *, namespace: CheckpointNamespace | None = None,
 ) -> Path:
     """Write the lineage profile, optionally with run-state fields.
 
-    ``extra`` keys (e.g. ``lr_schedule_step``) are informational run state,
-    never part of lineage validation — the validated key list is fixed, so
-    old and new code stay mutually compatible in both directions.
+    ``extra`` keys (e.g. ``lr_schedule_step``) cannot replace lineage fields.
+    Legacy profiles retain their original bytes; scoped profiles use a new
+    schema so a legacy reader cannot silently accept a task-bound snapshot.
     """
     destination = Path(path) / CHECKPOINT_PROFILE_NAME
-    payload = active_checkpoint_profile()
+    payload = active_checkpoint_profile(namespace=namespace)
     if extra:
         collisions = set(payload).intersection(extra)
         if collisions:
@@ -116,6 +120,8 @@ def validate_checkpoint_profile(
     ]
     if int(expected_value.get("schema_version", 1)) >= 2:
         lineage_keys.append("generation_contract_sha256")
+    if "checkpoint_namespace" in expected_value or "checkpoint_namespace" in value:
+        lineage_keys.extend(["checkpoint_namespace", "task_id", "training_run_id"])
     for key in lineage_keys:
         if value.get(key) != expected_value.get(key):
             raise CheckpointProfileMismatch(
