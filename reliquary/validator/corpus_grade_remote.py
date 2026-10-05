@@ -23,6 +23,15 @@ clock runs only while no live eligible executor exists (F3), and an item
 holding a vote goes back to the front of the queue, so a grading backlog
 never turns a failing replay into a dispute.
 
+An executor that failed an attempt on an item (its lease expired, it
+answered ``error``/``timeout``, or its result did not fit the lease) is kept
+off that item so the next attempt runs elsewhere. When no other live
+executor could take it (one executor, or one provider), that exclusion lapses
+after ``GRADE_RETRY_EXCLUDED_SECONDS``: the item is leased to it again, so an
+item with no vote can never wait forever (no dispute clock runs without a
+vote). The attempt counters are unchanged (two timeouts, three errors), and
+an executor that voted on an item is never leased it again.
+
 An item no lease can carry (actions or observations beyond the
 ``GradeLease`` bounds) is never leased: every executor would refuse the lease
 and it would cycle forever. It resolves at once as ``ungradeable``, the
@@ -134,6 +143,12 @@ GRADE_DISPUTE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS", 1
 GRADE_CLAIM_LIVE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_CLAIM_LIVE_SECONDS",
                                         2 * (REQUEST_TIMEOUT_SECONDS + ERROR_BACKOFF_SECONDS),
                                         30.0, 3600.0)
+# How long an executor that failed an attempt on an item stays off it when no
+# other executor could take it (production 2026-10-04: one executor, a replay
+# lease expired, the item waited forever and no period settled).
+GRADE_RETRY_EXCLUDED_BOUNDS = (60.0, 86400.0)
+GRADE_RETRY_EXCLUDED_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_RETRY_EXCLUDED_SECONDS",
+                                            600.0, *GRADE_RETRY_EXCLUDED_BOUNDS)
 UNGRADEABLE = "ungradeable"
 DISPUTED = "disputed"
 # Ruling P23: the box failed or the deadline passed once the trajectory's
@@ -189,7 +204,10 @@ class _Work:
     queued_at: float
     results: dict[str, dict] = field(default_factory=dict)
     providers: dict[str, str] = field(default_factory=dict)   # voter -> its provider
-    excluded: set[str] = field(default_factory=set)
+    excluded: set[str] = field(default_factory=set)      # voted on it: never again
+    # Failed an attempt on it (expiry, error, misfit) -> when it last did:
+    # off it while another executor could take it, else after the retry wait.
+    failed_at: dict[str, float] = field(default_factory=dict)
     drawn: bool | None = None           # recheck draw, made at the first result
     timeouts: int = 0
     errors: int = 0
@@ -231,7 +249,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
                  expiry_strikes: int = LEASE_EXPIRY_STRIKES,
                  lease_seconds: dict[str, float] | None = None,
                  dispute_seconds: float = GRADE_DISPUTE_SECONDS,
-                 claim_live_seconds: float = GRADE_CLAIM_LIVE_SECONDS) -> None:
+                 claim_live_seconds: float = GRADE_CLAIM_LIVE_SECONDS,
+                 retry_excluded_seconds: float = GRADE_RETRY_EXCLUDED_SECONDS) -> None:
         super().__init__(directory=directory, quarantine=quarantine,
                          record_heartbeat=record_heartbeat, clock=clock,
                          live_seconds=live_seconds,
@@ -254,6 +273,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
         # When each executor last asked for a lease (ruling P26).
         self._claimed_at: dict[str, float] = {}
         self._claim_live = float(claim_live_seconds)
+        self._retry_excluded = float(retry_excluded_seconds)
 
     def hold_on_quarantine(self, holder: Callable[[str], Any]) -> None:
         """``holder(executor_id)`` runs synchronously the moment an executor is
@@ -347,14 +367,32 @@ class RemoteGradeDispatcher(ExecutorLeases):
                 == (self._env["package"], self._env["version"])
                 and executor_id not in self._wrong_env)
 
-    def _eligible(self, executor_id: str, work: _Work) -> bool:
+    def _working(self, now: float) -> list[str]:
+        """Live executors that can actually take a next vote: claiming
+        lately, or busy with a lease (ruling P26)."""
+        return [eid for eid in self._live_executors()
+                if now - self._claimed_at.get(eid, -math.inf) <= self._claim_live
+                or self._held(eid) > 0]
+
+    def _eligible(self, executor_id: str, work: _Work, *, retry: bool = True) -> bool:
         """It may take ``work``'s next vote: registered for this control's
         env and not refused for it (N2), not excluded, of a provider that has
-        not voted on it."""
+        not voted on it. One that failed an attempt on it comes back only
+        after the retry wait, and only while no executor that never failed
+        it could take it instead."""
         provider = self._provider(executor_id)
-        return (executor_id not in work.excluded and provider is not None
+        if not (executor_id not in work.excluded and provider is not None
                 and provider not in work.providers.values()
-                and self._on_pinned_env(executor_id))
+                and self._on_pinned_env(executor_id)):
+            return False
+        failed_at = work.failed_at.get(executor_id)
+        if failed_at is None:
+            return True
+        now = self._clock()
+        if not retry or now - failed_at < self._retry_excluded:
+            return False
+        return not any(self._eligible(other, work, retry=False)
+                       for other in self._working(now) if other != executor_id)
 
     @staticmethod
     def _misfit(work: _Work, answer: GradeItemResult) -> str | None:
@@ -392,7 +430,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
                                             f"{self._strikes_limit} grade leases expired in a row"))
             raise LeaseRefused(410, "lease_expired")
         answer = result.results[0]
-        work.excluded.add(executor_id)
+        work.failed_at[executor_id] = self._clock()   # until its vote counts
         misfit = self._misfit(work, answer)
         if misfit is not None:
             # Never an honest executor's answer (it echoes the item it ran).
@@ -425,6 +463,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
             work.drawn = self._rng.random() < self._fraction
         work.results[executor_id] = answer.model_dump()
         work.providers[executor_id] = provider
+        work.excluded.add(executor_id)              # a vote is never repeated by it
+        work.failed_at.pop(executor_id, None)
         self.stats["graded"] += 1
         self._settle(work)
         return "accepted"
@@ -523,7 +563,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
                 self._queue.append(work)
 
     def _take_back(self, lease: _Lease, *, expired: bool) -> None:
-        lease.work.excluded.add(lease.executor_id)
+        lease.work.failed_at[lease.executor_id] = self._clock()
         if expired:
             self._failed_attempt(lease.work, "timeouts")
         else:
@@ -556,9 +596,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
         now = self._clock()
         live = self._live_executors()
         # Who can actually take a next vote: claiming lately, or busy with a lease.
-        working = [eid for eid in live
-                   if now - self._claimed_at.get(eid, -math.inf) <= self._claim_live
-                   or self._held(eid) > 0]
+        working = self._working(now)
         waiting = 0
         for work in list(self._queue):
             if work.future.done():
@@ -590,8 +628,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
             if live and not served:
                 self.stats["stranded"] += 1
                 logger.warning("grade item %d (%s) waits: every live grade executor is excluded "
-                               "from it (voted, failed it, same provider as a voter, not on "
-                               "this control's env, or neither claiming nor holding a lease)",
+                               "from it (voted, failed it and still inside the retry wait, "
+                               "same provider as a voter, not on this control's env, or "
+                               "neither claiming nor holding a lease)",
                                work.id, work.mode)
         self.stats["waiting"] = waiting
         if waiting and not live:
@@ -640,6 +679,7 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
 
 __all__ = ["DISPUTED", "REPLAY_LEASE_MARGIN_SECONDS", "check_replay_lease", "replay_lease_refusal",
            "GRADE_CLAIM_LIVE_SECONDS", "GRADE_DISPUTE_SECONDS", "GRADE_LEASE_SECONDS", "GRADE_PREFIX",
+           "GRADE_RETRY_EXCLUDED_SECONDS",
            "TRAJECTORY_STATUSES", "UNCERTIFIED", "UNGRADEABLE", "UNJUDGEABLE", "GradeDecision",
            "RemoteGradeDispatcher", "build_grade_executor_router", "decision_key",
            "replay_certified"]
