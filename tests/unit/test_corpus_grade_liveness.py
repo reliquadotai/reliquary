@@ -169,3 +169,83 @@ async def test_the_production_symptom_no_longer_waits_forever(monkeypatch):
     d.result("g0", second["lease_id"], _result(REPLAY_OK))
     got = await asyncio.wait_for(decision, 5)
     assert got.status == "ok" and got.graded_by == ("g0",)
+
+
+# --------------------------------------------------------------------------
+# Recheck draws need a second provider to recheck with
+# --------------------------------------------------------------------------
+
+ONE_PROVIDER = {"g0": "hetzner", "g1": "hetzner", "g2": "hetzner", "g3": "hetzner"}
+
+
+def _logged(monkeypatch):
+    said = []
+    for level in ("info", "warning"):
+        monkeypatch.setattr(corpus_grade_remote.logger, level,
+                            lambda *a, **k: said.append(a[0] % a[1:]))
+    return said
+
+
+@pytest.mark.parametrize("mode,answer", [("grade", None), ("replay", REPLAY_OK)])
+async def test_with_one_provider_nothing_is_drawn_for_a_recheck(monkeypatch, mode, answer):
+    from tests.unit.test_corpus_grade_remote import PASS
+
+    said = _logged(monkeypatch)
+    d = await _dispatcher(recheck=0.0, providers=dict(ONE_PROVIDER))    # would always draw
+    decision = asyncio.ensure_future(d.decide(_item(mode)))
+    await asyncio.sleep(0)
+    _answer(d, "g0", answer or PASS)
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "ok" and got.graded_by == ("g0",)          # at once, undrawn
+    assert sum("rechecks disabled" in s for s in said) == 1
+
+
+async def test_draws_resume_when_a_second_provider_registers(monkeypatch):
+    from tests.unit.test_corpus_grade_remote import PASS
+
+    said = _logged(monkeypatch)
+    providers = dict(ONE_PROVIDER)
+    d = await _dispatcher(recheck=0.0, providers=providers)
+    for _ in range(2):                                              # logged once, not per item
+        decision = asyncio.ensure_future(d.decide(_item()))
+        await asyncio.sleep(0)
+        _answer(d, "g0", PASS)
+        assert (await asyncio.wait_for(decision, 5)).graded_by == ("g0",)
+    assert sum("rechecks disabled" in s for s in said) == 1
+    providers["g1"] = "lium"
+    await d._directory.refresh()
+    decision = asyncio.ensure_future(d.decide(_item()))
+    await asyncio.sleep(0)
+    _answer(d, "g0", PASS)
+    await asyncio.sleep(0)
+    assert not decision.done()                                      # drawn: a second provider
+    _answer(d, "g1", PASS)
+    got = await asyncio.wait_for(decision, 5)
+    assert got.graded_by == ("g0", "g1") and got.providers == ("hetzner", "lium")
+    assert sum("rechecks enabled" in s for s in said) == 1
+
+
+async def test_a_quarantined_second_provider_does_not_count():
+    from tests.unit.test_corpus_grade_remote import PASS
+
+    d = await _dispatcher(recheck=0.0, providers={**ONE_PROVIDER, "g1": "lium"})
+    d._mark_quarantined("g1", "test")
+    decision = asyncio.ensure_future(d.decide(_item()))
+    await asyncio.sleep(0)
+    _answer(d, "g0", PASS)
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g0",)
+
+
+async def test_with_one_provider_a_failing_replay_still_needs_two_and_is_uncertified():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, dispute_seconds=1800.0,
+                          providers=dict(ONE_PROVIDER))
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    _answer(d, "g0", REPLAY_BAD)
+    await asyncio.sleep(0)
+    assert not decision.done()
+    clock.now += 1801
+    await d.sweep()
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "uncertified" and not d.quarantined

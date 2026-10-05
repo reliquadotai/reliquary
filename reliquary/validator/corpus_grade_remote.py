@@ -32,6 +32,13 @@ item with no vote can never wait forever (no dispute clock runs without a
 vote). The attempt counters are unchanged (two timeouts, three errors), and
 an executor that voted on an item is never leased it again.
 
+A recheck is only drawn while the executors registered on this control's env
+(not quarantined) span two providers or more: with one provider the second
+vote could never come, and every drawn item would wait out the dispute clock
+and resolve ``disputed`` (paid, not certified, not exported). A failing replay
+still needs two providers whatever the draw: with one it resolves
+``uncertified`` after the dispute wait, as before.
+
 An item no lease can carry (actions or observations beyond the
 ``GradeLease`` bounds) is never leased: every executor would refuse the lease
 and it would cycle forever. It resolves at once as ``ungradeable``, the
@@ -274,6 +281,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
         self._claimed_at: dict[str, float] = {}
         self._claim_live = float(claim_live_seconds)
         self._retry_excluded = float(retry_excluded_seconds)
+        # Whether recheck draws were last possible (two providers), to log changes once.
+        self._draws_possible: bool | None = None
 
     def hold_on_quarantine(self, holder: Callable[[str], Any]) -> None:
         """``holder(executor_id)`` runs synchronously the moment an executor is
@@ -360,6 +369,28 @@ class RemoteGradeDispatcher(ExecutorLeases):
         # Normalized as at registration, for any document written before it was.
         provider = str(provider).strip().lower() if provider else ""
         return provider or None
+
+    def _recheck_possible(self) -> bool:
+        """Two or more distinct providers among the executors registered on
+        this control's env and not quarantined: a recheck can be served."""
+        providers = {self._provider(eid) for eid in self._directory.executor_ids()
+                     if eid not in self.quarantined and self._directory.is_authorized(eid)
+                     and self._on_pinned_env(eid)}
+        providers.discard(None)
+        possible = len(providers) >= 2
+        if possible != self._draws_possible:
+            if possible:
+                if self._draws_possible is not None:
+                    logger.info("grade rechecks enabled: grade executors on %s@%s span %d "
+                                "providers", self._env["package"], self._env["version"][:12],
+                                len(providers))
+            else:
+                logger.warning("grade rechecks disabled: grade executors on %s@%s span %d "
+                               "provider(s) %s; a passing result needs no second vote "
+                               "until a second provider registers", self._env["package"],
+                               self._env["version"][:12], len(providers), sorted(providers))
+            self._draws_possible = possible
+        return possible
 
     def _on_pinned_env(self, executor_id: str) -> bool:
         document = self._directory.document(executor_id) or {}
@@ -460,7 +491,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
         if answer.status in TRAJECTORY_STATUSES:
             self.box_failure_votes[executor_id] += 1
         if work.drawn is None:
-            work.drawn = self._rng.random() < self._fraction
+            work.drawn = self._recheck_possible() and self._rng.random() < self._fraction
         work.results[executor_id] = answer.model_dump()
         work.providers[executor_id] = provider
         work.excluded.add(executor_id)              # a vote is never repeated by it
