@@ -225,7 +225,7 @@ class FillClosedRecoveryStore:
         self._sync(self.directory)
         return archive
 
-    def recover(self, window: int, *, queue: Any, archives: Any, rotation: Any) -> dict:
+    def recover(self, window: int, *, queue: Any, archives: Any, rotation: Any, service_runtime: Any = None) -> dict:
         """Archive an interrupted window and return the archive it enqueued."""
         record = self.load(window)
         if record["archive"] is not None:
@@ -326,4 +326,6 @@ class FillClosedRecoveryStore:
             "runners_up": [], "rejected": [], "reject_summary": {},
             "training_quarantine": {"quarantined": False, "reasons": [], "metrics": {}},
         }
+        if service_runtime is not None:
+            archive = service_runtime.reconcile_archive(archive, aborted=not bool(rows))
         return self.finish(window, archive, archives)

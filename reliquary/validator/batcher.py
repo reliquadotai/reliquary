@@ -942,6 +942,9 @@ class GrpoWindowBatcher:
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
         self.window_start = window_start
+        self.service_policy = None
+        self.service_runtime = None
+        self.service_window_pool = 0.0
         self.env = env
         self.batch_target = int(batch_target)
         if self.batch_target <= 0:
@@ -1778,7 +1781,8 @@ class GrpoWindowBatcher:
             else ()
         )
         sigma_min = BOOTSTRAP_SIGMA_MIN if self.bootstrap else SIGMA_MIN
-        if not robust_utility_admits(
+        exploration = self._service_exploration(pending)
+        if not exploration and not robust_utility_admits(
             pending.rewards,
             sigma_min=sigma_min,
             truncated_indices=truncated_indices,
@@ -2034,6 +2038,29 @@ class GrpoWindowBatcher:
                         status = f"proof_{decision.status.value}"
                     row["status"] = status
                 if decision.status is ProofDecisionStatus.PASSED:
+                    if self.service_runtime is not None:
+                        if pending is None:
+                            raise RuntimeError("service proof has no bound pending request")
+                        from reliquary.services.runtime import ServicePolicyLimit
+                        try:
+                            result = self._record_service_proof(pending, decision.value)
+                        except ServicePolicyLimit:
+                            self.fill_state.release(environment)
+                            if row is not None:
+                                row["status"] = "service_policy_limit"
+                            continue
+                        except BaseException:
+                            self._accounted_arrival_decisions.discard(decision.job_id)
+                            self._arrival_proof_meta[decision.job_id] = (rate, payload_bytes, receipt_id, pending)
+                            raise
+                        if row is not None:
+                            row["service_observation_id"] = result["observation_id"]
+                            row["exploration_fraction"] = result["amount"]
+                        if self._service_exploration(pending):
+                            self.fill_state.release(environment)
+                            if row is not None:
+                                row["status"] = "exploration_verified"
+                            continue
                     self.fill_state.record_proven(environment)
                     if row is not None:
                         self.difficulty_auction_metadata_by_id[
@@ -3787,6 +3814,16 @@ class GrpoWindowBatcher:
                 RejectReason.GENERATION_CONTRACT_MISMATCH,
                 "generation_contract",
             )
+        from reliquary.services.runtime import validate_submission_policy
+        try:
+            validate_submission_policy(request, self.service_policy)
+        except (ValueError, TypeError, KeyError):
+            return False, RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract"
+        if self.service_runtime is not None and (
+            not self.service_runtime.active()
+            or (self.service_runtime.view is not None and not self.service_runtime.view.eligible(request.prompt_idx))
+        ):
+            return False, RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility"
         if request.prompt_idx >= len(self.env):
             return False, RejectReason.BAD_PROMPT_IDX, "prompt"
         if self.prompt_range is not None:
@@ -4090,6 +4127,16 @@ class GrpoWindowBatcher:
                 **kwargs,
             )
 
+        from reliquary.services.runtime import validate_submission_policy
+        try:
+            service_contract = validate_submission_policy(request, self.service_policy)
+        except (ValueError, TypeError, KeyError):
+            return reject(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract")
+        if self.service_runtime is not None and (
+            not self.service_runtime.active()
+            or (self.service_runtime.view is not None and not self.service_runtime.view.eligible(pi))
+        ):
+            return reject(RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility")
         # Legacy environments stop after the trigger drand tier. Auction
         # environments intentionally collect for the full fixed deadline.
         if (
@@ -4349,6 +4396,11 @@ class GrpoWindowBatcher:
             if robust_utility is not None
             else is_in_zone(sigma, bootstrap=self.bootstrap)
         )
+        if service_contract is not None:
+            from reliquary.services.runtime import service_signal_admits
+            in_zone = service_signal_admits(request, service_contract, rewards)
+            if request.service_binding["purpose"] == "exploration" and unboxed_indices:
+                in_zone = False
         if not in_zone:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
@@ -4663,6 +4715,12 @@ class GrpoWindowBatcher:
             )
             return None
 
+        from reliquary.services.runtime import validate_submission_policy
+        try:
+            service_contract = validate_submission_policy(request, self.service_policy)
+        except (ValueError, TypeError, KeyError):
+            return reject(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract")
+
         # Re-derive the cheap locals the moved gates read. Each is a pure
         # function of the request, so they are identical to what admission saw.
         problem = self.env.get_problem(pi)
@@ -4793,6 +4851,12 @@ class GrpoWindowBatcher:
         prefetched_proofs = []
         def seed_uniforms(index, commit):
             positions = policy_token_positions(list(commit.get("tokens") or []), commit.get("rollout") or {})
+            if self.service_policy is not None and request.pool_selection is not None:
+                from reliquary.protocol.seed_pool import PoolSelection, pool_from_service_policy
+                pool = pool_from_service_policy(self.service_policy, prompt_idx=request.prompt_idx, checkpoint_hash=request.checkpoint_hash)
+                selection = PoolSelection.from_dict(request.pool_selection)
+                pool.validate_selection(selection, rollout_count=len(request.rollouts))
+                return [pool.uniform(selection.candidate_id, index, j) for j in range(len(positions))]
             return [u_at(self.randomness, request.prompt_idx, request.checkpoint_hash, index, j)
                     for j in range(len(positions))]
 
@@ -4880,6 +4944,11 @@ class GrpoWindowBatcher:
                         seed_u_values=seed_u,
                     )
             except TypeError as exc:
+                if service_contract is not None and (
+                    _is_missing_kwarg_typeerror(exc, "seed_u_values")
+                    or _is_missing_kwarg_typeerror(exc, "tokenizer")
+                ):
+                    return reject(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_proof_capability")
                 # Backward-compat fallback for stub verifiers (tests, legacy
                 # callers) that don't accept one or both of the newer kwargs.
                 # Retry narrowing from most- to least-featured signature
@@ -4906,6 +4975,8 @@ class GrpoWindowBatcher:
                     )
                 else:
                     raise
+            if service_contract is not None and not getattr(proof, "has_sparse_outputs", False):
+                return reject(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_proof_capability")
             rollout._validated_completion_logprobs = (
                 _verify_logprobs_for_training(proof, _seed_completion_len)
             )
@@ -5028,7 +5099,8 @@ class GrpoWindowBatcher:
             # test fixtures that opted out of behavioural enforcement).
             if proof.has_sparse_outputs and not _is_episode:
                 require_forced_terminal_pick = (
-                    PROTOCOL_VERSION == 6
+                    service_contract is not None
+                    or PROTOCOL_VERSION == 6
                     and FORCED_SEED_ENFORCE
                     and bool(self.current_checkpoint_hash)
                 )
@@ -5191,6 +5263,10 @@ class GrpoWindowBatcher:
                     "force_span",
                     sketch_diff_max=sketch_diff_max,
                 )
+            if service_contract is not None:
+                sampled_positions = sum(position not in exempt_positions for position in policy_positions)
+                if sampled_positions < 1 or seed_positions != sampled_positions:
+                    return reject(RejectReason.SEED_MISMATCH, "service_seed_coverage")
             if rollout_dict.get("forced") and not _is_episode:
                 declared_span = rollout_dict.get("force_span")
                 rollout._validated_force_span = (
@@ -5633,7 +5709,7 @@ class GrpoWindowBatcher:
         # current_checkpoint_hash disables WRONG_CHECKPOINT, so the miner
         # controls checkpoint_hash (a forced-seed derivation input) and could
         # grind it -- don't reject on a stream whose seed inputs aren't bound.
-        seed_enforce = FORCED_SEED_ENFORCE and bool(self.current_checkpoint_hash)
+        seed_enforce = service_contract is not None or FORCED_SEED_ENFORCE and bool(self.current_checkpoint_hash)
         group_would_reject = _forced_seed_verdict(
             grp_stoch, grp_match, True,
         )
@@ -5643,7 +5719,7 @@ class GrpoWindowBatcher:
         group_reject = seed_enforce and group_would_reject
         rollout_reject = seed_enforce and rollout_would_reject
         cdf_enforce = (
-            FORCED_SEED_CDF_ENFORCE and bool(self.current_checkpoint_hash)
+            service_contract is not None or FORCED_SEED_CDF_ENFORCE and bool(self.current_checkpoint_hash)
         )
         cdf_would_reject = grp_seed_hard_mismatch > 0
         cdf_reject = cdf_enforce and cdf_would_reject
@@ -5965,6 +6041,34 @@ class GrpoWindowBatcher:
                 return float(candidate)
         return 0.0
 
+    def _service_exploration(self, pending) -> bool:
+        binding = getattr(pending.request, "service_binding", None)
+        return self.service_runtime is not None and isinstance(binding, dict) and binding.get("purpose") == "exploration"
+
+    def _record_service_proof(self, pending, verified) -> dict:
+        from reliquary.protocol.release_contract import canonical_sha256
+        from reliquary.services.runtime import validate_submission_policy
+        contract = validate_submission_policy(pending.request, self.service_policy)
+        if contract is None or contract.sha256 != self.service_runtime.contract.sha256:
+            raise ValueError("proof service context no longer active")
+        if self._service_exploration(pending) and (verified.truncated_count or verified.unboxed_count):
+            raise ValueError("uncertain outcomes cannot earn exploration pay")
+        commits = [r.commit for r in verified.rollouts]
+        identity = canonical_sha256(pending.request.pool_selection or {"selection_digest": pending.selection_digest.hex()})
+        row = {
+            "schema": "prompt-observation/v1", "context_sha256": contract.context_sha256,
+            "row_id": self.service_runtime.row_ids[pending.prompt_idx], "group_id": identity,
+            "expected_samples": len(verified.rollouts), "sample_ids": [f"rollout-{i}" for i in range(len(verified.rollouts))],
+            "rewards_bps": [round(r * 10000) for r in pending.rewards],
+            "tokens": [len(r.commit["tokens"]) - int(r.commit["rollout"]["prompt_length"]) for r in verified.rollouts],
+            "window": self.window_start, "verification": {"generation": "verified", "sampling": "verified", "grading": "graded"},
+            "source_sha256": canonical_sha256(commits),
+        }
+        return self.service_runtime.record_verified(
+            row, hotkey=verified.hotkey, purpose=pending.request.service_binding["purpose"],
+            window_pool=self.service_window_pool, slots=self.fill_state.snapshot()["budgets"][str(getattr(self.env, "name", ""))],
+        )
+
     def _ranked_proof_for(
         self,
         pending: PendingSubmission,
@@ -6001,6 +6105,7 @@ class GrpoWindowBatcher:
             ) + resources
         return RankedProof(
             job_id=f"{self.window_start}:{environment}:{tag}:{rank}",
+            counts_toward_target=not self._service_exploration(pending),
             rank=rank,
             prompt_key=prompt_key,
             payload=_ScheduledProofPayload(

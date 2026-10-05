@@ -488,6 +488,8 @@ def _composed_task_entry(
 @tasks_app.command("create")
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
+    service_contract_file: Path = typer.Option(None, "--service-contract", exists=True, dir_okay=False, readable=True),
+    ack_service_fleet: bool = typer.Option(False, "--ack-service-fleet"),
     profile_id: str = typer.Option(
         None, "--profile-id", help="Compiled profile to pin; refused with --model"
     ),
@@ -643,6 +645,20 @@ def tasks_create(
                 env_split=_parse_env_split_option(env_split),
                 verification=verification,
             )
+        if service_contract_file is not None:
+            from dataclasses import replace
+            from reliquary.protocol.service_contract import ServiceContract
+            from reliquary.shared.strict_json import strict_json_loads
+            from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+            if not ack_service_fleet:
+                raise ValueError("service declaration requires --ack-service-fleet for upgraded registry readers")
+            if service_contract_file.stat().st_size > 65536:
+                raise ValueError("service contract exceeds 64 KiB")
+            contract = ServiceContract.from_dict(strict_json_loads(service_contract_file.read_bytes()))
+            entry = replace(entry, mechanism=MECHANISM_SERVICE_RL, service_contract=contract.to_dict(),
+                            params={**entry.params, "min_incentive_share": 0.0, "min_incentive_ramp_start": 0.0})
+        elif ack_service_fleet:
+            raise ValueError("--ack-service-fleet requires --service-contract")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -3807,6 +3823,7 @@ def validate(
                 ),
                 emission_cap=task_config.emission_cap,
                 price_params=task_config.price_params,
+                service_contract=task_config.service_contract,
                 env_caps=task_config.env_caps,
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,

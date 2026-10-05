@@ -174,6 +174,12 @@ class WeightOnlyValidator:
         """
         from botocore.exceptions import ClientError
 
+        try:
+            declared, _ = await read_registry()
+        except Exception:
+            logger.exception("Task registry unreadable; abstaining from this epoch")
+            return False
+
         by_task: dict[str, list[dict]] = {}
         try:
             windows_by_task: dict[str, list[int]] = {}
@@ -191,12 +197,17 @@ class WeightOnlyValidator:
                 (max(w) for w in windows_by_task.values()), default=0
             ) + 1
             for task_id in windows_by_task:
+                from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+                fields = ("window_start", "window_status", "rewards_by_hotkey")
+                if getattr(declared.get(task_id), "mechanism", None) == MECHANISM_SERVICE_RL:
+                    fields += ("service_payment_policy", "service_order_contract", "service_context_contract",
+                               "service_window_pool", "service_exploration_slots", "exploration_rewards_by_hotkey")
                 archives = await storage.list_recent_datasets(
                     current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
                     task_id=task_id,
                     # The replay reads only these; the task comes from the R2 prefix.
-                    fields=("window_start", "window_status", "rewards_by_hotkey"),
+                    fields=fields,
                 )
                 # A task whose last window fell out of the shared horizon
                 # contributes nothing, and must not be counted as an
@@ -208,11 +219,6 @@ class WeightOnlyValidator:
             # only the tasks we managed to see — worse than submitting
             # nothing. Abstain and let the next epoch retry the listing.
             logger.exception("Archive listing failed; abstaining from this epoch")
-            return False
-        try:
-            declared, _ = await read_registry()
-        except Exception:
-            logger.exception("Task registry unreadable; abstaining from this epoch")
             return False
         try:
             periods = await self._period_weights(declared)
@@ -245,6 +251,17 @@ class WeightOnlyValidator:
                 return False
 
         archives = self._merge_archives(by_task)
+        from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.services.runtime import validate_service_archive
+        try:
+            for archive in archives:
+                entry = declared.get(archive["task_id"])
+                if getattr(entry, "mechanism", None) == MECHANISM_SERVICE_RL:
+                    validate_service_archive(archive, ServiceContract.from_dict(entry.service_contract), cap=float(entry.params["cap"]))
+        except ValueError:
+            logger.error("Service archive policy validation failed; abstaining from weights")
+            return False
         logger.info(
             "Replaying %d archives across %d task(s): %s",
             len(archives), len(by_task), ", ".join(sorted(by_task)),
@@ -256,6 +273,8 @@ class WeightOnlyValidator:
             caps=self._caps_by_task(declared),
             floors=self._floors_by_task(declared),
             periods=periods,
+            service_tasks=frozenset(str(task_id) for task_id, entry in declared.items()
+                                    if getattr(entry, "mechanism", None) == MECHANISM_SERVICE_RL),
         )
         miner_weights = dict(ema)
 
@@ -448,6 +467,7 @@ class WeightOnlyValidator:
         caps: Mapping[str, float] | None = None,
         floors: Mapping[str, tuple[float, float]] | None = None,
         periods: Mapping[str, Mapping[str, float]] | None = None,
+        service_tasks: frozenset[str] = frozenset(),
     ) -> dict[str, float]:
         """Replay the per-window emission distribution into an EMA.
 
@@ -456,6 +476,8 @@ class WeightOnlyValidator:
         ``select_batch_and_distribute`` at seal time. The dict's values are
         already in units of ``pool`` (≤ 1.0 per window), so they map
         directly onto the EMA fraction with no further normalization.
+        Explicit service tasks retain every positive fraction; historical
+        tasks keep their pruning threshold even when their floor is zero.
 
         The field is deliberately mechanism-agnostic. Historical archives may
         contain same-prompt/boundary splits; auction-v2 archives contain one
@@ -508,7 +530,8 @@ class WeightOnlyValidator:
                 for hk in all_hotkeys:
                     fraction = rewards.get(hk, 0.0)
                     ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
-                ema = {hk: v for hk, v in ema.items() if v > 1e-6}
+                cutoff = 0.0 if task_id in service_tasks else 1e-6
+                ema = {hk: v for hk, v in ema.items() if v > cutoff}
             for hk, v in (periods.get(task_id) or {}).items():
                 ema[hk] = ema.get(hk, 0.0) + float(v)
             ema = WeightOnlyValidator._clamp_to_cap(
