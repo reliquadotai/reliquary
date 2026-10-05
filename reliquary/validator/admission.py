@@ -1109,7 +1109,7 @@ def score_and_finalize_submission(
                 )
                 if (
                     environment_spec.final_answer_policy == "boxed"
-                    and MATH_ANSWER_FORMAT == "boxed"
+                    and (MATH_ANSWER_FORMAT == "boxed" or context.service_policy is not None)
                 )
                 else ()
             )
@@ -1157,9 +1157,8 @@ def score_and_finalize_submission(
             if context.service_policy is not None:
                 from reliquary.services.runtime import service_signal_admits
                 from reliquary.protocol.service_contract import ServiceContract
-                in_zone = service_signal_admits(request, ServiceContract.from_dict(context.service_policy["contract"]), rewards)
-                if request.service_binding["purpose"] == "exploration" and uncertain_indices:
-                    in_zone = False
+                in_zone = service_signal_admits(request, ServiceContract.from_dict(context.service_policy["contract"]),
+                                               rewards, uncertain=bool(uncertain_indices))
             if not in_zone:
                 return result(
                     request=request,

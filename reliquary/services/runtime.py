@@ -66,8 +66,10 @@ def validate_submission_policy(request, announcement: dict | None) -> ServiceCon
     return contract
 
 
-def service_signal_admits(request, contract: ServiceContract, rewards: list[float]) -> bool:
+def service_signal_admits(request, contract: ServiceContract, rewards: list[float], *, uncertain: bool = False) -> bool:
     from reliquary.services.scoring import classify_signal
+    if uncertain:
+        return False
     signal = classify_signal([round(r * 10000) / 10000 for r in rewards], expected=len(request.rollouts),
                             sigma_min_bps=contract.to_dict()["scoring"]["sigma_min_bps"])
     if request.service_binding["purpose"] == "training":

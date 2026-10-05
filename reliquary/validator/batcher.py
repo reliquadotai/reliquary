@@ -1780,14 +1780,19 @@ class GrpoWindowBatcher:
             if pending.truncated_index is not None
             else ()
         )
-        sigma_min = BOOTSTRAP_SIGMA_MIN if self.bootstrap else SIGMA_MIN
-        exploration = self._service_exploration(pending)
-        if not exploration and not robust_utility_admits(
-            pending.rewards,
-            sigma_min=sigma_min,
-            truncated_indices=truncated_indices,
-            attainable_rewards=pending.attainable_rewards or (0.0, 1.0),
-        ):
+        if self.service_policy is not None:
+            from reliquary.protocol.service_contract import ServiceContract
+            from reliquary.services.runtime import service_signal_admits
+            eligible = service_signal_admits(pending.request, ServiceContract.from_dict(self.service_policy["contract"]),
+                pending.rewards, uncertain=bool(pending.truncated_count or truncated_indices or pending.unboxed_count))
+        else:
+            eligible = robust_utility_admits(
+                pending.rewards,
+                sigma_min=BOOTSTRAP_SIGMA_MIN if self.bootstrap else SIGMA_MIN,
+                truncated_indices=truncated_indices,
+                attainable_rewards=pending.attainable_rewards or (0.0, 1.0),
+            )
+        if not eligible:
             self.difficulty_auction_metadata_by_id[id(pending)] = {
                 "rank": None,
                 "status": "utility_ineligible",
@@ -4398,9 +4403,7 @@ class GrpoWindowBatcher:
         )
         if service_contract is not None:
             from reliquary.services.runtime import service_signal_admits
-            in_zone = service_signal_admits(request, service_contract, rewards)
-            if request.service_binding["purpose"] == "exploration" and unboxed_indices:
-                in_zone = False
+            in_zone = service_signal_admits(request, service_contract, rewards, uncertain=bool(unboxed_indices))
         if not in_zone:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
@@ -5788,6 +5791,9 @@ class GrpoWindowBatcher:
             truncated_flags,
         )
 
+        if service_contract is not None and (truncated_count or pending.truncated_count or pending.unboxed_count):
+            return reject(RejectReason.OUT_OF_ZONE, "service_signal")
+
         # All checks passed.
         new_sub = ValidSubmission(
             hotkey=request.miner_hotkey,
@@ -6051,8 +6057,9 @@ class GrpoWindowBatcher:
         contract = validate_submission_policy(pending.request, self.service_policy)
         if contract is None or contract.sha256 != self.service_runtime.contract.sha256:
             raise ValueError("proof service context no longer active")
-        if self._service_exploration(pending) and (verified.truncated_count or verified.unboxed_count):
-            raise ValueError("uncertain outcomes cannot earn exploration pay")
+        if verified.truncated_count or verified.unboxed_count:
+            from reliquary.services.runtime import ServicePolicyLimit
+            raise ServicePolicyLimit("uncertain outcomes cannot become a verified service observation")
         commits = [r.commit for r in verified.rollouts]
         identity = canonical_sha256(pending.request.pool_selection or {"selection_digest": pending.selection_digest.hex()})
         row = {

@@ -130,6 +130,88 @@ def test_same_uniform_group_cannot_fill_training_path(signed_request):
     assert score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5).reject_reason is RejectReason.OUT_OF_ZONE
 
 
+def test_training_uses_the_contract_threshold_in_the_actual_grader(signed_request):
+    request, announcement, wallet = signed_request(purpose="training")
+    request.rollouts[0].reward = 1.0
+    _sign_envelope(request, wallet)
+    parsed, context = _parse(request, announcement)
+    materials = AdmissionRuntimeMaterials(canonical_prompt_tokens=[1], problem={"ground_truth": "4"},
+        completion_texts=[f"Derivation number {i}. \\boxed{{{4 if i == 0 else 5}}}" for i in range(M_ROLLOUTS)])
+    prepared = score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5)
+    assert prepared.reject_reason is None
+    assert prepared.rewards == [1.0] + [0.0] * (M_ROLLOUTS - 1)
+
+
+@pytest.mark.parametrize("purpose", ["training", "exploration"])
+def test_service_grading_refuses_unboxed_outcomes_on_both_lanes(signed_request, purpose):
+    request, announcement, wallet = signed_request(purpose=purpose)
+    correct = M_ROLLOUTS // 2 if purpose == "training" else 0
+    for index, rollout in enumerate(request.rollouts):
+        rollout.reward = float(index < correct)
+    _sign_envelope(request, wallet)
+    parsed, context = _parse(request, announcement)
+    texts = [f"Derivation number {i}. \\boxed{{{4 if i < correct else 5}}}" for i in range(M_ROLLOUTS)]
+    texts[-1] = "Unfinished derivation without a final answer."
+    materials = AdmissionRuntimeMaterials(canonical_prompt_tokens=[1], problem={"ground_truth": "4"}, completion_texts=texts)
+    assert score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5).reject_reason is RejectReason.OUT_OF_ZONE
+
+
+@pytest.mark.parametrize("bootstrap", [False, True])
+@pytest.mark.parametrize("threshold,eligible", [(2400, True), (2600, False)])
+def test_arrival_gate_reuses_the_service_threshold_before_reserving(bootstrap, threshold, eligible):
+    from reliquary.validator.batcher import FillState
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+    from tests.unit.test_prove_on_arrival import _pending_stub
+
+    contract = _contract(pool=False).to_dict()
+    contract["scoring"]["sigma_min_bps"] = threshold
+    batcher = _make_batcher()
+    batcher.bootstrap = bootstrap
+    batcher.service_policy = {"contract": contract}
+    batcher.fill_state = FillState(budgets={"openmathinstruct": 4}, picks_target=16)
+    extended = []
+    batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
+    pending = _pending_stub(1, rewards=[0.0] * (M_ROLLOUTS // 2) + [0.5] * (M_ROLLOUTS // 2))
+    pending.request = SimpleNamespace(service_binding={"purpose": "training"}, rollouts=[None] * M_ROLLOUTS)
+    batcher._submit_arrival_proof(pending)
+    assert bool(extended) is eligible
+    assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == int(eligible)
+
+
+@pytest.mark.parametrize("purpose", ["training", "exploration"])
+@pytest.mark.parametrize("uncertain_field", ["truncated_count", "unboxed_count"])
+def test_uncertain_service_arrivals_never_reserve_capacity(purpose, uncertain_field):
+    from reliquary.validator.batcher import FillState
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+    from tests.unit.test_prove_on_arrival import _pending_stub
+
+    batcher = _make_batcher()
+    batcher.service_policy = {"contract": _contract(pool=False).to_dict()}
+    batcher.fill_state = FillState(budgets={"openmathinstruct": 4}, picks_target=16)
+    batcher._extend_proof_plan = lambda candidates: pytest.fail("uncertain group dispatched")
+    rewards = [0.0, 1.0] * (M_ROLLOUTS // 2) if purpose == "training" else [0.0] * M_ROLLOUTS
+    pending = _pending_stub(1, rewards=rewards)
+    pending.request = SimpleNamespace(service_binding={"purpose": purpose}, rollouts=[None] * M_ROLLOUTS)
+    setattr(pending, uncertain_field, 1)
+    batcher._submit_arrival_proof(pending)
+    assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 0
+
+
+@pytest.mark.parametrize("purpose", ["training", "exploration"])
+def test_deep_uncertainty_cannot_be_journaled_as_a_verified_signal(signed_request, purpose):
+    from reliquary.services.runtime import ServicePolicyLimit
+    from tests.unit.test_grpo_window_batcher import _make_batcher
+
+    request, announcement, _ = signed_request(purpose=purpose)
+    batcher = _make_batcher()
+    batcher.service_policy = announcement
+    batcher.service_runtime = SimpleNamespace(contract=ServiceContract.from_dict(announcement["contract"]))
+    pending = SimpleNamespace(request=request)
+    verified = SimpleNamespace(truncated_count=1, unboxed_count=0)
+    with pytest.raises(ServicePolicyLimit, match="uncertain outcomes"):
+        batcher._record_service_proof(pending, verified)
+
+
 def test_only_server_pool_beacon_and_epoch_are_authoritative(signed_request):
     request, announcement, _ = signed_request()
     for change in ({"pool_epoch": 6}, {"pool_randomness": "ef" * 32}):
@@ -215,6 +297,33 @@ def _service_proof(commit, **changes):
                   seed_n_stochastic=size, seed_n_match=size, seed_n_positions=size,
                   seed_n_boundary_match=size, **changes)
     return ProofResult(**values)
+
+
+@pytest.mark.parametrize("purpose", ["training", "exploration"])
+def test_service_cap_discovered_by_proof_cannot_become_a_scheduler_pass(signed_request, monkeypatch, purpose):
+    from reliquary.validator import batcher as batcher_module
+    from tests.unit.test_grpo_window_batcher import _prove_one
+
+    request, announcement, wallet = signed_request(purpose=purpose)
+    if purpose == "training":
+        for index, rollout in enumerate(request.rollouts):
+            rollout.reward = float(index < M_ROLLOUTS // 2)
+    _sign_envelope(request, wallet)
+    def verifier(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
+        return _service_proof(commit)
+    batcher = _deep_service_batcher(request, announcement, verifier)
+    def decode(ids, **kwargs):
+        index = next((i for i in range(M_ROLLOUTS) if 10 + i in ids), None)
+        if index is None:
+            return "".join("\\boxed{0}" if token == 2 else "" if token == 99 else "x" for token in ids)
+        correct = purpose == "training" and index < M_ROLLOUTS // 2
+        return f"Derivation number {index} {'CORRECT' if correct else 'wrong'}. \\boxed{{0}}"
+    batcher.tokenizer.decode = decode
+    # Simulate cap status learned only from the expensive proof. Legacy allows
+    # one such truncation; the service must reject before returning PASSED.
+    monkeypatch.setattr(batcher_module, "is_cap_truncation", lambda commit, *args, **kwargs: commit is request.rollouts[-1].commit)
+    assert _prove_one(batcher, request) is None
+    assert batcher.reject_counts[RejectReason.OUT_OF_ZONE.value] == 1
 
 
 @pytest.mark.parametrize("pool", [False, True])
