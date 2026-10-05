@@ -249,3 +249,115 @@ async def test_with_one_provider_a_failing_replay_still_needs_two_and_is_uncerti
     await d.sweep()
     got = await asyncio.wait_for(decision, 5)
     assert got.status == "uncertified" and not d.quarantined
+
+
+# --------------------------------------------------------------------------
+# Leaked leases: a claim whose reply was lost (production: RemoteProtocolError
+# several times an hour) self-heals through the executor's heartbeat
+# --------------------------------------------------------------------------
+
+GRACE = corpus_grade_remote.GRADE_LEASE_REPORT_GRACE_SECONDS
+
+
+async def test_a_claim_whose_reply_is_lost_is_taken_back_after_the_grace():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, retry_excluded_seconds=RETRY)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    lost = d.claim("g0")                          # the reply never reaches g0
+    assert lost is not None
+    clock.now += GRACE - 1
+    d.heartbeat("g0", {"leases": 0}, held_leases=[])
+    assert lost["lease_id"] in d._leases          # within the grace: kept
+    clock.now += 1
+    d.heartbeat("g0", {"leases": 0}, held_leases=[])
+    assert lost["lease_id"] not in d._leases      # taken back, no vote
+    assert d.stats["leases_unreported"] == 1 and not decision.done()
+    assert d._strikes["g0"] == 0 and not d.quarantined
+    with pytest.raises(corpus_grade_remote.LeaseRefused):
+        d.result("g0", lost["lease_id"], _result(REPLAY_OK))
+    # Requeued: another executor takes it at once...
+    _answer(d, "g1", REPLAY_OK)
+    got = await asyncio.wait_for(decision, 5)
+    assert got.status == "ok" and got.graded_by == ("g1",)
+
+
+async def test_a_lost_claim_with_a_single_executor_comes_back_to_it():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock, retry_excluded_seconds=RETRY)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    assert d.claim("g0") is not None
+    clock.now += GRACE
+    d.heartbeat("g0", None, held_leases=[])
+    assert d.claim("g0") is None                  # an executor fault: the retry wait
+    clock.now += RETRY
+    _answer(d, "g0", REPLAY_OK)
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g0",)
+
+
+async def test_a_held_lease_is_never_taken_back():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    lease = d.claim("g0")
+    for _ in range(100):
+        clock.now += 100
+        d.heartbeat("g0", {"leases": 0}, held_leases=[lease["lease_id"]])
+    assert lease["lease_id"] in d._leases
+    assert d.result("g0", lease["lease_id"], _result(REPLAY_OK)) == "accepted"
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g0",)
+
+
+async def test_another_executors_report_never_takes_back_a_lease():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock)
+    asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    lease = d.claim("g0")
+    clock.now += GRACE * 10
+    d.heartbeat("g1", None, held_leases=[])
+    assert lease["lease_id"] in d._leases
+
+
+async def test_an_old_executor_without_the_field_behaves_as_before():
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    lease = d.claim("g0")
+    clock.now += GRACE * 10
+    d.heartbeat("g0", {"leases": 0})              # no held_leases: nothing taken back
+    d.heartbeat("g0", {"leases": 0}, held_leases=None)
+    assert lease["lease_id"] in d._leases and "leases_unreported" not in d.stats
+    assert d.result("g0", lease["lease_id"], _result(REPLAY_OK)) == "accepted"
+    assert (await asyncio.wait_for(decision, 5)).graded_by == ("g0",)
+
+
+async def test_the_router_takes_the_held_leases_and_old_heartbeats_still_pass():
+    import httpx
+    from fastapi import FastAPI
+
+    from tests.unit.test_corpus_grade_remote import PACKAGE, TOKENS, VERSION
+
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock)
+    app = FastAPI()
+    app.include_router(corpus_grade_remote.build_grade_executor_router(d, d._directory))
+    asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://control") as http:
+        auth = {"Authorization": f"Bearer {TOKENS['g0']}"}
+        claim = {"executor_id": "g0", "env_package": PACKAGE, "env_version": VERSION}
+        lease = (await http.post("/corpus/internal/grade/claim", json=claim,
+                                 headers=auth)).json()
+        clock.now += GRACE
+        old = await http.post("/corpus/internal/grade/heartbeat",
+                              json={"executor_id": "g0", "detail": {"leases": 0}}, headers=auth)
+        assert old.status_code == 200 and lease["lease_id"] in d._leases
+        new = await http.post("/corpus/internal/grade/heartbeat",
+                              json={"executor_id": "g0", "detail": {"leases": 0},
+                                    "held_leases": []}, headers=auth)
+        assert new.status_code == 200 and lease["lease_id"] not in d._leases

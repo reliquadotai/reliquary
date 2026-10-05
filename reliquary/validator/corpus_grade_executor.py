@@ -288,8 +288,13 @@ class GradeExecutor(LeaseExecutor):
         # Lease expiry is the control's wall time.
         self._wall_clock = wall_clock
         self._running: set[asyncio.Task] = set()
+        # Leases claimed and not yet posted: reported on each heartbeat.
+        self._held: set[str] = set()
         self.env_package: str | None = None
         self.env_version: str | None = None
+
+    def held_lease_ids(self) -> list[str]:
+        return sorted(self._held)
 
     def heartbeat_detail(self) -> dict:
         return {"leases": self.leases, "running": len(self._running)}
@@ -314,8 +319,11 @@ class GradeExecutor(LeaseExecutor):
             await self.post_result(lease.lease_id, {"results": [result]},
                                    expires_at=lease.expires_at)
         except Exception:
-            # The lease expires on the control and goes to another executor.
+            # Dropped from the heartbeat's report below: the control takes it
+            # back after its grace (or, from an older control, it expires).
             logger.exception("grade lease %s was not completed", lease.lease_id[:8])
+        finally:
+            self._held.discard(lease.lease_id)
 
     async def step(self) -> bool:
         """One claim when there is room; True when a lease was started."""
@@ -336,6 +344,7 @@ class GradeExecutor(LeaseExecutor):
             logger.warning("grade lease %s expired before it was worked; skipped",
                            lease.lease_id[:8])
             return True
+        self._held.add(lease.lease_id)
         task = asyncio.create_task(self._work(lease))
         self._running.add(task)
         task.add_done_callback(self._running.discard)

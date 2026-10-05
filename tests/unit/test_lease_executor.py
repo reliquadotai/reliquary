@@ -136,3 +136,89 @@ async def test_the_grade_executor_hands_its_lease_expiry_to_the_post():
     assert await executor.step() is True
     await asyncio.gather(*executor._running)
     assert seen == [5_000.0]
+
+
+# --------------------------------------------------------------------------
+# Heartbeats: the held leases, one retry, and no stale keep-alive reuse
+# --------------------------------------------------------------------------
+
+
+class _Beats:
+    """Records heartbeat bodies; ``refuse_field`` answers 422 to one that
+    carries ``held_leases`` (a control from before the field)."""
+
+    def __init__(self, refuse_field=False, failures=()):
+        self.bodies, self.refuse_field, self.failures = [], refuse_field, list(failures)
+
+    async def post(self, path, json, headers, timeout):
+        request = httpx.Request("POST", f"http://control{path}")
+        if path.endswith("/heartbeat"):
+            self.bodies.append(json)
+            if self.failures:
+                raise self.failures.pop(0)
+            if self.refuse_field and "held_leases" in json:
+                return httpx.Response(422, json={"detail": "extra"}, request=request)
+            return httpx.Response(200, json={"executor_id": "g1", "model_id": "m",
+                                             "model_revision": "r"}, request=request)
+        return httpx.Response(200, json={"outcome": "accepted"}, request=request)
+
+
+async def test_a_plain_lease_executor_sends_no_held_leases():
+    http = _Beats()
+    executor, _ = _executor(http)
+    await executor.heartbeat()
+    assert "held_leases" not in http.bodies[0]
+
+
+async def test_the_grade_executor_reports_the_leases_it_holds_until_posted():
+    from reliquary.validator.corpus_grade_executor import GradeExecutor
+    from tests.unit.test_corpus_grade_executor import _Http
+
+    http = _Http()
+    release = asyncio.Event()
+
+    async def item(grade_item):
+        await release.wait()
+        return {"status": "ok", "diff_applied": True, "tests_passed": True}
+
+    executor = GradeExecutor(http=http, executor_id="g1", token="t" * 40, run_item=item,
+                             env_check=lambda p, v: None, sweep=lambda: 0)
+    await executor.start()
+    assert await executor.step() is True
+    await executor.heartbeat()
+    release.set()
+    await asyncio.gather(*executor._running)
+    await executor.heartbeat()
+    beats = [body for path, body in http.posts if path.endswith("/heartbeat")]
+    assert beats[0]["held_leases"] == []                     # at start
+    assert beats[1]["held_leases"] == ["c" * 32]             # while working
+    assert beats[2]["held_leases"] == []                     # once posted
+
+
+async def test_a_control_refusing_the_field_gets_heartbeats_without_it():
+    from reliquary.validator.corpus_grade_executor import GradeExecutor
+
+    http = _Beats(refuse_field=True)
+    executor = GradeExecutor(http=http, executor_id="g1", token="t" * 40,
+                             env_check=lambda p, v: None, sweep=lambda: 0)
+    assert (await executor.heartbeat())["model_id"] == "m"
+    await executor.heartbeat()
+    assert ["held_leases" in b for b in http.bodies] == [True, False, False]
+
+
+async def test_a_heartbeat_lost_on_the_wire_is_sent_once_more():
+    http = _Beats(failures=[_disconnect()])
+    executor, _ = _executor(http)
+    assert (await executor.heartbeat())["model_id"] == "m"
+    assert len(http.bodies) == 2
+    http = _Beats(failures=[_disconnect(), _disconnect()])
+    executor, _ = _executor(http)
+    with pytest.raises(httpx.RemoteProtocolError):
+        await executor.heartbeat()
+
+
+def test_the_client_never_reuses_a_connection_the_control_may_have_closed():
+    # uvicorn closes an idle keep-alive connection after 5 s; the grade
+    # executor polls every 5 s, so a reused connection raced that close.
+    limits = lease_executor.client_limits()
+    assert limits.keepalive_expiry is not None and limits.keepalive_expiry < 5.0
