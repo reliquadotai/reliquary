@@ -36,6 +36,10 @@ READ_CONCURRENCY = 16
 READ_WINDOW = 64
 # Room left in a shard for the Parquet footer and page headers.
 SHARD_OVERHEAD_BYTES = 1024 * 1024
+# The private dataset library's JSONL limits, including JavaScript string length.
+INSTRUCTION_MAX_BYTES = 5 * 1024 * 1024
+INSTRUCTION_MAX_ROWS = 10_000
+INSTRUCTION_MAX_UTF16 = 32_000
 
 _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -384,6 +388,70 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def instruction_source_for_job(job):
+    """Only chat-template single-turn jobs have an authoritative raw user prompt.
+
+    Legacy sources may already contain a rendered prompt; episode and system
+    messages cannot be represented by the library's prompt/response schema.
+    A missing source leaves the original Parquet delivery available.
+    """
+    from reliquary.validator.corpus_service import (
+        CHAT_TEMPLATE_RENDERERS, CorpusPromptSourceError, SingleTurnPromptJob,
+        prompt_job_for_spec,
+    )
+
+    if getattr(job, "episode", None) is not None:
+        return None, "episode_schema"
+    if getattr(job, "renderer_id", None) not in CHAT_TEMPLATE_RENDERERS:
+        return None, "unsupported_renderer"
+    try:
+        source = prompt_job_for_spec(job)
+    except CorpusPromptSourceError:
+        return None, "prompt_source_unavailable"
+    if not isinstance(source, SingleTurnPromptJob):
+        return None, "unsupported_prompt_source"
+    return source, None
+
+
+class _InstructionWriter:
+    """Bounded JSONL shards alongside (not replacing) the Parquet shards."""
+
+    def __init__(self, directory: Path, on_close) -> None:
+        self.directory, self.on_close = directory, on_close
+        self.path, self.rows, self.size, self.index = None, 0, 0, 0
+
+    async def add(self, prompt: str, response: str) -> None:
+        body = (json.dumps({"prompt": prompt, "response": response}, ensure_ascii=False,
+                           separators=(",", ":")) + "\n").encode()
+        if len(body) > INSTRUCTION_MAX_BYTES:
+            raise ValueError("an instruction example exceeds its shard byte limit")
+        if self.path is not None and (self.rows >= INSTRUCTION_MAX_ROWS
+                                      or self.size + len(body) > INSTRUCTION_MAX_BYTES):
+            await self.close()
+        if self.path is None:
+            self.path = self.directory / f"instruction-{self.index:05d}.jsonl"
+        with self.path.open("ab") as handle:
+            handle.write(body)
+        self.rows += 1
+        self.size += len(body)
+
+    async def close(self) -> None:
+        if self.path is not None:
+            await self.on_close(self.path, self.rows)
+            self.path, self.rows, self.size = None, 0, 0
+            self.index += 1
+
+
+def _instruction_text(value) -> bool:
+    # JS String.trim() also removes FEFF, which Python str.strip() retains.
+    if not isinstance(value, str) or re.search(r"[^\s\ufeff]", value) is None:
+        return False
+    try:
+        return len(value.encode("utf-16-le")) // 2 <= INSTRUCTION_MAX_UTF16
+    except UnicodeError:
+        return False
+
+
 async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           filter_note: str | None = None, work_dir: str | Path | None = None,
                           shard_max_bytes: int = SHARD_MAX_BYTES,
@@ -391,7 +459,8 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           concurrency: int = READ_CONCURRENCY, window: int = READ_WINDOW,
                           clock: Callable[[], float] = time.time, renderer=None, source=None,
                           sft_only: bool = False,
-                          quarantined: Collection[str] | None = None) -> dict:
+                          quarantined: Collection[str] | None = None,
+                          instruction_source=None, instruction_note: str | None = None) -> dict:
     """Write ``deliveries/{delivery_id}/``: the shards, ``report.json``, then
     ``manifest.json``. A delivery whose manifest exists is returned as stored.
 
@@ -412,21 +481,44 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=f"delivery-{delivery_id}-", dir=root))
     shards: list[dict] = []
+    instruction_shards: list[dict] = []
+    instruction_reason = ("episode_schema" if episode else instruction_note
+                          or ("raw_prompt_source_not_provided" if instruction_source is None
+                              else None))
+    if instruction_reason is None:
+        from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
+
+        if getattr(job, "renderer_id", None) not in CHAT_TEMPLATE_RENDERERS:
+            instruction_reason = "unsupported_renderer"
+    instruction = {"format": "instruction", "rows": 0, "omitted": {},
+                   "source": {"supported": instruction_reason is None,
+                              "reason": instruction_reason},
+                   "filter_applied": grade is not None,
+                   "policy": ("accepted_completions" if grade is not None
+                              else "audited_passing_completions"),
+                   "limits": {"bytes_per_shard": INSTRUCTION_MAX_BYTES,
+                              "rows_per_shard": INSTRUCTION_MAX_ROWS,
+                              "utf16_units_per_field": INSTRUCTION_MAX_UTF16}}
 
     async def uploaded(path: Path, rows: int) -> None:
         digest = await asyncio.to_thread(_sha256, path)
         size = path.stat().st_size
         key = f"{prefix}/{path.name}"
         await sink.put_file(key, path)
-        shards.append({"name": path.name, "key": key, "rows": rows, "bytes": size,
+        target = instruction_shards if path.suffix == ".jsonl" else shards
+        target.append({"name": path.name, "key": key, "rows": rows, "bytes": size,
                        "sha256": digest})
         path.unlink()
+
+    def omitted(reason: str) -> None:
+        instruction["omitted"][reason] = instruction["omitted"].get(reason, 0) + 1
 
     counts: dict = {}
     try:
         writer = _ShardWriter(directory, max_bytes=shard_max_bytes,
                               row_group_rows=row_group_rows, on_close=uploaded,
                               schema=_episode_row_schema() if episode else None)
+        instructions = _InstructionWriter(directory, uploaded)
         rows = (episode_rows(job=job, records=records, renderer=renderer, source=source,
                              counts=counts, sft_only=sft_only, quarantined=quarantined,
                              concurrency=concurrency, window=window)
@@ -435,7 +527,29 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                               concurrency=concurrency, window=window))
         async for row in rows:
             await writer.add(row)
+            if instruction_reason is not None:
+                omitted(instruction_reason)
+            elif grade is not None and row["accepted"] is not True:
+                omitted("filter_rejected")
+            else:
+                from reliquary.validator.corpus_service import CorpusPromptSourceError
+
+                try:
+                    task = await asyncio.to_thread(instruction_source.task_for,
+                                                   row["prompt_index"])
+                except CorpusPromptSourceError:
+                    omitted("prompt_source_unavailable")
+                    continue
+                if (getattr(task, "metadata", None) or {}).get("system"):
+                    omitted("system_message")
+                elif not (_instruction_text(task.prompt)
+                          and _instruction_text(row["completion"])):
+                    omitted("invalid_or_oversized_text")
+                else:
+                    await instructions.add(task.prompt, row["completion"])
+                    instruction["rows"] += 1
         await writer.close()
+        await instructions.close()
     finally:
         shutil.rmtree(directory, ignore_errors=True)
     report = {
@@ -447,16 +561,20 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                       else "every replay-certified trajectory")} if episode
             else {"applied": True, "grader_id": job.filter.grader_id,
                   "threshold": job.filter.threshold} if grade is not None
-            else {"applied": False, "note": filter_note or "the job declares no filter"}),
+            else {"applied": False, "note": filter_note or (
+                "the declared filter was not applied" if job.filter is not None
+                else "the job declares no filter")}),
         "shards": len(shards),
+        "instruction": instruction,
     }
     report_key = f"{prefix}/report.json"
     await sink.put_json(report_key, report)
     manifest = {
         "schema": DELIVERY_SCHEMA, "delivery_id": delivery_id, "job_id": job.job_id,
         "created_at": report["created_at"], "rows": counts.get("rows", 0), "shards": shards,
+        "instruction_shards": instruction_shards, "instruction": instruction,
         "columns": list(EPISODE_ROW_FIELDS if episode else ROW_FIELDS), "report": report_key,
-        "keys": [s["key"] for s in shards] + [report_key, manifest_key],
+        "keys": [s["key"] for s in shards + instruction_shards] + [report_key, manifest_key],
     }
     await sink.put_json(manifest_key, manifest)
     logger.info("corpus delivery %s of %s: %d rows in %d shards", delivery_id, job.job_id,
@@ -596,5 +714,6 @@ __all__ = [
     "episode_row",
     "episode_rows",
     "export_delivery",
+    "instruction_source_for_job",
     "validated_delivery_id",
 ]

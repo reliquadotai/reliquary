@@ -738,7 +738,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.post("/jobs/{job_id}/deliveries")
     async def create_delivery(job_id: str, body: CreateDelivery, response: Response) -> dict:
-        from reliquary.corpus.delivery import export_delivery, validated_delivery_id
+        from reliquary.corpus.delivery import (
+            export_delivery, instruction_source_for_job, validated_delivery_id,
+        )
         from reliquary.corpus.export import job_grader
 
         in_scope(job_id)
@@ -779,10 +781,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     grade = await asyncio.to_thread(job_grader, job)
                 except ValueError as exc:
                     note = str(exc)
+            instruction_source, instruction_note = await asyncio.to_thread(
+                instruction_source_for_job, job)
             # Long: run beside the request; the caller polls with the same id.
             exports[delivery_id] = asyncio.ensure_future(export_delivery(
                 job=job, records=records, sink=deliveries, delivery_id=delivery_id,
-                grade=grade, filter_note=note, work_dir=work_dir, clock=clock))
+                grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
+                instruction_source=instruction_source, instruction_note=instruction_note))
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
