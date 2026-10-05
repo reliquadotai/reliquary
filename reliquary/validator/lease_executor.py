@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 ERROR_BACKOFF_SECONDS = 10.0
 REQUEST_TIMEOUT_SECONDS = 120.0
 TOKEN_ENV = "RELIQUARY_EXECUTOR_TOKEN"
+# A result lost on the wire (the connection dropped, a timeout, a gateway
+# error) is posted again: otherwise its lease only expires on the control,
+# 3.3 h later for a replay. Bounded in attempts and in time, and never past
+# the lease's own expiry, when known.
+RESULT_POST_ATTEMPTS = 5
+RESULT_RETRY_SECONDS = 120.0
+RESULT_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 40.0)
+_RETRIED_STATUSES = frozenset({502, 503, 504})
 
 
 class LeaseExecutor:
@@ -33,6 +41,9 @@ class LeaseExecutor:
         self._heartbeat_every = heartbeat_seconds
         self._idle = idle_seconds
         self._clock = clock
+        # The control's time, which a lease's ``expires_at`` is in.
+        self._wall_clock: Callable[[], float] = time.time
+        self._sleep = asyncio.sleep
         self._last_heartbeat: float | None = None
         self.leases = 0
 
@@ -54,12 +65,50 @@ class LeaseExecutor:
         if self._last_heartbeat is None or self._clock() - self._last_heartbeat >= self._heartbeat_every:
             await self.heartbeat()
 
-    async def post_result(self, lease_id: str, body: dict) -> None:
+    async def post_result(self, lease_id: str, body: dict, *,
+                          expires_at: float | None = None) -> None:
         """A late (410) or refused (422) result is the control's call, not an
-        executor failure; anything else unexpected raises."""
-        posted = await self._post(f"{self._prefix}/{lease_id}/result", body)
+        executor failure; a transport error or a gateway error is retried
+        (``RESULT_POST_ATTEMPTS`` within ``RESULT_RETRY_SECONDS``, never past
+        ``expires_at``); anything else unexpected raises."""
+        import httpx
+
+        started = self._clock()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                posted = await self._post(f"{self._prefix}/{lease_id}/result", body)
+                if posted.status_code in _RETRIED_STATUSES:
+                    posted.raise_for_status()
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if isinstance(exc, httpx.HTTPStatusError) and status not in _RETRIED_STATUSES:
+                    raise
+                delay = RESULT_RETRY_BACKOFF_SECONDS[
+                    min(attempt - 1, len(RESULT_RETRY_BACKOFF_SECONDS) - 1)]
+                if (attempt >= RESULT_POST_ATTEMPTS
+                        or self._clock() - started + delay > RESULT_RETRY_SECONDS
+                        or (expires_at is not None and self._wall_clock() + delay >= expires_at)):
+                    logger.error("%s lease %s: result not delivered after %d attempt(s): %r",
+                                 self.kind, lease_id[:8], attempt, exc)
+                    raise
+                logger.warning("%s lease %s: result post failed (%r); retrying in %.0f s "
+                               "(attempt %d/%d)", self.kind, lease_id[:8], exc, delay, attempt,
+                               RESULT_POST_ATTEMPTS)
+                await self._sleep(delay)
+                continue
+            break
         if posted.status_code in (410, 422):
-            logger.warning("%s lease %s not taken: %s", self.kind, lease_id[:8], posted.text[:200])
+            if attempt > 1:
+                # The earlier attempt may have landed before its connection
+                # dropped: the control then no longer knows the lease. Final.
+                logger.warning("%s lease %s not taken after a retry (%d attempts; an earlier "
+                               "attempt may have been delivered): %s", self.kind, lease_id[:8],
+                               attempt, posted.text[:200])
+            else:
+                logger.warning("%s lease %s not taken: %s", self.kind, lease_id[:8],
+                               posted.text[:200])
         else:
             posted.raise_for_status()
         self.leases += 1
@@ -104,5 +153,6 @@ def serve_executor(control_url: str, build: Callable[..., LeaseExecutor]) -> Non
     asyncio.run(main())
 
 
-__all__ = ["ERROR_BACKOFF_SECONDS", "LeaseExecutor", "REQUEST_TIMEOUT_SECONDS", "TOKEN_ENV",
+__all__ = ["ERROR_BACKOFF_SECONDS", "LeaseExecutor", "REQUEST_TIMEOUT_SECONDS",
+           "RESULT_POST_ATTEMPTS", "RESULT_RETRY_SECONDS", "TOKEN_ENV",
            "serve_executor"]

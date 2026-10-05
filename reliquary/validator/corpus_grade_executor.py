@@ -311,7 +311,8 @@ class GradeExecutor(LeaseExecutor):
             item = lease.items[0]
             result = await self._run_item(item)
             result = {**result, "submission_id": item.submission_id}
-            await self.post_result(lease.lease_id, {"results": [result]})
+            await self.post_result(lease.lease_id, {"results": [result]},
+                                   expires_at=lease.expires_at)
         except Exception:
             # The lease expires on the control and goes to another executor.
             logger.exception("grade lease %s was not completed", lease.lease_id[:8])
