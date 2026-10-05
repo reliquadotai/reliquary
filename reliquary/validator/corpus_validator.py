@@ -761,6 +761,23 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     return app
 
 
+async def _run_corpus_services(server, services) -> None:
+    """Stop and await every service when HTTP serving ends or a service fails."""
+    serving = asyncio.create_task(server.serve())
+    workers = [asyncio.create_task(service) for service in services]
+    group = asyncio.gather(*workers)
+    try:
+        done, _ = await asyncio.wait((serving, group), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        serving.cancel()
+        group.cancel()
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(serving, group, *workers, return_exceptions=True)
+
+
 async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http_port,
                                set_weights: bool, entry=None, cap: float | None = None,
                                jobs=None, settle_every_seconds: float = 60.0,
@@ -1288,7 +1305,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         background.append(grade_dispatcher.run())
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
-    await asyncio.gather(server.serve(), job_set.run(), app.state.warm_corpus_tasks(), *background)
+    await _run_corpus_services(server, [job_set.run(), app.state.warm_corpus_tasks(), *background])
 
 
 __all__ = [

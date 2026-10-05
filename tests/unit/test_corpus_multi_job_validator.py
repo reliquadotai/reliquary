@@ -34,6 +34,73 @@ def _same_proof(entry):
     return "toploc-a"
 
 
+def test_http_shutdown_cancels_and_awaits_all_corpus_services():
+    from reliquary.validator.corpus_validator import _run_corpus_services
+
+    async def exercise():
+        started = [asyncio.Event(), asyncio.Event()]
+        cleaned = []
+        warmed = asyncio.Event()
+
+        async def service(index):
+            started[index].set()
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.append(index)
+
+        async def warm():
+            warmed.set()
+
+        class _Server:
+            async def serve(self):
+                await asyncio.gather(*(event.wait() for event in started), warmed.wait())
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_run_corpus_services(
+            _Server(), [service(0), warm(), service(1)]), timeout=1)
+        assert sorted(cleaned) == [0, 1]
+        assert all(task is asyncio.current_task() for task in asyncio.all_tasks())
+
+    asyncio.run(exercise())
+
+
+def test_corpus_service_failure_propagates_and_stops_the_server():
+    from reliquary.validator.corpus_validator import _run_corpus_services
+
+    async def exercise():
+        serving = asyncio.Event()
+        cleaned = []
+
+        class _Server:
+            async def serve(self):
+                serving.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    await asyncio.sleep(0)
+                    cleaned.append("server")
+
+        async def failure():
+            await serving.wait()
+            raise RuntimeError("fixture corpus service failure")
+
+        async def background():
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.append("background")
+
+        with pytest.raises(RuntimeError, match="fixture corpus service failure"):
+            await _run_corpus_services(_Server(), [failure(), background()])
+        assert sorted(cleaned) == ["background", "server"]
+        assert all(task is asyncio.current_task() for task in asyncio.all_tasks())
+
+    asyncio.run(exercise())
+
+
 def test_jobs_on_one_checkpoint_start():
     pairs = [(_entry("corpus-math", "math"), _job("math")),
              (_entry("corpus-code", "code"), _job("code"))]
