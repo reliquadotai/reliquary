@@ -5,7 +5,10 @@ period of drand time, not by RL window:
 
 - a token belongs to the period its submission was received in;
 - a period is settled once nothing received in it is still undecided, and its
-  pay enters the weights from the period it was settled in (its entry period);
+  pay enters the weights from the first period after its settlement with room
+  for it (its entry period): at most ``CATCHUP_ENTRIES`` archives enter in one
+  period, so a backlog settled at once is paid back within a few periods
+  instead of queueing one per period behind every later one;
 - the weights replay an EMA that decays every period, a period with no pay
   counting as zero, so each hotkey is paid in total what its tokens earned and
   a finished task stops paying on its own.
@@ -29,6 +32,11 @@ PERIOD_EMA_N = 6
 PERIOD_ALPHA = 2.0 / (PERIOD_EMA_N + 1)
 # Periods replayed back from the current one: (1 - alpha)^24 ~ 0.03 % never paid.
 REPLAY_DEPTH = 24
+# Archives that may enter in one period. One per period is the steady state;
+# more is a backlog being paid back. The weight setter bounds a task's replay at
+# this many caps (each archive holding at most one cap), so it must not change
+# without every weight setter first.
+CATCHUP_ENTRIES = 4
 # A pay below this fraction of its cap counts as finished (``tasks close``).
 CLOSE_THRESHOLD = 0.001
 
@@ -61,6 +69,23 @@ def closed_through(*, now: float, oldest_pending: float | None, genesis: float,
     return period_of(bound, genesis) - 1
 
 
+def entry_for(due: int, entered: Iterable[int], *, used: Iterable[int] = (),
+              per_period: int = CATCHUP_ENTRIES) -> int:
+    """The entry period of a new archive: the first from ``due`` on that holds
+    fewer than ``per_period`` of the task's archives (``entered``, the entry
+    periods already taken) and is not in ``used`` (its own work period's
+    entries: one archive per work and entry period)."""
+    taken: dict[int, int] = {}
+    for entry in entered:
+        if int(entry) >= due:
+            taken[int(entry)] = taken.get(int(entry), 0) + 1
+    used = {int(entry) for entry in used}
+    entry = int(due)
+    while taken.get(entry, 0) >= per_period or entry in used:
+        entry += 1
+    return entry
+
+
 def replay(archives: Iterable[Mapping], current_period: int, *,
            alpha: float = PERIOD_ALPHA, depth: int = REPLAY_DEPTH) -> dict[str, float]:
     """One task's weights at ``current_period``: every archive's rewards, from
@@ -79,6 +104,7 @@ def replay(archives: Iterable[Mapping], current_period: int, *,
 
 
 __all__ = [
+    "CATCHUP_ENTRIES",
     "CLOSE_THRESHOLD",
     "PERIOD_ALPHA",
     "PERIOD_EPOCH",
@@ -87,6 +113,7 @@ __all__ = [
     "REPLAY_DEPTH",
     "SETTLEMENT_PERIOD_EMA",
     "closed_through",
+    "entry_for",
     "is_period_task",
     "period_end",
     "period_of",

@@ -278,7 +278,13 @@ class WeightOnlyValidator:
                               genesis: float | None = None) -> dict[str, dict[str, float]]:
         """Each period-settled task's weights at the current drand period: its
         archives that entered within the replay depth, decayed once per period
-        (design 2026-10-03). Window archives never hold these tasks' pay."""
+        (design 2026-10-03). Window archives never hold these tasks' pay.
+
+        Each archive is held to the task's cap: it is one period's pay, and
+        ``_replay_ema`` bounds the task at ``CATCHUP_ENTRIES`` caps on that
+        ground. An archive moved to an earlier entry (``replaces_entry_period``,
+        scripts/requeue_period_archives.py) hides the one it replaces, should
+        that one still be listed."""
         from reliquary.validator import corpus_periods as cp
 
         tasks = sorted(str(t) for t, e in (declared or {}).items() if cp.is_period_task(e))
@@ -293,18 +299,48 @@ class WeightOnlyValidator:
 
             genesis = _drand_genesis()
         current = cp.period_of(time.time() if now is None else now, genesis)
+        caps = WeightOnlyValidator._caps_by_task(declared)
         weights: dict[str, dict[str, float]] = {}
         for task_id in tasks:
-            keys = [(work, entry) for work, entry in await archives.list(task_id)
+            listed = await archives.list(task_id)
+            keys = [(work, entry) for work, entry in listed
                     if 0 <= current - entry <= cp.REPLAY_DEPTH]
+            # A key that may have been replaced: an earlier entry of its work
+            # period exists. Those earlier archives are read to find out.
+            entries_of: dict[int, list[int]] = {}
+            for work, entry in listed:
+                entries_of.setdefault(work, []).append(entry)
+            read: dict[tuple[int, int], Mapping] = {}
+
+            async def doc_of(work, entry):
+                if (work, entry) not in read:
+                    doc = await archives.read(task_id, work, entry)
+                    if doc is None:
+                        raise RuntimeError(f"period archive {task_id} {work}-{entry} "
+                                           "listed but unreadable")
+                    read[(work, entry)] = doc
+                return read[(work, entry)]
+
+            replaced: set[tuple[int, int]] = set()
+            for work, entry in keys:
+                for earlier in entries_of[work]:
+                    if earlier < entry:
+                        moved = (await doc_of(work, earlier)).get("replaces_entry_period")
+                        if moved is not None and int(moved) == entry:
+                            replaced.add((work, entry))
+            cap = caps.get(task_id)
             docs = []
             for work, entry in keys:
-                doc = await archives.read(task_id, work, entry)
-                if doc is None:
-                    raise RuntimeError(f"period archive {task_id} {work}-{entry} listed "
-                                       "but unreadable")
-                docs.append({"entry_period": entry,
-                             "rewards_by_hotkey": doc.get("rewards_by_hotkey") or {}})
+                if (work, entry) in replaced:
+                    continue
+                rewards = {str(hk): float(v) for hk, v in
+                           ((await doc_of(work, entry)).get("rewards_by_hotkey") or {}).items()}
+                paid = sum(rewards.values())
+                if cap is not None and paid > cap * (1 + 1e-9):
+                    logger.warning("period archive %s %d-%d pays %.4f over its cap %.4f; "
+                                   "scaled down", task_id, work, entry, paid, cap)
+                    rewards = {hk: v * cap / paid for hk, v in rewards.items()}
+                docs.append({"entry_period": entry, "rewards_by_hotkey": rewards})
             replayed = cp.replay(docs, current)
             if replayed:
                 weights[task_id] = replayed
@@ -511,9 +547,15 @@ class WeightOnlyValidator:
                 ema = {hk: v for hk, v in ema.items() if v > 1e-6}
             for hk, v in (periods.get(task_id) or {}).items():
                 ema[hk] = ema.get(hk, 0.0) + float(v)
-            ema = WeightOnlyValidator._clamp_to_cap(
-                task_id, ema, None if caps is None else caps.get(task_id)
-            )
+            cap = None if caps is None else caps.get(task_id)
+            if cap is not None and task_id in periods:
+                from reliquary.validator import corpus_periods as cp
+
+                # Archives hold one cap each and up to CATCHUP_ENTRIES enter in
+                # one period: a backlog paid back is that much at most, and
+                # comes out of what would otherwise burn.
+                cap = cap * cp.CATCHUP_ENTRIES
+            ema = WeightOnlyValidator._clamp_to_cap(task_id, ema, cap)
             if floors is not None:
                 start, threshold = floors.get(
                     task_id, (MIN_INCENTIVE_RAMP_START, MIN_INCENTIVE_SHARE)

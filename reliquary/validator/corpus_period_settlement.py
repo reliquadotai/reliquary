@@ -2,7 +2,8 @@
 
 Pays each closed period of work its own cap, split by the verified tokens of
 submissions received in it, in one archive per period that enters the weights
-the period after it is written. No RL window is read: the clock is drand time.
+the first period after it is written with room for it (``cp.entry_for``). No RL
+window is read: the clock is drand time.
 
 Settlement stays two-phase (the pending archive is recorded in the settlement
 state before it is written), so a crash can delay a payment, never repeat it.
@@ -162,6 +163,15 @@ class CorpusPeriodSettler:
                 "rewards_by_hotkey": dict(pending["rewards"]),
                 "tokens": pending["tokens"], "verdicts": len(pending["ids"])}
 
+    async def _entry(self, work: int, due: int) -> int:
+        """Where a new archive of ``work`` enters: from ``due`` on, beside at
+        most ``CATCHUP_ENTRIES - 1`` others. Read from the archives themselves,
+        so a backlog queued by an older binary, or moved since, is counted as
+        it stands."""
+        listed = await self._archives.list(self._task_id)
+        return cp.entry_for(due, (entry for _, entry in listed),
+                            used=(entry for w, entry in listed if w == work))
+
     async def _finish(self, state: dict, etag) -> int:
         pending = state["pending"]
         written = await self._archives.read(self._task_id, pending["work_period"],
@@ -172,8 +182,9 @@ class CorpusPeriodSettler:
             # entered again, after them, so no share of it is ever skipped.
             due = cp.period_of(self._clock(), self._genesis()) + 1
             if pending["entry_period"] < due:
-                pending = {**pending, "entry_period": due}
-                state = {**state, "pending": pending, "last_entry": due}
+                entry = await self._entry(pending["work_period"], due)
+                pending = {**pending, "entry_period": entry}
+                state = {**state, "pending": pending, "last_entry": entry}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
             await self._archives.write(self._task_id, pending["work_period"],
                                        pending["entry_period"], self._archive(pending))
@@ -265,13 +276,11 @@ class CorpusPeriodSettler:
                 logger.error("corpus task %s: %d late verdict(s) for settled period %d",
                              self._task_id, len(ids), period)
             share = rewards_for(batch, self._cap * new_tokens / (earlier + new_tokens))
-            # One entry period per archive, strictly increasing: an entry never
-            # carries more than one period's cap, so a catch-up after a backlog is
-            # paid in full, later, instead of clamped at the task's cap.
-            last_entry = state.get("last_entry")
-            entry = cp.period_of(now, genesis) + 1
-            if last_entry is not None:
-                entry = max(entry, int(last_entry) + 1)
+            # At most CATCHUP_ENTRIES archives per entry period: a backlog settled
+            # at once is paid back over a few periods, in full (the weight setter
+            # bounds a task at that many caps), instead of queueing one per period
+            # ahead of every later period's pay.
+            entry = await self._entry(period, cp.period_of(now, genesis) + 1)
             state = {**state, "last_entry": entry, "pending": {
                 "work_period": period, "entry_period": entry,
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
