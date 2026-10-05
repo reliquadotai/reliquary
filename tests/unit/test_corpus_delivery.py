@@ -16,6 +16,7 @@ from reliquary.corpus.delivery import (
     R2DeliverySink,
     delivery_rows,
     export_delivery,
+    instruction_source_for_job,
 )
 
 
@@ -103,10 +104,10 @@ def test_reads_are_parallel_but_bounded():
     assert 1 < records.peak <= 8
 
 
-def _export(tmp_path, records, delivery_id="d1", **kw):
+def _export(tmp_path, records, delivery_id="d1", *, job=JOB, **kw):
     sink = LocalDirectorySink(tmp_path / "bucket")
     result = asyncio.run(export_delivery(
-        job=JOB, records=records, sink=sink, delivery_id=delivery_id,
+        job=job, records=records, sink=sink, delivery_id=delivery_id,
         work_dir=tmp_path / "work", clock=lambda: 1234.0, **kw))
     return sink, result
 
@@ -151,6 +152,176 @@ def test_an_empty_job_delivers_a_manifest_and_no_shard(tmp_path):
     records = _Records(n=0)
     _, result = _export(tmp_path, records)
     assert result["rows"] == 0 and result["shards"] == []
+
+
+INSTRUCTION_JOB = SimpleNamespace(
+    **vars(JOB), renderer_id="chat-template-v1", episode=None,
+    prompt_start=0, prompt_count=100_000, prompt_end=100_000, prompt_source="fixture",
+    owns=lambda index: 0 <= index < 100_000)
+
+
+class _RawSource:
+    def task_for(self, index):
+        return SimpleNamespace(prompt=f"Raw question {index}?", metadata={})
+
+
+def _instructions(tmp_path, manifest):
+    rows = []
+    for shard in manifest["instruction_shards"]:
+        data = (tmp_path / "bucket" / shard["key"]).read_bytes()
+        assert len(data) == shard["bytes"] <= 5 * 1024 * 1024
+        assert hashlib.sha256(data).hexdigest() == shard["sha256"]
+        parsed = [json.loads(line) for line in data.decode().splitlines()]
+        assert len(parsed) == shard["rows"] <= 10_000
+        assert all(set(row) == {"prompt", "response"} for row in parsed)
+        assert shard["key"] in manifest["keys"]
+        rows.extend(parsed)
+    return rows
+
+
+@pytest.mark.parametrize("renderer", ["chat-template-v1", "chat-template-thinking-v1"])
+def test_instruction_companion_uses_raw_prompts_not_rendered_records(tmp_path, renderer):
+    records = _Records(n=3, missing=())
+    job = SimpleNamespace(**{**vars(INSTRUCTION_JOB), "renderer_id": renderer})
+    _, manifest = _export(tmp_path, records, job=job, instruction_source=_RawSource())
+    rows = _instructions(tmp_path, manifest)
+    assert [row["prompt"] for row in rows] == ["Raw question 0?"] * 2 + ["Raw question 1?"] * 2
+    assert rows[0]["response"] == records.subs[_sid(0)]["completions"][0]["text"]
+    parquet = pq.read_table(tmp_path / "bucket" / manifest["shards"][0]["key"])
+    assert parquet.column("prompt").to_pylist() == ["q0", "q0", "q1", "q1"]
+    assert manifest["instruction"]["rows"] == 4
+    assert manifest["instruction"]["policy"] == "audited_passing_completions"
+    assert manifest["instruction"]["filter_applied"] is False
+    reads = records.reads
+    _, repeated = _export(tmp_path, records, job=job, instruction_source=None)
+    assert repeated == manifest and records.reads == reads
+
+
+def test_instruction_companion_filters_only_when_a_grader_really_ran(tmp_path):
+    job = SimpleNamespace(**{**vars(INSTRUCTION_JOB),
+                             "filter": SimpleNamespace(grader_id="fixture", threshold=0.5)})
+    _, manifest = _export(tmp_path, _Records(n=6, missing=()), job=job,
+                         instruction_source=_RawSource(),
+                         grade=lambda index, text: (index % 2 == 0, 0.5))
+    assert len(_instructions(tmp_path, manifest)) == 4
+    assert manifest["rows"] == 8  # rejected rows remain in the original delivery
+    assert manifest["instruction"]["omitted"] == {"filter_rejected": 4}
+    assert manifest["instruction"]["policy"] == "accepted_completions"
+    assert manifest["instruction"]["filter_applied"] is True
+    _, unfiltered = _export(tmp_path, _Records(n=6, missing=()), "unfiltered", job=job,
+                           instruction_source=_RawSource(), filter_note="filter unavailable")
+    assert len(_instructions(tmp_path, unfiltered)) == 8
+    assert unfiltered["instruction"]["filter_applied"] is False
+    report = json.loads((tmp_path / "bucket" / unfiltered["report"]).read_text())
+    assert report["filter"] == {"applied": False, "note": "filter unavailable"}
+
+
+def test_instruction_shards_respect_actual_byte_and_example_limits(tmp_path):
+    # Independent limits: long UTF-8 examples reach 5 MiB first; short rows reach 10k first.
+    for delivery_id, records in (("bytes", _Records(n=100, text_len=32_000, missing=())),
+                                 ("examples", _Records(n=7600, text_len=1, missing=()))):
+        if delivery_id == "bytes":
+            for record in records.subs.values():
+                for completion in record["completions"]:
+                    completion["text"] = "é" * 32_000
+        _, manifest = _export(tmp_path, records, delivery_id, job=INSTRUCTION_JOB,
+                              instruction_source=_RawSource())
+        assert len(manifest["instruction_shards"]) > 1
+        assert len(_instructions(tmp_path, manifest)) == manifest["rows"]
+    assert not list((tmp_path / "work").glob("**/*.jsonl"))
+
+
+@pytest.mark.parametrize("blank", [" \t\n", "\ufeff", " \t\ufeff\n"])
+def test_instruction_omissions_are_explicit_and_do_not_drop_parquet_rows(tmp_path, blank):
+    from reliquary.validator.corpus_service import CorpusPromptSourceError
+
+    class _Source:
+        def task_for(self, index):
+            if index == 4:
+                raise CorpusPromptSourceError("fixture source no longer available")
+            return SimpleNamespace(prompt=("😀" * 16_001 if index == 3 else "raw"),
+                                   metadata={"system": "retain this instruction"} if index == 0
+                                   else {})
+
+    records = _Records(n=6, missing=())
+    records.subs[_sid(1)]["completions"][0]["text"] = blank
+    records.subs[_sid(1)]["completions"][1]["text"] = "😀" * 16_000
+    _, manifest = _export(tmp_path, records, job=INSTRUCTION_JOB, instruction_source=_Source())
+    assert manifest["rows"] == 8
+    assert len(_instructions(tmp_path, manifest)) == 1
+    assert manifest["instruction"]["omitted"] == {
+        "system_message": 2, "invalid_or_oversized_text": 3, "prompt_source_unavailable": 2}
+
+
+def test_legacy_and_unavailable_sources_do_not_claim_instruction_compatibility(tmp_path):
+    job = SimpleNamespace(**{**vars(INSTRUCTION_JOB), "renderer_id": "single-turn-v1"})
+    _, manifest = _export(tmp_path, _Records(n=1, missing=()), job=job,
+                         instruction_source=_RawSource())
+    assert manifest["instruction_shards"] == [] and manifest["rows"] == 2
+    assert manifest["instruction"]["omitted"] == {"unsupported_renderer": 2}
+    _, unavailable = _export(tmp_path, _Records(n=1, missing=()), "unavailable",
+                            job=INSTRUCTION_JOB, instruction_note="prompt_source_unavailable")
+    assert unavailable["instruction_shards"] == []
+    assert unavailable["instruction"]["source"] == {
+        "supported": False, "reason": "prompt_source_unavailable"}
+
+
+def test_a_canonical_eval_source_system_turn_is_not_silently_lost(tmp_path):
+    from reliquary.validator.corpus_service import SingleTurnPromptJob
+
+    class _Environment:
+        def get_problem(self, position):
+            return {"prompt": "raw user question", "system": "essential system instruction"}
+
+    job = SimpleNamespace(**{**vars(INSTRUCTION_JOB), "prompt_source": "eval-set:fixture"})
+    _, manifest = _export(tmp_path, _Records(n=1, missing=()), job=job,
+                         instruction_source=SingleTurnPromptJob(job, _Environment()))
+    assert manifest["rows"] == 2 and manifest["instruction_shards"] == []
+    assert manifest["instruction"]["omitted"] == {"system_message": 2}
+
+
+def test_instruction_source_resolution_uses_the_canonical_single_turn_job(monkeypatch):
+    from reliquary.validator import corpus_service
+
+    class _Environment:
+        def get_problem(self, position):
+            return {"prompt": f"canonical raw {position}"}
+
+    canonical = corpus_service.SingleTurnPromptJob(INSTRUCTION_JOB, _Environment())
+    monkeypatch.setattr(corpus_service, "prompt_job_for_spec", lambda job: canonical)
+    source, note = instruction_source_for_job(INSTRUCTION_JOB)
+    assert source is canonical and note is None
+    assert source.task_for(3).prompt == "canonical raw 3"
+    legacy = SimpleNamespace(**{**vars(INSTRUCTION_JOB), "renderer_id": "single-turn-v1"})
+    assert instruction_source_for_job(legacy) == (None, "unsupported_renderer")
+    episode = SimpleNamespace(**{**vars(INSTRUCTION_JOB), "episode": object()})
+    assert instruction_source_for_job(episode) == (None, "episode_schema")
+    monkeypatch.setattr(corpus_service, "prompt_job_for_spec", lambda job: object())
+    assert instruction_source_for_job(INSTRUCTION_JOB) == (None, "unsupported_prompt_source")
+
+    def missing(job):
+        raise corpus_service.CorpusPromptSourceError("no local fixture source")
+
+    monkeypatch.setattr(corpus_service, "prompt_job_for_spec", missing)
+    assert instruction_source_for_job(INSTRUCTION_JOB) == (None, "prompt_source_unavailable")
+
+
+def test_an_instruction_upload_failure_never_commits_a_manifest(tmp_path):
+    class _FailingSink(LocalDirectorySink):
+        async def put_file(self, key, path):
+            if key.endswith(".jsonl"):
+                raise OSError("fixture upload failure")
+            await super().put_file(key, path)
+
+    with pytest.raises(OSError, match="upload failure"):
+        asyncio.run(export_delivery(job=INSTRUCTION_JOB, records=_Records(n=1, missing=()),
+                                   sink=_FailingSink(tmp_path / "bucket"), delivery_id="d1",
+                                   instruction_source=_RawSource(), work_dir=tmp_path / "work"))
+    assert not (tmp_path / "bucket" / "deliveries" / "d1" / "manifest.json").exists()
+    assert not list((tmp_path / "work").glob("**/*.jsonl"))
+    _, retried = _export(tmp_path, _Records(n=1, missing=()), job=INSTRUCTION_JOB,
+                         instruction_source=_RawSource())
+    assert len(_instructions(tmp_path, retried)) == 2
 
 
 @pytest.mark.parametrize("bad", ["../x", "", "a/b", "x" * 200])

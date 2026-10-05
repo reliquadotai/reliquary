@@ -245,8 +245,16 @@ def test_register_read_and_revoke_an_executor(admin):
 # --------------------------------------------------------------------------
 
 
-def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
+def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin, monkeypatch):
     assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    from reliquary.validator import corpus_service
+
+    class _Environment:
+        def get_problem(self, index):
+            return {"prompt": f"canonical question {index}?"}
+
+    monkeypatch.setattr(corpus_service, "prompt_job_for_spec",
+                        lambda job: corpus_service.SingleTurnPromptJob(job, _Environment()))
     sid = "1" * 64
     admin.records.verdicts = {sid: {"passed": True}}
     admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
@@ -264,6 +272,10 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
     assert done is not None and done["state"] == "done" and done["rows"] == 1
     assert "deliveries/order-1/manifest.json" in done["keys"]
     assert (admin.platform / "deliveries" / "order-1" / "report.json").exists()
+    assert "deliveries/order-1/instruction-00000.jsonl" in done["keys"]
+    instruction = admin.platform / "deliveries" / "order-1" / "instruction-00000.jsonl"
+    assert json.loads(instruction.read_text()) == {"prompt": "canonical question 3?",
+                                                 "response": "a"}
     # Done stays done, from the bucket.
     again = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-1"})
     assert again.status_code == 200 and again.json()["keys"] == done["keys"]
@@ -271,6 +283,34 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
 
 def test_a_delivery_of_an_unknown_job_is_404(admin):
     assert admin("POST", "/admin/v1/jobs/math-ghost/deliveries", {}).status_code == 404
+
+
+def test_a_missing_raw_source_preserves_the_original_admin_delivery(admin, monkeypatch):
+    from reliquary.validator import corpus_service
+
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+
+    def missing(job):
+        raise corpus_service.CorpusPromptSourceError("fixture source not installed")
+
+    monkeypatch.setattr(corpus_service, "prompt_job_for_spec", missing)
+    sid = "1" * 64
+    admin.records.verdicts = {sid: {"passed": True}}
+    admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
+                                "completions": [{"text": "a", "tokens": [1]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
+    path, body = "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-raw-missing"}
+    assert admin("POST", path, body).status_code == 202
+    for _ in range(100):
+        response = admin("POST", path, body)
+        if response.status_code == 200:
+            break
+        time.sleep(0.02)
+    assert response.status_code == 200 and response.json()["rows"] == 1
+    root = admin.platform / "deliveries" / "order-raw-missing"
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["shards"] and manifest["instruction_shards"] == []
+    assert manifest["instruction"]["omitted"] == {"prompt_source_unavailable": 1}
 
 
 def test_a_bad_pool_is_refused_at_build():
