@@ -791,11 +791,36 @@ class ValidationService:
         price_params: Any | None = None,
         proof_worker_pool: Any = None,
         signer_client: Any | None = None,
+        service_contract: Any | None = None,
     ) -> None:
         from reliquary.constants import DETACHED_TRAINER
 
         if active_checkpoint_namespace().scoped and not DETACHED_TRAINER:
             raise ValueError("task-scoped checkpoints require the detached trainer")
+        self._service_runtime = None
+        if service_contract is not None:
+            from reliquary.constants import FILL_CLOSED_ENABLED, PIPELINED_WINDOWS, ENFORCE_ENVELOPE_SIGNATURE
+            from reliquary.services.runtime import ServiceRuntime
+            from reliquary.shared.strict_json import strict_json_loads
+            if not DETACHED_TRAINER or not FILL_CLOSED_ENABLED or PIPELINED_WINDOWS or not ENFORCE_ENVELOPE_SIGNATURE:
+                raise ValueError("service policies require signed, serial fill-closed detached execution")
+            namespace = active_checkpoint_namespace()
+            namespace.require_policy(service_contract.to_dict()["policies"]["checkpoint"])
+            if not namespace.scoped:
+                raise ValueError("service training requires task-scoped checkpoint lineage")
+            source = os.environ.get("RELIQUARY_SERVICE_QUALIFICATION")
+            if not source:
+                raise ValueError("service task requires its operator-approved runtime qualification")
+            source_path = Path(source)
+            if not source_path.is_absolute() or source_path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("runtime qualification must be a bounded absolute local file")
+            qualification = strict_json_loads(source_path.read_bytes())
+            from reliquary.shared.training_payload import active_training_identity
+            if service_contract.to_dict()["generation_contract_sha256"] != active_training_identity()["generation_contract_sha256"]:
+                raise ValueError("service generation contract differs from the active runtime")
+            folder = Path(os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")) / "service-policies" / namespace.task_id / namespace.run_id
+            folder.mkdir(parents=True, exist_ok=True)
+            self._service_runtime = ServiceRuntime(folder / "runtime.sqlite3", service_contract, qualification)
         self.wallet = wallet
         self._signer_client = signer_client
         self._network_proof = getattr(proof_worker_pool, "is_remote", False) is True
@@ -1576,6 +1601,8 @@ class ValidationService:
         intake = self._checkpoint_intake
         manifest, staged_dir = intake.take_staged()
         revision = "<invalid>"
+        service_runtime = getattr(self, "_service_runtime", None)
+        installation_started = False
         try:
             checkpoint_n, repo_id, revision = canonical_checkpoint_identity(
                 manifest.get("checkpoint_n"),
@@ -1589,6 +1616,23 @@ class ValidationService:
                 manifest.get("trained_window_cursor"),
                 field="staged checkpoint trainer cursor",
             )
+            checkpoint_digest = None
+            if service_runtime is not None:
+                from reliquary.protocol.release_contract import canonical_sha256
+                from reliquary.protocol.service_contract import ServiceContract
+                from reliquary.shared.strict_json import strict_json_loads
+                from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+                receipt = strict_json_loads((staged_dir / PUBLICATION_RECEIPT).read_bytes())
+                expected_manifest = {k: v for k, v in manifest.items() if k != "revision"}
+                if (not isinstance(receipt, dict) or receipt.get("manifest") != expected_manifest
+                        or not isinstance(receipt.get("files"), dict) or not receipt["files"]):
+                    raise ValueError("service checkpoint publication receipt mismatch")
+                checkpoint_digest = canonical_sha256(receipt["files"])
+                candidate = service_runtime.order_contract.to_dict()
+                if candidate["checkpoint"]["repo"] != repo_id:
+                    raise ValueError("service checkpoint repository mismatch")
+                candidate["checkpoint"] = {"repo": repo_id, "revision": revision, "sha256": checkpoint_digest}
+                ServiceContract.from_dict(candidate)
             # Persist the trainer cursor binding before changing the active
             # checkpoint. Readiness also requires the active manifest to equal
             # this candidate, so a failed swap remains closed; a crash after a
@@ -1605,11 +1649,15 @@ class ValidationService:
                 await asyncio.to_thread(
                     self._synchronize_proof_models, revision, str(staged_dir),
                 )
+            installation_started = True
             entry = await asyncio.to_thread(
                 self._checkpoint_store.install_external,
                 checkpoint_n,
                 revision,
             )
+            if service_runtime is not None:
+                service_runtime.record_consumption(manifest["trained_window_cursor"])
+                service_runtime.adopt(repo=repo_id, revision=revision, sha256=checkpoint_digest)
             self._checkpoint_n = checkpoint_n
             self.server.set_current_checkpoint(entry)
             intake.mark_installed(revision, staged_dir)
@@ -1623,7 +1671,11 @@ class ValidationService:
             )
         except FatalProofPlaneError:
             raise
-        except Exception:
+        except Exception as exc:
+            if service_runtime is not None and installation_started:
+                raise FatalProofPlaneError(
+                    f"service checkpoint installation/adoption failed for {revision[:12]}; restart before reopening admission"
+                ) from exc
             logger.exception(
                 "staged checkpoint swap failed for %s; staying on the "
                 "current revision", revision[:12],
@@ -1783,7 +1835,7 @@ class ValidationService:
         queue = self._training_payload_queue_ref()
         store = FillClosedRotationStore(state_dir)
         for window in recovery.windows():
-            recovery.recover(window, queue=queue, archives=get_archive_queue(), rotation=store)
+            recovery.recover(window, queue=queue, archives=get_archive_queue(), rotation=store, service_runtime=getattr(self, "_service_runtime", None))
         gate = store.load()
         self._fill_closed_recovery_store = recovery
         self._fill_closed_rotation_store = store
@@ -2507,6 +2559,21 @@ class ValidationService:
         )
         cp = self._checkpoint_store.current_manifest()
         cp_hash = cp.revision if cp else ""
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is not None:
+            if len(self.envs) != 1 or next(iter(self.envs)) != runtime.contract.to_dict()["environment"]["id"]:
+                raise ValueError("service V1 requires one qualified environment per task")
+            if cp is None or cp.repo_id != runtime.contract.to_dict()["checkpoint"]["repo"]:
+                raise ValueError("service checkpoint repository mismatch")
+            if cp_hash != runtime.contract.to_dict()["checkpoint"]["revision"]:
+                saved = runtime.db.execute("SELECT contract FROM service_contexts WHERE order_id=?", (runtime.order_contract.sha256,)).fetchall()
+                from reliquary.protocol.service_contract import ServiceContract
+                contracts = [ServiceContract.from_dict(json.loads(r[0])) for r in saved]
+                match = next((c for c in contracts if c.to_dict()["checkpoint"]["revision"] == cp_hash), None)
+                if match is None:
+                    raise ValueError("active checkpoint has no qualified service context")
+                checkpoint = match.to_dict()["checkpoint"]
+                runtime.adopt(repo=checkpoint["repo"], revision=checkpoint["revision"], sha256=checkpoint["sha256"])
         if self.proof_scheduler is not None and not (
             cp_hash
             and self.proof_scheduler.state is SchedulerState.RUNNING
@@ -2563,9 +2630,8 @@ class ValidationService:
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
                 # Each environment's cap, scaled by its own price when armed.
-                window_pool=self._window_pool_for(
-                    [name for name, _ in self.env_mix]
-                ),
+                window_pool=(runtime.training_pool(self._window_pool_for([name for name, _ in self.env_mix]))
+                             if runtime is not None else self._window_pool_for([name for name, _ in self.env_mix])),
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
@@ -2628,6 +2694,26 @@ class ValidationService:
                 **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
+            if runtime is not None:
+                runtime.prepare_view(window=target_window, distinct_groups_per_window=runtime.measured_consumption())
+                from reliquary.validator.cooldown import CooldownMap, ContentCooldownMap
+                for map_name, map_type in (("_cooldown_per_env", CooldownMap), ("_content_cooldown_per_env", ContentCooldownMap)):
+                    maps = getattr(self, map_name)
+                    changed = map_type(runtime.view.cooldown_windows)
+                    changed.import_state(maps[env_name].export_state())
+                    maps[env_name] = changed
+                # The service epoch covers the frozen source; historical profiles retain their slice policy.
+                batcher.prompt_range = (0, len(env))
+                batcher._experimental_prompt_range = batcher.prompt_range
+                batcher._cooldown = self._cooldown_per_env[env_name]
+                batcher._content_cooldown = self._content_cooldown_per_env[env_name]
+                batcher.cooldown_prompts_membership = frozenset(batcher._cooldown.current_cooldown_set(target_window))
+                batcher.cooldown_prompts_snapshot = sorted(batcher.cooldown_prompts_membership)
+                if len(env) != len(runtime.row_ids):
+                    raise ValueError("qualified source index map differs from active dataset length")
+                batcher.service_runtime = runtime
+                original_pool = self._window_pool_for([env_name])
+                batcher.service_window_pool = original_pool[env_name] if isinstance(original_pool, dict) else original_pool
             if shared_fill_state is not None:
                 batcher.fill_state = shared_fill_state
             batchers[env_name] = batcher
@@ -3439,6 +3525,11 @@ class ValidationService:
 
         for batcher in self._active_batchers.values():
             batcher.randomness = randomness
+            runtime = getattr(batcher, "service_runtime", None)
+            if runtime is not None:
+                runtime.open_window(target_window, window_pool=batcher.service_window_pool,
+                                    slots=FILL_CLOSED_ADMISSION_BUDGET_PER_ENV)
+                batcher.service_policy = runtime.announcement(window=target_window, randomness=randomness)
 
         self._set_window_preparation_stage("prompt_manifest")
         try:
@@ -3526,6 +3617,18 @@ class ValidationService:
         self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
         batch_indices: dict | None = None, finalize: bool = True,
     ) -> None:
+        records = self._auction_final_verdict_records(batcher, paid_groups=paid_groups,
+                                                     batch_indices=batch_indices, finalize=finalize)
+        if records is None:
+            return
+        await asyncio.to_thread(self.server.persist_final_verdicts, records)
+        if finalize:
+            batcher._auction_final_verdicts_published = True
+
+    def _auction_final_verdict_records(
+        self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
+        batch_indices: dict | None = None, finalize: bool = True,
+    ):
         """Publish the final lifecycle state of every auction candidate.
 
         Admission and final selection are deliberately separate in auction mode:
@@ -3564,6 +3667,8 @@ class ValidationService:
                 rewarded = selected
             if not finalize and (not selected or row.get("verdict_selected_published")):
                 continue
+            if finalize and getattr(batcher, "service_runtime", None) is not None and row.get("status") == "exploration_verified":
+                rewarded = float(row.get("exploration_fraction", 0.0)) > 0.0
             proof_reject = pending.reject_response
             accepted = proof_reject is None
             reason = (
@@ -3595,6 +3700,8 @@ class ValidationService:
                 elif selection_reason in {"queued_for_proof", "proof_pending"}:
                     selection_reason = "proof_not_completed_before_window_close"
 
+            if row.get("status") == "exploration_verified":
+                selection_reason = "exploration_reward_recorded" if rewarded else "exploration_verified_no_entitlement"
             from reliquary.validator.verifier import rewards_std
 
             try:
@@ -3614,6 +3721,10 @@ class ValidationService:
                     sigma=rewards_std(list(pending.rewards or ())),
                     details={
                         "environment": str(getattr(batcher.env, "name", "")),
+                        **({"service_contract_sha256": batcher.service_runtime.contract.sha256,
+                            "service_purpose": pending.request.service_binding["purpose"],
+                            "exploration_fraction": float(row.get("exploration_fraction", 0.0))}
+                           if getattr(batcher, "service_runtime", None) is not None else {}),
                         "prompt_idx": pending.prompt_idx,
                         "checkpoint_revision": str(getattr(batcher, "current_checkpoint_hash", "")),
                         "receipt_id": getattr(pending.request, "_precommit_receipt_id", None),
@@ -3667,9 +3778,7 @@ class ValidationService:
                     pending.prompt_idx,
                 )
 
-        await asyncio.to_thread(self.server.persist_final_verdicts, records)
-        if finalize:
-            batcher._auction_final_verdicts_published = True
+        return records
 
     def _lr_global_step_hint(self) -> int:
         """Restored LR-schedule position for a same-run restart.
@@ -5464,6 +5573,9 @@ class ValidationService:
                 ).items()
             },
         }
+        runtime = getattr(first_batcher, "service_runtime", None)
+        if runtime is not None:
+            archive = runtime.reconcile_archive(archive)
         await asyncio.to_thread(
             self._utility_telemetry.write_window,
             window=int(first_batcher.window_start),
@@ -5688,6 +5800,13 @@ class ValidationService:
             queue.enqueue_committed_tombstone(key, data, accounting=accounting)
         else:
             queue.enqueue_committed_payload(key, data, accounting=accounting)
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is not None:
+            try:
+                runtime.record_training_journal(key, data, is_tombstone=is_tombstone, batches=batches, stride=FILL_CLOSED_EMISSIONS_PER_WINDOW)
+            except Exception:
+                # The payload is already committed; its optional throughput projection cannot undo it.
+                logger.exception("service consumption telemetry unavailable; adaptive cooldown falls back")
 
     def _write_fill_closed_training_payload(
         self, key: int, data: bytes,
@@ -5766,7 +5885,7 @@ class ValidationService:
                 raise RuntimeError(
                     f"window {window_start}: v6 recovery has no assembler"
                 )
-            self._close_and_commit_fill_closed_paid_side_effects(
+            paid = self._close_and_commit_fill_closed_paid_side_effects(
                 batchers,
                 assembler,
             )
@@ -5774,7 +5893,23 @@ class ValidationService:
             archive = recovery.recover(
                 window_start, queue=self._training_payload_queue_ref(),
                 archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
+                service_runtime=getattr(self, "_service_runtime", None),
             )
+            if getattr(self, "_service_runtime", None) is not None:
+                for name, batcher in batchers.items():
+                    if archive.get("window_status") == "aborted":
+                        for row in batcher.difficulty_auction_metadata_by_id.values():
+                            if row.get("status") == "exploration_verified":
+                                row["exploration_fraction"] = 0.0
+                    records = self._auction_final_verdict_records(
+                        batcher, paid_groups=[group for _, group in paid[name]],
+                        batch_indices={(group.hotkey, group.prompt_idx, bytes(group.merkle_root)): index
+                                       for index, group in paid[name]},
+                    )
+                    if records is not None:
+                        self.server.persist_final_verdicts(records)
+                        batcher._auction_final_verdicts_published = True
+                self.server.complete_final_verdict_window(window_start)
             # Keep the hash recovery cache contiguous; a gap stalls it for good.
             self._cache_archived_hashes(archive)
             self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
@@ -6664,8 +6799,13 @@ class ValidationService:
                     await asyncio.wait_for(task, timeout=5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-            await self._close_proof_scheduler()
-            await self.server.stop()
+            try:
+                await self._close_proof_scheduler()
+                await self.server.stop()
+            finally:
+                runtime = getattr(self, "_service_runtime", None)
+                if runtime is not None:
+                    runtime.close()
             telemetry.finish()
 
     async def _serve_axon_on_chain(self, subtensor) -> None:

@@ -60,4 +60,3 @@ def test_curation_rechecks_row_confidence_and_preserves_original_line_bytes():
     manifest["generation_verified"] = True
     with pytest.raises(ValueError,match="every mapped row"):
         curate_rows(source,body,manifest,c)
-

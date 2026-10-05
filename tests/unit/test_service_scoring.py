@@ -12,5 +12,3 @@ def test_fractional_signal_and_unknown_are_distinct():
     assert weighted_reward({"a":None},{"a":10000}) is None
     with pytest.raises(ValueError):
         weighted_reward({"a":float("nan")},{"a":10000})
-
-

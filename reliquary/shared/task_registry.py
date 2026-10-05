@@ -23,8 +23,9 @@ MECHANISM_RL_DISCOVERED_PRICE = "rl-discovered-price"
 # Corpus generation on a frozen checkpoint: paid per verified token, with the
 # price pinned by declaring floor == cap.
 MECHANISM_CORPUS_GENERATION = "corpus-generation"
+MECHANISM_SERVICE_RL = "rl-service-policy/v1"
 KNOWN_MECHANISMS = frozenset(
-    {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION}
+    {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION, MECHANISM_SERVICE_RL}
 )
 # What a task may pin as the way its rollouts are verified. Declaring one makes every validator
 # run the same path whatever its card; declaring none lets each derive it, which is the default.
@@ -82,6 +83,9 @@ class TaskEntry:
     # it: the contract says how generation happens, the job says which work to
     # do, and putting it inside would move every RL contract's digest.
     job_id: str | None = None
+    # Only on the explicit service mechanism; old readers refuse that mechanism.
+    # Absent fields never alter historical registry bytes or generation hashes.
+    service_contract: Mapping[str, Any] | None = None
 
 
 def _number(value: Any, field: str) -> float:
@@ -136,6 +140,25 @@ def validate_entry(entry: TaskEntry) -> None:
         )
     if entry.mechanism not in KNOWN_MECHANISMS:
         raise RegistryError(f"unknown incentive mechanism {entry.mechanism!r}")
+    if entry.mechanism == MECHANISM_SERVICE_RL:
+        from reliquary.protocol.service_contract import ServiceContract
+        if entry.service_contract is None or not isinstance(entry.contract, Mapping):
+            raise RegistryError("service tasks carry both generation and service contracts")
+        try:
+            service = ServiceContract.from_dict(entry.service_contract).to_dict()
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from exc
+        if entry.params.get("min_incentive_share") != 0 or entry.params.get("min_incentive_ramp_start") != 0:
+            raise RegistryError("service payouts require explicit zero incentive floor to preserve absolute group entitlements")
+        if service["service_kind"] != "adaptive_training" or service["generation_contract_sha256"] != entry.profile_sha256:
+            raise RegistryError("service must bind this adaptive generation contract")
+        if service["environment"]["id"] not in entry.contract.get("environments", {}):
+            raise RegistryError("service environment absent from generation contract")
+        if (service["checkpoint"]["repo"] != entry.contract.get("model_id") or
+            service["checkpoint"]["revision"] != entry.contract.get("model_revision")):
+            raise RegistryError("service checkpoint does not match generation model")
+    elif entry.service_contract is not None:
+        raise RegistryError("service contract requires the explicit service mechanism")
     if entry.verification is not None and entry.verification not in KNOWN_VERIFICATION:
         raise RegistryError(
             f"unknown verification replica {entry.verification!r}; "
@@ -462,6 +485,8 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             ),
             verification=_verification_of(task_id, body),
             job_id=_job_id_of(task_id, body),
+            service_contract=(None if body.get("service_contract") is None else
+                              json.loads(json.dumps(body["service_contract"]))),
         )
     if strict:
         validate_registry(entries)
@@ -500,6 +525,8 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
         # entries renders exactly as it did before contracts existed.
         if entry.contract is not None:
             body["contract"] = dict(entry.contract)
+        if entry.service_contract is not None:
+            body["service_contract"] = dict(entry.service_contract)
         return body
 
     document = {
