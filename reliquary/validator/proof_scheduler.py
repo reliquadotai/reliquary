@@ -85,6 +85,9 @@ class RankedProof:
     # The scheduler serializes active proofs sharing any identity so a failed
     # proof is applied before another candidate can bypass the same limit.
     resources: tuple[tuple[Hashable, int], ...] = ()
+    # Observational passes retain their proof decision and prompt/resource
+    # effects, but cannot fill a training target or reserve a target slot.
+    counts_toward_target: bool = True
 
 
 @dataclass(frozen=True)
@@ -473,6 +476,8 @@ class GlobalProofScheduler:
             added = tuple(sorted(candidates, key=lambda item: item.rank))
             highest = state.candidates[-1].rank if state.candidates else None
             for candidate in added:
+                if type(candidate.counts_toward_target) is not bool:
+                    raise ValueError("counts_toward_target must be a bool")
                 if candidate.job_id in state.candidate_by_id:
                     raise ValueError(
                         f"duplicate job_id {candidate.job_id!r}"
@@ -806,6 +811,8 @@ class GlobalProofScheduler:
         ranks: set[int] = set()
         job_ids: set[str] = set()
         for candidate in plan.candidates:
+            if type(candidate.counts_toward_target) is not bool:
+                raise ValueError("counts_toward_target must be a bool")
             if not candidate.job_id:
                 raise ValueError("job_id must be non-empty")
             if candidate.job_id in job_ids:
@@ -983,6 +990,7 @@ class GlobalProofScheduler:
                     state.abort_reason is not None
                     or (
                         not state.plan.complete_all
+                        and invocation.candidate.counts_toward_target
                         and state.passed >= state.plan.required_passes
                     )
                 ):
@@ -1040,16 +1048,15 @@ class GlobalProofScheduler:
         ):
             return None
         if not state.plan.complete_all:
-            # Every active or completed proof reserves one possible winner.
+            # Each active or completed training proof reserves one winner.
             # A rejection releases exactly one slot; a pass consumes it. This
             # bounds speculative work independently of rank-application gaps.
             outstanding = sum(
                 phase in (_JobPhase.ACTIVE, _JobPhase.RAW)
-                for phase in state.phases.values()
+                and state.candidate_by_id[job_id].counts_toward_target
+                for job_id, phase in state.phases.items()
             )
             remaining = state.plan.required_passes - state.passed - outstanding
-            if remaining <= 0:
-                return None
         eligible: list[RankedProof] = []
         newly_limited = True
         while newly_limited:
@@ -1113,12 +1120,13 @@ class GlobalProofScheduler:
             if phase in (_JobPhase.ACTIVE, _JobPhase.RAW):
                 continue
             if candidate.job_id in eligible_ids:
-                return candidate
+                if not candidate.counts_toward_target or remaining > 0:
+                    return candidate
+                continue
             # An unresolved head can still consume one winner slot. Reserve it
             # before allowing unrelated lower-ranked work around the blocker.
-            remaining -= 1
-            if remaining <= 0:
-                return None
+            if candidate.counts_toward_target:
+                remaining -= 1
         return None
 
     @staticmethod
@@ -1215,14 +1223,22 @@ class GlobalProofScheduler:
             if any(
                 state.phases[job_id]
                 in (_JobPhase.PENDING, _JobPhase.ACTIVE, _JobPhase.RAW)
+                and state.candidate_by_id[job_id].counts_toward_target
                 for job_id in chain
             ):
                 possible_prompts += 1
         if state.passed + possible_prompts < state.plan.required_passes:
             if state.plan.allow_shortfall:
-                if possible_prompts == 0:
+                pending_observations = any(
+                    phase in (_JobPhase.PENDING, _JobPhase.ACTIVE, _JobPhase.RAW)
+                    and not state.candidate_by_id[job_id].counts_toward_target
+                    for job_id, phase in state.phases.items()
+                )
+                if possible_prompts == 0 and not pending_observations:
                     self._stop_with_shortfall_locked(state)
                     self._apply_ready_locked(state)
+                elif pending_observations and state.attempts_started >= state.max_attempts and not state.active_job_ids:
+                    self._abort_plan_locked(state, CapacityAbortReason.ATTEMPT_LIMIT)
                 return
             self._abort_plan_locked(
                 state, CapacityAbortReason.INSUFFICIENT_DISTINCT_PROMPTS
@@ -1255,6 +1271,7 @@ class GlobalProofScheduler:
                     )
                 elif (
                     not state.plan.complete_all
+                    and candidate.counts_toward_target
                     and state.passed >= state.plan.required_passes
                 ):
                     decision = self._synthetic_decision(
@@ -1338,6 +1355,8 @@ class GlobalProofScheduler:
                     else "skipped"
                 ),
             }
+            if not candidate.counts_toward_target:
+                details["counts_toward_target"] = False
             if decision.status is ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT:
                 details["limits"] = [
                     {"scope": key[1], "counter_scope": "proof_plan", "count": state.resource_failures[key], "threshold": limit}
@@ -1364,7 +1383,8 @@ class GlobalProofScheduler:
             self._totals[f"decisions_{decision.status.value}"] += 1
 
             if decision.status is ProofDecisionStatus.PASSED:
-                state.passed += 1
+                if candidate.counts_toward_target or state.plan.complete_all:
+                    state.passed += 1
                 state.claimed_prompts.add(candidate.prompt_key)
                 self._skip_prompt_tail_locked(state, candidate.prompt_key)
             elif decision.status in (
@@ -1528,6 +1548,7 @@ class GlobalProofScheduler:
                 if (
                     outcome is ProofPlanOutcome.COMPLETED
                     and decision.status is ProofDecisionStatus.PASSED
+                    and (state.plan.complete_all or state.candidate_by_id[decision.job_id].counts_toward_target)
                 )
             ),
             attempts_started=state.attempts_started,
