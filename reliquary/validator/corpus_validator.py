@@ -763,19 +763,24 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
 
 async def _run_corpus_services(server, services) -> None:
     """Stop and await every service when HTTP serving ends or a service fails."""
-    serving = asyncio.create_task(server.serve())
-    workers = [asyncio.create_task(service) for service in services]
-    group = asyncio.gather(*workers)
-    try:
-        done, _ = await asyncio.wait((serving, group), return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            task.result()
-    finally:
-        serving.cancel()
-        group.cancel()
-        for task in workers:
-            task.cancel()
-        await asyncio.gather(serving, group, *workers, return_exceptions=True)
+    from contextlib import nullcontext
+
+    # Uvicorn replays captured signals when serve() returns. Keep that replay
+    # inside its handler until the other services have finished cleanup.
+    with getattr(server, "capture_signals", nullcontext)():
+        serving = asyncio.create_task(server.serve())
+        workers = [asyncio.create_task(service) for service in services]
+        group = asyncio.gather(*workers)
+        try:
+            done, _ = await asyncio.wait((serving, group), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            serving.cancel()
+            group.cancel()
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(serving, group, *workers, return_exceptions=True)
 
 
 async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http_port,

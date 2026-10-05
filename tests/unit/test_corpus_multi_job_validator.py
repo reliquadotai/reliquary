@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import signal
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -99,6 +103,44 @@ def test_corpus_service_failure_propagates_and_stops_the_server():
         assert all(task is asyncio.current_task() for task in asyncio.all_tasks())
 
     asyncio.run(exercise())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX signal exit status")
+def test_real_http_sigterm_awaits_background_cleanup_before_process_exit():
+    script = textwrap.dedent("""
+        import asyncio
+        import os
+        import signal
+        import uvicorn
+        from reliquary.validator.corpus_validator import _run_corpus_services
+
+        async def app(scope, receive, send):
+            pass
+
+        async def main():
+            server = uvicorn.Server(uvicorn.Config(
+                app, host="127.0.0.1", port=0, lifespan="off", ws="none",
+                log_level="critical"))
+
+            async def background(index):
+                try:
+                    if index == 0:
+                        while not server.started:
+                            await asyncio.sleep(0.01)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    await asyncio.Future()
+                finally:
+                    await asyncio.sleep(0.02 * (index + 1))
+                    print(f"background-cleaned-{index}", flush=True)
+
+            await _run_corpus_services(server, [background(0), background(1)])
+
+        asyncio.run(main())
+    """)
+    result = subprocess.run([sys.executable, "-u", "-c", script],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == -signal.SIGTERM, result.stderr
+    assert sorted(result.stdout.splitlines()) == ["background-cleaned-0", "background-cleaned-1"]
 
 
 def test_jobs_on_one_checkpoint_start():
