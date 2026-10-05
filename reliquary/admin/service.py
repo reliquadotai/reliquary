@@ -857,7 +857,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     @router.post("/jobs/{job_id}/deliveries")
     async def create_delivery(job_id: str, body: CreateDelivery, response: Response) -> dict:
         from reliquary.corpus.delivery import (
-            export_delivery, instruction_source_for_job, validated_delivery_id,
+            export_delivery, instruction_source_for_job, validate_cached_delivery,
+            validated_delivery_id,
         )
         from reliquary.corpus.export import job_grader
 
@@ -877,6 +878,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if job.episode is not None:
             raise HTTPException(status_code=422, detail="an episode job is delivered with "
                                 "`reliquary jobs export JOB --sft` on a host with its renderer")
+
+        def delivery_result(manifest):
+            try:
+                validate_cached_delivery(manifest, job=job, sink=deliveries)
+            except ValueError as exc:
+                detail = ("delivery_belongs_to_another_job" if manifest.get("job_id") != job_id
+                          else "delivery_belongs_to_another_contract")
+                raise HTTPException(status_code=409, detail=detail) from exc
+            return {"state": "done", "delivery_id": delivery_id, "keys": manifest["keys"],
+                    "rows": manifest["rows"]}
+
         running_export = exports.get(delivery_id)
         if running_export is not None and running_export[0] != job_id:
             raise HTTPException(status_code=409, detail="delivery_belongs_to_another_job")
@@ -887,18 +899,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=500,
                                     detail=f"delivery failed: {running.exception()}")
             manifest = running.result()
-            if manifest.get("job_id") != job_id:
-                raise HTTPException(status_code=409, detail="delivery_belongs_to_another_job")
-            return {"state": "done", "delivery_id": delivery_id, "keys": manifest["keys"],
-                    "rows": manifest["rows"]}
+            return delivery_result(manifest)
         if running is None:
             stored = await deliveries.get_json(f"deliveries/{delivery_id}/manifest.json")
             if stored is not None:
-                if stored.get("job_id") != job_id:
-                    raise HTTPException(status_code=409,
-                                        detail="delivery_belongs_to_another_job")
-                return {"state": "done", "delivery_id": delivery_id, "keys": stored["keys"],
-                        "rows": stored["rows"]}
+                return delivery_result(stored)
             from reliquary.validator.corpus_job_status import stored_job_counts
 
             # A delivery is final once written: never from a job still moving.

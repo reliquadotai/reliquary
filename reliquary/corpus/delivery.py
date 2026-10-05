@@ -456,6 +456,18 @@ def _instruction_text(value) -> bool:
         return False
 
 
+def validate_cached_delivery(manifest: Mapping, *, job, sink) -> None:
+    """Bind a completed delivery to its immutable job, retaining legacy storage reads."""
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    if manifest.get("job_id") != job.job_id:
+        raise ValueError("delivery belongs to another job")
+    if ("job_manifest_sha256" in manifest
+            or getattr(sink, "requires_job_contract_pin", False)):
+        if manifest.get("job_manifest_sha256") != canonical_sha256(job.to_contract()):
+            raise ValueError("delivery belongs to another job contract")
+
+
 async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           filter_note: str | None = None, work_dir: str | Path | None = None,
                           shard_max_bytes: int = SHARD_MAX_BYTES,
@@ -480,8 +492,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     manifest_key = f"{prefix}/manifest.json"
     stored = await sink.get_json(manifest_key)
     if stored is not None:
-        if stored.get("job_id") != job.job_id:
-            raise ValueError("delivery belongs to another job")
+        validate_cached_delivery(stored, job=job, sink=sink)
         return stored
     report_key = f"{prefix}/report.json"
     stored_report = await sink.get_json(report_key)
@@ -731,6 +742,7 @@ class HTTPDeliverySink:
 
     max_file_bytes = 64 * 1024 * 1024
     max_json_bytes = 1024 * 1024
+    requires_job_contract_pin = True
     evaluation_supported = False
     _key = re.compile(r"^deliveries/subnet-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
                       r"[89ab][0-9a-f]{3}-[0-9a-f]{12})/([A-Za-z0-9_.()-]{1,100})$")
@@ -842,5 +854,6 @@ __all__ = [
     "episode_rows",
     "export_delivery",
     "instruction_source_for_job",
+    "validate_cached_delivery",
     "validated_delivery_id",
 ]

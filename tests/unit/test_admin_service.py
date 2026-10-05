@@ -363,6 +363,42 @@ def test_a_stored_delivery_cannot_be_returned_for_another_job(admin):
     assert response.json()["detail"] == "delivery_belongs_to_another_job"
 
 
+def test_cached_delivery_retry_checks_the_immutable_job_contract(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink, export_delivery
+    from reliquary.corpus.job import parse_job
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    job = parse_job(admin("GET", "/admin/v1/jobs/math-a/status").json()["manifest"])
+    pin = canonical_sha256(job.to_contract())
+    root = admin.platform / "deliveries" / "order-existing"
+    root.mkdir(parents=True)
+    sink = LocalDirectorySink(admin.platform)
+    for required, fields, accepted in (
+        (False, {"job_manifest_sha256": pin}, True),
+        (False, {"job_manifest_sha256": "b" * 64}, False),
+        (False, {}, True),  # Historical storage exports predate the pin.
+        (True, {"job_manifest_sha256": pin}, True),
+        (True, {}, False),  # HTTP delivery recovery always requires it.
+    ):
+        monkeypatch.setattr(LocalDirectorySink, "requires_job_contract_pin", required,
+                            raising=False)
+        manifest = {"job_id": job.job_id, "keys": [], "rows": 1, **fields}
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                         {"delivery_id": "order-existing"})
+        retry = export_delivery(job=job, records=None, sink=sink,
+                                delivery_id="order-existing")
+        if accepted:
+            assert response.status_code == 200 and response.json()["state"] == "done"
+            assert asyncio.run(retry) == manifest
+        else:
+            assert response.status_code == 409
+            assert response.json()["detail"] == "delivery_belongs_to_another_contract"
+            with pytest.raises(ValueError, match="another job contract"):
+                asyncio.run(retry)
+
+
 def test_a_bounded_delivery_sink_refuses_unsupported_namespaces_and_evaluation(admin, monkeypatch):
     from reliquary.corpus.delivery import LocalDirectorySink
 
