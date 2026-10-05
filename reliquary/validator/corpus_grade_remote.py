@@ -358,6 +358,10 @@ class RemoteGradeDispatcher(ExecutorLeases):
             if (lease.executor_id != executor_id or lease_id in held
                     or now - lease.leased_at < self._report_grace):
                 continue
+            if lease.expires_at <= now:
+                # Expired: the sweep counts it (a timeout and a strike), so
+                # leaving a lease out of a report never dodges its expiry.
+                continue
             # Leased, but the executor does not hold it: the claim's reply
             # was lost (or its result could not be delivered). Its fault,
             # never the miner's, and no strike: the network's as often.

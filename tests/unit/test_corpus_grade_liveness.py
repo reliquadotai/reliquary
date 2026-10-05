@@ -361,3 +361,22 @@ async def test_the_router_takes_the_held_leases_and_old_heartbeats_still_pass():
                               json={"executor_id": "g0", "detail": {"leases": 0},
                                     "held_leases": []}, headers=auth)
         assert new.status_code == 200 and lease["lease_id"] not in d._leases
+
+
+async def test_an_expired_unreported_lease_is_an_expiry_not_an_error():
+    # An executor that stops reporting a lease past its expiry must not dodge
+    # the expiry strike: the sweep counts it as a timeout, with the strike.
+    clock = _Clock()
+    d = await _dispatcher(recheck=1.0, clock=clock)
+    decision = asyncio.ensure_future(d.decide(_item("replay")))
+    await asyncio.sleep(0)
+    lease = d.claim("g0")
+    clock.now = lease["expires_at"] + 1
+    d.heartbeat("g0", None, held_leases=[])
+    assert lease["lease_id"] in d._leases and "leases_unreported" not in d.stats
+    await d.sweep()
+    assert lease["lease_id"] not in d._leases
+    assert d._strikes["g0"] == 1
+    work = next(iter(d._queue))
+    assert work.timeouts == 1 and work.errors == 0 and not decision.done()
+    decision.cancel()
