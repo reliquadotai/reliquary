@@ -363,12 +363,12 @@ class CorpusJobSet:
 
     async def _maybe_unwire(self, job_id: str) -> None:
         wiring = self.served[job_id]
-        if self._routes.in_flight[job_id]:
+        if self._routes.admission_pending(job_id):
             return
         try:
-            # The gate is closed (retired) and nothing is in flight: no record can
-            # appear after this check.
-            if not await self._drained(wiring) or self._routes.in_flight[job_id]:
+            # The gate is closed and neither handlers nor their detached turns
+            # are pending: no record can appear after this check.
+            if not await self._drained(wiring) or self._routes.admission_pending(job_id):
                 return
         except Exception:
             logger.exception("corpus job %s: drain check failed; retrying next refresh", job_id)

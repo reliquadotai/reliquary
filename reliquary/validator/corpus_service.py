@@ -131,8 +131,8 @@ SEGMENT_PARALLELISM = 8
 # a request that never returns.
 DEFAULT_WRITE_ATTEMPTS = 4
 
-# How long a submission waits for its turn on the ledger. One hung PUT can hold
-# the turn for botocore's full ~135 s; past this the miner gets the retryable 503.
+# How long a submission waits for a turn not yet taken. Storage retries can
+# hold a taken turn longer; this timeout never abandons its durable writes.
 LEDGER_LOCK_TIMEOUT_SECONDS = 30.0
 
 # The most submissions and skips one ledger turn decides (group commit): one
@@ -2097,6 +2097,13 @@ def build_corpus_router(
     router.ledger_lock = ledger_lock
     # How many decisions wait for the next ledger turn.
     router.ledger_waiting = lambda: len(turn_queue)
+    # A cancelled HTTP handler can leave a taken turn and its durable record
+    # write running. Retirement must include those tasks, not only handlers.
+    router.admission_pending = lambda: bool(
+        turn_queue
+        or any(not task.done() for task in committer)
+        or any(not task.done() for task in finishing)
+    )
     return router
 
 
@@ -2115,8 +2122,8 @@ class CorpusJobRoutes:
         # Each job's prompt source: an eval job's names the set miners fetch.
         self.prompt_sources: dict[str, str] = {}
         self.retired: set[str] = set()
-        # Admissions (submit, skip) past the retired check and not yet returned:
-        # a job is unwired only once none is left.
+        # Handlers past the retired check. admission_pending also accounts for
+        # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
 
@@ -2142,6 +2149,14 @@ class CorpusJobRoutes:
 
     def open_jobs(self) -> list[str]:
         return sorted(j for j in self.routers if j not in self.retired)
+
+    def admission_pending(self, job_id: str) -> bool:
+        """A write handler or its detached ledger/record work is still running."""
+        if self.in_flight[job_id]:
+            return True
+        router = self.routers.get(job_id)
+        pending = getattr(router, "admission_pending", None)
+        return bool(pending is not None and pending())
 
     @contextlib.asynccontextmanager
     async def admission(self, job_id: str):
