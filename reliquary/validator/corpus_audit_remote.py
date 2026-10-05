@@ -163,6 +163,10 @@ class ExecutorDirectory:
     def document(self, executor_id: str) -> dict | None:
         return self._by_id.get(executor_id)
 
+    def executor_ids(self) -> list[str]:
+        """Every executor the registry, as last read, holds (any status)."""
+        return sorted(self._by_id)
+
     def quarantined_ids(self) -> list[str]:
         """This scope's executors the registry, as last read, says are quarantined."""
         return sorted(eid for eid, d in self._by_id.items()
