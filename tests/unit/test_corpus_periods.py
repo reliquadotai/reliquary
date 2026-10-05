@@ -157,7 +157,9 @@ def test_period_pay_is_capped_and_added_to_the_window_replay():
         window, caps={"default": 0.8, "eval-a": 0.02},
         floors={"default": (0.0, 0.0), "eval-a": (0.0, 0.0)},
         periods={"eval-a": {"m1": 0.05, "m2": 0.05}})
-    assert combined["m1"] == pytest.approx(0.01) and combined["m2"] == pytest.approx(0.01)
+    # Bounded at CATCHUP_ENTRIES caps: a backlog paid back, never more.
+    bound = 0.02 * cp.CATCHUP_ENTRIES
+    assert combined["m1"] == pytest.approx(bound / 2) and combined["m2"] == pytest.approx(bound / 2)
     assert combined["r"] == pytest.approx(
         WeightOnlyValidator._replay_ema(window, caps={"default": 0.8},
                                         floors={"default": (0.0, 0.0)})["r"])
@@ -243,3 +245,77 @@ def test_window_and_period_pay_of_one_task_add_up():
                                            floors={"corpus-x": (0.0, 0.0)},
                                            periods={"corpus-x": {"a": 0.001, "b": 0.002}})
     assert both["a"] == pytest.approx(alone + 0.001) and both["b"] == pytest.approx(0.002)
+
+
+def test_entries_fill_a_few_archives_a_period_from_the_due_one():
+    k = cp.CATCHUP_ENTRIES
+    assert cp.entry_for(10, []) == 10
+    assert cp.entry_for(10, [10] * (k - 1)) == 10
+    assert cp.entry_for(10, [10] * k) == 11
+    assert cp.entry_for(10, [3, 4, 9]) == 10  # entered already: no room taken
+    assert cp.entry_for(10, [], used=[10, 11]) == 12  # its own work's entries
+
+
+def test_a_backlog_paid_back_in_full_and_within_the_bound():
+    """Fifteen periods settled at once plus one a period after: everyone is
+    paid what the archives hold, and the task never replays past its bound."""
+    cap, k = 0.1, cp.CATCHUP_ENTRIES
+    archives, entered = [], []
+    for work in range(15):
+        entry = cp.entry_for(20, entered)
+        entered.append(entry)
+        archives.append({"entry_period": entry, "rewards_by_hotkey": {f"w{work}": cap}})
+    for work in range(15, 40):
+        entry = cp.entry_for(work + 6, entered)
+        entered.append(entry)
+        archives.append({"entry_period": entry, "rewards_by_hotkey": {f"w{work}": cap}})
+    assert max(entered[:15]) == 20 + 15 // k  # drained in four periods, not fifteen
+    peak = max(sum(cp.replay(archives, p).values()) for p in range(0, 100))
+    assert peak <= k * cap
+    paid = _pay(archives, 0, 200)
+    lost = (1 - cp.PERIOD_ALPHA) ** (cp.REPLAY_DEPTH + 1)
+    for work in range(40):
+        assert paid[f"w{work}"] == pytest.approx(cap, rel=lost * 1.5)
+
+
+def test_the_weight_setter_holds_each_archive_to_its_cap():
+    import asyncio
+
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    docs = {("eval-a", 30, 32): {"rewards_by_hotkey": {"m1": 0.5}}}
+    now = GENESIS + 32 * cp.PERIOD_SECONDS + 5
+    weights = asyncio.run(WeightOnlyValidator._period_weights(
+        {"eval-a": _entry(0.02)}, archives=_PeriodArchives(docs), now=now, genesis=GENESIS))
+    assert weights["eval-a"]["m1"] == pytest.approx(cp.PERIOD_ALPHA * 0.02)
+
+
+def test_a_moved_archive_hides_the_one_it_replaces():
+    """An interrupted requeue leaves both: the old entry, reached, pays nothing."""
+    import asyncio
+
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    docs = {("eval-a", 5, 30): {"rewards_by_hotkey": {"m": 0.02},
+                                "replaces_entry_period": 32},
+            ("eval-a", 5, 32): {"rewards_by_hotkey": {"m": 0.02}},
+            ("eval-a", 6, 32): {"rewards_by_hotkey": {"n": 0.02}}}
+    now = GENESIS + 32 * cp.PERIOD_SECONDS + 5
+    weights = asyncio.run(WeightOnlyValidator._period_weights(
+        {"eval-a": _entry(0.02)}, archives=_PeriodArchives(docs), now=now, genesis=GENESIS))
+    a = cp.PERIOD_ALPHA
+    assert weights["eval-a"]["m"] == pytest.approx(a * (1 - a) ** 2 * 0.02)
+    assert weights["eval-a"]["n"] == pytest.approx(a * 0.02)
+
+
+def test_the_requeue_moves_the_queue_to_the_earliest_room():
+    from scripts.requeue_period_archives import plan
+
+    k = cp.CATCHUP_ENTRIES
+    # Entered already (58-60), then one a period up to 76, as the old settler left it.
+    listed = [(0, 58), (1, 60), (2, 61)] + [(w, 59 + w) for w in range(3, 18)]
+    moves = plan(listed, due=62)
+    new = {work: n for work, _, n in moves}
+    assert min(new.values()) == 62 and max(new.values()) <= 62 + 15 // k
+    assert all(n < old for _, old, n in moves)
+    assert (2, 61) not in [(w, o) for w, o, _ in moves]  # entered: untouched

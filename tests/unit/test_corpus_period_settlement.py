@@ -54,6 +54,9 @@ class Archives:
     async def read(self, task_id, work, entry):
         return self.docs.get((work, entry))
 
+    async def list(self, task_id):
+        return sorted(self.docs)
+
 
 def verdict(sid, hotkey, tokens, received, passed=True):
     return {"submission_id": sid, "hotkey": hotkey, "token_count": tokens,
@@ -75,11 +78,12 @@ def test_each_closed_period_is_paid_its_own_cap_by_its_own_tokens():
     }
     # Now in period 5, nothing pending: periods up to 4 are closed.
     assert asyncio.run(settler(records, archives, at(5, 1000)).settle_once()) == 4
-    # Entering after this period, one entry period each: never two caps at once.
-    assert set(archives.docs) == {(3, 6), (4, 7)}
+    # Both enter the next period: a backlog is paid back at once, up to
+    # CATCHUP_ENTRIES archives a period.
+    assert set(archives.docs) == {(3, 6), (4, 6)}
     assert archives.docs[(3, 6)]["rewards_by_hotkey"] == {"a": pytest.approx(0.075),
                                                           "b": pytest.approx(0.025)}
-    assert archives.docs[(4, 7)]["rewards_by_hotkey"] == {"a": pytest.approx(0.1)}
+    assert archives.docs[(4, 6)]["rewards_by_hotkey"] == {"a": pytest.approx(0.1)}
     assert sorted(records.state["settled"]) == ["a1", "a2", "b1"]
     assert records.state["totals"]["verified_tokens"] == 450
 
@@ -142,7 +146,6 @@ def test_a_crash_after_choosing_pays_once():
     # at 16 instead, whole, rather than at 10 with most of its pay decayed away.
     assert asyncio.run(settler(records, archives, at(15)).settle_once()) == 2
     assert set(archives.docs) == {(2, 16)} and records.state["pending"] is None
-    assert records.state["last_entry"] == 16
 
 
 def test_a_crash_after_the_write_does_not_write_again():
@@ -171,11 +174,24 @@ def test_a_crash_after_the_write_does_not_write_again():
     assert set(archives.docs) == {(2, 10)} and records.state["pending"] is None
 
 
-def test_a_backlog_enters_one_period_at_a_time():
+def test_a_backlog_enters_a_few_archives_a_period():
     records, archives = Records(), Archives()
     records.verdicts = {f"v{p}": verdict(f"v{p}", "a", 10, at(p)) for p in range(2, 8)}
     asyncio.run(settler(records, archives, at(9)).settle_once())
-    assert sorted(entry for _, entry in archives.docs) == list(range(10, 16))
+    k = cp.CATCHUP_ENTRIES
+    assert sorted(entry for _, entry in archives.docs) == sorted(
+        10 + i // k for i in range(6))
+
+
+def test_a_new_period_enters_beside_a_queue_not_behind_it():
+    """A backlog queued one per period by an older settler (entries 10..20)
+    does not hold the next period's pay: it enters as soon as there is room."""
+    records, archives = Records(), Archives()
+    for work, entry in zip(range(0, 11), range(10, 21)):
+        archives.docs[(work, entry)] = {"rewards_by_hotkey": {"old": 0.1}}
+    records.verdicts = {"n": verdict("n", "a", 10, at(11))}
+    asyncio.run(settler(records, archives, at(12, 1000)).settle_once())
+    assert (11, 13) in archives.docs
 
 
 def test_a_window_settled_job_is_not_settled_by_period():

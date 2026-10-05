@@ -49,6 +49,18 @@ async def read_period_archive(task_id: str, work_period: int, entry_period: int)
         period_archive_key(task_id, work_period, entry_period), strict=True)
 
 
+async def delete_period_archive(task_id: str, work_period: int, entry_period: int,
+                                **client_kwargs) -> None:
+    """Remove one archive. Only the requeue script calls it, after writing the
+    archive that replaces it at an earlier entry."""
+    from reliquary.infrastructure import storage
+
+    bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+    async with storage.get_s3_client(**client_kwargs) as client:
+        await client.delete_object(
+            Bucket=bucket, Key=period_archive_key(task_id, work_period, entry_period))
+
+
 async def list_period_archives(task_id: str, **client_kwargs) -> list[tuple[int, int]]:
     """Every ``(work period, entry period)`` archived for the task, sorted."""
     from reliquary.infrastructure import storage
@@ -96,6 +108,7 @@ class R2PeriodArchives:
 __all__ = [
     "PERIODS_PREFIX",
     "R2PeriodArchives",
+    "delete_period_archive",
     "list_period_archives",
     "parse_key",
     "period_archive_key",
