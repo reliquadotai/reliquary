@@ -187,9 +187,13 @@ class GradeEvaluation(BaseModel):
     # Job mode: grade a job not every prompt of which holds its samples (the
     # platform, after its deadline); the report says complete=false.
     allow_incomplete: bool = False
+    service_contract: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _source_fields(self):
+        if self.service_contract is not None:
+            from reliquary.protocol.service_contract import ServiceContract
+            ServiceContract.from_dict(self.service_contract)
         if self.source == "uploads":
             if self.job_id is not None or not self.completion_keys:
                 raise ValueError("an uploads grading names completion_keys and no job_id")
@@ -934,7 +938,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=f"provenance_mismatch: {differs}")
         if not (await stored_job_counts(records, job.job_id))["drained"]:
             raise HTTPException(status_code=409, detail="job_not_drained")
-        collected = await collect_job_records(job, records)
+        collected = await collect_job_records(job, records, **({"include_generation_status": True} if body.service_contract is not None else {}))
         from reliquary.validator.corpus_service import rebuild_ledgers
 
         snapshot, _ = await job_store.read_ledgers(job.job_id)
@@ -947,6 +951,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                         "qualification_id": declared["qualification_id"],
                         "sampling_verified": False}
         for entry in await entries_naming(job.job_id):
+            if body.service_contract is not None:
+                facts["generation_contract_sha256"] = entry.profile_sha256
             proofs = (entry.contract or {}).get("proofs") or ()
             toploc = [p for p in proofs if p.get("scheme") == "toploc-v1"]
             if toploc:
@@ -981,6 +987,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             validated_delivery_id(eval_id)
             keys = (grading.validated_completion_keys(body.completion_keys)
                     if body.source == "uploads" else [])
+            from reliquary.protocol.service_contract import ServiceContract
+            service_contract = (None if body.service_contract is None else
+                                ServiceContract.from_dict(body.service_contract))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if body.source == "job":
@@ -990,7 +999,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if not body.job_id.startswith(eval_job_prefix(task_prefix)):
                 raise HTTPException(status_code=422, detail="not_an_eval_job")
         digest = grading.request_digest(body.set_ids, keys, body.problems_per_set,
-                                        body.samples_per_set, job_id=body.job_id)
+                                        body.samples_per_set, job_id=body.job_id,
+                                        service_contract_sha256=None if service_contract is None else service_contract.sha256)
 
         def done(manifest: dict) -> dict:
             if manifest.get("request_sha256") != digest:
@@ -1032,6 +1042,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 job_rows = None
                 if body.source == "job":
                     job_rows, provenance = await job_grading_source(body)
+                if service_contract is not None:
+                    from reliquary.services.mapping import validate_grading_context
+                    try:
+                        validate_grading_context(service_contract, sets, provenance)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
                 extra = {} if grade_scorer is None else {"scorer_for": grade_scorer}
                 gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
                     eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,
@@ -1040,11 +1056,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     provenance=provenance, platform=deliveries,
                     subnet=eval_store, open_environment=open_environment,
                     require_sandbox=require_sandbox, work_dir=work_dir, clock=clock,
+                    **({"service_contract": service_contract} if service_contract is not None else {}),
                     **extra)))
         response.status_code = 202
         return {"state": "running", "eval_id": eval_id}
 
-    GRADED_FILES = ("report.json", "manifest.json", "graded.parquet")
+    GRADED_FILES = ("report.json", "manifest.json", "graded.parquet", "mapping.jsonl", "mapping-manifest.json")
 
     @router.get("/evaluations/{eval_id}/files/{name}")
     async def evaluation_file(eval_id: str, name: str) -> Response:
