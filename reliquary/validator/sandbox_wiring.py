@@ -15,6 +15,8 @@ Settings:
   re-read period, the age past which the fleet fails closed, and each read's bound
   (`sandbox.fleet.Fleet`);
 * `RELIQUARY_SANDBOX_CLOSE_CONCURRENCY` (4): closes verified at once;
+* `RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY` (8): closes read and authenticated at
+  once, before their signature is known (one more is refused `close_busy` at once);
 * `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` (30): the time a close's body has to arrive;
 * `RELIQUARY_SANDBOX_*` policy settings (`sandbox.sessions.SandboxPolicy`), among them
   `RELIQUARY_SANDBOX_CLAIM_TTL_S` (300).
@@ -40,7 +42,7 @@ from reliquary.corpus.job import sandbox_split
 from reliquary.sandbox.fleet import (
     DIRECTORY_MAX_AGE_SECONDS, DIRECTORY_READ_TIMEOUT_SECONDS, DIRECTORY_REFRESH_SECONDS,
 )
-from reliquary.sandbox.routes import CLOSE_BODY_TIMEOUT_S
+from reliquary.sandbox.routes import CLOSE_BODY_TIMEOUT_S, MAX_PREAUTH_CLOSES
 from reliquary.sandbox.sessions import (
     CorpusEngagements, JobNotReady, RlPrecommitEngagements, SandboxPolicy, SessionBook, SessionIssuer,
     SignedJobView,
@@ -83,6 +85,7 @@ class SandboxValidatorConfig:
     directory_read_timeout_s: float = DIRECTORY_READ_TIMEOUT_SECONDS
     close_concurrency: int = CLOSE_CONCURRENCY
     close_body_timeout_s: float = CLOSE_BODY_TIMEOUT_S
+    close_preauth_concurrency: int = MAX_PREAUTH_CLOSES
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] = os.environ) -> SandboxValidatorConfig | None:
@@ -109,7 +112,9 @@ class SandboxValidatorConfig:
             close_concurrency=_positive(environ, "RELIQUARY_SANDBOX_CLOSE_CONCURRENCY",
                                         CLOSE_CONCURRENCY, int),
             close_body_timeout_s=_positive(environ, "RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S",
-                                           CLOSE_BODY_TIMEOUT_S))
+                                           CLOSE_BODY_TIMEOUT_S),
+            close_preauth_concurrency=_positive(
+                environ, "RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY", MAX_PREAUTH_CLOSES, int))
 
 
 @dataclass
@@ -224,7 +229,8 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix="/corpus",
         registration=registration, clock=clock,
         max_concurrent_closes=config.close_concurrency,
-        close_body_timeout_s=config.close_body_timeout_s)
+        close_body_timeout_s=config.close_body_timeout_s,
+        max_preauth_closes=config.close_preauth_concurrency)
     logger.info("sandbox services built: validator key %s, %d retired keys", config.key_id,
                 len(config.retired_keys))
     services = SandboxServices(signer=signer, token_verifier=token_verifier, fleet=fleet,

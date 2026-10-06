@@ -620,3 +620,77 @@ def test_a_stalled_close_body_times_out_without_holding_a_close_slot():
     assert honest.status_code == 200                   # the stalled body held no slot
     assert timed_out.status_code == 408 and timed_out.json()["reason"] == "body_timeout"
     assert len(issuer.calls) == 1
+
+
+# -- final review I4: unauthenticated close bodies are bounded in number and off the loop
+
+def test_closes_past_the_pre_auth_limit_are_refused_at_once_before_their_body_is_read():
+    import asyncio
+    import time
+
+    import httpx
+
+    issuer = FakeIssuer({"session_id": "s-1", "state": "closed", "status": "expired"})
+    app = FastAPI()
+    app.include_router(build_sandbox_sessions_router(
+        issuer, policy=SandboxPolicy(), validator_hotkey=VALIDATOR, verify_open=accept,
+        verify_close=accept, clock=lambda: NOW, max_preauth_closes=1, close_wait_s=5,
+        close_body_timeout_s=1.0))
+    gone = asyncio.Event()
+
+    async def stalled():
+        yield b'{"miner_hotkey": '
+        await gone.wait()
+        yield b'"x"}'
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://v") as http:
+            slow = asyncio.ensure_future(http.post(CLOSE, content=stalled()))
+            await asyncio.sleep(0.1)
+            started = time.monotonic()
+            busy = await http.post(CLOSE, json=close_body())
+            waited = time.monotonic() - started
+            timed_out = await slow
+            gone.set()
+            after = await http.post(CLOSE, json=close_body())
+        return busy, waited, timed_out, after
+
+    busy, waited, timed_out, after = asyncio.run(run())
+    assert busy.status_code == 503 and busy.json()["reason"] == "close_busy"
+    assert int(busy.headers["Retry-After"]) >= 1 and waited < 0.5     # at once, not queued
+    assert timed_out.status_code == 408
+    assert after.status_code == 200 and len(issuer.calls) == 1
+
+
+def test_the_pre_auth_close_limit_defaults_to_eight_and_must_be_positive():
+    assert routes.MAX_PREAUTH_CLOSES == 8
+    with pytest.raises(ValueError):
+        build_sandbox_sessions_router(FakeIssuer(None), policy=SandboxPolicy(),
+                                      validator_hotkey=VALIDATOR, max_preauth_closes=0)
+
+
+def test_a_close_is_parsed_and_its_signature_checked_off_the_event_loop(monkeypatch):
+    import threading
+
+    threads = {}
+    real_decode = routes._decode
+
+    def decode(*args, **kw):
+        threads["parse"] = threading.get_ident()
+        return real_decode(*args, **kw)
+
+    def verify(request, **audience):
+        threads["verify"] = threading.get_ident()
+        return True
+
+    class Issuer(FakeIssuer):
+        async def close(self, **kw):
+            threads["loop"] = threading.get_ident()
+            return await super().close(**kw)
+
+    monkeypatch.setattr(routes, "_decode", decode)
+    answer = client(Issuer({"session_id": "s-1", "state": "closed", "status": "expired"}),
+                    verify=verify).post(CLOSE, json=close_body())
+    assert answer.status_code == 200
+    assert threads["parse"] != threads["loop"] and threads["verify"] != threads["loop"]

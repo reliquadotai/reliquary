@@ -24,7 +24,12 @@ only be reached over TLS or the validator's tunnel. The miner's hotkey is normal
 its ss58 format-42 address (anything that does not decode is malformed); caps and
 idempotency key on that address.
 
-Closes are bounded. A close's body (up to MAX_CLOSE_BODY_BYTES) must arrive within
+Closes are bounded. At most `max_preauth_closes` (MAX_PREAUTH_CLOSES, setting
+RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY) closes are read and authenticated at once:
+one more is refused `close_busy` (503, `Retry-After`) at once, before its body is read,
+so unauthenticated bodies cannot pile up in memory. A body's JSON parse, model
+validation and signature check (which digests the transcript) run in a worker thread,
+never on the event loop. A close's body (up to MAX_CLOSE_BODY_BYTES) must arrive within
 `close_body_timeout_s` (CLOSE_BODY_TIMEOUT_S by default; 408 `body_timeout` past it),
 and its signature is checked, before it takes one of `max_concurrent_closes` slots for
 the transcript's verification; one that waits longer than `close_wait_s` (default
@@ -64,6 +69,9 @@ MAX_REPORTED_ERRORS = 8
 # A close's body must arrive within this many seconds (setting
 # RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S): a slow body never holds a worker for long.
 CLOSE_BODY_TIMEOUT_S = 30.0
+# Closes read and authenticated at once, before any signature is known (setting
+# RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY): 8 x MAX_CLOSE_BODY_BYTES at most in memory.
+MAX_PREAUTH_CLOSES = 8
 
 # Every reason either side of the routes refuses with, and the status a miner acts on:
 # 400/403/404/409/413/422 do not retry the same request; 408 (the body did not arrive
@@ -84,10 +92,10 @@ REFUSAL_STATUS: dict[str, int] = {
     "engagement_kind_unsupported": 409, "transcript_invalid": 409,
     # the intake's claim on a session (issuer.claim); `session_claimed` is retried
     "session_submitted": 409, "session_not_submittable": 409, "session_expired": 409,
-    "session_claimed": 503,
+    "session_claimed": 503, "session_busy": 503,
     # per-hotkey caps
     "live_cap": 429, "prompt_live_cap": 429, "job_live_cap": 429, "open_rate_cap": 429,
-    "aborted_cap": 429,
+    "aborted_cap": 429, "open_refused_rate": 429,
     # this validator cannot answer now: retry
     "sandbox_capacity": 503, "directory_unavailable": 503, "store_unavailable": 503,
     "ledger_unavailable": 503, "task_unavailable": 503, "registration_unavailable": 503,
@@ -165,6 +173,11 @@ async def _parse(request: Request, model: type[BaseModel], cap: int,
             raw = await asyncio.wait_for(_read_bounded(request, cap), deadline_s)
         except TimeoutError:
             raise _Refused(_refuse("body_timeout", {"max_seconds": deadline_s})) from None
+    # Up to MAX_CLOSE_BODY_BYTES of JSON and its model: off the event loop.
+    return await asyncio.to_thread(_decode, raw, model)
+
+
+def _decode(raw: bytes, model: type[BaseModel]) -> Any:
     try:
         body = json.loads(raw.decode("utf-8"), parse_constant=_no_constants)
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -198,9 +211,13 @@ def build_sandbox_sessions_router(
     max_concurrent_closes: int | None = None,
     close_wait_s: float | None = None,
     close_body_timeout_s: float | None = CLOSE_BODY_TIMEOUT_S,
+    max_preauth_closes: int | None = MAX_PREAUTH_CLOSES,
 ) -> APIRouter:
     if max_concurrent_closes is not None and max_concurrent_closes <= 0:
         raise ValueError("max_concurrent_closes must be positive")
+    if max_preauth_closes is not None and max_preauth_closes <= 0:
+        raise ValueError("max_preauth_closes must be positive")
+    preauth = None if max_preauth_closes is None else asyncio.Semaphore(max_preauth_closes)
     if close_body_timeout_s is not None and not (math.isfinite(close_body_timeout_s)
                                                  and close_body_timeout_s > 0):
         raise ValueError("close_body_timeout_s must be a positive number of seconds")
@@ -225,7 +242,9 @@ def build_sandbox_sessions_router(
             raise _Refused(refuse("stale_request", {"max_skew_s": policy.request_skew_s,
                                                     "now": now}))
         try:
-            verified = bool(verify(request, validator_hotkey=audience, path=path))
+            # The binding digests the request (a close's whole transcript): in a thread.
+            verified = bool(await asyncio.to_thread(verify, request, validator_hotkey=audience,
+                                                    path=path))
         except Exception:
             verified = False
         if not verified:
@@ -281,13 +300,21 @@ def build_sandbox_sessions_router(
     @router.post(sandbox_close_path(prefix, "{session_id}"))
     async def close_session(session_id: str, http: Request) -> JSONResponse:
         async def step() -> JSONResponse:
-            # The body is read (bounded in size and time) and its signature checked
-            # before a close slot is taken: a slow or unsigned body never holds one.
-            request, hotkey = await _parse(http, SandboxSessionCloseRequest,
-                                           MAX_CLOSE_BODY_BYTES, close_body_timeout_s)
-            if request.session_id != session_id:
-                return refuse("session_unknown", {"session_id": request.session_id})
-            await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
+            # At most `max_preauth_closes` bodies are read and authenticated at once; one
+            # more is refused before its body is read.
+            if preauth is None:
+                request, hotkey = await authenticate()
+            else:
+                if preauth.locked():
+                    logger.warning("sandbox session close %r refused: %d closes already being "
+                                   "read", session_id[:64], max_preauth_closes)
+                    return refuse("close_busy", {"stage": "read",
+                                                 "max_concurrent": max_preauth_closes})
+                await preauth.acquire()
+                try:
+                    request, hotkey = await authenticate()
+                finally:
+                    preauth.release()
             if closes is None:
                 return await settle(request, hotkey)
             try:
@@ -300,6 +327,16 @@ def build_sandbox_sessions_router(
                 return await settle(request, hotkey)
             finally:
                 closes.release()
+
+        async def authenticate():
+            # The body is read (bounded in size and time) and its signature checked
+            # before a close slot is taken: a slow or unsigned body never holds one.
+            request, hotkey = await _parse(http, SandboxSessionCloseRequest,
+                                           MAX_CLOSE_BODY_BYTES, close_body_timeout_s)
+            if request.session_id != session_id:
+                raise _Refused(refuse("session_unknown", {"session_id": request.session_id}))
+            await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
+            return request, hotkey
 
         async def settle(request, hotkey: str) -> JSONResponse:
             outcome = await issuer.close(hotkey=hotkey, session_id=session_id,
@@ -314,5 +351,6 @@ def build_sandbox_sessions_router(
     return router
 
 
-__all__ = ["CLOSE_BODY_TIMEOUT_S", "MAX_CLOSE_BODY_BYTES", "MAX_OPEN_BODY_BYTES", "REFUSAL_STATUS",
+__all__ = ["CLOSE_BODY_TIMEOUT_S", "MAX_CLOSE_BODY_BYTES", "MAX_OPEN_BODY_BYTES",
+           "MAX_PREAUTH_CLOSES", "REFUSAL_STATUS",
            "build_sandbox_sessions_router", "ss58_address"]

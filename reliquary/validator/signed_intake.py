@@ -99,7 +99,7 @@ class SignedEpisodeIntake(EpisodeIntake):
                                              received=facts.received_at)
         if refusal is None:
             return None
-        if refusal.reason == "session_claimed":
+        if refusal.reason in ("session_claimed", "session_busy"):
             return IntakeRefusal(REASON_SESSION_BUSY, {"session_id": facts.session_id},
                                  retry_after=refusal.retry_after or self._retry_after)
         if refusal.reason == "session_submitted":

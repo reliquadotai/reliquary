@@ -31,6 +31,17 @@ attempt has finished, only "not loaded yet" at info). It reopens on the first su
 read. A machine's silence is counted from the latest of the fleet's start, the moment
 it entered the directory, and the moment the directory last became usable.
 
+Our own egress. When a poll gets no accepted report from ANY listed machine, the
+validator suspects its own network rather than every machine at once: nothing is
+drained (an ALERT is logged once) until at least one machine reports again, and the
+silence of the others is then counted from that recovery. A single-machine fleet is
+therefore never drained for silence (it still gets no new session: placement needs a
+fresh report); its sessions end by their close or their lapse.
+
+Heartbeat summaries (observability) are written to R2 at most once a minute per
+machine, each write bounded by HEARTBEAT_RECORD_TIMEOUT_S so a slow R2 never stalls a
+poll.
+
 A key end backdated by the operator (compromise) refuses signatures from the next
 refresh on. It does NOT reach transcripts that were already admitted: those were
 verified against the snapshot of their time and stay admitted (and paid); undoing
@@ -69,6 +80,7 @@ DIRECTORY_READ_TIMEOUT_SECONDS = 15.0
 DIRECTORY_BACKOFF_BASE_SECONDS = 5.0
 DIRECTORY_BACKOFF_CAP_SECONDS = 30.0
 HEARTBEAT_RECORD_SECONDS = 60.0
+HEARTBEAT_RECORD_TIMEOUT_S = 5.0
 TOOLS_VERSION = "reliquary-tools/1"
 # Per machine, per poll: the whole fetch (connect, headers, body) must fit in this.
 FETCH_TIMEOUT_S = 4.0
@@ -158,6 +170,7 @@ class Fleet:
         self._issued: dict[str, list[int]] = {}
         self._started = clock()
         self.drained: set[str] = set()
+        self._egress_suspect = False      # the last poll heard no machine at all
 
     def directory_age(self, now: float | None = None) -> float | None:
         """Seconds since the last successful directory read, or None if never read."""
@@ -260,11 +273,27 @@ class Fleet:
         entries = [e for e in self._directory.entries() if e.status != "revoked"]
         reports = await asyncio.gather(*(self._bounded_fetch(e.address) for e in entries),
                                        return_exceptions=True)
+        heard = 0
         for entry, report in zip(entries, reports):
             if report is None or isinstance(report, BaseException):
                 continue
             if self.accept_report(entry.machine_id, report, now):
+                heard += 1
                 await self._maybe_record(entry.machine_id, now)
+        if entries and heard == 0:
+            # Every machine silent in the same poll: our egress, most likely. Drain
+            # nothing until one of them is heard again.
+            if not self._egress_suspect:
+                self._egress_suspect = True
+                logger.error("ALERT no sandbox machine answered this poll (%d listed): "
+                             "suspecting this validator's own egress; no machine is "
+                             "drained until one answers again", len(entries))
+            return
+        if self._egress_suspect:
+            self._egress_suspect = False
+            # Silence is counted from the recovery, not from before the outage.
+            self._fresh_since = now
+            logger.warning("sandbox machines answer again; drain checks resume")
         for entry in entries:
             # Silence is counted from when the directory last became usable at the earliest.
             baseline = max(self._started, self._first_seen.get(entry.machine_id, self._started))
@@ -297,8 +326,9 @@ class Fleet:
                    ("capacity", "active", "free", "env_packages", "tools_version", "runsc_version")}
         summary["images"] = len(document.get("images") or ())
         try:
-            await self._record(machine_id, at=now, summary=summary)
-        except Exception as exc:  # observability only
+            await asyncio.wait_for(self._record(machine_id, at=now, summary=summary),
+                                   HEARTBEAT_RECORD_TIMEOUT_S)
+        except Exception as exc:  # observability only (a timeout included)
             logger.warning("heartbeat summary of %s not written: %s", machine_id, type(exc).__name__)
 
     def note_issued(self, machine_id: str, at: int) -> None:
@@ -404,5 +434,5 @@ _EMPTY_DIRECTORY = DirectorySnapshot()
 
 __all__ = ["DIRECTORY_BACKOFF_BASE_SECONDS", "DIRECTORY_BACKOFF_CAP_SECONDS",
            "DIRECTORY_MAX_AGE_SECONDS", "DIRECTORY_READ_TIMEOUT_SECONDS", "DIRECTORY_REFRESH_SECONDS", "FETCH_TIMEOUT_S", "HEARTBEAT_MAX_AGE_S",
-           "HEARTBEAT_RECORD_SECONDS", "MAX_REPORT_BYTES", "POLL_SECONDS", "STALE_AFTER_S",
+           "HEARTBEAT_RECORD_SECONDS", "HEARTBEAT_RECORD_TIMEOUT_S", "MAX_REPORT_BYTES", "POLL_SECONDS", "STALE_AFTER_S",
            "TOOLS_VERSION", "Fleet", "Placement", "http_fetch_report"]

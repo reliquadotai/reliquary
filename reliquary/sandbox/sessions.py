@@ -110,6 +110,7 @@ STATES = frozenset(SESSION_TRANSITIONS)
 HOLDING = frozenset({LIVE, CLOSED_GRADED})
 WITHDRAW, WITHDRAWN = "withdraw", "withdrawn"         # the close reason, the closed status
 HOUR, DAY = 3600, 86400
+MINUTE = 60
 PERSIST_ATTEMPTS = 4
 PERSIST_BACKOFF_S = 0.5
 _sleep = asyncio.sleep
@@ -139,6 +140,12 @@ class SandboxPolicy:
     # record write's retries (RECORD_WRITE_ATTEMPTS x io_timeout_s) and 60 s of margin,
     # rounded up generously: no honest submission holds its claim longer.
     claim_ttl_s: int = 300
+    # How long an intake's claim waits for the issuer lock (held only for in-memory
+    # checks and one store write) before it is refused `session_busy`, retryably.
+    claim_wait_s: int = 5
+    # Refused opens per hotkey per rolling minute before `open_refused_rate` (429): a
+    # refused open costs ledger reads and is free to send.
+    max_refused_opens_per_minute: int = 60
 
     _ENV = {"max_live_per_hotkey": "RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY",
             "max_live_per_hotkey_job": "RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB",
@@ -148,7 +155,9 @@ class SandboxPolicy:
             "request_skew_s": "RELIQUARY_SANDBOX_REQUEST_SKEW_S",
             "retry_after_s": "RELIQUARY_SANDBOX_RETRY_AFTER_S",
             "io_timeout_s": "RELIQUARY_SANDBOX_IO_TIMEOUT_S",
-            "claim_ttl_s": "RELIQUARY_SANDBOX_CLAIM_TTL_S"}
+            "claim_ttl_s": "RELIQUARY_SANDBOX_CLAIM_TTL_S",
+            "claim_wait_s": "RELIQUARY_SANDBOX_CLAIM_WAIT_S",
+            "max_refused_opens_per_minute": "RELIQUARY_SANDBOX_MAX_REFUSED_OPENS_PER_MINUTE"}
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] = os.environ) -> SandboxPolicy:
@@ -190,6 +199,9 @@ class EngagementTerms:
     budgets: dict[str, int]
     job_id: str | None = None
     prompt_index: int | None = None
+    # The prompt's free slots as read (before the issuer lock), reservations not
+    # deducted: the issuer re-checks them against its reservations under the lock.
+    slots_remaining: int | None = None
 
 
 class EngagementBook(Protocol):
@@ -301,10 +313,14 @@ class CorpusEngagements:
                                                                      timeout):
                 return Refusal("miner_banned", {})
             remaining = await asyncio.wait_for(view.slots_remaining(index), timeout)
-        except TimeoutError:
-            return Refusal("ledger_unavailable", {"job_id": job_id}, retry_after=retry)
         except JobNotReady:
             return Refusal("job_not_ready", {"job_id": job_id}, retry_after=retry)
+        except Exception as exc:
+            # A timeout, the store's 503 (an HTTPException) or any transport error: the
+            # validator cannot read its ledger now, the miner retries (never a 500).
+            logger.warning("sandbox open: job %s ledger unreadable (%s)", job_id,
+                           type(exc).__name__)
+            return Refusal("ledger_unavailable", {"job_id": job_id}, retry_after=retry)
         if remaining is None:
             return Refusal("job_complete", {"job_id": job_id})
         reserved = self._book.reserved(job.job_id, index, int(self._clock()))
@@ -313,7 +329,9 @@ class CorpusEngagements:
                                                   "slots_remaining": remaining, "reserved": reserved})
         try:
             task = await asyncio.wait_for(view.resolve_task(index), timeout)
-        except TimeoutError:
+        except Exception as exc:
+            logger.warning("sandbox open: task %d of job %s unresolved (%s)", index, job_id,
+                           type(exc).__name__)
             return Refusal("task_unavailable", {"prompt_index": index}, retry_after=retry)
         spec = job.episode.sandbox
         budgets = spec.budgets.to_contract()
@@ -324,7 +342,8 @@ class CorpusEngagements:
                                split=sandbox_split(job.episode), index=index,
                                checkpoint=job.checkpoint_sha256, image=task.image,
                                env_package=spec.env_package, budgets=budgets,
-                               job_id=job.job_id, prompt_index=index)
+                               job_id=job.job_id, prompt_index=index,
+                               slots_remaining=int(remaining))
 
 
 class RlPrecommitEngagements:
@@ -493,6 +512,13 @@ class SessionBook:
             self._submitted = self._submitted - set(old)
 
 
+@dataclass(frozen=True)
+class _Issued:
+    grant: Grant
+    machine_id: str
+    engagement: str
+
+
 class SessionIssuer:
     def __init__(self, *, book: SessionBook, store, fleet, signer, token_verifier,
                  engagements: Mapping[str, EngagementBook], policy: SandboxPolicy,
@@ -506,6 +532,7 @@ class SessionIssuer:
         self._tokens: dict[str, tuple[dict, str]] = {}
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
+        self._refused_opens: dict[str, list[int]] = {}     # hotkey -> refusal times
 
     @property
     def policy(self) -> SandboxPolicy:
@@ -524,40 +551,92 @@ class SessionIssuer:
         self.book.restore(records)
         return len(records)
 
+    def _resent(self, hotkey: str, request_id: str, digest: str) -> Grant | Refusal | None:
+        """The answer to a request already granted (the same token), or None."""
+        existing = self.book.by_request(hotkey, request_id)
+        if existing is None:
+            return None
+        if existing.engagement_sha256 != digest:
+            return Refusal("request_conflict", {"session_id": existing.session_id})
+        cached = self._tokens.get(existing.session_id)
+        if cached is None or existing.state != LIVE:
+            return Refusal("request_reused", {"session_id": existing.session_id,
+                                              "state": existing.state})
+        token, address = cached
+        return Grant(existing.session_id, token, address, existing.expires_at)
+
+    def _refused_rate(self, hotkey: str, now: int) -> Refusal | None:
+        recent = [t for t in self._refused_opens.get(hotkey, ()) if t > now - MINUTE]
+        if recent:
+            self._refused_opens[hotkey] = recent
+        else:
+            self._refused_opens.pop(hotkey, None)
+        limit = self._policy.max_refused_opens_per_minute
+        if len(recent) < limit:
+            return None
+        return Refusal("open_refused_rate", {"refused": len(recent), "max": limit},
+                       retry_after=recent[len(recent) - limit] + MINUTE - now)
+
     async def open(self, *, hotkey: str, request_id: str,
                    engagement: Mapping[str, Any]) -> Grant | Refusal:
+        """The ban check, the ledger read and the task resolution run BEFORE the issuer
+        lock (an intake's claim never waits behind them); under it, the in-memory caps
+        and the prompt's free slots (against the reservations made meanwhile) are
+        re-checked, then the session is stored. Refused opens count toward a per-hotkey
+        rate (`max_refused_opens_per_minute`), checked before any read."""
         if not isinstance(engagement, Mapping):
             return Refusal("engagement_kind_unsupported", {"kind": None})
         try:
             digest = engagement_digest(engagement)
         except (TypeError, ValueError):
             return Refusal("engagement_kind_unsupported", {"why": "not JSON"})
+        now = int(self._clock())
+        resent = self._resent(hotkey, request_id, digest)
+        if resent is not None:
+            return resent
+        throttled = self._refused_rate(hotkey, now)
+        if throttled is not None:
+            return throttled
+        outcome = await self._open(hotkey, request_id, digest, engagement)
+        if isinstance(outcome, Refusal):
+            self._refused_opens.setdefault(hotkey, []).append(now)
+            return outcome
+        if isinstance(outcome, Grant):           # the same request, granted meanwhile
+            return outcome
+        logger.info("sandbox session %s issued to %s on %s for %s", outcome.grant.session_id,
+                    hotkey[:12], outcome.machine_id, outcome.engagement)
+        return outcome.grant
+
+    async def _open(self, hotkey: str, request_id: str, digest: str,
+                    engagement: Mapping[str, Any]):
+        now = int(self._clock())
+        refusal = self.book.open_refusal(hotkey, now)
+        if refusal is not None:
+            return refusal
+        if not self._fleet.directory_ready(now):
+            return self._directory_unavailable()
+        book = self._engagements.get(engagement.get("kind"))
+        if book is None:
+            return Refusal("engagement_kind_unsupported", {"kind": engagement.get("kind")})
+        terms = await book.terms(hotkey, engagement)            # reads: outside the lock
+        if isinstance(terms, Refusal):
+            return terms
         async with self._lock:
             now = int(self._clock())
-            existing = self.book.by_request(hotkey, request_id)
-            if existing is not None:
-                if existing.engagement_sha256 != digest:
-                    return Refusal("request_conflict", {"session_id": existing.session_id})
-                cached = self._tokens.get(existing.session_id)
-                if cached is None or existing.state != LIVE:
-                    return Refusal("request_reused", {"session_id": existing.session_id,
-                                                      "state": existing.state})
-                token, address = cached
-                return Grant(existing.session_id, token, address, existing.expires_at)
-            refusal = self.book.open_refusal(hotkey, now)
+            resent = self._resent(hotkey, request_id, digest)    # the same request, raced
+            if resent is not None:
+                return resent
+            refusal = (self.book.open_refusal(hotkey, now)
+                       or self.book.engagement_refusal(hotkey, terms.job_id,
+                                                       terms.prompt_index, now))
             if refusal is not None:
                 return refusal
-            if not self._fleet.directory_ready(now):
-                return self._directory_unavailable()
-            book = self._engagements.get(engagement.get("kind"))
-            if book is None:
-                return Refusal("engagement_kind_unsupported", {"kind": engagement.get("kind")})
-            terms = await book.terms(hotkey, engagement)
-            if isinstance(terms, Refusal):
-                return terms
-            refusal = self.book.engagement_refusal(hotkey, terms.job_id, terms.prompt_index, now)
-            if refusal is not None:
-                return refusal
+            if terms.slots_remaining is not None:
+                reserved = self.book.reserved(terms.job_id, terms.prompt_index, now)
+                if terms.slots_remaining - reserved <= 0:
+                    return Refusal("prompt_unavailable", {
+                        "prompt_index": terms.prompt_index,
+                        "slots_remaining": terms.slots_remaining, "reserved": reserved})
             validity = self._policy.open_window_s + int(terms.budgets["wall_s"])
             placement = self._fleet.pick(image=terms.image, env=terms.env,
                                          env_package=terms.env_package, budgets=terms.budgets,
@@ -590,9 +669,8 @@ class SessionIssuer:
             self.book.add(record)
             self._fleet.note_issued(placement.machine_id, now)
             self._tokens[session_id] = (token, placement.address)
-        logger.info("sandbox session %s issued to %s on %s for %s", session_id, hotkey[:12],
-                    placement.machine_id, terms.engagement)
-        return Grant(session_id, token, placement.address, claims.expires_at)
+        return _Issued(Grant(session_id, token, placement.address, claims.expires_at),
+                       placement.machine_id, terms.engagement)
 
     @staticmethod
     def _state_of(record: SessionRecord) -> dict:
@@ -660,9 +738,17 @@ class SessionIssuer:
         submission (its own clock). Only a `live` or `closed_graded` session of this
         hotkey, or a `lapsed` one received by its deadline (it lapsed during the check);
         received after the deadline is `session_expired`. `session_claimed` is retryable:
-        another submission of it is in flight. The claim ends with `submitted` or
+        another submission of it is in flight; so is `session_busy`, when the issuer lock
+        is not free within `claim_wait_s`. The claim ends with `submitted` or
         `release_claim`, or goes stale after `claim_ttl_s`."""
-        async with self._lock:
+        try:
+            await asyncio.wait_for(self._lock.acquire(), self._policy.claim_wait_s)
+        except TimeoutError:
+            logger.warning("sandbox session %s: claim waited %d s for the issuer lock; busy",
+                           session_id, self._policy.claim_wait_s)
+            return Refusal("session_busy", {"session_id": session_id},
+                           retry_after=self._policy.retry_after_s)
+        try:
             now = int(self._clock())
             record = self.book.get(session_id)
             if record is None or record.hotkey != hotkey:
@@ -680,6 +766,8 @@ class SessionIssuer:
             if not self.book.claim(session_id, now):
                 return Refusal("session_claimed", {"session_id": session_id},
                                retry_after=self._policy.retry_after_s)
+        finally:
+            self._lock.release()
         return None
 
     async def release_claim(self, session_id: str) -> None:
@@ -736,6 +824,9 @@ class SessionIssuer:
             for record in lapsed:
                 self._tokens.pop(record.session_id, None)
             self.book.prune(now)
+            for hotkey in [h for h, times in self._refused_opens.items()
+                           if not times or times[-1] <= now - MINUTE]:
+                del self._refused_opens[hotkey]
         for record in lapsed:
             await self._persist(record)
 

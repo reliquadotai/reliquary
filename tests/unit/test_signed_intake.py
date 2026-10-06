@@ -669,3 +669,17 @@ def test_the_deadline_is_read_when_the_route_received_the_submission(world, monk
     monkeypatch.setattr(world.intake, "check", slow_check)
     assert submit(world)["reason"] == "accepted"
     assert seen == [deadline]
+
+
+def test_a_claim_that_cannot_get_the_issuer_lock_is_retryable(world, monkeypatch):
+    """I2: a claim waits a bounded time for the issuer lock; then 503, nothing consumed."""
+    from reliquary.sandbox.sessions import Refusal
+
+    async def busy(session_id, *, hotkey, received=None):
+        return Refusal("session_busy", {"session_id": session_id}, retry_after=10)
+
+    monkeypatch.setattr(world.issuer, "claim", busy)
+    answer = post(world, request_for(world))
+    assert answer.status_code == 503 and answer.json()["detail"] == "sandbox_session_busy"
+    assert answer.headers["Retry-After"] == "10"
+    assert remaining(world) == JOB.slots_per_prompt

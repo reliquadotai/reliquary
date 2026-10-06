@@ -133,18 +133,19 @@ def test_draining_and_revoked_machines_get_no_session(tmp_path):
 
 
 def test_a_silent_machine_is_drained_once_and_comes_back(tmp_path):
+    # Another machine keeps answering: a lone silent machine is not our egress.
     drained = []
-    fleet, machine, served, clock = make(tmp_path, on_drained=drained.append)
-    served[ADDRESS] = capacity_report(machine, at=NOW)
+    fleet, beat, clock = _pair_beating(tmp_path, on_drained=drained.append)
+    beat("a", "b", at=NOW)
     asyncio.run(fleet.poll_once())
-    del served[ADDRESS]
     clock.now = NOW + 61
+    beat("a", at=NOW + 61)
     asyncio.run(fleet.poll_once())
     asyncio.run(fleet.poll_once())
-    assert drained == [MACHINE] and MACHINE in fleet.drained
-    served[ADDRESS] = capacity_report(machine, at=NOW + 61)
+    assert drained == ["m-b"] and "m-b" in fleet.drained
+    beat("a", "b", at=NOW + 61)
     asyncio.run(fleet.poll_once())
-    assert MACHINE not in fleet.drained
+    assert "m-b" not in fleet.drained
 
 
 def test_heartbeat_summaries_are_written_at_most_once_a_minute(tmp_path):
@@ -428,6 +429,10 @@ def test_a_directory_older_than_its_max_age_fails_closed_and_alerts(tmp_path, ca
 def test_a_stale_directory_drains_no_machine(tmp_path):
     drained = []
     fleet, machine, documents, served, clock = fleet_over(tmp_path, on_drained=drained.append)
+    # A second machine answers once R2 is back: a lone silent machine is not our egress.
+    companion = signer(tmp_path, "c", "kc")
+    documents.documents = documents.documents + [
+        machine_document(companion, machine_id="m-c", address="http://c:1")]
     asyncio.run(fleet.step())
     documents.failing = True
     for step in range(5, 400, 5):
@@ -435,8 +440,11 @@ def test_a_stale_directory_drains_no_machine(tmp_path):
         # heartbeats while the snapshot is usable, then silence once it is stale
         if step <= 120:
             served[ADDRESS] = capacity_report(machine, at=NOW + step)
+            served["http://c:1"] = capacity_report(companion, at=NOW + step, machine_id="m-c",
+                                                   address="http://c:1")
         else:
             served.pop(ADDRESS, None)
+            served.pop("http://c:1", None)
         asyncio.run(fleet.step())
     assert not fleet.directory_ready()
     assert drained == [] and fleet.drained == set()
@@ -444,9 +452,13 @@ def test_a_stale_directory_drains_no_machine(tmp_path):
     documents.failing = False
     clock.now = NOW + 400
     asyncio.run(fleet.refresh_directory())   # the recovery read (backoff timing aside)
+    served["http://c:1"] = capacity_report(companion, at=NOW + 400, machine_id="m-c",
+                                           address="http://c:1")
     asyncio.run(fleet.poll_once())
     assert drained == []
     clock.now = NOW + 461
+    served["http://c:1"] = capacity_report(companion, at=NOW + 461, machine_id="m-c",
+                                           address="http://c:1")
     asyncio.run(fleet.step())
     assert drained == [MACHINE]
 
@@ -532,8 +544,16 @@ def test_a_hanging_read_does_not_stop_polls_or_drain_checks(tmp_path, monkeypatc
             await asyncio.sleep(3600)
         return await real_read()
 
+    # A second machine answers: a lone silent machine is not our egress.
+    companion = signer(tmp_path, "c", "kc")
+    documents.documents = documents.documents + [
+        machine_document(companion, machine_id="m-c", address="http://c:1")]
+
     async def fetch(address):             # the machine is silent; each poll is 10 s of clock
         fetches.append(address)
+        if address == "http://c:1":
+            return capacity_report(companion, at=clock.now, machine_id="m-c",
+                                   address="http://c:1")
         clock.now += 10
         return None
 
@@ -683,3 +703,85 @@ def test_one_call_answers_the_snapshot_only_while_it_is_fresh(tmp_path):
     documents.failing = True
     assert fleet.directory_if_ready(NOW + 120) is snapshot
     assert fleet.directory_if_ready(NOW + 121) is None
+
+
+# --- final review I3 (b): our own egress down is not every machine down; M3 ---
+
+
+def _pair_beating(tmp_path, **kw):
+    one, two = signer(tmp_path, "a", "ka"), signer(tmp_path, "b", "kb")
+    documents = [machine_document(one, machine_id="m-a", address="http://a:1"),
+                 machine_document(two, machine_id="m-b", address="http://b:1")]
+    fleet, _, served, clock = make(tmp_path, documents=documents, **kw)
+
+    def beat(*which, at):
+        served.clear()
+        for name, key in (("a", one), ("b", two)):
+            if name in which:
+                served[f"http://{name}:1"] = capacity_report(
+                    key, at=at, machine_id=f"m-{name}", address=f"http://{name}:1")
+
+    return fleet, beat, clock
+
+
+def test_when_every_machine_goes_silent_at_once_none_is_drained(tmp_path, caplog):
+    caplog.set_level("ERROR", logger=fleet_module.logger.name)
+    fleet_module.logger.setLevel("DEBUG")
+    drained = []
+    fleet, beat, clock = _pair_beating(tmp_path, on_drained=drained.append)
+    beat("a", "b", at=NOW)
+    asyncio.run(fleet.poll_once())
+    beat(at=NOW)                                 # our egress is down: nobody answers
+    for step in (61, 90, 110):
+        clock.now = NOW + step
+        asyncio.run(fleet.poll_once())
+    assert drained == [] and fleet.drained == set()
+    assert caplog.text.count("ALERT") == 1 and "egress" in caplog.text
+    # Egress back, one machine answers: silence counts from the recovery.
+    clock.now = NOW + 115
+    asyncio.run(fleet.refresh_directory())
+    beat("a", at=NOW + 115)
+    asyncio.run(fleet.poll_once())
+    assert drained == []
+    clock.now = NOW + 170
+    beat("a", at=NOW + 170)
+    asyncio.run(fleet.poll_once())
+    assert drained == []                     # 55 s since the recovery, not 170
+    clock.now = NOW + 176
+    beat("a", at=NOW + 176)
+    asyncio.run(fleet.poll_once())
+    assert drained == ["m-b"]
+
+
+def test_one_silent_machine_among_answering_ones_is_drained(tmp_path):
+    drained = []
+    fleet, beat, clock = _pair_beating(tmp_path, on_drained=drained.append)
+    beat("a", "b", at=NOW)
+    asyncio.run(fleet.poll_once())
+    clock.now = NOW + 61
+    beat("a", at=NOW + 61)
+    asyncio.run(fleet.poll_once())
+    assert drained == ["m-b"]
+
+
+def test_a_hanging_heartbeat_summary_write_does_not_stall_the_poll(tmp_path, monkeypatch, caplog):
+    import time
+
+    monkeypatch.setattr(fleet_module, "HEARTBEAT_RECORD_TIMEOUT_S", 0.2)
+    caplog.set_level("WARNING", logger=fleet_module.logger.name)
+    fleet_module.logger.setLevel("DEBUG")
+
+    async def record(machine_id, *, at, summary):
+        await asyncio.sleep(3600)
+
+    fleet, machine, served, clock = make(tmp_path, record_heartbeat=record)
+    served[ADDRESS] = capacity_report(machine, at=NOW)
+    started = time.monotonic()
+    asyncio.run(fleet.poll_once())
+    assert time.monotonic() - started < 2
+    assert fleet.pick(now=NOW, **PICK) is not None
+    assert "not written" in caplog.text
+
+
+def test_the_heartbeat_summary_write_is_bounded_by_default():
+    assert fleet_module.HEARTBEAT_RECORD_TIMEOUT_S == 5.0

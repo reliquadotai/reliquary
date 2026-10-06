@@ -480,3 +480,25 @@ def test_a_failed_job_can_be_forgotten(tmp_path):
     services = _wired(tmp_path, None)
     services.forget(JOB.job_id)
     assert JOB.job_id not in services.jobs and _terms(services).reason == "job_not_served"
+
+
+def test_the_pre_auth_close_limit_is_a_setting_passed_to_the_route(tmp_path, monkeypatch):
+    from reliquary.sandbox import routes
+
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1"}
+    assert SandboxValidatorConfig.from_env(keys).close_preauth_concurrency == 8
+    assert SandboxValidatorConfig.from_env(
+        {**keys, "RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY": "3"}).close_preauth_concurrency == 3
+    with pytest.raises(ValueError):
+        SandboxValidatorConfig.from_env({**keys, "RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY": "0"})
+    built = {}
+    real = routes.build_sandbox_sessions_router
+
+    def spy(*args, **kw):
+        built.update(kw)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(routes, "build_sandbox_sessions_router", spy)
+    _services(tmp_path, close_preauth_concurrency=3)
+    assert built["max_preauth_closes"] == 3

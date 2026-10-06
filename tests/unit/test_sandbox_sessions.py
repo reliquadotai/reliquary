@@ -999,3 +999,176 @@ def test_a_withdraw_is_signed_apart_from_a_final():
     kw = {"validator_hotkey": "5Val", "path": "/corpus/sandbox/sessions/s-0/close"}
     assert build_sandbox_close_binding({**body, "reason": "withdraw"}, **kw) != \
         build_sandbox_close_binding({**body, "reason": "final"}, **kw)
+
+
+# -- final review: I1 (store errors are retryable), I2 (no slow I/O under the lock) ----
+
+def _with_view(env, *, slots=None, resolve=None, banned=None):
+    async def default_resolve(index):
+        return ResolvedTask(IMAGE, {})
+
+    async def default_slots(index):
+        return env.left["n"]
+
+    view = SignedJobView(job=JOB, resolve_task=resolve or default_resolve,
+                         slots_remaining=slots or default_slots, is_banned=banned)
+    env.issuer._engagements["corpus"] = CorpusEngagements({JOB.job_id: view}.get, env.book,
+                                                          env.clock)
+
+
+@pytest.mark.parametrize("error", [
+    lambda: __import__("fastapi").HTTPException(503, "corpus_store_unavailable"),
+    lambda: OSError("bucket down"),
+    lambda: RuntimeError("anything the store raises"),
+])
+@pytest.mark.parametrize("where", ["slots", "banned"])
+def test_a_store_error_during_an_open_is_a_retryable_ledger_refusal(tmp_path, error, where):
+    """I1: never a bare 500 (which the miner counts toward stopping the hotkey)."""
+    env = build(tmp_path)
+
+    async def failing(_):
+        raise error()
+
+    _with_view(env, **{where: failing})
+    refused = open_(env)
+    assert refused.reason == "ledger_unavailable"
+    assert refused.retry_after == env.issuer.policy.retry_after_s
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 0
+
+
+def test_a_task_that_cannot_be_resolved_is_a_retryable_refusal(tmp_path):
+    env = build(tmp_path)
+
+    async def failing(index):
+        raise OSError("registry unreachable")
+
+    _with_view(env, resolve=failing)
+    refused = open_(env)
+    assert (refused.reason, refused.retry_after) == ("task_unavailable", 10)
+
+
+def test_a_claim_is_not_delayed_by_a_slow_open(tmp_path):
+    """I2: the ledger read, the ban check and the task resolution run before the issuer
+    lock, so an intake's claim never waits behind them."""
+    import time as _time
+
+    env = build(tmp_path)
+    first = open_(env, hotkey="5Other", request_id="b" * 32)
+
+    async def slow_slots(index):
+        await asyncio.sleep(2.0)
+        return 2
+
+    _with_view(env, slots=slow_slots)
+
+    async def go():
+        opening = asyncio.create_task(env.issuer.open(hotkey="5Hot", request_id="c" * 32,
+                                                      engagement=CORPUS))
+        await asyncio.sleep(0.1)
+        started = _time.monotonic()
+        refused = await env.issuer.claim(first.session_id, hotkey="5Other", received=NOW)
+        waited = _time.monotonic() - started
+        return refused, waited, await opening
+
+    refused, waited, granted = asyncio.run(go())
+    assert refused is None and waited < 0.5
+    assert isinstance(granted, Grant)
+
+
+def test_a_claim_waits_a_bounded_time_for_the_lock_then_is_busy(tmp_path):
+    env = build(tmp_path, policy=SandboxPolicy(claim_wait_s=1))
+    grant = open_(env)
+
+    async def go():
+        await env.issuer._lock.acquire()          # a store write that hangs under the lock
+        try:
+            return await env.issuer.claim(grant.session_id, hotkey="5Hot", received=NOW)
+        finally:
+            env.issuer._lock.release()
+
+    refused = asyncio.run(go())
+    assert refused.reason == "session_busy" and refused.retry_after == 10
+    assert not env.book.is_claimed(grant.session_id)
+    assert asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot", received=NOW)) is None
+
+
+def test_the_claim_wait_is_a_setting():
+    assert SandboxPolicy().claim_wait_s == 5
+    assert SandboxPolicy.from_env({"RELIQUARY_SANDBOX_CLAIM_WAIT_S": "2"}).claim_wait_s == 2
+
+
+def test_concurrent_opens_never_overbook_a_prompt(tmp_path):
+    """The free slots read before the lock are re-checked under it against the
+    reservations made meanwhile."""
+    env = build(tmp_path, remaining=1)
+
+    async def slow_slots(index):
+        await asyncio.sleep(0.2)
+        return env.left["n"]
+
+    _with_view(env, slots=slow_slots)
+
+    async def go():
+        return await asyncio.gather(*(
+            env.issuer.open(hotkey=hotkey, request_id=hotkey[-1] * 32, engagement=CORPUS)
+            for hotkey in ("5HotA", "5HotB", "5HotC")))
+
+    outcomes = asyncio.run(go())
+    assert sum(isinstance(o, Grant) for o in outcomes) == 1
+    assert sorted(o.reason for o in outcomes if not isinstance(o, Grant)) == \
+        ["prompt_unavailable"] * 2
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 1
+
+
+def test_a_request_resent_while_its_first_send_is_in_flight_gets_the_same_token(tmp_path):
+    env = build(tmp_path, remaining=5)
+
+    async def slow_slots(index):
+        await asyncio.sleep(0.2)
+        return env.left["n"]
+
+    _with_view(env, slots=slow_slots)
+
+    async def go():
+        return await asyncio.gather(*(env.issuer.open(hotkey="5Hot", request_id="a" * 32,
+                                                      engagement=CORPUS) for _ in range(2)))
+
+    first, again = asyncio.run(go())
+    assert isinstance(first, Grant) and again == first
+    assert len(env.fleet.issued) == 1 and len(env.store.documents) == 1
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 1
+
+
+def test_refused_opens_are_rate_limited_per_hotkey_before_any_ledger_read(tmp_path):
+    env = build(tmp_path, policy=SandboxPolicy(max_refused_opens_per_minute=3), remaining=0)
+    reads = []
+
+    async def counted(index):
+        reads.append(index)
+        return env.left["n"]
+
+    _with_view(env, slots=counted)
+    for n in range(3):
+        assert open_(env, request_id=f"{n}" * 32).reason == "prompt_unavailable"
+    refused = open_(env, request_id="9" * 32)
+    assert refused.reason == "open_refused_rate" and refused.retry_after == 60
+    assert len(reads) == 3
+    assert open_(env, hotkey="5Other", request_id="8" * 32).reason == "prompt_unavailable"
+    env.clock.now = NOW + 61                       # the window passed
+    env.left["n"] = 2
+    assert isinstance(open_(env, request_id="7" * 32), Grant)
+
+
+def test_the_refused_open_rate_is_a_setting():
+    assert SandboxPolicy().max_refused_opens_per_minute == 60
+    assert SandboxPolicy.from_env({"RELIQUARY_SANDBOX_MAX_REFUSED_OPENS_PER_MINUTE": "7"}) \
+        .max_refused_opens_per_minute == 7
+
+
+def test_maintenance_forgets_refused_opens_past_the_minute(tmp_path):
+    env = build(tmp_path, remaining=0)
+    assert open_(env).reason == "prompt_unavailable"
+    assert "5Hot" in env.issuer._refused_opens
+    env.clock.now = NOW + 61
+    asyncio.run(env.issuer.maintain())
+    assert env.issuer._refused_opens == {}
