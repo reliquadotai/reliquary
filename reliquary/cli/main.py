@@ -2068,10 +2068,20 @@ app.add_typer(sandbox_app, name="sandbox")
 def _sandbox_store_call(coroutine):
     from reliquary.infrastructure.sandbox_store import MachineConflict
 
+    from botocore.exceptions import BotoCoreError, ClientError
+
     try:
         return asyncio.run(coroutine)
     except (ValueError, MachineConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except ClientError as exc:
+        # The error code only: a storage message may echo request details.
+        code = exc.response.get("Error", {}).get("Code", "?")
+        typer.echo(f"error: R2 refused the request ({code})", err=True)
+        raise typer.Exit(code=1) from exc
+    except BotoCoreError as exc:                # credentials, endpoint, connection
+        typer.echo(f"error: R2 is unreachable ({type(exc).__name__})", err=True)
         raise typer.Exit(code=1) from exc
 
 
@@ -2121,11 +2131,22 @@ def sandbox_machine_end_key(
     key_id: str = typer.Option(..., "--key-id"),
     valid_until: int = typer.Option(..., "--valid-until", help=(
         "unix seconds. Rotation: when the new key starts. COMPROMISE: the earliest time "
-        "the compromise is suspected, even in the past")),
+        "the compromise is suspected, even in the past, with --compromise")),
+    compromise: bool = typer.Option(False, "--compromise", help=(
+        "The key is compromised: end it at --valid-until minus the verifier's clock skew "
+        "(CLOCK_SKEW_S, 30 s), since an open may precede its token by that much")),
 ) -> None:
-    """End a key's validity; an end only ever moves earlier."""
+    """End a key's validity; an end only ever moves earlier. On compromise, pass the
+    suspected compromise time with --compromise: the end becomes that time minus
+    CLOCK_SKEW_S, so no forged open stamped up to the skew before it verifies."""
     from reliquary.infrastructure import sandbox_store
 
+    if compromise:
+        try:
+            valid_until = sandbox_store.compromise_valid_until(valid_until)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
     _echo_machine(_sandbox_store_call(sandbox_store.end_machine_key(
         machine_id, key_id=key_id, valid_until=valid_until)))
 

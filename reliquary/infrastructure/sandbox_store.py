@@ -3,12 +3,23 @@
 Machines: `reliquary/sandbox/machines/{machine_id}.json`, the directory the validator
 places sessions on and verifies signatures with. The admin registers machines and
 adds, ends or revokes keys; the validator writes heartbeat summaries. Every change is
-a read-modify-write under the object's ETag (the executor registry's pattern), so a
-summary never undoes an ended key or a status written between its read and its write.
-A key's end only moves earlier: on compromise it is set to the earliest time the
-compromise is suspected, possibly in the past (transcripts opened after it then fail
-`unknown_key`). Revoking a machine stops new sessions; its keys stay valid for the
-transcripts already signed in their windows.
+a read-modify-write under the object's ETag (the executor registry's pattern), with
+bounded, jittered retries, so a summary never undoes an ended key or a status written
+between its read and its write.
+
+Keys. A key's end only moves earlier, and is never reopened. On compromise it is set to
+the suspected compromise time minus `CLOCK_SKEW_S` (`compromise_valid_until`, the
+`end-key --compromise` flag): the verifier accepts an open up to `CLOCK_SKEW_S` before
+its token's issuance, so an end at the compromise time itself would still admit a
+forged open stamped just before it. Transcripts opened after the end fail
+`unknown_key`; rotation (an end at the new key's start) never voids honest work. A
+public key is used once: never under a second key id (a compromised key cannot come
+back renamed) and never by a second machine.
+
+Status. `active`, `draining`, `revoked`: status decides placement only, keys decide
+signatures. Revoking a machine stops new sessions while its keys keep verifying the
+transcripts already signed in their windows; going from revoked back to active is
+therefore allowed. Machine documents are never deleted: past transcripts need their keys.
 
 The CAS helpers below are the same as `corpus_executor_store`'s.
 """
@@ -19,28 +30,38 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import os
+import random
 import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from reliquary.infrastructure.storage import get_s3_client
 
+logger = logging.getLogger(__name__)
+
 MACHINE_SCHEMA = "reliquary/sandbox-machine/v1"
 MACHINE_PREFIX = "reliquary/sandbox/machines/"
 MACHINE_STATUSES = frozenset({"active", "draining", "revoked"})
 WRITE_ATTEMPTS = 5
+RETRY_BASE_S = 0.05
 READ_CONCURRENCY = 16
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_ADDRESS_RE = re.compile(r"^https?://[A-Za-z0-9.\-\[\]:]+$")
+# scheme://host[:port]: a DNS name or IPv4 address, or a bracketed IPv6 literal; no
+# path, no trailing slash, no empty host or port.
+_ADDRESS_RE = re.compile(
+    r"^https?://(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\[[0-9A-Fa-f:.]{2,45}\])"
+    r"(?::(?P<port>[0-9]{1,5}))?$")
 _ABSENT = {"NoSuchKey", "404", "NotFound"}
 _CONFLICT = {"PreconditionFailed", "412", "ConditionalRequestConflict"}
+_sleep = asyncio.sleep
 
 
 class MachineConflict(RuntimeError):
-    """A machine registered differently, a key id reused, an end moved later, or a
-    write that kept losing its race."""
+    """A machine registered differently, a key id or public key reused, an end moved
+    later, or a write that kept losing its race."""
 
 
 def _bucket(client_kwargs: dict[str, Any]) -> str:
@@ -51,7 +72,9 @@ def _code(exc) -> str:
     return exc.response.get("Error", {}).get("Code", "")
 
 
-async def _get(key: str, **client_kwargs) -> tuple[dict | None, str | None]:
+async def _get(key: str, **client_kwargs) -> tuple[Any, str | None]:
+    """The decoded JSON at `key` (any JSON value) and its ETag; (None, None) when absent.
+    Raises ValueError when the object is not JSON."""
     from botocore.exceptions import ClientError
 
     bucket = _bucket(client_kwargs)
@@ -82,6 +105,11 @@ async def _put(key: str, document: Mapping, etag: str | None, **client_kwargs) -
     return True
 
 
+async def _backoff(attempt: int) -> None:
+    """Full jitter: concurrent losers spread out instead of colliding again."""
+    await _sleep(random.uniform(0.0, RETRY_BASE_S * 2 ** attempt))
+
+
 async def _list_keys(prefix: str, **client_kwargs) -> list[str]:
     bucket = _bucket(dict(client_kwargs))
     keys: list[str] = []
@@ -93,15 +121,21 @@ async def _list_keys(prefix: str, **client_kwargs) -> list[str]:
     return [key for key in keys if key.endswith(".json")]
 
 
-async def _read_all(keys, **client_kwargs) -> list[dict]:
+async def _read_all(keys, **client_kwargs) -> list[tuple[str, Any]]:
+    """(key, decoded JSON) for every key that still exists. An object that is not JSON
+    is logged and left out: one bad object never hides the others."""
     gate = asyncio.Semaphore(READ_CONCURRENCY)
 
     async def one(key: str):
         async with gate:
-            document, _ = await _get(key, **dict(client_kwargs))
-            return document
+            try:
+                document, etag = await _get(key, **dict(client_kwargs))
+            except ValueError:                       # JSONDecodeError, UnicodeDecodeError
+                logger.error("sandbox object %s is not JSON; skipped", key)
+                return key, None, False
+            return key, document, etag is not None   # a JSON null still exists
 
-    return [d for d in await asyncio.gather(*(one(k) for k in keys)) if d is not None]
+    return [(k, d) for k, d, exists in await asyncio.gather(*(one(k) for k in keys)) if exists]
 
 
 def validated_machine_id(machine_id: Any) -> str:
@@ -110,11 +144,14 @@ def validated_machine_id(machine_id: Any) -> str:
     return machine_id
 
 
-def _key(machine_id: str) -> str:
-    return f"{MACHINE_PREFIX}{validated_machine_id(machine_id)}.json"
+def validated_address(address: Any) -> str:
+    match = _ADDRESS_RE.fullmatch(address) if isinstance(address, str) else None
+    if match is None or (match["port"] is not None and not 0 < int(match["port"]) < 65536):
+        raise ValueError("address must be scheme://host[:port], with no path or trailing slash")
+    return address
 
 
-def _check_public_key(text: Any) -> str:
+def validated_public_key(text: Any) -> str:
     try:
         raw = base64.b64decode(text.encode("ascii"), validate=True)
     except (AttributeError, binascii.Error, UnicodeEncodeError) as exc:
@@ -124,22 +161,53 @@ def _check_public_key(text: Any) -> str:
     return text
 
 
+def unix_seconds(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a unix time in whole seconds")
+    return value
+
+
+def _key(machine_id: str) -> str:
+    return f"{MACHINE_PREFIX}{validated_machine_id(machine_id)}.json"
+
+
 def _key_entry(key_id: Any, public_key_b64: Any, valid_from: Any) -> dict:
     validated_machine_id(key_id)                     # same alphabet as ids
-    if isinstance(valid_from, bool) or not isinstance(valid_from, int) or valid_from < 0:
-        raise ValueError("valid_from must be a unix time in whole seconds")
-    return {"key_id": key_id, "public_key_b64": _check_public_key(public_key_b64),
-            "valid_from": valid_from, "valid_until": None}
+    return {"key_id": key_id, "public_key_b64": validated_public_key(public_key_b64),
+            "valid_from": unix_seconds(valid_from, "valid_from"), "valid_until": None}
+
+
+def compromise_valid_until(suspected_at: int) -> int:
+    """The end to give a compromised key: the suspected compromise time minus the
+    verifier's `CLOCK_SKEW_S`, since an open may precede its token by that much."""
+    from reliquary_sandbox.attest import CLOCK_SKEW_S
+
+    return max(0, unix_seconds(suspected_at, "the compromise time") - CLOCK_SKEW_S)
+
+
+async def _refuse_key_of_another_machine(machine_id: str, public_key_b64: str,
+                                         **client_kwargs) -> None:
+    """Refuse a public key another machine lists, ended or not. Admin-only and not
+    atomic across objects: two admins registering the same key on two machines at the
+    same instant could both pass. The directory has one operator."""
+    for other in await list_machines(**client_kwargs):
+        if other["machine_id"] == machine_id:
+            continue
+        if any(isinstance(k, Mapping) and k.get("public_key_b64") == public_key_b64
+               for k in other.get("keys") or ()):
+            raise MachineConflict(f"that public key is already used by machine "
+                                  f"{other['machine_id']!r}")
 
 
 async def register_machine(*, machine_id: str, address: str, provider: str, capacity: int,
                            key_id: str, public_key_b64: str, valid_from: int, now: float,
                            **client_kwargs) -> tuple[dict, bool]:
     """Create-only. The same registration again returns the stored one; the same id
-    with another address, provider or first key is a conflict."""
+    with another address, provider or first key is a conflict, and so is a public key
+    another machine already lists (checked by listing: admin-only, not atomic across
+    objects, see `_refuse_key_of_another_machine`)."""
     key = _key(machine_id)
-    if not isinstance(address, str) or not _ADDRESS_RE.fullmatch(address):
-        raise ValueError("address must be scheme://host[:port], with no path or trailing slash")
+    validated_address(address)
     if not isinstance(provider, str) or not provider.strip() or len(provider) > 64:
         raise ValueError("provider must be a non-empty name")
     if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
@@ -148,14 +216,18 @@ async def register_machine(*, machine_id: str, address: str, provider: str, capa
                 "provider": provider.strip().lower(), "capacity": capacity, "status": "active",
                 "keys": [_key_entry(key_id, public_key_b64, valid_from)],
                 "registered_at": float(now), "last_heartbeat": None}
-    for _ in range(WRITE_ATTEMPTS):
+    await _refuse_key_of_another_machine(machine_id, public_key_b64, **client_kwargs)
+    for attempt in range(WRITE_ATTEMPTS):
+        if attempt:
+            await _backoff(attempt)
         if await _put(key, document, None, **dict(client_kwargs)):
             return document, True
         stored, _ = await _get(key, **dict(client_kwargs))
         if stored is None:
             continue
-        same = (all(stored.get(f) == document[f] for f in ("address", "provider", "capacity"))
-                and stored.get("keys", [None])[0] == document["keys"][0])
+        same = (isinstance(stored, Mapping)
+                and all(stored.get(f) == document[f] for f in ("address", "provider", "capacity"))
+                and (stored.get("keys") or [None])[0] == document["keys"][0])
         if not same:
             raise MachineConflict(f"machine {machine_id!r} is already registered differently")
         return stored, False
@@ -164,10 +236,14 @@ async def register_machine(*, machine_id: str, address: str, provider: str, capa
 
 async def _update(machine_id: str, change: Callable[[dict], dict], **client_kwargs) -> dict | None:
     key = _key(machine_id)
-    for _ in range(WRITE_ATTEMPTS):
+    for attempt in range(WRITE_ATTEMPTS):
+        if attempt:
+            await _backoff(attempt)
         stored, etag = await _get(key, **dict(client_kwargs))
         if stored is None:
             return None
+        if not isinstance(stored, Mapping):
+            raise ValueError(f"machine {machine_id!r}: the stored object is not a document")
         updated = change(json.loads(json.dumps(stored)))
         if await _put(key, updated, etag, **dict(client_kwargs)):
             return updated
@@ -176,11 +252,18 @@ async def _update(machine_id: str, change: Callable[[dict], dict], **client_kwar
 
 async def add_machine_key(machine_id: str, *, key_id: str, public_key_b64: str, valid_from: int,
                           **client_kwargs) -> dict | None:
+    """Add a key. Its id and its public key must be new to this machine (ended keys
+    included), and the public key must not be listed by any other machine (checked by
+    listing: admin-only, not atomic across objects)."""
     entry = _key_entry(key_id, public_key_b64, valid_from)
+    await _refuse_key_of_another_machine(machine_id, public_key_b64, **client_kwargs)
 
     def change(document: dict) -> dict:
         if any(k["key_id"] == key_id for k in document["keys"]):
             raise MachineConflict(f"key id {key_id!r} is already used by {machine_id!r}")
+        if any(k["public_key_b64"] == public_key_b64 for k in document["keys"]):
+            raise MachineConflict(f"that public key is already listed by {machine_id!r}, "
+                                  "ended or not: a key is never reused")
         document["keys"].append(entry)
         return document
 
@@ -190,10 +273,9 @@ async def add_machine_key(machine_id: str, *, key_id: str, public_key_b64: str, 
 async def end_machine_key(machine_id: str, *, key_id: str, valid_until: int,
                           **client_kwargs) -> dict | None:
     """End a key at `valid_until` (unix seconds). Rotation: when the new key starts.
-    Compromise: the earliest time the compromise is suspected, past times included.
-    An end only ever moves earlier."""
-    if isinstance(valid_until, bool) or not isinstance(valid_until, int) or valid_until < 0:
-        raise ValueError("valid_until must be a unix time in whole seconds")
+    Compromise: `compromise_valid_until(suspected time)`, i.e. the suspected time minus
+    `CLOCK_SKEW_S`, past times included. An end only ever moves earlier."""
+    unix_seconds(valid_until, "valid_until")
 
     def change(document: dict) -> dict:
         for entry in document["keys"]:
@@ -210,6 +292,8 @@ async def end_machine_key(machine_id: str, *, key_id: str, valid_until: int,
 
 async def set_machine_status(machine_id: str, status: str, *, reason: str | None = None,
                              **client_kwargs) -> dict | None:
+    """Any status to any status, revoked to active included: status decides placement,
+    keys decide signatures."""
     if status not in MACHINE_STATUSES:
         raise ValueError(f"status must be one of {sorted(MACHINE_STATUSES)}")
 
@@ -238,4 +322,17 @@ async def read_machine(machine_id: str, **client_kwargs) -> dict | None:
 
 
 async def list_machines(**client_kwargs) -> list[dict]:
-    return await _read_all(await _list_keys(MACHINE_PREFIX, **client_kwargs), **client_kwargs)
+    """Every machine document filed under its own id. An object that is not a JSON
+    object, or whose `machine_id` is not the one its key names, is logged and left out."""
+    found = []
+    for key, document in await _read_all(await _list_keys(MACHINE_PREFIX, **client_kwargs),
+                                          **client_kwargs):
+        filed_as = key[len(MACHINE_PREFIX):-len(".json")]
+        if not isinstance(document, Mapping):
+            logger.error("sandbox object %s is not a machine document; skipped", key)
+        elif document.get("machine_id") != filed_as:
+            logger.error("sandbox object %s names machine %r, not %r; skipped",
+                         key, str(document.get("machine_id")), filed_as)
+        else:
+            found.append(dict(document))
+    return found
