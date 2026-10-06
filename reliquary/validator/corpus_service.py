@@ -1295,7 +1295,10 @@ def worst_case_body(job: JobSpec) -> int:
     completions at about 24 JSON bytes a token, plus the rendered prompt and
     slack; an episode job's trajectory is bounded by the minimum."""
     if job.episode is not None:
-        return MIN_SUBMIT_BODY_BYTES
+        from reliquary.corpus.job import is_signed_sandbox
+        from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
+
+        return MIN_SUBMIT_BODY_BYTES + (MAX_TRANSCRIPT_BYTES if is_signed_sandbox(job) else 0)
     sampling = job.sampling
     return max(MIN_SUBMIT_BODY_BYTES,
                sampling.n * sampling.max_new_tokens * 24 + MAX_RENDERED_PROMPT_CHARS + 64 * 1024)
@@ -1429,6 +1432,8 @@ def build_corpus_router(
         submission_id = corpus_submission_id(request)
         if episode_facts is not None:
             trajectory = request.trajectory.model_dump()
+            if trajectory.get("transcript") is None:
+                trajectory.pop("transcript", None)      # replay records stay as they were
             # The prompt the audit prefills is the validator's own render,
             # never the miner's.
             trajectory["prompt_tokens"] = list(episode_facts.prompt_ids)

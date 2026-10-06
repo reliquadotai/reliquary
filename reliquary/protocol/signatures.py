@@ -488,6 +488,14 @@ CORPUS_DOMAIN = b"reliquary/corpus-submission/v1"
 # A trajectory is signed under its own domain, so its binding can never be
 # replayed as a single-turn submission's (or the other way round).
 CORPUS_TRAJECTORY_DOMAIN = b"reliquary/corpus-trajectory/v1"
+# A trajectory that carries a sandbox transcript: its own domain, plus the transcript's
+# digest as one more part. A trajectory without one binds exactly as before.
+CORPUS_SIGNED_TRAJECTORY_DOMAIN = b"reliquary/corpus-trajectory-signed/v1"
+
+
+def transcript_digest(transcript) -> bytes:
+    return hashlib.sha256(json.dumps(transcript, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, allow_nan=False).encode("utf-8")).digest()
 
 
 def _trajectory_parts(trajectory) -> list[bytes]:
@@ -536,8 +544,11 @@ def build_corpus_binding(request) -> bytes:
     ]
     trajectory = body.get("trajectory")
     if trajectory is not None:
-        domain = CORPUS_TRAJECTORY_DOMAIN
+        transcript = trajectory.get("transcript")
+        domain = CORPUS_TRAJECTORY_DOMAIN if transcript is None else CORPUS_SIGNED_TRAJECTORY_DOMAIN
         parts += _trajectory_parts(trajectory)
+        if transcript is not None:
+            parts.append(transcript_digest(transcript))
     else:
         domain = CORPUS_DOMAIN
         for completion in body["completions"]:

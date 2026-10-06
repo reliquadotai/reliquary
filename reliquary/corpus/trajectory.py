@@ -33,12 +33,16 @@ class BuiltTrajectory:
     proofs: tuple[tuple[str, ...], ...]
     final_diff: str
     stop: str
+    transcript: dict | None = None
 
     def wire(self) -> dict:
-        return {"tokens": list(self.tokens),
-                "turns": [{"start": start, "end": end, "proofs": list(proofs)}
-                          for (start, end), proofs in zip(self.spans, self.proofs)],
-                "final_diff": self.final_diff, "stop": self.stop}
+        out = {"tokens": list(self.tokens),
+               "turns": [{"start": start, "end": end, "proofs": list(proofs)}
+                         for (start, end), proofs in zip(self.spans, self.proofs)],
+               "final_diff": self.final_diff, "stop": self.stop}
+        if self.transcript is not None:
+            out["transcript"] = self.transcript
+        return out
 
 
 class TrajectoryUnbuildable(ValueError):

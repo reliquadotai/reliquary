@@ -6,6 +6,7 @@ Named ``corpus`` rather than ``batch``: ``BatchSubmissionRequest`` in
 
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Any, Literal
 
@@ -40,6 +41,11 @@ MAX_TRAJECTORY_TURNS = 64
 MAX_FINAL_DIFF_CHARS = 1_048_576
 # The binding writes token ids as 4 bytes.
 MAX_TOKEN_ID = 2**32 - 1
+
+# A signed-sandbox trajectory's transcript (records 0 to final, signed by our machine).
+# Observations shown to the model are in the tokens already (<= 60k), so an honest
+# transcript stays far below this; the last turn's unanswered outputs are the rest.
+MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
 
 
 class CorpusRejectReason(str, Enum):
@@ -103,6 +109,15 @@ class CorpusRejectReason(str, Enum):
     BAD_STOP = "bad_stop"
     BAD_PROOF_SHAPE = "bad_proof_shape"
     PROOF_FAIL = "proof_fail"
+    # Signed-sandbox trajectories (plan 3, reliquary.corpus.signed_reasons): a
+    # transcript that does not verify or bind to this submission, one that arrived
+    # after its session's deadline, a session already paid, calls or state that are
+    # not the signed ones.
+    SANDBOX_TRANSCRIPT_INVALID = "sandbox_transcript_invalid"
+    SANDBOX_SESSION_EXPIRED = "sandbox_session_expired"
+    SANDBOX_SESSION_REUSED = "sandbox_session_reused"
+    SANDBOX_CALL_MISMATCH = "sandbox_call_mismatch"
+    SANDBOX_STATE_MISMATCH = "sandbox_state_mismatch"
 
 
 class CorpusCompletion(BaseModel):
@@ -169,6 +184,23 @@ class CorpusTrajectory(BaseModel):
     # unpaid, and `corpus.signed_parse` refuses it with a graded final anyway. Kept
     # out of the wire as defense in depth.
     stop: Literal["agent_completed", "max_turns", "context_length"]
+    # Signed-sandbox jobs only: the gateway's transcript `{"token", "records"}`.
+    transcript: dict[str, Any] | None = None
+
+    @field_validator("transcript")
+    @classmethod
+    def _transcript_is_bounded(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return value
+        if set(value) != {"token", "records"} or not isinstance(value["records"], list):
+            raise ValueError("the transcript is not {\"token\", \"records\": [...]}")
+        # allow_nan=False: a NaN or infinity is not JSON, and the signed binding
+        # (`transcript_digest`) refuses it too, so it is a malformed body, not a crash.
+        size = len(json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                              allow_nan=False).encode("utf-8"))
+        if size > MAX_TRANSCRIPT_BYTES:
+            raise ValueError(f"the transcript is {size} bytes, over {MAX_TRANSCRIPT_BYTES}")
+        return value
 
     @field_validator("tokens")
     @classmethod
