@@ -1444,8 +1444,13 @@ def build_corpus_router(
         submission_id = corpus_submission_id(request)
         if episode_facts is not None:
             trajectory = request.trajectory.model_dump()
-            if trajectory.get("transcript") is None:
+            transcript = trajectory.get("transcript")
+            if transcript is None:
                 trajectory.pop("transcript", None)      # replay records stay as they were
+            elif isinstance(transcript.get("token"), dict):
+                # The token's signature is a bearer secret, never written to R2; the
+                # grader and the export read its claims only.
+                transcript["token"].pop("signature", None)
             # The prompt the audit prefills is the validator's own render,
             # never the miner's.
             trajectory["prompt_tokens"] = list(episode_facts.prompt_ids)
@@ -1548,6 +1553,10 @@ def build_corpus_router(
     async def submit_corpus(
         request: CorpusSubmissionRequest,
     ) -> CorpusSubmissionResponse:
+        # The intake's clock, read on arrival (a signed job's deadline is when the
+        # submission was received, not when its check ran).
+        intake_clock = getattr(episode_intake, "clock", None)
+        received = intake_clock() if intake_clock is not None else None
         # First, and before the store is touched at all: another job's work is
         # not this validator's to admit, record or eventually pay for.
         if request.job_id != job_id:
@@ -1600,8 +1609,11 @@ def build_corpus_router(
             if episode_intake is None:
                 logger.error("corpus job %s is an episode job but has no episode intake", job_id)
                 raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
-            # Every refusal here precedes any slot or cursor consumption.
-            outcome = await asyncio.to_thread(episode_intake.check, request)
+            # Every refusal here precedes any slot or cursor consumption. The
+            # signed intake's deadline is the time the submission arrived.
+            outcome = await (asyncio.to_thread(episode_intake.check, request, received=received)
+                             if received is not None
+                             else asyncio.to_thread(episode_intake.check, request))
             if not isinstance(outcome, IntakeFacts):
                 if getattr(outcome, "retry_after", None) is not None:
                     raise _retry_later(outcome)

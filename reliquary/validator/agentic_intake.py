@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import threading
+import time
 from dataclasses import dataclass, field
 
 from reliquary.corpus.checks import (
@@ -57,6 +58,8 @@ class EpisodeIntake:
         # (ruling P6). The renderer guards itself (QwenTurnRenderer's RLock).
         self._tokenizer_lock = threading.Lock()
         self.initial_ids = functools.lru_cache(maxsize=4096)(self._initial_ids)
+        # The route reads this when a submission arrives (`check(received=)`).
+        self.clock = time.time
 
     @property
     def renderer(self):
@@ -69,12 +72,18 @@ class EpisodeIntake:
     def _initial_ids(self, prompt_index: int) -> tuple[int, ...]:
         return tuple(self._renderer.initial_ids(self._source.prompt(prompt_index)))
 
-    def check(self, request) -> IntakeFacts | IntakeRefusal:
+    def check(self, request, received: float | None = None) -> IntakeFacts | IntakeRefusal:
+        """`received` (when the route received it) is unused by a replay job."""
         trajectory = request.trajectory
         if trajectory is None or request.completions:
             return IntakeRefusal("malformed_submission", {
                 "why": "an episode job takes one trajectory, not completions",
                 "trajectory": trajectory is not None, "completions": len(request.completions)})
+        if trajectory.transcript is not None:
+            # A replay job never stores a transcript: its record would otherwise read as
+            # a signed one wherever the record alone decides (plan 3 final review, C1).
+            return IntakeRefusal("malformed_submission", {
+                "transcript": "a replay job takes no sandbox transcript"})
         if not self._job.owns(request.prompt_index):
             return IntakeRefusal("prompt_mismatch", {"got": request.prompt_index})
         prompt_ids, refusal = self._prompt_refusal(request)

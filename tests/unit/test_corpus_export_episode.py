@@ -312,8 +312,8 @@ def test_a_row_whose_messages_do_not_render_to_its_tokens_is_skipped():
     assert rows == [] and counts["unrendered"] == 2
 
 
-async def _rows_with(renderer, counts, records=None):
-    return [row async for row in episode_rows(job=JOB, records=records or _Records(),
+async def _rows_with(renderer, counts, records=None, job=JOB):
+    return [row async for row in episode_rows(job=job, records=records or _Records(),
                                               renderer=renderer, source=SOURCE, counts=counts,
                                               quarantined=("q1",))]
 
@@ -373,3 +373,61 @@ def test_cli_writes_the_counts_beside_the_rows(cli, monkeypatch, tmp_path):
     assert sidecar["quarantined_executors"] == ["q1"]
     assert isinstance(sidecar["exported_at"], float)
     assert sidecar["counts"]["rows"] == 2
+
+
+def test_a_replay_record_carrying_a_transcript_is_not_exported():
+    """C1: the job decides the parser, never the record: a replay job's record with a
+    transcript is skipped and counted, not parsed as a signed episode."""
+    records = _Records()
+    records.submissions[IDS["certified"]]["completions"][0]["transcript"] = {
+        "token": {"claims": {}}, "records": []}
+    rows, counts = _collect(False, records)
+    assert [r["submission_id"] for r in rows] == [IDS["failed"]]
+    assert counts["kind_mismatch"] == 1 and counts["unparseable"] == 0
+
+
+_BLOCK_SANDBOX = """
+import sys
+
+class _Blocked:
+    def find_spec(self, name, path=None, target=None):
+        if name == "reliquary_sandbox" or name.startswith("reliquary_sandbox."):
+            raise ModuleNotFoundError(f"No module named {name!r} (blocked)", name=name)
+        return None
+
+sys.meta_path.insert(0, _Blocked())
+for name in [m for m in sys.modules if m.startswith("reliquary_sandbox")]:
+    del sys.modules[name]
+"""
+
+
+def test_a_replay_export_runs_on_a_host_without_the_sandbox_package():
+    """C1: a replay export never needs reliquary_sandbox; a signed job's row on such a
+    host is a typed refusal, never an uncaught ImportError."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = _BLOCK_SANDBOX + """
+import asyncio
+from reliquary.corpus.job import parse_job
+from tests.unit import test_corpus_export_episode as T
+from tests.unit.test_corpus_job_episode import _manifest
+from tests.unit.test_corpus_job_signed_sandbox import signed_episode
+
+rows, counts = T._collect(False)
+assert sorted(r["submission_id"] for r in rows) == sorted([T.IDS["certified"], T.IDS["failed"]])
+
+records = T._Records()
+for record in records.submissions.values():
+    record["completions"][0]["transcript"] = {"token": {"claims": {}}, "records": []}
+signed = parse_job(_manifest(prompt_count=3, episode=signed_episode()))
+counts = {}
+rows = asyncio.run(T._rows_with(T.R, counts, records, job=signed))
+assert rows == [] and counts["sandbox_unavailable"] == 2, counts
+print("ok", any(m.startswith("reliquary_sandbox") for m in sys.modules))
+"""
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False,
+                         cwd=Path(__file__).resolve().parents[2])
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == "ok False"

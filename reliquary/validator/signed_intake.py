@@ -90,6 +90,7 @@ class SignedEpisodeIntake(EpisodeIntake):
         self._sessions = sessions
         self._seen = seen
         self._clock = clock
+        self.clock = clock
         self._retry_after = retry_after_s
 
     async def claim(self, facts: SignedIntakeFacts) -> IntakeRefusal | None:
@@ -117,10 +118,17 @@ class SignedEpisodeIntake(EpisodeIntake):
         """After the ledger write accepted it: the claim and the reservation end."""
         await self._sessions.submitted(facts.session_id)
 
-    def check(self, request) -> SignedIntakeFacts | IntakeRefusal:
-        received = self._clock()
+    def check(self, request, received: float | None = None) -> SignedIntakeFacts | IntakeRefusal:
+        """`received`: when the route received the submission (this validator's clock,
+        `self.clock`), read before anything else ran; now when not given."""
+        received = self._clock() if received is None else float(received)
         directory = self._directory(received)
         if directory is None:
+            late = _unverified_deadline(request)
+            if late is not None and received > late:
+                # No retry can bring it back on time: answered now, not after a retry.
+                return IntakeRefusal(REASON_SANDBOX_EXPIRED,
+                                     {"received_at": int(received), "deadline": late})
             return IntakeRefusal(REASON_DIRECTORY_UNAVAILABLE,
                                  {"why": "the machine directory is stale"},
                                  retry_after=self._retry_after)
@@ -185,6 +193,21 @@ class SignedEpisodeIntake(EpisodeIntake):
                                  session_key=session_seen_key(claims.session_id),
                                  machine_id=claims.machine_id, hotkey=claims.hotkey,
                                  reward=float(final.reward), received_at=received)
+
+
+def _unverified_deadline(request) -> int | None:
+    """The grading deadline the transcript's token CLAIMS, unverified: used only to
+    refuse a late submission while the directory is stale (a forged value can only
+    get its own sender refused). None when there is none to read."""
+    trajectory = getattr(request, "trajectory", None)
+    transcript = getattr(trajectory, "transcript", None)
+    try:
+        expires_at = transcript["token"]["claims"]["expires_at"]
+    except (KeyError, TypeError, IndexError):
+        return None
+    if type(expires_at) is not int:
+        return None
+    return expires_at + GRADING_GRACE_S
 
 
 def build_signed_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_size: int | None,

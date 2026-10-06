@@ -71,3 +71,27 @@ def test_tokens_that_are_not_the_records_rendering_do_not_export(tmp_path):
     trajectory, renderer = build(tmp_path, observation="forged\n")
     with pytest.raises(TrajectoryRefused):
         row(trajectory, renderer, job)
+
+
+def test_a_signed_jobs_record_without_its_transcript_is_refused(tmp_path):
+    """C1: the job decides the parser; a signed job's record with no transcript is a
+    typed refusal, not a replay parse."""
+    from reliquary.corpus.delivery import EpisodeKindMismatch
+
+    job = parse_job(_manifest(episode=signed_episode()))
+    trajectory, renderer = build(tmp_path)
+    del trajectory["transcript"]
+    with pytest.raises(EpisodeKindMismatch):
+        row(trajectory, renderer, job)
+
+
+def test_a_signed_row_without_the_sandbox_package_is_a_typed_refusal(tmp_path, monkeypatch):
+    import sys
+
+    from reliquary.corpus.delivery import EpisodeSandboxUnavailable
+
+    job = parse_job(_manifest(episode=signed_episode()))
+    trajectory, renderer = build(tmp_path)
+    monkeypatch.setitem(sys.modules, "reliquary.corpus.signed_parse", None)
+    with pytest.raises(EpisodeSandboxUnavailable):
+        row(trajectory, renderer, job)

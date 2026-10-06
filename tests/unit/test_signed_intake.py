@@ -597,8 +597,8 @@ def test_a_session_lapsed_after_its_on_time_receipt_is_paid(world, monkeypatch):
     world.clock.now = deadline                                   # received on time
     real = world.intake.check
 
-    def check_then_lapse(request):
-        outcome = real(request)
+    def check_then_lapse(request, received=None):
+        outcome = real(request, received=received)
         world.book.lapse(deadline + 30)                          # the check took 30 s
         return outcome
 
@@ -619,3 +619,53 @@ def test_the_directory_is_read_once_for_readiness_and_verify(world, monkeypatch)
     monkeypatch.setattr(signed_intake, "verify_transcript", spy)
     assert submit(world)["reason"] == "accepted"
     assert world.fleet.asked == [NOW + 100] and seen_directories == [world.fleet.snapshot]
+
+
+# -- final review fixes ----------------------------------------------------------------
+
+def test_the_stored_record_never_carries_the_tokens_signature(world):
+    """M4: a session token's signature is a bearer secret, never written to R2; the
+    grader reads the claims only."""
+    request = request_for(world)
+    assert "signature" in request.trajectory.transcript["token"]
+    assert submit(world)["reason"] == "accepted"
+    (record,) = world.records.written.values()
+    token = record["completions"][0]["transcript"]["token"]
+    assert "signature" not in token
+    assert token["claims"]["session_id"] == "s-1"
+    assert "signature" in request.trajectory.transcript["token"]        # the request is untouched
+
+
+def test_a_late_submission_is_expired_even_while_the_directory_is_stale(world):
+    """M2: a stale directory is retryable, but no retry can make a late submission on
+    time: the deadline is answered first, permanently."""
+    world.fleet.ready = False
+    world.clock.now = NOW + 4500 + attest.GRADING_GRACE_S + 1
+    answer = post(world, request_for(world))
+    assert answer.status_code == 200
+    assert answer.json()["reason"] == "sandbox_session_expired"
+
+
+def test_an_on_time_submission_waits_out_a_stale_directory(world):
+    world.fleet.ready = False
+    world.clock.now = NOW + 4500 + attest.GRADING_GRACE_S
+    answer = post(world, request_for(world))
+    assert answer.status_code == 503
+    assert answer.json()["detail"] == "sandbox_directory_unavailable"
+
+
+def test_the_deadline_is_read_when_the_route_received_the_submission(world, monkeypatch):
+    """M2: received on time, checked after the deadline (a slow job read): on time."""
+    deadline = NOW + 4500 + attest.GRADING_GRACE_S
+    world.clock.now = deadline
+    original = world.intake.check
+    seen = []
+
+    def slow_check(request, received=None):
+        seen.append(received)
+        world.clock.now = deadline + 50
+        return original(request, received=received)
+
+    monkeypatch.setattr(world.intake, "check", slow_check)
+    assert submit(world)["reason"] == "accepted"
+    assert seen == [deadline]

@@ -97,6 +97,16 @@ class EpisodeUnrendered(ValueError):
     """The rebuilt messages do not render back to the row's tokens."""
 
 
+class EpisodeKindMismatch(ValueError):
+    """A record whose trajectory is not its job's kind: a transcript on a replay job's
+    record, or none on a signed-sandbox job's. The job chooses the parser, never the
+    record."""
+
+
+class EpisodeSandboxUnavailable(ValueError):
+    """A signed-sandbox job's row needs reliquary-sandbox, which this host cannot import."""
+
+
 def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, renderer,
                 user_prompt: str) -> dict:
     """The row of one graded trajectory. Messages are rebuilt from the proven
@@ -104,8 +114,12 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
     user messages must render to the record's prompt tokens, so the messages
     and the tokens are one and the same trajectory.
 
-    Raises ``TrajectoryRefused``, ``EpisodePromptMismatch`` or
-    ``EpisodeUnrendered``."""
+    The job chooses the parser (``is_signed_sandbox``): a replay job's record never
+    carries a transcript and a signed job's always does (``EpisodeKindMismatch``).
+
+    Raises ``TrajectoryRefused``, ``EpisodePromptMismatch``, ``EpisodeUnrendered``,
+    ``EpisodeKindMismatch`` or ``EpisodeSandboxUnavailable``."""
+    from reliquary.corpus.job import is_signed_sandbox
     from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
     from reliquary.environment.agentic_swe import BASH_SYSTEM_PROMPT
 
@@ -116,14 +130,20 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
     if [int(t) for t in renderer.initial_ids(user_prompt)] != prompt:
         raise EpisodePromptMismatch(submission_id)
     signed = trajectory.get("transcript")
-    if signed is None:
+    signed_job = is_signed_sandbox(job)
+    if signed_job != (signed is not None):
+        raise EpisodeKindMismatch(submission_id)
+    if not signed_job:
         parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
                                   stop=trajectory["stop"], max_turns=job.episode.max_turns)
         system_prompt = BASH_SYSTEM_PROMPT
     else:
         # A signed episode: its observations are the signed records' renderings, compared
         # forward against the tokens, never decoded from them (plan 3 ruling 6).
-        from reliquary.corpus.signed_parse import parse_signed_trajectory, signed_records
+        try:
+            from reliquary.corpus.signed_parse import parse_signed_trajectory, signed_records
+        except ImportError as exc:
+            raise EpisodeSandboxUnavailable(submission_id) from exc
         from reliquary.corpus.signed_reasons import REASON_SANDBOX_TRANSCRIPT
         from reliquary.environment.agentic_swe import harness_system_prompt
 
@@ -263,7 +283,8 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
     read_voided = getattr(records, "read_voided", None)
     counts.update(verdicts=len(ids), passing_submissions=0, voided=0, ungraded=0, held=0,
                   uncertified=0, not_successful=0, missing_records=0, task_mismatch=0,
-                  prompt_mismatch=0, unparseable=0, unrendered=0, sft_rows=0, rows=0)
+                  prompt_mismatch=0, unparseable=0, unrendered=0, kind_mismatch=0,
+                  sandbox_unavailable=0, sft_rows=0, rows=0)
     gate = asyncio.Semaphore(concurrency)
     for start in range(0, len(ids), window):
         chunk = ids[start:start + window]
@@ -312,6 +333,16 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
             except EpisodeUnrendered:
                 logger.error("corpus export: %s's messages do not render to its tokens", sid[:12])
                 counts["unrendered"] += 1
+                continue
+            except EpisodeKindMismatch:
+                logger.error("corpus export: %s's record is not its job's kind (replay or "
+                             "signed)", sid[:12])
+                counts["kind_mismatch"] += 1
+                continue
+            except EpisodeSandboxUnavailable:
+                logger.error("corpus export: %s is a signed episode and reliquary-sandbox is "
+                             "not installed here", sid[:12])
+                counts["sandbox_unavailable"] += 1
                 continue
             except EpisodePromptMismatch:
                 logger.error("corpus export: %s's prompt tokens are not its task's", sid[:12])
@@ -863,6 +894,8 @@ class HTTPDeliverySink:
 __all__ = [
     "DELIVERY_SCHEMA",
     "EPISODE_ROW_FIELDS",
+    "EpisodeKindMismatch",
+    "EpisodeSandboxUnavailable",
     "LocalDirectorySink",
     "HTTPDeliverySink",
     "R2DeliverySink",
