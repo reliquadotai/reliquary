@@ -644,3 +644,72 @@ def verify_corpus_skip_signature(request) -> bool:
     except Exception as e:
         logger.debug("corpus skip signature verify failed: %s", e)
         return False
+
+
+# Sandbox session requests (plan 3), each under its own domain: an open never verifies
+# as a close, a submission or a skip.
+SANDBOX_OPEN_DOMAIN = b"reliquary/sandbox-session-open/v1"
+SANDBOX_CLOSE_DOMAIN = b"reliquary/sandbox-session-close/v1"
+
+
+def _bound(domain: bytes, parts: list[bytes]) -> bytes:
+    h = hashlib.sha256()
+    h.update(domain)
+    for part in parts:
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def _engagement_bytes(engagement) -> bytes:
+    present = {key: value for key, value in dict(engagement).items() if value is not None}
+    return json.dumps(present, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def build_sandbox_open_binding(request) -> bytes:
+    body = _corpus_fields(request)
+    return _bound(SANDBOX_OPEN_DOMAIN, [
+        str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
+        int(body["at"]).to_bytes(8, "big", signed=False),
+        hashlib.sha256(_engagement_bytes(body["engagement"])).digest()])
+
+
+def build_sandbox_close_binding(request) -> bytes:
+    body = _corpus_fields(request)
+    transcript = body.get("transcript")
+    return _bound(SANDBOX_CLOSE_DOMAIN, [
+        str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
+        int(body["at"]).to_bytes(8, "big", signed=False), str(body["session_id"]).encode("utf-8"),
+        str(body["reason"]).encode("utf-8"),
+        b"" if transcript is None else transcript_digest(transcript)])
+
+
+def verify_hotkey_signature(hotkey: str, binding: bytes, signature_hex: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    if bt is None:
+        return False
+    try:
+        signature = bytes.fromhex(signature_hex or "")
+    except ValueError:
+        return False
+    if not signature:
+        return False
+    try:
+        keypair = bt.Keypair(ss58_address=hotkey)  # type: ignore[union-attr]
+        return bool(keypair.verify(data=binding, signature=signature))
+    except Exception as e:
+        logger.debug("hotkey signature verify failed: %s", type(e).__name__)
+        return False
+
+
+def verify_sandbox_open_signature(request) -> bool:
+    body = _corpus_fields(request)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), build_sandbox_open_binding(request),
+                                   str(body.get("signature") or ""))
+
+
+def verify_sandbox_close_signature(request) -> bool:
+    body = _corpus_fields(request)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), build_sandbox_close_binding(request),
+                                   str(body.get("signature") or ""))
