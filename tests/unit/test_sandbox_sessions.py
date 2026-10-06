@@ -446,30 +446,31 @@ def test_a_graded_close_is_not_voided_by_a_drain(tmp_path):
     assert env.book.get(grant.session_id).state == CLOSED_GRADED
 
 
-@pytest.mark.parametrize("before", [VOIDED, LAPSED, CLOSED_GRADED])
-def test_a_submission_dominates_every_earlier_end(tmp_path, before):
+def test_a_submission_ends_a_graded_close(tmp_path):
     env = build(tmp_path)
     grant = open_(env)
-    if before == CLOSED:
-        close(env, grant, final_of(env, grant, "expired"))
-    elif before == CLOSED_GRADED:
-        close(env, grant, final_of(env, grant, "graded"))
-    elif before == VOIDED:
-        async def drain():
-            env.issuer.void_machine(MACHINE)
-            await asyncio.sleep(0)
-        asyncio.run(drain())
-    else:
-        env.clock.now = grant.expires_at + attest.GRADING_GRACE_S + 1
-        asyncio.run(env.issuer.maintain())
-    assert env.book.get(grant.session_id).state == before
+    close(env, grant, final_of(env, grant, "graded"))
     asyncio.run(env.issuer.submitted(grant.session_id))
     assert env.book.get(grant.session_id).state == SUBMITTED
     assert env.store.documents[grant.session_id]["state"] == SUBMITTED
-    assert env.book.reserved(JOB.job_id, 3, env.clock.now) == 0
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 0
 
 
-def test_a_voided_sessions_late_graded_submission_is_recorded(tmp_path):
+def test_a_lapsed_session_is_never_paid(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    env.clock.now = grant.expires_at + attest.GRADING_GRACE_S + 1
+    asyncio.run(env.issuer.maintain())
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert not sessions.session_submittable(LAPSED)
+    assert env.book.get(grant.session_id).state == LAPSED
+    assert env.store.documents[grant.session_id]["state"] == LAPSED
+    assert SUBMITTED not in sandbox_store.SESSION_TRANSITIONS[LAPSED]
+
+
+def test_a_voided_session_is_never_paid(tmp_path):
+    """Amended ruling 3: a drained machine is our fault, so the miner keeps its open
+    refund and opens again; its voided session's late graded submission is not paid."""
     env = build(tmp_path)
     grant = open_(env)
 
@@ -479,10 +480,24 @@ def test_a_voided_sessions_late_graded_submission_is_recorded(tmp_path):
         await env.issuer.submitted(grant.session_id)
 
     asyncio.run(drain_then_submit())
-    record = env.book.get(grant.session_id)
-    assert (record.state, record.closed_status) == (SUBMITTED, "graded")
-    # the late close then sees the submitted state; nothing is re-opened
-    assert close(env, grant, final_of(env, grant, "graded"))["state"] == SUBMITTED
+    assert not sessions.session_submittable(VOIDED)
+    assert env.book.get(grant.session_id).state == VOIDED
+    assert env.store.documents[grant.session_id]["state"] == VOIDED
+    assert SUBMITTED not in sandbox_store.SESSION_TRANSITIONS[VOIDED]
+    # the late close sees the voided state; the miner may open again
+    assert close(env, grant, final_of(env, grant, "graded"))["state"] == VOIDED
+    assert isinstance(open_(env, request_id="b" * 32), Grant)
+
+
+def test_an_aborted_session_is_never_paid(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    assert close(env, grant, final_of(env, grant, "aborted"))["state"] == ABORTED
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert not sessions.session_submittable(ABORTED)
+    assert env.book.get(grant.session_id).state == ABORTED
+    assert env.store.documents[grant.session_id]["state"] == ABORTED
+    assert SUBMITTED not in sandbox_store.SESSION_TRANSITIONS[ABORTED]
 
 
 def test_a_close_racing_a_submission_reports_the_submission(tmp_path, monkeypatch):
@@ -657,7 +672,8 @@ def test_only_a_live_or_graded_closed_session_is_submittable(state, submittable)
     assert sessions.session_submittable(state) is submittable
 
 
-def test_a_closed_session_never_becomes_submitted_in_the_store():
-    assert SUBMITTED not in sandbox_store.SESSION_TRANSITIONS[CLOSED]
+def test_only_a_live_or_graded_closed_session_becomes_submitted_in_the_store():
+    assert {state for state, moves in sandbox_store.SESSION_TRANSITIONS.items()
+            if SUBMITTED in moves} == {LIVE, CLOSED_GRADED}
     assert set(sandbox_store.SESSION_TRANSITIONS) == {LIVE, CLOSED_GRADED, SUBMITTED, CLOSED,
                                                        ABORTED, VOIDED, LAPSED}

@@ -15,8 +15,8 @@ States. A session is `live` until the first of:
 * `closed_graded`: a verified `graded` final was reported. It still HOLDS its slot,
   because the transcript is still submittable: freeing it would let another miner take
   the slot this episode may yet consume. It ends `submitted` or `lapsed`;
-* `submitted`: its submission was accepted. Terminal; once the ledger has consumed
-  the slot it overrides `voided`, `lapsed` and `closed_graded` in the book;
+* `submitted`: its submission was accepted. Terminal; reached only from `live` or
+  `closed_graded` (`session_submittable`);
 * `closed`: an unpaid final (expired, box_failed, budget_exhausted including
   `transcript_bytes`) or a failed open. Terminal for payment: its slot was freed, so a
   submission after it could take a slot another miner now holds.
@@ -24,8 +24,13 @@ States. A session is `live` until the first of:
 The intake asks `session_submittable(state)` BEFORE its ledger write: only `live` and
 `closed_graded` sessions may be paid.
 * `aborted`: void, refunded from the open rate, counted against the aborted cap;
-* `voided`: its machine was drained (no fault; not counted in the open rate);
-* `lapsed`: past `expires_at + GRADING_GRACE_S`, when submissions are refused anyway.
+  never paid;
+* `voided`: its machine was drained. Our fault, not the miner's: not counted in the
+  open rate, so the miner opens again; never paid (plan ruling 3 as amended
+  2026-10-06: a late graded submission of a voided session is refused, which leaves
+  no room for oversubscription);
+* `lapsed`: past `expires_at + GRADING_GRACE_S`, when submissions are refused anyway;
+  never paid.
 The moves allowed are `sandbox_store.SESSION_TRANSITIONS`, used both by the book and by
 the store's compare-and-swap, so a stale write never overwrites a later state. A
 failed write of a state is retried with backoff and alerts on final failure.
