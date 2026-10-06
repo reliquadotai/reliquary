@@ -5,7 +5,6 @@ text of a call that is never sent)."""
 import asyncio
 import hashlib
 import json
-from pathlib import Path
 
 import pytest
 
@@ -275,7 +274,6 @@ def test_the_pure_helpers():
     assert state_matches(None, "") and not state_matches(None, "d")
 
 
-@pytest.mark.skipif(not (Path(__file__).parent / "sandbox_fixtures.py").exists(), reason="Task 7")
 def test_signed_records_reads_tools_calls_and_final(tmp_path):
     from tests.unit.sandbox_fixtures import claims, signer, transcript
 

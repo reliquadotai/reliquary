@@ -2059,6 +2059,95 @@ def eval_run(
     typer.echo(json.dumps(result) if result is not None else "no evaluation task to claim")
 
 
+sandbox_app = typer.Typer(help="Signed-episode sandboxes (reliquary-sandbox machines)")
+sandbox_machines_app = typer.Typer(help="The machine directory in R2")
+sandbox_app.add_typer(sandbox_machines_app, name="machines")
+app.add_typer(sandbox_app, name="sandbox")
+
+
+def _sandbox_store_call(coroutine):
+    from reliquary.infrastructure.sandbox_store import MachineConflict
+
+    try:
+        return asyncio.run(coroutine)
+    except (ValueError, MachineConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _echo_machine(document) -> None:
+    import json
+
+    if document is None:
+        typer.echo("error: no such machine", err=True)
+        raise typer.Exit(code=2)
+    typer.echo(json.dumps(document, sort_keys=True))
+
+
+@sandbox_machines_app.command("register")
+def sandbox_machine_register(
+    machine_id: str = typer.Option(..., "--machine-id"),
+    address: str = typer.Option(..., "--address", help="scheme://host[:port] miners reach"),
+    provider: str = typer.Option(..., "--provider"),
+    capacity: int = typer.Option(..., "--capacity", help="Concurrent episodes"),
+    key_id: str = typer.Option(..., "--key-id"),
+    public_key: str = typer.Option(..., "--public-key", help="base64 Ed25519 public key"),
+    valid_from: int = typer.Option(..., "--valid-from", help="unix seconds"),
+) -> None:
+    """Register a machine with its first signing key (create-only)."""
+    from reliquary.infrastructure import sandbox_store
+
+    document, _ = _sandbox_store_call(sandbox_store.register_machine(
+        machine_id=machine_id, address=address, provider=provider, capacity=capacity,
+        key_id=key_id, public_key_b64=public_key, valid_from=valid_from, now=_time.time()))
+    _echo_machine(document)
+
+
+@sandbox_machines_app.command("add-key")
+def sandbox_machine_add_key(machine_id: str = typer.Option(..., "--machine-id"),
+                            key_id: str = typer.Option(..., "--key-id"),
+                            public_key: str = typer.Option(..., "--public-key"),
+                            valid_from: int = typer.Option(..., "--valid-from")) -> None:
+    """Add a rotated key (switch the machine to it when it has no live episode)."""
+    from reliquary.infrastructure import sandbox_store
+
+    _echo_machine(_sandbox_store_call(sandbox_store.add_machine_key(
+        machine_id, key_id=key_id, public_key_b64=public_key, valid_from=valid_from)))
+
+
+@sandbox_machines_app.command("end-key")
+def sandbox_machine_end_key(
+    machine_id: str = typer.Option(..., "--machine-id"),
+    key_id: str = typer.Option(..., "--key-id"),
+    valid_until: int = typer.Option(..., "--valid-until", help=(
+        "unix seconds. Rotation: when the new key starts. COMPROMISE: the earliest time "
+        "the compromise is suspected, even in the past")),
+) -> None:
+    """End a key's validity; an end only ever moves earlier."""
+    from reliquary.infrastructure import sandbox_store
+
+    _echo_machine(_sandbox_store_call(sandbox_store.end_machine_key(
+        machine_id, key_id=key_id, valid_until=valid_until)))
+
+
+@sandbox_machines_app.command("status")
+def sandbox_machine_status(machine_id: str = typer.Option(..., "--machine-id"),
+                           status: str = typer.Option(..., "--status",
+                                                      help="active, draining or revoked"),
+                           reason: str = typer.Option(None, "--reason")) -> None:
+    from reliquary.infrastructure import sandbox_store
+
+    _echo_machine(_sandbox_store_call(sandbox_store.set_machine_status(machine_id, status, reason=reason)))
+
+
+@sandbox_machines_app.command("list")
+def sandbox_machine_list() -> None:
+    from reliquary.infrastructure import sandbox_store
+
+    for document in _sandbox_store_call(sandbox_store.list_machines()):
+        _echo_machine(document)
+
+
 corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
