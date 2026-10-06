@@ -683,3 +683,29 @@ def test_a_claim_that_cannot_get_the_issuer_lock_is_retryable(world, monkeypatch
     assert answer.status_code == 503 and answer.json()["detail"] == "sandbox_session_busy"
     assert answer.headers["Retry-After"] == "10"
     assert remaining(world) == JOB.slots_per_prompt
+
+
+def test_a_drain_between_the_final_close_and_the_submission_does_not_void_it(world):
+    """M8 / I3: the miner closes `final` before submitting (closed_graded); its
+    machine is then drained; the submission is still paid. Without the close (live),
+    the same drain voids it."""
+    from reliquary.sandbox.sessions import VOIDED
+
+    async def drain():
+        world.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+
+    world.book.settle("s-1", CLOSED_GRADED, now=NOW + 50, status="graded")
+    asyncio.run(drain())
+    assert world.book.get("s-1").state == CLOSED_GRADED
+    assert submit(world)["reason"] == "accepted"
+    assert world.book.get("s-1").state == SUBMITTED
+
+    world.book.add(session_record("s-2", index=1))
+    asyncio.run(drain())
+    assert world.book.get("s-2").state == VOIDED
+    answer = submit(world, session=claims(session_id="s-2", index=1,
+                                          engagement=corpus_engagement(JOB.job_id, 1)),
+                    prompt_index=1)
+    assert (answer["reason"], answer["detail"].get("session_state")) == \
+        ("sandbox_transcript_invalid", VOIDED), answer

@@ -110,7 +110,12 @@ Rolling back is the reverse: retire the signed job first, then unset the key set
    nothing is drained, an `ALERT` is logged once, and the silence of the others is
    counted again from the first poll in which one machine answers. A single-machine
    fleet is therefore never drained for silence (it gets no new session while silent;
-   its sessions end by close or lapse).
+   its sessions end by close or lapse). **Trade-off:** with one machine, a real outage
+   of that machine looks like our own egress failing, so its live sessions stay live
+   (holding their slots and the miners' live caps) until their close or their lapse
+   (`expires_at` + 1800 s), not 60 s. Run at least two machines, or drain a dead single
+   machine by hand (`status --status draining` stops placement; its sessions still end
+   only by close or lapse).
 
 ### Every setting
 
