@@ -1208,3 +1208,20 @@ def test_the_rescan_grades_the_oldest_arrivals_first():
     asyncio.run(run())
     graded = [item["submission_id"] for item in dispatcher.items if item["mode"] == "grade"]
     assert graded == sorted(arrivals, key=arrivals.get)
+
+
+def test_the_grade_lease_cap_follows_its_setting():
+    """Read once at import: checked in a fresh interpreter."""
+    import os
+    import subprocess
+    import sys
+
+    code = ("from reliquary.validator import corpus_grade_remote as g; "
+            "print(g.MAX_LEASES_PER_EXECUTOR)")
+    def cap(value):
+        env = {**os.environ, "RELIQUARY_CORPUS_GRADE_MAX_LEASES_PER_EXECUTOR": value}
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                              text=True)
+
+    assert cap("12").stdout.strip() == "12"
+    assert cap("500").returncode != 0  # out of bounds: refused at start, as every bound

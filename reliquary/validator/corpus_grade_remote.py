@@ -147,7 +147,12 @@ GRADE_RECHECK_FRACTION = 0.05
 MAX_RESULTS_PER_ITEM = 3
 MAX_TIMEOUTS = 2
 MAX_ERRORS = 3
-MAX_LEASES_PER_EXECUTOR = 8
+# Leases one executor holds at once. A grade executor runs that many boxes at
+# most whatever its own --concurrency (production 2026-10-06: grade-01 set to 12
+# held 8, a third of its CPU idle while the SWE backlog grew): set it to the
+# executors' concurrency.
+MAX_LEASES_PER_EXECUTOR = int(_bounded_env("RELIQUARY_CORPUS_GRADE_MAX_LEASES_PER_EXECUTOR",
+                                           8.0, 1.0, 64.0))
 # How long an item holding a vote waits for a next distinct-provider executor.
 GRADE_DISPUTE_SECONDS = _bounded_env("RELIQUARY_CORPUS_GRADE_DISPUTE_SECONDS", 1800.0, 60.0, 86400.0)
 # Ruling P26: an executor serves the dispute clock only while it claims (a
