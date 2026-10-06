@@ -2598,6 +2598,10 @@ def corpus_mine_agentic(
         None, "--validator-hotkey",
         help="The validator's ss58 hotkey; signed-sandbox jobs sign their session requests "
              "for it"),
+    max_live_per_job: int = typer.Option(
+        4, "--max-live-per-job", min=1,
+        help="Signed-sandbox jobs: live sessions at once for this hotkey on the job (match "
+             "the validator's per-job cap, 4 by default)"),
 ) -> None:
     """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
     against a local vLLM with per-turn proofs. Replay jobs need Docker and the
@@ -2684,8 +2688,16 @@ def corpus_mine_agentic(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
         gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
-        sessions=sessions))
+        sessions=sessions, max_live_per_job=max_live_per_job))
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
+    halted = [hotkey_ for hotkey_, c in counts.items()
+              if c.get("halted") or c.get("identity_crashed")]
+    if halted:
+        hint = (" (a bad_signature: is --validator-hotkey this validator's hotkey?)"
+                if any(c.get("session_refused:bad_signature") for c in counts.values()) else "")
+        typer.echo(f"error: mining stopped for {', '.join(h[:8] for h in halted)}{hint}",
+                   err=True)
+        raise typer.Exit(code=3)
 
 
 @corpus_app.command("status")

@@ -135,3 +135,8 @@ TLS or the validator's tunnel, and never log request bodies at the proxy.
 `reliquary corpus mine-agentic` detects the job's execution. In signed mode it needs
 `reliquary[sandbox-miner]` (verifiers installed from git at the pinned commit) and no
 Docker. It reports every unsubmitted session so that its reservation ends early.
+A graded transcript it will not submit (its own precheck refused it, the submission
+was refused, the deadline passed) is closed with `withdraw` and that transcript: the
+validator verifies it and frees the slot and the hotkey's caps for good. Signed mode
+needs `--validator-hotkey` (session requests are signed for that validator) and keeps at
+most `--max-live-per-job` (default 4, the validator's cap) sessions live per job.

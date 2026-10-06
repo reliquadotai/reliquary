@@ -18,15 +18,19 @@ from reliquary.protocol.sandbox_session import SessionRefused
 
 logger = logging.getLogger(__name__)
 
-# The longest one episode slot waits on a session refusal's Retry-After; the signed
-# runner itself holds every later open of the hotkey until the whole delay has passed.
-MAX_SESSION_WAIT_S = 60.0
-# Session refusals no later request of this identity can clear: it stops.
+# Session refusals no later request of this identity can clear: it stops. Waiting
+# (Retry-After, backoff) is the signed runner's: it holds the hotkey's next open.
 SESSION_HALT = frozenset({
-    "bad_signature", "hotkey_not_registered", "miner_banned", "job_not_served",
-    "job_not_signed", "job_complete", "stale_request", "malformed_request",
-    "engagement_kind_unsupported",
+    "bad_signature", "hotkey_not_registered", "miner_banned", "job_not_signed",
+    "job_complete", "stale_request", "malformed_request", "engagement_kind_unsupported",
+    "validator_unavailable",
 })
+SESSION_HALT_HINTS = {
+    "bad_signature": " (is --validator-hotkey this validator's hotkey?)",
+    "stale_request": " (is this machine's clock right?)",
+}
+# Reporting unsubmitted sessions when an episode crashes or is cancelled.
+REPORT_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -138,6 +142,13 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                 logger.warning("reporting the sandbox session of episode %d failed",
                                prompt_index)
 
+    async def bounded_report(pending: list, prompt_index: int) -> None:
+        try:
+            async with asyncio.timeout(REPORT_TIMEOUT_S):
+                await report(pending, prompt_index)
+        except TimeoutError:
+            logger.warning("reporting the sandbox session of episode %d timed out", prompt_index)
+
     async def episode(cursor: int, prompt_index: int, sessions: list[str],
                       pending: list) -> None:
         deadline = getattr(runner, "deadline", None)
@@ -155,12 +166,9 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                            refused.reason)
             if refused.reason in SESSION_HALT:
                 counts["halted"] += 1
-                logger.error("%s stops: the validator refuses its sandbox sessions (%s)", tag,
-                             refused.reason)
+                logger.error("%s stops: the validator refuses its sandbox sessions (%s)%s", tag,
+                             refused.reason, SESSION_HALT_HINTS.get(refused.reason, ""))
                 halt()
-                return
-            if refused.retry_after:
-                await asyncio.sleep(min(float(refused.retry_after), MAX_SESSION_WAIT_S))
             return
 
         if result.release is not None:
@@ -196,7 +204,12 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             await unsubmitted()
             return
         # Before the forgery hook: the hook tests the validator, the check the honest run.
-        refusal = await asyncio.to_thread(precheck, built) if precheck is not None else None
+        if precheck is None:
+            refusal = None
+        elif getattr(precheck, "takes_prompt_index", False):
+            refusal = await asyncio.to_thread(precheck, built, prompt_index)
+        else:
+            refusal = await asyncio.to_thread(precheck, built)
         if refusal is not None:
             reason, detail = refusal
             counts["precheck_refused"] += 1
@@ -210,6 +223,12 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
         body = build_trajectory_submission(
             job=job, hotkey=identity.hotkey, cursor=cursor, prompt_index=prompt_index,
             rendered_prompt=decode(list(built.prompt_ids)), trajectory=built, sign=identity.sign)
+        if result.submit_by is not None and time.time() > result.submit_by:
+            counts["submit_deadline_passed"] += 1
+            logger.warning("episode %d of %s not submitted: past the validator's deadline",
+                           prompt_index, tag)
+            await unsubmitted()
+            return
         try:
             answer = await asyncio.to_thread(_submit, client, body, counts)
         except (CorpusJobRetired, CorpusMinerHalted) as exc:
@@ -221,6 +240,8 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
         reason = str(answer.get("reason"))
         if reason == "accepted":
             pending.clear()          # the validator ends an accepted session's reservation
+            if result.submitted is not None:
+                result.submitted()
         else:
             await unsubmitted()
         counts[reason] += 1
@@ -241,12 +262,12 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             await episode(cursor, prompt_index, sessions, pending)
         except asyncio.CancelledError:
             counts["episode_cancelled"] += 1
-            await report(pending, prompt_index)
+            await bounded_report(pending, prompt_index)
             raise
         except Exception:
             counts["episode_crashed"] += 1
             logger.exception("episode %d of %s crashed", prompt_index, tag)
-            await report(pending, prompt_index)
+            await bounded_report(pending, prompt_index)
         finally:
             for session_id in dict.fromkeys(sessions):
                 try:
@@ -319,7 +340,8 @@ async def serve_loopback(app, port: int):
 async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, identities, client,
                             concurrency: int = 8, port: int = 8011,
                             gpu_memory_utilization: float | None = None,
-                            max_num_seqs: int = 16, sessions=None) -> dict[str, Counter]:
+                            max_num_seqs: int = 16, sessions=None,
+                            max_live_per_job: int = 4) -> dict[str, Counter]:
     """The whole miner in one process: engine thread, loopback endpoint, episodes.
     A signed-sandbox job needs ``sessions`` (the validator's session client,
     ``signed_episode.HttpSandboxSessions``) and each identity's ``sign_binding``."""
@@ -371,15 +393,20 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                             sessions=sessions, model_name=job.checkpoint_repo,
                             renderer_model_dir=checkpoint_dir,
                             generate_url=f"http://127.0.0.1:{port}", sampling=job.sampling,
-                            harness_env=identity.harness_env))
+                            harness_env=identity.harness_env, max_live=max_live_per_job))
+                from reliquary.corpus.job import sandbox_split
+                from reliquary.environment.agentic_swe import SignedSweSource
+
                 return await mine_agentic(
                     job=job, identities=identities, client=client, engine=engine, runners={},
                     runner_for=lambda identity: per_identity[identity.hotkey],
                     decode=lambda ids: tokenizer.decode(ids, skip_special_tokens=False,
                                                         clean_up_tokenization_spaces=False),
                     concurrency=concurrency,
-                    precheck=signed_trajectory_precheck(renderer,
-                                                        max_turns=job.episode.max_turns))
+                    precheck=signed_trajectory_precheck(
+                        renderer, max_turns=job.episode.max_turns, job=job, tokenizer=tokenizer,
+                        source=SignedSweSource(sandbox_split(job.episode)),
+                        chunk_tokens=proof.chunk_tokens))
             runners = {}
             for identity in identities:
                 key = harness_key(identity.harness_env)

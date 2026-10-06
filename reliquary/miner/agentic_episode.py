@@ -10,7 +10,7 @@ client and the job's renderer, sampling and turn limit.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -23,8 +23,12 @@ class EpisodeResult:
     error: str | None = None
     # Signed-sandbox episodes: the gateway's transcript, submitted with the tokens, and
     # how to report the session when it is not submitted (its reservation ends).
-    transcript: dict | None = None
-    release: Callable[[], Awaitable[None]] | None = None
+    transcript: dict | None = field(default=None, repr=False)
+    release: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
+    # The validator accepted the submission: the session ended there (frees its live slot).
+    submitted: Callable[[], None] | None = field(default=None, repr=False)
+    # Wall-clock time after which the validator would refuse the submission.
+    submit_by: float | None = None
 
 
 def env_config(episode, *, harness_env: dict | None = None) -> dict:

@@ -55,27 +55,49 @@ def _grant(signed):
 class FakeSessions:
     validator_hotkey, prefix = VALIDATOR, "/corpus"
 
-    def __init__(self, grant=None, refuse=None, close_refusals=()):
+    def __init__(self, grant=None, refuse=None, close_refusals=(), clock=None):
         self.grant, self.refuse, self.opened, self.closed = grant, refuse, [], []
         self.close_refusals = list(close_refusals)
+        self.clock, self.times, self.live, self.peak = clock, [], 0, 0
 
     def open(self, body):
         self.opened.append(body)
+        if self.clock is not None:
+            self.times.append(self.clock())
         if self.refuse is not None:
             raise self.refuse
+        self.live += 1
+        self.peak = max(self.peak, self.live)
         return self.grant
 
     def close(self, session_id, body):
         self.closed.append((session_id, body))
         if self.close_refusals:
             raise self.close_refusals.pop(0)
+        self.live -= 1
         return {"state": "closed"}
 
 
+class FakeTime:
+    """The runner's monotonic clock and sleep, advanced only by its sleeps."""
+
+    def __init__(self):
+        self.now, self.sleeps = 0.0, []
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += max(0.0, seconds)
+        await asyncio.sleep(0)
+
+
 class FakeSandboxRunner:
-    def __init__(self, signed, status="graded", state=b"diff\n", error=None, raises=None):
+    def __init__(self, signed, status="graded", state=b"diff\n", error=None, raises=None,
+                 delay=0.0):
         self.transcript, self.status, self.state = signed, status, state
-        self.error, self.raises, self.runs = error, raises, []
+        self.error, self.raises, self.runs, self.delay = error, raises, [], delay
 
     async def __aenter__(self):
         return self
@@ -85,6 +107,8 @@ class FakeSandboxRunner:
 
     async def run(self, *, token, prompt, on_trace=None):
         self.runs.append((token, prompt))
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.raises is not None:
             raise self.raises
         trace = SimpleNamespace(id="t-1", stop_condition="agent_completed")
@@ -97,18 +121,19 @@ class FakeSandboxRunner:
                                                "reason": None}})
 
 
-def runner(sessions, sandbox, sleeps=None):
-    async def sleep(seconds):
-        if sleeps is not None:
-            sleeps.append(seconds)
+def runner(sessions, sandbox, sleeps=None, fake_time=None, max_live=4, new_request_id=None):
+    fake_time = fake_time or FakeTime()
+    if sleeps is not None:
+        fake_time.sleeps = sleeps
 
     return SignedSweEpisodeRunner(
         job=JOB, hotkey=HOT, sign_binding=lambda binding: "sig-" + binding.hex()[:16],
         sessions=sessions, model_name="m", renderer_model_dir="/ck",
         generate_url="http://127.0.0.1:1", sampling=JOB.sampling,
         source=SignedSweSource("train:20", prompt_of=lambda s, i: f"Fix task {i}."),
-        runner_factory=lambda url: sandbox, clock=lambda: NOW, new_request_id=lambda: "a" * 32,
-        sleep=sleep)
+        runner_factory=lambda url: sandbox, clock=lambda: NOW,
+        new_request_id=new_request_id or (lambda: "a" * 32),
+        sleep=fake_time.sleep, monotonic=fake_time.monotonic, max_live=max_live)
 
 
 async def _run(signed, index=3, times=1):
@@ -123,7 +148,7 @@ async def _run(signed, index=3, times=1):
 
 
 def test_a_graded_episode_is_returned_with_its_transcript_and_released_on_demand(tmp_path, caplog):
-    caplog.set_level("DEBUG")
+    caplog.set_level("DEBUG", logger="reliquary.miner.signed_episode")
     signed = _transcript(tmp_path)
     sessions = FakeSessions(grant=_grant(signed))
     sandbox = FakeSandboxRunner(signed)
@@ -137,28 +162,32 @@ def test_a_graded_episode_is_returned_with_its_transcript_and_released_on_demand
     assert body["signature"] == "sig-" + binding.hex()[:16]
     assert sandbox.runs == [(signed["token"], "Fix task 3.")]
     assert sessions.closed == []
+    assert result.submit_by == NOW + 4500 + 1800 - 60
     asyncio.run(result.release())
     session_id, close = sessions.closed[0]
-    assert session_id == "s-1" and close["reason"] == "final" and close["transcript"] == signed
+    assert session_id == "s-1" and close["reason"] == "withdraw" and close["transcript"] == signed
     assert close["signature"] == "sig-" + build_sandbox_close_binding(
         close, validator_hotkey=VALIDATOR, path="/corpus/sandbox/sessions/s-1/close").hex()[:16]
+    assert "sandbox session s-1" in caplog.text            # the log is captured
     assert signed["token"]["signature"] not in caplog.text
 
 
-@pytest.mark.parametrize("kw,why", [
-    (dict(status="expired"), "expired"),
+@pytest.mark.parametrize("kw,why,close", [
+    (dict(status="expired"), "expired", "final"),
     (dict(status="budget_exhausted",
-          error="TaskError: EpisodeClosed: 409: budget"), "EpisodeClosed"),
-    (dict(error="RoutingError: x"), "RoutingError"),
-    (dict(state=b"\xff\xfe"), "UTF-8"),
+          error="TaskError: EpisodeClosed: 409: budget"), "EpisodeClosed", "final"),
+    (dict(error="RoutingError: x"), "RoutingError", "withdraw"),
+    (dict(state=b"\xff\xfe"), "UTF-8", "withdraw"),
 ])
-def test_an_unpaid_or_unusable_episode_is_reported_at_once(tmp_path, kw, why):
+def test_an_unpaid_or_unusable_episode_is_reported_at_once(tmp_path, kw, why, close):
+    """A graded transcript that will not be submitted is withdrawn (slot and caps
+    freed); any other final is reported as final."""
     status = kw.get("status", "graded")
     signed = _transcript(tmp_path, status=status)
     sessions = FakeSessions(grant=_grant(signed))
     result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed, **kw))))
     assert not result.ok and why in result.error and result.release is None
-    assert [body["reason"] for _, body in sessions.closed] == ["final"]
+    assert [body["reason"] for _, body in sessions.closed] == [close]
     assert sessions.closed[0][1]["transcript"] == signed
 
 
@@ -174,7 +203,23 @@ def test_a_transcript_the_validator_would_refuse_is_closed_not_returned(tmp_path
     sessions = FakeSessions(grant=_grant(signed))
     result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed))))
     assert not result.ok and reason in result.error
-    assert [body["reason"] for _, body in sessions.closed] == ["final"]
+    assert [body["reason"] for _, body in sessions.closed] == ["withdraw"]
+    assert sessions.closed[0][1]["transcript"] == signed
+
+
+def test_any_failure_after_the_episode_withdraws_the_graded_session(tmp_path, monkeypatch):
+    from reliquary.miner import signed_episode
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(signed_episode, "transcript_refusal", boom)
+    signed = _transcript(tmp_path)
+    sessions = FakeSessions(grant=_grant(signed))
+    result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed))))
+    assert not result.ok and "RuntimeError" in result.error
+    assert [(body["reason"], body["transcript"]) for _, body in sessions.closed] == [
+        ("withdraw", signed)]
 
 
 def test_a_failed_open_is_reported_without_a_transcript(tmp_path):
@@ -210,13 +255,15 @@ def test_a_busy_close_is_retried_after_its_retry_after(tmp_path):
     signed = _transcript(tmp_path)
     sessions = FakeSessions(grant=_grant(signed), close_refusals=[
         SessionRefused("close_busy", retry_after=7.0, status=503),
-        SessionRefused("directory_unavailable", retry_after=3.0, status=503)])
+        SessionRefused("directory_unavailable", retry_after=3.0, status=503),
+        SessionRefused("body_timeout", status=408),
+        SessionRefused("close_busy", retry_after=600.0, status=503)])
     sleeps = []
     result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed, status="expired"),
                                         sleeps=sleeps)))
     assert not result.ok
-    assert [body["reason"] for _, body in sessions.closed] == ["final"] * 3
-    assert sleeps == [7.0, 3.0]
+    assert [body["reason"] for _, body in sessions.closed] == ["final"] * 5
+    assert sleeps[:2] == [7.0, 3.0] and 1.0 <= sleeps[2] <= 10.0 and sleeps[3] == 60.0
 
 
 def test_a_refused_session_raises_before_any_episode(tmp_path):
@@ -232,7 +279,114 @@ def test_a_throttled_open_waits_its_retry_after_before_the_next_open(tmp_path):
     sleeps = []
     asyncio.run(_run(runner(sessions, FakeSandboxRunner(_transcript(tmp_path)), sleeps=sleeps),
                      times=2))
-    assert len(sessions.opened) == 2 and len(sleeps) == 1 and 41.0 < sleeps[0] <= 42.0
+    assert len(sessions.opened) == 2 and sleeps == [42.0]
+
+
+def test_a_cancelled_open_still_closes_the_grant_it_gets(tmp_path):
+    import time as wall
+
+    signed = _transcript(tmp_path)
+
+    class Slow(FakeSessions):
+        def open(self, body):
+            wall.sleep(0.2)
+            return super().open(body)
+
+    sessions = Slow(grant=_grant(signed))
+
+    async def main():
+        signed_runner = runner(sessions, FakeSandboxRunner(signed))
+        async with signed_runner:
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await signed_runner.run(3)
+
+    asyncio.run(main())
+    assert [(sid, body["reason"]) for sid, body in sessions.closed] == [("s-1", "open_failed")]
+
+
+def test_a_grant_lost_to_transport_errors_is_recovered_and_closed(tmp_path):
+    signed = _transcript(tmp_path)
+    ids = iter(f"{n:032x}" for n in range(1000))
+
+    class Flaky(FakeSessions):
+        failures = 3
+
+        def open(self, body):
+            self.opened.append(body)
+            if self.failures:
+                self.failures -= 1
+                raise httpx.ConnectError("lost")
+            return dict(self.grant, session_id="s-" + body["request_id"][-2:])
+
+    sessions = Flaky(grant=_grant(signed))
+    results, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed),
+                                         new_request_id=lambda: next(ids)), times=2))
+    assert isinstance(results[0], SessionRefused)
+    assert results[0].reason == "validator_unreachable"
+    lost = sessions.opened[0]["request_id"]
+    assert [body["request_id"] for body in sessions.opened[:4]] == [lost] * 4
+    assert sessions.opened[4]["request_id"] != lost
+    assert sessions.closed[0] == ("s-" + lost[-2:], sessions.closed[0][1])
+    assert sessions.closed[0][1]["reason"] == "open_failed"
+    assert results[1].ok
+
+
+def _mine_signed(signed_runner, *, episodes, concurrency=8):
+    identity = Identity(HOT, sign=lambda body: "sig", episodes=episodes,
+                        sign_binding=lambda binding: "s")
+
+    async def main():
+        async with signed_runner:
+            return await mine_agentic(
+                job=JOB, identities=[identity], client=FakeClient(), engine=FakeEngine(),
+                runners={}, runner_for=lambda identity: signed_runner,
+                decode=lambda ids: "".join(map(str, ids)), concurrency=concurrency)
+
+    return asyncio.run(main())[HOT]
+
+
+@pytest.mark.parametrize("refusal,halts", [
+    (SessionRefused("http_404", status=404), True),
+    (SessionRefused("internal_error", status=500), True),
+    (SessionRefused("http_502", status=502), True),
+    (SessionRefused("prompt_unavailable", status=409), False),
+])
+def test_refusals_without_retry_after_back_off(refusal, halts):
+    fake_time = FakeTime()
+    sessions = FakeSessions(refuse=refusal, clock=fake_time.monotonic)
+    counts = _mine_signed(runner(sessions, FakeSandboxRunner(None), fake_time=fake_time),
+                          episodes=40)
+    opens = len(sessions.opened)
+    assert opens <= 5 * max(fake_time.now, 1.0)
+    assert all(later - earlier >= 1.0
+               for earlier, later in zip(sessions.times, sessions.times[1:]))
+    assert max(fake_time.sleeps) <= 60.0
+    if halts:
+        assert opens == 10 and counts["halted"] == 1
+        assert counts["session_refused:validator_unavailable"] == 1
+    else:
+        assert opens == 40 and counts["halted"] == 0
+
+
+def test_a_hold_does_not_end_in_a_burst():
+    fake_time = FakeTime()
+    sessions = FakeSessions(refuse=SessionRefused("sandbox_capacity", retry_after=42.0,
+                                                  status=503), clock=fake_time.monotonic)
+    counts = _mine_signed(runner(sessions, FakeSandboxRunner(None), fake_time=fake_time),
+                          episodes=20)
+    assert len(sessions.opened) == 20 and counts["halted"] == 0
+    assert all(later - earlier >= 42.0
+               for earlier, later in zip(sessions.times, sessions.times[1:]))
+
+
+def test_live_sessions_never_exceed_the_per_job_cap(tmp_path):
+    signed = _transcript(tmp_path, status="expired")
+    sessions = FakeSessions(grant=_grant(signed))
+    _mine_signed(runner(sessions, FakeSandboxRunner(signed, status="expired", delay=0.01),
+                        max_live=4), episodes=16, concurrency=8)
+    assert len(sessions.opened) == 16 and len(sessions.closed) == 16
+    assert sessions.peak == 4
 
 
 def test_a_non_format_42_hotkey_is_refused():
@@ -290,8 +444,8 @@ def test_http_sessions_send_compact_json_and_never_echo_the_body():
 class LoopRunner:
     """The mining loop's view: what SignedSweEpisodeRunner returns."""
 
-    def __init__(self, refuse=None):
-        self.released, self.refuse = [], refuse
+    def __init__(self, refuse=None, submit_by=None):
+        self.released, self.refuse, self.submitted, self.submit_by = [], refuse, [], submit_by
 
     def deadline(self, index):
         return None
@@ -305,7 +459,9 @@ class LoopRunner:
             self.released.append(index)
 
         return EpisodeResult(f"s{index}", f"diff {index}", "agent_completed", True, 1.0,
-                             transcript={"token": {}, "records": [index]}, release=release)
+                             transcript={"token": {}, "records": [index]}, release=release,
+                             submitted=lambda: self.submitted.append(index),
+                             submit_by=self.submit_by)
 
 
 def _mine(loop_runner, client=None, episodes=2, precheck=None):
@@ -325,7 +481,14 @@ def test_the_submission_carries_the_transcript_and_keeps_the_session():
     assert counts["accepted"] == 2
     assert all(body["trajectory"]["transcript"]["records"] == [body["prompt_index"]]
                for body in client.bodies)
-    assert loop_runner.released == []
+    assert loop_runner.released == [] and len(loop_runner.submitted) == 2
+
+
+def test_a_submission_past_its_deadline_is_withdrawn_not_sent():
+    loop_runner = LoopRunner(submit_by=1.0)
+    counts, client = _mine(loop_runner)
+    assert client.bodies == [] and len(loop_runner.released) == 2
+    assert counts["submit_deadline_passed"] == 2
 
 
 def test_a_refused_submission_releases_its_session():
@@ -351,6 +514,28 @@ def test_a_refused_session_is_counted_not_crashed():
 def test_a_permanent_session_refusal_halts_the_identity():
     counts, client = _mine(LoopRunner(refuse=SessionRefused("hotkey_not_registered")), episodes=5)
     assert counts["session_refused:hotkey_not_registered"] == 1 and counts["halted"] == 1
+
+
+def test_a_bad_signature_halts_with_a_validator_hotkey_hint(caplog):
+    caplog.set_level("INFO", logger="reliquary.miner.agentic_miner")
+    counts, _ = _mine(LoopRunner(refuse=SessionRefused("bad_signature", status=403)))
+    assert counts["halted"] == 1 and "--validator-hotkey" in caplog.text
+
+
+def test_a_refused_submissions_detail_is_logged_without_its_token(caplog):
+    caplog.set_level("INFO", logger="reliquary.miner.corpus_miner")
+    from collections import Counter
+
+    from reliquary.miner.corpus_miner import CorpusMinerHalted, CorpusPermanentFailure, _retry
+
+    def call():
+        raise CorpusPermanentFailure("409", status=409, detail={
+            "reason": "x", "token": {"signature": "SECRET-SIG"}, "more": "y" * 5000})
+
+    with pytest.raises(CorpusMinerHalted):
+        _retry(call, sleep=lambda s: None, counts=Counter(), max_consecutive_failures=1)
+    assert "corpus request failed" in caplog.text           # the log is captured
+    assert "SECRET-SIG" not in caplog.text and "y" * 1000 not in caplog.text
 
 
 def test_a_throttled_submission_waits_its_retry_after():
@@ -404,6 +589,14 @@ def test_the_precheck_is_the_validators_signed_parse(tmp_path):
                             transcript=signed)
     precheck = signed_trajectory_precheck(S, max_turns=40)
     assert precheck(built) is None
+    full_check = signed_trajectory_precheck(
+        S, max_turns=40, job=JOB, chunk_tokens=32,
+        tokenizer=SimpleNamespace(decode=lambda ids, **kw: ",".join(map(str, ids))),
+        source=SignedSweSource("train:20", prompt_of=lambda s, i: f"Fix task {i}."))
+    assert full_check(built, prompt_index=0) is None
+    assert full_check(built, prompt_index=1)[0] == "prompt_not_faithful"
+    assert full_check(dataclasses.replace(built, proofs=(("p", "q"), ("p",))),
+                      prompt_index=0) is not None
     assert precheck(dataclasses.replace(built, final_diff="x\n"))[0] == "sandbox_state_mismatch"
     assert precheck(dataclasses.replace(built, transcript=None))[0] == "malformed_submission"
     other = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims(),
@@ -447,3 +640,53 @@ def test_the_precheck_accepts_an_honest_transcript_with_the_real_tokenizer(tmp_p
                             proofs=(("p",), ("p",)), final_diff="d\n", stop="agent_completed",
                             transcript=signed)
     assert signed_trajectory_precheck(r, max_turns=40)(built) is None
+
+
+def test_withdraw_and_open_interoperate_with_the_real_router_and_real_keys(tmp_path):
+    """The real session router, real sr25519 signatures (miner //Alice, validator //Bob):
+    the miner's open verifies, and a graded transcript it will not submit reaches the
+    issuer as a `withdraw` close carrying that transcript."""
+    bt = pytest.importorskip("bittensor")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from reliquary.sandbox.routes import build_sandbox_sessions_router
+    from reliquary.sandbox.sessions import Grant, SandboxPolicy
+
+    alice = bt.Keypair.create_from_uri("//Alice")
+    bob = bt.Keypair.create_from_uri("//Bob")
+    signed = _transcript(tmp_path, hotkey=alice.ss58_address)
+
+    class Issuer:
+        def __init__(self):
+            self.calls = []
+
+        async def open(self, **kw):
+            self.calls.append(("open", kw))
+            return Grant("s-1", signed["token"], "http://10.0.0.5:8080", NOW + 4500)
+
+        async def close(self, **kw):
+            self.calls.append(("close", kw))
+            return {"session_id": kw["session_id"], "state": "closed", "status": "withdrawn"}
+
+    issuer = Issuer()
+    app = FastAPI()
+    app.include_router(build_sandbox_sessions_router(issuer, policy=SandboxPolicy(),
+                                                     validator_hotkey=bob.ss58_address,
+                                                     clock=lambda: NOW))
+    sessions = HttpSandboxSessions(TestClient(app), validator_hotkey=bob.ss58_address)
+    ids = iter(f"{n:032x}" for n in range(100))
+    signed_runner = SignedSweEpisodeRunner(
+        job=JOB, hotkey=alice.ss58_address, sign_binding=lambda b: alice.sign(b).hex(),
+        sessions=sessions, model_name="m", renderer_model_dir="/ck",
+        generate_url="http://127.0.0.1:1", sampling=JOB.sampling,
+        source=SignedSweSource("train:20", prompt_of=lambda s, i: f"Fix task {i}."),
+        runner_factory=lambda url: FakeSandboxRunner(signed), clock=lambda: NOW,
+        new_request_id=lambda: next(ids))
+    result, _ = asyncio.run(_run(signed_runner))
+    assert result.ok
+    asyncio.run(result.release())
+    (_, opened), (_, closed) = issuer.calls
+    assert opened["hotkey"] == alice.ss58_address
+    assert opened["engagement"] == {"kind": "corpus", "job_id": JOB.job_id, "prompt_index": 3}
+    assert closed["reason"] == "withdraw" and closed["transcript"] == signed

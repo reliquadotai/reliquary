@@ -65,6 +65,29 @@ def retry_after_seconds(value) -> float | None:
     return float(max(1, math.ceil(seconds)))
 
 
+_SECRET_KEYS = frozenset({"token", "transcript", "signature", "episode_key"})
+MAX_LOGGED_DETAIL_CHARS = 500
+
+
+def loggable_detail(detail) -> str:
+    """A refusal's detail for a log line: keys that can carry a session token or a
+    signed transcript are dropped, and the rest is truncated."""
+    def scrub(value, depth=0):
+        if depth > 4:
+            return "..."
+        if isinstance(value, dict):
+            return {key: ("<redacted>" if key in _SECRET_KEYS else scrub(item, depth + 1))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item, depth + 1) for item in value[:20]]
+        return value
+
+    if not detail:
+        return ""
+    text = str(scrub(detail))
+    return text if len(text) <= MAX_LOGGED_DETAIL_CHARS else text[:MAX_LOGGED_DETAIL_CHARS] + "..."
+
+
 class CorpusTransientFailure(Exception):
     """Ledger contention (HTTP 503) or a transport-level failure (timeout,
     connection error). The request that failed is idempotent -- it is either
@@ -324,7 +347,8 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
         except CorpusPermanentFailure as exc:
             consecutive_permanent += 1
             counts["permanent_failure"] += 1
-            logger.error("corpus request failed (status=%s): %s", exc.status, exc.detail or exc)
+            logger.error("corpus request failed (status=%s): %s", exc.status,
+                         loggable_detail(exc.detail) or exc)
             if consecutive_permanent >= max_consecutive_failures:
                 raise CorpusMinerHalted(
                     f"{consecutive_permanent} consecutive permanent failures: {exc}",
