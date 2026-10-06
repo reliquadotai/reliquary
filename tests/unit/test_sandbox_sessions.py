@@ -446,7 +446,7 @@ def test_a_graded_close_is_not_voided_by_a_drain(tmp_path):
     assert env.book.get(grant.session_id).state == CLOSED_GRADED
 
 
-@pytest.mark.parametrize("before", [CLOSED, VOIDED, LAPSED, CLOSED_GRADED])
+@pytest.mark.parametrize("before", [VOIDED, LAPSED, CLOSED_GRADED])
 def test_a_submission_dominates_every_earlier_end(tmp_path, before):
     env = build(tmp_path)
     grant = open_(env)
@@ -625,3 +625,39 @@ def test_the_swe_task_resolver_cache_is_bounded_and_not_on_the_class():
     for index in (1, 2, 1, 3, 1, 2):
         asyncio.run(resolver.resolve(index))
     assert calls == [1, 2, 3, 2]
+
+
+
+# -- fix round 2 ---------------------------------------------------------------------
+
+def test_an_open_failed_close_can_never_be_paid_later(tmp_path):
+    """Probe 7: hold a graded transcript, close `open_failed` to free the slot, let
+    another miner take it, then submit. The late submission is refused, and the other
+    miner's reservation stands."""
+    env = build(tmp_path, remaining=1)
+    grant = open_(env)
+    graded = final_of(env, grant, "graded")                       # kept by the miner
+    assert close(env, grant, None, reason="open_failed")["state"] == CLOSED
+    other = open_(env, hotkey="5Other", request_id="b" * 32)
+    assert isinstance(other, Grant)
+    assert graded["records"][-1]["body"]["status"] == "graded"
+    assert not sessions.session_submittable(env.book.get(grant.session_id).state)
+    asyncio.run(env.issuer.submitted(grant.session_id))           # even if called anyway
+    assert env.book.get(grant.session_id).state == CLOSED
+    assert env.store.documents[grant.session_id]["state"] == CLOSED
+    assert env.book.get(other.session_id).state == LIVE
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 1
+
+
+@pytest.mark.parametrize("state,submittable", [
+    (LIVE, True), (CLOSED_GRADED, True), (SUBMITTED, False), (CLOSED, False),
+    (ABORTED, False), (VOIDED, False), (LAPSED, False), ("unknown", False), (None, False),
+])
+def test_only_a_live_or_graded_closed_session_is_submittable(state, submittable):
+    assert sessions.session_submittable(state) is submittable
+
+
+def test_a_closed_session_never_becomes_submitted_in_the_store():
+    assert SUBMITTED not in sandbox_store.SESSION_TRANSITIONS[CLOSED]
+    assert set(sandbox_store.SESSION_TRANSITIONS) == {LIVE, CLOSED_GRADED, SUBMITTED, CLOSED,
+                                                       ABORTED, VOIDED, LAPSED}

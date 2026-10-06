@@ -352,7 +352,9 @@ _DAY = 86400
 # Session states and the only moves between them, shared by the in-memory book
 # (`reliquary.sandbox.sessions.SessionBook.settle`) and the store's CAS, so a stale
 # write (a lapse computed before a submission landed) never overwrites a later state.
-# `submitted` is terminal and dominant: the ledger already paid the slot.
+# `submitted` is terminal and dominant over the states whose slot was not handed back
+# by the miner's own report; `closed` is terminal for payment (an `open_failed` or
+# unpaid close freed its slot, so a later submission could take someone else's).
 SESSION_LIVE, SESSION_CLOSED_GRADED = "live", "closed_graded"
 SESSION_SUBMITTED, SESSION_CLOSED, SESSION_ABORTED = "submitted", "closed", "aborted"
 SESSION_VOIDED, SESSION_LAPSED = "voided", "lapsed"
@@ -360,7 +362,8 @@ SESSION_TRANSITIONS: dict[str, frozenset[str]] = {
     SESSION_LIVE: frozenset({SESSION_CLOSED_GRADED, SESSION_SUBMITTED, SESSION_CLOSED,
                              SESSION_ABORTED, SESSION_VOIDED, SESSION_LAPSED}),
     SESSION_CLOSED_GRADED: frozenset({SESSION_SUBMITTED, SESSION_LAPSED}),
-    SESSION_CLOSED: frozenset({SESSION_SUBMITTED}),
+    # `closed` (unpaid final or failed open) released its slot: never paid afterwards.
+    SESSION_CLOSED: frozenset(),
     SESSION_VOIDED: frozenset({SESSION_SUBMITTED}),
     SESSION_LAPSED: frozenset({SESSION_SUBMITTED}),
     SESSION_ABORTED: frozenset({SESSION_SUBMITTED}),
