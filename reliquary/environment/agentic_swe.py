@@ -9,6 +9,7 @@ holds them equal to the pinned package when it is installed.
 from __future__ import annotations
 
 import functools
+import importlib
 import importlib.metadata
 import json
 import re
@@ -22,11 +23,11 @@ SUPPORTED_RENDERER = "renderers:qwen38@0.1.11"
 RENDERERS_VERSION = "0.1.11"
 SUPPORTED_VERIFIERS = "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf"
 
-# harnesses/bash/harness.py: BASH_SYSTEM_PROMPT + " " + EDIT_SYSTEM_PROMPT.
-BASH_SYSTEM_PROMPT = (
-    "You are a coding agent. You have access to a bash tool for running shell commands. "
-    "You also have an edit tool for single-occurrence string replacement in a file."
-)
+# harnesses/bash/harness.py: BASH_SYSTEM_PROMPT and EDIT_SYSTEM_PROMPT; the harness
+# joins the enabled fragments with one space.
+BASH_SENTENCE = "You are a coding agent. You have access to a bash tool for running shell commands."
+EDIT_SENTENCE = "You also have an edit tool for single-occurrence string replacement in a file."
+BASH_SYSTEM_PROMPT = BASH_SENTENCE + " " + EDIT_SENTENCE
 # harnesses/bash/program.py: BASH_TOOL, EDIT_TOOL, as the train client renders them.
 BASH_HARNESS_TOOLS: tuple[dict, ...] = (
     {"type": "function", "function": {
@@ -48,6 +49,34 @@ BASH_HARNESS_TOOLS: tuple[dict, ...] = (
                            "new_str": {"type": "string", "description": "Replacement string."}},
                        "required": ["path", "old_str", "new_str"]}}},
 )
+_TOOL_SETS = (("bash",), ("bash", "edit"))
+
+
+def harness_tools(tools) -> tuple[dict, ...]:
+    """The tool specs verifiers' bash harness sends for `tools` (bash always, edit
+    optionally): the renderer must parse with exactly these, since parameter
+    coercion follows their schemas."""
+    names = tuple(tools)
+    if names not in _TOOL_SETS:
+        raise ValueError(f"the bash harness offers bash or bash and edit, not {list(names)}")
+    return BASH_HARNESS_TOOLS[:len(names)]
+
+
+def harness_system_prompt(tools) -> str:
+    harness_tools(tools)
+    return " ".join([BASH_SENTENCE] + ([EDIT_SENTENCE] if "edit" in tools else []))
+
+
+def pinned_tool_calls(parsed_calls, unknown_status) -> list[tuple[str, str]]:
+    """The one parser miners (through verifiers' train client) and validators share
+    (spec §5.C amendment 1): verifiers b2e4e81 `response_from_generate`'s filter,
+    exactly. A call needs a non-empty name and a status other than UNKNOWN_TOOL (so a
+    block with no name, unclosed or malformed, is no call on either side); arguments
+    are the raw string, or the parsed dict through `json.dumps` with its defaults."""
+    return [(call.name, call.arguments if isinstance(call.arguments, str)
+             else json.dumps(call.arguments or {}))
+            for call in parsed_calls
+            if getattr(call, "name", None) and getattr(call, "status", None) != unknown_status]
 
 
 # dialects/base.py CAPABILITY_NOTICE: verifiers' interception appends it to the
@@ -172,6 +201,88 @@ def load_swe_source(num_images: int) -> SweSource:
                       for row in rows])
 
 
+class SignedSweSource:
+    """The prompts of a signed-sandbox job: `reliquary_swe.sandbox.sandbox_prompt(split,
+    index)` exactly, with no restricted-network notice (the sandbox bridge runs the
+    harness in a subprocess runtime, which adds none; ruling 7 of plan 3)."""
+
+    def __init__(self, split: str, *, prompt_of=None, row_of=None) -> None:
+        self.split = split
+        self._prompt_of = prompt_of
+        self._row_of = row_of
+        self._prompts = functools.lru_cache(maxsize=4096)(self._prompt)
+
+    def _prompt(self, index: int) -> str:
+        prompt_of = self._prompt_of
+        if prompt_of is None:
+            from reliquary_swe.sandbox import sandbox_prompt as prompt_of
+        return prompt_of(self.split, index)
+
+    def prompt(self, index: int) -> str:
+        return self._prompts(int(index))
+
+    def instance_id(self, index: int) -> str:
+        row_of = self._row_of
+        if row_of is None:
+            from reliquary_swe.sandbox import row_for as row_of
+        return row_of(self.split, int(index))[1].instance_id
+
+    def task_for(self, index: int) -> EpisodeTask:
+        return EpisodeTask(id=self.instance_id(index), prompt=self.prompt(index), tools=())
+
+
+def installed_env_package(package: str) -> str:
+    """The `env_package` a gateway serving this install writes into record 0:
+    `<distribution>==<version>+g<16 hex>`, computed by reliquary-sandbox's own task
+    registry over the `sandbox` module's installed files (one source of truth)."""
+    from reliquary_sandbox_service.episodes.registry import _package_of
+
+    return _package_of(f"{package.replace('-', '_')}.sandbox:sandbox_task")
+
+
+def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None:
+    """Why this process cannot serve a signed-sandbox `episode`, or None:
+    reliquary-sandbox at the job's commit, the env package at the exact version and
+    code digest record 0 will carry, its `sandbox` entry points, and (miners) the
+    verifiers bridge."""
+    from reliquary import sandbox as sandbox_support
+
+    if getattr(episode, "sandbox", None) is None:
+        return "the episode is not a signed_sandbox one"
+    try:
+        sandbox_support.require_sandbox()
+    except sandbox_support.SandboxUnavailable as exc:
+        return str(exc)
+    refusal = sandbox_support.sandbox_commit_refusal(episode.sandbox.sandbox_commit)
+    if refusal:
+        return refusal
+    package = episode.env.package
+    pinned = episode.sandbox.env_package
+    try:
+        installed = f"{package}=={importlib.metadata.version(package)}"
+    except importlib.metadata.PackageNotFoundError:
+        return f"{package} is not installed"
+    if installed != pinned.rsplit("+g", 1)[0]:
+        return f"{installed} is installed, the job pins {pinned}"
+    try:
+        importlib.import_module(f"{package.replace('-', '_')}.sandbox")
+    except ImportError as exc:
+        return (f"{package.replace('-', '_')}.sandbox cannot be imported ({exc}): "
+                f"install {package} at the job's commit")
+    try:
+        identity = installed_env_package(package)
+    except Exception as exc:  # an unreadable install cannot be the pinned code
+        return f"cannot compute the installed {package} identity ({exc})"
+    if identity != pinned:
+        return f"{identity} is installed, the job pins {pinned}"
+    if need_bridge:
+        try:
+            importlib.import_module("reliquary_sandbox_verifiers")
+        except Exception as exc:  # the bridge refuses an unpinned verifiers with RuntimeError
+            return f"the verifiers bridge cannot load: {exc}"
+    return None
+
+
 def _locked(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -184,7 +295,7 @@ class QwenTurnRenderer:
     """`trajectory_parse.TurnRenderer` over the pinned `renderers` Qwen3.8
     renderer: the one verifiers' train client renders every turn with."""
 
-    def __init__(self, renderer) -> None:
+    def __init__(self, renderer, tools=("bash", "edit")) -> None:
         from renderers.base import ToolCallParseStatus
 
         self._r = renderer
@@ -199,7 +310,8 @@ class QwenTurnRenderer:
         self._close = renderer._token_id("</tool_response>")
         self.turn_markup_ids = frozenset(
             int(renderer._token_id(t)) for t in ("<|im_start|>", "<tool_response>", "</tool_response>"))
-        self._tools = [dict(tool) for tool in BASH_HARNESS_TOOLS]
+        self._tools = [dict(tool) for tool in harness_tools(tools)]
+        self._system_prompt = harness_system_prompt(tools)
         self._im_start = int(renderer._token_id("<|im_start|>"))
         self._think = int(renderer._token_id("<think>"))
         self._think_end = int(renderer._token_id("</think>"))
@@ -211,16 +323,14 @@ class QwenTurnRenderer:
     @_locked
     def initial_ids(self, prompt: str) -> list[int]:
         rendered = self._r.render(
-            [{"role": "system", "content": BASH_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            [{"role": "system", "content": self._system_prompt}, {"role": "user", "content": prompt}],
             tools=self._tools, add_generation_prompt=True)
         return [int(t) for t in rendered.token_ids]
 
     @_locked
     def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
         parsed = self._r.parse_response(list(completion_ids), tools=self._tools)
-        return [(call.name, call.arguments if isinstance(call.arguments, str)
-                 else json.dumps(call.arguments or {}))
-                for call in parsed.tool_calls if call.name and call.status != self._unknown]
+        return pinned_tool_calls(parsed.tool_calls, self._unknown)
 
     @_locked
     def observations(self, segment_ids) -> list[str]:
@@ -320,11 +430,13 @@ class QwenTurnRenderer:
         return message
 
 
-def load_turn_renderer(checkpoint_dir: str) -> QwenTurnRenderer:
+def load_turn_renderer(checkpoint_dir: str, tools=("bash", "edit")) -> QwenTurnRenderer:
     """The renderer the train client builds for this checkpoint
-    (`create_renderer(load_tokenizer(model), Qwen38RendererConfig())`)."""
+    (`create_renderer(load_tokenizer(model), Qwen38RendererConfig())`), over the
+    job's tools."""
     from renderers import create_renderer
     from renderers.base import load_tokenizer
     from renderers.configs import Qwen38RendererConfig
 
-    return QwenTurnRenderer(create_renderer(load_tokenizer(checkpoint_dir), Qwen38RendererConfig()))
+    return QwenTurnRenderer(create_renderer(load_tokenizer(checkpoint_dir), Qwen38RendererConfig()),
+                            tools=tools)
