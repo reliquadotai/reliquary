@@ -18,9 +18,15 @@ it is signed; the mining loop reports it when it does not.
 Every 429 and 503 is honoured: a throttled open holds this hotkey's next open until its
 `Retry-After` has passed; a refusal without one backs off (1 s to 60 s); a throttled or
 timed-out close (`close_busy`, a stale directory, `body_timeout`) is resent after it.
-A graded transcript that is not submitted is closed `withdraw` (the validator verifies
-it and frees the slot and the caps); any other final is closed `final`; a session
-with no transcript (the run raised, or was cancelled) is closed `open_failed`. Tokens and signed open bodies are bearer secrets: nothing here logs them, and
+A graded transcript the miner intends to submit is first closed `final`: the session
+becomes `closed_graded`, which holds its slot and which no drain of its machine can
+void, so it stays payable while the submission travels (a failed close changes
+nothing; a close answering a state the validator will not pay, such as `voided`, ends
+the episode unsubmitted). A graded transcript that is not submitted is closed
+`withdraw` (the validator verifies it and frees the slot and the caps); any other final
+is closed `final`; a session with no transcript (the run raised, or was cancelled) is
+closed `open_failed`. A resent open answered `request_reused` for a session still
+`live` (the validator restarted and lost the token) closes that session `open_failed`. Tokens and signed open bodies are bearer secrets: nothing here logs them, and
 errors carry exception types and statuses, never a request body."""
 
 from __future__ import annotations
@@ -68,10 +74,13 @@ hotkey stops."""
 VALIDATOR_THROTTLES = frozenset({
     "sandbox_capacity", "directory_unavailable", "store_unavailable", "ledger_unavailable",
     "task_unavailable", "registration_unavailable", "close_busy", "session_claimed",
+    "session_busy", "job_not_ready",
 })
 """The validator's named 503s: it is serving, only busy; they never stop the hotkey."""
 SUBMIT_TRANSIT_S = 60
 """A trajectory is submitted no later than this before the validator's grading deadline."""
+PAYABLE_STATES = frozenset({"live", "closed_graded", "submitted"})
+"""Session states a submission can still be paid in (the close answer's `state`)."""
 MAX_ERROR_CHARS = 300
 
 
@@ -406,8 +415,9 @@ class SignedSweEpisodeRunner:
                 continue
             try:
                 grant = await self._send_open(self._open_body(lost.index, lost.request_id))
-            except SessionRefused:
+            except SessionRefused as refused:
                 grant = None                 # not live (any more): nothing to close
+                await self._close_reused(refused)
             except Exception:
                 continue                     # still unreachable: kept
             self._unconfirmed.remove(lost)
@@ -424,6 +434,8 @@ class SignedSweEpisodeRunner:
                 try:
                     grant = await self._send_open(self._open_body(index, request_id))
                 except SessionRefused as refused:
+                    if attempt:
+                        await self._close_reused(refused)
                     raise self._note_refusal(refused) from None
                 except Exception as exc:
                     # A lost answer: the same request id returns the same grant.
@@ -439,11 +451,22 @@ class SignedSweEpisodeRunner:
                 index, request_id, slot, self._monotonic() + self.deadline(index)))
             raise self._note_refusal(SessionRefused("validator_unreachable"))
 
+    async def _close_reused(self, refused: SessionRefused) -> None:
+        """`request_reused` names a session our lost open was granted; if it is still
+        live (the validator lost its token in a restart), it holds a slot: close it."""
+        detail = refused.detail if isinstance(refused.detail, Mapping) else {}
+        session_id = detail.get("session_id")
+        if (refused.reason == "request_reused" and detail.get("state") == "live"
+                and isinstance(session_id, str) and session_id):
+            await self._close(session_id, "open_failed", None)
+
     # -- closes --------------------------------------------------------------------
 
-    async def _close(self, session_id: str, reason: str, transcript: dict | None) -> None:
+    async def _close(self, session_id: str, reason: str, transcript: dict | None) -> dict | None:
         """Report how the session ended; a throttled or timed-out report is resent after
-        its `Retry-After` (at most MAX_CLOSE_WAIT_S). Never raises an Exception."""
+        its `Retry-After` (at most MAX_CLOSE_WAIT_S). Returns the validator's answer
+        (the session's state), or None when it was refused or never arrived. Never
+        raises an Exception."""
         path = sandbox_close_path(self._prefix, session_id)
         for attempt in range(CLOSE_ATTEMPTS):
             body = signed_close_request(hotkey=self._hotkey, session_id=session_id,
@@ -461,17 +484,18 @@ class SignedSweEpisodeRunner:
                     continue
                 logger.warning("reporting sandbox session %s (%s) refused: %s", session_id,
                                reason, refused.reason)
-                return
+                return None
             except Exception as exc:
                 if not last:
                     await self._sleep(2.0 ** attempt)
                     continue
                 logger.warning("reporting sandbox session %s (%s) failed: %s", session_id,
                                reason, type(exc).__name__)
-                return
+                return None
             logger.info("sandbox session %s reported %s: %s", session_id, reason,
                         answer.get("state") if isinstance(answer, Mapping) else None)
-            return
+            return dict(answer) if isinstance(answer, Mapping) else None
+        return None
 
     async def _end(self, session_id: str, slot: _Slot, reason: str,
                    transcript: dict | None, *, bounded: bool = False) -> None:
@@ -556,6 +580,13 @@ class SignedSweEpisodeRunner:
             reason, detail = refusal
             return await unusable(f"the validator would refuse the transcript: {reason} {detail}")
         expires_at = int(transcript["token"]["claims"]["expires_at"])
+        # Closed `final` first: `closed_graded` keeps the slot and no drain voids it.
+        answer = await self._close(session_id, "final", transcript)
+        state = answer.get("state") if answer is not None else None
+        if state is not None and state not in PAYABLE_STATES:
+            slot.free()                     # the validator already ended it
+            return EpisodeResult(trace_id, "", stop, False, None,
+                                 error=f"the validator will not pay this session: {state}")
 
         async def release() -> None:
             await self._end(session_id, slot, "withdraw", transcript)

@@ -75,7 +75,8 @@ class FakeSessions:
         if self.close_refusals:
             raise self.close_refusals.pop(0)
         self.live -= 1
-        return {"state": "closed"}
+        # A final close of a graded transcript holds the slot (closed_graded).
+        return {"state": "closed_graded" if body["reason"] == "final" else "closed"}
 
 
 class FakeTime:
@@ -161,10 +162,11 @@ def test_a_graded_episode_is_returned_with_its_transcript_and_released_on_demand
     binding = build_sandbox_open_binding(body, validator_hotkey=VALIDATOR, path=OPEN_PATH)
     assert body["signature"] == "sig-" + binding.hex()[:16]
     assert sandbox.runs == [(signed["token"], "Fix task 3.")]
-    assert sessions.closed == []
+    # Closed `final` before it is returned for submission (closed_graded, drain-immune).
+    assert [(sid, body["reason"]) for sid, body in sessions.closed] == [("s-1", "final")]
     assert result.submit_by == NOW + 4500 + 1800 - 60
     asyncio.run(result.release())
-    session_id, close = sessions.closed[0]
+    session_id, close = sessions.closed[1]
     assert session_id == "s-1" and close["reason"] == "withdraw" and close["transcript"] == signed
     assert close["signature"] == "sig-" + build_sandbox_close_binding(
         close, validator_hotkey=VALIDATOR, path="/corpus/sandbox/sessions/s-1/close").hex()[:16]
@@ -667,6 +669,9 @@ def test_withdraw_and_open_interoperate_with_the_real_router_and_real_keys(tmp_p
 
         async def close(self, **kw):
             self.calls.append(("close", kw))
+            if kw["reason"] == "final":
+                return {"session_id": kw["session_id"], "state": "closed_graded",
+                        "status": "graded"}
             return {"session_id": kw["session_id"], "state": "closed", "status": "withdrawn"}
 
     issuer = Issuer()
@@ -686,7 +691,129 @@ def test_withdraw_and_open_interoperate_with_the_real_router_and_real_keys(tmp_p
     result, _ = asyncio.run(_run(signed_runner))
     assert result.ok
     asyncio.run(result.release())
-    (_, opened), (_, closed) = issuer.calls
+    (_, opened), (_, final), (_, closed) = issuer.calls
+    assert final["reason"] == "final" and final["transcript"] == signed
     assert opened["hotkey"] == alice.ss58_address
     assert opened["engagement"] == {"kind": "corpus", "job_id": JOB.job_id, "prompt_index": 3}
     assert closed["reason"] == "withdraw" and closed["transcript"] == signed
+
+
+# -- final review: I1 (named throttles), I3 (a) (close final before submitting), M1, M2 ---
+
+@pytest.mark.parametrize("reason", [
+    "job_not_ready", "ledger_unavailable", "directory_unavailable", "store_unavailable",
+    "sandbox_capacity", "close_busy", "session_busy",
+])
+def test_the_validators_named_throttles_never_stop_the_hotkey(reason):
+    fake_time = FakeTime()
+    sessions = FakeSessions(refuse=SessionRefused(reason, retry_after=7.0, status=503),
+                            clock=fake_time.monotonic)
+    counts = _mine_signed(runner(sessions, FakeSandboxRunner(None), fake_time=fake_time),
+                          episodes=15)
+    assert len(sessions.opened) == 15 and counts["halted"] == 0
+    assert all(later - earlier >= 7.0
+               for earlier, later in zip(sessions.times, sessions.times[1:]))
+
+
+class AnsweringSessions(FakeSessions):
+    """Closes answer the session's state as the validator would."""
+
+    def __init__(self, *args, close_state="closed_graded", **kw):
+        super().__init__(*args, **kw)
+        self.close_state = close_state
+
+    def close(self, session_id, body):
+        self.closed.append((session_id, body))
+        if self.close_refusals:
+            raise self.close_refusals.pop(0)
+        state = self.close_state if body["reason"] == "final" else "closed"
+        return {"session_id": session_id, "state": state, "status": "graded"}
+
+
+def test_a_graded_transcript_is_closed_final_before_it_is_submitted(tmp_path):
+    """I3 (a): `closed_graded` holds the slot and is immune to a drain, so the session
+    stays payable while the submission travels."""
+    signed = _transcript(tmp_path)
+    sessions = AnsweringSessions(grant=_grant(signed))
+    result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed))))
+    assert result.ok and result.transcript == signed and result.release is not None
+    assert [(sid, body["reason"]) for sid, body in sessions.closed] == [("s-1", "final")]
+    assert sessions.closed[0][1]["transcript"] == signed
+
+
+def test_a_final_close_that_fails_still_lets_the_transcript_be_submitted(tmp_path):
+    signed = _transcript(tmp_path)
+    refusals = [SessionRefused("transcript_invalid", status=409)]
+    sessions = AnsweringSessions(grant=_grant(signed), close_refusals=refusals)
+    result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed))))
+    assert result.ok and result.release is not None
+    assert [body["reason"] for _, body in sessions.closed] == ["final"]
+
+
+@pytest.mark.parametrize("state", ["voided", "lapsed", "closed"])
+def test_a_session_the_validator_will_not_pay_is_not_submitted(tmp_path, state):
+    signed = _transcript(tmp_path)
+    sessions = AnsweringSessions(grant=_grant(signed), close_state=state)
+    result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed))))
+    assert not result.ok and state in result.error and result.release is None
+    assert [body["reason"] for _, body in sessions.closed] == ["final"]
+
+
+def test_a_reused_request_for_a_live_session_closes_it(tmp_path):
+    """M1: after a validator restart a resent open answers `request_reused` (the token
+    is gone); its session is still live and holds a slot: the miner closes it."""
+    signed = _transcript(tmp_path)
+    ids = iter(f"{n:032x}" for n in range(1000))
+
+    class Restarted(FakeSessions):
+        sent = 0
+
+        def open(self, body):
+            self.opened.append(body)
+            self.sent += 1
+            if self.sent == 1:
+                raise httpx.ConnectError("lost")          # granted, answer lost
+            raise SessionRefused("request_reused", {"session_id": "s-lost", "state": "live"},
+                                 status=409)
+
+    sessions = Restarted(grant=_grant(signed))
+    result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed),
+                                        new_request_id=lambda: next(ids))))
+    assert isinstance(result, SessionRefused) and result.reason == "request_reused"
+    assert [(sid, body["reason"]) for sid, body in sessions.closed] == [("s-lost", "open_failed")]
+
+
+def test_a_reused_request_for_a_session_already_ended_is_not_closed(tmp_path):
+    signed = _transcript(tmp_path)
+    sessions = FakeSessions(refuse=SessionRefused(
+        "request_reused", {"session_id": "s-old", "state": "closed"}, status=409))
+    result, _ = asyncio.run(_run(runner(sessions, FakeSandboxRunner(signed))))
+    assert isinstance(result, SessionRefused) and sessions.closed == []
+
+
+def test_a_submission_retried_past_its_deadline_is_withdrawn(monkeypatch):
+    """M2: the submit retries stop at `submit_by`; the session is then withdrawn."""
+    import time as _time
+
+    from reliquary.miner import agentic_miner
+    from reliquary.miner.corpus_miner import CorpusTransientFailure
+
+    slept = []
+
+    def sleep(seconds):                   # never really sleeps; a runaway retry loop ends
+        slept.append(seconds)
+        if len(slept) > 3:
+            raise RuntimeError("still retrying past the deadline")
+
+    monkeypatch.setattr(agentic_miner.time, "sleep", sleep)
+
+    class Busy(FakeClient):
+        def submit(self, body):
+            self.bodies.append(body)
+            raise CorpusTransientFailure("503 sandbox_directory_unavailable", retry_after=600.0)
+
+    loop_runner = LoopRunner(submit_by=_time.time() + 300)
+    counts, client = _mine(loop_runner, client=Busy(), episodes=1)
+    assert len(client.bodies) == 1 and slept == []           # 600 s would pass the deadline
+    assert len(loop_runner.released) == 1
+    assert counts["submit_deadline_passed"] == 1 and counts["episode_crashed"] == 0

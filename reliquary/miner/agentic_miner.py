@@ -112,8 +112,19 @@ def docker_storage_warning(*, refusal: Callable[[], str | None] | None = None) -
             f"tolerance (honest episodes can be voided). Put Docker's storage on xfs.")
 
 
-def _submit(client, body: dict, counts: Counter) -> dict:
-    return _retry(lambda: client.submit(body), sleep=time.sleep, counts=counts,
+class _SubmitDeadline(Exception):
+    """The next retry of a submission would land past its `submit_by`."""
+
+
+def _submit(client, body: dict, counts: Counter, submit_by: float | None = None) -> dict:
+    """Submit, retrying; with `submit_by`, a retry that would wait past it stops
+    (`_SubmitDeadline`): the validator would refuse it anyway."""
+    def sleep(seconds: float) -> None:
+        if submit_by is not None and time.time() + seconds > submit_by:
+            raise _SubmitDeadline()
+        time.sleep(seconds)
+
+    return _retry(lambda: client.submit(body), sleep=sleep, counts=counts,
                   max_consecutive_failures=5)
 
 
@@ -230,7 +241,13 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             await unsubmitted()
             return
         try:
-            answer = await asyncio.to_thread(_submit, client, body, counts)
+            answer = await asyncio.to_thread(_submit, client, body, counts, result.submit_by)
+        except _SubmitDeadline:
+            counts["submit_deadline_passed"] += 1
+            logger.warning("episode %d of %s not submitted: its retries reached the validator's "
+                           "deadline", prompt_index, tag)
+            await unsubmitted()
+            return
         except (CorpusJobRetired, CorpusMinerHalted) as exc:
             counts["halted"] += 1
             logger.error("%s stops: %s", tag, exc)
