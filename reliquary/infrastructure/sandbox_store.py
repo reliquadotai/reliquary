@@ -16,6 +16,9 @@ forged open stamped just before it. Transcripts opened after the end fail
 public key is used once: never under a second key id (a compromised key cannot come
 back renamed) and never by a second machine.
 
+Sessions: `reliquary/sandbox/sessions/{yyyymmdd of expires_at}/{session_id}.json`, one
+document per issued session token (claims, machine, state), never the token's signature.
+
 Status. `active`, `draining`, `revoked`: status decides placement only, keys decide
 signatures. Revoking a machine stops new sessions while its keys keep verifying the
 transcripts already signed in their windows; going from revoked back to active is
@@ -34,6 +37,7 @@ import logging
 import os
 import random
 import re
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -336,3 +340,98 @@ async def list_machines(**client_kwargs) -> list[dict]:
         else:
             found.append(dict(document))
     return found
+
+
+# -- session documents ------------------------------------------------------------
+
+SESSION_PREFIX = "reliquary/sandbox/sessions/"
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DAY = 86400
+
+
+class SessionStoreConflict(RuntimeError):
+    """A session document that already exists, is missing, or kept changing."""
+
+
+def _day(at: int) -> str:
+    return time.strftime("%Y%m%d", time.gmtime(int(at)))
+
+
+def session_key(session_id: str, expires_at: int) -> str:
+    """Bucketed by the day the token expires, so a restart lists a few days, not all."""
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(f"session id {session_id!r} is not a name")
+    return f"{SESSION_PREFIX}{_day(expires_at)}/{session_id}.json"
+
+
+def _without_secrets(document: Mapping) -> dict:
+    """A session document never carries a token (nor its signature)."""
+    if "token" in document or "signature" in document:
+        raise ValueError("a session document never carries a token or its signature")
+    return dict(document)
+
+
+class R2SessionStore:
+    """One document per issued token: claims, machine, state; never the signature."""
+
+    def __init__(self, **client_kwargs) -> None:
+        self._kw = client_kwargs
+
+    async def create(self, document: Mapping) -> None:
+        document = _without_secrets(document)
+        key = session_key(document["session_id"], document["expires_at"])
+        if not await _put(key, document, None, **dict(self._kw)):
+            raise SessionStoreConflict(f"session {document['session_id']} already exists")
+
+    async def update(self, document: Mapping) -> None:
+        document = _without_secrets(document)
+        key = session_key(document["session_id"], document["expires_at"])
+        for attempt in range(WRITE_ATTEMPTS):
+            if attempt:
+                await _backoff(attempt)
+            stored, etag = await _get(key, **dict(self._kw))
+            if stored is None:
+                raise SessionStoreConflict(f"session {document['session_id']} is missing")
+            if await _put(key, document, etag, **dict(self._kw)):
+                return
+        raise SessionStoreConflict(f"session {document['session_id']} kept changing")
+
+    async def list_recent(self, now: int) -> list[dict]:
+        """Sessions whose token expires from two days ago to tomorrow: every one still
+        live, and every one inside the per-hotkey windows (24 h). An object that is not
+        a JSON object is logged and left out."""
+        keys: list[str] = []
+        for offset in (-2, -1, 0, 1):
+            keys += await _list_keys(f"{SESSION_PREFIX}{_day(now + offset * _DAY)}/",
+                                     **dict(self._kw))
+        found = []
+        for key, document in await _read_all(keys, **self._kw):
+            if isinstance(document, Mapping):
+                found.append(dict(document))
+            else:
+                logger.error("sandbox object %s is not a session document; skipped", key)
+        return found
+
+
+class MemorySessionStore:
+    """For tests and for a validator run without R2 persistence."""
+
+    def __init__(self) -> None:
+        self.documents: dict[str, dict] = {}
+        self.fail = False
+
+    async def create(self, document: Mapping) -> None:
+        if self.fail:
+            raise OSError("bucket down")
+        document = _without_secrets(document)
+        if document["session_id"] in self.documents:
+            raise SessionStoreConflict(document["session_id"])
+        self.documents[document["session_id"]] = document
+
+    async def update(self, document: Mapping) -> None:
+        if self.fail:
+            raise OSError("bucket down")
+        self.documents[document["session_id"]] = _without_secrets(document)
+
+    async def list_recent(self, now: int) -> list[dict]:
+        return [dict(d) for d in self.documents.values()]
