@@ -9,6 +9,7 @@ client and the job's renderer, sampling and turn limit.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 
@@ -20,6 +21,10 @@ class EpisodeResult:
     ok: bool
     reward: float | None
     error: str | None = None
+    # Signed-sandbox episodes: the gateway's transcript, submitted with the tokens, and
+    # how to report the session when it is not submitted (its reservation ends).
+    transcript: dict | None = None
+    release: Callable[[], Awaitable[None]] | None = None
 
 
 def env_config(episode, *, harness_env: dict | None = None) -> dict:

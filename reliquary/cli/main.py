@@ -2594,10 +2594,16 @@ def corpus_mine_agentic(
     max_num_seqs: int = typer.Option(
         16, "--max-num-seqs",
         help="vLLM's concurrent sequences; lower it if turns fail as preempted (unprovable)"),
+    validator_hotkey: str = typer.Option(
+        None, "--validator-hotkey",
+        help="The validator's ss58 hotkey; signed-sandbox jobs sign their session requests "
+             "for it"),
 ) -> None:
     """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
-    against a local vLLM with per-turn proofs. Needs Docker and the job's
-    pinned reliquary-swe, verifiers and renderers installed."""
+    against a local vLLM with per-turn proofs. Replay jobs need Docker and the
+    job's pinned reliquary-swe, verifiers and renderers installed. Signed-sandbox
+    jobs need no Docker: every tool call runs on the validator's sandbox machines
+    (they need `--validator-hotkey` and the reliquary[sandbox-miner] extra)."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
@@ -2637,26 +2643,48 @@ def corpus_mine_agentic(
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
     client.scoped_submit = submits_scoped(job)
-    refusal = episode_support_refusal(job.episode, need_verifiers=True)
+    from reliquary.corpus.job import is_signed_sandbox
+    from reliquary.environment.agentic_swe import sandbox_support_refusal
+
+    signed = is_signed_sandbox(job)
+    refusal = episode_support_refusal(job.episode, need_verifiers=True) or (
+        sandbox_support_refusal(job.episode, need_bridge=True) if signed else None)
     if refusal:
         typer.echo(f"error: {refusal}", err=True)
         raise typer.Exit(code=4)
-    from reliquary.miner.agentic_miner import docker_storage_warning
+    sessions = None
+    if signed:
+        from reliquary.miner.signed_episode import HttpSandboxSessions
 
-    warning = docker_storage_warning()
-    if warning:
-        typer.echo(warning, err=True)
+        if not validator_hotkey:
+            typer.echo("error: a signed-sandbox job needs --validator-hotkey (the validator's "
+                       "ss58 hotkey: session requests are signed for it)", err=True)
+            raise typer.Exit(code=2)
+        try:
+            sessions = HttpSandboxSessions(httpx.Client(base_url=validator_url, timeout=60.0),
+                                           validator_hotkey=validator_hotkey)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+    else:
+        from reliquary.miner.agentic_miner import docker_storage_warning
+
+        warning = docker_storage_warning()
+        if warning:
+            typer.echo(warning, err=True)
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
     if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
         typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
         raise typer.Exit(code=4)
     identity = Identity(hotkey=wallet.hotkey.ss58_address,
                         sign=lambda body: sign_corpus_submission(wallet, body),
-                        episodes=episodes or None)
+                        episodes=episodes or None,
+                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
     counts = asyncio.run(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
-        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs))
+        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
+        sessions=sessions))
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
 
 
