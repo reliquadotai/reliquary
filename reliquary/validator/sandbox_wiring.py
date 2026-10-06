@@ -144,6 +144,10 @@ class SandboxServices:
             return None
         return view
 
+    def publish(self, w) -> None:
+        """Serve sessions for a wired signed job (its `wire_signed_job` view)."""
+        self.jobs[str(w.job.job_id)] = w.sandbox_view
+
     def forget(self, job_id: str) -> None:
         """A job that failed to wire, or retired: no session is opened for it again."""
         if self.jobs.pop(str(job_id), None) is not None:
@@ -241,8 +245,11 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
 def wire_signed_job(w, *, services: SandboxServices, routes: Callable[[], Any],
                     checkpoint_dir: str, tokenizer, vocab_size, chunk_tokens: int,
                     intake_factory=build_signed_episode_intake,
-                    resolver_factory=SweTaskResolver) -> None:
-    """`w.episode_intake` for a signed job, and its view for the session issuer. `routes`
+                    resolver_factory=SweTaskResolver, publish: bool = True) -> None:
+    """`w.episode_intake` for a signed job, and its view for the session issuer
+    (`w.sandbox_view`; published to the issuer at once, or with `publish=False` only by
+    `services.publish(w)` once the rest of the job's wiring succeeded, so no open ever
+    sees a job still being wired). `routes`
     returns the app's CorpusJobRoutes (built after the intakes), read at call time.
     Until the job's router is adopted there (a hot add in progress), an open for it is
     refused `job_not_ready` (503, retried); once it is retired, `job_not_served`."""
@@ -268,9 +275,11 @@ def wire_signed_job(w, *, services: SandboxServices, routes: Callable[[], Any],
         check = getattr(w, "is_banned", None)
         return False if check is None else bool(await check(hotkey))
 
-    services.jobs[job_id] = SignedJobView(
+    w.sandbox_view = SignedJobView(
         job=job, resolve_task=resolver_factory(sandbox_split(job.episode)).resolve,
         slots_remaining=slots_remaining, is_banned=is_banned)
+    if publish:
+        services.publish(w)
 
 
 def wire_signed_grader(w, *, judge_records, parse_executor=None) -> None:

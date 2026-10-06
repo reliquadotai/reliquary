@@ -1199,7 +1199,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
             wire_signed_job(w, services=sandbox_services, routes=lambda: routes_ref.get("routes"),
                             checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
-                            vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
+                            vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens,
+                            publish=False)       # published once the whole job is wired
             return w.episode_intake
         from reliquary.validator import agentic_intake
 
@@ -1249,6 +1250,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             if sandbox_services is not None:
                 sandbox_services.forget(str(w.job.job_id))
             wiring.remove(w)
+            continue
+        if sandbox_services is not None and is_signed_sandbox(w.job):
+            sandbox_services.publish(w)
     if not wiring:
         raise RuntimeError("no corpus job left to serve: " + "; ".join(
             f"{task}: {why}" for task, why in sorted(unserved.items())))
@@ -1300,6 +1304,11 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             if sandbox_services is not None and is_signed_sandbox(job):
                 sandbox_services.forget(str(job.job_id))     # no session for an unwired job
             raise
+        if sandbox_services is not None and is_signed_sandbox(job):
+            # Only now: a job still being wired (or failing to be) is never visible to
+            # the session issuer. Its router is adopted after this; until then an
+            # open is refused `job_not_ready`.
+            sandbox_services.publish(w)
         unserved.pop(str(task_entry.task_id), None)       # served now
         return w
 

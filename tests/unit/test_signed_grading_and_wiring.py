@@ -517,3 +517,30 @@ def test_the_runbook_lists_every_sandbox_setting_with_its_default():
         r"^\| `(RELIQUARY_SANDBOX_[A-Z_0-9]+)` \| ([^|]+) \|", runbook, re.M)}
     assert names and names <= set(rows), sorted(names - set(rows))
     assert all(default.strip() for default in rows.values())
+
+
+def test_a_signed_jobs_view_is_published_only_once_its_wiring_completed(tmp_path):
+    """The session issuer never sees a job whose wiring is still in progress (or later
+    fails): the validator wires with publish=False and publishes after the job's
+    grader and auditor are wired."""
+    _, services = _services(tmp_path)
+    w = SimpleNamespace(job=JOB, is_banned=None)
+    wire_signed_job(w, services=services, routes=lambda: None, checkpoint_dir="/ck",
+                    tokenizer=None, vocab_size=None, chunk_tokens=32,
+                    intake_factory=lambda job, **kw: SimpleNamespace(source=SOURCE),
+                    resolver_factory=lambda split: SimpleNamespace(resolve=None), publish=False)
+    assert services.jobs == {} and w.sandbox_view.job is JOB
+    services.publish(w)
+    assert services.jobs[JOB.job_id] is w.sandbox_view
+
+
+def test_the_validator_publishes_a_signed_view_only_after_audit_and_settle():
+    """Source pin: both the startup loop and the hot add wire with publish=False and
+    publish after `audit_and_settle` succeeded."""
+    import inspect
+
+    from reliquary.validator import corpus_validator
+
+    source = inspect.getsource(corpus_validator)
+    assert "publish=False" in source
+    assert source.count("sandbox_services.publish(w)") == 2
