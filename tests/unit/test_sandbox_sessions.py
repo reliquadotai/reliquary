@@ -1172,3 +1172,96 @@ def test_maintenance_forgets_refused_opens_past_the_minute(tmp_path):
     env.clock.now = NOW + 61
     asyncio.run(env.issuer.maintain())
     assert env.issuer._refused_opens == {}
+
+
+# -- re-review N1: a slot read before the lock is re-read when the prompt moved ---------
+
+def test_a_slot_read_made_stale_by_a_submission_is_read_again_under_the_lock(tmp_path):
+    """The reviewer's probe: Y reads 2 free slots, blocks in task resolution; X's
+    submission consumes a slot and ends its reservation; W takes the last slot. Y must
+    not be granted on its stale read (2 live reservations for 1 slot)."""
+    env = build(tmp_path)
+    left = {"n": 1}
+    gate = asyncio.Event()
+    blocking = {"on": False}
+    reads = []
+
+    async def slots(index):
+        reads.append(left["n"])
+        return left["n"]
+
+    async def resolve(index):
+        if blocking["on"]:
+            await gate.wait()
+        return ResolvedTask(IMAGE, {})
+
+    _with_view(env, slots=slots, resolve=resolve)
+
+    async def main():
+        x = await env.issuer.open(hotkey="5X", request_id="a" * 32, engagement=CORPUS)
+        assert isinstance(x, Grant)
+        left["n"] = 2
+        blocking["on"] = True
+        y = asyncio.create_task(env.issuer.open(hotkey="5Y", request_id="b" * 32,
+                                                engagement=CORPUS))
+        await asyncio.sleep(0.05)                    # Y read 2, waits in resolve
+        assert await env.issuer.claim(x.session_id, hotkey="5X", received=NOW) is None
+        left["n"] = 1                                # the ledger consumed X's slot
+        await env.issuer.submitted(x.session_id)
+        blocking["on"] = False
+        w = await env.issuer.open(hotkey="5W", request_id="d" * 32, engagement=CORPUS)
+        gate.set()
+        return w, await y
+
+    w, y = asyncio.run(main())
+    assert isinstance(w, Grant)
+    assert not isinstance(y, Grant) and y.reason == "prompt_unavailable"
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 1
+    assert reads[-1] == 1                            # Y read the ledger again
+
+
+def test_an_unmoved_prompt_is_not_read_again(tmp_path):
+    env = build(tmp_path, remaining=3)
+    reads = []
+
+    async def slots(index):
+        reads.append(index)
+        return env.left["n"]
+
+    _with_view(env, slots=slots)
+    assert isinstance(open_(env), Grant)
+    assert isinstance(open_(env, hotkey="5Other", request_id="b" * 32), Grant)
+    assert reads == [3, 3]                           # one read per open
+
+
+def test_a_failed_re_read_is_a_retryable_ledger_refusal(tmp_path):
+    env = build(tmp_path, remaining=2)
+    gate = asyncio.Event()
+    state = {"block": False, "fail": False}
+
+    async def slots(index):
+        if state["fail"]:
+            raise OSError("bucket down")
+        return env.left["n"]
+
+    async def resolve(index):
+        if state["block"]:
+            await gate.wait()
+        return ResolvedTask(IMAGE, {})
+
+    _with_view(env, slots=slots, resolve=resolve)
+
+    async def main():
+        x = await env.issuer.open(hotkey="5X", request_id="a" * 32, engagement=CORPUS)
+        state["block"] = True
+        y = asyncio.create_task(env.issuer.open(hotkey="5Y", request_id="b" * 32,
+                                                engagement=CORPUS))
+        await asyncio.sleep(0.05)
+        await env.issuer.close(hotkey="5X", session_id=x.session_id, reason="open_failed",
+                               transcript=None)          # the prompt moved
+        state["fail"] = True
+        gate.set()
+        return await y
+
+    refused = asyncio.run(main())
+    assert (refused.reason, refused.retry_after) == ("ledger_unavailable", 10)

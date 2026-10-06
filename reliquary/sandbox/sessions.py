@@ -202,6 +202,10 @@ class EngagementTerms:
     # The prompt's free slots as read (before the issuer lock), reservations not
     # deducted: the issuer re-checks them against its reservations under the lock.
     slots_remaining: int | None = None
+    # Reads the free slots again (bounded; a Refusal when it fails): the issuer calls
+    # it under the lock when the prompt's reservations moved since the first read.
+    refresh_slots: Callable[[], Awaitable[int | None | Refusal]] | None = field(
+        default=None, repr=False, compare=False)
 
 
 class EngagementBook(Protocol):
@@ -327,6 +331,16 @@ class CorpusEngagements:
         if remaining - reserved <= 0:
             return Refusal("prompt_unavailable", {"prompt_index": index,
                                                   "slots_remaining": remaining, "reserved": reserved})
+        async def refresh_slots() -> int | None | Refusal:
+            try:
+                return await asyncio.wait_for(view.slots_remaining(index), timeout)
+            except JobNotReady:
+                return Refusal("job_not_ready", {"job_id": job_id}, retry_after=retry)
+            except Exception as exc:
+                logger.warning("sandbox open: job %s ledger unreadable on re-read (%s)",
+                               job_id, type(exc).__name__)
+                return Refusal("ledger_unavailable", {"job_id": job_id}, retry_after=retry)
+
         try:
             task = await asyncio.wait_for(view.resolve_task(index), timeout)
         except Exception as exc:
@@ -343,7 +357,7 @@ class CorpusEngagements:
                                checkpoint=job.checkpoint_sha256, image=task.image,
                                env_package=spec.env_package, budgets=budgets,
                                job_id=job.job_id, prompt_index=index,
-                               slots_remaining=int(remaining))
+                               slots_remaining=int(remaining), refresh_slots=refresh_slots)
 
 
 class RlPrecommitEngagements:
@@ -380,6 +394,13 @@ class SessionBook:
         # Replaced, never mutated: read from the intake's thread while the loop
         # changes the book.
         self._submitted: frozenset[str] = frozenset()
+        # (job id, prompt index) -> bumped whenever one of its sessions changes state
+        # (submitted, closed, withdrawn, aborted, lapsed, voided): an open whose free-
+        # slot read predates a bump reads the ledger again under the issuer lock.
+        self._generations: dict[tuple[Any, Any], int] = {}
+
+    def generation(self, job_id: Any, prompt_index: Any) -> int:
+        return self._generations.get((job_id, prompt_index), 0)
 
     def claim(self, session_id: str, now: int) -> bool:
         """Mark a session as being paid; False while a fresh claim already holds it."""
@@ -479,6 +500,9 @@ class SessionBook:
         if record is None or not session_transition_allowed(record.state, state):
             return None
         record.state, record.closed_status, record.closed_at = state, status, int(now)
+        if record.job_id is not None:
+            key = (record.job_id, record.prompt_index)
+            self._generations[key] = self._generations.get(key, 0) + 1
         if state == SUBMITTED:
             self._submitted = self._submitted | {session_id}
         return record
@@ -510,6 +534,11 @@ class SessionBook:
             self._claimed.pop(session_id, None)
         if old:
             self._submitted = self._submitted - set(old)
+            # Only prompts with no session left (their last change is a day old: no
+            # open in flight can have read before it).
+            live_keys = {(r.job_id, r.prompt_index) for r in self._sessions.values()}
+            for key in [k for k in self._generations if k not in live_keys]:
+                del self._generations[key]
 
 
 @dataclass(frozen=True)
@@ -582,7 +611,11 @@ class SessionIssuer:
         """The ban check, the ledger read and the task resolution run BEFORE the issuer
         lock (an intake's claim never waits behind them); under it, the in-memory caps
         and the prompt's free slots (against the reservations made meanwhile) are
-        re-checked, then the session is stored. Refused opens count toward a per-hotkey
+        re-checked, then the session is stored. When a session of the prompt changed
+        state since the free-slot read (the book's per-prompt generation moved: a
+        submission consumed a slot, a close freed one), that read is stale and the
+        ledger is read once more under the lock (bounded by io_timeout_s; a failure is
+        a retryable `ledger_unavailable`). Refused opens count toward a per-hotkey
         rate (`max_refused_opens_per_minute`), checked before any read."""
         if not isinstance(engagement, Mapping):
             return Refusal("engagement_kind_unsupported", {"kind": None})
@@ -618,6 +651,13 @@ class SessionIssuer:
         book = self._engagements.get(engagement.get("kind"))
         if book is None:
             return Refusal("engagement_kind_unsupported", {"kind": engagement.get("kind")})
+        # Taken before the slot read: any session of the prompt changing state after it
+        # makes that read stale (a submission consumed a slot and ended a reservation).
+        try:
+            generation = self.book.generation(engagement.get("job_id"),
+                                              engagement.get("prompt_index"))
+        except TypeError:                                       # unhashable: terms refuses it
+            generation = None
         terms = await book.terms(hotkey, engagement)            # reads: outside the lock
         if isinstance(terms, Refusal):
             return terms
@@ -632,11 +672,21 @@ class SessionIssuer:
             if refusal is not None:
                 return refusal
             if terms.slots_remaining is not None:
+                remaining = terms.slots_remaining
+                moved = generation != self.book.generation(terms.job_id, terms.prompt_index)
+                if moved and terms.refresh_slots is not None:
+                    # One bounded read under the lock (a claim waits at most claim_wait_s).
+                    remaining = await terms.refresh_slots()
+                    if isinstance(remaining, Refusal):
+                        return remaining
+                    if remaining is None:
+                        return Refusal("job_complete", {"job_id": terms.job_id})
+                    now = int(self._clock())
                 reserved = self.book.reserved(terms.job_id, terms.prompt_index, now)
-                if terms.slots_remaining - reserved <= 0:
+                if remaining - reserved <= 0:
                     return Refusal("prompt_unavailable", {
                         "prompt_index": terms.prompt_index,
-                        "slots_remaining": terms.slots_remaining, "reserved": reserved})
+                        "slots_remaining": remaining, "reserved": reserved})
             validity = self._policy.open_window_s + int(terms.budgets["wall_s"])
             placement = self._fleet.pick(image=terms.image, env=terms.env,
                                          env_package=terms.env_package, budgets=terms.budgets,
