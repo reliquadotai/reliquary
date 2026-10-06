@@ -336,8 +336,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         entries, _ = await registry_store.read_registry(strict=False)
         return [e for _, e in sorted(entries.items()) if e.job_id == job_id]
 
-    async def draining_limits():
+    async def draining_limits(new_cap: float):
         """The cap guard, counting retired corpus tasks whose job has not drained."""
+        if new_cap == 0.0:
+            # Adding no share or lowering one cannot increase either total;
+            # historical job listings are unnecessary for this cap decision.
+            return cap_limits(float(pool_max), drained_tasks=set(drained_tasks))
         from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
         from reliquary.validator.corpus_job_status import stored_job_counts
 
@@ -693,7 +697,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
                 require_default_declared_first(entries, entry)
                 updated = add_task(entries, entry)
-                (await draining_limits())(entries, updated)
+                (await draining_limits(float(entry.params["cap"])))(entries, updated)
             except RegistryError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         return job_contract(manifest, entry)
@@ -737,7 +741,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=409, detail=(
                 f"job {body.job_id!r} is already declared by task {named[0].task_id!r}"))
         try:
-            await registry_store.create_task(entry, guard=await draining_limits())
+            await registry_store.create_task(entry, guard=await draining_limits(cap))
         except (RegistryError, registry_store.RegistryConflict) as exc:
             # Lost to an identical concurrent call: its task is this answer.
             for other in await entries_naming(body.job_id):
@@ -770,7 +774,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def set_cap(task_id: str, body: SetCap) -> dict:
         await corpus_entry(task_id)
         try:
-            await registry_store.set_task_cap(task_id, body.cap, guard=await draining_limits())
+            await registry_store.set_task_cap(task_id, body.cap, guard=await draining_limits(body.cap))
         except RegistryError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except registry_store.RegistryConflict as exc:

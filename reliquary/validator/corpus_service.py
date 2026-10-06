@@ -834,14 +834,9 @@ def seal_chunks(digests: Iterable[str], segment_max: int = SEGMENT_MAX) -> list[
 async def _all_or_cancel(awaitables: Iterable[Awaitable[Any]]) -> list[Any]:
     """``gather``, except that the first failure cancels and awaits the rest,
     so no segment call outlives the request and no exception goes unretrieved."""
-    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
-    try:
-        return list(await asyncio.gather(*tasks))
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    from reliquary.shared.async_tasks import gather_owned
+
+    return await gather_owned(awaitables)
 
 
 class SeenIndex:

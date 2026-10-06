@@ -40,6 +40,8 @@ def _same_proof(entry):
 
 def test_http_shutdown_cancels_and_awaits_all_corpus_services():
     from reliquary.validator.corpus_validator import _run_corpus_services
+    from reliquary.validator.corpus_hot_jobs import CorpusJobSet
+    from reliquary.validator.corpus_service import CorpusJobRoutes
 
     async def exercise():
         started = [asyncio.Event(), asyncio.Event()]
@@ -51,7 +53,7 @@ def test_http_shutdown_cancels_and_awaits_all_corpus_services():
             try:
                 await asyncio.Future()
             finally:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01 * (index + 1))
                 cleaned.append(index)
 
         async def warm():
@@ -62,9 +64,13 @@ def test_http_shutdown_cancels_and_awaits_all_corpus_services():
                 await asyncio.gather(*(event.wait() for event in started), warmed.wait())
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(_run_corpus_services(
-            _Server(), [service(0), warm(), service(1)]), timeout=1)
+        jobs = CorpusJobSet(routes=CorpusJobRoutes(), router_for=lambda w: None, wire=None,
+                            jobs_of=lambda w: [service(0), service(1)])
+        jobs.adopt(SimpleNamespace(entry=SimpleNamespace(job_id="fixture-job")))
+        owned = list(jobs._tasks["fixture-job"])
+        await asyncio.wait_for(_run_corpus_services(_Server(), [jobs.run(), warm()]), timeout=1)
         assert sorted(cleaned) == [0, 1]
+        assert all(task.done() for task in owned)
         assert all(task is asyncio.current_task() for task in asyncio.all_tasks())
 
     asyncio.run(exercise())
@@ -112,6 +118,9 @@ def test_real_http_sigterm_awaits_background_cleanup_before_process_exit():
         import os
         import signal
         import uvicorn
+        from types import SimpleNamespace
+        from reliquary.validator.corpus_hot_jobs import CorpusJobSet
+        from reliquary.validator.corpus_service import CorpusJobRoutes
         from reliquary.validator.corpus_validator import _run_corpus_services
 
         async def app(scope, receive, send):
@@ -133,7 +142,10 @@ def test_real_http_sigterm_awaits_background_cleanup_before_process_exit():
                     await asyncio.sleep(0.02 * (index + 1))
                     print(f"background-cleaned-{index}", flush=True)
 
-            await _run_corpus_services(server, [background(0), background(1)])
+            jobs = CorpusJobSet(routes=CorpusJobRoutes(), router_for=lambda w: None, wire=None,
+                                jobs_of=lambda w: [background(0), background(1)])
+            jobs.adopt(SimpleNamespace(entry=SimpleNamespace(job_id="fixture-job")))
+            await _run_corpus_services(server, [jobs.run()])
 
         asyncio.run(main())
     """)
@@ -227,6 +239,14 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
     import reliquary.shared.modeling as modeling
     from reliquary.validator import corpus_auditor, corpus_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
+    from reliquary.validator.corpus_judge_threads import JudgeThreads
+
+    # This fixture exercises the captured app after its fake server exits.
+    # Keep its record codecs alive until the test finishes using that app.
+    shutdown = JudgeThreads.shutdown
+    held_threads = []
+    monkeypatch.setattr(JudgeThreads, "shutdown",
+                        lambda self, **kwargs: held_threads.append(self))
 
     asyncio.run(job_store.write_job({**_manifest(), "job_id": "swe-v2"}, None, **fake_r2))
     loads = {"snapshot": 0, "model": 0, "tokenizer": 0}
@@ -286,7 +306,11 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
             jobs=jobs, wallet=None, netuid=0, signer_client=None, http_host="127.0.0.1",
             http_port=0, set_weights=False, registration_gate=False,
         ))
-    return SimpleNamespace(loads=loads, **built)
+    try:
+        yield SimpleNamespace(loads=loads, **built)
+    finally:
+        for threads in held_threads:
+            shutdown(threads, wait=True)
 
 
 def test_the_model_is_loaded_once_for_both_jobs(booted):

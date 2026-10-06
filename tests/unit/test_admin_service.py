@@ -211,6 +211,42 @@ def test_review_hash_changes_are_refused_before_a_write(admin):
     assert list(admin.registry["entries"]) == ["default"]
 
 
+def test_zero_cap_review_and_create_do_not_scan_inherited_retired_jobs(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.validator import corpus_job_status
+
+    assert admin("POST", "/admin/v1/jobs", _job("math-old", cap=0.2)).status_code == 201
+    assert admin("POST", "/admin/v1/tasks/math-old/retire", {}).status_code == 200
+    before = dict(admin.registry["entries"])
+
+    async def forbidden_read(*args, **kwargs):
+        raise AssertionError("zero-cap operations must not read historical job counts")
+
+    monkeypatch.setattr(corpus_job_status, "stored_job_counts", forbidden_read)
+    app = create_admin_app(secret=SECRET, pool_max=0.0, models=MODELS, records=admin.records,
+                           task_prefix="math-", deliveries=LocalDirectorySink(admin.platform))
+    body = _job("math-zero", cap=0.0, prompt_count=2, samples_per_prompt=1, max_new_tokens=128)
+    with TestClient(app) as client:
+        def signed(path, body):
+            data = json.dumps(body).encode()
+            stamp, nonce = str(int(time.time())), secrets.token_hex(16)
+            return client.post(path, content=data, headers={
+                TIMESTAMP_HEADER: stamp, NONCE_HEADER: nonce,
+                SIGNATURE_HEADER: sign_request(SECRET, stamp, nonce, "POST", path, data),
+                "content-type": "application/json"})
+
+        review = signed("/admin/v1/jobs/validate", body)
+        assert review.status_code == 200, review.text
+        pins = review.json()
+        created = signed("/admin/v1/jobs", {**body,
+            "manifest_sha256": pins["manifest_sha256"], "profile_sha256": pins["profile_sha256"]})
+        assert created.status_code == 201, created.text
+        assert signed("/admin/v1/tasks/math-zero/cap", {"cap": 0.0}).status_code == 200
+    assert admin.registry["entries"]["default"] == before["default"]
+    assert admin.registry["entries"]["math-zero"].params["cap"] == 0.0
+    assert admin.registry["entries"]["math-old"] == before["math-old"]
+
+
 def test_reusing_a_job_id_cannot_silently_change_the_emission_cap(admin):
     assert admin("POST", "/admin/v1/jobs", _job(cap=0.0)).status_code == 201
     response = admin("POST", "/admin/v1/jobs", _job(cap=0.01))

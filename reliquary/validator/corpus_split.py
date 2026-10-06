@@ -22,6 +22,7 @@ import asyncio
 import ctypes
 import importlib
 import logging
+import math
 import multiprocessing
 import os
 import signal
@@ -44,6 +45,7 @@ MAX_RESTART_BACKOFF_SECONDS = 60.0
 # A child up this long has its backoff reset.
 HEALTHY_SECONDS = 300.0
 STOP_GRACE_SECONDS = 20.0
+STOP_GRACE_ENV = "RELIQUARY_CORPUS_SPLIT_STOP_GRACE_SECONDS"
 POLL_SECONDS = 1.0
 
 
@@ -152,10 +154,33 @@ def _set_parent_death_signal() -> None:
         logger.debug("PR_SET_PDEATHSIG unavailable", exc_info=True)
 
 
-def _exit_now(signum, frame) -> None:
-    logging.getLogger(__name__).info("corpus split: signal %d, exiting", signum)
-    logging.shutdown()
-    os._exit(0)
+async def _run_child(coroutine) -> None:
+    """A signal cancels this child's owner once and awaits its finalizers."""
+    loop = asyncio.get_running_loop()
+    owner = asyncio.current_task()
+    stopping = False
+
+    def stop() -> None:
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            owner.cancel()
+
+    signals = (signal.SIGTERM, signal.SIGINT)
+    previous = {sig: signal.getsignal(sig) for sig in signals}
+    # An ordinary handler lets Uvicorn replace it while it drains HTTP, then
+    # restore and replay it. A loop signal callback would also fire during
+    # that native drain and cancel the serving task prematurely.
+    for sig in signals:
+        signal.signal(sig, lambda signum, frame: loop.call_soon_threadsafe(stop))
+    try:
+        await coroutine
+    except asyncio.CancelledError:
+        if not stopping:
+            raise
+    finally:
+        for sig in signals:
+            signal.signal(sig, previous[sig])
 
 
 def _call(path: str) -> None:
@@ -222,11 +247,6 @@ def child_main(role: str, index: int, spec: SplitSpec) -> None:
         except OSError:
             pass
     _set_parent_death_signal()
-    # SIGTERM ends the child at once: what it was doing is safe to cut (create-only
-    # verdicts, CAS ledgers and settlement). The front's HTTP server takes the
-    # signal first, drains in-flight submissions, then re-raises it here.
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, _exit_now)
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s | {name} | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
@@ -235,7 +255,7 @@ def child_main(role: str, index: int, spec: SplitSpec) -> None:
         _call(spec.child_init)
     coroutine = {"front": lambda: _front(spec), "gpu": lambda: _gpu(spec),
                  "judge": lambda: _judge(spec, index)}[role]()
-    asyncio.run(coroutine)
+    asyncio.run(_run_child(coroutine))
 
 
 @dataclass
@@ -260,6 +280,9 @@ class Supervisor:
         self._clock = clock
         self._backoff = backoff_seconds
         self._max_backoff = max_backoff_seconds
+        self._stop_grace = float(os.environ.get(STOP_GRACE_ENV, STOP_GRACE_SECONDS))
+        if not math.isfinite(self._stop_grace) or self._stop_grace < 0:
+            raise ValueError(f"{STOP_GRACE_ENV} must be finite and nonnegative")
         self._context = multiprocessing.get_context("spawn")
         self.children: dict[str, _Child] = {"gpu": _Child("gpu", "gpu", 0)}
         for index in range(len(spec.groups)):
@@ -312,7 +335,11 @@ class Supervisor:
             if now >= child.restart_at and not self._stopping:
                 self._start(child)
 
-    def stop(self, grace_seconds: float = STOP_GRACE_SECONDS) -> None:
+    def stop(self, grace_seconds: float | None = None) -> None:
+        if grace_seconds is None:
+            grace_seconds = self._stop_grace
+        if not math.isfinite(grace_seconds) or grace_seconds < 0:
+            raise ValueError(f"{STOP_GRACE_ENV} must be finite and nonnegative")
         self._stopping = True
         live = [c.process for c in self.children.values()
                 if c.process is not None and c.process.is_alive()]

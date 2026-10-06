@@ -682,6 +682,14 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     # The serving process warms it at start (`run_corpus_validator`).
     app.state.warm_corpus_tasks = refresh_tasks
 
+    async def stop_tasks_refresh() -> None:
+        task = tasks_cache.get("refresh")
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    app.router.on_shutdown.append(stop_tasks_refresh)
+
     @app.get("/corpus/tasks")
     async def corpus_tasks() -> dict:
         # Public: every declared task's emission share. Served from the last registry
@@ -761,7 +769,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     return app
 
 
-async def _run_corpus_services(server, services) -> None:
+async def _run_corpus_services(server, services, *, cleanup=None) -> None:
     """Stop and await every service when HTTP serving ends or a service fails."""
     from contextlib import nullcontext
 
@@ -772,15 +780,17 @@ async def _run_corpus_services(server, services) -> None:
         workers = [asyncio.create_task(service) for service in services]
         group = asyncio.gather(*workers)
         try:
-            done, _ = await asyncio.wait((serving, group), return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait((serving, group) if workers else (serving,),
+                                         return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
         finally:
             serving.cancel()
-            group.cancel()
             for task in workers:
                 task.cancel()
             await asyncio.gather(serving, group, *workers, return_exceptions=True)
+            if cleanup is not None:
+                await cleanup()
 
 
 async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http_port,
@@ -1310,7 +1320,13 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         background.append(grade_dispatcher.run())
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
-    await _run_corpus_services(server, [job_set.run(), app.state.warm_corpus_tasks(), *background])
+    async def cleanup_threads() -> None:
+        await asyncio.to_thread(judge_threads.shutdown, wait=True)
+        if grade_parse_threads is not None:
+            await asyncio.to_thread(grade_parse_threads.shutdown, wait=True, cancel_futures=True)
+
+    await _run_corpus_services(server, [job_set.run(), app.state.warm_corpus_tasks(), *background],
+                               cleanup=cleanup_threads)
 
 
 __all__ = [

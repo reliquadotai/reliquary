@@ -17,6 +17,8 @@ import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
 
+from reliquary.shared.async_tasks import gather_owned
+
 from reliquary.validator import corpus_periods as cp
 from reliquary.validator.corpus_settlement import (
     VERDICT_READ_CONCURRENCY,
@@ -125,7 +127,7 @@ class CorpusPeriodSettler:
             async with gate:
                 return sid, await self._records.read_verdict(self._job_id, sid)
 
-        pairs = await asyncio.gather(*(one(sid) for sid in ids if sid not in self._fed),
+        pairs = await gather_owned((one(sid) for sid in ids if sid not in self._fed),
                                      return_exceptions=True)
         for pair in pairs:
             if isinstance(pair, BaseException):
