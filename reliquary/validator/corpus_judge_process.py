@@ -143,16 +143,20 @@ async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, sock
     feed.auditors = {job_id: w.auditor for job_id, w in wiring.items()}
     app = build_judge_app(wiring, feed)
     logger.info("corpus judge serving %s on %s", sorted(wiring), socket_path)
-    tasks = [serve_unix(app, socket_path)]
+    tasks = []
     for w in wiring.values():
         tasks += [w.auditor.run(), settle_forever(w.entry.task_id, w.settler, settle_every_seconds)]
     if hot:
         tasks.append(refresh_caps(wiring, registry_reader(), JOB_REFRESH_SECONDS))
     try:
-        await asyncio.gather(*tasks)
+        await serve_unix(app, socket_path, services=tasks)
     finally:
-        feed.close()
-        judge_threads.shutdown()
+        await feed.aclose()
+        books = [w.miners for w in wiring.values()]
+        for book in books:
+            book.close()
+        await asyncio.gather(*(book.wait_backfill() for book in books), return_exceptions=True)
+        await asyncio.to_thread(judge_threads.shutdown, wait=True)
 
 
 __all__ = ["build_judge_app", "refresh_caps", "registry_reader", "run_corpus_judges"]

@@ -26,9 +26,14 @@ def _entry(**kw):
 
 def _profile(toploc=True, model_id="org/Frozen", model_revision="abc123"):
     proof = SimpleNamespace(scheme=PROOF_SCHEME_TOPLOC, mode="enforce", chunk_tokens=32, topk=128)
-    return SimpleNamespace(
+    profile = SimpleNamespace(
         model_id=model_id, model_revision=model_revision, proofs=(proof,) if toploc else ()
     )
+    profile.to_generation_contract = lambda: {
+        "model_id": profile.model_id, "model_revision": profile.model_revision,
+        "proofs": [vars(p) for p in profile.proofs],
+    }
+    return profile
 
 
 def test_a_contract_without_toploc_refuses(seeded_job):

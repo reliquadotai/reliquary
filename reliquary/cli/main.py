@@ -1760,7 +1760,9 @@ def build_admin_app_from_environment():
     ``RELIQUARY_ADMIN_TASK_PREFIX`` (default ``order-``) bounds the task and job
     ids the platform may touch; deliveries and evaluation grading need
     ``RELIQUARY_PLATFORM_BUCKET`` and its scoped ``RELIQUARY_PLATFORM_R2_*``
-    credentials, and are off without them. Eval sets' grading files are read
+    credentials. Subnet-run deliveries may instead use the origin and secret in
+    ``RELIQUARY_PLATFORM_DELIVERY_URL`` and ``RELIQUARY_PLATFORM_DELIVERY_SECRET``.
+    Delivery is off without either sink. Eval sets' grading files are read
     from the subnet bucket (``R2_*``).
     """
     import json
@@ -1779,7 +1781,12 @@ def build_admin_app_from_environment():
     with open(models_path, encoding="utf-8") as handle:
         models = json.load(handle)
     deliveries = None
-    if os.getenv("RELIQUARY_PLATFORM_BUCKET", "").strip():
+    if (os.getenv("RELIQUARY_PLATFORM_DELIVERY_URL", "").strip()
+            or os.getenv("RELIQUARY_PLATFORM_DELIVERY_SECRET", "")):
+        from reliquary.corpus.delivery import HTTPDeliverySink
+
+        deliveries = HTTPDeliverySink.from_environment()
+    elif os.getenv("RELIQUARY_PLATFORM_BUCKET", "").strip():
         from reliquary.corpus.delivery import R2DeliverySink
 
         deliveries = R2DeliverySink.from_environment()

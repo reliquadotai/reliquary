@@ -157,6 +157,104 @@ def test_create_job_is_idempotent_on_the_job_id(admin):
     assert other.status_code == 409
 
 
+def test_signed_catalog_and_scoped_task_contracts(admin):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    assert admin.client.get("/admin/v1/task-catalog").status_code == 401
+    catalog = admin("GET", "/admin/v1/task-catalog").json()
+    assert catalog["schema"] == "subnet-task-catalog/v1"
+    assert catalog["zero_cap_supported"] is True
+    assert catalog["models"][0] == {"model": MODEL, **MODELS[MODEL]}
+    source = next(e for e in catalog["environments"] if e["environment"] == SOURCE)
+    assert source["contract_sha256"] == canonical_sha256(source["contract"])
+    assert source["legacy_generation_supported"] is True
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    tasks = admin("GET", "/admin/v1/tasks").json()["tasks"]
+    assert [e["task_id"] for e in tasks] == ["math-a"]
+    task = admin("GET", "/admin/v1/tasks/math-a").json()["task"]
+    assert task["profile_sha256"] == canonical_sha256(task["contract"])
+    assert admin("GET", "/admin/v1/tasks/default").status_code == 409
+
+
+def test_reviewed_zero_cap_manifest_is_read_only_then_created_and_replayed(admin):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    body = _job(cap=0.0, prompt_count=2, samples_per_prompt=1, max_new_tokens=128)
+    before = dict(admin.bucket.objects)
+    review = admin("POST", "/admin/v1/jobs/validate", body)
+    assert review.status_code == 200, review.text
+    contract = review.json()
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
+    assert contract["manifest_sha256"] == canonical_sha256(contract["manifest"])
+    assert contract["profile_sha256"] == canonical_sha256(contract["task"]["contract"])
+    pinned = {**body, "manifest_sha256": contract["manifest_sha256"],
+              "profile_sha256": contract["profile_sha256"]}
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 200
+    entry = admin.registry["entries"]["math-a"]
+    assert entry.params["cap"] == entry.params["floor"] == 0.0
+    assert entry.params["min_incentive_share"] == 0.0
+    status = admin("GET", "/admin/v1/jobs/math-a/status").json()
+    assert status["manifest"] == contract["manifest"]
+    assert status["manifest_sha256"] == contract["manifest_sha256"]
+    assert status["profile_sha256"] == contract["profile_sha256"]
+
+
+def test_review_hash_changes_are_refused_before_a_write(admin):
+    body = _job(manifest_sha256="0" * 64)
+    before = dict(admin.bucket.objects)
+    response = admin("POST", "/admin/v1/jobs", body)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "reviewed_contract_changed"
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
+
+
+def test_zero_cap_review_and_create_do_not_scan_inherited_retired_jobs(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.validator import corpus_job_status
+
+    assert admin("POST", "/admin/v1/jobs", _job("math-old", cap=0.2)).status_code == 201
+    assert admin("POST", "/admin/v1/tasks/math-old/retire", {}).status_code == 200
+    before = dict(admin.registry["entries"])
+
+    async def forbidden_read(*args, **kwargs):
+        raise AssertionError("zero-cap operations must not read historical job counts")
+
+    monkeypatch.setattr(corpus_job_status, "stored_job_counts", forbidden_read)
+    app = create_admin_app(secret=SECRET, pool_max=0.0, models=MODELS, records=admin.records,
+                           task_prefix="math-", deliveries=LocalDirectorySink(admin.platform))
+    body = _job("math-zero", cap=0.0, prompt_count=2, samples_per_prompt=1, max_new_tokens=128)
+    with TestClient(app) as client:
+        def signed(path, body):
+            data = json.dumps(body).encode()
+            stamp, nonce = str(int(time.time())), secrets.token_hex(16)
+            return client.post(path, content=data, headers={
+                TIMESTAMP_HEADER: stamp, NONCE_HEADER: nonce,
+                SIGNATURE_HEADER: sign_request(SECRET, stamp, nonce, "POST", path, data),
+                "content-type": "application/json"})
+
+        review = signed("/admin/v1/jobs/validate", body)
+        assert review.status_code == 200, review.text
+        pins = review.json()
+        created = signed("/admin/v1/jobs", {**body,
+            "manifest_sha256": pins["manifest_sha256"], "profile_sha256": pins["profile_sha256"]})
+        assert created.status_code == 201, created.text
+        assert signed("/admin/v1/tasks/math-zero/cap", {"cap": 0.0}).status_code == 200
+    assert admin.registry["entries"]["default"] == before["default"]
+    assert admin.registry["entries"]["math-zero"].params["cap"] == 0.0
+    assert admin.registry["entries"]["math-old"] == before["math-old"]
+
+
+def test_reusing_a_job_id_cannot_silently_change_the_emission_cap(admin):
+    assert admin("POST", "/admin/v1/jobs", _job(cap=0.0)).status_code == 201
+    response = admin("POST", "/admin/v1/jobs", _job(cap=0.01))
+    assert response.status_code == 409
+    assert response.json()["detail"] == "task_exists_with_another_contract"
+    assert admin.registry["entries"]["math-a"].params["cap"] == 0.0
+
+
 def test_create_job_resumes_a_declaration_whose_registry_write_was_lost(admin):
     assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
     del admin.registry["entries"]["math-a"]
@@ -177,6 +275,10 @@ def test_the_corpus_pool_limit_holds_and_keeps_the_manifest(admin):
     assert "math-b" not in admin.registry["entries"]
     # Never deleted: a racing call's task may name it; an orphan is harmless.
     assert "reliquary/corpus/jobs/math-b.json" in admin.bucket.objects
+    status = admin("GET", "/admin/v1/jobs/math-b/status").json()
+    assert len(status["manifest_sha256"]) == 64
+    assert status["profile_sha256"] is None
+    assert status["tasks"] == status["task_contracts"] == []
 
 
 def test_the_sum_of_active_caps_stays_within_one(admin):
@@ -285,6 +387,71 @@ def test_a_delivery_of_an_unknown_job_is_404(admin):
     assert admin("POST", "/admin/v1/jobs/math-ghost/deliveries", {}).status_code == 404
 
 
+def test_a_stored_delivery_cannot_be_returned_for_another_job(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    root = admin.platform / "deliveries" / "order-existing"
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text(json.dumps({"job_id": "math-other", "keys": [],
+                                                   "rows": 0}))
+    response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                     {"delivery_id": "order-existing"})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "delivery_belongs_to_another_job"
+
+
+def test_cached_delivery_retry_checks_the_immutable_job_contract(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink, export_delivery
+    from reliquary.corpus.job import parse_job
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    job = parse_job(admin("GET", "/admin/v1/jobs/math-a/status").json()["manifest"])
+    pin = canonical_sha256(job.to_contract())
+    root = admin.platform / "deliveries" / "order-existing"
+    root.mkdir(parents=True)
+    sink = LocalDirectorySink(admin.platform)
+    for required, fields, accepted in (
+        (False, {"job_manifest_sha256": pin}, True),
+        (False, {"job_manifest_sha256": "b" * 64}, False),
+        (False, {}, True),  # Historical storage exports predate the pin.
+        (True, {"job_manifest_sha256": pin}, True),
+        (True, {}, False),  # HTTP delivery recovery always requires it.
+    ):
+        monkeypatch.setattr(LocalDirectorySink, "requires_job_contract_pin", required,
+                            raising=False)
+        manifest = {"job_id": job.job_id, "keys": [], "rows": 1, **fields}
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                         {"delivery_id": "order-existing"})
+        retry = export_delivery(job=job, records=None, sink=sink,
+                                delivery_id="order-existing")
+        if accepted:
+            assert response.status_code == 200 and response.json()["state"] == "done"
+            assert asyncio.run(retry) == manifest
+        else:
+            assert response.status_code == 409
+            assert response.json()["detail"] == "delivery_belongs_to_another_contract"
+            with pytest.raises(ValueError, match="another job contract"):
+                asyncio.run(retry)
+
+
+def test_a_bounded_delivery_sink_refuses_unsupported_namespaces_and_evaluation(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink
+
+    monkeypatch.setattr(LocalDirectorySink, "accepts_delivery_id", lambda self, value: False,
+                        raising=False)
+    monkeypatch.setattr(LocalDirectorySink, "evaluation_supported", False, raising=False)
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    refused = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-other"})
+    assert refused.status_code == 503
+    assert refused.json()["detail"] == "delivery_namespace_not_configured"
+    grade = admin("POST", "/admin/v1/evaluations/math-a/grade",
+                  {"source": "job", "job_id": "math-a", "set_ids": ["math"],
+                   "problems_per_set": {"math": 1}, "samples_per_set": {"math": 1}})
+    assert grade.status_code == 503
+    assert admin("GET", "/admin/v1/evaluations/math-a/files/report.json").status_code == 503
+
+
 def test_a_missing_raw_source_preserves_the_original_admin_delivery(admin, monkeypatch):
     from reliquary.validator import corpus_service
 
@@ -327,7 +494,8 @@ def test_admin_serve_refuses_to_start_unconfigured_and_serves_once_configured(
     from reliquary.cli.main import app
 
     for name in ("RELIQUARY_ADMIN_SECRET", "RELIQUARY_ADMIN_POOL_MAX", "RELIQUARY_ADMIN_MODELS",
-                 "RELIQUARY_PLATFORM_BUCKET"):
+                 "RELIQUARY_PLATFORM_BUCKET", "RELIQUARY_PLATFORM_DELIVERY_URL",
+                 "RELIQUARY_PLATFORM_DELIVERY_SECRET"):
         monkeypatch.delenv(name, raising=False)
     served = []
     monkeypatch.setattr(uvicorn, "run", lambda application, **kw: served.append((application, kw)))
@@ -343,6 +511,26 @@ def test_admin_serve_refuses_to_start_unconfigured_and_serves_once_configured(
     result = CliRunner().invoke(app, ["admin", "serve", "--port", "9999"])
     assert result.exit_code == 0, result.output
     assert served and served[0][1]["port"] == 9999
+
+
+def test_admin_environment_uses_the_bounded_http_delivery_sink(tmp_path, monkeypatch):
+    from reliquary.cli import main
+    from reliquary.corpus.delivery import HTTPDeliverySink
+
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps(MODELS))
+    monkeypatch.setenv("RELIQUARY_ADMIN_SECRET", "s" * 32)
+    monkeypatch.setenv("RELIQUARY_ADMIN_MODELS", str(models))
+    monkeypatch.setenv("RELIQUARY_ADMIN_POOL_MAX", "0")
+    monkeypatch.setenv("RELIQUARY_PLATFORM_DELIVERY_URL", "https://example.test")
+    monkeypatch.setenv("RELIQUARY_PLATFORM_DELIVERY_SECRET", "s" * 32)
+    monkeypatch.setattr("reliquary.admin.service.create_admin_app", lambda **kwargs: kwargs)
+    configured = main.build_admin_app_from_environment()
+    assert isinstance(configured["deliveries"], HTTPDeliverySink)
+    assert configured["deliveries"].max_file_bytes == 64 * 1024 * 1024
+    monkeypatch.delenv("RELIQUARY_PLATFORM_DELIVERY_SECRET")
+    with pytest.raises(ValueError, match="secret"):
+        main.build_admin_app_from_environment()
 
 
 

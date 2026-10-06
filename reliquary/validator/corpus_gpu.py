@@ -353,7 +353,7 @@ def _free_cuda() -> None:
         logger.debug("empty_cache failed", exc_info=True)
 
 
-async def serve_unix(app, path: str | Path) -> None:
+async def serve_unix(app, path: str | Path, *, services=()) -> None:
     """``app`` on the unix socket ``path`` (a stale one is removed first).
 
     Signals are left to the process (``corpus_split.child_main``): an
@@ -362,6 +362,7 @@ async def serve_unix(app, path: str | Path) -> None:
     import contextlib
 
     import uvicorn
+    from reliquary.validator.corpus_validator import _run_corpus_services
 
     class _Server(uvicorn.Server):
         @contextlib.contextmanager
@@ -372,7 +373,7 @@ async def serve_unix(app, path: str | Path) -> None:
     path.unlink(missing_ok=True)
     server = _Server(uvicorn.Config(app, uds=str(path), log_level="warning", ws="none",
                                     timeout_keep_alive=600))
-    await server.serve()
+    await _run_corpus_services(server, services)
 
 
 async def run_gpu_process(*, directory: str, run_dir: str, model_id: str = "",
@@ -398,19 +399,24 @@ async def run_gpu_process(*, directory: str, run_dir: str, model_id: str = "",
         # The answers in flight go out first; then the supervisor reloads us.
         loop.call_later(1.0, os._exit, 1)
 
-    batcher = GpuBatcher(score, executor=ThreadPoolExecutor(1, thread_name_prefix="corpus-gpu"),
+    executor = ThreadPoolExecutor(1, thread_name_prefix="corpus-gpu")
+    batcher = GpuBatcher(score, executor=executor,
                          on_error=_free_cuda, on_fatal=fatal)
     app = build_gpu_app(batcher, info)
-    server = asyncio.ensure_future(serve_unix(app, Path(run_dir) / GPU_SOCKET))
-    worker = asyncio.ensure_future(batcher.run())
-    # Published once the socket exists: a reader of the info can connect.
-    for _ in range(200):
-        if (Path(run_dir) / GPU_SOCKET).exists():
-            break
-        await asyncio.sleep(0.05)
-    write_info(run_dir, info)
-    logger.info("corpus gpu: ready (vocab %d)", info["vocab_size"])
-    await asyncio.gather(server, worker)
+
+    async def ready() -> None:
+        # Published once the socket exists: a reader of the info can connect.
+        for _ in range(200):
+            if (Path(run_dir) / GPU_SOCKET).exists():
+                break
+            await asyncio.sleep(0.05)
+        write_info(run_dir, info)
+        logger.info("corpus gpu: ready (vocab %d)", info["vocab_size"])
+
+    try:
+        await serve_unix(app, Path(run_dir) / GPU_SOCKET, services=[batcher.run(), ready()])
+    finally:
+        await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
 
 
 class GpuScorer:

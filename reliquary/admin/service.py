@@ -79,6 +79,9 @@ class CreateJob(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
     audit_q: float | None = Field(default=None, gt=0.0, le=1.0)
     sampling: "OrderSampling | None" = None
+    # A reviewed contract can be pinned before the first durable write.
+    manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    profile_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class OrderSampling(BaseModel):
@@ -282,7 +285,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         records = BucketRecordStore()
     if prepare is None:
         from reliquary.cli.main import prepare_corpus_job as prepare
-    exports: dict[str, asyncio.Task] = {}
+    exports: dict[str, tuple[str, asyncio.Task]] = {}
     # eval id -> (request digest, the running grading)
     gradings: dict[str, tuple[str, asyncio.Task]] = {}
     # One decision at a time per eval id, so two first calls start one grading.
@@ -333,8 +336,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         entries, _ = await registry_store.read_registry(strict=False)
         return [e for _, e in sorted(entries.items()) if e.job_id == job_id]
 
-    async def draining_limits():
+    async def draining_limits(new_cap: float):
         """The cap guard, counting retired corpus tasks whose job has not drained."""
+        if new_cap == 0.0:
+            # Adding no share or lowering one cannot increase either total;
+            # historical job listings are unnecessary for this cap decision.
+            return cap_limits(float(pool_max), drained_tasks=set(drained_tasks))
         from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
         from reliquary.validator.corpus_job_status import stored_job_counts
 
@@ -394,7 +401,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=409, detail=(
                 f"architecture_unsupported: {result.get('architecture')!r}"))
 
-    async def eval_job_arguments(body: CreateJob) -> dict:
+    async def eval_job_arguments(body: CreateJob, *, record_order: bool) -> dict:
         """What an evaluation job is declared from: its set's first
         prompt_count prompts, the qualification's model and thresholds."""
         from reliquary.eval import qualification as qual
@@ -449,12 +456,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         seed = body.seed if body.seed is not None else int(
             hashlib.sha256(body.job_id.encode()).hexdigest()[:15], 16)
         try:
-            await eval_jobs.create({
-                "schema": qual.EVAL_JOB_SCHEMA, "job_id": body.job_id,
-                "qualification_id": body.qualification_id, "set_id": set_id,
-                "problems": body.prompt_count, "samples": body.samples_per_prompt,
-                "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
-                "thinking": body.thinking})
+            if record_order:
+                await eval_jobs.create({
+                    "schema": qual.EVAL_JOB_SCHEMA, "job_id": body.job_id,
+                    "qualification_id": body.qualification_id, "set_id": set_id,
+                    "problems": body.prompt_count, "samples": body.samples_per_prompt,
+                    "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
+                    "thinking": body.thinking})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dict(
@@ -467,7 +475,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             top_k=body.sampling.top_k,
         )
 
-    async def gen_job_arguments(body: CreateJob) -> dict:
+    async def gen_job_arguments(body: CreateJob, *, record_order: bool) -> dict:
         """What a generation order on any model is declared from: its catalog
         env's range, the qualification's model and thresholds, whose
         conditions (env, range, package, sampling, budget, thinking) it repeats."""
@@ -510,12 +518,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                 detail=f"qualification_conditions_differ: {differs}")
         try:
             # What the order control checks the job against before serving it.
-            await eval_jobs.create({
-                "schema": qual.ORDER_JOB_SCHEMA, "job_id": body.job_id, "kind": qual.GENERATION,
-                "qualification_id": body.qualification_id, "env": body.env,
-                "prompt_start": body.prompt_start, "problems": body.prompt_count,
-                "samples": body.samples_per_prompt, "sampling": body.sampling.model_dump(),
-                "max_new_tokens": body.max_new_tokens, "thinking": body.thinking})
+            if record_order:
+                await eval_jobs.create({
+                    "schema": qual.ORDER_JOB_SCHEMA, "job_id": body.job_id, "kind": qual.GENERATION,
+                    "qualification_id": body.qualification_id, "env": body.env,
+                    "prompt_start": body.prompt_start, "problems": body.prompt_count,
+                    "samples": body.samples_per_prompt, "sampling": body.sampling.model_dump(),
+                    "max_new_tokens": body.max_new_tokens, "thinking": body.thinking})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dict(
@@ -530,9 +539,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             top_k=body.sampling.top_k,
         )
 
-    @router.post("/jobs")
-    async def create_job(body: CreateJob, response: Response) -> dict:
-        from reliquary.corpus.job import parse_job
+    async def prepare_job(body: CreateJob):
         from reliquary.eval.prompt_source import eval_job_prefix, gen_job_prefix
 
         eval_prefix = eval_job_prefix(task_prefix)
@@ -565,10 +572,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
         cap = body.cap
         if evaluation:
-            arguments = await eval_job_arguments(body)
+            arguments = await eval_job_arguments(body, record_order=False)
             cap = DEFAULT_EVAL_CAP if cap is None else cap
         elif generation:
-            arguments = await gen_job_arguments(body)
+            arguments = await gen_job_arguments(body, record_order=False)
             cap = DEFAULT_GEN_CAP if cap is None else cap
         else:
             if cap is None:
@@ -599,6 +606,113 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             )
         except (RegistryError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        from reliquary.protocol.release_contract import canonical_sha256
+
+        if ((body.manifest_sha256 is not None and body.manifest_sha256 != canonical_sha256(manifest))
+                or (body.profile_sha256 is not None and body.profile_sha256 != entry.profile_sha256)):
+            raise HTTPException(status_code=409, detail="reviewed_contract_changed")
+        return manifest, entry
+
+    def task_document(entry) -> dict:
+        from reliquary.shared.task_registry import render_registry
+
+        return {"task_id": entry.task_id,
+                **json.loads(render_registry({entry.task_id: entry}))["tasks"][entry.task_id]}
+
+    def job_contract(manifest, entry) -> dict:
+        from reliquary.corpus.job import parse_job
+        from reliquary.protocol.release_contract import canonical_sha256
+
+        wanted = parse_job(manifest).to_contract()
+        return {"schema": "subnet-task-contract/v1", "manifest": wanted,
+                "manifest_sha256": canonical_sha256(wanted),
+                "profile_sha256": entry.profile_sha256, "task": task_document(entry)}
+
+    def refuse_changed_task(existing, expected) -> None:
+        if (existing.profile_sha256 != expected.profile_sha256
+                or float(existing.params["cap"]) != float(expected.params["cap"])):
+            raise HTTPException(status_code=409, detail="task_exists_with_another_contract")
+
+    @router.get("/task-catalog")
+    async def task_catalog() -> dict:
+        from reliquary.environment.registry import ENVIRONMENT_SPECS
+        from reliquary.eval.qualification import order_environment_refusal
+        from reliquary.protocol.environment_catalog import (
+            ENVIRONMENT_CATALOG, environment_body_contract,
+        )
+        from reliquary.protocol.release_contract import canonical_sha256
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+        environments = []
+        for name in sorted(set(ENVIRONMENT_CATALOG) & set(ENVIRONMENT_SPECS)):
+            spec = ENVIRONMENT_SPECS[name]
+            contract = environment_body_contract(name)
+            environments.append({
+                "environment": name, "interaction_mode": spec.interaction_mode,
+                "contract": contract, "contract_sha256": canonical_sha256(contract),
+                "legacy_generation_supported": spec.interaction_mode == "single_turn",
+                "qualified_generation_supported": order_environment_refusal(name) is None,
+            })
+        return {"schema": "subnet-task-catalog/v1", "task_prefix": task_prefix,
+                "pool_max": float(pool_max), "zero_cap_supported": True,
+                "requires_matching_corpus_control": True,
+                "mechanisms": [MECHANISM_CORPUS_GENERATION],
+                "models": [{"model": name, **spec.model_dump()}
+                           for name, spec in sorted(catalog.items())],
+                "environments": environments,
+                "limits": {"max_prompts": 10000, "max_samples": 16,
+                           "max_new_tokens": 32768},
+                "renderers": dict(THINKING_RENDERERS)}
+
+    @router.get("/tasks")
+    async def list_tasks() -> dict:
+        entries, _ = await registry_store.read_registry(strict=False)
+        return {"schema": "subnet-task-list/v1", "tasks": [task_document(e)
+                for name, e in sorted(entries.items()) if name.startswith(task_prefix)]}
+
+    @router.get("/tasks/{task_id}")
+    async def read_task(task_id: str) -> dict:
+        in_scope(task_id)
+        entries, _ = await registry_store.read_registry(strict=False)
+        entry = entries.get(task_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="task_unknown")
+        return {"schema": "subnet-task/v1", "task": task_document(entry)}
+
+    @router.post("/jobs/validate")
+    async def validate_job(body: CreateJob) -> dict:
+        manifest, entry = await prepare_job(body)
+        entries, _ = await registry_store.read_registry(strict=False)
+        named = [e for e in entries.values() if e.job_id == body.job_id]
+        existing, _ = await job_store.read_job(body.job_id)
+        if existing is not None and existing.to_contract() != job_contract(manifest, entry)["manifest"]:
+            raise HTTPException(status_code=409, detail="job_exists_with_another_manifest")
+        if named and any(e.task_id != entry.task_id for e in named):
+            raise HTTPException(status_code=409, detail="job_already_declared")
+        for existing_task in named:
+            refuse_changed_task(existing_task, entry)
+        if not named:
+            try:
+                from reliquary.shared.task_registry import add_task, require_default_declared_first
+
+                require_default_declared_first(entries, entry)
+                updated = add_task(entries, entry)
+                (await draining_limits(float(entry.params["cap"])))(entries, updated)
+            except RegistryError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return job_contract(manifest, entry)
+
+    @router.post("/jobs")
+    async def create_job(body: CreateJob, response: Response) -> dict:
+        from reliquary.corpus.job import parse_job
+        from reliquary.eval.prompt_source import gen_job_prefix
+
+        manifest, entry = await prepare_job(body)
+        cap = float(entry.params["cap"])
+        if body.eval_set_id is not None:
+            await eval_job_arguments(body, record_order=True)
+        elif body.job_id.startswith(gen_job_prefix(task_prefix)):
+            await gen_job_arguments(body, record_order=True)
         answer = {"job_id": body.job_id, "task_id": entry.task_id}
         wanted = parse_job(manifest).to_contract()
 
@@ -620,17 +734,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         named = await entries_naming(body.job_id)
         for other in named:
             if other.task_id == entry.task_id:
+                refuse_changed_task(other, entry)
                 response.status_code = 200
                 return idempotent(answer, other)
         if named:
             raise HTTPException(status_code=409, detail=(
                 f"job {body.job_id!r} is already declared by task {named[0].task_id!r}"))
         try:
-            await registry_store.create_task(entry, guard=await draining_limits())
+            await registry_store.create_task(entry, guard=await draining_limits(cap))
         except (RegistryError, registry_store.RegistryConflict) as exc:
             # Lost to an identical concurrent call: its task is this answer.
             for other in await entries_naming(body.job_id):
                 if other.task_id == entry.task_id:
+                    refuse_changed_task(other, entry)
                     response.status_code = 200
                     return idempotent(answer, other)
             status = 409 if isinstance(exc, RegistryError) else 503
@@ -658,7 +774,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def set_cap(task_id: str, body: SetCap) -> dict:
         await corpus_entry(task_id)
         try:
-            await registry_store.set_task_cap(task_id, body.cap, guard=await draining_limits())
+            await registry_store.set_task_cap(task_id, body.cap, guard=await draining_limits(body.cap))
         except RegistryError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except registry_store.RegistryConflict as exc:
@@ -686,6 +802,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.get("/jobs/{job_id}/status")
     async def job_status(job_id: str) -> dict:
+        from reliquary.protocol.release_contract import canonical_sha256
         from reliquary.validator.corpus_job_status import stored_job_counts
 
         in_scope(job_id)
@@ -696,9 +813,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if job is None:
             raise HTTPException(status_code=404, detail="job_unknown")
         counts = await stored_job_counts(records, job_id)
+        entries = await entries_naming(job_id)
         tasks = [{"task_id": e.task_id, "status": e.status, "cap": float(e.params["cap"])}
-                 for e in await entries_naming(job_id)]
-        return {"job_id": job_id, **counts, "manifest": job.to_contract(), "tasks": tasks}
+                 for e in entries]
+        manifest = job.to_contract()
+        return {"job_id": job_id, **counts, "manifest": manifest, "tasks": tasks,
+                "manifest_sha256": canonical_sha256(manifest),
+                "profile_sha256": entries[0].profile_sha256 if len(entries) == 1 else None,
+                "task_contracts": [task_document(e) for e in entries]}
 
     @router.post("/executors")
     async def register_executor(body: RegisterExecutor, response: Response) -> dict:
@@ -739,7 +861,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     @router.post("/jobs/{job_id}/deliveries")
     async def create_delivery(job_id: str, body: CreateDelivery, response: Response) -> dict:
         from reliquary.corpus.delivery import (
-            export_delivery, instruction_source_for_job, validated_delivery_id,
+            export_delivery, instruction_source_for_job, validate_cached_delivery,
+            validated_delivery_id,
         )
         from reliquary.corpus.export import job_grader
 
@@ -753,23 +876,38 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if job is None:
             raise HTTPException(status_code=404, detail="job_unknown")
+        accepts = getattr(deliveries, "accepts_delivery_id", None)
+        if accepts is not None and not accepts(delivery_id):
+            raise HTTPException(status_code=503, detail="delivery_namespace_not_configured")
         if job.episode is not None:
             raise HTTPException(status_code=422, detail="an episode job is delivered with "
                                 "`reliquary jobs export JOB --sft` on a host with its renderer")
-        running = exports.get(delivery_id)
+
+        def delivery_result(manifest):
+            try:
+                validate_cached_delivery(manifest, job=job, sink=deliveries)
+            except ValueError as exc:
+                detail = ("delivery_belongs_to_another_job" if manifest.get("job_id") != job_id
+                          else "delivery_belongs_to_another_contract")
+                raise HTTPException(status_code=409, detail=detail) from exc
+            return {"state": "done", "delivery_id": delivery_id, "keys": manifest["keys"],
+                    "rows": manifest["rows"]}
+
+        running_export = exports.get(delivery_id)
+        if running_export is not None and running_export[0] != job_id:
+            raise HTTPException(status_code=409, detail="delivery_belongs_to_another_job")
+        running = running_export[1] if running_export is not None else None
         if running is not None and running.done():
             exports.pop(delivery_id)
             if running.exception() is not None:
                 raise HTTPException(status_code=500,
                                     detail=f"delivery failed: {running.exception()}")
             manifest = running.result()
-            return {"state": "done", "delivery_id": delivery_id, "keys": manifest["keys"],
-                    "rows": manifest["rows"]}
+            return delivery_result(manifest)
         if running is None:
             stored = await deliveries.get_json(f"deliveries/{delivery_id}/manifest.json")
             if stored is not None:
-                return {"state": "done", "delivery_id": delivery_id, "keys": stored["keys"],
-                        "rows": stored["rows"]}
+                return delivery_result(stored)
             from reliquary.validator.corpus_job_status import stored_job_counts
 
             # A delivery is final once written: never from a job still moving.
@@ -784,10 +922,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             instruction_source, instruction_note = await asyncio.to_thread(
                 instruction_source_for_job, job)
             # Long: run beside the request; the caller polls with the same id.
-            exports[delivery_id] = asyncio.ensure_future(export_delivery(
+            exports[delivery_id] = (job_id, asyncio.ensure_future(export_delivery(
                 job=job, records=records, sink=deliveries, delivery_id=delivery_id,
                 grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
-                instruction_source=instruction_source, instruction_note=instruction_note))
+                instruction_source=instruction_source, instruction_note=instruction_note)))
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
@@ -975,7 +1113,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.eval import grading
 
         in_scope(eval_id)
-        if deliveries is None:
+        if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
             raise HTTPException(status_code=503, detail="deliveries_not_configured")
         try:
             validated_delivery_id(eval_id)
@@ -1063,7 +1201,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if name not in GRADED_FILES:
             raise HTTPException(status_code=422, detail=f"a graded evaluation's files are "
                                                         f"{list(GRADED_FILES)}")
-        if deliveries is None:
+        if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
             raise HTTPException(status_code=503, detail="deliveries_not_configured")
         with tempfile.TemporaryDirectory() as scratch:
             local = Path(scratch) / name

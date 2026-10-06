@@ -18,6 +18,8 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from reliquary.shared.async_tasks import gather_owned
+
 logger = logging.getLogger(__name__)
 
 MINER_STATUS_CACHE_SECONDS = 30.0
@@ -241,7 +243,7 @@ class MinerBook:
                     if rest > 0:
                         await asyncio.sleep(rest)
 
-            await asyncio.gather(*(reader() for _ in range(BACKFILL_CONCURRENCY)))
+            await gather_owned(reader() for _ in range(BACKFILL_CONCURRENCY))
             last = state.get("last_window")
             if self._read_windows is not None and last is not None:
                 for archive in await self._read_windows(self._task_id, int(last), SHARE_WINDOWS):

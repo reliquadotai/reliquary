@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from reliquary.corpus.delivery import (
+    HTTPDeliverySink,
     LocalDirectorySink,
     R2DeliverySink,
     delivery_rows,
@@ -132,6 +133,9 @@ def test_an_export_writes_shards_a_manifest_with_hashes_and_a_report(tmp_path):
     assert total == manifest["rows"] == report["counts"]["rows"]
     assert report["counts"]["missing_records"] == 1
     assert report["job"] == {"job_id": "math-v1", "prompt_count": 30}
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    assert manifest["job_manifest_sha256"] == canonical_sha256(report["job"])
     assert report["filter"] == {"applied": False, "note": "the job declares no filter"}
     assert sorted(result["keys"]) == sorted(
         [f"deliveries/d1/{s['name']}" for s in manifest["shards"]]
@@ -146,6 +150,14 @@ def test_the_same_delivery_again_returns_the_stored_keys_without_reading(tmp_pat
     reads = records.reads
     _, second = _export(tmp_path, records)
     assert second == first and records.reads == reads
+
+
+def test_a_delivery_id_cannot_be_reused_for_another_job(tmp_path):
+    records = _Records(n=0)
+    _export(tmp_path, records)
+    another = SimpleNamespace(**{**vars(JOB), "job_id": "math-v2"})
+    with pytest.raises(ValueError, match="delivery belongs to another job"):
+        _export(tmp_path, records, job=another)
 
 
 def test_an_empty_job_delivers_a_manifest_and_no_shard(tmp_path):
@@ -334,11 +346,12 @@ def test_the_r2_sink_uploads_through_the_scoped_client(tmp_path):
     calls = []
 
     class _Client:
-        def upload_file(self, filename, bucket, key, Config=None):
-            calls.append(("file", bucket, key, Path(filename).read_bytes(), Config is not None))
+        def upload_file(self, filename, bucket, key, Config=None, ExtraArgs=None):
+            calls.append(("file", bucket, key, Path(filename).read_bytes(), Config is not None,
+                          ExtraArgs))
 
-        def put_object(self, Bucket, Key, Body, ContentType=None):
-            calls.append(("json", Bucket, Key, Body, ContentType))
+        def put_object(self, Bucket, Key, Body, ContentType=None, Metadata=None):
+            calls.append(("json", Bucket, Key, Body, ContentType, Metadata))
 
         def get_object(self, Bucket, Key):
             from botocore.exceptions import ClientError
@@ -351,6 +364,138 @@ def test_the_r2_sink_uploads_through_the_scoped_client(tmp_path):
     asyncio.run(sink.put_file("deliveries/d1/part-00000.parquet", path))
     asyncio.run(sink.put_json("deliveries/d1/manifest.json", {"a": 1}))
     assert asyncio.run(sink.get_json("deliveries/d1/manifest.json")) is None
-    assert calls[0] == ("file", "platform", "deliveries/d1/part-00000.parquet", b"PAR1", True)
+    assert calls[0] == ("file", "platform", "deliveries/d1/part-00000.parquet", b"PAR1", True,
+                        {"Metadata": {"sha256": hashlib.sha256(b"PAR1").hexdigest()}})
     assert calls[1][:3] == ("json", "platform", "deliveries/d1/manifest.json")
     assert json.loads(calls[1][3]) == {"a": 1}
+    assert calls[1][5] == {"sha256": hashlib.sha256(calls[1][3]).hexdigest()}
+
+
+RUN_ID = "12345678-1234-4234-8234-123456789012"
+HTTP_KEY = f"deliveries/subnet-{RUN_ID}/part-00000.parquet"
+
+
+@pytest.mark.parametrize("url", ["http://example.test", "https://u:p@example.test",
+                                  "https://example.test/path", "https://example.test?x=1",
+                                  "https://example.test/#x"])
+def test_http_delivery_requires_one_https_origin(url):
+    with pytest.raises(ValueError, match="HTTPS origin"):
+        HTTPDeliverySink(url=url, secret="s" * 32)
+
+
+def test_http_delivery_streams_files_with_checked_size_and_digest(tmp_path, monkeypatch):
+    sink = HTTPDeliverySink(url="https://example.test", secret="s" * 32)
+    calls, headers, chunks = [], {}, []
+    assert sink.evaluation_supported is False
+    assert sink.accepts_delivery_id("subnet-" + RUN_ID)
+    assert not sink.accepts_delivery_id("order-other")
+
+    class _Connection:
+        def putrequest(self, method, route):
+            calls.append((method, route))
+
+        def putheader(self, key, value):
+            headers[key] = value
+
+        def endheaders(self):
+            pass
+
+        def send(self, body):
+            chunks.append(body)
+
+        def getresponse(self):
+            return SimpleNamespace(status=201, read=lambda n: b"")
+
+        def close(self):
+            calls.append("closed")
+
+    monkeypatch.setattr(sink, "_connection", _Connection)
+    data = b"x" * (2 * 1024 * 1024 + 1)
+    path = tmp_path / "part.parquet"
+    path.write_bytes(data)
+    asyncio.run(sink.put_file(HTTP_KEY, path))
+    assert calls == [("PUT", f"/api/internal/subnet/tasks/{RUN_ID}/deliveries/part-00000.parquet"),
+                     "closed"]
+    assert headers["Authorization"] == "Bearer " + "s" * 32
+    assert headers["Content-Length"] == str(len(data))
+    assert headers["X-Content-SHA256"] == hashlib.sha256(data).hexdigest()
+    assert len(chunks) == 3 and max(map(len, chunks)) <= 1024 * 1024
+    assert b"".join(chunks) == data
+    with pytest.raises(ValueError, match="subnet-run"):
+        asyncio.run(sink.put_file("deliveries/another/part.parquet", path))
+    monkeypatch.setattr(sink, "max_file_bytes", 10)
+    with pytest.raises(ValueError, match="size limit"):
+        asyncio.run(sink.put_file(HTTP_KEY, path))
+
+
+def test_http_delivery_reads_manifest_for_restart_and_refuses_redirects(monkeypatch):
+    sink = HTTPDeliverySink(url="https://example.test", secret="s" * 32)
+    status = [200]
+    document = {"job_id": "order-ops-" + RUN_ID, "keys": [HTTP_KEY]}
+    requests = []
+
+    class _Connection:
+        def request(self, method, route, headers):
+            requests.append((method, route, headers))
+
+        def getresponse(self):
+            return SimpleNamespace(status=status[0],
+                                   read=lambda n: json.dumps(document).encode())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sink, "_connection", _Connection)
+    key = f"deliveries/subnet-{RUN_ID}/manifest.json"
+    assert asyncio.run(sink.get_json(key)) == document
+    assert requests[0][0] == "GET"
+    assert requests[0][2] == {"Authorization": "Bearer " + "s" * 32}
+    status[0] = 404
+    assert asyncio.run(sink.get_json(key)) is None
+    status[0] = 302
+    with pytest.raises(RuntimeError, match="refused"):
+        asyncio.run(sink.get_json(key))
+    with pytest.raises(ValueError, match="manifest and report"):
+        asyncio.run(sink.get_json(HTTP_KEY))
+
+
+def test_export_obeys_the_sink_shard_limit(tmp_path):
+    class _BoundedSink(LocalDirectorySink):
+        max_file_bytes = 64 * 1024
+
+    sink = _BoundedSink(tmp_path / "bucket")
+    manifest = asyncio.run(export_delivery(
+        job=JOB, records=_Records(n=90, text_len=4000), sink=sink, delivery_id="d1",
+        work_dir=tmp_path / "work"))
+    assert len(manifest["shards"]) > 1
+    assert all(shard["bytes"] <= sink.max_file_bytes for shard in manifest["shards"])
+
+
+def test_manifest_upload_failure_replays_an_immutable_report(tmp_path):
+    class _ImmutableSink(LocalDirectorySink):
+        fail = True
+
+        async def put_file(self, key, path):
+            existing = self._path(key)
+            if existing.exists():
+                assert existing.read_bytes() == path.read_bytes()
+                return
+            await super().put_file(key, path)
+
+        async def put_json(self, key, document):
+            if key.endswith("manifest.json") and self.fail:
+                self.fail = False
+                raise RuntimeError("fixture missing final acknowledgement")
+            existing = await self.get_json(key)
+            if existing is not None:
+                assert existing == document
+                return
+            await super().put_json(key, document)
+
+    sink = _ImmutableSink(tmp_path / "bucket")
+    with pytest.raises(RuntimeError, match="acknowledgement"):
+        asyncio.run(export_delivery(job=JOB, records=_Records(n=1, missing=()), sink=sink,
+                                   delivery_id="d1", clock=lambda: 123.0))
+    manifest = asyncio.run(export_delivery(job=JOB, records=_Records(n=1, missing=()), sink=sink,
+                                          delivery_id="d1", clock=lambda: 456.0))
+    assert manifest["created_at"] == 123.0

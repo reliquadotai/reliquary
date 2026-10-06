@@ -197,9 +197,11 @@ class CorpusJobSet:
         # (job, hotkey) -> (computed at, status).
         self._miner_cache: collections.OrderedDict = collections.OrderedDict()
         self._tasks: dict[str, list[asyncio.Task]] = {}
+        self._stopping: set[str] = set()
         # Task ids already decided against (ignored or refused): logged once.
         self._passed_over: set[str] = set()
         self._failure: asyncio.Future | None = None
+        self.running = False
         # One refresh at a time: two interleaved would wire one entry twice.
         self._refresh_lock = asyncio.Lock()
         # Jobs retired as of the end of the last refresh: only those may be unwired.
@@ -362,12 +364,12 @@ class CorpusJobSet:
 
     async def _maybe_unwire(self, job_id: str) -> None:
         wiring = self.served[job_id]
-        if self._routes.in_flight[job_id]:
+        if self._routes.admission_pending(job_id):
             return
         try:
-            # The gate is closed (retired) and nothing is in flight: no record can
-            # appear after this check.
-            if not await self._drained(wiring) or self._routes.in_flight[job_id]:
+            # The gate is closed and neither handlers nor their detached turns
+            # are pending: no record can appear after this check.
+            if not await self._drained(wiring) or self._routes.admission_pending(job_id):
                 return
         except Exception:
             logger.exception("corpus job %s: drain check failed; retrying next refresh", job_id)
@@ -386,22 +388,36 @@ class CorpusJobSet:
             except Exception:
                 logger.exception("corpus job %s: final status not written; retrying", job_id)
                 return
-        for task in self._tasks.pop(job_id, ()):
-            task.cancel()
+        await self._stop_jobs(job_id)
         self._routes.remove(job_id)
         del self.served[job_id]
         self.finished[job_id] = final
         self._status_cache.pop(job_id, None)
         self._status_locks.pop(job_id, None)
-        book = getattr(wiring, "miners", None)
-        if book is not None:
-            book.close()
         if self._on_unwired is not None:
             try:
                 self._on_unwired(wiring)
             except Exception:
                 logger.exception("corpus job %s: releasing its wiring failed", job_id)
         logger.info("corpus job %s drained and unwired", job_id)
+
+    async def _stop_jobs(self, job_id: str) -> None:
+        """Cancel this job once, and retain ownership until its workers exit."""
+        tasks = self._tasks.get(job_id, ())
+        book = getattr(self.served.get(job_id), "miners", None)
+        if job_id not in self._stopping:
+            self._stopping.add(job_id)
+            for task in tasks:
+                task.cancel()
+            if book is not None:
+                book.close()
+        # A shutdown interrupting retirement must not cancel their cleanup
+        # again; run() still owns and awaits the same tasks in its finally.
+        await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+        if book is not None and hasattr(book, "wait_backfill"):
+            await asyncio.shield(asyncio.gather(book.wait_backfill(), return_exceptions=True))
+        self._tasks.pop(job_id, None)
+        self._stopping.discard(job_id)
 
     async def _compute_status(self, job_id: str, *, drained: bool = False) -> dict:
         from reliquary.validator.corpus_job_status import job_status
@@ -511,6 +527,7 @@ class CorpusJobSet:
         """Refresh forever (when a registry reader is given) and raise the first
         background task failure."""
         self._failure = asyncio.get_running_loop().create_future()
+        self.running = True
         for tasks in self._tasks.values():
             for task in tasks:
                 if task.done():
@@ -523,9 +540,8 @@ class CorpusJobSet:
                 if done:
                     self._failure.result()
         finally:
-            for tasks in self._tasks.values():
-                for task in tasks:
-                    task.cancel()
+            self.running = False
+            await asyncio.gather(*(self._stop_jobs(job_id) for job_id in list(self._tasks)))
 
 
 __all__ = [

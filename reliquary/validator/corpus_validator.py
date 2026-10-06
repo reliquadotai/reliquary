@@ -616,6 +616,24 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             raise HTTPException(status_code=404, detail="corpus_contract_unknown")
         return legacy_contract
 
+    @app.get("/corpus/runtime-contract")
+    async def corpus_runtime_contract() -> dict:
+        runtime = getattr(app.state, "corpus_runtime_contract", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="corpus_runtime_contract_unavailable")
+        job_set = getattr(app.state, "corpus_jobs", None)
+        failure = getattr(job_set, "_failure", None)
+        healthy = bool(job_set is not None and job_set.running and failure is not None
+                       and not failure.done())
+        audit_ready = False
+        if healthy:
+            try:
+                audit_ready = await app.state.corpus_audit_ready()
+            except Exception:
+                logger.warning("corpus runtime: audit readiness unavailable", exc_info=True)
+        return {**runtime, "ready": healthy and audit_ready, "audit_ready": audit_ready,
+                "jobs": routes.open_jobs()}
+
     @app.get("/corpus/jobs/{job_id}/status")
     async def corpus_job_status(job_id: str) -> dict:
         # Public: counts only. The job set is attached once the process runs.
@@ -663,6 +681,14 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
 
     # The serving process warms it at start (`run_corpus_validator`).
     app.state.warm_corpus_tasks = refresh_tasks
+
+    async def stop_tasks_refresh() -> None:
+        task = tasks_cache.get("refresh")
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    app.router.on_shutdown.append(stop_tasks_refresh)
 
     @app.get("/corpus/tasks")
     async def corpus_tasks() -> dict:
@@ -741,6 +767,30 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         return await request_validation_exception_handler(request, exc)
 
     return app
+
+
+async def _run_corpus_services(server, services, *, cleanup=None) -> None:
+    """Stop and await every service when HTTP serving ends or a service fails."""
+    from contextlib import nullcontext
+
+    # Uvicorn replays captured signals when serve() returns. Keep that replay
+    # inside its handler until the other services have finished cleanup.
+    with getattr(server, "capture_signals", nullcontext)():
+        serving = asyncio.create_task(server.serve())
+        workers = [asyncio.create_task(service) for service in services]
+        group = asyncio.gather(*workers)
+        try:
+            done, _ = await asyncio.wait((serving, group) if workers else (serving,),
+                                         return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            serving.cancel()
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(serving, group, *workers, return_exceptions=True)
+            if cleanup is not None:
+                await cleanup()
 
 
 async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http_port,
@@ -1202,6 +1252,37 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     )
     app.state.corpus_jobs = job_set
     app.state.corpus_unserved = unserved
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    runtime_contract = ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
+    app.state.corpus_runtime_contract = {
+        "schema": "corpus-runtime-contract/v1",
+        "contract": runtime_contract, "contract_sha256": canonical_sha256(runtime_contract),
+        "checkpoint_sha256": fingerprint, "registry_refresh_enabled": hot,
+        "intake_only": intake_only,
+    }
+    if split is not None:
+        from reliquary.validator.corpus_feed import UdsClient
+        from reliquary.validator.corpus_gpu import GPU_SOCKET
+
+        gpu_status = UdsClient(Path(split.run_dir) / GPU_SOCKET, timeout=2.0)
+
+    async def audit_ready() -> bool:
+        if intake_only:
+            return False
+        if split is None:
+            return model is not None
+        info = await gpu_status.get("/info")
+        if info is None or (info.get("model_id"), info.get("model_revision")) != (
+                ACTIVE_PROTOCOL_PROFILE.model_id, ACTIVE_PROTOCOL_PROFILE.model_revision):
+            return False
+        # One existing job per judge is enough to prove its status route is live.
+        judged = {id(w.judge_link): w for w in job_set.served.values()
+                  if getattr(w, "judge_link", None) is not None}
+        return all(result is not None for result in await asyncio.gather(
+            *(w.judge_link.stats(w.job.job_id) for w in judged.values())))
+
+    app.state.corpus_audit_ready = audit_ready
     for w in wiring:
         job_set.adopt(w)
 
@@ -1239,7 +1320,13 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         background.append(grade_dispatcher.run())
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
-    await asyncio.gather(server.serve(), job_set.run(), app.state.warm_corpus_tasks(), *background)
+    async def cleanup_threads() -> None:
+        await asyncio.to_thread(judge_threads.shutdown, wait=True)
+        if grade_parse_threads is not None:
+            await asyncio.to_thread(grade_parse_threads.shutdown, wait=True, cancel_futures=True)
+
+    await _run_corpus_services(server, [job_set.run(), app.state.warm_corpus_tasks(), *background],
+                               cleanup=cleanup_threads)
 
 
 __all__ = [

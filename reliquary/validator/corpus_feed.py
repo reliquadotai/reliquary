@@ -255,6 +255,11 @@ class ArrivalFeed:
         for task in list(self._tasks):
             task.cancel()
 
+    async def aclose(self) -> None:
+        tasks = list(self._tasks)
+        self.close()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 
 __all__ = [
     "ArrivalFeed",

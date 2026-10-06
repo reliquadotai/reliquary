@@ -389,15 +389,16 @@ def test_a_request_queued_past_the_timeout_is_withdrawn_not_decided_later(
     assert seeded_job.store.ledger_write_attempts == 0
 
 
-def test_a_miner_that_hangs_up_after_its_turn_began_still_gets_its_record(
+def test_a_cancelled_taken_submission_blocks_retirement_until_its_record_is_durable(
     fake_r2, seeded_job
 ):
-    """The ledger consumed the slot, so the record must follow even though
-    the handler was cancelled (a client disconnect) while the write ran."""
-    from tests.unit.test_corpus_route_skip import _Records
+    """A disconnect does not let retirement overtake either durable write."""
+    from reliquary.infrastructure import corpus_record_store
+    from tests.unit.test_corpus_hot_jobs import _Harness, _hot_entry
 
     _declare(fake_r2, FREE, prompt_order="free", slots_per_prompt=1)
     writing, release = asyncio.Event(), asyncio.Event()
+    recording, record_release, durable = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     class _HeldStore(_CountingStore):
         async def write_ledgers(self, job_id, snapshot, etag):
@@ -405,22 +406,72 @@ def test_a_miner_that_hangs_up_after_its_turn_began_still_gets_its_record(
             await release.wait()
             return await super().write_ledgers(job_id, snapshot, etag)
 
+    class _HeldRecords:
+        written = []
+
+        async def write_submission(self, job_id, submission_id, record):
+            recording.set()
+            await record_release.wait()
+            result = await corpus_record_store.write_submission(
+                job_id, submission_id, record, **fake_r2,
+            )
+            self.written.append(submission_id)
+            durable.set()
+            return result
+
     seeded_job.store = _HeldStore(fake_r2)
-    records, announced = _Records(), []
+    records, announced = _HeldRecords(), []
     router = _router(seeded_job, FREE, records=records, on_accepted=announced.append)
 
     async def scenario():
-        handler = asyncio.ensure_future(router.submit_corpus(_submit(FREE, "5A", 0, 1)))
-        await writing.wait()
-        handler.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await handler
-        release.set()
-        for _ in range(200):
-            if records.written:
-                break
-            await asyncio.sleep(0.005)
-        await asyncio.sleep(0.02)
+        h = _Harness([_hot_entry(job_id=FREE)])
+        h.set._router_for = lambda wiring: router
+
+        async def final_status(job_id, *, drained=False):
+            return {"job_id": job_id, "state": "drained" if drained else "open"}
+
+        h.set._compute_status = final_status
+        await h.set.refresh()
+        await asyncio.sleep(0)
+        async with h.client() as client:
+            handler = asyncio.create_task(client.post(
+                f"/corpus/jobs/{FREE}/submit",
+                json=_submit(FREE, "5A", 0, 1).model_dump(mode="json"),
+            ))
+            await asyncio.wait_for(writing.wait(), 2)
+            handler.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await handler
+            assert h.routes.in_flight[FREE] == 0
+            assert h.routes.admission_pending(FREE)
+            # Even a drain read that sees no records cannot release the job.
+            h.drained[FREE] = True
+            h.entries = [_hot_entry(job_id=FREE, status="retired")]
+            await h.set.refresh()
+            await h.set.refresh()
+            assert FREE in h.set.served and h.cancelled == []
+
+            release.set()
+            await asyncio.wait_for(recording.wait(), 2)
+            ledger, _ = await job_store.read_ledgers(FREE, **fake_r2)
+            assert ledger["slots"] == {"0": 1} and records.written == []
+            await h.set.refresh()
+            assert h.routes.admission_pending(FREE)
+            assert FREE in h.set.served and h.cancelled == []
+
+            record_release.set()
+            await asyncio.wait_for(durable.wait(), 2)
+            for _ in range(200):
+                if not h.routes.admission_pending(FREE):
+                    break
+                await asyncio.sleep(0.005)
+            assert not h.routes.admission_pending(FREE)
+            stored = await corpus_record_store.read_submission(FREE, records.written[0], **fake_r2)
+            assert stored["prompt_index"] == 0
+            await h.set.refresh()
+            await asyncio.sleep(0)
+            assert FREE not in h.set.served and FREE in h.set.finished
+            assert sorted(h.cancelled) == [f"audit:{FREE}", f"settle:{FREE}"]
 
     asyncio.run(scenario())
     ledger, _ = asyncio.run(job_store.read_ledgers(FREE, **fake_r2))

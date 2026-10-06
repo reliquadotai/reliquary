@@ -9,10 +9,13 @@ alive. Settlement is two-phase so a crash can delay a payment, never repeat it.
 from __future__ import annotations
 
 import asyncio
+
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 import logging
 import os
 import time
+
+from reliquary.shared.async_tasks import gather_owned
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +144,7 @@ class CorpusSettler:
                 return sid, await self._records.read_verdict(self._job_id, sid)
 
         # Every read finishes before an error is raised: none outlives the call.
-        pairs = await asyncio.gather(*(one(sid) for sid in ids if sid not in self._fed),
+        pairs = await gather_owned((one(sid) for sid in ids if sid not in self._fed),
                                      return_exceptions=True)
         for pair in pairs:
             if isinstance(pair, BaseException):

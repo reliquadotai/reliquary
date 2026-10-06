@@ -394,14 +394,21 @@ class ExecutorLeases:
         raise NotImplementedError
 
     async def run(self, *, sweep_seconds: float = SWEEP_SECONDS) -> None:
-        while True:
-            try:
-                await self._directory.maybe_refresh()
-                await self.sweep()
-                await self.write_heartbeats()
-            except Exception:
-                logger.exception("%s dispatcher sweep failed; retrying", self.kind)
-            await asyncio.sleep(sweep_seconds)
+        try:
+            while True:
+                try:
+                    await self._directory.maybe_refresh()
+                    await self.sweep()
+                    await self.write_heartbeats()
+                except Exception:
+                    logger.exception("%s dispatcher sweep failed; retrying", self.kind)
+                await asyncio.sleep(sweep_seconds)
+        finally:
+            while self._background:
+                tasks = list(self._background)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class RemoteAuditDispatcher(ExecutorLeases):

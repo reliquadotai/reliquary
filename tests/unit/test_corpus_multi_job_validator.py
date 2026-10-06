@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import signal
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +36,123 @@ def _job(job_id, **kw):
 
 def _same_proof(entry):
     return "toploc-a"
+
+
+def test_http_shutdown_cancels_and_awaits_all_corpus_services():
+    from reliquary.validator.corpus_validator import _run_corpus_services
+    from reliquary.validator.corpus_hot_jobs import CorpusJobSet
+    from reliquary.validator.corpus_service import CorpusJobRoutes
+
+    async def exercise():
+        started = [asyncio.Event(), asyncio.Event()]
+        cleaned = []
+        warmed = asyncio.Event()
+
+        async def service(index):
+            started[index].set()
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0.01 * (index + 1))
+                cleaned.append(index)
+
+        async def warm():
+            warmed.set()
+
+        class _Server:
+            async def serve(self):
+                await asyncio.gather(*(event.wait() for event in started), warmed.wait())
+                await asyncio.sleep(0)
+
+        jobs = CorpusJobSet(routes=CorpusJobRoutes(), router_for=lambda w: None, wire=None,
+                            jobs_of=lambda w: [service(0), service(1)])
+        jobs.adopt(SimpleNamespace(entry=SimpleNamespace(job_id="fixture-job")))
+        owned = list(jobs._tasks["fixture-job"])
+        await asyncio.wait_for(_run_corpus_services(_Server(), [jobs.run(), warm()]), timeout=1)
+        assert sorted(cleaned) == [0, 1]
+        assert all(task.done() for task in owned)
+        assert all(task is asyncio.current_task() for task in asyncio.all_tasks())
+
+    asyncio.run(exercise())
+
+
+def test_corpus_service_failure_propagates_and_stops_the_server():
+    from reliquary.validator.corpus_validator import _run_corpus_services
+
+    async def exercise():
+        serving = asyncio.Event()
+        cleaned = []
+
+        class _Server:
+            async def serve(self):
+                serving.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    await asyncio.sleep(0)
+                    cleaned.append("server")
+
+        async def failure():
+            await serving.wait()
+            raise RuntimeError("fixture corpus service failure")
+
+        async def background():
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.append("background")
+
+        with pytest.raises(RuntimeError, match="fixture corpus service failure"):
+            await _run_corpus_services(_Server(), [failure(), background()])
+        assert sorted(cleaned) == ["background", "server"]
+        assert all(task is asyncio.current_task() for task in asyncio.all_tasks())
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX signal exit status")
+def test_real_http_sigterm_awaits_background_cleanup_before_process_exit():
+    script = textwrap.dedent("""
+        import asyncio
+        import os
+        import signal
+        import uvicorn
+        from types import SimpleNamespace
+        from reliquary.validator.corpus_hot_jobs import CorpusJobSet
+        from reliquary.validator.corpus_service import CorpusJobRoutes
+        from reliquary.validator.corpus_validator import _run_corpus_services
+
+        async def app(scope, receive, send):
+            pass
+
+        async def main():
+            server = uvicorn.Server(uvicorn.Config(
+                app, host="127.0.0.1", port=0, lifespan="off", ws="none",
+                log_level="critical"))
+
+            async def background(index):
+                try:
+                    if index == 0:
+                        while not server.started:
+                            await asyncio.sleep(0.01)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    await asyncio.Future()
+                finally:
+                    await asyncio.sleep(0.02 * (index + 1))
+                    print(f"background-cleaned-{index}", flush=True)
+
+            jobs = CorpusJobSet(routes=CorpusJobRoutes(), router_for=lambda w: None, wire=None,
+                                jobs_of=lambda w: [background(0), background(1)])
+            jobs.adopt(SimpleNamespace(entry=SimpleNamespace(job_id="fixture-job")))
+            await _run_corpus_services(server, [jobs.run()])
+
+        asyncio.run(main())
+    """)
+    result = subprocess.run([sys.executable, "-u", "-c", script],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == -signal.SIGTERM, result.stderr
+    assert sorted(result.stdout.splitlines()) == ["background-cleaned-0", "background-cleaned-1"]
 
 
 def test_jobs_on_one_checkpoint_start():
@@ -118,6 +239,14 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
     import reliquary.shared.modeling as modeling
     from reliquary.validator import corpus_auditor, corpus_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
+    from reliquary.validator.corpus_judge_threads import JudgeThreads
+
+    # This fixture exercises the captured app after its fake server exits.
+    # Keep its record codecs alive until the test finishes using that app.
+    shutdown = JudgeThreads.shutdown
+    held_threads = []
+    monkeypatch.setattr(JudgeThreads, "shutdown",
+                        lambda self, **kwargs: held_threads.append(self))
 
     asyncio.run(job_store.write_job({**_manifest(), "job_id": "swe-v2"}, None, **fake_r2))
     loads = {"snapshot": 0, "model": 0, "tokenizer": 0}
@@ -161,6 +290,11 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
 
         async def serve(self):
             await asyncio.sleep(0.05)
+            import httpx
+
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=built["app"]),
+                                         base_url="http://corpus") as client:
+                built["runtime_at_start"] = (await client.get("/corpus/runtime-contract")).json()
             raise _Stop()
 
     monkeypatch.setattr(uvicorn, "Server", _Server)
@@ -172,11 +306,30 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
             jobs=jobs, wallet=None, netuid=0, signer_client=None, http_host="127.0.0.1",
             http_port=0, set_weights=False, registration_gate=False,
         ))
-    return SimpleNamespace(loads=loads, **built)
+    try:
+        yield SimpleNamespace(loads=loads, **built)
+    finally:
+        for threads in held_threads:
+            shutdown(threads, wait=True)
 
 
 def test_the_model_is_loaded_once_for_both_jobs(booted):
     assert booted.loads == {"snapshot": 1, "model": 1, "tokenizer": 1}
+
+
+def test_runtime_contract_attests_the_loaded_checkpoint_and_wired_jobs(booted):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    runtime = TestClient(booted.app).get("/corpus/runtime-contract")
+    assert runtime.status_code == 200
+    document = runtime.json()
+    assert document["ready"] is False  # The test's server has stopped.
+    assert booted.runtime_at_start["ready"] is True
+    assert booted.runtime_at_start["audit_ready"] is True
+    assert document["checkpoint_sha256"] == CHECKPOINT
+    assert document["contract_sha256"] == canonical_sha256(document["contract"])
+    assert document["registry_refresh_enabled"] is False
+    assert sorted(document["jobs"]) == ["swe-v1", "swe-v2"]
 
 
 def test_each_job_gets_its_own_auditor_on_one_shared_gpu_lock(booted):
