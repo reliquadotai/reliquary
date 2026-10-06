@@ -433,7 +433,7 @@ def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
 def _parse_episode(raw: Any) -> EpisodeSpec:
     raw = _fields(raw, _EPISODE_FIELDS, "episode", optional=_EPISODE_OPTIONAL_FIELDS)
     env = _fields(raw["env"], _EPISODE_ENV_FIELDS, "episode.env")
-    if env["package"] not in EPISODE_ENV_PACKAGES:
+    if not isinstance(env["package"], str) or env["package"] not in EPISODE_ENV_PACKAGES:
         raise JobError(f"episode.env.package must be one of {sorted(EPISODE_ENV_PACKAGES)}")
     if not isinstance(env["version"], str) or not _COMMIT_RE.match(env["version"]):
         raise JobError("episode.env.version must be the environment repository's 40-hex commit")
@@ -452,7 +452,7 @@ def _parse_episode(raw: Any) -> EpisodeSpec:
     if "execution" in raw and raw["execution"] == EXECUTION_REPLAY:
         raise JobError("episode.execution is written only when it is not 'replay'")
     execution = raw.get("execution", EXECUTION_REPLAY)
-    if execution not in EXECUTIONS:
+    if not isinstance(execution, str) or execution not in EXECUTIONS:
         raise JobError(f"episode.execution must be one of {sorted(EXECUTIONS)}, got {execution!r}")
     sandbox = None
     if execution == EXECUTION_SIGNED_SANDBOX:

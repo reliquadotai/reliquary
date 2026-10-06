@@ -67,6 +67,8 @@ def test_replay_is_never_written_explicitly():
     (_episode(execution="signed_sandbox"), "needs episode.sandbox"),
     (_episode(sandbox=sandbox_spec()), "only for execution"),
     (_episode(execution="docker"), "execution must be one of"),
+    (_episode(execution=["signed_sandbox"]), "execution must be one of"),
+    (_episode(execution={}), "execution must be one of"),
     (signed_episode(replay_fraction_failed=0.1), "never replayed"),
     (signed_episode(sandbox=sandbox_spec(env="reliquary-terminal")), "episode's package"),
     (signed_episode(sandbox=sandbox_spec(env_package="reliquary-swe")), "env_package"),
