@@ -10,18 +10,26 @@ no new session, and `on_drained(machine_id)` voids its live sessions with no fau
 their miners. A session goes to the least-loaded eligible machine: active in the
 directory, fresh, holding the image and the env package at the pinned version, the
 tools version this build renders, caps no lower than the budgets and token validity,
-and a free slot once the tokens issued since its report are counted. A machine whose
+and a free slot once the tokens issued since its report are counted. "Least loaded" is
+the largest FREE FRACTION (free / capacity); equal fractions go to the smallest machine
+id, so ties bias toward lexicographically small ids (deterministic, not balanced). A machine whose
 `max_transcript_bytes` is refused by `transcript_cap_refusal` is never placed.
 
 The directory snapshot (keys, addresses, statuses) is rebuilt from R2 every
 `directory_refresh_s` (setting `sandbox_directory_refresh_s`, default
 DIRECTORY_REFRESH_SECONDS): a revoked machine or an ended key stops counting within that
-bound. The snapshot's age is kept. Once it is older than `directory_max_age_s` (default
+bound. Each read is bounded by `directory_read_timeout_s` (default
+DIRECTORY_READ_TIMEOUT_SECONDS) and runs beside the polls, never in front of them, so a
+hung R2 read cannot stop heartbeats or drain checks. A failed read is retried with
+exponential backoff (DIRECTORY_BACKOFF_BASE_SECONDS doubling, capped at
+DIRECTORY_BACKOFF_CAP_SECONDS), one error line per attempt. The snapshot's age is kept. Once it is older than `directory_max_age_s` (default
 DIRECTORY_MAX_AGE_SECONDS), whether it was never read or the R2 reads keep failing,
 the fleet fails closed: `directory()` is an empty snapshot (no key verifies, so no
 heartbeat and no transcript does), `pick` places nothing, polling stops (no machine is
-drained for the validator's own outage), and an error is logged. It reopens on the
-first successful read.
+drained for the validator's own outage), and an error is logged (before the first read
+attempt has finished, only "not loaded yet" at info). It reopens on the first successful
+read. A machine's silence is counted from the latest of the fleet's start, the moment
+it entered the directory, and the moment the directory last became usable.
 
 A key end backdated by the operator (compromise) refuses signatures from the next
 refresh on. It does NOT reach transcripts that were already admitted: those were
@@ -57,6 +65,9 @@ STALE_AFTER_S = 60
 POLL_SECONDS = 5.0
 DIRECTORY_REFRESH_SECONDS = 30.0
 DIRECTORY_MAX_AGE_SECONDS = 120.0
+DIRECTORY_READ_TIMEOUT_SECONDS = 15.0
+DIRECTORY_BACKOFF_BASE_SECONDS = 5.0
+DIRECTORY_BACKOFF_CAP_SECONDS = 30.0
 HEARTBEAT_RECORD_SECONDS = 60.0
 TOOLS_VERSION = "reliquary-tools/1"
 # Per machine, per poll: the whole fetch (connect, headers, body) must fit in this.
@@ -84,7 +95,7 @@ async def http_fetch_report(address: str, *, timeout: float = FETCH_TIMEOUT_S,
     limit = MAX_REPORT_BYTES if max_bytes is None else max_bytes
 
     async def fetch() -> dict | None:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False,
                                      transport=transport) as client:
             async with client.stream("GET", f"{address.rstrip('/')}/capacity",
                                      headers={"accept-encoding": "identity"}) as response:
@@ -116,10 +127,20 @@ class Fleet:
                  record_heartbeat: Callable[..., Awaitable[Any]] | None = None,
                  on_drained: Callable[[str], None] | None = None,
                  directory_refresh_s: float = DIRECTORY_REFRESH_SECONDS,
-                 directory_max_age_s: float = DIRECTORY_MAX_AGE_SECONDS) -> None:
+                 directory_max_age_s: float = DIRECTORY_MAX_AGE_SECONDS,
+                 directory_read_timeout_s: float = DIRECTORY_READ_TIMEOUT_SECONDS) -> None:
         if not directory_refresh_s > 0 or not directory_max_age_s > directory_refresh_s:
             raise ValueError("the directory needs 0 < refresh period < max age, got "
                              f"{directory_refresh_s} and {directory_max_age_s}")
+        if not directory_read_timeout_s > 0:
+            raise ValueError(f"the directory read timeout must be positive, got "
+                             f"{directory_read_timeout_s}")
+        self.directory_read_timeout_s = float(directory_read_timeout_s)
+        self._next_refresh_at: float | None = None   # None: due now
+        self._refresh_failures = 0
+        self._read_attempted = False                 # the first read has finished (either way)
+        self._not_loaded_logged = False
+        self._first_seen: dict[str, float] = {}
         self._refresh_s = float(directory_refresh_s)
         self._max_age_s = float(directory_max_age_s)
         self._directory_at: float | None = None      # clock time of the last good read
@@ -158,6 +179,11 @@ class Fleet:
         return self._directory
 
     def _alert_stale(self, now: float) -> None:
+        if not self._read_attempted:
+            if not self._not_loaded_logged:
+                self._not_loaded_logged = True
+                logger.info("sandbox machine directory not loaded yet; no session is placed")
+            return
         if self._stale_alerted:
             return
         self._stale_alerted = True
@@ -168,8 +194,16 @@ class Fleet:
                      f"max {self._max_age_s:.0f} s")
 
     async def refresh_directory(self) -> None:
-        snapshot = snapshot_from_documents(await self._read_documents())
+        """Read the directory once, within the read timeout (TimeoutError past it)."""
+        try:
+            documents = await asyncio.wait_for(self._read_documents(),
+                                               timeout=self.directory_read_timeout_s)
+        finally:
+            self._read_attempted = True
+        snapshot = snapshot_from_documents(documents)
         now = self._clock()
+        for entry in snapshot.entries():
+            self._first_seen.setdefault(entry.machine_id, now)
         if not self.directory_ready(now):
             self._fresh_since = now
             if self._stale_alerted:
@@ -220,7 +254,8 @@ class Fleet:
                 await self._maybe_record(entry.machine_id, now)
         for entry in entries:
             # Silence is counted from when the directory last became usable at the earliest.
-            last = max(self._last_ok.get(entry.machine_id, self._started),
+            baseline = max(self._started, self._first_seen.get(entry.machine_id, self._started))
+            last = max(self._last_ok.get(entry.machine_id, baseline),
                        self._fresh_since if self._fresh_since is not None else self._started)
             if now - last > STALE_AFTER_S and entry.machine_id not in self.drained:
                 self.drained.add(entry.machine_id)
@@ -293,36 +328,68 @@ class Fleet:
                 best, chosen = key, Placement(entry.machine_id, entry.address)
         return chosen
 
+    async def refresh_if_due(self) -> None:
+        """Read the directory if its period (or, after failures, its backoff) has
+        elapsed. Never raises; one error line per failed attempt."""
+        now = self._clock()
+        if self._next_refresh_at is not None and now < self._next_refresh_at:
+            return
+        try:
+            await self.refresh_directory()
+        except Exception as exc:
+            self._refresh_failures += 1
+            delay = min(DIRECTORY_BACKOFF_CAP_SECONDS,
+                        DIRECTORY_BACKOFF_BASE_SECONDS * 2 ** (self._refresh_failures - 1))
+            self._next_refresh_at = self._clock() + delay
+            logger.error("sandbox machine directory read failed (%s, attempt %d); next try in "
+                         "%.0f s; keeping the last snapshot until it is %.0f s old",
+                         type(exc).__name__, self._refresh_failures, delay, self._max_age_s)
+            return
+        self._refresh_failures = 0
+        self._next_refresh_at = self._clock() + self._refresh_s
+
     async def step(self) -> None:
-        """One tick of `run`: refresh the directory when due (a failed read is retried
-        on the next tick), then poll the machines."""
-        age = self.directory_age()
-        if age is None or age >= self._refresh_s:
-            try:
-                await self.refresh_directory()
-            except Exception as exc:
-                logger.error("sandbox machine directory read failed (%s); keeping the last "
-                             "snapshot until it is %.0f s old", type(exc).__name__,
-                             self._max_age_s)
+        """One sequential tick: poll the machines, then refresh the directory if due.
+        `run` runs the two side by side instead, so a slow read never delays a poll."""
+        await self._poll_guarded()
+        await self.refresh_if_due()
+
+    async def _poll_guarded(self) -> None:
         try:
             await self.poll_once()
         except Exception:
             logger.exception("machine heartbeat poll failed")
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
-        while stop is None or not stop.is_set():
-            await self.step()
+        """Poll every POLL_SECONDS and refresh the directory on its own schedule, in two
+        independent loops; both end (an in-flight read is cancelled) when `stop` is set."""
+        async def every_tick(action: Callable[[], Awaitable[None]]) -> None:
+            while stop is None or not stop.is_set():
+                await action()
+                if stop is None:
+                    await asyncio.sleep(POLL_SECONDS)
+                else:
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=POLL_SECONDS)
+                    except TimeoutError:
+                        pass
+
+        loops = [asyncio.create_task(every_tick(self.refresh_if_due)),
+                 asyncio.create_task(every_tick(self._poll_guarded))]
+        try:
             if stop is None:
-                await asyncio.sleep(POLL_SECONDS)
+                await asyncio.gather(*loops)
             else:
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=POLL_SECONDS)
-                except TimeoutError:
-                    pass
+                await stop.wait()
+        finally:
+            for loop in loops:
+                loop.cancel()
+            await asyncio.gather(*loops, return_exceptions=True)
 
 
 _EMPTY_DIRECTORY = DirectorySnapshot()
 
-__all__ = ["DIRECTORY_MAX_AGE_SECONDS", "DIRECTORY_REFRESH_SECONDS", "FETCH_TIMEOUT_S", "HEARTBEAT_MAX_AGE_S",
+__all__ = ["DIRECTORY_BACKOFF_BASE_SECONDS", "DIRECTORY_BACKOFF_CAP_SECONDS",
+           "DIRECTORY_MAX_AGE_SECONDS", "DIRECTORY_READ_TIMEOUT_SECONDS", "DIRECTORY_REFRESH_SECONDS", "FETCH_TIMEOUT_S", "HEARTBEAT_MAX_AGE_S",
            "HEARTBEAT_RECORD_SECONDS", "MAX_REPORT_BYTES", "POLL_SECONDS", "STALE_AFTER_S",
            "TOOLS_VERSION", "Fleet", "Placement", "http_fetch_report"]

@@ -419,7 +419,8 @@ def test_a_directory_older_than_its_max_age_fails_closed_and_alerts(tmp_path, ca
     documents.failing = False
     clock.now = NOW + 200
     served[ADDRESS] = capacity_report(machine, at=NOW + 200)
-    asyncio.run(fleet.step())
+    asyncio.run(fleet.step())             # due after backoff: polls (still stale), then reads
+    asyncio.run(fleet.poll_once())        # the next tick's poll
     assert fleet.directory_ready() and MACHINE not in fleet.drained
     assert fleet.pick(now=NOW + 200, **PICK) == Placement(MACHINE, ADDRESS)
 
@@ -442,7 +443,8 @@ def test_a_stale_directory_drains_no_machine(tmp_path):
     # R2 back: silence is counted from the recovery, not from the last heartbeat
     documents.failing = False
     clock.now = NOW + 400
-    asyncio.run(fleet.step())
+    asyncio.run(fleet.refresh_directory())   # the recovery read (backoff timing aside)
+    asyncio.run(fleet.poll_once())
     assert drained == []
     clock.now = NOW + 461
     asyncio.run(fleet.step())
@@ -488,3 +490,183 @@ def test_run_stops_on_its_event(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     assert documents.reads >= 1 and fleet.directory_ready()
+
+
+# --- fix round 1: bounded, non-blocking, backed-off directory reads; drain baseline ---
+
+
+def test_a_hanging_directory_read_times_out(tmp_path):
+    fleet, machine, documents, served, clock = fleet_over(tmp_path, directory_read_timeout_s=0.1)
+
+    async def hang():
+        await asyncio.sleep(3600)
+
+    fleet._read_documents = hang
+
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            await fleet.refresh_directory()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    assert fleet.directory_read_timeout_s == 0.1
+
+
+def test_the_read_timeout_defaults_to_15_and_must_be_positive(tmp_path):
+    assert fleet_module.DIRECTORY_READ_TIMEOUT_SECONDS == 15.0
+    with pytest.raises(ValueError):
+        fleet_over(tmp_path, directory_read_timeout_s=0)
+
+
+def test_a_hanging_read_does_not_stop_polls_or_drain_checks(tmp_path, monkeypatch):
+    monkeypatch.setattr(fleet_module, "POLL_SECONDS", 0.01)
+    drained = []
+    fleet, machine, documents, served, clock = fleet_over(
+        tmp_path, on_drained=drained.append, directory_refresh_s=1,
+        directory_read_timeout_s=3600)
+    fetches = []
+    real_read = documents.__call__
+
+    async def read():
+        if documents.reads >= 1:          # the first read works, every later one hangs
+            documents.reads += 1
+            await asyncio.sleep(3600)
+        return await real_read()
+
+    async def fetch(address):             # the machine is silent; each poll is 10 s of clock
+        fetches.append(address)
+        clock.now += 10
+        return None
+
+    fleet._read_documents, fleet._fetch = read, fetch
+
+    async def scenario():
+        stop = asyncio.Event()
+        fleet.on_drained = lambda machine_id: (drained.append(machine_id), stop.set())
+        await fleet.run(stop)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+    assert drained == [MACHINE]
+    assert documents.reads >= 2           # a read was hanging while the polls went on
+    assert len(fetches) >= 6
+
+
+def test_failed_refreshes_back_off_exponentially_up_to_30_s(tmp_path, caplog):
+    fleet, machine, documents, served, clock = fleet_over(
+        tmp_path, directory_refresh_s=30, directory_max_age_s=1000)
+    asyncio.run(fleet.step())
+    assert documents.reads == 1
+    documents.failing = True
+    attempts = []
+    with caplog.at_level("ERROR", logger="reliquary.sandbox.fleet"):
+        for second in range(1, 200):
+            clock.now = NOW + second
+            before = documents.reads
+            asyncio.run(fleet.step())
+            if documents.reads > before:
+                attempts.append(second)
+    assert attempts == [30, 35, 45, 65, 95, 125, 155, 185]
+    failures = [r for r in caplog.records
+                if r.levelname == "ERROR" and "read failed" in r.getMessage()]
+    assert len(failures) == len(attempts)              # one line per backoff step
+    # a success resets the backoff: the next read is a full period later
+    documents.failing = False
+    clock.now = NOW + 215
+    asyncio.run(fleet.step())
+    assert documents.reads == len(attempts) + 2
+    clock.now = NOW + 244
+    asyncio.run(fleet.step())
+    assert documents.reads == len(attempts) + 2
+    clock.now = NOW + 245
+    asyncio.run(fleet.step())
+    assert documents.reads == len(attempts) + 3
+    # and the backoff starts over at 5 s after a success
+    documents.failing = True
+    retried = []
+    for second in range(246, 300):
+        clock.now = NOW + second
+        before = documents.reads
+        asyncio.run(fleet.step())
+        if documents.reads > before:
+            retried.append(second)
+    assert retried == [275, 280, 290]
+
+
+def test_silence_counts_from_when_a_machine_entered_the_directory(tmp_path):
+    drained = []
+    fleet, machine, documents, served, clock = fleet_over(tmp_path, on_drained=drained.append)
+    newcomer = signer(tmp_path, "n", "kn")
+    served[ADDRESS] = capacity_report(machine, at=NOW)
+    asyncio.run(fleet.step())
+    asyncio.run(fleet.poll_once())
+    clock.now = NOW + 100
+    documents.documents = [machine_document(machine),
+                           machine_document(newcomer, machine_id="m-new", address="http://n:1")]
+    served[ADDRESS] = capacity_report(machine, at=NOW + 100)
+    asyncio.run(fleet.refresh_directory())
+    clock.now = NOW + 130
+    served[ADDRESS] = capacity_report(machine, at=NOW + 130)
+    asyncio.run(fleet.poll_once())
+    assert drained == []                                  # 30 s in the directory, not 130
+    clock.now = NOW + 161
+    served[ADDRESS] = capacity_report(machine, at=NOW + 161)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert drained == ["m-new"]
+
+
+def test_no_alert_before_the_first_read_has_finished(tmp_path, caplog):
+    fleet, machine, documents, served, clock = fleet_over(tmp_path)
+    with caplog.at_level("INFO", logger="reliquary.sandbox.fleet"):
+        assert fleet.pick(now=NOW, **PICK) is None
+        assert fleet.directory().entries() == ()
+        asyncio.run(fleet.poll_once())
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("not loaded yet" in r.getMessage() for r in caplog.records
+               if r.levelname == "INFO")
+    caplog.clear()
+    documents.failing = True
+    with caplog.at_level("ERROR", logger="reliquary.sandbox.fleet"):
+        asyncio.run(fleet.step())
+        fleet.directory()
+    assert any("ALERT" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+
+
+def test_http_fetch_report_ignores_proxy_environment(monkeypatch):
+    import httpx
+
+    made = []
+    real = httpx.AsyncClient
+
+    def client(*args, **kwargs):
+        made.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    transport = _mock_transport(lambda request: httpx.Response(500, content=_streamed(b"")))
+    asyncio.run(fleet_module.http_fetch_report(ADDRESS, transport=transport))
+    assert made and made[0].get("trust_env") is False
+
+
+def _two_machines(tmp_path, a, b):
+    one, two = signer(tmp_path, "a", "ka"), signer(tmp_path, "b", "kb")
+    # listed b first: the order of the documents must not matter
+    documents = [machine_document(two, machine_id="m-b", address="http://b:1", capacity=b[1]),
+                 machine_document(one, machine_id="m-a", address="http://a:1", capacity=a[1])]
+    fleet, _, served, _ = make(tmp_path, documents=documents)
+    served["http://a:1"] = capacity_report(one, at=NOW, machine_id="m-a", address="http://a:1",
+                                           free=a[0], capacity=a[1])
+    served["http://b:1"] = capacity_report(two, at=NOW, machine_id="m-b", address="http://b:1",
+                                           free=b[0], capacity=b[1])
+    asyncio.run(fleet.poll_once())
+    return fleet
+
+
+@pytest.mark.parametrize("a,b,winner", [
+    ((2, 4), (2, 4), "m-a"),          # same free fraction: the smaller machine id
+    ((1, 2), (2, 4), "m-a"),          # same fraction, different sizes: still the smaller id
+    ((2, 2), (3, 4), "m-a"),          # the free FRACTION decides, not the free count
+    ((1, 4), (2, 4), "m-b"),
+])
+def test_the_tie_break_order_is_pinned(tmp_path, a, b, winner):
+    fleet = _two_machines(tmp_path, a, b)
+    assert fleet.pick(now=NOW, **PICK).machine_id == winner
