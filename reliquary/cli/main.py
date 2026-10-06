@@ -1571,10 +1571,17 @@ def jobs_export(
                     "change; pass --allow-incomplete to export what is final so far")
             quarantined = await _quarantined_grade_executors()
 
-            renderer = await asyncio.to_thread(agentic_swe.load_turn_renderer,
-                                               await asyncio.to_thread(_episode_tokenizer_dir, job))
-            source = await asyncio.to_thread(agentic_swe.load_swe_source,
-                                             job.episode.env.num_images)
+            from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+
+            signed_job = is_signed_sandbox(job)
+            tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
+            # A replay job renders with the loader's default tools, as it always did.
+            renderer = await asyncio.to_thread(
+                agentic_swe.load_turn_renderer, tokenizer_dir,
+                *((job.episode.sandbox.tools,) if signed_job else ()))
+            source = (agentic_swe.SignedSweSource(sandbox_split(job.episode)) if signed_job
+                      else await asyncio.to_thread(agentic_swe.load_swe_source,
+                                                   job.episode.env.num_images))
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,

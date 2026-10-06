@@ -106,7 +106,7 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
 
     Raises ``TrajectoryRefused``, ``EpisodePromptMismatch`` or
     ``EpisodeUnrendered``."""
-    from reliquary.corpus.trajectory_parse import parse_trajectory
+    from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
     from reliquary.environment.agentic_swe import BASH_SYSTEM_PROMPT
 
     trajectory = record["completions"][0]
@@ -115,9 +115,28 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
     spans = [(int(turn["start"]), int(turn["end"])) for turn in trajectory["turns"]]
     if [int(t) for t in renderer.initial_ids(user_prompt)] != prompt:
         raise EpisodePromptMismatch(submission_id)
-    parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
-                              stop=trajectory["stop"], max_turns=job.episode.max_turns)
-    messages = [{"role": "system", "content": BASH_SYSTEM_PROMPT},
+    signed = trajectory.get("transcript")
+    if signed is None:
+        parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
+                                  stop=trajectory["stop"], max_turns=job.episode.max_turns)
+        system_prompt = BASH_SYSTEM_PROMPT
+    else:
+        # A signed episode: its observations are the signed records' renderings, compared
+        # forward against the tokens, never decoded from them (plan 3 ruling 6).
+        from reliquary.corpus.signed_parse import parse_signed_trajectory, signed_records
+        from reliquary.corpus.signed_reasons import REASON_SANDBOX_TRANSCRIPT
+        from reliquary.environment.agentic_swe import harness_system_prompt
+
+        try:
+            found = signed_records(signed)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TrajectoryRefused(REASON_SANDBOX_TRANSCRIPT, {"why": str(exc)}) from exc
+        parsed = parse_signed_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
+                                         stop=trajectory["stop"], max_turns=job.episode.max_turns,
+                                         calls=found.calls, offered=found.tools,
+                                         final=found.final)
+        system_prompt = harness_system_prompt(found.tools)
+    messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}]
     for t, ((start, end), turn) in enumerate(zip(spans, parsed.turns)):
         message = renderer.assistant_message(tokens[start:end])
