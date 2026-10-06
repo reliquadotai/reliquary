@@ -11,16 +11,25 @@ record 0's offered tools. Then:
 * records left over, or a `Send` with no record left, are a mismatch;
 * the final span of a `context_length` or `max_turns` stop has its sent calls recorded
   but no observation after it: they are counted, nothing is compared;
-* the final span of an `episode_closed` stop (the gateway sent a final record on one of
-  its calls: budget, deadline or transcript cap) has records for a prefix of its sent
-  calls (the call that closed the episode has one only when the gateway recorded it,
-  the calls after it have none), the transcript's final record right after them, and
-  no observation after it; it must hold at least one sent call;
+* an `episode_closed` stop (the bridge's stop after the gateway sent a final record on
+  one of the last span's calls: budget, deadline or transcript cap) needs a final whose
+  status is `expired` or `budget_exhausted`; any other final is `bad_stop`, so a miner
+  cannot skip its last turn's calls and `/finish` a graded episode. The last span's
+  records match a non-empty prefix of its sent calls (the closing call returned its
+  record with the final; the calls after it were never sent) and no observation follows.
+  What this parser checks is that no call record is left after that prefix; that the
+  final record is the next record in the chain is §5.A's (`verify_transcript`);
 * observations are never decoded or searched for: every other span's segment must be
   `renderer.next_prompt(prompt, completion, expected)`, token for token, where
   `expected` is `render_observation(record)` or the refusal text, in call order.
   Literal special-token text in an output is encoded by the renderer exactly as the
   miner's renderer encoded it (ruling 6), so it needs no rule of its own here.
+
+Precondition: the transcript passed §5.A (`verify_transcript`: token, signatures,
+session, contiguous chain, bindings). This parser compares record contents only: a
+content-identical record taken from another session is caught there, not here.
+The wire (`CorpusTrajectory.stop`) does not even carry `episode_closed` today; the rule
+above holds here regardless, as defense in depth.
 """
 
 from __future__ import annotations
@@ -28,7 +37,10 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from typing import Any, NamedTuple
 
-from reliquary_sandbox.attest import KIND_CALL, KIND_FINAL, KIND_OPEN, canonical_json, parse_body
+from reliquary_sandbox.attest import (
+    KIND_CALL, KIND_FINAL, KIND_OPEN, STATUS_BUDGET_EXHAUSTED, STATUS_EXPIRED, canonical_json,
+    parse_body,
+)
 from reliquary_sandbox.attest.canonical import CanonicalError
 from reliquary_sandbox.observation import Refuse, Send, plan_call, render_observation, sent_positions
 
@@ -45,6 +57,8 @@ STOP_EPISODE_CLOSED = "episode_closed"
 (`reliquary_sandbox_verifiers.task.SandboxEpisodeTask.episode_closed`). Signed episodes
 only: the replay parser's `STOPS` do not hold it."""
 SIGNED_STOPS = STOPS | {STOP_EPISODE_CLOSED}
+CLOSED_ON_A_CALL = frozenset({STATUS_EXPIRED, STATUS_BUDGET_EXHAUSTED})
+"""The final statuses a gateway sends on a call (deadline, budget, transcript cap)."""
 _UNOBSERVED_LAST_TURN = ("context_length", "max_turns")
 
 
@@ -75,11 +89,16 @@ def _same_arguments(signed: Any, sent: Mapping[str, Any]) -> bool:
 def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
                             tokens: Sequence[int], spans: Sequence[tuple[int, int]], stop: str,
                             max_turns: int | None, calls: Sequence[Any],
-                            offered: Collection[str]) -> ParsedTrajectory:
+                            offered: Collection[str], final: Any) -> ParsedTrajectory:
     """The trajectory's turns and actions, or `TrajectoryRefused`. `calls` are the
-    verified transcript's call bodies in order; `offered` is record 0's `tools`."""
+    verified transcript's call bodies in order; `offered` is record 0's `tools`;
+    `final` is its final body (`signed_records(...).final`)."""
     if stop not in SIGNED_STOPS:
         raise TrajectoryRefused(REASON_BAD_STOP, {"stop": stop})
+    if stop == STOP_EPISODE_CLOSED and final.status not in CLOSED_ON_A_CALL:
+        raise TrajectoryRefused(REASON_BAD_STOP, {
+            "stop": stop, "status": final.status,
+            "why": "only a final sent on a call closes an episode mid-turn"})
     if not spans:
         raise TrajectoryRefused(REASON_BAD_TURNS, {"turns": 0})
     if stop == "max_turns" and len(spans) != max_turns:
@@ -130,13 +149,14 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
                 for plan, position in sends:
                     take(k, position, plan)
             elif stop == STOP_EPISODE_CLOSED:
-                if not sends:
-                    raise TrajectoryRefused(REASON_BAD_STOP, {
-                        "turn": k, "why": "the episode closed on no sent call"})
+                before = used
                 for plan, position in sends:
                     if used == len(records):
-                        break                       # the rest were never recorded
+                        break                       # the rest were never sent
                     take(k, position, plan)
+                if used == before:
+                    raise TrajectoryRefused(REASON_BAD_STOP, {
+                        "turn": k, "why": "the episode closed on no recorded call of this turn"})
             actions += [Action(name, arguments, None) for name, arguments in pairs]
             turns.append(ParsedTurn(tuple(pairs), ()))
             continue
@@ -158,5 +178,5 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
     return ParsedTrajectory(tuple(turns), tuple(actions))
 
 
-__all__ = ["SIGNED_STOPS", "STOP_EPISODE_CLOSED", "SignedRecords", "parse_signed_trajectory",
+__all__ = ["CLOSED_ON_A_CALL", "SIGNED_STOPS", "STOP_EPISODE_CLOSED", "SignedRecords", "parse_signed_trajectory",
            "signed_records"]

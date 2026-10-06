@@ -58,15 +58,28 @@ def rec(turn, k, j, output="a.py\n", **fields):
         cpu_ms=0, wall_ms=0, at=0, prev="")
 
 
+def fin(status="graded"):
+    graded = status == "graded"
+    return attest.FinalBody(i=9, session_id="s", status=status, reward=1.0 if graded else None,
+                            grading=None, state_sha256=None, cpu_total_ms=0, reason=None, at=0,
+                            prev="")
+
+
+CLOSE = fin("budget_exhausted")
+
+
 def seen(record):
     return render_observation(record.to_dict())
 
 
 def parse(turns, calls, stop="agent_completed", offered=("bash", "edit"), renderer=S,
-          max_turns=40):
+          max_turns=40, final=None):
     tokens, spans = build(turns)
+    if final is None:
+        final = CLOSE if stop == "episode_closed" else fin()
     return parse_signed_trajectory(renderer, prompt_ids=PROMPT, tokens=tokens, spans=spans,
-                                   stop=stop, max_turns=max_turns, calls=calls, offered=offered)
+                                   stop=stop, max_turns=max_turns, calls=calls, offered=offered,
+                                   final=final)
 
 
 def refused(turns, calls, **kw):
@@ -197,14 +210,31 @@ def closed_turns():
     return [(SPAN + [CALL, TERM], [seen(r0)]), (SPAN + [CALL, BAD, CALL, CALL, TERM], None)], r0
 
 
-@pytest.mark.parametrize("recorded", [0, 1, 2, 3])
-def test_a_mid_turn_close_matches_a_prefix_of_the_last_turns_sent_calls(recorded):
-    """The call that closed the episode has a record only when the gateway recorded it;
-    the calls after it have none, and no observation follows."""
+@pytest.mark.parametrize("status", ["budget_exhausted", "expired"])
+@pytest.mark.parametrize("recorded", [1, 2, 3])
+def test_a_mid_turn_close_matches_a_prefix_of_the_last_turns_sent_calls(recorded, status):
+    """The closing call returned its record with the final; the calls after it were
+    never sent, and no observation follows."""
     turns, r0 = closed_turns()
     sent = [rec(1, 0, 0), rec(1, 1, 2), rec(1, 2, 3)][:recorded]
-    parsed = parse(turns, [r0, *sent], stop="episode_closed")
+    parsed = parse(turns, [r0, *sent], stop="episode_closed", final=fin(status))
     assert [a.observation for a in parsed.actions][1:] == [None] * 4
+
+
+def test_a_mid_turn_close_needs_a_recorded_call_in_the_last_turn():
+    turns, r0 = closed_turns()
+    assert refused(turns, [r0], stop="episode_closed").reason == "bad_stop"
+
+
+@pytest.mark.parametrize("status", ["graded", "aborted", "box_failed"])
+def test_only_a_final_sent_on_a_call_closes_an_episode_mid_turn(status):
+    """A graded final comes from /finish: a miner that stopped routing its last turn's
+    calls and finished early must not pass them off as a gateway close."""
+    turns, r0 = closed_turns()
+    for recorded in (1, 3):
+        sent = [rec(1, 0, 0), rec(1, 1, 2), rec(1, 2, 3)][:recorded]
+        error = refused(turns, [r0, *sent], stop="episode_closed", final=fin(status))
+        assert error.reason == "bad_stop" and error.detail["status"] == status
 
 
 def test_a_mid_turn_close_still_matches_and_exhausts_its_records():
@@ -278,7 +308,7 @@ class Scripted(FakeRenderer):
 G = Scripted()
 
 
-async def _drive(gateway, completions, *, budgets):
+async def _drive(gateway, completions, *, budgets, route_last=None):
     """A miner without a model: each completion's calls are routed through the bridge's
     ToolRouter (offered = record 0's tools), and the answers rendered into the next
     prompt, as the train client does."""
@@ -298,6 +328,12 @@ async def _drive(gateway, completions, *, budgets):
             calls = [(f"call_{j}", name, arguments)
                      for j, (name, arguments) in enumerate(G.tool_calls(completion))]
             answers = []
+            if route_last is not None and turn == len(completions) - 1:
+                # A forger: route only the first `route_last` calls, then /finish.
+                for call_id, _, _ in calls[:route_last]:
+                    await router.answer(turn, calls, call_id)
+                full += list(completion)
+                break
             for call_id, _, _ in calls:
                 try:
                     answers.append(await router.answer(turn, calls, call_id))
@@ -314,13 +350,14 @@ async def _drive(gateway, completions, *, budgets):
     return full[len(PROMPT):], spans, finished, transcript
 
 
-def _served(tmp_path, completions, **budget_overrides):
+def _served(tmp_path, completions, route_last=None, **budget_overrides):
     from reliquary_sandbox_service.episodes.local_gateway import default_budgets
     from reliquary_sandbox_service.episodes.testing import fake_gateway
 
     with fake_gateway(tmp_path) as (gateway, _):
         tokens, spans, finished, transcript = asyncio.run(
-            _drive(gateway, completions, budgets=default_budgets(**budget_overrides)))
+            _drive(gateway, completions, budgets=default_budgets(**budget_overrides),
+                   route_last=route_last))
         verified = gateway.verify(transcript, require_graded=False)
     assert verified.ok, verified.reasons
     return tokens, spans, finished, transcript
@@ -337,7 +374,7 @@ def test_an_honest_gateway_episode_passes_and_any_edit_to_it_does_not(tmp_path):
     def check(calls=found.calls, offered=found.tools, tokens=tokens):
         return parse_signed_trajectory(G, prompt_ids=PROMPT, tokens=tokens, spans=spans,
                                        stop="agent_completed", max_turns=40, calls=calls,
-                                       offered=offered)
+                                       offered=offered, final=found.final)
 
     parsed = check()
     assert [a.observation for a in parsed.actions] == [
@@ -366,12 +403,28 @@ def test_a_gateway_close_mid_turn_is_an_episode_closed_stop(tmp_path):
     assert [c.arguments["command"] for c in found.calls] == ["echo hi", "burn 1500"]
     parsed = parse_signed_trajectory(G, prompt_ids=PROMPT, tokens=tokens, spans=spans,
                                      stop="episode_closed", max_turns=40, calls=found.calls,
-                                     offered=found.tools)
+                                     offered=found.tools, final=found.final)
     assert [a.observation for a in parsed.actions] == ["hi\n", None, None]
     with pytest.raises(TrajectoryRefused):              # no observation follows the close
         parse_signed_trajectory(G, prompt_ids=PROMPT, tokens=tokens, spans=spans,
                                 stop="agent_completed", max_turns=40, calls=found.calls,
-                                offered=found.tools)
+                                offered=found.tools, final=found.final)
+
+
+@pytest.mark.parametrize("last, routed", [([ECHO], 0), ([ECHO, BAD, ECHO, ECHO], 1)])
+def test_finishing_before_the_last_turns_calls_is_not_a_close(tmp_path, last, routed):
+    """The forgery: route 0 of 1 (or 1 of 3) of the last turn's sent calls, /finish for
+    a graded final, and claim the gateway closed the episode mid-turn."""
+    completions = [SPAN + [WRITE, TERM], SPAN + [FIX, TERM], SPAN + last + [TERM]]
+    tokens, spans, finished, transcript = _served(tmp_path, completions, route_last=routed)
+    found = signed_records(transcript)
+    assert found.final.status == "graded" and finished.state == b"42\n"
+    assert len(found.calls) == 2 + routed
+    with pytest.raises(TrajectoryRefused) as caught:
+        parse_signed_trajectory(G, prompt_ids=PROMPT, tokens=tokens, spans=spans,
+                                stop="episode_closed", max_turns=40, calls=found.calls,
+                                offered=found.tools, final=found.final)
+    assert caught.value.reason == "bad_stop" and caught.value.detail["status"] == "graded"
 
 
 # -- the special-token rule, with the real tokenizer (opt-in) ------------------------
@@ -404,7 +457,7 @@ def test_special_token_literals_in_an_output_are_compared_forward_not_segmented(
     spans = [(0, len(first)), (len(second) - len(prompt), len(tokens))]
     parsed = parse_signed_trajectory(r, prompt_ids=prompt, tokens=tokens, spans=spans,
                                      stop="agent_completed", max_turns=40, calls=[record],
-                                     offered=("bash", "edit"))
+                                     offered=("bash", "edit"), final=fin())
     assert parsed.actions[0].observation == seen(record)
     segment = tokens[len(first):spans[1][0]]
     assert segment.count(r._close) == 2           # the literal became the special id

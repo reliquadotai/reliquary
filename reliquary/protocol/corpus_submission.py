@@ -165,6 +165,9 @@ class CorpusTrajectory(BaseModel):
     tokens: list[int] = Field(min_length=1, max_length=MAX_TRAJECTORY_TOKENS)
     turns: list[CorpusTurn] = Field(min_length=1, max_length=MAX_TRAJECTORY_TURNS)
     final_diff: str = Field(max_length=MAX_FINAL_DIFF_CHARS)
+    # No "episode_closed" (the signed bridge's mid-turn close): such an episode ends
+    # unpaid, and `corpus.signed_parse` refuses it with a graded final anyway. Kept
+    # out of the wire as defense in depth.
     stop: Literal["agent_completed", "max_turns", "context_length"]
 
     @field_validator("tokens")
