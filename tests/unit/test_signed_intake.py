@@ -20,7 +20,7 @@ from reliquary.infrastructure import corpus_job_store as job_store  # noqa: E402
 from reliquary.infrastructure.sandbox_store import MemorySessionStore  # noqa: E402
 from reliquary.protocol.corpus_submission import CorpusSubmissionRequest  # noqa: E402
 from reliquary.sandbox.sessions import (  # noqa: E402
-    ABORTED, CLOSED, CLOSED_GRADED, LAPSED, LIVE, SUBMITTED, VOIDED, SandboxPolicy, SessionBook,
+    ABORTED, CLOSED, CLOSED_GRADED, LIVE, SUBMITTED, VOIDED, SandboxPolicy, SessionBook,
     SessionIssuer, SessionRecord,
 )
 from reliquary.validator import signed_intake  # noqa: E402
@@ -58,12 +58,9 @@ class Fleet:
     def __init__(self, snapshot):
         self.snapshot, self.ready, self.asked = snapshot, True, []
 
-    def directory(self):
-        return self.snapshot
-
-    def directory_ready(self, now=None):
+    def directory_if_ready(self, now=None):
         self.asked.append(now)
-        return self.ready
+        return self.snapshot if self.ready else None
 
 
 class FailingStore(_CountingStore):
@@ -116,8 +113,7 @@ def make_world(tmp_path, fake_r2, *, renderer=S, tokenizer=TOKENIZER, chunk_toke
     intake = SignedEpisodeIntake(
         job=JOB, source=SOURCE, renderer=renderer, tokenizer=tokenizer, vocab_size=None,
         chunk_tokens=chunk_tokens,
-        directory=fleet.directory, directory_ready=fleet.directory_ready,
-        token_verifier=verifier, sessions=issuer, seen=seen, clock=clock)
+        directory=fleet.directory_if_ready, token_verifier=verifier, sessions=issuer, seen=seen, clock=clock)
     from reliquary.validator.corpus_service import build_corpus_router
 
     store = FailingStore(fake_r2)
@@ -315,7 +311,9 @@ def test_a_refused_aborted_submission_keeps_the_hotkeys_aborted_cap(world):
 
 # -- the session's state, claimed before the write -----------------------------------
 
-@pytest.mark.parametrize("state", [CLOSED, VOIDED, LAPSED, ABORTED])
+# `lapsed` is payable only for a submission received by the deadline: see
+# test_a_session_lapsed_after_its_on_time_receipt_is_paid and the deadline tests.
+@pytest.mark.parametrize("state", [CLOSED, VOIDED, ABORTED])
 def test_a_session_that_is_not_submittable_is_never_paid(world, state):
     world.book.get("s-1").state = state
     answer = submit(world)
@@ -574,3 +572,50 @@ def test_a_real_qwen38_episode_with_special_token_literals_is_paid_once(tmp_path
     again = post(world, request(None)).json()
     assert again["reason"] != "accepted"
     assert remaining(world) == JOB.slots_per_prompt - 1
+
+
+# -- fix round 1 ----------------------------------------------------------------------
+
+def test_a_record_write_that_raises_still_ends_the_claim(world, monkeypatch):
+    """The reviewer's case: the record step raises after the ledger accepted. The slot is
+    consumed, so the session is submitted and its claim ends (never leaked)."""
+    from reliquary.protocol import signatures
+
+    def broken(request):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(signatures, "corpus_submission_id", broken)
+    with pytest.raises(RuntimeError):
+        post(world, request_for(world))
+    assert not world.book.is_claimed("s-1")
+    assert world.book.get("s-1").state == SUBMITTED
+    assert remaining(world) == JOB.slots_per_prompt - 1
+
+
+def test_a_session_lapsed_after_its_on_time_receipt_is_paid(world, monkeypatch):
+    deadline = NOW + 4500 + attest.GRADING_GRACE_S
+    world.clock.now = deadline                                   # received on time
+    real = world.intake.check
+
+    def check_then_lapse(request):
+        outcome = real(request)
+        world.book.lapse(deadline + 30)                          # the check took 30 s
+        return outcome
+
+    monkeypatch.setattr(world.intake, "check", check_then_lapse)
+    assert world.book.get("s-1").state == LIVE
+    assert submit(world)["reason"] == "accepted"
+    assert world.book.get("s-1").state == SUBMITTED
+
+
+def test_the_directory_is_read_once_for_readiness_and_verify(world, monkeypatch):
+    seen_directories = []
+    real = signed_intake.verify_transcript
+
+    def spy(transcript_, directory_, *args, **kw):
+        seen_directories.append(directory_)
+        return real(transcript_, directory_, *args, **kw)
+
+    monkeypatch.setattr(signed_intake, "verify_transcript", spy)
+    assert submit(world)["reason"] == "accepted"
+    assert world.fleet.asked == [NOW + 100] and seen_directories == [world.fleet.snapshot]

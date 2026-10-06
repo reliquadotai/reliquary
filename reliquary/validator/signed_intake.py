@@ -3,8 +3,10 @@ mode next to the replay intake. `check` is synchronous and CPU-bound (signatures
 parse through the renderer): the route runs it in a thread.
 
 In order, cheapest first:
-0. the machine directory is fresh (`directory_ready` on THIS validator's clock), else
-   a retryable refusal: a stale directory must never read as `unknown_key`;
+0. the machine directory, read once (`directory(received)`, i.e.
+   `fleet.directory_if_ready`, on THIS validator's clock) for both the readiness check
+   and the verify; when it is stale, a retryable refusal: a stale directory must never
+   read as `unknown_key`;
 1. one trajectory carrying its transcript, for a prompt index the job owns;
 2. §5.A/B: `verify_transcript` with EVERY `Expected` field (hotkey, engagement
    `corpus:<job>:<index>`, env, split, index, checkpoint) and the paid-session snapshot,
@@ -20,8 +22,9 @@ In order, cheapest first:
 8. the replay intake's turn checks (short turns, budget, termination, proof shape).
 
 Then the route asks `claim` BEFORE its ledger write: the issuer holds the session
-(only `live` or `closed_graded`, see `sessions.session_submittable`) so no close,
-drain or lapse moves it while the write runs. The facts carry the session's seen key;
+(only `live` or `closed_graded`, see `sessions.session_submittable`, or one that lapsed
+after this submission was received on time) so no close, drain or lapse moves it while
+the write runs. The facts carry the session's seen key;
 `corpus_service` adds it to the ledger turn, so the slot and the session are recorded
 in one compare-and-swap, and `admit` refuses a key already seen. After the turn,
 `accepted` (the write accepted it) or `release` (anything else) ends the claim.
@@ -63,14 +66,18 @@ class SignedIntakeFacts(IntakeFacts):
     machine_id: str = ""
     hotkey: str = ""
     reward: float = 0.0
+    received_at: float = 0.0
 
 
 class SignedEpisodeIntake(EpisodeIntake):
-    """`sessions` is the session issuer (`claim`, `release_claim`, `submitted`)."""
+    """`directory(now)` is the machine directory snapshot, or None while it is stale
+    (`fleet.directory_if_ready`). `sessions` is the session issuer (`claim`,
+    `release_claim`, `submitted`). `seen()` is read from the check's thread: it must
+    return an immutable snapshot (`SessionBook.submitted_ids`)."""
 
     def __init__(self, *, job, source, renderer, tokenizer, vocab_size: int | None,
-                 chunk_tokens: int, directory: Callable[[], Any],
-                 directory_ready: Callable[[float], bool], token_verifier, sessions,
+                 chunk_tokens: int, directory: Callable[[float], Any | None],
+                 token_verifier, sessions,
                  seen: Callable[[], Collection[str]] = frozenset,
                  clock: Callable[[], float] = time.time,
                  retry_after_s: int = DEFAULT_RETRY_AFTER_S,
@@ -79,7 +86,6 @@ class SignedEpisodeIntake(EpisodeIntake):
                          vocab_size=vocab_size, chunk_tokens=chunk_tokens,
                          min_chunk_tokens=min_chunk_tokens)
         self._directory = directory
-        self._directory_ready = directory_ready
         self._tokens = token_verifier
         self._sessions = sessions
         self._seen = seen
@@ -88,7 +94,8 @@ class SignedEpisodeIntake(EpisodeIntake):
 
     async def claim(self, facts: SignedIntakeFacts) -> IntakeRefusal | None:
         """Hold the session for this submission, before the ledger write."""
-        refusal = await self._sessions.claim(facts.session_id, hotkey=facts.hotkey)
+        refusal = await self._sessions.claim(facts.session_id, hotkey=facts.hotkey,
+                                             received=facts.received_at)
         if refusal is None:
             return None
         if refusal.reason == "session_claimed":
@@ -96,6 +103,8 @@ class SignedEpisodeIntake(EpisodeIntake):
                                  retry_after=refusal.retry_after or self._retry_after)
         if refusal.reason == "session_submitted":
             return IntakeRefusal(REASON_SANDBOX_SESSION_REUSED, {"session_id": facts.session_id})
+        if refusal.reason == "session_expired":
+            return IntakeRefusal(REASON_SANDBOX_EXPIRED, dict(refusal.detail))
         state = refusal.detail.get("state") if refusal.reason == "session_not_submittable" else None
         return IntakeRefusal(REASON_SANDBOX_TRANSCRIPT, {
             "session_id": facts.session_id, "session_state": state or "unknown"})
@@ -110,7 +119,8 @@ class SignedEpisodeIntake(EpisodeIntake):
 
     def check(self, request) -> SignedIntakeFacts | IntakeRefusal:
         received = self._clock()
-        if not self._directory_ready(received):
+        directory = self._directory(received)
+        if directory is None:
             return IntakeRefusal(REASON_DIRECTORY_UNAVAILABLE,
                                  {"why": "the machine directory is stale"},
                                  retry_after=self._retry_after)
@@ -131,7 +141,7 @@ class SignedEpisodeIntake(EpisodeIntake):
                             env=spec.env, split=sandbox_split(episode), index=request.prompt_index,
                             checkpoint=self._job.checkpoint_sha256,
                             seen_session_ids=self._seen(), require_graded=True)
-        result = verify_transcript(trajectory.transcript, self._directory(), self._tokens, expected)
+        result = verify_transcript(trajectory.transcript, directory, self._tokens, expected)
         if not result.ok:
             return IntakeRefusal(REASON_SANDBOX_TRANSCRIPT,
                                  {"reasons": [reason.value for reason in result.reasons]})
@@ -174,11 +184,11 @@ class SignedEpisodeIntake(EpisodeIntake):
                                  session_id=claims.session_id,
                                  session_key=session_seen_key(claims.session_id),
                                  machine_id=claims.machine_id, hotkey=claims.hotkey,
-                                 reward=float(final.reward))
+                                 reward=float(final.reward), received_at=received)
 
 
 def build_signed_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_size: int | None,
-                                chunk_tokens: int, directory, directory_ready, token_verifier,
+                                chunk_tokens: int, directory, token_verifier,
                                 sessions, seen: Callable[[], Collection[str]] = frozenset,
                                 retry_after_s: int = DEFAULT_RETRY_AFTER_S) -> SignedEpisodeIntake:
     """The intake a validator serves a signed-sandbox job with; refuses to start on a
@@ -193,7 +203,7 @@ def build_signed_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_si
         job=job, source=agentic_swe.SignedSweSource(sandbox_split(job.episode)),
         renderer=agentic_swe.load_turn_renderer(checkpoint_dir, tools=job.episode.sandbox.tools),
         tokenizer=tokenizer, vocab_size=vocab_size, chunk_tokens=chunk_tokens,
-        directory=directory, directory_ready=directory_ready, token_verifier=token_verifier,
+        directory=directory, token_verifier=token_verifier,
         sessions=sessions, seen=seen, retry_after_s=retry_after_s)
 
 

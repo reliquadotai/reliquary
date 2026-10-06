@@ -1716,14 +1716,17 @@ def build_corpus_router(
             # Outside the turn: the record is create-only and keyed by its own
             # id, so it needs no turn on the ledger. Run even if the miner hung
             # up, so a slot the ledger consumed always gets its record.
-            if turn.verdict is None or not turn.verdict.accepted:
-                await end_claim(False)
-                return
-            timing.update(turn.timing)
-            mark = time.perf_counter()
-            await _record_accepted(request, job_id, episode_facts)
-            await end_claim(True)
-            timing["record_write"] = time.perf_counter() - mark
+            accepted = turn.verdict is not None and turn.verdict.accepted
+            try:
+                if not accepted:
+                    return
+                timing.update(turn.timing)
+                mark = time.perf_counter()
+                await _record_accepted(request, job_id, episode_facts)
+                timing["record_write"] = time.perf_counter() - mark
+            finally:
+                # Whatever the record step does: the ledger's verdict decides.
+                await end_claim(accepted)
             timing["total"] = time.perf_counter() - started
             logger.info(
                 "corpus submission timing %s: %s attempts=%d batch=%d",

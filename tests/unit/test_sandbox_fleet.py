@@ -670,3 +670,16 @@ def _two_machines(tmp_path, a, b):
 def test_the_tie_break_order_is_pinned(tmp_path, a, b, winner):
     fleet = _two_machines(tmp_path, a, b)
     assert fleet.pick(now=NOW, **PICK).machine_id == winner
+
+
+def test_one_call_answers_the_snapshot_only_while_it_is_fresh(tmp_path):
+    """The intake's readiness check and its verify read one snapshot (no TOCTOU)."""
+    fleet, machine, documents, served, clock = fleet_over(
+        tmp_path, directory_refresh_s=30, directory_max_age_s=120)
+    assert fleet.directory_if_ready(NOW) is None                 # never read
+    asyncio.run(fleet.step())
+    snapshot = fleet.directory_if_ready(NOW)
+    assert snapshot is not None and snapshot.public_key(MACHINE, "k1", NOW) is not None
+    documents.failing = True
+    assert fleet.directory_if_ready(NOW + 120) is snapshot
+    assert fleet.directory_if_ready(NOW + 121) is None

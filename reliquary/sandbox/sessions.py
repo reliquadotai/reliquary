@@ -23,9 +23,12 @@ States. A session is `live` until the first of:
 
 The intake claims a session (`SessionIssuer.claim`, under the issuer lock) BEFORE its
 ledger write: only a `live` or `closed_graded` session (`session_submittable`) of the
-submitting hotkey, not already claimed. A claimed session is frozen: no close, drain or
-lapse moves it until `submitted` (after the write) or `release_claim` (the write did
-not accept it).
+submitting hotkey, not already claimed; or a `lapsed` one whose submission was received
+by its deadline (it lapsed while that submission was being checked). A claimed session
+is frozen: no close, drain or lapse moves it until `submitted` (after the write) or
+`release_claim` (the write did not accept it). A claim is bounded by `claim_ttl_s`:
+past it (a leaked claim), drain, lapse and close act again, with an ALERT log, and a
+new submission may claim it.
 * `aborted`: void, refunded from the open rate, counted against the aborted cap;
   never paid;
 * `voided`: its machine was drained. Our fault, not the miner's: not counted in the
@@ -119,6 +122,10 @@ class SandboxPolicy:
     request_skew_s: int = 120
     retry_after_s: int = 10
     io_timeout_s: int = 10
+    # A ledger turn's wait (corpus_service.LEDGER_LOCK_TIMEOUT_SECONDS, 30 s), the
+    # record write's retries (RECORD_WRITE_ATTEMPTS x io_timeout_s) and 60 s of margin,
+    # rounded up generously: no honest submission holds its claim longer.
+    claim_ttl_s: int = 300
 
     _ENV = {"max_live_per_hotkey": "RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY",
             "max_live_per_hotkey_job": "RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB",
@@ -127,7 +134,8 @@ class SandboxPolicy:
             "open_window_s": "RELIQUARY_SANDBOX_OPEN_WINDOW_S",
             "request_skew_s": "RELIQUARY_SANDBOX_REQUEST_SKEW_S",
             "retry_after_s": "RELIQUARY_SANDBOX_RETRY_AFTER_S",
-            "io_timeout_s": "RELIQUARY_SANDBOX_IO_TIMEOUT_S"}
+            "io_timeout_s": "RELIQUARY_SANDBOX_IO_TIMEOUT_S",
+            "claim_ttl_s": "RELIQUARY_SANDBOX_CLAIM_TTL_S"}
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] = os.environ) -> SandboxPolicy:
@@ -329,24 +337,44 @@ class SessionBook:
         self.policy = policy
         self._sessions: dict[str, SessionRecord] = {}
         self._requests: dict[tuple[str, str], str] = {}
-        self._claimed: set[str] = set()
+        self._claimed: dict[str, int] = {}          # session id -> claimed at
+        # Replaced, never mutated: read from the intake's thread while the loop
+        # changes the book.
+        self._submitted: frozenset[str] = frozenset()
 
-    def claim(self, session_id: str) -> bool:
-        """Mark a session as being paid; False when it already is."""
-        if session_id in self._claimed:
+    def claim(self, session_id: str, now: int) -> bool:
+        """Mark a session as being paid; False while a fresh claim already holds it."""
+        if self.claim_fresh(session_id, now):
             return False
-        self._claimed.add(session_id)
+        self._claimed[session_id] = int(now)
         return True
 
     def release_claim(self, session_id: str) -> None:
-        self._claimed.discard(session_id)
+        self._claimed.pop(session_id, None)
 
     def is_claimed(self, session_id: str) -> bool:
         return session_id in self._claimed
 
+    def claim_fresh(self, session_id: str, now: int) -> bool:
+        at = self._claimed.get(session_id)
+        return at is not None and now - at <= self.policy.claim_ttl_s
+
+    def _frozen(self, record: SessionRecord, now: int, action: str) -> bool:
+        """Whether a claim keeps `action` off this session; a stale claim does not, loudly."""
+        if record.session_id not in self._claimed:
+            return False
+        if self.claim_fresh(record.session_id, now):
+            return True
+        logger.error("ALERT sandbox session %s claimed %d s ago, past its %d s ttl: %s "
+                     "proceeds", record.session_id, now - self._claimed[record.session_id],
+                     self.policy.claim_ttl_s, action)
+        return False
+
     def add(self, record: SessionRecord) -> None:
         self._sessions[record.session_id] = record
         self._requests[(record.hotkey, record.request_id)] = record.session_id
+        if record.state == SUBMITTED:
+            self._submitted = self._submitted | {record.session_id}
 
     def restore(self, records) -> None:
         for record in records:
@@ -368,7 +396,8 @@ class SessionBook:
                    if r.job_id == job_id and r.prompt_index == prompt_index and self._holds(r, now))
 
     def submitted_ids(self) -> frozenset[str]:
-        return frozenset(s for s, r in self._sessions.items() if r.state == SUBMITTED)
+        """Safe from any thread: an immutable set, kept up to date by `settle`."""
+        return self._submitted
 
     def open_refusal(self, hotkey: str, now: int) -> Refusal | None:
         mine = [r for r in self._sessions.values() if r.hotkey == hotkey]
@@ -411,12 +440,14 @@ class SessionBook:
         if record is None or not session_transition_allowed(record.state, state):
             return None
         record.state, record.closed_status, record.closed_at = state, status, int(now)
+        if state == SUBMITTED:
+            self._submitted = self._submitted | {session_id}
         return record
 
     def lapse(self, now: int) -> list[SessionRecord]:
         lapsed = [r for r in self._sessions.values()
                   if r.state in HOLDING and now > r.expires_at + GRADING_GRACE_S
-                  and r.session_id not in self._claimed]
+                  and not self._frozen(r, now, "lapse")]
         for record in lapsed:
             self.settle(record.session_id, LAPSED, now=now, status=record.closed_status)
         return lapsed
@@ -426,7 +457,7 @@ class SessionBook:
         and a claimed one is being paid."""
         voided = [r for r in self._sessions.values()
                   if r.machine_id == machine_id and r.state == LIVE and self._holds(r, now)
-                  and r.session_id not in self._claimed]
+                  and not self._frozen(r, now, "drain")]
         for record in voided:
             self.settle(record.session_id, VOIDED, now=now, status="machine_drained")
         return voided
@@ -437,6 +468,9 @@ class SessionBook:
         for session_id in old:
             record = self._sessions.pop(session_id)
             self._requests.pop((record.hotkey, record.request_id), None)
+            self._claimed.pop(session_id, None)
+        if old:
+            self._submitted = self._submitted - set(old)
 
 
 class SessionIssuer:
@@ -555,7 +589,7 @@ class SessionIssuer:
             record = self.book.get(session_id)
             if record is None or record.hotkey != hotkey:
                 return Refusal("session_unknown", {"session_id": session_id})
-            if record.state != LIVE or self.book.is_claimed(session_id):
+            if record.state != LIVE or self.book._frozen(record, now, "close"):
                 return self._state_of(record)
             if reason == "open_failed":
                 if transcript is not None:
@@ -585,7 +619,7 @@ class SessionIssuer:
         async with self._lock:
             now = int(self._clock())
             current = self.book.get(session_id)
-            if current is None or current.state != LIVE or self.book.is_claimed(session_id):
+            if current is None or current.state != LIVE or self.book._frozen(current, now, "close"):
                 return (self._state_of(current) if current is not None
                         else Refusal("session_unknown", {"session_id": session_id}))
             settled = self.book.settle(session_id, state, now=now, status=status)
@@ -594,21 +628,31 @@ class SessionIssuer:
         logger.info("sandbox session %s of %s closed: %s", session_id, hotkey[:12], status)
         return self._state_of(settled)
 
-    async def claim(self, session_id: str, *, hotkey: str) -> Refusal | None:
+    async def claim(self, session_id: str, *, hotkey: str,
+                    received: float | None = None) -> Refusal | None:
         """The intake's hold on a session it is about to pay, taken BEFORE its ledger
-        write: None, or why not. Only a `live` or `closed_graded` session of this hotkey,
-        not claimed already (`session_claimed` is retryable: another submission of it is
-        in flight). The claim ends with `submitted` or `release_claim`."""
+        write: None, or why not. `received` is when the validator received the
+        submission (its own clock). Only a `live` or `closed_graded` session of this
+        hotkey, or a `lapsed` one received by its deadline (it lapsed during the check);
+        received after the deadline is `session_expired`. `session_claimed` is retryable:
+        another submission of it is in flight. The claim ends with `submitted` or
+        `release_claim`, or goes stale after `claim_ttl_s`."""
         async with self._lock:
+            now = int(self._clock())
             record = self.book.get(session_id)
             if record is None or record.hotkey != hotkey:
                 return Refusal("session_unknown", {"session_id": session_id})
             if record.state == SUBMITTED:
                 return Refusal("session_submitted", {"session_id": session_id})
-            if not session_submittable(record.state):
+            deadline = record.expires_at + GRADING_GRACE_S
+            if received is not None and received > deadline:
+                return Refusal("session_expired", {"session_id": session_id,
+                                                   "deadline": deadline})
+            on_time_lapse = record.state == LAPSED and received is not None
+            if not (session_submittable(record.state) or on_time_lapse):
                 return Refusal("session_not_submittable", {"session_id": session_id,
                                                            "state": record.state})
-            if not self.book.claim(session_id):
+            if not self.book.claim(session_id, now):
                 return Refusal("session_claimed", {"session_id": session_id},
                                retry_after=self._policy.retry_after_s)
         return None
@@ -623,7 +667,11 @@ class SessionIssuer:
         """The intake accepted this session's submission (called after the ledger write,
         so the slot is never counted twice): its claim and its reservation end."""
         async with self._lock:
+            claimed = self.book.is_claimed(session_id)
             self.book.release_claim(session_id)
+            current = self.book.get(session_id)
+            if current is not None and current.state == LAPSED and not claimed:
+                return                 # a lapsed session is paid only through a claim
             record = self.book.settle(session_id, SUBMITTED, now=int(self._clock()),
                                       status=STATUS_GRADED)
             self._tokens.pop(session_id, None)

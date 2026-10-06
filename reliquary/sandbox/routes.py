@@ -72,7 +72,8 @@ REFUSAL_STATUS: dict[str, int] = {
     "job_complete": 409, "request_reused": 409, "request_conflict": 409,
     "engagement_kind_unsupported": 409, "transcript_invalid": 409,
     # the intake's claim on a session (issuer.claim); `session_claimed` is retried
-    "session_submitted": 409, "session_not_submittable": 409, "session_claimed": 503,
+    "session_submitted": 409, "session_not_submittable": 409, "session_expired": 409,
+    "session_claimed": 503,
     # per-hotkey caps
     "live_cap": 429, "prompt_live_cap": 429, "job_live_cap": 429, "open_rate_cap": 429,
     "aborted_cap": 429,

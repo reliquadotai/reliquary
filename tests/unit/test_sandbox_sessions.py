@@ -465,7 +465,9 @@ def test_a_lapsed_session_is_never_paid(tmp_path):
     assert not sessions.session_submittable(LAPSED)
     assert env.book.get(grant.session_id).state == LAPSED
     assert env.store.documents[grant.session_id]["state"] == LAPSED
-    assert SUBMITTED not in sandbox_store.SESSION_TRANSITIONS[LAPSED]
+    # a lapsed session is paid only through an on-time claim (task 11 fix round)
+    assert asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot")).reason == \
+        "session_not_submittable"
 
 
 def test_a_voided_session_is_never_paid(tmp_path):
@@ -674,7 +676,7 @@ def test_only_a_live_or_graded_closed_session_is_submittable(state, submittable)
 
 def test_only_a_live_or_graded_closed_session_becomes_submitted_in_the_store():
     assert {state for state, moves in sandbox_store.SESSION_TRANSITIONS.items()
-            if SUBMITTED in moves} == {LIVE, CLOSED_GRADED}
+            if SUBMITTED in moves} == {LIVE, CLOSED_GRADED, LAPSED}
     assert set(sandbox_store.SESSION_TRANSITIONS) == {LIVE, CLOSED_GRADED, SUBMITTED, CLOSED,
                                                        ABORTED, VOIDED, LAPSED}
 
@@ -729,6 +731,7 @@ def test_a_submitted_session_cannot_be_claimed(tmp_path):
 def test_a_drain_a_lapse_or_a_close_never_overrides_a_claimed_session(tmp_path):
     env = build(tmp_path)
     grant = open_(env)
+    env.clock.now = grant.expires_at + attest.GRADING_GRACE_S - 10
     assert claim(env, grant) is None
 
     async def drain_and_lapse():
@@ -739,7 +742,7 @@ def test_a_drain_a_lapse_or_a_close_never_overrides_a_claimed_session(tmp_path):
 
     asyncio.run(drain_and_lapse())
     assert env.book.get(grant.session_id).state == LIVE
-    env.clock.now = NOW
+    env.clock.now = grant.expires_at + attest.GRADING_GRACE_S
     assert close(env, grant, final_of(env, grant, "expired"))["state"] == LIVE
     asyncio.run(env.issuer.submitted(grant.session_id))
     assert env.book.get(grant.session_id).state == SUBMITTED
@@ -759,3 +762,123 @@ def test_a_released_claim_lets_drain_and_lapse_act_again(tmp_path):
     asyncio.run(drain())
     assert env.book.get(grant.session_id).state == VOIDED
     assert claim(env, grant).reason == "session_not_submittable"
+
+
+# -- fix round (task 11) --------------------------------------------------------------
+
+def test_a_claim_older_than_its_ttl_no_longer_freezes_the_session(tmp_path, caplog):
+    policy = SandboxPolicy(claim_ttl_s=100)
+    env = build(tmp_path, policy=policy)
+    grant = open_(env)
+    assert claim(env, grant) is None
+    env.clock.now = NOW + 100
+
+    async def drain():
+        env.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+
+    asyncio.run(drain())
+    assert env.book.get(grant.session_id).state == LIVE           # still fresh at the ttl
+    env.clock.now = NOW + 101
+    with caplog.at_level("ERROR", logger="reliquary.sandbox.sessions"):
+        asyncio.run(drain())
+    assert env.book.get(grant.session_id).state == VOIDED
+    assert "ALERT" in caplog.text and grant.session_id in caplog.text
+
+
+def test_a_stale_claim_can_be_taken_again(tmp_path):
+    env = build(tmp_path, policy=SandboxPolicy(claim_ttl_s=100))
+    grant = open_(env)
+    assert claim(env, grant) is None
+    assert claim(env, grant).reason == "session_claimed"
+    env.clock.now = NOW + 101
+    assert claim(env, grant) is None
+
+
+def test_a_stale_claim_lets_a_lapse_happen_with_an_alert(tmp_path, caplog):
+    env = build(tmp_path, policy=SandboxPolicy(claim_ttl_s=100))
+    grant = open_(env)
+    env.clock.now = grant.expires_at + attest.GRADING_GRACE_S - 50
+    assert claim(env, grant) is None
+    env.clock.now = grant.expires_at + attest.GRADING_GRACE_S + 1
+    asyncio.run(env.issuer.maintain())
+    assert env.book.get(grant.session_id).state == LIVE           # claimed 51 s ago
+    env.clock.now += 100
+    with caplog.at_level("ERROR", logger="reliquary.sandbox.sessions"):
+        asyncio.run(env.issuer.maintain())
+    assert env.book.get(grant.session_id).state == LAPSED
+    assert "ALERT" in caplog.text
+
+
+def test_the_default_claim_ttl_covers_a_ledger_turn_and_its_record_write():
+    from reliquary.validator.corpus_service import LEDGER_LOCK_TIMEOUT_SECONDS, RECORD_WRITE_ATTEMPTS
+
+    policy = SandboxPolicy()
+    assert policy.claim_ttl_s >= (LEDGER_LOCK_TIMEOUT_SECONDS
+                                  + RECORD_WRITE_ATTEMPTS * policy.io_timeout_s + 60)
+    assert SandboxPolicy.from_env({"RELIQUARY_SANDBOX_CLAIM_TTL_S": "500"}).claim_ttl_s == 500
+
+
+def test_a_session_lapsed_after_an_on_time_receipt_is_still_claimable(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    deadline = grant.expires_at + attest.GRADING_GRACE_S
+    env.clock.now = deadline + 5
+    asyncio.run(env.issuer.maintain())
+    assert env.book.get(grant.session_id).state == LAPSED
+    late = asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot", received=deadline + 1))
+    assert late.reason == "session_expired"
+    assert asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot")).reason == \
+        "session_not_submittable"                                  # no receipt: not on time
+    assert asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot", received=deadline)) is None
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == SUBMITTED
+    assert env.store.documents[grant.session_id]["state"] == SUBMITTED
+
+
+def test_a_claim_received_after_the_deadline_is_refused(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    deadline = grant.expires_at + attest.GRADING_GRACE_S
+    late = asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot", received=deadline + 1))
+    assert late.reason == "session_expired"
+    assert asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot", received=deadline)) is None
+
+
+class _MutatingDict(dict):
+    """Grows while iterated, as the event loop may while a thread reads the book."""
+
+    def _grow(self):
+        self[f"x-{len(self)}"] = next(iter(self.values()))
+
+    def values(self):
+        for value in list(super().values()):
+            self._grow()
+            yield value
+            raise RuntimeError("dictionary changed size during iteration")
+
+    def items(self):
+        for item in list(super().items()):
+            self._grow()
+            yield item
+            raise RuntimeError("dictionary changed size during iteration")
+
+
+def test_the_paid_session_snapshot_never_iterates_the_live_book(tmp_path):
+    """`submitted_ids` runs on the intake's thread while the loop mutates the book."""
+    env = build(tmp_path)
+    grant = open_(env)
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    env.book._sessions = _MutatingDict(env.book._sessions)
+    assert env.book.submitted_ids() == frozenset({grant.session_id})
+
+
+def test_the_paid_session_snapshot_follows_restore_and_prune(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    book = SessionBook(SandboxPolicy())
+    book.restore([env.book.get(grant.session_id)])
+    assert book.submitted_ids() == frozenset({grant.session_id})
+    book.prune(NOW + 3 * 86400)
+    assert book.submitted_ids() == frozenset()

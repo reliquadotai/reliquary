@@ -178,6 +178,19 @@ class Fleet:
             return _EMPTY_DIRECTORY
         return self._directory
 
+    def directory_if_ready(self, now: float | None = None) -> DirectorySnapshot | None:
+        """The snapshot, or None when it is not young enough: one call for a readiness
+        check and the verify that follows it, so they cannot see two directories. The
+        read time is taken before the snapshot (a refresh assigns the snapshot first),
+        so a fresh time never pairs with an older snapshot."""
+        at = self._directory_at
+        snapshot = self._directory
+        now = self._clock() if now is None else now
+        if at is None or now - at > self._max_age_s:
+            self._alert_stale(now)
+            return None
+        return snapshot
+
     def _alert_stale(self, now: float) -> None:
         if not self._read_attempted:
             if not self._not_loaded_logged:

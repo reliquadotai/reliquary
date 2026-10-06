@@ -365,7 +365,9 @@ SESSION_TRANSITIONS: dict[str, frozenset[str]] = {
     SESSION_CLOSED_GRADED: frozenset({SESSION_SUBMITTED, SESSION_LAPSED}),
     SESSION_CLOSED: frozenset(),
     SESSION_VOIDED: frozenset(),
-    SESSION_LAPSED: frozenset(),
+    # Only through an on-time claim (`SessionIssuer.claim(received=...)`): a session that
+    # lapsed while its submission, received by the deadline, was being checked.
+    SESSION_LAPSED: frozenset({SESSION_SUBMITTED}),
     SESSION_ABORTED: frozenset(),
     SESSION_SUBMITTED: frozenset(),
 }
