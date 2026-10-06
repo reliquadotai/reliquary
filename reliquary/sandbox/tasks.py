@@ -6,7 +6,8 @@ task's limits)."""
 from __future__ import annotations
 
 import asyncio
-import functools
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 _LIMIT_FIELDS = ("memory_bytes", "disk_bytes", "pids", "wall_s", "per_call_timeout_s", "max_calls")
@@ -19,10 +20,18 @@ class ResolvedTask:
 
 
 class SweTaskResolver:
-    def __init__(self, split: str, sandbox_task=None) -> None:
+    """Resolves (and remembers, least recently used first out, at most `cache_size`)
+    each index's task. The cache is the instance's own dict: no `lru_cache` on a bound
+    method, which would hold the resolver alive from a shared cache."""
+
+    def __init__(self, split: str, sandbox_task=None, *, cache_size: int = 8192) -> None:
+        if cache_size <= 0:
+            raise ValueError("cache_size must be positive")
         self._split = split
         self._sandbox_task = sandbox_task
-        self._cached = functools.lru_cache(maxsize=8192)(self._resolve)
+        self._cache_size = cache_size
+        self._cache: OrderedDict[int, ResolvedTask] = OrderedDict()
+        self._lock = threading.Lock()
 
     def _resolve(self, index: int) -> ResolvedTask:
         factory = self._sandbox_task
@@ -34,6 +43,19 @@ class SweTaskResolver:
             name: int(getattr(limits, name)) for name in _LIMIT_FIELDS
             if getattr(limits, name, None) is not None}
         return ResolvedTask(task.image, values)
+
+    def _cached(self, index: int) -> ResolvedTask:
+        with self._lock:
+            if index in self._cache:
+                self._cache.move_to_end(index)
+                return self._cache[index]
+        task = self._resolve(index)
+        with self._lock:
+            self._cache[index] = task
+            self._cache.move_to_end(index)
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+        return task
 
     async def resolve(self, index: int) -> ResolvedTask:
         return await asyncio.to_thread(self._cached, int(index))

@@ -349,8 +349,44 @@ _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DAY = 86400
 
 
+# Session states and the only moves between them, shared by the in-memory book
+# (`reliquary.sandbox.sessions.SessionBook.settle`) and the store's CAS, so a stale
+# write (a lapse computed before a submission landed) never overwrites a later state.
+# `submitted` is terminal and dominant: the ledger already paid the slot.
+SESSION_LIVE, SESSION_CLOSED_GRADED = "live", "closed_graded"
+SESSION_SUBMITTED, SESSION_CLOSED, SESSION_ABORTED = "submitted", "closed", "aborted"
+SESSION_VOIDED, SESSION_LAPSED = "voided", "lapsed"
+SESSION_TRANSITIONS: dict[str, frozenset[str]] = {
+    SESSION_LIVE: frozenset({SESSION_CLOSED_GRADED, SESSION_SUBMITTED, SESSION_CLOSED,
+                             SESSION_ABORTED, SESSION_VOIDED, SESSION_LAPSED}),
+    SESSION_CLOSED_GRADED: frozenset({SESSION_SUBMITTED, SESSION_LAPSED}),
+    SESSION_CLOSED: frozenset({SESSION_SUBMITTED}),
+    SESSION_VOIDED: frozenset({SESSION_SUBMITTED}),
+    SESSION_LAPSED: frozenset({SESSION_SUBMITTED}),
+    SESSION_ABORTED: frozenset({SESSION_SUBMITTED}),
+    SESSION_SUBMITTED: frozenset(),
+}
+
+
+def session_transition_allowed(current: Any, new: Any) -> bool:
+    return isinstance(current, str) and new in SESSION_TRANSITIONS.get(current, ())
+
+
 class SessionStoreConflict(RuntimeError):
-    """A session document that already exists, is missing, or kept changing."""
+    """A session document that already exists, is missing, kept changing, or whose
+    stored state may not move to the new one."""
+
+
+def _check_replace(stored: Any, document: Mapping) -> bool:
+    """True to write, False when the stored document is already this one; raises when
+    the stored state may not move to the new state."""
+    if stored == document:
+        return False
+    current = stored.get("state") if isinstance(stored, Mapping) else None
+    if not session_transition_allowed(current, document.get("state")):
+        raise SessionStoreConflict(f"session {document['session_id']}: stored state "
+                                   f"{current!r} may not become {document.get('state')!r}")
+    return True
 
 
 def _day(at: int) -> str:
@@ -392,6 +428,8 @@ class R2SessionStore:
             stored, etag = await _get(key, **dict(self._kw))
             if stored is None:
                 raise SessionStoreConflict(f"session {document['session_id']} is missing")
+            if not _check_replace(stored, document):
+                return
             if await _put(key, document, etag, **dict(self._kw)):
                 return
         raise SessionStoreConflict(f"session {document['session_id']} kept changing")
@@ -431,7 +469,12 @@ class MemorySessionStore:
     async def update(self, document: Mapping) -> None:
         if self.fail:
             raise OSError("bucket down")
-        self.documents[document["session_id"]] = _without_secrets(document)
+        document = _without_secrets(document)
+        stored = self.documents.get(document["session_id"])
+        if stored is None:
+            raise SessionStoreConflict(f"session {document['session_id']} is missing")
+        if _check_replace(stored, document):
+            self.documents[document["session_id"]] = document
 
     async def list_recent(self, now: int) -> list[dict]:
         return [dict(d) for d in self.documents.values()]

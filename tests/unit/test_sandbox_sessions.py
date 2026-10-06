@@ -2,6 +2,7 @@
 caps, the machine; and how each session ends."""
 
 import asyncio
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +13,9 @@ from reliquary.corpus.job import parse_job  # noqa: E402
 from reliquary.infrastructure import sandbox_store  # noqa: E402
 from reliquary.infrastructure.sandbox_store import MemorySessionStore, R2SessionStore  # noqa: E402
 from reliquary.sandbox.fleet import Placement  # noqa: E402
+from reliquary.sandbox import sessions  # noqa: E402
 from reliquary.sandbox.sessions import (  # noqa: E402
-    ABORTED, CLOSED, LAPSED, LIVE, SUBMITTED, VOIDED, CorpusEngagements, Grant,
+    ABORTED, CLOSED, CLOSED_GRADED, LAPSED, LIVE, SUBMITTED, VOIDED, SessionRecord, CorpusEngagements, Grant,
     RlPrecommitEngagements, SandboxPolicy, SessionBook, SessionIssuer, SignedJobView,
 )
 from reliquary.sandbox.tasks import ResolvedTask  # noqa: E402
@@ -26,6 +28,17 @@ from tests.unit.test_corpus_job_store import _FakeMultiObjectR2  # noqa: E402
 
 JOB = parse_job(_manifest(episode=signed_episode()))
 CORPUS = {"kind": "corpus", "job_id": JOB.job_id, "prompt_index": 3}
+
+
+@pytest.fixture(autouse=True)
+def _sessions_logs_reach_caplog():
+    """Importing bittensor sets every logger that exists then to CRITICAL; without this,
+    a log assertion here would pass on an empty capture."""
+    logger = sessions.logger
+    level = logger.level
+    logger.setLevel("DEBUG")
+    yield
+    logger.setLevel(level)
 
 
 class FakeFleet:
@@ -124,6 +137,7 @@ def test_a_token_never_reaches_the_logs(tmp_path, caplog):
     env = build(tmp_path)
     caplog.set_level("DEBUG")
     grant = open_(env)
+    assert f"sandbox session {grant.session_id} issued" in caplog.text   # captured for real
     assert grant.token["signature"] not in caplog.text
     assert grant.token["signature"] not in repr(grant)
     assert "signature" not in env.store.documents[grant.session_id]
@@ -216,7 +230,8 @@ def test_an_unpaid_final_ends_the_reservation(tmp_path, status, reason, state):
 
 def test_a_close_must_carry_the_sessions_own_verified_transcript(tmp_path):
     env = build(tmp_path, remaining=5)
-    grant, other = open_(env), open_(env, request_id="b" * 32)
+    grant = open_(env)
+    other = open_(env, request_id="b" * 32, engagement={**CORPUS, "prompt_index": 4})
     assert close(env, grant, final_of(env, other, "expired")).reason == "transcript_invalid"
     assert close(env, grant, None).reason == "transcript_invalid"
     assert close(env, grant, final_of(env, grant, "expired"), hotkey="5Other").reason == \
@@ -369,3 +384,244 @@ def test_a_restart_keeps_the_aborted_cap(tmp_path, monkeypatch):
     assert asyncio.run(again.issuer.restore()) == 1
     assert again.book.get(grant.session_id).state == ABORTED
     assert open_(again, request_id="b" * 32).reason == "aborted_cap"
+
+
+
+# -- fix round 1 ---------------------------------------------------------------------
+
+def test_a_hotkey_holds_one_live_session_per_prompt(tmp_path):
+    env = build(tmp_path, remaining=5)
+    open_(env)
+    refused = open_(env, request_id="b" * 32)
+    assert refused.reason == "prompt_live_cap"
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 1
+    assert isinstance(open_(env, hotkey="5Other", request_id="b" * 32), Grant)
+
+
+def test_a_hotkey_holds_a_bounded_number_of_live_sessions_per_job(tmp_path):
+    env = build(tmp_path, policy=SandboxPolicy(max_live_per_hotkey_job=2), remaining=5)
+    for n, index in enumerate((3, 4)):
+        assert isinstance(open_(env, request_id=str(n) * 32,
+                                engagement={**CORPUS, "prompt_index": index}), Grant)
+    refused = open_(env, request_id="z" * 32, engagement={**CORPUS, "prompt_index": 5})
+    assert refused.reason == "job_live_cap"
+    assert SandboxPolicy().max_live_per_hotkey_job == 4
+    assert SandboxPolicy.from_env({"RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB": "6"}) \
+        .max_live_per_hotkey_job == 6
+
+
+def test_a_graded_close_keeps_the_slot_until_submitted_or_lapsed(tmp_path):
+    env = build(tmp_path, remaining=1)
+    grant = open_(env)
+    closed = close(env, grant, final_of(env, grant, "graded"))
+    assert closed == {"session_id": grant.session_id, "state": CLOSED_GRADED, "status": "graded"}
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 1
+    assert open_(env, hotkey="5Other", request_id="b" * 32).reason == "prompt_unavailable"
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == SUBMITTED
+    assert env.store.documents[grant.session_id]["state"] == SUBMITTED
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 0
+
+
+def test_a_graded_close_that_is_never_submitted_lapses(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    close(env, grant, final_of(env, grant, "graded"))
+    env.clock.now = grant.expires_at + attest.GRADING_GRACE_S + 1
+    asyncio.run(env.issuer.maintain())
+    assert env.book.get(grant.session_id).state == LAPSED
+    assert env.store.documents[grant.session_id]["state"] == LAPSED
+
+
+def test_a_graded_close_is_not_voided_by_a_drain(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    close(env, grant, final_of(env, grant, "graded"))
+
+    async def drain():
+        env.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+
+    asyncio.run(drain())
+    assert env.book.get(grant.session_id).state == CLOSED_GRADED
+
+
+@pytest.mark.parametrize("before", [CLOSED, VOIDED, LAPSED, CLOSED_GRADED])
+def test_a_submission_dominates_every_earlier_end(tmp_path, before):
+    env = build(tmp_path)
+    grant = open_(env)
+    if before == CLOSED:
+        close(env, grant, final_of(env, grant, "expired"))
+    elif before == CLOSED_GRADED:
+        close(env, grant, final_of(env, grant, "graded"))
+    elif before == VOIDED:
+        async def drain():
+            env.issuer.void_machine(MACHINE)
+            await asyncio.sleep(0)
+        asyncio.run(drain())
+    else:
+        env.clock.now = grant.expires_at + attest.GRADING_GRACE_S + 1
+        asyncio.run(env.issuer.maintain())
+    assert env.book.get(grant.session_id).state == before
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == SUBMITTED
+    assert env.store.documents[grant.session_id]["state"] == SUBMITTED
+    assert env.book.reserved(JOB.job_id, 3, env.clock.now) == 0
+
+
+def test_a_voided_sessions_late_graded_submission_is_recorded(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+
+    async def drain_then_submit():
+        env.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+        await env.issuer.submitted(grant.session_id)
+
+    asyncio.run(drain_then_submit())
+    record = env.book.get(grant.session_id)
+    assert (record.state, record.closed_status) == (SUBMITTED, "graded")
+    # the late close then sees the submitted state; nothing is re-opened
+    assert close(env, grant, final_of(env, grant, "graded"))["state"] == SUBMITTED
+
+
+def test_a_close_racing_a_submission_reports_the_submission(tmp_path, monkeypatch):
+    env = build(tmp_path)
+    grant = open_(env)
+    real = sessions.verify_transcript
+
+    def verify_while_submitted(*args, **kwargs):
+        result = real(*args, **kwargs)
+        env.book.settle(grant.session_id, SUBMITTED, now=NOW, status="graded")
+        return result
+
+    monkeypatch.setattr(sessions, "verify_transcript", verify_while_submitted)
+    closed = close(env, grant, final_of(env, grant, "graded"))
+    assert closed["state"] == SUBMITTED
+    assert env.book.get(grant.session_id).state == SUBMITTED
+
+
+def test_a_close_is_verified_outside_the_issuer_lock(tmp_path, monkeypatch):
+    env = build(tmp_path)
+    grant = open_(env)
+    real = sessions.verify_transcript
+    held = []
+
+    def verify(*args, **kwargs):
+        held.append(env.issuer._lock.locked())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(sessions, "verify_transcript", verify)
+    close(env, grant, final_of(env, grant, "expired"))
+    assert held == [False]
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "r2"])
+def test_a_stale_lapse_never_overwrites_a_submission(tmp_path, monkeypatch, store_kind):
+    fake = _FakeMultiObjectR2()
+    monkeypatch.setattr(sandbox_store, "get_s3_client", lambda **kw: fake)
+    store = MemorySessionStore() if store_kind == "memory" else R2SessionStore()
+    env = build(tmp_path, store=store)
+    grant = open_(env)
+    live = SessionRecord.from_document(asyncio.run(store.list_recent(NOW))[0])
+    submitted = dataclasses.replace(live, state=SUBMITTED, closed_status="graded", closed_at=NOW)
+    lapsed = dataclasses.replace(live, state=LAPSED, closed_at=NOW + 9999)
+    asyncio.run(store.update(submitted.to_document()))
+    asyncio.run(store.update(submitted.to_document()))           # the same write again: fine
+    with pytest.raises(sandbox_store.SessionStoreConflict):
+        asyncio.run(store.update(lapsed.to_document()))
+    (stored,) = asyncio.run(store.list_recent(NOW))
+    assert stored["state"] == SUBMITTED and stored["session_id"] == grant.session_id
+
+
+def test_a_failed_persist_is_retried_then_alerts(tmp_path, monkeypatch, caplog):
+    slept = []
+
+    async def no_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(sessions, "_sleep", no_sleep)
+    env = build(tmp_path)
+    grant = open_(env)
+    failures = {"n": 2}
+    real_update = env.store.update
+
+    async def flaky(document):
+        if failures["n"]:
+            failures["n"] -= 1
+            raise OSError("bucket down")
+        await real_update(document)
+
+    env.store.update = flaky
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.store.documents[grant.session_id]["state"] == SUBMITTED and len(slept) == 2
+
+    second = open_(env, request_id="b" * 32, engagement={**CORPUS, "prompt_index": 4})
+    assert isinstance(second, Grant), second
+    env.store.fail = True
+    env.store.update = real_update
+    caplog.set_level("ERROR")
+    asyncio.run(env.issuer.submitted(second.session_id))
+    assert "ALERT" in caplog.text and second.session_id in caplog.text
+    assert len(slept) == 2 + sessions.PERSIST_ATTEMPTS - 1
+
+
+def test_a_request_id_reused_for_another_engagement_conflicts(tmp_path):
+    env = build(tmp_path, remaining=5)
+    first = open_(env)
+    assert open_(env, engagement={**CORPUS, "prompt_index": 4}).reason == "request_conflict"
+    assert open_(env) == first
+
+
+def test_a_malformed_session_document_is_skipped_on_restore(tmp_path, caplog):
+    store = MemorySessionStore()
+    env = build(tmp_path, store=store)
+    grant = open_(env)
+    good = dict(store.documents[grant.session_id])
+    for n, change in enumerate(({"index": "3"}, {"issued_at": True}, {"state": "weird"},
+                                {"job_id": 7}, {"hotkey": None})):
+        store.documents[f"bad-{n}"] = {**good, "session_id": f"bad-{n}", **change}
+    again = build(tmp_path / "b", store=store)
+    assert asyncio.run(again.issuer.restore()) == 1
+    again.issuer._new_id = lambda: "s-after-restart"          # the first run used s-0
+    assert isinstance(open_(again, hotkey="5Other", request_id="b" * 32), Grant)
+
+
+def test_voided_sessions_do_not_count_toward_the_open_rate(tmp_path):
+    env = build(tmp_path, policy=SandboxPolicy(max_opens_per_hour=1), remaining=5)
+    open_(env)
+
+    async def drain():
+        env.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+
+    asyncio.run(drain())
+    assert isinstance(open_(env, request_id="b" * 32), Grant)
+
+
+def test_a_ledger_that_hangs_is_refused_retryably(tmp_path):
+    env = build(tmp_path, policy=SandboxPolicy(io_timeout_s=1))
+
+    async def hang(index):
+        await asyncio.sleep(30)
+
+    view = SignedJobView(job=JOB, resolve_task=None, slots_remaining=hang)
+    env.issuer._engagements["corpus"] = CorpusEngagements({JOB.job_id: view}.get, env.book,
+                                                          env.clock)
+    refused = open_(env)
+    assert refused.reason == "ledger_unavailable" and refused.retry_after == 10
+
+
+def test_the_swe_task_resolver_cache_is_bounded_and_not_on_the_class():
+    from reliquary.sandbox.tasks import SweTaskResolver
+
+    calls = []
+
+    def sandbox_task(split, index):
+        calls.append(index)
+        return SimpleNamespace(image=IMAGE, limits=None)
+
+    resolver = SweTaskResolver("train:20", sandbox_task=sandbox_task, cache_size=2)
+    for index in (1, 2, 1, 3, 1, 2):
+        asyncio.run(resolver.resolve(index))
+    assert calls == [1, 2, 3, 2]
