@@ -882,3 +882,120 @@ def test_the_paid_session_snapshot_follows_restore_and_prune(tmp_path):
     assert book.submitted_ids() == frozenset({grant.session_id})
     book.prune(NOW + 3 * 86400)
     assert book.submitted_ids() == frozenset()
+
+
+# -- withdraw (task 14 review) ----------------------------------------------------------
+
+def test_a_withdraw_frees_the_slot_and_the_live_caps(tmp_path):
+    policy = SandboxPolicy(max_live_per_hotkey=1, max_live_per_hotkey_job=1)
+    env = build(tmp_path, remaining=1, policy=policy)
+    grant = open_(env)
+    graded = final_of(env, grant, "graded")
+    assert close(env, grant, graded)["state"] == CLOSED_GRADED
+    assert open_(env, request_id="b" * 32).reason == "live_cap"
+    withdrawn = close(env, grant, graded, reason="withdraw")
+    assert withdrawn == {"session_id": grant.session_id, "state": CLOSED, "status": "withdrawn"}
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 0
+    assert env.store.documents[grant.session_id]["state"] == CLOSED
+    assert isinstance(open_(env, request_id="b" * 32), Grant)        # slot, live and job caps
+
+
+def test_a_withdraw_straight_from_live_closes_too(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    assert close(env, grant, final_of(env, grant, "graded"), reason="withdraw")["state"] == CLOSED
+    assert env.book.reserved(JOB.job_id, 3, NOW) == 0
+
+
+def test_a_submission_after_a_withdraw_is_refused(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    graded = final_of(env, grant, "graded")
+    close(env, grant, graded)
+    close(env, grant, graded, reason="withdraw")
+    assert not sessions.session_submittable(env.book.get(grant.session_id).state)
+    assert claim(env, grant).reason == "session_not_submittable"
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == CLOSED
+
+
+def test_a_withdraw_needs_the_sessions_own_verified_transcript(tmp_path):
+    env = build(tmp_path, remaining=5)
+    grant = open_(env)
+    other = open_(env, request_id="b" * 32, engagement={**CORPUS, "prompt_index": 4})
+    graded = final_of(env, grant, "graded")
+    close(env, grant, graded)
+    assert close(env, grant, None, reason="withdraw").reason == "transcript_invalid"
+    assert close(env, grant, final_of(env, other, "graded"),
+                 reason="withdraw").reason == "transcript_invalid"
+    forged = final_of(env, grant, "graded")
+    forged["records"][-1]["body"]["reward"] = 0.5
+    assert close(env, grant, forged, reason="withdraw").reason == "transcript_invalid"
+    assert close(env, grant, graded, hotkey="5Other", reason="withdraw").reason == \
+        "session_unknown"
+    assert env.book.get(grant.session_id).state == CLOSED_GRADED
+    env.fleet.ready = False
+    assert close(env, grant, graded, reason="withdraw").reason == "directory_unavailable"
+    assert env.book.get(grant.session_id).state == CLOSED_GRADED
+
+
+def test_a_claim_taken_first_wins_over_a_withdraw(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    graded = final_of(env, grant, "graded")
+    close(env, grant, graded)
+    assert claim(env, grant) is None
+    assert close(env, grant, graded, reason="withdraw")["state"] == CLOSED_GRADED
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == SUBMITTED
+
+
+def test_a_withdraw_settled_first_wins_over_a_claim(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    graded = final_of(env, grant, "graded")
+    close(env, grant, graded)
+    assert close(env, grant, graded, reason="withdraw")["state"] == CLOSED
+    assert claim(env, grant).reason == "session_not_submittable"
+    assert env.book.get(grant.session_id).state == CLOSED
+
+
+def test_a_claim_landing_during_a_withdraws_verification_wins(tmp_path, monkeypatch):
+    env = build(tmp_path)
+    grant = open_(env)
+    graded = final_of(env, grant, "graded")
+    close(env, grant, graded)
+    real = sessions.verify_transcript
+
+    def verify_while_claimed(*args, **kwargs):
+        result = real(*args, **kwargs)
+        assert env.book.claim(grant.session_id, NOW)
+        return result
+
+    monkeypatch.setattr(sessions, "verify_transcript", verify_while_claimed)
+    assert close(env, grant, graded, reason="withdraw")["state"] == CLOSED_GRADED
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == SUBMITTED   # paid once, never withdrawn
+
+
+def test_the_close_request_accepts_withdraw():
+    from reliquary.protocol.sandbox_session import SandboxSessionCloseRequest
+
+    request = SandboxSessionCloseRequest(miner_hotkey="5Hot", request_id="a" * 32, at=1,
+                                         session_id="s-0", reason="withdraw",
+                                         transcript={"token": {}, "records": []},
+                                         signature="00")
+    assert request.reason == "withdraw"
+    with pytest.raises(ValueError):
+        SandboxSessionCloseRequest(miner_hotkey="5Hot", request_id="a" * 32, at=1,
+                                   session_id="s-0", reason="cancel", signature="00")
+
+
+def test_a_withdraw_is_signed_apart_from_a_final():
+    from reliquary.protocol.signatures import build_sandbox_close_binding
+
+    body = {"miner_hotkey": "5Hot", "request_id": "a" * 32, "at": 1, "session_id": "s-0",
+            "transcript": {"token": {}, "records": []}, "signature": "00"}
+    kw = {"validator_hotkey": "5Val", "path": "/corpus/sandbox/sessions/s-0/close"}
+    assert build_sandbox_close_binding({**body, "reason": "withdraw"}, **kw) != \
+        build_sandbox_close_binding({**body, "reason": "final"}, **kw)

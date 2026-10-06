@@ -65,7 +65,10 @@ class SandboxSessionCloseRequest(BaseModel):
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     at: int = Field(ge=0, strict=True)
     session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    reason: Literal["final", "open_failed"]
+    # final: the machine's final record (with its transcript); open_failed: no box, no
+    # transcript; withdraw: a verified transcript the miner will not submit, releasing
+    # its slot for good (the session is never paid afterwards).
+    reason: Literal["final", "open_failed", "withdraw"]
     transcript: dict[str, Any] | None = None
     signature: str = Field(min_length=1, max_length=256)
 

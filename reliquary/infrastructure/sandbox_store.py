@@ -362,7 +362,9 @@ SESSION_VOIDED, SESSION_LAPSED = "voided", "lapsed"
 SESSION_TRANSITIONS: dict[str, frozenset[str]] = {
     SESSION_LIVE: frozenset({SESSION_CLOSED_GRADED, SESSION_SUBMITTED, SESSION_CLOSED,
                              SESSION_ABORTED, SESSION_VOIDED, SESSION_LAPSED}),
-    SESSION_CLOSED_GRADED: frozenset({SESSION_SUBMITTED, SESSION_LAPSED}),
+    # `closed`: the miner withdrew a graded transcript it will not submit (close reason
+    # `withdraw`), which releases the slot for good.
+    SESSION_CLOSED_GRADED: frozenset({SESSION_SUBMITTED, SESSION_LAPSED, SESSION_CLOSED}),
     SESSION_CLOSED: frozenset(),
     SESSION_VOIDED: frozenset(),
     # Only through an on-time claim (`SessionIssuer.claim(received=...)`): a session that

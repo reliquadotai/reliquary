@@ -14,12 +14,24 @@ another engagement (by digest) is refused `request_conflict`.
 States. A session is `live` until the first of:
 * `closed_graded`: a verified `graded` final was reported. It still HOLDS its slot,
   because the transcript is still submittable: freeing it would let another miner take
-  the slot this episode may yet consume. It ends `submitted` or `lapsed`;
+  the slot this episode may yet consume. It ends `submitted`, `lapsed`, or `closed`
+  when the miner withdraws it;
 * `submitted`: its submission was accepted. Terminal; reached only from `live` or
   `closed_graded` (`session_submittable`);
 * `closed`: an unpaid final (expired, box_failed, budget_exhausted including
-  `transcript_bytes`) or a failed open. Terminal for payment: its slot was freed, so a
-  submission after it could take a slot another miner now holds.
+  `transcript_bytes`), a failed open, or a withdrawal. Terminal for payment: its slot
+  was freed, so a submission after it could take a slot another miner now holds.
+
+Closes. Reason `final` reports the machine's final record with its transcript (a live
+session only); `open_failed` reports a box that never opened, with no transcript (a
+live session only); `withdraw` gives up a transcript the miner will not submit (its
+precheck failed, its state is not UTF-8, its submission was refused): it needs the
+session's own transcript, verified exactly as for `final`, moves a `live` or
+`closed_graded` session to `closed` (status `withdrawn`) and so frees its slot and its
+live caps, never to be paid. A withdrawal and a claim exclude each other under the
+issuer lock: a claim taken first (even during the withdrawal's verification) wins
+and the withdrawal answers the claimed state; a withdrawal settled first wins and the
+claim is refused `session_not_submittable`.
 
 The intake claims a session (`SessionIssuer.claim`, under the issuer lock) BEFORE its
 ledger write: only a `live` or `closed_graded` session (`session_submittable`) of the
@@ -96,6 +108,7 @@ CLOSED, ABORTED, VOIDED, LAPSED = (_store.SESSION_CLOSED, _store.SESSION_ABORTED
                                    _store.SESSION_VOIDED, _store.SESSION_LAPSED)
 STATES = frozenset(SESSION_TRANSITIONS)
 HOLDING = frozenset({LIVE, CLOSED_GRADED})
+WITHDRAW, WITHDRAWN = "withdraw", "withdrawn"         # the close reason, the closed status
 HOUR, DAY = 3600, 86400
 PERSIST_ATTEMPTS = 4
 PERSIST_BACKOFF_S = 0.5
@@ -588,22 +601,26 @@ class SessionIssuer:
 
     async def close(self, *, hotkey: str, session_id: str, reason: str,
                     transcript: Mapping[str, Any] | None) -> dict | Refusal:
-        """Settle a live session from its machine's final (or a failed open) and return
-        the state the session is actually in afterwards (a submission that landed
-        meanwhile wins). The transcript is verified outside the lock."""
+        """Settle a live session from its machine's final (or a failed open), or
+        withdraw a live or graded-closed one, and return the state the session is
+        actually in afterwards (a claim or submission that landed meanwhile wins). The
+        transcript is verified outside the lock."""
+        withdraw = reason == WITHDRAW
+        closable = (LIVE, CLOSED_GRADED) if withdraw else (LIVE,)
         async with self._lock:
             now = int(self._clock())
             record = self.book.get(session_id)
             if record is None or record.hotkey != hotkey:
                 return Refusal("session_unknown", {"session_id": session_id})
-            if record.state != LIVE or self.book._frozen(record, now, "close"):
+            if record.state not in closable or self.book._frozen(record, now, "close"):
                 return self._state_of(record)
             if reason == "open_failed":
                 if transcript is not None:
                     return Refusal("transcript_invalid", {"why": "a failed open has no transcript"})
             else:
                 if transcript is None:
-                    return Refusal("transcript_invalid", {"why": "a final close carries its transcript"})
+                    return Refusal("transcript_invalid",
+                                   {"why": f"a {reason} close carries its transcript"})
                 if not self._fleet.directory_ready(now):
                     return self._directory_unavailable()
                 directory = self._fleet.directory()
@@ -620,13 +637,14 @@ class SessionIssuer:
             if not result.ok or result.claims.session_id != session_id:
                 return Refusal("transcript_invalid", {
                     "reasons": [r.value for r in result.reasons] or ["session_mismatch"]})
-            status = result.final.status
-        state = (ABORTED if status == STATUS_ABORTED
+            status = WITHDRAWN if withdraw else result.final.status
+        state = (CLOSED if withdraw else ABORTED if status == STATUS_ABORTED
                  else CLOSED_GRADED if status == STATUS_GRADED else CLOSED)
         async with self._lock:
             now = int(self._clock())
             current = self.book.get(session_id)
-            if current is None or current.state != LIVE or self.book._frozen(current, now, "close"):
+            if (current is None or current.state not in closable
+                    or self.book._frozen(current, now, "close")):
                 return (self._state_of(current) if current is not None
                         else Refusal("session_unknown", {"session_id": session_id}))
             settled = self.book.settle(session_id, state, now=now, status=status)
