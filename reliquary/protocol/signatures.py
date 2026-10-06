@@ -667,22 +667,30 @@ def _engagement_bytes(engagement) -> bytes:
                       ensure_ascii=False).encode("utf-8")
 
 
-def build_sandbox_open_binding(request) -> bytes:
+def _audience(validator_hotkey: str, path: str) -> list[bytes]:
+    """The request's audience: the validator's hotkey (ss58) and the HTTP path it is
+    posted to, so a signed request never verifies at another validator or route."""
+    return [str(validator_hotkey).encode("utf-8"), str(path).encode("utf-8")]
+
+
+def build_sandbox_open_binding(request, *, validator_hotkey: str, path: str) -> bytes:
     body = _corpus_fields(request)
     return _bound(SANDBOX_OPEN_DOMAIN, [
         str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
         int(body["at"]).to_bytes(8, "big", signed=False),
-        hashlib.sha256(_engagement_bytes(body["engagement"])).digest()])
+        hashlib.sha256(_engagement_bytes(body["engagement"])).digest(),
+        *_audience(validator_hotkey, path)])
 
 
-def build_sandbox_close_binding(request) -> bytes:
+def build_sandbox_close_binding(request, *, validator_hotkey: str, path: str) -> bytes:
     body = _corpus_fields(request)
     transcript = body.get("transcript")
     return _bound(SANDBOX_CLOSE_DOMAIN, [
         str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
         int(body["at"]).to_bytes(8, "big", signed=False), str(body["session_id"]).encode("utf-8"),
         str(body["reason"]).encode("utf-8"),
-        b"" if transcript is None else transcript_digest(transcript)])
+        b"" if transcript is None else transcript_digest(transcript),
+        *_audience(validator_hotkey, path)])
 
 
 def verify_hotkey_signature(hotkey: str, binding: bytes, signature_hex: str) -> bool:
@@ -690,7 +698,7 @@ def verify_hotkey_signature(hotkey: str, binding: bytes, signature_hex: str) -> 
     if bt is None:
         return False
     try:
-        signature = bytes.fromhex(signature_hex or "")
+        signature = bytes.fromhex((signature_hex or "").strip().replace("0x", "").replace("0X", ""))
     except ValueError:
         return False
     if not signature:
@@ -703,13 +711,15 @@ def verify_hotkey_signature(hotkey: str, binding: bytes, signature_hex: str) -> 
         return False
 
 
-def verify_sandbox_open_signature(request) -> bool:
+def verify_sandbox_open_signature(request, *, validator_hotkey: str, path: str) -> bool:
     body = _corpus_fields(request)
-    return verify_hotkey_signature(str(body["miner_hotkey"]), build_sandbox_open_binding(request),
+    binding = build_sandbox_open_binding(request, validator_hotkey=validator_hotkey, path=path)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), binding,
                                    str(body.get("signature") or ""))
 
 
-def verify_sandbox_close_signature(request) -> bool:
+def verify_sandbox_close_signature(request, *, validator_hotkey: str, path: str) -> bool:
     body = _corpus_fields(request)
-    return verify_hotkey_signature(str(body["miner_hotkey"]), build_sandbox_close_binding(request),
+    binding = build_sandbox_close_binding(request, validator_hotkey=validator_hotkey, path=path)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), binding,
                                    str(body.get("signature") or ""))

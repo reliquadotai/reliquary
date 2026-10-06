@@ -359,13 +359,18 @@ class SessionBook:
         live = sum(1 for r in mine if self._holds(r, now))
         if live >= policy.max_live_per_hotkey:
             return Refusal("live_cap", {"live": live, "max": policy.max_live_per_hotkey})
-        opens = sum(1 for r in mine
-                    if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED))
-        if opens >= policy.max_opens_per_hour:
-            return Refusal("open_rate_cap", {"opens": opens, "max": policy.max_opens_per_hour})
-        aborted = sum(1 for r in mine if r.state == ABORTED and (r.closed_at or 0) > now - DAY)
+        counted = sorted(r.issued_at for r in mine
+                         if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED))
+        opens = len(counted)
+        if opens >= policy.max_opens_per_hour:     # retry when enough of them leave the hour
+            return Refusal("open_rate_cap", {"opens": opens, "max": policy.max_opens_per_hour},
+                           retry_after=counted[opens - policy.max_opens_per_hour] + HOUR - now)
+        closed = sorted(r.closed_at or 0 for r in mine
+                        if r.state == ABORTED and (r.closed_at or 0) > now - DAY)
+        aborted = len(closed)
         if aborted >= policy.max_aborted_per_day:
-            return Refusal("aborted_cap", {"aborted": aborted, "max": policy.max_aborted_per_day})
+            return Refusal("aborted_cap", {"aborted": aborted, "max": policy.max_aborted_per_day},
+                           retry_after=closed[aborted - policy.max_aborted_per_day] + DAY - now)
         return None
 
     def engagement_refusal(self, hotkey: str, job_id: str | None, prompt_index: int | None,

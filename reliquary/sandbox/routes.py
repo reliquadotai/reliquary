@@ -11,12 +11,25 @@ locations only, never FastAPI's default 422 that echoes the input (a close's tra
 carries the session token). Every refusal is `{"reason", "detail"}` with the status from
 `REFUSAL_STATUS`, plus `Retry-After` when the refusal names a delay. An issuer failure
 is a bare 500 and logs its exception type only. The grant's token is in the answer
-body once and nowhere else; nothing here logs it."""
+body once and nowhere else; nothing here logs it. Every 429 and 503 carries
+`Retry-After` (the refusal's own delay, else `policy.retry_after_s`), in whole seconds
+rounded up, at least 1.
+
+Audience. Each signature binds the validator's hotkey and the route's path
+(`signatures.build_sandbox_open_binding`), so a request signed for validator A is
+refused by validator B, and a close signed for one session is refused on another's.
+A signed open body is nonetheless a bearer credential for its freshness window
+(±policy.request_skew_s, 120 s): the client must never log it, and this endpoint must
+only be reached over TLS or the validator's tunnel. The miner's hotkey is normalised to
+its ss58 format-42 address (anything that does not decode is malformed); caps and
+idempotency key on that address. Task 12 adds a concurrency limit for closes (each
+verifies a transcript of up to MAX_TRANSCRIPT_BYTES) when it mounts this router."""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -26,15 +39,19 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
 from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
-from reliquary.protocol.sandbox_session import SandboxSessionCloseRequest, SandboxSessionOpenRequest
+from reliquary.protocol.sandbox_session import (
+    SandboxSessionCloseRequest, SandboxSessionOpenRequest, sandbox_close_path, sandbox_open_path,
+)
 from reliquary.protocol.signatures import (
     verify_sandbox_close_signature, verify_sandbox_open_signature,
 )
 from reliquary.sandbox.sessions import Refusal, SandboxPolicy
+from reliquary.validator.corpus_registration import NOT_REGISTERED
 
 logger = logging.getLogger(__name__)
 
-NOT_REGISTERED = "not_registered"          # corpus_registration.NOT_REGISTERED
+SS58_FORMAT = 42
+THROTTLED = frozenset({429, 503})
 MAX_OPEN_BODY_BYTES = 16 * 1024
 MAX_CLOSE_BODY_BYTES = MAX_TRANSCRIPT_BYTES + 64 * 1024
 MAX_REPORTED_ERRORS = 8
@@ -54,6 +71,8 @@ REFUSAL_STATUS: dict[str, int] = {
     "job_not_signed": 409, "prompt_mismatch": 409, "prompt_unavailable": 409,
     "job_complete": 409, "request_reused": 409, "request_conflict": 409,
     "engagement_kind_unsupported": 409, "transcript_invalid": 409,
+    # the intake's claim on a session (issuer.claim); `session_claimed` is retried
+    "session_submitted": 409, "session_not_submittable": 409, "session_claimed": 503,
     # per-hotkey caps
     "live_cap": 429, "prompt_live_cap": 429, "job_live_cap": 429, "open_rate_cap": 429,
     "aborted_cap": 429,
@@ -65,16 +84,34 @@ REFUSAL_STATUS: dict[str, int] = {
 UNMAPPED_STATUS = 409
 
 
-def _refuse(reason: str, detail: dict | None = None,
-            retry_after: int | None = None) -> JSONResponse:
+def ss58_address(address: Any) -> str | None:
+    """`address` re-encoded as an ss58 format-42 account address, or None when it does
+    not decode to a 32-byte public key (or the decoder is missing: fail closed)."""
+    if not isinstance(address, str) or not address:
+        return None
+    try:
+        from scalecodec.utils.ss58 import ss58_decode, ss58_encode
+
+        public_key = ss58_decode(address)
+        if not isinstance(public_key, str) or len(public_key) != 64:
+            return None
+        return ss58_encode(public_key, SS58_FORMAT)
+    except Exception:
+        return None
+
+
+def _refuse(reason: str, detail: dict | None = None, retry_after: float | None = None,
+            *, default_retry_after: int | None = None) -> JSONResponse:
     status = REFUSAL_STATUS.get(reason)
     if status is None:
         logger.warning("sandbox session refusal %s has no status; answering %d", reason,
                        UNMAPPED_STATUS)
         status = UNMAPPED_STATUS
     headers = {"Cache-Control": "no-store"}
-    if retry_after:
-        headers["Retry-After"] = str(int(retry_after))
+    if retry_after is None and status in THROTTLED:
+        retry_after = default_retry_after
+    if retry_after is not None:
+        headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
     return JSONResponse(status_code=status, content={"reason": reason, "detail": dict(detail or {})},
                         headers=headers)
 
@@ -110,12 +147,14 @@ async def _parse(request: Request, model: type[BaseModel], cap: int) -> Any:
     raw = await _read_bounded(request, cap)
     try:
         body = json.loads(raw.decode("utf-8"), parse_constant=_no_constants)
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise _Refused(_refuse("malformed_request", {"why": "the body is not JSON"})) from None
     if not isinstance(body, dict):
         raise _Refused(_refuse("malformed_request", {"why": "the body is not a JSON object"}))
     try:
-        return model.model_validate(body)
+        parsed = model.model_validate(body)
+    except RecursionError:
+        raise _Refused(_refuse("malformed_request", {"why": "the body nests too deep"})) from None
     except ValidationError as exc:
         # Locations and error types only: a message or an input could carry the token.
         errors = [{"loc": [str(part) for part in error.get("loc", ())],
@@ -123,43 +162,60 @@ async def _parse(request: Request, model: type[BaseModel], cap: int) -> Any:
                   for error in exc.errors(include_url=False, include_input=False,
                                           include_context=False)[:MAX_REPORTED_ERRORS]]
         raise _Refused(_refuse("malformed_request", {"errors": errors})) from None
+    hotkey = ss58_address(parsed.miner_hotkey)
+    if hotkey is None:
+        raise _Refused(_refuse("malformed_request", {"errors": [
+            {"loc": ["miner_hotkey"], "type": "ss58_address"}]}))
+    return parsed, hotkey
 
 
 def build_sandbox_sessions_router(
-    issuer, *, policy: SandboxPolicy, prefix: str = "/corpus",
+    issuer, *, policy: SandboxPolicy, validator_hotkey: str, prefix: str = "/corpus",
     verify_open: Callable = verify_sandbox_open_signature,
     verify_close: Callable = verify_sandbox_close_signature,
     registration: Callable[[str], Awaitable[str | None]] | None = None,
     clock: Callable[[], float] = time.time,
 ) -> APIRouter:
+    audience = ss58_address(validator_hotkey)
+    if audience is None:
+        raise ValueError("validator_hotkey must be an ss58 account address")
+    if registration is None:
+        logger.warning("sandbox session routes built WITHOUT a registration check: any hotkey "
+                       "that signs is served")
     router = APIRouter()
+    retry_s = policy.retry_after_s
 
-    async def gate(request, verify) -> None:
-        if abs(int(clock()) - request.at) > policy.request_skew_s:
-            raise _Refused(_refuse("stale_request", {"max_skew_s": policy.request_skew_s}))
+    def refuse(reason: str, detail: dict | None = None,
+               retry_after: float | None = None) -> JSONResponse:
+        return _refuse(reason, detail, retry_after, default_retry_after=retry_s)
+
+    async def gate(request, hotkey: str, verify, path: str) -> None:
+        now = int(clock())
+        if abs(now - request.at) > policy.request_skew_s:
+            raise _Refused(refuse("stale_request", {"max_skew_s": policy.request_skew_s,
+                                                    "now": now}))
         try:
-            verified = bool(verify(request))
+            verified = bool(verify(request, validator_hotkey=audience, path=path))
         except Exception:
             verified = False
         if not verified:
-            raise _Refused(_refuse("bad_signature"))
+            raise _Refused(refuse("bad_signature"))
         if registration is not None:
             try:
-                why = await registration(request.miner_hotkey)
+                why = await registration(hotkey)
             except Exception as exc:
                 logger.warning("sandbox session registration check failed (%s)",
                                type(exc).__name__)
                 why = "unavailable"
             if why == NOT_REGISTERED:
-                raise _Refused(_refuse("hotkey_not_registered", {"why": why}))
+                raise _Refused(refuse("hotkey_not_registered", {"why": why}))
             if why is not None:
-                raise _Refused(_refuse("registration_unavailable", {"why": str(why)},
-                                       policy.retry_after_s))
+                raise _Refused(refuse("registration_unavailable", {"why": str(why)}))
 
     def outcome_of(what: str, hotkey: str, outcome) -> JSONResponse | None:
         if isinstance(outcome, Refusal):
             logger.info("sandbox session %s refused for %s: %s", what, hotkey[:12], outcome.reason)
-            return _refuse(outcome.reason, outcome.detail, outcome.retry_after)
+            return refuse(outcome.reason, outcome.detail, outcome.retry_after)
         return None
 
     async def guarded(what: str, step: Callable[[], Awaitable[JSONResponse]]) -> JSONResponse:
@@ -171,36 +227,37 @@ def build_sandbox_sessions_router(
             # The exception type only: neither a traceback nor a message reaches a log
             # or the answer (either could carry a request's token).
             logger.error("sandbox session %s failed (%s)", what, type(exc).__name__)
-            return _refuse("internal_error")
+            return refuse("internal_error")
 
-    @router.post(f"{prefix}/sandbox/sessions")
+    open_path = sandbox_open_path(prefix)
+
+    @router.post(open_path)
     async def open_session(http: Request) -> JSONResponse:
         async def step() -> JSONResponse:
-            request = await _parse(http, SandboxSessionOpenRequest, MAX_OPEN_BODY_BYTES)
-            await gate(request, verify_open)
+            request, hotkey = await _parse(http, SandboxSessionOpenRequest, MAX_OPEN_BODY_BYTES)
+            await gate(request, hotkey, verify_open, open_path)
             outcome = await issuer.open(
-                hotkey=request.miner_hotkey, request_id=request.request_id,
+                hotkey=hotkey, request_id=request.request_id,
                 engagement=request.engagement.model_dump(exclude_none=True))
-            refused = outcome_of("open", request.miner_hotkey, outcome)
+            refused = outcome_of("open", hotkey, outcome)
             if refused is not None:
                 return refused
-            logger.info("sandbox session %s granted to %s", outcome.session_id,
-                        request.miner_hotkey[:12])
+            logger.info("sandbox session %s granted to %s", outcome.session_id, hotkey[:12])
             return _answer({"session_id": outcome.session_id, "token": outcome.token,
                             "gateway_url": outcome.gateway_url, "expires_at": outcome.expires_at})
 
         return await guarded("open", step)
 
-    @router.post(f"{prefix}/sandbox/sessions/{{session_id}}/close")
+    @router.post(sandbox_close_path(prefix, "{session_id}"))
     async def close_session(session_id: str, http: Request) -> JSONResponse:
         async def step() -> JSONResponse:
-            request = await _parse(http, SandboxSessionCloseRequest, MAX_CLOSE_BODY_BYTES)
+            request, hotkey = await _parse(http, SandboxSessionCloseRequest, MAX_CLOSE_BODY_BYTES)
             if request.session_id != session_id:
-                return _refuse("session_unknown", {"session_id": request.session_id})
-            await gate(request, verify_close)
-            outcome = await issuer.close(hotkey=request.miner_hotkey, session_id=session_id,
+                return refuse("session_unknown", {"session_id": request.session_id})
+            await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
+            outcome = await issuer.close(hotkey=hotkey, session_id=session_id,
                                          reason=request.reason, transcript=request.transcript)
-            refused = outcome_of("close", request.miner_hotkey, outcome)
+            refused = outcome_of("close", hotkey, outcome)
             if refused is not None:
                 return refused
             return _answer(dict(outcome))
@@ -211,4 +268,4 @@ def build_sandbox_sessions_router(
 
 
 __all__ = ["MAX_CLOSE_BODY_BYTES", "MAX_OPEN_BODY_BYTES", "REFUSAL_STATUS",
-           "build_sandbox_sessions_router"]
+           "build_sandbox_sessions_router", "ss58_address"]
