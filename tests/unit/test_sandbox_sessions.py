@@ -677,3 +677,85 @@ def test_only_a_live_or_graded_closed_session_becomes_submitted_in_the_store():
             if SUBMITTED in moves} == {LIVE, CLOSED_GRADED}
     assert set(sandbox_store.SESSION_TRANSITIONS) == {LIVE, CLOSED_GRADED, SUBMITTED, CLOSED,
                                                        ABORTED, VOIDED, LAPSED}
+
+
+# -- the intake's claim (task 11) -----------------------------------------------------
+
+def claim(env, grant, hotkey="5Hot"):
+    return asyncio.run(env.issuer.claim(grant.session_id, hotkey=hotkey))
+
+
+@pytest.mark.parametrize("closing,claimable", [
+    (None, True), ("graded", True), ("aborted", False), ("expired", False),
+    ("box_failed", False), ("budget_exhausted", False),
+])
+def test_only_a_live_or_graded_closed_session_can_be_claimed(tmp_path, closing, claimable):
+    env = build(tmp_path)
+    grant = open_(env)
+    if closing is not None:
+        close(env, grant, final_of(env, grant, closing))
+    refusal = claim(env, grant)
+    assert (refusal is None) is claimable
+    if not claimable:
+        assert refusal.reason == "session_not_submittable" and refusal.retry_after is None
+
+
+def test_a_claim_needs_the_sessions_own_hotkey_and_a_known_session(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    assert claim(env, grant, hotkey="5Other").reason == "session_unknown"
+    assert asyncio.run(env.issuer.claim("nope", hotkey="5Hot")).reason == "session_unknown"
+
+
+def test_a_session_is_claimed_once_until_released(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    assert claim(env, grant) is None
+    busy = claim(env, grant)
+    assert busy.reason == "session_claimed" and busy.retry_after == SandboxPolicy().retry_after_s
+    asyncio.run(env.issuer.release_claim(grant.session_id))
+    assert claim(env, grant) is None
+
+
+def test_a_submitted_session_cannot_be_claimed(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    assert claim(env, grant) is None
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == SUBMITTED
+    assert claim(env, grant).reason == "session_submitted"
+
+
+def test_a_drain_a_lapse_or_a_close_never_overrides_a_claimed_session(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    assert claim(env, grant) is None
+
+    async def drain_and_lapse():
+        env.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+        env.clock.now = grant.expires_at + attest.GRADING_GRACE_S + 1
+        await env.issuer.maintain()
+
+    asyncio.run(drain_and_lapse())
+    assert env.book.get(grant.session_id).state == LIVE
+    env.clock.now = NOW
+    assert close(env, grant, final_of(env, grant, "expired"))["state"] == LIVE
+    asyncio.run(env.issuer.submitted(grant.session_id))
+    assert env.book.get(grant.session_id).state == SUBMITTED
+    assert env.store.documents[grant.session_id]["state"] == SUBMITTED
+
+
+def test_a_released_claim_lets_drain_and_lapse_act_again(tmp_path):
+    env = build(tmp_path)
+    grant = open_(env)
+    assert claim(env, grant) is None
+    asyncio.run(env.issuer.release_claim(grant.session_id))
+
+    async def drain():
+        env.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+
+    asyncio.run(drain())
+    assert env.book.get(grant.session_id).state == VOIDED
+    assert claim(env, grant).reason == "session_not_submittable"

@@ -21,8 +21,11 @@ States. A session is `live` until the first of:
   `transcript_bytes`) or a failed open. Terminal for payment: its slot was freed, so a
   submission after it could take a slot another miner now holds.
 
-The intake asks `session_submittable(state)` BEFORE its ledger write: only `live` and
-`closed_graded` sessions may be paid.
+The intake claims a session (`SessionIssuer.claim`, under the issuer lock) BEFORE its
+ledger write: only a `live` or `closed_graded` session (`session_submittable`) of the
+submitting hotkey, not already claimed. A claimed session is frozen: no close, drain or
+lapse moves it until `submitted` (after the write) or `release_claim` (the write did
+not accept it).
 * `aborted`: void, refunded from the open rate, counted against the aborted cap;
   never paid;
 * `voided`: its machine was drained. Our fault, not the miner's: not counted in the
@@ -326,6 +329,20 @@ class SessionBook:
         self.policy = policy
         self._sessions: dict[str, SessionRecord] = {}
         self._requests: dict[tuple[str, str], str] = {}
+        self._claimed: set[str] = set()
+
+    def claim(self, session_id: str) -> bool:
+        """Mark a session as being paid; False when it already is."""
+        if session_id in self._claimed:
+            return False
+        self._claimed.add(session_id)
+        return True
+
+    def release_claim(self, session_id: str) -> None:
+        self._claimed.discard(session_id)
+
+    def is_claimed(self, session_id: str) -> bool:
+        return session_id in self._claimed
 
     def add(self, record: SessionRecord) -> None:
         self._sessions[record.session_id] = record
@@ -398,15 +415,18 @@ class SessionBook:
 
     def lapse(self, now: int) -> list[SessionRecord]:
         lapsed = [r for r in self._sessions.values()
-                  if r.state in HOLDING and now > r.expires_at + GRADING_GRACE_S]
+                  if r.state in HOLDING and now > r.expires_at + GRADING_GRACE_S
+                  and r.session_id not in self._claimed]
         for record in lapsed:
             self.settle(record.session_id, LAPSED, now=now, status=record.closed_status)
         return lapsed
 
     def void_machine(self, machine_id: str, now: int) -> list[SessionRecord]:
-        """Only `live` sessions: a `closed_graded` one already holds its signed transcript."""
+        """Only `live` sessions: a `closed_graded` one already holds its signed transcript,
+        and a claimed one is being paid."""
         voided = [r for r in self._sessions.values()
-                  if r.machine_id == machine_id and r.state == LIVE and self._holds(r, now)]
+                  if r.machine_id == machine_id and r.state == LIVE and self._holds(r, now)
+                  and r.session_id not in self._claimed]
         for record in voided:
             self.settle(record.session_id, VOIDED, now=now, status="machine_drained")
         return voided
@@ -535,7 +555,7 @@ class SessionIssuer:
             record = self.book.get(session_id)
             if record is None or record.hotkey != hotkey:
                 return Refusal("session_unknown", {"session_id": session_id})
-            if record.state != LIVE:
+            if record.state != LIVE or self.book.is_claimed(session_id):
                 return self._state_of(record)
             if reason == "open_failed":
                 if transcript is not None:
@@ -565,7 +585,7 @@ class SessionIssuer:
         async with self._lock:
             now = int(self._clock())
             current = self.book.get(session_id)
-            if current is None or current.state != LIVE:
+            if current is None or current.state != LIVE or self.book.is_claimed(session_id):
                 return (self._state_of(current) if current is not None
                         else Refusal("session_unknown", {"session_id": session_id}))
             settled = self.book.settle(session_id, state, now=now, status=status)
@@ -574,11 +594,36 @@ class SessionIssuer:
         logger.info("sandbox session %s of %s closed: %s", session_id, hotkey[:12], status)
         return self._state_of(settled)
 
+    async def claim(self, session_id: str, *, hotkey: str) -> Refusal | None:
+        """The intake's hold on a session it is about to pay, taken BEFORE its ledger
+        write: None, or why not. Only a `live` or `closed_graded` session of this hotkey,
+        not claimed already (`session_claimed` is retryable: another submission of it is
+        in flight). The claim ends with `submitted` or `release_claim`."""
+        async with self._lock:
+            record = self.book.get(session_id)
+            if record is None or record.hotkey != hotkey:
+                return Refusal("session_unknown", {"session_id": session_id})
+            if record.state == SUBMITTED:
+                return Refusal("session_submitted", {"session_id": session_id})
+            if not session_submittable(record.state):
+                return Refusal("session_not_submittable", {"session_id": session_id,
+                                                           "state": record.state})
+            if not self.book.claim(session_id):
+                return Refusal("session_claimed", {"session_id": session_id},
+                               retry_after=self._policy.retry_after_s)
+        return None
+
+    async def release_claim(self, session_id: str) -> None:
+        """The claimed submission was not accepted (refused, contended, or its write
+        failed): the session is as it was before the claim."""
+        async with self._lock:
+            self.book.release_claim(session_id)
+
     async def submitted(self, session_id: str) -> None:
         """The intake accepted this session's submission (called after the ledger write,
-        so the slot is never counted twice): the reservation ends, whatever state the
-        session had reached (`submitted` is dominant)."""
+        so the slot is never counted twice): its claim and its reservation end."""
         async with self._lock:
+            self.book.release_claim(session_id)
             record = self.book.settle(session_id, SUBMITTED, now=int(self._clock()),
                                       status=STATUS_GRADED)
             self._tokens.pop(session_id, None)
