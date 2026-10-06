@@ -25,8 +25,11 @@ def test_the_system_prompt_follows_the_tools():
         BASH_SENTENCE + " " + EDIT_SENTENCE
     assert harness_tools(("bash",)) == BASH_HARNESS_TOOLS[:1]
     assert harness_tools(("bash", "edit")) == BASH_HARNESS_TOOLS
-    with pytest.raises(ValueError):
-        harness_tools(("edit",))
+    assert harness_tools(["edit", "bash"]) == harness_tools(("bash", "edit", "bash")) == BASH_HARNESS_TOOLS
+    assert harness_system_prompt(["edit", "bash"]) == BASH_SYSTEM_PROMPT
+    for refused in (("edit",), ("bash", "python"), (), ("bash", "edit", "search")):
+        with pytest.raises(ValueError):
+            harness_tools(refused)
 
 
 def test_the_sentences_are_verifiers_own():
@@ -36,6 +39,7 @@ def test_the_sentences_are_verifiers_own():
 
 
 def test_the_pinned_parser_is_verifiers_filter():
+    pytest.importorskip("renderers")
     train = pytest.importorskip("verifiers.v1.clients.train")
     from renderers.base import ParsedToolCall, ToolCallParseStatus as S
 
@@ -98,6 +102,9 @@ def _router_input(parsed_calls) -> list[tuple[str, str]]:
 
 
 def test_the_router_receives_what_the_pinned_parser_returns():
+    pytest.importorskip("renderers")
+    pytest.importorskip("verifiers.v1.clients.train")
+    pytest.importorskip("reliquary_sandbox_verifiers.task")
     from renderers.base import ParsedToolCall, ToolCallParseStatus as S
 
     calls = [
@@ -145,6 +152,7 @@ def test_the_validator_parses_real_completions_as_the_miner_routes_them(tools):
     """The validator's `QwenTurnRenderer.tool_calls` against the miner's path for the
     same tokens: the train client parses with the program's tools as verifiers' chat
     dialect carries them to the wire, then the bridge routes."""
+    pytest.importorskip("renderers")
     train = pytest.importorskip("verifiers.v1.clients.train")
     program = pytest.importorskip("verifiers.v1.harnesses.bash.program")
     from verifiers.v1.dialects.chat import parse_tools
@@ -158,6 +166,32 @@ def test_the_validator_parses_real_completions_as_the_miner_routes_them(tools):
                                           add_special_tokens=False)
         parsed = miner.parse_response(ids, tools=wire_tools)
         assert validator.tool_calls(ids) == _router_input(parsed.tool_calls), (tools, case)
+
+
+_DEEP = "[" * 10_000 + "]" * 10_000
+
+
+@pytest.mark.skipif(not TOKENIZER, reason="set RELIQUARY_QWEN38_TOKENIZER")
+def test_a_parameter_nested_10k_deep_is_refused_not_raised():
+    """The pinned parser's JSON coercion of an unschema'd parameter recurses: the
+    validator refuses the trajectory (`bad_turns`) instead of crashing the intake."""
+    pytest.importorskip("renderers")
+    from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
+
+    r = agentic_swe.load_turn_renderer(TOKENIZER, tools=("bash",))
+    prompt = r.initial_ids("Fix it.")
+    opened = "<think>" in r._tokenizer.decode(prompt[-4:], skip_special_tokens=False)
+    text = (("" if opened else "<think>\n") + "x\n</think>\n\n"
+            + _call("bash", [("command", "ls"), ("timeout", _DEEP)]) + "<|im_end|>")
+    completion = r._tokenizer.encode(text, add_special_tokens=False)
+    for parse in (r.tool_calls, r.assistant_message):
+        with pytest.raises(TrajectoryRefused) as caught:
+            parse(completion)
+        assert caught.value.reason == "bad_turns"
+    with pytest.raises(TrajectoryRefused) as caught:
+        parse_trajectory(r, prompt_ids=prompt, tokens=completion, spans=[(0, len(completion))],
+                         stop="max_turns", max_turns=1)
+    assert caught.value.reason == "bad_turns"
 
 
 class _StubRenderer:
@@ -175,6 +209,36 @@ class _StubRenderer:
     def render(self, messages, tools, add_generation_prompt):
         self.rendered.append((messages, tools))
         return SimpleNamespace(token_ids=[9])
+
+    def parse_response(self, ids, tools):
+        raise self.raises
+
+
+@pytest.mark.parametrize("error", [RecursionError("maximum recursion depth exceeded"),
+                                   ValueError("bad"), KeyError("name")])
+def test_any_parser_failure_becomes_a_bad_turns_refusal(error):
+    pytest.importorskip("renderers")
+    from reliquary.corpus.trajectory_parse import TrajectoryRefused
+
+    stub = _StubRenderer()
+    stub.raises = error
+    renderer = agentic_swe.QwenTurnRenderer(stub)
+    for parse in (renderer.tool_calls, renderer.assistant_message):
+        with pytest.raises(TrajectoryRefused) as caught:
+            parse([1, 2])
+        assert caught.value.reason == "bad_turns"
+        assert caught.value.detail["error"] == type(error).__name__
+
+
+def test_a_refusal_from_the_parser_passes_unchanged():
+    pytest.importorskip("renderers")
+    from reliquary.corpus.trajectory_parse import TrajectoryRefused
+
+    stub = _StubRenderer()
+    stub.raises = TrajectoryRefused("bad_stop", {"why": "stub"})
+    with pytest.raises(TrajectoryRefused) as caught:
+        agentic_swe.QwenTurnRenderer(stub).tool_calls([1])
+    assert caught.value is stub.raises
 
 
 def test_a_bash_only_renderer_renders_bash_only():
@@ -203,19 +267,31 @@ def test_a_signed_source_serves_the_sandbox_prompt_without_the_notice():
         return f"task {index}"
 
     rows = {3: SimpleNamespace(instance_id="repo__x.3")}
-    source = SignedSweSource("train:20", prompt_of=prompt_of,
-                             row_of=lambda split, index: (None, rows[index]))
+    rows_asked = []
+
+    def row_of(split, index):
+        rows_asked.append((split, index))
+        return None, rows[index]
+
+    source = SignedSweSource("train:20", prompt_of=prompt_of, row_of=row_of)
     assert source.prompt(3) == "task 3" and source.prompt(3) == "task 3"
     assert asked == [("train:20", 3)]                      # cached
     assert agentic_swe.PINNED_NETWORK_NOTICE not in source.prompt(3)
     assert source.instance_id(3) == "repo__x.3"
     assert source.task_for(3).prompt == "task 3" and source.split == "train:20"
+    assert source.task_for(3).id == "repo__x.3" and rows_asked == [("train:20", 3)]  # cached
+
+
+def _no_sandbox_install(monkeypatch):
+    """CI installs `.[dev]` only: reliquary_sandbox is absent, so its presence is faked."""
+    monkeypatch.setattr("reliquary.sandbox.require_sandbox", lambda: None)
 
 
 def test_sandbox_support_refuses_what_this_process_cannot_serve(monkeypatch):
     job = parse_job(_manifest(episode=signed_episode()))
     replay = parse_job(_manifest())
     assert "not a signed_sandbox" in agentic_swe.sandbox_support_refusal(replay.episode)
+    _no_sandbox_install(monkeypatch)
     monkeypatch.setattr("reliquary.sandbox.sandbox_commit_refusal",
                         lambda pinned: f"the job pins reliquary-sandbox {pinned}")
     assert "the job pins" in agentic_swe.sandbox_support_refusal(job.episode)
@@ -229,6 +305,7 @@ def test_sandbox_support_compares_the_code_digest_record_0_carries(monkeypatch):
     the same version with other code is refused, the exact identity is served."""
     job = parse_job(_manifest(episode=signed_episode()))
     version = ENV_PACKAGE.split("==", 1)[1].split("+g", 1)[0]
+    _no_sandbox_install(monkeypatch)
     monkeypatch.setattr("reliquary.sandbox.sandbox_commit_refusal", lambda pinned: None)
     monkeypatch.setattr(agentic_swe.importlib.metadata, "version", lambda name: version)
     monkeypatch.setattr(agentic_swe.importlib, "import_module", lambda name: None)
@@ -238,3 +315,19 @@ def test_sandbox_support_compares_the_code_digest_record_0_carries(monkeypatch):
     assert "+gffffffffffffffff is installed" in refusal and ENV_PACKAGE in refusal
     monkeypatch.setattr(agentic_swe, "installed_env_package", lambda package: ENV_PACKAGE)
     assert agentic_swe.sandbox_support_refusal(job.episode) is None
+
+
+def test_an_env_sandbox_module_that_fails_to_import_is_reported(monkeypatch):
+    job = parse_job(_manifest(episode=signed_episode()))
+    version = ENV_PACKAGE.split("==", 1)[1].split("+g", 1)[0]
+    _no_sandbox_install(monkeypatch)
+    monkeypatch.setattr("reliquary.sandbox.sandbox_commit_refusal", lambda pinned: None)
+    monkeypatch.setattr(agentic_swe.importlib.metadata, "version", lambda name: version)
+
+    def import_module(name):
+        raise RuntimeError("verifiers is not the pinned commit")
+
+    monkeypatch.setattr(agentic_swe.importlib, "import_module", import_module)
+    refusal = agentic_swe.sandbox_support_refusal(job.episode)
+    assert "reliquary_swe.sandbox cannot be imported (RuntimeError: verifiers is not the pinned" \
+        in refusal

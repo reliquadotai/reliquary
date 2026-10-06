@@ -55,8 +55,9 @@ _TOOL_SETS = (("bash",), ("bash", "edit"))
 def harness_tools(tools) -> tuple[dict, ...]:
     """The tool specs verifiers' bash harness sends for `tools` (bash always, edit
     optionally): the renderer must parse with exactly these, since parameter
-    coercion follows their schemas."""
-    names = tuple(tools)
+    coercion follows their schemas. Order and repeats do not matter; an unknown
+    name, or edit without bash, is refused."""
+    names = tuple(sorted(set(tools)))
     if names not in _TOOL_SETS:
         raise ValueError(f"the bash harness offers bash or bash and edit, not {list(names)}")
     return BASH_HARNESS_TOOLS[:len(names)]
@@ -211,6 +212,7 @@ class SignedSweSource:
         self._prompt_of = prompt_of
         self._row_of = row_of
         self._prompts = functools.lru_cache(maxsize=4096)(self._prompt)
+        self._instance_ids = functools.lru_cache(maxsize=4096)(self._instance_id)
 
     def _prompt(self, index: int) -> str:
         prompt_of = self._prompt_of
@@ -222,6 +224,9 @@ class SignedSweSource:
         return self._prompts(int(index))
 
     def instance_id(self, index: int) -> str:
+        return self._instance_ids(int(index))
+
+    def _instance_id(self, index: int) -> str:
         row_of = self._row_of
         if row_of is None:
             from reliquary_swe.sandbox import row_for as row_of
@@ -266,8 +271,8 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
         return f"{installed} is installed, the job pins {pinned}"
     try:
         importlib.import_module(f"{package.replace('-', '_')}.sandbox")
-    except ImportError as exc:
-        return (f"{package.replace('-', '_')}.sandbox cannot be imported ({exc}): "
+    except Exception as exc:  # an import-time pin check raises RuntimeError, not ImportError
+        return (f"{package.replace('-', '_')}.sandbox cannot be imported ({type(exc).__name__}: {exc}): "
                 f"install {package} at the job's commit")
     try:
         identity = installed_env_package(package)
@@ -329,8 +334,22 @@ class QwenTurnRenderer:
 
     @_locked
     def tool_calls(self, completion_ids) -> list[tuple[str, str]]:
-        parsed = self._r.parse_response(list(completion_ids), tools=self._tools)
-        return pinned_tool_calls(parsed.tool_calls, self._unknown)
+        return pinned_tool_calls(self._parse(completion_ids).tool_calls, self._unknown)
+
+    def _parse(self, completion_ids):
+        """The pinned parser, made total: whatever it raises on a span (a parameter
+        nested 10k deep raises RecursionError from its JSON coercion) refuses the
+        trajectory as `bad_turns` instead of escaping the intake."""
+        from reliquary.corpus.checks import REASON_BAD_TURNS
+        from reliquary.corpus.trajectory_parse import TrajectoryRefused
+
+        try:
+            return self._r.parse_response(list(completion_ids), tools=self._tools)
+        except TrajectoryRefused:
+            raise
+        except Exception as exc:  # RecursionError is an Exception
+            raise TrajectoryRefused(REASON_BAD_TURNS, {
+                "why": "the pinned parser failed on a span", "error": type(exc).__name__}) from None
 
     @_locked
     def observations(self, segment_ids) -> list[str]:
@@ -418,7 +437,7 @@ class QwenTurnRenderer:
 
     @_locked
     def assistant_message(self, completion_ids) -> dict:
-        parsed = self._r.parse_response(list(completion_ids), tools=self._tools)
+        parsed = self._parse(completion_ids)
         message = {"role": "assistant", "content": parsed.content or ""}
         if parsed.reasoning_content:
             message["reasoning_content"] = parsed.reasoning_content
