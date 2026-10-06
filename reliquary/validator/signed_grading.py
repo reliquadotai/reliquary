@@ -2,16 +2,24 @@
 final record's, so the grade document is written as soon as the accepted record is
 read: no executor, no replay, no drand draw. Everything else (what is ready to pay,
 the oldest ungraded arrival a period settler waits for, rescans, the void hook) is
-CorpusGrader's own bookkeeping: only `grade_one` differs."""
+CorpusGrader's own bookkeeping: only `grade_one` differs.
+
+The transcript (up to 8 MiB) is parsed on the grader's parse executor under its parse
+gate, never on the event loop. The grade carries `replay: {"signed": true, "status":
+"ok", "certified": true}` so `delivery.certified` exports it like a certified replay;
+its only grader is `sandbox:<machine_id>`, never a grade executor, so a grade-executor
+quarantine never holds it."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
 from reliquary.corpus.signed_parse import signed_records
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
 from reliquary.validator.corpus_grading import GRADE_SCHEMA, CorpusGrader
+from reliquary.validator.corpus_judge_threads import run_in
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +42,12 @@ class SignedEpisodeGrader(CorpusGrader):
             return await self._write(submission_id, {
                 **base, "status": "audit_failed", "graded_success": False, "replay": None,
                 "replay_certified": False, "graded_at": self._clock()}, regrade=regrade)
+        if self._parse_gate is None:
+            self._parse_gate = asyncio.Semaphore(self._parse_concurrency)
         try:
             transcript = record["completions"][0].get("transcript")
-            final = signed_records(transcript).final
+            async with self._parse_gate:
+                final = (await run_in(self._parse_executor, signed_records, transcript)).final
             claims = transcript["token"]["claims"]
             machine = str(claims["machine_id"])
             session_id = claims["session_id"]
@@ -51,7 +62,7 @@ class SignedEpisodeGrader(CorpusGrader):
             "grade": {"reward": final.reward, "facts": final.grading,
                       "session_id": session_id, "machine_id": machine,
                       "state_sha256": final.state_sha256, "cpu_total_ms": final.cpu_total_ms},
-            "graded_by": [f"sandbox:{machine}"], "replay": {"signed": True},
+            "graded_by": [f"sandbox:{machine}"], "replay": {"signed": True, "status": "ok", "certified": True},
             "replay_certified": True, "graded_at": self._clock()}, regrade=regrade)
 
 

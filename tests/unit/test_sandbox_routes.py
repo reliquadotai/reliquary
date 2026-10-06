@@ -224,11 +224,11 @@ def test_every_refusal_the_sessions_emit_has_a_status():
     source = Path(sessions.__file__).read_text()
     emitted = set(re.findall(r'Refusal\(\s*"([a-z_]+)"', source))
     assert emitted and emitted <= set(REFUSAL_STATUS), emitted - set(REFUSAL_STATUS)
-    assert all(code in (400, 403, 404, 409, 413, 422, 429, 500, 503)
+    assert all(code in (400, 403, 404, 408, 409, 413, 422, 429, 500, 503)
                for code in REFUSAL_STATUS.values())
     assert all(REFUSAL_STATUS[reason] == 503 for reason in (
         "sandbox_capacity", "directory_unavailable", "store_unavailable", "ledger_unavailable",
-        "task_unavailable", "registration_unavailable"))
+        "task_unavailable", "registration_unavailable", "close_busy", "job_not_ready"))
 
 
 def test_an_unknown_engagement_kind_is_malformed():
@@ -586,3 +586,37 @@ def test_the_close_limit_must_be_positive():
     with pytest.raises(ValueError):
         build_sandbox_sessions_router(FakeIssuer(None), policy=SandboxPolicy(),
                                       validator_hotkey=VALIDATOR, max_concurrent_closes=0)
+
+
+def test_a_stalled_close_body_times_out_without_holding_a_close_slot():
+    import asyncio
+
+    import httpx
+
+    issuer = FakeIssuer({"session_id": "s-1", "state": "closed", "status": "expired"})
+    app = FastAPI()
+    app.include_router(build_sandbox_sessions_router(
+        issuer, policy=SandboxPolicy(), validator_hotkey=VALIDATOR, verify_open=accept,
+        verify_close=accept, clock=lambda: NOW, max_concurrent_closes=1, close_wait_s=0.2,
+        close_body_timeout_s=0.5))
+    gone = asyncio.Event()
+
+    async def stalled():
+        yield b'{"miner_hotkey": '
+        await gone.wait()                               # the rest never arrives in time
+        yield b'"x"}'
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://v") as http:
+            slow = asyncio.ensure_future(http.post(CLOSE, content=stalled()))
+            await asyncio.sleep(0.1)
+            honest = await http.post(CLOSE, json=close_body())
+            timed_out = await slow
+            gone.set()
+        return honest, timed_out
+
+    honest, timed_out = asyncio.run(run())
+    assert honest.status_code == 200                   # the stalled body held no slot
+    assert timed_out.status_code == 408 and timed_out.json()["reason"] == "body_timeout"
+    assert len(issuer.calls) == 1

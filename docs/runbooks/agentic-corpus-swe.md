@@ -41,41 +41,97 @@ validators and the miners install reliquary-swe from the same git wheel at the j
 pinned commit; a different install method gives a different `env_package` and every
 transcript is refused (record 0 `env_package`) or never placed.
 
-Validator:
+### Safe deployment order
+
+1. Install `reliquary[sandbox]` in the validator image, set nothing yet, and redeploy:
+   with no key settings and no signed job, the validator imports nothing new and
+   replay jobs run exactly as before.
+2. Generate the validator key (below) and give every machine its public key.
+3. Register the machines in the directory, and check that each answers `GET /capacity`
+   from the validator host.
+4. Set the key settings on the validator and restart it. From now on its start reads the
+   directory and restores the sessions from R2 (see "Restore" below).
+5. Only then declare the signed job in the registry. Miners need
+   `reliquary[sandbox-miner]` before they can mine it.
+
+Rolling back is the reverse: retire the signed job first, then unset the key settings.
+
+### Validator
+
 1. `python -m reliquary_sandbox.attest.signing generate /etc/reliquary/sandbox-validator.pem`
-   prints the public key; put it in every machine's `RELIQUARY_SANDBOX_VALIDATOR_PUBLIC_KEYS`.
-   The file is mode 0600 and owned by the validator's user; only its path is ever logged.
-2. Set `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE`, `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID`
-   (and, after a rotation, `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS`, JSON
-   `{key_id: base64 public key}`). Without both key settings a signed job is not
-   served (logged as unserved; replay jobs start as before). Policy defaults:
-   8 live sessions, 120 opens per hour (aborted refunded), 20 aborted per 24 h per hotkey,
-   a 300 s claim ttl (`RELIQUARY_SANDBOX_CLAIM_TTL_S`); `RELIQUARY_SANDBOX_MAX_*` override
-   the caps. The machine directory is re-read every `RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S`
-   (30), each read bounded by `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` (15); past
-   `RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S` (120) without a good read the validator fails
-   closed (no session placed, no signed transcript admitted, retryable refusals). At most
-   `RELIQUARY_SANDBOX_CLOSE_CONCURRENCY` (4) closes are verified at once; others wait up to
-   the io timeout, then get `503 close_busy` with `Retry-After`.
-3. At start, before any route serves, the validator reads the directory once and
-   restores the recent sessions from R2 (`reliquary/sandbox/sessions/...`). **If the
-   restore fails the validator does not start**: it would otherwise serve opens with
-   empty reservations and caps. Fix R2 access and restart.
-4. Register each machine: `reliquary sandbox machines register --machine-id ... --address
+   prints the public key. Each machine reads `RELIQUARY_SANDBOX_VALIDATOR_PUBLIC_KEYS`,
+   a JSON object from key id to the base64 Ed25519 public key, for example
+   `{"validator-2026-10": "<base64>"}`. The key id there must be exactly the validator's
+   `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID`: a token names its key id, and a machine that knows
+   the key under another id refuses every token.
+2. The key file must be a regular file with mode 0600 (or stricter), owned by the user
+   the validator process runs as; a symlink is refused. Under Docker, that is the
+   container's user, not the host's: `chown` the file to the container's uid (root in
+   the current image) on the host, and mount it read-only (`:ro`) at the path the setting
+   names. Only the path is ever logged, never the contents.
+3. Set `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE` and `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID` (neither
+   may be blank). After a rotation also set `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS`, a JSON
+   object `{key_id: base64 public key}`. Without both key settings, a signed job is not
+   served: it is logged as unserved, and replay jobs start as before.
+4. Policy defaults per hotkey:
+   - 8 live sessions in total (`RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY`);
+   - 4 live sessions per job (`RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB`);
+   - one live session per prompt (fixed);
+   - 120 opens per hour, with aborted opens refunded (`RELIQUARY_SANDBOX_MAX_OPENS_PER_HOUR`);
+   - 20 aborted sessions per 24 h (`RELIQUARY_SANDBOX_MAX_ABORTED_PER_DAY`);
+   - a 300 s claim ttl (`RELIQUARY_SANDBOX_CLAIM_TTL_S`).
+
+   A prompt never has more live sessions than free slots.
+5. The machine directory:
+   - it is re-read every `RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S` (30 s);
+   - each read is bounded by `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` (15 s);
+   - past `RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S` (120 s) without a good read, the
+     validator fails closed: no session is placed, no signed transcript is admitted,
+     and miners get retryable refusals.
+6. Closes:
+   - a close's body has `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` (30 s) to arrive, else
+     `408 body_timeout`;
+   - at most `RELIQUARY_SANDBOX_CLOSE_CONCURRENCY` (4) transcripts are verified at once;
+   - a close that waits longer than the io timeout for a slot gets `503 close_busy` with
+     `Retry-After`.
+
+   Every setting must be a positive, finite number.
+7. Register each machine: `reliquary sandbox machines register --machine-id ... --address
    http://host:port --provider ... --capacity ... --key-id ... --public-key ...
    --valid-from <unix>`. Addresses come from this directory only.
-5. Key rotation: `add-key`, switch the machine when `GET /capacity` shows `active: 0`,
+8. Key rotation: `add-key`, switch the machine when `GET /capacity` shows `active: 0`,
    then `end-key --valid-until <start of the new key>`. **Compromise:** `end-key
    --valid-until <earliest suspected time> --compromise` (past times allowed; the end is
-   moved 30 s earlier for clock skew): transcripts opened after it no longer verify from
-   the next directory refresh on. Transcripts already admitted stay admitted.
-6. `status --status draining` stops new sessions; a machine silent for 60 s is drained
+   moved 30 s earlier for clock skew). From the next directory refresh on, transcripts
+   opened after that time no longer verify. Transcripts already admitted stay admitted.
+9. `status --status draining` stops new sessions. A machine silent for 60 s is drained
    automatically and its live sessions voided (no fault to their miners).
 
-The session route is `POST /corpus/sandbox/sessions` (and `/{id}/close`) on the corpus
-app: the existing `/corpus` nginx location and tunnel serve it. Requests are signed for
-this validator's hotkey and the route's path, so they only reach it over TLS or the tunnel.
+### Restore
 
-Miners: `reliquary corpus mine-agentic` detects the job's execution. In signed mode it
-needs `reliquary[sandbox-miner]` (verifiers installed from git at the pinned commit), no
-Docker, and it reports every unsubmitted session so its reservation ends early.
+At start, before any route serves, the validator reads the directory once. A failure
+there is logged and retried by the fleet, and it never stops the start. It then restores
+the recent sessions from R2 (`reliquary/sandbox/sessions/...`). Each attempt is bounded
+to 60 s, and there are 3 attempts with backoff. **If the restore still fails, the
+validator does not start at all, so the replay jobs it serves stop too.** It would
+otherwise serve opens with empty reservations and caps. Fix R2 access and restart. To
+keep replay jobs running meanwhile, unset the key settings and retire the signed job.
+At shutdown, the session writes still in flight get 10 s.
+
+### Session route
+
+The route is `POST /corpus/sandbox/sessions` (and `/{id}/close`) on the corpus app.
+The existing `/corpus` nginx location and tunnel serve it. A close carries a transcript
+of up to 8 MiB plus 64 KiB of envelope, so the `/corpus` location's
+`client_max_body_size` must be at least 9m. The current edge template sets 128m; check
+any other proxy in front.
+
+A signed open or close body is a bearer credential for its freshness window (120 s): it
+carries the session token or the request that obtains one. Serve the route only over
+TLS or the validator's tunnel, and never log request bodies at the proxy.
+
+### Miners
+
+`reliquary corpus mine-agentic` detects the job's execution. In signed mode it needs
+`reliquary[sandbox-miner]` (verifiers installed from git at the pinned commit) and no
+Docker. It reports every unsubmitted session so that its reservation ends early.

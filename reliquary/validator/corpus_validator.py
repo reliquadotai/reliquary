@@ -1177,7 +1177,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     # Every grader's trajectory parses, on threads of their own (bounded):
     # never the default executor the submit routes' ledger turns run on.
     grade_parse_threads = None
-    if grade_dispatcher is not None:
+    if grade_dispatcher is not None or sandbox_services is not None:
         from concurrent.futures import ThreadPoolExecutor
 
         from reliquary.validator.corpus_grading import GRADE_PARSE_THREADS
@@ -1218,8 +1218,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         if is_signed_sandbox(w.job):
             from reliquary.validator.sandbox_wiring import wire_signed_grader
 
-            wire_signed_grader(w, judge_records=judge_records)
-            graders[str(w.job.job_id)] = w.grader
+            # Not in `graders`: a grade executor's quarantine never holds or regrades
+            # a transcript grade (no executor decided it).
+            wire_signed_grader(w, judge_records=judge_records,
+                               parse_executor=grade_parse_threads)
         elif w.job.episode is not None:
             wire_job_grader(w, records=records, judge_records=judge_records,
                             dispatcher=grade_dispatcher, parse_executor=grade_parse_threads,
@@ -1244,6 +1246,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         except Exception as exc:  # noqa: BLE001 - isolated: the others still start
             not_served(w.entry, w.job, "its intake, grader or auditor wiring", exc)
             graders.pop(str(w.job.job_id), None)
+            if sandbox_services is not None:
+                sandbox_services.forget(str(w.job.job_id))
             wiring.remove(w)
     if not wiring:
         raise RuntimeError("no corpus job left to serve: " + "; ".join(
@@ -1287,10 +1291,15 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             await lease_checked(job)
         seen_index = await migrate_ledgers_at_startup(store, job)
         w = prepared(task_entry, task_cap, job, own_profile, renderer, seen_index)
-        if job.episode is not None:
-            w.episode_intake = await asyncio.to_thread(episode_intake_for, w)
-            await warm_drand_chain(judge_threads.beacon)
-        audit_and_settle(w)
+        try:
+            if job.episode is not None:
+                w.episode_intake = await asyncio.to_thread(episode_intake_for, w)
+                await warm_drand_chain(judge_threads.beacon)
+            audit_and_settle(w)
+        except BaseException:
+            if sandbox_services is not None and is_signed_sandbox(job):
+                sandbox_services.forget(str(job.job_id))     # no session for an unwired job
+            raise
         unserved.pop(str(task_entry.task_id), None)       # served now
         return w
 
@@ -1391,6 +1400,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     async def cleanup_threads() -> None:
+        if sandbox_services is not None:
+            await sandbox_services.stop()          # in-flight session writes, bounded
         await asyncio.to_thread(judge_threads.shutdown, wait=True)
         if grade_parse_threads is not None:
             await asyncio.to_thread(grade_parse_threads.shutdown, wait=True, cancel_futures=True)

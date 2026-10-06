@@ -185,6 +185,11 @@ class EngagementBook(Protocol):
     async def terms(self, hotkey: str, engagement: Mapping[str, Any]) -> EngagementTerms | Refusal: ...
 
 
+class JobNotReady(Exception):
+    """A served job's view is registered but its submit router is not adopted yet (a
+    hot add in progress): the open is refused retryably."""
+
+
 @dataclass(frozen=True)
 class SignedJobView:
     """What the corpus engagement book needs of a served signed job."""
@@ -285,6 +290,8 @@ class CorpusEngagements:
             remaining = await asyncio.wait_for(view.slots_remaining(index), timeout)
         except TimeoutError:
             return Refusal("ledger_unavailable", {"job_id": job_id}, retry_after=retry)
+        except JobNotReady:
+            return Refusal("job_not_ready", {"job_id": job_id}, retry_after=retry)
         if remaining is None:
             return Refusal("job_complete", {"job_id": job_id})
         reserved = self._book.reserved(job.job_id, index, int(self._clock()))
@@ -689,6 +696,21 @@ class SessionIssuer:
             logger.warning("machine %s drained: %d live sessions voided, no fault to their miners",
                            machine_id, len(records))
 
+    async def drain(self, timeout: float) -> int:
+        """Wait up to `timeout` seconds for the state writes started in the background
+        (a drained machine's voids); cancel what is left. Returns how many were cut."""
+        pending = [task for task in self._tasks if not task.done()]
+        if not pending:
+            return 0
+        _, late = await asyncio.wait(pending, timeout=timeout)
+        for task in late:
+            task.cancel()
+        if late:
+            await asyncio.gather(*late, return_exceptions=True)
+            logger.error("ALERT %d sandbox session writes cut at shutdown; a restart reads "
+                         "their older stored state", len(late))
+        return len(late)
+
     async def maintain(self) -> None:
         async with self._lock:
             now = int(self._clock())
@@ -736,6 +758,6 @@ class SessionIssuer:
 
 
 __all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "LAPSED", "LIVE", "SUBMITTED", "VOIDED",
-           "CorpusEngagements", "EngagementBook", "EngagementTerms", "Grant", "Refusal",
+           "CorpusEngagements", "EngagementBook", "EngagementTerms", "Grant", "JobNotReady", "Refusal",
            "RlPrecommitEngagements", "SandboxPolicy", "SessionBook", "SessionIssuer",
            "SessionRecord", "SignedJobView", "engagement_digest", "session_submittable"]

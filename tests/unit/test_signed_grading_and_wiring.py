@@ -248,3 +248,235 @@ def test_signed_jobs_never_join_the_replay_grade_pins():
     wiring = [SimpleNamespace(job=JOB), SimpleNamespace(job=replay),
               SimpleNamespace(job=single_turn)]
     assert replay_episode_pins(wiring) == {("reliquary-swe", "a" * 40)}
+
+
+# -- fix round 1 ---------------------------------------------------------------
+
+
+def test_a_signed_grade_is_certified_for_the_export(tmp_path):
+    from reliquary.corpus.delivery import certified, held_by_quarantine
+
+    signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims())
+    _, document = grade(Records({"sub-1": record(signed)}))
+    assert document["replay"] == {"signed": True, "status": "ok", "certified": True}
+    assert certified(document)
+    assert held_by_quarantine(document, {"executor-1", "machine-1"}) == []
+    failed = grade(Records({"sub-1": record(signed)}, verdicts={"sub-1": {"passed": False}}))[1]
+    assert not certified(failed)
+
+
+def test_a_signed_grade_round_trips_through_the_export(tmp_path):
+    from reliquary.corpus.delivery import episode_rows
+    from tests.unit.test_corpus_export_signed import build
+
+    trajectory, renderer = build(tmp_path)
+    stored = {"schema": RECORD_SCHEMA_V2, "hotkey": "5Hot", "prompt_index": 0,
+              "received_at": NOW + 50.0, "completions": [trajectory]}
+
+    class Exported(Records):
+        async def list_verdict_ids(self, job_id):
+            return ["sub-1"]
+
+        async def list_voided_ids(self, job_id):
+            return []
+
+        async def read_regrade(self, job_id, sid):
+            return None
+
+        async def read_grade(self, job_id, sid):
+            return self.grades.get(sid)
+
+    records = Exported({"sub-1": stored}, verdicts={"sub-1": {"passed": True}})
+    source = SignedSweSource("train:20", prompt_of=lambda s, i: "Fix task 0.",
+                             row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__{i}")))
+    grader = SignedEpisodeGrader(job=JOB, records=records, source=source, clock=lambda: NOW + 60)
+    assert asyncio.run(grader.grade_one("sub-1"))["status"] == "ok"
+
+    async def export():
+        counts = {}
+        rows = [r async for r in episode_rows(job=JOB, records=records, renderer=renderer,
+                                               source=source, counts=counts, quarantined=())]
+        return rows, counts
+
+    rows, counts = asyncio.run(export())
+    assert counts["rows"] == 1 and counts["uncertified"] == 0 and counts["held"] == 0
+    assert rows[0]["graded_success"] is True and rows[0]["replay_certified"] is True
+
+
+def test_the_grader_parses_transcripts_on_its_parse_executor(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from reliquary.validator import signed_grading
+
+    seen = []
+    real = signed_grading.signed_records
+
+    def spy(transcript_):
+        seen.append(threading.current_thread().name)
+        return real(transcript_)
+
+    monkeypatch.setattr(signed_grading, "signed_records", spy)
+    pool = ThreadPoolExecutor(1, thread_name_prefix="corpus-grade-parse")
+    signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims())
+    grader = SignedEpisodeGrader(job=JOB, records=Records({"sub-1": record(signed)}),
+                                 source=SOURCE, clock=lambda: NOW + 60, parse_executor=pool)
+    assert asyncio.run(grader.grade_one("sub-1"))["status"] == "ok"
+    pool.shutdown()
+    assert seen and seen[0].startswith("corpus-grade-parse")
+
+
+@pytest.mark.parametrize("name,value", [
+    ("RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S", "nan"),
+    ("RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S", "inf"),
+    ("RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S", "-1"),
+    ("RELIQUARY_SANDBOX_VALIDATOR_KEY_ID", "  "),
+])
+def test_the_config_refuses_non_finite_settings_and_a_blank_key_id(tmp_path, name, value):
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1"}
+    with pytest.raises(ValueError):
+        SandboxValidatorConfig.from_env({**keys, name: value})
+
+
+def test_the_close_body_timeout_is_a_setting(tmp_path):
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1"}
+    assert SandboxValidatorConfig.from_env(keys).close_body_timeout_s == 30.0
+    assert SandboxValidatorConfig.from_env(
+        {**keys, "RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S": "5"}).close_body_timeout_s == 5.0
+
+
+class FlakyStore(MemorySessionStore):
+    def __init__(self, failures, hang=False):
+        super().__init__()
+        self.failures, self.hang, self.calls = failures, hang, 0
+
+    async def list_recent(self, now):
+        self.calls += 1
+        if self.calls <= self.failures:
+            if self.hang:
+                await asyncio.sleep(3600)
+            raise OSError("R2 down")
+        return await super().list_recent(now)
+
+
+def _flaky_services(tmp_path, store):
+    _, services = _services(tmp_path)
+    services.issuer._store = store
+    services.restore_backoff_s = 0.0
+    services.restore_timeout_s = 0.05
+    return services
+
+
+def test_restore_is_retried_before_the_start_aborts(tmp_path):
+    store = FlakyStore(failures=2)
+    asyncio.run(_flaky_services(tmp_path, store).start())
+    assert store.calls == 3
+
+
+def test_a_hung_restore_times_out_and_is_retried(tmp_path):
+    store = FlakyStore(failures=1, hang=True)
+    asyncio.run(_flaky_services(tmp_path, store).start())
+    assert store.calls == 2
+
+
+def test_a_restore_that_keeps_failing_aborts_the_start(tmp_path):
+    store = FlakyStore(failures=99)
+    services = _flaky_services(tmp_path, store)
+    with pytest.raises(OSError):
+        asyncio.run(services.start())
+    assert store.calls == services.restore_attempts
+
+
+def test_a_failed_directory_read_at_start_does_not_abort(tmp_path):
+    validator = signer(tmp_path, "v", "v1")
+    config = SandboxValidatorConfig(Path(tmp_path / "v.pem"), "v1", {}, None)
+    reads = []
+
+    async def broken():
+        reads.append(1)
+        raise OSError("R2 down")
+
+    async def fetch(address):
+        return None
+
+    services = build_sandbox_services(config, validator_hotkey=VALIDATOR,
+                                      session_store=MemorySessionStore(),
+                                      read_documents=broken, fetch_report=fetch)
+    asyncio.run(services.start())                      # logged, retried by the fleet
+    assert reads == [1] and services.fleet._next_refresh_at is not None
+    assert services.signer.public_key_b64 == validator.public_key_b64
+
+
+def test_stop_awaits_the_void_persists_within_its_bound(tmp_path):
+    _, services = _services(tmp_path)
+
+    async def run():
+        written = []
+
+        async def slow_update(document):
+            await asyncio.sleep(0.05)
+            written.append(document["session_id"])
+
+        async def stuck_update(document):
+            await asyncio.sleep(3600)
+
+        services.issuer._store.update = slow_update
+        task = asyncio.get_running_loop().create_task(slow_update({"session_id": "s-1"}))
+        services.issuer._tasks.add(task)
+        await services.stop(timeout=5)
+        assert written == ["s-1"]
+        stuck = asyncio.get_running_loop().create_task(stuck_update({}))
+        services.issuer._tasks.add(stuck)
+        started = asyncio.get_running_loop().time()
+        await services.stop(timeout=0.1)
+        assert asyncio.get_running_loop().time() - started < 2 and stuck.cancelled()
+
+    asyncio.run(run())
+
+
+def _wired(tmp_path, routes):
+    _, services = _services(tmp_path)
+    w = SimpleNamespace(job=JOB)
+
+    async def resolve(index):
+        raise AssertionError("not reached")
+
+    wire_signed_job(w, services=services, routes=lambda: routes, checkpoint_dir="/ck",
+                    tokenizer=None, vocab_size=None, chunk_tokens=32,
+                    intake_factory=lambda job, **kw: SimpleNamespace(source=SOURCE),
+                    resolver_factory=lambda split: SimpleNamespace(resolve=resolve))
+    return services
+
+
+def _terms(services, index=0):
+    engagement = {"kind": "corpus", "job_id": JOB.job_id, "prompt_index": index}
+    return asyncio.run(services.issuer._engagements["corpus"].terms("5Hot", engagement))
+
+
+def test_a_job_not_adopted_yet_is_retryable(tmp_path):
+    from reliquary.sandbox.routes import REFUSAL_STATUS
+
+    services = _wired(tmp_path, SimpleNamespace(routers={}, retired=set()))
+    refusal = _terms(services)
+    assert refusal.reason == "job_not_ready" and refusal.retry_after
+    assert REFUSAL_STATUS["job_not_ready"] == 503
+    assert _terms(_wired(tmp_path, None)).reason == "job_not_ready"
+
+
+def test_a_retired_job_loses_its_session_view(tmp_path):
+    class Router:
+        async def slots_remaining(self, index):
+            return 0
+
+    routes = SimpleNamespace(routers={JOB.job_id: Router()}, retired={JOB.job_id})
+    services = _wired(tmp_path, routes)
+    assert _terms(services).reason == "job_not_served"
+    assert JOB.job_id not in services.jobs
+
+
+def test_a_failed_job_can_be_forgotten(tmp_path):
+    services = _wired(tmp_path, None)
+    services.forget(JOB.job_id)
+    assert JOB.job_id not in services.jobs and _terms(services).reason == "job_not_served"

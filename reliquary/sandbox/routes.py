@@ -24,10 +24,11 @@ only be reached over TLS or the validator's tunnel. The miner's hotkey is normal
 its ss58 format-42 address (anything that does not decode is malformed); caps and
 idempotency key on that address.
 
-Closes are bounded: each reads and verifies a transcript of up to MAX_TRANSCRIPT_BYTES,
-so with `max_concurrent_closes` at most that many are read and verified at once; one
-that waits longer than `close_wait_s` (default `policy.io_timeout_s`) for its turn is
-refused `close_busy` (503, `Retry-After`) before its body is read."""
+Closes are bounded. A close's body (up to MAX_CLOSE_BODY_BYTES) must arrive within
+`close_body_timeout_s` (CLOSE_BODY_TIMEOUT_S by default; 408 `body_timeout` past it),
+and its signature is checked, before it takes one of `max_concurrent_closes` slots for
+the transcript's verification; one that waits longer than `close_wait_s` (default
+`policy.io_timeout_s`) for a slot is refused `close_busy` (503, `Retry-After`)."""
 
 from __future__ import annotations
 
@@ -60,10 +61,14 @@ THROTTLED = frozenset({429, 503})
 MAX_OPEN_BODY_BYTES = 16 * 1024
 MAX_CLOSE_BODY_BYTES = MAX_TRANSCRIPT_BYTES + 64 * 1024
 MAX_REPORTED_ERRORS = 8
+# A close's body must arrive within this many seconds (setting
+# RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S): a slow body never holds a worker for long.
+CLOSE_BODY_TIMEOUT_S = 30.0
 
 # Every reason either side of the routes refuses with, and the status a miner acts on:
-# 400/403/404/409/413/422 do not retry the same request; 429 waits for a session to
-# end; 503 retries after `Retry-After`; 500 is this validator's fault.
+# 400/403/404/409/413/422 do not retry the same request; 408 (the body did not arrive
+# in time) may be resent at once; 429 waits for a session to end; 503 retries after
+# `Retry-After`; 500 is this validator's fault.
 REFUSAL_STATUS: dict[str, int] = {
     # the request itself
     "stale_request": 400,
@@ -72,6 +77,7 @@ REFUSAL_STATUS: dict[str, int] = {
     # who is asking
     "bad_signature": 403, "hotkey_not_registered": 403, "miner_banned": 403,
     # what is asked for
+    "body_timeout": 408,
     "job_not_served": 404, "session_unknown": 404,
     "job_not_signed": 409, "prompt_mismatch": 409, "prompt_unavailable": 409,
     "job_complete": 409, "request_reused": 409, "request_conflict": 409,
@@ -85,7 +91,7 @@ REFUSAL_STATUS: dict[str, int] = {
     # this validator cannot answer now: retry
     "sandbox_capacity": 503, "directory_unavailable": 503, "store_unavailable": 503,
     "ledger_unavailable": 503, "task_unavailable": 503, "registration_unavailable": 503,
-    "close_busy": 503,
+    "close_busy": 503, "job_not_ready": 503,
     "internal_error": 500,
 }
 UNMAPPED_STATUS = 409
@@ -150,8 +156,15 @@ async def _read_bounded(request: Request, cap: int) -> bytes:
     return b"".join(chunks)
 
 
-async def _parse(request: Request, model: type[BaseModel], cap: int) -> Any:
-    raw = await _read_bounded(request, cap)
+async def _parse(request: Request, model: type[BaseModel], cap: int,
+                 deadline_s: float | None = None) -> Any:
+    if deadline_s is None:
+        raw = await _read_bounded(request, cap)
+    else:
+        try:
+            raw = await asyncio.wait_for(_read_bounded(request, cap), deadline_s)
+        except TimeoutError:
+            raise _Refused(_refuse("body_timeout", {"max_seconds": deadline_s})) from None
     try:
         body = json.loads(raw.decode("utf-8"), parse_constant=_no_constants)
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -184,9 +197,13 @@ def build_sandbox_sessions_router(
     clock: Callable[[], float] = time.time,
     max_concurrent_closes: int | None = None,
     close_wait_s: float | None = None,
+    close_body_timeout_s: float | None = CLOSE_BODY_TIMEOUT_S,
 ) -> APIRouter:
     if max_concurrent_closes is not None and max_concurrent_closes <= 0:
         raise ValueError("max_concurrent_closes must be positive")
+    if close_body_timeout_s is not None and not (math.isfinite(close_body_timeout_s)
+                                                 and close_body_timeout_s > 0):
+        raise ValueError("close_body_timeout_s must be a positive number of seconds")
     closes = None if max_concurrent_closes is None else asyncio.Semaphore(max_concurrent_closes)
     close_wait = float(policy.io_timeout_s if close_wait_s is None else close_wait_s)
     audience = ss58_address(validator_hotkey)
@@ -263,33 +280,39 @@ def build_sandbox_sessions_router(
 
     @router.post(sandbox_close_path(prefix, "{session_id}"))
     async def close_session(session_id: str, http: Request) -> JSONResponse:
-        if closes is None:
-            return await guarded("close", lambda: closing(session_id, http))
-        try:
-            await asyncio.wait_for(closes.acquire(), close_wait)
-        except TimeoutError:
-            logger.warning("sandbox session close %s refused: %d closes already in flight",
-                           session_id[:64], max_concurrent_closes)
-            return refuse("close_busy", {"max_concurrent": max_concurrent_closes})
-        try:
-            return await guarded("close", lambda: closing(session_id, http))
-        finally:
-            closes.release()
+        async def step() -> JSONResponse:
+            # The body is read (bounded in size and time) and its signature checked
+            # before a close slot is taken: a slow or unsigned body never holds one.
+            request, hotkey = await _parse(http, SandboxSessionCloseRequest,
+                                           MAX_CLOSE_BODY_BYTES, close_body_timeout_s)
+            if request.session_id != session_id:
+                return refuse("session_unknown", {"session_id": request.session_id})
+            await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
+            if closes is None:
+                return await settle(request, hotkey)
+            try:
+                await asyncio.wait_for(closes.acquire(), close_wait)
+            except TimeoutError:
+                logger.warning("sandbox session close %r refused: %d closes already in flight",
+                               session_id[:64], max_concurrent_closes)
+                return refuse("close_busy", {"max_concurrent": max_concurrent_closes})
+            try:
+                return await settle(request, hotkey)
+            finally:
+                closes.release()
 
-    async def closing(session_id: str, http: Request) -> JSONResponse:
-        request, hotkey = await _parse(http, SandboxSessionCloseRequest, MAX_CLOSE_BODY_BYTES)
-        if request.session_id != session_id:
-            return refuse("session_unknown", {"session_id": request.session_id})
-        await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
-        outcome = await issuer.close(hotkey=hotkey, session_id=session_id,
-                                     reason=request.reason, transcript=request.transcript)
-        refused = outcome_of("close", hotkey, outcome)
-        if refused is not None:
-            return refused
-        return _answer(dict(outcome))
+        async def settle(request, hotkey: str) -> JSONResponse:
+            outcome = await issuer.close(hotkey=hotkey, session_id=session_id,
+                                         reason=request.reason, transcript=request.transcript)
+            refused = outcome_of("close", hotkey, outcome)
+            if refused is not None:
+                return refused
+            return _answer(dict(outcome))
+
+        return await guarded("close", step)
 
     return router
 
 
-__all__ = ["MAX_CLOSE_BODY_BYTES", "MAX_OPEN_BODY_BYTES", "REFUSAL_STATUS",
+__all__ = ["CLOSE_BODY_TIMEOUT_S", "MAX_CLOSE_BODY_BYTES", "MAX_OPEN_BODY_BYTES", "REFUSAL_STATUS",
            "build_sandbox_sessions_router", "ss58_address"]
