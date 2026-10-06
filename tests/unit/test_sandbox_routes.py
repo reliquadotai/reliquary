@@ -542,3 +542,47 @@ def test_the_wire_models_refuse_unknown_fields():
     with pytest.raises(ValueError):
         SandboxSessionOpenRequest(**open_body(request_id="A" * 32))
     assert json.loads(SandboxSessionOpenRequest(**open_body()).model_dump_json())["at"] == NOW
+
+
+def test_closes_beyond_the_limit_wait_then_are_refused_busy():
+    import asyncio
+
+    import httpx
+
+    release = asyncio.Event()
+
+    class SlowIssuer(FakeIssuer):
+        async def close(self, **kw):
+            self.calls.append(("close", kw))
+            await release.wait()
+            return {"session_id": "s-1", "state": "closed", "status": "expired"}
+
+    issuer = SlowIssuer(None)
+    app = FastAPI()
+    app.include_router(build_sandbox_sessions_router(
+        issuer, policy=SandboxPolicy(), validator_hotkey=VALIDATOR, verify_open=accept,
+        verify_close=accept, clock=lambda: NOW, max_concurrent_closes=1, close_wait_s=0.2))
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://v") as http:
+            first = asyncio.ensure_future(http.post(CLOSE, json=close_body()))
+            while not issuer.calls:
+                await asyncio.sleep(0.01)
+            busy = await http.post(CLOSE, json=close_body())
+            release.set()
+            done = await first
+            after = await http.post(CLOSE, json=close_body())
+        return busy, done, after
+
+    busy, done, after = asyncio.run(run())
+    assert busy.status_code == 503 and busy.json()["reason"] == "close_busy"
+    assert int(busy.headers["Retry-After"]) >= 1
+    assert done.status_code == 200 and after.status_code == 200
+    assert len(issuer.calls) == 2                   # the refused close never reached it
+
+
+def test_the_close_limit_must_be_positive():
+    with pytest.raises(ValueError):
+        build_sandbox_sessions_router(FakeIssuer(None), policy=SandboxPolicy(),
+                                      validator_hotkey=VALIDATOR, max_concurrent_closes=0)

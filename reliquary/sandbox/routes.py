@@ -22,11 +22,16 @@ A signed open body is nonetheless a bearer credential for its freshness window
 (±policy.request_skew_s, 120 s): the client must never log it, and this endpoint must
 only be reached over TLS or the validator's tunnel. The miner's hotkey is normalised to
 its ss58 format-42 address (anything that does not decode is malformed); caps and
-idempotency key on that address. Task 12 adds a concurrency limit for closes (each
-verifies a transcript of up to MAX_TRANSCRIPT_BYTES) when it mounts this router."""
+idempotency key on that address.
+
+Closes are bounded: each reads and verifies a transcript of up to MAX_TRANSCRIPT_BYTES,
+so with `max_concurrent_closes` at most that many are read and verified at once; one
+that waits longer than `close_wait_s` (default `policy.io_timeout_s`) for its turn is
+refused `close_busy` (503, `Retry-After`) before its body is read."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -80,6 +85,7 @@ REFUSAL_STATUS: dict[str, int] = {
     # this validator cannot answer now: retry
     "sandbox_capacity": 503, "directory_unavailable": 503, "store_unavailable": 503,
     "ledger_unavailable": 503, "task_unavailable": 503, "registration_unavailable": 503,
+    "close_busy": 503,
     "internal_error": 500,
 }
 UNMAPPED_STATUS = 409
@@ -176,7 +182,13 @@ def build_sandbox_sessions_router(
     verify_close: Callable = verify_sandbox_close_signature,
     registration: Callable[[str], Awaitable[str | None]] | None = None,
     clock: Callable[[], float] = time.time,
+    max_concurrent_closes: int | None = None,
+    close_wait_s: float | None = None,
 ) -> APIRouter:
+    if max_concurrent_closes is not None and max_concurrent_closes <= 0:
+        raise ValueError("max_concurrent_closes must be positive")
+    closes = None if max_concurrent_closes is None else asyncio.Semaphore(max_concurrent_closes)
+    close_wait = float(policy.io_timeout_s if close_wait_s is None else close_wait_s)
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
@@ -251,19 +263,30 @@ def build_sandbox_sessions_router(
 
     @router.post(sandbox_close_path(prefix, "{session_id}"))
     async def close_session(session_id: str, http: Request) -> JSONResponse:
-        async def step() -> JSONResponse:
-            request, hotkey = await _parse(http, SandboxSessionCloseRequest, MAX_CLOSE_BODY_BYTES)
-            if request.session_id != session_id:
-                return refuse("session_unknown", {"session_id": request.session_id})
-            await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
-            outcome = await issuer.close(hotkey=hotkey, session_id=session_id,
-                                         reason=request.reason, transcript=request.transcript)
-            refused = outcome_of("close", hotkey, outcome)
-            if refused is not None:
-                return refused
-            return _answer(dict(outcome))
+        if closes is None:
+            return await guarded("close", lambda: closing(session_id, http))
+        try:
+            await asyncio.wait_for(closes.acquire(), close_wait)
+        except TimeoutError:
+            logger.warning("sandbox session close %s refused: %d closes already in flight",
+                           session_id[:64], max_concurrent_closes)
+            return refuse("close_busy", {"max_concurrent": max_concurrent_closes})
+        try:
+            return await guarded("close", lambda: closing(session_id, http))
+        finally:
+            closes.release()
 
-        return await guarded("close", step)
+    async def closing(session_id: str, http: Request) -> JSONResponse:
+        request, hotkey = await _parse(http, SandboxSessionCloseRequest, MAX_CLOSE_BODY_BYTES)
+        if request.session_id != session_id:
+            return refuse("session_unknown", {"session_id": request.session_id})
+        await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
+        outcome = await issuer.close(hotkey=hotkey, session_id=session_id,
+                                     reason=request.reason, transcript=request.transcript)
+        refused = outcome_of("close", hotkey, outcome)
+        if refused is not None:
+            return refused
+        return _answer(dict(outcome))
 
     return router
 
