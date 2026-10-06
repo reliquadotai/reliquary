@@ -9,10 +9,12 @@ extras until it is published, which is a user decision.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 SANDBOX_DISTRIBUTION = "reliquary-sandbox"
 # The reliquary-sandbox commit this build verifies and drives. A job's contract pins
 # its own (`episode.sandbox.sandbox_commit`); both must agree.
-SANDBOX_COMMIT = "e7c765c596d0017fe9698916efd73eadd7f1b010"
+SANDBOX_COMMIT = "bfce1e8dec8fa365cbc3098e3bad4c51ff321d84"
 
 
 class SandboxUnavailable(RuntimeError):
@@ -51,5 +53,23 @@ def sandbox_commit_refusal(pinned: str) -> str | None:
     return None
 
 
+def transcript_cap_refusal(caps) -> str | None:
+    """Why a machine advertising these capacity-report `caps` cannot be placed, or None.
+
+    The machine stops a transcript at its `max_transcript_bytes` (compact UTF-8 JSON,
+    final record included); the submission body carries it under Catalyst's own
+    `MAX_TRANSCRIPT_BYTES`, measured the same way. A machine whose cap is larger
+    would sign honest episodes no miner can submit, so the fleet refuses it."""
+    from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
+
+    value = caps.get("max_transcript_bytes") if isinstance(caps, Mapping) else None
+    if type(value) is not int or value <= 0:
+        return "the capacity report carries no max_transcript_bytes"
+    if value > MAX_TRANSCRIPT_BYTES:
+        return (f"the machine's max_transcript_bytes {value} is over the submission "
+                f"cap {MAX_TRANSCRIPT_BYTES}")
+    return None
+
+
 __all__ = ["SANDBOX_COMMIT", "SANDBOX_DISTRIBUTION", "SandboxUnavailable",
-           "require_sandbox", "sandbox_commit_refusal"]
+           "require_sandbox", "sandbox_commit_refusal", "transcript_cap_refusal"]

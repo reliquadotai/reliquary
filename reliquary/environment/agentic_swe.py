@@ -240,9 +240,9 @@ def installed_env_package(package: str) -> str:
     """The `env_package` a gateway serving this install writes into record 0:
     `<distribution>==<version>+g<16 hex>`, computed by reliquary-sandbox's own task
     registry over the `sandbox` module's installed files (one source of truth)."""
-    from reliquary_sandbox_service.episodes.registry import _package_of
+    from reliquary_sandbox_service.episodes.registry import env_package_of
 
-    return _package_of(f"{package.replace('-', '_')}.sandbox:sandbox_task")
+    return env_package_of(f"{package.replace('-', '_')}.sandbox:sandbox_task")
 
 
 def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None:
