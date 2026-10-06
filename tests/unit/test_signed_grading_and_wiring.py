@@ -502,3 +502,18 @@ def test_the_pre_auth_close_limit_is_a_setting_passed_to_the_route(tmp_path, mon
     monkeypatch.setattr(routes, "build_sandbox_sessions_router", spy)
     _services(tmp_path, close_preauth_concurrency=3)
     assert built["max_preauth_closes"] == 3
+
+
+def test_the_runbook_lists_every_sandbox_setting_with_its_default():
+    """M6: every RELIQUARY_SANDBOX_* setting the code reads is in the runbook's table."""
+    import re
+
+    root = Path(__file__).resolve().parents[2]
+    names = set()
+    for path in (root / "reliquary").rglob("*.py"):
+        names |= set(re.findall(r"RELIQUARY_SANDBOX_[A-Z_0-9]+", path.read_text()))
+    runbook = (root / "docs/runbooks/agentic-corpus-swe.md").read_text()
+    rows = {m.group(1): m.group(2) for m in re.finditer(
+        r"^\| `(RELIQUARY_SANDBOX_[A-Z_0-9]+)` \| ([^|]+) \|", runbook, re.M)}
+    assert names and names <= set(rows), sorted(names - set(rows))
+    assert all(default.strip() for default in rows.values())

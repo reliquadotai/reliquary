@@ -105,7 +105,70 @@ Rolling back is the reverse: retire the signed job first, then unset the key set
    moved 30 s earlier for clock skew). From the next directory refresh on, transcripts
    opened after that time no longer verify. Transcripts already admitted stay admitted.
 9. `status --status draining` stops new sessions. A machine silent for 60 s is drained
-   automatically and its live sessions voided (no fault to their miners).
+   automatically and its live sessions voided (no fault to their miners). When EVERY
+   listed machine is silent in the same poll, the validator suspects its own egress:
+   nothing is drained, an `ALERT` is logged once, and the silence of the others is
+   counted again from the first poll in which one machine answers. A single-machine
+   fleet is therefore never drained for silence (it gets no new session while silent;
+   its sessions end by close or lapse).
+
+### Every setting
+
+All are validator environment variables; each numeric one must be a positive, finite
+number (a bad value refuses the start).
+
+| Setting | Default | What it bounds |
+| --- | --- | --- |
+| `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE` | unset (signed jobs not served) | the validator's Ed25519 key (0600, owned by the process user) |
+| `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID` | unset (signed jobs not served) | its key id, as the machines know it |
+| `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS` | `{}` | earlier keys whose tokens may still be in flight |
+| `RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY` | 8 | live sessions per hotkey |
+| `RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB` | 4 | live sessions per hotkey and job |
+| `RELIQUARY_SANDBOX_MAX_OPENS_PER_HOUR` | 120 | opens per hotkey per rolling hour (aborted and voided refunded) |
+| `RELIQUARY_SANDBOX_MAX_ABORTED_PER_DAY` | 20 | aborted sessions per hotkey per rolling 24 h |
+| `RELIQUARY_SANDBOX_MAX_REFUSED_OPENS_PER_MINUTE` | 60 | refused opens per hotkey per rolling minute, then `429 open_refused_rate` before any ledger read |
+| `RELIQUARY_SANDBOX_OPEN_WINDOW_S` | 900 | token validity before the budgets' `wall_s` (box creation and `prepare`) |
+| `RELIQUARY_SANDBOX_REQUEST_SKEW_S` | 120 | a signed request's freshness, either side of the validator clock |
+| `RELIQUARY_SANDBOX_RETRY_AFTER_S` | 10 | `Retry-After` of a refusal that names no delay of its own |
+| `RELIQUARY_SANDBOX_IO_TIMEOUT_S` | 10 | each ledger read, task resolution and session write of an open or close |
+| `RELIQUARY_SANDBOX_CLAIM_TTL_S` | 300 | how long an intake's claim freezes a session (a leaked claim alerts past it) |
+| `RELIQUARY_SANDBOX_CLAIM_WAIT_S` | 5 | how long an intake's claim waits for the issuer lock, then `503 sandbox_session_busy` |
+| `RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S` | 30 | the machine directory's re-read period |
+| `RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S` | 120 | the directory age past which the validator fails closed |
+| `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` | 15 | each directory read |
+| `RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY` | 8 | closes read and authenticated at once; one more gets `503 close_busy` at once, before its body is read |
+| `RELIQUARY_SANDBOX_CLOSE_CONCURRENCY` | 4 | authenticated closes whose transcript is verified at once (a wait past the io timeout gets `503 close_busy`) |
+| `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` | 30 | the time a close's body has to arrive, else `408 body_timeout` |
+
+Fixed (not settings): one live session per (hotkey, prompt); a machine silent 60 s is
+drained; heartbeat summaries are written to R2 at most once a minute, each write bounded
+to 5 s.
+
+### Refusal names
+
+The session route (`/corpus/sandbox/sessions`) and the submission route
+(`/corpus/submit`) name the same conditions differently; a miner treats both as below.
+
+| Session route (`reason`) | Submission route | Meaning | Miner |
+| --- | --- | --- | --- |
+| `503 directory_unavailable` | `503 sandbox_directory_unavailable` | the machine directory is stale | wait `Retry-After` |
+| `503 session_claimed`, `503 session_busy` | `503 sandbox_session_busy` | another submission of the session is in flight, or the issuer lock is busy | wait `Retry-After` |
+| `409 session_expired` | `sandbox_session_expired` | received after `expires_at + 1800 s` (validator clock), even while the directory is stale | give up (withdraw) |
+| `409 session_submitted` | `sandbox_session_reused` | already paid | give up |
+| `409 session_not_submittable` | `sandbox_transcript_invalid` (`session_state`) | closed, voided, aborted or lapsed | give up |
+| `503 ledger_unavailable`, `503 job_not_ready`, `503 store_unavailable`, `503 sandbox_capacity`, `503 task_unavailable`, `503 close_busy` | (none) | the validator is serving but busy | wait `Retry-After`; never counted toward stopping the hotkey |
+| `429 open_refused_rate` and the other 429 caps | (none) | a per-hotkey cap | wait `Retry-After` |
+
+A replay job's submission that carries a transcript is `malformed_submission`; an
+export picks the parser from the job (`execution`), never from the record, and counts a
+record of the other kind as `kind_mismatch` (and a signed row on a host without
+reliquary-sandbox as `sandbox_unavailable`).
+
+### What is stored
+
+Submission records keep the transcript's records and the token's claims, never the
+token's `signature` (a bearer secret until the episode closes): the grader and the
+export read the claims only. Session documents never carry it either.
 
 ### Restore
 
@@ -137,6 +200,11 @@ TLS or the validator's tunnel, and never log request bodies at the proxy.
 Docker. It reports every unsubmitted session so that its reservation ends early.
 A graded transcript it will not submit (its own precheck refused it, the submission
 was refused, the deadline passed) is closed with `withdraw` and that transcript: the
-validator verifies it and frees the slot and the hotkey's caps for good. Signed mode
+validator verifies it and frees the slot and the hotkey's caps for good. A graded
+transcript it will submit is first closed `final` (`closed_graded`: it keeps its slot
+and no drain can void it), then submitted; the submission's retries stop at the
+validator's deadline, and the session is then withdrawn. A resent open answered
+`request_reused` for a still-`live` session (a validator restart lost its token) closes
+that session `open_failed`. Signed mode
 needs `--validator-hotkey` (session requests are signed for that validator) and keeps at
 most `--max-live-per-job` (default 4, the validator's cap) sessions live per job.
