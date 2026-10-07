@@ -1314,7 +1314,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         if split is None:
             return model is not None
         info = await gpu_status.get("/info")
-        if info is None or (info.get("model_id"), info.get("model_revision")) != (
+        if info is None or info.get("ready", True) is not True or (
+                info.get("model_id"), info.get("model_revision")) != (
                 ACTIVE_PROTOCOL_PROFILE.model_id, ACTIVE_PROTOCOL_PROFILE.model_revision):
             return False
         # One existing job per judge is enough to prove its status route is live.

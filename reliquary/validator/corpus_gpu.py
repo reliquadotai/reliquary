@@ -17,11 +17,13 @@ from __future__ import annotations
 import array
 import asyncio
 import collections
+import inspect
 import json
 import logging
 import os
 import sys
 import time
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -172,6 +174,7 @@ class GpuBatcher:
         self._on_fatal = on_fatal
         self._fatal_after = fatal_after
         self._failures = 0
+        self.ready = True
         self.stats = collections.Counter()
 
     @property
@@ -204,9 +207,32 @@ class GpuBatcher:
     async def _call(self, rows, chunk_tokens, topk):
         from reliquary.validator.corpus_judge_threads import run_in
 
-        return await run_in(self._executor, self._score, rows, chunk_tokens, topk)
+        result = await run_in(self._executor, self._score, rows, chunk_tokens, topk)
+        if rows:
+            self.ready = True
+        return result
 
     def _failed(self, exc: BaseException) -> None:
+        self.ready = False
+        # Executor Futures may keep their own traceback. Clear completed
+        # synchronous forward frames, but never close a suspended caller if
+        # the same exception was raised before. Keep its type and message.
+        continuation_flags = inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_GENERATOR
+        pending, seen = [exc], set()
+        while pending:
+            error = pending.pop()
+            if id(error) in seen:
+                continue
+            seen.add(id(error))
+            pending.extend(link for link in (error.__cause__, error.__context__) if link is not None)
+            for frame, _ in traceback.walk_tb(error.__traceback__):
+                if frame.f_code.co_flags & continuation_flags:
+                    continue
+                try:
+                    frame.clear()
+                except RuntimeError:
+                    pass  # A still-executing synchronous caller cannot be cleared.
+            error.__traceback__ = error.__cause__ = error.__context__ = None
         if self._on_error is not None:
             self._on_error()
         if not is_out_of_memory(exc):
@@ -233,22 +259,28 @@ class GpuBatcher:
             return
         rows = [row for r in live for row in r.rows]
         started = time.monotonic()
+        failure = None
         try:
             scores, forward, verify = await self._call(rows, live[0].chunk_tokens, live[0].topk)
         except Exception as exc:  # noqa: BLE001 - handed to the requests
+            failure = exc
+        if failure is not None:
             self.stats["failed_batches"] += 1
-            self._failed(exc)
+            self._failed(failure)
             if len(live) == 1:
-                self._settle(live[0], exc=exc)
+                self._settle(live[0], exc=failure)
                 return
             logger.warning("corpus gpu batch of %d requests failed (%r); each alone",
-                           len(live), exc)
+                           len(live), failure)
             for request in live:
+                failure = None
                 try:
                     result = await self._call(request.rows, request.chunk_tokens, request.topk)
                 except Exception as alone:  # noqa: BLE001
-                    self._failed(alone)
-                    self._settle(request, exc=alone)
+                    failure = alone
+                if failure is not None:
+                    self._failed(failure)
+                    self._settle(request, exc=failure)
                 else:
                     self._failures = 0
                     self._settle(request, result)
@@ -284,7 +316,7 @@ def build_gpu_app(batcher: GpuBatcher, info: dict) -> FastAPI:
 
     @app.get("/info")
     async def gpu_info() -> dict:
-        return info
+        return {**info, "ready": batcher.ready}
 
     @app.post("/score")
     async def score(request: Request):

@@ -113,15 +113,17 @@ def test_generation_control_cli_preserves_explicit_initial_ownership(monkeypatch
 
 
 @pytest.mark.parametrize("initial_jobs", [False, True])
+@pytest.mark.parametrize("scorer_ready", [False, True, None])
 def test_shared_generation_mode_never_loads_another_model_and_keeps_audit_rechecks(
     seeded_job, fake_r2, fixed_drand_chain, wired_records, monkeypatch, initial_jobs,  # noqa: F811
+    scorer_ready,
 ):
     import huggingface_hub
     import uvicorn
     from reliquary.infrastructure import corpus_executor_store, corpus_job_store
     from reliquary.protocol import profiles
     from reliquary.shared import modeling
-    from reliquary.validator import corpus_auditor, corpus_gpu, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_feed, corpus_gpu, corpus_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
     from tests.unit.test_corpus_audit_remote import _R2
     from tests.unit.test_corpus_multi_job_validator import _entry
@@ -148,6 +150,13 @@ def test_shared_generation_mode_never_loads_another_model_and_keeps_audit_rechec
     async def info(path):
         return {"vocab_size": 4096}
 
+    async def gpu_info(self, path):
+        assert path == "/info"
+        facts = {"model_id": profile.model_id, "model_revision": profile.model_revision}
+        if scorer_ready is not None:
+            facts["ready"] = scorer_ready
+        return facts
+
     async def idle(self):
         await asyncio.Future()
 
@@ -155,6 +164,7 @@ def test_shared_generation_mode_never_loads_another_model_and_keeps_audit_rechec
         return None
 
     monkeypatch.setattr(corpus_gpu, "read_info", info)
+    monkeypatch.setattr(corpus_feed.UdsClient, "get", gpu_info)
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
     monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", settle)
     scored = []
@@ -177,6 +187,12 @@ def test_shared_generation_mode_never_loads_another_model_and_keeps_audit_rechec
             self.app = config.app
 
         async def serve(self):
+            await asyncio.sleep(0)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app),
+                                         base_url="http://corpus") as client:
+                observed = (await client.get("/corpus/runtime-contract")).json()
+            assert observed["audit_ready"] is (scorer_ready is not False)
+            assert observed["ready"] is (scorer_ready is not False)
             runtime = self.app.state.corpus_runtime_contract
             assert runtime["execution_scope"] == "generation-operations"
             assert runtime["durable_executor_attempts"] is True
