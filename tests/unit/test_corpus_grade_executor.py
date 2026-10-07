@@ -711,3 +711,19 @@ def test_the_grade_executor_command_refuses_unbounded_box_disks(monkeypatch):
     result = CliRunner().invoke(app, argv + ["--allow-non-xfs"])        # tests only: unchecked
     assert result.exit_code == 0, result.output
     assert calls[0]["limits"].disk_gb is None
+
+
+def test_the_grade_box_index_is_refreshed_before_the_env_grades(monkeypatch):
+    """The env's reset would otherwise rewrite every file of the image and a
+    meson build (pandas) would recompile everything on the first import."""
+    seen = []
+
+    async def grade(box, data, patch):
+        seen.append(list(box.runs))
+        return types.SimpleNamespace(reward=1.0, applied=True)
+
+    _fake_grading(monkeypatch, grade)
+    task = types.SimpleNamespace(data=types.SimpleNamespace(
+        timeout=types.SimpleNamespace(scoring=60), workdir="/testbed"))
+    asyncio.run(corpus_grade_executor.grade_patch(task, "diff"))
+    assert seen == [[["git", "-C", "/testbed", "update-index", "-q", "--refresh"]]]
