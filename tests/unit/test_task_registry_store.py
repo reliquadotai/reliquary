@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from reliquary.shared.task_registry import (
@@ -48,15 +50,15 @@ class FakeR2:
         return False
 
     async def get_object(self, Bucket, Key):
-        if self.body is None:
+        if Key != store.REGISTRY_KEY or self.body is None:
             raise _client_error("NoSuchKey")
 
         class _Body:
             def __init__(self, data):
-                self._data = data
+                self._stream = io.BytesIO(data)
 
-            async def read(self):
-                return self._data
+            async def read(self, amt=None):
+                return self._stream.read(-1 if amt is None else amt)
 
         return {"Body": _Body(self.body), "ETag": self.etag}
 
