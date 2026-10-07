@@ -42,13 +42,22 @@ Decision:
 - Not paid: unusable groups (grading error, incomplete).
 - To code: replace #327's fixed reserve b + divisor d + burned remainder with this model.
 
-## C. Proof cost of exploration: OPEN
+## C. Verifying exploration groups: DECIDED (07-10)
 
-Today every exploration group is fully proven. At 32k tokens on Teutonic that is
-about 20-30 s of H100 per group. Cheap no-signal groups can starve the proof plane.
-
-Recommendation: sampled TOPLOC audit, as in the corpus, instead of a full proof. A
-separate exploration proof budget that can never starve training.
+- **Training groups (in-zone):** full pipeline unchanged. Every group is proven,
+  because its tokens enter the gradient, the trainer needs π_old from the proof, and
+  forced-seed checks rely on it.
+- **Exploration groups (out-of-zone, paid 15 %):** sampled TOPLOC audit, not trained.
+  - **q = 15 % base** (same as the corpus). Extra proof load is about 0.67 × q ≈ +10 %.
+  - **100 % audit for the first 100 exploration groups of a new hotkey.**
+  - Audit draw by drand **after** submission (not predictable). Payment is held until
+    the window's draw is known.
+  - **Sanction** on a failed audit: forfeit all exploration earnings of the period, and
+    no exploration for **24 h**.
+  - A separate exploration proof budget, lower priority than training (never starves
+    it).
+  - Published observations carry `audited` / `pending` / `unproven`.
+  - Always on, for free: validator-recomputed grading, prompt fidelity, length bounds.
 
 ## D. What is published to miners: DECIDED (07-10)
 
