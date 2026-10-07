@@ -319,7 +319,10 @@ class CorpusGrader:
         await self._learn_arrivals(sid for sid in listed if sid not in self._final)
         await self._learn_arrivals(self._regrading | self._regrade_retry)
         self._listed = {sid for sid in listed if sid not in self._final}
-        for sid in listed:
+        # Oldest arrival first (the gate admits in this order): a period is paid
+        # once all of it is graded, so a backlog graded in id order, larger than
+        # what the executors grade meanwhile, would let no period close.
+        for sid in sorted(listed, key=lambda sid: (self._arrival.get(sid, math.inf), sid)):
             self._enqueue(sid)
         self._ungraded = sum(1 for sid in listed if sid not in self._final)
         for executor_id in sorted(self._held_executors - self._executor_regrades_inflight):

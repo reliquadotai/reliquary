@@ -1187,3 +1187,41 @@ def test_an_uncertified_replay_without_any_vote_voids_unpaid():
     assert doc["replay"]["status"] == "uncertified" and doc["replay_certified"] is False
     assert records.voided[SID]["reason"] == "replay_unjudgeable" and voided == [SID]
     assert records.voided[SID]["graded_by"] == [] and states.states == {}
+
+
+def test_the_rescan_grades_the_oldest_arrivals_first():
+    """A backlog relisted after a restart is graded by arrival, not by id: a
+    period settles once all of it is graded, so an id-ordered backlog larger
+    than the grading rate never lets any period close."""
+    records, dispatcher = _Records(), _Dispatcher(FAILED, CERTIFIED)
+    arrivals = {"c" * 64: 100.0, "a" * 64: 300.0, "b" * 64: 200.0}
+    records.submissions = {sid: {**_record(), "received_at": at} for sid, at in arrivals.items()}
+    grader = CorpusGrader(job=_job(fraction=0.0), records=records, dispatcher=dispatcher,
+                          renderer=R, source=SweSource([("i0", "p"), ("repo__x.1", "fix it"),
+                                                        ("i2", "q")]),
+                          params=AuditParams(), clock=lambda: 1000.0, concurrency=1)
+
+    async def run():
+        await grader.rescan_once()
+        await grader.drain()
+
+    asyncio.run(run())
+    graded = [item["submission_id"] for item in dispatcher.items if item["mode"] == "grade"]
+    assert graded == sorted(arrivals, key=arrivals.get)
+
+
+def test_the_grade_lease_cap_follows_its_setting():
+    """Read once at import: checked in a fresh interpreter."""
+    import os
+    import subprocess
+    import sys
+
+    code = ("from reliquary.validator import corpus_grade_remote as g; "
+            "print(g.MAX_LEASES_PER_EXECUTOR)")
+    def cap(value):
+        env = {**os.environ, "RELIQUARY_CORPUS_GRADE_MAX_LEASES_PER_EXECUTOR": value}
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                              text=True)
+
+    assert cap("12").stdout.strip() == "12"
+    assert cap("500").returncode != 0  # out of bounds: refused at start, as every bound
