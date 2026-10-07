@@ -70,6 +70,7 @@ def _refusal(entry, job=None, process_contract=None, **kw):
                                                   "protocol_version": 5},
             fingerprint=kw.pop("fingerprint", CHECKPOINT),
             profile_of=lambda e: _profile(e.contract["model_id"], e.contract["model_revision"]),
+            generation_only=kw.pop("generation_only", False),
         )
     finally:
         profiles.toploc_proof = real
@@ -77,6 +78,39 @@ def _refusal(entry, job=None, process_contract=None, **kw):
 
 def test_an_entry_on_this_model_with_this_environment_is_admitted():
     assert _refusal(_hot_entry()) is None
+
+
+def test_generation_ownership_is_disjoint_from_legacy_and_other_orders():
+    from reliquary.validator.corpus_hot_jobs import generation_entry_screen, order_entry_screen
+
+    entry = _hot_entry(job_id="order-gen-ops-new")
+    job = _hot_job(job_id=entry.job_id, submit="scoped")
+    assert order_entry_screen(entry)[0] == OTHER_MODEL
+    assert generation_entry_screen(entry) is None
+    assert _refusal(entry, job, generation_only=True) is None
+    assert _refusal(entry, job)[0] == OTHER_MODEL
+    for job_id in ("legacy-job", "order-ops-old", "order-gen-customer", "order-eval-ops-new"):
+        assert generation_entry_screen(_hot_entry(job_id=job_id))[0] == OTHER_MODEL
+
+
+def test_generation_ownership_keeps_pin_and_scoped_single_turn_requirements():
+    entry = _hot_entry(job_id="order-gen-ops-new")
+    job = _hot_job(job_id=entry.job_id, submit="scoped")
+    assert _refusal(entry, _hot_job(job_id=entry.job_id, submit="scoped", episode=object()),
+                    generation_only=True)[0] == REFUSED
+    assert _refusal(entry, _hot_job(job_id=entry.job_id, submit="legacy"),
+                    generation_only=True)[0] == REFUSED
+    assert _refusal(entry, job, generation_only=True, fingerprint="0" * 64)[0] == REFUSED
+
+
+def test_generation_ownership_uses_the_existing_configured_admin_prefix(monkeypatch):
+    from reliquary.validator.corpus_hot_jobs import generation_entry_screen, order_entry_screen
+
+    monkeypatch.setenv("RELIQUARY_ADMIN_TASK_PREFIX", "pilot-")
+    entry = _hot_entry(job_id="pilot-gen-ops-new")
+    assert generation_entry_screen(entry) is None
+    assert order_entry_screen(entry)[0] == OTHER_MODEL
+    assert generation_entry_screen(_hot_entry(job_id="order-gen-ops-new"))[0] == OTHER_MODEL
 
 
 def test_an_entry_for_another_model_is_ignored_not_refused():
@@ -259,6 +293,51 @@ def test_retired_stops_admission_drains_then_unwires():
     asyncio.run(go())
 
 
+def test_pause_keeps_draining_and_resume_reuses_the_same_running_job():
+    async def go():
+        entry = _hot_entry(cap=0)
+        h = _Harness([entry])
+        await h.set.refresh()
+        await asyncio.sleep(0)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def admitted_write():
+            async with h.routes.admission("job-b"):
+                entered.set()
+                await release.wait()
+
+        pending = asyncio.create_task(admitted_write())
+        await entered.wait()
+        entry.admission = "paused"
+        await h.set.refresh()
+        await h.set.refresh()
+        assert h.routes.admission_pending("job-b")
+        assert h.cancelled == [] and h.wired == ["corpus-b"]
+        async with h.client() as client:
+            assert (await client.get("/corpus/jobs/job-b/next/5Hot")).status_code == 409
+            assert (await client.get("/corpus/next/5Hot")).status_code == 409
+            assert (await client.get("/corpus/jobs/job-b/job")).status_code == 200
+            assert (await client.get("/corpus/jobs/job-b/cursor/5Hot")).status_code == 200
+            assert (await client.get("/corpus/jobs")).json() == {"jobs": []}
+        release.set()
+        await pending
+        h.drained["job-b"] = True
+        await h.set.refresh()
+        assert "job-b" in h.set.served and h.cancelled == []
+        entry.admission = "open"
+        await h.set.refresh()
+        async with h.client() as client:
+            assert (await client.get("/corpus/jobs/job-b/next/5Hot")).status_code == 200
+            assert (await client.get("/corpus/jobs")).json() == {"jobs": ["job-b"]}
+        assert h.wired == ["corpus-b"] and h.caps == {}
+        for tasks in h.set._tasks.values():
+            for task in tasks:
+                task.cancel()
+
+    asyncio.run(go())
+
+
 def test_a_retired_job_refuses_submit_and_skip_with_410():
     from tests.unit.test_corpus_multi_job_service import _body
 
@@ -277,6 +356,26 @@ def test_a_retired_job_refuses_submit_and_skip_with_410():
             for path in ("/corpus/skip", "/corpus/jobs/swe-v1/skip"):
                 response = await client.post(path, json=skip)
                 assert response.status_code == 410, (path, response.text)
+
+    asyncio.run(go())
+
+
+def test_a_paused_job_refuses_legacy_and_scoped_submit_and_skip_before_storage():
+    from tests.unit.test_corpus_multi_job_service import _body
+
+    async def go():
+        entry = _hot_entry(job_id="swe-v1")
+        entry.admission = "paused"
+        h = _Harness([entry])
+        await h.set.refresh()
+        async with h.client() as client:
+            skip = {"job_id": "swe-v1", "miner_hotkey": "5Hot", "cursor": 0, "prompt_index": 0,
+                    "to_cursor": 1, "signature": "ok"}
+            for path, body in (("/corpus/submit", _body("swe-v1")),
+                               ("/corpus/jobs/swe-v1/submit", _body("swe-v1")),
+                               ("/corpus/skip", skip), ("/corpus/jobs/swe-v1/skip", skip)):
+                response = await client.post(path, json=body)
+                assert response.status_code == 409 and response.json() == {"detail": "job_paused"}
 
     asyncio.run(go())
 

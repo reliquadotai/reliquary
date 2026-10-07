@@ -28,6 +28,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from reliquary.protocol.toploc import MIN_CHUNK_TOKENS, ChunkResult
+from reliquary.infrastructure.corpus_attempt_store import AttemptRefused
+from reliquary.validator.durable_attempts import DurableAttempts
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V2,
@@ -240,7 +242,7 @@ def scores_agree(remote: Sequence[Score], local: Sequence[Score], proof, *,
     return True
 
 
-class ExecutorLeases:
+class ExecutorLeases(DurableAttempts):
     """What every control-side lease dispatcher shares, whatever its executors
     compute: executor liveness, the per-executor lease cap, lease expiry
     strikes, quarantine (written to the registry until it lands, then announced
@@ -253,7 +255,8 @@ class ExecutorLeases:
                  quarantine: Callable[[str, str], Awaitable[Any]] | None,
                  record_heartbeat: Callable[[str, float, dict], Awaitable[Any]] | None,
                  clock: Callable[[], float], live_seconds: float,
-                 max_leases_per_executor: int, expiry_strikes: int) -> None:
+                 max_leases_per_executor: int, expiry_strikes: int, attempt_store=None) -> None:
+        self._init_attempts(attempt_store)
         self._directory = directory
         self._quarantine_write = quarantine
         self._heartbeat_write = record_heartbeat
@@ -313,6 +316,11 @@ class ExecutorLeases:
         return self._strikes[executor_id] >= self._strikes_limit
 
     async def _expire_leases(self) -> None:
+        async with self._attempt_lock:
+            await self._expire_owned_leases()
+            await self._flush_attempts()
+
+    async def _expire_owned_leases(self) -> None:
         now = self._clock()
         for lease_id, lease in list(self._leases.items()):
             if lease.expires_at <= now:
@@ -320,6 +328,7 @@ class ExecutorLeases:
                 logger.warning("%s lease %s of %s expired; re-queued", self.kind, lease_id[:8],
                                lease.executor_id)
                 self._take_back(lease, expired=True)
+                self._attempt_changed(lease.work, "expired", error=[410, "lease_expired"])
                 if self._strike(lease.executor_id):
                     await self.quarantine(lease.executor_id,
                                           f"{self._strikes_limit} leases expired in a row")
@@ -341,6 +350,7 @@ class ExecutorLeases:
             if lease.executor_id == executor_id:
                 del self._leases[lease_id]
                 self._take_back(lease, expired=False)
+                self._attempt_changed(lease.work, "quarantined", error=[403, "executor_binding_changed"])
         self._on_quarantined(executor_id)
         self._unwritten_quarantines[executor_id] = reason
         return True
@@ -399,6 +409,7 @@ class ExecutorLeases:
                 try:
                     await self._directory.maybe_refresh()
                     await self.sweep()
+                    await self._flush_attempts()
                     await self.write_heartbeats()
                 except Exception:
                     logger.exception("%s dispatcher sweep failed; retrying", self.kind)
@@ -421,6 +432,7 @@ class RemoteAuditDispatcher(ExecutorLeases):
     """
 
     kind = "corpus audit executor"
+    _result_model = AuditResult
 
     def __init__(self, *, directory: ExecutorDirectory, proof, local_scores,
                  quarantine: Callable[[str, str], Awaitable[Any]] | None = None,
@@ -431,12 +443,12 @@ class RemoteAuditDispatcher(ExecutorLeases):
                  live_seconds: float = EXECUTOR_LIVE_SECONDS,
                  queue_wait_seconds: float = QUEUE_WAIT_SECONDS,
                  max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
-                 expiry_strikes: int = LEASE_EXPIRY_STRIKES) -> None:
+                 expiry_strikes: int = LEASE_EXPIRY_STRIKES, attempt_store=None) -> None:
         super().__init__(directory=directory, quarantine=quarantine,
                          record_heartbeat=record_heartbeat, clock=clock,
                          live_seconds=live_seconds,
                          max_leases_per_executor=max_leases_per_executor,
-                         expiry_strikes=expiry_strikes)
+                         expiry_strikes=expiry_strikes, attempt_store=attempt_store)
         self._proof = proof
         self._local_scores = local_scores
         # Each batch is drawn on its own, from the OS: an executor cannot predict it.
@@ -475,10 +487,11 @@ class RemoteAuditDispatcher(ExecutorLeases):
                              future=loop.create_future(), queued_at=self._clock(),
                              protocol=protocol)
                 units.append((indexes, work))
-                self._queue.append(work)
+                if not await self.prepare_work(work):
+                    self._queue.append(work)
         scored: list = [None] * len(items)
         for indexes, work in units:
-            scores, scored_by = await work.future
+            scores, scored_by = await (asyncio.shield(work.future) if self._attempt_store else work.future)
             for k, (status, chunks) in zip(indexes, scores):
                 scored[k] = (status, chunks, scored_by)
         return scored
@@ -547,7 +560,9 @@ class RemoteAuditDispatcher(ExecutorLeases):
         converted = [(s.status, tuple(ChunkResult(int(e), float(m), float(d))
                                       for e, m, d in s.chunks)) for s in scores]
         self.stats["scored"] += 1
-        if self._rng.random() < self._fraction:
+        if getattr(work, "recheck_drawn", None) is None:
+            work.recheck_drawn = self._rng.random() < self._fraction
+        if work.recheck_drawn:
             # Held until this GPU agrees; vouches for this batch alone.
             self._spawn(self._recheck(executor_id, work, converted))
         else:
@@ -560,6 +575,7 @@ class RemoteAuditDispatcher(ExecutorLeases):
         if work.future.done():
             return
         work.attempts += 1
+        work.recheck_drawn = None
         if work.attempts >= REMOTE_ATTEMPTS:
             self._local.append(work)
         else:
@@ -582,9 +598,12 @@ class RemoteAuditDispatcher(ExecutorLeases):
             # Ours, not the executor's: the batch is scored again, here or by another.
             logger.exception("corpus audit recheck of executor %s failed locally", executor_id)
             self._requeue(work)
+            self._attempt_changed(work, "requeued")
             return
         self.stats["rechecks"] += 1
         self._resolve(work, local, None)
+        self._attempt_changed(work, "accepted")
+        await self._flush_attempts()
         if executor_id not in self.quarantined and not scores_agree(remote, local, self._proof):
             await self.quarantine(
                 executor_id, f"recheck of batch {work.id} disagreed beyond the drift tolerance")
@@ -592,6 +611,7 @@ class RemoteAuditDispatcher(ExecutorLeases):
     async def sweep(self) -> None:
         """One pass: expire leases (striking their executor), score locally what
         no executor will take, write pending quarantines."""
+        await self.recover_uncertain()
         await self._expire_leases()
         now = self._clock()
         # Work no connected executor can take (none at all, or none that speaks
@@ -646,7 +666,13 @@ def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
         if (body.model_id, body.model_revision) != (document["model_id"],
                                                     document["model_revision"]):
             raise HTTPException(status_code=409, detail="wrong_model")
-        lease = dispatcher.claim(document["executor_id"], tuple(body.protocols))
+        try:
+            lease = await dispatcher.durable_claim(document["executor_id"], tuple(body.protocols))
+        except AttemptRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        except Exception as exc:
+            logger.exception("audit claim ownership unavailable")
+            raise HTTPException(status_code=503, detail="attempt_store_unavailable") from exc
         if lease is None:
             return Response(status_code=204)
         return lease
@@ -662,9 +688,12 @@ def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
     async def result(lease_id: str, body: AuditResult, request: Request) -> dict:
         document = _authenticated(request)
         try:
-            outcome = dispatcher.result(document["executor_id"], lease_id, body)
-        except LeaseRefused as exc:
+            outcome = await dispatcher.durable_result(document["executor_id"], lease_id, body)
+        except (LeaseRefused, AttemptRefused) as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        except Exception as exc:
+            logger.exception("audit result ownership unavailable")
+            raise HTTPException(status_code=503, detail="attempt_store_unavailable") from exc
         return {"lease_id": lease_id, "outcome": outcome}
 
     return router

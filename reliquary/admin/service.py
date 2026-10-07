@@ -135,6 +135,11 @@ class Retire(BaseModel):
     retired_at: int | None = Field(default=None, ge=0)
 
 
+class SetAdmission(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    admission: Literal["open", "paused"]
+
+
 class RegisterExecutor(BaseModel):
     model_config = ConfigDict(extra="forbid")
     executor_id: str
@@ -616,7 +621,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     def task_document(entry) -> dict:
         from reliquary.shared.task_registry import render_registry
 
-        return {"task_id": entry.task_id,
+        return {"task_id": entry.task_id, "admission": entry.admission,
                 **json.loads(render_registry({entry.task_id: entry}))["tasks"][entry.task_id]}
 
     def job_contract(manifest, entry) -> dict:
@@ -655,6 +660,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             })
         return {"schema": "subnet-task-catalog/v1", "task_prefix": task_prefix,
                 "pool_max": float(pool_max), "zero_cap_supported": True,
+                "admission_controls_supported": True,
                 "requires_matching_corpus_control": True,
                 "mechanisms": [MECHANISM_CORPUS_GENERATION],
                 "models": [{"model": name, **spec.model_dump()}
@@ -780,6 +786,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         except registry_store.RegistryConflict as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"task_id": task_id, "cap": body.cap}
+
+    @router.post("/tasks/{task_id}/admission")
+    async def set_admission(task_id: str, body: SetAdmission) -> dict:
+        await corpus_entry(task_id)
+        try:
+            await registry_store.set_task_admission(task_id, body.admission)
+        except RegistryError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except registry_store.RegistryConflict as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"task_id": task_id, "admission": body.admission, "status": "active"}
 
     @router.post("/tasks/{task_id}/retire")
     async def retire(task_id: str, body: Retire) -> dict:

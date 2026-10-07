@@ -73,6 +73,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import ValidationError
 
 from reliquary.corpus.replay_compare import ReplayReport, within_tolerance
+from reliquary.infrastructure.corpus_attempt_store import AttemptRefused
 from reliquary.validator.corpus_audit_protocol import HeartbeatRequest
 from reliquary.validator.corpus_audit_remote import (
     EXECUTOR_LIVE_SECONDS,
@@ -262,6 +263,7 @@ class _Lease:
 
 class RemoteGradeDispatcher(ExecutorLeases):
     kind = "grade executor"
+    _result_model = GradeResult
 
     def __init__(self, *, directory: ExecutorDirectory, env_package: str, env_version: str,
                  quarantine: Callable[[str, str], Awaitable[Any]] | None = None,
@@ -275,12 +277,13 @@ class RemoteGradeDispatcher(ExecutorLeases):
                  dispute_seconds: float = GRADE_DISPUTE_SECONDS,
                  claim_live_seconds: float = GRADE_CLAIM_LIVE_SECONDS,
                  retry_excluded_seconds: float = GRADE_RETRY_EXCLUDED_SECONDS,
-                 report_grace_seconds: float = GRADE_LEASE_REPORT_GRACE_SECONDS) -> None:
+                 report_grace_seconds: float = GRADE_LEASE_REPORT_GRACE_SECONDS,
+                 attempt_store=None) -> None:
         super().__init__(directory=directory, quarantine=quarantine,
                          record_heartbeat=record_heartbeat, clock=clock,
                          live_seconds=live_seconds,
                          max_leases_per_executor=max_leases_per_executor,
-                         expiry_strikes=expiry_strikes)
+                         expiry_strikes=expiry_strikes, attempt_store=attempt_store)
         self._env = {"package": env_package, "version": env_version}
         # Each result is drawn on its own, from the OS: an executor cannot predict it.
         self._rng = rng or secrets.SystemRandom()
@@ -348,8 +351,9 @@ class RemoteGradeDispatcher(ExecutorLeases):
         loop = asyncio.get_running_loop()
         work = _Work(id=next(self._ids), item=item, future=loop.create_future(),
                      queued_at=self._clock())
-        self._queue.append(work)
-        return await work.future
+        if not await self.prepare_work(work):
+            self._queue.append(work)
+        return await (asyncio.shield(work.future) if self._attempt_store else work.future)
 
     # -- the executor's side ----------------------------------------------------
 
@@ -377,6 +381,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
                            lease.work.mode, executor_id, now - lease.leased_at)
             lease.work.failed_at[executor_id] = now
             self._failed_attempt(lease.work, "errors")
+            self._attempt_changed(lease.work, "unreported", error=[410, "lease_unreported"])
 
     def refused_env(self, executor_id: str) -> None:
         """A claim of ``executor_id`` was refused for its env (409): it
@@ -666,8 +671,10 @@ class RemoteGradeDispatcher(ExecutorLeases):
             work.providers.pop(executor_id, None)
             if id(work) not in leased:
                 self._settle(work)               # a leased one settles when its lease answers
+                self._attempt_changed(work, "requeued")
 
     async def _sweep(self) -> None:
+        await self.recover_uncertain()
         await self._expire_leases()
         now = self._clock()
         live = self._live_executors()
@@ -685,11 +692,13 @@ class RemoteGradeDispatcher(ExecutorLeases):
                 if not served:
                     work.unserved += max(0.0, now - since)
                 work.swept_at = now
+                self._attempt_changed(work, "waiting")
             if work.results and work.unserved >= self._dispute_seconds:
                 if work.mode == "replay" and not self._certifying(work):
                     # Ruling P27: no vote certifies it. Nobody is sanctioned
                     # (no agreement), but it is not paid as a dispute either.
                     self._uncertified(work, f"{work.unserved:.0f} s without a next executor")
+                    self._attempt_changed(work, "uncertified")
                     continue
                 # No distinct executor came for the next vote: nobody is judged.
                 self.stats[DISPUTED] += 1
@@ -699,6 +708,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
                     work.mode, work.item["submission_id"][:12], work.unserved,
                     {e: decision_key(work.mode, r) for e, r in sorted(work.results.items())})
                 self._resolve(work, GradeDecision(DISPUTED, None, tuple(sorted(work.results))))
+                self._attempt_changed(work, "disputed")
                 continue
             waiting += 1
             if live and not served:
@@ -728,7 +738,13 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
         if (body.env_package, body.env_version) != (document["model_id"], document["model_revision"]):
             dispatcher.refused_env(document["executor_id"])
             raise HTTPException(status_code=409, detail="wrong_env")
-        lease = dispatcher.claim(document["executor_id"])
+        try:
+            lease = await dispatcher.durable_claim(document["executor_id"])
+        except AttemptRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        except Exception as exc:
+            logger.exception("grade claim ownership unavailable")
+            raise HTTPException(status_code=503, detail="attempt_store_unavailable") from exc
         if lease is None:
             return Response(status_code=204)
         return lease
@@ -745,9 +761,12 @@ def build_grade_executor_router(dispatcher: RemoteGradeDispatcher,
     async def result(lease_id: str, body: GradeResult, request: Request) -> dict:
         document = _authenticated(request)
         try:
-            outcome = dispatcher.result(document["executor_id"], lease_id, body)
-        except LeaseRefused as exc:
+            outcome = await dispatcher.durable_result(document["executor_id"], lease_id, body)
+        except (LeaseRefused, AttemptRefused) as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+        except Exception as exc:
+            logger.exception("grade result ownership unavailable")
+            raise HTTPException(status_code=503, detail="attempt_store_unavailable") from exc
         return {"lease_id": lease_id, "outcome": outcome}
 
     return router
