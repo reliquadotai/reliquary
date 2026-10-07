@@ -15,38 +15,32 @@ Status: `DECIDED`, `OPEN` or `KEEP` (unchanged).
 
 ---
 
-## A. How long an observation stays valid: DECIDED (07-10)
+## A. How long an observation stays valid: DECIDED (07-10, revised)
 
-Problem: the context hash includes the checkpoint, so observations, dataset epochs,
-the in-zone panel and the cooldown all reset at every checkpoint adoption, which in
-RL means almost every window.
+Problem: the context hash includes the checkpoint, so observations, epochs, the panel
+and the cooldown reset at every checkpoint adoption (about every window in RL).
 
 Decision:
-- **Key** observations, epochs and cooldown by `(order, dataset)`. The checkpoint
-  becomes an attribute (`observed_at_checkpoint`), with an age.
-- **Validity by verdict:**
-  - *always solved* (uniform high): excluded until the end of the dataset epoch,
-    since the model does not regress.
-  - *always failed* (uniform low): scannable again after **K = 16 checkpoints**
-    (about 4 h at 1 checkpoint per 16-min window). Tune K once the rate is measured.
-  - *in-zone*: consumed by training and enters the normal cooldown.
-  - *unknown* (grading error, incomplete group): not an observation and never
-    excludes anything.
-- **Epochs (#323):** the first group of a row in an epoch fixes its category. A later
-  group never overwrites it. Slightly late windows are accepted.
+- Observations are a **run-wide log**, keyed by `(order, dataset, prompt)`, never
+  reset. Each entry keeps `checkpoint`, `window` and a timestamp as attributes, not as
+  part of the key.
+- **The validator enforces no validity or exclusion rule** (no K, no blocking of
+  "always solved"). **The miner chooses** which prompts to try, from the published data
+  (see D).
+- Only validator-side effects:
+  - exploration is paid for the first scan of a prompt in the run only (see B);
+  - the training cooldown of in-zone prompts stays (see E).
+- A grading error or an incomplete group is not an observation.
 
-## B. Paying out-of-zone groups (exploration): OPEN
+## B. Paying out-of-zone groups (exploration): DECIDED (07-10)
 
-Today (#327):
-- b = 10 % of the training pool is always taken, even when nobody explores.
-- One exploration group gets P·b/S/d, about 1.4 % of a training group (b=10 %, d=4,
-  S=32).
-- Unpaid exploration money (≥ 7.5 % of P) is burned to UID 0.
-
-Recommendation:
-- The reserve is taken only when used; anything unused goes back to training.
-- A real per-group price, still to be set.
-- Only the first scanner of a prompt in a validity period is paid.
+- **Price: 15 % of a training group.**
+- **Paid: the first miner to send a prompt never scanned before in the run.** A prompt
+  already scanned (by anyone, at any checkpoint) earns nothing more as exploration.
+- Cap: exploration ≤ 10 % of the window pool. **Unused budget goes back to training.**
+  Nothing is burned and no fixed reserve is taken.
+- Not paid: unusable groups (grading error, incomplete).
+- To code: replace #327's fixed reserve b + divisor d + burned remainder with this model.
 
 ## C. Proof cost of exploration: OPEN
 
