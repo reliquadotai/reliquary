@@ -1299,6 +1299,23 @@ _PROFILE_VALUES = (
                 # One pass through the 10,871-problem train split at 8 a window.
                 prompt_cooldown_windows=1359,
             ),
+            "reliquary_hard_math_v1": EnvironmentProfile(
+                # The competition-maths budget, not yet measured on this
+                # corpus, which is harder than DAPO's on upstream's pass rates.
+                max_new_tokens=32768,
+                bft=None,
+                answer_format="boxed",
+                batch_target=8,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/boxed-answer/v1",
+                environment_manifest_sha256=(
+                    "317ca1d13802c653a7e57fb7214bb5e7e780a97396b3f0e9d094e7ba3f42b478"
+                ),
+                # One pass through the 23,227-problem train split at 8 a window.
+                prompt_cooldown_windows=2904,
+            ),
             "reliquary_instruction_following_v1": EnvironmentProfile(
                 max_new_tokens=8192,
                 bft=None,
