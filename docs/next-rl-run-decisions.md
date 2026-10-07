@@ -85,16 +85,21 @@ validator's API is never hit by observation readers.
 - Grizz's `/service-observations` becomes internal/admin. The run-wide log (A) feeds
   the segment writer.
 
-## E. In-zone rate for the cooldown (#324): OPEN
+## E. Cooldown from the in-zone rate: DECIDED (07-10), manual first
 
-Today the panel is an operator-supplied JSON file, unsigned. A bad panel closes
-admission.
-
-Recommendation:
-- The validator draws a random prompt sample itself (drand) and measures the rate
-  from observations (exploration + training).
-- A bad panel falls back to the static cooldown and never closes admission.
-- Guard Q (consumption) against miners who under-supply on purpose.
+- **Start manual:** before the run we measure the in-zone rate ourselves (qualification
+  sweep on the starting model), set a static cooldown per env, and have **a simple way
+  to change it live** (an operator command or a registry field that takes effect
+  without a restart; no redeploy).
+- **An analyser recommends:** the validator computes the in-zone rate continuously from
+  the run-wide log (A), counting **first scans only**, which are always reported since
+  the first scan is paid in both lanes. It also tracks Q (groups actually consumed by
+  the trainer, smoothed) and computes #324's formula
+  `cooldown = N × p / Q × margin` (bounds, EMA, hysteresis). The result is shown on
+  the dashboard/CLI as a **recommendation only**. A human applies it.
+- The analyser never closes admission. With insufficient data it just says so.
+- Later: an `active` mode that applies the recommendation by itself, switchable once
+  its values have been validated over the run.
 
 ## F. Seeds 2×M (#325): KEEP
 
