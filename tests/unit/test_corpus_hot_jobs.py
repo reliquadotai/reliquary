@@ -259,6 +259,51 @@ def test_retired_stops_admission_drains_then_unwires():
     asyncio.run(go())
 
 
+def test_pause_keeps_draining_and_resume_reuses_the_same_running_job():
+    async def go():
+        entry = _hot_entry(cap=0)
+        h = _Harness([entry])
+        await h.set.refresh()
+        await asyncio.sleep(0)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def admitted_write():
+            async with h.routes.admission("job-b"):
+                entered.set()
+                await release.wait()
+
+        pending = asyncio.create_task(admitted_write())
+        await entered.wait()
+        entry.admission = "paused"
+        await h.set.refresh()
+        await h.set.refresh()
+        assert h.routes.admission_pending("job-b")
+        assert h.cancelled == [] and h.wired == ["corpus-b"]
+        async with h.client() as client:
+            assert (await client.get("/corpus/jobs/job-b/next/5Hot")).status_code == 409
+            assert (await client.get("/corpus/next/5Hot")).status_code == 409
+            assert (await client.get("/corpus/jobs/job-b/job")).status_code == 200
+            assert (await client.get("/corpus/jobs/job-b/cursor/5Hot")).status_code == 200
+            assert (await client.get("/corpus/jobs")).json() == {"jobs": []}
+        release.set()
+        await pending
+        h.drained["job-b"] = True
+        await h.set.refresh()
+        assert "job-b" in h.set.served and h.cancelled == []
+        entry.admission = "open"
+        await h.set.refresh()
+        async with h.client() as client:
+            assert (await client.get("/corpus/jobs/job-b/next/5Hot")).status_code == 200
+            assert (await client.get("/corpus/jobs")).json() == {"jobs": ["job-b"]}
+        assert h.wired == ["corpus-b"] and h.caps == {}
+        for tasks in h.set._tasks.values():
+            for task in tasks:
+                task.cancel()
+
+    asyncio.run(go())
+
+
 def test_a_retired_job_refuses_submit_and_skip_with_410():
     from tests.unit.test_corpus_multi_job_service import _body
 
@@ -277,6 +322,26 @@ def test_a_retired_job_refuses_submit_and_skip_with_410():
             for path in ("/corpus/skip", "/corpus/jobs/swe-v1/skip"):
                 response = await client.post(path, json=skip)
                 assert response.status_code == 410, (path, response.text)
+
+    asyncio.run(go())
+
+
+def test_a_paused_job_refuses_legacy_and_scoped_submit_and_skip_before_storage():
+    from tests.unit.test_corpus_multi_job_service import _body
+
+    async def go():
+        entry = _hot_entry(job_id="swe-v1")
+        entry.admission = "paused"
+        h = _Harness([entry])
+        await h.set.refresh()
+        async with h.client() as client:
+            skip = {"job_id": "swe-v1", "miner_hotkey": "5Hot", "cursor": 0, "prompt_index": 0,
+                    "to_cursor": 1, "signature": "ok"}
+            for path, body in (("/corpus/submit", _body("swe-v1")),
+                               ("/corpus/jobs/swe-v1/submit", _body("swe-v1")),
+                               ("/corpus/skip", skip), ("/corpus/jobs/swe-v1/skip", skip)):
+                response = await client.post(path, json=body)
+                assert response.status_code == 409 and response.json() == {"detail": "job_paused"}
 
     asyncio.run(go())
 

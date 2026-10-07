@@ -270,6 +270,7 @@ class CorpusJobSet:
                     self._routes.retire(job_id)
                 continue
             cap = float(entry.params["cap"])
+            self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
             if cap != float(wiring.cap):
                 logger.info("corpus task %s cap %s -> %s", task_id, wiring.cap, cap)
                 wiring.cap = cap
@@ -347,6 +348,7 @@ class CorpusJobSet:
         self._wire_failures.pop(task_id, None)
         self._routes.add(job_id, router, contract=entry.contract,
                          prompt_source=job.prompt_source)
+        self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
         if entry.status != "active":
             # Wired only to finish its audits and settlement: no admission.
             self._routes.retire(job_id)
@@ -443,6 +445,7 @@ class CorpusJobSet:
         if grader is not None:
             # An episode job: grading holds payment, so its backlog is public.
             status = {**status, "grading": grader.status()}
+        status["admission"] = "paused" if job_id in self._routes.paused else "open"
         return status
 
     async def status(self, job_id: str) -> dict | None:
@@ -465,14 +468,19 @@ class CorpusJobSet:
         now = self._clock()
         cached = self._status_cache.get(job_id)
         if cached is not None and now - cached[0] < STATUS_CACHE_SECONDS:
-            return cached[1]
+            return self._observed_admission(job_id, cached[1])
         lock = self._status_locks.setdefault(job_id, asyncio.Lock())
         async with lock:
             # One recompute per period, however many requests wait on it.
             cached = self._status_cache.get(job_id)
             if cached is not None and self._clock() - cached[0] < STATUS_CACHE_SECONDS:
-                return cached[1]
-            return await self._recompute(job_id, cached)
+                return self._observed_admission(job_id, cached[1])
+            status = await self._recompute(job_id, cached)
+            return self._observed_admission(job_id, status)
+
+    def _observed_admission(self, job_id: str, status: dict) -> dict:
+        status["admission"] = "paused" if job_id in self._routes.paused else "open"
+        return status
 
     async def _recompute(self, job_id: str, cached) -> dict:
         now = self._clock()

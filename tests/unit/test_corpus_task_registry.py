@@ -9,6 +9,11 @@ from reliquary.shared.task_registry import (
     TaskEntry,
     add_task,
     validate_entry,
+    parse_registry,
+    render_registry,
+    retire_task,
+    set_admission,
+    set_cap,
 )
 
 
@@ -43,6 +48,25 @@ def _entry(**overrides):
 
 def test_the_corpus_mechanism_is_declarable():
     validate_entry(_entry())
+
+
+def test_pause_resume_preserves_contract_bytes_and_economics_and_retirement_is_terminal():
+    entries = {"corpus-math": _entry()}
+    original = render_registry(entries)
+    assert b'"admission"' not in original
+    assert parse_registry(original)["corpus-math"].admission == "open"
+    paused = set_admission(entries, "corpus-math", "paused")
+    assert paused["corpus-math"].params == entries["corpus-math"].params
+    assert paused["corpus-math"].profile_sha256 == entries["corpus-math"].profile_sha256
+    assert paused["corpus-math"].status == "active"
+    assert parse_registry(render_registry(paused))["corpus-math"].admission == "paused"
+    assert render_registry(set_admission(paused, "corpus-math", "open")) == original
+    assert set_cap(entries, "corpus-math", 0)["corpus-math"].admission == "open"
+    retired = retire_task(paused, "corpus-math", 1000)
+    with pytest.raises(RegistryError, match="retired"):
+        set_admission(retired, "corpus-math", "open")
+    with pytest.raises(RegistryError, match="admission"):
+        set_admission(entries, "corpus-math", "invalid")
 
 
 def test_a_pinned_price_is_legal():

@@ -20,6 +20,7 @@ from reliquary.shared.task_registry import (
     require_default_declared_first,
     retire_task,
     set_cap,
+    set_admission,
     validate_registry,
 )
 
@@ -140,6 +141,12 @@ async def retire_task_entry(
         attempts=attempts,
         **client_kwargs,
     )
+
+
+async def set_task_admission(task_id: str, admission: str, *, attempts: int = 5,
+                             **client_kwargs) -> None:
+    await _mutate(lambda entries: set_admission(entries, task_id, admission),
+                  attempts=attempts, **client_kwargs)
 
 
 async def set_task_cap(

@@ -544,6 +544,15 @@ def test_a_retired_job_is_a_410_job_retired_not_a_permanent_failure():
         issue_corpus_request(lambda: _response(410, b'{"detail": "job_retired"}'))
 
 
+def test_a_paused_job_retries_until_resume_without_becoming_a_permanent_failure():
+    from reliquary.miner.corpus_miner import issue_corpus_request
+
+    with pytest.raises(CorpusTransientFailure):
+        issue_corpus_request(lambda: _response(409, b'{"detail": "job_paused"}'))
+    with pytest.raises(CorpusPermanentFailure):
+        issue_corpus_request(lambda: _response(409, b'{"detail": "wrong_contract"}'))
+
+
 def test_a_retired_job_ends_the_miner_cleanly_with_one_log_line(caplog):
     import logging
 

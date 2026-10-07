@@ -105,6 +105,22 @@ async def test_an_absent_registry_reads_as_empty(fake):
 
 
 @pytest.mark.asyncio
+async def test_admission_retries_cas_without_undoing_concurrent_cap_change(fake):
+    from tests.unit.test_corpus_task_registry import _entry as corpus_entry
+    from reliquary.shared.task_registry import set_cap
+
+    entries = {"corpus-math": corpus_entry()}
+    client = fake(render_registry(entries))
+    client.steal_once = render_registry(set_cap(entries, "corpus-math", 0.05))
+    await store.set_task_admission("corpus-math", "paused")
+    entry = parse_registry(client.body)["corpus-math"]
+    assert entry.admission == "paused" and entry.params["cap"] == 0.05
+    await store.set_task_admission("corpus-math", "open")
+    entry = parse_registry(client.body)["corpus-math"]
+    assert entry.admission == "open" and entry.params["cap"] == 0.05
+
+
+@pytest.mark.asyncio
 async def test_creating_the_first_task_writes_the_object(fake):
     client = fake(None)
 

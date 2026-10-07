@@ -129,7 +129,7 @@ def test_a_served_job_reports_every_field_and_no_hotkey():
     stats.accepted()
     status = asyncio.run(job_set.status("job-b"))
     assert status == {
-        "job_id": "job-b", "state": "open", "prompts_total": 3, "prompts_full": 1,
+        "job_id": "job-b", "state": "open", "admission": "open", "prompts_total": 3, "prompts_full": 1,
         "submissions_accepted": 3, "audited": 12, "passed": 9, "verified_tokens": 90,
         "settled": 4, "accepted_last_hour": 1, "counts_complete": True,
     }
@@ -163,6 +163,19 @@ def test_the_status_is_cached_and_the_ledger_read_at_most_once_per_period():
     now[0] += 30.5
     assert asyncio.run(job_set.status("job-b"))["passed"] == 9
     assert router.reads == 2
+
+
+def test_observed_admission_changes_without_recounting_cached_progress():
+    now = [10_000.0]
+    job_set, router, _ = _set({0: 1}, now=now)
+    before = asyncio.run(job_set.status("job-b"))
+    assert before["admission"] == "open"
+    job_set._routes.set_admission("job-b", "paused")
+    paused = asyncio.run(job_set.status("job-b"))
+    assert paused["admission"] == "paused" and router.reads == 1
+    job_set._routes.set_admission("job-b", "open")
+    assert asyncio.run(job_set.status("job-b"))["admission"] == "open"
+    assert router.reads == 1
 
 
 def test_concurrent_requests_on_an_expired_cache_recompute_once():

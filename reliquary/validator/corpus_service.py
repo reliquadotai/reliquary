@@ -2117,6 +2117,7 @@ class CorpusJobRoutes:
         # Each job's prompt source: an eval job's names the set miners fetch.
         self.prompt_sources: dict[str, str] = {}
         self.retired: set[str] = set()
+        self.paused: set[str] = set()
         # Handlers past the retired check. admission_pending also accounts for
         # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
@@ -2135,6 +2136,12 @@ class CorpusJobRoutes:
     def retire(self, job_id: str) -> None:
         self.retired.add(job_id)
 
+    def set_admission(self, job_id: str, admission: str) -> None:
+        if admission == "paused":
+            self.paused.add(job_id)
+        elif admission == "open" and job_id not in self.retired:
+            self.paused.discard(job_id)
+
     def remove(self, job_id: str) -> None:
         # Stays in `retired`: its miners keep hearing 410, not an unknown job.
         self.retired.add(job_id)
@@ -2143,7 +2150,7 @@ class CorpusJobRoutes:
         self.prompt_sources.pop(job_id, None)
 
     def open_jobs(self) -> list[str]:
-        return sorted(j for j in self.routers if j not in self.retired)
+        return sorted(j for j in self.routers if j not in self.retired and j not in self.paused)
 
     def admission_pending(self, job_id: str) -> bool:
         """A write handler or its detached ledger/record work is still running."""
@@ -2158,6 +2165,8 @@ class CorpusJobRoutes:
         """The job's router for one write, refused once retired, counted while it runs."""
         if job_id in self.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if job_id in self.paused:
+            raise HTTPException(status_code=409, detail="job_paused")
         router = self.routers.get(job_id)
         if router is None:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
@@ -2210,6 +2219,8 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         # Before any store is touched: a retired job admits nothing more.
         if job_id in routes.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if job_id in routes.paused:
+            raise HTTPException(status_code=409, detail="job_paused")
         return _served(job_id)
 
     @router.get(JOBS_PATH)

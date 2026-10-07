@@ -600,6 +600,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         routes.add(str(served.entry.job_id), router_for(served),
                    contract=contract if len(jobs) == 1 else getattr(served.entry, "contract", None),
                    prompt_source=getattr(served.job, "prompt_source", None))
+        routes.set_admission(str(served.entry.job_id), getattr(served.entry, "admission", "open"))
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=True))
     app.state.corpus_routes = routes
@@ -658,6 +659,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         tasks = [
             {"task_id": e.task_id, "mechanism": e.mechanism, "cap": float(e.params["cap"]),
              "status": e.status, "job_id": getattr(e, "job_id", None),
+             "admission": getattr(e, "admission", "open"),
              "retired_at": getattr(e, "retired_at", None)}
             for e in sorted(entries.values(), key=lambda e: e.task_id)
         ]
@@ -1058,6 +1060,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     remote = directory = None
     if remote_audit:
         from reliquary.infrastructure import corpus_executor_store as executor_store
+        from reliquary.infrastructure.corpus_attempt_store import AttemptStore
         from reliquary.validator.corpus_audit import rows_of_items, score_sequences
         from reliquary.validator.corpus_audit_remote import (
             RECHECK_FRACTION, ExecutorDirectory, RemoteAuditDispatcher,
@@ -1077,6 +1080,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                       model_revision=first.checkpoint_revision)
         remote = RemoteAuditDispatcher(
             directory=directory, proof=proof, local_scores=local_scores,
+            attempt_store=AttemptStore({"kind": "audit", "model": first.checkpoint_repo,
+                "revision": first.checkpoint_revision, "checkpoint_sha256": first.checkpoint_sha256,
+                "chunk_tokens": proof.chunk_tokens, "topk": proof.topk}),
             recheck_fraction=RECHECK_FRACTION if recheck_fraction is None else recheck_fraction,
             quarantine=lambda executor_id, reason: executor_store.set_executor_status(
                 executor_id, "quarantined", reason=reason),
@@ -1103,6 +1109,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         raise RuntimeError(f"one validator grades one env pin, these jobs name {sorted(pins)}")
     if pins:
         from reliquary.infrastructure import corpus_executor_store as grade_store
+        from reliquary.infrastructure.corpus_attempt_store import AttemptStore
         from reliquary.validator.corpus_audit_remote import ExecutorDirectory
         from reliquary.validator.corpus_grade_remote import RemoteGradeDispatcher
 
@@ -1117,6 +1124,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         grade_directory = ExecutorDirectory(model_id=package, model_revision=version, scope="grade")
         grade_dispatcher = RemoteGradeDispatcher(
             directory=grade_directory, env_package=package, env_version=version,
+            attempt_store=AttemptStore({"kind": "grade", "package": package, "version": version}),
             quarantine=lambda executor_id, reason: grade_store.set_executor_status(
                 executor_id, "quarantined", reason=reason, scope="grade"),
             record_heartbeat=lambda executor_id, at, detail: grade_store.record_heartbeat(

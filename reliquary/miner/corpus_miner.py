@@ -110,6 +110,8 @@ def issue_corpus_request(request_call):
         raise CorpusTransientFailure(f"transport error: {exc}") from exc
     if response.status_code == 410 and _error_object(response).get("detail") == "job_retired":
         raise CorpusJobRetired(f"410 job_retired from {response.request.url}")
+    if response.status_code == 409 and _error_object(response).get("detail") == "job_paused":
+        raise CorpusTransientFailure(f"409 job_paused from {response.request.url}")
     if response.status_code in TRANSIENT_STATUSES:
         raise CorpusTransientFailure(f"{response.status_code} from {response.request.url}")
     if response.status_code >= 400:
