@@ -616,6 +616,14 @@ CORPUS_DOMAIN = b"reliquary/corpus-submission/v1"
 # A trajectory is signed under its own domain, so its binding can never be
 # replayed as a single-turn submission's (or the other way round).
 CORPUS_TRAJECTORY_DOMAIN = b"reliquary/corpus-trajectory/v1"
+# A trajectory that carries a sandbox transcript: its own domain, plus the transcript's
+# digest as one more part. A trajectory without one binds exactly as before.
+CORPUS_SIGNED_TRAJECTORY_DOMAIN = b"reliquary/corpus-trajectory-signed/v1"
+
+
+def transcript_digest(transcript) -> bytes:
+    return hashlib.sha256(json.dumps(transcript, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, allow_nan=False).encode("utf-8")).digest()
 
 
 def _trajectory_parts(trajectory) -> list[bytes]:
@@ -664,8 +672,11 @@ def build_corpus_binding(request) -> bytes:
     ]
     trajectory = body.get("trajectory")
     if trajectory is not None:
-        domain = CORPUS_TRAJECTORY_DOMAIN
+        transcript = trajectory.get("transcript")
+        domain = CORPUS_TRAJECTORY_DOMAIN if transcript is None else CORPUS_SIGNED_TRAJECTORY_DOMAIN
         parts += _trajectory_parts(trajectory)
+        if transcript is not None:
+            parts.append(transcript_digest(transcript))
     else:
         domain = CORPUS_DOMAIN
         for completion in body["completions"]:
@@ -761,3 +772,82 @@ def verify_corpus_skip_signature(request) -> bool:
     except Exception as e:
         logger.debug("corpus skip signature verify failed: %s", e)
         return False
+
+
+# Sandbox session requests (plan 3), each under its own domain: an open never verifies
+# as a close, a submission or a skip.
+SANDBOX_OPEN_DOMAIN = b"reliquary/sandbox-session-open/v1"
+SANDBOX_CLOSE_DOMAIN = b"reliquary/sandbox-session-close/v1"
+
+
+def _bound(domain: bytes, parts: list[bytes]) -> bytes:
+    h = hashlib.sha256()
+    h.update(domain)
+    for part in parts:
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def _engagement_bytes(engagement) -> bytes:
+    present = {key: value for key, value in dict(engagement).items() if value is not None}
+    return json.dumps(present, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def _audience(validator_hotkey: str, path: str) -> list[bytes]:
+    """The request's audience: the validator's hotkey (ss58) and the HTTP path it is
+    posted to, so a signed request never verifies at another validator or route."""
+    return [str(validator_hotkey).encode("utf-8"), str(path).encode("utf-8")]
+
+
+def build_sandbox_open_binding(request, *, validator_hotkey: str, path: str) -> bytes:
+    body = _corpus_fields(request)
+    return _bound(SANDBOX_OPEN_DOMAIN, [
+        str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
+        int(body["at"]).to_bytes(8, "big", signed=False),
+        hashlib.sha256(_engagement_bytes(body["engagement"])).digest(),
+        *_audience(validator_hotkey, path)])
+
+
+def build_sandbox_close_binding(request, *, validator_hotkey: str, path: str) -> bytes:
+    body = _corpus_fields(request)
+    transcript = body.get("transcript")
+    return _bound(SANDBOX_CLOSE_DOMAIN, [
+        str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
+        int(body["at"]).to_bytes(8, "big", signed=False), str(body["session_id"]).encode("utf-8"),
+        str(body["reason"]).encode("utf-8"),
+        b"" if transcript is None else transcript_digest(transcript),
+        *_audience(validator_hotkey, path)])
+
+
+def verify_hotkey_signature(hotkey: str, binding: bytes, signature_hex: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    if bt is None:
+        return False
+    try:
+        signature = bytes.fromhex((signature_hex or "").strip().replace("0x", "").replace("0X", ""))
+    except ValueError:
+        return False
+    if not signature:
+        return False
+    try:
+        keypair = bt.Keypair(ss58_address=hotkey)  # type: ignore[union-attr]
+        return bool(keypair.verify(data=binding, signature=signature))
+    except Exception as e:
+        logger.debug("hotkey signature verify failed: %s", type(e).__name__)
+        return False
+
+
+def verify_sandbox_open_signature(request, *, validator_hotkey: str, path: str) -> bool:
+    body = _corpus_fields(request)
+    binding = build_sandbox_open_binding(request, validator_hotkey=validator_hotkey, path=path)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), binding,
+                                   str(body.get("signature") or ""))
+
+
+def verify_sandbox_close_signature(request, *, validator_hotkey: str, path: str) -> bool:
+    body = _corpus_fields(request)
+    binding = build_sandbox_close_binding(request, validator_hotkey=validator_hotkey, path=path)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), binding,
+                                   str(body.get("signature") or ""))

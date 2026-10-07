@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import threading
+import time
 from dataclasses import dataclass, field
 
 from reliquary.corpus.checks import (
@@ -38,6 +39,9 @@ class IntakeFacts:
 class IntakeRefusal:
     reason: str
     detail: dict = field(default_factory=dict)
+    # Set on a transient refusal (the route answers 503 with this Retry-After); the
+    # replay intake never sets it.
+    retry_after: int | None = None
 
 
 class EpisodeIntake:
@@ -54,6 +58,8 @@ class EpisodeIntake:
         # (ruling P6). The renderer guards itself (QwenTurnRenderer's RLock).
         self._tokenizer_lock = threading.Lock()
         self.initial_ids = functools.lru_cache(maxsize=4096)(self._initial_ids)
+        # The route reads this when a submission arrives (`check(received=)`).
+        self.clock = time.time
 
     @property
     def renderer(self):
@@ -66,28 +72,26 @@ class EpisodeIntake:
     def _initial_ids(self, prompt_index: int) -> tuple[int, ...]:
         return tuple(self._renderer.initial_ids(self._source.prompt(prompt_index)))
 
-    def check(self, request) -> IntakeFacts | IntakeRefusal:
+    def check(self, request, received: float | None = None) -> IntakeFacts | IntakeRefusal:
+        """`received` (when the route received it) is unused by a replay job."""
         trajectory = request.trajectory
         if trajectory is None or request.completions:
             return IntakeRefusal("malformed_submission", {
                 "why": "an episode job takes one trajectory, not completions",
                 "trajectory": trajectory is not None, "completions": len(request.completions)})
+        if trajectory.transcript is not None:
+            # A replay job never stores a transcript: its record would otherwise read as
+            # a signed one wherever the record alone decides (plan 3 final review, C1).
+            return IntakeRefusal("malformed_submission", {
+                "transcript": "a replay job takes no sandbox transcript"})
         if not self._job.owns(request.prompt_index):
             return IntakeRefusal("prompt_mismatch", {"got": request.prompt_index})
-        prompt_ids = self.initial_ids(request.prompt_index)
-        with self._tokenizer_lock:
-            expected = self._tokenizer.decode(list(prompt_ids), skip_special_tokens=False,
-                                              clean_up_tokenization_spaces=False)
-        if expected != request.rendered_prompt:
-            return IntakeRefusal(REASON_PROMPT_MISMATCH, {
-                "prompt_index": request.prompt_index, "expected_chars": len(expected),
-                "rendered_chars": len(request.rendered_prompt)})
+        prompt_ids, refusal = self._prompt_refusal(request)
+        if refusal is not None:
+            return refusal
         tokens = trajectory.tokens
-        if self._vocab_size is not None and max(tokens) >= self._vocab_size:
-            return IntakeRefusal(REASON_TOKEN_OUT_OF_VOCAB, {"vocab_size": self._vocab_size})
         spans = [(turn.start, turn.end) for turn in trajectory.turns]
         episode = self._job.episode
-
         refusal = check_turn_spans(spans, len(tokens), episode.max_turns)
         if not refusal.ok:
             return IntakeRefusal(refusal.reason or "", dict(refusal.detail))
@@ -100,7 +104,30 @@ class EpisodeIntake:
         too_large = grade_item_bounds_refusal(parsed.actions, trajectory.final_diff)
         if too_large is not None:
             return IntakeRefusal(REASON_TRAJECTORY_TOO_LARGE, too_large)
-        # Only after the spans are known sound: termination indexes them.
+        refusal = self._shape_refusal(trajectory, spans, prompt_ids)
+        if refusal is not None:
+            return refusal
+        return self._facts(request, spans, prompt_ids)
+
+    def _prompt_refusal(self, request) -> tuple[tuple[int, ...], IntakeRefusal | None]:
+        """The validator's own render of the prompt, and its fidelity and vocabulary checks."""
+        prompt_ids = self.initial_ids(request.prompt_index)
+        with self._tokenizer_lock:
+            expected = self._tokenizer.decode(list(prompt_ids), skip_special_tokens=False,
+                                              clean_up_tokenization_spaces=False)
+        if expected != request.rendered_prompt:
+            return prompt_ids, IntakeRefusal(REASON_PROMPT_MISMATCH, {
+                "prompt_index": request.prompt_index, "expected_chars": len(expected),
+                "rendered_chars": len(request.rendered_prompt)})
+        tokens = request.trajectory.tokens
+        if self._vocab_size is not None and max(tokens) >= self._vocab_size:
+            return prompt_ids, IntakeRefusal(REASON_TOKEN_OUT_OF_VOCAB, {"vocab_size": self._vocab_size})
+        return prompt_ids, None
+
+    def _shape_refusal(self, trajectory, spans, prompt_ids) -> IntakeRefusal | None:
+        """Only after the spans are known sound: termination indexes them."""
+        tokens = trajectory.tokens
+        episode = self._job.episode
         checks = (
             lambda: check_short_turns(spans, self._min_chunk),
             lambda: check_turn_budget(spans, prompt_len=len(prompt_ids), length=len(tokens),
@@ -118,6 +145,10 @@ class EpisodeIntake:
             result = check()
             if not result.ok:
                 return IntakeRefusal(result.reason or "", dict(result.detail))
+        return None
+
+    def _facts(self, request, spans, prompt_ids) -> IntakeFacts:
+        tokens = request.trajectory.tokens
         return IntakeFacts(prompt_ids=prompt_ids, token_count=sum(e - s for s, e in spans),
                            digest=completion_digest(request.prompt_index, tokens),
                            last_token_id=int(tokens[-1]))

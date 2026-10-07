@@ -44,6 +44,17 @@ dev = [
 wandb = [
     "wandb>=0.16",
 ]
+# Signed-episode sandboxes (plan 3). reliquary-sandbox is a PRIVATE repository:
+# third parties cannot install these extras until it is published (user decision).
+sandbox = [
+    "reliquary-sandbox @ git+https://github.com/reliquadotai/reliquary-sandbox.git@bfce1e8dec8fa365cbc3098e3bad4c51ff321d84",
+]
+sandbox-miner = [
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@bfce1e8dec8fa365cbc3098e3bad4c51ff321d84",
+]
+sandbox-test = [
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@bfce1e8dec8fa365cbc3098e3bad4c51ff321d84",
+]
 
 [project.scripts]
 reliquary = "reliquary.cli.main:app"
@@ -51,6 +62,9 @@ reliquary = "reliquary.cli.main:app"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
