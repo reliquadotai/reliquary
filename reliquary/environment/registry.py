@@ -698,6 +698,30 @@ _SPEC_VALUES = (
         external_artifact_resource="reliquary_science/artifact.json",
     ),
     EnvironmentSpec(
+        # Olympiad problems from AoPS (Nemotron-Math-v2, CC BY 4.0) whose
+        # reference is a closed form: graded by the package on a binary
+        # lattice, the last boxed span after the reasoning compared by exact
+        # or high-precision equivalence. The corpus ships in the wheel and is
+        # checked against its digest on first use. `boxed` switches on the
+        # same integrity check as the maths siblings.
+        name="reliquary_hard_math_v1",
+        factory_path="reliquary_hard_math:HardMathEnvironment",
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="boxed",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/boxed-answer/v1",
+        environment_manifest_sha256=(
+            "317ca1d13802c653a7e57fb7214bb5e7"
+            "e780a97396b3f0e9d094e7ba3f42b478"
+        ),
+        external_distribution="reliquary-hard-math",
+        external_artifact_resource="reliquary_hard_math/artifact.json",
+    ),
+    EnvironmentSpec(
         # Constraints checked by deterministic verifiers against the whole
         # completion. Binary — every constraint or nothing — so the package
         # grades and the reward is bounded. `text` because there is no answer
