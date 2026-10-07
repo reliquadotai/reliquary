@@ -395,6 +395,24 @@ class ReplayTimeout(Exception):
         self.trajectory_caused = trajectory_caused
 
 
+async def refresh_repository_index(box, task) -> None:
+    """Refresh the git index of a fresh box's repository before the env
+    prepares it (production 2026-10-07).
+
+    A box starts from the image's index, whose stat data (inode, ctime) no
+    longer match the container's files: the env's `git reset --hard` then takes
+    every entry for modified and rewrites the whole tree with fresh mtimes, and
+    a build keyed on mtimes starts over. pandas' meson editable install
+    recompiled every C extension on the first import of every grade and replay
+    box: 770 s on 2 CPUs, against 2 s once refreshed. The refresh changes no
+    content, history or observation the agent can make: only the reset after
+    it rewrites nothing that was not different. Best effort: it exits 1 when
+    files do differ, which is the reset's job."""
+    workdir = getattr(getattr(task, "data", None), "workdir", None)
+    if workdir:
+        await box.run(["git", "-C", workdir, "update-index", "-q", "--refresh"], {})
+
+
 class BoxLost(Exception):
     """The box failed while or after running the recorded actions: it died,
     an exec into it failed, or finalize could not read a diff from the repo
@@ -498,6 +516,7 @@ async def replay_swe(task, actions: Sequence[Action], *,
         async with asyncio.timeout(setup_deadline) as clock:
             async with bounded_box(task, limits) as box:
                 await box.prepare_setup()
+                await refresh_repository_index(box, task)
                 await task.setup(trace, box)
                 await prepare_harness_footprint(box)
                 await box.prepare_execution([])

@@ -32,6 +32,7 @@ from reliquary.validator.agentic_replay import (
     ReplayTimeout,
     bounded_box,
     output_bounded,
+    refresh_repository_index,
     root_size_bytes,
     replay_swe,
     sweep_orphan_boxes,
@@ -92,6 +93,7 @@ async def grade_patch(task, patch: str, *, limits: BoxLimits = DEFAULT_BOX_LIMIT
         async with asyncio.timeout(deadline):
             async with bounded_box(task, limits) as box:
                 await box.prepare_setup()
+                await refresh_repository_index(box, task)
                 await box.prepare_execution([])
                 watch = _PatchWatch()
                 try:
