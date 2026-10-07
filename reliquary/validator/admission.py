@@ -88,6 +88,7 @@ class AdmissionContext:
     bootstrap: bool
     enforce_envelope_signature: bool
     enforce_legacy_merkle: bool
+    service_policy: dict | None = None
 
 
 @dataclass
@@ -623,6 +624,14 @@ def parse_and_validate_submission(
                     body_parse_ms=parse_ms,
                     preparation_started=started,
                 )
+            from reliquary.services.runtime import validate_submission_policy
+            try:
+                validate_submission_policy(request, context.service_policy)
+            except (ValueError, TypeError, KeyError):
+                return _reject_parsed(
+                    RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract",
+                    request=request, body_parse_ms=parse_ms, preparation_started=started,
+                )
             if context.enforce_envelope_signature and not verify_envelope_signature(
                 miner_hotkey=request.miner_hotkey,
                 window_start=request.window_start,
@@ -635,6 +644,8 @@ def parse_and_validate_submission(
                 protocol_version=request.protocol_version,
                 generation_profile_id=request.generation_profile_id,
                 envelope_signature=request.envelope_signature,
+                pool_selection=request.pool_selection,
+                service_binding=request.service_binding,
             ):
                 return _reject_parsed(
                     RejectReason.BAD_ENVELOPE_SIGNATURE,
@@ -1098,7 +1109,7 @@ def score_and_finalize_submission(
                 )
                 if (
                     environment_spec.final_answer_policy == "boxed"
-                    and MATH_ANSWER_FORMAT == "boxed"
+                    and (MATH_ANSWER_FORMAT == "boxed" or context.service_policy is not None)
                 )
                 else ()
             )
@@ -1143,6 +1154,11 @@ def score_and_finalize_submission(
                 if robust_utility is not None
                 else _in_zone(rewards, bootstrap=context.bootstrap)
             )
+            if context.service_policy is not None:
+                from reliquary.services.runtime import service_signal_admits
+                from reliquary.protocol.service_contract import ServiceContract
+                in_zone = service_signal_admits(request, ServiceContract.from_dict(context.service_policy["contract"]),
+                                               rewards, uncertain=bool(uncertain_indices))
             if not in_zone:
                 return result(
                     request=request,

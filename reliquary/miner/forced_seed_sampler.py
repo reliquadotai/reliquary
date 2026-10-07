@@ -67,7 +67,8 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
                  checkpoint_hash: str, rollout_indices: list[int],
                  base_offsets: list[int], start_len: int,
                  temperature: float = T_PROTO, top_k: int = TOP_K_PROTO,
-                 top_p: float = TOP_P_PROTO) -> None:
+                 top_p: float = TOP_P_PROTO, seed_pool=None,
+                 candidate_id: int | None = None) -> None:
         self.randomness = randomness
         self.hotkey = hotkey
         self.prompt_idx = int(prompt_idx)
@@ -78,6 +79,14 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
         self.temperature = float(temperature)
         self.top_k = int(top_k)
         self.top_p = float(top_p)
+        self.seed_pool = seed_pool
+        self.candidate_id = candidate_id
+        if seed_pool is not None:
+            if seed_pool.prompt_idx != self.prompt_idx or seed_pool.checkpoint_hash != checkpoint_hash:
+                raise ValueError("generation context differs from the public pool")
+            seed_pool.selection(candidate_id)
+        elif candidate_id is not None:
+            raise ValueError("candidate_id requires a public pool")
 
     def __call__(self, input_ids: torch.LongTensor,
                  scores: torch.FloatTensor) -> torch.FloatTensor:
@@ -85,8 +94,10 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
         out = torch.full_like(scores, float("-inf"))
         for r in range(scores.shape[0]):
             t = self.base_offsets[r] + s
-            u = u_at(self.randomness, self.prompt_idx,
-                     self.checkpoint_hash, self.rollout_indices[r], t)
+            u = (self.seed_pool.uniform(self.candidate_id, self.rollout_indices[r], t)
+                 if self.seed_pool is not None else
+                 u_at(self.randomness, self.prompt_idx,
+                      self.checkpoint_hash, self.rollout_indices[r], t))
             probs = warp(scores[r], t=self.temperature,
                          top_k=self.top_k, top_p=self.top_p)
             out[r, pick(probs, u)] = 0.0
