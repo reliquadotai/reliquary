@@ -191,9 +191,8 @@ def test_replay_prepares_the_bash_harness_like_the_miner_before_the_network_cut(
     task.setup = setup
     _fake_verifiers(monkeypatch, box)
     asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")]))
-    assert box.events == ["prepare_setup",
-                          ("git", ["-C", "/testbed", "update-index", "-q", "--refresh"]),
-                          "task_setup",
+    # No index refresh in a replay box: it must rebuild as the miner's did.
+    assert box.events == ["prepare_setup", "task_setup",
                           ("uv_script", "THE BASH HARNESS PROGRAM", {}),
                           ("prepare_execution", [])]
 
