@@ -13,6 +13,36 @@ Phases:
 
 Status: `DECIDED`, `OPEN` or `KEEP` (unchanged).
 
+Still open: J only (left open on purpose), plus the "even for math?" point of H.
+
+## State of the run's inputs (07-10)
+
+SFT distillation (Qwen3.8-27B teacher, corpus jobs on the subnet), before the RL:
+- Done: code v1, math OMI, IF, logic, science (cap 0 since 07-10, not retired).
+- Running: code v2 (~84 %), SWE agentic (~60 %; pay held by an undecided submission).
+- Hard math: env `reliquary_hard_math_v1` merged (environments #28, reliquary #335).
+  nvidia/Nemotron-Math-v2 AoPS subset, 23,227 train problems, disjoint from DAPO.
+  Left to launch: corpus image with the wheel (with 0xgrizz), miners on main >= #335
+  with the wheel, a 200-problem pilot, then the job (n=4, 32k, cap 0.10). Keep only
+  EOS-terminated traces at export (a 32k-truncated trace is read whole).
+- DAPO-Math-17k stays reserved for the RL.
+
+RL envs:
+- Single-turn, ready: DAPO, code (OpenCodeInstruct), IF, logic, science, telecom.
+- Terminal (TMax): validation ends ~07-10 20:00 UTC; SFT/RL split coded on
+  environments `feat/reliquary-terminal-tmax` (`tmax_sft` / `tmax_rl`). An SFT terminal
+  job costs 3-5 days of Catalyst work (grade the final box state, not a patch); the
+  TMax paper saw no gain from SFT before RL. Proposed: all TMax to RL.
+- SWE and terminal RL halves need phase 2 (multi-turn).
+- Competitive code: NOT ready (07-10 audit): branch unpushed, dataset not built, no
+  stdin mode in the gVisor worker, nothing registered, band not measured. ~6-8 days.
+- This branch must merge main to pick up hard math and the new Teutonic profile
+  digest (#335 changed it).
+
+Proposed order: code phase 1, fix the env list (start single-turn and add multi-turn
+envs live, which G allows), qualify on Teutonic (band per env, cooldowns, forced
+seed), phase 4 short run; phase 2 in parallel, phase 3 after.
+
 ---
 
 ## A. How long an observation stays valid: DECIDED (07-10, revised)
@@ -106,7 +136,7 @@ validator's API is never hit by observation readers.
 The miner chooses between 2 candidate groups of 16. This is intended: over-generation
 pays off (the user is to supply the paper). Never allow choosing individual rollouts.
 
-## G. Several envs per task, one checkpoint lineage: DECIDED (07-10), one point OPEN
+## G. Several envs per task, one checkpoint lineage: DECIDED (07-10)
 
 - **One task = one checkpoint lineage = several envs**, like today's production RL task
   (per-env quota per pick, one optimizer step per pick, per-env pricing).
@@ -117,24 +147,27 @@ pays off (the user is to supply the paper). Never allow choosing individual roll
 - Everything decided in A-E applies **per env**: observation log, exploration, audit,
   cooldown recommendation.
 - #322's per-task checkpoint isolation is kept. It separates **runs**, not envs.
-- **OPEN:** exploration cap per env (10 % of each env's share) or global (10 % of the
-  whole window). Recommended: **per env**, so one very out-of-zone env cannot drain the
-  others.
+- **Exploration cap per env: DECIDED (07-10).** 10 % of each env's share, not 10 % of
+  the whole window, so one very out-of-zone env cannot drain the others.
 
-## H. Truncation and `\boxed` (#328): OPEN
+## H. Truncation and `\boxed` (#328): DECIDED (07-10), one point to revisit
 
 Today one truncated rollout rejects the whole group, on both lanes, and `\boxed` is
 forced everywhere.
 
-Recommendation: go back to the current tolerance (`robust_utility_admits`), and force
-`\boxed` only for math.
+Decision:
+- **Truncation:** go back to the current tolerance (`robust_utility_admits`). One
+  truncated rollout no longer rejects the whole group.
+- **`\boxed`:** forced **only for math envs**, never for the others.
+- **To revisit:** whether `\boxed` should be forced even for math (user: "à voir même").
+  Check what the math graders already require before coding the rule.
 
 ## I. Forced seed hard-on (#328): KEEP + qualify
 
 Qualify on GPU with Teutonic before the run (agreement measured 0.897 on 09-20; floors
 0.80/0.70).
 
-## J. Production robustness (#327/#328): OPEN
+## J. Production robustness (#327/#328): OPEN (left open on purpose, 07-10)
 
 - A bad service archive makes the whole subnet abstain from setting weights. Abstain
   for that task only.
