@@ -50,14 +50,31 @@ about 20-30 s of H100 per group. Cheap no-signal groups can starve the proof pla
 Recommendation: sampled TOPLOC audit, as in the corpus, instead of a full proof. A
 separate exploration proof budget that can never starve training.
 
-## D. What is published to miners: OPEN
+## D. What is published to miners: DECIDED (07-10)
 
-Today `/service-observations` exists, resets at every checkpoint, and no miner client
-reads it.
+Static public files on R2, not an API that miners poll (0xgrizz's idea). The
+validator's API is never hit by observation readers.
 
-Recommendation: per prompt, publish the verdict (in-zone / always solved / always
-failed), the checkpoint and the age, immediately. Write a miner client that skips
-excluded prompts.
+- **What:** for every verified group (training or exploration): env, prompt index,
+  checkpoint, window, timestamp, **the 16 rewards** and the derived verdict (in-zone /
+  16/16 / 0/16), the chosen candidate group (2×M seeds), and the status (trained /
+  exploration paid / already scanned).
+  - Rescans that are not proven are also published, marked **unproven**.
+  - No hotkey, no tokens.
+- **How:**
+  - **Immutable segments** `observations/run-<id>/seg-NNNNNN.jsonl.gz`, one per
+    **flush every 60 s**, cached indefinitely.
+  - **Index** `observations/run-<id>/index.json`: segment list (seq range, window,
+    checkpoint, sha256, URL), rewritten at each flush, short cache (~15 s), **signed
+    with the validator hotkey**.
+  - A miner reads the index every 15-30 s and downloads only new segments; at start it
+    downloads the whole history.
+  - Cost: about 3,000 PUTs a day; reads are cached and R2 egress is free.
+- **Miner side:** a reference client keeps a local table prompt → observations. A
+  default policy (skip 16/16, retry 0/16 after a few checkpoints) is overridable: each
+  miner decides.
+- Grizz's `/service-observations` becomes internal/admin. The run-wide log (A) feeds
+  the segment writer.
 
 ## E. In-zone rate for the cooldown (#324): OPEN
 
