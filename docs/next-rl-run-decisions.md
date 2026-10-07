@@ -106,11 +106,20 @@ validator's API is never hit by observation readers.
 The miner chooses between 2 candidate groups of 16. This is intended: over-generation
 pays off (the user is to supply the paper). Never allow choosing individual rollouts.
 
-## G. One env per task with its own checkpoint lineage (#328): OPEN, big change
+## G. Several envs per task, one checkpoint lineage: DECIDED (07-10), one point OPEN
 
-This makes a mixed-env Teutonic run impossible (each env would train its own model).
-
-Recommendation: several envs per task, with one shared checkpoint lineage.
+- **One task = one checkpoint lineage = several envs**, like today's production RL task
+  (per-env quota per pick, one optimizer step per pick, per-env pricing).
+- The service contract lists the envs: dataset, policy (2×M seeds, exploration,
+  cooldown) and quota for each.
+- **Envs can be added or removed, and their quotas changed, live during the run**
+  (same mechanism as E: an operator command, no redeploy).
+- Everything decided in A-E applies **per env**: observation log, exploration, audit,
+  cooldown recommendation.
+- #322's per-task checkpoint isolation is kept. It separates **runs**, not envs.
+- **OPEN:** exploration cap per env (10 % of each env's share) or global (10 % of the
+  whole window). Recommended: **per env**, so one very out-of-zone env cannot drain the
+  others.
 
 ## H. Truncation and `\boxed` (#328): OPEN
 
