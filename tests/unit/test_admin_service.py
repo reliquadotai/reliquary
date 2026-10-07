@@ -58,6 +58,15 @@ def bucket(monkeypatch):
 @pytest.fixture
 def admin(bucket, registry, monkeypatch, tmp_path):  # noqa: F811
     from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.infrastructure import task_registry_store
+
+    monkeypatch.setattr(task_registry_store, "get_s3_client", lambda **kw: bucket)
+
+    async def read_registry(*, strict=True, **kw):
+        admissions, _ = await task_registry_store._read_admissions(**kw)
+        return task_registry_store._overlay_admissions(registry["entries"], admissions), registry["etag"]
+
+    monkeypatch.setattr(task_registry_store, "read_registry", read_registry)
 
     stub_source_rows(monkeypatch, SOURCE, 100_000)
     registry["entries"] = {"default": _rl_entry("default", 0.5)}

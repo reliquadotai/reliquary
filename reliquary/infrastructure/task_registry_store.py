@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+from dataclasses import replace
 from collections.abc import Mapping
 
 from reliquary.infrastructure.storage import get_s3_client
 from reliquary.shared.task_registry import (
     TaskEntry,
+    MECHANISM_CORPUS_GENERATION,
+    RegistryError,
     add_task,
     parse_registry,
     render_registry,
@@ -27,6 +31,10 @@ from reliquary.shared.task_registry import (
 logger = logging.getLogger(__name__)
 
 REGISTRY_KEY = "reliquary/tasks/registry.json"
+ADMISSION_KEY = "reliquary/tasks/admission.json"
+ADMISSION_SCHEMA = "reliquary/task-admission/v1"
+ADMISSION_MAX_BYTES = 1 << 20
+ADMISSION_MAX_TASKS = 4096
 
 _ABSENT_CODES = {"NoSuchKey", "404", "NotFound"}
 _CONFLICT_CODES = {"PreconditionFailed", "412", "ConditionalRequestConflict"}
@@ -38,6 +46,64 @@ class RegistryConflict(RuntimeError):
 
 def _error_code(exc) -> str:
     return exc.response.get("Error", {}).get("Code", "")
+
+
+async def _read_admissions(**client_kwargs) -> tuple[dict, str | None]:
+    from botocore.exceptions import ClientError
+    from reliquary.shared.task_id import normalise_task_id
+
+    bucket = client_kwargs.pop("bucket_name", None) or os.getenv("R2_BUCKET_ID", "reliquary")
+    async with get_s3_client(**client_kwargs) as client:
+        try:
+            response = await client.get_object(Bucket=bucket, Key=ADMISSION_KEY)
+        except ClientError as exc:
+            if _error_code(exc) in _ABSENT_CODES:
+                return {}, None
+            raise
+        raw = await response["Body"].read(ADMISSION_MAX_BYTES + 1)
+    if len(raw) > ADMISSION_MAX_BYTES:
+        raise RegistryError("task admission object exceeds its bound")
+    document = json.loads(raw)
+    if (not isinstance(document, dict) or set(document) != {"schema", "tasks"}
+            or document["schema"] != ADMISSION_SCHEMA or not isinstance(document["tasks"], dict)
+            or len(document["tasks"]) > ADMISSION_MAX_TASKS):
+        raise RegistryError("task admission object has an unsupported shape")
+    for task_id, value in document["tasks"].items():
+        if (not isinstance(task_id, str) or normalise_task_id(task_id) != task_id
+                or not isinstance(value, dict) or set(value) != {"job_id", "profile_sha256", "admission"}
+                or not isinstance(value["job_id"], str) or not value["job_id"]
+                or not isinstance(value["profile_sha256"], str) or len(value["profile_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in value["profile_sha256"])
+                or not isinstance(value["admission"], str) or value["admission"] not in {"open", "paused"}):
+            raise RegistryError("task admission object has an invalid task binding")
+    return document["tasks"], response.get("ETag")
+
+
+def _admission_binding(entry: TaskEntry, admission: str) -> dict:
+    return {"job_id": entry.job_id, "profile_sha256": entry.profile_sha256, "admission": admission}
+
+
+def _overlay_admissions(entries: Mapping[str, TaskEntry], tasks: dict) -> dict[str, TaskEntry]:
+    result = dict(entries)
+    for task_id, entry in entries.items():
+        value = tasks.get(task_id)
+        if (entry.mechanism == MECHANISM_CORPUS_GENERATION and value is not None
+                and value == _admission_binding(entry, value["admission"])):
+            result[task_id] = replace(entry, admission=value["admission"])
+    return result
+
+
+async def _write_admissions(tasks: dict, etag: str | None, **client_kwargs) -> None:
+    if len(tasks) > ADMISSION_MAX_TASKS:
+        raise RegistryError("task admission object exceeds its task bound")
+    body = json.dumps({"schema": ADMISSION_SCHEMA, "tasks": tasks}, sort_keys=True,
+                      separators=(",", ":")).encode()
+    if len(body) > ADMISSION_MAX_BYTES:
+        raise RegistryError("task admission object exceeds its byte bound")
+    bucket = client_kwargs.pop("bucket_name", None) or os.getenv("R2_BUCKET_ID", "reliquary")
+    async with get_s3_client(**client_kwargs) as client:
+        await client.put_object(Bucket=bucket, Key=ADMISSION_KEY, Body=body,
+                                **({"IfNoneMatch": "*"} if etag is None else {"IfMatch": etag}))
 
 
 async def read_registry(
@@ -63,7 +129,12 @@ async def read_registry(
                 return {}, None
             raise
         body = await response["Body"].read()
-        return parse_registry(body, strict=strict), response.get("ETag")
+        entries = parse_registry(body, strict=strict)
+        etag = response.get("ETag")
+    if any(entry.mechanism == MECHANISM_CORPUS_GENERATION for entry in entries.values()):
+        tasks, _ = await _read_admissions(bucket_name=bucket, **client_kwargs)
+        entries = _overlay_admissions(entries, tasks)
+    return entries, etag
 
 
 async def write_registry(
@@ -145,8 +216,31 @@ async def retire_task_entry(
 
 async def set_task_admission(task_id: str, admission: str, *, attempts: int = 5,
                              **client_kwargs) -> None:
-    await _mutate(lambda entries: set_admission(entries, task_id, admission),
-                  attempts=attempts, **client_kwargs)
+    """Admission has its own CAS object; legacy economic writers cannot drop it."""
+    from botocore.exceptions import ClientError
+
+    for _ in range(attempts):
+        entries, _ = await read_registry(**client_kwargs)
+        entry = set_admission(entries, task_id, admission)[task_id]
+        tasks, etag = await _read_admissions(**client_kwargs)
+        desired = _admission_binding(entry, admission)
+        if tasks.get(task_id) != desired:
+            try:
+                await _write_admissions({**tasks, task_id: desired}, etag, **client_kwargs)
+            except ClientError as exc:
+                if _error_code(exc) in _CONFLICT_CODES:
+                    continue
+                raise
+        current, _ = await read_registry(**client_kwargs)
+        observed = current.get(task_id)
+        if observed is None or observed.status != "active":
+            raise RegistryError("task is no longer active; admission cannot reopen")
+        if _admission_binding(observed, admission) != desired:
+            raise RegistryConflict("task binding changed during its admission update")
+        if observed.admission != admission:
+            continue
+        return
+    raise RegistryConflict("task admission kept changing under concurrent updates")
 
 
 async def set_task_cap(

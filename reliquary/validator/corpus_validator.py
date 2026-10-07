@@ -803,7 +803,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                remote_audit: bool = False,
                                recheck_fraction: float | None = None,
                                split=None, auditor_kwargs=None,
-                               intake_only: bool = False) -> None:
+                               intake_only: bool = False,
+                               generation_only: bool = False) -> None:
     """Serve one corpus task (``entry``, ``cap``) or several (``jobs``, a list
     of ``(entry, cap)``) from one process and one loaded model.
 
@@ -832,7 +833,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     if intake_only and (remote_audit or split is not None):
         raise RuntimeError("intake-only serves no audit; unset RELIQUARY_CORPUS_REMOTE_AUDIT "
                            "and RELIQUARY_CORPUS_SPLIT")
-    if split is not None and remote_audit:
+    if generation_only and (split is None or split.links or set_weights):
+        raise RuntimeError("a pinned generation control needs one external GPU scorer, "
+                           "no judge links and no weight setting")
+    if split is not None and remote_audit and not generation_only:
         raise RuntimeError("remote audit executors are not served by the split validator; "
                            "unset RELIQUARY_CORPUS_REMOTE_AUDIT or RELIQUARY_CORPUS_SPLIT")
     if split is not None and set_weights:
@@ -859,16 +863,22 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         JudgeThreads, judge_record_store, run_in,
     )
     from reliquary.validator.corpus_hot_jobs import (
-        JOB_REFRESH_SECONDS, CorpusJobSet, hot_job_refusal, job_drained, order_entry_screen,
+        JOB_REFRESH_SECONDS, CorpusJobSet, generation_entry_screen, hot_job_refusal,
+        job_drained, order_entry_screen,
     )
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
     from reliquary.validator.corpus_settlement import R2Archives
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
+    if not served and not generation_only:
+        raise RuntimeError("the corpus control requires an initial job")
     from reliquary.eval.prompt_source import is_order_job_id
 
     for task_entry, _ in served:
-        if is_order_job_id(task_entry.job_id):
+        if generation_only:
+            if generation_entry_screen(task_entry) is not None:
+                raise RuntimeError("the pinned generation control serves generation orders only")
+        elif is_order_job_id(task_entry.job_id):
             # Its own process serves it; two would pay its records twice.
             raise RuntimeError(f"task {task_entry.task_id!r} is an order job (eval or "
                                "generation): the order control (eval control) serves it, "
@@ -897,7 +907,16 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 f"task {task_entry.task_id!r} declares job {task_entry.job_id!r} but it has no manifest"
             )
         manifests.append((task_entry, task_cap, job))
-    for _, _, job in manifests:
+    for task_entry, _, job in manifests:
+        if generation_only and job.episode is not None:
+            raise RuntimeError("the pinned generation control serves single-turn generation jobs")
+        if generation_only:
+            refusal = hot_job_refusal(
+                task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,
+                process_contract=ACTIVE_PROTOCOL_PROFILE.to_generation_contract(),
+                fingerprint=split.fingerprint, generation_only=True)
+            if refusal is not None:
+                raise RuntimeError(refusal[1])
         # Before any download or ledger migration: a judge process cannot grade.
         refusal = split_episode_refusal(split, job)
         if refusal is not None:
@@ -1002,7 +1021,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             logger.warning("subnet registrations unknown at start; miners get 503 until they load")
 
     # Every job names this one checkpoint (`multi_job_refusal`): load it once.
-    first = wiring[0].job
+    first = wiring[0].job if wiring else None
     if split is None:
         directory = Path(snapshot_download(first.checkpoint_repo,
                                            revision=first.checkpoint_revision))
@@ -1070,18 +1089,23 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         async def local_scores(items):
             # The trusted verifier: this GPU, in turn with every job's auditor.
             async with gpu_lock:
+                if scorer is not None:
+                    scores, _, _ = await scorer(rows_of_items(items))
+                    return scores
                 scores, _, _ = await run_in(judge_threads.gpu, lambda: score_sequences(
                     model, rows_of_items(items),
                     chunk_tokens=proof.chunk_tokens, topk=proof.topk,
                     batch_tokens=AUDIT_BATCH_TOKENS))
             return scores
 
-        directory = ExecutorDirectory(model_id=first.checkpoint_repo,
-                                      model_revision=first.checkpoint_revision)
+        model_id = first.checkpoint_repo if first is not None else ACTIVE_PROTOCOL_PROFILE.model_id
+        model_revision = first.checkpoint_revision if first is not None else ACTIVE_PROTOCOL_PROFILE.model_revision
+        checkpoint_sha256 = first.checkpoint_sha256 if first is not None else fingerprint
+        directory = ExecutorDirectory(model_id=model_id, model_revision=model_revision)
         remote = RemoteAuditDispatcher(
             directory=directory, proof=proof, local_scores=local_scores,
-            attempt_store=AttemptStore({"kind": "audit", "model": first.checkpoint_repo,
-                "revision": first.checkpoint_revision, "checkpoint_sha256": first.checkpoint_sha256,
+            attempt_store=AttemptStore({"kind": "audit", "model": model_id,
+                "revision": model_revision, "checkpoint_sha256": checkpoint_sha256,
                 "chunk_tokens": proof.chunk_tokens, "topk": proof.topk}),
             recheck_fraction=RECHECK_FRACTION if recheck_fraction is None else recheck_fraction,
             quarantine=lambda executor_id, reason: executor_store.set_executor_status(
@@ -1152,7 +1176,11 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         grade_parse_threads = ThreadPoolExecutor(GRADE_PARSE_THREADS,
                                                  thread_name_prefix="corpus-grade-parse")
     job_set: CorpusJobSet | None = None
-    archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
+    archives = R2Archives(
+        served=lambda: ((job_set.task_ids() if generation_only else job_set.hot_task_ids())
+                        if job_set is not None else ()),
+        served_only=generation_only,
+    )
 
     def episode_intake_for(w):
         # Loads the task set and the renderers: blocking, so a hot-added job
@@ -1197,7 +1225,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             not_served(w.entry, w.job, "its intake, grader or auditor wiring", exc)
             graders.pop(str(w.job.job_id), None)
             wiring.remove(w)
-    if not wiring:
+    if not wiring and (served or not generation_only):
         raise RuntimeError("no corpus job left to serve: " + "; ".join(
             f"{task}: {why}" for task, why in sorted(unserved.items())))
     if any(w.job.episode is not None for w in wiring):
@@ -1250,11 +1278,14 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         jobs_of=lambda w: judge_jobs(w, intake_only=intake_only,
                                      settle_every_seconds=settle_every_seconds),
         read_entries=read_registry, read_job=read_job,
-        screen=order_entry_screen,
+        screen=generation_entry_screen if generation_only else order_entry_screen,
         admit=lambda task_entry, job: split_episode_refusal(split, job) or hot_job_refusal(
             task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,
-            process_contract=process_contract, fingerprint=fingerprint),
+            process_contract=process_contract, fingerprint=fingerprint,
+            generation_only=generation_only),
         drained=drained,
+        finals=records if generation_only else None,
+        wire_retired=generation_only,
         refresh_every_seconds=(refresh_every_seconds if refresh_every_seconds is not None
                                else JOB_REFRESH_SECONDS),
     )
@@ -1268,6 +1299,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         "contract": runtime_contract, "contract_sha256": canonical_sha256(runtime_contract),
         "checkpoint_sha256": fingerprint, "registry_refresh_enabled": hot,
         "intake_only": intake_only,
+        "execution_scope": "generation-operations" if generation_only else "corpus",
+        "durable_executor_attempts": remote is not None or grade_dispatcher is not None,
     }
     if split is not None:
         from reliquary.validator.corpus_feed import UdsClient

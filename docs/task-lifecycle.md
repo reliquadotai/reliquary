@@ -27,6 +27,10 @@ shipped miner retries a paused request with its existing bounded backoff and
 continues after resume. Retirement continues to return `410 job_retired`.
 Legacy registry entries default to open, and rendering an open registry entry
 keeps its historical bytes. Admission does not change the generation contract.
+Admission intent is authoritative in a separate bounded CAS object, bound to
+the task's job and profile digest. Registry reads overlay that intent. A legacy
+economic writer can therefore rewrite caps without dropping a pending pause;
+pause and resume do not change the economic registry object.
 
 The corpus controller journals actual remote audit and grading attempts with
 conditional object writes. An attempt binds its input digest, pinned runtime,
@@ -50,3 +54,25 @@ Conditional attempt writes and generation fencing do not qualify concurrent
 controller failover, automatic provisioning, or execution of a new workload
 engine. Production release still requires a compatible runtime, preserved
 admitted backlog, and live qualification.
+
+An operator generation control can share an already running GPU scorer without
+restarting its original supervisor or judges. It owns only
+`<admin task prefix>gen-ops-` jobs, on its configured checkpoint and proof. The
+normal corpus control continues excluding generation-order ids. This control
+refuses evaluation, other generation orders, and episode jobs; routing and
+deployment must give each job exactly one owner. Its runtime contract exposes
+`execution_scope: "generation-operations"` and `durable_executor_attempts`.
+
+```sh
+reliquary corpus generation-control --task-id TASK_ID \
+  --checkpoint-dir CHECKPOINT_DIRECTORY --gpu-run-dir GPU_SOCKET_DIRECTORY
+```
+
+The command checks the pinned checkpoint, live scorer model, initial task
+contracts, and scoped submission manifests before migrating any ledger. It
+can start without initial tasks and add real tasks through registry refresh;
+retired generation tasks recover to finish their existing audits and settlement.
+It loads a CPU tokenizer and uses the existing scorer for local audit fallback and
+trusted rechecks. Remote audit workers retain the existing claim/result protocol
+and durable attempt journal. GPU scoring still uses the existing bounded queue;
+this mode does not add GPU capacity or qualify concurrent ownership of one job.

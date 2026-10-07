@@ -51,8 +51,18 @@ def order_entry_screen(entry) -> tuple[str, str] | None:
 eval_entry_screen = order_entry_screen
 
 
+def generation_entry_screen(entry) -> tuple[str, str] | None:
+    """The pinned control owns only operator generation-order job ids."""
+    from reliquary.eval.prompt_source import gen_job_prefix
+
+    if not str(getattr(entry, "job_id", "") or "").startswith(gen_job_prefix() + "ops-"):
+        return OTHER_MODEL, "not an operator generation order, served by another control"
+    return None
+
+
 def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[str, Any],
-                    fingerprint: str, profile_of=_entry_profile) -> tuple[str, str] | None:
+                    fingerprint: str, profile_of=_entry_profile,
+                    generation_only: bool = False) -> tuple[str, str] | None:
     """Why a registry entry cannot join this running process, or None.
 
     ``(OTHER_MODEL, why)`` is an entry for another checkpoint: not ours, not an
@@ -65,11 +75,15 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     from reliquary.protocol.profiles import toploc_proof
     from reliquary.validator.corpus_validator import startup_refusal
 
-    screened = order_entry_screen(entry)
+    screened = (generation_entry_screen(entry) if generation_only else order_entry_screen(entry))
     if screened is not None:
         # Served by the order control alone, whatever its model: two processes
         # auditing and settling one job would pay its records twice.
         return screened
+    if generation_only and getattr(job, "episode", None) is not None:
+        return REFUSED, "the pinned generation control serves single-turn generation jobs"
+    if generation_only and getattr(job, "submit", None) != "scoped":
+        return REFUSED, "the pinned generation control requires scoped submission routes"
     if getattr(entry, "contract", None) is None:
         return REFUSED, "it carries no contract to check against the one this process runs"
     try:
@@ -561,6 +575,7 @@ __all__ = [
     "REFUSED",
     "eval_entry_screen",
     "order_entry_screen",
+    "generation_entry_screen",
     "hot_job_refusal",
     "job_drained",
 ]

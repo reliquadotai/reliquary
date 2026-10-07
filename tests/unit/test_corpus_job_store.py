@@ -57,8 +57,8 @@ class _FakeMultiObjectR2:
             def __init__(self, data):
                 self._data = data
 
-            async def read(self):
-                return self._data
+            async def read(self, amount=None):
+                return self._data if amount is None else self._data[:amount]
 
         return {"Body": _Body(body), "ETag": etag}
 

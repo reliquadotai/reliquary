@@ -2316,6 +2316,32 @@ def corpus_order_control(
     asyncio.run(eval_control.run_order_control(netuid=netuid, http_host=host, http_port=port))
 
 
+@corpus_app.command("generation-control")
+def corpus_generation_control(
+    task_ids: list[str] = typer.Option([], "--task-id"),
+    checkpoint_dir: str = typer.Option(..., "--checkpoint-dir"),
+    gpu_run_dir: str = typer.Option(..., "--gpu-run-dir"),
+    netuid: int = typer.Option(81, "--netuid"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8792, "--port"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Serve operator generation orders with a shared, already loaded GPU scorer.
+
+    Owns only <admin prefix>gen-ops- jobs on the configured pinned model. Supply
+    the checkpoint and existing GPU socket directories; optional initial task
+    ids must be distinct. It may start empty and hot-add actual registry tasks.
+    The original corpus supervisor, judges and tasks retain their ownership.
+    Route only these generation jobs to this control.
+    """
+    from reliquary.validator.generation_control import run_generation_control
+
+    setup_logging(log_level)
+    asyncio.run(run_generation_control(task_ids=task_ids, checkpoint_dir=checkpoint_dir,
+                                      gpu_run_dir=gpu_run_dir, netuid=netuid,
+                                      http_host=host, http_port=port))
+
+
 # The command's first name, kept for existing deployments.
 corpus_app.command("eval-control", help="Alias of `order-control`.")(corpus_order_control)
 

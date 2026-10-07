@@ -106,6 +106,25 @@ def test_the_settler_still_refuses_another_task_with_one_id(monkeypatch):
     assert keys == ["reliquary/tasks/corpus-math/dataset/window-3.json.gz"]
 
 
+def test_explicit_archive_owner_tracks_actual_wired_tasks_without_inheriting_legacy_ids(monkeypatch):
+    from reliquary.validator.corpus_settlement import R2Archives
+
+    monkeypatch.setenv("RELIQUARY_TASK_ID", "corpus-legacy")
+    keys = _capture_puts(monkeypatch)
+    served = set()
+    archives = R2Archives(served=lambda: served, served_only=True)
+    for task in ("corpus-legacy", "corpus-fresh"):
+        with pytest.raises(RuntimeError, match="refusing to archive"):
+            asyncio.run(archives.write(task, 3, {}))
+    monkeypatch.delenv("RELIQUARY_TASK_ID")
+    served.add("corpus-fresh")
+    asyncio.run(archives.write("corpus-fresh", 3, {}))
+    served.clear()
+    with pytest.raises(RuntimeError, match="refusing to archive"):
+        asyncio.run(archives.write("corpus-fresh", 4, {}))
+    assert keys == ["reliquary/tasks/corpus-fresh/dataset/window-3.json.gz"]
+
+
 @pytest.mark.parametrize("value", ["corpus-math,", "corpus-math,,corpus-code", "corpus-math,corpus-math"])
 def test_a_malformed_task_id_list_exits_four_without_a_traceback(value):
     env = {k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")}

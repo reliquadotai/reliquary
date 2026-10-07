@@ -70,6 +70,7 @@ def _refusal(entry, job=None, process_contract=None, **kw):
                                                   "protocol_version": 5},
             fingerprint=kw.pop("fingerprint", CHECKPOINT),
             profile_of=lambda e: _profile(e.contract["model_id"], e.contract["model_revision"]),
+            generation_only=kw.pop("generation_only", False),
         )
     finally:
         profiles.toploc_proof = real
@@ -77,6 +78,39 @@ def _refusal(entry, job=None, process_contract=None, **kw):
 
 def test_an_entry_on_this_model_with_this_environment_is_admitted():
     assert _refusal(_hot_entry()) is None
+
+
+def test_generation_ownership_is_disjoint_from_legacy_and_other_orders():
+    from reliquary.validator.corpus_hot_jobs import generation_entry_screen, order_entry_screen
+
+    entry = _hot_entry(job_id="order-gen-ops-new")
+    job = _hot_job(job_id=entry.job_id, submit="scoped")
+    assert order_entry_screen(entry)[0] == OTHER_MODEL
+    assert generation_entry_screen(entry) is None
+    assert _refusal(entry, job, generation_only=True) is None
+    assert _refusal(entry, job)[0] == OTHER_MODEL
+    for job_id in ("legacy-job", "order-ops-old", "order-gen-customer", "order-eval-ops-new"):
+        assert generation_entry_screen(_hot_entry(job_id=job_id))[0] == OTHER_MODEL
+
+
+def test_generation_ownership_keeps_pin_and_scoped_single_turn_requirements():
+    entry = _hot_entry(job_id="order-gen-ops-new")
+    job = _hot_job(job_id=entry.job_id, submit="scoped")
+    assert _refusal(entry, _hot_job(job_id=entry.job_id, submit="scoped", episode=object()),
+                    generation_only=True)[0] == REFUSED
+    assert _refusal(entry, _hot_job(job_id=entry.job_id, submit="legacy"),
+                    generation_only=True)[0] == REFUSED
+    assert _refusal(entry, job, generation_only=True, fingerprint="0" * 64)[0] == REFUSED
+
+
+def test_generation_ownership_uses_the_existing_configured_admin_prefix(monkeypatch):
+    from reliquary.validator.corpus_hot_jobs import generation_entry_screen, order_entry_screen
+
+    monkeypatch.setenv("RELIQUARY_ADMIN_TASK_PREFIX", "pilot-")
+    entry = _hot_entry(job_id="pilot-gen-ops-new")
+    assert generation_entry_screen(entry) is None
+    assert order_entry_screen(entry)[0] == OTHER_MODEL
+    assert generation_entry_screen(_hot_entry(job_id="order-gen-ops-new"))[0] == OTHER_MODEL
 
 
 def test_an_entry_for_another_model_is_ignored_not_refused():

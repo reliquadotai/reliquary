@@ -105,19 +105,74 @@ async def test_an_absent_registry_reads_as_empty(fake):
 
 
 @pytest.mark.asyncio
-async def test_admission_retries_cas_without_undoing_concurrent_cap_change(fake):
+async def test_admission_survives_legacy_registry_writes_and_concurrent_cap_change(monkeypatch):
     from tests.unit.test_corpus_task_registry import _entry as corpus_entry
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
     from reliquary.shared.task_registry import set_cap
+    import json
 
     entries = {"corpus-math": corpus_entry()}
-    client = fake(render_registry(entries))
-    client.steal_once = render_registry(set_cap(entries, "corpus-math", 0.05))
+    client = _FakeMultiObjectR2()
+    client.objects[store.REGISTRY_KEY] = (render_registry(entries), '"v1"')
+    monkeypatch.setattr(store, "get_s3_client", lambda **kw: client)
+    original = client.put_object
+    writes = []
+
+    async def put(**kw):
+        writes.append(kw["Key"])
+        if len(writes) == 1:
+            # An old economic writer rewrites its registry during the separate
+            # admission CAS. It knows no admission field and changes the cap.
+            body = json.loads(render_registry(set_cap(entries, "corpus-math", 0.05)))
+            body["tasks"]["corpus-math"].pop("admission", None)
+            client.objects[store.REGISTRY_KEY] = (json.dumps(body).encode(), '"legacy"')
+        return await original(**kw)
+
+    client.put_object = put
     await store.set_task_admission("corpus-math", "paused")
-    entry = parse_registry(client.body)["corpus-math"]
+    entry = (await store.read_registry())[0]["corpus-math"]
     assert entry.admission == "paused" and entry.params["cap"] == 0.05
+    assert parse_registry(client.objects[store.REGISTRY_KEY][0])["corpus-math"].admission == "open"
+    assert writes == [store.ADMISSION_KEY]
+    await store.set_task_cap("corpus-math", 0.04)
+    assert (await store.read_registry())[0]["corpus-math"].admission == "paused"
+    legacy = json.loads(client.objects[store.REGISTRY_KEY][0])
+    legacy["tasks"]["corpus-math"].pop("admission", None)
+    client.objects[store.REGISTRY_KEY] = (json.dumps(legacy).encode(), '"legacy2"')
+    assert (await store.read_registry())[0]["corpus-math"].admission == "paused"
     await store.set_task_admission("corpus-math", "open")
-    entry = parse_registry(client.body)["corpus-math"]
-    assert entry.admission == "open" and entry.params["cap"] == 0.05
+    entry = (await store.read_registry())[0]["corpus-math"]
+    assert entry.admission == "open" and entry.params["cap"] == 0.04
+
+
+@pytest.mark.asyncio
+async def test_admission_cas_retries_preserving_other_task_intent(monkeypatch):
+    import json
+    from tests.unit.test_corpus_task_registry import _entry as corpus_entry
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+
+    entries = {"corpus-math": corpus_entry()}
+    client = _FakeMultiObjectR2()
+    client.objects[store.REGISTRY_KEY] = (render_registry(entries), '"v1"')
+    monkeypatch.setattr(store, "get_s3_client", lambda **kw: client)
+    original = client.put_object
+    attempts = []
+    other = {"job_id": "another-job", "profile_sha256": "b" * 64, "admission": "paused"}
+
+    async def put(**kw):
+        attempts.append(kw)
+        if len(attempts) == 1:
+            client.objects[store.ADMISSION_KEY] = (json.dumps({"schema": store.ADMISSION_SCHEMA,
+                "tasks": {"other-task": other}}).encode(), '"rival"')
+            raise _client_error("PreconditionFailed")
+        return await original(**kw)
+
+    client.put_object = put
+    await store.set_task_admission("corpus-math", "paused")
+    tasks, _ = await store._read_admissions()
+    assert tasks["other-task"] == other
+    assert tasks["corpus-math"]["admission"] == "paused"
+    assert attempts[1]["IfMatch"] == '"rival"'
 
 
 @pytest.mark.asyncio
