@@ -86,6 +86,8 @@ class TaskEntry:
     # Only on the explicit service mechanism; old readers refuse that mechanism.
     # Absent fields never alter historical registry bytes or generation hashes.
     service_contract: Mapping[str, Any] | None = None
+    # Admission is reversible; retirement and the economic controller remain separate.
+    admission: str = "open"
 
 
 def _number(value: Any, field: str) -> float:
@@ -166,6 +168,10 @@ def validate_entry(entry: TaskEntry) -> None:
         )
     if entry.status not in {"active", "retired"}:
         raise RegistryError(f"unknown status {entry.status!r}")
+    if entry.admission not in {"open", "paused"}:
+        raise RegistryError(f"unknown admission state {entry.admission!r}")
+    if entry.admission == "paused" and entry.mechanism != MECHANISM_CORPUS_GENERATION:
+        raise RegistryError("reversible admission applies to corpus tasks")
     missing = [f for f in PRICE_PARAM_FIELDS if f not in entry.params]
     if missing:
         raise RegistryError(f"missing price parameters: {', '.join(missing)}")
@@ -415,6 +421,21 @@ def set_cap(
     return updated
 
 
+def set_admission(entries: Mapping[str, TaskEntry], task_id: str, admission: str) -> dict[str, TaskEntry]:
+    if admission not in {"open", "paused"}:
+        raise RegistryError("admission must be open or paused")
+    entry = entries.get(task_id)
+    if entry is None:
+        raise RegistryError(f"task {task_id!r} is not in the registry")
+    if entry.status != "active":
+        raise RegistryError(f"task {task_id!r} is retired; admission cannot reopen")
+    if entry.mechanism != MECHANISM_CORPUS_GENERATION:
+        raise RegistryError("reversible admission applies to corpus tasks")
+    updated = {**entries, task_id: replace(entry, admission=admission)}
+    validate_registry(updated)
+    return updated
+
+
 def _verification_of(task_id: str, body: Mapping[str, Any]) -> str | None:
     """Read the declared replica, refusing a block this reader does not understand."""
     declared = body.get("verification")
@@ -487,6 +508,7 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             job_id=_job_id_of(task_id, body),
             service_contract=(None if body.get("service_contract") is None else
                               json.loads(json.dumps(body["service_contract"]))),
+            admission=body.get("admission", "open"),
         )
     if strict:
         validate_registry(entries)
@@ -527,6 +549,9 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
             body["contract"] = dict(entry.contract)
         if entry.service_contract is not None:
             body["service_contract"] = dict(entry.service_contract)
+        # Keep the historical bytes when admission is open.
+        if entry.admission != "open":
+            body["admission"] = entry.admission
         return body
 
     document = {

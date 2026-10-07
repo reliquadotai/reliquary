@@ -99,6 +99,7 @@ def _wiring():
 
 class _Routes:
     retired: set = set()
+    paused: set = set()
 
     def __init__(self):
         self.routers = {"math": SimpleNamespace(ledger_state=self._ledger)}

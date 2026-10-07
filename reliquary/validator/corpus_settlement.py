@@ -302,12 +302,18 @@ class R2Archives:
     """The two archive calls the settler makes, against the real bucket.
 
     ``served`` names the tasks this process wired after boot, which
-    ``RELIQUARY_TASK_ID`` cannot list.
+    ``RELIQUARY_TASK_ID`` cannot list. ``served_only`` uses that reader as the
+    complete ownership set, including tasks wired at boot, without inheriting
+    another control's environment task list.
     """
 
-    def __init__(self, *, served=None, ttl_seconds: float = OTHER_MAX_TTL_SECONDS,
+    def __init__(self, *, served=None, served_only: bool = False,
+                 ttl_seconds: float = OTHER_MAX_TTL_SECONDS,
                  clock=time.monotonic) -> None:
+        if served_only and served is None:
+            raise ValueError("explicit archive ownership requires a served task reader")
         self._served = served
+        self._served_only = served_only
         self._ttl = ttl_seconds
         self._clock = clock
         # Per task, its highest window (None: no archive), as of `_listed_at`;
@@ -354,6 +360,10 @@ class R2Archives:
 
         served = os.getenv("RELIQUARY_TASK_ID")
         hot = set(self._served()) if self._served is not None else set()
+        if self._served_only:
+            if task_id not in hot:
+                raise RuntimeError(f"this process does not serve {task_id!r}; refusing to archive")
+            return
         if not served or (task_id not in parse_task_ids(served) and task_id not in hot):
             raise RuntimeError(f"RELIQUARY_TASK_ID does not name {task_id!r}; refusing to archive")
 

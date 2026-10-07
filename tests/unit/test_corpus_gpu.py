@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -109,6 +112,212 @@ def test_one_judges_bad_rows_never_fail_another_judges():
     assert len(good[0]) == 2
     assert isinstance(bad, RuntimeError)
     assert freed == [1, 1]
+
+
+@pytest.mark.parametrize("request_count", [1, 3])
+def test_failed_forward_tensors_are_freed_before_cleanup_and_retries(request_count, monkeypatch):
+    import torch
+
+    class _SimulatedOOM(RuntimeError):
+        pass
+
+    tensors, errors, calls, freed, fatal, forwards = [], [], [], [], [], []
+
+    def score(rows, chunk_tokens, topk):
+        assert all(ref() is None for ref in tensors)
+        calls.append(len(rows))
+        if len(calls) <= (2 if request_count > 1 else 1):
+            # Both the failing frame and its chained cause can own activations.
+            try:
+                inner_tensor = torch.zeros(1)
+                tensors.append(weakref.ref(inner_tensor))
+                raise ValueError("forward allocation failed")
+            except ValueError as cause:
+                tensor = torch.zeros(1)
+                tensors.append(weakref.ref(tensor))
+                error = _SimulatedOOM("CUDA out of memory")
+                errors.append(error)
+                raise error from cause
+        return fakes.score_rows(rows), 0.25, 0.5
+
+    def free_cuda():
+        assert all(ref() is None for ref in tensors)
+        assert sys.exc_info() == (None, None, None)
+        freed.append(1)
+
+    async def scenario(executor):
+        loop = asyncio.get_running_loop()
+        run_in_executor = loop.run_in_executor
+
+        def retain_forward(*args):
+            future = run_in_executor(*args)
+            forwards.append(future)
+            return future
+
+        # The awaiting Future can retain its own copy of the traceback.
+        monkeypatch.setattr(loop, "run_in_executor", retain_forward)
+        batcher = GpuBatcher(score, executor=executor, merge_tokens_limit=10_000,
+                             queue_tokens_limit=10_000, on_error=free_cuda,
+                             on_fatal=fatal.append)
+        jobs = [asyncio.create_task(batcher.submit(_rows(k + 1), 32, 128))
+                for k in range(request_count)]
+        await asyncio.sleep(0)
+        worker = asyncio.create_task(batcher.run())
+        try:
+            gathered = asyncio.gather(*jobs, return_exceptions=True)
+            done, _ = await asyncio.wait((worker, gathered), timeout=5,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if worker in done:
+                await worker
+            assert gathered in done
+            results = await gathered
+            # Keep the failed Future and original exception alive while the
+            # next request scores: neither may retain the failed activations.
+            assert jobs[0].exception() is errors[-1]
+            assert results[0] is errors[-1]
+            assert type(results[0]) is _SimulatedOOM
+            assert str(results[0]) == "CUDA out of memory"
+            assert results[0].__cause__ is results[0].__context__ is None
+            later = await asyncio.wait_for(batcher.submit(_rows(1), 32, 128), timeout=5)
+            return results, later
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    with ThreadPoolExecutor(1) as executor:
+        results, later = asyncio.run(scenario(executor))
+    assert calls == ([1, 1] if request_count == 1 else [6, 1, 2, 3, 1])
+    assert len(forwards) == len(calls) and all(future.done() for future in forwards)
+    assert freed == [1] * len(errors)
+    assert fatal == []
+    assert all(ref() is None for ref in tensors)
+    assert later == (fakes.score_rows(_rows(1)), 0.25, 0.5)
+    if request_count > 1:
+        assert [result[0] for result in results[1:]] == [
+            fakes.score_rows(_rows(2)), fakes.score_rows(_rows(3))]
+
+
+@pytest.mark.parametrize("explicit_cause", [False, True])
+def test_forward_cleanup_releases_chained_frames_without_garbage_collection(explicit_cause):
+    import gc
+    import torch
+
+    tensors, freed = [], []
+
+    def allocate():
+        tensor = torch.zeros(1)
+        tensors.append(weakref.ref(tensor))
+        error = ValueError("forward allocation failed")
+        raise error  # Its traceback and this local form a reference cycle.
+
+    def score(rows, chunk_tokens, topk):
+        try:
+            allocate()
+        except ValueError as cause:
+            if explicit_cause:
+                raise RuntimeError("CUDA out of memory") from cause
+            raise RuntimeError("CUDA out of memory")
+
+    async def scenario(executor):
+        batcher = GpuBatcher(score, executor=executor,
+                             on_error=lambda: freed.append(all(ref() is None for ref in tensors)))
+        worker = asyncio.create_task(batcher.run())
+        try:
+            failed = asyncio.create_task(batcher.submit(_rows(1), 32, 128))
+            (error,) = await asyncio.wait_for(
+                asyncio.gather(failed, return_exceptions=True), timeout=5)
+            assert type(error) is RuntimeError and str(error) == "CUDA out of memory"
+            assert failed.exception() is error
+            assert freed == [True]
+            assert len(tensors) == 1 and tensors[0]() is None
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    enabled = gc.isenabled()
+    gc.disable()  # Incidental collection must not hide retained activations.
+    try:
+        with ThreadPoolExecutor(1) as executor:
+            asyncio.run(scenario(executor))
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_info_reports_forward_failure_until_scoring_recovers():
+    import httpx
+
+    calls = []
+    info = {"vocab_size": 7, "model_id": "org/Frozen", "model_revision": "abc123"}
+
+    def score(rows, chunk_tokens, topk):
+        if not rows:
+            return [], 0.0, 0.0
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory")
+        return fakes.score_rows(rows), 0.25, 0.5
+
+    async def scenario(executor):
+        batcher = GpuBatcher(score, executor=executor)
+        worker = asyncio.create_task(batcher.run())
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(
+                    app=build_gpu_app(batcher, info)), base_url="http://gpu") as client:
+                assert (await client.get("/info")).json() == {**info, "ready": True}
+                body = encode_request(_rows(1), chunk_tokens=32, topk=128)
+                failed = await client.post("/score", content=body)
+                assert failed.status_code == 200
+                assert failed.json() == {"error": "CUDA out of memory", "kind": "RuntimeError",
+                                         "value_error": False, "runtime_error": True}
+                assert (await client.get("/info")).json() == {**info, "ready": False}
+                empty = await client.post("/score", content=encode_request([], chunk_tokens=32, topk=128))
+                assert empty.status_code == 200 and empty.json()["scores"] == []
+                assert (await client.get("/info")).json() == {**info, "ready": False}
+                recovered = await client.post("/score", content=body)
+                assert scores_from_wire(recovered.json()["scores"]) == fakes.score_rows(_rows(1))
+                assert (await client.get("/info")).json() == {**info, "ready": True}
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    with ThreadPoolExecutor(1) as executor:
+        asyncio.run(scenario(executor))
+    assert "ready" not in info
+
+
+def test_info_recovers_after_a_merged_forward_falls_back_successfully():
+    import httpx
+
+    calls, failed_ready = [], []
+
+    def score(rows, chunk_tokens, topk):
+        calls.append(len(rows))
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory")
+        return fakes.score_rows(rows), 0.25, 0.5
+
+    async def scenario(executor):
+        batcher = GpuBatcher(score, executor=executor, merge_tokens_limit=10_000,
+                             on_error=lambda: failed_ready.append(batcher.ready))
+        jobs = [asyncio.create_task(batcher.submit(_rows(k), 32, 128)) for k in (1, 2)]
+        await asyncio.sleep(0)
+        worker = asyncio.create_task(batcher.run())
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*jobs), timeout=5)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(
+                    app=build_gpu_app(batcher, {})), base_url="http://gpu") as client:
+                assert (await client.get("/info")).json() == {"ready": True}
+            return results
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    with ThreadPoolExecutor(1) as executor:
+        results = asyncio.run(scenario(executor))
+    assert calls == [3, 1, 2]
+    assert failed_ready == [False]
+    assert [result[0] for result in results] == [fakes.score_rows(_rows(1)), fakes.score_rows(_rows(2))]
 
 
 def test_a_full_queue_refuses_until_it_drains():

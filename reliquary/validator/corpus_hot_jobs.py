@@ -51,8 +51,18 @@ def order_entry_screen(entry) -> tuple[str, str] | None:
 eval_entry_screen = order_entry_screen
 
 
+def generation_entry_screen(entry) -> tuple[str, str] | None:
+    """The pinned control owns only operator generation-order job ids."""
+    from reliquary.eval.prompt_source import gen_job_prefix
+
+    if not str(getattr(entry, "job_id", "") or "").startswith(gen_job_prefix() + "ops-"):
+        return OTHER_MODEL, "not an operator generation order, served by another control"
+    return None
+
+
 def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[str, Any],
-                    fingerprint: str, profile_of=_entry_profile) -> tuple[str, str] | None:
+                    fingerprint: str, profile_of=_entry_profile,
+                    generation_only: bool = False) -> tuple[str, str] | None:
     """Why a registry entry cannot join this running process, or None.
 
     ``(OTHER_MODEL, why)`` is an entry for another checkpoint: not ours, not an
@@ -65,11 +75,15 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     from reliquary.protocol.profiles import toploc_proof
     from reliquary.validator.corpus_validator import startup_refusal
 
-    screened = order_entry_screen(entry)
+    screened = (generation_entry_screen(entry) if generation_only else order_entry_screen(entry))
     if screened is not None:
         # Served by the order control alone, whatever its model: two processes
         # auditing and settling one job would pay its records twice.
         return screened
+    if generation_only and getattr(job, "episode", None) is not None:
+        return REFUSED, "the pinned generation control serves single-turn generation jobs"
+    if generation_only and getattr(job, "submit", None) != "scoped":
+        return REFUSED, "the pinned generation control requires scoped submission routes"
     if getattr(entry, "contract", None) is None:
         return REFUSED, "it carries no contract to check against the one this process runs"
     try:
@@ -270,6 +284,7 @@ class CorpusJobSet:
                     self._routes.retire(job_id)
                 continue
             cap = float(entry.params["cap"])
+            self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
             if cap != float(wiring.cap):
                 logger.info("corpus task %s cap %s -> %s", task_id, wiring.cap, cap)
                 wiring.cap = cap
@@ -347,6 +362,7 @@ class CorpusJobSet:
         self._wire_failures.pop(task_id, None)
         self._routes.add(job_id, router, contract=entry.contract,
                          prompt_source=job.prompt_source)
+        self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
         if entry.status != "active":
             # Wired only to finish its audits and settlement: no admission.
             self._routes.retire(job_id)
@@ -443,6 +459,7 @@ class CorpusJobSet:
         if grader is not None:
             # An episode job: grading holds payment, so its backlog is public.
             status = {**status, "grading": grader.status()}
+        status["admission"] = "paused" if job_id in self._routes.paused else "open"
         return status
 
     async def status(self, job_id: str) -> dict | None:
@@ -465,14 +482,19 @@ class CorpusJobSet:
         now = self._clock()
         cached = self._status_cache.get(job_id)
         if cached is not None and now - cached[0] < STATUS_CACHE_SECONDS:
-            return cached[1]
+            return self._observed_admission(job_id, cached[1])
         lock = self._status_locks.setdefault(job_id, asyncio.Lock())
         async with lock:
             # One recompute per period, however many requests wait on it.
             cached = self._status_cache.get(job_id)
             if cached is not None and self._clock() - cached[0] < STATUS_CACHE_SECONDS:
-                return cached[1]
-            return await self._recompute(job_id, cached)
+                return self._observed_admission(job_id, cached[1])
+            status = await self._recompute(job_id, cached)
+            return self._observed_admission(job_id, status)
+
+    def _observed_admission(self, job_id: str, status: dict) -> dict:
+        status["admission"] = "paused" if job_id in self._routes.paused else "open"
+        return status
 
     async def _recompute(self, job_id: str, cached) -> dict:
         now = self._clock()
@@ -553,6 +575,7 @@ __all__ = [
     "REFUSED",
     "eval_entry_screen",
     "order_entry_screen",
+    "generation_entry_screen",
     "hot_job_refusal",
     "job_drained",
 ]

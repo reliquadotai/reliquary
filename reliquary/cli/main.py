@@ -681,7 +681,7 @@ def tasks_list() -> None:
     entries, _ = asyncio.run(read_registry(strict=False))
     for task_id, entry in sorted(entries.items()):
         typer.echo(
-            f"{task_id:24s} {entry.status:8s} cap={entry.params['cap']:.3f} "
+            f"{task_id:24s} {entry.status:8s} admission={entry.admission} cap={entry.params['cap']:.3f} "
             f"{entry.profile_id}"
         )
     typer.echo(f"total declared cap: {total_cap(entries):.4f} / 1.0")
@@ -746,6 +746,30 @@ def tasks_set_cap(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"task {task_id} now has cap {cap}" + (f" and floor {floor}" if floor is not None else ""))
+
+
+def _task_admission(task_id: str, admission: str) -> None:
+    from reliquary.infrastructure.task_registry_store import RegistryConflict, set_task_admission
+    from reliquary.shared.task_registry import RegistryError
+
+    try:
+        asyncio.run(set_task_admission(task_id, admission))
+    except (RegistryError, RegistryConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"task {task_id} admission {admission}; active state and cap unchanged")
+
+
+@tasks_app.command("pause")
+def tasks_pause(task_id: str = typer.Option(..., "--task-id")) -> None:
+    """Stop new corpus admissions on the control's next registry refresh; drain existing work."""
+    _task_admission(task_id, "paused")
+
+
+@tasks_app.command("resume")
+def tasks_resume(task_id: str = typer.Option(..., "--task-id")) -> None:
+    """Reopen a paused active corpus task; terminal retirement cannot resume."""
+    _task_admission(task_id, "open")
 
 
 @tasks_app.command("retire")
@@ -2423,6 +2447,32 @@ def corpus_order_control(
 
     setup_logging(log_level)
     asyncio.run(eval_control.run_order_control(netuid=netuid, http_host=host, http_port=port))
+
+
+@corpus_app.command("generation-control")
+def corpus_generation_control(
+    task_ids: list[str] = typer.Option([], "--task-id"),
+    checkpoint_dir: str = typer.Option(..., "--checkpoint-dir"),
+    gpu_run_dir: str = typer.Option(..., "--gpu-run-dir"),
+    netuid: int = typer.Option(81, "--netuid"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8792, "--port"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Serve operator generation orders with a shared, already loaded GPU scorer.
+
+    Owns only <admin prefix>gen-ops- jobs on the configured pinned model. Supply
+    the checkpoint and existing GPU socket directories; optional initial task
+    ids must be distinct. It may start empty and hot-add actual registry tasks.
+    The original corpus supervisor, judges and tasks retain their ownership.
+    Route only these generation jobs to this control.
+    """
+    from reliquary.validator.generation_control import run_generation_control
+
+    setup_logging(log_level)
+    asyncio.run(run_generation_control(task_ids=task_ids, checkpoint_dir=checkpoint_dir,
+                                      gpu_run_dir=gpu_run_dir, netuid=netuid,
+                                      http_host=host, http_port=port))
 
 
 # The command's first name, kept for existing deployments.

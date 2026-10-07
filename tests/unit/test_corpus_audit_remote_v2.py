@@ -175,7 +175,7 @@ async def _router_claim(body):
     seen = []
 
     class Stub:
-        def claim(self, executor_id, protocols=(AUDIT_PROTOCOL,)):
+        async def durable_claim(self, executor_id, protocols=(AUDIT_PROTOCOL,)):
             seen.append(tuple(protocols))
             return None
 
@@ -183,9 +183,10 @@ async def _router_claim(body):
     app.include_router(build_audit_executor_router(Stub(), directory))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                  base_url="http://control") as client:
-        await client.post("/corpus/internal/audit/claim", headers={"Authorization": f"Bearer {GOOD}"},
+        response = await client.post("/corpus/internal/audit/claim", headers={"Authorization": f"Bearer {GOOD}"},
                           json={"executor_id": "pod-1", "model_id": MODEL,
                                 "model_revision": REVISION, **body})
+        assert response.status_code == 204
     return seen
 
 

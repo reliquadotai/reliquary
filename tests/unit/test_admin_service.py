@@ -58,6 +58,15 @@ def bucket(monkeypatch):
 @pytest.fixture
 def admin(bucket, registry, monkeypatch, tmp_path):  # noqa: F811
     from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.infrastructure import task_registry_store
+
+    monkeypatch.setattr(task_registry_store, "get_s3_client", lambda **kw: bucket)
+
+    async def read_registry(*, strict=True, **kw):
+        admissions, _ = await task_registry_store._read_admissions(**kw)
+        return task_registry_store._overlay_admissions(registry["entries"], admissions), registry["etag"]
+
+    monkeypatch.setattr(task_registry_store, "read_registry", read_registry)
 
     stub_source_rows(monkeypatch, SOURCE, 100_000)
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
@@ -97,6 +106,26 @@ def _job(job_id="math-a", cap=0.1, **kw):
 
 def test_an_unsigned_request_is_refused(admin):
     assert admin.client.get("/admin/v1/executors/pod-1").status_code == 401
+
+
+def test_signed_pause_resume_is_reversible_and_retirement_cannot_resume(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    before = admin("GET", "/admin/v1/tasks/math-a").json()["task"]
+    path = "/admin/v1/tasks/math-a/admission"
+    assert admin.client.post(path, json={"admission": "paused"}).status_code == 401
+    assert admin("GET", "/admin/v1/task-catalog").json()["admission_controls_supported"] is True
+    for admission in ("paused", "paused", "open"):
+        response = admin("POST", path, {"admission": admission})
+        assert response.status_code == 200
+        assert response.json() == {"task_id": "math-a", "status": "active", "admission": admission}
+        after = admin("GET", "/admin/v1/tasks/math-a").json()["task"]
+        assert after["admission"] == admission
+        assert after["profile_sha256"] == before["profile_sha256"]
+        assert {k: v for k, v in after.items() if k != "admission"} == {
+            k: v for k, v in before.items() if k != "admission"}
+    assert admin("POST", path, {"admission": "open", "cap": 0}).status_code == 422
+    assert admin("POST", "/admin/v1/tasks/math-a/retire", {}).status_code == 200
+    assert admin("POST", path, {"admission": "open"}).status_code == 409
 
 
 def test_a_replayed_request_is_refused(admin):
