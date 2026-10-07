@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
@@ -544,6 +545,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             top_k=body.sampling.top_k,
         )
 
+    def operator_generation_job(body: CreateJob) -> bool:
+        from reliquary.eval.prompt_source import gen_job_prefix
+
+        prefix = gen_job_prefix(task_prefix) + "ops-"
+        if not (body.job_id.startswith(prefix) or (body.task_id or "").startswith(prefix)):
+            return False
+        if (body.task_id != body.job_id or not re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                body.job_id.removeprefix(prefix))):
+            raise HTTPException(status_code=422, detail="operator_generation_ids_must_match_uuid4")
+        return True
+
     async def prepare_job(body: CreateJob):
         from reliquary.eval.prompt_source import eval_job_prefix, gen_job_prefix
 
@@ -564,9 +577,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 evaluation and not (body.task_id or body.job_id).startswith(eval_prefix)):
             raise HTTPException(status_code=422, detail=(
                 f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))
-        # A generation order on any model: order-gen- ids, both of them, and
-        # always from a qualification record.
-        generation = body.job_id.startswith(gen_prefix)
+        # Pinned operator work has its own exact namespace and catalog path.
+        # Other generation orders always require their qualification record.
+        operator_generation = operator_generation_job(body)
+        generation = body.job_id.startswith(gen_prefix) and not operator_generation
         if generation and not (body.task_id or body.job_id).startswith(gen_prefix):
             raise HTTPException(status_code=422, detail=(
                 f"a generation order's ids both start with {gen_prefix!r}"))
@@ -600,6 +614,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                              checkpoint_sha256=spec.checkpoint_sha256,
                              eos_token_id=spec.eos_token_id, prompt_source=body.env,
                              audit_params={})
+            if operator_generation:
+                arguments["submit"] = "scoped"
         try:
             manifest, entry = await asyncio.to_thread(
                 prepare, job_id=body.job_id, task_id=body.task_id, model=body.model,
@@ -717,7 +733,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         cap = float(entry.params["cap"])
         if body.eval_set_id is not None:
             await eval_job_arguments(body, record_order=True)
-        elif body.job_id.startswith(gen_job_prefix(task_prefix)):
+        elif (body.job_id.startswith(gen_job_prefix(task_prefix))
+              and not operator_generation_job(body)):
             await gen_job_arguments(body, record_order=True)
         answer = {"job_id": body.job_id, "task_id": entry.task_id}
         wanted = parse_job(manifest).to_contract()
