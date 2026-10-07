@@ -208,7 +208,8 @@ class GpuBatcher:
         from reliquary.validator.corpus_judge_threads import run_in
 
         result = await run_in(self._executor, self._score, rows, chunk_tokens, topk)
-        self.ready = True
+        if rows:
+            self.ready = True
         return result
 
     def _failed(self, exc: BaseException) -> None:
@@ -217,14 +218,21 @@ class GpuBatcher:
         # synchronous forward frames, but never close a suspended caller if
         # the same exception was raised before. Keep its type and message.
         continuation_flags = inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_GENERATOR
-        for frame, _ in traceback.walk_tb(exc.__traceback__):
-            if frame.f_code.co_flags & continuation_flags:
+        pending, seen = [exc], set()
+        while pending:
+            error = pending.pop()
+            if id(error) in seen:
                 continue
-            try:
-                frame.clear()
-            except RuntimeError:
-                pass  # A still-executing synchronous caller cannot be cleared.
-        exc.__traceback__ = exc.__cause__ = exc.__context__ = None
+            seen.add(id(error))
+            pending.extend(link for link in (error.__cause__, error.__context__) if link is not None)
+            for frame, _ in traceback.walk_tb(error.__traceback__):
+                if frame.f_code.co_flags & continuation_flags:
+                    continue
+                try:
+                    frame.clear()
+                except RuntimeError:
+                    pass  # A still-executing synchronous caller cannot be cleared.
+            error.__traceback__ = error.__cause__ = error.__context__ = None
         if self._on_error is not None:
             self._on_error()
         if not is_out_of_memory(exc):

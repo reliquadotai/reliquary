@@ -197,6 +197,53 @@ def test_failed_forward_tensors_are_freed_before_cleanup_and_retries(request_cou
             fakes.score_rows(_rows(2)), fakes.score_rows(_rows(3))]
 
 
+@pytest.mark.parametrize("explicit_cause", [False, True])
+def test_forward_cleanup_releases_chained_frames_without_garbage_collection(explicit_cause):
+    import gc
+    import torch
+
+    tensors, freed = [], []
+
+    def allocate():
+        tensor = torch.zeros(1)
+        tensors.append(weakref.ref(tensor))
+        error = ValueError("forward allocation failed")
+        raise error  # Its traceback and this local form a reference cycle.
+
+    def score(rows, chunk_tokens, topk):
+        try:
+            allocate()
+        except ValueError as cause:
+            if explicit_cause:
+                raise RuntimeError("CUDA out of memory") from cause
+            raise RuntimeError("CUDA out of memory")
+
+    async def scenario(executor):
+        batcher = GpuBatcher(score, executor=executor,
+                             on_error=lambda: freed.append(all(ref() is None for ref in tensors)))
+        worker = asyncio.create_task(batcher.run())
+        try:
+            failed = asyncio.create_task(batcher.submit(_rows(1), 32, 128))
+            (error,) = await asyncio.wait_for(
+                asyncio.gather(failed, return_exceptions=True), timeout=5)
+            assert type(error) is RuntimeError and str(error) == "CUDA out of memory"
+            assert failed.exception() is error
+            assert freed == [True]
+            assert len(tensors) == 1 and tensors[0]() is None
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    enabled = gc.isenabled()
+    gc.disable()  # Incidental collection must not hide retained activations.
+    try:
+        with ThreadPoolExecutor(1) as executor:
+            asyncio.run(scenario(executor))
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def test_info_reports_forward_failure_until_scoring_recovers():
     import httpx
 
@@ -204,6 +251,8 @@ def test_info_reports_forward_failure_until_scoring_recovers():
     info = {"vocab_size": 7, "model_id": "org/Frozen", "model_revision": "abc123"}
 
     def score(rows, chunk_tokens, topk):
+        if not rows:
+            return [], 0.0, 0.0
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("CUDA out of memory")
@@ -221,6 +270,9 @@ def test_info_reports_forward_failure_until_scoring_recovers():
                 assert failed.status_code == 200
                 assert failed.json() == {"error": "CUDA out of memory", "kind": "RuntimeError",
                                          "value_error": False, "runtime_error": True}
+                assert (await client.get("/info")).json() == {**info, "ready": False}
+                empty = await client.post("/score", content=encode_request([], chunk_tokens=32, topk=128))
+                assert empty.status_code == 200 and empty.json()["scores"] == []
                 assert (await client.get("/info")).json() == {**info, "ready": False}
                 recovered = await client.post("/score", content=body)
                 assert scores_from_wire(recovered.json()["scores"]) == fakes.score_rows(_rows(1))
