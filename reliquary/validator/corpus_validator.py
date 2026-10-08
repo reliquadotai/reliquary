@@ -329,6 +329,14 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
         entry=w.entry, job=w.job, records=records
     )
+    if not hasattr(w, "pending_record_arrivals"):
+        w.pending_record_arrivals = {}
+
+    def covered():
+        if w.pending_record_arrivals:
+            return None
+        return arrivals_covered() if arrivals_covered is not None else math.inf
+
     # The miner status route's view: in memory, fed by the same reports.
     w.audit_params, w.miner_states = params, miner_states
     w.miners = MinerBook(job_id=w.job.job_id, task_id=w.entry.task_id, records=records,
@@ -372,7 +380,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               on_verdict=settler_fed(w.settler, on_verdict),
                               remote=remote, on_voided=w.miners.voided,
                               threads=judge_threads, scorer=scorer, vocab_size=vocab_size,
-                              arrivals_covered=arrivals_covered,
+                              arrivals_covered=covered,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
     if getattr(w, "grader", None) is not None:
@@ -521,6 +529,9 @@ def wire_job_front_only(w, *, records, link) -> None:
     w.miners = None
     w.auditor = w.settler = JudgedElsewhere(records, str(w.job.job_id))
     job_id = str(w.job.job_id)
+    if not hasattr(w, "pending_record_arrivals"):
+        w.pending_record_arrivals = {}
+    link.pending_record_arrivals[job_id] = w.pending_record_arrivals
 
     def on_accepted(submission_id: str) -> None:
         w.stats.accepted()
@@ -591,6 +602,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             registration=registration,
             seen_index=getattr(served, "seen_index", None),
             episode_intake=getattr(served, "episode_intake", None), job=getattr(served, "job", None),
+            pending_record_arrivals=getattr(served, "pending_record_arrivals", None),
+            durable_records=False if not hasattr(served, "pending_record_arrivals") else None,
         )
 
     # Miners have no registry access: each job's own task contract. With one
@@ -884,6 +897,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                "generation): the order control (eval control) serves it, "
                                "never the corpus control")
     store = BucketJobStore()
+    records = BucketRecordStore()
 
     # A tokenizer isn't loaded yet, but the renderer only calls `encode` once
     # a submission arrives -- by then `tokenizer_box` is populated. Resolving
@@ -896,7 +910,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         encoded = tokenizer_box["tokenizer"].encode(text, add_special_tokens=False)
         return list(getattr(encoded, "ids", encoded))
 
-    from reliquary.validator.corpus_service import migrate_ledgers_at_startup
+    from reliquary.validator.corpus_service import migrate_ledgers_at_startup, recover_pending_records
 
     several = len(served) > 1
     manifests = []
@@ -946,6 +960,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             prompt_job_for=(functools.partial(prompt_job_for_spec, profile=own_profile)
                             if own_profile is not None else None),
             stats=JobStats(),
+            pending_record_arrivals={},
         )
 
         def on_accepted(submission_id: str) -> None:
@@ -983,6 +998,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                and getattr(task_entry, "contract", None) is not None else None)
                 renderer = build_renderer(job, own_profile)
                 seen_index = await migrate_ledgers_at_startup(store, job)
+                await recover_pending_records(store, records, job)
             except Exception as exc:  # noqa: BLE001 - isolated: the others still start
                 not_served(task_entry, job, "its renderer or ledger migration", exc)
                 continue
@@ -991,6 +1007,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # Before anything serves: the route would otherwise seal a v1 seen set
         # inside its first submission's ledger turn. One ledger, one index, per job.
         seen_index = await migrate_ledgers_at_startup(store, job)
+        await recover_pending_records(store, records, job)
         # With several jobs the process runs their merged contract; each job's
         # renderer is still checked against its OWN task's contract.
         own_profile = (_entry_profile(task_entry)
@@ -1055,7 +1072,6 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
         model, proof = None, split.proof
         vocab_size = (await read_info(split.run_dir))["vocab_size"]
-    records = BucketRecordStore()
     # The auditors' and settlers' own connections (miners.json included): their
     # reads and writes in flight (up to 32 a job) never queue the route's behind
     # botocore's 10. The route's ban check keeps the route's client.
@@ -1255,6 +1271,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             grade_refusal(job, grade_dispatcher)
             await lease_checked(job)
         seen_index = await migrate_ledgers_at_startup(store, job)
+        await recover_pending_records(store, records, job)
         w = prepared(task_entry, task_cap, job, own_profile, renderer, seen_index)
         if job.episode is not None:
             w.episode_intake = await asyncio.to_thread(episode_intake_for, w)

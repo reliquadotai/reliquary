@@ -25,6 +25,8 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 import logging
+import math
+import os
 import re
 import time
 from typing import Any, NamedTuple, Protocol
@@ -107,6 +109,7 @@ RECORD_WRITE_ATTEMPTS = 3
 # later the schema marker gives the named failure instead.
 LEDGER_SCHEMA_V1 = "reliquary/corpus-ledgers/v1"
 LEDGER_SCHEMA_V2 = "reliquary/corpus-ledgers/v2"
+LEDGER_SCHEMA_V3 = "reliquary/corpus-ledgers/v3"
 # The schema this binary writes.
 LEDGER_SCHEMA = LEDGER_SCHEMA_V2
 LEDGER_FIELDS = {
@@ -116,6 +119,8 @@ LEDGER_FIELDS = {
         # submission failed: every other ledger is byte-identical.
         {"schema", "slots", "cursors", "seen_pending", "seen_segments", "failed"}
     ),
+    LEDGER_SCHEMA_V3: frozenset({"schema", "slots", "cursors", "seen_pending",
+                                "seen_segments", "failed", "pending_records"}),
 }
 
 # Pending digests are sealed into a segment once this many accumulate, so the
@@ -681,6 +686,25 @@ class LedgerState:
     cursors: CursorLedger
     pending: set[str]
     segments: tuple[SegmentRef, ...]
+    records: tuple[dict[str, Any], ...] = ()
+
+
+def _record_refs(job: JobSpec, value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        raise LedgerSnapshotError(f"job {job.job_id!r} has no pending record list")
+    refs = []
+    for ref in value:
+        if (not isinstance(ref, dict) or set(ref) != {"submission_id", "sha256", "received_at"}
+                or not all(isinstance(ref[k], str) and _SEGMENT_ID_RE.fullmatch(ref[k])
+                           for k in ("submission_id", "sha256"))
+                or isinstance(ref["received_at"], bool)
+                or not isinstance(ref["received_at"], (int, float))
+                or not math.isfinite(ref["received_at"]) or ref["received_at"] < 0):
+            raise LedgerSnapshotError(f"job {job.job_id!r} has an invalid pending record")
+        refs.append(dict(ref))
+    if len({ref["submission_id"] for ref in refs}) != len(refs):
+        raise LedgerSnapshotError(f"job {job.job_id!r} repeats a pending record")
+    return tuple(refs)
 
 
 def _digest_list(job: JobSpec, field: str, value: Any, *, unique: bool) -> list[str]:
@@ -768,7 +792,8 @@ def rebuild_ledgers(job: JobSpec, snapshot: Any) -> LedgerState:
             raise LedgerSnapshotError(f"job {job.job_id!r} has v2 ledgers without {field}")
     pending = _digest_list(job, "seen_pending", snapshot["seen_pending"], unique=True)
     return LedgerState(
-        schema, slots, cursors, set(pending), _segment_refs(job, snapshot["seen_segments"])
+        schema, slots, cursors, set(pending), _segment_refs(job, snapshot["seen_segments"]),
+        _record_refs(job, snapshot.get("pending_records")) if schema == LEDGER_SCHEMA_V3 else (),
     )
 
 
@@ -777,12 +802,13 @@ def ledger_snapshot(
     cursors: CursorLedger,
     pending: Iterable[str],
     segments: Sequence[SegmentRef] = (),
+    *, pending_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The JSON-native v2 form the store persists. Prompt indices are
     stringified here rather than by the encoder, so a snapshot compares equal
     to the one that comes back out of the bucket."""
     snapshot = {
-        "schema": LEDGER_SCHEMA_V2,
+        "schema": LEDGER_SCHEMA_V3 if pending_records is not None else LEDGER_SCHEMA_V2,
         "slots": {str(index): count for index, count in slots.snapshot().items()},
         "cursors": cursors.snapshot(),
         "seen_pending": sorted(pending),
@@ -791,6 +817,9 @@ def ledger_snapshot(
     failed = slots.failed_snapshot()
     if failed:
         snapshot["failed"] = {str(index): count for index, count in failed.items()}
+    if pending_records is not None:
+        snapshot["pending_records"] = sorted((dict(ref) for ref in pending_records),
+                                              key=lambda ref: ref["submission_id"])
     return snapshot
 
 
@@ -809,12 +838,13 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
     for _ in range(attempts):
         snapshot, etag = await store.read_ledgers(job.job_id)
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
-        if snapshot and state.schema != LEDGER_SCHEMA_V2:
+        if snapshot and state.schema not in (LEDGER_SCHEMA_V2, LEDGER_SCHEMA_V3):
             raise LedgerSnapshotError(f"job {job.job_id!r} ledgers are not v2")
         outcome = state.slots.record_failure(prompt_index, submission_id)
         if outcome is None:
             return None
-        after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments)
+        after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments,
+                                pending_records=state.records if state.schema == LEDGER_SCHEMA_V3 else None)
         try:
             await store.write_ledgers(job.job_id, after, etag)
         except CorpusStoreConflict:
@@ -975,6 +1005,8 @@ class _TurnEntry:
     settled: Callable[["_TurnResult"], Awaitable[None]] | None = None
     taken: bool = False
     finisher: asyncio.Task | None = None
+    record_ref: dict[str, Any] | None = None
+    record: dict[str, Any] | None = None
 
 
 class _TurnResult(NamedTuple):
@@ -1013,6 +1045,7 @@ def plan_turn(
     failed: set[int] = set()
     while True:
         slots, cursors, pending = state.slots, state.cursors, state.pending
+        record_refs = {ref["submission_id"]: ref for ref in state.records}
         # Sealed earlier in this turn: seen exactly as if a ledger named them.
         sealed: set[str] = set()
         chunks: list[list[str]] = []
@@ -1036,6 +1069,11 @@ def plan_turn(
                 # `admit` reads `seen`, it does not grow it: recording what was
                 # paid for is the caller's half of the duplicate check.
                 pending.update(entry.digests)
+                ref = getattr(entry, "record_ref", None)
+                if ref is not None:
+                    if ref["submission_id"] in record_refs and record_refs[ref["submission_id"]] != ref:
+                        raise LedgerSnapshotError("accepted record reference cannot be replaced")
+                    record_refs[ref["submission_id"]] = ref
             elif (slots.filled, cursors.snapshot()) == before:
                 # A refusal that moved nothing costs no write.
                 continue
@@ -1048,7 +1086,9 @@ def plan_turn(
             if not moved:
                 return TurnPlan(outcomes, None, [])
             return TurnPlan(
-                outcomes, ledger_snapshot(slots, cursors, pending, state.segments), chunks
+                outcomes, ledger_snapshot(slots, cursors, pending, state.segments,
+                    pending_records=tuple(record_refs.values())
+                    if state.schema == LEDGER_SCHEMA_V3 or record_refs else None), chunks
             )
         state = rebuild_ledgers(job, snapshot)
 
@@ -1087,8 +1127,8 @@ async def ensure_ledgers_v2(
         if etag is None:
             return "absent"
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
-        if state.schema == LEDGER_SCHEMA_V2:
-            return "v2"
+        if state.schema in (LEDGER_SCHEMA_V2, LEDGER_SCHEMA_V3):
+            return "v3" if state.schema == LEDGER_SCHEMA_V3 else "v2"
         await store.write_ledgers_backup(job.job_id, snapshot)
         chunks = await asyncio.to_thread(seal_chunks, state.pending, segment_max)
         refs = await _write_segments(store, job.job_id, chunks, parallelism)
@@ -1171,6 +1211,8 @@ async def downgrade_ledgers_v1(store: Any, job: JobSpec) -> str:
             return "absent"
         if state.schema == LEDGER_SCHEMA_V1:
             return "v1"
+        if state.records:
+            raise LedgerSnapshotError("pending accepted records must be recovered before downgrade")
         base = ledger_snapshot(state.slots, state.cursors, ())
         v1 = {
             "schema": LEDGER_SCHEMA_V1,
@@ -1184,6 +1226,50 @@ async def downgrade_ledgers_v1(store: Any, job: JobSpec) -> str:
             continue
         return "downgraded"
     raise CorpusStoreConflict(f"ledgers of {job.job_id!r} kept changing during downgrade")
+
+
+async def recover_pending_records(store: Any, records: Any, job: JobSpec, *,
+                                  on_recovered=None) -> list[str]:
+    """Materialize only bodies committed by the slot CAS; then clear matching refs.
+
+    A failed publication or cleanup leaves the reference durable. Retrying
+    verifies the same create-only canonical body; it never consumes another slot.
+    """
+    snapshot, _ = await store.read_ledgers(job.job_id)
+    state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
+    if not state.records:
+        return []
+    if records is None:
+        raise LedgerSnapshotError("accepted record recovery has no record store")
+    committed = {ref["submission_id"]: ref for ref in state.records}
+    for sid, ref in committed.items():
+        # This ref came from the actual ledger, not an uncommitted staged body.
+        record = await records.promote_submission(job.job_id, ref)
+        if (record.get("submission_id") != sid or record.get("job_id") != job.job_id
+                or record.get("received_at") != ref["received_at"]):
+            raise LedgerSnapshotError("published accepted record differs from its committed reference")
+        if on_recovered is not None:
+            on_recovered(sid)
+    for _ in range(LEDGER_REWRITE_ATTEMPTS):
+        current, etag = await store.read_ledgers(job.job_id)
+        state = await asyncio.to_thread(rebuild_ledgers, job, current)
+        remaining = []
+        for ref in state.records:
+            sid = ref["submission_id"]
+            if sid in committed and ref != committed[sid]:
+                raise LedgerSnapshotError("committed accepted record reference changed")
+            if sid not in committed:
+                remaining.append(ref)
+        if len(remaining) == len(state.records):
+            return list(committed)
+        after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments,
+                                pending_records=remaining)
+        try:
+            await store.write_ledgers(job.job_id, after, etag)
+        except CorpusStoreConflict:
+            continue
+        return list(committed)
+    raise CorpusStoreConflict("accepted record cleanup stayed contended")
 
 
 async def verify_ledgers(store: Any, job: JobSpec) -> dict[str, Any]:
@@ -1369,6 +1455,8 @@ def build_corpus_router(
     ledger_batch_max: int = LEDGER_BATCH_MAX,
     episode_intake=None,
     job: JobSpec | None = None,
+    durable_records: bool | None = None,
+    pending_record_arrivals: dict[str, float] | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1402,6 +1490,51 @@ def build_corpus_router(
     committer: list[asyncio.Task] = []
     # Strong references to the post-turn tasks until they finish.
     finishing: set[asyncio.Task] = set()
+    # Enable writers only after every ledger reader has v3 support. Existing
+    # v3 refs are still readable and recoverable with the writer opt-in off.
+    if durable_records is None:
+        option = os.environ.get("RELIQUARY_CORPUS_DURABLE_RECORDS", "0")
+        if option not in ("0", "1"):
+            raise ValueError("RELIQUARY_CORPUS_DURABLE_RECORDS must be 0 or 1")
+        durable_records = option == "1"
+    if durable_records and (records is None or any(not callable(getattr(records, name, None))
+            for name in ("stage_submission", "promote_submission", "read_submission"))):
+        raise ValueError("durable admission requires staged record storage")
+    record_arrivals = pending_record_arrivals if pending_record_arrivals is not None else {}
+    active_records: collections.Counter = collections.Counter()
+    announced: set[str] = set()
+    record_lock = asyncio.Lock()
+
+    def announce(sid: str) -> None:
+        if sid not in announced and on_accepted is not None:
+            on_accepted(sid)
+            announced.add(sid)
+
+    async def recover_records(job: JobSpec | None = None) -> None:
+        if job is None:
+            job = await _read_job_checked()
+        if job is None:
+            return
+        async with record_lock:
+            snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger recovery read")
+            state = _rebuild_ledgers_checked(job, snapshot)
+            record_arrivals.update((ref["submission_id"], ref["received_at"]) for ref in state.records)
+            try:
+                await _from_store(recover_pending_records(store, records, job, on_recovered=announce),
+                                  "accepted record recovery")
+            except (ValueError, LedgerSnapshotError) as exc:
+                raise _ledger_corrupt(exc) from exc
+            except CorpusStoreConflict as exc:
+                raise HTTPException(status_code=503, detail="corpus_records_pending") from exc
+            current, _ = await _from_store(store.read_ledgers(job_id), "ledger recovery readback")
+            current_refs = _rebuild_ledgers_checked(job, current).records
+            record_arrivals.update((ref["submission_id"], ref["received_at"]) for ref in current_refs)
+            pending = {ref["submission_id"] for ref in current_refs}
+            for sid in list(record_arrivals):
+                if sid not in pending and not active_records[sid]:
+                    del record_arrivals[sid]
+                    active_records.pop(sid, None)
+                    announced.discard(sid)
     # The sealed part of the seen set, touched only under `ledger_lock`; the
     # startup path hands in one it has already loaded.
     if seen_index is None:
@@ -1418,12 +1551,10 @@ def build_corpus_router(
     # Also exposed, so the mount can reach the check without the handler.
     router.prompt_fidelity = prompt_fidelity
 
-    async def _record_accepted(request: CorpusSubmissionRequest, served: str,
-                               episode_facts: IntakeFacts | None = None) -> None:
-        # After the ledger write, never before: a record without its slot would
-        # be paid for work the ledgers say never happened.
-        if records is None:
-            return
+    def _accepted_record(request: CorpusSubmissionRequest, served: str,
+                         episode_facts: IntakeFacts | None = None, *, received_at=None) -> dict:
+        # Staging is not auditable. Only a ledger-committed reference may
+        # publish this body under the canonical submissions prefix.
         from reliquary.protocol.signatures import corpus_submission_id
 
         submission_id = corpus_submission_id(request)
@@ -1445,10 +1576,18 @@ def build_corpus_router(
             "cursor": request.cursor,
             "prompt_index": request.prompt_index,
             "rendered_prompt": request.rendered_prompt,
-            "received_at": time.time(),
+            "received_at": time.time() if received_at is None else received_at,
             "token_count": token_count,
             "completions": completions,
         }
+        return record
+
+    async def _record_accepted(request: CorpusSubmissionRequest, served: str,
+                               episode_facts: IntakeFacts | None = None) -> None:
+        if records is None:
+            return
+        record = _accepted_record(request, served, episode_facts)
+        submission_id = record["submission_id"]
         written = False
         for attempt in range(RECORD_WRITE_ATTEMPTS):
             try:
@@ -1647,6 +1786,31 @@ def build_corpus_router(
 
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
+        record = None
+        if durable_records:
+            from reliquary.protocol.signatures import corpus_submission_id
+
+            await recover_records(job)
+            sid = corpus_submission_id(request)
+            standing = await _from_store(records.read_submission(job_id, sid), "accepted record read")
+            # Freeze arrival only after the read. No await may let the feed's
+            # coverage advance between this timestamp and its pending fence.
+            record = _accepted_record(request, job_id, episode_facts)
+            if standing is not None:
+                # A response can be lost after publication. The identical signed
+                # request retrieves its acceptance without consuming another slot.
+                arrival = standing.get("received_at")
+                if (type(arrival) not in (int, float) or not math.isfinite(arrival) or arrival < 0
+                        or standing != {**record, "received_at": arrival}):
+                    raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
+                state = await _read_state(job)
+                return _respond(Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index)))
+            active_records[sid] += 1
+            # Fence coverage before queueing. The serialized turn stages only
+            # entries its native admission plan actually accepts.
+            record_arrivals.setdefault(sid, record["received_at"])
+            record["received_at"] = record_arrivals[sid]
+
         def decide(slots: SlotLedger, cursors: CursorLedger, seen: AbstractSet[str]) -> Verdict:
             # Run inside a ledger turn, against the ledgers as the entries
             # before this one in the turn left them (`plan_turn`).
@@ -1676,7 +1840,10 @@ def build_corpus_router(
                 return
             timing.update(turn.timing)
             mark = time.perf_counter()
-            await _record_accepted(request, job_id, episode_facts)
+            if record is not None:
+                await recover_records(job)
+            else:
+                await _record_accepted(request, job_id, episode_facts)
             timing["record_write"] = time.perf_counter() - mark
             timing["total"] = time.perf_counter() - started
             logger.info(
@@ -1688,7 +1855,7 @@ def build_corpus_router(
             )
 
         try:
-            turn = await _take_turn(job, decide, digests, settled)
+            turn = await _take_turn(job, decide, digests, settled, record=record)
         except asyncio.TimeoutError:
             logger.warning(
                 "corpus ledger turn for %s not granted within %.0f s (miner %s)",
@@ -1699,6 +1866,20 @@ def build_corpus_router(
         written = turn.verdict
 
         if written is not None:
+            if record is not None and not written.accepted:
+                # Concurrent retries of the same signed request can share a
+                # ledger turn. Only the verified canonical receipt makes the
+                # losing duplicate an idempotent acceptance.
+                await recover_records(job)
+                standing = await _from_store(records.read_submission(job_id, sid),
+                                              "accepted record retry read")
+                if standing is not None:
+                    arrival = standing.get("received_at")
+                    if (type(arrival) not in (int, float) or not math.isfinite(arrival) or arrival < 0
+                            or standing != {**record, "received_at": arrival}):
+                        raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
+                    state = await _read_state(job)
+                    written = Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index))
             return _respond(written)
 
         logger.warning(
@@ -1847,14 +2028,14 @@ def build_corpus_router(
         )
 
     async def _take_turn(job: JobSpec, decide, digests: Sequence[str],
-                         settled=None) -> "_TurnResult":
+                         settled=None, *, record=None) -> "_TurnResult":
         """Queue one decision for the next ledger turn and wait for its
         verdict. Raises ``asyncio.TimeoutError`` when no turn takes it within
         ``ledger_lock_timeout`` (it is then withdrawn: nothing was consumed);
         once a turn has taken it, it waits for that turn as a lock holder did."""
         loop = asyncio.get_running_loop()
         entry = _TurnEntry(job, decide, digests, loop.create_future(), time.perf_counter(),
-                           settled)
+                           settled, record=record)
         turn_queue.append(entry)
         _wake_committer()
         try:
@@ -1862,19 +2043,41 @@ def build_corpus_router(
         except BaseException:
             if not entry.taken:
                 turn_queue.remove(entry)
+                await release_record(entry)
             raise
         if not done and not entry.taken:
             turn_queue.remove(entry)
+            await release_record(entry)
             raise asyncio.TimeoutError
         # Shielded: a request cancelled now must not cancel its turn's result
         # out from under the batch it shares, nor its record write.
         return await asyncio.shield(entry.finisher)
 
     async def _finish(entry: _TurnEntry) -> _TurnResult:
-        turn = await entry.future
-        if entry.settled is not None:
-            await entry.settled(turn)
-        return turn
+        try:
+            turn = await entry.future
+            if entry.settled is not None:
+                await entry.settled(turn)
+            return turn
+        finally:
+            # The detached turn, not its HTTP handler, owns this fence.
+            await release_record(entry)
+
+    async def release_record(entry: _TurnEntry) -> None:
+        if entry.record is None:
+            return
+        sid = entry.record["submission_id"]
+        active_records[sid] -= 1
+        if not active_records[sid]:
+            active_records.pop(sid, None)
+        try:
+            current, _ = await store.read_ledgers(job_id)
+            committed = {ref["submission_id"] for ref in rebuild_ledgers(entry.job, current).records}
+            if sid not in committed and not active_records[sid]:
+                record_arrivals.pop(sid, None)
+                announced.discard(sid)
+        except Exception:
+            logger.warning("corpus accepted record fence retained until recovery", exc_info=True)
 
     def _finished(task: asyncio.Task) -> None:
         finishing.discard(task)
@@ -1949,6 +2152,17 @@ def build_corpus_router(
                 mark = time.perf_counter()
                 snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
                 state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+                if state.schema == LEDGER_SCHEMA_V3 and not durable_records:
+                    raise HTTPException(status_code=503, detail="corpus_durable_records_disabled")
+                if state.records and any(entry.record is not None for entry in live):
+                    # A queued burst can predate the first failed publication.
+                    # Do not consume its next batch until the committed bodies
+                    # are canonical; one batch is bounded by ledger_batch_max.
+                    await recover_records(job)
+                    snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger recovery read")
+                    state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+                    if state.records:
+                        raise HTTPException(status_code=503, detail="corpus_records_pending")
                 timing["ledger_read"] += time.perf_counter() - mark
 
                 # The integrity step before anything is decided (I2, I3).
@@ -1985,6 +2199,31 @@ def build_corpus_router(
                         settle(entry, verdict)
                     return
                 after = plan.after
+                committed_refs = {ref["submission_id"]: ref for ref in after.get("pending_records", [])}
+                for entry, verdict in decided:
+                    if not verdict.accepted or entry.record is None:
+                        continue
+                    if entry.record_ref is None:
+                        sid = entry.record["submission_id"]
+                        try:
+                            ref = await _from_store(records.stage_submission(job_id, sid, entry.record),
+                                                    "accepted record staging")
+                            _record_refs(job, [ref])
+                            if ref["submission_id"] != sid or ref["received_at"] != entry.record["received_at"]:
+                                raise LedgerSnapshotError("staged accepted record identity differs")
+                        except CorpusStoreConflict as exc:
+                            raise HTTPException(status_code=503, detail="corpus_records_pending") from exc
+                        except (ValueError, LedgerSnapshotError) as exc:
+                            raise _ledger_corrupt(exc) from exc
+                        entry.record_ref = ref
+                    ref = entry.record_ref
+                    sid = ref["submission_id"]
+                    if sid in committed_refs and committed_refs[sid] != ref:
+                        raise _ledger_corrupt(LedgerSnapshotError("accepted record reference cannot be replaced"))
+                    committed_refs[sid] = ref
+                if committed_refs or "pending_records" in after:
+                    after["schema"] = LEDGER_SCHEMA_V3
+                    after["pending_records"] = sorted(committed_refs.values(), key=lambda ref: ref["submission_id"])
                 mark = time.perf_counter()
                 if plan.chunks:
                     sealed = await seal(plan.chunks)
@@ -2007,7 +2246,8 @@ def build_corpus_router(
             for entry in live:
                 settle(entry, None)
         except Exception as exc:
-            # A store or ledger failure is every entry's: none of them was written.
+            # A failed acknowledgment may still have committed the CAS. Its
+            # durable references, not this exception, decide recovery.
             for entry in live:
                 fail(entry, exc)
         finally:
@@ -2090,6 +2330,7 @@ def build_corpus_router(
     router.corpus_next = corpus_next
     router.skip_corpus = skip_corpus
     router.ledger_lock = ledger_lock
+    router.recover_records = recover_records
     # How many decisions wait for the next ledger turn.
     router.ledger_waiting = lambda: len(turn_queue)
     # A cancelled HTTP handler can leave a taken turn and its durable record
@@ -2098,6 +2339,7 @@ def build_corpus_router(
         turn_queue
         or any(not task.done() for task in committer)
         or any(not task.done() for task in finishing)
+        or bool(record_arrivals)
     )
     return router
 
@@ -2159,6 +2401,11 @@ class CorpusJobRoutes:
         router = self.routers.get(job_id)
         pending = getattr(router, "admission_pending", None)
         return bool(pending is not None and pending())
+
+    async def recover_records(self, job_id: str) -> None:
+        recover = getattr(self.routers.get(job_id), "recover_records", None)
+        if recover is not None:
+            await recover()
 
     @contextlib.asynccontextmanager
     async def admission(self, job_id: str):
@@ -2320,6 +2567,7 @@ __all__ = [
     "LEDGER_SCHEMA",
     "LEDGER_SCHEMA_V1",
     "LEDGER_SCHEMA_V2",
+    "LEDGER_SCHEMA_V3",
     "LedgerState",
     "MAX_RESOLVED_PROMPT_SOURCES",
     "LedgerSnapshotError",
@@ -2345,6 +2593,7 @@ __all__ = [
     "ledger_snapshot",
     "prompt_job_for_spec",
     "rebuild_ledgers",
+    "recover_pending_records",
     "seal_chunks",
     "refuse_unsigned_corpus_submissions",
     "renderer_for_job",

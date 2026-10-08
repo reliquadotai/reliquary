@@ -1025,6 +1025,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         build_corpus_jobs_router,
         build_corpus_router,
         migrate_ledgers_at_startup,
+        recover_pending_records,
         prompt_job_for_spec,
         renderer_for_job,
     )
@@ -1053,7 +1054,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             records=records, on_accepted=w.on_accepted,
             proof_chunk_tokens=w.proof.chunk_tokens, vocab_size=w.vocab_size,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
-            job=getattr(w, "job", None))
+            job=getattr(w, "job", None), durable_records=False)
 
     async def wire(entry, cap, job):
         from reliquary.eval.prompt_source import is_eval_source
@@ -1084,6 +1085,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         # The set's prompts (or the catalog source's rows), read and checked.
         await asyncio.to_thread(prompt_job_for, job)
         seen_index = await migrate_ledgers_at_startup(store, job)
+        # This lane has no shared sampled-coverage fence, so it cannot enable
+        # v3 writers. Finish any committed bodies before constructing readers.
+        await recover_pending_records(store, records, job)
         params, miner_states, is_banned, beacon, round_at = build_corpus_audit_wiring(
             entry=entry, job=job, records=records)
         w = SimpleNamespace(entry=entry, cap=cap, job=job, tokenizer=tokenizer,

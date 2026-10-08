@@ -399,6 +399,28 @@ def test_a_server_that_declines_the_mount_is_not_walked_past(bucket, registry):
     assert entry.job_id in str(caught.value)
 
 
+@pytest.mark.parametrize("schema,reason", [("reliquary/corpus-ledgers/v3", "no record store"),
+                                           ("reliquary/corpus-ledgers/v4", "v4")])
+def test_standalone_mount_refuses_pending_bodies_or_unknown_ledger_before_serving(
+    bucket, registry, schema, reason
+):
+    from reliquary.validator.corpus_service import LedgerSnapshotError
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
+    entry = registry["entries"][TASK_ID]
+    snapshot = {"schema": schema, "slots": {}, "cursors": {},
+                "seen_pending": [], "seen_segments": [],
+                "pending_records": [{"submission_id": "b" * 64, "sha256": "c" * 64,
+                                     "received_at": 1.0}]}
+    asyncio.run(job_store.write_ledgers(entry.job_id, snapshot, None))
+    server = ValidatorServer()
+    with pytest.raises(LedgerSnapshotError, match=reason):
+        _mount_on(server, entry)
+    assert not any(getattr(route, "path", "").startswith("/corpus/")
+                   for route in server.app.routes)
+
+
 def _boot_validate_dispatching_to_corpus_validator(monkeypatch, *, side_effect=None):
     """Run `validate` on a declared corpus task, with `run_corpus_validator`
     itself replaced.

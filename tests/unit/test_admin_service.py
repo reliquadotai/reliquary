@@ -31,6 +31,12 @@ class _Records:
     def __init__(self):
         self.subs, self.verdicts, self.settlement = {}, {}, {}
 
+    async def read_job(self, job_id):
+        return await job_store.read_job(job_id)
+
+    async def read_ledgers(self, job_id):
+        return await job_store.read_ledgers(job_id)
+
     async def list_submission_ids(self, job_id):
         return sorted(self.subs)
 

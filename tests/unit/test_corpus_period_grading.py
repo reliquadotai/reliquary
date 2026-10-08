@@ -260,6 +260,22 @@ def test_a_period_task_without_a_grader_waits_for_its_auditor_alone():
     assert w.settler._oldest_pending() == 5.0
 
 
+def test_period_payment_waits_for_recovery_of_an_accepted_body():
+    w = _wire()
+    archives = Archives()
+    w.auditor._seeded = True
+    w.settler._archives = archives
+    w.settler._genesis = lambda: GENESIS
+    w.settler._clock = lambda: at(6)
+    w.pending_record_arrivals["b" * 64] = at(3)
+    assert w.auditor._covered() is None
+    assert asyncio.run(w.settler.settle_once()) is None
+    assert archives.docs == {} and w.settler._records.state == {}
+    w.pending_record_arrivals.clear()
+    assert asyncio.run(w.settler.settle_once()) == 3
+    assert archives.docs[(3, 7)]["rewards_by_hotkey"] == {"5Hot": pytest.approx(0.1)}
+
+
 def test_a_period_paid_episode_job_waits_for_its_auditor_and_its_grader():
     grader = _grader(_Records(), _Sequence([], []), [at(6)])
     w = _wire(grader)

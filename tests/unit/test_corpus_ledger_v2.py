@@ -16,6 +16,7 @@ from reliquary.validator.corpus_service import (
     LEDGER_SCHEMA,
     LEDGER_SCHEMA_V1,
     LEDGER_SCHEMA_V2,
+    LEDGER_SCHEMA_V3,
     LedgerSnapshotError,
     SeenIndex,
     SeenView,
@@ -132,8 +133,40 @@ def test_malformed_v2_seen_fields_are_refused(job, bad):
 
 
 def test_unknown_schema_refused(job):
-    with pytest.raises(LedgerSnapshotError, match="v3"):
-        rebuild_ledgers(job, {"schema": "reliquary/corpus-ledgers/v3"})
+    with pytest.raises(LedgerSnapshotError, match="v4"):
+        rebuild_ledgers(job, {"schema": "reliquary/corpus-ledgers/v4"})
+
+
+@pytest.mark.parametrize("refs", [None, {}, [None],
+    [{"submission_id": "a" * 64, "sha256": "b" * 64, "received_at": float("nan")}],
+    [{"submission_id": "a" * 64, "sha256": "b" * 64, "received_at": True}],
+    [{"submission_id": "a" * 64, "sha256": "B" * 64, "received_at": 1.0}],
+    [{"submission_id": "a" * 64, "sha256": "b" * 64, "received_at": 1.0}] * 2,
+])
+def test_v3_ref_corruption_never_reads_as_an_empty_pending_set(job, refs):
+    with pytest.raises(LedgerSnapshotError):
+        rebuild_ledgers(job, {"schema": LEDGER_SCHEMA_V3, "seen_pending": [],
+                             "seen_segments": [], "pending_records": refs})
+
+
+def test_v3_requires_upgraded_v2_readers_even_after_cleanup(job):
+    v2 = ledger_snapshot(rebuild_ledgers(job, {}).slots, rebuild_ledgers(job, {}).cursors, ())
+    v3 = {**v2, "schema": LEDGER_SCHEMA_V3, "pending_records": []}
+    assert rebuild_ledgers(job, v2).records == rebuild_ledgers(job, v3).records == ()
+    # The previous binary rejects the new marker and its extra field; there
+    # is no writer activation until every ledger reader has been upgraded.
+    frozen_v2_fields = {"schema", "slots", "cursors", "seen_pending", "seen_segments", "failed"}
+    def frozen_v2_reader(snapshot):
+        if snapshot.get("schema", LEDGER_SCHEMA_V1) not in (LEDGER_SCHEMA_V1, LEDGER_SCHEMA_V2):
+            raise LedgerSnapshotError("unknown ledger schema")
+        if set(snapshot) - frozen_v2_fields:
+            raise LedgerSnapshotError("unknown ledger fields")
+
+    frozen_v2_reader(v2)
+    with pytest.raises(LedgerSnapshotError, match="schema"):
+        frozen_v2_reader(v3)
+    with pytest.raises(LedgerSnapshotError, match="fields"):
+        frozen_v2_reader({**v3, "schema": LEDGER_SCHEMA_V2})
 
 
 # The field check `rebuild_ledgers` ran before v2, frozen here: every binary
