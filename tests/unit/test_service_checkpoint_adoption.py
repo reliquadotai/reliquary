@@ -12,10 +12,20 @@ from reliquary.services.runtime import ServiceRuntime
 from reliquary.trainer.publisher import PUBLICATION_RECEIPT
 from reliquary.validator.errors import FatalProofPlaneError
 from reliquary.validator.service import ValidationService
-from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2, qualification_v2
+from reliquary.protocol.service_contract import ServiceContract
+from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2, contract_v2_dict, qualification_v2
 
 ROOT = "d" * 40
 NEXT = "f" * 40
+THIRD = "a" * 40
+FILES = {"config.json": {"size": 2, "sha256": "e" * 64, "blob_id": "e" * 40}}
+
+
+def pinned_contract(files=FILES):
+    """An order whose root pin is the digest the validator computes for the published root files."""
+    value = contract_v2_dict()
+    value["checkpoint"]["sha256"] = canonical_sha256(files)
+    return ServiceContract.from_dict(value)
 
 
 def build(path, contract=None, now=0):
@@ -23,15 +33,16 @@ def build(path, contract=None, now=0):
     return ServiceRuntime(path, contract, qualification_v2(contract), now=now)
 
 
-def staged_service(tmp_path, runtime, *, repo="models/test"):
-    manifest = {"checkpoint_n": 1, "repo_id": repo, "revision": NEXT, "trained_window_cursor": 0}
-    stage = tmp_path / "stage"
+def staged_service(tmp_path, runtime, *, repo="models/test", revision=NEXT, parent=ROOT, checkpoint_n=1,
+                   files=FILES, installed=(0, ROOT)):
+    manifest = {"checkpoint_n": checkpoint_n, "repo_id": repo, "revision": revision, "trained_window_cursor": 0}
+    stage = tmp_path / f"stage-{revision[:6]}-{len(list(tmp_path.glob('stage-*')))}"
     stage.mkdir()
-    receipt = {"publication_id": "unit-publication", "parent_revision": ROOT,
+    receipt = {"publication_id": "unit-publication", "parent_revision": parent,
                "manifest": {key: value for key, value in manifest.items() if key != "revision"},
-               "files": {"config.json": {"size": 2, "sha256": "e" * 64, "blob_id": "e" * 40}}}
+               "files": files}
     (stage / PUBLICATION_RECEIPT).write_text(json.dumps(receipt))
-    old = SimpleNamespace(checkpoint_n=0, revision=ROOT)
+    old = SimpleNamespace(checkpoint_n=installed[0], revision=installed[1])
     store = SimpleNamespace(repo_id=manifest["repo_id"], current=old)
 
     def install(number, revision):
@@ -93,6 +104,7 @@ async def test_a_checkpoint_of_another_repository_is_refused_before_any_mutation
 @pytest.mark.parametrize("failing", ["consumption", "adopt", "announce", "mark"])
 async def test_service_error_after_installation_never_returns_old_revision_fallback(tmp_path, monkeypatch, failing):
     runtime = build(tmp_path / "runtime.sqlite3")
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)   # NEXT is a child of the root
     service, manifest, stage, _ = staged_service(tmp_path, runtime)
     if failing == "consumption":
         monkeypatch.setattr(runtime, "record_consumption", MagicMock(side_effect=OSError("unit journal failure")))
@@ -142,6 +154,106 @@ async def test_service_adoption_follows_installation_keeps_the_run_and_runs_off_
     service._checkpoint_intake.mark_installed.assert_called_once_with(manifest["revision"], stage)
     service._training_accumulator.reset.assert_called_once()
     assert runtime.db.execute("SELECT cursor FROM service_consumption").fetchone()[0] == 0
+    runtime.close()
+
+
+def assert_not_installed(service, stage):
+    service._record_fill_closed_checkpoint_candidate.assert_not_called()
+    service._proof_worker_pool.bind_checkpoint.assert_not_called()
+    service._checkpoint_store.install_external.assert_not_called()
+    service.server.set_current_checkpoint.assert_not_called()
+    service._checkpoint_intake.mark_installed.assert_not_called()
+    assert not stage.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["not_the_root", "root_with_another_digest"])
+async def test_the_first_adoption_must_be_the_orders_pinned_root(tmp_path, case):
+    """I1: a wrong --resume-from or a stale candidate never becomes the lineage root."""
+    runtime = build(tmp_path / "runtime.sqlite3", pinned_contract())            # nothing adopted yet
+    if case == "not_the_root":
+        service, _, stage, _ = staged_service(tmp_path, runtime, revision=NEXT, parent=ROOT, checkpoint_n=1)
+    else:
+        other = {"config.json": {"size": 3, "sha256": "1" * 64, "blob_id": "1" * 40}}
+        service, _, stage, _ = staged_service(tmp_path, runtime, revision=ROOT, parent="9" * 40, checkpoint_n=0,
+                                              files=other)
+    await ValidationService._swap_staged_checkpoint(service, 1)                  # refused: old revision kept
+    assert_not_installed(service, stage)
+    assert service._checkpoint_n == 0 and service._checkpoint_store.current.revision == ROOT
+    assert runtime.db.execute("SELECT COUNT(*) FROM service_checkpoints").fetchone()[0] == 0
+    assert runtime.db.execute("SELECT COUNT(*) FROM service_consumption").fetchone()[0] == 0
+    with pytest.raises(ValueError, match="no service checkpoint has been adopted"):
+        runtime.checkpoint
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_whose_parent_is_not_the_current_one_is_refused_before_any_mutation(tmp_path):
+    runtime = build(tmp_path / "runtime.sqlite3")
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    service, _, stage, _ = staged_service(tmp_path, runtime, revision=THIRD, parent=NEXT, checkpoint_n=2)
+    await ValidationService._swap_staged_checkpoint(service, 1)
+    assert_nothing_moved(service, runtime, stage)
+    # A receipt without a parent at all is no better.
+    service, _, stage, receipt = staged_service(tmp_path, runtime)
+    del receipt["parent_revision"]
+    (stage / PUBLICATION_RECEIPT).write_text(json.dumps(receipt))
+    await ValidationService._swap_staged_checkpoint(service, 1)
+    assert_nothing_moved(service, runtime, stage)
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_the_legitimate_chain_root_then_child_then_restart_is_adopted(tmp_path):
+    contract = pinned_contract()
+    path = tmp_path / "runtime.sqlite3"
+    runtime = build(path, contract)
+    digest = canonical_sha256(FILES)
+    # First boot: --resume-from is the order's root, published with the pinned files.
+    service, _, _, _ = staged_service(tmp_path, runtime, revision=ROOT, parent="9" * 40, checkpoint_n=0,
+                                      installed=(0, "0" * 40))
+    await ValidationService._swap_staged_checkpoint(service, 0)
+    assert runtime.checkpoint == {"checkpoint_n": 0, "repo": "models/test", "revision": ROOT, "sha256": digest}
+    # The trainer publishes a child of the root, then a child of that child.
+    child = {"model.safetensors": {"size": 9, "sha256": "2" * 64, "blob_id": "2" * 40}}
+    service, _, _, _ = staged_service(tmp_path, runtime, revision=NEXT, parent=ROOT, checkpoint_n=1, files=child)
+    await ValidationService._swap_staged_checkpoint(service, 1)
+    service, _, _, _ = staged_service(tmp_path, runtime, revision=THIRD, parent=NEXT, checkpoint_n=2, files=child,
+                                      installed=(1, NEXT))
+    await ValidationService._swap_staged_checkpoint(service, 2)
+    assert runtime.db.execute("SELECT revision FROM service_checkpoints ORDER BY seq").fetchall() == [
+        (ROOT,), (NEXT,), (THIRD,)]
+    runtime.close()
+
+    # Restart on --resume-from NEXT (an adopted revision, not a child of the current one): re-selected.
+    restarted = build(path, contract, now=1)
+    service, _, _, _ = staged_service(tmp_path, restarted, revision=NEXT, parent=ROOT, checkpoint_n=1, files=child,
+                                      installed=(2, THIRD))
+    await ValidationService._swap_staged_checkpoint(service, 3)
+    service._checkpoint_store.install_external.assert_called_once_with(1, NEXT)
+    assert restarted.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT,
+                                    "sha256": canonical_sha256(child)}
+    assert restarted.db.execute("SELECT COUNT(*) FROM service_checkpoints").fetchone()[0] == 3
+    # The same revision published with other files is not the revision that was adopted.
+    service, _, stage, _ = staged_service(tmp_path, restarted, revision=THIRD, parent=NEXT, checkpoint_n=2,
+                                          files=FILES, installed=(1, NEXT))
+    await ValidationService._swap_staged_checkpoint(service, 4)
+    assert_not_installed(service, stage)
+    assert restarted.checkpoint["revision"] == NEXT
+    restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_the_lineage_check_runs_off_the_event_loop(tmp_path, monkeypatch):
+    runtime = build(tmp_path / "runtime.sqlite3")
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    service, _, _, _ = staged_service(tmp_path, runtime)
+    threads, real = [], runtime.require_adoptable
+    monkeypatch.setattr(runtime, "require_adoptable",
+                        lambda **kwargs: (threads.append(threading.get_ident()), real(**kwargs))[1])
+    await ValidationService._swap_staged_checkpoint(service, 1)
+    assert threads and threading.get_ident() not in threads
+    assert runtime.checkpoint["revision"] == NEXT
     runtime.close()
 
 

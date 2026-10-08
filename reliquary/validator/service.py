@@ -757,7 +757,90 @@ def _coerce_lr_schedule_step(raw) -> int | None:
     return raw if raw >= 0 else None
 
 
+def _closing_service_runtime_on_failure(init):
+    """A constructor that fails after it opened the service runtime closes it (SQLite handle).
+
+    Nothing happens for a task without a service runtime: the error is re-raised as it is.
+    """
+    @functools.wraps(init)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return init(self, *args, **kwargs)
+        except BaseException:
+            runtime = getattr(self, "_service_runtime", None)
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except Exception:
+                    logger.exception("service runtime could not be closed after a failed start")
+            raise
+    return wrapper
+
+
+def _service_request_folder(folder: Path) -> Path:
+    """The folder of a service task's runtime database and schedule requests.
+
+    Created 0700 when the validator itself creates it (whatever the umask). A folder that is
+    already there is never chmod-ed: if another user owns it or group/others can write it, it is
+    refused as a request channel (the request store refuses every request read from it) and that
+    is logged here, once per boot, with what the operator has to do.
+    """
+    from reliquary.services.schedule import UnsafeLocation, _check_owner_and_mode
+
+    try:
+        folder.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        try:
+            _check_owner_and_mode(folder.stat(), f"folder {folder}")
+        except UnsafeLocation as exc:
+            logger.error(
+                "service request folder refused: %s (mode %04o). Schedule requests are "
+                "ignored until the operator fixes it (chmod 700, owned by the validator's "
+                "user) and restarts; the validator does not change an existing folder",
+                exc, folder.stat().st_mode & 0o7777,
+            )
+    else:
+        os.chmod(folder, 0o700)   # mkdir's mode is narrowed by the umask and never widened; be explicit
+    return folder
+
+
+def _discard_unactivated_service_window(runtime, recovery, window: int) -> None:
+    """I3: drop what the runtime froze for a candidate window that was never activated.
+
+    BLOCKING (SQLite). A window with a recovery record WAS activated: it is recovered
+    from its journal, never rebuilt. The runtime itself refuses a window holding an
+    observation, a ledger row or a settlement.
+    """
+    from reliquary.services.runtime import ServicePolicyLimit
+
+    try:
+        frozen = runtime.envelope(window)
+    except ServicePolicyLimit:
+        return
+    if recovery is not None and recovery._path(window).exists():
+        raise RuntimeError(
+            f"service window {window} was activated (it has a recovery record); "
+            "it is recovered from its journal, never rebuilt"
+        )
+    runtime.discard_unactivated_window(window)
+    logger.warning(
+        "service window %d was frozen on checkpoint %s (schedule revision %s) and never "
+        "activated; that envelope and its beacon are discarded, the window is frozen again "
+        "on the current checkpoint and schedule with a fresh beacon",
+        window, frozen["checkpoint"]["revision"][:12], frozen["schedule"].get("revision"),
+    )
+
+
+def _require_service_checkpoint_lineage(runtime, *, checkpoint_n, repo, revision, digest, receipt) -> None:
+    """I1: the staged checkpoint continues the order's lineage. BLOCKING read (SQLite), no mutation."""
+    runtime.require_adoptable(
+        checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=digest,
+        parent_revision=receipt.get("parent_revision"),
+    )
+
+
 class ValidationService:
+    @_closing_service_runtime_on_failure
     def __init__(
         self,
         wallet,
@@ -802,6 +885,11 @@ class ValidationService:
         # The next service window as prepared at the boundary (None for every other task).
         self._candidate_service_window: dict[str, Any] | None = None
         self._candidate_service_pools: dict[str, float] | None = None
+        # Service windows whose seal reached the archive step (their exploration is
+        # payable even with an empty training batch), and the boundary at which each
+        # window left unarchived was last retried. Empty for every other task.
+        self._service_sealed_windows: set[int] = set()
+        self._service_recovery_attempts: dict[int, int] = {}
         if service_contract is not None:
             from reliquary.constants import FILL_CLOSED_ENABLED, PIPELINED_WINDOWS, ENFORCE_ENVELOPE_SIGNATURE
             from reliquary.services.runtime import ServiceRuntime
@@ -828,8 +916,9 @@ class ValidationService:
             from reliquary.shared.training_payload import active_training_identity
             if service_contract.to_dict()["generation_contract_sha256"] != active_training_identity()["generation_contract_sha256"]:
                 raise ValueError("service generation contract differs from the active runtime")
-            folder = Path(os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")) / "service-policies" / namespace.task_id / namespace.run_id
-            folder.mkdir(parents=True, exist_ok=True)
+            folder = _service_request_folder(
+                Path(os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")) / "service-policies" / namespace.task_id / namespace.run_id
+            )
             self._service_runtime = ServiceRuntime(folder / "runtime.sqlite3", service_contract, qualification)
             # The operator's schedule requests live beside the runtime database
             # (``python -m reliquary.services.schedule --folder <this folder>``).
@@ -938,11 +1027,8 @@ class ValidationService:
         if self._service_runtime is not None:
             # R7: what must be installed is what the PERSISTED schedule runs now,
             # not only what the order activated at launch.
-            try:
-                self._require_service_environments(self._service_runtime.schedule)
-            except BaseException:
-                self._service_runtime.close()
-                raise
+            # (A refusal closes the runtime: see ``_closing_service_runtime_on_failure``.)
+            self._require_service_environments(self._service_runtime.schedule)
 
         # Legacy accessor — archive code and tests grew up around single-env.
         # Points to the first env in the mix; consumers needing all envs
@@ -1663,6 +1749,16 @@ class ValidationService:
                 # One order, one checkpoint lineage: the repository never changes.
                 if service_runtime.contract.to_dict()["checkpoint"]["repo"] != repo_id:
                     raise ValueError("service checkpoint repository mismatch")
+                # The order pins its root (revision and digest) and every later
+                # checkpoint is a child of the current one. Checked before anything
+                # is recorded, bound or installed.
+                await asyncio.to_thread(
+                    functools.partial(
+                        _require_service_checkpoint_lineage, service_runtime,
+                        checkpoint_n=checkpoint_n, repo=repo_id, revision=revision,
+                        digest=checkpoint_digest, receipt=receipt,
+                    )
+                )
             # Persist the trainer cursor binding before changing the active
             # checkpoint. Readiness also requires the active manifest to equal
             # this candidate, so a failed swap remains closed; a crash after a
@@ -2609,16 +2705,17 @@ class ValidationService:
     def _service_activation_version(self, name: str) -> str | None:
         """What the runtime's activation check sees as the installed version of ``name``.
 
-        None (refused: not installed) unless this process can really run it, so a
-        request can never switch on an env the next window could not build.
+        A request can never switch on an env the next window could not build: unless
+        this process can really run it, the request is refused with the actual reason
+        (``ScheduleRefused``, which the runtime records as the request's status).
         """
-        installed = self._service_installed_version(name)
+        from reliquary.services.schedule import ScheduleRefused
+
         problem = self._service_environment_problem(name)
         if problem is None:
-            return installed
+            return self._service_installed_version(name)
         logger.error("service environment %s cannot be activated: it %s", name, problem)
-        declared = self._service_runtime.contract.environments.get(name) or {}
-        return installed if installed != declared.get("version") else None
+        raise ScheduleRefused(f"cannot activate {name}: the environment {problem}")
 
     def _service_window_pool(self, schedule, env_order: list[str]) -> dict[str, float]:
         """Each active env's pool: the task cap times its live share, then its price."""
@@ -2635,15 +2732,18 @@ class ValidationService:
         """The boundary work of one service window. BLOCKING (SQLite commits):
         ``_prepare_service_window`` runs it in a worker thread.
 
-        Order: the operator's pending schedule request is applied first (it lands
-        on this window unless the window is already frozen, R6), then the
-        installed checkpoint is selected in the order's lineage, then the window
-        is derived from the schedule it will freeze: active envs, their constant
-        group count per pick, pool = cap x share (x price).
-        A window the runtime froze earlier (failed open, restart) is rebuilt
-        from its envelope, never re-derived from the latest schedule.
+        Order: an envelope the runtime still holds for this candidate window (a
+        failed open, a restart before activation) is discarded first, so the window
+        is always frozen on what is true NOW: the installed checkpoint, the current
+        schedule, and a fresh beacon at its open. Then the operator's pending
+        schedule request is applied (it lands on this window), the installed
+        checkpoint is selected in the order's lineage, and the window is derived
+        from the schedule it will freeze: active envs, their constant group count
+        per pick, pool = cap x share (x price).
+        A window that was activated is never rebuilt here: it has a recovery record
+        (or observations, or a settlement) and is refused.
         """
-        from reliquary.services.runtime import ServicePolicyLimit, protocol_slot_geometry
+        from reliquary.services.runtime import protocol_slot_geometry
 
         runtime = self._service_runtime
         target_window = int(target_window)
@@ -2651,6 +2751,9 @@ class ValidationService:
         root = runtime.contract.to_dict()["checkpoint"]
         if cp is None or not cp.revision or cp.repo_id != root["repo"]:
             raise ValueError("service checkpoint repository mismatch")
+        _discard_unactivated_service_window(
+            runtime, getattr(self, "_fill_closed_recovery_store", None), target_window,
+        )
         schedule = runtime.apply_pending_schedule_request(
             self._service_schedule_store,
             window=target_window,
@@ -2663,24 +2766,7 @@ class ValidationService:
         active = set(schedule.active_environments())
         env_mix = [(name, target) for name, target in self.env_mix if name in active]
         env_order = [name for name, _ in env_mix]
-        try:
-            envelope = runtime.envelope(target_window)
-        except ServicePolicyLimit:
-            envelope = None
-        if envelope is None:
-            pools = self._service_window_pool(schedule, env_order)
-        else:
-            if envelope["checkpoint"]["revision"] != cp.revision:
-                raise ValueError(
-                    f"service window {target_window} is frozen on checkpoint "
-                    f"{envelope['checkpoint']['revision'][:12]} but "
-                    f"{cp.revision[:12]} is installed"
-                )
-            if set(envelope["pools"]) != set(env_order):
-                raise ValueError(
-                    f"service window {target_window} is frozen on other environments"
-                )
-            pools = {name: float(envelope["pools"][name]) for name in env_order}
+        pools = self._service_window_pool(schedule, env_order)
         picks_target, batch_slots = protocol_slot_geometry()
         return {
             "window": target_window,
@@ -2693,25 +2779,136 @@ class ValidationService:
             "opened": False,
         }
 
-    async def _prepare_service_window(self) -> None:
-        """Window boundary of a service task, before the next window is built."""
+    def _recover_leftover_service_windows(self, target_window: int) -> tuple[list[dict], bool]:
+        """Settle again the windows an earlier failure left unarchived. BLOCKING; never raises.
+
+        A window whose settlement failed at its seal and again in its recovery keeps
+        its recovery record and pays nobody. At the next boundary it gets what a
+        restart would give it (quarantine, then ``recover`` from its journal
+        receipts), ONE attempt per boundary. A window that still cannot be settled
+        stays as it is (logged at error with its number): it is never aborted here,
+        and it does not stop the next window from opening. The start of the process
+        stays fail-closed on such a record.
+        Returns the archives now enqueued and whether any attempt was made.
+        """
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        rotation = getattr(self, "_fill_closed_rotation_store", None)
+        if recovery is None or rotation is None:
+            return [], False
+        try:
+            leftovers = [window for window in recovery.windows() if window < target_window]
+        except Exception as exc:
+            logger.error(
+                "service window %d: the records of unarchived windows cannot be read "
+                "(%s: %s); nothing is retried at this boundary",
+                target_window, type(exc).__name__, exc, exc_info=True,
+            )
+            return [], False
+        recovered: list[dict] = []
+        attempted = False
+        for window in leftovers:
+            if self._service_recovery_attempts.get(window) == target_window:
+                continue
+            self._service_recovery_attempts[window] = target_window
+            attempted = True
+            logger.error(
+                "service window %d was left unarchived by an earlier failure; settling "
+                "it again at the boundary of window %d",
+                window, target_window,
+            )
+            try:
+                from reliquary.infrastructure.archive_queue import get_archive_queue
+
+                queue = self._training_payload_queue_ref()
+                recovery.quarantine_uncommitted(Path(queue.queue_dir))
+                archive = recovery.recover(
+                    window, queue=queue, archives=get_archive_queue(), rotation=rotation,
+                    service_runtime=self._service_runtime,
+                    sealed=window in self._service_sealed_windows,
+                )
+            except Exception as exc:
+                logger.error(
+                    "service window %d: still not archived at the boundary of window %d "
+                    "(%s: %s); its record is kept, nobody is paid for it yet, it is "
+                    "retried at the next boundary and never aborted automatically",
+                    window, target_window, type(exc).__name__, exc, exc_info=True,
+                )
+                continue
+            logger.info("service window %d: archived at the boundary of window %d", window, target_window)
+            recovered.append(archive)
+        return recovered, attempted
+
+    def _service_window_boundary(self, target_window: int) -> dict[str, Any]:
+        """Everything the boundary does off the event loop, in ONE worker thread.
+
+        First the windows left unarchived (``_recover_leftover_service_windows``).
+        A recovery attempt (re)writes the durable rotation barrier of the window it
+        recovers, exactly as a restart does; when one is armed afterwards the plan
+        is NOT derived: the loop goes back to the rotation wait, and derives the
+        window once the barrier cleared. Otherwise the plan of ``target_window``.
+        """
+        recovered, attempted = self._recover_leftover_service_windows(target_window)
+        outcome: dict[str, Any] = {"recovered": recovered, "attempted": attempted, "plan": None, "error": None}
+        if attempted:
+            try:
+                outcome["rotation_gate"] = self._fill_closed_rotation_store.load()
+            except Exception as exc:
+                outcome["error"] = exc
+                return outcome
+            if outcome["rotation_gate"] is not None:
+                return outcome
+        try:
+            outcome["plan"] = self._service_window_plan(target_window)
+        except Exception as exc:
+            outcome["error"] = exc
+        return outcome
+
+    async def _prepare_service_window(self) -> bool:
+        """Window boundary of a service task, before the next window is built.
+
+        True: the window is prepared and can be built. False: recovering a window
+        left unarchived armed its rotation barrier; nothing was prepared and the
+        caller goes back to the rotation wait (the existing rule: the next window
+        never opens before the trainer consumed the previous one and, if it holds
+        payloads, before its successor checkpoint is installed).
+        """
         if self._candidate_window_n is None:
             self._candidate_window_n = self._window_n + 1
         target_window = int(self._candidate_window_n)
         self._candidate_service_window = None
         self._candidate_service_pools = None
         self._set_window_preparation_stage("service_schedule")
-        try:
-            self._candidate_service_window = await asyncio.to_thread(
-                self._service_window_plan, target_window,
+        outcome = await asyncio.to_thread(self._service_window_boundary, target_window)
+        for archive in outcome["recovered"]:
+            # What ``_enqueue_aborted_window`` does once a window is archived.
+            window = int(archive["window_start"])
+            self._cache_archived_hashes(archive)
+            self._fill_closed_assemblers.pop(window, None)
+            current = getattr(self, "_fill_closed_assembler", None)
+            if current is not None and current.window_start == window:
+                self._fill_closed_assembler = None
+            self._cooldown_durable_window = max(getattr(self, "_cooldown_durable_window", 0), window)
+            self._service_sealed_windows.discard(window)
+            self._service_recovery_attempts.pop(window, None)
+        if outcome["attempted"] and outcome.get("rotation_gate") is not None:
+            # The store is the truth after a recovery, as at a restart.
+            self._fill_closed_rotation_gate = outcome["rotation_gate"]
+            logger.warning(
+                "service window %d: the recovery of an unarchived window armed its "
+                "rotation barrier; back to the rotation wait before this window opens",
+                target_window,
             )
-        except Exception as exc:
+            return False
+        exc = outcome["error"]
+        if exc is not None:
             logger.error(
                 "service window %d: boundary preparation failed (%s: %s); the "
                 "window is not opened and is retried",
-                target_window, type(exc).__name__, exc, exc_info=True,
+                target_window, type(exc).__name__, exc, exc_info=exc,
             )
-            raise
+            raise exc
+        self._candidate_service_window = outcome["plan"]
+        return True
 
     def _open_service_window(self, target_window: int, randomness: str) -> dict[str, dict]:
         """Freeze the window in the runtime, then announce it. BLOCKING (SQLite).
@@ -2737,6 +2934,13 @@ class ValidationService:
             )
             for name, _ in window["env_mix"]
         }
+        # One beacon per window: what miners are told IS what the batchers verify
+        # with. (An older beacon can only belong to an envelope the boundary should
+        # have discarded; the window is not opened and its retry starts clean.)
+        if any(value["pool_randomness"] != randomness for value in announcements.values()):
+            raise RuntimeError(
+                f"service window {target_window} is announced with another beacon than its randomness"
+            )
         window["opened"] = True
         return announcements
 
@@ -2745,8 +2949,9 @@ class ValidationService:
 
         A failure is logged with its window and re-raised: the caller's handler
         then archives the window from its durable journal receipts instead
-        (``_enqueue_aborted_window``), which settles it again from well-formed
-        rows. Nothing was enqueued for the window at this point.
+        (``_enqueue_aborted_window``, told that the window sealed), which settles
+        it again from well-formed rows. Nothing was enqueued for the window at this
+        point: the settlement is the step just before ``finish``.
         """
         try:
             return await asyncio.to_thread(runtime.reconcile_archive, archive)
@@ -5884,9 +6089,6 @@ class ValidationService:
                 ).items()
             },
         }
-        runtime = getattr(first_batcher, "service_runtime", None)
-        if runtime is not None:
-            archive = await self._settle_service_archive(runtime, archive)
         await asyncio.to_thread(
             self._utility_telemetry.write_window,
             window=int(first_batcher.window_start),
@@ -5920,11 +6122,18 @@ class ValidationService:
         from reliquary.infrastructure.archive_queue import get_archive_queue
         archived_window = int(first_batcher.window_start)
         recovery = getattr(self, "_fill_closed_recovery_store", None)
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is not None:
+            # The last step before the archive is committed: nothing that can fail
+            # stands between the settlement and ``finish`` but ``finish`` itself.
+            archive = await self._settle_service_archive(runtime, archive)
         if FILL_CLOSED_ENABLED and recovery is not None:
             recovery.finish(archived_window, archive, get_archive_queue())
         else:
             get_archive_queue().enqueue(archived_window, archive)
         self._archive_enqueued_windows.add(archived_window)
+        if runtime is not None:
+            self._service_sealed_windows.discard(archived_window)
         if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
             self._fill_closed_assemblers.pop(archived_window, None)
             if getattr(self, "_fill_closed_assembler", None) is fill_closed_assembler:
@@ -6201,11 +6410,34 @@ class ValidationService:
                 assembler,
             )
             recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
-            archive = recovery.recover(
-                window_start, queue=self._training_payload_queue_ref(),
-                archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
-                service_runtime=getattr(self, "_service_runtime", None),
-            )
+            if getattr(self, "_service_runtime", None) is None:
+                archive = recovery.recover(
+                    window_start, queue=self._training_payload_queue_ref(),
+                    archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
+                    service_runtime=getattr(self, "_service_runtime", None),
+                )
+            else:
+                # A failure of the archive step means the window SEALED: its audits
+                # ran and its exploration is owed even when no training group was
+                # paid. Remembered for every later attempt of this process (the
+                # loop's own handler, the next boundary).
+                if failure_stage == "archive_enqueue":
+                    self._service_sealed_windows.add(window_start)
+                try:
+                    archive = recovery.recover(
+                        window_start, queue=self._training_payload_queue_ref(),
+                        archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
+                        service_runtime=self._service_runtime,
+                        sealed=window_start in self._service_sealed_windows,
+                    )
+                except Exception:
+                    # ``recover`` wrote the window's rotation barrier before it failed.
+                    # The store is the truth after a recovery (as below and at a
+                    # restart): the next window still waits for the trainer.
+                    self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+                    raise
+                self._service_sealed_windows.discard(window_start)
+                self._service_recovery_attempts.pop(window_start, None)
             if getattr(self, "_service_runtime", None) is not None:
                 for name, batcher in batchers.items():
                     if archive.get("window_status") == "aborted":
@@ -6710,7 +6942,8 @@ class ValidationService:
                         await asyncio.sleep(FILL_CLOSED_ROTATION_POLL_SECONDS)
                         continue
                     if self._service_runtime is not None:
-                        await self._prepare_service_window()
+                        if not await self._prepare_service_window():
+                            continue
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
                     self._set_window_preparation_stage("admission_pools")

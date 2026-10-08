@@ -560,6 +560,49 @@ class ServiceRuntime:
                             "DO UPDATE SET seq=excluded.seq", (order, revision, checkpoint_n, repo, sha256, seq))
             return self._checkpoint()
 
+    def require_adoptable(self, *, checkpoint_n: int, repo: str, revision: str, sha256: str,
+                          parent_revision) -> None:
+        """Refuse a checkpoint that does not continue this order's lineage. Reads only.
+
+        The caller runs it BEFORE it installs anything, so a wrong ``--resume-from`` or a stale
+        candidate never becomes the lineage root:
+
+        * a revision already in the lineage is re-selected (restart) under the identity it was
+          adopted with (same number, same digest);
+        * with no checkpoint adopted yet, only the order's root is accepted: the contract's
+          ``checkpoint.revision`` AND ``checkpoint.sha256`` (``sha256`` is the caller's digest of
+          the published files, the same value ``adopt`` stores);
+        * otherwise the checkpoint must be a child of the current one
+          (``parent_revision == checkpoint["revision"]``).
+        """
+        _integer(checkpoint_n, "checkpoint_n", 0)
+        root = self.contract.to_dict()["checkpoint"]
+        if repo != root["repo"]:
+            raise ValueError("adoption cannot change checkpoint repository")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("checkpoint revision must be an immutable 40-hex commit")
+        _sha(sha256, "checkpoint sha256")
+        order = self.contract.sha256
+        with self.lock:
+            known = self.db.execute("SELECT checkpoint_n, sha256 FROM service_checkpoints WHERE order_id=? AND revision=?",
+                                    (order, revision)).fetchone()
+            head = self.db.execute("SELECT revision FROM service_checkpoints WHERE order_id=? ORDER BY seq DESC LIMIT 1",
+                                   (order,)).fetchone()
+        if known is not None:
+            if known != (checkpoint_n, sha256):
+                raise ValueError("checkpoint revision was already adopted with another identity")
+            return
+        if head is None:
+            if revision != root["revision"]:
+                raise ValueError(f"the first service checkpoint must be the order's root revision "
+                                 f"{root['revision'][:12]}, not {revision[:12]}")
+            if sha256 != root["sha256"]:
+                raise ValueError("the root checkpoint's digest differs from the order's checkpoint.sha256")
+            return
+        if parent_revision != head[0]:
+            raise ValueError(f"service checkpoint {revision[:12]} is not a child of the current lineage "
+                             f"checkpoint {head[0][:12]}")
+
     def ensure_checkpoint(self, *, checkpoint_n: int, repo: str, revision: str) -> dict:
         """Re-select an adopted revision (restart), or adopt the order's root checkpoint."""
         with self.lock:
@@ -627,6 +670,44 @@ class ServiceRuntime:
             self.db.execute("INSERT INTO service_windows(order_id, window, envelope, opened_at) VALUES(?,?,?,?)",
                             (order, window, canonical_json_bytes(envelope).decode(), instant))
             return envelope
+
+    def discard_unactivated_window(self, window: int) -> bool:
+        """Forget the frozen envelope and pool beacon of a window that was never activated.
+
+        For the validator's retry of a candidate window: frozen by ``open_window`` (and maybe
+        announced), then never exposed to admission. The next ``open_window`` freezes it again on
+        the current checkpoint and schedule, and its next ``announcement`` stores a fresh beacon.
+        Refused (``ServicePolicyLimit``, nothing deleted) as soon as the window carries anything a
+        miner or a settlement could rely on: an observation, an exploration ledger row, a finalized
+        env or a settled row. "The first beacon of a window is permanent" therefore holds from the
+        first admission on. Returns False when the window has no envelope.
+        """
+        _integer(window, "window", 0)
+        order = self.contract.sha256
+        with self._txn():
+            saved = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?",
+                                    (order, window)).fetchone()
+            if saved is None:
+                return False
+            if self._settled(window):
+                raise ServicePolicyLimit(f"service window {window} is settled; its envelope is permanent")
+            if self.log.window_observations(window):
+                raise ServicePolicyLimit(f"service window {window} has observations; its envelope is permanent")
+            for env in sorted(json.loads(saved[0])["pools"]):
+                if self.ledger.rows(window, environment=env) or self.ledger.is_finalized(window, environment=env):
+                    raise ServicePolicyLimit(f"service window {window} has exploration ledger rows; "
+                                             f"its envelope is permanent")
+            self.db.execute("DELETE FROM service_pools WHERE order_id=? AND window=?", (order, window))
+            self.db.execute("DELETE FROM service_windows WHERE order_id=? AND window=?", (order, window))
+            return True
+
+    def window_disposition(self, window: int) -> str | None:
+        """``"settled"`` / ``"aborted"`` as the last ``reconcile_archive`` of ``window`` left it; None before."""
+        _integer(window, "window", 0)
+        with self.lock:
+            row = self.db.execute("SELECT aborted FROM service_settled WHERE order_id=? AND window=?",
+                                  (self.contract.sha256, window)).fetchone()
+        return None if row is None else ("aborted" if row[0] else "settled")
 
     def _envelope(self, window: int) -> dict:
         row = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?",

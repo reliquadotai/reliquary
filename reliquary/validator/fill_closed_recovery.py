@@ -229,8 +229,14 @@ class FillClosedRecoveryStore:
         self._sync(self.directory)
         return archive
 
-    def recover(self, window: int, *, queue: Any, archives: Any, rotation: Any, service_runtime: Any = None) -> dict:
-        """Archive an interrupted window and return the archive it enqueued."""
+    def recover(self, window: int, *, queue: Any, archives: Any, rotation: Any, service_runtime: Any = None,
+                sealed: bool = False) -> dict:
+        """Archive an interrupted window and return the archive it enqueued.
+
+        ``sealed`` is read for a service task only: the window reached its seal (its
+        archive step failed afterwards), so it is settled NOT aborted even when no
+        training group was paid, and what it owes for exploration stays owed.
+        """
         record = self.load(window)
         if record["archive"] is not None:
             return self.finish(window, record["archive"], archives)
@@ -335,7 +341,15 @@ class FillClosedRecoveryStore:
             # first lines): a committed one is re-enqueued as it is, never settled
             # again. The rows come from validated journal receipts.
             try:
-                archive = service_runtime.reconcile_archive(archive, aborted=not bool(rows))
+                # A window with paid groups is never aborted. An empty one is, unless it
+                # sealed: the caller says so, or the runtime already settled it not
+                # aborted (the process died between that settlement and ``finish``).
+                # Same disposition as the seal's, whatever the number of attempts.
+                if not rows and (sealed is True or service_runtime.window_disposition(window) == "settled"):
+                    archive["window_status"] = "completed"
+                archive = service_runtime.reconcile_archive(
+                    archive, aborted=archive["window_status"] == "aborted",
+                )
             except Exception as exc:
                 logger.error(
                     "service window %d: recovery could not settle it (%s: %s); its "

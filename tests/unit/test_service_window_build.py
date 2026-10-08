@@ -10,6 +10,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import os
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -17,9 +18,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import reliquary.validator.service as service_module
-from reliquary.constants import B_BATCH, FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
+from reliquary.constants import B_BATCH, FILL_CLOSED_ADMISSION_BUDGET_PER_ENV, M_ROLLOUTS
+from reliquary.protocol.release_contract import canonical_sha256
 from reliquary.protocol.service_schedule import next_schedule
-from reliquary.services.runtime import FROZEN_ARCHIVE_FIELDS, ServiceRuntime, protocol_slot_geometry
+from reliquary.services.runtime import (
+    FROZEN_ARCHIVE_FIELDS, ServicePolicyLimit, ServiceRuntime, protocol_slot_geometry,
+)
 from reliquary.services.schedule import ScheduleRequestStore
 from reliquary.services.settlement import SettlementError
 from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
@@ -31,6 +35,7 @@ from tests.unit.test_service_v2 import _build_late_drop_service
 
 PICKS, SLOTS = protocol_slot_geometry()
 ROOT = "d" * 40
+NEXT = "f" * 40
 BEACON = "ab" * 32
 CAP = 0.5
 
@@ -48,13 +53,18 @@ def drand_round(instant: float) -> int:
     return int(instant) // 3
 
 
-def _runtime(folder, contract):
-    return ServiceRuntime(folder / "runtime.sqlite3", contract, qualification_v2(contract), now=0,
+def _runtime(folder, contract, started=0):
+    return ServiceRuntime(folder / "runtime.sqlite3", contract, qualification_v2(contract), now=started,
                           drand_round_at=drand_round)
 
 
-def _service(monkeypatch, tmp_path, contract=None, *, loaded=None, cap=CAP, revision=ROOT, checkpoint_n=0):
-    """A real ValidationService wired the way ``__init__`` wires a service task."""
+def _service(monkeypatch, tmp_path, contract=None, *, loaded=None, cap=CAP, revision=ROOT, checkpoint_n=0,
+             started=0):
+    """A real ValidationService wired the way ``__init__`` wires a service task.
+
+    ``started`` is the order's start on the validator clock: a test that records observations
+    on the wall clock starts its order now (an order started at 0 is long past its deadline).
+    """
     monkeypatch.setattr(service_module, "FILL_CLOSED_ENABLED", True)
     monkeypatch.setattr("reliquary.constants.EMISSION_PRICE_ARMED", False)
     contract = contract or contract_v2()
@@ -73,7 +83,7 @@ def _service(monkeypatch, tmp_path, contract=None, *, loaded=None, cap=CAP, revi
     svc._cooldown_map = svc._cooldown_per_env[names[0]]
     svc._emission_cap = cap
     svc._env_caps = {}
-    svc._service_runtime = _runtime(folder, contract)
+    svc._service_runtime = _runtime(folder, contract, started)
     svc._service_schedule_store = ScheduleRequestStore(folder)
     svc._service_installed_version = lambda name: contract.environments[name]["version"]
     svc._checkpoint_store = SimpleNamespace(current_manifest=lambda: SimpleNamespace(
@@ -135,6 +145,26 @@ def _pay_one_group_per_env(svc, window=1):
     svc._fill_closed_assembler.accept(CODE, [_paid("bob", 4)], window, ROOT)
 
 
+def _explore(svc, *, window=1, hotkey="explorer", prompt=9, env=MATH):
+    """One exploration group of a never-scanned prompt, recorded, drawn and audited: owed at the seal."""
+    runtime = svc._service_runtime
+    opened = runtime.db.execute("SELECT opened_at FROM service_windows WHERE window=?", (window,)).fetchone()[0]
+    pool = runtime.seed_pool(environment=env, prompt_idx=prompt, window=window)
+    selection = pool.selection(list(range(M_ROLLOUTS)))
+    result = runtime.record_exploration(
+        environment=env, prompt_idx=prompt, hotkey=hotkey, window=window, rewards=[0.0] * M_ROLLOUTS,
+        group_id=selection.sha256, candidate={"pool_sha256": selection.pool_sha256, "seeds": list(selection.seeds)},
+        token_count=100, now=opened + 1)
+    assert result["entitled"], result
+    runtime.resolve_draws(window, beacon_for_round=lambda round_id: "cd" * 32, now=opened + 1000)
+    assert runtime.record_audit(result["observation_id"], passed=True, now=opened + 1000).kind == "passed"
+    return result
+
+
+def _exploration_price(pool):
+    return 0.15 * pool / (PICKS * SLOTS)
+
+
 def _seal(svc):
     for batcher in svc._active_batchers.values():
         batcher.force_seal("unit")
@@ -144,7 +174,7 @@ def _money(archive):
     return json.dumps({key: archive.get(key) for key in FROZEN_ARCHIVE_FIELDS}, sort_keys=True)
 
 
-async def _run(svc, monkeypatch, *, windows, mid_window=None):
+async def _run(svc, monkeypatch, *, windows, mid_window=None, rotation_wait=None):
     """The REAL ``ValidationService.run`` loop until ``windows`` windows are behind it.
 
     Stubbed: chain, R2 history, drand waits, the proof plane and the seal wait (it seals at once).
@@ -161,7 +191,8 @@ async def _run(svc, monkeypatch, *, windows, mid_window=None):
     monkeypatch.setattr(svc.server, "prepare_admission_pools", AsyncMock())
     monkeypatch.setattr(svc, "_log_startup_config_banner", MagicMock())
     monkeypatch.setattr(svc, "_arm_fill_closed_rotation_gate", MagicMock())
-    monkeypatch.setattr(svc, "_wait_for_fill_closed_rotation", AsyncMock(return_value="not_armed"))
+    monkeypatch.setattr(svc, "_wait_for_fill_closed_rotation",
+                        rotation_wait or AsyncMock(return_value="not_armed"))
     if svc._service_runtime is not None:
         monkeypatch.setattr(svc._service_runtime, "close", MagicMock())   # the tests read it afterwards
     iterations, stalled = [], []
@@ -301,11 +332,12 @@ async def test_an_env_activated_mid_window_gets_no_batcher_until_the_next_window
     running = dict(first)
     _request(svc, active=[MATH, CODE, SCIENCE], shares={MATH: 4000, CODE: 4000, SCIENCE: 2000})
     assert svc._active_batchers == running and SCIENCE not in runtime.envelope(1)["pools"]
-    # Even a second boundary pass on the SAME window (a retried open) keeps it frozen.
-    plan = await asyncio.to_thread(svc._service_window_plan, 1)
-    assert runtime.schedule.revision == 1                            # the request is applied ...
-    assert [name for name, _ in plan["env_mix"]] == [MATH, CODE]     # ... and window 1 does not see it
-    assert plan["pools"] == runtime.envelope(1)["pools"]
+    # A boundary pass on the ACTIVATED window is refused: it is never rebuilt, nor its envelope dropped.
+    envelope = runtime.envelope(1)
+    with pytest.raises(RuntimeError, match="window 1 was activated"):
+        await asyncio.to_thread(svc._service_window_plan, 1)
+    assert runtime.envelope(1) == envelope and runtime.schedule.revision == 0
+    assert svc._active_batchers[MATH].service_policy["pool_randomness"] == svc._active_batchers[MATH].randomness
     _archived(svc, 1)
     second = await _open(svc)
     assert list(second) == [MATH, CODE, SCIENCE]
@@ -391,48 +423,116 @@ async def test_the_window_opens_on_the_validator_clock(monkeypatch, tmp_path):
 # ---------------------------------------------------------------- restart / retry
 
 @pytest.mark.asyncio
-async def test_a_restart_before_activation_rebuilds_the_same_envelope_and_pools(monkeypatch, tmp_path):
+async def test_a_window_frozen_before_a_restart_and_never_activated_is_frozen_again_on_what_is_true_now(
+        monkeypatch, tmp_path, caplog):
+    """I3 + m4: the unactivated envelope is discarded; current schedule, current price, fresh beacon."""
     contract = contract_v2(shares={MATH: 6000, CODE: 4000})
     svc = _service(monkeypatch, tmp_path, contract)
     await _open(svc, activate=False)                                 # frozen and announced, then the crash
     envelope = svc._service_runtime.envelope(1)
     announced = svc._active_batchers[MATH].service_policy
+    assert envelope["pools"] == {MATH: CAP * 0.6, CODE: CAP * 0.4}
     _request(svc, shares={MATH: 2000, CODE: 8000}, cooldowns={MATH: 9})
     svc._service_runtime.close()
 
     again = _service(monkeypatch, tmp_path, contract)                # restart: same file, same request folder
     again._derive_randomness = AsyncMock(return_value=("other-drand-material", None))
-    # Whatever the price walk says after the restart, the frozen window keeps the pools it was priced with.
     from reliquary.validator.emission_price import PriceState
     monkeypatch.setattr("reliquary.constants.EMISSION_PRICE_ARMED", True)
     again._price_shadow_state = PriceState(price=0.5, last_good=0.5)
     assert again._window_n == svc._window_n                          # the same window number is rebuilt
-    batchers = await _open(again)
+    with caplog.at_level(logging.WARNING):
+        batchers = await _open(again)
+    assert "service window 1 was frozen on checkpoint dddddddddddd (schedule revision 0) and never activated" \
+        in caplog.text
     runtime = again._service_runtime
-    assert runtime.schedule.revision == 1                            # the request was taken at the boundary ...
-    assert runtime.envelope(1) == envelope                           # ... and window 1 stays what was frozen
-    assert again._candidate_service_pools == envelope["pools"] == {MATH: CAP * 0.6, CODE: CAP * 0.4}
-    assert again._fill_closed_assembler.pool_for(CODE) == CAP * 4000 / 10000
-    assert batchers[MATH]._cooldown.cooldown_windows == 50           # the frozen schedule's cooldown
-    assert batchers[MATH].service_policy == announced                # first beacon is permanent
-    assert batchers[MATH].randomness != announced["pool_randomness"]
-    _archived(again, 1)
-    await _open(again)
-    assert again._candidate_service_pools == pytest.approx({MATH: CAP * 0.2 * 0.5, CODE: CAP * 0.8 * 0.5})
-    assert again._active_batchers[MATH]._cooldown.cooldown_windows == 9
+    fresh = runtime.envelope(1)
+    # No miner was ever admitted on the first envelope: the window takes the request and today's price.
+    assert runtime.schedule.revision == 1 == fresh["schedule"]["revision"]
+    assert again._candidate_service_pools == fresh["pools"] == pytest.approx({MATH: CAP * 0.2 * 0.5,
+                                                                             CODE: CAP * 0.8 * 0.5})
+    assert again._fill_closed_assembler.pool_for(CODE) == fresh["pools"][CODE]
+    assert batchers[MATH]._cooldown.cooldown_windows == 9
+    for batcher in batchers.values():
+        policy = batcher.service_policy
+        # m4: what miners derive their seed pool from IS what the batcher verifies with.
+        assert policy["pool_randomness"] == batcher.randomness != announced["pool_randomness"]
+        assert policy["schedule"] == fresh["schedule"] and policy["pool_epoch"] == 1
+    assert runtime.db.execute("SELECT randomness FROM service_pools WHERE window=1").fetchall() == [
+        (batchers[MATH].randomness,)]
+    # Now the window IS activated: from here its envelope and its beacon are permanent.
+    with pytest.raises(RuntimeError, match="window 1 was activated"):
+        again._service_window_plan(1)
+    assert runtime.envelope(1) == fresh
 
 
 @pytest.mark.asyncio
-async def test_a_frozen_window_is_never_rebuilt_on_another_checkpoint(monkeypatch, tmp_path):
+async def test_a_checkpoint_installed_between_two_attempts_of_one_window_does_not_block_it(
+        monkeypatch, tmp_path, caplog):
+    """I3 (liveness): the first attempt froze window 1 on the root; the retry runs on its child."""
     contract = contract_v2()
     svc = _service(monkeypatch, tmp_path, contract)
+    runtime = svc._service_runtime
+    first_open = []
+    real_time = service_module.time.time
+    monkeypatch.setattr(service_module.time, "time", lambda: 1000.0)
+    await svc._prepare_service_window()
+    svc._open_window()
+    await svc._set_window_randomness(subtensor=None)                 # frozen + announced on ROOT ...
+    first_open.append((runtime.envelope(1), svc._active_batchers[MATH].randomness))
+    svc._rollback_preopen_window(RuntimeError("unit: the open failed after the freeze"))   # ... never activated
+    assert svc._fill_closed_recovery_store.windows() == [] and svc._candidate_window_n == 1
+    # The rotation gate installs the trainer's next checkpoint before the retry.
+    runtime.adopt(checkpoint_n=1, repo="models/test", revision=NEXT, sha256="e" * 64)
+    svc._checkpoint_store = SimpleNamespace(current_manifest=lambda: SimpleNamespace(
+        repo_id="models/test", revision=NEXT, checkpoint_n=1))
+    svc._derive_randomness = AsyncMock(return_value=("later-drand-material", None))
+    monkeypatch.setattr(service_module.time, "time", lambda: 2000.0)
+    with caplog.at_level(logging.WARNING):
+        batchers = await _open(svc)
+    monkeypatch.setattr(service_module.time, "time", real_time)
+    assert "that envelope and its beacon are discarded" in caplog.text
+    envelope = runtime.envelope(1)
+    assert first_open[0][0]["checkpoint"]["revision"] == ROOT and envelope["checkpoint"]["revision"] == NEXT
+    assert runtime.db.execute("SELECT opened_at FROM service_windows WHERE window=1").fetchone()[0] == 2000.0
+    assert svc._window_n == 1 and svc._fill_closed_recovery_store.load(1)["parent_revision"] == NEXT
+    for batcher in batchers.values():
+        assert batcher.current_checkpoint_hash == NEXT == batcher.service_policy["checkpoint"]["revision"]
+        assert batcher.randomness == batcher.service_policy["pool_randomness"] != first_open[0][1]   # m4
+    # The seed pool miners derive is the one of the fresh beacon and the installed checkpoint.
+    pool = runtime.seed_pool(environment=MATH, prompt_idx=3, window=1)
+    from reliquary.protocol.seed_pool import pool_from_service_policy
+    assert pool.sha256 == pool_from_service_policy(batchers[MATH].service_policy, environment=MATH, prompt_idx=3,
+                                                   checkpoint_hash=NEXT).sha256
+
+
+@pytest.mark.asyncio
+async def test_a_window_with_an_observation_is_never_frozen_again(monkeypatch, tmp_path, caplog):
+    """The runtime's own refusal reaches the loop as a boundary failure: nothing is opened."""
+    svc = _service(monkeypatch, tmp_path, started=service_module.time.time())
+    runtime = svc._service_runtime
     await _open(svc, activate=False)
-    svc._service_runtime.adopt(checkpoint_n=1, repo="models/test", revision="f" * 40, sha256="e" * 64)
-    svc._service_runtime.close()
-    again = _service(monkeypatch, tmp_path, contract, revision="f" * 40, checkpoint_n=1)
-    with pytest.raises(ValueError, match="frozen on checkpoint"):
-        await again._prepare_service_window()
-    assert again._candidate_service_window is None
+    _explore(svc)                                                    # cannot happen unactivated; if it did ...
+    envelope = runtime.envelope(1)
+    svc._rollback_preopen_window(RuntimeError("unit"))
+    with caplog.at_level(logging.ERROR), pytest.raises(ServicePolicyLimit, match="has observations"):
+        await svc._prepare_service_window()
+    assert "service window 1: boundary preparation failed (ServicePolicyLimit" in caplog.text
+    assert runtime.envelope(1) == envelope and svc._candidate_service_window is None
+
+
+@pytest.mark.asyncio
+async def test_a_beacon_that_is_not_the_windows_randomness_opens_nothing(monkeypatch, tmp_path):
+    """m4 as a rule: an announcement carrying another beacon than the batchers' randomness is refused."""
+    svc = _service(monkeypatch, tmp_path)
+    runtime = svc._service_runtime
+    real = runtime.announcement
+    monkeypatch.setattr(runtime, "announcement",
+                        lambda **kwargs: {**real(**kwargs), "pool_randomness": "77" * 32})
+    with pytest.raises(RuntimeError, match="announced with another beacon"):
+        await _open(svc)
+    assert all(b.randomness == "" and b.service_policy is None for b in svc._active_batchers.values())
+    assert svc._fill_closed_recovery_store.windows() == [] and not svc._candidate_service_window["opened"]
 
 
 @pytest.mark.asyncio
@@ -490,9 +590,40 @@ async def test_a_request_cannot_activate_an_env_this_process_did_not_load(monkey
     with caplog.at_level(logging.ERROR):
         batchers = await _open(svc)
     status = svc._service_schedule_store.status()
-    assert status["status"] == "refused" and "not installed" in status["detail"]
+    assert status["status"] == "refused"
+    assert status["detail"] == f"cannot activate {SCIENCE}: the environment is not loaded by this validator"
     assert svc._service_runtime.schedule.revision == 0 and list(batchers) == [MATH, CODE]
     assert f"service environment {SCIENCE} cannot be activated: it is not loaded" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem, said", [
+    ("rows", "has another dataset size than the order"),
+    ("name", "is loaded under another name"),
+    ("group_count", "has a group count per pick that differs from the protocol's"),
+    ("version", "is installed at another version than the one the order pins"),
+])
+async def test_a_refused_activation_says_what_is_wrong_with_the_env(monkeypatch, tmp_path, problem, said):
+    """m3: the operator reads the real reason, not "not installed"."""
+    contract = contract_v2(envs=(MATH, CODE, SCIENCE), shares={MATH: 5000, CODE: 5000, SCIENCE: 0})
+    svc = _service(monkeypatch, tmp_path, contract)
+    if problem == "rows":
+        svc.envs[SCIENCE] = _Env(SCIENCE, rows=999)
+    elif problem == "name":
+        svc.envs[SCIENCE] = _Env("other")
+    elif problem == "group_count":
+        svc.env_targets[SCIENCE] = B_BATCH * 2
+    else:
+        pinned = svc._service_installed_version
+        svc._service_installed_version = lambda name: "0" * 64 if name == SCIENCE else pinned(name)
+    _request(svc, active=[MATH, CODE, SCIENCE], shares={MATH: 4000, CODE: 4000, SCIENCE: 2000})
+    batchers = await _open(svc)
+    status = svc._service_schedule_store.status()
+    assert status["status"] == "refused" and status["detail"] == f"cannot activate {SCIENCE}: the environment {said}"
+    assert "not installed" not in status["detail"]
+    assert svc._service_runtime.schedule.revision == 0 and list(batchers) == [MATH, CODE]
+    # An env this process can run is still switched on, with its version.
+    assert svc._service_activation_version(MATH) == contract.environments[MATH]["version"]
 
 
 # ---------------------------------------------------------------- failures at open
@@ -524,6 +655,7 @@ async def test_a_runtime_failure_at_open_leaves_nothing_open_and_the_window_is_r
     assert svc._window_n == 1 and list(batchers) == [MATH, CODE]
     assert svc._fill_closed_recovery_store.windows() == [1] and len(exposed) == 1
     assert all(b.service_policy["pool_epoch"] == 1 for b in batchers.values())
+    assert all(b.service_policy["pool_randomness"] == b.randomness for b in batchers.values())   # m4
 
 
 # ---------------------------------------------------------------- legacy tasks
@@ -608,6 +740,77 @@ async def test_the_loop_applies_requests_before_open_refreshes_advice_after_sett
 
 
 @pytest.mark.asyncio
+async def test_a_checkpoint_swap_between_two_windows_in_the_real_loop(monkeypatch, tmp_path):
+    """The REAL ``_swap_staged_checkpoint`` at the rotation gate between window 1 and window 2."""
+    from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+
+    svc = _service(monkeypatch, tmp_path)
+    archives = _journal(svc, monkeypatch, tmp_path)
+    runtime = svc._service_runtime
+    current = {"entry": SimpleNamespace(repo_id="models/test", revision=ROOT, checkpoint_n=0)}
+
+    def install(number, revision):
+        current["entry"] = SimpleNamespace(repo_id="models/test", revision=revision, checkpoint_n=number)
+        return current["entry"]
+    svc._checkpoint_store = SimpleNamespace(repo_id="models/test", current_manifest=lambda: current["entry"],
+                                            install_external=install)
+    manifest = {"checkpoint_n": 1, "repo_id": "models/test", "revision": NEXT, "trained_window_cursor": 0}
+    files = {"model.safetensors": {"size": 9, "sha256": "2" * 64, "blob_id": "2" * 40}}
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / PUBLICATION_RECEIPT).write_text(json.dumps({
+        "publication_id": "unit", "parent_revision": ROOT, "files": files,
+        "manifest": {key: value for key, value in manifest.items() if key != "revision"}}))
+    svc._checkpoint_intake = SimpleNamespace(take_staged=lambda: (manifest, stage), mark_installed=MagicMock(),
+                                             snapshot=lambda: {}, staged_ready=False)
+    refreshed = MagicMock()                                              # the verify plane's weight load
+    monkeypatch.setattr(svc, "_refresh_verify_model_from_dir", refreshed)
+    monkeypatch.setattr(svc.server, "set_current_checkpoint", MagicMock())
+    calls = _spy_runtime(svc, monkeypatch)
+    real_adopt = runtime.adopt
+    monkeypatch.setattr(runtime, "adopt", lambda **kwargs: (
+        calls.append(("adopt", kwargs["revision"], threading.get_ident())), real_adopt(**kwargs))[1])
+
+    async def rotation_gate():
+        if svc._window_n == 1 and current["entry"].revision == ROOT:
+            await svc._swap_staged_checkpoint(1)                       # where the loop installs a checkpoint
+            return "checkpoint_adopted"
+        return "not_armed"
+    seen = {}
+
+    def mid_window(window):
+        revision = ROOT if window == 1 else NEXT
+        group = dataclasses.replace(_paid("alice", 3 + window), claimed_checkpoint_hash=revision)
+        svc._fill_closed_assembler.accept(MATH, [group], window, revision)
+        seen[window] = (svc._fill_closed_recovery_store.load(window)["parent_revision"],
+                        {b.current_checkpoint_hash for b in svc._active_batchers.values()},
+                        {b.service_policy["checkpoint"]["revision"] for b in svc._active_batchers.values()},
+                        all(b.randomness == b.service_policy["pool_randomness"]
+                            for b in svc._active_batchers.values()))
+    iterations = await _run(svc, monkeypatch, windows=2, mid_window=mid_window,
+                            rotation_wait=AsyncMock(side_effect=rotation_gate))
+    assert iterations == [0, 1, 2]
+    assert seen == {1: (ROOT, {ROOT}, {ROOT}, True), 2: (NEXT, {NEXT}, {NEXT}, True)}
+    # Window 1 settles on the root before the swap; window 2 is frozen on the child.
+    names = [(name, window) for name, window, _ in calls]
+    assert names.index(("reconcile_archive", 1)) < names.index(("adopt", NEXT)) \
+        < names.index(("apply_pending_schedule_request", 2)) < names.index(("open_window", 2))
+    assert runtime.envelope(1)["checkpoint"]["revision"] == ROOT
+    assert runtime.envelope(2)["checkpoint"] == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT,
+                                                  "sha256": canonical_sha256(files)}
+    assert runtime.db.execute("SELECT revision FROM service_checkpoints ORDER BY seq").fetchall() == [
+        (ROOT,), (NEXT,)]
+    pending = archives.pending_archives(start_window=1, end_window=2)
+    unit = CAP * 0.5 / (PICKS * SLOTS)
+    assert all(pending[window]["window_status"] == "completed" and
+               pending[window]["rewards_by_hotkey"] == {"alice": unit} for window in (1, 2))
+    assert [row["prompt_idx"] for window in (1, 2) for row in pending[window]["batch"]] == [4, 5]
+    # One run across the swap: the observations and scans of window 1 are still there.
+    assert svc._checkpoint_n == 1 and svc._fill_closed_recovery_store.windows() == []
+    refreshed.assert_called_once_with(stage, NEXT)
+
+
+@pytest.mark.asyncio
 async def test_a_runtime_failure_at_the_boundary_or_at_open_does_not_stop_the_loop(monkeypatch, tmp_path, caplog):
     svc = _service(monkeypatch, tmp_path)
     archives = _journal(svc, monkeypatch, tmp_path)
@@ -630,9 +833,10 @@ async def test_a_runtime_failure_at_the_boundary_or_at_open_does_not_stop_the_lo
 
 
 @pytest.mark.asyncio
-async def test_a_settlement_failure_at_seal_archives_the_window_from_its_receipts_and_the_loop_goes_on(
+async def test_a_settlement_failure_at_seal_settles_the_sealed_window_again_and_the_loop_goes_on(
         monkeypatch, tmp_path, caplog):
-    svc = _service(monkeypatch, tmp_path)
+    """I2: the window SEALED; with no paid training group it is still settled not aborted."""
+    svc = _service(monkeypatch, tmp_path, started=service_module.time.time())
     archives = _journal(svc, monkeypatch, tmp_path)
     runtime = svc._service_runtime
     real, seen = runtime.reconcile_archive, []
@@ -644,15 +848,94 @@ async def test_a_settlement_failure_at_seal_archives_the_window_from_its_receipt
         return real(archive, **kwargs)
     monkeypatch.setattr(runtime, "reconcile_archive", flaky)
     with caplog.at_level(logging.ERROR):
-        iterations = await _run(svc, monkeypatch, windows=1)
+        iterations = await _run(svc, monkeypatch, windows=1,
+                                mid_window=lambda window: _explore(svc) if window == 1 else None)
     assert iterations == [0, 1]
     assert "service window 1: settlement failed at seal (SettlementError" in caplog.text
-    # Second settlement: the same window, rebuilt from the journal receipts (no paid group here -> aborted).
-    assert seen == [(1, "completed", {}), (1, "aborted", {"aborted": True})]
+    # Second settlement: the same window, rebuilt from the journal receipts, told that it sealed.
+    assert seen == [(1, "completed", {}), (1, "completed", {"aborted": False})]
+    archive = archives.pending_archives(start_window=1, end_window=1)[1]
+    assert archive["window_status"] == "completed" and archive["batch"] == []
+    assert archive["service_exploration_by_environment"] == {MATH: {"explorer": 1}}
+    assert archive["rewards_by_hotkey"] == {"explorer": pytest.approx(_exploration_price(CAP * 0.5))}
+    assert runtime.window_disposition(1) == "settled" and runtime.log.is_scanned(MATH, 9)
+    assert svc._fill_closed_recovery_store.windows() == [] and svc._active_batchers == {}
+    assert svc._service_sealed_windows == set()
+
+
+@pytest.mark.asyncio
+async def test_the_seal_writes_the_window_then_settles_then_commits_the_archive(monkeypatch, tmp_path):
+    """I2: nothing that can fail stands between the settlement and ``finish``."""
+    svc = _service(monkeypatch, tmp_path)
+    _journal(svc, monkeypatch, tmp_path)
+    runtime, recovery, order = svc._service_runtime, svc._fill_closed_recovery_store, []
+    for owner, name in ((svc._utility_telemetry, "write_window"), (runtime, "reconcile_archive"),
+                        (recovery, "finish")):
+        def spy(*args, _real=getattr(owner, name), _name=name, **kwargs):
+            order.append(_name)
+            return _real(*args, **kwargs)
+        monkeypatch.setattr(owner, name, spy)
+    batchers = await _open(svc)
+    _seal(svc)
+    await svc._archive_window(dict(batchers), {name: ([], {}) for name in batchers})
+    assert order == ["write_window", "reconcile_archive", "finish"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["write_window", "finish"])
+async def test_an_exploration_only_window_keeps_its_pay_when_the_archive_step_fails(
+        monkeypatch, tmp_path, caplog, failing):
+    """I2: a failure before the settlement (never settled) or right after it (settled, not committed)."""
+    svc = _service(monkeypatch, tmp_path, started=service_module.time.time())
+    archives = _journal(svc, monkeypatch, tmp_path)
+    runtime, recovery = svc._service_runtime, svc._fill_closed_recovery_store
+    settled, attempts = [], []
+    real = runtime.reconcile_archive
+    monkeypatch.setattr(runtime, "reconcile_archive",
+                        lambda archive, **kw: (settled.append((kw, real(archive, **kw))), settled[-1][1])[1])
+    owner = svc._utility_telemetry if failing == "write_window" else recovery
+
+    def flaky(*args, _real=getattr(owner, failing), **kwargs):
+        attempts.append(failing)
+        if len(attempts) == 1:
+            raise OSError("unit: disk full")
+        return _real(*args, **kwargs)
+    monkeypatch.setattr(owner, failing, flaky)
+    paid = {}
+    with caplog.at_level(logging.ERROR):
+        iterations = await _run(svc, monkeypatch, windows=1,
+                                mid_window=lambda window: paid.update(_explore(svc)) if window == 1 else None)
+    assert iterations == [0, 1] and "window archive failed" in caplog.text
+    # The seal settled it (or never got to), then the recovery settled it: not aborted, both times.
+    assert [kw for kw, _ in settled] == ([{"aborted": False}] if failing == "write_window"
+                                         else [{}, {"aborted": False}])
+    assert "is now settled as" not in caplog.text and "settled again with another batch" not in caplog.text
+    archive = archives.pending_archives(start_window=1, end_window=1)[1]
+    assert archive["window_status"] == "completed" and archive["batch"] == []
+    assert archive["service_exploration_by_environment"] == {MATH: {"explorer": 1}}
+    assert archive["rewards_by_hotkey"] == {"explorer": pytest.approx(_exploration_price(CAP * 0.5))}
+    assert all(_money(result) == _money(archive) for _, result in settled)
+    assert runtime.log.is_scanned(MATH, 9)                              # the paid first scan is kept
+    statuses = [event["status"] for _, event in runtime.events(limit=1000)
+                if event["id"] == paid["observation_id"] and event["type"] == "settle"]
+    assert statuses[-1] == "exploration_paid" and "exploration_unpaid" not in statuses
+    assert recovery.windows() == [] and svc._service_sealed_windows == set()
+
+
+@pytest.mark.asyncio
+async def test_a_window_that_fails_before_its_seal_is_aborted_and_pays_no_exploration(monkeypatch, tmp_path):
+    """The other side of I2: only a SEALED window keeps exploration with an empty batch."""
+    svc = _service(monkeypatch, tmp_path, started=service_module.time.time())
+    archives = _journal(svc, monkeypatch, tmp_path)
+    runtime = svc._service_runtime
+    await _open(svc)
+    _explore(svc)
+    svc._enqueue_aborted_window(failure_stage="active", failure_type="UnitFailure")
     archive = archives.pending_archives(start_window=1, end_window=1)[1]
     assert archive["window_status"] == "aborted" and archive["rewards_by_hotkey"] == {}
     assert archive["service_exploration_by_environment"] == {}
-    assert svc._fill_closed_recovery_store.windows() == [] and svc._active_batchers == {}
+    assert runtime.window_disposition(1) == "aborted" and not runtime.log.is_scanned(MATH, 9)
+    assert svc._service_sealed_windows == set()
 
 
 @pytest.mark.asyncio
@@ -685,33 +968,59 @@ async def test_a_failed_seal_settlement_keeps_every_committed_training_payment(m
     assert caplog.text.count("service window 1: settlement failed at seal") == 1
 
 
+def _broken_settlement(svc, monkeypatch, *, window=1, failures=None):
+    """``reconcile_archive`` of ``window`` fails ``failures`` times (None: until switched off)."""
+    runtime = svc._service_runtime
+    real, state = runtime.reconcile_archive, {"on": True, "calls": 0}
+
+    def reconcile(archive, **kwargs):
+        if archive["window_start"] == window:
+            state["calls"] += 1
+            if state["on"] and (failures is None or state["calls"] <= failures):
+                raise SettlementError(f"unit: window {window} cannot be settled")
+        return real(archive, **kwargs)
+    monkeypatch.setattr(runtime, "reconcile_archive", reconcile)
+    return state
+
+
 @pytest.mark.asyncio
-async def test_a_window_the_runtime_cannot_settle_is_left_unarchived_and_settled_at_the_next_start(
+async def test_a_window_the_runtime_cannot_settle_is_retried_once_per_boundary_and_never_blocks_the_next(
         monkeypatch, tmp_path, caplog):
+    """I4: persistent failure. The record is kept, nothing is paid or aborted, the loop goes on."""
     svc = _service(monkeypatch, tmp_path)
     archives = _journal(svc, monkeypatch, tmp_path)
     runtime = svc._service_runtime
-    real = runtime.reconcile_archive
-    broken = {"on": True}
-
-    def reconcile(archive, **kwargs):
-        if broken["on"] and archive["window_start"] == 1:
-            raise SettlementError("unit: window 1 cannot be settled")
-        return real(archive, **kwargs)
-    monkeypatch.setattr(runtime, "reconcile_archive", reconcile)
+    broken = _broken_settlement(svc, monkeypatch)
+    boundary_threads = []
+    real_recover = svc._recover_leftover_service_windows
+    monkeypatch.setattr(svc, "_recover_leftover_service_windows", lambda target: (
+        boundary_threads.append(threading.get_ident()), real_recover(target))[1])
 
     def mid_window(window):                                          # groups are paid during window 1
         if window == 1:
             _pay_one_group_per_env(svc)
     with caplog.at_level(logging.ERROR):
-        iterations = await _run(svc, monkeypatch, windows=2, mid_window=mid_window)
-    assert iterations == [0, 1, 2]                                   # the loop went on to window 2
-    pending = archives.pending_archives(start_window=1, end_window=2)
-    assert sorted(pending) == [2]                                    # nothing was paid for window 1 ...
+        iterations = await _run(svc, monkeypatch, windows=3, mid_window=mid_window)
+    # Each boundary after window 1: one recovery attempt, back to the rotation wait, then the window opens.
+    assert iterations == [0, 1, 1, 2, 2, 3]
+    pending = archives.pending_archives(start_window=1, end_window=3)
+    assert sorted(pending) == [2, 3]                                 # nothing was paid for window 1 ...
     assert svc._fill_closed_recovery_store.windows() == [1]          # ... and its record is kept
     assert svc._fill_closed_recovery_store.load(1)["archive"] is None
+    assert runtime.window_disposition(1) is None                     # never aborted on its own
+    # Seal, its recovery, the loop handler's, then ONE attempt at the boundary of window 2 and ONE at 3's.
+    assert broken["calls"] == 5
+    assert svc._service_recovery_attempts == {1: 3}
+    # The only failed iteration is window 1's own seal: a retry that fails never fails the boundary.
+    assert caplog.text.count("Window iteration failed") == 1
+    assert threading.get_ident() not in boundary_threads             # in the boundary's worker thread
     assert "service window 1: recovery could not settle it (SettlementError" in caplog.text
     assert "Failed to enqueue aborted-window tombstone" in caplog.text
+    assert "service window 1 was left unarchived by an earlier failure; settling it again at the boundary " \
+           "of window 2" in caplog.text
+    assert "service window 1: still not archived at the boundary of window 3 (SettlementError" in caplog.text
+    # The rotation barrier that recovery wrote for window 1 is the one the loop waits on again.
+    assert svc._fill_closed_rotation_gate is not None and svc._fill_closed_rotation_gate.source_window == 1
     # Next start (``_initialize_fill_closed_rotation_store``): the same record, the committed payments.
     broken["on"] = False
     recovered = svc._fill_closed_recovery_store.recover(
@@ -720,8 +1029,75 @@ async def test_a_window_the_runtime_cannot_settle_is_left_unarchived_and_settled
     unit = CAP * 0.5 / (PICKS * SLOTS)
     assert recovered["window_status"] == "recovered_partial"
     assert recovered["rewards_by_hotkey"] == {"alice": unit, "bob": unit}
-    assert sorted(archives.pending_archives(start_window=1, end_window=2)) == [1, 2]
+    assert sorted(archives.pending_archives(start_window=1, end_window=3)) == [1, 2, 3]
     assert svc._fill_closed_recovery_store.windows() == []
+
+
+@pytest.mark.asyncio
+async def test_a_transient_settlement_failure_heals_at_the_next_boundary_without_a_restart(
+        monkeypatch, tmp_path, caplog):
+    """I4: seal, recovery and the loop handler all fail on window 1; the boundary of window 2 archives it."""
+    svc = _service(monkeypatch, tmp_path)
+    archives = _journal(svc, monkeypatch, tmp_path)
+    runtime = svc._service_runtime
+    broken = _broken_settlement(svc, monkeypatch, failures=3)
+    waits = []
+    rotation_wait = AsyncMock(side_effect=lambda: (
+        waits.append((svc._window_n, getattr(svc._fill_closed_rotation_gate, "source_window", None))),
+        "not_armed")[1])
+
+    def mid_window(window):
+        if window == 1:
+            _pay_one_group_per_env(svc)
+            assert svc._fill_closed_recovery_store.windows() == [1]
+        else:
+            # Window 2 runs: window 1 was archived at its boundary, by this process.
+            assert sorted(archives.pending_archives(start_window=1, end_window=2)) == [1]
+            assert svc._fill_closed_recovery_store.windows() == [2]
+    with caplog.at_level(logging.WARNING):
+        iterations = await _run(svc, monkeypatch, windows=2, mid_window=mid_window, rotation_wait=rotation_wait)
+    assert iterations == [0, 1, 1, 2] and broken["calls"] == 4
+    assert caplog.text.count("Window iteration failed") == 1         # window 1's seal, nothing else
+    assert "service window 2: the recovery of an unarchived window armed its rotation barrier; back to the " \
+           "rotation wait before this window opens" in caplog.text
+    pending = archives.pending_archives(start_window=1, end_window=2)
+    unit = CAP * 0.5 / (PICKS * SLOTS)
+    assert pending[1]["window_status"] == "recovered_partial"
+    assert pending[1]["rewards_by_hotkey"] == {"alice": unit, "bob": unit}
+    assert pending[2]["window_status"] == "completed"
+    assert runtime.window_disposition(1) == "settled"
+    assert svc._fill_closed_recovery_store.windows() == []
+    assert svc._service_recovery_attempts == {} and 1 not in svc._fill_closed_assemblers
+    assert svc._cooldown_durable_window >= 1
+    # The existing rule is kept: the barrier recovery wrote for window 1 is waited on before window 2 opens.
+    assert waits == [(0, None), (1, 1), (1, 1)]
+    assert "service window 1 was left unarchived by an earlier failure" in caplog.text
+    assert "still not archived" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_sealed_window_healed_at_the_boundary_keeps_its_exploration(monkeypatch, tmp_path):
+    """I2 + I4: the boundary retry knows the window sealed, as the first recovery did."""
+    svc = _service(monkeypatch, tmp_path, started=service_module.time.time())
+    archives = _journal(svc, monkeypatch, tmp_path)
+    _broken_settlement(svc, monkeypatch, failures=3)
+    await _run(svc, monkeypatch, windows=2, mid_window=lambda window: _explore(svc) if window == 1 else None)
+    archive = archives.pending_archives(start_window=1, end_window=2)[1]
+    assert archive["window_status"] == "completed" and archive["batch"] == []
+    assert archive["rewards_by_hotkey"] == {"explorer": pytest.approx(_exploration_price(CAP * 0.5))}
+    assert svc._service_sealed_windows == set()
+
+
+@pytest.mark.asyncio
+async def test_the_boundary_never_stops_on_the_records_of_unarchived_windows(monkeypatch, tmp_path, caplog):
+    svc = _service(monkeypatch, tmp_path)
+    _journal(svc, monkeypatch, tmp_path)
+    assert svc._recover_leftover_service_windows(1) == ([], False)   # nothing left: nothing attempted
+    monkeypatch.setattr(svc._fill_closed_recovery_store, "windows", MagicMock(side_effect=ValueError("corrupt")))
+    with caplog.at_level(logging.ERROR):
+        assert await svc._prepare_service_window() is True
+    assert "the records of unarchived windows cannot be read (ValueError: corrupt)" in caplog.text
+    assert svc._candidate_service_window["window"] == 1
 
 
 # ---------------------------------------------------------------- recovery never settles an archived window
@@ -761,6 +1137,41 @@ async def test_a_crash_between_settlement_and_archive_enqueue_recovers_the_same_
     assert _money(archive) == _money(settled[0])
     assert archives.pending_archives(start_window=1, end_window=1)[1] == archive
     assert again.windows() == []
+    restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_the_seal_settlement_of_an_exploration_only_window_keeps_its_disposition(
+        monkeypatch, tmp_path, caplog):
+    """I2 across a restart: nobody tells the next process the window sealed; the runtime remembers."""
+    contract = contract_v2()
+    started = service_module.time.time()
+    svc = _service(monkeypatch, tmp_path, contract, started=started)
+    archives = _journal(svc, monkeypatch, tmp_path)
+    runtime = svc._service_runtime
+    batchers = await _open(svc)
+    _explore(svc)
+    settled = []
+    real = runtime.reconcile_archive
+    monkeypatch.setattr(runtime, "reconcile_archive",
+                        lambda archive, **kw: (settled.append(real(archive, **kw)), settled[-1])[1])
+    monkeypatch.setattr(svc._fill_closed_recovery_store, "finish", MagicMock(side_effect=_Crash()))
+    _seal(svc)
+    with pytest.raises(_Crash):
+        await svc._archive_window(dict(batchers), {name: ([], {}) for name in batchers})
+    assert len(settled) == 1 and settled[0]["rewards_by_hotkey"] == {
+        "explorer": pytest.approx(_exploration_price(CAP * 0.5))}
+    runtime.close()
+
+    restarted = _runtime(tmp_path / "service", contract, started)
+    again = FillClosedRecoveryStore(tmp_path / "state")
+    with caplog.at_level(logging.ERROR, logger="reliquary.services.runtime"):
+        archive = again.recover(1, queue=svc._training_payload_queue, archives=archives,
+                                rotation=svc._fill_closed_rotation_store, service_runtime=restarted)
+    assert "settled" not in caplog.text                                  # no flip, no other batch
+    assert archive["window_status"] == "completed" and _money(archive) == _money(settled[0])
+    assert restarted.log.is_scanned(MATH, 9) and restarted.window_disposition(1) == "settled"
+    assert archives.pending_archives(start_window=1, end_window=1)[1] == archive
     restarted.close()
 
 
@@ -925,3 +1336,97 @@ def test_boot_refuses_a_service_task_outside_its_execution_mode(monkeypatch, tmp
                         lambda self, *a, **k: real_init(self, *a, **{**k, "use_drand": False}))
     with pytest.raises(ValueError, match="drand"):
         _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])
+
+
+def test_boot_closes_the_runtime_when_the_constructor_fails_later(monkeypatch, tmp_path):
+    """m2: whatever fails after the runtime was opened, its SQLite handle is closed."""
+    import sqlite3
+
+    contract = _bootable_contract()
+    opened, closed = [], []
+    real_init, real_close = ServiceRuntime.__init__, ServiceRuntime.close
+    monkeypatch.setattr(ServiceRuntime, "__init__",
+                        lambda self, *a, **k: (real_init(self, *a, **k), opened.append(self))[0])
+    monkeypatch.setattr(ServiceRuntime, "close", lambda self: (closed.append(self), real_close(self))[1])
+    monkeypatch.setattr(service_module, "ValidatorServer", MagicMock(side_effect=RuntimeError("unit: no port")))
+    with pytest.raises(RuntimeError, match="unit: no port"):
+        _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])
+    assert len(opened) == 1 and closed == opened
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].db.execute("SELECT 1")
+    # The same for a failure right after the runtime (the request store) and for a boot refusal (R7).
+    monkeypatch.setattr("reliquary.services.schedule.ScheduleRequestStore", MagicMock(side_effect=OSError("unit")))
+    with pytest.raises(OSError, match="unit"):
+        _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])
+    assert len(opened) == 2 and closed == opened
+    monkeypatch.undo()
+    monkeypatch.setattr(ServiceRuntime, "close", lambda self: (closed.append(self), real_close(self))[1])
+    with pytest.raises(ValueError, match="another version"):
+        _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE], installed=lambda name: "0" * 64)
+    assert len(closed) == 3
+
+
+@pytest.mark.parametrize("umask", [0o000, 0o002, 0o022, 0o277])
+def test_the_request_folder_the_validator_creates_is_0700_whatever_the_umask(tmp_path, umask):
+    """I5: the request store refuses a folder group or others can write."""
+    target = tmp_path / "state" / "service-policies" / "task" / "run"
+    target.parent.mkdir(parents=True)
+    previous = os.umask(umask)
+    try:
+        assert service_module._service_request_folder(target) == target
+    finally:
+        os.umask(previous)
+    assert target.stat().st_mode & 0o7777 == 0o700
+    store = ScheduleRequestStore(target)
+    assert store.take() is None                                      # safe: read without a refusal
+
+
+def test_boot_creates_the_request_folder_0700_and_takes_requests_from_it(monkeypatch, tmp_path):
+    contract = _bootable_contract()
+    previous = os.umask(0o002)                                       # the umask of this machine's operator
+    try:
+        svc = _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])
+    finally:
+        os.umask(previous)
+    folder = tmp_path / "state" / "service-policies" / "task" / "run"
+    assert folder.stat().st_mode & 0o7777 == 0o700 and svc._service_schedule_store.folder == folder
+    _request(svc, cooldowns={MATH: 9})
+    schedule = svc._service_runtime.apply_pending_schedule_request(svc._service_schedule_store, window=1)
+    assert schedule.revision == 1 and svc._service_schedule_store.status()["status"] == "applied"
+    svc._service_runtime.close()
+
+
+@pytest.mark.parametrize("mode, refused", [(0o775, True), (0o757, True), (0o755, False), (0o700, False)])
+def test_boot_never_chmods_an_existing_request_folder_and_refuses_an_unsafe_one_once(
+        monkeypatch, tmp_path, caplog, mode, refused):
+    """I5: an existing folder is the operator's. Unsafe: logged once per boot, requests refused."""
+    contract = _bootable_contract()
+    folder = _persisted_folder(tmp_path)
+    folder.chmod(mode)
+    with caplog.at_level(logging.ERROR, logger="reliquary.validator.service"):
+        svc = _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])
+        assert folder.stat().st_mode & 0o7777 == mode                # not ours to change
+        _request(svc, cooldowns={MATH: 9})
+        for window in (1, 2, 3):                                     # three boundaries, one boot
+            schedule = svc._service_runtime.apply_pending_schedule_request(svc._service_schedule_store, window=window)
+    assert caplog.text.count("service request folder refused") == (1 if refused else 0)
+    if refused:
+        assert f"is writable by group or others (mode {mode:04o})" in caplog.text
+        assert schedule.revision == 0                                # the request is never read from there
+    else:
+        assert schedule.revision == 1 and svc._service_schedule_store.status()["status"] == "applied"
+    assert folder.stat().st_mode & 0o7777 == mode
+    svc._service_runtime.close()
+
+
+def test_a_legacy_task_still_boots_without_drand(monkeypatch):
+    """Only a service task needs drand window randomness."""
+    from reliquary.validator.service import ValidationService
+    from tests.unit.test_service_v2 import _LateDropFakeEnv, _LateDropFakeWallet
+
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 99
+    svc = ValidationService(wallet=_LateDropFakeWallet(), model=MagicMock(), tokenizer=tokenizer,
+                            env=_LateDropFakeEnv(), netuid=99, use_drand=False)
+    assert svc.use_drand is False and svc._service_runtime is None and svc._service_schedule_store is None
+    assert svc._service_sealed_windows == set() and svc._service_recovery_attempts == {}

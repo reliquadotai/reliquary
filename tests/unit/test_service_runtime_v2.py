@@ -1466,3 +1466,134 @@ def test_a_legacy_sampling_env_records_and_pays_without_a_pool_selection(tmp_pat
     result = rt.reconcile_archive(archive(batch=[("a", CODE, 4)]), now=10_100.0)
     assert result["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T), "x": pytest.approx(PRICE)}
     validate_service_archive_v2(result, rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
+
+
+# ---------------------------------------------------------------- Task 10 fix round: I1, I2, I3
+
+def test_i3_an_unactivated_window_is_discarded_and_frozen_again_on_what_is_true_now(tmp_path):
+    rt = build(tmp_path / "runtime.sqlite3")
+    rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
+    assert rt.discard_unactivated_window(1) is False                    # nothing frozen: nothing to do
+    first = open_window(rt, 1, now=100.0)                               # frozen and announced, never activated
+    assert rt.announcement(window=1, randomness=WINDOW_BEACON)["pool_randomness"] == WINDOW_BEACON
+    # Meanwhile: another checkpoint is installed and the operator changes the schedule.
+    rt.adopt(checkpoint_n=1, repo="models/test", revision="f" * 40, sha256="e" * 64)
+    rt.apply_schedule(next_schedule(rt.contract, rt.schedule, active=(MATH,), shares={MATH: 10000}),
+                      request_id="r1", window=1)
+    assert rt.discard_unactivated_window(1) is True
+    with pytest.raises(ServicePolicyLimit, match="no frozen envelope"):
+        rt.envelope(1)
+    assert rt.db.execute("SELECT COUNT(*) FROM service_pools").fetchone()[0] == 0
+    again = rt.open_window(1, pools={MATH: 0.5}, picks_target=PICKS, batch_slots=SLOTS, now=200.0)
+    assert again["checkpoint"]["revision"] == "f" * 40 != first["checkpoint"]["revision"]
+    assert again["schedule"]["revision"] == 1 and set(again["pools"]) == {MATH}
+    assert rt.db.execute("SELECT opened_at FROM service_windows WHERE window=1").fetchone()[0] == 200.0
+    fresh = "12" * 32
+    announced = rt.announcement(window=1, randomness=fresh)
+    assert announced["pool_randomness"] == fresh and announced["checkpoint"]["revision"] == "f" * 40
+    assert rt.seed_pool(environment=MATH, prompt_idx=7, window=1).sha256 != pool_from_service_policy(
+        {**announced, "pool_randomness": WINDOW_BEACON}, environment=MATH, prompt_idx=7,
+        checkpoint_hash="f" * 40).sha256
+    # From the first admission on, the envelope and its first beacon are permanent.
+    explore(rt, now=250.0)
+    with pytest.raises(ServicePolicyLimit, match="observations"):
+        rt.discard_unactivated_window(1)
+    assert rt.envelope(1) == again
+    assert rt.announcement(window=1, randomness="34" * 32)["pool_randomness"] == fresh
+    rt.close()
+
+
+@pytest.mark.parametrize("carries", ["training_observation", "exploration_observation", "ledger_row",
+                                     "finalized_env", "settled", "settled_aborted"])
+def test_i3_a_window_that_carries_anything_is_never_discarded(tmp_path, carries):
+    rt = runtime(tmp_path)                                              # window 1 frozen and announced
+    match = "observations"
+    if carries == "training_observation":
+        train(rt)
+    elif carries == "exploration_observation":
+        explore(rt, hotkey="a")
+        explore(rt, hotkey="b")                                         # unpaid: an observation without a ledger row
+        rt.db.execute("DELETE FROM exploration_entitlements")
+        rt.db.commit()
+    elif carries == "ledger_row":
+        explore(rt)
+        rt.db.execute("DELETE FROM run_observations")                   # only the ledger still knows the group
+        rt.db.commit()
+        match = "ledger rows"
+    elif carries == "finalized_env":
+        rt.finalize_exploration(1, environment=CODE, now=200.0)
+        match = "ledger rows"
+    else:
+        rt.reconcile_archive(archive(), aborted=carries == "settled_aborted", now=200.0)
+        match = "settled"
+    before = (rt.envelope(1), rt.db.execute("SELECT * FROM service_pools").fetchall())
+    with pytest.raises(ServicePolicyLimit, match=match) as refusal:
+        rt.discard_unactivated_window(1)
+    assert isinstance(refusal.value, ValueError)
+    assert (rt.envelope(1), rt.db.execute("SELECT * FROM service_pools").fetchall()) == before
+    rt.close()
+
+
+def test_i3_discarding_the_highest_window_keeps_the_opening_order(tmp_path):
+    rt = runtime(tmp_path)                                              # window 1
+    open_window(rt, 2, now=10.0)
+    assert rt.discard_unactivated_window(2) is True
+    assert rt.open_window(2, pools={MATH: POOL, CODE: POOL}, picks_target=PICKS, batch_slots=SLOTS,
+                          now=20.0)["schedule"]["revision"] == 0
+    assert rt.envelope(1)["pools"] == {MATH: POOL, CODE: POOL}          # the other window is untouched
+    with pytest.raises(ValueError):
+        rt.discard_unactivated_window(-1)
+    rt.close()
+
+
+def test_i1_only_the_pinned_root_then_children_of_the_current_checkpoint_are_adoptable(tmp_path):
+    rt = build(tmp_path / "runtime.sqlite3")
+    root = rt.contract.to_dict()["checkpoint"]
+    base = dict(repo=root["repo"], parent_revision="9" * 40)
+    with pytest.raises(ValueError, match="must be the order's root revision"):
+        rt.require_adoptable(checkpoint_n=1, revision="f" * 40, sha256=root["sha256"], **base)
+    with pytest.raises(ValueError, match="differs from the order's checkpoint.sha256"):
+        rt.require_adoptable(checkpoint_n=0, revision=root["revision"], sha256="e" * 64, **base)
+    with pytest.raises(ValueError, match="repository"):
+        rt.require_adoptable(checkpoint_n=0, revision=root["revision"], sha256=root["sha256"],
+                             repo="models/other", parent_revision=None)
+    rt.require_adoptable(checkpoint_n=0, revision=root["revision"], sha256=root["sha256"], **base)
+    assert rt.db.execute("SELECT COUNT(*) FROM service_checkpoints").fetchone()[0] == 0     # a read, nothing else
+    rt.adopt(checkpoint_n=0, repo=root["repo"], revision=root["revision"], sha256=root["sha256"])
+    child = dict(checkpoint_n=1, repo=root["repo"], revision="f" * 40, sha256="e" * 64)
+    for parent in ("9" * 40, None, "f" * 40):
+        with pytest.raises(ValueError, match="not a child of the current lineage checkpoint"):
+            rt.require_adoptable(**child, parent_revision=parent)
+    rt.require_adoptable(**child, parent_revision=root["revision"])
+    rt.adopt(**child)
+    # The root is no longer the current checkpoint: its children are refused, the child's are accepted.
+    grandchild = dict(checkpoint_n=2, repo=root["repo"], revision="a" * 40, sha256="e" * 64)
+    with pytest.raises(ValueError, match="not a child"):
+        rt.require_adoptable(**grandchild, parent_revision=root["revision"])
+    rt.require_adoptable(**grandchild, parent_revision="f" * 40)
+    # A revision already in the lineage is re-selected (restart) under its own identity only.
+    rt.require_adoptable(checkpoint_n=0, repo=root["repo"], revision=root["revision"], sha256=root["sha256"],
+                         parent_revision=None)
+    for other in (dict(checkpoint_n=5), dict(sha256="1" * 64)):
+        with pytest.raises(ValueError, match="another identity"):
+            rt.require_adoptable(**{**child, **other}, parent_revision=root["revision"])
+    with pytest.raises(ValueError, match="40-hex"):
+        rt.require_adoptable(**{**grandchild, "revision": "main"}, parent_revision="f" * 40)
+    rt.close()
+
+
+def test_i2_the_runtime_tells_how_a_window_was_last_settled(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    rt = build(path)
+    rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
+    open_window(rt, 1)
+    open_window(rt, 2)
+    assert rt.window_disposition(1) is None and rt.window_disposition(7) is None
+    rt.reconcile_archive(archive(1), now=100.0)
+    rt.reconcile_archive(archive(2), aborted=True, now=100.0)
+    rt.close()
+    rt = build(path)                                                    # it survives a restart
+    assert rt.window_disposition(1) == "settled" and rt.window_disposition(2) == "aborted"
+    rt.reconcile_archive(archive(1), aborted=True, now=200.0)           # the last call is the answer
+    assert rt.window_disposition(1) == "aborted"
+    rt.close()
