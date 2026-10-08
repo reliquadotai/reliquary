@@ -583,6 +583,9 @@ class MiningEngine:
             self.mix = [(env.name, 1)]
             self.env = env
         self._cooldown_per_env: dict[str, set[int]] = {n: set() for n in self.envs}
+        self._observations = None
+        self._prompt_policy = None
+        self._configure_observations()
 
         # Lazy imports for heavy deps — keep module import cheap.
         from reliquary.shared.hf_compat import resolve_hidden_size
@@ -977,19 +980,25 @@ class MiningEngine:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                try:
-                    env_name, prompt_idx = pick_env_and_prompt(
-                        self.envs,
-                        generation_mix,
-                        self._cooldown_per_env,
-                        rng=rng,
-                        randomness=randomness,
-                        prompt_ranges=prompt_ranges or None,
-                    )
-                except RuntimeError:
+                picked = None
+                for cooldowns in await self._cooldown_options(state, rng):
+                    try:
+                        picked = pick_env_and_prompt(
+                            self.envs,
+                            generation_mix,
+                            cooldowns,
+                            rng=rng,
+                            randomness=randomness,
+                            prompt_ranges=prompt_ranges or None,
+                        )
+                        break
+                    except RuntimeError:
+                        continue
+                if picked is None:
                     logger.info("all envs fully in cooldown; sleeping")
                     await asyncio.sleep(5)
                     continue
+                env_name, prompt_idx = picked
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
@@ -1431,6 +1440,63 @@ class MiningEngine:
                 generation["seed_pool"] = selection.rollout_binding(index)
         return rollouts
 
+    # ------------------------------------------------------------------
+    # Optional run observation source (decision D, miner side)
+    # ------------------------------------------------------------------
+
+    def _configure_observations(self) -> None:
+        """Read the observation source from the environment. Without RELIQUARY_OBSERVATIONS_URL nothing
+        is created and mining is exactly the legacy one."""
+        url = os.environ.get("RELIQUARY_OBSERVATIONS_URL")
+        if not url:
+            return
+        from reliquary.miner.observation_client import (
+            DEFAULT_RETAIN_WINDOWS, ObservationClient, load_policy,
+        )
+        self._observations = ObservationClient(
+            url, os.environ["RELIQUARY_OBSERVATIONS_RUN_ID"],
+            os.environ["RELIQUARY_OBSERVATIONS_VALIDATOR_HOTKEY"],
+            directory=os.environ.get("RELIQUARY_OBSERVATIONS_DIR") or None,
+            retain_windows=int(os.environ.get("RELIQUARY_OBSERVATIONS_RETAIN_WINDOWS") or DEFAULT_RETAIN_WINDOWS))
+        self._prompt_policy = load_policy(os.environ.get("RELIQUARY_PROMPT_POLICY"))
+
+    async def _cooldown_options(self, state, rng) -> list[dict[str, set[int]]]:
+        """Cooldown sets to try, in order, for the prompt choice. Legacy: the one set of the engine."""
+        observations = getattr(self, "_observations", None)
+        if observations is None or getattr(state, "service_policy", None) is None:
+            return [self._cooldown_per_env]
+        try:
+            await asyncio.to_thread(observations.sync)  # rate-limited and backed off inside
+        except Exception:
+            logger.warning("observation sync failed; using the table as it is", exc_info=True)
+        try:
+            checkpoint_n = int(getattr(state, "checkpoint_n", 0) or 0)
+            policy, table = self._prompt_policy, observations.table
+            seed = rng.getrandbits(32)
+            hard = {env: set(cooled) | observations.skipped(env, policy=policy, checkpoint_n=checkpoint_n)
+                    for env, cooled in self._cooldown_per_env.items()}
+            prefers = getattr(policy, "prefers_unscanned", None)
+            fresh = {env: (cooled | observations.scanned(env)
+                           if prefers is not None and prefers(table, env, seed=seed) else cooled)
+                     for env, cooled in hard.items()}
+        except Exception:
+            logger.warning("observation source failed; mining without it", exc_info=True)
+            return [self._cooldown_per_env]
+        return [fresh, hard] if fresh != hard else [hard]
+
+    def _preferred_public_seeds(self, seed_pool) -> tuple[int, ...] | None:
+        choose = getattr(self._prompt_policy, "preferred_seeds", None)
+        if choose is None:
+            return None
+        try:
+            seeds = choose(self._observations.table, seed_pool.environment, seed_pool.prompt_idx,
+                           pool_sha256=seed_pool.sha256, group_size=seed_pool.group_size,
+                           pool_seeds=seed_pool.pool_seeds)
+        except Exception:
+            logger.warning("prompt policy failed choosing seeds; using the default", exc_info=True)
+            return None
+        return None if seeds is None else tuple(seeds)
+
     def choose_public_seed_group(self, seed_pool, generate, *, problem, env) -> list[dict]:
         """HOOK -- which ``seed_pool.group_size`` seeds of the public pool this miner submits.
 
@@ -1456,6 +1522,10 @@ class MiningEngine:
         them by seed and rebinds them, so the returned order does not matter; a
         duplicate seed or a wrong count is refused before anything is signed.
         """
+        if getattr(self, "_observations", None) is not None:
+            preferred = self._preferred_public_seeds(seed_pool)
+            if preferred is not None:
+                return generate(preferred)
         return generate(tuple(range(seed_pool.group_size)))
 
     def _generate_public_pool_rollouts(
