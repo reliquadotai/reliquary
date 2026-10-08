@@ -187,6 +187,36 @@ Fix:
 - a row with several groups selected as soon as one group matches;
 - a crash on a blank line.
 
+## Phase 1 implementation rulings: CONFIRMED by the user (10-08)
+
+Rules the phase 1 plan had to settle, each confirmed:
+
+1. **Sanction period.** The "period" forfeited on a failed audit is the window being
+   settled. A window already paid cannot be clawed back; the 24 h exploration ban
+   covers what comes after.
+2. **Audit timing.** The proof plane only holds the current checkpoint, so an
+   exploration group is audited inside its own window. A group drawn for audit but
+   not audited before the window closes is **not paid and not sanctioned**.
+3. **Adding an env live.** Only an env **already declared in the profile at launch**
+   can be switched on. An env's "quota" is its emission share; 16 groups per env per
+   pick stays a protocol constant. Multi-turn envs (SWE, terminal) must therefore be
+   declared at launch and activated when ready.
+4. **`\boxed`.** Math: a missing box makes the rollout "uncertain" and does not
+   reject the group. Science: a missing box is a plain 0.
+5. **Full pool: proportional split.** A training group counts 1 share, an exploration
+   group 0.15 share. Price of a share = `P / max(T, total shares)` per env, where T
+   is the env's training slots in the window.
+   - Window not full: everyone is paid full price and the rest is burned, as today.
+   - Window full with exploration: **everyone is scaled by the same factor**,
+     explorers included (at most about -9 %, since exploration is capped at 10 % of
+     the pool). Nobody is paid first.
+6. **Cooldown delay.** A cooldown change applies from the next window, which can be
+   up to 6 h later under fill-closed.
+
+Needed from the user before the run (not for coding): a public R2 bucket for the
+observation files, an admin token for the internal endpoint, and the GPU
+qualification of forced seeds on Teutonic.
+
 ## L. Multi-turn episodes: phase 2
 
 The service stack refuses episodes. Spec to write: one RL group = 16 signed sandbox
