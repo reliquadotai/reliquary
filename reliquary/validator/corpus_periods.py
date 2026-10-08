@@ -41,6 +41,35 @@ CATCHUP_ENTRIES = 4
 CLOSE_THRESHOLD = 0.001
 
 
+# The highest cap a period task was paid at, written to its entry's params when
+# its cap is lowered (``task_registry.set_cap``). Its archives keep paying up
+# to that bound after the cap falls, so a cap only governs work still to come.
+TAIL_CAP_PARAM = "tail_cap"
+
+
+def pay_ceiling(params) -> float | None:
+    """The most one of a period task's archives may pay: its cap, or the
+    highest cap it was paid at if that is higher. None without a cap."""
+    if not isinstance(params, Mapping) or params.get("cap") is None:
+        return None
+    ceiling = float(params["cap"])
+    tail = params.get(TAIL_CAP_PARAM)
+    if tail is not None:
+        ceiling = max(ceiling, float(tail))
+    return ceiling
+
+
+def archive_bound(recorded, ceiling: float | None) -> float | None:
+    """What one archive may pay: the cap it was settled under (``recorded``,
+    absent from archives written before it was kept), never past the task's
+    ``pay_ceiling``."""
+    if recorded is None:
+        return ceiling
+    if ceiling is None:
+        return float(recorded)
+    return min(float(recorded), ceiling)
+
+
 def is_period_task(entry) -> bool:
     params = getattr(entry, "params", None)
     return isinstance(params, Mapping) and params.get("settlement") == SETTLEMENT_PERIOD_EMA
@@ -112,9 +141,12 @@ __all__ = [
     "PERIOD_SECONDS",
     "REPLAY_DEPTH",
     "SETTLEMENT_PERIOD_EMA",
+    "TAIL_CAP_PARAM",
+    "archive_bound",
     "closed_through",
     "entry_for",
     "is_period_task",
+    "pay_ceiling",
     "period_end",
     "period_of",
     "replay",
