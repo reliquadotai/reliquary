@@ -13,8 +13,8 @@ import pytest
 from reliquary.constants import M_ROLLOUTS
 from reliquary.services import admission_policy as policy
 from reliquary.services.admission_policy import (
-    ExplorationEntitlement, default_missing_box, exploration_pay_entitlement, missing_box_is_uncertain,
-    service_signal_admits, uncertain_rollout_indices,
+    LANE_EXPLORATION, LANE_TRAINING, ExplorationEntitlement, default_missing_box, exploration_pay_entitlement,
+    missing_box_is_uncertain, service_lane, uncertain_rollout_indices,
 )
 from reliquary.services.scoring import classify_signal
 from tests.unit.service_v2_fixtures import CODE, MATH, SCIENCE, contract_v2, contract_v2_dict
@@ -32,6 +32,15 @@ def contract(sigma_min_bps=2400):
     value["scoring"]["sigma_min_bps"] = sigma_min_bps
     from reliquary.protocol.service_contract import ServiceContract
     return ServiceContract.from_dict(value)
+
+
+def lane_admits(request, contract, rewards, *, uncertain_indices=(), attainable_rewards=()):
+    """The live rule (``service_lane``): a training group is admitted when its vector lands in the training lane,
+    an exploration observation when it lands in the exploration lane."""
+    lane = service_lane(request, contract, rewards, uncertain_indices=uncertain_indices,
+                        attainable_rewards=attainable_rewards)
+    wanted = LANE_TRAINING if request.service_binding["purpose"] == "training" else LANE_EXPLORATION
+    return lane is not None and lane.lane == wanted
 
 
 def known_in_zone(rewards, sigma_min_bps):
@@ -100,7 +109,7 @@ def test_math_group_with_missing_boxes_is_admitted_exactly_per_the_robust_rule(s
             rewards = vector(ones)
             uncertain = tuple(range(ones, ones + unboxed))
             expected = all(known_in_zone(vector(n), sigma_min_bps) for n in range(ones, ones + unboxed + 1))
-            got = service_signal_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=BINARY)
+            got = lane_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=BINARY)
             assert got is expected, (ones, unboxed)
             admitted += got
             refused += not got
@@ -114,23 +123,23 @@ def test_the_boundary_at_the_default_threshold():
     half = M // 2
     # half right, every failure but one unboxed: still in zone if they had all been right
     reach = tuple(range(half, half + (top - half)))
-    assert service_signal_admits(req(), c, vector(half), uncertain_indices=reach, attainable_rewards=BINARY)
+    assert lane_admits(req(), c, vector(half), uncertain_indices=reach, attainable_rewards=BINARY)
     # one more unboxed failure and the group could be uniform: refused
     over = tuple(range(half, M))
-    assert not service_signal_admits(req(), c, vector(half), uncertain_indices=over, attainable_rewards=BINARY)
+    assert not lane_admits(req(), c, vector(half), uncertain_indices=over, attainable_rewards=BINARY)
 
 
 def test_one_uncertain_rollout_no_longer_rejects_a_training_group():
-    assert service_signal_admits(req(), contract(), vector(M // 2), uncertain_indices=(0,), attainable_rewards=BINARY)
-    assert service_signal_admits(req(), contract(), vector(M // 2), uncertain_indices=(M - 1,),
+    assert lane_admits(req(), contract(), vector(M // 2), uncertain_indices=(0,), attainable_rewards=BINARY)
+    assert lane_admits(req(), contract(), vector(M // 2), uncertain_indices=(M - 1,),
                                  attainable_rewards=BINARY)
 
 
 def test_uncertainty_that_could_collapse_the_signal_is_still_refused():
     # the only success is uncertain: it may have been a failure, i.e. a uniform group
-    assert not service_signal_admits(req(), contract(), vector(1), uncertain_indices=(0,), attainable_rewards=BINARY)
+    assert not lane_admits(req(), contract(), vector(1), uncertain_indices=(0,), attainable_rewards=BINARY)
     # the only failure is uncertain: it may have been a success
-    assert not service_signal_admits(req(), contract(), vector(M - 1), uncertain_indices=(M - 1,),
+    assert not lane_admits(req(), contract(), vector(M - 1), uncertain_indices=(M - 1,),
                                      attainable_rewards=BINARY)
 
 
@@ -143,12 +152,12 @@ def test_the_same_vector_in_a_science_env_has_no_uncertainty():
     for env in (MATH, SCIENCE):
         uncertain = uncertain_rollout_indices(
             unboxed_indices=unboxed if missing_box_is_uncertain(env, c) else (), size=M)
-        seen[env] = (uncertain, service_signal_admits(req(), c, rewards, uncertain_indices=uncertain,
+        seen[env] = (uncertain, lane_admits(req(), c, rewards, uncertain_indices=uncertain,
                                                       attainable_rewards=BINARY))
     assert seen == {MATH: ((M - 1,), False), SCIENCE: ((), True)}
     # ... and a length-capped rollout is uncertain in science too
     capped = uncertain_rollout_indices(truncated_indices=(M - 1,), size=M)
-    assert not service_signal_admits(req(), c, rewards, uncertain_indices=capped, attainable_rewards=BINARY)
+    assert not lane_admits(req(), c, rewards, uncertain_indices=capped, attainable_rewards=BINARY)
 
 
 def test_an_unknown_lattice_proves_nothing():
@@ -159,18 +168,18 @@ def test_an_unknown_lattice_proves_nothing():
     c, uncertain = contract(2400), (M - 1,)
     assert all(known_in_zone(o, 2400) for o in completions(rewards, uncertain, BINARY))
     assert not known_in_zone(rewards[:-1] + [0.5], 2400)
-    assert service_signal_admits(req(), c, rewards)                      # nothing uncertain: plain rule
-    assert not service_signal_admits(req(), c, rewards, uncertain_indices=uncertain)   # no lattice given
-    assert not service_signal_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=())
+    assert lane_admits(req(), c, rewards)                      # nothing uncertain: plain rule
+    assert not lane_admits(req(), c, rewards, uncertain_indices=uncertain)   # no lattice given
+    assert not lane_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=())
     fine = tuple(n / 50 for n in range(51))
-    assert not service_signal_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=fine)
-    assert not service_signal_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=(0.0, 7.0))
+    assert not lane_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=fine)
+    assert not lane_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=(0.0, 7.0))
 
 
 def test_a_bad_index_refuses_instead_of_admitting():
     c = contract()
     for bad in ((M,), (-1,), (True,), ("0",)):
-        assert not service_signal_admits(req(), c, vector(M // 2), uncertain_indices=bad, attainable_rewards=BINARY)
+        assert not lane_admits(req(), c, vector(M // 2), uncertain_indices=bad, attainable_rewards=BINARY)
 
 
 # -- what a miner can gain by making rollouts uncertain: nothing ---------------------------
@@ -185,7 +194,7 @@ def test_binary_uncertainty_can_only_cost_admission_exhaustive(sigma_min_bps):
         for from_ones in range(ones + 1):
             for from_zeros in range(M - ones + 1):
                 uncertain = tuple(range(from_ones)) + tuple(range(ones, ones + from_zeros))
-                if not service_signal_admits(req(), c, rewards, uncertain_indices=uncertain,
+                if not lane_admits(req(), c, rewards, uncertain_indices=uncertain,
                                              attainable_rewards=BINARY):
                     continue
                 admitted += 1
@@ -194,7 +203,7 @@ def test_binary_uncertainty_can_only_cost_admission_exhaustive(sigma_min_bps):
                     outcome = list(rewards)
                     for rank, index in enumerate(uncertain):
                         outcome[index] = 1.0 if rank < wins else 0.0
-                    assert service_signal_admits(req(), c, outcome), (rewards, uncertain, outcome)
+                    assert lane_admits(req(), c, outcome), (rewards, uncertain, outcome)
                     assert known_in_zone(outcome, sigma_min_bps)
     assert admitted
 
@@ -208,12 +217,12 @@ def test_fractional_uncertainty_can_only_cost_admission(lattice):
         c = contract(sigma_min_bps)
         rewards = [rng.choice(lattice) for _ in range(M)]
         uncertain = tuple(rng.sample(range(M), rng.randint(1, 3)))
-        if not service_signal_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=lattice):
+        if not lane_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=lattice):
             refused += 1
             continue
         admitted += 1
         for outcome in completions(rewards, uncertain, lattice):
-            assert service_signal_admits(req(), c, outcome), (rewards, uncertain, outcome)
+            assert lane_admits(req(), c, outcome), (rewards, uncertain, outcome)
     assert admitted > 20 and refused > 20
 
 
@@ -223,10 +232,10 @@ def test_more_uncertainty_never_admits_more():
         rewards = vector(ones)
         for size in range(1, 4):
             for uncertain in combinations(range(M), size):
-                if service_signal_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=BINARY):
-                    assert service_signal_admits(req(), c, rewards)
+                if lane_admits(req(), c, rewards, uncertain_indices=uncertain, attainable_rewards=BINARY):
+                    assert lane_admits(req(), c, rewards)
                     for smaller in combinations(uncertain, size - 1):
-                        assert service_signal_admits(req(), c, rewards, uncertain_indices=smaller,
+                        assert lane_admits(req(), c, rewards, uncertain_indices=smaller,
                                                      attainable_rewards=BINARY)
 
 
@@ -235,7 +244,7 @@ def test_cutting_failures_cannot_manufacture_a_signal():
     c = contract(2400)
     for rewards in (vector(0), vector(M), [0.5] * M):
         for size in range(M + 1):
-            assert not service_signal_admits(req(), c, rewards, uncertain_indices=tuple(range(size)),
+            assert not lane_admits(req(), c, rewards, uncertain_indices=tuple(range(size)),
                                              attainable_rewards=(0.0, 0.5, 1.0))
 
 
@@ -248,10 +257,10 @@ def test_the_named_rule_is_the_one_consulted(monkeypatch):
         return False
 
     monkeypatch.setattr(admission, "robust_utility_admits", spy)
-    assert not service_signal_admits(req(), contract(3400), vector(M // 2), uncertain_indices=(1, 1, 0),
+    assert not lane_admits(req(), contract(3400), vector(M // 2), uncertain_indices=(1, 1, 0),
                                      attainable_rewards=BINARY)
     assert calls == [(vector(M // 2), 0.34, (1, 0), BINARY)]
-    assert service_signal_admits(req(), contract(3400), vector(M // 2))     # nothing uncertain: not consulted
+    assert lane_admits(req(), contract(3400), vector(M // 2))     # nothing uncertain: not consulted
     assert len(calls) == 1
 
 
@@ -259,10 +268,10 @@ def test_the_named_rule_is_the_one_consulted(monkeypatch):
 
 def test_exploration_observation_is_not_refused_for_an_uncertain_rollout():
     c = contract()
-    assert service_signal_admits(req("exploration"), c, vector(0))
-    assert service_signal_admits(req("exploration"), c, vector(0), uncertain_indices=(3,), attainable_rewards=BINARY)
-    assert service_signal_admits(req("exploration"), c, vector(0), uncertain_indices=(3,))
-    assert not service_signal_admits(req("exploration"), c, vector(M // 2), uncertain_indices=(3,),
+    assert lane_admits(req("exploration"), c, vector(0))
+    assert lane_admits(req("exploration"), c, vector(0), uncertain_indices=(3,), attainable_rewards=BINARY)
+    assert lane_admits(req("exploration"), c, vector(0), uncertain_indices=(3,))
+    assert not lane_admits(req("exploration"), c, vector(M // 2), uncertain_indices=(3,),
                                      attainable_rewards=BINARY)
 
 

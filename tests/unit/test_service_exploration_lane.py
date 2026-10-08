@@ -325,7 +325,7 @@ def test_both_real_reservation_sites_refuse_a_banned_declared_exploration(tmp_pa
     ready(rt)
     tick(b)
     rt.record_audit(first["service_observation_id"], passed=False)
-    monkeypatch.setattr("reliquary.services.admission_policy.validate_submission_policy", lambda request, policy: rt.contract)
+    monkeypatch.setattr("reliquary.services.admission_policy.validate_submission_policy", lambda request, policy, **_: rt.contract)
 
     def request(hotkey, purpose):
         return SimpleNamespace(miner_hotkey=hotkey, service_binding={"purpose": purpose}, window_start=1,
@@ -358,7 +358,7 @@ def _decision(job_id, verified, status=ProofDecisionStatus.PASSED):
 
 def _proved(b, pending, verified, monkeypatch, rt):
     monkeypatch.setattr("reliquary.services.admission_policy.validate_submission_policy",
-                        lambda request, policy: rt.contract)
+                        lambda request, policy, **_: rt.contract)
     job = f"1:{MATH}:arrival:1"
     b._arrival_proof_meta[job] = (None, 0, "", pending)
     b._open_proof_plan_handle = SimpleNamespace(decisions=lambda: (_decision(job, verified),), done=lambda: False)
@@ -404,7 +404,7 @@ def test_the_training_record_is_made_on_the_proof_worker_and_the_reconciliation_
     real = rt.record_training
     rt.record_training = lambda **kw: (calls.append(threading.get_ident()), real(**kw))[1]
     monkeypatch.setattr("reliquary.services.admission_policy.validate_submission_policy",
-                        lambda request, policy: rt.contract)
+                        lambda request, policy, **_: rt.contract)
     pending = make_pending(rt, hotkey="t", rewards=HALF, purpose="training")
     verified = SimpleNamespace(hotkey="t")
     worker = threading.Thread(target=lambda: b._prerecord_service_training(pending, verified))
@@ -1668,3 +1668,154 @@ def test_the_pre_forward_guard_never_takes_the_environment_from_the_payload(tmp_
     pending.request.rollouts[0].env_name = MATH      # the miner's claim must not stand in for the validator's
     with pytest.raises(RuntimeError, match="no service_environment"):
         b._service_pre_forward_guard(pending.request, _vocab_model(100))
+
+
+# ---------------------------------------------------------------- final review fixes (I1, m1, m2, m6, end to end)
+
+def _admission_request(hotkey, purpose):
+    from reliquary.constants import FORCED_SEED_PROTOCOL_VERSION, PROTOCOL_PROFILE_ID
+    return SimpleNamespace(miner_hotkey=hotkey, service_binding={"purpose": purpose}, window_start=1,
+                           checkpoint_hash="d" * 40, protocol_version=FORCED_SEED_PROTOCOL_VERSION,
+                           generation_profile_id=PROTOCOL_PROFILE_ID, prompt_idx=7, _grading_refundable=False)
+
+
+def test_i1_a_held_runtime_lock_does_not_block_admission_on_the_loop(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    monkeypatch.setattr("reliquary.services.admission_policy.validate_submission_policy",
+                        lambda request, policy, **_: rt.contract)
+    monkeypatch.setattr(ServiceRuntime, "ACTIVE_CACHE_SECONDS", 0.0)   # any computing read would need the lock
+    # the next gate after the order's activity: reaching it means the activity check did not block
+    monkeypatch.setattr(b, "_service_admission_refusal", lambda request: (RejectReason.RATE_LIMITED, "past_the_gate"))
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with rt.lock:
+            held.set()
+            release.wait(30)
+    owner = threading.Thread(target=holder)
+    owner.start()
+    assert held.wait(5)
+    results = []
+    admission = threading.Thread(target=lambda: results.append((
+        b.reserve_prepared_identity(_admission_request("hk", "training"), []),
+        b._accept_locked(_admission_request("hk2", "training")))))
+    try:
+        admission.start()
+        admission.join(5)
+        blocked = admission.is_alive()
+    finally:
+        release.set()
+        owner.join()
+        admission.join()
+    assert not blocked, "admission waited on the runtime lock"
+    (reserved, response), = results
+    assert reserved == (False, RejectReason.RATE_LIMITED, "past_the_gate")
+    assert response.accepted is False and response.reason is RejectReason.RATE_LIMITED
+    # and it really is the cached answer that admission reads
+    rt._active_last = False
+    assert b.reserve_prepared_identity(_admission_request("hk", "training"), []) == (
+        False, RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility")
+
+
+def test_i1_the_cached_answer_is_the_last_computed_one_and_never_locks(tmp_path):
+    rt = make_runtime(tmp_path)
+    assert rt.active_cached() is True                                 # computed at boot
+    with rt.lock:
+        pass
+    rt._compute_active = None                                          # any computation would now fail
+    assert rt.active_cached() is True
+    del rt._compute_active
+    assert rt.active(now=time.time() + 10 ** 9) is False              # an explicit clock past the deadline
+    assert rt.active_cached() is False                                 # is the last answer admission sees
+
+
+def test_m2_a_training_group_publishes_its_uncertain_positions(tmp_path, monkeypatch):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    pending = make_pending(rt, hotkey="t", rewards=HALF, purpose="training", uncertain_indices=(LAST,))
+    b.difficulty_auction_metadata_by_id[id(pending)] = {"rank": 1, "status": "proof_pending"}
+    _proved(b, pending, SimpleNamespace(hotkey="t"), monkeypatch, rt)
+    (event,) = events(rt)
+    assert event["lane"] == "training" and event["uncertain"] == [LAST]
+
+
+def test_m6_the_announcement_is_parsed_once_per_window(tmp_path, monkeypatch):
+    from reliquary.services import admission_policy
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    parses, seen, contracts = [], [], []
+    real_parse = admission_policy.parse_service_announcement
+    monkeypatch.setattr(admission_policy, "parse_service_announcement",
+                        lambda announcement, **kw: (parses.append(1), real_parse(announcement, **kw))[1])
+    real_from_dict = ServiceContract.from_dict
+    monkeypatch.setattr(ServiceContract, "from_dict",
+                        classmethod(lambda cls, value: (contracts.append(1), real_from_dict(value))[1]))
+    monkeypatch.setattr(admission_policy, "validate_submission_policy",
+                        lambda request, policy, *, parsed=None: (seen.append(parsed), parsed[0])[1])
+    for prompt in range(3):
+        assert b._service_submission_contract(_admission_request("hk", "exploration")) == rt.contract
+        assert b._service_lane_of(make_pending(rt, prompt=prompt)) is not None
+    assert len(parses) == 1 and all(p is seen[0] for p in seen)
+    assert len(contracts) == 1                                         # one contract parse for the whole window
+    b.service_policy = dict(b.service_policy)                          # a new announcement object: parsed again
+    b._service_submission_contract(_admission_request("hk", "exploration"))
+    assert len(parses) == 2
+
+
+@pytest.mark.asyncio
+async def test_m1_a_void_at_settlement_reaches_the_verdict_row(tmp_path):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    pending = make_pending(rt, hotkey="e", prompt=5)
+    arrive(b, pending)
+    ready(rt)
+    tick(b)
+    assert rt.record_audit(pending.service_observation_id, passed=True).passed
+    b.finalize_service_exploration()
+    row = b.difficulty_auction_metadata_by_id[id(pending)]
+    assert row["status"] == "exploration_audit_passed" and row["exploration_fraction"] > 0
+    # the batch trains prompt 5 (R17): the settlement voids the entitlement
+    result = await _service(rt, [b])._settle_service_archive(
+        rt, {"window_start": 1, "window_status": "complete", "rewards_by_hotkey": {},
+             "batch": [{"hotkey": "t", "env_name": MATH, "prompt_idx": 5}]})
+    assert "e" not in result["rewards_by_hotkey"]
+    row = b.difficulty_auction_metadata_by_id[id(pending)]
+    assert row["status"] == "exploration_unpaid" and row["exploration_fraction"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_v2_window_seal_settle_json_replay_equals_the_runtime_map(tmp_path, monkeypatch):
+    """One v2 chain on CPU: a real runtime window with a training and a paid exploration group, the seal
+    (finalize), ``reconcile_archive`` through the validator's settlement, a JSON round trip, then weight replay."""
+    import json
+    from reliquary.services.settlement import service_archive_rewards
+    from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    explored = make_pending(rt, hotkey="x", prompt=3)
+    arrive(b, explored)
+    ready(rt)
+    tick(b)
+    assert rt.record_audit(explored.service_observation_id, passed=True).passed
+    trained = make_pending(rt, hotkey="t", rewards=HALF, purpose="training", prompt=9)
+    b.difficulty_auction_metadata_by_id[id(trained)] = {"rank": 1, "status": "proof_pending"}
+    _proved(b, trained, SimpleNamespace(hotkey="t"), monkeypatch, rt)
+    assert len(b._proven_groups[MATH]) == 1
+    service = _service(rt, [b])
+    b.close_service_exploration()                                       # the seal: close, then finalize
+    b.finalize_service_exploration()
+    result = await service._settle_service_archive(
+        rt, {"window_start": 1, "window_status": "complete", "rewards_by_hotkey": {},
+             "batch": [{"hotkey": "t", "env_name": MATH, "prompt_idx": 9}]})
+    assert set(result["rewards_by_hotkey"]) == {"t", "x"} and min(result["rewards_by_hotkey"].values()) > 0
+    record = {**json.loads(json.dumps(result)), "task_id": "next-rl"}
+    picks, slots = protocol_slot_geometry()
+    replayed = service_archive_rewards(record, rt.contract, cap=0.5, picks_target=picks, batch_slots=slots)
+    assert replayed == pytest.approx(result["rewards_by_hotkey"], abs=1e-12)
+    declared = {"next-rl": SimpleNamespace(mechanism=MECHANISM_SERVICE_RL, service_contract=rt.contract.to_dict(),
+                                           params={"cap": 0.5})}
+    (out,) = WeightOnlyValidator._validated_service_archives([record], declared)
+    assert out["rewards_by_hotkey"] == pytest.approx(result["rewards_by_hotkey"], abs=1e-12)
+    assert b.difficulty_auction_metadata_by_id[id(explored)]["status"] == "exploration_audit_passed"

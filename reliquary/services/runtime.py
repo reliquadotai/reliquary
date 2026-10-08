@@ -58,21 +58,17 @@ from reliquary.protocol.service_contract import (
     PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract, _identifier, _integer, _sha,
 )
 from reliquary.protocol.service_schedule import ServiceSchedule, initial_schedule
-from reliquary.services.admission_policy import (  # noqa: F401
-    missing_box_problems, service_signal_admits, validate_submission_policy,
-)
+from reliquary.services.admission_policy import missing_box_problems
 from reliquary.services.exploration import (
     AUDIT_DRAW_ROUND_OFFSET, STATUS_FORFEITED, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger,
     UNAUDITED_HORIZON, UNAUDITED_VALIDATOR_LOST, apply_exploration_verdict, exploration_cap, exploration_price,
     finalize_exploration, record_exploration,
 )
 from reliquary.services.run_log import STATUS_PROVEN_UNPAID, Observation, RunObservationLog, observation_id
-from reliquary.services.settlement import SERVICE_PAYMENT_POLICY_V2, settle_window, validate_service_archive_v2
+from reliquary.services.settlement import settle_window, validate_service_archive_v2
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SERVICE_CAPABILITIES = SUPPORTED_V2_CAPABILITIES
-SERVICE_PAYMENT_POLICY = SERVICE_PAYMENT_POLICY_V2
 QUALIFICATION_SCHEMA = "service-runtime-qualification/v2"
 STATUS_PAID = "exploration_paid"
 _EPS = 1e-12
@@ -147,18 +143,6 @@ def protocol_slot_geometry() -> tuple[int, int]:
     """``(picks_target, batch_slots)`` of one env in one window, from the protocol constants."""
     from reliquary.constants import B_BATCH, FILL_CLOSED_PICKS_PER_WINDOW
     return int(FILL_CLOSED_PICKS_PER_WINDOW), int(B_BATCH)
-
-
-def validate_service_archive(record: dict, contract: ServiceContract, *, cap: float,
-                             picks_target: int | None = None, batch_slots: int | None = None) -> None:
-    """``validate_service_archive_v2`` under the protocol slot geometry unless one is given.
-
-    Kept under its old name for weight replay, which catches ``ValueError`` and abstains.
-    """
-    picks, slots = protocol_slot_geometry()
-    validate_service_archive_v2(record, contract, cap=cap,
-                                picks_target=picks if picks_target is None else picks_target,
-                                batch_slots=slots if batch_slots is None else batch_slots)
 
 
 def _drand_round_at(instant: float) -> int:
@@ -257,12 +241,14 @@ class ServiceRuntime:
                                          sigma_min_bps=contract.to_dict()["scoring"]["sigma_min_bps"])
             self.ledger = ExplorationLedger(self.db, order_sha256=contract.sha256)
             self.db.commit()
-            # M9: the admission path reads these on the event loop. ``active()`` is cached for a moment;
-            # the bans are an in-memory copy of the ledger's, loaded here and refreshed by every verdict
+            # M9: the admission path reads these on the event loop. ``active_cached()`` is the last computed
+            # answer (I1: no lock on the loop); the bans are an in-memory copy of the ledger's, loaded here and refreshed by every verdict
             # that bans (``record_audit``), in the same code path, so a ban binds the next admission.
             self._active_cache: tuple[float, bool] | None = None
             self._bans: dict[str, float] = {}
             self._reload_bans()
+            # I1: the last answer any computation gave, read by admission without the lock (``active_cached``).
+            self._active_last = self._compute_active(instant)
         except BaseException:
             self.db.close()
             raise
@@ -324,6 +310,12 @@ class ServiceRuntime:
             return answer
         return self._compute_active(now)
 
+    def active_cached(self) -> bool:
+        """I1: the event-loop answer. Never takes the lock, never touches SQLite: the last value
+        ``active`` computed (at boot, then off the loop by the heartbeat refresh, the window thread
+        and the proof workers). The limits only tighten, so it is at most one refresh late."""
+        return self._active_last
+
     def _compute_active(self, now: float | None) -> bool:
         instant = _instant(now)
         with self.lock, self.db:
@@ -332,7 +324,9 @@ class ServiceRuntime:
             self.db.execute("UPDATE service_orders SET clock=? WHERE id=?", (instant, self.order_contract.sha256))
             limits = self.order_contract.to_dict()["limits"]
             groups, tokens = self.db.execute("SELECT groups,tokens FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()
-            return instant < start + limits["deadline_seconds"] and groups < limits["max_groups"] and tokens < limits["max_tokens"]
+            answer = instant < start + limits["deadline_seconds"] and groups < limits["max_groups"] and tokens < limits["max_tokens"]
+        self._active_last = answer
+        return answer
 
     def record_consumption(self, cursor: int) -> dict[str, float]:
         """Only an adopted trainer cursor turns enqueued groups into measured Q, per env.
@@ -660,10 +654,11 @@ class ServiceRuntime:
             raise ValueError(f"service checkpoint {revision[:12]} is not a child of the current lineage "
                              f"checkpoint {head[0][:12]}")
 
-    def require_resumable(self, *, checkpoint_n: int, repo: str, revision: str) -> None:
+    def require_resumable(self, *, checkpoint_n: int, repo: str, revision: str, receipt: dict | None = None) -> None:
         """Boot-time, read-only twin of ``ensure_checkpoint``: refuse a resume target that
         ``ensure_checkpoint`` would refuse at the first window boundary (an ancestor of the lineage
-        head, or a revision outside the lineage that is not the order's root)."""
+        head, or a revision outside the lineage that is not the order's root). With its publication
+        ``receipt``, an unknown revision that is the head's child passes (I2: it is healed there)."""
         root = self.contract.to_dict()["checkpoint"]
         with self.lock:
             row = self.db.execute("SELECT sha256 FROM service_checkpoints WHERE revision=? AND order_id=?",
@@ -672,6 +667,14 @@ class ServiceRuntime:
                                    (self.contract.sha256,)).fetchone()
         hint = f"; resume from the lineage head {head[0]}" if head is not None else ""
         if row is None and (revision != root["revision"] or repo != root["repo"]):
+            if receipt is not None:
+                try:
+                    self._healable_digest(checkpoint_n=checkpoint_n, repo=repo, revision=revision, receipt=receipt)
+                except ValueError as exc:
+                    raise ValueError(f"{exc}{hint}") from exc
+                logger.warning("resume checkpoint %s is not adopted yet but continues the lineage head; it is "
+                               "healed (adopted) before the first service window", revision[:12])
+                return
             raise ValueError("resume checkpoint has no adopted service lineage entry" + hint)
         try:
             self.require_adoptable(checkpoint_n=checkpoint_n, repo=repo, revision=revision,
@@ -679,8 +682,13 @@ class ServiceRuntime:
         except ValueError as exc:
             raise ValueError(f"{exc}{hint}") from exc
 
-    def ensure_checkpoint(self, *, checkpoint_n: int, repo: str, revision: str) -> dict:
-        """Re-select an adopted revision (restart), or adopt the order's root checkpoint."""
+    def ensure_checkpoint(self, *, checkpoint_n: int, repo: str, revision: str, receipt: dict | None = None) -> dict:
+        """Re-select an adopted revision (restart), or adopt the order's root checkpoint.
+
+        I2 heal: an ACTIVE revision the lineage does not know (a crash between the install and
+        ``adopt``) is adopted when ``receipt`` -- its trainer publication receipt -- proves it is the
+        next link: see ``_healable_digest``. Logged at warning. Anything else is refused as before.
+        """
         with self.lock:
             row = self.db.execute("SELECT sha256 FROM service_checkpoints WHERE revision=? AND order_id=?",
                                   (revision, self.contract.sha256)).fetchone()
@@ -688,8 +696,32 @@ class ServiceRuntime:
             return self.adopt(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=row[0])
         root = self.contract.to_dict()["checkpoint"]
         if revision != root["revision"] or repo != root["repo"]:
-            raise ValueError("active checkpoint has no adopted service lineage entry")
+            if receipt is None:
+                raise ValueError("active checkpoint has no adopted service lineage entry")
+            digest = self._healable_digest(checkpoint_n=checkpoint_n, repo=repo, revision=revision, receipt=receipt)
+            adopted = self.adopt(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=digest)
+            logger.warning("service checkpoint %s (n=%d) was installed but never adopted; healed: adopted as the "
+                           "child of the lineage head %s", revision[:12], checkpoint_n,
+                           str(receipt.get("parent_revision"))[:12])
+            return adopted
         return self.adopt(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=root["sha256"])
+
+    def _healable_digest(self, *, checkpoint_n: int, repo: str, revision: str, receipt) -> str:
+        """The files digest under which an unknown active revision may be adopted, or ValueError.
+
+        Same checks as the swap (``require_adoptable`` after the receipt check): the receipt names
+        this checkpoint (number and repository) and a non-empty file list; its digest is the one
+        ``adopt`` stores; and its ``parent_revision`` is the current lineage head. Reads only."""
+        if (not isinstance(receipt, dict) or not isinstance(receipt.get("manifest"), dict)
+                or not isinstance(receipt.get("files"), dict) or not receipt["files"]):
+            raise ValueError("active checkpoint has no adopted service lineage entry (no publication receipt)")
+        manifest = receipt["manifest"]
+        if manifest.get("checkpoint_n") != checkpoint_n or manifest.get("repo_id") != repo:
+            raise ValueError("active checkpoint publication receipt names another checkpoint")
+        digest = canonical_sha256(receipt["files"])
+        self.require_adoptable(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=digest,
+                               parent_revision=receipt.get("parent_revision"))
+        return digest
 
     # --- windows ---
     def open_window(self, window: int, *, pools: dict, picks_target: int, batch_slots: int,
@@ -923,8 +955,10 @@ class ServiceRuntime:
         return observation_id(self.contract.sha256, obs, self.log.run_salt)
 
     def record_training(self, *, environment, prompt_idx, hotkey, window, rewards, group_id, candidate,
-                        token_count, now=None) -> dict:
+                        token_count, now=None, uncertain=()) -> dict:
         """Record a PROVEN training group as an observation (it takes the prompt's first scan).
+
+        ``uncertain``: the rollout positions whose reward is not trusted (published, R23).
 
         Returns ``{"observation_id", "first_scan", "inserted"}``. Raises ``ServicePolicyLimit``
         (nothing written) when the order is inactive, the window is unknown / settled, the env is
@@ -939,7 +973,8 @@ class ServiceRuntime:
             with self._txn():
                 obs = self._observation(self._envelope(window), environment=environment, prompt_idx=prompt_idx,
                                         hotkey=hotkey, window=window, rewards=rewards, group_id=group_id,
-                                        candidate=candidate, token_count=token_count, lane="training", now=instant)
+                                        candidate=candidate, token_count=token_count, lane="training", now=instant,
+                                        uncertain=uncertain)
                 context["observation_id"] = self._observation_id(obs)
                 result = self.log.record(obs, status="proven", proof="proven")
                 if result.inserted:

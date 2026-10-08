@@ -263,7 +263,7 @@ def test_legacy_grading_never_reaches_the_service_rule(signed_request, monkeypat
     def unreachable(*args, **kwargs):
         raise AssertionError("service policy code reached without a service policy")
 
-    for name in ("service_signal_admits", "missing_box_is_uncertain", "uncertain_rollout_indices",
+    for name in ("service_lane", "missing_box_is_uncertain", "uncertain_rollout_indices",
                  "exploration_pay_entitlement"):
         monkeypatch.setattr(policy, name, unreachable)
     request, _, wallet = signed_request(pool=False, legacy=True)
@@ -400,7 +400,7 @@ def test_the_legacy_arrival_gate_never_reaches_the_service_rule(monkeypatch):
     def unreachable(*args, **kwargs):
         raise AssertionError("service policy code reached without a service policy")
 
-    for name in ("service_signal_admits", "missing_box_is_uncertain", "uncertain_rollout_indices",
+    for name in ("service_lane", "missing_box_is_uncertain", "uncertain_rollout_indices",
                  "exploration_pay_entitlement"):
         monkeypatch.setattr(policy, name, unreachable)
     calls = []

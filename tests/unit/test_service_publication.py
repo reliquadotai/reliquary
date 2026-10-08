@@ -191,6 +191,14 @@ def test_reason_mapping_hides_submitter_state():
     assert [e["reason"] for e in events][:2] == ["probation_limit", "banned"]  # the input is untouched
 
 
+def test_truncated_and_not_robust_publish_as_themselves():
+    """I3: the batcher's lane reasons are public as such, not coarsened to ``refused``."""
+    from reliquary.services.admission_policy import EXPLORATION_TRUNCATED, UNPROVEN_NOT_ROBUST
+    events = [{"type": "observation", "id": str(i), "reason": r} for i, r in
+              enumerate((EXPLORATION_TRUNCATED, UNPROVEN_NOT_ROBUST))]
+    assert [e["reason"] for e in public_events(events, flush_at=1.0)] == ["truncated", "not_robust"]
+
+
 def test_timestamps_are_rounded_to_the_flush_time(tmp_path):
     rt = runtime(tmp_path)
     r = explore(rt, now=120.0)
@@ -582,9 +590,11 @@ def test_an_error_reading_the_remote_is_retried_not_disabling(tmp_path):
 
 
 def test_every_reason_the_runtime_can_emit_is_in_the_published_allow_list(tmp_path):
+    from reliquary.services.admission_policy import EXPLORATION_TRUNCATED, UNPROVEN_NOT_ROBUST
     from reliquary.services.exploration import REFUSAL_REASONS, UNAUDITED_REASONS
     emitted = set(REFUSAL_REASONS) | set(UNAUDITED_REASONS) | {"order_inactive", "exploration_disabled",
-                                                              "token_limit", "trained", "unaudited"}
+                                                              "token_limit", "trained", "unaudited",
+                                                              EXPLORATION_TRUNCATED, UNPROVEN_NOT_ROBUST}
     out = public_events([{"type": "observation", "id": "a", "reason": r} for r in sorted(emitted)], flush_at=1.0)
     assert {e["reason"] for e in out} <= publication.PUBLIC_REASONS
     assert publication.PUBLIC_REASONS - {"refused"} <= emitted | {"unaudited"}

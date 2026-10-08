@@ -5,12 +5,25 @@ from dataclasses import dataclass
 
 from reliquary.protocol.service_contract import PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract
 
-UNIFORM = frozenset({"uniform-low", "uniform-high", "uniform-intermediate"})
 
-
-def validate_submission_policy(request, announcement: dict | None) -> ServiceContract | None:
-    from reliquary.protocol.seed_pool import PoolSelection, pool_from_service_policy, validate_rollout_selection
+def parse_service_announcement(announcement: dict, *, contract: ServiceContract | None = None):
+    """``(contract, schedule)`` of a window's announcement, checked (v2 only, capabilities). A batcher
+    parses its frozen announcement once per window and hands the pair to ``validate_submission_policy``.
+    ``contract``: the announcement's contract when the caller already parsed it."""
     from reliquary.protocol.service_schedule import ServiceSchedule
+
+    if contract is None:
+        contract = ServiceContract.from_dict(announcement["contract"])
+    if contract.version != 2:
+        raise ValueError("only service-contract/v2 runs RL")
+    contract.require_capabilities(set(announcement["supported_capabilities"]))
+    contract.require_capabilities(set(SUPPORTED_V2_CAPABILITIES))
+    return contract, ServiceSchedule.from_dict(announcement["schedule"], contract)
+
+
+def validate_submission_policy(request, announcement: dict | None, *, parsed=None) -> ServiceContract | None:
+    """``parsed``: the announcement's ``parse_service_announcement`` result, when the caller holds it."""
+    from reliquary.protocol.seed_pool import PoolSelection, pool_from_service_policy, validate_rollout_selection
     from reliquary.protocol.service_submission import ServiceBinding, validate_service_rollout_bindings
 
     binding = getattr(request, "service_binding", None)
@@ -23,12 +36,7 @@ def validate_submission_policy(request, announcement: dict | None) -> ServiceCon
                 or any(row.get("service_binding") is not None or row.get("seed_pool") is not None for row in metadata)):
             raise ValueError("service metadata requires an active service task")
         return None
-    contract = ServiceContract.from_dict(announcement["contract"])
-    if contract.version != 2:
-        raise ValueError("only service-contract/v2 runs RL")
-    contract.require_capabilities(set(announcement["supported_capabilities"]))
-    contract.require_capabilities(set(SUPPORTED_V2_CAPABILITIES))
-    schedule = ServiceSchedule.from_dict(announcement["schedule"], contract)
+    contract, schedule = parse_service_announcement(announcement) if parsed is None else parsed
     if binding is None:
         raise ValueError("service task requires a signed service binding")
     intent = ServiceBinding.from_dict(binding)
@@ -202,37 +210,3 @@ def service_lane(request, contract: ServiceContract, rewards, *, truncated_indic
     if classify_signal(zeroed, expected=size, sigma_min_bps=sigma_min_bps).in_zone:
         return ServiceLane(LANE_UNPROVEN, tuple(zeroed), UNPROVEN_NOT_ROBUST)
     return ServiceLane(LANE_EXPLORATION, tuple(zeroed))
-
-
-def service_signal_admits(request, contract: ServiceContract, rewards: list[float], *,
-                          uncertain_indices=(), attainable_rewards=()) -> bool:
-    """Training: the group is in zone, and stays in zone whatever reward each uncertain rollout
-    really had (``robust_utility_admits`` over the environment's attainable rewards), so an
-    uncertain rollout can only cost admission. Exploration: a uniform observed vector; an
-    uncertain rollout does not refuse the observation (pay is ``exploration_pay_entitlement``).
-    """
-    from reliquary.services.scoring import classify_signal
-
-    sigma_min_bps = contract.to_dict()["scoring"]["sigma_min_bps"]
-    graded = [round(r * 10000) / 10000 for r in rewards]  # the precision the run log records
-    signal = classify_signal(graded, expected=len(request.rollouts), sigma_min_bps=sigma_min_bps)
-    if request.service_binding["purpose"] != "training":
-        return signal.category in UNIFORM
-    if not signal.in_zone:
-        return False
-    try:
-        uncertain = _indices(uncertain_indices, len(rewards))
-    except ValueError:
-        return False
-    if not uncertain:
-        return True
-    lattice = tuple(round(float(r) * 10000) / 10000 for r in attainable_rewards)
-    if not lattice:  # unknown lattice: no completion can be ruled out, so nothing is proven robust
-        return False
-    from reliquary.validator.admission import robust_utility_admits
-
-    try:
-        return robust_utility_admits(graded, sigma_min=sigma_min_bps / 10000,
-                                     truncated_indices=uncertain, attainable_rewards=lattice)
-    except (ValueError, TypeError, OverflowError):  # a malformed lattice proves nothing
-        return False

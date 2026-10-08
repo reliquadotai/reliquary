@@ -2724,8 +2724,12 @@ class ValidatorServer:
         sigma: float | None = None,
         details: dict[str, Any] | None = None,
         batch_filled_reason: str | None = None,
+        withhold: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
+
+        ``withhold``: keys never stored, whatever telemetry or ``details`` carry (m5: a service
+        exploration verdict must not name its prompt). Empty for every legacy caller.
 
         Called from every code path that decides a lifecycle stage:
 
@@ -2800,6 +2804,8 @@ class ValidatorServer:
             entry["sigma"] = float(sigma)
         if batch_filled_reason is not None:
             entry["batch_filled_reason"] = batch_filled_reason
+        for key in withhold:
+            entry.pop(key, None)
         self._verdict_sequence_by_hotkey[hotkey] += 1
         entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)

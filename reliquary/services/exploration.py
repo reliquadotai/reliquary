@@ -1,7 +1,7 @@
 """Exploration pay (first scan only, 15 % of a training group, per-env 10 % cap) and its sampled audit.
 
 Ledger and log methods write without committing; the caller wraps them in ``with db:``. The three
-module functions at the bottom (``record_exploration``, ``apply_exploration_audit``,
+module functions at the bottom (``record_exploration``, ``apply_exploration_verdict``,
 ``finalize_exploration``) are the entry points a runtime should use: each is atomic on the
 connection shared by the log and the ledger and keeps the first-scan table consistent with the money.
 
@@ -583,13 +583,6 @@ def apply_exploration_verdict(log: "RunObservationLog", ledger: ExplorationLedge
         for identity in forfeited:
             log.release_first_scan(identity)
         return kind, forfeited
-
-
-def apply_exploration_audit(log: "RunObservationLog", ledger: ExplorationLedger, observation_id: str, *,
-                            passed: bool, now: float, ban_seconds: int) -> list[str]:
-    """``apply_exploration_verdict`` without the kind: the forfeited ids (first scans released)."""
-    return apply_exploration_verdict(log, ledger, observation_id, passed=passed, now=now,
-                                     ban_seconds=ban_seconds)[1]
 
 
 def finalize_exploration(log: "RunObservationLog", ledger: ExplorationLedger, window: int, *,

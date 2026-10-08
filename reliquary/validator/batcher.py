@@ -969,6 +969,9 @@ class GrpoWindowBatcher:
 
         self.window_start = window_start
         self.service_policy = None
+        # m6: (announcement, contract) and (announcement, (contract, schedule)) of this window
+        self._service_policy_contract = None
+        self._service_policy_parsed = None
         self.service_runtime = None
         self._init_service_exploration_state()
         self.env = env
@@ -3850,13 +3853,13 @@ class GrpoWindowBatcher:
                 RejectReason.GENERATION_CONTRACT_MISMATCH,
                 "generation_contract",
             )
-        from reliquary.services.admission_policy import validate_submission_policy
         try:
-            validate_submission_policy(request, self.service_policy)
+            self._service_submission_contract(request)
         except (ValueError, TypeError, KeyError):
             return False, RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract"
         if self.service_runtime is not None:
-            if not self.service_runtime.active():
+            # I1: the event loop never takes the runtime lock: the last value computed off the loop.
+            if not self.service_runtime.active_cached():
                 return False, RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility"
             refusal = self._service_admission_refusal(request)
             if refusal is not None:
@@ -4181,13 +4184,13 @@ class GrpoWindowBatcher:
                 **kwargs,
             )
 
-        from reliquary.services.admission_policy import validate_submission_policy
         try:
-            service_contract = validate_submission_policy(request, self.service_policy)
+            service_contract = self._service_submission_contract(request)
         except (ValueError, TypeError, KeyError):
             return reject(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract")
         if self.service_runtime is not None:
-            if not self.service_runtime.active():
+            # I1: the event loop never takes the runtime lock: the last value computed off the loop.
+            if not self.service_runtime.active_cached():
                 return reject(RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility")
             refusal = self._service_admission_refusal(request)
             if refusal is not None:
@@ -4815,9 +4818,8 @@ class GrpoWindowBatcher:
                              "payload", hk)
                 return reject(RejectReason.BAD_TOKENS, "service_length")
 
-        from reliquary.services.admission_policy import validate_submission_policy
         try:
-            service_contract = validate_submission_policy(request, self.service_policy)
+            service_contract = self._service_submission_contract(request)
         except (ValueError, TypeError, KeyError):
             return reject(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract")
 
@@ -6216,12 +6218,45 @@ class GrpoWindowBatcher:
 
     # --- lane decision -------------------------------------------------------------------------
 
+    def _service_window_contract(self):
+        """m6: the contract of the window's frozen announcement, parsed once per window (the batcher
+        lives one window; a new announcement object is parsed again). Service tasks only."""
+        from reliquary.protocol.service_contract import ServiceContract
+
+        policy = self.service_policy
+        cached = getattr(self, "_service_policy_contract", None)
+        if cached is not None and cached[0] is policy:
+            return cached[1]
+        contract = ServiceContract.from_dict(policy["contract"])
+        self._service_policy_contract = (policy, contract)
+        return contract
+
+    def _parsed_service_policy(self):
+        """m6: ``(contract, schedule)`` of the window's frozen announcement, checked once per window."""
+        from reliquary.services.admission_policy import parse_service_announcement
+
+        policy = self.service_policy
+        cached = getattr(self, "_service_policy_parsed", None)
+        if cached is not None and cached[0] is policy:
+            return cached[1]
+        parsed = parse_service_announcement(policy, contract=self._service_window_contract())
+        self._service_policy_parsed = (policy, parsed)
+        return parsed
+
+    def _service_submission_contract(self, request):
+        """``validate_submission_policy`` for this window: the announcement is never re-parsed per
+        submission. Without a service policy it is the legacy call, unchanged."""
+        from reliquary.services.admission_policy import validate_submission_policy
+
+        if self.service_policy is None:
+            return validate_submission_policy(request, None)
+        return validate_submission_policy(request, self.service_policy, parsed=self._parsed_service_policy())
+
     def _service_lane_of(self, pending):
         """The validator's lane for a graded group, from its vector. None: not an observation."""
-        from reliquary.protocol.service_contract import ServiceContract
         from reliquary.services.admission_policy import service_lane
 
-        contract = ServiceContract.from_dict(self.service_policy["contract"])
+        contract = self._service_window_contract()
         try:
             return service_lane(
                 pending.request,
@@ -6453,10 +6488,9 @@ class GrpoWindowBatcher:
 
     def _record_service_training(self, pending, verified) -> str | None:
         """Record a proven training group. None: refused, so the group must not be batched."""
-        from reliquary.services.admission_policy import validate_submission_policy
         from reliquary.services.runtime import ServicePolicyLimit
 
-        contract = validate_submission_policy(pending.request, self.service_policy)
+        contract = self._service_submission_contract(pending.request)
         if contract is None or contract.sha256 != self.service_runtime.contract.sha256:
             raise ValueError("proof service order no longer active")
         try:
@@ -6469,6 +6503,7 @@ class GrpoWindowBatcher:
                 group_id=self._service_group_id(pending),
                 candidate=self._service_candidate(pending.request),
                 token_count=self._service_token_count(pending.request),
+                uncertain=tuple(sorted(pending.uncertain_indices)),
             )
         except ServicePolicyLimit as exc:
             logger.error(

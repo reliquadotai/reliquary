@@ -72,7 +72,8 @@ COARSENED_REASONS = frozenset({"probation_limit", "banned"})
 REFUSED = "refused"
 # Every reason the runtime can publish (anything else is published as ``refused``).
 PUBLIC_REASONS = frozenset({"already_scanned", "finalized", "zero_price", "cap", "order_inactive",
-                            "exploration_disabled", "token_limit", "trained", "unaudited", REFUSED})
+                            "exploration_disabled", "token_limit", "trained", "unaudited", "truncated",
+                            "not_robust", REFUSED})
 
 
 def segment_key(run_id: str, number: int) -> str:

@@ -13,7 +13,7 @@ from reliquary.protocol.service_schedule import next_schedule
 from reliquary.protocol.submission import ServicePolicyAnnouncement
 from reliquary.services import runtime as runtime_module
 from reliquary.services.runtime import (
-    FROZEN_ARCHIVE_FIELDS, AuditOutcome, ServicePolicyLimit, ServiceRuntime, protocol_slot_geometry, validate_service_archive,
+    FROZEN_ARCHIVE_FIELDS, AuditOutcome, ServicePolicyLimit, ServiceRuntime, protocol_slot_geometry,
 )
 from reliquary.services.settlement import SettlementError, validate_service_archive_v2
 from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2, contract_v2_dict, qualification_v2
@@ -501,9 +501,8 @@ def test_full_window_scales_training_and_exploration_alike_and_the_archive_valid
     assert rewards["a"] + explorers == pytest.approx(POOL, rel=1e-12)   # env pool conserved
     assert rewards["b"] == pytest.approx(POOL / 2, rel=1e-12)                     # the other env is untouched
     validate_service_archive_v2(json.loads(json.dumps(result)), rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
-    validate_service_archive(json.loads(json.dumps(result)), rt.contract, cap=1.0)   # replay's name, protocol geometry
     with pytest.raises(SettlementError, match="geometry"):
-        validate_service_archive(result, rt.contract, cap=1.0, picks_target=1)
+        validate_service_archive_v2(result, rt.contract, cap=1.0, picks_target=1, batch_slots=SLOTS)
 
 
 def test_late_failed_audit_after_finalize_bans_and_changes_no_archive(tmp_path):

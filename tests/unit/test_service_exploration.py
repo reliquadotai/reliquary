@@ -6,7 +6,7 @@ import pytest
 
 from reliquary.constants import M_ROLLOUTS, PROBATION_PENDING_LIMIT
 from reliquary.services.exploration import (
-    ExplorationLedger, apply_exploration_audit, audit_selected, exploration_cap, exploration_price,
+    ExplorationLedger, apply_exploration_verdict, audit_selected, exploration_cap, exploration_price,
     exploration_within_cap, finalize_exploration, record_exploration, training_group_price,
 )
 from reliquary.services.run_log import Observation, RunObservationLog
@@ -552,7 +552,7 @@ def refused_by_ban(pair):
     first = admit(pair, obs(50), now=100.0)
     with pair[1].db:
         pair[1].resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
-    apply_exploration_audit(*pair, first.observation_id, passed=False, now=100.0, ban_seconds=DAY)
+    apply_exploration_verdict(*pair, first.observation_id, passed=False, now=100.0, ban_seconds=DAY)[1]
     return {"now": 100.0 + DAY - 1}
 
 
@@ -664,15 +664,15 @@ def test_failed_audit_releases_the_first_scans_it_forfeits(pair):
     other = admit(pair, obs(3, hotkey="honest"), cap=1.0)
     with book.db:
         book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
-    forfeited = apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    forfeited = apply_exploration_verdict(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)[1]
     assert set(forfeited) == {a.observation_id, b.observation_id}
     assert not log.is_scanned(ENV, 1) and not log.is_scanned(ENV, 2) and log.is_scanned(ENV, 3)
-    assert apply_exploration_audit(log, book, other.observation_id, passed=True, now=10.0, ban_seconds=DAY) == []
+    assert apply_exploration_verdict(log, book, other.observation_id, passed=True, now=10.0, ban_seconds=DAY)[1] == []
     assert log.is_scanned(ENV, 3)
     # prompt 1 was re-scanned by someone else since: replaying the verdict must not release THAT scan
     again = admit(pair, obs(1, hotkey="honest", group="other-subset"), cap=1.0)
     assert again.first_scan
-    assert set(apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)) == set(forfeited)
+    assert set(apply_exploration_verdict(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)[1]) == set(forfeited)
     assert log.is_scanned(ENV, 1)
 
 
@@ -783,7 +783,7 @@ def test_n2_the_entry_point_releases_the_first_scans_a_late_failure_forfeits(pai
             book.resolve_draws(1, environment=env, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     finalize_exploration(log, book, 1, environment="math")
     assert not log.is_scanned("math", 1) and log.is_scanned("code", 2)
-    forfeited = apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    forfeited = apply_exploration_verdict(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)[1]
     assert forfeited == [b.observation_id] and not log.is_scanned("code", 2)
 
 
@@ -883,7 +883,7 @@ def test_n6_a_replay_reports_the_state_of_the_row_now(pair):
         book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     again = admit(pair, obs(1), cap=1.0)
     assert again.status == "exploration_pending" and again.entitlement == a.entitlement
-    apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    apply_exploration_verdict(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)[1]
     for o, i in ((a, 1), (b, 2)):                                # forfeited by the failure
         r = admit(pair, obs(i), cap=1.0)
         assert (r.status, r.entitlement, r.inserted) == ("exploration_forfeited", None, False)
@@ -902,7 +902,7 @@ def test_n6_a_group_refused_for_cap_and_resubmitted_with_room_is_a_new_attempt(p
     assert (again.reason, again.status) == ("cap", "exploration_unpaid")   # still full: the refusal, not "replay"
     with book.db:
         book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
-    apply_exploration_audit(log, book, first.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    apply_exploration_verdict(log, book, first.observation_id, passed=False, now=10.0, ban_seconds=DAY)[1]
     retry = admit(pair, obs(3, hotkey="c"), now=20.0)            # room again (a's row was forfeited)
     assert retry.observation_id == third.observation_id and not retry.inserted
     assert (retry.status, retry.reason, retry.first_scan) == ("exploration_pending", None, True)
@@ -984,7 +984,7 @@ def test_m_a_a_probation_limit_refusal_is_retryable_like_a_cap_refusal(pair):
     assert (again.reason, again.status, again.entitlement) == ("probation_limit", "exploration_unpaid", None)
     with book.db:
         book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
-    apply_exploration_audit(log, book, held[0].observation_id, passed=True, now=10.0, ban_seconds=DAY)
+    apply_exploration_verdict(log, book, held[0].observation_id, passed=True, now=10.0, ban_seconds=DAY)[1]
     retry = admit(pair, over, cap=10.0, now=20.0)           # a passed audit freed a probation slot
     assert retry.observation_id == refused.observation_id and not retry.inserted
     assert (retry.status, retry.reason, retry.first_scan) == ("exploration_pending", None, True)
@@ -1076,7 +1076,7 @@ def test_r17_entry_point_voids_and_reseats_the_scan_on_the_training_observation(
     assert not here.first_scan and scan_of(log, 1) == probe.observation_id
     with book.db:
         book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
-    apply_exploration_audit(log, book, other.observation_id, passed=True, now=10.0, ban_seconds=DAY)
+    apply_exploration_verdict(log, book, other.observation_id, passed=True, now=10.0, ban_seconds=DAY)[1]
     unpaid = finalize_exploration(log, book, 1, environment=ENV)
     assert unpaid == [probe.observation_id]
     assert book.state(probe.observation_id)[1] == "trained" and book.payable(1, environment=ENV) == {"x": 1}
@@ -1096,7 +1096,7 @@ def test_i1_every_release_path_keeps_a_trained_prompt_scanned(pair, path):
     if path == "forfeit":
         with book.db:
             book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
-        apply_exploration_audit(log, book, held.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+        apply_exploration_verdict(log, book, held.observation_id, passed=False, now=10.0, ban_seconds=DAY)[1]
     else:
         finalize_exploration(log, book, 1, environment=ENV, aborted=path == "aborted")
     assert scan_of(log, 1) == seat.observation_id and log.is_scanned(ENV, 1)

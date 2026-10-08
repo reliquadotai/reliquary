@@ -276,8 +276,11 @@ async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdi
     from reliquary.validator.service import ValidationService
     runtime = SimpleNamespace(contract=contract_v2())
     request = SimpleNamespace(merkle_root="e" * 64, service_binding={"purpose": "exploration"})
-    pending = SimpleNamespace(hotkey="fixture-miner", prompt_idx=0, merkle_root=b"a", request=request,
-                              reject_response=None, telemetry=None, rewards=[0.0, 0.0])
+    from reliquary.validator.observability import canonical_prompt_hash_lead
+    telemetry = SimpleNamespace(prompt_idx=4321, t_body_completed=1.0, prompt_hash_lead=canonical_prompt_hash_lead(4321),
+                                verdict_fields=lambda: {"prompt_hash_lead": canonical_prompt_hash_lead(4321)})
+    pending = SimpleNamespace(hotkey="fixture-miner", prompt_idx=4321, merkle_root=b"a", request=request,
+                              reject_response=None, telemetry=telemetry, rewards=[0.0, 0.0])
     row = {"status": status, "exploration_fraction": 0.0, "proof_status": "passed"}
     batcher = SimpleNamespace(window_start=1, difficulty_auction_enabled=True, service_runtime=runtime,
                               difficulty_auction_metadata_by_id={id(pending): row}, env=SimpleNamespace(name="math"),
@@ -291,9 +294,17 @@ async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdi
     (verdict,) = body["verdicts"]
     assert verdict["accepted"] is True and verdict["rewarded"] is False
     assert verdict["selected_for_batch"] is False and verdict["is_final"] is True
-    assert verdict["outcome_code"] == status
+    # m5: paid or not, and the amount; never its status nor its prompt (they would join the public log to it).
+    assert verdict["outcome_code"] == "exploration_unpaid" and verdict["exploration_fraction"] == 0.0
     assert not verdict["explanation"].startswith("Validator outcome:")  # a real, miner-facing sentence
     assert "draw" not in json.dumps(verdict).lower()
+    client = TestClient(service.server.app)
+    for path in ("/verdicts/fixture-miner?details=true", "/miner-verdicts/fixture-miner?details=true",
+                 f"/miner-verdicts/fixture-miner/1/{'e' * 64}"):
+        text = client.get(path).text
+        assert "4321" not in text and canonical_prompt_hash_lead(4321) not in text, path
+        if status != "exploration_unpaid":
+            assert status not in text, path
 
 
 # ---- review fixes (round 1) ------------------------------------------------------------------

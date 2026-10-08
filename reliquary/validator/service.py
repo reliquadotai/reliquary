@@ -274,6 +274,10 @@ _SERVICE_EXPLORATION_STATUSES = frozenset({
     "exploration_unavailable", "service_record_failed", "service_policy_limit",
 })
 
+# m5: verdict keys that name the prompt of a service observation (``prompt_hash_lead`` is a hash of
+# the index: it names it too). Withheld from its verdict on every route.
+_SERVICE_OBSERVATION_WITHHELD = frozenset({"prompt_idx", "prompt_hash_lead"})
+
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 180.0
 _STARTUP_HASH_REBUILD_CHUNK_WINDOWS = 16
@@ -852,6 +856,29 @@ def _paid_from_archive(archive: dict, batchers: dict) -> dict:
     return paid
 
 
+async def _enqueue_aborted_window_off_loop(service, **kwargs) -> None:
+    """The window loop's tombstone call. Legacy RL tasks and corpus jobs (no service runtime): the
+    synchronous ``_enqueue_aborted_window``, exactly as before. A service task: its variant whose
+    blocking steps run in a worker thread (m3)."""
+    if getattr(service, "_service_runtime", None) is None:
+        service._enqueue_aborted_window(**kwargs)
+        return
+    await service._enqueue_aborted_service_window(**kwargs)
+
+
+def _read_publication_receipt(snapshot_dir) -> dict | None:
+    """The trainer publication receipt of a downloaded snapshot, or None (absent, unreadable, not a map).
+    BLOCKING (file read). Service tasks only: it proves an unadopted checkpoint's lineage (I2)."""
+    from reliquary.shared.strict_json import strict_json_loads
+    from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+
+    try:
+        receipt = strict_json_loads((Path(snapshot_dir) / PUBLICATION_RECEIPT).read_bytes())
+    except Exception:
+        return None
+    return receipt if isinstance(receipt, dict) else None
+
+
 def _require_service_checkpoint_lineage(runtime, *, checkpoint_n, repo, revision, digest, receipt) -> None:
     """I1: the staged checkpoint continues the order's lineage. BLOCKING read (SQLite), no mutation."""
     runtime.require_adoptable(
@@ -912,6 +939,8 @@ class ValidationService:
         self._service_sealed_windows: set[int] = set()
         self._service_recovery_attempts: dict[int, int] = {}
         self._service_recovery_context: dict[int, tuple] = {}
+        # I2: (revision, publication receipt) of the last service checkpoint installed or resumed.
+        self._service_installed_receipt: tuple[str, dict] | None = None
         if service_contract is not None:
             from reliquary.constants import FILL_CLOSED_ENABLED, PIPELINED_WINDOWS, ENFORCE_ENVELOPE_SIGNATURE
             from reliquary.services.runtime import ServiceRuntime
@@ -1813,22 +1842,34 @@ class ValidationService:
                     self._synchronize_proof_models, revision, str(staged_dir),
                 )
             installation_started = True
+            if service_runtime is not None:
+                # I2: kept in memory before the install, so a failed adoption is healed at the next
+                # boundary (``ensure_checkpoint`` with this receipt) instead of stalling the order.
+                self._service_installed_receipt = (revision, receipt)
             entry = await asyncio.to_thread(
                 self._checkpoint_store.install_external,
                 checkpoint_n,
                 revision,
             )
             if service_runtime is not None:
-                # SQLite commits (fsync): off the event loop, like the install above.
-                await asyncio.to_thread(
-                    service_runtime.record_consumption, manifest["trained_window_cursor"],
-                )
+                # SQLite commits (fsync): off the event loop, like the install above. Adoption FIRST
+                # (I2): the consumption Q is telemetry and never stands between an install and it.
                 await asyncio.to_thread(
                     functools.partial(
                         service_runtime.adopt, checkpoint_n=checkpoint_n, repo=repo_id,
                         revision=revision, sha256=checkpoint_digest,
                     )
                 )
+                try:
+                    await asyncio.to_thread(
+                        service_runtime.record_consumption, manifest["trained_window_cursor"],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "service checkpoint %s: trainer consumption not recorded (%s: %s); "
+                        "telemetry only, the checkpoint is adopted",
+                        revision[:12], type(exc).__name__, exc, exc_info=True,
+                    )
             self._checkpoint_n = checkpoint_n
             self.server.set_current_checkpoint(entry)
             intake.mark_installed(revision, staged_dir)
@@ -2592,6 +2633,10 @@ class ValidationService:
                     "reliquary_protocol_profile.json", "config.json", "generation_config.json",
                     "tokenizer*", "special_tokens_map.json", "vocab.json", "merges.txt",
                 ]
+                if getattr(self, "_service_runtime", None) is not None:
+                    # I2: the publication receipt proves an unadopted resume target's lineage.
+                    from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+                    options["allow_patterns"].append(PUBLICATION_RECEIPT)
             return snapshot_download(repo_id=repo_id, revision=revision, **options)
 
         source = parse_resume_source(self._resume_from)
@@ -2604,9 +2649,15 @@ class ValidationService:
         runtime = getattr(self, "_service_runtime", None)
         if runtime is not None and isinstance(source, ShaSource):
             # An ancestor of the lineage head is refused at start, not at the first window boundary.
+            # I2: a target installed but never adopted (a crash in between) passes with its receipt
+            # when it is the head's child; the first boundary (or the scoped swap) adopts it.
+            receipt = await asyncio.to_thread(_read_publication_receipt, local_path)
             await asyncio.to_thread(
-                runtime.require_resumable, checkpoint_n=checkpoint_n,
-                repo=self._checkpoint_store.repo_id, revision=source.sha)
+                functools.partial(
+                    runtime.require_resumable, checkpoint_n=checkpoint_n,
+                    repo=self._checkpoint_store.repo_id, revision=source.sha, receipt=receipt))
+            if receipt is not None:
+                self._service_installed_receipt = (source.sha, receipt)
         from reliquary.validator.checkpoint_profile import (
             validate_checkpoint_profile,
         )
@@ -2799,8 +2850,10 @@ class ValidationService:
         )
         # The checkpoint first: a lineage refusal (an ancestor) must not leave an operator's schedule
         # request applied for a window that will not open.
+        installed = getattr(self, "_service_installed_receipt", None)
         runtime.ensure_checkpoint(
             checkpoint_n=int(cp.checkpoint_n), repo=cp.repo_id, revision=cp.revision,
+            receipt=installed[1] if installed is not None and installed[0] == cp.revision else None,
         )
         schedule = runtime.apply_pending_schedule_request(
             self._service_schedule_store,
@@ -2996,14 +3049,17 @@ class ValidationService:
         it again from well-formed rows. Nothing was enqueued for the window at this
         point: the settlement is the step just before ``finish``.
         """
+        batchers = [
+            batcher for batcher in list(getattr(self, "_active_batchers", {}).values())
+            if getattr(batcher, "service_runtime", None) is not None
+            and batcher.window_start == archive.get("window_start")
+        ]
         try:
             # Normally a no-op (the seal drained and finalized already): never settle with an env's
             # exploration still open.
-            for batcher in list(getattr(self, "_active_batchers", {}).values()):
-                if (getattr(batcher, "service_runtime", None) is not None
-                        and batcher.window_start == archive.get("window_start")):
-                    await asyncio.to_thread(batcher.finalize_service_exploration)
-            return await asyncio.to_thread(runtime.reconcile_archive, archive)
+            for batcher in batchers:
+                await asyncio.to_thread(batcher.finalize_service_exploration)
+            result = await asyncio.to_thread(runtime.reconcile_archive, archive)
         except Exception as exc:
             logger.error(
                 "service window %s: settlement failed at seal (%s: %s); the window "
@@ -3011,6 +3067,16 @@ class ValidationService:
                 archive.get("window_start"), type(exc).__name__, exc, exc_info=True,
             )
             raise
+        # m1: the settlement may still void an entitlement (R17: its prompt is in the batch). The
+        # per-hotkey verdict rows follow the ledger again, so the final verdicts say what is paid.
+        for batcher in batchers:
+            try:
+                await asyncio.to_thread(batcher._refresh_exploration_rows)
+            except Exception:
+                logger.exception("service window %s env %s: exploration rows not refreshed after the "
+                                 "settlement", archive.get("window_start"),
+                                 getattr(batcher, "service_environment", None))
+        return result
 
     async def _refresh_service_cooldown_advice(self, window: int) -> None:
         """After a window settled: recompute the cooldown recommendation. Never raises."""
@@ -4388,7 +4454,9 @@ class ValidationService:
                     selection_reason = "proof_not_completed_before_window_close"
 
             if service_observation:
-                selection_reason = "exploration_reward_recorded" if payable else str(service_status)
+                # m5: an exploration / unproven verdict says only paid or not (and the amount): its
+                # status and prompt would join the public observation log to this hotkey.
+                selection_reason = "exploration_reward_recorded" if payable else "exploration_unpaid"
             from reliquary.validator.verifier import rewards_std
 
             try:
@@ -4429,6 +4497,7 @@ class ValidationService:
                         "selection_target": FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH if paid_groups is not None else self._batch_target(batcher),
                         "selected_count": len(paid) if paid_groups is not None else sum(bool(r.get("selected")) for r in metadata.values()),
                     },
+                    **({"withhold": _SERVICE_OBSERVATION_WITHHELD} if service_observation else {}),
                 )
                 if isinstance(record, dict):
                     records.append((pending.hotkey, record))
@@ -4554,7 +4623,8 @@ class ValidationService:
                 "Window %d: dropping seal+train+archive — beacon invalid",
                 window_n,
             )
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="beacon_verification",
                 failure_type="InvalidBeacon",
                 batchers=batchers,
@@ -4576,7 +4646,8 @@ class ValidationService:
                 "rewards, training and checkpoint publication",
                 window_n,
             )
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="admission_drain",
                 failure_type="AdmissionDrainTimeout",
                 batchers=batchers,
@@ -4690,7 +4761,8 @@ class ValidationService:
                 window_n,
                 proof_capacity_aborts,
             )
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="proof_capacity",
                 failure_type="ProofCapacityAbort",
                 batchers=batchers,
@@ -5258,7 +5330,8 @@ class ValidationService:
             )
         except Exception as exc:
             logger.exception("window archive failed")
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="archive_enqueue",
                 failure_type=type(exc).__name__,
                 batchers=batchers,
@@ -6589,6 +6662,79 @@ class ValidationService:
         self._service_recovery_attempts.pop(window, None)
         self._service_recovery_context.pop(window, None)
 
+    # --- service part of an aborted window (m3: its blocking steps run off the event loop) ---
+
+    def _begin_service_abort_recovery(self, window_start: int, failure_stage: str) -> None:
+        # A failure of the archive step means the window SEALED: its audits
+        # ran and its exploration is owed even when no training group was
+        # paid. Remembered for every later attempt of this process (the
+        # loop's own handler, the next boundary).
+        if failure_stage == "archive_enqueue":
+            self._service_sealed_windows.add(window_start)
+
+    def _service_abort_recovery(self, window_start: int, batchers: dict) -> dict:
+        """BLOCKING (SQLite, the archive queue): finalize the window's exploration, then recover it."""
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+
+        for batcher in batchers.values():
+            if getattr(batcher, "service_runtime", None) is not None:
+                # No drain here (the window failed): the validator lost the audit inputs, so what is
+                # open ends validator_lost (unpaid, unsanctioned, no horizon: R25).
+                batcher.finalize_service_exploration(audits_could_run=False)
+        return self._fill_closed_recovery_store.recover(
+            window_start, queue=self._training_payload_queue_ref(),
+            archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
+            service_runtime=self._service_runtime,
+            sealed=window_start in self._service_sealed_windows,
+        )
+
+    def _service_abort_recovery_failed(self, window_start: int, batchers: dict, paid) -> None:
+        # Kept for the boundary healing (``_recover_leftover_service_windows``): the
+        # same post-recovery steps run there with these batchers and paid groups.
+        self._service_recovery_context[window_start] = (dict(batchers), paid)
+        # ``recover`` wrote the window's rotation barrier before it failed.
+        # The store is the truth after a recovery (as below and at a
+        # restart): the next window still waits for the trainer.
+        self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+
+    def _finish_service_abort_recovery(self, window_start: int, archive: dict, batchers: dict, paid) -> None:
+        self._complete_service_recovery(window_start, archive, batchers, paid)
+        self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+
+    async def _enqueue_aborted_service_window(
+        self,
+        *,
+        failure_stage: str,
+        failure_type: str,
+        batchers: dict | None = None,
+        late_drops: dict | None = None,
+    ) -> None:
+        """``_enqueue_aborted_window`` of a service task, with the exploration finalize and the
+        recovery (SQLite commits, fsync) in a worker thread; everything else on the loop, in the
+        same order. Only reached with a service runtime (``_enqueue_aborted_window_off_loop``)."""
+        if batchers is None:
+            batchers = self._active_batchers
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if not batchers or not FILL_CLOSED_ENABLED or recovery is None:
+            self._enqueue_aborted_window(failure_stage=failure_stage, failure_type=failure_type,
+                                         batchers=batchers, late_drops=late_drops)
+            return
+        window_start = int(next(iter(batchers.values())).window_start)
+        if window_start in getattr(self, "_archive_enqueued_windows", set()):
+            return
+        assembler = getattr(self, "_fill_closed_assemblers", {}).get(window_start)
+        if assembler is None:
+            raise RuntimeError(f"window {window_start}: v6 recovery has no assembler")
+        paid = self._close_and_commit_fill_closed_paid_side_effects(batchers, assembler)
+        recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
+        self._begin_service_abort_recovery(window_start, failure_stage)
+        try:
+            archive = await asyncio.to_thread(self._service_abort_recovery, window_start, batchers)
+        except Exception:
+            self._service_abort_recovery_failed(window_start, batchers, paid)
+            raise
+        self._finish_service_abort_recovery(window_start, archive, batchers, paid)
+
     def _enqueue_aborted_window(
         self,
         *,
@@ -6631,43 +6777,25 @@ class ValidationService:
                 assembler,
             )
             recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
-            for batcher in batchers.values():
-                if getattr(batcher, "service_runtime", None) is not None:
-                    # No drain here (the window failed): the validator lost the audit inputs, so what is
-                    # open ends validator_lost (unpaid, unsanctioned, no horizon: R25).
-                    batcher.finalize_service_exploration(audits_could_run=False)
             if getattr(self, "_service_runtime", None) is None:
+                for batcher in batchers.values():
+                    if getattr(batcher, "service_runtime", None) is not None:
+                        # No drain here (the window failed): the validator lost the audit inputs, so what is
+                        # open ends validator_lost (unpaid, unsanctioned, no horizon: R25).
+                        batcher.finalize_service_exploration(audits_could_run=False)
                 archive = recovery.recover(
                     window_start, queue=self._training_payload_queue_ref(),
                     archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
                     service_runtime=getattr(self, "_service_runtime", None),
                 )
             else:
-                # A failure of the archive step means the window SEALED: its audits
-                # ran and its exploration is owed even when no training group was
-                # paid. Remembered for every later attempt of this process (the
-                # loop's own handler, the next boundary).
-                if failure_stage == "archive_enqueue":
-                    self._service_sealed_windows.add(window_start)
+                self._begin_service_abort_recovery(window_start, failure_stage)
                 try:
-                    archive = recovery.recover(
-                        window_start, queue=self._training_payload_queue_ref(),
-                        archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
-                        service_runtime=self._service_runtime,
-                        sealed=window_start in self._service_sealed_windows,
-                    )
+                    archive = self._service_abort_recovery(window_start, batchers)
                 except Exception:
-                    # Kept for the boundary healing (``_recover_leftover_service_windows``): the
-                    # same post-recovery steps run there with these batchers and paid groups.
-                    self._service_recovery_context[window_start] = (dict(batchers), paid)
-                    # ``recover`` wrote the window's rotation barrier before it failed.
-                    # The store is the truth after a recovery (as below and at a
-                    # restart): the next window still waits for the trainer.
-                    self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+                    self._service_abort_recovery_failed(window_start, batchers, paid)
                     raise
-            if getattr(self, "_service_runtime", None) is not None:
-                self._complete_service_recovery(window_start, archive, batchers, paid)
-                self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+                self._finish_service_abort_recovery(window_start, archive, batchers, paid)
                 return
             # Keep the hash recovery cache contiguous; a gap stalls it for good.
             self._cache_archived_hashes(archive)
@@ -7275,7 +7403,8 @@ class ValidationService:
                             # own tombstone first (the handler only sees the
                             # collecting window's routing).
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="FatalProofPlaneError",
                                     batchers=stashed_batchers,
@@ -7317,7 +7446,8 @@ class ValidationService:
                                 stashed_n,
                             )
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="PipelinedTrainFailure",
                                     batchers=stashed_batchers,
@@ -7461,7 +7591,8 @@ class ValidationService:
                     )
                     try:
                         # Per-window dedup happens inside the helper.
-                        self._enqueue_aborted_window(
+                        await _enqueue_aborted_window_off_loop(
+                            self,
                             failure_stage=self._window_iteration_stage,
                             failure_type="FatalProofPlaneError",
                         )
@@ -7491,7 +7622,8 @@ class ValidationService:
                             "pipelined_train_archive"
                         )
                         try:
-                            self._enqueue_aborted_window(
+                            await _enqueue_aborted_window_off_loop(
+                                self,
                                 failure_stage="pipelined_train_archive",
                                 failure_type="FatalProofPlaneError",
                                 batchers=_fb,
@@ -7508,7 +7640,8 @@ class ValidationService:
                 except Exception as exc:
                     logger.exception("Window iteration failed")
                     try:
-                        self._enqueue_aborted_window(
+                        await _enqueue_aborted_window_off_loop(
+                            self,
                             failure_stage=self._window_iteration_stage,
                             failure_type=type(exc).__name__,
                         )
@@ -7558,7 +7691,8 @@ class ValidationService:
                                 "of window %d; terminating for restart", _sn,
                             )
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="FatalProofPlaneError",
                                     batchers=_sb,
@@ -7575,7 +7709,8 @@ class ValidationService:
                                 "Salvage of stashed window %d failed", _sn,
                             )
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="PipelinedSalvageFailure",
                                     batchers=_sb,

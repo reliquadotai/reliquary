@@ -101,14 +101,12 @@ async def test_a_checkpoint_of_another_repository_is_refused_before_any_mutation
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failing", ["consumption", "adopt", "announce", "mark"])
+@pytest.mark.parametrize("failing", ["adopt", "announce", "mark"])
 async def test_service_error_after_installation_never_returns_old_revision_fallback(tmp_path, monkeypatch, failing):
     runtime = build(tmp_path / "runtime.sqlite3")
     runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)   # NEXT is a child of the root
     service, manifest, stage, _ = staged_service(tmp_path, runtime)
-    if failing == "consumption":
-        monkeypatch.setattr(runtime, "record_consumption", MagicMock(side_effect=OSError("unit journal failure")))
-    elif failing == "adopt":
+    if failing == "adopt":
         monkeypatch.setattr(runtime, "adopt", MagicMock(side_effect=OSError("unit journal failure")))
     elif failing == "announce":
         service.server.set_current_checkpoint.side_effect = OSError("unit server failure")
@@ -142,7 +140,7 @@ async def test_service_adoption_follows_installation_keeps_the_run_and_runs_off_
 
     await ValidationService._swap_staged_checkpoint(service, 1)
 
-    assert order == ["install", "consumption", "adopt", "announce"]
+    assert order == ["install", "adopt", "consumption", "announce"]          # I2: adoption first
     assert threading.get_ident() not in threads                       # SQLite commits leave the event loop
     assert runtime.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT,
                                   "sha256": canonical_sha256(receipt["files"])}
@@ -406,4 +404,125 @@ async def test_boot_refuses_a_resume_target_outside_the_lineage_head(tmp_path, m
     assert f"resume from the lineage head {THIRD}" in str(refused.value)
     loaded.assert_not_called()
     runtime.require_resumable(checkpoint_n=2, repo="models/test", revision=THIRD)   # the head itself is fine
+    runtime.close()
+
+
+# ---- I2: an installed checkpoint is never left unadopted for good ------------------------------------------
+
+def _boundary_service(runtime, installed, receipt_memory=None):
+    return SimpleNamespace(
+        _service_runtime=runtime, _service_schedule_store=SimpleNamespace(take=lambda: None),
+        _checkpoint_store=SimpleNamespace(current_manifest=lambda: installed),
+        env_mix=[(MATH, 16), (CODE, 16)], _emission_cap=0.5,
+        _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
+        _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
+        _service_installed_receipt=receipt_memory,
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_consumption_raising_does_not_prevent_adoption(tmp_path, monkeypatch, caplog):
+    import logging
+    runtime = build(tmp_path / "runtime.sqlite3")
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    service, manifest, stage, receipt = staged_service(tmp_path, runtime)
+    monkeypatch.setattr(runtime, "record_consumption", MagicMock(side_effect=OSError("unit journal failure")))
+    with caplog.at_level(logging.ERROR, logger="reliquary"):
+        await ValidationService._swap_staged_checkpoint(service, 1)              # no FatalProofPlaneError
+    assert runtime.checkpoint["revision"] == NEXT and runtime.checkpoint["sha256"] == canonical_sha256(FILES)
+    assert service._checkpoint_n == 1
+    service.server.set_current_checkpoint.assert_called_once()
+    service._checkpoint_intake.mark_installed.assert_called_once_with(manifest["revision"], stage)
+    assert any("consumption not recorded" in r.getMessage() for r in caplog.records)
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_install_before_adopt_heals_at_the_next_boundary(tmp_path, monkeypatch):
+    path = tmp_path / "runtime.sqlite3"
+    runtime = build(path)
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    service, manifest, stage, receipt = staged_service(tmp_path, runtime)
+    real_adopt = runtime.adopt
+    monkeypatch.setattr(runtime, "adopt", MagicMock(side_effect=OSError("crash between install and adopt")))
+    with pytest.raises(FatalProofPlaneError):
+        await ValidationService._swap_staged_checkpoint(service, 1)
+    assert service._checkpoint_store.current.revision == NEXT                    # installed ...
+    assert runtime.db.execute("SELECT COUNT(*) FROM service_checkpoints").fetchone()[0] == 1   # ... never adopted
+    assert service._service_installed_receipt == (NEXT, receipt)
+    monkeypatch.setattr(runtime, "adopt", real_adopt)
+    installed = SimpleNamespace(repo_id="models/test", revision=NEXT, checkpoint_n=1)
+    # Without the receipt the old refusal stands (the order would stall) ...
+    with pytest.raises(ValueError, match="no adopted service lineage entry"):
+        ValidationService._service_window_plan(_boundary_service(runtime, installed), 2)
+    # ... with it, the next boundary adopts the installed child of the head, loudly.
+    from reliquary.services import runtime as runtime_module
+    warnings = []
+    monkeypatch.setattr(runtime_module.logger, "warning", lambda *args: warnings.append(args[0] % args[1:]))
+    plan = ValidationService._service_window_plan(
+        _boundary_service(runtime, installed, service._service_installed_receipt), 2)
+    assert plan["checkpoint_revision"] == NEXT
+    assert runtime.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT,
+                                  "sha256": canonical_sha256(FILES)}
+    assert any("healed" in message for message in warnings)
+    runtime.close()
+    # A restart reads the same lineage: the healed head is re-selected, idempotent.
+    restarted = build(path, now=1)
+    assert ValidationService._service_window_plan(_boundary_service(restarted, installed), 3)["checkpoint_revision"] == NEXT
+    restarted.close()
+
+
+@pytest.mark.parametrize("case", ["not_a_child", "ancestor_parent", "other_number", "no_files"])
+def test_the_heal_never_adopts_a_revision_that_is_not_the_heads_child(tmp_path, case):
+    runtime = _three_deep(tmp_path)                                              # ROOT -> NEXT -> THIRD
+    before = _order(runtime)
+    revision, number = "c" * 40, 3
+    receipt = {"parent_revision": THIRD, "manifest": {"checkpoint_n": number, "repo_id": "models/test"},
+               "files": FILES}
+    if case == "not_a_child":
+        receipt["parent_revision"] = "9" * 40
+    elif case == "ancestor_parent":
+        receipt["parent_revision"] = NEXT
+    elif case == "other_number":
+        receipt["manifest"]["checkpoint_n"] = 9
+    else:
+        receipt["files"] = {}
+    with pytest.raises(ValueError):
+        runtime.ensure_checkpoint(checkpoint_n=number, repo="models/test", revision=revision, receipt=receipt)
+    with pytest.raises(ValueError):
+        runtime.require_resumable(checkpoint_n=number, repo="models/test", revision=revision, receipt=receipt)
+    assert _order(runtime) == before and runtime.checkpoint["revision"] == THIRD
+    # the same receipt naming the head as its parent heals
+    receipt.update(parent_revision=THIRD, manifest={"checkpoint_n": number, "repo_id": "models/test"}, files=FILES)
+    runtime.require_resumable(checkpoint_n=number, repo="models/test", revision=revision, receipt=receipt)
+    assert _order(runtime) == before                                             # the boot check only reads
+    assert runtime.ensure_checkpoint(checkpoint_n=number, repo="models/test", revision=revision,
+                                     receipt=receipt)["revision"] == revision
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_boot_accepts_an_unadopted_child_of_the_head_with_its_receipt_and_keeps_it(tmp_path, monkeypatch):
+    runtime = build(tmp_path / "runtime.sqlite3")
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    receipt = {"parent_revision": ROOT, "manifest": {"checkpoint_n": 1, "repo_id": "models/test",
+                                                     "trained_window_cursor": 0}, "files": FILES}
+    (weights / PUBLICATION_RECEIPT).write_text(json.dumps(receipt))
+    monkeypatch.setattr("reliquary.validator.resume.resolve_resume_source", lambda source, **kw: (str(weights), 1))
+
+    class Reached(Exception):
+        pass
+
+    def past_the_lineage_check(*args, **kwargs):
+        raise Reached()
+    monkeypatch.setattr("reliquary.validator.checkpoint_profile.validate_checkpoint_profile", past_the_lineage_check)
+    service = SimpleNamespace(_resume_from=f"sha:{NEXT}", _service_runtime=runtime,
+                              _checkpoint_store=SimpleNamespace(repo_id="models/test"),
+                              _service_installed_receipt=None)
+    with pytest.raises(Reached):
+        await ValidationService._apply_resume_from(service)
+    assert service._service_installed_receipt == (NEXT, receipt)
+    assert runtime.checkpoint["revision"] == ROOT                                # adopted at the boundary, not here
     runtime.close()
