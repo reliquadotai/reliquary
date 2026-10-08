@@ -6,12 +6,66 @@ only the prompts actually consumed may cost memory.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 
 # An eval job reopens a prompt's slot when a submission fails its audit, up to
 # this many attempts per prompt in all (as a multiple of its slots).
 ATTEMPTS_PER_SLOT = 3
+
+
+# How `GET .../open` writes `SlotLedger.open_bitmap`: base64 of the bytes, row
+# `prompt_start + i` at byte `i >> 3`, mask `0x80 >> (i & 7)`.
+OPEN_ENCODING = "bitmap-msb0-base64"
+
+
+@dataclass(frozen=True)
+class OpenMap:
+    """A job's open prompts as the validator answered them (``parse_open_map``)."""
+
+    prompt_start: int
+    prompt_count: int
+    open_count: int
+    bitmap: bytes
+
+    def is_open(self, index: int) -> bool:
+        """Whether SOURCE row ``index`` still had a slot; False outside the job."""
+        offset = int(index) - self.prompt_start
+        if not 0 <= offset < self.prompt_count:
+            return False
+        return bool(self.bitmap[offset >> 3] & (0x80 >> (offset & 7)))
+
+    def indices(self) -> list[int]:
+        return [self.prompt_start + offset for offset in range(self.prompt_count)
+                if self.bitmap[offset >> 3] & (0x80 >> (offset & 7))]
+
+
+def parse_open_map(body) -> OpenMap:
+    """Read a `GET .../open` answer, or raise ``ValueError`` on one this
+    reader cannot trust (another encoding, a bitmap shorter than its count)."""
+    if not isinstance(body, Mapping):
+        raise ValueError("the open map is not an object")
+    if body.get("encoding") != OPEN_ENCODING:
+        raise ValueError(f"unknown open map encoding {body.get('encoding')!r}")
+    numbers = []
+    for name in ("prompt_start", "prompt_count", "open_count"):
+        value = body.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"open map {name} is not a count: {value!r}")
+        numbers.append(value)
+    start, count, opened = numbers
+    if count <= 0 or opened > count:
+        raise ValueError(f"open map counts {opened} open of {count}")
+    try:
+        bitmap = base64.b64decode(body.get("open"), validate=True)
+    except (binascii.Error, TypeError, ValueError) as exc:
+        raise ValueError(f"open map bitmap is not base64: {exc}") from exc
+    if len(bitmap) != -(-count // 8):
+        raise ValueError(f"open map bitmap is {len(bitmap)} bytes for {count} prompts")
+    return OpenMap(start, count, opened, bitmap)
 
 
 class SlotExhausted(Exception):
@@ -117,6 +171,26 @@ class SlotLedger:
         for offset in range(self._prompt_count):
             counts[self.prompt_state(self._prompt_start + offset)] += 1
         return counts
+
+    def open_bitmap(self) -> tuple[bytes, int]:
+        """Which prompts still have a slot, one bit per row, and how many do.
+
+        Bit ``i`` is row ``prompt_start + i``: byte ``i >> 3``, mask
+        ``0x80 >> (i & 7)``, set while ``remaining`` is positive; the last byte
+        is padded with zeros. Costs ``prompt_count`` bytes of scratch, so the
+        caller bounds the count (a generated source declares up to 1 << 31).
+        """
+        count, start, slots = self._prompt_count, self._prompt_start, self._slots_per_prompt
+        flags = bytearray(b"1") * count
+        failed = self._failed
+        for position, taken in self._consumed.items():
+            # No failure recorded (every job but an eval one): capacity is V.
+            if taken >= slots and (not failed or taken >= self.capacity(position)):
+                flags[position - start] = 48  # "0"
+        opened = flags.count(b"1")
+        padded = -(-count // 8) * 8
+        flags.extend(b"0" * (padded - count))
+        return int(flags, 2).to_bytes(padded // 8, "big"), opened
 
     def failed_snapshot(self) -> dict[int, list[str]]:
         return {index: sorted(ids) for index, ids in self._failed.items() if ids}

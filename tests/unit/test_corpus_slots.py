@@ -91,3 +91,62 @@ def test_a_snapshot_outside_a_started_range_is_refused():
         SlotLedger.from_snapshot(3, 2, {2: 1}, prompt_start=100)
     with pytest.raises(ValueError):
         SlotLedger.from_snapshot(3, 2, {103: 1}, prompt_start=100)
+
+
+# -- the open map: which prompts still have a slot, one bit per source row --
+
+def _bit(bitmap, offset):
+    return bool(bitmap[offset >> 3] & (0x80 >> (offset & 7)))
+
+
+def test_the_open_bitmap_of_a_fresh_ledger_is_every_prompt():
+    bitmap, count = SlotLedger(prompt_count=10, slots_per_prompt=2).open_bitmap()
+    # Ten rows, first row in the high bit, the last byte padded with zeros.
+    assert (bitmap, count) == (bytes([0xFF, 0xC0]), 10)
+
+
+def test_the_open_bitmap_drops_only_the_prompts_with_no_slot_left():
+    ledger = SlotLedger(prompt_count=10, slots_per_prompt=2)
+    ledger.consume(0)                      # one slot left: still open
+    ledger.consume(3), ledger.consume(3)   # full
+    ledger.consume(9), ledger.consume(9)   # full
+    bitmap, count = ledger.open_bitmap()
+    assert count == 8
+    assert [_bit(bitmap, i) for i in range(10)] == [ledger.remaining(i) > 0 for i in range(10)]
+
+
+def test_the_open_bitmap_is_keyed_from_the_jobs_first_row():
+    ledger = SlotLedger(prompt_count=9, slots_per_prompt=1, prompt_start=500)
+    ledger.consume(500), ledger.consume(508)
+    bitmap, count = ledger.open_bitmap()
+    assert count == 7 and len(bitmap) == 2
+    assert [_bit(bitmap, i) for i in range(9)] == [ledger.remaining(500 + i) > 0 for i in range(9)]
+
+
+def test_the_open_bitmap_of_a_complete_ledger_is_empty():
+    ledger = SlotLedger(prompt_count=3, slots_per_prompt=1)
+    for index in range(3):
+        ledger.consume(index)
+    assert ledger.is_complete and ledger.open_bitmap() == (bytes([0]), 0)
+
+
+def test_the_open_bitmap_counts_a_slot_a_failed_submission_reopened():
+    ledger = SlotLedger(prompt_count=2, slots_per_prompt=1)
+    ledger.consume(0), ledger.consume(1)
+    assert ledger.record_failure(1, "a" * 12) is True
+    bitmap, count = ledger.open_bitmap()
+    assert count == 1 and not _bit(bitmap, 0) and _bit(bitmap, 1)
+
+
+def test_the_open_bitmap_agrees_with_remaining_on_a_random_ledger():
+    import random
+
+    rng = random.Random(7)
+    ledger = SlotLedger(prompt_count=1003, slots_per_prompt=2, prompt_start=40)
+    for _ in range(1500):
+        index = 40 + rng.randrange(1003)
+        if not ledger.is_full(index):
+            ledger.consume(index)
+    bitmap, count = ledger.open_bitmap()
+    opened = [ledger.remaining(40 + i) > 0 for i in range(1003)]
+    assert [_bit(bitmap, i) for i in range(1003)] == opened and count == sum(opened)

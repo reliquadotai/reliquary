@@ -18,6 +18,7 @@ reversible step.
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import contextlib
 from collections import OrderedDict
@@ -45,7 +46,7 @@ from reliquary.corpus.admission import (
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobError, JobSpec
-from reliquary.corpus.slots import SlotLedger
+from reliquary.corpus.slots import OPEN_ENCODING, SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
 from reliquary.environment.agentic.types import EpisodeTask
 from reliquary.environment.registry import ENVIRONMENT_SPECS
@@ -84,6 +85,21 @@ NEXT_PATH = "/corpus/next/{hotkey}"
 NEXT_SCOPED_PATH = "/corpus/jobs/{job_id}/next/{hotkey}"
 SKIP_PATH = "/corpus/skip"
 SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
+# Check before starting an episode: which of the job's prompts still have a
+# slot, whatever its prompt order (a free job has no walk for `next` to read).
+OPEN_PATH = "/corpus/open"
+OPEN_SCOPED_PATH = "/corpus/jobs/{job_id}/open"
+# How long one computed open map answers every caller, and what a client or a
+# proxy in front may keep it: a miner acts on it for minutes anyway.
+OPEN_CACHE_SECONDS = 5.0
+# One bit per prompt: 128 KiB of bitmap at this count. A generated source
+# declares up to 1 << 31 prompts; past this the route refuses rather than
+# build (and ship) a map that size.
+OPEN_MAX_PROMPTS = 1 << 20
+
+
+def _open_clock() -> float:
+    return time.monotonic()
 
 # The record's own schema tag, so a reader of the bucket can tell what shape
 # to expect before it parses the rest of the document.
@@ -1541,6 +1557,9 @@ def build_corpus_router(
         seen_index = SeenIndex(store, job_id)
     # One rebuilt ledger state, keyed by the ETag it was read under (`_read_state`).
     read_cache: dict[str, Any] = {}
+    # The last open map (`corpus_open`): when it was built, from which state.
+    open_cache: dict[str, Any] = {}
+    open_lock = asyncio.Lock()
 
     async def _from_store(call, what: str):
         try:
@@ -1945,6 +1964,56 @@ def build_corpus_router(
             "skip_to": skip_target(job, hotkey, cursor, state.slots),
         }
 
+    def _open_response(body: dict) -> JSONResponse:
+        return JSONResponse(body, headers={
+            "Cache-Control": f"public, max-age={int(OPEN_CACHE_SECONDS)}"})
+
+    def _open_cached() -> dict | None:
+        if "body" in open_cache and _open_clock() - open_cache["at"] < OPEN_CACHE_SECONDS:
+            return open_cache["body"]
+        return None
+
+    @router.get(OPEN_PATH)
+    async def corpus_open() -> JSONResponse:
+        """Which of the job's prompts still have a slot, for any prompt order:
+        ``open`` is base64 of one bit per SOURCE row from ``prompt_start``
+        (``slots.OPEN_ENCODING``), ``as_of`` the unix time the ledger was read.
+        A read, exposed like the cursor: no signature, no write. One answer
+        serves every caller for ``OPEN_CACHE_SECONDS``, so polling miners cost
+        neither a bucket read nor a second pass over the ledger."""
+        body = _open_cached()
+        if body is not None:
+            return _open_response(body)
+        async with open_lock:
+            # Whoever held the lock may have just built it.
+            body = _open_cached()
+            if body is not None:
+                return _open_response(body)
+            job = await _read_job_checked()
+            if job is None:
+                raise HTTPException(status_code=404, detail="corpus_job_unknown")
+            if job.prompt_count > OPEN_MAX_PROMPTS:
+                raise HTTPException(status_code=409, detail="corpus_job_open_too_large")
+            state = await _read_state(job)
+            as_of = time.time()
+            if open_cache.get("state") is state:
+                # The same ledger version: the map stands, only its age moves.
+                body = {**open_cache["body"], "as_of": as_of}
+            else:
+                # Off the loop: a pass over every consumed prompt.
+                bitmap, opened = await asyncio.to_thread(state.slots.open_bitmap)
+                body = {
+                    "job_id": job.job_id,
+                    "prompt_start": job.prompt_start,
+                    "prompt_count": job.prompt_count,
+                    "open_count": opened,
+                    "as_of": as_of,
+                    "encoding": OPEN_ENCODING,
+                    "open": base64.b64encode(bitmap).decode("ascii"),
+                }
+            open_cache.update(at=_open_clock(), state=state, body=body)
+            return _open_response(body)
+
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus(request: CorpusSkipRequest) -> CorpusSkipResponse:
         """Step this hotkey's cursor from ``cursor`` to ``to_cursor`` over walk
@@ -2328,6 +2397,7 @@ def build_corpus_router(
     router.corpus_cursor = corpus_cursor
     router.submit_corpus = submit_corpus
     router.corpus_next = corpus_next
+    router.corpus_open = corpus_open
     router.skip_corpus = skip_corpus
     router.ledger_lock = ledger_lock
     router.recover_records = recover_records
@@ -2470,6 +2540,13 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
             raise HTTPException(status_code=409, detail="job_paused")
         return _served(job_id)
 
+    def _open_of(job_id: str) -> APIRouter:
+        # A read, so a paused job answers; a retired one admits nothing more,
+        # and its miners stop on the 410 instead of reading a map of slots.
+        if job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        return _served(job_id)
+
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
         return {"jobs": routes.open_jobs()}
@@ -2485,6 +2562,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(NEXT_SCOPED_PATH)
     async def corpus_next_scoped(job_id: str, hotkey: str) -> dict:
         return await _admitting(job_id).corpus_next(hotkey)
+
+    @router.get(OPEN_SCOPED_PATH)
+    async def corpus_open_scoped(job_id: str) -> JSONResponse:
+        return await _open_of(job_id).corpus_open()
 
     @router.post(SKIP_SCOPED_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_scoped(job_id: str, request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -2519,6 +2600,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(NEXT_PATH)
     async def corpus_next_legacy(hotkey: str) -> dict:
         return await _admitting(_default()).corpus_next(hotkey)
+
+    @router.get(OPEN_PATH)
+    async def corpus_open_legacy() -> JSONResponse:
+        return await _open_of(_default()).corpus_open()
 
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_legacy(request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -2560,6 +2645,10 @@ __all__ = [
     "JOBS_PATH",
     "NEXT_PATH",
     "NEXT_SCOPED_PATH",
+    "OPEN_CACHE_SECONDS",
+    "OPEN_MAX_PROMPTS",
+    "OPEN_PATH",
+    "OPEN_SCOPED_PATH",
     "SKIP_PATH",
     "SKIP_SCOPED_PATH",
     "JOB_PATH",
