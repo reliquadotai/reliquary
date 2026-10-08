@@ -362,9 +362,8 @@ def test_upload_bytes_sets_headers_and_never_replaces_with_different_bytes(monke
 
 # --- Fix round 1: bounded head + immutable pages (R29), remote check (I-1), reasons, close (m-6) ---
 
-def small_pages(monkeypatch, page=3, head=2):
+def small_pages(monkeypatch, page=3):
     monkeypatch.setattr(publication, "PAGE_SEGMENTS", page)
-    monkeypatch.setattr(publication, "HEAD_SEGMENTS", head)
     monkeypatch.setattr(publication, "SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS", 1)  # one event per segment
 
 
@@ -391,7 +390,7 @@ def test_pages_roll_over_the_head_stays_bounded_and_a_reader_verifies_across_pag
     assert {c for k, _, _, c in puts if k in (page1, page2)} == {SEGMENT_CACHE}
     head_bytes = [b for k, b, _, _ in puts if k == index_key("r1")][-1]
     head = verify(head_bytes, key, min_last_number=7)
-    assert head["last_number"] == 7 and [s["number"] for s in head["segments"]] == [6, 7]   # bounded by HEAD_SEGMENTS
+    assert head["last_number"] == 7 and [s["number"] for s in head["segments"]] == [7]   # every segment after the last closed page
     assert [p["key"] for p in head["pages"]] == [page1, page2]
     # the reader walks the pages once: every segment 1..7 is reachable and verifies
     segments = {k: b for k, b, _, _ in puts if k.endswith(".gz")}
@@ -402,7 +401,7 @@ def test_pages_roll_over_the_head_stays_bounded_and_a_reader_verifies_across_pag
         body = verify(raw, key)
         assert body["kind"] == "page" and body["first_number"] == page["first_number"]
         seen += body["segments"]
-    seen += head["segments"][1:]   # the head overlaps nothing it does not repeat: 6 is in page 2
+    seen += head["segments"]
     assert [e["number"] for e in seen] == [1, 2, 3, 4, 5, 6, 7]
     for e in seen:
         assert verify_segment(segments[e["key"]], e)
@@ -619,3 +618,223 @@ def test_stopping_the_service_closes_the_publisher_before_the_runtime():
         await ValidationService._stop_observation_publication(me)
     asyncio.run(scenario())
     assert order == ["publisher"]
+
+
+# --- Fix round 2 (N-1 .. N-5) ---
+
+def fake_segments(n):
+    return [{"number": i, "first_seq": i, "last_seq": i, "sha256": "%064x" % i, "size": 1} for i in range(1, n + 1)]
+
+
+class _StubRuntime:
+    """Just enough runtime for the publisher's head/page code (no database)."""
+    def __init__(self, n):
+        self.n, self.pages, self.page_reads = n, {}, 0
+        self.contract = SimpleNamespace(sha256="0" * 64)
+
+    def published_segments(self, *, first_number=1, last_number=None):
+        return [s for s in fake_segments(self.n) if first_number <= s["number"] <= (last_number or 2 ** 62)]
+
+    def index_page(self, first, build):
+        self.page_reads += 1
+        if first not in self.pages:
+            self.pages[first] = build()
+        return self.pages[first]
+
+    def last_published_number(self):
+        return self.n
+
+
+def stub_publisher(rt, key=None):
+    key = key or keypair()
+    return ObservationPublisher(rt, run_id="r1", task_id="t", wallet=SimpleNamespace(hotkey=key),
+                                put=None), key
+
+
+@pytest.mark.parametrize("page", [5, None])
+def test_pages_and_head_cover_every_number_exactly_once(monkeypatch, page):
+    if page is not None:
+        monkeypatch.setattr(publication, "PAGE_SEGMENTS", page)
+    size = publication.PAGE_SEGMENTS
+    top = 3 * size + 2
+    lasts = range(1, top + 1)
+    rt = _StubRuntime(0)
+    pub, key = stub_publisher(rt)
+    for last in lasts:
+        rt.n = last
+        head_bytes, head = pub._head(last)
+        body = verify_index(head_bytes, key.ss58_address, expected_run_id="r1", min_last_number=last)
+        assert body["kind"] == "head" and len(body["segments"]) < size
+        numbers = []
+        for entry in body["pages"]:
+            raw = pub._page_bytes((entry["first_number"] - 1) // size)
+            publication.verify_page_entry(raw, entry)
+            page_body = verify_index(raw, key.ss58_address, expected_run_id="r1")
+            assert page_body["kind"] == "page"
+            numbers += [e["number"] for e in page_body["segments"]]
+        numbers += [e["number"] for e in body["segments"]]
+        assert numbers == list(range(1, last + 1))   # union exactly 1..last, no duplicate, no gap
+
+
+def test_verify_index_refuses_a_head_that_leaves_a_gap_or_a_whole_page(monkeypatch):
+    monkeypatch.setattr(publication, "PAGE_SEGMENTS", 5)
+    rt = _StubRuntime(12)
+    pub, key = stub_publisher(rt)
+    _, head = pub._head(12)
+    wallet = SimpleNamespace(hotkey=key)
+
+    def check(mutate, message):
+        broken = json.loads(json.dumps(head))
+        mutate(broken)
+        with pytest.raises(ValueError, match=message):
+            verify_index(publication.sign_document(broken, wallet), key.ss58_address, expected_run_id="r1")
+    check(lambda b: b["segments"].pop(0), "continue its pages")                 # gap after the last page
+    check(lambda b: b.update(pages=[], segments=head["segments"]), "continue its pages")   # first entry must be 1 w/o page
+    check(lambda b: b["pages"].pop(), "continue its pages")
+    rt.n = 4
+    _, no_page = pub._head(4)
+    broken = json.loads(json.dumps(no_page))
+    broken["segments"].pop(0)
+    with pytest.raises(ValueError, match="continue its pages"):
+        verify_index(publication.sign_document(broken, wallet), key.ss58_address, expected_run_id="r1")
+
+
+def test_a_closed_page_is_read_once_per_process(monkeypatch):
+    monkeypatch.setattr(publication, "PAGE_SEGMENTS", 5)
+    rt = _StubRuntime(0)
+    pub, _ = stub_publisher(rt)
+    for last in range(1, 23):
+        rt.n = last
+        pub._head(last)
+    assert rt.page_reads == 4        # pages 0..3, once each, not once per flush
+
+
+def test_a_failed_remote_read_does_not_mark_the_check_done_and_ten_failures_are_critical(tmp_path, caplog):
+    rt = runtime(tmp_path)
+    explore(rt)
+    puts = []
+
+    async def broken(key):
+        raise OSError("r2 down")
+    pub, _ = publisher(rt, puts, get=broken)
+    with caplog.at_level("CRITICAL"):
+        for _ in range(9):
+            with pytest.raises(OSError):
+                asyncio.run(pub.flush())
+        assert "consecutive" not in caplog.text
+        with pytest.raises(OSError):
+            asyncio.run(pub.flush())
+    assert not pub._checked and "10 consecutive failures" in caplog.text and puts == []
+    # a remote that is ahead, read after the failures, still disables (the check really ran after them)
+    raw, _ = remote_head(tmp_path, 1)
+    pub2, _ = publisher(rt, [], get=broken)
+    with pytest.raises(OSError):
+        asyncio.run(pub2.flush())
+    assert not pub2._checked
+    pub2.get = getter(None)
+    asyncio.run(pub2.flush())
+    assert pub2._checked
+
+
+def paged_remote(tmp_path, n, monkeypatch):
+    """(head bytes, {key: bytes}) published by another journal that filled n events with pages of 3."""
+    small_pages(monkeypatch)
+    rt = runtime(tmp_path / "remote")
+    fill(rt, n)
+    puts = []
+    pub, key = publisher(rt, puts)
+    while asyncio.run(pub.flush()) is not None:
+        pass
+    store = {k: b for k, b, _, _ in puts}
+    return store[index_key("r1")], store, rt
+
+
+def store_getter(store):
+    async def get(key):
+        return store.get(key)
+    return get
+
+
+def test_remote_check_reads_and_adopts_the_remote_pages(tmp_path, monkeypatch):
+    head, store, remote_rt = paged_remote(tmp_path, 7, monkeypatch)
+    # same journal, but its page table was lost: the remote bytes are adopted, nothing is rebuilt
+    restored = runtime(tmp_path / "restored")
+    for number in range(1, 8):
+        seg = remote_rt.published_segments(first_number=number, last_number=number)[0]
+        restored.db.execute("INSERT INTO service_segments(number, first_seq, last_seq, flush_at, sha256, size, windows, checkpoints, committed) "
+                            "VALUES(?,?,?,?,?,?,?,?,1)", (seg["number"], seg["first_seq"], seg["last_seq"], 0.0, seg["sha256"], seg["size"], "[]", "[]"))
+    restored.db.commit()
+    puts = []
+    pub, _ = publisher(restored, puts, get=store_getter(store))
+    asyncio.run(pub.flush())
+    assert not pub.disabled
+    assert restored.index_page(1, lambda: pytest.fail("adopted")) == store[page_key("r1", 1, 3)]
+    assert restored.index_page(4, lambda: pytest.fail("adopted")) == store[page_key("r1", 4, 6)]
+
+
+def test_remote_check_disables_when_a_remote_page_is_missing_forged_or_differs(tmp_path, monkeypatch):
+    head, store, remote_rt = paged_remote(tmp_path, 7, monkeypatch)
+    page1 = page_key("r1", 1, 3)
+    cases = {"missing": {k: v for k, v in store.items() if k != page1},
+             "forged": {**store, page1: store[page1].replace(b'"size":', b'"size":1')},
+             "other signed page": {**store, page1: store[page_key("r1", 4, 6)]}}
+    for name, bad in cases.items():
+        pub, _ = publisher(remote_rt, [], get=store_getter(bad))
+        asyncio.run(pub.flush())
+        assert pub.disabled, name
+    body = {k: v for k, v in json.loads(store[page1]).items() if k != "signature"}
+    resigned = publication.sign_document(body, SimpleNamespace(hotkey=keypair()))
+    assert resigned != store[page1]
+    # the remote is the journal's own: not disabled; then its local page bytes differ from the remote's
+    pub, _ = publisher(remote_rt, [], get=store_getter(store))
+    asyncio.run(pub.flush())
+    assert not pub.disabled
+    with remote_rt.db:
+        remote_rt.db.execute("UPDATE service_index_pages SET body=? WHERE first_number=1", (resigned,))
+    pub, _ = publisher(remote_rt, [], get=store_getter(store))
+    asyncio.run(pub.flush())
+    assert pub.disabled
+    # a valid re-signed page whose bytes are not the ones the head hashes, with no local copy to compare to
+    with remote_rt.db:
+        remote_rt.db.execute("DELETE FROM service_index_pages")
+    pub, _ = publisher(remote_rt, [], get=store_getter({**store, page1: resigned}))
+    asyncio.run(pub.flush())
+    assert pub.disabled
+
+
+def test_close_keeps_waiting_for_a_thread_call_that_outlives_the_timeout(tmp_path):
+    import time
+    rt = runtime(tmp_path)
+    explore(rt)
+    pub, _ = publisher(rt, [])
+    finished = []
+    real = rt.plan_segment
+
+    def slow(**kw):
+        time.sleep(0.4)
+        out = real(**kw)
+        finished.append(1)
+        return out
+    rt.plan_segment = slow
+
+    async def scenario():
+        task = asyncio.create_task(pub.flush())
+        await asyncio.sleep(0.05)
+        await pub.close(timeout=0.05)
+        seen = list(finished)
+        task.cancel()
+        with pytest.raises(BaseException):
+            await task
+        return seen
+    assert asyncio.run(scenario()) == [1]    # close() returned only after the running call ended
+
+
+def test_verify_index_refuses_a_head_holding_a_whole_page(monkeypatch):
+    monkeypatch.setattr(publication, "PAGE_SEGMENTS", 7)
+    rt = _StubRuntime(5)
+    pub, key = stub_publisher(rt)
+    head_bytes, _ = pub._head(5)
+    assert verify_index(head_bytes, key.ss58_address, expected_run_id="r1")["last_number"] == 5
+    monkeypatch.setattr(publication, "PAGE_SEGMENTS", 5)       # now five entries are a whole page
+    with pytest.raises(ValueError, match="whole page"):
+        verify_index(head_bytes, key.ss58_address, expected_run_id="r1")

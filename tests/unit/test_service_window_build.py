@@ -1343,7 +1343,7 @@ def _model_with_vocab(size):
     return model
 
 
-def _boot(monkeypatch, tmp_path, contract, *, loaded, installed=None, model=None, **overrides):
+def _boot(monkeypatch, tmp_path, contract, *, loaded, installed=None, model=None, signer_client=None, **overrides):
     from reliquary.validator.service import ValidationService
     from tests.unit.test_service_v2 import _LateDropFakeWallet
 
@@ -1364,7 +1364,7 @@ def _boot(monkeypatch, tmp_path, contract, *, loaded, installed=None, model=None
     tokenizer.eos_token_id = 99
     return ValidationService(wallet=_LateDropFakeWallet(), model=model or _model_with_vocab(1000), tokenizer=tokenizer, netuid=99,
                              env_mix=[(name, B_BATCH) for name in loaded], service_contract=contract,
-                             emission_cap=CAP)
+                             emission_cap=CAP, signer_client=signer_client)
 
 
 def _bootable_contract(**kwargs):
@@ -1520,6 +1520,15 @@ def test_boot_never_chmods_an_existing_request_folder_and_refuses_an_unsafe_one_
     else:
         assert schedule.revision == 1 and svc._service_schedule_store.status()["status"] == "applied"
     assert folder.stat().st_mode & 0o7777 == mode
+    svc._service_runtime.close()
+
+
+def test_boot_refuses_publication_with_a_remote_signer_through_the_real_constructor(monkeypatch, tmp_path):
+    contract = _bootable_contract()
+    monkeypatch.setenv("RELIQUARY_OBSERVATIONS_BUCKET", "fake-public-bucket")
+    with pytest.raises(ValueError, match="remote signer.*observation index"):
+        _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE], signer_client=object())
+    svc = _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])        # local hotkey: boots
     svc._service_runtime.close()
 
 
