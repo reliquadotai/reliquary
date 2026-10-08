@@ -777,7 +777,9 @@ def test_checkpoint_lineage_is_append_only_and_restorable(tmp_path):
     with pytest.raises(ValueError, match="another identity"):
         rt.adopt(checkpoint_n=1, repo="models/test", revision="f" * 40, sha256="a" * 64)
     assert rt.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": "f" * 40, "sha256": "e" * 64}
-    assert rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)["revision"] == "d" * 40
+    with pytest.raises(ValueError, match="ancestor"):          # J1: the root is behind the head now
+        rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
+    assert rt.checkpoint["revision"] == "f" * 40
     assert rt.ensure_checkpoint(checkpoint_n=1, repo="models/test", revision="f" * 40)["sha256"] == "e" * 64
 
 
@@ -1585,9 +1587,11 @@ def test_i1_only_the_pinned_root_then_children_of_the_current_checkpoint_are_ado
     with pytest.raises(ValueError, match="not a child"):
         rt.require_adoptable(**grandchild, parent_revision=root["revision"])
     rt.require_adoptable(**grandchild, parent_revision="f" * 40)
-    # A revision already in the lineage is re-selected (restart) under its own identity only.
-    rt.require_adoptable(checkpoint_n=0, repo=root["repo"], revision=root["revision"], sha256=root["sha256"],
-                         parent_revision=None)
+    # J1: the head is re-selected (restart) under its own identity only; an ancestor never is.
+    rt.require_adoptable(**child, parent_revision=root["revision"])
+    with pytest.raises(ValueError, match="ancestor of the current lineage head"):
+        rt.require_adoptable(checkpoint_n=0, repo=root["repo"], revision=root["revision"], sha256=root["sha256"],
+                             parent_revision=None)
     for other in (dict(checkpoint_n=5), dict(sha256="1" * 64)):
         with pytest.raises(ValueError, match="another identity"):
             rt.require_adoptable(**{**child, **other}, parent_revision=root["revision"])

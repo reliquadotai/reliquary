@@ -87,6 +87,7 @@ def test_aborted_exploration_final_verdict_cannot_claim_its_burned_reward(monkey
     service._fill_closed_rotation_store = SimpleNamespace(load=lambda: {})
     service._service_sealed_windows = set()
     service._service_recovery_attempts = {}
+    service._service_recovery_context = {}
     service._cache_archived_hashes = lambda _: None
     service._enqueue_aborted_window(failure_stage="fixture", failure_type="interrupted")
     batcher.finalize_service_exploration.assert_called_once()      # what is open ends unaudited before the recovery

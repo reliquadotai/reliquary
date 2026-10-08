@@ -195,6 +195,10 @@ def _validate_qualification(qualification: dict, contract: ServiceContract) -> N
         raise ValueError(f"runtime qualification needs its forced-seed report: {exc}") from exc
 
 
+_ANCESTOR_REFUSED = ("service checkpoint {} is an ancestor of the current lineage head {}; "
+                     "the lineage never moves back")
+
+
 class ServiceRuntime:
     """One qualified controller per task/run, over one SQLite file."""
 
@@ -564,9 +568,16 @@ class ServiceRuntime:
                                     (order, revision)).fetchone()
             if known is not None and known != (checkpoint_n, sha256):
                 raise ValueError("checkpoint revision was already adopted with another identity")
+            if known is not None:
+                # J1: a known revision is the head again (idempotent) or it is refused; a row never moves.
+                head = self.db.execute("SELECT revision FROM service_checkpoints WHERE order_id=? "
+                                       "ORDER BY seq DESC LIMIT 1", (order,)).fetchone()
+                if head[0] != revision:
+                    raise ValueError(_ANCESTOR_REFUSED.format(revision[:12], head[0][:12]))
+                return self._checkpoint()
             seq = self.db.execute("SELECT COALESCE(MAX(seq),0)+1 FROM service_checkpoints WHERE order_id=?", (order,)).fetchone()[0]
-            self.db.execute("INSERT INTO service_checkpoints VALUES(?,?,?,?,?,?) ON CONFLICT(order_id, revision) "
-                            "DO UPDATE SET seq=excluded.seq", (order, revision, checkpoint_n, repo, sha256, seq))
+            self.db.execute("INSERT INTO service_checkpoints VALUES(?,?,?,?,?,?)",
+                            (order, revision, checkpoint_n, repo, sha256, seq))
             return self._checkpoint()
 
     def require_adoptable(self, *, checkpoint_n: int, repo: str, revision: str, sha256: str,
@@ -576,8 +587,9 @@ class ServiceRuntime:
         The caller runs it BEFORE it installs anything, so a wrong ``--resume-from`` or a stale
         candidate never becomes the lineage root:
 
-        * a revision already in the lineage is re-selected (restart) under the identity it was
-          adopted with (same number, same digest);
+        * a revision already in the lineage is accepted only if it IS the current head (restart,
+          idempotent) under the identity it was adopted with (same number, same digest); an
+          ancestor is refused: the head never moves back;
         * with no checkpoint adopted yet, only the order's root is accepted: the contract's
           ``checkpoint.revision`` AND ``checkpoint.sha256`` (``sha256`` is the caller's digest of
           the published files, the same value ``adopt`` stores);
@@ -600,6 +612,8 @@ class ServiceRuntime:
         if known is not None:
             if known != (checkpoint_n, sha256):
                 raise ValueError("checkpoint revision was already adopted with another identity")
+            if head[0] != revision:
+                raise ValueError(_ANCESTOR_REFUSED.format(revision[:12], head[0][:12]))
             return
         if head is None:
             if revision != root["revision"]:

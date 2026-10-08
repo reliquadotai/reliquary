@@ -225,13 +225,13 @@ async def test_the_legitimate_chain_root_then_child_then_restart_is_adopted(tmp_
         (ROOT,), (NEXT,), (THIRD,)]
     runtime.close()
 
-    # Restart on --resume-from NEXT (an adopted revision, not a child of the current one): re-selected.
+    # Restart on --resume-from THIRD (the head): re-selected, idempotent.
     restarted = build(path, contract, now=1)
-    service, _, _, _ = staged_service(tmp_path, restarted, revision=NEXT, parent=ROOT, checkpoint_n=1, files=child,
-                                      installed=(2, THIRD))
+    service, _, _, _ = staged_service(tmp_path, restarted, revision=THIRD, parent=NEXT, checkpoint_n=2, files=child,
+                                      installed=(1, NEXT))
     await ValidationService._swap_staged_checkpoint(service, 3)
-    service._checkpoint_store.install_external.assert_called_once_with(1, NEXT)
-    assert restarted.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT,
+    service._checkpoint_store.install_external.assert_called_once_with(2, THIRD)
+    assert restarted.checkpoint == {"checkpoint_n": 2, "repo": "models/test", "revision": THIRD,
                                     "sha256": canonical_sha256(child)}
     assert restarted.db.execute("SELECT COUNT(*) FROM service_checkpoints").fetchone()[0] == 3
     # The same revision published with other files is not the revision that was adopted.
@@ -239,7 +239,7 @@ async def test_the_legitimate_chain_root_then_child_then_restart_is_adopted(tmp_
                                           files=FILES, installed=(1, NEXT))
     await ValidationService._swap_staged_checkpoint(service, 4)
     assert_not_installed(service, stage)
-    assert restarted.checkpoint["revision"] == NEXT
+    assert restarted.checkpoint["revision"] == THIRD
     restarted.close()
 
 
@@ -275,7 +275,6 @@ def test_restart_restores_only_a_revision_adopted_in_the_lineage(tmp_path, saved
     runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
     if saved:
         runtime.adopt(checkpoint_n=1, repo="models/test", revision=NEXT, sha256="e" * 64)
-        runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)   # NEXT is not the latest row
     runtime.close()
 
     restored = build(path, contract, now=1)
@@ -288,7 +287,7 @@ def test_restart_restores_only_a_revision_adopted_in_the_lineage(tmp_path, saved
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
     )
     if saved:
-        plan = ValidationService._service_window_plan(service, 2)
+        plan = ValidationService._service_window_plan(service, 2)       # NEXT is the head: idempotent
         assert plan["checkpoint_revision"] == NEXT and plan["window"] == 2
         assert restored.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT, "sha256": "e" * 64}
     else:
@@ -299,3 +298,72 @@ def test_restart_restores_only_a_revision_adopted_in_the_lineage(tmp_path, saved
         restored.ensure_checkpoint(checkpoint_n=7, repo="models/test",
                                    revision=NEXT if saved else ROOT)
     restored.close()
+
+
+def _three_deep(tmp_path):
+    runtime = build(tmp_path / "runtime.sqlite3")
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    runtime.adopt(checkpoint_n=1, repo="models/test", revision=NEXT, sha256=canonical_sha256(FILES))
+    runtime.adopt(checkpoint_n=2, repo="models/test", revision=THIRD, sha256=canonical_sha256(FILES))
+    return runtime
+
+
+def _order(runtime):
+    return runtime.db.execute("SELECT revision, seq FROM service_checkpoints ORDER BY seq").fetchall()
+
+
+@pytest.mark.asyncio
+async def test_j1_a_staged_swap_naming_an_ancestor_is_refused_before_any_mutation(tmp_path):
+    runtime = _three_deep(tmp_path)
+    before = _order(runtime)
+    service, _, stage, _ = staged_service(tmp_path, runtime, revision=NEXT, parent=ROOT, checkpoint_n=1,
+                                          installed=(2, THIRD))
+    await ValidationService._swap_staged_checkpoint(service, 3)
+    assert_not_installed(service, stage)
+    assert runtime.checkpoint["revision"] == THIRD and _order(runtime) == before
+    with pytest.raises(ValueError, match="ancestor of the current lineage head"):
+        runtime.require_adoptable(checkpoint_n=1, repo="models/test", revision=NEXT,
+                                  sha256=canonical_sha256(FILES), parent_revision=ROOT)
+    runtime.close()
+
+
+def test_j1_adopt_and_ensure_checkpoint_never_move_a_row_back_to_the_head(tmp_path):
+    runtime = _three_deep(tmp_path)
+    before = _order(runtime)
+    for revision, number in ((ROOT, 0), (NEXT, 1)):
+        with pytest.raises(ValueError, match="ancestor of the current lineage head"):
+            runtime.ensure_checkpoint(checkpoint_n=number, repo="models/test", revision=revision)
+        with pytest.raises(ValueError, match="ancestor of the current lineage head"):
+            runtime.adopt(checkpoint_n=number, repo="models/test", revision=revision,
+                          sha256=canonical_sha256(FILES) if revision == NEXT else runtime.contract.to_dict()["checkpoint"]["sha256"])
+    assert _order(runtime) == before and runtime.checkpoint["revision"] == THIRD
+    runtime.close()
+
+
+def test_j1_re_adopting_the_head_is_idempotent(tmp_path):
+    runtime = _three_deep(tmp_path)
+    before = _order(runtime)
+    digest = canonical_sha256(FILES)
+    assert runtime.adopt(checkpoint_n=2, repo="models/test", revision=THIRD, sha256=digest)["revision"] == THIRD
+    assert runtime.ensure_checkpoint(checkpoint_n=2, repo="models/test", revision=THIRD)["revision"] == THIRD
+    runtime.require_adoptable(checkpoint_n=2, repo="models/test", revision=THIRD, sha256=digest,
+                              parent_revision=NEXT)
+    assert _order(runtime) == before
+    runtime.close()
+
+
+def test_j1_a_restart_with_resume_from_an_ancestor_is_refused_at_the_boundary(tmp_path):
+    runtime = _three_deep(tmp_path)
+    before = _order(runtime)
+    installed = SimpleNamespace(repo_id="models/test", revision=NEXT, checkpoint_n=1)
+    service = SimpleNamespace(
+        _service_runtime=runtime, _service_schedule_store=SimpleNamespace(take=lambda: None),
+        _checkpoint_store=SimpleNamespace(current_manifest=lambda: installed),
+        env_mix=[(MATH, 16), (CODE, 16)], _emission_cap=0.5,
+        _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
+        _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
+    )
+    with pytest.raises(ValueError, match="ancestor of the current lineage head"):
+        ValidationService._service_window_plan(service, 4)
+    assert _order(runtime) == before and runtime.checkpoint["revision"] == THIRD
+    runtime.close()

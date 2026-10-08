@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import tempfile
 import time
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from reliquary.constants import (
@@ -839,6 +840,17 @@ def _discard_unactivated_service_window(runtime, recovery, window: int) -> None:
     )
 
 
+def _paid_from_archive(archive: dict, batchers: dict) -> dict:
+    """{env: [(batch_index, group-like)]} of a recovered archive's paid rows (identity fields only)."""
+    paid: dict = {name: [] for name in batchers}
+    for row in archive.get("batch") or ():
+        if row.get("env_name") in paid:
+            paid[row["env_name"]].append((row["batch_index"], SimpleNamespace(
+                hotkey=row["hotkey"], prompt_idx=row["prompt_idx"],
+                merkle_root=bytes.fromhex(row["merkle_root"]))))
+    return paid
+
+
 def _require_service_checkpoint_lineage(runtime, *, checkpoint_n, repo, revision, digest, receipt) -> None:
     """I1: the staged checkpoint continues the order's lineage. BLOCKING read (SQLite), no mutation."""
     runtime.require_adoptable(
@@ -898,6 +910,7 @@ class ValidationService:
         # window left unarchived was last retried. Empty for every other task.
         self._service_sealed_windows: set[int] = set()
         self._service_recovery_attempts: dict[int, int] = {}
+        self._service_recovery_context: dict[int, tuple] = {}
         if service_contract is not None:
             from reliquary.constants import FILL_CLOSED_ENABLED, PIPELINED_WINDOWS, ENFORCE_ENVELOPE_SIGNATURE
             from reliquary.services.runtime import ServiceRuntime
@@ -2895,16 +2908,12 @@ class ValidationService:
         self._set_window_preparation_stage("service_schedule")
         outcome = await asyncio.to_thread(self._service_window_boundary, target_window)
         for archive in outcome["recovered"]:
-            # What ``_enqueue_aborted_window`` does once a window is archived.
+            # The steps ``_enqueue_aborted_window`` runs once a window is archived.
             window = int(archive["window_start"])
-            self._cache_archived_hashes(archive)
-            self._fill_closed_assemblers.pop(window, None)
-            current = getattr(self, "_fill_closed_assembler", None)
-            if current is not None and current.window_start == window:
-                self._fill_closed_assembler = None
-            self._cooldown_durable_window = max(getattr(self, "_cooldown_durable_window", 0), window)
-            self._service_sealed_windows.discard(window)
-            self._service_recovery_attempts.pop(window, None)
+            batchers, paid = self._service_recovery_context.get(window, (None, None))
+            if paid is None and batchers:
+                paid = _paid_from_archive(archive, batchers)
+            self._complete_service_recovery(window, archive, batchers, paid)
         if outcome["attempted"] and outcome.get("rotation_gate") is not None:
             # The store is the truth after a recovery, as at a restart.
             self._fill_closed_rotation_gate = outcome["rotation_gate"]
@@ -6255,6 +6264,11 @@ class ValidationService:
         if runtime is not None:
             # The last step before the archive is committed: nothing that can fail
             # stands between the settlement and ``finish`` but ``finish`` itself.
+            # J2: the window sealed. Persisted BEFORE the settlement so that a restart after a
+            # double fault (settlement and recovery both failed) still recovers it as completed.
+            self._service_sealed_windows.add(archived_window)
+            if FILL_CLOSED_ENABLED and recovery is not None:
+                await asyncio.to_thread(recovery.mark_sealed, archived_window)
             archive = await self._settle_service_archive(runtime, archive)
         if FILL_CLOSED_ENABLED and recovery is not None:
             recovery.finish(archived_window, archive, get_archive_queue())
@@ -6497,6 +6511,45 @@ class ValidationService:
             key, data
         )
 
+    def _complete_service_recovery(self, window: int, archive: dict, batchers: dict | None, paid: dict | None) -> None:
+        """What follows a service window's recovery, whoever ran it (J3).
+
+        Called by the in-process recovery (``_enqueue_aborted_window``) and by the
+        boundary healing (``_prepare_service_window``): the final verdicts of the
+        window's submissions (an aborted window pays no exploration), the verdict
+        window closed, the hash cache kept contiguous, and the per-window memory
+        dropped. ``batchers`` / ``paid`` ({env: [(index, group)]}) are None when
+        the process no longer holds the window (a restart): the verdict records
+        of those submissions are not republished, the rest is identical.
+        """
+        for name, batcher in (batchers or {}).items():
+            if archive.get("window_status") == "aborted":
+                for row in batcher.difficulty_auction_metadata_by_id.values():
+                    if row.get("status") in _SERVICE_EXPLORATION_STATUSES:
+                        row["exploration_fraction"] = 0.0
+                        row["window_aborted"] = True
+            groups = (paid or {}).get(name, [])
+            records = self._auction_final_verdict_records(
+                batcher, paid_groups=[group for _, group in groups],
+                batch_indices={(group.hotkey, group.prompt_idx, bytes(group.merkle_root)): index
+                               for index, group in groups},
+            )
+            if records is not None:
+                self.server.persist_final_verdicts(records)
+                batcher._auction_final_verdicts_published = True
+        self.server.complete_final_verdict_window(window)
+        # Keep the hash recovery cache contiguous; a gap stalls it for good.
+        self._cache_archived_hashes(archive)
+        self._fill_closed_assemblers.pop(window, None)
+        current = getattr(self, "_fill_closed_assembler", None)
+        if current is not None and current.window_start == window:
+            self._fill_closed_assembler = None
+        self._archive_enqueued_windows.add(window)
+        self._cooldown_durable_window = max(getattr(self, "_cooldown_durable_window", 0), window)
+        self._service_sealed_windows.discard(window)
+        self._service_recovery_attempts.pop(window, None)
+        self._service_recovery_context.pop(window, None)
+
     def _enqueue_aborted_window(
         self,
         *,
@@ -6564,29 +6617,18 @@ class ValidationService:
                         sealed=window_start in self._service_sealed_windows,
                     )
                 except Exception:
+                    # Kept for the boundary healing (``_recover_leftover_service_windows``): the
+                    # same post-recovery steps run there with these batchers and paid groups.
+                    self._service_recovery_context[window_start] = (dict(batchers), paid)
                     # ``recover`` wrote the window's rotation barrier before it failed.
                     # The store is the truth after a recovery (as below and at a
                     # restart): the next window still waits for the trainer.
                     self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
                     raise
-                self._service_sealed_windows.discard(window_start)
-                self._service_recovery_attempts.pop(window_start, None)
             if getattr(self, "_service_runtime", None) is not None:
-                for name, batcher in batchers.items():
-                    if archive.get("window_status") == "aborted":
-                        for row in batcher.difficulty_auction_metadata_by_id.values():
-                            if row.get("status") in _SERVICE_EXPLORATION_STATUSES:
-                                row["exploration_fraction"] = 0.0
-                                row["window_aborted"] = True
-                    records = self._auction_final_verdict_records(
-                        batcher, paid_groups=[group for _, group in paid[name]],
-                        batch_indices={(group.hotkey, group.prompt_idx, bytes(group.merkle_root)): index
-                                       for index, group in paid[name]},
-                    )
-                    if records is not None:
-                        self.server.persist_final_verdicts(records)
-                        batcher._auction_final_verdicts_published = True
-                self.server.complete_final_verdict_window(window_start)
+                self._complete_service_recovery(window_start, archive, batchers, paid)
+                self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+                return
             # Keep the hash recovery cache contiguous; a gap stalls it for good.
             self._cache_archived_hashes(archive)
             self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()

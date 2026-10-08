@@ -1176,6 +1176,98 @@ async def test_a_crash_after_the_seal_settlement_of_an_exploration_only_window_k
 
 
 @pytest.mark.asyncio
+async def test_j2_a_double_fault_then_a_restart_keeps_the_sealed_window_completed_and_paid(
+        monkeypatch, tmp_path, caplog):
+    """J2: settlement and recovery both fail, the process dies: the record itself says the window sealed."""
+    contract = contract_v2()
+    started = service_module.time.time()
+    svc = _service(monkeypatch, tmp_path, contract, started=started)
+    archives = _journal(svc, monkeypatch, tmp_path)
+    runtime, recovery = svc._service_runtime, svc._fill_closed_recovery_store
+    batchers = await _open(svc)
+    paid = _explore(svc)
+    assert "sealed" not in recovery.load(1)                              # nothing marked before the seal
+    monkeypatch.setattr(runtime, "reconcile_archive", MagicMock(side_effect=SettlementError("unit: down")))
+    _seal(svc)
+    with pytest.raises(SettlementError):
+        await svc._archive_window(dict(batchers), {name: ([], {}) for name in batchers})
+    with pytest.raises(SettlementError):                                 # the in-process recovery fails as well
+        svc._enqueue_aborted_window(failure_stage="archive_enqueue", failure_type="SettlementError")
+    assert recovery.load(1)["sealed"] is True and archives.pending_archives(start_window=1, end_window=1) == {}
+    runtime.close()
+
+    # The next process: no in-memory marker at all, only the record on disk.
+    restarted = _runtime(tmp_path / "service", contract, started)
+    again = FillClosedRecoveryStore(tmp_path / "state")
+    archive = again.recover(1, queue=svc._training_payload_queue, archives=archives,
+                            rotation=svc._fill_closed_rotation_store, service_runtime=restarted)
+    assert archive["window_status"] == "completed" and archive["batch"] == []
+    assert archive["rewards_by_hotkey"] == {"explorer": pytest.approx(_exploration_price(CAP * 0.5))}
+    assert restarted.log.is_scanned(MATH, 9) and restarted.window_disposition(1) == "settled"
+    statuses = [event["status"] for _, event in restarted.events(limit=1000)
+                if event["id"] == paid["observation_id"] and event["type"] == "settle"]
+    assert statuses[-1] == "exploration_paid" and again.windows() == []
+    restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_j2_a_window_that_never_sealed_is_not_marked_and_a_restart_aborts_it(monkeypatch, tmp_path):
+    contract = contract_v2()
+    started = service_module.time.time()
+    svc = _service(monkeypatch, tmp_path, contract, started=started)
+    archives = _journal(svc, monkeypatch, tmp_path)
+    await _open(svc)
+    _explore(svc)
+    assert "sealed" not in svc._fill_closed_recovery_store.load(1)
+    svc._service_runtime.close()
+    restarted = _runtime(tmp_path / "service", contract, started)
+    archive = FillClosedRecoveryStore(tmp_path / "state").recover(
+        1, queue=svc._training_payload_queue, archives=archives, rotation=svc._fill_closed_rotation_store,
+        service_runtime=restarted)
+    assert archive["window_status"] == "aborted" and archive["rewards_by_hotkey"] == {}
+    restarted.close()
+
+
+def _verdict_spies(svc, monkeypatch):
+    calls = {"records": [], "complete": [], "helper": []}
+    real_records, real_helper = svc._auction_final_verdict_records, svc._complete_service_recovery
+    monkeypatch.setattr(svc, "_auction_final_verdict_records", lambda batcher, **kw: (
+        calls["records"].append((batcher.window_start, kw.get("paid_groups") is not None)),
+        real_records(batcher, **kw))[1])
+    monkeypatch.setattr(svc, "_complete_service_recovery", lambda window, *a, **kw: (
+        calls["helper"].append(window), real_helper(window, *a, **kw))[1])
+    monkeypatch.setattr(svc.server, "complete_final_verdict_window", lambda window: calls["complete"].append(window))
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_j3_a_window_healed_at_the_boundary_runs_the_same_post_recovery_steps_as_the_in_process_one(
+        monkeypatch, tmp_path):
+    """J3: final verdicts + verdict window closed on BOTH paths, through one helper."""
+    # In-process: the seal's settlement fails once, the recovery in the handler succeeds.
+    (tmp_path / "a").mkdir()
+    svc = _service(monkeypatch, tmp_path / "a")
+    _journal(svc, monkeypatch, tmp_path / "a")
+    _broken_settlement(svc, monkeypatch, failures=1)
+    inprocess = _verdict_spies(svc, monkeypatch)
+    await _run(svc, monkeypatch, windows=1, mid_window=lambda window: _pay_one_group_per_env(svc) if window == 1 else None)
+    assert inprocess["helper"] == [1] and 1 in inprocess["complete"]
+    in_process_records = [call for call in inprocess["records"] if call[0] == 1]
+    assert len(in_process_records) == 2 and all(paid for _, paid in in_process_records)
+
+    # Boundary: seal, recovery and handler all fail; the boundary of window 2 heals it.
+    (tmp_path / "b").mkdir()
+    svc = _service(monkeypatch, tmp_path / "b")
+    _journal(svc, monkeypatch, tmp_path / "b")
+    _broken_settlement(svc, monkeypatch, failures=3)
+    healed = _verdict_spies(svc, monkeypatch)
+    await _run(svc, monkeypatch, windows=2, mid_window=lambda window: _pay_one_group_per_env(svc) if window == 1 else None)
+    assert healed["helper"] == [1] and 1 in healed["complete"]
+    assert [call for call in healed["records"] if call[0] == 1] == in_process_records
+    assert svc._service_recovery_context == {} and svc._service_recovery_attempts == {}
+
+
+@pytest.mark.asyncio
 async def test_a_committed_archive_is_enqueued_again_as_it_is_and_never_settled_again(monkeypatch, tmp_path):
     contract = contract_v2()
     svc = _service(monkeypatch, tmp_path, contract)

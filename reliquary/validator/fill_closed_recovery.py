@@ -93,6 +93,11 @@ class FillClosedRecoveryStore:
             "schema_version", "window_start", "identity", "parent_checkpoint_n",
             "parent_revision", "environments", "batch_targets", "archive",
         }
+        if isinstance(value, dict) and "sealed" in value:
+            # J2: the service seal marks the record before it settles; absent from every other record.
+            if value["sealed"] is not True:
+                raise ValueError("invalid active window record")
+            base_keys = base_keys | {"sealed"}
         if not isinstance(value, dict) or type(value.get("schema_version")) is not int:
             raise ValueError("invalid active window record")
         schema_version = value["schema_version"]
@@ -184,6 +189,19 @@ class FillClosedRecoveryStore:
         })
         self.load(window)
 
+    def mark_sealed(self, window: int) -> None:
+        """J2: persist that ``window`` reached its seal, BEFORE the seal settles it (service tasks only).
+
+        ``recover`` reads it, so a restart after a double fault (the settlement and the recovery
+        both failed) still archives an exploration-only window as completed, not aborted.
+        """
+        record = self.load(window)
+        if record.get("sealed") is True:
+            return
+        record["sealed"] = True
+        write_json(self._path(window), record)
+        self.load(window)
+
     def quarantine_uncommitted(self, queue_dir: Path) -> None:
         """Only a known active window permits discarding an unpaid staging body."""
         commit_dir = queue_dir / "journal_commits"
@@ -235,7 +253,9 @@ class FillClosedRecoveryStore:
 
         ``sealed`` is read for a service task only: the window reached its seal (its
         archive step failed afterwards), so it is settled NOT aborted even when no
-        training group was paid, and what it owes for exploration stays owed.
+        training group was paid, and what it owes for exploration stays owed. The record's own
+        ``sealed`` marker (``mark_sealed``, written before the seal settles) counts the same, so
+        the knowledge survives a restart.
         """
         record = self.load(window)
         if record["archive"] is not None:
@@ -345,7 +365,7 @@ class FillClosedRecoveryStore:
                 # sealed: the caller says so, or the runtime already settled it not
                 # aborted (the process died between that settlement and ``finish``).
                 # Same disposition as the seal's, whatever the number of attempts.
-                if not rows and (sealed is True or service_runtime.window_disposition(window) == "settled"):
+                if not rows and (sealed is True or record.get("sealed") is True or service_runtime.window_disposition(window) == "settled"):
                     archive["window_status"] = "completed"
                 archive = service_runtime.reconcile_archive(
                     archive, aborted=archive["window_status"] == "aborted",
