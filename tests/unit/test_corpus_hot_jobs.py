@@ -434,6 +434,18 @@ def test_job_drained_needs_every_submission_judged_and_every_verdict_settled():
         async def list_verdict_ids(self, job_id):
             return self.verdicts
 
+        async def list_submission_ids(self, job_id):
+            return ["s1"]
+
+        async def read_job(self, job_id):
+            from reliquary.corpus.job import parse_job
+
+            return parse_job(_manifest()), None
+
+        async def read_ledgers(self, job_id):
+            return {"schema": "reliquary/corpus-ledgers/v2", "slots": {},
+                    "cursors": {}, "seen_pending": [], "seen_segments": []}, None
+
         async def read_settlement(self, job_id):
             return self.state, None
 

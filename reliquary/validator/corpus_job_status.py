@@ -108,6 +108,16 @@ def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:
 async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
     """What the bucket says of a job's drain, by listing it: the counts
     `jobs status` prints and the admin service proxies."""
+    from reliquary.validator.corpus_service import rebuild_ledgers
+
+    # These reads must use the record store's own bucket, not ambient storage
+    # defaults. An implementation without them cannot certify a drain.
+    job, _ = await records.read_job(job_id)
+    before, before_etag = await records.read_ledgers(job_id)
+    before = {} if before is None else before
+    pending_records = len(rebuild_ledgers(job, before).records) if job is not None else 0
+    if job is None and before:
+        raise ValueError("stored ledger has no job manifest")
     submissions = set(await records.list_submission_ids(job_id))
     verdicts = set(await records.list_verdict_ids(job_id))
     state, _ = await records.read_settlement(job_id)
@@ -116,13 +126,21 @@ async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
     pending = state.get("pending")
     unaudited = len(submissions - verdicts)
     unsettled = len(verdicts - settled)
+    after, after_etag = await records.read_ledgers(job_id)
+    after = {} if after is None else after
+    after_pending = len(rebuild_ledgers(job, after).records) if job is not None else 0
+    if job is None and after:
+        raise ValueError("stored ledger has no job manifest")
+    pending_records = max(pending_records, after_pending)
     return {
         "submissions": len(submissions), "verdicts": len(verdicts), "unaudited": unaudited,
         "settled": len(settled), "unsettled": unsettled,
+        "pending_records": pending_records,
         "pending_window": (pending.get("window", pending.get("work_period"))
                            if pending else None),
         "last_window": state.get("last_window"),
-        "drained": unaudited == 0 and unsettled == 0 and pending is None,
+        "drained": (unaudited == 0 and unsettled == 0 and pending is None
+                    and pending_records == 0 and before_etag == after_etag and before == after),
     }
 
 

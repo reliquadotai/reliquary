@@ -109,6 +109,10 @@ class _FakeBox:
         self.writes.append(path)
 
     async def run(self, argv, env):
+        if argv[:1] == ["git"]:
+            # The index refresh before the env's setup: an event, not an action.
+            self.events.append(("git", list(argv[1:])))
+            return types.SimpleNamespace(stdout="", exit_code=0)
         self.runs.append(list(argv))
         if argv[:2] == ["sh", "-c"]:
             return types.SimpleNamespace(stdout=self.python + "\n", exit_code=0)
@@ -187,6 +191,7 @@ def test_replay_prepares_the_bash_harness_like_the_miner_before_the_network_cut(
     task.setup = setup
     _fake_verifiers(monkeypatch, box)
     asyncio.run(agentic_replay.replay_swe(task, [Action("bash", "{}", "")]))
+    # No index refresh in a replay box: it must rebuild as the miner's did.
     assert box.events == ["prepare_setup", "task_setup",
                           ("uv_script", "THE BASH HARNESS PROGRAM", {}),
                           ("prepare_execution", [])]

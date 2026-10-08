@@ -6444,6 +6444,7 @@ class ValidatorServer:
                 seen_index=seen_index,
                 # Sets the submit body cap (a single-turn job may be large).
                 job=job,
+                durable_records=False,
             )
         )
         return True

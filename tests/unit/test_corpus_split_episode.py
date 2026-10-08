@@ -88,6 +88,7 @@ class _Stop(Exception):
 class _Link:
     def __init__(self):
         self.accepted_ids = []
+        self.pending_record_arrivals = {}
 
     def accepted(self, job_id, submission_id):
         self.accepted_ids.append((job_id, submission_id))
@@ -116,7 +117,7 @@ def front(monkeypatch, tmp_path):
             "swe-agentic-v2": _episode_job("swe-agentic-v2"),
             "swe-agentic-other": _episode_job("swe-agentic-other", version="e" * 40)}
     # ``fail``: step name -> exceptions to raise there, one per call, in order.
-    calls = SimpleNamespace(migrated=[], intakes=[], leases=[], fail={})
+    calls = SimpleNamespace(migrated=[], recovered=[], intakes=[], leases=[], fail={})
 
     def maybe_fail(step):
         pending = calls.fail.get(step)
@@ -133,8 +134,16 @@ def front(monkeypatch, tmp_path):
         calls.migrated.append(str(job.job_id))
         return None
 
+    async def recover(store, records, job):
+        if job.episode is not None:
+            maybe_fail("recover")
+        assert str(job.job_id) in calls.migrated
+        calls.recovered.append(str(job.job_id))
+        return []
+
     def intake(job, **kw):
         maybe_fail("intake")
+        assert str(job.job_id) in calls.recovered
         calls.intakes.append((str(job.job_id), kw))
         return SimpleNamespace(renderer=R, source=SweSource([("i0", "p"), ("i1", "q")]))
 
@@ -155,6 +164,7 @@ def front(monkeypatch, tmp_path):
     monkeypatch.setattr(corpus_record_store, "BucketRecordStore", _Records)
     monkeypatch.setattr(corpus_judge_threads, "judge_record_store", lambda *a, **kw: _Records())
     monkeypatch.setattr(corpus_service, "migrate_ledgers_at_startup", migrate)
+    monkeypatch.setattr(corpus_service, "recover_pending_records", recover)
     monkeypatch.setattr(corpus_service, "renderer_for_job", lambda job, encode, **kw: object())
     monkeypatch.setattr(modeling, "load_tokenizer", lambda path: fakes.Tokenizer())
     monkeypatch.setattr(corpus_gpu, "read_info", info)
@@ -254,6 +264,8 @@ def test_the_front_serves_an_episode_job_no_group_names(front):
     # The single-turn job still goes to its judge process, as before.
     single = started.served[SINGLE_ID]
     assert single.judge_link is started.link and getattr(single, "grader", None) is None
+    assert single.pending_record_arrivals is started.link.pending_record_arrivals[SINGLE_ID]
+    assert set(front.calls.recovered) == {SINGLE_ID, EPISODE_ID}
 
 
 def test_single_turn_jobs_alone_mount_no_grade_route(front):
@@ -375,6 +387,7 @@ def _listed_jobs(app):
     ("lease", RuntimeError("the replay lease is shorter than the task's replay work")),
     ("registry", OSError("R2 unreachable")),
     ("migrate", OSError("R2 unreachable")),
+    ("recover", OSError("accepted body is not readable")),
 ])
 def test_an_episode_job_that_fails_to_wire_leaves_the_others_served(front, step, exc,
                                                                     monkeypatch):

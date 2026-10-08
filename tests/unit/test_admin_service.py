@@ -31,6 +31,12 @@ class _Records:
     def __init__(self):
         self.subs, self.verdicts, self.settlement = {}, {}, {}
 
+    async def read_job(self, job_id):
+        return await job_store.read_job(job_id)
+
+    async def read_ledgers(self, job_id):
+        return await job_store.read_ledgers(job_id)
+
     async def list_submission_ids(self, job_id):
         return sorted(self.subs)
 
@@ -228,6 +234,62 @@ def test_reviewed_zero_cap_manifest_is_read_only_then_created_and_replayed(admin
     assert status["manifest"] == contract["manifest"]
     assert status["manifest_sha256"] == contract["manifest_sha256"]
     assert status["profile_sha256"] == contract["profile_sha256"]
+
+
+def test_operator_generation_review_create_and_replay_keep_pinned_scoped_contract(admin):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    job_id = "math-gen-ops-01234567-89ab-4cde-8fab-0123456789ab"
+    body = _job(job_id, task_id=job_id, cap=0.0, prompt_count=2,
+                samples_per_prompt=1, max_new_tokens=32)
+    before = dict(admin.bucket.objects)
+    for path in ("/admin/v1/jobs/validate", "/admin/v1/jobs"):
+        assert admin.client.post(path, json=body).status_code == 401
+    review = admin("POST", "/admin/v1/jobs/validate", body)
+    assert review.status_code == 200, review.text
+    contract = review.json()
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
+    assert contract["manifest"]["submit"] == "scoped"
+    assert contract["manifest"]["checkpoint_repo"] == MODEL
+    assert contract["manifest"]["checkpoint_revision"] == MODELS[MODEL]["revision"]
+    assert contract["manifest"]["checkpoint_sha256"] == MODELS[MODEL]["checkpoint_sha256"]
+    assert contract["manifest_sha256"] == canonical_sha256(contract["manifest"])
+    pinned = {**body, "manifest_sha256": contract["manifest_sha256"],
+              "profile_sha256": contract["profile_sha256"]}
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 200
+    stored = asyncio.run(job_store.read_job(job_id))[0]
+    assert stored.to_contract() == contract["manifest"]
+    assert stored.submit == "scoped"
+    assert admin.registry["entries"][job_id].params["cap"] == 0.0
+    # Operator work never writes a commercial order or qualification record.
+    assert not any("eval" in key for key in admin.bucket.objects)
+
+
+@pytest.mark.parametrize("path", ["/admin/v1/jobs/validate", "/admin/v1/jobs"])
+@pytest.mark.parametrize("change", [
+    {"task_id": None},
+    {"task_id": "math-gen-other"},
+    {"task_id": "math-gen-ops-01234567-89ab-4cde-8fab-0123456789ac"},
+    {"job_id": "math-gen-other"},
+    {"job_id": "math-gen-ops-fresh", "task_id": "math-gen-ops-fresh"},
+    {"job_id": "math-gen-ops-01234567-89ab-1cde-8fab-0123456789ab",
+     "task_id": "math-gen-ops-01234567-89ab-1cde-8fab-0123456789ab"},
+    {"model": "org/Unknown"},
+    {"sampling": {"temperature": 1.0}},
+    {"qualification_id": "math-q1"},
+    {"cap": None},
+])
+def test_operator_generation_refuses_other_ids_or_unpinned_fields_before_write(admin, path, change):
+    job_id = "math-gen-ops-01234567-89ab-4cde-8fab-0123456789ab"
+    body = _job(job_id, task_id=job_id, cap=0.0, prompt_count=2,
+                samples_per_prompt=1, max_new_tokens=32)
+    before = dict(admin.bucket.objects)
+    response = admin("POST", path, {**body, **change})
+    assert response.status_code == 422, response.text
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
 
 
 def test_review_hash_changes_are_refused_before_a_write(admin):
