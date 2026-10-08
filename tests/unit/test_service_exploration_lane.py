@@ -566,29 +566,69 @@ def test_a_proof_that_could_not_judge_the_group_is_no_verdict(tmp_path, stage):
     rt, b, pending = _drawn(tmp_path, "hk")
     _audit(b, pending, verified=None, stage=stage)
     assert not rt.exploration_banned("hk")
-    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_audit_queued"
+    # R25: the validator could not judge it: unaudited, reason validator_lost (no horizon), unpaid, no ban
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_unaudited"
     (entry,) = rt.ledger.rows(1, environment=MATH)
-    assert entry["audit"] == "queued" and entry["status"] == "reserved"
+    assert entry["audit"] == "unaudited" and entry["status"] == "reserved"
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "validator_lost"
+    assert b.proof_failure_debt("hk") == 0                    # M7: a validator-side stage never charges the miner
 
 
-def test_r21_a_cap_the_proof_finds_is_not_a_failed_audit_and_not_a_pass(tmp_path):
-    rt, b, pending = _drawn(tmp_path, "hk")
+@pytest.mark.parametrize("stage, debt", [("service_contract", 0), ("service_proof_capability", 0), ("grail", 1),
+                                         ("termination", 1)])
+def test_m7_only_a_real_proof_failure_adds_hotkey_debt_never_an_inconclusive_stage(tmp_path, stage, debt):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    b._reject(RejectReason.GRAIL_FAIL, hotkey="hk", prompt_idx=7, reject_stage=stage)
+    assert b.proof_failure_debt("hk") == debt
 
+
+def _cap_found_by_the_proof(b):
     def prove(p, model=None, audit=False):
         assert audit is True
         p.truncated_indices = (LAST,)             # what `_verify_expensive` merges when the proof finds a cut
-        return SimpleNamespace(hotkey="hk")
+        return SimpleNamespace(hotkey=p.hotkey)
     b._verify_expensive = prove
+
+
+def test_r26_a_cap_the_proof_finds_on_a_rollout_admission_saw_terminated_is_a_failed_audit_and_a_ban(tmp_path, monkeypatch):
+    monkeypatch.setattr("reliquary.shared.modeling.resolve_eos_token_ids", lambda model, tokenizer: {99})
+    rt, b, pending = _drawn(tmp_path, "forger")
+    pending.request.rollouts[LAST].commit["tokens"] = [1] + [2] * 10 + [99]      # the forged trailing EOS
+    _cap_found_by_the_proof(b)
     b._execute_exploration_audit(pending, model=None)
-    assert not rt.exploration_banned("hk")
+    assert rt.exploration_banned("forger")
+    row = b.difficulty_auction_metadata_by_id[id(pending)]
+    assert row["status"] == "exploration_forfeited" and row["exploration_fraction"] == 0.0
+    (entry,) = rt.ledger.rows(1, environment=MATH)
+    assert entry["audit"] == "failed" and entry["status"] == "forfeited"
+    b.finalize_service_exploration()
+    assert rt.ledger.payable(1, environment=MATH) == {}
+
+
+def test_r26_a_cap_the_proof_finds_when_admission_had_no_eos_ids_is_no_verdict_validator_lost(tmp_path, monkeypatch):
+    monkeypatch.setattr("reliquary.shared.modeling.resolve_eos_token_ids", lambda model, tokenizer: set())
+    rt, b, pending = _drawn(tmp_path, "hk")
+    pending.request.rollouts[LAST].commit["tokens"] = [1] + [2] * 10 + [99]
+    _cap_found_by_the_proof(b)
+    b._execute_exploration_audit(pending, model=None)
+    assert not rt.exploration_banned("hk")                                # no evidence of a forgery: no sanction
     row = b.difficulty_auction_metadata_by_id[id(pending)]
     assert row["status"] == "exploration_unaudited" and row["exploration_fraction"] == 0.0
     (entry,) = rt.ledger.rows(1, environment=MATH)
-    assert entry["audit"] == "queued"                 # no verdict: it ends unaudited (unpaid, no ban)
+    assert entry["audit"] == "unaudited" and rt.ledger.unaudited_reason(pending.service_observation_id) == "validator_lost"
     b.finalize_service_exploration()
-    (entry,) = rt.ledger.rows(1, environment=MATH)
-    assert entry["audit"] == "unaudited" and rt.ledger.payable(1, environment=MATH) == {}
+    assert rt.ledger.payable(1, environment=MATH) == {}
     assert b.difficulty_auction_metadata_by_id[id(pending)]["exploration_fraction"] == 0.0
+
+
+def test_r26_a_cap_on_a_rollout_without_a_trailing_eos_is_no_evidence_of_a_forgery_even_with_eos_ids(tmp_path, monkeypatch):
+    monkeypatch.setattr("reliquary.shared.modeling.resolve_eos_token_ids", lambda model, tokenizer: {99})
+    rt, b, pending = _drawn(tmp_path, "hk")                               # the default tokens end in 2, not in an EOS
+    _cap_found_by_the_proof(b)
+    b._execute_exploration_audit(pending, model=None)
+    assert not rt.exploration_banned("hk")
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "validator_lost"
 
 
 def test_a_forged_termination_stays_a_failed_audit_on_the_service_path(tmp_path):
@@ -910,3 +950,327 @@ def test_a_legacy_batcher_reaches_none_of_the_service_lane_code(monkeypatch):
     assert b._exploration_pending == {} and b._exploration_executor is None
     b._verify_expensive = lambda p, model=None, audit=False: SimpleNamespace(hotkey="x")
     assert b._execute_scheduled_proof(pending, model=None, count_operator_debt=True) is not None
+
+
+# ---------------------------------------------------------------- Fix round 1: I2 (R26), the non-training bound
+
+@pytest.fixture
+def fill_closed(monkeypatch):
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+
+
+def _prepared(rt, b, *, hotkey, prompt, rewards=ZERO):
+    """A graded body through the REAL commit (`accept_prepared_submission`): same request as `make_pending`."""
+    from reliquary.validator.admission import PreparedSubmission
+    pending = make_pending(rt, prompt=prompt, hotkey=hotkey, rewards=rewards)
+    request = pending.request
+    request.prompt_idx, request.drand_round, request.merkle_root = prompt, 3, pending.merkle_root.hex()
+    request._logical_group_reservation, request._retain_payload, request._payload_bytes = None, False, 1000
+    return PreparedSubmission(request=request, completion_texts=[], rewards=list(rewards), rollout_hashes=[],
+                              selection_digest=pending.selection_digest, prompt_content_sha256="a" * 64,
+                              target_content_sha256="b" * 64, attainable_rewards=BINARY)
+
+
+def _retain(b, prepared):
+    """What the HTTP worker does after the commit returns: the request's bytes move to the retained bucket."""
+    request = prepared.request
+    with b._proof_admission_lock:
+        if not request._retain_payload:           # exactly the in-flight release: a cleared flag frees the bytes
+            return
+        b._retained_payload_reservations[id(request)] = (request, request.miner_hotkey, request._payload_bytes)
+        b._retained_payload_bytes += request._payload_bytes
+        b._payload_bytes_by_hotkey[request.miner_hotkey] = b._payload_bytes_by_hotkey.get(request.miner_hotkey, 0) + 1000
+
+
+def test_i2_a_sybil_flood_of_non_training_groups_is_refused_at_the_limit_before_anything_is_retained(fill_closed, tmp_path, monkeypatch):
+    monkeypatch.setattr(constants, "SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV", 3)
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    answers = []
+    for prompt in range(1, 6):
+        prepared = _prepared(rt, b, hotkey="sybil", prompt=prompt)
+        response = b.accept_prepared_submission(prepared)
+        answers.append((response.accepted, response.reason))
+        if response.accepted:
+            assert prepared.request._retain_payload is True
+        else:
+            assert prepared.request._retain_payload is False            # refused BEFORE the payload is retained
+    assert answers[:3] == [(True, RejectReason.ACCEPTED)] * 3
+    assert answers[3:] == [(False, RejectReason.RATE_LIMITED)] * 2
+    assert b.rejected_submissions[-1].reject_stage == "service_non_training_limit"
+    assert len(b._pending) == 3
+    other = b.accept_prepared_submission(_prepared(rt, b, hotkey="honest", prompt=9))
+    assert other.accepted                                                  # another hotkey is not affected
+    training = b.accept_prepared_submission(_prepared(rt, b, hotkey="sybil", prompt=10, rewards=HALF))
+    assert training.accepted                                               # honest training from the same hotkey too
+    assert b._non_training_by_hotkey == {"sybil": 3, "honest": 1}
+
+
+def test_i2_the_per_prompt_cap_applies_to_non_training_groups_too(fill_closed, tmp_path, monkeypatch):
+    monkeypatch.setattr(batcher_module, "MAX_SUBMISSIONS_PER_PROMPT", 2)
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    results = [b.accept_prepared_submission(_prepared(rt, b, hotkey=f"hk{i}", prompt=5)) for i in range(3)]
+    assert [r.accepted for r in results] == [True, True, False]
+    assert results[2].reason is RejectReason.PROMPT_FULL
+    assert b.rejected_submissions[-1].reject_stage == "prompt_capacity"
+    assert b.accept_prepared_submission(_prepared(rt, b, hotkey="hk9", prompt=6)).accepted   # another prompt is free
+
+
+def test_i2_the_limit_is_a_service_constant_and_the_guard_keeps_legacy_admission_unchanged(monkeypatch):
+    assert constants.SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV == 32
+    legacy = _make_batcher()
+    pending = SimpleNamespace(hotkey="hk", prompt_idx=1, service_lane=None)
+    assert legacy._service_non_training_refusal(pending) is None
+    legacy._note_service_non_training(pending)
+    assert legacy._non_training_by_hotkey == {} and legacy._non_training_per_prompt == {}
+
+
+def test_i2_the_bytes_of_a_group_that_is_not_entitled_are_released_at_once(fill_closed, tmp_path):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    first = _prepared(rt, b, hotkey="a", prompt=7)
+    assert b.accept_prepared_submission(first).accepted
+    _retain(b, first)
+    b.flush_service_admissions()
+    assert b._retained_payload_bytes == 1000                              # entitled (first scan): held until its draw
+    second = _prepared(rt, b, hotkey="b", prompt=7)                       # the same never-scanned prompt: "already_scanned"
+    assert b.accept_prepared_submission(second).accepted
+    _retain(b, second)
+    b.flush_service_admissions()
+    assert b._retained_payload_bytes == 1000 and second.request._retain_payload is False   # only the entitled one is held
+    assert b._payload_bytes_by_hotkey.get("b", 0) == 0
+    assert id(second.request) not in b._retained_payload_reservations
+
+
+def test_i2_when_the_worker_has_not_retained_yet_the_flag_makes_it_release_directly(fill_closed, tmp_path):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    prepared = _prepared(rt, b, hotkey="b", prompt=7)
+    other = _prepared(rt, b, hotkey="a", prompt=7)
+    assert b.accept_prepared_submission(other).accepted
+    b.flush_service_admissions()
+    assert b.accept_prepared_submission(prepared).accepted
+    b.flush_service_admissions()                                          # recorded (and released) before the worker retained
+    assert prepared.request._retain_payload is False                      # so the in-flight release frees the bytes itself
+
+
+def test_i2_an_entitled_group_keeps_its_bytes_until_the_draw_says_it_is_not_audited_and_a_drawn_one_until_its_audit(fill_closed, tmp_path):
+    rt = make_runtime(tmp_path, reward_contract(new_hotkey_audit_groups=1, audit_bps=0))   # the first group is forced, the rest are not drawn
+    b = make_batcher(rt)
+    b._verify_expensive = lambda p, model=None, audit=False: SimpleNamespace(hotkey=p.hotkey)
+
+    def admit(prompt):
+        prepared = _prepared(rt, b, hotkey="old", prompt=prompt)
+        assert b.accept_prepared_submission(prepared).accepted
+        _retain(b, prepared)
+        b.flush_service_admissions()
+        return prepared
+
+    first = admit(1)
+    assert b._retained_payload_bytes == 1000                              # entitled, waiting for the draw: held
+    ready(rt)
+    tick(b)
+    (entry,) = rt.exploration_rows(1, environment=MATH)
+    assert entry["audit"] == "queued" and b._retained_payload_bytes == 1000   # drawn and queued: keeps its tokens
+    b._execute_exploration_audit(b._exploration_pending[entry["observation_id"]], model=None)
+    assert b._retained_payload_bytes == 0                                 # its audit concluded: released
+    admit(2), admit(3)                                                    # past probation now: not drawn
+    assert b._retained_payload_bytes == 2000
+    ready(rt)
+    tick(b)
+    audits = sorted(r["audit"] for r in rt.exploration_rows(1, environment=MATH))
+    assert audits == ["not_drawn", "not_drawn", "passed"]
+    assert b._retained_payload_bytes == 0                                 # not drawn: nothing will audit them, released
+
+
+# ---------------------------------------------------------------- Fix round 1: I4 (no dead wait) and I3/R25 (reasons)
+
+def _lost_setup(tmp_path, scheduler):
+    """A seasoned hotkey with three drawn rows waiting for an audit that the validator will not be able to run."""
+    rt = make_runtime(tmp_path, _seasoned_contract())
+    b = make_batcher(rt, scheduler=scheduler)
+    seasoned = arrive(b, make_pending(rt, hotkey="old", prompt=1))
+    ready(rt)
+    tick(b)
+    rt.record_audit(seasoned["service_observation_id"], passed=True)
+    b._audit_submitted.add(seasoned["service_observation_id"])
+    for prompt in (2, 3, 4):
+        arrive(b, make_pending(rt, hotkey="old", prompt=prompt))
+    ready(rt)
+    return rt, b, seasoned["service_observation_id"]
+
+
+async def _drain_fast(rt, b, monkeypatch):
+    service = _service(rt, [b])
+    _short_bounds(monkeypatch, drain=30.0, probation=0.2)
+    started = time.monotonic()
+    await service._drain_service_exploration([b])
+    return time.monotonic() - started
+
+
+def _assert_lost(rt, b, passed_id):
+    assert rt.ledger.is_finalized(1, environment=MATH)
+    rows = [r for r in rt.ledger.rows(1, environment=MATH) if r["observation_id"] != passed_id]
+    assert len(rows) == 3 and all(r["audit"] == "unaudited" for r in rows)
+    assert {rt.ledger.unaudited_reason(r["observation_id"]) for r in rows} == {"validator_lost"}   # no horizon (R25)
+    assert not rt.exploration_banned("old")
+    for r in rows:
+        settles = [e for e in events(rt, r["observation_id"]) if e["type"] == "settle"]
+        assert settles[-1]["status"] == "exploration_unpaid" and settles[-1]["reason"] == "unaudited"
+
+
+def _stop_scheduler():
+    scheduler = MagicMock()
+    scheduler.submit.return_value.decisions.return_value = ()
+    return scheduler
+
+
+@pytest.mark.asyncio
+async def test_i4_no_proof_scheduler_the_drain_does_not_wait_and_the_rows_are_validator_lost(tmp_path, monkeypatch, caplog):
+    rt, b, passed_id = _lost_setup(tmp_path, None)
+    b._proof_scheduler = None
+    assert b.audits_can_progress() is False
+    with caplog.at_level(logging.ERROR, logger="reliquary"):
+        waited = await _drain_fast(rt, b, monkeypatch)
+    assert waited < 5.0                                                   # not the 30 s bound
+    assert any("audits cannot run" in r.getMessage() for r in caplog.records)
+    _assert_lost(rt, b, passed_id)
+
+
+@pytest.mark.asyncio
+async def test_i4_the_audit_plan_cannot_take_work_the_drain_does_not_wait_and_the_rows_are_validator_lost(tmp_path, monkeypatch):
+    from reliquary.validator.proof_scheduler import ProofPlanClosed
+    scheduler = _stop_scheduler()
+    scheduler.submit.side_effect = ProofPlanClosed("no longer accepts work")
+    rt, b, passed_id = _lost_setup(tmp_path, scheduler)
+    waited = await _drain_fast(rt, b, monkeypatch)
+    assert waited < 5.0 and b._audit_unavailable_logged
+    _assert_lost(rt, b, passed_id)
+
+
+@pytest.mark.asyncio
+async def test_i4_the_audit_plan_was_retired_the_drain_does_not_wait_and_the_rows_are_validator_lost(tmp_path, monkeypatch):
+    scheduler = _stop_scheduler()
+    rt, b, passed_id = _lost_setup(tmp_path, scheduler)
+    b._audit_submitted.update(r["observation_id"] for r in rt.queued_audits(1))     # all handed over...
+    b._audit_handle = scheduler.submit.return_value
+    scheduler.submit.return_value.done.return_value = True                         # ...and the plan is retired
+    waited = await _drain_fast(rt, b, monkeypatch)
+    assert waited < 5.0
+    _assert_lost(rt, b, passed_id)
+
+
+@pytest.mark.asyncio
+async def test_i4_the_dispatch_deadline_passed_the_drain_does_not_wait_and_the_rows_are_validator_lost(tmp_path, monkeypatch):
+    rt, b, passed_id = _lost_setup(tmp_path, _stop_scheduler())
+    base = b._time_fn
+    b._time_fn = lambda: base() + 10 ** 6                                           # far past window_opened_at + bound
+    waited = await _drain_fast(rt, b, monkeypatch)
+    assert waited < 5.0
+    _assert_lost(rt, b, passed_id)
+
+
+@pytest.mark.asyncio
+async def test_i4_the_checkpoint_was_swapped_the_drain_does_not_wait_and_the_rows_are_validator_lost(tmp_path, monkeypatch):
+    from reliquary.validator.proof_scheduler import CheckpointNotReady
+    scheduler = _stop_scheduler()
+    scheduler.submit.side_effect = CheckpointNotReady("plan requires another checkpoint")
+    scheduler.active_checkpoint_revision = "e" * 40                                 # the scheduler moved on
+    rt, b, passed_id = _lost_setup(tmp_path, scheduler)
+    waited = await _drain_fast(rt, b, monkeypatch)
+    assert waited < 5.0
+    _assert_lost(rt, b, passed_id)
+
+
+@pytest.mark.asyncio
+async def test_i4_a_transient_checkpoint_not_ready_is_still_waited_for_up_to_the_bound(tmp_path, monkeypatch):
+    from reliquary.validator.proof_scheduler import CheckpointNotReady
+    scheduler = _stop_scheduler()
+    scheduler.submit.side_effect = CheckpointNotReady("devices not ready")          # same revision: transient
+    rt, b, passed_id = _lost_setup(tmp_path, scheduler)
+    service = _service(rt, [b])
+    _short_bounds(monkeypatch, drain=1.0, probation=0.2)
+    started = time.monotonic()
+    await service._drain_service_exploration([b])
+    assert 0.9 <= time.monotonic() - started < 8.0                                  # the bound, as before
+    rows = [r for r in rt.ledger.rows(1, environment=MATH) if r["observation_id"] != passed_id]
+    # the validator could have audited them: the audit plan was running, so the horizon reason applies
+    assert {rt.ledger.unaudited_reason(r["observation_id"]) for r in rows} == {"unaudited"}
+
+
+@pytest.mark.asyncio
+async def test_r25_the_drain_bound_reached_with_the_plan_running_leaves_rows_that_set_the_horizon(tmp_path, monkeypatch):
+    rt, b, passed_id = _lost_setup(tmp_path, _stop_scheduler())                     # MagicMock plan: running, never completes
+    service = _service(rt, [b])
+    _short_bounds(monkeypatch, drain=1.0, probation=0.2)
+    await service._drain_service_exploration([b])
+    rows = [r for r in rt.ledger.rows(1, environment=MATH) if r["observation_id"] != passed_id]
+    assert rows and {rt.ledger.unaudited_reason(r["observation_id"]) for r in rows} == {"unaudited"}
+
+
+def test_r25_a_proof_that_never_ran_to_a_verdict_is_validator_lost(tmp_path):
+    scheduler = _stop_scheduler()
+    rt, b, passed_id = _lost_setup(tmp_path, scheduler)
+    b._audit_open.clear()                                                          # (the passed row's slot is free)
+    tick(b)                                                                        # hands the audits over
+    open_ids = {j: i for j, i in b._audit_open.items() if i != passed_id}
+    assert len(open_ids) >= 2
+    job_id, identity = next(iter(open_ids.items()))
+    scheduler.submit.return_value.decisions.return_value = (
+        SimpleNamespace(job_id=job_id, status=ProofDecisionStatus.ERROR),)
+    b._reconcile_audit_decisions()
+    assert rt.ledger.unaudited_reason(identity) == "validator_lost"
+
+
+def test_i3_the_finalize_failure_path_forces_validator_lost_even_while_the_plan_runs(tmp_path):
+    rt, b, passed_id = _lost_setup(tmp_path, _stop_scheduler())
+    assert b.audits_can_progress() is True
+    b.finalize_service_exploration(audits_could_run=False)                         # service.py's window-failed path
+    rows = [r for r in rt.ledger.rows(1, environment=MATH) if r["observation_id"] != passed_id]
+    assert {rt.ledger.unaudited_reason(r["observation_id"]) for r in rows} == {"validator_lost"}
+
+
+def test_m5_every_row_status_the_batcher_publishes_for_a_non_trained_group_is_a_known_service_status():
+    import inspect
+    import re
+    from reliquary.validator.service import _SERVICE_EXPLORATION_STATUSES
+    source = inspect.getsource(GrpoWindowBatcher)
+    used = set(re.findall(r'_set_service_row\(\s*\w+,\s*"([a-z_]+)"', source))
+    used |= set(re.findall(r'^\s*"[a-z_]+": "((?:exploration|service)_[a-z_]+|already_scanned)",?$', source, re.M))
+    used |= set(re.findall(r'return "((?:exploration|service)_[a-z_]+)"', source))
+    assert {"exploration_unavailable", "service_record_failed", "service_policy_limit"} <= used
+    assert used - _SERVICE_EXPLORATION_STATUSES == set()
+
+
+def test_i2_both_commit_sites_decide_the_lane_and_refuse_before_the_payload_is_retained():
+    import inspect
+    for method in (GrpoWindowBatcher.accept_prepared_submission, GrpoWindowBatcher._accept_locked):
+        source = inspect.getsource(method)
+        gate = source.index("self._service_non_training_refusal(pending)")
+        assert gate < source.index("request._retain_payload = True") < source.index("self._pending.append(pending)")
+        assert source.rindex("self.confirm_logical_group_reservation(request)") > gate
+        assert source.index("self._note_service_non_training(pending)") > source.index("self._pending.append(pending)")
+
+
+def test_i4_audits_cannot_progress_without_a_scheduler_even_before_any_audit_was_handed_over(tmp_path):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    b._proof_scheduler = None
+    assert b._audit_unavailable_logged is False and b.audits_can_progress() is False
+    b._proof_scheduler = MagicMock()
+    assert b.audits_can_progress() is True
+
+
+@pytest.mark.asyncio
+async def test_r25_what_the_finalize_stop_releases_is_judged_by_the_finalize_not_marked_lost(tmp_path):
+    scheduler = _stop_scheduler()
+    rt, b, passed_id = _lost_setup(tmp_path, scheduler)
+    b._audit_open.clear()
+    tick(b)
+    open_ids = {j: i for j, i in b._audit_open.items() if i != passed_id}
+    job_id, identity = next(iter(open_ids.items()))
+    scheduler.submit.return_value.decisions.return_value = (
+        SimpleNamespace(job_id=job_id, status=ProofDecisionStatus.NOT_NEEDED),)     # released by stop_dispatch
+    b.finalize_service_exploration()                                               # the plan was running
+    assert rt.ledger.unaudited_reason(identity) == "unaudited"                     # horizon reason, not validator_lost

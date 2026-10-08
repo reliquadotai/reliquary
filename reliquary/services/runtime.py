@@ -63,7 +63,8 @@ from reliquary.services.admission_policy import (  # noqa: F401
 )
 from reliquary.services.exploration import (
     AUDIT_DRAW_ROUND_OFFSET, STATUS_FORFEITED, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger,
-    apply_exploration_verdict, exploration_cap, exploration_price, finalize_exploration, record_exploration,
+    UNAUDITED_HORIZON, UNAUDITED_VALIDATOR_LOST, apply_exploration_verdict, exploration_cap, exploration_price,
+    finalize_exploration, record_exploration,
 )
 from reliquary.services.run_log import STATUS_PROVEN_UNPAID, Observation, RunObservationLog, observation_id
 from reliquary.services.settlement import SERVICE_PAYMENT_POLICY_V2, settle_window, validate_service_archive_v2
@@ -254,6 +255,12 @@ class ServiceRuntime:
                                          sigma_min_bps=contract.to_dict()["scoring"]["sigma_min_bps"])
             self.ledger = ExplorationLedger(self.db, order_sha256=contract.sha256)
             self.db.commit()
+            # M9: the admission path reads these on the event loop. ``active()`` is cached for a moment;
+            # the bans are an in-memory copy of the ledger's, loaded here and refreshed by every verdict
+            # that bans (``record_audit``), in the same code path, so a ban binds the next admission.
+            self._active_cache: tuple[float, bool] | None = None
+            self._bans: dict[str, float] = {}
+            self._reload_bans()
         except BaseException:
             self.db.close()
             raise
@@ -294,7 +301,28 @@ class ServiceRuntime:
             if previous != row[2:]:
                 raise ValueError("service consumption projection conflicts with its journal key")
 
+    ACTIVE_CACHE_SECONDS = 1.0
+
+    def _reload_bans(self) -> None:
+        with self.lock:
+            self._bans = {hotkey: float(until) for hotkey, until in self.db.execute(
+                "SELECT hotkey, until FROM exploration_bans WHERE order_id=?", (self.contract.sha256,))}
+
     def active(self, *, now: float | None = None) -> bool:
+        """Whether the order's limits still allow work. With the default clock the answer is cached for
+        ``ACTIVE_CACHE_SECONDS`` (the limits only ever tighten; a stale answer is at most that late).
+        An explicit ``now`` always computes (and does not touch the cache)."""
+        if now is None:
+            cached = self._active_cache
+            current = time.monotonic()
+            if cached is not None and current - cached[0] < self.ACTIVE_CACHE_SECONDS:
+                return cached[1]
+            answer = self._compute_active(None)
+            self._active_cache = (current, answer)
+            return answer
+        return self._compute_active(now)
+
+    def _compute_active(self, now: float | None) -> bool:
         instant = _instant(now)
         with self.lock, self.db:
             start, previous = self.db.execute("SELECT started,clock FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()
@@ -901,8 +929,9 @@ class ServiceRuntime:
                 "inserted": result.inserted}
 
     def exploration_banned(self, hotkey: str, *, now: float | None = None) -> bool:
-        with self.lock:
-            return self.ledger.banned(hotkey, time.time() if now is None else now)
+        """Memory only (no lock, no SQLite): the ban set is refreshed by the verdict that bans (M9)."""
+        until = self._bans.get(hotkey)
+        return until is not None and (time.time() if now is None else now) < until
 
     def record_exploration(self, *, environment, prompt_idx, hotkey, window, rewards, group_id, candidate,
                            token_count, arrived_at: float | None = None, now=None, refuse: str | None = None,
@@ -1136,14 +1165,37 @@ class ServiceRuntime:
                     entry = self._entitlement_row(lost)
                     if not self.ledger.is_finalized(entry[0], environment=entry[1]):
                         self.log.settle(lost, status=STATUS_FORFEITED, proof=_PROOF[entry[2]], at=instant)
+            if kind == "failed":
+                self._reload_bans()  # the ban just committed binds the very next admission
         except (ValueError, OverflowError, sqlite3.OperationalError) as exc:
             logger.error("exploration audit verdict not applied for observation %s (passed=%s): %s: %s",
                          identity, passed, type(exc).__name__, exc)
             return AuditOutcome("not_applied")
         return AuditOutcome(kind, tuple(forfeited))
 
+    def mark_validator_lost(self, identity: str) -> bool:
+        """The validator could not audit this row (R25): it ends ``unaudited`` with the ledger reason
+        ``validator_lost`` (unpaid, unsanctioned, and it sets NO horizon). Narrow on purpose: there is no
+        way to void a row that audits could have judged. Only a row still waiting for its draw or its
+        audit changes. True when the row is unaudited afterwards. The public settle event follows at the
+        finalize."""
+        with self._txn():
+            self.ledger.mark_unaudited(identity, UNAUDITED_VALIDATOR_LOST)
+            state = self.ledger.state(identity)
+            return state is not None and state[0] == "unaudited"
+
+    @staticmethod
+    def _unpaid_reason(row: dict) -> str | None:
+        """The public reason of an unpaid row: ``trained`` (R17), ``unaudited`` for BOTH unaudited reasons
+        (R25: the validator's own incidents are not told apart in public; the ledger keeps the difference)."""
+        if row["status"] == "trained":
+            return "trained"
+        if row["audit"] == "unaudited" and row["status"] == "reserved":
+            return UNAUDITED_HORIZON
+        return None
+
     def _finalize_env(self, window: int, environment: str, *, aborted: bool, at: float,
-                      extra_trained=()) -> list[str]:
+                      extra_trained=(), unaudited_reason: str = UNAUDITED_VALIDATOR_LOST) -> list[str]:
         """THE one place a (window, env) is finalized. Runs inside the caller's transaction.
 
         Every id whose first scan is released gets its settle event (``exploration_unpaid``, with
@@ -1154,16 +1206,17 @@ class ServiceRuntime:
         # The single call site of the ledger's finalize. ``aborted`` is the one transition allowed on a
         # (window, env) the batcher already finalized before it knew the window was aborted.
         released = list(finalize_exploration(self.log, self.ledger, window, environment=environment,
-                                             aborted=aborted, extra_trained=extra_trained))
+                                             aborted=aborted, extra_trained=extra_trained,
+                                             unaudited_reason=unaudited_reason))
         rows = {row["observation_id"]: row for row in self.ledger.rows(window, environment=environment)}
         for identity in released:
             row = rows[identity]  # a forfeited row keeps its label (R8), whatever its audit became
             self.log.settle(identity, status=STATUS_FORFEITED if row["status"] == "forfeited" else STATUS_UNPAID,
-                            proof=_PROOF[row["audit"]], at=at,
-                            reason="trained" if row["status"] == "trained" else None)
+                            proof=_PROOF[row["audit"]], at=at, reason=self._unpaid_reason(row))
         return released
 
-    def finalize_exploration(self, window: int, *, environment: str, now: float | None = None) -> list[str]:
+    def finalize_exploration(self, window: int, *, environment: str, now: float | None = None,
+                             audits_could_run: bool = False) -> list[str]:
         """Freeze the exploration of one (window, env); return the ids left unpaid by it.
 
         SEAL CONTRACT (the caller's, before calling this): stop admitting exploration groups for
@@ -1182,11 +1235,17 @@ class ServiceRuntime:
         ``exploration_unpaid`` settle events published, in this transaction. Idempotent. After
         it the rows never change: a later verdict pays nothing and takes nothing back.
         ``reconcile_archive`` finalizes whatever env was not, so a restart cannot pay an unaudited row.
+
+        ``audits_could_run`` (R25): True only when the validator could have audited what is left (the
+        drain bound was reached with the audit plan running): those rows are ``unaudited`` and set the
+        per-hotkey horizon. By default (False) the validator lost the audit inputs or could not run audits:
+        the rows end ``validator_lost`` (unpaid, unsanctioned, no horizon).
         """
         instant = _instant(now)
+        reason = UNAUDITED_HORIZON if audits_could_run else UNAUDITED_VALIDATOR_LOST
         with self._txn():
             self._environments(window, environment)
-            return self._finalize_env(window, environment, aborted=False, at=instant)
+            return self._finalize_env(window, environment, aborted=False, at=instant, unaudited_reason=reason)
 
     # --- settlement (decision B) ---
     def reconcile_archive(self, archive: dict, *, aborted: bool = False, now: float | None = None) -> dict:
@@ -1308,7 +1367,7 @@ class ServiceRuntime:
                 else:
                     status = STATUS_PAID
                 self.log.settle(row["id"], status=status, proof=_PROOF[entry["audit"]], at=at,
-                                reason="trained" if entry["status"] == "trained" else None)
+                                reason=self._unpaid_reason(entry))
             # An exploration observation without an entitlement was published unpaid, with its reason.
 
     # --- publication / admin reads ---

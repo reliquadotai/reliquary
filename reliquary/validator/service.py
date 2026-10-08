@@ -271,6 +271,7 @@ _SERVICE_EXPLORATION_STATUSES = frozenset({
     "exploration_forfeited", "exploration_unaudited", "exploration_unpaid", "exploration_banned",
     "exploration_cap_reached", "exploration_window_closed", "already_scanned",
     "service_unproven_recording", "service_unproven_published",
+    "exploration_unavailable", "service_record_failed", "service_policy_limit",
 })
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -3911,7 +3912,8 @@ class ValidationService:
            first-come only during the first ``SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS``);
         4. finalize each env. A drain that hits its bound finalizes anyway: the groups left
            unaudited are unpaid, a hotkey's later not-drawn rows then follow the per-hotkey audit
-           horizon (R15), and nobody is sanctioned. It never waits forever and nothing else waits
+           horizon (R15), and nobody is sanctioned. An env whose audits cannot run (I4) is not waited
+           for; its groups end ``validator_lost`` (R25: unpaid, no horizon). It never waits forever and nothing else waits
            on it for longer than the bound.
         """
         from reliquary.constants import (
@@ -3933,6 +3935,7 @@ class ValidationService:
         except Exception:
             period = 3.0
         draw_deadline = started + SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS * period + 1.0
+        blocked_logged: set = set()
         try:
             for batcher in service_batchers:
                 await asyncio.to_thread(batcher.close_service_exploration)
@@ -3946,6 +3949,16 @@ class ValidationService:
                 for batcher in service_batchers:
                     state = await asyncio.to_thread(batcher.exploration_drain_state)
                     waiting_draw += state["pending_draw"]
+                    if not state.get("can_progress", 1):
+                        # I4: audits cannot run for this env (no scheduler, plan unavailable or retired,
+                        # dispatch deadline passed, checkpoint swapped): waiting would only burn the bound.
+                        # What is left ends validator_lost at the finalize (R25).
+                        if (state["past_probation"] or state["probation"]) and batcher not in blocked_logged:
+                            blocked_logged.add(batcher)
+                            logger.error("service window %s env %s: exploration audits cannot run; not waiting "
+                                         "for them (their groups end unaudited, unpaid, not sanctioned)",
+                                         batcher.window_start, getattr(batcher, "service_environment", "?"))
+                        continue
                     waiting_audit += state["past_probation"]
                     waiting_probation += state["probation"]
                 draws_settled = waiting_draw == 0 or now >= draw_deadline
@@ -6594,8 +6607,9 @@ class ValidationService:
             recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
             for batcher in batchers.values():
                 if getattr(batcher, "service_runtime", None) is not None:
-                    # No drain here (the window failed): what is open ends unaudited, unpaid.
-                    batcher.finalize_service_exploration()
+                    # No drain here (the window failed): the validator lost the audit inputs, so what is
+                    # open ends validator_lost (unpaid, unsanctioned, no horizon: R25).
+                    batcher.finalize_service_exploration(audits_could_run=False)
             if getattr(self, "_service_runtime", None) is None:
                 archive = recovery.recover(
                     window_start, queue=self._training_payload_queue_ref(),

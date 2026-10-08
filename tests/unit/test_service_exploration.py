@@ -1110,3 +1110,78 @@ def test_i1_an_admission_refusal_on_a_trained_prompt_leaves_the_training_scan_al
     seat = trained(log, 1)
     refused = admit(pair, obs(1, hotkey="a"), refuse="token_limit")
     assert refused.reason == "already_scanned" and scan_of(log, 1) == seat.observation_id
+
+
+# ---------------------------------------------------------------- R25: the unaudited reason
+
+def sub(tmp_path, name):
+    (tmp_path / name).mkdir()
+    return ledger(tmp_path / name)
+
+
+def finalize_as(book, reason, *, env="math", window=1):
+    with book.db:
+        return book.finalize_window(window, environment=env, unaudited_reason=reason)
+
+
+def test_r25_validator_lost_rows_set_no_horizon_audits_could_run_rows_do(tmp_path):
+    lost, horizon = sub(tmp_path, "a"), sub(tmp_path, "b")
+    for book, reason in ((lost, "validator_lost"), (horizon, "unaudited")):
+        mixed_hotkey(book, "A")                                  # A: drawn row 2 (round 20) never audited; 3 (15), 4 (25), 5 (30)
+        finalize_as(book, reason)
+    # audits could run: the R15 horizon voids A's later rows. The validator lost them: only the queued row is unpaid.
+    assert states(horizon)[4] == ("unaudited", "reserved") and states(horizon)[5] == ("unaudited", "reserved")
+    assert horizon.payable(1, environment="math") == {"A": 2}
+    assert states(lost) == {1: ("passed", "reserved"), 2: ("unaudited", "reserved"), 3: ("not_drawn", "reserved"),
+                            4: ("not_drawn", "reserved"), 5: ("not_drawn", "reserved")}
+    assert lost.payable(1, environment="math") == {"A": 4}
+    for book in (lost, horizon):
+        assert book.db.execute("SELECT COUNT(*) FROM exploration_bans").fetchone()[0] == 0   # never sanctioned
+
+
+def test_r25_the_ledger_records_the_reason_and_the_horizon_reason_is_the_default(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A")
+    finalize(book)                                               # default: audits could run
+    assert [book.unaudited_reason(oid(i)) for i in (1, 2, 3, 4, 5)] == [None, "unaudited", None, "unaudited", "unaudited"]
+    lost = sub(tmp_path, "x")
+    mixed_hotkey(lost, "A")
+    finalize_as(lost, "validator_lost")
+    assert lost.unaudited_reason(oid(2)) == "validator_lost" and lost.unaudited_reason(oid(4)) is None
+    with pytest.raises(ValueError):
+        finalize_as(sub(tmp_path, "y"), "because")
+
+
+def test_r25_a_row_marked_validator_lost_before_the_finalize_sets_no_horizon(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A")
+    with book.db:
+        book.mark_unaudited(oid(2), "validator_lost")
+    assert book.unaudited_reason(oid(2)) == "validator_lost"
+    finalize(book)                                               # even a horizon finalize: this row set none
+    assert states(book)[4] == ("not_drawn", "reserved") and states(book)[5] == ("not_drawn", "reserved")
+    assert book.payable(1, environment="math") == {"A": 4}
+
+
+def test_r25_a_late_failed_audit_on_a_validator_lost_drawn_row_still_bans(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A")
+    finalize_as(book, "validator_lost")
+    kind, _ = verdict(book, 2, False, now=10.0, ban=100)
+    assert kind == "failed" and book.banned("A", 50.0)
+
+
+def test_r25_an_old_ledger_without_the_reason_column_is_migrated_and_reads_as_horizon(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript("""CREATE TABLE exploration_entitlements(
+        observation_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, window INTEGER NOT NULL,
+        environment TEXT NOT NULL, hotkey TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
+        amount REAL NOT NULL, draw_round INTEGER NOT NULL, forced INTEGER NOT NULL,
+        audit TEXT NOT NULL, status TEXT NOT NULL, drawn INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO exploration_entitlements VALUES('%s','%s',1,'math','hk',1,0.1,5,0,'unaudited','reserved',1);""" % (oid(1), ORDER))
+    db.commit()
+    book = ExplorationLedger(db, order_sha256=ORDER)
+    assert book.unaudited_reason(oid(1)) == "unaudited"          # an old row set the horizon, as it did
+    with book.db:
+        book.mark_unaudited(oid(1), "validator_lost")            # the new column works on the migrated table

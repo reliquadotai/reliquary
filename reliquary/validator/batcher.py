@@ -4042,9 +4042,18 @@ class GrpoWindowBatcher:
                     reject_stage="dedup",
                 )
 
+            service_refusal = self._service_non_training_refusal(pending)
+            if service_refusal is not None:
+                self.cancel_logical_group_reservation(request)
+                return self._reject(
+                    service_refusal[0], hotkey=request.miner_hotkey,
+                    prompt_idx=request.prompt_idx, telemetry=telemetry,
+                    reject_stage=service_refusal[1],
+                )
             self.confirm_logical_group_reservation(request)
             request._retain_payload = True
             self._pending.append(pending)
+            self._note_service_non_training(pending)
             if FILL_CLOSED_ENABLED and self.fill_state is not None:
                 self._submit_arrival_proof(pending)
             if pending.service_lane in (None, "training"):
@@ -4675,9 +4684,14 @@ class GrpoWindowBatcher:
             # The HTTP worker releases its in-flight marker after this returns,
             # but the request remains reachable from the auction pool until
             # seal. Transfer its byte accounting to the retained bucket.
+            service_refusal = self._service_non_training_refusal(pending)
+            if service_refusal is not None:
+                self.cancel_logical_group_reservation(request)
+                return reject(*service_refusal)
             self.confirm_logical_group_reservation(request)
             request._retain_payload = True
             self._pending.append(pending)
+            self._note_service_non_training(pending)
             if FILL_CLOSED_ENABLED and self.fill_state is not None:
                 self._submit_arrival_proof(pending)
             if pending.service_lane in (None, "training"):
@@ -6182,6 +6196,11 @@ class GrpoWindowBatcher:
         self._audit_open: dict[str, str] = {}
         self._audit_decisions_seen: set[str] = set()
         self._audit_unavailable_logged = False
+        # R26: non-training acceptances of this (window, env), per hotkey and per prompt (the sybil bound),
+        # and the observations whose retained payload bytes were already released.
+        self._non_training_by_hotkey: dict[str, int] = {}
+        self._non_training_per_prompt: dict[int, int] = {}
+        self._payload_released: set[int] = set()
         self._service_training_receipts: dict[int, str | None] = {}
 
     # --- lane decision -------------------------------------------------------------------------
@@ -6203,6 +6222,57 @@ class GrpoWindowBatcher:
             )
         except ValueError:
             return None
+
+    def _service_non_training_refusal(self, pending) -> tuple[RejectReason, str] | None:
+        """R26, at the commit under ``self._lock`` and BEFORE the payload is retained: refuse a non-training
+        (exploration / unproven) group beyond the per-(hotkey, window, env) limit or the per-prompt cap.
+
+        Reached only under the service guard; a training or undecided group, and every legacy task, is
+        never refused here. Also records the lane on the group (the arrival proof decides it again)."""
+        if (
+            self.service_policy is None
+            or self.service_runtime is None
+            or not FILL_CLOSED_ENABLED
+            or self.fill_state is None
+        ):
+            return None
+        from reliquary.constants import SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV
+
+        lane = self._service_lane_of(pending)
+        if lane is None or lane.lane == "training":
+            return None
+        pending.service_lane = lane.lane
+        if self._non_training_by_hotkey.get(pending.hotkey, 0) >= SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV:
+            return RejectReason.RATE_LIMITED, "service_non_training_limit"
+        if self._non_training_per_prompt.get(pending.prompt_idx, 0) >= MAX_SUBMISSIONS_PER_PROMPT:
+            return RejectReason.PROMPT_FULL, "prompt_capacity"
+        return None
+
+    def _note_service_non_training(self, pending) -> None:
+        """Count an accepted non-training group (the caller holds ``self._lock``)."""
+        if pending.service_lane in (None, "training"):
+            return
+        self._non_training_by_hotkey[pending.hotkey] = self._non_training_by_hotkey.get(pending.hotkey, 0) + 1
+        self._non_training_per_prompt[pending.prompt_idx] = (
+            self._non_training_per_prompt.get(pending.prompt_idx, 0) + 1
+        )
+
+    def _release_observation_payload(self, pending) -> None:
+        """R26: give back the retained payload bytes of one observation (idempotent, any thread).
+
+        Called as soon as the group is known not to need them: not entitled, drawn out of the audit, its
+        audit concluded. If the HTTP worker has not yet moved the group's reservation into the retained
+        bucket, the flag is cleared and it releases directly. The group object itself (tokens) stays until
+        the audit needs it no more or the window ends."""
+        request = pending.request
+        with self._proof_admission_lock:
+            request._retain_payload = False
+            self._payload_released.add(id(pending))
+            entry = self._retained_payload_reservations.pop(id(request), None)
+            if entry is not None:
+                _, hotkey, payload_bytes = entry
+                self._retained_payload_bytes = max(0, self._retained_payload_bytes - payload_bytes)
+                self._release_hotkey_payload_locked(hotkey, payload_bytes)
 
     @staticmethod
     def _service_group_id(pending) -> str:
@@ -6267,11 +6337,13 @@ class GrpoWindowBatcher:
         if self.service_runtime is None:
             # A service policy without a runtime cannot record anything: nothing is owed or published.
             self._set_service_row(pending, "exploration_unavailable")
+            self._release_observation_payload(pending)
             return
         self._set_service_row(pending, "exploration_recording" if lane.lane == "exploration" else "service_unproven_recording")
         with self._exploration_lock:
             if self._exploration_closed:
                 self._set_service_row(pending, "exploration_window_closed")
+                self._release_observation_payload(pending)
                 return
             if self._exploration_executor is None:
                 self._exploration_executor = ThreadPoolExecutor(
@@ -6316,10 +6388,12 @@ class GrpoWindowBatcher:
                 type(exc).__name__, exc, context, getattr(exc, "observation_id", None),
             )
             self._set_service_row(pending, "service_policy_limit")
+            self._release_observation_payload(pending)
             return
         except Exception:
             logger.exception("service exploration group NOT recorded %s", context)
             self._set_service_row(pending, "service_record_failed")
+            self._release_observation_payload(pending)
             return
         identity = result["observation_id"]
         pending.service_observation_id = identity
@@ -6330,6 +6404,7 @@ class GrpoWindowBatcher:
                 pending, "exploration_pending",
                 service_observation_id=identity, exploration_fraction=result["amount"])
             return
+        self._release_observation_payload(pending)  # not entitled: nothing will ever need its payload
         reason = result["reason"]
         status = {
             "already_scanned": "already_scanned",
@@ -6447,7 +6522,26 @@ class GrpoWindowBatcher:
         except Exception:
             logger.exception("service window %s env %s: audit draws failed", self.window_start, self.service_environment)
         self._reconcile_audit_decisions()
+        self._release_undrawn_payloads()
         self._submit_audits(drain=drain)
+
+    def _release_undrawn_payloads(self) -> None:
+        """R26: an entitled group the draw did not select needs no audit: release its payload bytes."""
+        with self._exploration_lock:
+            candidates = [(i, p) for i, p in self._exploration_pending.items() if id(p) not in self._payload_released]
+        if not candidates:
+            return
+        try:
+            rows = {r["observation_id"]: r for r in self.service_runtime.exploration_rows(
+                self.window_start, environment=self.service_environment)}
+        except Exception:
+            logger.exception("service window %s env %s: exploration rows unreadable", self.window_start,
+                             self.service_environment)
+            return
+        for identity, pending in candidates:
+            entry = rows.get(identity)
+            if entry is not None and entry["audit"] == "not_drawn":
+                self._release_observation_payload(pending)
 
     def _submit_audits(self, *, drain: bool) -> None:
         from reliquary.constants import (
@@ -6537,8 +6631,11 @@ class GrpoWindowBatcher:
                 self._audit_open[candidate.job_id] = row["observation_id"]
                 self._set_service_row(self._exploration_pending[row["observation_id"]], "exploration_audit_queued")
 
-    def _reconcile_audit_decisions(self) -> None:
-        """Bookkeeping only: the verdicts were recorded by the audit callable itself."""
+    def _reconcile_audit_decisions(self, *, validator_lost: bool = True) -> None:
+        """Bookkeeping: the verdicts were recorded by the audit callable itself. A handed-over audit that the
+        scheduler ended without running (error, abort, skipped, not needed) is the validator's loss (R25):
+        the row is marked ``validator_lost`` (unpaid, unsanctioned, no horizon) -- except at the finalize
+        (``validator_lost=False``), where what the stop released is judged by the finalize."""
         handle = self._audit_handle
         if handle is None:
             return
@@ -6551,13 +6648,44 @@ class GrpoWindowBatcher:
             if identity is not None and decision.status not in (
                 ProofDecisionStatus.PASSED, ProofDecisionStatus.REJECTED
             ):
-                # The proof never ran to a verdict (not needed, skipped, aborted, error): the row stays
-                # queued and ends unaudited at the finalize -- unpaid, never sanctioned.
+                # The proof never ran to a verdict (not needed, skipped, aborted, error): the row ends
+                # unaudited -- unpaid, never sanctioned.
                 logger.warning("service exploration audit %s ended %s without a verdict", identity, decision.status.value)
+                if validator_lost:
+                    self._mark_validator_lost(identity)
 
     def audits_in_flight(self) -> int:
         with self._exploration_lock:
             return len(self._audit_open)
+
+    def audits_can_progress(self) -> bool:
+        """Whether an audit handed to (or still to be handed to) the scheduler can run (I4/R25).
+
+        False as soon as it cannot: no proof scheduler, the audit plan cannot take work, the plan was
+        retired, its dispatch deadline has passed, or the scheduler runs another checkpoint than this
+        window's (a swap). The seal drain then stops waiting, and what is left ends ``validator_lost``."""
+        from reliquary.constants import FILL_CLOSED_MAX_SECONDS, SERVICE_EXPLORATION_DRAIN_SECONDS
+
+        scheduler = self._proof_scheduler
+        if scheduler is None or self._audit_unavailable_logged:
+            return False
+        try:
+            active = scheduler.active_checkpoint_revision
+        except Exception:
+            active = None
+        if isinstance(active, str) and active != self.current_checkpoint_hash:
+            return False
+        if self._time_fn() >= (self.window_opened_at + FILL_CLOSED_MAX_SECONDS
+                               + SERVICE_EXPLORATION_DRAIN_SECONDS):
+            return False
+        handle = self._audit_handle
+        if handle is not None:
+            try:
+                if handle.done() is True:
+                    return False
+            except Exception:
+                return False
+        return True
 
     def exploration_drain_state(self) -> dict[str, int]:
         """What the seal drain still waits for in this env: ``pending_draw``, and the audits that can still
@@ -6577,6 +6705,7 @@ class GrpoWindowBatcher:
             "pending_draw": backlog["pending_draw"],
             "past_probation": sum(r["past_probation"] for r in waiting) + in_flight,
             "probation": sum(not r["past_probation"] for r in waiting),
+            "can_progress": int(self.audits_can_progress()),
         }
 
     def _execute_exploration_audit(self, pending, *, model) -> "ValidSubmission | None":
@@ -6591,6 +6720,7 @@ class GrpoWindowBatcher:
                     if identity == pending.service_observation_id:
                         # The decision lands in the plan a moment later; do not hold a slot meanwhile.
                         self._audit_open.pop(job_id, None)
+            self._release_observation_payload(pending)  # the audit is over: its bytes are no longer held
         return verified
 
     # A proof that could not judge the group is not a verdict on the miner.
@@ -6603,17 +6733,28 @@ class GrpoWindowBatcher:
                          pending.hotkey, pending.prompt_idx)
             return
         if verified is not None:
-            if set(pending.truncated_indices) - set(caps_at_admission):
-                # R21: the proof found a cap the admission did not see. That is not a forgery and not a
-                # failure; the group cannot be paid on a termination the proof disputes, so it gets no
-                # verdict: it ends unaudited (unpaid, no ban).
+            found = sorted(set(pending.truncated_indices) - set(caps_at_admission))
+            if found and self._admission_saw_termination(pending, found):
+                # R26: admission saw a proper EOS on a rollout the proof finds cut by the length cap: the
+                # termination was forged (a cap-length rollout with a trailing EOS). A failed audit.
+                logger.error("exploration audit %s: the proof found a length-capped rollout (%s) that "
+                             "admission saw terminated: forged termination", identity, found)
+                passed = False
+            elif found:
+                # Admission had no EOS to judge by (no ``eos_token_ids``): no evidence of a forgery, and
+                # the group cannot be paid on a termination the proof disputes. No verdict: the row ends
+                # unaudited, reason validator_lost (R25: no horizon), unpaid and unsanctioned.
                 logger.warning("exploration audit %s: the proof found a length-capped rollout; no verdict", identity)
+                self._mark_validator_lost(identity)
                 self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0,
                                       service_unpaid_reason="truncated")
                 return
-            passed = True
+            else:
+                passed = True
         elif pending.proof_reject_stage in self._AUDIT_INCONCLUSIVE_STAGES:
             logger.error("exploration audit %s inconclusive (%s); no verdict", identity, pending.proof_reject_stage)
+            self._mark_validator_lost(identity)
+            self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0)
             return
         else:
             passed = False
@@ -6626,9 +6767,42 @@ class GrpoWindowBatcher:
                 lost = [self._exploration_pending[i] for i in outcome.forfeited if i in self._exploration_pending]
             for other in lost:
                 self._set_service_row(other, "exploration_forfeited", exploration_fraction=0.0)
+                self._release_observation_payload(other)
         else:
             logger.error("exploration audit verdict for %s (passed=%s) was not applied", identity, passed)
             self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0)
+
+    def _admission_saw_termination(self, pending, indices) -> bool:
+        """Whether admission could judge termination (it had EOS ids) and saw a proper final EOS on every
+        one of ``indices``. Without EOS ids admission cannot tell a cap from a stop: no evidence."""
+        from reliquary.shared.modeling import resolve_eos_token_ids
+
+        try:
+            eos_ids = {int(t) for t in (resolve_eos_token_ids(self.model, self.tokenizer) or ())}
+        except Exception:
+            eos_ids = set()
+        if not eos_ids:
+            return False
+        for index in indices:
+            try:
+                commit = pending.request.rollouts[index].commit
+                tokens = list(commit.get("tokens") or [])
+                meta = commit.get("rollout", {}) or {}
+                start = int(meta.get("prompt_length", 0))
+                length = int(meta.get("completion_length", len(tokens) - start))
+                completion = tokens[start:start + length]
+                if not completion or int(completion[-1]) not in eos_ids:
+                    return False
+            except (TypeError, ValueError, IndexError, AttributeError, OverflowError):
+                return False
+        return True
+
+    def _mark_validator_lost(self, identity: str) -> None:
+        """The validator could not audit this row (R25): unaudited, reason validator_lost, no horizon."""
+        try:
+            self.service_runtime.mark_validator_lost(identity)
+        except Exception:
+            logger.exception("service window %s: row %s not marked validator_lost", self.window_start, identity)
 
     def _apply_audit_verdict(self, identity: str, passed: bool):
         """``record_audit`` with its explicit outcome acted on: a row still awaiting the verdict is retried."""
@@ -6678,15 +6852,22 @@ class GrpoWindowBatcher:
                 payable = False
             self._set_service_row(pending, status, **({} if payable else {"exploration_fraction": 0.0}))
 
-    def finalize_service_exploration(self) -> None:
+    def finalize_service_exploration(self, *, audits_could_run: bool | None = None) -> None:
         """Seal step 3 (the drain is the caller's): stop the audits, freeze the env's exploration.
 
         Idempotent. Whatever is still waiting for a draw or an audit becomes unaudited in the runtime
         (unpaid, never sanctioned). A late audit verdict after this changes no row (R3).
+
+        R25: the rows end with the reason ``unaudited`` (the R15 horizon applies) only when audits could
+        still run; otherwise (no scheduler, plan unavailable or retired, checkpoint swapped) the validator
+        lost them: ``validator_lost``, no horizon. Decided BEFORE the plan is stopped (or forced by the
+        caller: ``False`` when the validator itself failed the window).
         """
         runtime = self.service_runtime
         if runtime is None or getattr(self, "service_environment", None) is None:
             return
+        if audits_could_run is None:
+            audits_could_run = self.audits_can_progress()
         with self._exploration_lock:
             self._exploration_closed = True
             self._audit_closed = True
@@ -6701,9 +6882,10 @@ class GrpoWindowBatcher:
                 self._proof_scheduler.stop_dispatch(self._audit_plan_id)
             except (ValueError, ProofPlanClosed):
                 pass
-        self._reconcile_audit_decisions()
+        self._reconcile_audit_decisions(validator_lost=False)
         try:
-            runtime.finalize_exploration(self.window_start, environment=self.service_environment)
+            runtime.finalize_exploration(self.window_start, environment=self.service_environment,
+                                         audits_could_run=audits_could_run)
         except Exception:
             # reconcile_archive finalizes every env it finds open, so nothing is paid unaudited.
             logger.exception("service window %s env %s: exploration finalize failed",

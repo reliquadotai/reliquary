@@ -892,7 +892,7 @@ def release_failed_audit(rt, held):
 def release_horizon(rt, held):
     # "a" leaves probation, then holds a drawn row never audited: its later not-drawn row is unpaid too.
     assert [r["audit"] for r in rt.ledger.rows(1, environment=MATH)] == ["passed", "queued", "not_drawn"]
-    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0, audits_could_run=True)   # audits could run: R15 horizon
     assert [r["audit"] for r in rt.ledger.rows(1, environment=MATH)] == ["passed", "unaudited", "unaudited"]
 
 
@@ -946,7 +946,8 @@ def test_i1_without_any_training_observation_a_released_prompt_is_free_again(tmp
     held = explore(rt, hotkey="a", prompt=7)
     rt.finalize_exploration(1, environment=MATH, now=10_050.0)
     assert rt.log.is_scanned(MATH, 7) is False and scan_holder(rt, 7) is None
-    assert settle_event(rt, held)["status"] == "exploration_unpaid" and "reason" not in settle_event(rt, held)
+    # R25: the public reason is "unaudited" whatever the ledger reason (validator_lost here: no audit could run)
+    assert settle_event(rt, held)["status"] == "exploration_unpaid" and settle_event(rt, held)["reason"] == "unaudited"
 
 
 def test_i1_the_scan_is_seated_on_the_earliest_surviving_training_observation(tmp_path):
@@ -1071,10 +1072,10 @@ def test_c2_training_a_drawn_prompt_does_not_take_it_out_of_the_audit_queue_nor_
     rt, passed, drawn, behind = seasoned_hotkey_with_a_drawn_row_on_a_prompt_it_then_trains(tmp_path)
     assert [row["observation_id"] for row in rt.queued_audits(1)] == [drawn["observation_id"]]
     assert rt.exploration_backlog(1) == {"pending_draw": 0, "queued": 1, "queued_past_probation": 1}
-    released = rt.finalize_exploration(1, environment=MATH, now=20_050.0)   # the audit was never run
+    released = rt.finalize_exploration(1, environment=MATH, now=20_050.0, audits_could_run=True)   # the audit was never run
     assert released == [drawn["observation_id"], behind["observation_id"]]  # the row behind it is unpaid too
     assert rt.ledger.payable(1, environment=MATH) == {"x": 1}
-    assert settle_event(rt, drawn)["reason"] == "trained" and "reason" not in settle_event(rt, behind)
+    assert settle_event(rt, drawn)["reason"] == "trained" and settle_event(rt, behind)["reason"] == "unaudited"
     assert not rt.exploration_banned("x", now=20_051.0)
     # and the late verdict of that row still bans
     assert rt.record_audit(drawn["observation_id"], passed=False, now=20_100.0).failed
@@ -1615,3 +1616,96 @@ def test_i2_the_runtime_tells_how_a_window_was_last_settled(tmp_path):
     rt.reconcile_archive(archive(1), aborted=True, now=200.0)           # the last call is the answer
     assert rt.window_disposition(1) == "aborted"
     rt.close()
+
+
+# ---------------------------------------------------------------- Fix round 1 (task 12): R25 reasons, M9 cache
+
+def _drawn_unaudited_row(tmp_path):
+    rt = runtime(tmp_path)
+    held = explore(rt, hotkey="x", prompt=7)
+    assert draw(rt) == [held["observation_id"]]
+    return rt, held
+
+
+@pytest.mark.parametrize("could_run, ledger_reason", [(True, "unaudited"), (False, "validator_lost")])
+def test_r25_the_ledger_keeps_the_reason_and_the_public_event_says_unaudited_for_both(tmp_path, could_run, ledger_reason):
+    rt, held = _drawn_unaudited_row(tmp_path)
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0, audits_could_run=could_run)
+    assert rt.ledger.unaudited_reason(held["observation_id"]) == ledger_reason
+    event = settle_event(rt, held)
+    assert (event["status"], event["reason"]) == ("exploration_unpaid", "unaudited")   # validator incidents are not told apart
+    assert not rt.exploration_banned("x", now=10_051.0)
+
+
+def test_r25_finalize_defaults_to_validator_lost_and_reconcile_archive_finalizes_what_is_open_as_lost(tmp_path):
+    rt, held = _drawn_unaudited_row(tmp_path)
+    rt.reconcile_archive(archive(), now=10_050.0)                       # the restart / recovery path: nothing finalized it
+    assert rt.ledger.unaudited_reason(held["observation_id"]) == "validator_lost"
+    other = tmp_path / "second"
+    rt2, held2 = _drawn_unaudited_row(other)
+    rt2.finalize_exploration(1, environment=MATH, now=10_050.0)          # no audit-could-run claim: the validator's loss
+    assert rt2.ledger.unaudited_reason(held2["observation_id"]) == "validator_lost"
+
+
+def test_r25_validator_lost_does_not_void_the_hotkeys_later_not_drawn_rows_a_real_horizon_does(tmp_path):
+    rt, passed, drawn, behind = seasoned_hotkey_with_a_drawn_row_on_a_prompt_it_then_trains(tmp_path / "lost")
+    rt.finalize_exploration(1, environment=MATH, now=20_050.0)
+    assert rt.ledger.payable(1, environment=MATH) == {"x": 2}            # passed + behind (the trained row is unpaid anyway)
+    assert rt.ledger.unaudited_reason(behind["observation_id"]) is None
+    rt2, passed2, drawn2, behind2 = seasoned_hotkey_with_a_drawn_row_on_a_prompt_it_then_trains(tmp_path / "horizon")
+    rt2.finalize_exploration(1, environment=MATH, now=20_050.0, audits_could_run=True)
+    assert rt2.ledger.payable(1, environment=MATH) == {"x": 1}
+    assert rt2.ledger.unaudited_reason(behind2["observation_id"]) == "unaudited"
+
+
+def test_r25_mark_validator_lost_is_narrow_unpaid_unsanctioned_and_settles_unaudited(tmp_path):
+    rt, held = _drawn_unaudited_row(tmp_path)
+    assert rt.mark_validator_lost(held["observation_id"]) is True
+    assert rt.ledger.state(held["observation_id"]) == ("unaudited", "reserved")
+    assert rt.ledger.unaudited_reason(held["observation_id"]) == "validator_lost"
+    assert rt.queued_audits(1) == []                                     # nothing left to wait for
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    assert rt.ledger.payable(1, environment=MATH) == {} and settle_event(rt, held)["reason"] == "unaudited"
+    passed = explore(rt, hotkey="y", prompt=8, window=1, now=121.0)      # after finalize: refused, nothing to mark
+    assert passed["entitled"] is False
+    assert rt.mark_validator_lost(held["observation_id"]) is True        # idempotent on a row already unaudited
+    audited_row = _audited_row(tmp_path / "other")
+    assert audited_row[0].mark_validator_lost(audited_row[1]) is False   # a passed row is never voided
+
+
+def _audited_row(tmp_path):
+    rt, held = _drawn_unaudited_row(tmp_path)
+    assert rt.record_audit(held["observation_id"], passed=True, now=10_000.0).passed
+    return rt, held["observation_id"]
+
+
+def test_m9_active_is_cached_for_a_moment_and_an_explicit_clock_always_computes(tmp_path, monkeypatch):
+    rt = runtime(tmp_path)
+    calls = []
+    real = rt._compute_active
+    rt._compute_active = lambda now: (calls.append(now), real(now))[1]
+    first = rt.active()                                                  # (the order started at t=0: expired by the wall clock)
+    assert [rt.active(), rt.active()] == [first, first]
+    assert len(calls) == 1                                               # one SQLite round trip for three admissions
+    rt.active(now=121.0)
+    rt.active(now=122.0)
+    assert len(calls) == 3                                               # an explicit clock is never cached
+    monkeypatch.setattr(ServiceRuntime, "ACTIVE_CACHE_SECONDS", 0.0)
+    rt.active()
+    assert len(calls) == 4                                               # and the cache does expire
+
+
+def test_m9_a_ban_binds_the_next_admission_from_memory_and_survives_a_restart(tmp_path):
+    import time as _time
+    rt = runtime(tmp_path)
+    first = explore(rt, hotkey="cheat", prompt=7)
+    draw(rt)
+    assert not rt.exploration_banned("cheat")
+    assert rt.record_audit(first["observation_id"], passed=False, now=_time.time()).failed
+    rt.ledger.banned = lambda *a, **k: (_ for _ in ()).throw(AssertionError("the admission path must not query SQLite"))
+    assert rt.exploration_banned("cheat") is True                        # the very next admission after the verdict
+    assert rt.exploration_banned("honest") is False
+    assert rt.exploration_banned("cheat", now=_time.time() + 86_401) is False   # and it expires by itself
+    rt.db.close()
+    again = build(tmp_path / "runtime.sqlite3")
+    assert again.exploration_banned("cheat") is True                     # loaded at boot

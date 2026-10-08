@@ -877,6 +877,10 @@ PROBATION_PENDING_LIMIT = 4
 SERVICE_EXPLORATION_AUDIT_INFLIGHT = 2
 SERVICE_EXPLORATION_PROBATION_EVERY = 4
 SERVICE_EXPLORATION_TICK_SECONDS = 1.0
+# Non-training acceptances (exploration and unproven observations) one hotkey may have in one (window, env)
+# batcher. Beyond it the submission is refused before its payload is retained (R26): the sybil bound on the
+# memory these groups hold for the audit.
+SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV = 32
 # Seal drain. After the window seals the validator stops admitting exploration, waits at most
 # ``..._DRAW_WAIT_ROUNDS`` drand rounds for pending draws, proves EVERY queued audit of a hotkey past
 # probation (at most ``..._DRAIN_SECONDS`` in all) and lets hotkeys still in probation use only the first

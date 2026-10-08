@@ -20,6 +20,10 @@ Rules a reader of the public log can rely on:
   hotkey already lost the window). A group is paid without an audit only if every audit drawn for
   its own hotkey up to its round was actually performed. ``unaudited`` is unpaid and never
   sanctioned; nobody is banned by the horizon.
+* Unaudited reason (R25): the ledger records why a row ended ``unaudited``. ``validator_lost`` (the
+  validator lost the audit inputs or could not run audits) is unpaid and unsanctioned and sets NO
+  horizon; only ``unaudited`` (audits could run, the drain bound was reached) does. The public event
+  says ``unaudited`` for both.
 * What the runtime owes: audits of hotkeys past probation run before audits of hotkeys still in
   probation, and at seal the queued audits are drained (bounded wait, and up to 2 drand rounds for
   pending draws) BEFORE ``finalize_exploration`` is called. The audit load is bounded by the cap.
@@ -68,6 +72,13 @@ _EPS = 1e-12
 STATUS_PENDING = "exploration_pending"
 STATUS_UNPAID = "exploration_unpaid"
 STATUS_FORFEITED = "exploration_forfeited"
+# Why a row ended ``unaudited`` (R25). The ledger keeps the difference; the public event says ``unaudited``
+# for both. ``validator_lost``: the validator lost the audit inputs or could not run audits (restart,
+# recovery, plan unavailable, checkpoint swapped): unpaid, unsanctioned, NO horizon. ``unaudited``: audits
+# could run and the drain bound was reached: unpaid, unsanctioned, and the R15 horizon applies.
+UNAUDITED_HORIZON = "unaudited"
+UNAUDITED_VALIDATOR_LOST = "validator_lost"
+UNAUDITED_REASONS = (UNAUDITED_HORIZON, UNAUDITED_VALIDATOR_LOST)
 REFUSAL_REASONS = ("already_scanned", "banned", "finalized", "zero_price", "probation_limit", "cap")
 # A refusal that is about the hotkey's or the env's room, not about the group: when the same submission
 # comes back and room exists it is a new attempt (never a replay of the stale refusal).
@@ -146,7 +157,8 @@ class ExplorationLedger:
                 observation_id TEXT PRIMARY KEY, order_id TEXT NOT NULL, window INTEGER NOT NULL,
                 environment TEXT NOT NULL, hotkey TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
                 amount REAL NOT NULL, draw_round INTEGER NOT NULL, forced INTEGER NOT NULL,
-                audit TEXT NOT NULL, status TEXT NOT NULL, drawn INTEGER NOT NULL DEFAULT 0);
+                audit TEXT NOT NULL, status TEXT NOT NULL, drawn INTEGER NOT NULL DEFAULT 0,
+                unaudited_reason TEXT);
             CREATE INDEX IF NOT EXISTS exploration_window ON exploration_entitlements(order_id, window);
             CREATE INDEX IF NOT EXISTS exploration_hotkey ON exploration_entitlements(order_id, hotkey);
             CREATE TABLE IF NOT EXISTS exploration_finalized(
@@ -157,6 +169,8 @@ class ExplorationLedger:
             CREATE TABLE IF NOT EXISTS exploration_late_failures(
                 order_id TEXT NOT NULL, observation_id TEXT NOT NULL, PRIMARY KEY(order_id, observation_id));
         """)
+        if "unaudited_reason" not in {r[1] for r in db.execute("PRAGMA table_info(exploration_entitlements)")}:
+            db.execute("ALTER TABLE exploration_entitlements ADD COLUMN unaudited_reason TEXT")
 
     def banned(self, hotkey: str, now: float) -> bool:
         row = self.db.execute("SELECT until FROM exploration_bans WHERE order_id=? AND hotkey=?",
@@ -335,12 +349,23 @@ class ExplorationLedger:
         """``apply_verdict`` without the kind: the ids whose first scan the caller must release."""
         return self.apply_verdict(observation_id, passed=passed, now=now, ban_seconds=ban_seconds)[1]
 
-    def mark_unaudited(self, observation_id: str) -> None:
-        self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE observation_id=? "
-                        "AND order_id=? AND audit IN ('pending_draw','queued')", (observation_id, self.order))
+    def mark_unaudited(self, observation_id: str, reason: str = UNAUDITED_HORIZON) -> None:
+        if reason not in UNAUDITED_REASONS:
+            raise ValueError("unknown unaudited reason")
+        self.db.execute("UPDATE exploration_entitlements SET audit='unaudited', unaudited_reason=? "
+                        "WHERE observation_id=? AND order_id=? AND audit IN ('pending_draw','queued')",
+                        (reason, observation_id, self.order))
+
+    def unaudited_reason(self, observation_id: str) -> str | None:
+        """Why a row ended unaudited (``UNAUDITED_REASONS``), or None for a row that is not."""
+        row = self.db.execute("SELECT audit, unaudited_reason FROM exploration_entitlements "
+                              "WHERE observation_id=? AND order_id=?", (observation_id, self.order)).fetchone()
+        if row is None or row[0] != "unaudited":
+            return None
+        return row[1] or UNAUDITED_HORIZON  # rows written before the reason existed set the horizon
 
     def finalize_window(self, window: int, *, environment: str, aborted: bool = False,
-                        trained_prompts=()) -> list[str]:
+                        trained_prompts=(), unaudited_reason: str = UNAUDITED_HORIZON) -> list[str]:
         """Freeze a (window, env) and return every unpaid id of it (none sanctioned).
 
         Groups waiting for their draw or their audit become ``unaudited``; so does every
@@ -360,22 +385,33 @@ class ExplorationLedger:
         unaudited it sets its hotkey's horizon like any other row.
         Applied on every call, so a training observation recorded after the env was finalized still
         voids the row as long as the caller finalizes again before reading ``payable``.
+
+        ``unaudited_reason`` (R25) is the reason of the rows this call turns ``unaudited``.
+        ``validator_lost`` sets no horizon, neither for those rows nor (below) for rows that were
+        marked ``validator_lost`` earlier; only ``unaudited`` rows (audits could run) set it.
         """
+        if unaudited_reason not in UNAUDITED_REASONS:
+            raise ValueError("unknown unaudited reason")
         scope = (self.order, window, environment)
         for prompt in sorted({int(p) for p in trained_prompts}):
             self.db.execute("UPDATE exploration_entitlements SET status='trained' WHERE order_id=? AND window=? "
                             "AND environment=? AND prompt_idx=? AND status='reserved'", (*scope, prompt))
         if not self.is_finalized(window, environment=environment):
+            horizon_open = "AND (audit='queued' OR (audit='unaudited' AND COALESCE(unaudited_reason, 'unaudited')<>'validator_lost'))"
+            if unaudited_reason == UNAUDITED_VALIDATOR_LOST:
+                horizon_open = "AND (audit='unaudited' AND COALESCE(unaudited_reason, 'unaudited')<>'validator_lost')"
             horizons = self.db.execute(
                 "SELECT hotkey, MIN(draw_round) FROM exploration_entitlements WHERE order_id=? AND window=? "
-                "AND environment=? AND drawn=1 AND audit IN ('queued','unaudited') "
+                f"AND environment=? AND drawn=1 {horizon_open} "
                 "AND status IN ('reserved','trained') GROUP BY hotkey", scope).fetchall()
-            self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE order_id=? AND window=? "
-                            "AND environment=? AND audit IN ('pending_draw','queued')", scope)
+            self.db.execute("UPDATE exploration_entitlements SET audit='unaudited', unaudited_reason=? "
+                            "WHERE order_id=? AND window=? AND environment=? AND audit IN ('pending_draw','queued')",
+                            (unaudited_reason, *scope))
             for hotkey, horizon in horizons:
-                self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE order_id=? AND window=? "
-                                "AND environment=? AND hotkey=? AND audit='not_drawn' AND draw_round>=?",
-                                (*scope, hotkey, horizon))
+                self.db.execute("UPDATE exploration_entitlements SET audit='unaudited', unaudited_reason=? "
+                                "WHERE order_id=? AND window=? AND environment=? AND hotkey=? "
+                                "AND audit='not_drawn' AND draw_round>=?",
+                                (UNAUDITED_HORIZON, *scope, hotkey, horizon))
             self.db.execute("INSERT INTO exploration_finalized VALUES(?,?,?)", scope)
         if aborted:
             self.db.execute("UPDATE exploration_entitlements SET status='unpaid' WHERE order_id=? AND window=? "
@@ -557,7 +593,8 @@ def apply_exploration_audit(log: "RunObservationLog", ledger: ExplorationLedger,
 
 
 def finalize_exploration(log: "RunObservationLog", ledger: ExplorationLedger, window: int, *,
-                         environment: str, aborted: bool = False, extra_trained=()) -> list[str]:
+                         environment: str, aborted: bool = False, extra_trained=(),
+                         unaudited_reason: str = UNAUDITED_HORIZON) -> list[str]:
     """Finalize a (window, env) and release the first scan of every unpaid id, atomically.
 
     ``aborted=True`` also works on an already finalized (window, env): every row still reserved
@@ -572,7 +609,8 @@ def finalize_exploration(log: "RunObservationLog", ledger: ExplorationLedger, wi
     with _Atomic(_same_store(log, ledger)):
         unaudited = ledger.finalize_window(
             window, environment=environment, aborted=aborted,
-            trained_prompts=set(log.trained_prompts(window, environment)) | set(extra_trained))
+            trained_prompts=set(log.trained_prompts(window, environment)) | set(extra_trained),
+            unaudited_reason=unaudited_reason)
         for identity in unaudited:
             log.release_first_scan(identity)
         return unaudited
