@@ -11,9 +11,9 @@ What "scanned" means (table ``run_scans``, one row per scanned (env, prompt)):
   observation may still be paid; when it ends unpaid for any reason its scan is released, and the
   prompt then stays scanned if a counting training observation of it exists (the scan is re-seated
   on the earliest one), else it is free again. ``release_first_scan`` is the ONE place that decides.
-* A training observation counts from the moment it is recorded (proven) until it is settled
-  ``proven_unpaid``: a proven group that was not trained (left out of the batch, or its window
-  aborted -- an aborted window trained nothing) stops counting and gives the prompt back.
+* A PROVEN training observation counts whatever its pay (its rewards are public), including a
+  group left out of the batch. Only the training observations of an ABORTED window stop counting
+  (the window trained nothing) and give their prompts back: ``set_window_aborted``.
 
 Exploration observations go through ``reliquary.services.exploration.record_exploration``, which
 records and reserves the pay in one transaction; ``record`` alone is for training observations.
@@ -33,8 +33,7 @@ from reliquary.services.scoring import classify_signal
 LANES = frozenset({"training", "exploration"})
 _MUTABLE = ("status", "proof", "ts", "reason")  # not evidence: a retry may differ on them
 _REASON = re.compile(r"[a-z][a-z0-9_]{0,39}")
-# Settle status of a training observation that was proven but not trained: it does not count as a scan.
-STATUS_PROVEN_UNPAID = "proven_unpaid"
+STATUS_PROVEN_UNPAID = "proven_unpaid"  # settle status of a training group proven but not paid
 
 
 class NotAnObservation(ValueError):
@@ -213,9 +212,9 @@ class RunObservationLog:
         recorded before or after): the scan is re-seated on the earliest one. Otherwise the prompt
         is free again and a later exploration observation can be paid for it.
 
-        Which training observations count (module docstring): every one that is not settled
-        ``proven_unpaid``. So the training observations of an ABORTED window never keep a prompt:
-        the window trained nothing, its settlement marks them all ``proven_unpaid``. A counting
+        Which training observations count (module docstring): every proven one, paid or not,
+        except those of a window the runtime declared aborted (``set_window_aborted``): an aborted
+        window trained nothing, so its training observations never keep a prompt. A counting
         training observation is never released (returns False, nothing changes).
 
         Returns True when ``observation_id`` held the scan and no longer does. Idempotent.
@@ -258,28 +257,36 @@ class RunObservationLog:
                               (observation_id, self.order)).fetchone()
         return None if row is None else json.loads(row[0]).get("reason")
 
+    def set_window_aborted(self, window: int, aborted: bool) -> None:
+        """Tell the log whether ``window`` aborted (the runtime knows; the log cannot).
+
+        An aborted window trained nothing: its training observations stop counting as scans and
+        give their prompts back (``release_first_scan``: next counting training observation, or
+        free). ``aborted=False`` makes them count again and re-seats the prompts that have no scan.
+        Idempotent; only rows whose state changes are touched.
+        """
+        rows = self.db.execute(
+            "SELECT id, environment, prompt_idx FROM run_observations WHERE order_id=? AND window=? "
+            "AND lane='training' AND untrained<>? ORDER BY seq", (self.order, window, int(aborted))).fetchall()
+        for identity, environment, prompt_idx in rows:
+            self.db.execute("UPDATE run_observations SET untrained=? WHERE id=?", (int(aborted), identity))
+            if aborted:
+                self.release_first_scan(identity)
+            else:
+                self._seat(environment, prompt_idx)
+
     def settle(self, observation_id: str, *, status: str, proof: str, at: float,
                reason: str | None = None) -> None:
-        """Publish a settle event (idempotent on the latest status, proof and reason).
-
-        A TRAINING observation settled ``proven_unpaid`` stops counting as a scan: if it held the
-        prompt's scan, the scan moves to the next counting training observation or the prompt is
-        free again. Any other status makes it count (again)."""
+        """Publish a settle event (idempotent on the latest status, proof and reason). The status
+        never changes what counts as a scan (``set_window_aborted`` does)."""
         if reason is not None and (not isinstance(reason, str) or _REASON.fullmatch(reason) is None):
             raise ValueError("settle reason must be a short lowercase identifier")
-        row = self.db.execute("SELECT window, order_id, lane, environment, prompt_idx FROM run_observations "
+        row = self.db.execute("SELECT window, order_id FROM run_observations "
                               "WHERE id=?", (observation_id,)).fetchone()
         if row is None:
             raise ValueError("unknown observation")
         if row[1] != self.order:
             raise ValueError("observation belongs to another order")
-        if row[2] == "training":
-            untrained = status == STATUS_PROVEN_UNPAID
-            self.db.execute("UPDATE run_observations SET untrained=? WHERE id=?", (int(untrained), observation_id))
-            if untrained:
-                self.release_first_scan(observation_id)
-            else:
-                self._seat(row[3], row[4])
         for (payload,) in self.db.execute(
                 "SELECT payload FROM run_events WHERE order_id=? AND observation_id=? ORDER BY seq DESC",
                 (self.order, observation_id)):

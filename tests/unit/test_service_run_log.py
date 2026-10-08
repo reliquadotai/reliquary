@@ -343,25 +343,31 @@ def test_release_reseats_the_scan_on_the_earliest_counting_training_observation(
     assert not again.first_scan
 
 
-def test_a_training_observation_settled_proven_unpaid_stops_counting_as_a_scan(log):
+def test_only_the_training_observations_of_an_aborted_window_stop_counting_as_scans(log):
     with log.db:
         first = log.record(obs(group="t1", window=1, hotkey="b"), status="proven", proof="proven")
         second = log.record(obs(group="t2", window=2, hotkey="c"), status="proven", proof="proven")
-    assert log.trained_prompts(1, ENV) == {7} and log.trained_prompts(2, ENV) == {7} and log.trained_prompts(3, ENV) == set()
-    with log.db:
+        other = log.record(obs(prompt=8, group="t3", window=1, hotkey="b"), status="proven", proof="proven")
+    assert log.trained_prompts(1, ENV) == {7, 8} and log.trained_prompts(2, ENV) == {7} and log.trained_prompts(3, ENV) == set()
+    with log.db:                                                  # proven but unpaid: still a scan (public rewards)
         log.settle(first.observation_id, status="proven_unpaid", proof="proven", at=5.0)
-    assert holder(log) == second.observation_id                   # moved to the next counting one
+    assert holder(log) == first.observation_id and log.trained_prompts(1, ENV) == {7, 8}
+    with log.db:
+        log.set_window_aborted(1, True)
+    assert holder(log) == second.observation_id                   # 7: moved to the next counting one
+    assert holder(log, 8) is None and not log.is_scanned(ENV, 8)  # 8: nothing else trained it, free again
     assert log.trained_prompts(1, ENV) == set() and log.trained_prompts(2, ENV) == {7}
     with log.db:
-        log.settle(second.observation_id, status="proven_unpaid", proof="proven", at=6.0)
-    assert not log.is_scanned(ENV, 7) and holder(log) is None      # nothing trained it: free again
+        log.set_window_aborted(1, True)                           # idempotent
+        log.set_window_aborted(2, True)
+    assert not log.is_scanned(ENV, 7) and holder(log) is None
     with log.db:
-        log.settle(second.observation_id, status="trained", proof="proven", at=7.0)
-    assert holder(log) == second.observation_id                   # "trained" counts
-    with log.db:                                                  # an exploration status on an exploration row: no effect
-        probe = log.record(obs(prompt=8, rewards=ZERO, lane="exploration"), status="exploration_pending", proof="pending")
-        log.settle(probe.observation_id, status="proven_unpaid", proof="unproven", at=8.0)
-    assert holder(log, 8) == probe.observation_id
+        log.set_window_aborted(2, False)                          # not aborted after all: it counts again
+    assert holder(log) == second.observation_id and holder(log, 8) is None
+    with log.db:                                                  # exploration observations are not concerned
+        probe = log.record(obs(prompt=9, rewards=ZERO, lane="exploration", window=3), status="exploration_pending", proof="pending")
+        log.set_window_aborted(3, True)
+    assert holder(log, 9) == probe.observation_id
 
 
 def test_settle_publishes_its_reason_and_is_idempotent_on_it(log):

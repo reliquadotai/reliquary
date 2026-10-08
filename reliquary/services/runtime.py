@@ -27,11 +27,11 @@ What a caller can rely on:
 * Seal. See ``finalize_exploration`` for the contract the batcher owes before settlement.
 * Settlement. ``reconcile_archive`` finalizes what is left, prices the ledger's integer
   entitlement counts with ``settle_window``, self-checks the result with
-  ``validate_service_archive_v2`` under the protocol slot geometry, and freezes it. Calling it
-  again returns the frozen service fields and disposition whatever the archive or the keyword says
-  (the first settlement is the truth; it never raises on that path); a verdict arriving after
-  finalize changes nothing.
-* Scans. A prompt with a counting training observation is scanned for the run; exploration on a
+  ``validate_service_archive_v2`` under the protocol slot geometry, and closes the window to
+  new observations. Calling it again recomputes from the caller's batch and the same finalized
+  entitlement counts (same input, same bytes); a verdict arriving after finalize changes nothing.
+* Scans. A prompt with a proven training observation is scanned for the run (aborted windows
+  excepted: they trained nothing); exploration on a
   prompt trained in the same window is unpaid (``trained``, no sanction). See ``run_log``.
 
 Only ``service-contract/v2`` runs RL here; ``service-contract/v1`` (dataset mapping / curation)
@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from reliquary.protocol.release_contract import canonical_json_bytes
+from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
 from reliquary.protocol.service_contract import (
     PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract, _identifier, _integer, _sha,
 )
@@ -75,8 +75,8 @@ _BEACON = re.compile(r"[0-9a-f]{64}")
 # Published proof label of an entitlement, from its audit state in the ledger (R8).
 _PROOF = {"passed": "audited", "failed": "failed", "pending_draw": "pending", "queued": "pending",
           "not_drawn": "unproven", "unaudited": "unproven"}
-# What a settled window freezes. ``service_training_recomputed_delta`` is informational
-# (it compares with the caller's own map) and is not part of the frozen money.
+# The service money of an archive. ``service_training_recomputed_delta`` is informational
+# (it compares with the caller's own map) and is not part of it.
 FROZEN_ARCHIVE_FIELDS = (
     "service_payment_policy", "service_order_sha256", "service_schedule", "service_schedule_sha256",
     "service_pools_by_environment", "service_picks_target", "service_batch_slots",
@@ -450,7 +450,7 @@ class ServiceRuntime:
         Windows open in increasing order: a window lower than the highest frozen one is refused
         unless it is itself frozen (restart), so an old window can never be born with the latest
         schedule. The opening instant (``now``, validator clock) is stored with the frozen row, first
-        one wins: an exploration group cannot claim an arrival before it (``record_exploration``).
+        one wins: an exploration arrival is never taken as earlier than it (``record_exploration``).
         """
         _integer(window, "window", 0)
         instant = _instant(now)
@@ -657,9 +657,10 @@ class ServiceRuntime:
 
         ``arrived_at`` is the VALIDATOR-clock time the submission arrived (default: now; never a
         miner-supplied value, and never later than now). The audit draw round is the drand round
-        of that instant + 2, so its beacon does not exist when the group is committed. An arrival
-        before the window was opened (``open_window``'s stored instant) is refused: a group cannot
-        pick a past round whose beacon is already public.
+        of that instant + 2, so its beacon does not exist when the group is committed. The
+        arrival is clamped into the window's life: ``max(open time, min(now, arrived_at))``, the
+        open time being ``open_window``'s stored instant. A group can therefore never pick a round
+        older than the window, and a validator clock stepping back does not stop exploration.
 
         Returns ``{"observation_id", "inserted", "first_scan", "entitled", "amount", "status",
         "reason", "forced_audit", "draw_round"}``. ``status`` is ``exploration_pending`` when one
@@ -683,10 +684,6 @@ class ServiceRuntime:
             if type(arrival) not in (int, float) or not _finite(arrival):
                 raise ValueError("invalid arrival time")
             arrival = min(float(arrival), instant)
-            try:
-                draw_round = int(self._round_at(arrival)) + AUDIT_DRAW_ROUND_OFFSET
-            except RuntimeError as exc:  # no drand clock: the audit cannot be drawn, so nothing is owed
-                raise ValueError(f"audit draw round is unknown: {exc}") from exc
             active = self.active(now=instant)  # outside the transaction: active() commits its clock
             with self._txn():
                 envelope = self._envelope(window)
@@ -696,8 +693,12 @@ class ServiceRuntime:
                 context["observation_id"] = self._observation_id(obs)
                 opened = self.db.execute("SELECT opened_at FROM service_windows WHERE order_id=? AND window=?",
                                          (self.contract.sha256, window)).fetchone()[0]
-                if opened is not None and arrival < opened:
-                    raise ValueError("arrival time precedes the opening of the window")
+                if opened is not None:
+                    arrival = max(arrival, opened)
+                try:
+                    draw_round = int(self._round_at(arrival)) + AUDIT_DRAW_ROUND_OFFSET
+                except RuntimeError as exc:  # no drand clock: the audit cannot be drawn, so nothing is owed
+                    raise ValueError(f"audit draw round is unknown: {exc}") from exc
                 refuse = None
                 if not active:
                     refuse = "order_inactive"
@@ -933,20 +934,29 @@ class ServiceRuntime:
         First call for a window, in one transaction: finalize every env of the frozen envelope
         (a no-op for those the caller finalized after draining audits), read the ledger's integer
         entitlement counts, ``settle_window`` (proportional split per env), validate the result
-        with ``validate_service_archive_v2`` under the protocol slot geometry, store the frozen
-        service fields and publish the final settle events (``trained`` / ``proven_unpaid``,
-        ``exploration_paid`` / ``exploration_unpaid`` / ``exploration_forfeited``).
+        with ``validate_service_archive_v2`` under the protocol slot geometry, mark the window
+        settled (no observation is taken after that) and publish the final settle events
+        (``trained`` / ``proven_unpaid``, ``exploration_paid`` / ``exploration_unpaid`` /
+        ``exploration_forfeited``).
 
-        Later calls return the caller's archive stamped with the FROZEN service fields and the
-        frozen disposition: the first settlement is the truth. Same archive in, same bytes out.
-        A later call that disagrees (another disposition, another batch, an archive that cannot be
-        settled) is logged at error level and still gets the frozen answer; it never raises and
-        publishes nothing, so a restart recovery that rebuilds the window differently cannot brick
-        the validator. An aborted window (``aborted=True`` or an archive whose ``window_status`` is
-        ``aborted``) pays no exploration, releases its first scans, and its training observations
-        stop counting as scans (they settle ``proven_unpaid``: nothing was trained).
-        On the FIRST call every ``batch`` row must carry ``env_name`` (an env of the envelope) and a
-        string ``hotkey``; anything else raises (``SettlementError``) and freezes nothing.
+        The answer is a pure recomputation from (the caller's ``batch``, the ledger's finalized
+        entitlement counts, the disposition): same input, same bytes out, at any time and after a
+        restart; it always passes the self-check. After the first call the exploration counts only
+        move on an abort, so another batch gives recomputed training rows and scale with the SAME
+        exploration counts, and a late audit verdict changes nothing. Dispositions:
+
+        * not aborted, then called aborted (restart recovery rebuilt the window empty): allowed.
+          The exploration rows become unpaid, their first scans are released, the window's
+          training observations stop counting as scans, the archive pays no exploration.
+        * aborted, then called not aborted: exploration stays unpaid (its counts are empty); the
+          result is a valid non-aborted archive with zero exploration.
+
+        Neither raises. A call whose disposition or batch digest differs from the previous call
+        of that window is logged at error level (table ``service_settled`` keeps both), and the
+        public settle events follow the latest answer (nothing is published when nothing changed).
+        An aborted window (``aborted=True`` or an archive whose ``window_status`` is ``aborted``)
+        pays no exploration. Every ``batch`` row must carry ``env_name`` (an env of the envelope)
+        and a string ``hotkey``; anything else raises (``SettlementError``) and stores nothing.
         """
         if type(aborted) is not bool or not isinstance(archive, dict):
             raise ValueError("invalid service settlement disposition")
@@ -959,72 +969,41 @@ class ServiceRuntime:
             envelope = self._envelope(window)
             settled = self.db.execute("SELECT aborted, payload FROM service_settled WHERE order_id=? AND window=?",
                                       (order, window)).fetchone()
-            if settled is not None:
-                return self._frozen_result(archive, window, envelope, bool(settled[0]), json.loads(settled[1]),
-                                           aborted)
+            if settled is None or aborted:
+                for env in sorted(envelope["pools"]):
+                    if not self.ledger.is_finalized(window, environment=env):
+                        waiting = sum(row["audit"] in ("pending_draw", "queued")
+                                      for row in self.ledger.rows(window, environment=env))
+                        if waiting:
+                            logger.warning("service window %d env %s settles with %d exploration group(s) "
+                                           "never audited (unpaid)", window, env, waiting)
+                    # Also for an env the caller finalized: abort, and R17 for a late training group.
+                    self._finalize_env(window, env, aborted=aborted, at=instant)
+            exploration = {}
             for env in sorted(envelope["pools"]):
-                if not self.ledger.is_finalized(window, environment=env):
-                    waiting = sum(row["audit"] in ("pending_draw", "queued")
-                                  for row in self.ledger.rows(window, environment=env))
-                    if waiting:
-                        logger.warning("service window %d env %s settles with %d exploration group(s) "
-                                       "never audited (unpaid)", window, env, waiting)
-                # Also for an env the caller finalized: abort, and R17 for a late training group.
-                self._finalize_env(window, env, aborted=aborted, at=instant)
+                counts = self.ledger.payable(window, environment=env)
+                if counts:
+                    exploration[env] = counts
             result = settle_window(archive=archive, envelope=envelope, contract=self.contract,
-                                   exploration=self._payable(window, envelope), aborted=aborted)
+                                   exploration=exploration, aborted=aborted)
             # Lane consistency under the protocol geometry; the task-cap bound is weight replay's.
             validate_service_archive_v2(result, self.contract, cap=1.0, picks_target=picks, batch_slots=slots)
-            record = {"fields": {key: result[key] for key in FROZEN_ARCHIVE_FIELDS},
-                      "delta": result["service_training_recomputed_delta"],
-                      "window_status": result.get("window_status")}
-            self.db.execute("INSERT INTO service_settled VALUES(?,?,?,?)",
-                            (order, window, int(aborted), canonical_json_bytes(record).decode()))
+            digest = canonical_sha256(sorted(
+                [str(row.get("env_name")), str(row.get("hotkey")), str(row.get("prompt_idx"))]
+                for row in archive.get("batch") or []))
+            if settled is not None:
+                previous = json.loads(settled[1]).get("batch_sha256")
+                if bool(settled[0]) != aborted:
+                    logger.error("service window %d was settled as %s and is now settled as %s", window,
+                                 "aborted" if settled[0] else "not aborted", "aborted" if aborted else "not aborted")
+                if previous != digest:
+                    logger.error("service window %d is settled again with another batch (digest %s, was %s)",
+                                 window, digest, previous)
+            self.db.execute("INSERT INTO service_settled VALUES(?,?,?,?) ON CONFLICT(order_id, window) DO UPDATE SET "
+                            "aborted=excluded.aborted, payload=excluded.payload",
+                            (order, window, int(aborted), canonical_json_bytes({"batch_sha256": digest}).decode()))
+            self.log.set_window_aborted(window, aborted)
             self._emit_settle_events(window, envelope, archive, aborted, instant)
-        return result
-
-    def _payable(self, window: int, envelope: dict) -> dict:
-        exploration = {}
-        for env in sorted(envelope["pools"]):
-            counts = self.ledger.payable(window, environment=env)
-            if counts:
-                exploration[env] = counts
-        return exploration
-
-    def _frozen_result(self, archive: dict, window: int, envelope: dict, frozen_aborted: bool, record: dict,
-                       aborted: bool) -> dict:
-        """A settled window: the caller's archive stamped with what the first settlement froze.
-
-        Never raises and writes nothing. A disagreement with the first settlement is an error log.
-        """
-        if "fields" not in record:  # a row written before the disposition was stored with it
-            record = {"fields": record, "delta": 0.0, "window_status": None}
-        fields = record["fields"]
-        if aborted != frozen_aborted:
-            logger.error("service window %d is already settled as %s; a later settlement as %s is ignored "
-                         "(the first settlement stands)", window, "aborted" if frozen_aborted else "not aborted",
-                         "aborted" if aborted else "not aborted")
-        else:
-            try:
-                again = settle_window(archive=archive, envelope=envelope, contract=self.contract,
-                                      exploration=self._payable(window, envelope), aborted=frozen_aborted)
-                same = canonical_json_bytes({key: again[key] for key in FROZEN_ARCHIVE_FIELDS}) == \
-                    canonical_json_bytes(fields)
-            except Exception as exc:  # the frozen answer is returned whatever this archive is
-                logger.error("service window %d is already settled; the archive of a later settlement cannot "
-                             "be settled (%s: %s) and is ignored", window, type(exc).__name__, exc)
-            else:
-                if not same:
-                    logger.error("service window %d is already settled; a later settlement computes another "
-                                 "reward map and is ignored (the first settlement stands)", window)
-        result = {**archive, **fields, "service_training_recomputed_delta": record["delta"]}
-        if frozen_aborted:
-            result["window_status"] = "aborted"
-        elif result.get("window_status") == "aborted":  # the window was NOT aborted: its first status stands
-            if record["window_status"] is None:
-                result.pop("window_status")
-            else:
-                result["window_status"] = record["window_status"]
         return result
 
     def _emit_settle_events(self, window: int, envelope: dict, archive: dict, aborted: bool, at: float) -> None:
@@ -1041,8 +1020,7 @@ class ServiceRuntime:
                 trained = paid.get(key, 0) > 0
                 if trained:
                     paid[key] -= 1
-                # proven_unpaid: proven, not trained (left out of the batch, or the window aborted).
-                # The log stops counting it as a scan of its prompt.
+                # proven_unpaid: proven, not paid (left out of the batch, or the window aborted).
                 self.log.settle(row["id"], status="trained" if trained else STATUS_PROVEN_UNPAID, proof="proven", at=at)
             elif row["id"] in ledger:
                 entry = ledger[row["id"]]

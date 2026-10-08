@@ -463,10 +463,6 @@ def test_reconcile_pays_from_the_envelope_self_validates_and_is_idempotent(tmp_p
     assert final[paid["observation_id"]] == ("exploration_paid", "audited")
     assert final[won["observation_id"]] == ("trained", "proven")
     assert final[lost["observation_id"]] == ("proven_unpaid", "proven")
-    # Another batch or another disposition for a settled window: the frozen money, never a raise (I2).
-    assert frozen(rt.reconcile_archive(archive(batch=[("a", MATH, 20), ("b", MATH, 21)]))) == frozen(first)
-    assert frozen(rt.reconcile_archive(given, aborted=True)) == frozen(first)
-    assert len(events(rt)) == before
     with pytest.raises(ServicePolicyLimit, match="settled"):
         explore(rt, prompt=30, now=12_001.0)
     with pytest.raises(ServicePolicyLimit, match="settled"):
@@ -543,8 +539,6 @@ def test_aborted_window_pays_no_exploration_and_gives_its_first_scans_back(tmp_p
     assert not any(e["status"] in ("exploration_paid", "trained") for e in events(rt, "settle"))
     assert rt.log.is_scanned(MATH, 1) is False
     validate_service_archive_v2(result, rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
-    later = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), aborted=False)   # frozen as aborted (I2)
-    assert later["window_status"] == "aborted" and frozen(later) == frozen(result)
     # An archive that says "aborted" is aborted, whatever the keyword.
     rt2 = runtime(tmp_path / "second")
     audited(rt2, explore(rt2, hotkey="x"))
@@ -986,18 +980,21 @@ def test_an_aborted_window_trains_nothing_so_its_training_observations_do_not_ke
         assert later["entitled"] and later["first_scan"]
 
 
-def test_a_proven_group_left_out_of_the_batch_does_not_keep_the_prompt_a_trained_one_does(tmp_path):
+def test_a_proven_group_left_out_of_the_batch_keeps_its_prompt_scanned_in_a_normal_window(tmp_path):
     rt = runtime(tmp_path)
     won = train(rt, hotkey="a", prompt=20)
     lost = train(rt, hotkey="b", prompt=21)
-    assert rt.log.is_scanned(MATH, 21)                                  # scanned while it may still be trained
-    assert explore(rt, hotkey="x", prompt=21)["reason"] == "already_scanned"
+    held = explore(rt, hotkey="x", prompt=22)                           # saw 22 first, will end unpaid...
+    also = train(rt, hotkey="b", prompt=22, now=130.0)                  # ...and 22 is proven, left out too
     rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_100.0)
-    assert settle_event(rt, won)["status"] == "trained" and settle_event(rt, lost)["status"] == "proven_unpaid"
-    assert rt.log.is_scanned(MATH, 20) is True and rt.log.is_scanned(MATH, 21) is False
+    assert settle_event(rt, won)["status"] == "trained"
+    assert settle_event(rt, lost)["status"] == settle_event(rt, also)["status"] == "proven_unpaid"
+    assert settle_event(rt, held)["reason"] == "trained"
+    assert scan_holder(rt, 21) == lost["observation_id"] and scan_holder(rt, 22) == also["observation_id"]
     open_window(rt, 2)
-    assert explore(rt, hotkey="x", prompt=20, window=2, now=10_200.0)["reason"] == "already_scanned"
-    assert explore(rt, hotkey="x", prompt=21, window=2, now=10_200.0)["entitled"] is True
+    for prompt in (20, 21, 22):                                         # proven = scanned, whatever its pay
+        late = explore(rt, hotkey="x", prompt=prompt, window=2, now=10_200.0)
+        assert (late["entitled"], late["reason"]) == (False, "already_scanned")
 
 
 LOW, HIGH = range(M_ROLLOUTS), range(M_ROLLOUTS, 2 * M_ROLLOUTS)
@@ -1160,78 +1157,143 @@ def test_m4_windows_open_in_increasing_order_and_a_frozen_one_reopens(tmp_path):
     assert rt.open_window(6, pools={MATH: 0.5}, picks_target=PICKS, batch_slots=SLOTS, now=13.0)["schedule"]["revision"] == 1
 
 
-def test_m5_an_arrival_before_the_window_opened_is_refused(tmp_path):
+def test_m5_an_arrival_is_clamped_between_the_window_opening_and_now(tmp_path):
     path = tmp_path / "runtime.sqlite3"
     rt = build(path)
     rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
     open_window(rt, 1, now=1_000.0)
-    with pytest.raises(ServicePolicyLimit, match="precedes the opening"):
-        explore(rt, prompt=1, now=1_200.0, arrived_at=999.0)            # would pick a round already public
-    with pytest.raises(ServicePolicyLimit, match="precedes the opening"):
-        explore(rt, prompt=1, now=990.0)                                # the clamp to now cannot go below it either
-    assert events(rt) == [] and rt.ledger.rows(1, environment=MATH) == []
-    assert explore(rt, prompt=1, now=1_200.0, arrived_at=1_000.0)["draw_round"] == drand_round(1_000.0) + 2
+    floor = drand_round(1_000.0) + 2
+    # an arrival "before the window" cannot pick a round already public: it is the opening's round
+    assert explore(rt, prompt=1, now=1_200.0, arrived_at=10.0)["draw_round"] == floor
+    # the validator clock stepped back below the opening: exploration goes on, at the opening's round
+    stepped = explore(rt, prompt=2, now=990.0)
+    assert stepped["entitled"] and stepped["draw_round"] == floor
+    assert explore(rt, prompt=3, now=1_200.0, arrived_at=1_100.0)["draw_round"] == drand_round(1_100.0) + 2
+    assert explore(rt, prompt=4, now=1_200.0, arrived_at=9_999.0)["draw_round"] == drand_round(1_200.0) + 2
     # the opening instant is the FIRST one, and it survives a restart and a reopen
     rt.close()
     rt = build(path)
     open_window(rt, 1, now=5_000.0)
     assert rt.db.execute("SELECT opened_at FROM service_windows WHERE window=1").fetchone()[0] == 1_000.0
-    assert explore(rt, prompt=2, now=5_100.0, arrived_at=1_500.0)["entitled"] is True
-    with pytest.raises(ServicePolicyLimit, match="precedes the opening"):
-        explore(rt, prompt=3, now=5_100.0, arrived_at=999.9)
+    assert explore(rt, prompt=5, hotkey="other", now=5_100.0, arrived_at=1_500.0)["draw_round"] == drand_round(1_500.0) + 2
+    assert explore(rt, prompt=6, hotkey="other", now=5_100.0, arrived_at=999.0)["draw_round"] == floor
+    rt.close()
 
 
-# ---------------------------------------------------------------- I2: the first settlement is the truth
+# ---------------------------------------------------------------- I2: settlement is a pure recomputation
 
-def test_i2_a_crash_after_settlement_then_a_recovery_that_rebuilds_the_window_aborted_cannot_brick(tmp_path, monkeypatch):
-    path = tmp_path / "runtime.sqlite3"
+def validates(rt, result):
+    validate_service_archive_v2(json.loads(json.dumps(result)), rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
+
+
+def settled_window(tmp_path):
     rt = runtime(tmp_path)
     paid = explore(rt, hotkey="x", prompt=1)
     audited(rt, paid)
-    train(rt, prompt=20, hotkey="a")
+    unaudited = explore(rt, hotkey="y", prompt=2, now=9_000.0)          # never drawn: unpaid at finalize
+    won = train(rt, prompt=20, hotkey="a")
+    lost = train(rt, prompt=21, hotkey="b")
     rt.finalize_exploration(1, environment=MATH, now=10_050.0)
-    first = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_100.0)   # settled, not aborted...
+    first = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_100.0)
     assert first["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T), "x": pytest.approx(PRICE)}
+    return rt, first, {"paid": paid, "unaudited": unaudited, "won": won, "lost": lost}
+
+
+def test_i2_the_same_batch_twice_is_byte_identical_and_silent(tmp_path, monkeypatch):
+    rt, first, _ = settled_window(tmp_path)
+    errors = []
+    monkeypatch.setattr(runtime_module.logger, "error", lambda *args: errors.append(args))
     count = len(events(rt))
-    rt.close()                                                          # ...then the validator dies
+    for now in (10_200.0, 99_000.0):
+        again = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=now)
+        assert json.dumps(again, sort_keys=True) == json.dumps(first, sort_keys=True)
+    assert frozen(rt.reconcile_archive(first, now=99_100.0)) == frozen(first)     # fed back enriched
+    assert errors == [] and len(events(rt)) == count and not rt.db.in_transaction
+
+
+def test_i2_another_batch_after_settlement_is_recomputed_with_the_same_exploration_and_self_validates(tmp_path, monkeypatch):
+    rt, first, ids = settled_window(tmp_path)
+    errors = []
+    monkeypatch.setattr(runtime_module.logger, "error", lambda *args: errors.append(args))
+    other = rt.reconcile_archive(archive(batch=[("a", MATH, 20), ("b", MATH, 21)]), now=10_200.0)
+    assert other["service_exploration_by_environment"] == first["service_exploration_by_environment"] == {MATH: {"x": 1}}
+    assert other["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T), "b": pytest.approx(POOL / T),
+                                          "x": pytest.approx(PRICE)}     # NOT the first map on another batch
+    validates(rt, other)
+    assert len(errors) == 1 and "another batch" in errors[0][0]
+    assert settle_event(rt, ids["lost"])["status"] == "trained"         # the public status follows the answer
+    # a full batch: the scale is recomputed too, exploration counts unchanged, still valid
+    full = rt.reconcile_archive(archive(batch=[("a", MATH, 100 + i) for i in range(T)]), now=10_300.0)
+    assert full["service_scale_by_environment"][MATH] == pytest.approx(1 / (1 + 0.15 / T), rel=1e-12)
+    assert full["service_exploration_by_environment"] == {MATH: {"x": 1}}
+    validates(rt, full)
+    assert len(errors) == 2
+    # a late verdict changes nothing, before or after another recomputation
+    rows = rt.ledger.rows(1, environment=MATH)
+    assert rt.record_audit(ids["unaudited"]["observation_id"], passed=True, now=10_400.0) == AuditOutcome("not_applied")
+    assert rt.record_audit(ids["paid"]["observation_id"], passed=False, now=10_400.0) == AuditOutcome("not_applied")
+    assert rt.ledger.rows(1, environment=MATH) == rows
+    again = rt.reconcile_archive(archive(batch=[("a", MATH, 20), ("b", MATH, 21)]), now=10_500.0)
+    assert json.dumps(again, sort_keys=True) == json.dumps(other, sort_keys=True)
+    with pytest.raises(ServicePolicyLimit, match="settled"):
+        explore(rt, prompt=30, now=10_600.0)
+
+
+def test_i2_a_crash_after_settlement_then_a_recovery_that_rebuilds_the_window_aborted(tmp_path, monkeypatch):
+    path = tmp_path / "runtime.sqlite3"
+    rt, first, ids = settled_window(tmp_path)
+    assert rt.log.is_scanned(MATH, 1) and rt.log.is_scanned(MATH, 20) and rt.log.is_scanned(MATH, 21)
+    rt.close()                                                          # settled, then the validator dies
 
     rt = build(path)                                                    # restart: fill_closed_recovery.recover
     errors = []
     monkeypatch.setattr(runtime_module.logger, "error", lambda *args: errors.append(args))
     rebuilt = {"window_start": 1, "window_status": "aborted", "batch": [], "rewards_by_hotkey": {},
                "failure_stage": "active_window_recovery"}
-    for _ in range(2):                                                  # at every start, not only the first
-        recovered = rt.reconcile_archive(rebuilt, aborted=True, now=20_000.0)
-        assert frozen(recovered) == frozen(first)                       # byte-identical frozen money
-        assert recovered["window_status"] == "complete"                 # the frozen disposition: NOT aborted
-        assert recovered["failure_stage"] == "active_window_recovery" and recovered["batch"] == []
-        assert recovered["service_training_recomputed_delta"] == first["service_training_recomputed_delta"]
-    assert len(errors) == 2 and "already settled" in errors[0][0]
-    assert len(events(rt)) == count and not rt.db.in_transaction        # nothing published, nothing written
-    assert rt.log.is_scanned(MATH, 1) and rt.log.is_scanned(MATH, 20)   # paid scans are not given back
-    assert rt.db.execute("SELECT aborted FROM service_settled WHERE window=1").fetchone()[0] == 0
-    # a recovered-partial archive (same disposition, another batch) and one that cannot even be settled
-    partial = rt.reconcile_archive({**rebuilt, "window_status": "recovered_partial"}, now=20_100.0)
-    assert frozen(partial) == frozen(first) and partial["window_status"] == "recovered_partial"
-    broken = rt.reconcile_archive({"window_start": 1, "batch": [{"hotkey": 5}], "rewards_by_hotkey": {}}, now=20_200.0)
-    assert frozen(broken) == frozen(first) and len(errors) == 4
-    # the same archive as the first time: same bytes, and no error
-    assert json.dumps(rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=20_300.0), sort_keys=True) == \
-        json.dumps(first, sort_keys=True)
-    assert len(errors) == 4
+    recovered = rt.reconcile_archive(rebuilt, aborted=True, now=20_000.0)   # used to raise at every start
+    assert recovered["window_status"] == "aborted" and recovered["rewards_by_hotkey"] == {}
+    assert recovered["service_exploration_by_environment"] == {} and recovered["failure_stage"] == "active_window_recovery"
+    validates(rt, recovered)
+    assert len(errors) == 2 and "now settled as aborted" in errors[0][0] % errors[0][1:]
+    # the aborted transition: exploration unpaid, scans released, training observations stop counting
+    assert [r["status"] for r in rt.ledger.rows(1, environment=MATH)] == ["unpaid", "unpaid"]
+    assert rt.ledger.payable(1, environment=MATH) == {}
+    assert settle_event(rt, ids["paid"])["status"] == "exploration_unpaid"
+    assert settle_event(rt, ids["won"])["status"] == "proven_unpaid"
+    assert not any(rt.log.is_scanned(MATH, prompt) for prompt in (1, 2, 20, 21))
+    count = len(events(rt))
+    again = rt.reconcile_archive(rebuilt, aborted=True, now=20_100.0)   # the next start: same bytes, silent
+    assert json.dumps(again, sort_keys=True) == json.dumps(recovered, sort_keys=True)
+    assert len(errors) == 2 and len(events(rt)) == count and not rt.db.in_transaction
+    open_window(rt, 2)
+    assert explore(rt, hotkey="z", prompt=1, window=2, now=20_200.0)["entitled"] is True   # free again
     rt.close()
 
 
-def test_i2_a_window_frozen_as_aborted_stays_aborted(tmp_path, monkeypatch):
+def test_i2_a_window_settled_aborted_then_called_not_aborted_is_a_valid_archive_without_exploration(tmp_path, monkeypatch):
+    path = tmp_path / "runtime.sqlite3"
     rt = runtime(tmp_path)
-    audited(rt, explore(rt, hotkey="x", prompt=1))
-    train(rt, prompt=20, hotkey="a")
+    paid = explore(rt, hotkey="x", prompt=1)
+    audited(rt, paid)
+    won = train(rt, prompt=20, hotkey="a")
     first = rt.reconcile_archive(archive(), aborted=True, now=10_100.0)
+    assert first["window_status"] == "aborted" and not rt.log.is_scanned(MATH, 20)
+    rt.close()
+
+    rt = build(path)
     errors = []
     monkeypatch.setattr(runtime_module.logger, "error", lambda *args: errors.append(args))
     later = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_200.0)
-    assert later["window_status"] == "aborted" and frozen(later) == frozen(first) and later["rewards_by_hotkey"] == {}
-    assert len(errors) == 1 and rt.log.is_scanned(MATH, 20) is False
+    assert later["window_status"] == "complete" and later["service_exploration_by_environment"] == {}
+    assert later["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T)}  # exploration stays unpaid
+    validates(rt, later)
+    assert len(errors) == 2
+    assert settle_event(rt, paid)["status"] == "exploration_unpaid" and settle_event(rt, won)["status"] == "trained"
+    assert rt.ledger.payable(1, environment=MATH) == {} and not rt.log.is_scanned(MATH, 1)
+    assert rt.log.is_scanned(MATH, 20) and scan_holder(rt, 20) == won["observation_id"]   # trained after all
+    again = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_300.0)
+    assert json.dumps(again, sort_keys=True) == json.dumps(later, sort_keys=True) and len(errors) == 2
+    rt.close()
 
 
 # ---------------------------------------------------------------- restart
