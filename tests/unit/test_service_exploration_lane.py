@@ -1576,3 +1576,87 @@ def test_n_gap_prove_ranked_keeps_legacy_and_training_entries_and_skips_a_servic
     b._prove_ranked()
     assert sorted(id(p) for p in seen) == sorted([id(legacy), id(training)])
     assert b._pending == [legacy, explo, training]
+
+
+# ---------------------------------------------------------------- Fix round 4: O1 (oversize / out-of-range payloads)
+
+def _vocab_model(size):
+    return SimpleNamespace(config=SimpleNamespace(vocab_size=size))
+
+
+def _never_forward(monkeypatch, pending):
+    """A forward pass reached by the guarded payload would be the OOM: fail loudly if the guard let it by."""
+    pending.request.prompt_idx = pending.prompt_idx
+
+    def forward(*args, **kwargs):
+        raise AssertionError("the forward pass was reached")
+    monkeypatch.setattr(batcher_module, "_active_profile", forward)
+
+
+def test_o1_b_a_token_id_beyond_the_proof_models_embedding_is_the_rows_horizon_before_any_forward(tmp_path, monkeypatch):
+    rt, b, pending = _drawn(tmp_path)
+    pending.request.rollouts[0].commit["tokens"][3] = 5_000          # beyond the loaded model's embedding
+    _never_forward(monkeypatch, pending)
+    assert b._execute_exploration_audit(pending, model=_vocab_model(100)) is None    # does not propagate
+    identity = pending.service_observation_id
+    assert rt.ledger.unaudited_reason(identity) == "unaudited"       # horizon, no validator_lost
+    assert not rt.exploration_banned("hk")
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_unaudited"
+
+
+def test_o1_b_the_embedding_size_is_the_loaded_models_not_the_admission_vocab(tmp_path, monkeypatch):
+    rt, b, pending = _drawn(tmp_path)
+    _never_forward(monkeypatch, pending)
+    # admission's vocab (the batcher's own model: 10000) accepts these ids; the proof model's table is smaller
+    assert b._execute_exploration_audit(pending, model=SimpleNamespace(config=SimpleNamespace(vocab_size=2))) is None
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "unaudited"
+
+
+def test_o1_a_an_oversize_rollout_is_the_rows_horizon_in_the_audit_before_any_forward(tmp_path, monkeypatch):
+    rt, b, pending = _drawn(tmp_path)
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, MATH, 5)   # the rollouts hold 10 completion tokens
+    _never_forward(monkeypatch, pending)
+    assert b._execute_exploration_audit(pending, model=_vocab_model(100)) is None
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "unaudited"
+    assert not rt.exploration_banned("hk")
+
+
+def test_o1_b_an_undeterminable_embedding_size_is_the_validators_fault_never_the_miners(tmp_path, monkeypatch):
+    rt, b, pending = _drawn(tmp_path)
+    _never_forward(monkeypatch, pending)
+    with pytest.raises(RuntimeError, match="embedding"):
+        b._execute_exploration_audit(pending, model=SimpleNamespace(config=SimpleNamespace()))
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "validator_lost"
+
+
+def test_o1_the_training_proof_refuses_the_same_payloads_as_a_reject_not_a_scheduler_fault(tmp_path, monkeypatch):
+    rt, b, pending = _drawn(tmp_path)
+    pending.request.rollouts[0].commit["tokens"][3] = 5_000
+    _never_forward(monkeypatch, pending)
+    seen = []
+    b._reject = lambda reason, **kw: seen.append((reason, kw["reject_stage"]))
+    assert b._verify_expensive(pending, model=_vocab_model(100)) is None
+    assert seen == [(RejectReason.BAD_TOKENS, "service_length")]
+
+
+def test_o1_b_an_in_range_payload_passes_the_guard(tmp_path):
+    rt, b, pending = _drawn(tmp_path)
+    b._service_pre_forward_guard(pending.request, _vocab_model(100))        # no exception
+
+
+def test_o1_the_legacy_path_has_no_pre_forward_guard():
+    b = _make_batcher()
+    assert b.service_policy is None
+    b._service_pre_forward_guard(SimpleNamespace(rollouts=[SimpleNamespace(
+        commit={"tokens": [10 ** 9], "rollout": {"prompt_length": 0}})]), _vocab_model(1))   # inert: no exception
+
+
+def test_o1_a_the_guard_names_an_oversize_rollout_and_an_out_of_range_id_apart(tmp_path, monkeypatch):
+    rt, b, pending = _drawn(tmp_path)
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, MATH, 5)
+    with pytest.raises(ValueError, match="longer than the environment"):
+        b._service_pre_forward_guard(pending.request, _vocab_model(100))
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, MATH, 100)
+    with pytest.raises(ValueError, match="embedding"):
+        b._service_pre_forward_guard(pending.request, _vocab_model(2))
+    b._service_pre_forward_guard(pending.request, _vocab_model(100))

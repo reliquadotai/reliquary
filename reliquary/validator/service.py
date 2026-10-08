@@ -1047,6 +1047,11 @@ class ValidationService:
         # ever narrows it (to its schedule's active envs).
         self._window_env_mix: list[tuple[str, int]] = list(self.env_mix)
         if self._service_runtime is not None:
+            # O1: the proof plane checks every token id against the model's embedding size before the forward
+            # pass; without the size the service cannot tell a crafted id from an honest one.
+            from reliquary.shared.hf_compat import resolve_vocab_size
+            if resolve_vocab_size(getattr(self.verify_model, "config", None)) is None:
+                raise ValueError("service task needs the model's vocab_size (model config missing or without it)")
             # R7: what must be installed is what the PERSISTED schedule runs now,
             # not only what the order activated at launch.
             # (A refusal closes the runtime: see ``_closing_service_runtime_on_failure``.)

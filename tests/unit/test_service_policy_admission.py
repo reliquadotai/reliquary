@@ -96,10 +96,10 @@ def _sign_envelope(request, wallet):
         service_binding=request.service_binding, pool_selection=request.pool_selection).hex()
 
 
-def _parse(request, announcement):
+def _parse(request, announcement, max_sequence_length=4096):
     raw = request.model_dump_json().encode()
     context = AdmissionContext(randomness="cd" * 16, environment="openmathinstruct", vocab_size=128,
-                               max_sequence_length=4096, eos_token_ids=(99,), canonical_force_ids=(), think_close_ids=(),
+                               max_sequence_length=max_sequence_length, eos_token_ids=(99,), canonical_force_ids=(), think_close_ids=(),
                                bootstrap=False, enforce_envelope_signature=True, enforce_legacy_merkle=True,
                                service_policy=announcement)
     binding = AdmissionReceiptBinding(miner_hotkey=request.miner_hotkey, prompt_idx=request.prompt_idx,
@@ -788,3 +788,37 @@ def test_deep_service_enforces_seed_gates_when_legacy_flags_are_shadow(signed_re
         assert batcher.reject_counts[RejectReason.SEED_MISMATCH.value] == 1
     else:
         assert result is not None
+
+
+# ---- O1(a): the rollout length is bounded at admission on the service path (every lane) -------------------
+# The schema already ties completion_length to the largest per-environment cap; the environment's own bound can
+# be smaller, which is what a long-completion payload would exploit. Shrink it to make the group oversize.
+
+@pytest.fixture
+def small_bound(monkeypatch):
+    from reliquary import constants
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, OMI, CHALLENGE_K - 1)
+
+
+@pytest.mark.parametrize("purpose", ["training", "exploration"])
+def test_o1_a_service_group_with_a_rollout_longer_than_the_environment_bound_is_refused_at_admission(
+        signed_request, small_bound, purpose):
+    request, announcement, _ = signed_request(purpose=purpose)
+    parsed, _ = _parse(request, announcement)
+    assert parsed.reject_reason == RejectReason.BAD_TOKENS
+    assert parsed.reject_stage == "service_length"
+
+
+def test_o1_a_a_rollout_at_the_bound_is_not_refused_for_its_length(signed_request, monkeypatch):
+    from reliquary import constants
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, OMI, CHALLENGE_K)
+    request, announcement, _ = signed_request()
+    parsed, _ = _parse(request, announcement)
+    assert parsed.reject_reason is None
+
+
+def test_o1_a_the_length_rule_is_the_environments_bound_on_the_completion(signed_request, small_bound):
+    from reliquary.validator.admission import service_length_valid
+    request, announcement, _ = signed_request()
+    rollout = request.rollouts[0]
+    assert not service_length_valid(rollout.commit["tokens"], rollout.commit["rollout"], OMI)

@@ -1337,7 +1337,13 @@ async def test_a_legacy_task_goes_through_the_real_loop_without_any_service_call
 
 # ---------------------------------------------------------------- boot (the real constructor)
 
-def _boot(monkeypatch, tmp_path, contract, *, loaded, installed=None, **overrides):
+def _model_with_vocab(size):
+    model = MagicMock()
+    model.config.vocab_size = size
+    return model
+
+
+def _boot(monkeypatch, tmp_path, contract, *, loaded, installed=None, model=None, **overrides):
     from reliquary.validator.service import ValidationService
     from tests.unit.test_service_v2 import _LateDropFakeWallet
 
@@ -1356,7 +1362,7 @@ def _boot(monkeypatch, tmp_path, contract, *, loaded, installed=None, **override
                         installed or (lambda name: contract.environments[name]["version"]))
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 99
-    return ValidationService(wallet=_LateDropFakeWallet(), model=MagicMock(), tokenizer=tokenizer, netuid=99,
+    return ValidationService(wallet=_LateDropFakeWallet(), model=model or _model_with_vocab(1000), tokenizer=tokenizer, netuid=99,
                              env_mix=[(name, B_BATCH) for name in loaded], service_contract=contract,
                              emission_cap=CAP)
 
@@ -1428,6 +1434,12 @@ def test_boot_refuses_a_service_task_outside_its_execution_mode(monkeypatch, tmp
                         lambda self, *a, **k: real_init(self, *a, **{**k, "use_drand": False}))
     with pytest.raises(ValueError, match="drand"):
         _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])
+
+
+def test_o1_b_boot_refuses_a_service_task_whose_model_config_has_no_vocab_size(monkeypatch, tmp_path):
+    contract = _bootable_contract(envs=(MATH, CODE), shares={MATH: 5000, CODE: 5000})
+    with pytest.raises(ValueError, match="vocab_size"):
+        _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE], model=MagicMock())   # config.vocab_size is a Mock
 
 
 def test_boot_closes_the_runtime_when_the_constructor_fails_later(monkeypatch, tmp_path):

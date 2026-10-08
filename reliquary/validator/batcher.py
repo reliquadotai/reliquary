@@ -4804,6 +4804,17 @@ class GrpoWindowBatcher:
             )
             return None
 
+        if self.service_policy is not None:
+            # O1: before any forward pass, on the audit and the training proof alike.
+            try:
+                self._service_pre_forward_guard(request, proof_model)
+            except ValueError:
+                if audit:
+                    raise          # the audit callable classifies it: this row's horizon, not a plane fault
+                logger.error("service proof of %s refused before the forward pass: oversize or out-of-range "
+                             "payload", hk)
+                return reject(RejectReason.BAD_TOKENS, "service_length")
+
         from reliquary.services.admission_policy import validate_submission_policy
         try:
             service_contract = validate_submission_policy(request, self.service_policy)
@@ -6772,6 +6783,44 @@ class GrpoWindowBatcher:
                         self._audit_open.pop(job_id, None)
             self._release_observation_payload(pending)  # the audit is over: its bytes are no longer held
         return self._strip_audit_result(verified)
+
+    @staticmethod
+    def _proof_embedding_size(proof_model: Any) -> int:
+        """The token-id range of the model the proof plane actually loaded: its input embedding table, else
+        its config (a ``ProofModelProxy`` carries the config of the replica its worker holds)."""
+        from reliquary.shared.hf_compat import resolve_vocab_size
+
+        try:
+            size = proof_model.get_input_embeddings().num_embeddings
+            if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+                return size
+        except Exception:
+            pass
+        size = resolve_vocab_size(getattr(proof_model, "config", None))
+        if size is None:
+            # Not the miner's doing: the validator cannot tell what range its model accepts.
+            raise RuntimeError("cannot determine the proof model's embedding size")
+        return size
+
+    def _service_pre_forward_guard(self, request, proof_model) -> None:
+        """Service path only, before the forward pass: a rollout longer than the environment's bound or with a
+        token id outside the loaded model's embedding would crash the GPU proof (CUDA OOM / device assert,
+        infrastructure class). ``ValueError`` = the payload's fault; an unknowable embedding size is a
+        ``RuntimeError`` (the validator's)."""
+        if self.service_policy is None:
+            return
+        from reliquary.validator.admission import service_length_valid
+
+        size = self._proof_embedding_size(proof_model)
+        environment = str(getattr(self, "service_environment", None)
+                          or getattr(request.rollouts[0], "env_name", ""))
+        for rollout in request.rollouts:
+            commit = rollout.commit or {}
+            tokens = list(commit.get("tokens") or [])
+            if not service_length_valid(tokens, commit.get("rollout") or {}, environment):
+                raise ValueError("rollout longer than the environment's bound")
+            if any(not isinstance(t, int) or isinstance(t, bool) or not 0 <= t < size for t in tokens):
+                raise ValueError("token id outside the proof model's embedding")
 
     # Exceptions a crafted payload can provoke inside the proof; a subclass of an infrastructure type
     # (RuntimeError, OSError, MemoryError, TimeoutError) is always the validator's.

@@ -342,6 +342,35 @@ def _tokens_valid(
     )
 
 
+def service_length_valid(
+    tokens: list[int],
+    meta: dict[str, Any],
+    environment: str,
+) -> bool:
+    """Service path only: the rollout fits the environment's own length bound.
+
+    Completion length is at most ``max_new_tokens_for_environment`` (an episode: the whole episode is at most
+    its profile's ``max_episode_tokens``). Shared by admission and the proof's pre-forward guard, so an
+    oversize payload is refused before it can reach the GPU."""
+    meta = meta or {}
+    try:
+        prompt_length = int(meta.get("prompt_length", 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if prompt_length < 0 or prompt_length > len(tokens):
+        return False
+    if isinstance(meta.get("episode"), dict):
+        limits = episode_limits_for_environment(environment)
+        if limits is not None:
+            return len(tokens) <= limits[1]
+    bound = max_new_tokens_for_environment(environment)
+    try:
+        claimed = int(meta.get("completion_length", len(tokens) - prompt_length))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return len(tokens) - prompt_length <= bound and claimed <= bound
+
+
 def _force_span_valid(
     tokens: list[int],
     meta: dict[str, Any],
@@ -710,6 +739,19 @@ def parse_and_validate_submission(
                     return _reject_parsed(
                         RejectReason.BAD_TOKENS,
                         "tokens",
+                        request=request,
+                        body_parse_ms=parse_ms,
+                        preparation_started=started,
+                        legacy_merkle_status=legacy_status,
+                    )
+                if context.service_policy is not None and not service_length_valid(
+                    tokens, (rollout.commit or {}).get("rollout") or {}, context.environment,
+                ):
+                    # O1: a service group (training or exploration) longer than the environment's bound would
+                    # reach the proof plane as an OOM; refuse it before any retention or grading.
+                    return _reject_parsed(
+                        RejectReason.BAD_TOKENS,
+                        "service_length",
                         request=request,
                         body_parse_ms=parse_ms,
                         preparation_started=started,
