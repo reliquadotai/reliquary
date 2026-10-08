@@ -181,3 +181,27 @@ def test_the_declared_verification_replica_reaches_the_task_config():
     assert config.verification == "streamed"
     assert _resolve({"default": _entry()}).verification is None, "deriving it is the default"
     assert legacy_task_config().verification is None
+
+
+def test_service_entry_env_caps_follow_contract_shares(monkeypatch):
+    from reliquary.validator import task_config
+    from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2_dict
+    from tests.unit.test_service_task_registry import _service_entry
+    contract = contract_v2_dict(shares={MATH: 6000, CODE: 4000})
+    entry = _service_entry(contract)
+    specs = {name: type("Spec", (), {"environment_manifest_sha256": contract["environments"][name]["version"]})()
+             for name in (MATH, CODE)}
+    monkeypatch.setattr("reliquary.environment.registry.ENVIRONMENT_SPECS", {**specs}, raising=False)
+    config = task_config._service_env_caps(entry, cap=0.5)
+    assert config == {MATH: pytest.approx(0.3), CODE: pytest.approx(0.2)}
+
+
+def test_service_env_version_must_match_installed_manifest(monkeypatch):
+    from reliquary.validator import task_config
+    from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2_dict
+    from tests.unit.test_service_task_registry import _service_entry
+    entry = _service_entry(contract_v2_dict())
+    specs = {name: type("Spec", (), {"environment_manifest_sha256": "0" * 64})() for name in (MATH, CODE)}
+    monkeypatch.setattr("reliquary.environment.registry.ENVIRONMENT_SPECS", specs, raising=False)
+    with pytest.raises(task_config.TaskConfigError, match="environment version"):
+        task_config._service_env_caps(entry, cap=0.5)

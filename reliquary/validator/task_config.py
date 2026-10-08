@@ -146,6 +146,10 @@ def resolve_task_config(
 
     params = PriceParams(**{f: entry.params[f] for f in PRICE_PARAM_FIELDS})
     cap = float(entry.params["cap"])
+    if entry.service_contract is not None:
+        return TaskConfig(task_id=task_id, entry=entry, price_params=params, emission_cap=cap,
+                          env_caps=_service_env_caps(entry, cap=cap), verification=entry.verification,
+                          service_contract=ServiceContract.from_dict(entry.service_contract))
     if entry.env_split is not None:
         env_caps = {
             environment: cap * float(share)
@@ -165,6 +169,24 @@ def resolve_task_config(
         service_contract=(None if entry.service_contract is None else
                           ServiceContract.from_dict(entry.service_contract)),
     )
+
+
+def _service_env_caps(entry: TaskEntry, *, cap: float) -> dict[str, float]:
+    """A service task's initial per-env caps, from its contract's shares (the live
+    schedule re-derives them every window)."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    contract = ServiceContract.from_dict(entry.service_contract)
+    caps = {}
+    for name, env in contract.environments.items():
+        spec = ENVIRONMENT_SPECS.get(name)
+        installed = getattr(spec, "environment_manifest_sha256", None)
+        if installed != env["version"]:
+            raise TaskConfigError(
+                f"task {entry.task_id!r} pins environment version {env['version'][:12]}... for {name!r} "
+                f"but this build installs {str(installed)[:12]}... (environment version mismatch)")
+        caps[name] = cap * env["share_bps"] / 10000
+    return caps
 
 
 def legacy_registry_fallback(

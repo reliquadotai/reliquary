@@ -143,19 +143,26 @@ def validate_entry(entry: TaskEntry) -> None:
     if entry.mechanism not in KNOWN_MECHANISMS:
         raise RegistryError(f"unknown incentive mechanism {entry.mechanism!r}")
     if entry.mechanism == MECHANISM_SERVICE_RL:
-        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_contract import ServiceContract, ServiceContractError
         if entry.service_contract is None or not isinstance(entry.contract, Mapping):
             raise RegistryError("service tasks carry both generation and service contracts")
         try:
-            service = ServiceContract.from_dict(entry.service_contract).to_dict()
-        except ValueError as exc:
-            raise RegistryError(str(exc)) from exc
+            contract = ServiceContract.from_dict(entry.service_contract)
+        except ServiceContractError as exc:
+            raise RegistryError(f"invalid service contract: {exc}") from exc
+        if contract.version != 2:
+            raise RegistryError("RL service tasks need service-contract/v2")
+        service = contract.to_dict()
+        if entry.env_split is not None:
+            raise RegistryError("service tasks take env shares from their schedule, not env_split")
         if entry.params.get("min_incentive_share") != 0 or entry.params.get("min_incentive_ramp_start") != 0:
             raise RegistryError("service payouts require explicit zero incentive floor to preserve absolute group entitlements")
         if service["service_kind"] != "adaptive_training" or service["generation_contract_sha256"] != entry.profile_sha256:
             raise RegistryError("service must bind this adaptive generation contract")
-        if service["environment"]["id"] not in entry.contract.get("environments", {}):
-            raise RegistryError("service environment absent from generation contract")
+        declared = set(entry.contract.get("environments", {}))
+        missing = sorted(set(service["environments"]) - declared)
+        if missing:
+            raise RegistryError(f"service environment absent from generation contract: {missing}")
         if (service["checkpoint"]["repo"] != entry.contract.get("model_id") or
             service["checkpoint"]["revision"] != entry.contract.get("model_revision")):
             raise RegistryError("service checkpoint does not match generation model")
