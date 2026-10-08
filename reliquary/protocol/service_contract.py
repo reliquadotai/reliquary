@@ -77,7 +77,7 @@ def _sha(value: Any, name: str) -> str:
     return value
 
 
-def validate_service_contract(value: dict) -> None:
+def _validate_v1(value: dict) -> None:
     _object(value, {"schema", "service_kind", "revision_id", "dataset", "checkpoint", "environment",
                     "generation_contract_sha256", "scoring", "policies", "limits", "visibility"}, "contract")
     if value["schema"] != SCHEMA or not isinstance(value["service_kind"], str) or value["service_kind"] not in SERVICE_KINDS:
@@ -140,6 +140,99 @@ def validate_service_contract(value: dict) -> None:
         raise ServiceContractError("unknown visibility")
 
 
+SCHEMA_V2 = "service-contract/v2"
+_ENV_ID = re.compile(r"[a-z0-9][a-z0-9_]{0,63}\Z")
+_DATASET_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@_-]{0,255}\Z")
+_V2_FIELDS = {"schema", "service_kind", "revision_id", "checkpoint", "generation_contract_sha256",
+              "scoring", "policies", "environments", "limits", "visibility"}
+_V2_REWARD = {"price_bps": (1, 10000), "cap_bps": (0, 10000), "audit_bps": (0, 10000),
+              "new_hotkey_audit_groups": (0, 1_000_000), "ban_seconds": (0, 30 * 86400),
+              "max_tokens_per_group": (1, MAX_SAFE_INTEGER)}
+_V2_ADVICE = {"margin_bps": (1, 10000), "min_windows": (0, 1_000_000), "max_windows": (1, 1_000_000),
+              "smoothing_bps": (1, 10000), "hysteresis_windows": (0, 1_000_000),
+              "max_change_windows": (1, 1_000_000), "min_first_scans": (1, 1_000_000)}
+_V2_SAMPLING = {"legacy/v1": {}, "public-group-pool/v1": _POLICIES["sampling"]["public-group-pool/v1"]}
+SUPPORTED_V2_CAPABILITIES = frozenset({
+    "environment-reward/v1", "trainer-driven/v1", "task-scoped/v1", "exploration-first-scan/v1",
+    "in-zone-rotation/v1", "public-group-pool/v1", "legacy/v1",
+})
+
+
+def _validate_v2(value: dict) -> None:
+    _object(value, _V2_FIELDS, "contract")
+    if value["service_kind"] != "adaptive_training":
+        raise ServiceContractError("service-contract/v2 orders adaptive_training only")
+    _identifier(value["revision_id"], "revision_id")
+    _object(value["checkpoint"], {"repo", "revision", "sha256"}, "checkpoint")
+    _identifier(value["checkpoint"]["repo"], "checkpoint.repo")
+    if not isinstance(value["checkpoint"]["revision"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["checkpoint"]["revision"]):
+        raise ServiceContractError("checkpoint.revision must pin an immutable 40-hex commit")
+    _sha(value["checkpoint"]["sha256"], "checkpoint.sha256")
+    _sha(value["generation_contract_sha256"], "generation_contract_sha256")
+    score = _object(value["scoring"], {"kind", "sigma_min_bps", "weights_bps"}, "scoring")
+    if score["kind"] != "environment-reward/v1" or score["weights_bps"] != {"reward": 10000}:
+        raise ServiceContractError("v2 scoring is the environment reward unchanged")
+    _integer(score["sigma_min_bps"], "sigma_min_bps", 0, 10000)
+    policies = _object(value["policies"], {"checkpoint", "reward", "cooldown_advice"}, "policies")
+    checkpoint = _object(policies["checkpoint"], {"kind", "task_scoped"}, "checkpoint policy")
+    if checkpoint["kind"] != "trainer-driven/v1":
+        raise ServiceContractError("v2 needs trainer-driven/v1 checkpoints")
+    _integer(checkpoint["task_scoped"], "task_scoped", 0, 1)
+    reward = _object(policies["reward"], {"kind", *_V2_REWARD}, "reward policy")
+    if reward["kind"] != "exploration-first-scan/v1":
+        raise ServiceContractError("unknown v2 reward policy")
+    for name, bounds in _V2_REWARD.items():
+        _integer(reward[name], name, *bounds)
+    advice = _object(policies["cooldown_advice"], {"kind", *_V2_ADVICE}, "cooldown_advice")
+    if advice["kind"] != "in-zone-rotation/v1":
+        raise ServiceContractError("unknown cooldown advice policy")
+    for name, bounds in _V2_ADVICE.items():
+        _integer(advice[name], name, *bounds)
+    if advice["min_windows"] > advice["max_windows"]:
+        raise ServiceContractError("cooldown advice bounds are inverted")
+    environments = value["environments"]
+    if not isinstance(environments, dict) or not 1 <= len(environments) <= 16:
+        raise ServiceContractError("environments: 1..16 entries required")
+    total = 0
+    for name, env in environments.items():
+        if not isinstance(name, str) or not _ENV_ID.fullmatch(name):
+            raise ServiceContractError(f"invalid environment id {name!r}")
+        _object(env, {"version", "dataset", "sampling", "exploration", "missing_box",
+                      "cooldown_windows", "share_bps"}, f"environment {name}")
+        _sha(env["version"], f"{name}.version")
+        dataset = _object(env["dataset"], {"id", "rows"}, f"{name}.dataset")
+        if not isinstance(dataset["id"], str) or not _DATASET_ID.fullmatch(dataset["id"]) or ".." in dataset["id"]:
+            raise ServiceContractError(f"{name}.dataset.id: canonical identifier required")
+        _integer(dataset["rows"], f"{name}.dataset.rows", 1, 2**31)
+        sampling = env["sampling"]
+        if not isinstance(sampling, dict) or sampling.get("kind") not in _V2_SAMPLING:
+            raise ServiceContractError(f"{name}: unknown sampling policy")
+        params = _V2_SAMPLING[sampling["kind"]]
+        _object(sampling, {"kind", *params}, f"{name}.sampling")
+        for field_name, bounds in params.items():
+            _integer(sampling[field_name], f"{name}.sampling.{field_name}", *bounds)
+        if type(env["exploration"]) is not int or env["exploration"] not in (0, 1):
+            raise ServiceContractError(f"{name}.exploration must be 0 or 1")
+        if env["missing_box"] not in ("uncertain", "graded"):
+            raise ServiceContractError(f"{name}.missing_box must be uncertain or graded")
+        _integer(env["cooldown_windows"], f"{name}.cooldown_windows", 0, 1_000_000)
+        total += _integer(env["share_bps"], f"{name}.share_bps", 0, 10000)
+    if total != 10000:
+        raise ServiceContractError("environment share_bps must sum to 10000")
+    limits = _object(value["limits"], {"max_groups", "max_tokens", "deadline_seconds"}, "limits")
+    for name, amount in limits.items():
+        _integer(amount, f"limits.{name}")
+    if value["visibility"] not in {"private", "task"}:
+        raise ServiceContractError("unknown visibility")
+
+
+def validate_service_contract(value: dict) -> None:
+    if isinstance(value, dict) and value.get("schema") == SCHEMA_V2:
+        _validate_v2(value)
+    else:
+        _validate_v1(value)
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceContract:
     """Canonical bytes prevent a caller mutating an already ordered contract."""
@@ -169,16 +262,54 @@ class ServiceContract:
         return canonical_sha256(self.to_dict())
 
     @property
+    def version(self) -> int:
+        return 2 if self.to_dict()["schema"] == SCHEMA_V2 else 1
+
+    def _v2(self) -> dict:
+        value = self.to_dict()
+        if value["schema"] != SCHEMA_V2:
+            raise ServiceContractError("this accessor needs service-contract/v2")
+        return value
+
+    @property
+    def environments(self) -> dict:
+        return self._v2()["environments"]
+
+    def environment(self, name: str) -> dict:
+        environments = self.environments
+        if name not in environments:
+            raise ServiceContractError(f"environment {name!r} is not in this order")
+        return environments[name]
+
+    @property
+    def reward_policy(self) -> dict:
+        return self._v2()["policies"]["reward"]
+
+    @property
+    def advice_policy(self) -> dict:
+        return self._v2()["policies"]["cooldown_advice"]
+
+    @property
     def context_sha256(self) -> str:
+        if self.version == 2:
+            raise ServiceContractError("v2 observations are run-wide; there is no checkpoint-bound context")
         value = self.to_dict()
         return canonical_sha256({name: value[name] for name in
                                  ("dataset", "checkpoint", "environment", "generation_contract_sha256", "scoring")})
 
     def require_capabilities(self, supported: set[str]) -> None:
         value = self.to_dict()
-        required = {value["scoring"]["kind"], *(p["kind"] for p in value["policies"].values())}
-        if value["policies"]["checkpoint"].get("task_scoped") == 1:
-            required.add("task-scoped/v1")
+        if value["schema"] == SCHEMA_V2:
+            policies = value["policies"]
+            required = {value["scoring"]["kind"], policies["checkpoint"]["kind"],
+                        policies["reward"]["kind"], policies["cooldown_advice"]["kind"],
+                        *(env["sampling"]["kind"] for env in value["environments"].values())}
+            if policies["checkpoint"]["task_scoped"] == 1:
+                required.add("task-scoped/v1")
+        else:
+            required = {value["scoring"]["kind"], *(p["kind"] for p in value["policies"].values())}
+            if value["policies"]["checkpoint"].get("task_scoped") == 1:
+                required.add("task-scoped/v1")
         missing = required - supported
         if missing:
             raise ServiceContractError(f"runtime lacks capabilities: {sorted(missing)}")
