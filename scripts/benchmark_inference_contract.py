@@ -27,6 +27,13 @@ Example (GPU box, one fresh process per profile)::
         --randomness BEACON_HEX --pool-epoch WINDOW --pool-subset all \
         --pool-pick lowest-agreement
 
+Scope notes: the top-level ``summary`` of the report (and the legacy per-rollout statistics)
+covers EVERY generated rollout, including the non-submitted half in ``--pool-subset all``;
+the ``forced_seed`` section covers only the submitted group of each prompt. In pool mode
+``--randomness``, ``--pool-epoch`` and ``--checkpoint-hash`` are required (a default would
+silently build a pool no window uses), and ``--pool-pick`` is only valid with
+``--pool-subset all``.
+
 The JSON report has a ``forced_seed`` section: per rollout (``n_stochastic``,
 ``n_exact_match``, agreement) and per group, scored with the validator's own
 ``_forced_seed_verdict`` / ``_forced_seed_rollout_reject`` at the floors of
@@ -64,7 +71,7 @@ def load_contract(path: Path):
 
 def build_pool(args, *, prompt_idx: int):
     """The pool the validator builds for (contract, env, prompt, checkpoint, epoch, beacon)."""
-    from reliquary.protocol.seed_pool import CAPABILITY, SeedPool, SeedPoolError
+    from reliquary.protocol.seed_pool import SeedPool
 
     contract = args.contract if not isinstance(args.contract, (str, Path)) else load_contract(args.contract)
     pool = SeedPool.from_contract(
@@ -75,19 +82,20 @@ def build_pool(args, *, prompt_idx: int):
         pool_epoch=int(args.pool_epoch),
         randomness=args.randomness,
     )
-    if pool.renewal_windows != 1:  # R16: public pools renew every window
-        raise SeedPoolError(f"{CAPABILITY} pools renew every window")
+    # R16 (pools renew every window) is enforced by the contract itself: v2 refuses
+    # renewal_windows != 1 at parse time, so no pool reaches here with another value.
     return pool
 
 
-def uniform_source(args, *, prompt_idx: int):
+def uniform_source(args, *, prompt_idx: int, pool=None):
     """``u(key, offset)``: the public uniform the validator recomputes for this run.
 
     Window source: ``key`` is the rollout index (``u_at``). Pool source: ``key`` is the
     SEED INDEX (``SeedPool.uniform``), whatever rank the seed has in the submitted group.
     """
     if args.seed_source == "pool":
-        pool = build_pool(args, prompt_idx=prompt_idx)
+        if pool is None:
+            pool = build_pool(args, prompt_idx=prompt_idx)
         return pool.uniform
     from reliquary.environment.forced_sampling import u_at
 
@@ -122,7 +130,13 @@ def choose_seeds(pool, pick: str, agreement: dict[int, float]) -> tuple[int, ...
 
 
 def score_group(rows: list[dict]) -> dict:
-    """Score one group of rows with the validator's own forced-seed functions."""
+    """Score one group of rows with the validator's own forced-seed functions.
+
+    Measured: the group ratio verdict, the per-rollout verdict and the service-path CDF
+    hard-mismatch reject (``n_hard_mismatch`` summed over the group > 0, batcher.py
+    ``cdf_reject``). NOT measured: the terminal-pick and EOS-padding checks; they need the
+    submitted proofs, which this harness does not build.
+    """
     from reliquary.constants import (
         FORCED_SEED_CONSISTENCY_FLOOR,
         FORCED_SEED_MIN_STOCH_POSITIONS,
@@ -139,7 +153,11 @@ def score_group(rows: list[dict]) -> dict:
     n_match = sum(m for _, m in per_rollout)
     group_reject = _forced_seed_verdict(n_stoch, n_match, True)
     rollout_reject = _forced_seed_rollout_reject(per_rollout, True)
+    hard = sum(int(r["n_hard_mismatch"]) for r in rows)
+    cdf_reject = hard > 0
     return {
+        "n_hard_mismatch": hard,
+        "cdf_rejected": cdf_reject,
         "n_stochastic": n_stoch,
         "n_exact_match": n_match,
         "agreement": n_match / n_stoch if n_stoch else None,
@@ -154,7 +172,7 @@ def score_group(rows: list[dict]) -> dict:
             if n >= FORCED_SEED_ROLLOUT_MIN_STOCH and m / n < FORCED_SEED_ROLLOUT_FLOOR
         ),
         "rollout_rejected": bool(rollout_reject),
-        "accepted": not (group_reject or rollout_reject),
+        "accepted": not (group_reject or rollout_reject or cdf_reject),
     }
 
 
@@ -183,6 +201,9 @@ def forced_seed_summary(groups: list[dict]) -> dict:
         "group_floor_pass_rate": (
             sum(not g["score"]["group_rejected"] for g in groups) / n if n else None
         ),
+        "cdf_hard_mismatch_rate": (
+            sum(g["score"]["cdf_rejected"] for g in groups) / n if n else None
+        ),
         "rollouts_judged": len(judged),
         "rollout_floor_pass_rate": len(rollouts_ok) / len(judged) if judged else None,
         "mean_group_agreement": (
@@ -191,6 +212,68 @@ def forced_seed_summary(groups: list[dict]) -> dict:
             if n else None
         ),
     }
+
+
+def build_group_record(prompt_idx: int, prompt_rows: list[dict], pool, subset: str, pick: str | None) -> dict:
+    """The report record of one prompt: the submitted group, scored.
+
+    Pool rows are keyed on ``seed_index``; ``group_rank`` is the rank of a submitted
+    rollout inside the submitted (ascending) group.
+    """
+    if pool is not None:
+        agreement = {int(r["seed_index"]): rollout_agreement(r) for r in prompt_rows}
+        if subset == "first":
+            chosen = tuple(sorted(agreement))
+        else:
+            chosen = choose_seeds(pool, pick, agreement)
+        selection = pool.selection(chosen)
+        chosen_set = set(chosen)
+        group_rows = sorted(
+            (r for r in prompt_rows if r["seed_index"] in chosen_set),
+            key=lambda r: r["seed_index"],
+        )
+        group_rows = [dict(r, group_rank=rank) for rank, r in enumerate(group_rows)]
+        group_meta = {
+            "pool_sha256": pool.sha256,
+            "pool": pool.to_dict(),
+            "generated_seeds": sorted(agreement),
+            "chosen_seeds": list(chosen),
+            "selection_sha256": selection.sha256,
+        }
+    else:
+        group_rows = prompt_rows
+        group_meta = {}
+    return {
+        "prompt_idx": prompt_idx,
+        **group_meta,
+        "score": score_group(group_rows),
+        "rollouts": [
+            {
+                key: row[key]
+                for key in ("rollout_idx", "seed_index", "group_rank", "n_stochastic",
+                            "n_exact_match", "n_hard_mismatch", "completion_length")
+                if key in row
+            } | {"agreement": rollout_agreement(row)}
+            for row in group_rows
+        ],
+        "generated_rollouts": len(prompt_rows),
+    }
+
+
+def pool_arg_errors(args) -> list[str]:
+    """Problems with the pool-mode arguments (empty when fine)."""
+    errors = []
+    if args.seed_source != "pool":
+        return errors
+    if args.contract is None or not args.pool_env:
+        errors.append("--seed-source pool needs --contract and --pool-env")
+    for flag, value in (("--randomness", args.randomness), ("--pool-epoch", args.pool_epoch),
+                        ("--checkpoint-hash", args.checkpoint_hash)):
+        if value is None or value == "":
+            errors.append(f"{flag} is required in pool mode (a default builds a pool no window uses)")
+    if args.pool_subset == "first" and args.pool_pick is not None:
+        errors.append("--pool-pick needs --pool-subset all (subset first submits seeds 0..M-1)")
+    return errors
 
 
 def _dtype(torch, name: str):
@@ -269,7 +352,7 @@ def main() -> None:
     parser.add_argument("--deterministic-algorithms", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--allow-tf32", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--randomness", default="42" * 32)
+    parser.add_argument("--randomness", help="Window beacon hex (required in pool mode).")
     parser.add_argument("--hotkey", default="benchmark-hotkey")
     parser.add_argument("--include-text", action="store_true")
     parser.add_argument(
@@ -278,24 +361,29 @@ def main() -> None:
     )
     parser.add_argument("--contract", type=Path, help="service-contract/v2 JSON (pool mode).")
     parser.add_argument("--pool-env", help="Environment id in the contract (pool mode).")
-    parser.add_argument("--pool-epoch", type=int, default=0, help="Pool epoch = the window (pool mode).")
+    parser.add_argument("--pool-epoch", type=int, help="Pool epoch = the window (required in pool mode).")
     parser.add_argument(
         "--pool-subset", choices=POOL_SUBSETS, default="first",
         help="first: generate and submit seeds 0..M-1. all: generate all 2M seeds, submit M.",
     )
     parser.add_argument(
-        "--pool-pick", choices=POOL_PICKS, default="first",
-        help="With --pool-subset all, which M of the 2M seeds are submitted.",
+        "--pool-pick", choices=POOL_PICKS,
+        help="With --pool-subset all, which M of the 2M seeds are submitted (default lowest-agreement).",
     )
     parser.add_argument(
         "--required-group-acceptance", type=float,
         help="Optional: write qualified=true only if the group acceptance rate reaches this.",
     )
     args = parser.parse_args()
+    errors = pool_arg_errors(args)
+    if errors:
+        parser.error("; ".join(errors))
     if args.seed_source == "pool":
-        if args.contract is None or not args.pool_env:
-            parser.error("--seed-source pool needs --contract and --pool-env")
         args.contract = load_contract(args.contract)
+        if args.pool_subset == "all" and args.pool_pick is None:
+            args.pool_pick = "lowest-agreement"
+    elif args.randomness is None:
+        args.randomness = "42" * 32
 
     if args.batch_size <= 0 or args.max_new_tokens <= 0:
         raise ValueError("batch-size and max-new-tokens must be positive")
@@ -393,7 +481,7 @@ def main() -> None:
             build_pool(args, prompt_idx=prompt_idx)
             if args.seed_source == "pool" else None
         )
-        u = uniform_source(args, prompt_idx=prompt_idx)
+        u = uniform_source(args, prompt_idx=prompt_idx, pool=pool)
         chunks = (
             seeds_to_generate(pool, args.pool_subset)
             if pool is not None else [list(range(args.batch_size))]
@@ -525,7 +613,8 @@ def main() -> None:
                 teacher_force_seconds_total += verify_seconds
                 row = {
                     "prompt_idx": prompt_idx,
-                    "rollout_idx": rollout_idx,
+                    # pool mode: unique across chunks (the seed index); window mode: batch row
+                    "rollout_idx": draw_key if pool is not None else rollout_idx,
                     **({"seed_index": draw_key} if pool is not None else {}),
                     "prompt_length": prompt_length,
                     "completion_length": len(completion),
@@ -587,40 +676,9 @@ def main() -> None:
                     row["completion_text"] = completion_text
                 rows.append(row)
                 prompt_rows.append(row)
-        if pool is not None:
-            agreement = {int(r["seed_index"]): rollout_agreement(r) for r in prompt_rows}
-            if args.pool_subset == "first":
-                chosen = tuple(sorted(agreement))
-            else:
-                chosen = choose_seeds(pool, args.pool_pick, agreement)
-            selection = pool.selection(chosen)
-            group_rows = [r for r in prompt_rows if r["seed_index"] in set(chosen)]
-            group_rows.sort(key=lambda r: r["seed_index"])
-            group_meta = {
-                "pool_sha256": pool.sha256,
-                "pool": pool.to_dict(),
-                "generated_seeds": sorted(agreement),
-                "chosen_seeds": list(chosen),
-                "selection_sha256": selection.sha256,
-            }
-        else:
-            group_rows = prompt_rows
-            group_meta = {}
-        group_records.append({
-            "prompt_idx": prompt_idx,
-            **group_meta,
-            "score": score_group(group_rows),
-            "rollouts": [
-                {
-                    key: row[key]
-                    for key in ("rollout_idx", "seed_index", "n_stochastic",
-                                "n_exact_match", "n_hard_mismatch", "completion_length")
-                    if key in row
-                } | {"agreement": rollout_agreement(row)}
-                for row in group_rows
-            ],
-            "generated_rollouts": len(prompt_rows),
-        })
+        group_records.append(build_group_record(
+            prompt_idx, prompt_rows, pool, args.pool_subset, args.pool_pick,
+        ))
 
     elapsed = time.perf_counter() - started
     positions = sum(int(row["n_positions"]) for row in rows)

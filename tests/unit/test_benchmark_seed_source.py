@@ -46,8 +46,9 @@ def _validator_pool(contract, *, prompt_idx, epoch=3, beacon=BEACON):
     return pool_from_service_policy(announcement, environment=MATH, prompt_idx=prompt_idx, checkpoint_hash=CKPT)
 
 
-def _row(seed, n_stoch=100, n_match=100):
-    return {"seed_index": seed, "n_stochastic": n_stoch, "n_exact_match": n_match}
+def _row(seed, n_stoch=100, n_match=100, hard=0):
+    return {"seed_index": seed, "n_stochastic": n_stoch, "n_exact_match": n_match,
+            "n_hard_mismatch": hard}
 
 
 # --- seed source ---------------------------------------------------------------------------
@@ -58,25 +59,49 @@ def test_window_source_matches_the_protocol_u_at():
     assert u(1, 5) == u_at("42" * 32, 3, "c" * 40, 1, 5)
 
 
-def test_pool_source_is_the_validators_seed_uniforms_path():
-    contract = contract_v2()
-    pool = _validator_pool(contract, prompt_idx=9)
-    selection = pool.selection(list(range(1, POOL_SEEDS, 2)))
+def test_pool_source_matches_the_validators_pool_uniform():
+    """Independent: the pool the validator resolves from the announcement, drawn directly."""
+    pool = _validator_pool(contract_v2(), prompt_idx=9)
     u = B.uniform_source(_args(), prompt_idx=9)
-    # validator: pool.uniform(selection.seeds[rollout_rank], position)
-    for rank in range(M_ROLLOUTS):
+    for seed in (0, 1, POOL_SEEDS - 1):
         for position in (0, 1, 777):
-            assert u(selection.seeds[rank], position) == pool.uniform(selection.seeds[rank], position)
-    assert B.build_pool(_args(), prompt_idx=9) == pool
+            assert u(seed, position) == pool.uniform(seed, position)
     assert B.build_pool(_args(), prompt_idx=9).sha256 == pool.sha256
 
 
 def test_draw_depends_on_seed_not_on_rank_or_subset():
-    u = B.uniform_source(_args(), prompt_idx=9)
-    first, odd = list(range(M_ROLLOUTS)), list(range(1, POOL_SEEDS, 2))
-    # seed 1 is rank 1 of the first subset and rank 0 of the odd one: same draw
-    assert first[1] == odd[0] == 1
-    assert [u(1, t) for t in range(50)] == [B.uniform_source(_args(), prompt_idx=9)(1, t) for t in range(50)]
+    pool = B.build_pool(_args(), prompt_idx=9)
+    u = B.uniform_source(_args(), prompt_idx=9, pool=pool)
+    # seed 1 is rank 1 of the first subset and rank 0 of the odd one: one draw, whatever the rank
+    assert [u(1, t) for t in range(50)] == [pool.uniform(1, t) for t in range(50)]
+    assert [u(1, t) for t in range(50)] != [u(0, t) for t in range(50)]
+
+
+def test_generation_side_draws_the_seed_index_not_the_chunk_row():
+    """Glue: in the second chunk the processor's row r draws seed M+r, equal to scoring u(M+r, t)."""
+    import torch
+    from reliquary.environment.forced_sampling import pick, warp
+    from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
+    from reliquary.miner.forced_seed_sampler import ForcedSeedLogitsProcessor
+
+    pool = B.build_pool(_args(), prompt_idx=5)
+    u = B.uniform_source(_args(), prompt_idx=5, pool=pool)
+    chunk = list(range(M_ROLLOUTS, 2 * M_ROLLOUTS))
+    start_len = 4
+    proc = ForcedSeedLogitsProcessor(
+        randomness=BEACON, hotkey="h", prompt_idx=5, checkpoint_hash=CKPT,
+        rollout_indices=list(range(M_ROLLOUTS)), base_offsets=[0] * M_ROLLOUTS,
+        start_len=start_len, seed_pool=pool, seeds=chunk,
+    )
+    gen = torch.Generator().manual_seed(0)
+    for t in range(6):
+        scores = torch.randn(M_ROLLOUTS, 64, generator=gen)
+        out = proc(torch.zeros(M_ROLLOUTS, start_len + t, dtype=torch.long), scores)
+        for r in range(M_ROLLOUTS):
+            expected = pick(warp(scores[r], t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO), u(chunk[r], t))
+            assert int(out[r].argmax()) == expected
+            # and the wrong key (the chunk row) would have drawn something else somewhere
+    assert any(pool.uniform(r, t) != u(chunk[r], t) for r in range(M_ROLLOUTS) for t in range(6))
 
 
 def test_pool_source_is_deterministic_and_varies_with_the_inputs():
@@ -101,7 +126,7 @@ def test_r16_pools_renew_every_window_so_the_epoch_changes_the_pool():
     b = B.build_pool(_args(pool_epoch=4), prompt_idx=1)
     assert a.sha256 != b.sha256
     assert a.renewal_windows == 1
-    value = contract_v2_dict()
+    value = contract_v2_dict()  # the contract itself refuses a multi-window pool
     value["environments"][MATH]["sampling"]["renewal_windows"] = 2
     with pytest.raises(ServiceContractError):
         ServiceContract.from_dict(value)
@@ -173,3 +198,45 @@ def test_summary_rates():
     assert summary["group_acceptance_rate"] == 0.75
     assert summary["rollout_floor_pass_rate"] == pytest.approx(48 / 64)
     assert summary["group_floor"] == FORCED_SEED_CONSISTENCY_FLOOR
+
+
+def test_cdf_hard_mismatch_rejects_the_group_like_the_service_path():
+    clean = [_row(s) for s in range(M_ROLLOUTS)]
+    assert B.score_group(clean)["accepted"] and not B.score_group(clean)["cdf_rejected"]
+    one = [_row(s, hard=(1 if s == 3 else 0)) for s in range(M_ROLLOUTS)]  # ratios perfect
+    score = B.score_group(one)
+    assert score["cdf_rejected"] and score["n_hard_mismatch"] == 1
+    assert not score["group_rejected"] and not score["rollout_rejected"] and not score["accepted"]
+    def group(rows):
+        return {"score": B.score_group(rows), "rollouts": rows}
+    summary = B.forced_seed_summary([group(clean), group(one)])
+    assert summary["cdf_hard_mismatch_rate"] == 0.5 and summary["group_acceptance_rate"] == 0.5
+
+
+def test_group_record_keys_rows_on_seed_index_with_group_rank():
+    pool = B.build_pool(_args(), prompt_idx=1)
+    # all mode, two chunks of M: rollout_idx restarted per chunk upstream, seed_index is unique
+    rows = [dict(_row(s), rollout_idx=s % M_ROLLOUTS) for s in range(POOL_SEEDS)]
+    record = B.build_group_record(1, rows, pool, "all", "last")
+    assert record["chosen_seeds"] == list(range(M_ROLLOUTS, POOL_SEEDS))
+    assert [r["seed_index"] for r in record["rollouts"]] == record["chosen_seeds"]
+    assert [r["group_rank"] for r in record["rollouts"]] == list(range(M_ROLLOUTS))
+    assert record["generated_rollouts"] == POOL_SEEDS
+    assert "cdf_rejected" in record["score"]
+
+
+def test_pool_arg_errors():
+    ok = _args(pool_subset="all", pool_pick="lowest-agreement")
+    assert B.pool_arg_errors(ok) == []
+    assert B.pool_arg_errors(_args(pool_subset="first", pool_pick=None)) == []
+    assert B.pool_arg_errors(_args(pool_subset="first", pool_pick="last"))
+    for kw in (dict(randomness=None), dict(pool_epoch=None), dict(checkpoint_hash=None)):
+        assert B.pool_arg_errors(_args(pool_subset="first", pool_pick=None, **kw))
+    assert B.pool_arg_errors(_args(seed_source="window", randomness=None, pool_epoch=None,
+                                   pool_subset="first", pool_pick=None)) == []
+
+
+def test_pool_is_built_once_when_given():
+    pool = B.build_pool(_args(), prompt_idx=1)
+    args = _args(contract=None)  # would crash if uniform_source rebuilt the pool
+    assert B.uniform_source(args, prompt_idx=1, pool=pool)(0, 0) == pool.uniform(0, 0)
