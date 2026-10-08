@@ -46,6 +46,7 @@ import logging
 import math
 import threading
 import time
+import zlib
 
 from reliquary.constants import SERVICE_OBSERVATION_FLUSH_SECONDS, SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS
 from reliquary.protocol.release_contract import canonical_json_bytes
@@ -65,7 +66,7 @@ OBSERVATIONS_BUCKET_ENV = "RELIQUARY_OBSERVATIONS_BUCKET"
 
 PUBLIC_KEYS = frozenset({"type", "id", "env", "dataset", "prompt_idx", "checkpoint_n", "checkpoint", "window",
                          "ts", "rewards_bps", "verdict", "candidate", "lane", "status", "proof", "reason",
-                         "uncertain"})
+                         "uncertain", "window_aborted"})
 TRANSIENT_STATUSES = frozenset({"exploration_recording", "service_unproven_recording"})
 COARSENED_REASONS = frozenset({"probation_limit", "banned"})
 REFUSED = "refused"
@@ -213,11 +214,26 @@ def verify_page_entry(page_bytes: bytes, entry: dict) -> None:
         raise ValueError("page does not match its head entry")
 
 
-def verify_segment(segment_bytes: bytes, entry: dict) -> list[dict]:
-    """The events of a segment if its size and sha256 are the ones its (verified) index entry states."""
+MAX_SEGMENT_BYTES = 256 * 1024 * 1024   # decompressed size a reader accepts for one segment
+
+
+def verify_segment(segment_bytes: bytes, entry: dict, *, max_size: int = MAX_SEGMENT_BYTES) -> list[dict]:
+    """The events of a segment if its size and sha256 are the ones its (verified) index entry states.
+
+    The decompressed size is capped at ``max_size`` (a signed segment is still not trusted to be small):
+    above it, or when the gzip stream is truncated or followed by other bytes, ``ValueError``."""
     if len(segment_bytes) != entry["size"] or hashlib.sha256(segment_bytes).hexdigest() != entry["sha256"]:
         raise ValueError("segment does not match its index entry")
-    return [json.loads(x) for x in gzip.decompress(segment_bytes).decode().splitlines()]
+    decompressor = zlib.decompressobj(31)
+    try:
+        raw = decompressor.decompress(segment_bytes, max_size + 1)
+    except zlib.error as exc:
+        raise ValueError(f"segment is not a valid gzip stream: {exc}") from exc
+    if len(raw) > max_size:
+        raise ValueError("segment decompresses above the size limit")
+    if not decompressor.eof or decompressor.unused_data:
+        raise ValueError("segment is not exactly one complete gzip stream")
+    return [json.loads(x) for x in raw.decode().splitlines()]
 
 
 def r2_put(bucket: str):

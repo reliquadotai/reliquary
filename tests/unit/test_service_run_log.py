@@ -455,3 +455,40 @@ def test_uncertain_positions_are_published_only_when_given_and_must_name_rollout
         with pytest.raises(ValueError, match="uncertain"):
             with log.db:
                 log.record(replace(obs(group="g3", prompt=9), uncertain=bad), status="proven", proof="proven")
+
+
+def test_r30_an_aborted_window_resettles_its_training_observations_with_the_flag(log):
+    with log.db:
+        a = log.record(obs(group="t1", window=1, hotkey="b"), status="proven", proof="proven")
+        b = log.record(obs(prompt=8, group="t2", window=1, hotkey="b"), status="proven", proof="proven")      # never settled
+        other = log.record(obs(prompt=9, group="t3", window=2, hotkey="b"), status="proven", proof="proven")
+        probe = log.record(obs(prompt=10, rewards=(0,) * M_ROLLOUTS, lane="exploration", window=1),
+                           status="exploration_pending", proof="pending")
+        for r in (a, other):
+            log.settle(r.observation_id, status="trained", proof="proven", at=5.0)
+        log.settle(probe.observation_id, status="exploration_unpaid", proof="unproven", at=5.0, reason="trained")
+    before = [(s, e) for s, e in log.events() if e["type"] == "settle"]
+    assert all("window_aborted" not in e for _, e in before)            # existing events: bytes unchanged
+    with log.db:
+        log.set_window_aborted(1, True)
+        log.set_window_aborted(1, True)                                  # idempotent: no second event
+    settles = [e for _, e in log.events() if e["type"] == "settle"]
+    assert [(e["id"], e.get("window_aborted")) for e in settles[len(before):]] == [(a.observation_id, True)]
+    assert settles[-1]["status"] == "trained" and settles[-1]["proof"] == "proven"
+    assert [(s, e) for s, e in log.events() if e["type"] == "settle"][:len(before)] == before   # history untouched
+    with log.db:                                                         # a later settle of the window keeps the flag
+        log.settle(b.observation_id, status="proven_unpaid", proof="proven", at=6.0)
+        log.settle(a.observation_id, status="proven_unpaid", proof="proven", at=6.0)
+    last = {e["id"]: e for _, e in log.events() if e["type"] == "settle"}
+    assert last[a.observation_id]["window_aborted"] is True and last[b.observation_id]["window_aborted"] is True
+    assert "window_aborted" not in last[other.observation_id] and "window_aborted" not in last[probe.observation_id]
+    with log.db:
+        log.set_window_aborted(1, False)                                 # un-abort: new settle events, flag absent
+    last = {e["id"]: e for _, e in log.events() if e["type"] == "settle"}
+    assert "window_aborted" not in last[a.observation_id] and "window_aborted" not in last[b.observation_id]
+    assert last[a.observation_id]["status"] == "proven_unpaid"
+    count = len([1 for _, e in log.events() if e["type"] == "settle"])
+    with log.db:
+        log.set_window_aborted(1, False)
+        log.settle(a.observation_id, status="proven_unpaid", proof="proven", at=9.0)
+    assert len([1 for _, e in log.events() if e["type"] == "settle"]) == count

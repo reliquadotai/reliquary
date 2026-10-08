@@ -302,32 +302,49 @@ class RunObservationLog:
                 self.release_first_scan(identity)
             else:
                 self._seat(environment, prompt_idx)
+            # Publish the flip (R30): an observation already settled is settled again with the flag, so a
+            # reader learns that the window trained nothing. History is never rewritten: a new event.
+            latest = self._latest_settle(identity)
+            if latest is not None:
+                self.settle(identity, status=latest["status"], proof=latest["proof"], at=float(latest["ts"]),
+                            reason=latest.get("reason"))
+
+    def _latest_settle(self, observation_id: str) -> dict | None:
+        for (payload,) in self.db.execute(
+                "SELECT payload FROM run_events WHERE order_id=? AND observation_id=? ORDER BY seq DESC",
+                (self.order, observation_id)):
+            event = json.loads(payload)
+            if event.get("type") == "settle":
+                return event
+        return None
 
     def settle(self, observation_id: str, *, status: str, proof: str, at: float,
                reason: str | None = None) -> None:
-        """Publish a settle event (idempotent on the latest status, proof and reason). The status
-        never changes what counts as a scan (``set_window_aborted`` does)."""
+        """Publish a settle event (idempotent on the latest status, proof, reason and abort flag). The
+        status never changes what counts as a scan (``set_window_aborted`` does).
+
+        A training observation of a window declared aborted carries ``window_aborted: true`` (R30);
+        the key is absent otherwise, so the bytes of every other settle event are unchanged and an
+        event without it means false."""
         if reason is not None and (not isinstance(reason, str) or _REASON.fullmatch(reason) is None):
             raise ValueError("settle reason must be a short lowercase identifier")
-        row = self.db.execute("SELECT window, order_id FROM run_observations "
+        row = self.db.execute("SELECT window, order_id, lane, untrained FROM run_observations "
                               "WHERE id=?", (observation_id,)).fetchone()
         if row is None:
             raise ValueError("unknown observation")
         if row[1] != self.order:
             raise ValueError("observation belongs to another order")
-        for (payload,) in self.db.execute(
-                "SELECT payload FROM run_events WHERE order_id=? AND observation_id=? ORDER BY seq DESC",
-                (self.order, observation_id)):
-            event = json.loads(payload)
-            if event.get("type") != "settle":
-                continue
-            if event.get("status") == status and event.get("proof") == proof and event.get("reason") == reason:
-                return  # same as the LATEST settlement: nothing new to publish
-            break  # an older identical settlement does not hide a change back (A, B, A)
+        aborted = row[2] == "training" and bool(row[3])
+        event = self._latest_settle(observation_id)
+        if (event is not None and event.get("status") == status and event.get("proof") == proof
+                and event.get("reason") == reason and bool(event.get("window_aborted")) == aborted):
+            return  # same as the LATEST settlement: nothing new (an older identical one does not hide A, B, A)
         public = {"type": "settle", "id": observation_id, "window": int(row[0]),
                   "status": str(status), "proof": str(proof), "ts": float(at)}
         if reason is not None:
             public["reason"] = reason
+        if aborted:
+            public["window_aborted"] = True
         self.db.execute("INSERT INTO run_events(order_id,observation_id,payload) VALUES(?,?,?)",
                         (self.order, observation_id, canonical_json_bytes(public).decode()))
 

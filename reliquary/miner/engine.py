@@ -1482,7 +1482,12 @@ class MiningEngine:
         except Exception:
             logger.warning("observation source failed; mining without it", exc_info=True)
             return [self._cooldown_per_env]
-        return [fresh, hard] if fresh != hard else [hard]
+        # Last resort: the miner's own cooldown set, so a policy that skips every prompt of an env cannot stall it.
+        options: list = []
+        for candidate in (fresh, hard, self._cooldown_per_env):
+            if not any(candidate == held for held in options):
+                options.append(candidate)
+        return options
 
     def _preferred_public_seeds(self, seed_pool) -> tuple[int, ...] | None:
         choose = getattr(self._prompt_policy, "preferred_seeds", None)

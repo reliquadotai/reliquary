@@ -838,3 +838,12 @@ def test_verify_index_refuses_a_head_holding_a_whole_page(monkeypatch):
     monkeypatch.setattr(publication, "PAGE_SEGMENTS", 5)       # now five entries are a whole page
     with pytest.raises(ValueError, match="whole page"):
         verify_index(head_bytes, key.ss58_address, expected_run_id="r1")
+
+
+def test_r30_window_aborted_is_public_on_settle_events_only_when_set():
+    assert "window_aborted" in publication.PUBLIC_KEYS
+    plain = {"type": "settle", "id": "a" * 64, "window": 1, "status": "trained", "proof": "proven", "ts": 5.0}
+    flagged = {**plain, "window_aborted": True}
+    out = publication.public_events([plain, flagged], flush_at=100.9)
+    assert out[0] == {**plain, "ts": 100.0} and "window_aborted" not in out[0]
+    assert out[1]["window_aborted"] is True

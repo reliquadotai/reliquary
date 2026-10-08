@@ -34,7 +34,10 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
+import urllib.parse
+import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
@@ -62,16 +65,16 @@ class ObservationVerificationError(ValueError):
 
 # ------------------------------------------------------------------------------------------ table
 
-def _scans(lane: str, status: str, proof: str) -> bool:
+def _scans(lane: str, status: str, proof: str, aborted: bool = False) -> bool:
     """Whether an observation holds the first scan of its prompt as published NOW.
 
-    A proven training observation is a scan whatever its pay (the final ``proven_unpaid`` of an
-    aborted window is indistinguishable from an unpaid one: counted, the safe side for a miner that
-    wants unscanned prompts). An exploration observation is a scan while it is entitled
+    A proven training observation is a scan whatever its pay, unless its last settle says its window
+    aborted (``window_aborted``: that window trained nothing and gave its prompts back; an event
+    without the field means false). An exploration observation is a scan while it is entitled
     (``exploration_pending`` / ``exploration_paid``) and not failed; unpaid, forfeited and unproven
     observations (``already_scanned``, ``not_robust``, ``unaudited`` ...) are not."""
     if lane == "training":
-        return proof == "proven"
+        return proof == "proven" and not aborted
     return lane == "exploration" and status in ("exploration_pending", "exploration_paid") and proof != "failed"
 
 
@@ -85,11 +88,24 @@ class PromptSummary:
     best_in_zone: dict | None      # latest in-zone evidence: pool_sha256, seeds, rewards_bps, window
 
 
+def _locked(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class ObservationTable:
-    """SQLite-backed table of the run's observations (``path=None``: in memory, for tests)."""
+    """SQLite-backed table of the run's observations (``path=None``: in memory, for tests).
+
+    Thread safe: the engine syncs on a worker thread and reads on the event loop thread, so the
+    connection is shared (``check_same_thread=False``) and every public method holds one lock."""
 
     def __init__(self, path: str | os.PathLike | None = None):
-        self.db = sqlite3.connect(":memory:" if path is None else str(path), isolation_level=None)
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(":memory:" if path is None else str(path), isolation_level=None,
+                                  check_same_thread=False)
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -97,7 +113,8 @@ class ObservationTable:
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, env TEXT NOT NULL,
                 prompt_idx INTEGER NOT NULL, window INTEGER NOT NULL, checkpoint_n INTEGER NOT NULL,
                 lane TEXT NOT NULL, verdict TEXT NOT NULL, status TEXT NOT NULL, proof TEXT NOT NULL,
-                reason TEXT, pool TEXT, seeds TEXT, rewards TEXT NOT NULL, uncertain TEXT NOT NULL);
+                reason TEXT, pool TEXT, seeds TEXT, rewards TEXT NOT NULL, uncertain TEXT NOT NULL,
+                window_aborted INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS observations_prompt ON observations(env, prompt_idx);
             CREATE TABLE IF NOT EXISTS prompts(
                 env TEXT NOT NULL, prompt_idx INTEGER NOT NULL, n_obs INTEGER NOT NULL DEFAULT 0,
@@ -105,6 +122,8 @@ class ObservationTable:
                 PRIMARY KEY(env, prompt_idx));
             CREATE TABLE IF NOT EXISTS pages(first_number INTEGER PRIMARY KEY, raw BLOB NOT NULL);
         """)
+        if "window_aborted" not in {r[1] for r in self.db.execute("PRAGMA table_info(observations)")}:
+            self.db.execute("ALTER TABLE observations ADD COLUMN window_aborted INTEGER NOT NULL DEFAULT 0")
         stamped = self.get_meta("table_version")
         if stamped is None:
             self.set_meta("table_version", str(TABLE_VERSION))
@@ -113,10 +132,12 @@ class ObservationTable:
         self.version = 0  # bumped on every change: callers cache derived sets on it
 
     # --- meta
+    @_locked
     def get_meta(self, key: str) -> str | None:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return None if row is None else row[0]
 
+    @_locked
     def set_meta(self, key: str, value: str) -> None:
         self.db.execute("INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         (key, value))
@@ -129,10 +150,12 @@ class ObservationTable:
     def last_seq(self) -> int:
         return int(self.get_meta("last_seq") or 0)
 
+    @_locked
     def close(self) -> None:
         self.db.close()
 
     # --- writes
+    @_locked
     def apply(self, event: dict) -> None:
         """Apply one published event (own transaction). Observations are idempotent on their id."""
         self.db.execute("BEGIN")
@@ -144,6 +167,7 @@ class ObservationTable:
         self.db.execute("COMMIT")
         self.version += 1
 
+    @_locked
     def apply_segment(self, number: int, last_seq: int, events: Iterable[dict], *, order_sha256: str | None = None) -> None:
         """Apply a whole segment and advance ``last_number`` / ``last_seq`` in ONE transaction."""
         self.db.execute("BEGIN")
@@ -184,16 +208,27 @@ class ObservationTable:
         elif kind == "settle":
             # The last settle of an id wins: events are applied in sequence order. An id compacted away
             # (or never seen) is ignored.
-            self.db.execute("UPDATE observations SET status=?, proof=?, reason=? WHERE id=?",
-                            (str(event["status"]), str(event["proof"]), event.get("reason"), str(event["id"])))
+            try:
+                values = (str(event["status"]), str(event["proof"]), event.get("reason"),
+                          int(bool(event.get("window_aborted", False))), str(event["id"]))
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise ObservationVerificationError(f"malformed settle event: {exc!r}") from exc
+            self.db.execute("UPDATE observations SET status=?, proof=?, reason=?, window_aborted=? WHERE id=?", values)
 
+    @_locked
     def cache_page(self, first_number: int, raw: bytes) -> None:
         self.db.execute("INSERT OR REPLACE INTO pages(first_number, raw) VALUES(?,?)", (first_number, raw))
 
+    @_locked
+    def drop_page(self, first_number: int) -> None:
+        self.db.execute("DELETE FROM pages WHERE first_number=?", (first_number,))
+
+    @_locked
     def cached_page(self, first_number: int) -> bytes | None:
         row = self.db.execute("SELECT raw FROM pages WHERE first_number=?", (first_number,)).fetchone()
         return None if row is None else bytes(row[0])
 
+    @_locked
     def compact(self, retain_windows: int) -> int:
         """Fold observations older than ``retain_windows`` windows (before the newest seen) into their
         prompt row and delete them. Returns the number of rows deleted."""
@@ -208,9 +243,9 @@ class ObservationTable:
         try:
             deleted = 0
             for env, prompt in old:
-                rows = self.db.execute("SELECT window, lane, status, proof FROM observations WHERE env=? AND prompt_idx=? "
-                                       "ORDER BY n", (env, prompt)).fetchall()
-                first = next((r for r in rows if _scans(r[1], r[2], r[3])), None)
+                rows = self.db.execute("SELECT window, lane, status, proof, window_aborted FROM observations WHERE env=? "
+                                       "AND prompt_idx=? ORDER BY n", (env, prompt)).fetchall()
+                first = next((r for r in rows if _scans(r[1], r[2], r[3], bool(r[4]))), None)
                 held = self.db.execute("SELECT scanned, first_scan_status FROM prompts WHERE env=? AND prompt_idx=?",
                                        (env, prompt)).fetchone()
                 scanned = bool(held[0]) or first is not None
@@ -232,33 +267,37 @@ class ObservationTable:
         return {"id": r[0], "env": r[1], "prompt_idx": r[2], "window": r[3], "checkpoint_n": r[4], "lane": r[5],
                 "verdict": r[6], "status": r[7], "proof": r[8], "reason": r[9], "pool_sha256": r[10],
                 "seeds": None if r[11] is None else json.loads(r[11]), "rewards_bps": json.loads(r[12]),
-                "uncertain": json.loads(r[13])}
+                "uncertain": json.loads(r[13]), "window_aborted": bool(r[14])}
 
-    _COLUMNS = "id,env,prompt_idx,window,checkpoint_n,lane,verdict,status,proof,reason,pool,seeds,rewards,uncertain"
+    _COLUMNS = "id,env,prompt_idx,window,checkpoint_n,lane,verdict,status,proof,reason,pool,seeds,rewards,uncertain,window_aborted"
 
+    @_locked
     def records(self, env: str, prompt_idx: int) -> list[dict]:
         """The retained observations of a prompt in the order they were published, with their latest status."""
         return [self._record(r) for r in self.db.execute(
             f"SELECT {self._COLUMNS} FROM observations WHERE env=? AND prompt_idx=? ORDER BY n", (env, int(prompt_idx)))]
 
+    @_locked
     def prompts(self, env: str) -> list[int]:
         return [r[0] for r in self.db.execute("SELECT prompt_idx FROM prompts WHERE env=? ORDER BY prompt_idx", (env,))]
 
+    @_locked
     def scanned_prompts(self, env: str) -> set[int]:
         out = {r[0] for r in self.db.execute("SELECT prompt_idx FROM prompts WHERE env=? AND scanned=1", (env,))}
-        for prompt, lane, status, proof in self.db.execute(
-                "SELECT prompt_idx, lane, status, proof FROM observations WHERE env=?", (env,)):
-            if _scans(lane, status, proof):
+        for prompt, lane, status, proof, aborted in self.db.execute(
+                "SELECT prompt_idx, lane, status, proof, window_aborted FROM observations WHERE env=?", (env,)):
+            if _scans(lane, status, proof, bool(aborted)):
                 out.add(prompt)
         return out
 
+    @_locked
     def summary(self, env: str, prompt_idx: int) -> PromptSummary | None:
         held = self.db.execute("SELECT n_obs, last_window, scanned, first_scan_status FROM prompts WHERE env=? AND "
                                "prompt_idx=?", (env, int(prompt_idx))).fetchone()
         if held is None:
             return None
         records = self.records(env, prompt_idx)
-        first = next((r for r in records if _scans(r["lane"], r["status"], r["proof"])), None)
+        first = next((r for r in records if _scans(r["lane"], r["status"], r["proof"], r["window_aborted"])), None)
         scanned = bool(held[2]) or first is not None
         status = held[3] if held[2] else (first["status"] if first else None)
         usable = [r for r in records if r["proof"] != "failed"]
@@ -273,6 +312,7 @@ class ObservationTable:
                     "window": r["window"]}
         return PromptSummary(held[0], scanned, status, held[1], verdicts, best)
 
+    @_locked
     def seed_rewards(self, env: str, prompt_idx: int, *, pool_sha256: str | None = None) -> dict[int, list[int]]:
         """Rewards (bps) per pool seed index over the retained non-failed observations; ``pool_sha256``
         restricts it to one pool. Uncertain positions (an unboxed 0) are left out."""
@@ -368,9 +408,30 @@ def load_policy(spec: str | None) -> PromptPolicy:
 
 # ------------------------------------------------------------------------------------------ client
 
-def _http_get(url: str) -> bytes:
+def _check_url(url: str) -> None:
+    """Only https (http on localhost for tests): no file:, ftp: or any other scheme, redirects included."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https" and parts.hostname:
+        return
+    if parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1"):
+        return
+    raise ValueError("an observation source is read over https (http only on localhost)")
+
+
+def _opener():
     import urllib.request
-    with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310 - the operator-chosen base URL
+
+    class SameSchemes(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            _check_url(urllib.parse.urljoin(req.full_url, newurl))
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return urllib.request.build_opener(SameSchemes)
+
+
+def _http_get(url: str) -> bytes:
+    _check_url(url)
+    with _opener().open(url, timeout=30) as response:  # noqa: S310 - scheme checked above
         body = response.read(MAX_DOWNLOAD_BYTES + 1)
     if len(body) > MAX_DOWNLOAD_BYTES:
         raise ObservationVerificationError("published object is larger than the download limit")
@@ -387,6 +448,7 @@ class ObservationClient:
                  clock: Callable[[], float] = time.monotonic, retain_windows: int = DEFAULT_RETAIN_WINDOWS):
         if not _RUN_ID.fullmatch(run_id):
             raise ValueError("run id must be a plain identifier")
+        _check_url(base_url)
         self.base = base_url.rstrip("/") + "/"
         self.run_id, self.validator_hotkey = run_id, validator_hotkey
         self.fetch = fetch or _http_get
@@ -415,7 +477,12 @@ class ObservationClient:
         if not force and now < self._next_poll:
             return 0
         try:
-            applied = self._sync_once()
+            try:
+                applied = self._sync_once()
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                if isinstance(exc, ObservationVerificationError):
+                    raise
+                raise ObservationVerificationError(f"malformed published document: {exc!r}") from exc
         except Exception:
             self._failures += 1
             self._next_poll = now + min(BACKOFF_MAX, HEAD_MAX_AGE * 2 ** self._failures)
@@ -448,18 +515,23 @@ class ObservationClient:
         for page in head["pages"]:
             if page["last_number"] <= last:
                 continue
-            raw = table.cached_page(page["first_number"])
-            try:
-                if raw is None:
-                    raw = self._get(page["key"])
+            body = None
+            cached = table.cached_page(page["first_number"])
+            if cached is not None:
+                try:
+                    verify_page_entry(cached, page)
+                    body = self._verify(cached)
+                except ValueError:
+                    logger.warning("cached index page %d failed verification; fetching it again", page["first_number"])
+                    table.drop_page(page["first_number"])
+            if body is None:
+                raw = self._get(page["key"])
+                try:
                     verify_page_entry(raw, page)
                     body = self._verify(raw)
-                    table.cache_page(page["first_number"], raw)
-                else:
-                    verify_page_entry(raw, page)
-                    body = self._verify(raw)
-            except ValueError as exc:
-                raise ObservationVerificationError(str(exc)) from exc
+                except ValueError as exc:
+                    raise ObservationVerificationError(str(exc)) from exc
+                table.cache_page(page["first_number"], raw)
             if (body["kind"] != "page" or body["first_number"] != page["first_number"]
                     or body["last_number"] != page["last_number"]):
                 raise ObservationVerificationError("a page is not the one the head lists")
@@ -469,8 +541,10 @@ class ObservationClient:
         for entry in entries:
             if entry["number"] != table.last_number + 1:
                 raise ObservationVerificationError("the published segments leave a gap after the last applied one")
-            if table.last_seq and entry["first_seq"] != table.last_seq + 1:
+            if entry["first_seq"] != table.last_seq + 1:   # also the first segment: the log starts at seq 1
                 raise ObservationVerificationError("segment sequence does not continue the applied log")
+            if entry["size"] > MAX_DOWNLOAD_BYTES:
+                raise ObservationVerificationError("a published segment is larger than the download limit")
             raw = self._get(entry["key"])
             try:
                 events = verify_segment(raw, entry)

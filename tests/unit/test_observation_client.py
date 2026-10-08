@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -525,11 +526,12 @@ def test_engine_with_a_source_merges_skips_and_prefers_unscanned_only_for_servic
     engine._observations.table.apply(obs("b", 2, verdict="in-zone"))                  # scanned, still allowed
     service = SimpleNamespace(service_policy=object(), checkpoint_n=5)
     engine._prompt_policy = DefaultPromptPolicy(unscanned_share=1.0)
-    fresh, hard = asyncio.run(engine._cooldown_options(service, _Rng()))
-    assert hard == {"math": {1, 3}} and fresh == {"math": {1, 2, 3}}
+    fresh, hard, legacy = asyncio.run(engine._cooldown_options(service, _Rng()))
+    assert hard == {"math": {1, 3}} and fresh == {"math": {1, 2, 3}} and legacy is engine._cooldown_per_env
     assert engine._cooldown_per_env == {"math": {3}}                                  # the engine's own set is untouched
     engine._prompt_policy = DefaultPromptPolicy(unscanned_share=0.0)
-    assert asyncio.run(engine._cooldown_options(service, _Rng())) == [{"math": {1, 3}}]
+    options = asyncio.run(engine._cooldown_options(service, _Rng()))
+    assert options == [{"math": {1, 3}}, {"math": {3}}] and options[-1] is engine._cooldown_per_env
     # a non-service window ignores the source altogether
     assert asyncio.run(engine._cooldown_options(SimpleNamespace(service_policy=None), _Rng()))[0] is engine._cooldown_per_env
 
@@ -551,3 +553,170 @@ def test_engine_hook_uses_the_policy_seeds_only_with_a_source(tmp_path):
     pool.prompt_idx = 7
     engine.choose_public_seed_group(pool, lambda s: asked.append(tuple(s)) or [], problem=None, env=None)
     assert asked[2] == tuple(range(M_ROLLOUTS))
+
+
+# ------------------------------------------------------------------ fix round 1
+
+def _env_engine(monkeypatch, tmp_path, bucket):
+    monkeypatch.setenv("RELIQUARY_OBSERVATIONS_URL", BASE)
+    monkeypatch.setenv("RELIQUARY_OBSERVATIONS_RUN_ID", RUN)
+    monkeypatch.setenv("RELIQUARY_OBSERVATIONS_VALIDATOR_HOTKEY", keypair().ss58_address)
+    monkeypatch.setenv("RELIQUARY_OBSERVATIONS_DIR", str(tmp_path / "t"))
+    engine = bare_engine()
+    engine._configure_observations()      # the table (a file) is opened HERE, on the calling thread
+    engine._observations.fetch = bucket.fetch
+    engine._cooldown_per_env = {MATH: {3}}
+    return engine
+
+
+def test_f1_the_engine_syncs_on_a_worker_thread_and_fills_the_table(monkeypatch, tmp_path):
+    rt = runtime(tmp_path / "v")
+    explore(rt, prompt=11, hotkey="h")
+    bucket = FakeR2()
+    publish_all(rt, bucket)
+    engine = _env_engine(monkeypatch, tmp_path, bucket)
+    threads = []
+    real = engine._observations.sync
+    engine._observations.sync = lambda *a, **k: threads.append(threading.current_thread()) or real(*a, **k)
+    service = SimpleNamespace(service_policy=object(), checkpoint_n=1)
+    options = asyncio.run(engine._cooldown_options(service, _Rng()))
+    assert threads and threads[0] is not threading.main_thread()          # the real asyncio.to_thread path
+    assert engine._observations.table.prompts(MATH) == [11]               # the worker thread's sync landed
+    assert engine._observations.table.last_number >= 1
+    assert 11 in options[0][MATH] and 11 not in options[-1][MATH]
+
+
+def test_f2_a_decompression_bomb_is_refused_by_verify_segment():
+    import gzip as gz
+    import hashlib
+
+    def entry_of(raw):
+        return {"size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    bomb = gz.compress(b"0" * 100_000, mtime=0)
+    with pytest.raises(ValueError, match="size limit"):
+        publication.verify_segment(bomb, entry_of(bomb), max_size=1000)
+    small = gz.compress(b'{"a":1}\n', mtime=0)
+    assert publication.verify_segment(small, entry_of(small), max_size=8) == [{"a": 1}]
+    truncated = bomb[:-8]
+    with pytest.raises(ValueError):
+        publication.verify_segment(truncated, entry_of(truncated))
+
+
+def test_f2_the_client_refuses_an_oversized_segment_before_downloading_it(tmp_path, monkeypatch):
+    _, bucket = published(tmp_path, n=1)
+    from reliquary.miner import observation_client as oc
+    monkeypatch.setattr(oc, "MAX_DOWNLOAD_BYTES", 10)
+    c = client(bucket, tmp_path)
+    with pytest.raises(ObservationVerificationError, match="download limit"):
+        c.sync()
+    assert not any("/seg-" in k for k in bucket.fetched)
+
+
+def test_f3_every_option_ends_with_the_miners_own_cooldown_set(tmp_path):
+    engine = bare_engine()
+    engine._observations = SimpleNamespace(table=ObservationTable(), sync=lambda: 0,
+                                           skipped=lambda env, **k: set(range(100)),
+                                           scanned=lambda env: set(range(100, 200)))
+    engine._prompt_policy = DefaultPromptPolicy(unscanned_share=1.0)
+    options = asyncio.run(engine._cooldown_options(SimpleNamespace(service_policy=object(), checkpoint_n=1), _Rng()))
+    assert len(options) == 3 and options[-1] is engine._cooldown_per_env == {"math": {3}}
+    assert len(options[0]["math"]) > len(options[1]["math"]) > 1
+
+
+def test_f4_the_client_stops_counting_a_training_scan_of_an_aborted_window(tmp_path):
+    rt = runtime(tmp_path / "v")
+    r = train(rt, prompt=30, rewards=HALF)
+    with rt._txn():
+        rt.log.settle(r["observation_id"], status="trained", proof="proven", at=150.0)
+    bucket = FakeR2()
+    pub = publish_all(rt, bucket)
+    c = client(bucket, tmp_path)
+    c.sync()
+    assert c.table.scanned_prompts(MATH) == {30} and c.table.summary(MATH, 30).scanned
+
+    def flush():
+        while asyncio.run(pub.flush()) is not None:
+            pass
+        c.sync(force=True)
+    with rt._txn():
+        rt.log.set_window_aborted(1, True)
+    flush()
+    (record,) = c.table.records(MATH, 30)
+    assert record["window_aborted"] is True and record["status"] == "trained"
+    assert c.table.scanned_prompts(MATH) == set() and not c.table.summary(MATH, 30).scanned
+    with rt._txn():
+        rt.log.set_window_aborted(1, False)
+    flush()
+    assert c.table.scanned_prompts(MATH) == {30} and c.table.summary(MATH, 30).scanned
+
+
+def test_f4_an_aborted_flag_survives_compaction_as_not_scanned():
+    t = ObservationTable()
+    t.apply(obs("a", 1, window=1))
+    t.apply(settle("a", "trained", "proven", window_aborted=True))
+    t.apply(obs("b", 2, window=2000))
+    assert t.compact(10) == 1
+    assert t.summary("math", 1).scanned is False and t.scanned_prompts("math") == {2}
+
+
+def test_f5_a_corrupted_cached_page_is_dropped_and_fetched_again(tmp_path, monkeypatch):
+    small_pages(monkeypatch)
+    _, bucket = published(tmp_path, n=4)
+    c = client(bucket, tmp_path)
+    c.table.cache_page(1, b"garbage")
+    assert c.sync() > 0
+    assert c.table.cached_page(1) == bucket.objects[page_key(RUN, 1, 3)]
+    assert bucket.count(page_key(RUN, 1, 3)) == 1
+    bucket.objects[page_key(RUN, 1, 3)] += b" "                    # a bad page on the network stays an error
+    with pytest.raises(ObservationVerificationError):
+        client(bucket, tmp_path / "other").sync()
+
+
+def test_f6_malformed_entries_raise_a_verification_error(tmp_path, monkeypatch):
+    t = ObservationTable()
+    for bad in ({"type": "settle"}, {"type": "settle", "id": "a"}):
+        with pytest.raises(ObservationVerificationError, match="settle"):
+            t.apply(bad)
+    _, bucket = published(tmp_path, n=1)
+    from reliquary.miner import observation_client as oc
+    monkeypatch.setattr(oc, "verify_segment", lambda raw, entry: [{"type": "settle", "id": "x"}])
+    c = client(bucket, tmp_path)
+    with pytest.raises(ObservationVerificationError):
+        c.sync()
+    assert c.table.last_number == 0
+    monkeypatch.setattr(oc, "verify_index", lambda *a, **k: {"kind": "head", "order_sha256": "o", "last_number": 1,
+                                                              "pages": [{}], "segments": []})
+    with pytest.raises(ObservationVerificationError):
+        client(bucket, tmp_path / "x").sync()
+
+
+def test_f7_only_https_or_local_http_and_no_redirect_to_another_scheme():
+    import urllib.request
+    from reliquary.miner import observation_client as oc
+    for url in ("file:///etc/passwd", "ftp://x.example/", "http://example.com/", "gopher://x/"):
+        with pytest.raises(ValueError, match="https"):
+            ObservationClient(url, RUN, "5X", fetch=lambda u: b"", table=ObservationTable())
+        with pytest.raises(ValueError, match="https"):
+            oc._http_get(url + "x")
+    ObservationClient("http://127.0.0.1:9/", RUN, "5X", fetch=lambda u: b"", table=ObservationTable())
+    ObservationClient("https://ok.example/p", RUN, "5X", fetch=lambda u: b"", table=ObservationTable())
+    handler = next(h for h in oc._opener().handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+                   and type(h) is not urllib.request.HTTPRedirectHandler)
+    request = urllib.request.Request("https://ok.example/a")
+    with pytest.raises(ValueError, match="https"):
+        handler.redirect_request(request, None, 302, "Found", {}, "file:///etc/passwd")
+    assert handler.redirect_request(request, None, 302, "Found", {}, "https://other.example/b") is not None
+
+
+def test_f8_the_very_first_segment_must_start_at_seq_1(tmp_path):
+    rt = runtime(tmp_path / "v")
+    explore(rt, prompt=11, hotkey="h")
+    explore(rt, prompt=12, hotkey="h2")
+    with rt._txn():
+        rt.log.db.execute("DELETE FROM run_events WHERE seq=1")      # the log starts after seq 1
+    bucket = FakeR2()
+    publish_all(rt, bucket)
+    c = client(bucket, tmp_path)
+    with pytest.raises(ObservationVerificationError, match="sequence"):
+        c.sync()
+    assert c.table.last_number == 0
