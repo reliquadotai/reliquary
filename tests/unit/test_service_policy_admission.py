@@ -130,12 +130,24 @@ def test_uniform_exploration_still_requires_truthful_reward_and_valid_answers(si
     assert score_and_finalize_submission(parsed, bad, context, time.monotonic() + 5).reject_reason is not None
 
 
-def test_same_uniform_group_cannot_fill_training_path(signed_request):
+def _lane_of(prepared, announcement=None, *, request=None, contract=None):
+    from reliquary.services.admission_policy import service_lane
+
+    return service_lane(prepared.request, contract or _contract(), prepared.rewards,
+                        truncated_indices=prepared.truncated_indices, uncertain_indices=prepared.uncertain_indices,
+                        attainable_rewards=prepared.attainable_rewards)
+
+
+def test_a_uniform_group_declared_for_training_is_admitted_as_an_exploration_observation(signed_request):
+    """The worker no longer refuses on the declared purpose: the VECTOR decides the lane, so a uniform
+    group cannot fill the training path whatever it declares."""
     request, announcement, _ = signed_request(purpose="training")
     parsed, context = _parse(request, announcement)
     materials = AdmissionRuntimeMaterials(canonical_prompt_tokens=[1], problem={"ground_truth": "4"},
         completion_texts=[f"Derivation number {i}. \\boxed{{5}}" for i in range(M_ROLLOUTS)])
-    assert score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5).reject_reason is RejectReason.OUT_OF_ZONE
+    prepared = score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5)
+    assert prepared.reject_reason is None
+    assert _lane_of(prepared).lane == "exploration"
 
 
 def test_training_uses_the_contract_threshold_in_the_actual_grader(signed_request):
@@ -180,8 +192,10 @@ def test_training_refuses_a_math_group_whose_only_failure_is_unboxed(signed_requ
     """All right but one, and that one has no box: it may have been right, i.e. a uniform group."""
     prepared = _graded(signed_request, purpose="training", correct=M_ROLLOUTS)
     assert prepared.rewards == [1.0] * (M_ROLLOUTS - 1) + [0.0]
-    assert prepared.reject_reason is RejectReason.OUT_OF_ZONE
-    assert prepared.reject_stage == "zone"
+    assert prepared.reject_reason is None
+    # In zone as observed but not robust (R23): never a training group, never exploration.
+    lane = _lane_of(prepared)
+    assert (lane.lane, lane.reason) == ("unproven", "not_robust")
 
 
 def test_the_same_group_where_a_missing_box_is_a_plain_zero_is_in_zone(signed_request):
@@ -199,9 +213,11 @@ def test_a_length_capped_rollout_is_uncertain_in_every_environment(signed_reques
     monkeypatch.setattr(admission, "truncated_rollout_indices", lambda request, context: (M_ROLLOUTS - 1,))
     wrong = _graded(signed_request, purpose="training", correct=M_ROLLOUTS - 1, missing_box=missing_box, unboxed=())
     assert wrong.rewards == [1.0] * (M_ROLLOUTS - 1) + [0.0]
-    assert wrong.reject_reason is RejectReason.OUT_OF_ZONE     # the capped failure may have been a success
+    assert wrong.reject_reason is None
+    assert _lane_of(wrong).lane == "unproven"                  # the capped failure may have been a success (R23)
     half = _graded(signed_request, purpose="training", correct=M_ROLLOUTS // 2, missing_box=missing_box, unboxed=())
     assert half.reject_reason is None
+    assert _lane_of(half).lane == "training"
     assert half.truncated_indices == (M_ROLLOUTS - 1,)
     assert half.uncertain_indices == (M_ROLLOUTS - 1,)
     assert half.truncated_count == 1
@@ -213,8 +229,11 @@ def test_exploration_keeps_an_observation_with_an_unboxed_rollout(signed_request
     assert prepared.rewards == [0.0] * M_ROLLOUTS
     assert prepared.uncertain_indices == (M_ROLLOUTS - 1,)
     assert prepared.truncated_indices == ()
+    assert _lane_of(prepared).lane == "exploration"
+    # A miner cannot route an in-zone vector to exploration: the declared purpose plays no part.
     in_zone = _graded(signed_request, purpose="exploration", correct=M_ROLLOUTS // 2)
-    assert in_zone.reject_reason is RejectReason.OUT_OF_ZONE
+    assert in_zone.reject_reason is None
+    assert _lane_of(in_zone).lane == "training"
 
 
 def test_the_worker_derives_the_lattice_without_the_legacy_flag(signed_request, monkeypatch):
@@ -225,6 +244,16 @@ def test_the_worker_derives_the_lattice_without_the_legacy_flag(signed_request, 
     assert prepared.reject_reason is None
     assert prepared.attainable_rewards == (0.0, 1.0)
     assert prepared.robust_utility is None
+
+
+def test_the_service_path_never_carries_the_legacy_threshold_utility(signed_request, monkeypatch):
+    """The legacy SIGMA_MIN utility must not leak into a service group (the lane uses the contract's
+    threshold), even when the legacy switch is on."""
+    import reliquary.validator.admission as admission
+    monkeypatch.setattr(admission, "ROBUST_TRUNCATION_UTILITY_ENABLED", True)
+    prepared = _graded(signed_request, purpose="training", correct=M_ROLLOUTS // 2)
+    assert prepared.uncertain_indices == (M_ROLLOUTS - 1,)
+    assert prepared.robust_utility is None and prepared.reject_reason is None
 
 
 def test_legacy_grading_never_reaches_the_service_rule(signed_request, monkeypatch):
@@ -331,10 +360,15 @@ def test_a_training_arrival_without_a_lattice_cannot_carry_uncertainty():
     assert _arrival("training", HALF, uncertain_indices=(M_ROLLOUTS - 1,)) == 0
 
 
-def test_an_exploration_arrival_with_an_uncertain_rollout_is_still_an_observation():
+def test_an_exploration_arrival_with_an_uncertain_rollout_is_still_an_observation_and_reserves_nothing():
+    # Out of zone: an exploration observation, which never reserves fill-closed capacity.
     assert _arrival("exploration", [0.0] * M_ROLLOUTS, uncertain_indices=(3,), truncated_indices=(3,),
-                    attainable_rewards=BINARY, truncated_count=1) == 1
-    assert _arrival("exploration", HALF, uncertain_indices=(3,), attainable_rewards=BINARY) == 0
+                    attainable_rewards=BINARY, truncated_count=1) == 0
+    # The same vector declared for training is the same lane.
+    assert _arrival("training", [0.0] * M_ROLLOUTS, uncertain_indices=(3,), truncated_indices=(3,),
+                    attainable_rewards=BINARY, truncated_count=1) == 0
+    # An in-zone vector is a training group whatever it declares.
+    assert _arrival("exploration", HALF, uncertain_indices=(3,), attainable_rewards=BINARY) == 1
 
 
 def test_the_worker_result_reaches_the_pending_group_with_its_indices():
@@ -383,20 +417,6 @@ def test_the_legacy_arrival_gate_never_reaches_the_service_rule(monkeypatch):
                     uncertain_indices=(0, 1, 2)) == 1
     assert calls == [{"sigma_min": SIGMA_MIN, "truncated_indices": (M_ROLLOUTS - 1,),
                       "attainable_rewards": (0.0, 1.0)}]
-
-
-def test_a_verified_group_with_uncertain_rollouts_is_no_longer_refused_at_the_journal(signed_request):
-    """The proof stage decided with the robust rule; the journal step has no veto of its own left."""
-    from tests.unit.test_grpo_window_batcher import _make_batcher
-
-    request, announcement, _ = signed_request(purpose="training")
-    batcher = _make_batcher()
-    batcher.service_policy = announcement
-    batcher.service_runtime = SimpleNamespace(contract=ServiceContract.from_dict(announcement["contract"]))
-    pending = SimpleNamespace(request=request)
-    verified = SimpleNamespace(truncated_count=1, unboxed_count=1)
-    with pytest.raises(AttributeError, match="rollouts"):       # it went past the old veto, into the row build
-        batcher._record_service_proof(pending, verified)
 
 
 def test_only_server_pool_beacon_and_epoch_are_authoritative(signed_request):
@@ -484,8 +504,6 @@ def test_two_rollouts_cannot_claim_the_same_seed(signed_request):
 
 
 def test_validator_draws_each_rollout_from_its_seed_not_its_rank(signed_request):
-    from tests.unit.test_grpo_window_batcher import _prove_one
-
     draws = {}
     for seeds in (SEEDS, (0, *SEEDS[:-1])):               # SEEDS[k] sits at rank k, then at rank k + 1
         request, announcement, _ = signed_request(seeds=seeds)
@@ -553,6 +571,18 @@ def test_announced_capability_cannot_enable_unsupported_draw_variant(signed_requ
         validate_submission_policy(request, announcement)
 
 
+def _prove_one(batcher, request, audit=True, admission_caps=()):
+    """The lane-independent proof checks (seed gates, capability, termination, logprobs) in audit mode:
+    what an exploration audit runs. These tests send a uniform group, which is no training group."""
+    if not batcher.accept_submission(request).accepted:
+        return None
+    pending = batcher.pending_submissions()[-1]
+    if admission_caps:   # caps the (worker) admission already saw, before the proof finds its own
+        pending.truncated_indices = tuple(admission_caps)
+        pending.uncertain_indices = tuple(sorted({*pending.uncertain_indices, *admission_caps}))
+    return batcher._verify_expensive(pending, audit=audit)
+
+
 def _deep_service_batcher(request, announcement, verify):
     from reliquary.constants import PROTOCOL_PROFILE_ID, PROTOCOL_VERSION
     from reliquary.protocol.signatures import verify_commit_signature
@@ -588,12 +618,10 @@ def _service_proof(commit, **changes):
 
 
 def _proved_with_a_cap(signed_request, monkeypatch, *, purpose, correct, capped=True, unboxed=(),
-                       missing_box="uncertain"):
+                       missing_box="uncertain", admission_caps=()):
     """Prove a group through the in-process path. ``capped``: the proof alone finds the last
     rollout cut by the length cap. ``unboxed``: rollouts that terminated without any box."""
     from reliquary.validator import batcher as batcher_module
-    from tests.unit.test_grpo_window_batcher import _prove_one
-
     request, announcement, wallet = signed_request(purpose=purpose, missing_box=missing_box)
     for index, rollout in enumerate(request.rollouts):
         rollout.reward = float(index < correct and index not in unboxed)
@@ -612,9 +640,12 @@ def _proved_with_a_cap(signed_request, monkeypatch, *, purpose, correct, capped=
         index = next(i for i, candidate in enumerate(request.rollouts) if candidate is rollout)
         return f"wrong {index}, and no final answer" if index in unboxed else graded_text(rollout)
     batcher._completion_text = completion_text
+    # ``capped``: True = the last rollout; a tuple = those rollout positions; False = none.
+    cut = (M_ROLLOUTS - 1,) if capped is True else tuple(capped or ())
+    cut_commits = [request.rollouts[index].commit for index in cut]
     monkeypatch.setattr(batcher_module, "is_cap_truncation",
-                        lambda commit, *args, **kwargs: capped and commit is request.rollouts[-1].commit)
-    result = _prove_one(batcher, request)
+                        lambda commit, *args, **kwargs: any(commit is c for c in cut_commits))
+    result = _prove_one(batcher, request, audit=purpose == "exploration", admission_caps=admission_caps)
     pending = batcher.pending_submissions()[-1] if batcher.pending_submissions() else None
     return result, batcher, pending
 
@@ -637,13 +668,47 @@ def test_a_cap_found_by_the_proof_refuses_a_training_group_it_could_collapse(sig
     assert batcher.reject_counts[RejectReason.OUT_OF_ZONE.value] == 1
 
 
+def test_two_capped_rollouts_are_no_longer_a_bad_termination_on_the_service_path(signed_request, monkeypatch):
+    """R21: the legacy count limit (more than N capped rollouts) does not apply; the robust rule decides."""
+    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
+    two = (M_ROLLOUTS - 2, M_ROLLOUTS - 1)
+    assert len(two) > MAX_TRUNCATED_PER_SUBMISSION        # the legacy limit WOULD reject this group
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
+                                                  correct=M_ROLLOUTS // 2, capped=two)
+    assert result is not None and result.truncated_count == 2
+    assert batcher.reject_counts.get(RejectReason.BAD_TERMINATION.value, 0) == 0
+    assert pending.truncated_indices == two and pending.uncertain_indices == two
+    # the robust rule still prices both: all right but the two cut -> they may both have been right
+    result, batcher, _ = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
+                                            correct=M_ROLLOUTS - 2, capped=two)
+    assert result is None
+    assert batcher.reject_counts[RejectReason.OUT_OF_ZONE.value] == 1
+    assert batcher.reject_counts.get(RejectReason.BAD_TERMINATION.value, 0) == 0
+
+
+def test_the_caps_admission_saw_and_the_caps_the_proof_finds_are_one_union(signed_request, monkeypatch):
+    """Two successes only: with rollout 0 uncertain the group is robust (it may have been one success),
+    with rollout 1 uncertain too (found by the proof) both may have failed, i.e. a uniform group."""
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training", correct=2,
+                                                  capped=False, admission_caps=(0,))
+    assert result is not None and pending.truncated_indices == (0,)                  # admission's cap alone: robust
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training", correct=2,
+                                                  capped=(1,), admission_caps=(0,))
+    assert result is None and batcher.reject_counts[RejectReason.OUT_OF_ZONE.value] == 1
+    assert pending.truncated_indices == (0, 1) and pending.uncertain_indices == (0, 1)   # the union, no duplicates
+    result, _, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training", correct=M_ROLLOUTS // 2,
+                                            capped=(0, M_ROLLOUTS - 1), admission_caps=(0,))
+    assert result is not None and pending.truncated_indices == (0, M_ROLLOUTS - 1)    # a cap seen twice counts once
+
+
 def test_in_process_missing_box_follows_the_contract(signed_request, monkeypatch):
     """Direct (non worker) path: all right but one, which terminated without a box."""
     last = (M_ROLLOUTS - 1,)
     result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
                                                   correct=M_ROLLOUTS, capped=False, unboxed=last)
     assert result is None                                         # maths: it may have been right
-    assert pending is None                                        # refused at admission, before any proof
+    # R23: no longer refused at admission (it is an unproven observation); a TRAINING proof of it refuses
+    assert pending.proof_reject_stage == "service_signal"
     assert batcher.reject_counts[RejectReason.OUT_OF_ZONE.value] == 1
     result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
                                                   correct=M_ROLLOUTS, capped=False, unboxed=last,
@@ -672,8 +737,6 @@ def test_a_cap_found_by_the_proof_keeps_the_exploration_observation_and_marks_it
 
 @pytest.mark.parametrize("pool", [False, True])
 def test_deep_service_refuses_verifier_without_seed_interface(signed_request, pool):
-    from tests.unit.test_grpo_window_batcher import _prove_one
-
     request, announcement, _ = signed_request(pool=pool)
     def old_verifier(commit, model, randomness):
         return _service_proof(commit)
@@ -685,8 +748,6 @@ def test_deep_service_refuses_verifier_without_seed_interface(signed_request, po
 @pytest.mark.parametrize("pool", [False, True])
 @pytest.mark.parametrize("missing", ["sparse", "positions"])
 def test_deep_service_refuses_missing_sampling_evidence(signed_request, pool, missing):
-    from tests.unit.test_grpo_window_batcher import _prove_one
-
     request, announcement, _ = signed_request(pool=pool)
     def verifier(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
         proof = _service_proof(commit)
@@ -705,8 +766,6 @@ def test_deep_service_refuses_missing_sampling_evidence(signed_request, pool, mi
 @pytest.mark.parametrize("mismatch", ["ratio", "cdf", None])
 def test_deep_service_enforces_seed_gates_when_legacy_flags_are_shadow(signed_request, monkeypatch, pool, mismatch):
     from reliquary.validator import batcher as batcher_module
-    from tests.unit.test_grpo_window_batcher import _prove_one
-
     monkeypatch.setattr(batcher_module, "FORCED_SEED_ENFORCE", False)
     monkeypatch.setattr(batcher_module, "FORCED_SEED_CDF_ENFORCE", False)
     request, announcement, _ = signed_request(pool=pool)

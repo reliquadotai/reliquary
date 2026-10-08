@@ -972,6 +972,26 @@ def test_n10_the_entry_point_refuses_with_probation_limit_publishes_unpaid_and_r
         assert admit(pair, obs(p, hotkey="vet"), cap=10.0, groups=0).first_scan
 
 
+def test_m_a_a_probation_limit_refusal_is_retryable_like_a_cap_refusal(pair):
+    """The same submission coming back after a slot freed is a NEW attempt, not a replay of the stale refusal."""
+    log, book = pair
+    held = [admit(pair, obs(p), cap=10.0) for p in range(1, PROBATION_PENDING_LIMIT + 1)]
+    assert all(h.first_scan for h in held)
+    over = obs(50)
+    refused = admit(pair, over, cap=10.0)
+    assert refused.reason == "probation_limit" and not log.is_scanned(ENV, 50)
+    again = admit(pair, over, cap=10.0)                     # still full: the refusal stands (not "replay")
+    assert (again.reason, again.status, again.entitlement) == ("probation_limit", "exploration_unpaid", None)
+    with book.db:
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
+    apply_exploration_audit(log, book, held[0].observation_id, passed=True, now=10.0, ban_seconds=DAY)
+    retry = admit(pair, over, cap=10.0, now=20.0)           # a passed audit freed a probation slot
+    assert retry.observation_id == refused.observation_id and not retry.inserted
+    assert (retry.status, retry.reason, retry.first_scan) == ("exploration_pending", None, True)
+    assert retry.entitlement is not None and log.is_scanned(ENV, 50)
+    assert admit(pair, over, cap=10.0, now=21.0).entitlement == retry.entitlement      # now a plain replay
+
+
 # ---- Task 7 review: I1 + R17 ----
 
 def trained(log, prompt, *, window=1, hotkey="trainer", env=ENV):

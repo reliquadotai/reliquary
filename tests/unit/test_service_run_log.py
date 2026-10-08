@@ -406,3 +406,52 @@ def test_c1_the_lane_is_part_of_the_observation_identity(log):
     assert again.observation_id == proven.observation_id and not again.inserted
     assert log.trained_prompts(1, ENV) == {7} and len(log.window_observations(1)) == 2
     assert len(log.run_salt) == 32
+
+
+# ---- Task 12: identity version (m-c) and uncertain positions (R23)
+
+def test_the_observation_identity_version_is_stamped_and_a_mismatch_is_refused_on_reopen(tmp_path):
+    from reliquary.services.run_log import IDENTITY_VERSION
+    path = tmp_path / "log.sqlite3"
+    db = sqlite3.connect(path)
+    first = RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
+    with db:
+        first.record(obs(), status="proven", proof="proven")
+    assert db.execute("SELECT value FROM run_meta WHERE key='identity_version'").fetchone()[0] == IDENTITY_VERSION.encode()
+    db.close()
+    RunObservationLog(sqlite3.connect(path), order_sha256=ORDER, sigma_min_bps=2400)       # same version: fine
+    db = sqlite3.connect(path)
+    db.execute("UPDATE run_meta SET value=? WHERE key='identity_version'", (b"observation-id/v2",))
+    db.commit()
+    db.close()
+    with pytest.raises(ValueError, match="identity"):
+        RunObservationLog(sqlite3.connect(path), order_sha256=ORDER, sigma_min_bps=2400)
+
+
+def test_a_file_with_observations_and_no_identity_stamp_is_refused(tmp_path):
+    path = tmp_path / "log.sqlite3"
+    db = sqlite3.connect(path)
+    log = RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
+    with db:
+        log.record(obs(), status="proven", proof="proven")
+    db.execute("DELETE FROM run_meta WHERE key='identity_version'")      # a file written before the stamp existed
+    db.commit()
+    db.close()
+    with pytest.raises(ValueError, match="before identities were versioned"):
+        RunObservationLog(sqlite3.connect(path), order_sha256=ORDER, sigma_min_bps=2400)
+    empty = sqlite3.connect(tmp_path / "empty.sqlite3")
+    empty.execute("CREATE TABLE run_meta(key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+    empty.commit()
+    RunObservationLog(empty, order_sha256=ORDER, sigma_min_bps=2400)     # nothing to misread: stamped
+
+
+def test_uncertain_positions_are_published_only_when_given_and_must_name_rollouts(log):
+    with log.db:
+        log.record(replace(obs(), uncertain=(2, 5)), status="proven", proof="proven")
+        log.record(obs(group="g2", prompt=8), status="proven", proof="proven")
+    published = [payload for _, payload in log.events()]
+    assert published[0]["uncertain"] == [2, 5] and "uncertain" not in published[1]
+    for bad in ((M_ROLLOUTS,), (3, 3), (4, 2), (-1,), (True,)):
+        with pytest.raises(ValueError, match="uncertain"):
+            with log.db:
+                log.record(replace(obs(group="g3", prompt=9), uncertain=bad), status="proven", proof="proven")

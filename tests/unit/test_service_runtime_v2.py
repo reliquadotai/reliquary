@@ -1081,8 +1081,11 @@ def test_c2_training_a_drawn_prompt_does_not_take_it_out_of_the_audit_queue_nor_
 
 def test_c2_a_drawn_row_on_a_trained_prompt_can_still_fail_its_audit(tmp_path):
     rt, passed, drawn, behind = seasoned_hotkey_with_a_drawn_row_on_a_prompt_it_then_trains(tmp_path)
+    # the voided row is still in the audit queue until its verdict: R17 voids the pay, not the audit
+    assert [row["observation_id"] for row in rt.queued_audits(1)] == [drawn["observation_id"]]
     outcome = rt.record_audit(drawn["observation_id"], passed=False, now=20_020.0)
     assert outcome.failed and set(outcome.forfeited) == {r["observation_id"] for r in (passed, drawn, behind)}
+    assert rt.queued_audits(1) == []                                   # and the verdict takes it out
     assert rt.exploration_banned("x", now=20_021.0)
     rt.finalize_exploration(1, environment=MATH, now=20_050.0)
     assert rt.ledger.payable(1, environment=MATH) == {}
@@ -1402,18 +1405,29 @@ def test_restart_reuses_the_stored_draw_beacon_and_the_run_salt_whatever_the_new
     rt.close()
 
 
-def test_r18_two_runs_draw_different_rows_for_the_same_public_inputs(tmp_path):
+def test_r18_two_runs_with_the_same_public_inputs_draw_different_groups_through_the_runtime(tmp_path):
+    """Two real runtimes, the same hotkeys, prompts, windows and beacon: only the secret run salt differs, and it
+    alone changes WHICH groups the runtime queues for audit (so a miner cannot predict its drawn groups)."""
     from reliquary.services.exploration import audit_selected
-    salts = []
+    contract = reward_contract(new_hotkey_audit_groups=0, audit_bps=5000)
+    keys = [(env, prompt) for env in (MATH, CODE) for prompt in range(min(CAP_COUNT, 20))]
+    drawn, salts = [], []
     for name in ("one", "two"):
-        rt = runtime(tmp_path / name)
+        rt = runtime(tmp_path / name, contract=contract)
+        ids = {}
+        for env, prompt in keys:
+            ids[(env, prompt)] = explore(rt, env=env, prompt=prompt, hotkey=f"h{prompt % 6}", now=120.0)["observation_id"]
+        rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=200.0)
+        queued = {(row["environment"], row["prompt_idx"]) for row in rt.queued_audits(1)}
+        drawn.append(queued)
         salts.append(rt.log.run_salt)
+        # each run's draw is exactly the draw function under its OWN salt...
+        assert queued == {key for key in keys if audit_selected(
+            beacon_randomness=BEACON, observation_id=ids[key], audit_bps=5000, forced=False, run_salt=rt.log.run_salt)}
         rt.close()
     assert salts[0] != salts[1]
-    ids = [f"{i:064x}" for i in range(400)]
-    drawn = [{i for i in ids if audit_selected(beacon_randomness=BEACON, observation_id=i, audit_bps=1500,
-                                               forced=False, run_salt=salt)} for salt in salts]
-    assert drawn[0] != drawn[1] and all(20 < len(d) < 110 for d in drawn)
+    assert drawn[0] != drawn[1]                                         # ...so the runtime's two draws differ
+    assert all(8 < len(d) < len(keys) - 4 for d in drawn)
 
 
 def test_restart_between_finalize_and_reconcile_settles_what_was_finalized(tmp_path):
