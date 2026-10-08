@@ -42,7 +42,7 @@ def entry(cap=0.04, settlement="period-ema-v1", status="active", mechanism="corp
                            status=status, params=params)
 
 
-def run(e, *, paying=0.0, drained=True, cut_tail=False):
+def run(e, *, paying=0.0, drained=True):
     calls = []
 
     async def registry():
@@ -57,7 +57,7 @@ def run(e, *, paying=0.0, drained=True, cut_tail=False):
     async def retire(task_id, at):
         calls.append(("retire", task_id, at))
 
-    message = asyncio.run(close_task("eval-a", cut_tail=cut_tail, read_registry=registry,
+    message = asyncio.run(close_task("eval-a", read_registry=registry,
                                      records=Records(drained), period_weights=weights,
                                      set_cap=set_cap, retire=retire, drand_round=lambda: 99))
     return message, calls
@@ -69,9 +69,10 @@ def test_a_drained_decayed_period_task_closes():
     assert "free" in message
 
 
-def test_a_task_still_paying_what_it_earned_does_not_close():
-    with pytest.raises(TaskNotClosable, match="still pays"):
-        run(entry(), paying=0.01)
+def test_a_task_still_paying_what_it_earned_closes_and_says_its_tail_runs_on():
+    message, calls = run(entry(), paying=0.01)
+    assert calls == [("cap", "eval-a", 0.0), ("retire", "eval-a", 99)]
+    assert "tail" in message and "0.010000" in message and "RELIQUARY_TASK_ID" in message
 
 
 def test_an_undrained_job_does_not_close():
@@ -79,11 +80,27 @@ def test_an_undrained_job_does_not_close():
         run(entry(), drained=False)
 
 
-def test_a_window_settled_task_closes_only_when_told_to_cut_its_tail():
-    with pytest.raises(TaskNotClosable, match="--cut-tail"):
-        run(entry(settlement=None))
-    _, calls = run(entry(settlement=None), cut_tail=True)
+def test_a_window_settled_task_closes_with_nothing_to_cut():
+    _, calls = run(entry(settlement=None))
     assert calls == [("cap", "eval-a", 0.0), ("retire", "eval-a", 99)]
+
+
+def test_the_cli_still_accepts_cut_tail(monkeypatch):
+    from typer.testing import CliRunner
+
+    import reliquary.validator.corpus_close as corpus_close
+    from reliquary.cli.main import app
+
+    seen = []
+
+    async def close(task_id):
+        seen.append(task_id)
+        return "closed"
+
+    monkeypatch.setattr(corpus_close, "close_task", close)
+    result = CliRunner().invoke(app, ["tasks", "close", "--task-id", "eval-a", "--cut-tail"])
+    assert result.exit_code == 0, result.output
+    assert seen == ["eval-a"]
 
 
 def test_only_corpus_tasks_close():
@@ -167,6 +184,8 @@ def test_a_real_corpus_entry_takes_cap_zero_then_retires(bucket, registry):  # n
                            drand_round=lambda: 7))
     closed = registry["entries"]["corpus-run"]
     assert closed.params["cap"] == 0.0 and closed.status == "retired"
+    # The cap it was paid at stays the bound of its earned tail.
+    assert closed.params["tail_cap"] == 0.30
 
 
 async def _none():

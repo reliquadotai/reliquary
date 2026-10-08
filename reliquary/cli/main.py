@@ -779,17 +779,18 @@ def tasks_retire(
 def tasks_close(
     task_id: str = typer.Option(..., "--task-id"),
     cut_tail: bool = typer.Option(
-        False, "--cut-tail",
-        help="A task settled by RL window: stop paying its frozen tail now",
+        False, "--cut-tail", hidden=True,
+        help="Accepted and ignored: a window-settled corpus task is no longer paid",
     ),
 ) -> None:
-    """Close a finished corpus task: cap 0 and retired, so it pays nothing more
-    and its share of the pool is free. Refused while its job is not drained, or
-    while a period-settled task still pays what it earned."""
+    """Close a finished corpus task: cap 0 and retired, so it is paid nothing
+    new and its share of the pool is free; what it already earned keeps being
+    paid until its tail runs out. Refused while its job is not drained."""
     from reliquary.validator.corpus_close import TaskNotClosable, close_task
 
+    del cut_tail  # corpus window archives are no longer paid: no tail to cut
     try:
-        message = asyncio.run(close_task(task_id, cut_tail=cut_tail))
+        message = asyncio.run(close_task(task_id))
     except TaskNotClosable as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
