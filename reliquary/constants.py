@@ -866,6 +866,9 @@ SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV = int(_os.environ.get(
 SERVICE_EXPLORATION_AUDIT_PRIORITY = 5
 SERVICE_OBSERVATION_FLUSH_SECONDS = 60
 SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS = 50_000
+# A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
+# passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
+PROBATION_PENDING_LIMIT = 4
 
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.

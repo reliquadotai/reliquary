@@ -31,7 +31,9 @@ Aborted windows: ``settle_window(aborted=True)`` pays no exploration and stamps
 existing convention the reward map of an aborted window is NOT paid by weight replay, so the
 training amounts it still carries are informational.
 
-Every malformed input, archive or argument, raises ``SettlementError`` (a ``ValueError``).
+Every malformed input, archive or argument, raises ``SettlementError`` (a ``ValueError``): amounts
+beyond ``MAX_AMOUNT``, slot geometry or basis points beyond a sane bound (a 400-digit JSON integer
+included) are malformed, and the public entry points turn any arithmetic or shape error into one.
 """
 from __future__ import annotations
 
@@ -40,12 +42,14 @@ import math
 from reliquary.protocol.service_contract import ServiceContract
 from reliquary.protocol.service_schedule import ServiceSchedule
 from reliquary.services.exploration import (
-    exploration_cap, exploration_price, exploration_within_cap, training_group_price,
+    exploration_cap, exploration_price, exploration_within_cap, finite_amount, training_group_price,
 )
 
 SERVICE_PAYMENT_POLICY_V2 = "service-first-scan-exploration/v1"
 _EPS = 1e-12
 _MAX_COUNT = 2**53  # far above any cap; keeps count * price inside float range
+_MAX_GEOMETRY = 10**6  # picks_target and batch_slots
+_MAX_BPS = 10**9
 
 
 class SettlementError(ValueError):
@@ -53,7 +57,7 @@ class SettlementError(ValueError):
 
 
 def _number(value, what: str) -> float:
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+    if not finite_amount(value):
         raise SettlementError(f"invalid {what}")
     return float(value)
 
@@ -71,7 +75,8 @@ def _amounts(value, what: str) -> dict[str, float]:
 
 
 def _geometry(picks, slots) -> tuple[int, int]:
-    if type(picks) is not int or type(slots) is not int or picks < 1 or slots < 1:
+    if (type(picks) is not int or type(slots) is not int or not 1 <= picks <= _MAX_GEOMETRY
+            or not 1 <= slots <= _MAX_GEOMETRY):
         raise SettlementError("invalid service slot geometry")
     return picks, slots
 
@@ -82,7 +87,8 @@ def _reward_bps(contract: ServiceContract) -> tuple[int, int]:
         price_bps, cap_bps = policy["price_bps"], policy["cap_bps"]
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise SettlementError("contract has no exploration reward policy") from exc
-    if type(price_bps) is not int or type(cap_bps) is not int or price_bps < 0 or cap_bps < 0:
+    if (type(price_bps) is not int or type(cap_bps) is not int or not 0 <= price_bps <= _MAX_BPS
+            or not 0 <= cap_bps <= _MAX_BPS):
         raise SettlementError("invalid exploration reward policy")
     return price_bps, cap_bps
 
@@ -166,6 +172,19 @@ def _compute(pools: dict[str, float], picks: int, slots: int, price_bps: int,
 
 def settle_window(*, archive: dict, envelope: dict, contract: ServiceContract,
                   exploration: dict[str, dict[str, int]], aborted: bool) -> dict:
+    """Stamp the service money on a window archive (see ``_settle_window``); only ``SettlementError``
+    escapes, whatever the (JSON-representable) input."""
+    try:
+        return _settle_window(archive=archive, envelope=envelope, contract=contract,
+                              exploration=exploration, aborted=aborted)
+    except SettlementError:
+        raise
+    except (ArithmeticError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as exc:
+        raise SettlementError(f"malformed service settlement input: {type(exc).__name__}") from exc
+
+
+def _settle_window(*, archive: dict, envelope: dict, contract: ServiceContract,
+                   exploration: dict[str, dict[str, int]], aborted: bool) -> dict:
     """Stamp the service money on a window archive.
 
     ``exploration`` is ``{env: ExplorationLedger.payable(window, environment=env)}``: whole
@@ -173,6 +192,8 @@ def settle_window(*, archive: dict, envelope: dict, contract: ServiceContract,
     """
     if not isinstance(archive, dict) or not isinstance(envelope, dict):
         raise SettlementError("archive and envelope must be maps")
+    if not isinstance(contract, ServiceContract):
+        raise SettlementError("settlement needs the service contract")
     if type(aborted) is not bool:
         raise SettlementError("invalid service settlement disposition")
     for key in ("order_sha256", "schedule", "schedule_sha256", "pools", "picks_target", "batch_slots"):
@@ -183,6 +204,14 @@ def settle_window(*, archive: dict, envelope: dict, contract: ServiceContract,
     price_bps, cap_bps = _reward_bps(contract)
     pools = _amounts(envelope["pools"], "service pool")
     pools = {env: pools[env] for env in sorted(pools)}
+    try:
+        schedule = ServiceSchedule.from_dict(envelope["schedule"], contract)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise SettlementError(f"invalid service schedule: {exc}") from exc
+    if schedule.sha256 != envelope["schedule_sha256"]:
+        raise SettlementError("service schedule digest mismatch")
+    if set(pools) != set(schedule.active_environments()):
+        raise SettlementError("service pools must cover exactly the active environments")
     picks, slots = _geometry(envelope["picks_target"], envelope["batch_slots"])
     counts = _count_rows(archive.get("batch"), pools)
     # Checked even when aborted: a bad map is a caller bug whatever the disposition.
@@ -222,14 +251,26 @@ def _same_map(a: dict, b: dict) -> bool:
 
 def validate_service_archive_v2(record: dict, contract: ServiceContract, *, cap: float,
                                 picks_target: int, batch_slots: int) -> None:
+    """Only ``SettlementError`` escapes, whatever the (JSON-representable) input; see ``_validate``."""
+    try:
+        _validate(record, contract, cap=cap, picks_target=picks_target, batch_slots=batch_slots)
+    except SettlementError:
+        raise
+    except (ArithmeticError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as exc:
+        raise SettlementError(f"malformed service archive: {type(exc).__name__}") from exc
+
+
+def _validate(record: dict, contract: ServiceContract, *, cap: float, picks_target: int, batch_slots: int) -> None:
     """Refuse (``SettlementError``) an archive whose service money cannot be recomputed.
 
     ``cap`` is the task's emission cap; ``picks_target`` / ``batch_slots`` are the slot geometry the
     CALLER expects from the protocol constants. The archive's own copy must agree: it is never the
     source, otherwise ``picks_target=1`` would let a handful of rows take a whole pool.
     """
-    if type(cap) not in (int, float) or not math.isfinite(cap) or not 0 <= cap <= 1 + _EPS:
+    if not finite_amount(cap, 2) or cap > 1 + _EPS:
         raise SettlementError("invalid service archive cap")
+    if not isinstance(contract, ServiceContract):
+        raise SettlementError("validation needs the service contract")
     picks, slots = _geometry(picks_target, batch_slots)
     if not isinstance(record, dict):
         raise SettlementError("service archive must be a map")
@@ -240,7 +281,7 @@ def validate_service_archive_v2(record: dict, contract: ServiceContract, *, cap:
         raise SettlementError("service archive belongs to another order")
     try:
         schedule = ServiceSchedule.from_dict(record.get("service_schedule") or {}, contract)
-    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+    except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as exc:
         raise SettlementError(f"invalid service schedule: {exc}") from exc
     if schedule.sha256 != record.get("service_schedule_sha256"):
         raise SettlementError("service schedule digest mismatch")

@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from reliquary.constants import M_ROLLOUTS
+from reliquary.constants import M_ROLLOUTS, PROBATION_PENDING_LIMIT
 from reliquary.services.exploration import (
     ExplorationLedger, apply_exploration_audit, audit_selected, exploration_cap, exploration_price,
     exploration_within_cap, finalize_exploration, record_exploration, training_group_price,
@@ -166,13 +166,14 @@ def test_probation_spans_windows_and_envs_and_survives_reopen(tmp_path):
 
 def test_a_hotkey_whose_forced_groups_are_never_audited_stays_forced(tmp_path):
     book = ledger(tmp_path)
-    for i in range(1, 6):
-        assert reserve(book, i, groups=3)["forced"] is True
-    assert len(draw(book)) == 5
-    assert set(finalize(book)) == {oid(i) for i in range(1, 6)}  # drawn, never audited: unaudited
+    n = PROBATION_PENDING_LIMIT                                  # a probationer holds at most this many
+    for i in range(1, n + 1):
+        assert reserve(book, i, groups=n + 1)["forced"] is True
+    assert len(draw(book)) == n
+    assert set(finalize(book)) == {oid(i) for i in range(1, n + 1)}  # drawn, never audited: unaudited
     assert book.passed_audits("hk") == 0
-    for i in range(6, 12):                                       # window after window, still at 100 %
-        assert reserve(book, i, window=2, groups=3)["forced"] is True
+    for i in range(n + 1, 2 * n + 1):                            # window after window, still at 100 %
+        assert reserve(book, i, window=2, groups=n + 1)["forced"] is True
 
 
 def test_forfeited_and_not_drawn_groups_do_not_count_for_probation(tmp_path):
@@ -690,3 +691,276 @@ def test_finalize_releases_the_first_scan_of_every_unpaid_row_and_only_those(pai
     assert finalize_exploration(log, book, 1, environment=ENV) == unaudited
     assert log.is_scanned(ENV, 1) and admit(pair, obs(9), cap=1.0).reason == "finalized"
     assert paid.first_scan
+
+
+# ---- round 4 ----
+
+def mark(book, i):
+    with book.db:
+        book.mark_unaudited(oid(i))
+
+
+def verdict(book, i, passed, *, now=1000.0, ban=DAY):
+    with book.db:
+        return book.apply_verdict(oid(i), passed=passed, now=now, ban_seconds=ban)
+
+
+def test_n1_a_drawn_row_marked_unaudited_before_finalize_sets_the_horizon_like_a_queued_one(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A", first=1)                             # drawn row 2 (round 20); not drawn 3 (15), 4 (25), 5 (30)
+    mixed_hotkey(book, "B", first=11)
+    audit(book, 12, True)                                        # B's drawn row passed: B has no horizon
+    mark(book, 2)                                                # the runtime lost A's audit slot before the seal
+    assert states(book)[2] == ("unaudited", "reserved")
+    finalize(book)
+    got = states(book)
+    assert got[3] == ("not_drawn", "reserved")                   # before the horizon: paid
+    assert got[4] == ("unaudited", "reserved") and got[5] == ("unaudited", "reserved")
+    assert all(got[i] == ("not_drawn", "reserved") for i in (13, 14, 15))   # another hotkey: untouched
+    assert book.payable(1, environment="math") == {"A": 2, "B": 5}          # A: passed + row 3
+
+
+def test_n1_a_marked_row_that_was_forfeited_sets_no_horizon(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A", first=1)
+    mark(book, 2)
+    with book.db:                                                # another env's failure forfeits A's rows of the window
+        book.db.execute("UPDATE exploration_entitlements SET status='forfeited' WHERE observation_id=?", (oid(2),))
+    finalize(book)
+    assert states(book)[4] == ("not_drawn", "reserved") and states(book)[5] == ("not_drawn", "reserved")
+
+
+def test_n1_a_verdict_on_a_row_marked_unaudited_never_raises(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A", first=1)
+    mark(book, 2)
+    assert verdict(book, 2, True) == ("not_applied", [])         # a pass is ignored
+    assert states(book)[2] == ("unaudited", "reserved") and not book.banned("A", 1.0)
+    kind, forfeited = verdict(book, 2, False, now=10.0, ban=100)  # a failure still bans and forfeits
+    assert kind == "failed" and set(forfeited) == {oid(i) for i in (2, 3, 4, 5)} | {oid(1)}
+    assert book.banned("A", 50.0)
+    assert verdict(book, 2, False, now=500.0, ban=100)[0] == "failed"      # replay: same, no second ban
+    assert not book.banned("A", 510.0)
+
+
+def test_n1_a_verdict_on_a_row_marked_unaudited_after_finalize_never_raises(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A", first=1)
+    mark(book, 2)
+    finalize(book)
+    before = book.rows(1, environment="math")
+    assert verdict(book, 2, True) == ("not_applied", [])
+    assert verdict(book, 2, False, now=10.0, ban=100)[0] == "failed"
+    assert book.banned("A", 50.0) and book.rows(1, environment="math") == before
+
+
+def test_n2_a_late_failure_forfeits_the_hotkeys_entitlements_in_the_envs_not_yet_finalized(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1, env="math", groups=100)
+    reserve(book, 2, env="code", groups=100)
+    reserve(book, 3, env="code", hotkey="other", groups=0)       # another hotkey: spared
+    draw(book, env="math")
+    draw(book, env="code")
+    finalize(book, env="math")                                   # row 1: drawn, never audited -> unaudited
+    math_rows = book.rows(1, environment="math")
+    kind, forfeited = verdict(book, 1, False, now=10.0, ban=100)
+    assert (kind, forfeited) == ("failed", [oid(2)])             # the ids whose first scan the caller releases
+    assert book.rows(1, environment="math") == math_rows         # finalized env: never changes
+    assert states(book, env="code") == {2: ("queued", "forfeited"), 3: ("not_drawn", "reserved")}
+    assert book.banned("hk", 50.0) and not book.banned("other", 50.0)
+    assert verdict(book, 1, False, now=500.0, ban=100) == ("failed", [oid(2)])   # retry-safe
+    finalize(book, env="code")
+    assert book.payable(1, environment="code") == {"other": 1}
+
+
+def test_n2_the_entry_point_releases_the_first_scans_a_late_failure_forfeits(pair):
+    log, book = pair
+    a = admit(pair, obs(1, env="math"), cap=1.0)
+    b = admit(pair, obs(2, env="code"), cap=1.0)
+    for env in ("math", "code"):
+        with book.db:
+            book.resolve_draws(1, environment=env, beacon_for_round=lambda r: BEACON, audit_bps=0)
+    finalize_exploration(log, book, 1, environment="math")
+    assert not log.is_scanned("math", 1) and log.is_scanned("code", 2)
+    forfeited = apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    assert forfeited == [b.observation_id] and not log.is_scanned("code", 2)
+
+
+def test_n3_aborted_finalize_unpays_every_reserved_row_even_after_a_plain_finalize(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1, groups=0)                                   # not drawn: payable
+    reserve(book, 2, groups=100)
+    reserve(book, 3, hotkey="bad", groups=100)
+    reserve(book, 4, hotkey="bad", groups=0)
+    draw(book)
+    audit(book, 2, True)                                         # passed: payable
+    audit(book, 3, False, now=5.0)                               # forfeited (row 4 too)
+    finalize(book)
+    assert book.payable(1, environment="math") == {"hk": 2}
+    with book.db:
+        ids = book.finalize_window(1, environment="math", aborted=True)    # AFTER the plain finalize
+    assert set(ids) == {oid(1), oid(2)}                          # forfeited rows were released when forfeited
+    assert states(book) == {1: ("not_drawn", "unpaid"), 2: ("passed", "unpaid"), 3: ("failed", "forfeited"),
+                            4: ("not_drawn", "forfeited")}        # a forfeited row keeps its label
+    assert book.payable(1, environment="math") == {}
+    with book.db:
+        assert book.finalize_window(1, environment="math", aborted=True) == ids          # idempotent
+    assert finalize(book) == ids and book.payable(1, environment="math") == {}
+    assert book.passed_audits("hk") == 1                         # the audit that passed is still a fact
+
+
+def test_n3_aborted_finalize_on_an_open_env_is_a_finalize_that_pays_nothing(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1, groups=0)
+    draw(book)
+    with book.db:
+        assert book.finalize_window(1, environment="math", aborted=True) == [oid(1)]
+    assert book.is_finalized(1, environment="math") and book.payable(1, environment="math") == {}
+    assert reserve(book, 2, groups=0) is None                    # finalized: no new reservation
+
+
+def test_n3_aborted_finalize_gives_every_first_scan_back_and_only_aborted_does(pair):
+    log, book = pair
+    paid = admit(pair, obs(1), groups=0, cap=1.0)
+    other = admit(pair, obs(2, env="code"), groups=0, cap=1.0)
+    for env in (ENV, "code"):
+        with book.db:
+            book.resolve_draws(1, environment=env, beacon_for_round=lambda r: BEACON, audit_bps=0)
+    assert finalize_exploration(log, book, 1, environment=ENV) == []
+    assert log.is_scanned(ENV, 1) and book.payable(1, environment=ENV) == {"hk": 1}
+    assert finalize_exploration(log, book, 1, environment=ENV, aborted=True) == [paid.observation_id]
+    assert not log.is_scanned(ENV, 1) and log.is_scanned("code", 2)          # per (window, env)
+    assert finalize_exploration(log, book, 1, environment=ENV, aborted=True) == [paid.observation_id]
+    assert admit(pair, obs(1, window=2, hotkey="later"), cap=1.0).first_scan  # scannable again, later
+    assert other.first_scan
+
+
+def test_n5_racing_connections_admit_exactly_one_first_scan_and_nobody_raises(tmp_path):
+    import threading
+    path = tmp_path / "race.sqlite3"
+    seed = sqlite3.connect(path)
+    RunObservationLog(seed, order_sha256=ORDER, sigma_min_bps=2400)
+    ExplorationLedger(seed, order_sha256=ORDER)
+    seed.close()
+    threads, start = 8, threading.Barrier(8)
+    outcomes, errors = [], []
+
+    def worker(index):
+        db = sqlite3.connect(path, timeout=60)
+        try:
+            log = RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
+            book = ExplorationLedger(db, order_sha256=ORDER)
+            start.wait()
+            for prompt in range(3):                              # three never-scanned prompts, all contended
+                outcomes.append((prompt, record_exploration(
+                    log, book, obs(prompt, hotkey=f"hk{index}", group=f"g{index}-{prompt}"), amount=PRICE, cap=10.0,
+                    draw_round=60, new_hotkey_audit_groups=100, now=1000.0)))
+        except BaseException as exc:  # noqa: BLE001 - the point of the test
+            errors.append(repr(exc))
+        finally:
+            db.close()
+
+    pool = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+    for t in pool:
+        t.start()
+    for t in pool:
+        t.join(120)
+    assert errors == []
+    assert len(outcomes) == threads * 3
+    for prompt in range(3):
+        mine = [o for p, o in outcomes if p == prompt]
+        assert sum(o.first_scan for o in mine) == 1 and sum(o.status == "exploration_pending" for o in mine) == 1
+        assert {o.reason for o in mine if not o.first_scan} == {"already_scanned"}
+
+
+def test_n6_a_replay_reports_the_state_of_the_row_now(pair):
+    log, book = pair
+    a = admit(pair, obs(1), cap=1.0)
+    b = admit(pair, obs(2), cap=1.0)
+    c = admit(pair, obs(3, hotkey="honest"), cap=1.0)
+    with book.db:
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+    again = admit(pair, obs(1), cap=1.0)
+    assert again.status == "exploration_pending" and again.entitlement == a.entitlement
+    apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    for o, i in ((a, 1), (b, 2)):                                # forfeited by the failure
+        r = admit(pair, obs(i), cap=1.0)
+        assert (r.status, r.entitlement, r.inserted) == ("exploration_forfeited", None, False)
+    finalize_exploration(log, book, 1, environment=ENV)          # c: drawn, never audited -> unpaid
+    r = admit(pair, obs(3, hotkey="honest"), cap=1.0)
+    assert (r.status, r.entitlement) == ("exploration_unpaid", None) and not r.first_scan
+
+
+def test_n6_a_group_refused_for_cap_and_resubmitted_with_room_is_a_new_attempt(pair):
+    log, book = pair
+    first = admit(pair, obs(1, hotkey="a"))                      # CAP fits two
+    second = admit(pair, obs(2, hotkey="b"))
+    third = admit(pair, obs(3, hotkey="c"))
+    assert (third.reason, third.first_scan) == ("cap", False) and not log.is_scanned(ENV, 3)
+    again = admit(pair, obs(3, hotkey="c"))
+    assert (again.reason, again.status) == ("cap", "exploration_unpaid")   # still full: the refusal, not "replay"
+    with book.db:
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+    apply_exploration_audit(log, book, first.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    retry = admit(pair, obs(3, hotkey="c"), now=20.0)            # room again (a's row was forfeited)
+    assert retry.observation_id == third.observation_id and not retry.inserted
+    assert (retry.status, retry.reason, retry.first_scan) == ("exploration_pending", None, True)
+    assert retry.entitlement is not None and log.is_scanned(ENV, 3)
+    assert last_event(log)["status"] == "exploration_pending"
+    assert admit(pair, obs(3, hotkey="c"), now=21.0).entitlement == retry.entitlement   # now a plain replay
+    assert second.first_scan
+
+
+def test_n6_a_cap_refused_retry_loses_to_someone_who_took_the_prompt_meanwhile(pair):
+    log, book = pair
+    admit(pair, obs(1, hotkey="a"))
+    admit(pair, obs(2, hotkey="b"))
+    late = admit(pair, obs(3, hotkey="c"))
+    assert late.reason == "cap"
+    admit(pair, obs(3, hotkey="d", group="elsewhere"), cap=1.0)  # another hotkey takes the prompt, cap raised
+    retry = admit(pair, obs(3, hotkey="c"), cap=1.0)
+    assert (retry.reason, retry.status, retry.first_scan) == ("already_scanned", "exploration_unpaid", False)
+
+
+def test_n10_a_probationer_holds_at_most_the_limit_of_unpassed_rows_per_window_env(tmp_path):
+    book = ledger(tmp_path)
+    for i in range(1, PROBATION_PENDING_LIMIT + 1):
+        assert reserve(book, i, groups=100) is not None
+    assert reserve(book, 50, groups=100) is None
+    assert book.refusal(window=1, environment="math", hotkey="hk", amount=0.1, cap=1.0, now=0.0,
+                        new_hotkey_audit_groups=100) == "probation_limit"
+    assert reserve(book, 51, groups=100, env="code") is not None            # per env
+    assert reserve(book, 52, groups=100, window=2) is not None              # and per window
+    assert reserve(book, 53, groups=100, hotkey="other") is not None        # and per hotkey
+    draw(book)
+    audit(book, 1, True)                                         # a passed audit frees a slot
+    assert reserve(book, 54, groups=100) is not None
+    assert reserve(book, 55, groups=100) is None
+
+
+def test_n10_a_hotkey_past_probation_is_not_limited(tmp_path):
+    book = ledger(tmp_path)
+    for i in range(1, 3 * PROBATION_PENDING_LIMIT - 2):          # 10 fit under the cap
+        assert reserve(book, i, groups=0) is not None
+
+
+def test_n10_an_unaudited_or_forfeited_row_does_not_hold_a_slot(tmp_path):
+    book = ledger(tmp_path)
+    for i in range(1, PROBATION_PENDING_LIMIT + 1):
+        reserve(book, i, groups=100)
+    mark(book, 1)
+    assert reserve(book, 50, groups=100) is not None             # an unaudited row is unpaid: it frees its slot
+
+
+def test_n10_the_entry_point_refuses_with_probation_limit_publishes_unpaid_and_releases_the_scan(pair):
+    log, book = pair
+    for p in range(1, PROBATION_PENDING_LIMIT + 1):
+        assert admit(pair, obs(p), cap=10.0).first_scan
+    over = admit(pair, obs(50), cap=10.0)
+    assert (over.status, over.reason, over.first_scan, over.entitlement) == \
+        ("exploration_unpaid", "probation_limit", False, None)
+    assert not log.is_scanned(ENV, 50)
+    assert last_event(log)["reason"] == "probation_limit" and last_event(log)["status"] == "exploration_unpaid"
+    assert admit(pair, obs(60, hotkey="vet"), cap=10.0, groups=0).first_scan   # past probation: not limited
+    for p in range(70, 80):
+        assert admit(pair, obs(p, hotkey="vet"), cap=10.0, groups=0).first_scan

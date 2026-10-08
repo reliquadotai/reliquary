@@ -13,7 +13,7 @@ from reliquary.protocol.service_schedule import next_schedule
 from reliquary.protocol.submission import ServicePolicyAnnouncement
 from reliquary.services import runtime as runtime_module
 from reliquary.services.runtime import (
-    FROZEN_ARCHIVE_FIELDS, ServicePolicyLimit, ServiceRuntime, protocol_slot_geometry, validate_service_archive,
+    FROZEN_ARCHIVE_FIELDS, AuditOutcome, ServicePolicyLimit, ServiceRuntime, protocol_slot_geometry, validate_service_archive,
 )
 from reliquary.services.settlement import SettlementError, validate_service_archive_v2
 from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2, contract_v2_dict, qualification_v2
@@ -281,7 +281,9 @@ def test_failed_audit_forfeits_bans_and_reopens_the_prompt(tmp_path):
     first = explore(rt, hotkey="cheat", prompt=7)
     other = explore(rt, hotkey="cheat", prompt=8, env=CODE)
     assert set(draw(rt)) == {first["observation_id"], other["observation_id"]}
-    forfeited = rt.record_audit(first["observation_id"], passed=False, now=10_000.0)
+    outcome = rt.record_audit(first["observation_id"], passed=False, now=10_000.0)
+    assert outcome.kind == "failed" and outcome.failed and outcome.applied
+    forfeited = outcome.forfeited
     assert set(forfeited) == {first["observation_id"], other["observation_id"]}   # the window, every env
     assert rt.exploration_banned("cheat", now=10_001.0) and rt.exploration_banned("cheat", now=10_000.0 + 86_399)
     assert not rt.exploration_banned("cheat", now=10_000.0 + 86_401)
@@ -307,7 +309,7 @@ def test_banned_hotkey_is_published_unpaid_and_holds_no_first_scan(tmp_path):
 
 def test_over_cap_is_published_unpaid_and_holds_no_first_scan(tmp_path):
     rt = runtime(tmp_path)
-    results = [explore(rt, prompt=prompt, hotkey=f"h{prompt % 3}") for prompt in range(CAP_COUNT + 1)]
+    results = [explore(rt, prompt=prompt, hotkey=f"h{prompt % 6}") for prompt in range(CAP_COUNT + 1)]
     assert all(r["entitled"] for r in results[:CAP_COUNT])
     last = results[-1]
     assert (last["entitled"], last["status"], last["reason"], last["first_scan"]) == \
@@ -322,7 +324,7 @@ def test_over_cap_is_published_unpaid_and_holds_no_first_scan(tmp_path):
 def test_passed_audit_publishes_audited_but_never_paid_before_finalize(tmp_path):
     rt = runtime(tmp_path)
     result = explore(rt)
-    assert audited(rt, result) == []
+    assert audited(rt, result) == AuditOutcome("passed") and audited(rt, result).passed
     (settle,) = events(rt, "settle", result["observation_id"])
     assert (settle["status"], settle["proof"]) == ("exploration_pending", "audited")
     assert not any(e["status"] == "exploration_paid" for e in events(rt))
@@ -394,16 +396,17 @@ def test_a_verdict_that_cannot_be_applied_is_logged_and_never_raises(tmp_path, m
     not_drawn = explore(rt)
     draw(rt)                                               # audit_bps 0, no probation: not drawn
     assert rt.ledger.rows(1, environment=MATH)[0]["audit"] == "not_drawn"
-    assert rt.record_audit(not_drawn["observation_id"], passed=False, now=10_000.0) == []
-    assert rt.record_audit("f" * 64, passed=True, now=10_000.0) == []
+    assert rt.record_audit(not_drawn["observation_id"], passed=False, now=10_000.0) == AuditOutcome("not_applied")
+    assert rt.record_audit("f" * 64, passed=True, now=10_000.0) == AuditOutcome("not_applied")
+    assert not AuditOutcome("not_applied").applied
     assert len(errors) == 2 and not_drawn["observation_id"] in str(errors[0]) and "f" * 64 in str(errors[1])
     assert not rt.exploration_banned("hk", now=10_001.0) and events(rt, "settle") == []
     assert not rt.db.in_transaction
 
     def busy(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked")
-    monkeypatch.setattr(runtime_module, "apply_exploration_audit", busy)
-    assert rt.record_audit(not_drawn["observation_id"], passed=True, now=10_000.0) == []
+    monkeypatch.setattr(runtime_module, "apply_exploration_verdict", busy)
+    assert rt.record_audit(not_drawn["observation_id"], passed=True, now=10_000.0).kind == "not_applied"
     assert len(errors) == 3 and not rt.db.in_transaction
 
 
@@ -484,7 +487,7 @@ def test_reconcile_finalizes_what_the_caller_did_not_and_never_pays_an_unaudited
 def test_full_window_scales_training_and_exploration_alike_and_the_archive_validates(tmp_path):
     rt = runtime(tmp_path)
     for prompt in range(CAP_COUNT):
-        explore(rt, prompt=prompt, hotkey=f"x{prompt % 2}")
+        explore(rt, prompt=prompt, hotkey=f"x{prompt % 6}")
     draw(rt)
     for row in rt.queued_audits(1):
         rt.record_audit(row["observation_id"], passed=True, now=10_000.0)
@@ -496,8 +499,9 @@ def test_full_window_scales_training_and_exploration_alike_and_the_archive_valid
     assert result["service_scale_by_environment"][CODE] == 1.0
     rewards = result["rewards_by_hotkey"]
     assert rewards["a"] == pytest.approx(POOL * scale, rel=1e-12)                 # training scaled...
-    assert rewards["x0"] + rewards["x1"] == pytest.approx(CAP_COUNT * PRICE * scale, rel=1e-12)   # ...explorers too
-    assert rewards["a"] + rewards["x0"] + rewards["x1"] == pytest.approx(POOL, rel=1e-12)   # env pool conserved
+    explorers = sum(rewards[f"x{i}"] for i in range(6))
+    assert explorers == pytest.approx(CAP_COUNT * PRICE * scale, rel=1e-12)       # ...explorers too
+    assert rewards["a"] + explorers == pytest.approx(POOL, rel=1e-12)   # env pool conserved
     assert rewards["b"] == pytest.approx(POOL / 2, rel=1e-12)                     # the other env is untouched
     validate_service_archive_v2(json.loads(json.dumps(result)), rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
     validate_service_archive(json.loads(json.dumps(result)), rt.contract, cap=1.0)   # replay's name, protocol geometry
@@ -516,9 +520,10 @@ def test_late_failed_audit_after_finalize_bans_and_changes_no_archive(tmp_path):
     first = rt.reconcile_archive(given, now=10_100.0)
     assert first["rewards_by_hotkey"] == {"x": pytest.approx(PRICE)}
     rows, count = rt.ledger.rows(1, environment=MATH), len(events(rt))
-    assert rt.record_audit(unaudited["observation_id"], passed=False, now=10_200.0) == []
+    late = rt.record_audit(unaudited["observation_id"], passed=False, now=10_200.0)
+    assert late == AuditOutcome("failed", ())                            # applied (it bans), nothing to forfeit
     assert rt.exploration_banned("x", now=10_201.0)                      # the sanction that is left (R3)
-    assert rt.record_audit(unaudited["observation_id"], passed=True, now=10_210.0) == []   # nor a late pass
+    assert rt.record_audit(unaudited["observation_id"], passed=True, now=10_210.0) == AuditOutcome("not_applied")   # nor a late pass
     assert rt.ledger.rows(1, environment=MATH) == rows and len(events(rt)) == count
     assert rt.log.is_scanned(MATH, 1) is True                            # the paid first scan is not released
     assert json.dumps(rt.reconcile_archive(given, now=10_300.0), sort_keys=True) == json.dumps(first, sort_keys=True)
@@ -705,8 +710,8 @@ def test_restart_mid_window_keeps_the_envelope_the_pending_draws_and_the_queued_
     assert rt.exploration_backlog(1) == {"pending_draw": 1, "queued": 2, "queued_past_probation": 0}
     # Same run salt: a retry after the restart is the same observation, not a second one.
     assert explore(rt, hotkey="a", prompt=1, now=9_050.0)["observation_id"] == queued_a["observation_id"]
-    assert rt.record_audit(queued_a["observation_id"], passed=True, now=9_060.0) == []
-    assert rt.record_audit(queued_b["observation_id"], passed=True, now=9_060.0) == []
+    assert rt.record_audit(queued_a["observation_id"], passed=True, now=9_060.0) == AuditOutcome("passed")
+    assert rt.record_audit(queued_b["observation_id"], passed=True, now=9_060.0) == AuditOutcome("passed")
     assert rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=9_100.0) == [pending["observation_id"]]
     rt.record_audit(pending["observation_id"], passed=True, now=9_110.0)
     for env in (MATH, CODE):
@@ -816,3 +821,53 @@ def test_removed_v1_entry_points_fail_closed_and_name_their_task(tmp_path):
         with pytest.raises(NotImplementedError, match="wired in Task 1"):
             call()
     assert not hasattr(rt, "mark_unaudited")              # it would defeat the per-hotkey audit horizon
+
+
+# ---------------------------------------------------------------- round 4
+
+def test_n3_a_window_finalized_then_found_aborted_gives_its_prompts_back_and_they_pay_later(tmp_path):
+    rt = runtime(tmp_path)
+    first = explore(rt, hotkey="x", prompt=1)
+    audited(rt, first)
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)   # the batcher finalizes before it knows
+    assert rt.log.is_scanned(MATH, 1) is True and rt.ledger.payable(1, environment=MATH) == {"x": 1}
+    result = rt.reconcile_archive(archive(), aborted=True, now=10_100.0)
+    assert result["window_status"] == "aborted" and result["service_exploration_by_environment"] == {}
+    assert rt.ledger.payable(1, environment=MATH) == {}
+    assert [r["status"] for r in rt.ledger.rows(1, environment=MATH)] == ["unpaid"]
+    assert rt.log.is_scanned(MATH, 1) is False
+    assert events(rt, "settle", first["observation_id"])[-1]["status"] == "exploration_unpaid"
+    # a later window: the same prompt is a first scan again, and it is paid there
+    open_window(rt, 2)
+    again = explore(rt, hotkey="y", prompt=1, window=2, now=130.0)
+    assert again["first_scan"] and again["entitled"]
+    audited(rt, again, window=2)
+    rt.finalize_exploration(2, environment=MATH, now=10_150.0)
+    later = rt.reconcile_archive(archive(window=2), now=10_200.0)
+    assert later["service_exploration_by_environment"] == {MATH: {"y": 1}}
+    assert later["rewards_by_hotkey"] == {"y": pytest.approx(PRICE)}
+
+
+def test_n3_an_aborted_finalize_through_the_runtime_is_idempotent(tmp_path):
+    rt = runtime(tmp_path)
+    audited(rt, explore(rt, hotkey="x", prompt=1))
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    first = rt.reconcile_archive(archive(), aborted=True, now=10_100.0)
+    again = rt.reconcile_archive(archive(), aborted=True, now=10_200.0)
+    assert frozen(first) == frozen(again)
+
+
+def test_n2_n11_a_late_failure_forfeits_the_other_open_env_and_says_so(tmp_path):
+    rt = runtime(tmp_path)
+    math = explore(rt, hotkey="cheat", prompt=1)
+    code = explore(rt, hotkey="cheat", prompt=2, env=CODE)
+    draw(rt)
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)    # math row: drawn, never audited
+    assert rt.log.is_scanned(CODE, 2)
+    outcome = rt.record_audit(math["observation_id"], passed=False, now=10_100.0)
+    assert outcome == AuditOutcome("failed", (code["observation_id"],)) and outcome.failed
+    assert rt.exploration_banned("cheat", now=10_101.0)
+    assert not rt.log.is_scanned(CODE, 2)
+    assert events(rt, "settle", code["observation_id"])[-1]["status"] == "exploration_forfeited"
+    assert rt.record_audit(math["observation_id"], passed=True, now=10_110.0) == AuditOutcome("not_applied")
+    assert rt.record_audit(code["observation_id"], passed=True, now=10_120.0).kind == "not_applied"

@@ -27,7 +27,12 @@ Rules a reader of the public log can rely on:
   a failed audit, ``unaudited`` at finalize, horizon included) gives its first scan back, so the
   prompt can be paid to a later observation. Only a paid entitlement keeps the prompt.
 * Once a (window, env) is finalized its rows never change: no reservation, no draw, no forfeit, no
-  release. A failed audit that arrives late only bans, once, and only for a group that was drawn.
+  release. A failed audit that arrives late bans once (only for a group that was drawn) and forfeits
+  the hotkey's entitlements in the envs of that window not yet finalized (R3). The one transition
+  allowed after finalize is ``aborted=True`` (an aborted window pays no exploration): every row still
+  ``reserved`` becomes ``unpaid`` and gives its first scan back.
+* Probation cap: a hotkey still in probation holds at most ``PROBATION_PENDING_LIMIT`` reserved rows
+  whose audit has not passed per (window, env); beyond that it is refused (``probation_limit``).
 """
 from __future__ import annotations
 
@@ -36,6 +41,8 @@ import math
 import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
+
+from reliquary.constants import PROBATION_PENDING_LIMIT
 
 if TYPE_CHECKING:  # pragma: no cover
     from reliquary.services.run_log import Observation, RunObservationLog
@@ -46,7 +53,9 @@ _EPS = 1e-12
 
 STATUS_PENDING = "exploration_pending"
 STATUS_UNPAID = "exploration_unpaid"
-REFUSAL_REASONS = ("already_scanned", "banned", "finalized", "zero_price", "cap")
+STATUS_FORFEITED = "exploration_forfeited"
+REFUSAL_REASONS = ("already_scanned", "banned", "finalized", "zero_price", "probation_limit", "cap")
+MAX_AMOUNT = 1e12  # a pool, price or cap above this is not money; it also keeps every product finite
 
 
 def training_group_price(pool: float, *, picks_target: int, batch_slots: int) -> float:
@@ -86,8 +95,16 @@ def audit_selected(*, beacon_randomness: str, observation_id: str, audit_bps: in
     return int.from_bytes(digest[:8], "big") / 2**64 < audit_bps / 10000
 
 
+def finite_amount(value, bound: float = MAX_AMOUNT) -> bool:
+    """True for an int/float in ``[0, bound]``. Never raises: a 400-digit int is just "too big"
+    (``math.isfinite`` raises OverflowError on it)."""
+    if type(value) is int:
+        return 0 <= value <= bound
+    return type(value) is float and math.isfinite(value) and 0 <= value <= bound
+
+
 def _money(value, name: str) -> float:
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+    if not finite_amount(value):
         raise ValueError(f"invalid exploration {name}")
     return float(value)
 
@@ -120,22 +137,29 @@ class ExplorationLedger:
         return row is not None and now < row[0]
 
     def passed_audits(self, hotkey: str) -> int:
-        """Probation counter: this hotkey's groups whose audit passed and that are still entitled,
-        over every window and env of the order. Derived from the rows, so it survives a reopen."""
+        """Probation counter: this hotkey's groups whose audit passed and that were not forfeited
+        (a pass is a fact even if the window was later aborted), over every window and env of the order. Derived from the rows, so it survives a reopen."""
         return int(self.db.execute(
             "SELECT COUNT(*) FROM exploration_entitlements WHERE order_id=? AND hotkey=? "
-            "AND audit='passed' AND status='reserved'", (self.order, hotkey)).fetchone()[0])
+            "AND audit='passed' AND status<>'forfeited'", (self.order, hotkey)).fetchone()[0])
 
     def entitlement(self, observation_id: str) -> dict | None:
         row = self.db.execute("SELECT amount, forced, draw_round FROM exploration_entitlements "
                               "WHERE observation_id=? AND order_id=?", (observation_id, self.order)).fetchone()
         return None if row is None else {"amount": row[0], "forced": bool(row[1]), "draw_round": row[2]}
 
+    def state(self, observation_id: str) -> tuple[str, str] | None:
+        """``(audit, status)`` of an entitlement as it is NOW, or None."""
+        row = self.db.execute("SELECT audit, status FROM exploration_entitlements WHERE observation_id=? "
+                              "AND order_id=?", (observation_id, self.order)).fetchone()
+        return None if row is None else (row[0], row[1])
+
     def refusal(self, *, window: int, environment: str, hotkey: str, amount: float, cap: float,
-                now: float | None = None) -> str | None:
+                now: float | None = None, new_hotkey_audit_groups: int | None = None) -> str | None:
         """Why a NEW reservation would be refused (one of ``REFUSAL_REASONS``), or None.
 
         ``now`` enables the ban check; without it the caller answers for the ban.
+        ``new_hotkey_audit_groups`` enables the probation cap (``probation_limit``).
         """
         amount, cap = _money(amount, "price"), _money(cap, "cap")
         if now is not None and self.banned(hotkey, now):
@@ -149,6 +173,13 @@ class ExplorationLedger:
             "AND amount<>? LIMIT 1", (self.order, window, environment, amount)).fetchone()
         if other is not None:  # counts are only money if one window has one price
             raise ValueError("exploration price changed inside a (window, env)")
+        if new_hotkey_audit_groups is not None and self.passed_audits(hotkey) < new_hotkey_audit_groups:
+            holding = self.db.execute(
+                "SELECT COUNT(*) FROM exploration_entitlements WHERE order_id=? AND window=? AND environment=? "
+                "AND hotkey=? AND status='reserved' AND audit NOT IN ('passed','unaudited','failed')",
+                (self.order, window, environment, hotkey)).fetchone()[0]
+            if holding >= PROBATION_PENDING_LIMIT:
+                return "probation_limit"
         used = self.db.execute(
             "SELECT COUNT(*) FROM exploration_entitlements WHERE order_id=? AND window=? "
             "AND environment=? AND status='reserved' AND audit<>'unaudited'",
@@ -166,7 +197,7 @@ class ExplorationLedger:
         if known is not None:
             return known
         if self.refusal(window=window, environment=environment, hotkey=hotkey, amount=amount, cap=cap,
-                        now=now) is not None:
+                        now=now, new_hotkey_audit_groups=new_hotkey_audit_groups) is not None:
             return None
         forced = self.passed_audits(hotkey) < new_hotkey_audit_groups
         self.db.execute(
@@ -214,63 +245,93 @@ class ExplorationLedger:
             "SELECT observation_id FROM exploration_entitlements WHERE order_id=? AND window=? AND hotkey=? "
             "AND status='forfeited' ORDER BY rowid", (self.order, window, hotkey)).fetchall()]
 
-    def record_audit(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int) -> list[str]:
-        """Record an audit verdict; return the ids whose first scan the caller must release.
-
-        A failure forfeits every entitlement of the hotkey in that window, in every env not yet
-        finalized, and bans the hotkey. Replaying a failed verdict returns the same forfeited ids
-        again and never bans twice. In a finalized (window, env) no row changes: a late failure
-        bans once, and only if the group was drawn; anything else is a no-op.
-        """
-        row = self.db.execute("SELECT window, hotkey, environment, audit, drawn FROM exploration_entitlements "
-                              "WHERE observation_id=? AND order_id=?", (observation_id, self.order)).fetchone()
-        if row is None:
-            raise ValueError("unknown exploration entitlement")
-        window, hotkey, environment, state, drawn = row
-        if not passed and state == "failed":  # replay: the caller's release must be retry-safe
-            return self._forfeited(window, hotkey)
-        if self.is_finalized(window, environment=environment):
-            if not passed and drawn and state == "unaudited":
-                first = self.db.execute("INSERT OR IGNORE INTO exploration_late_failures VALUES(?,?)",
-                                        (self.order, observation_id)).rowcount == 1
-                if first:
-                    self._ban(hotkey, now, ban_seconds)
-            return []
-        if passed and state == "passed":
-            return []
-        if state != "queued":  # never drawn, or already settled otherwise: no late flip, no late sanction
-            raise ValueError(f"exploration entitlement is not awaiting an audit ({state})")
-        if passed:
-            self.db.execute("UPDATE exploration_entitlements SET audit='passed' WHERE observation_id=?", (observation_id,))
-            return []
-        self.db.execute("UPDATE exploration_entitlements SET audit='failed' WHERE observation_id=?", (observation_id,))
-        # Every entitlement of the hotkey in this window, in every env not yet finalized.
+    def _forfeit_open_envs(self, window: int, hotkey: str) -> list[str]:
+        """Forfeit every entitlement of ``hotkey`` in ``window``, in every env not yet finalized;
+        return the hotkey's forfeited ids of the window (idempotent)."""
         self.db.execute(
             """UPDATE exploration_entitlements SET status='forfeited' WHERE order_id=? AND window=? AND hotkey=?
                AND NOT EXISTS (SELECT 1 FROM exploration_finalized f WHERE f.order_id=exploration_entitlements.order_id
                                AND f.window=exploration_entitlements.window
                                AND f.environment=exploration_entitlements.environment)""",
             (self.order, window, hotkey))
-        self._ban(hotkey, now, ban_seconds)
         return self._forfeited(window, hotkey)
+
+    def apply_verdict(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int) -> tuple[str, list[str]]:
+        """Record an audit verdict; return ``(kind, ids)``.
+
+        ``kind`` is ``"passed"`` (the row is audited-and-passed), ``"failed"`` (a failure was applied:
+        ban, and ``ids`` = the hotkey's forfeited ids of the window, whose first scans the caller
+        must release) or ``"not_applied"`` (nothing changed). Raises ValueError for an unknown id or
+        a row that never awaited an audit (never drawn).
+
+        A failure forfeits every entitlement of the hotkey in that window, in every env not yet
+        finalized, and bans the hotkey. Replaying a failed verdict returns the same forfeited ids
+        again and never bans twice. A row already marked ``unaudited`` (lost its audit slot): a pass
+        is ignored (``not_applied``); a failure of a DRAWN row counts as in any other state. In a
+        finalized (window, env) no row of it changes: a late failure on a drawn, unaudited row bans
+        once and forfeits the hotkey's entitlements of the window in the envs not yet finalized (R3).
+        """
+        row = self.db.execute("SELECT window, hotkey, environment, audit, drawn, status FROM "
+                              "exploration_entitlements WHERE observation_id=? AND order_id=?",
+                              (observation_id, self.order)).fetchone()
+        if row is None:
+            raise ValueError("unknown exploration entitlement")
+        window, hotkey, environment, state, drawn, status = row
+        if not passed and state == "failed":  # replay: the caller's release must be retry-safe
+            return "failed", self._forfeited(window, hotkey)
+        if self.is_finalized(window, environment=environment):
+            if passed:
+                return ("passed" if state == "passed" else "not_applied"), []
+            if not (drawn and state == "unaudited"):
+                return "not_applied", []
+            if self.db.execute("INSERT OR IGNORE INTO exploration_late_failures VALUES(?,?)",
+                               (self.order, observation_id)).rowcount == 1:
+                self._ban(hotkey, now, ban_seconds)
+            return "failed", self._forfeit_open_envs(window, hotkey)
+        if passed and state == "passed":
+            return "passed", []
+        if passed and status == "forfeited":  # the hotkey already lost the window: a pass flips nothing
+            return "not_applied", []
+        if state == "unaudited" and drawn:
+            if passed:
+                return "not_applied", []
+        elif state != "queued":  # never drawn, or already settled otherwise: no late flip, no late sanction
+            raise ValueError(f"exploration entitlement is not awaiting an audit ({state})")
+        if passed:
+            self.db.execute("UPDATE exploration_entitlements SET audit='passed' WHERE observation_id=?", (observation_id,))
+            return "passed", []
+        self.db.execute("UPDATE exploration_entitlements SET audit='failed' WHERE observation_id=?", (observation_id,))
+        self._ban(hotkey, now, ban_seconds)
+        return "failed", self._forfeit_open_envs(window, hotkey)
+
+    def record_audit(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int) -> list[str]:
+        """``apply_verdict`` without the kind: the ids whose first scan the caller must release."""
+        return self.apply_verdict(observation_id, passed=passed, now=now, ban_seconds=ban_seconds)[1]
 
     def mark_unaudited(self, observation_id: str) -> None:
         self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE observation_id=? "
                         "AND order_id=? AND audit IN ('pending_draw','queued')", (observation_id, self.order))
 
-    def finalize_window(self, window: int, *, environment: str) -> list[str]:
-        """Freeze a (window, env) and return every ``unaudited`` id of it (all unpaid, none sanctioned).
+    def finalize_window(self, window: int, *, environment: str, aborted: bool = False) -> list[str]:
+        """Freeze a (window, env) and return every unpaid id of it (none sanctioned).
 
         Groups waiting for their draw or their audit become ``unaudited``; so does every
-        ``not_drawn`` group of a hotkey at or after that hotkey's audit horizon (module docstring). The caller releases
-        the first scan of every returned id in the same transaction (``finalize_exploration``).
-        Calling it again changes nothing and returns the same ids.
+        ``not_drawn`` group of a hotkey at or after that hotkey's audit horizon (module docstring).
+        The horizon of a hotkey is its smallest draw round among its DRAWN, still entitled groups
+        that end unaudited, whether they were still ``queued`` here or ``mark_unaudited`` earlier.
+        The caller releases the first scan of every returned id in the same transaction
+        (``finalize_exploration``). Calling it again changes nothing and returns the same ids.
+
+        ``aborted=True`` is the one transition allowed on an already finalized (window, env): the
+        window pays no exploration, so every row still ``reserved`` becomes ``unpaid`` (``payable``
+        is then empty) and is returned too. Idempotent.
         """
         scope = (self.order, window, environment)
         if not self.is_finalized(window, environment=environment):
             horizons = self.db.execute(
                 "SELECT hotkey, MIN(draw_round) FROM exploration_entitlements WHERE order_id=? AND window=? "
-                "AND environment=? AND audit='queued' AND status='reserved' GROUP BY hotkey", scope).fetchall()
+                "AND environment=? AND drawn=1 AND audit IN ('queued','unaudited') AND status='reserved' "
+                "GROUP BY hotkey", scope).fetchall()
             self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE order_id=? AND window=? "
                             "AND environment=? AND audit IN ('pending_draw','queued')", scope)
             for hotkey, horizon in horizons:
@@ -278,9 +339,12 @@ class ExplorationLedger:
                                 "AND environment=? AND hotkey=? AND audit='not_drawn' AND draw_round>=?",
                                 (*scope, hotkey, horizon))
             self.db.execute("INSERT INTO exploration_finalized VALUES(?,?,?)", scope)
+        if aborted:
+            self.db.execute("UPDATE exploration_entitlements SET status='unpaid' WHERE order_id=? AND window=? "
+                            "AND environment=? AND status='reserved'", scope)
         return [r for r, in self.db.execute(
             "SELECT observation_id FROM exploration_entitlements WHERE order_id=? AND window=? "
-            "AND environment=? AND audit='unaudited' ORDER BY rowid", scope).fetchall()]
+            "AND environment=? AND (audit='unaudited' OR status='unpaid') ORDER BY rowid", scope).fetchall()]
 
     def payable(self, window: int, *, environment: str) -> dict[str, int]:
         """``{hotkey: whole entitlements to pay}`` of a FINALIZED (window, env): still entitled and
@@ -320,19 +384,71 @@ def _same_store(log: "RunObservationLog", ledger: ExplorationLedger) -> sqlite3.
 
 
 class _Atomic:
-    """A savepoint: joins the caller's open transaction, or is a transaction of its own."""
+    """A savepoint: joins the caller's open transaction, or is a transaction of its own.
+
+    A transaction of its own starts with ``BEGIN IMMEDIATE``: the entry points read before they
+    write, and a deferred transaction that upgrades its read lock fails at once with
+    "database is locked" when another connection writes meanwhile (the busy timeout cannot help).
+    """
 
     def __init__(self, db: sqlite3.Connection):
-        self.db = db
+        self.db, self.own = db, False
 
     def __enter__(self):
+        if not self.db.in_transaction:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.own = True
         self.db.execute("SAVEPOINT exploration_entry")
 
     def __exit__(self, kind, value, trace):
         if kind is not None:
             self.db.execute("ROLLBACK TO exploration_entry")
         self.db.execute("RELEASE exploration_entry")
+        if self.own:
+            self.db.execute("ROLLBACK" if kind is not None else "COMMIT")
         return False
+
+
+def _replayed(log: "RunObservationLog", ledger: ExplorationLedger, result, *, obs: "Observation", amount: float,
+              cap: float, draw_round: int, new_hotkey_audit_groups: int, now: float,
+              refuse: str | None) -> ExplorationOutcome:
+    """The outcome of a submission that is already in the log (nothing new is recorded).
+
+    The status is derived from the row's state NOW. A submission that was refused only for the
+    per-env ``cap`` is a new attempt when it comes back: if room exists it takes the prompt's first
+    scan and a reservation (never a replay of the stale refusal).
+    """
+    state = ledger.state(result.observation_id)
+    if state is not None:
+        audit, status = state
+        if status == "forfeited":
+            return ExplorationOutcome(result.observation_id, False, result.first_scan, result.category,
+                                      STATUS_FORFEITED, "replay", None)
+        if status != "reserved" or audit == "unaudited":
+            return ExplorationOutcome(result.observation_id, False, result.first_scan, result.category,
+                                      STATUS_UNPAID, "replay", None)
+        return ExplorationOutcome(result.observation_id, False, result.first_scan, result.category,
+                                  STATUS_PENDING, None, ledger.entitlement(result.observation_id))
+    if log.refusal_reason(result.observation_id) != "cap" or refuse is not None:
+        return ExplorationOutcome(result.observation_id, False, result.first_scan, result.category,
+                                  STATUS_UNPAID, "replay", None)
+    if log.is_scanned(obs.environment, obs.prompt_idx):
+        reason = "already_scanned"
+    else:
+        reason = ledger.refusal(window=obs.window, environment=obs.environment, hotkey=obs.hotkey, amount=amount,
+                                cap=cap, now=now, new_hotkey_audit_groups=new_hotkey_audit_groups)
+    if reason is not None:
+        return ExplorationOutcome(result.observation_id, False, False, result.category, STATUS_UNPAID, reason, None)
+    if not log.claim_first_scan(result.observation_id):
+        raise RuntimeError("exploration reservation and first scan disagree")
+    entitlement = ledger.reserve(
+        window=obs.window, environment=obs.environment, observation_id=result.observation_id,
+        hotkey=obs.hotkey, prompt_idx=obs.prompt_idx, amount=amount, cap=cap, draw_round=draw_round,
+        new_hotkey_audit_groups=new_hotkey_audit_groups, now=now)
+    if entitlement is None:
+        raise RuntimeError("exploration reservation and first scan disagree")
+    log.settle(result.observation_id, status=STATUS_PENDING, proof="pending", at=now)
+    return ExplorationOutcome(result.observation_id, False, True, result.category, STATUS_PENDING, None, entitlement)
 
 
 def record_exploration(log: "RunObservationLog", ledger: ExplorationLedger, obs: "Observation", *,
@@ -361,13 +477,13 @@ def record_exploration(log: "RunObservationLog", ledger: ExplorationLedger, obs:
             reason = str(refuse)
         else:
             reason = ledger.refusal(window=obs.window, environment=obs.environment, hotkey=obs.hotkey,
-                                    amount=amount, cap=cap, now=now)
+                                    amount=amount, cap=cap, now=now,
+                                    new_hotkey_audit_groups=new_hotkey_audit_groups)
         result = log.record(obs, status=STATUS_PENDING if reason is None else STATUS_UNPAID,
                             proof="pending" if reason is None else "unproven", reason=reason)
         if not result.inserted:
-            held = ledger.entitlement(result.observation_id)
-            return ExplorationOutcome(result.observation_id, False, result.first_scan, result.category,
-                                      STATUS_PENDING if held else STATUS_UNPAID, None if held else "replay", held)
+            return _replayed(log, ledger, result, obs=obs, amount=amount, cap=cap, draw_round=draw_round,
+                             new_hotkey_audit_groups=new_hotkey_audit_groups, now=now, refuse=refuse)
         if reason is not None:
             if result.first_scan:
                 log.release_first_scan(result.observation_id)
@@ -381,21 +497,33 @@ def record_exploration(log: "RunObservationLog", ledger: ExplorationLedger, obs:
         return ExplorationOutcome(result.observation_id, True, True, result.category, STATUS_PENDING, None, entitlement)
 
 
-def apply_exploration_audit(log: "RunObservationLog", ledger: ExplorationLedger, observation_id: str, *,
-                            passed: bool, now: float, ban_seconds: int) -> list[str]:
-    """Record an audit verdict and release the first scan of every forfeited id, atomically."""
+def apply_exploration_verdict(log: "RunObservationLog", ledger: ExplorationLedger, observation_id: str, *,
+                              passed: bool, now: float, ban_seconds: int) -> tuple[str, list[str]]:
+    """Record an audit verdict and release the first scan of every forfeited id, atomically.
+
+    Returns ``(kind, forfeited_ids)``, kind being ``passed`` / ``failed`` / ``not_applied``."""
     with _Atomic(_same_store(log, ledger)):
-        forfeited = ledger.record_audit(observation_id, passed=passed, now=now, ban_seconds=ban_seconds)
+        kind, forfeited = ledger.apply_verdict(observation_id, passed=passed, now=now, ban_seconds=ban_seconds)
         for identity in forfeited:
             log.release_first_scan(identity)
-        return forfeited
+        return kind, forfeited
+
+
+def apply_exploration_audit(log: "RunObservationLog", ledger: ExplorationLedger, observation_id: str, *,
+                            passed: bool, now: float, ban_seconds: int) -> list[str]:
+    """``apply_exploration_verdict`` without the kind: the forfeited ids (first scans released)."""
+    return apply_exploration_verdict(log, ledger, observation_id, passed=passed, now=now,
+                                     ban_seconds=ban_seconds)[1]
 
 
 def finalize_exploration(log: "RunObservationLog", ledger: ExplorationLedger, window: int, *,
-                         environment: str) -> list[str]:
-    """Finalize a (window, env) and release the first scan of every unaudited id, atomically."""
+                         environment: str, aborted: bool = False) -> list[str]:
+    """Finalize a (window, env) and release the first scan of every unpaid id, atomically.
+
+    ``aborted=True`` also works on an already finalized (window, env): every row still reserved
+    becomes unpaid and gives its first scan back (see ``ExplorationLedger.finalize_window``)."""
     with _Atomic(_same_store(log, ledger)):
-        unaudited = ledger.finalize_window(window, environment=environment)
+        unaudited = ledger.finalize_window(window, environment=environment, aborted=aborted)
         for identity in unaudited:
             log.release_first_scan(identity)
         return unaudited

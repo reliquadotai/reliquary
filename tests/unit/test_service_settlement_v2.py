@@ -435,3 +435,77 @@ def test_settle_raises_settlement_error_on_malformed_archive_or_envelope(change)
         with pytest.raises(SettlementError, match="disposition"):
             settle_window(archive=archive([]), envelope=envelope(contract, {MATH: 0.4, CODE: 0.4}), contract=contract,
                           exploration={}, aborted=bad)
+
+
+# ---- N4: no integer of any size can raise anything but SettlementError ----
+
+HUGE = [10**400, -10**400, 10**309, 10**20]
+HUGE_IDS = ["400 digits", "-400 digits", "309 digits", "10**20"]
+
+
+@pytest.mark.parametrize("huge", HUGE, ids=HUGE_IDS)
+@pytest.mark.parametrize("target", [
+    ("service_pools_by_environment", MATH), ("service_scale_by_environment", MATH),
+    ("service_training_by_environment", MATH, "a"), ("rewards_by_hotkey", "a"),
+    ("service_exploration_by_environment", MATH, "x"), ("service_picks_target",), ("service_batch_slots",),
+], ids=lambda t: "/".join(t))
+def test_validate_raises_only_settlement_error_on_a_huge_integer(target, huge):
+    record = good_record()
+    validate(record)
+    put(*target, huge)(record)
+    record = json.loads(json.dumps(record))                      # JSON-representable, as on the wire
+    with pytest.raises(SettlementError):
+        validate(record)
+
+
+@pytest.mark.parametrize("huge", HUGE, ids=HUGE_IDS)
+@pytest.mark.parametrize("what", ["pool", "picks", "slots", "caller_rewards", "count", "cap_arg", "geometry_arg"])
+def test_settle_and_validate_raise_only_settlement_error_on_a_huge_integer(what, huge):
+    contract = contract_v2()
+    a, e, x = archive([("a", MATH)]), envelope(contract, {MATH: 0.4, CODE: 0.4}), {MATH: {"x": 1}}
+    if what == "pool":
+        e["pools"][MATH] = huge
+    elif what == "picks":
+        e["picks_target"] = huge
+    elif what == "slots":
+        e["batch_slots"] = huge
+    elif what == "caller_rewards":
+        a["rewards_by_hotkey"] = {"a": huge}
+    elif what == "count":
+        x = {MATH: {"x": huge}}
+    if what in ("cap_arg", "geometry_arg"):
+        with pytest.raises(SettlementError):
+            validate(good_record(), cap=huge) if what == "cap_arg" else validate(good_record(), picks=huge)
+        return
+    with pytest.raises(SettlementError):
+        settle_window(archive=a, envelope=e, contract=contract, exploration=x, aborted=False)
+
+
+# ---- N9: settle checks its envelope like validate does ----
+
+@pytest.mark.parametrize("pools", [
+    {MATH: 0.4}, {MATH: 0.4, CODE: 0.4, "ghost": 0.1}, {MATH: 0.4, "ghost": 0.4}, {},
+], ids=["env missing", "extra env", "wrong env", "no pool"])
+def test_settle_refuses_pools_that_are_not_exactly_the_active_envs(pools):
+    contract = contract_v2()
+    with pytest.raises(SettlementError, match="active"):
+        settle_window(archive=archive([]), envelope=envelope(contract, pools), contract=contract,
+                      exploration={}, aborted=False)
+
+
+@pytest.mark.parametrize("contract", [None, "contract", {}, 5])
+def test_settle_and_validate_refuse_a_missing_contract(contract):
+    good = contract_v2()
+    with pytest.raises(SettlementError):
+        settle_window(archive=archive([]), envelope=envelope(good, {MATH: 0.4, CODE: 0.4}), contract=contract,
+                      exploration={}, aborted=False)
+    with pytest.raises(SettlementError):
+        validate_service_archive_v2(good_record(), contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
+
+
+def test_settle_refuses_an_envelope_whose_schedule_digest_is_not_its_schedule():
+    contract = contract_v2()
+    e = envelope(contract, {MATH: 0.4, CODE: 0.4})
+    e["schedule_sha256"] = "0" * 64
+    with pytest.raises(SettlementError, match="digest"):
+        settle_window(archive=archive([]), envelope=e, contract=contract, exploration={}, aborted=False)

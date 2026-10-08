@@ -185,6 +185,27 @@ class RunObservationLog:
             self.db.execute("UPDATE run_observations SET first_scan=0 WHERE id=?", (observation_id,))
         return released
 
+    def claim_first_scan(self, observation_id: str) -> bool:
+        """Give the first scan of its (env, prompt) to an already recorded observation that does not
+        hold it (a retry of a group refused for lack of room). False if the prompt is scanned."""
+        row = self.db.execute("SELECT environment, prompt_idx, category, first_scan FROM run_observations "
+                              "WHERE id=? AND order_id=?", (observation_id, self.order)).fetchone()
+        if row is None:
+            raise ValueError("unknown observation")
+        if row[3]:
+            return False
+        if self.db.execute("INSERT OR IGNORE INTO run_scans VALUES(?,?,?,?,?)",
+                           (self.order, row[0], row[1], observation_id, row[2])).rowcount != 1:
+            return False
+        self.db.execute("UPDATE run_observations SET first_scan=1 WHERE id=?", (observation_id,))
+        return True
+
+    def refusal_reason(self, observation_id: str) -> str | None:
+        """The ``reason`` the observation was RECORDED with (None when it had none)."""
+        row = self.db.execute("SELECT public FROM run_observations WHERE id=? AND order_id=?",
+                              (observation_id, self.order)).fetchone()
+        return None if row is None else json.loads(row[0]).get("reason")
+
     def settle(self, observation_id: str, *, status: str, proof: str, at: float) -> None:
         row = self.db.execute("SELECT window, order_id FROM run_observations WHERE id=?",
                               (observation_id,)).fetchone()

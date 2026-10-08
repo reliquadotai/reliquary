@@ -43,6 +43,7 @@ import re
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -53,8 +54,8 @@ from reliquary.protocol.service_contract import (
 from reliquary.protocol.service_schedule import ServiceSchedule, initial_schedule
 from reliquary.services.admission_policy import service_signal_admits, validate_submission_policy  # noqa: F401
 from reliquary.services.exploration import (
-    AUDIT_DRAW_ROUND_OFFSET, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger, apply_exploration_audit,
-    exploration_cap, exploration_price, finalize_exploration, record_exploration,
+    AUDIT_DRAW_ROUND_OFFSET, STATUS_FORFEITED, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger,
+    apply_exploration_verdict, exploration_cap, exploration_price, finalize_exploration, record_exploration,
 )
 from reliquary.services.run_log import Observation, RunObservationLog, observation_id
 from reliquary.services.settlement import SERVICE_PAYMENT_POLICY_V2, settle_window, validate_service_archive_v2
@@ -64,7 +65,6 @@ logger = logging.getLogger(__name__)
 SUPPORTED_SERVICE_CAPABILITIES = SUPPORTED_V2_CAPABILITIES
 SERVICE_PAYMENT_POLICY = SERVICE_PAYMENT_POLICY_V2
 QUALIFICATION_SCHEMA = "service-runtime-qualification/v2"
-STATUS_FORFEITED = "exploration_forfeited"
 STATUS_PAID = "exploration_paid"
 _EPS = 1e-12
 _BEACON = re.compile(r"[0-9a-f]{64}")
@@ -79,6 +79,31 @@ FROZEN_ARCHIVE_FIELDS = (
     "service_training_by_environment", "service_exploration_by_environment",
     "service_scale_by_environment", "rewards_by_hotkey",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditOutcome:
+    """What ``ServiceRuntime.record_audit`` did with one verdict.
+
+    ``kind``: ``"passed"`` (the group is audited-and-passed), ``"failed"`` (a failure was applied:
+    the hotkey is banned and ``forfeited`` holds the ids it lost, their first scans released) or
+    ``"not_applied"`` (nothing changed: unknown id, row not awaiting an audit, a verdict that is
+    moot after finalize or on a row already unaudited, or SQLite busy -- the caller may retry).
+    """
+    kind: str
+    forfeited: tuple[str, ...] = ()
+
+    @property
+    def passed(self) -> bool:
+        return self.kind == "passed"
+
+    @property
+    def failed(self) -> bool:
+        return self.kind == "failed"
+
+    @property
+    def applied(self) -> bool:
+        return self.kind != "not_applied"
 
 
 class ServicePolicyLimit(ValueError):
@@ -771,40 +796,41 @@ class ServiceRuntime:
         return self.db.execute("SELECT window, environment, audit, status FROM exploration_entitlements "
                                "WHERE observation_id=? AND order_id=?", (identity, self.contract.sha256)).fetchone()
 
-    def record_audit(self, identity: str, *, passed: bool, now: float | None = None) -> list[str]:
-        """Apply one audit verdict; return the ids forfeited by a failure (their first scans are released).
+    def record_audit(self, identity: str, *, passed: bool, now: float | None = None) -> AuditOutcome:
+        """Apply one audit verdict; return an ``AuditOutcome`` (passed / failed + forfeited ids / not_applied).
 
-        One transaction: the verdict, the release of every forfeited first scan, and the public
+        One transaction: the verdict, the release of every forfeited first scan and the public
         settle events (``exploration_pending`` / ``audited`` on a pass; ``exploration_forfeited``
-        for every forfeited id, ``failed`` for the audited one). No paid status is published here:
-        pay is only known at finalize. A verdict on a (window, env) already finalized changes no
-        row and publishes nothing; a late failure on a drawn group still bans (R3).
+        for every id forfeited in an env not yet finalized, ``failed`` for the audited one). No paid
+        status is published here: pay is only known at finalize. A verdict on a (window, env)
+        already finalized changes none of its rows and publishes nothing for them; a late failure on
+        a drawn group still bans and forfeits the hotkey's entitlements in the envs of that window
+        not yet finalized (R3). A pass on a row already marked unaudited is ignored.
 
         Never raises on a verdict it cannot apply (unknown id, row not awaiting an audit, SQLite
-        busy): it logs at error level with the observation id and returns ``[]``.
+        busy): it logs at error level with the observation id and returns ``not_applied``.
         """
         if type(passed) is not bool:
             raise ValueError("an audit verdict is a boolean")
         instant = time.time() if now is None else now
         try:
             with self._txn():
-                row = self._entitlement_row(identity)
-                if row is None:
-                    raise ValueError("unknown exploration entitlement")
-                frozen = self.ledger.is_finalized(row[0], environment=row[1])
-                forfeited = apply_exploration_audit(self.log, self.ledger, identity, passed=passed, now=instant,
-                                                    ban_seconds=self.contract.reward_policy["ban_seconds"])
-                if not frozen:
-                    if passed:
+                kind, forfeited = apply_exploration_verdict(
+                    self.log, self.ledger, identity, passed=passed, now=instant,
+                    ban_seconds=self.contract.reward_policy["ban_seconds"])
+                if kind == "passed":
+                    entry = self._entitlement_row(identity)
+                    if not self.ledger.is_finalized(entry[0], environment=entry[1]):
                         self.log.settle(identity, status=STATUS_PENDING, proof="audited", at=instant)
-                    for lost in forfeited:
-                        self.log.settle(lost, status=STATUS_FORFEITED, proof=_PROOF[self._entitlement_row(lost)[2]],
-                                        at=instant)
+                for lost in forfeited:
+                    entry = self._entitlement_row(lost)
+                    if not self.ledger.is_finalized(entry[0], environment=entry[1]):
+                        self.log.settle(lost, status=STATUS_FORFEITED, proof=_PROOF[entry[2]], at=instant)
         except (ValueError, sqlite3.OperationalError) as exc:
             logger.error("exploration audit verdict not applied for observation %s (passed=%s): %s: %s",
                          identity, passed, type(exc).__name__, exc)
-            return []
-        return forfeited
+            return AuditOutcome("not_applied")
+        return AuditOutcome(kind, tuple(forfeited))
 
     def _finalize_env(self, window: int, environment: str, *, aborted: bool, at: float) -> list[str]:
         """THE one place a (window, env) is finalized. Runs inside the caller's transaction.
@@ -812,15 +838,10 @@ class ServiceRuntime:
         Every id whose first scan is released gets its settle event (``exploration_unpaid``, or
         ``exploration_forfeited`` for a row a failed audit already forfeited).
         """
-        # The single call site of the ledger's finalize: an ``aborted=aborted`` keyword goes here.
-        released = list(finalize_exploration(self.log, self.ledger, window, environment=environment))
-        if aborted:
-            # An aborted window pays no exploration: no entitlement of it may keep a first scan.
-            # (To drop once ``finalize_exploration`` takes ``aborted`` and does this itself.)
-            for row in self.ledger.rows(window, environment=environment):
-                if row["status"] == "reserved" and row["audit"] != "unaudited":
-                    self.log.release_first_scan(row["observation_id"])
-                    released.append(row["observation_id"])
+        # The single call site of the ledger's finalize. ``aborted`` is the one transition allowed on a
+        # (window, env) the batcher already finalized before it knew the window was aborted.
+        released = list(finalize_exploration(self.log, self.ledger, window, environment=environment,
+                                             aborted=aborted))
         rows = {row["observation_id"]: row for row in self.ledger.rows(window, environment=environment)}
         for identity in released:
             row = rows[identity]  # a forfeited row keeps its label (R8), whatever its audit became
