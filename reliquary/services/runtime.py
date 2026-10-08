@@ -237,6 +237,7 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_training_stride(order_id TEXT PRIMARY KEY, stride INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_consumption(order_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL, q TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_cooldown_advice(environment TEXT PRIMARY KEY, window INTEGER NOT NULL, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS service_segments(number INTEGER PRIMARY KEY, first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL, flush_at REAL NOT NULL, sha256 TEXT, size INTEGER, windows TEXT, checkpoints TEXT, committed INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS service_schedule_requests(order_id TEXT NOT NULL, request_id TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, revision INTEGER NOT NULL, window INTEGER NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, request_id));
             """)
             if "opened_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(service_windows)")}:
@@ -1382,6 +1383,38 @@ class ServiceRuntime:
     def events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
         with self.lock:
             return self.log.events(after=after, limit=limit)
+
+    def plan_segment(self, *, max_events: int, now: float | None = None) -> dict | None:
+        """The next publication segment: the unfinished one if any (same range and flush time, so the
+        same bytes after a restart), else a new one over the events after the last planned one.
+        The plan is persisted before anything is uploaded."""
+        with self._txn():
+            row = self.db.execute("SELECT number, first_seq, last_seq, flush_at FROM service_segments "
+                                  "WHERE committed=0").fetchone()
+            if row is not None:
+                return {"number": row[0], "first_seq": row[1], "last_seq": row[2], "flush_at": row[3]}
+            last_seq, last_number = self.db.execute(
+                "SELECT COALESCE(MAX(last_seq),0), COALESCE(MAX(number),0) FROM service_segments").fetchone()
+            events = self.log.events(after=last_seq, limit=max_events)
+            if not events:
+                return None
+            plan = {"number": last_number + 1, "first_seq": events[0][0], "last_seq": events[-1][0],
+                    "flush_at": _instant(now)}
+            self.db.execute("INSERT INTO service_segments(number, first_seq, last_seq, flush_at) VALUES(?,?,?,?)",
+                            (plan["number"], plan["first_seq"], plan["last_seq"], plan["flush_at"]))
+            return plan
+
+    def commit_segment(self, number: int, *, sha256: str, size: int, windows: list[int], checkpoints: list[int]) -> None:
+        with self._txn():
+            self.db.execute("UPDATE service_segments SET sha256=?, size=?, windows=?, checkpoints=?, committed=1 "
+                            "WHERE number=?", (sha256, size, json.dumps(windows), json.dumps(checkpoints), number))
+
+    def published_segments(self) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute("SELECT number, first_seq, last_seq, sha256, size, windows, checkpoints "
+                                   "FROM service_segments WHERE committed=1 ORDER BY number").fetchall()
+        return [{"number": r[0], "first_seq": r[1], "last_seq": r[2], "sha256": r[3], "size": r[4],
+                 "windows": json.loads(r[5]), "checkpoints": json.loads(r[6])} for r in rows]
 
     def admin_events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
         with self.lock:

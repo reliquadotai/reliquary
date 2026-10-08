@@ -7109,6 +7109,7 @@ class ValidationService:
             archive_queue.run_forever(),
             name="archive_queue_worker",
         )
+        self._start_observation_publication()
         from reliquary.constants import WRITE_TRAINING_PAYLOADS
 
         if WRITE_TRAINING_PAYLOADS:
@@ -7573,6 +7574,7 @@ class ValidationService:
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
             try:
+                await self._stop_observation_publication()
                 await self._close_proof_scheduler()
                 await self.server.stop()
             finally:
@@ -7580,6 +7582,39 @@ class ValidationService:
                 if runtime is not None:
                     runtime.close()
             telemetry.finish()
+
+    def _start_observation_publication(self) -> None:
+        """Signed static publication of the run observation log (decision D). Off unless this is a
+        service run AND ``RELIQUARY_OBSERVATIONS_BUCKET`` names the public bucket."""
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None:
+            return
+        bucket = os.environ.get("RELIQUARY_OBSERVATIONS_BUCKET")
+        if not bucket:
+            logger.warning("RELIQUARY_OBSERVATIONS_BUCKET unset: service observations are not published")
+            return
+        if self._signer_client is not None:
+            logger.warning("service observations are not published: the hotkey lives in the remote signer, "
+                           "which does not sign observation indexes")
+            return
+        from reliquary.services.publication import ObservationPublisher, r2_put
+
+        namespace = active_checkpoint_namespace()
+        self._observation_stop = asyncio.Event()
+        self._observation_task = asyncio.create_task(
+            ObservationPublisher(runtime, run_id=namespace.run_id, task_id=namespace.task_id,
+                                 wallet=self.wallet, put=r2_put(bucket)).run(self._observation_stop),
+            name="service_observation_publisher")
+
+    async def _stop_observation_publication(self) -> None:
+        task = getattr(self, "_observation_task", None)
+        if task is None:
+            return
+        self._observation_stop.set()
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            task.cancel()
 
     async def _serve_axon_on_chain(self, subtensor) -> None:
         """Publish this validator's axon (ip:port) to the chain metagraph.

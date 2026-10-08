@@ -177,6 +177,33 @@ async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
     return True
 
 
+async def upload_bytes(key: str, body: bytes, *, content_type: str, cache_control: str,
+                       if_absent: bool = False, **client_kwargs) -> bool:
+    """PUT raw bytes with explicit cache headers (public static files).
+
+    ``if_absent`` makes the PUT conditional (``If-None-Match: *``): an existing key is never
+    replaced. If it already exists its bytes must be identical (an idempotent re-upload after a
+    crash); different bytes raise ``ValueError`` and nothing is written.
+    """
+    from botocore.exceptions import ClientError
+
+    async with get_s3_client(**client_kwargs) as client:
+        bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+        extra = {"IfNoneMatch": "*"} if if_absent else {}
+        try:
+            await client.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type,
+                                    CacheControl=cache_control, **extra)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if not if_absent or (code not in ("PreconditionFailed", "412") and status != 412):
+                raise
+            existing = await _read_object_body(await client.get_object(Bucket=bucket, Key=key))
+            if existing != body:
+                raise ValueError(f"immutable object {key} already exists with different bytes") from exc
+    return True
+
+
 async def download_json(
     key: str,
     *,
