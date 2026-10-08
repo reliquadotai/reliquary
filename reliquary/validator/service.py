@@ -3938,6 +3938,11 @@ class ValidationService:
             period = 3.0
         draw_deadline = started + SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS * period + 1.0
         blocked_logged: set = set()
+        # B2b: per batcher, whether audits could run at the drain's first tick, and whether nothing but the
+        # clock stopped them at its last tick. A window sealed at its full length reaches the dispatch
+        # deadline exactly when the drain bound is reached: that is not the validator's loss.
+        first_progress: dict = {}
+        last_untimed: dict = {}
         try:
             for batcher in service_batchers:
                 await asyncio.to_thread(batcher.close_service_exploration)
@@ -3951,6 +3956,8 @@ class ValidationService:
                 for batcher in service_batchers:
                     state = await asyncio.to_thread(batcher.exploration_drain_state)
                     waiting_draw += state["pending_draw"]
+                    first_progress.setdefault(batcher, bool(state.get("can_progress", 1)))
+                    last_untimed[batcher] = bool(state.get("can_progress_untimed", state.get("can_progress", 1)))
                     if not state.get("can_progress", 1):
                         # I4: audits cannot run for this env (no scheduler, plan unavailable or retired,
                         # dispatch deadline passed, checkpoint swapped): waiting would only burn the bound.
@@ -3981,7 +3988,8 @@ class ValidationService:
         finally:
             for batcher in service_batchers:
                 try:
-                    await asyncio.to_thread(batcher.finalize_service_exploration)
+                    could_run = (first_progress[batcher] and last_untimed[batcher]) if batcher in first_progress else None
+                    await asyncio.to_thread(batcher.finalize_service_exploration, audits_could_run=could_run)
                 except Exception:
                     logger.exception("service window %s: exploration finalize failed", batcher.window_start)
 

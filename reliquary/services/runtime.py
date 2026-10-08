@@ -1184,6 +1184,14 @@ class ServiceRuntime:
             state = self.ledger.state(identity)
             return state is not None and state[0] == "unaudited"
 
+    def mark_audit_error(self, identity: str) -> bool:
+        """The audit's own proof of this row errored (B2): ``unaudited`` with the horizon reason (the hotkey's
+        later rows wait for an audit; no ban, no money). Only a row still waiting for its draw or audit changes."""
+        with self._txn():
+            self.ledger.mark_unaudited(identity, UNAUDITED_HORIZON)
+            state = self.ledger.state(identity)
+            return state is not None and state[0] == "unaudited"
+
     @staticmethod
     def _unpaid_reason(row: dict) -> str | None:
         """The public reason of an unpaid row: ``trained`` (R17), ``unaudited`` for BOTH unaudited reasons

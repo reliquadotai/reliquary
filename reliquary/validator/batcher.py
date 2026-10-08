@@ -6273,6 +6273,15 @@ class GrpoWindowBatcher:
                 _, hotkey, payload_bytes = entry
                 self._retained_payload_bytes = max(0, self._retained_payload_bytes - payload_bytes)
                 self._release_hotkey_payload_locked(hotkey, payload_bytes)
+        if pending.service_lane not in (None, "training"):
+            # B1: the accounting above is only a number; the tokens are what a sybil flood would pin in
+            # memory until the window is torn down. Nothing reads them again: a group that still needs an
+            # audit never reaches this call (it is released when its audit concluded).
+            try:
+                request.rollouts = []
+            except Exception:
+                logger.exception("service window %s: payload of %s not dropped", self.window_start,
+                                 pending.service_observation_id)
 
     @staticmethod
     def _service_group_id(pending) -> str:
@@ -6651,14 +6660,21 @@ class GrpoWindowBatcher:
                 # The proof never ran to a verdict (not needed, skipped, aborted, error): the row ends
                 # unaudited -- unpaid, never sanctioned.
                 logger.warning("service exploration audit %s ended %s without a verdict", identity, decision.status.value)
-                if validator_lost:
+                if decision.status is ProofDecisionStatus.ERROR and getattr(decision, "started_at", None) is not None:
+                    # B2: the job ran this row's own proof and it errored: the horizon, not a validator loss.
+                    pending = self._exploration_pending.get(identity)
+                    if pending is not None:
+                        self._mark_audit_error(pending)
+                    else:
+                        self.service_runtime.mark_audit_error(identity)
+                elif validator_lost:
                     self._mark_validator_lost(identity)
 
     def audits_in_flight(self) -> int:
         with self._exploration_lock:
             return len(self._audit_open)
 
-    def audits_can_progress(self) -> bool:
+    def audits_can_progress(self, *, ignore_deadline: bool = False) -> bool:
         """Whether an audit handed to (or still to be handed to) the scheduler can run (I4/R25).
 
         False as soon as it cannot: no proof scheduler, the audit plan cannot take work, the plan was
@@ -6675,8 +6691,8 @@ class GrpoWindowBatcher:
             active = None
         if isinstance(active, str) and active != self.current_checkpoint_hash:
             return False
-        if self._time_fn() >= (self.window_opened_at + FILL_CLOSED_MAX_SECONDS
-                               + SERVICE_EXPLORATION_DRAIN_SECONDS):
+        if not ignore_deadline and self._time_fn() >= (
+                self.window_opened_at + FILL_CLOSED_MAX_SECONDS + SERVICE_EXPLORATION_DRAIN_SECONDS):
             return False
         handle = self._audit_handle
         if handle is not None:
@@ -6706,22 +6722,50 @@ class GrpoWindowBatcher:
             "past_probation": sum(r["past_probation"] for r in waiting) + in_flight,
             "probation": sum(not r["past_probation"] for r in waiting),
             "can_progress": int(self.audits_can_progress()),
+            # B2b: the same without the dispatch-deadline clause, which a window sealed at its full length
+            # crosses exactly when the drain bound is reached.
+            "can_progress_untimed": int(self.audits_can_progress(ignore_deadline=True)),
         }
 
     def _execute_exploration_audit(self, pending, *, model) -> "ValidSubmission | None":
-        """The audit callable (a proof-worker thread): the same checks as a training proof, then the verdict."""
+        """The audit callable (a proof-worker thread): the same checks as a training proof, then the verdict.
+
+        B2: whatever this row's own proof raises stays this row's: the scheduler treats a raising job as a
+        fault of the whole proof plane (it is the right call for the training proofs), so the exception is
+        caught here and becomes an ERROR outcome for this row only -- ``unaudited`` with the horizon reason
+        (the hotkey's later rows wait for an audit; no ban, no money). The other audits keep running."""
+        identity = pending.service_observation_id
+        if id(pending) in self._payload_released and not pending.request.rollouts:
+            # Released while queued (a forfeited sibling): the tokens are gone and the row already has its end.
+            return None
         caps_at_admission = tuple(pending.truncated_indices)
-        verified = self._verify_expensive(pending, model=model, audit=True)
+        verified = None
         try:
+            verified = self._verify_expensive(pending, model=model, audit=True)
             self._conclude_exploration_audit(pending, verified, caps_at_admission)
+        except Exception:
+            logger.exception("exploration audit %s: the proof raised; this row ends unaudited (horizon), "
+                             "nothing else is affected", identity)
+            self._mark_audit_error(pending)
+            verified = None
         finally:
             with self._exploration_lock:
-                for job_id, identity in list(self._audit_open.items()):
-                    if identity == pending.service_observation_id:
+                for job_id, open_identity in list(self._audit_open.items()):
+                    if open_identity == identity:
                         # The decision lands in the plan a moment later; do not hold a slot meanwhile.
                         self._audit_open.pop(job_id, None)
             self._release_observation_payload(pending)  # the audit is over: its bytes are no longer held
         return verified
+
+    def _mark_audit_error(self, pending) -> None:
+        """The audit of this row failed with an error of its own proof: unaudited, reason horizon (B2)."""
+        identity = pending.service_observation_id
+        try:
+            if identity is not None:
+                self.service_runtime.mark_audit_error(identity)
+            self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0)
+        except Exception:
+            logger.exception("service window %s: row %s not marked after an audit error", self.window_start, identity)
 
     # A proof that could not judge the group is not a verdict on the miner.
     _AUDIT_INCONCLUSIVE_STAGES = frozenset({"service_contract", "service_proof_capability"})
@@ -7198,7 +7242,9 @@ class GrpoWindowBatcher:
         strictly serial.
         """
         with self._lock:
-            pending = list(self._pending)
+            # A non-training group (service policy) never competes for a training seat and its payload is
+            # dropped after release (B1); lane is None on every legacy path.
+            pending = [p for p in self._pending if p.service_lane in (None, "training")]
         scored = [(p, _pending_difficulty_score(p)) for p in pending]
         operator_by_id: dict[int, str | None] = {}
         arrival_by_id: dict[int, int] = {}
@@ -7760,6 +7806,7 @@ class GrpoWindowBatcher:
             remainder = [
                 p for p in self._pending
                 if id(p) not in self._attempted_pending_ids
+                and p.service_lane in (None, "training")      # B1: an observation's payload is gone
             ]
         selected_contents = {
             submission.prompt_content_sha256 for submission in self._valid
