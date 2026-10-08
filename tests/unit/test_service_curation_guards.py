@@ -22,7 +22,8 @@ def contract_for(source: bytes, dataset_id="train-slice"):
 
 
 CATALOG_CARD = {"source_kind": "catalog", "source": "reliquary_dapo_math_v1", "split": "train",
-                "index_range": [0, 3], "set_id": "dapo-train-slice"}
+                "index_range": [0, 3], "set_id": "dapo-train-slice",
+                "disjointness": {"external_benchmark": False, "held_out": []}}
 
 
 def obs(contract, row, group, rewards, generation="verified"):
@@ -51,10 +52,65 @@ def test_the_clean_training_card_is_accepted():
     {"source": "reliquary_code_v1", "index_range": [2_400_000, 2_450_000]},   # code held-out tail
     {"source": "reliquary_logic_v2", "split": "eval"},
     {"source_kind": "verifiers"},
+    {"index_range": [0]},                                   # F2: incomplete card fails closed
+    {"index_range": None},
+    {"split": None},
+    {"disjointness": None},
 ])
 def test_held_out_and_benchmark_sets_are_refused(override):
     with pytest.raises(HeldOutEvalSet):
         refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, **override})
+
+
+def test_card_without_a_required_key_is_refused():
+    for key in ("split", "index_range", "disjointness"):
+        card = {k: v for k, v in CATALOG_CARD.items() if k != key}
+        with pytest.raises(HeldOutEvalSet):
+            refuse_held_out(contract_for(b"x\n"), card)
+
+
+def test_card_disagreeing_with_a_contract_that_carries_provenance_is_refused():
+    contract = contract_for(b"x\n")
+    class Carrying:
+        def __getattr__(self, name):
+            return getattr(contract, name)
+        def to_dict(self):
+            value = contract.to_dict()
+            value["dataset"] = {**value["dataset"], "source": "other_source"}
+            return value
+    with pytest.raises(HeldOutEvalSet, match="disagrees"):
+        refuse_held_out(Carrying(), CATALOG_CARD)
+
+
+SLIPPING_FORMS = [
+    "princeton-nlp/SWE-bench_Verified", "SWE-bench Verified", "swe-bench", "swe-bench-lite", "swebench",
+    "MMLU Pro", "terminalbench", "aimev2", "livecodebenchv6", "gpqadiamond", "Idavidrein/gpqa",
+    "AIME_2025", "aime25", "LiveCodeBench/code_generation_lite", "TIGER-Lab/MMLU-Pro", "gorilla-llm/BFCL_v3",
+    "allenai/IFBench_test", "sierra-research/tau2-bench", "tau-bench", "SWEBenchVerified", "lcb-v5",
+]
+LEGIT_TRAIN_NAMES = [
+    "nvidia/OpenMathInstruct-2", "agentica-org/DeepScaleR-Preview-Dataset", "open-r1/codeforces",
+    "PrimeIntellect/verifiable-math-problems", "allenai/tulu-3-sft-mixture", "claimed-rows", "paid-ament",
+    "mainstream-slice", "xaime-slice", "ugpqa", "tau2x", "gpqas", "HuggingFaceH4/ultrafeedback_binarized",
+    "airbnb/listings", "aimed-dataset", "AI-MO/NuminaMath-CoT", "terminal-sessions-train",
+]
+
+
+@pytest.mark.parametrize("name", SLIPPING_FORMS)
+def test_every_spelling_of_a_held_out_name_is_refused_in_every_name_field(name):
+    with pytest.raises(HeldOutEvalSet):
+        refuse_held_out(contract_for(b"x\n", dataset_id="train-slice"), {**CATALOG_CARD, "set_id": name})
+    with pytest.raises(HeldOutEvalSet):
+        refuse_held_out(contract_for(b"x\n", dataset_id="train-slice"), {**CATALOG_CARD, "source": name})
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", name):   # dataset ids are canonical identifiers
+        with pytest.raises(HeldOutEvalSet):
+            refuse_held_out(contract_for(b"x\n", dataset_id=name), CATALOG_CARD)
+
+
+@pytest.mark.parametrize("name", LEGIT_TRAIN_NAMES)
+def test_legitimate_training_dataset_names_pass(name):
+    refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "set_id": name})
+    refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "source": name} | {"source": CATALOG_CARD["source"], "name": name})
 
 
 def test_benchmark_name_in_dataset_id_is_refused():
@@ -67,12 +123,25 @@ def test_names_match_on_word_boundaries(name):
     refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "set_id": name})
 
 
+# Checked-in copy of the 7 tasksets of reliquary-environments benchmarks/heldout/configs (CI has no checkout).
+TASKSET_IDS = ["aime25", "aime26", "bfcl-v3", "gpqa", "ifbench", "livecodebench", "mmlu-pro"]
+
+
+@pytest.mark.parametrize("taskset", TASKSET_IDS)
+def test_guard_refuses_every_checked_in_taskset_id(taskset):
+    with pytest.raises(HeldOutEvalSet):
+        refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "set_id": taskset})
+    with pytest.raises(HeldOutEvalSet):
+        refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "source": f"org/{taskset}"})
+
+
 def test_guard_covers_every_taskset_the_environments_repo_declares():
     configs = Path.home() / "reliquadotai/reliquary-environments/benchmarks/heldout/configs"
     if not configs.is_dir():
         pytest.skip("reliquary-environments checkout not present")
     ids = {re.search(r'id = "([^"]+)"', p.read_text()).group(1) for p in configs.glob("*.toml")}
     assert ids
+    assert ids == set(TASKSET_IDS)   # the checked-in list must follow the repo
     for taskset in ids:
         with pytest.raises(HeldOutEvalSet):
             refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "set_id": taskset})
@@ -110,11 +179,11 @@ def test_blank_lines_do_not_crash_and_are_not_emitted():
     assert curated == b'{"row_id":"a"}\n{"row_id":"b"}\n'
 
 
-def _ledger_with(tmp_path, audit):
+def _ledger_with(tmp_path, audit, status="reserved"):
     ledger = ExplorationLedger(sqlite3.connect(tmp_path / "l.sqlite3"), order_sha256="a" * 64)
     ledger.db.execute("INSERT INTO exploration_entitlements(observation_id, order_id, window, environment, hotkey,"
                       " prompt_idx, amount, draw_round, forced, audit, status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                      ("run-obs", "a" * 64, 0, "env", "hk", 1, 1.0, 5, 0, audit, "reserved"))
+                      ("run-obs", "a" * 64, 0, "env", "hk", 1, 1.0, 5, 0, audit, status))
     ledger.db.commit()
     return ledger
 
@@ -134,13 +203,22 @@ def test_exploration_group_counts_only_when_its_audit_passed(tmp_path):
     with pytest.raises(ValueError, match="generation"):
         curate_rows(source, body, manifest, contract, set_card=CATALOG_CARD)  # no ledger: not proven
     for audit in ("queued", "pending_draw", "unaudited", "failed"):   # sampled-but-not-drawn etc.
+        folder = tmp_path / audit
+        folder.mkdir()
         with pytest.raises(ValueError, match="generation"):
-            curate_rows(source, body, manifest, contract, set_card=CATALOG_CARD,
-                        ledger=_ledger_with(tmp_path / audit if (tmp_path / audit).mkdir() is None else tmp_path, audit))
+            curate_rows(source, body, manifest, contract, set_card=CATALOG_CARD, ledger=_ledger_with(folder, audit))
     passed = tmp_path / "ok"
     passed.mkdir()
     curated, _ = curate_rows(source, body, manifest, contract, set_card=CATALOG_CARD, ledger=_ledger_with(passed, "passed"))
     assert curated == source
+
+
+def test_a_passed_audit_with_a_forfeited_entitlement_does_not_count(tmp_path):
+    from reliquary.services.exploration import STATUS_FORFEITED
+    source, contract, body, manifest = _exploration_mapping()
+    with pytest.raises(ValueError, match="generation"):
+        curate_rows(source, body, manifest, contract, set_card=CATALOG_CARD,
+                    ledger=_ledger_with(tmp_path, "passed", STATUS_FORFEITED))
 
 
 def _collect(verdicts):

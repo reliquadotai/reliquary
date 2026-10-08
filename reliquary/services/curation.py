@@ -3,15 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from reliquary.protocol.service_contract import ServiceContract
+from reliquary.services.exploration import STATUS_FORFEITED
 from reliquary.services.heldout_guard import refuse_held_out
 from reliquary.services.observations import observation_signal
 
 
 def audit_passed(ledger, observation_id: str) -> bool:
     """Read-only: did the exploration audit of this observation PASS? ``ledger`` is an
-    ``ExplorationLedger``; a group sampled but not drawn, or drawn and not audited, is not."""
+    ``ExplorationLedger``; a group sampled but not drawn, drawn and not audited, or whose hotkey
+    forfeited its earnings (audit failed on another group), is not."""
     state = ledger.state(observation_id)
-    return state is not None and state[0] == "passed"
+    return state is not None and state[0] == "passed" and state[1] != STATUS_FORFEITED
 
 
 def generation_proven(mapped: dict, observation: dict, ledger=None) -> bool:

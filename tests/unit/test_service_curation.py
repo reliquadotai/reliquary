@@ -11,7 +11,8 @@ from reliquary.services.curation import curate_rows
 from reliquary.services.observations import ObservationStore, observation_signal
 
 CATALOG_CARD = {"source_kind": "catalog", "source": "reliquary_dapo_math_v1", "split": "train",
-                "index_range": [0, 3], "set_id": "dapo-train-slice"}
+                "index_range": [0, 3], "set_id": "dapo-train-slice",
+                "disjointness": {"external_benchmark": False, "held_out": []}}
 
 
 def contract(source=None):
