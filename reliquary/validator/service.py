@@ -2601,6 +2601,12 @@ class ValidationService:
             download_fn=_download,
             commit_title_fn=_commit_title,
         )
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is not None and isinstance(source, ShaSource):
+            # An ancestor of the lineage head is refused at start, not at the first window boundary.
+            await asyncio.to_thread(
+                runtime.require_resumable, checkpoint_n=checkpoint_n,
+                repo=self._checkpoint_store.repo_id, revision=source.sha)
         from reliquary.validator.checkpoint_profile import (
             validate_checkpoint_profile,
         )
@@ -2772,9 +2778,9 @@ class ValidationService:
         Order: an envelope the runtime still holds for this candidate window (a
         failed open, a restart before activation) is discarded first, so the window
         is always frozen on what is true NOW: the installed checkpoint, the current
-        schedule, and a fresh beacon at its open. Then the operator's pending
-        schedule request is applied (it lands on this window), the installed
-        checkpoint is selected in the order's lineage, and the window is derived
+        schedule, and a fresh beacon at its open. Then the installed
+        checkpoint is selected in the order's lineage, the operator's pending
+        schedule request is applied (it lands on this window), and the window is derived
         from the schedule it will freeze: active envs, their constant group count
         per pick, pool = cap x share (x price).
         A window that was activated is never rebuilt here: it has a recovery record
@@ -2791,13 +2797,15 @@ class ValidationService:
         _discard_unactivated_service_window(
             runtime, getattr(self, "_fill_closed_recovery_store", None), target_window,
         )
+        # The checkpoint first: a lineage refusal (an ancestor) must not leave an operator's schedule
+        # request applied for a window that will not open.
+        runtime.ensure_checkpoint(
+            checkpoint_n=int(cp.checkpoint_n), repo=cp.repo_id, revision=cp.revision,
+        )
         schedule = runtime.apply_pending_schedule_request(
             self._service_schedule_store,
             window=target_window,
             installed_version=self._service_activation_version,
-        )
-        runtime.ensure_checkpoint(
-            checkpoint_n=int(cp.checkpoint_n), repo=cp.repo_id, revision=cp.revision,
         )
         self._require_service_environments(schedule)
         active = set(schedule.active_environments())
@@ -7030,15 +7038,31 @@ class ValidationService:
         except Exception:
             logger.exception("service order activity could not be refreshed; keeping the last value")
 
+    SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS = 4.0
+
+    async def _refresh_service_active_bounded(self) -> None:
+        """``_refresh_service_active`` off the event loop, given up on after a few seconds (the
+        thread may still finish; the last published value is kept meanwhile)."""
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self._refresh_service_active),
+                                   self.SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("service order activity refresh is slow (runtime busy); keeping the last value")
+
     async def _control_heartbeat(self) -> None:
-        while True:
-            try:
-                self._control_store.heartbeat(window=self._window_n)
-            except OSError:
-                logger.exception("control heartbeat could not be persisted")
-            if getattr(self, "_service_runtime", None) is not None:
-                await asyncio.to_thread(self._refresh_service_active)
-            await asyncio.sleep(5)
+        refresh = None  # its own task: the heartbeat write never waits behind the runtime lock
+        try:
+            while True:
+                try:
+                    self._control_store.heartbeat(window=self._window_n)
+                except OSError:
+                    logger.exception("control heartbeat could not be persisted")
+                if getattr(self, "_service_runtime", None) is not None and (refresh is None or refresh.done()):
+                    refresh = asyncio.ensure_future(self._refresh_service_active_bounded())
+                await asyncio.sleep(5)
+        finally:
+            if refresh is not None and not refresh.done():
+                refresh.cancel()
 
     async def run(self, subtensor) -> None:
         from reliquary.infrastructure.archive_queue import get_archive_queue

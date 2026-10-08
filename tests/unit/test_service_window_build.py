@@ -389,7 +389,7 @@ async def test_window_open_order_is_checkpoint_then_freeze_then_announce_then_jo
     monkeypatch.setattr(service_module, "open_grpo_window",
                         lambda **kwargs: (calls.append("batcher"), real_open(**kwargs))[1])
     await _open(svc)
-    assert calls == ["apply_pending_schedule_request", "ensure_checkpoint", "adopt", "batcher", "batcher",
+    assert calls == ["ensure_checkpoint", "adopt", "apply_pending_schedule_request", "batcher", "batcher",
                      "open_window", "announcement", "announcement", "recovery.begin", "admission"]
 
 
@@ -726,9 +726,9 @@ async def test_the_loop_applies_requests_before_open_refreshes_advice_after_sett
     assert seen == [(1, 0, sorted([MATH, CODE]), 5), (2, 1, [MATH], 11)]
     loop_thread = threading.get_ident()
     assert [(name, window) for name, window, _ in calls] == [
-        ("apply_pending_schedule_request", 1), ("ensure_checkpoint", None), ("open_window", 1),
+        ("ensure_checkpoint", None), ("apply_pending_schedule_request", 1), ("open_window", 1),
         ("announcement", 1), ("announcement", 1), ("reconcile_archive", 1), ("refresh_cooldown_advice", 1),
-        ("apply_pending_schedule_request", 2), ("ensure_checkpoint", None), ("open_window", 2),
+        ("ensure_checkpoint", None), ("apply_pending_schedule_request", 2), ("open_window", 2),
         ("announcement", 2), ("reconcile_archive", 2), ("refresh_cooldown_advice", 2)]
     assert all(thread != loop_thread for _, _, thread in calls)      # SQLite never runs on the event loop
     pending = archives.pending_archives(start_window=1, end_window=2)
@@ -1543,3 +1543,24 @@ def test_a_legacy_task_still_boots_without_drand(monkeypatch):
                             env=_LateDropFakeEnv(), netuid=99, use_drand=False)
     assert svc.use_drand is False and svc._service_runtime is None and svc._service_schedule_store is None
     assert svc._service_sealed_windows == set() and svc._service_recovery_attempts == {}
+
+
+@pytest.mark.asyncio
+async def test_j3_a_window_healed_after_a_restart_has_no_batcher_and_still_completes_its_steps(
+        monkeypatch, tmp_path):
+    """J3, post-restart: the boundary heals a window whose batchers are gone (the process restarted)."""
+    svc = _service(monkeypatch, tmp_path)
+    _journal(svc, monkeypatch, tmp_path)
+    _broken_settlement(svc, monkeypatch, failures=3)
+    healed = _verdict_spies(svc, monkeypatch)
+    real_prepare = svc._prepare_service_window
+
+    async def after_restart(*args, **kwargs):
+        svc._service_recovery_context.clear()                      # a new process holds no batcher
+        return await real_prepare(*args, **kwargs)
+    monkeypatch.setattr(svc, "_prepare_service_window", after_restart)
+    await _run(svc, monkeypatch, windows=2, mid_window=lambda window: _pay_one_group_per_env(svc) if window == 1 else None)
+    assert healed["helper"] == [1] and 1 in healed["complete"]       # the post-recovery steps still ran
+    assert [call for call in healed["records"] if call[0] == 1 and call[1]] == []   # no verdict republished
+    assert svc._service_runtime.window_disposition(1) == "settled"
+    assert svc._service_recovery_context == {} and svc._service_recovery_attempts == {}

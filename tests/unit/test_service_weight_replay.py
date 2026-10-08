@@ -144,7 +144,9 @@ def test_forged_archive_is_dropped_and_logged_at_error_not_raised(name, monkeypa
     monkeypatch.setattr(weight_only.logger, "error", lambda msg, *a, **k: logged.append(msg % a))
     record = mutate(FORGERIES[name])
     assert check([record]) == []
-    assert len(logged) == 1 and TASK in logged[0] and "window 3" in logged[0]
+    assert TASK in logged[0] and "window 3" in logged[0] and "dropped" in logged[0]
+    # Their only window gone, the task gets one more line saying the whole task pays nothing.
+    assert len(logged) == 2 and "EVERY" in logged[1] and TASK in logged[1]
 
 
 def test_a_forgery_drops_only_its_own_window_legacy_and_other_windows_survive():
@@ -323,7 +325,10 @@ async def test_submit_once_asks_for_row_projection_for_service_tasks_only(monkey
 
     monkeypatch.setattr(weight_only.storage, "list_recent_datasets", recent)
     await wov.submit_once()
-    assert seen["default"] == {} and seen[TASK] == {"row_fields": {"batch": ("hotkey", "env_name", "prompt_idx")}}
+    assert seen["default"] == {} and seen[TASK] == {
+        "row_fields": {"batch": ("hotkey", "env_name", "prompt_idx")},
+        "number_map_fields": weight_only.SERVICE_NUMBER_MAPS,
+        "nested_number_map_fields": weight_only.SERVICE_NESTED_NUMBER_MAPS}
 
 
 @pytest.mark.asyncio
@@ -408,3 +413,62 @@ async def test_row_projection_keeps_non_dict_rows_refusable_without_their_bulk()
     record["batch"] = [{"hotkey": "a", "env_name": MATH, "prompt_idx": 1, "x": "y"}, "z" * 10_000, 5]
     (projected,) = await _through_storage(record, fields=("window_start", "batch"), row_fields={"batch": ("hotkey",)})
     assert projected["batch"] == [{"hotkey": "a"}, None, None]
+
+
+def test_one_dropped_window_among_good_ones_logs_no_every_line(monkeypatch):
+    logged = []
+    monkeypatch.setattr(weight_only.logger, "error", lambda msg, *a, **k: logged.append(msg % a))
+    assert [r["window_start"] for r in check([mutate(FORGERIES["scale"]), settled(window=4)])] == [4]
+    assert len(logged) == 1 and "EVERY" not in logged[0]
+
+
+def test_a_code_shaped_fault_logs_its_full_traceback_a_plain_refusal_does_not(monkeypatch):
+    seen = []
+    monkeypatch.setattr(weight_only.logger, "error", lambda msg, *a, **k: seen.append((msg % a, k.get("exc_info"))))
+    check([mutate(FORGERIES["policy"])])                                  # a plain SettlementError
+    assert seen[0][1] is None
+    seen.clear()
+    forged = settled(window=3)
+    from reliquary.services import settlement
+    monkeypatch.setattr(settlement, "_validate", lambda *a, **k: {}["boom"])      # KeyError raised by the validation itself
+    check([forged])
+    assert isinstance(seen[0][1], KeyError)
+
+
+@pytest.mark.asyncio
+async def test_projection_refuses_what_the_row_and_map_bounds_forbid():
+    record = settled(rows=(("a", MATH),))
+    fields = ("window_start", "window_status", "rewards_by_hotkey") + weight_only.SERVICE_ARCHIVE_FIELDS
+    kw = dict(fields=fields, row_fields=weight_only.SERVICE_ROW_FIELDS,
+              number_map_fields=weight_only.SERVICE_NUMBER_MAPS,
+              nested_number_map_fields=weight_only.SERVICE_NESTED_NUMBER_MAPS)
+
+    # batch: not a list -> None; row values: str of at most 256 chars or int, nothing else.
+    bad = {**record, "batch": {"hotkey": "a"}}
+    assert (await _through_storage(bad, **kw))[0]["batch"] is None
+    rows = [{"hotkey": "h" * 257, "env_name": MATH, "prompt_idx": True},
+            {"hotkey": "h" * 256, "env_name": ["x"], "prompt_idx": 5}]
+    (projected,) = await _through_storage({**record, "batch": rows}, **kw)
+    assert projected["batch"] == [{"env_name": MATH}, {"hotkey": "h" * 256, "prompt_idx": 5}]
+
+    # service_* maps: short str keys, numeric values, at most 10 000 entries, otherwise None (archive dropped).
+    maps = {
+        "service_pools_by_environment": [
+            {MATH: "0.5"}, {MATH: True}, {"e" * 257: 0.1}, {f"e{i}": 0.0 for i in range(10_001)}, [1]],
+        "service_scale_by_environment": [{MATH: {"a": 1}}, {MATH: None}],
+        "service_training_by_environment": [{MATH: [1]}, {MATH: {"a": "1"}}, {MATH: 0.5}],
+        "service_exploration_by_environment": [
+            {MATH: {"h" * 257: 1}}, {MATH: {"h": "1"}}, {MATH: 5}, {MATH: {f"h{i}": 1 for i in range(10_001)}}],
+    }
+    for field, variants in maps.items():
+        for variant in variants:
+            (projected,) = await _through_storage({**record, field: variant}, **kw)
+            assert projected[field] is None, (field, str(variant)[:40])
+    (untouched,) = await _through_storage(record, **kw)
+    for field in weight_only.SERVICE_NUMBER_MAPS + weight_only.SERVICE_NESTED_NUMBER_MAPS:
+        assert untouched[field] == record[field]
+    assert check([{**untouched, "task_id": TASK}]) == check([record])        # a good archive still pays the same
+    (ten_thousand,) = await _through_storage(
+        {**record, "service_pools_by_environment": {f"e{i}": 0.0 for i in range(10_000)}}, **kw)
+    assert len(ten_thousand["service_pools_by_environment"]) == 10_000          # the bound is inclusive
+    assert check([{**projected, "task_id": TASK}]) == []                        # a None map drops the archive (logged)

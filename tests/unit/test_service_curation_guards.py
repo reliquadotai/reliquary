@@ -87,12 +87,13 @@ SLIPPING_FORMS = [
     "MMLU Pro", "terminalbench", "aimev2", "livecodebenchv6", "gpqadiamond", "Idavidrein/gpqa",
     "AIME_2025", "aime25", "LiveCodeBench/code_generation_lite", "TIGER-Lab/MMLU-Pro", "gorilla-llm/BFCL_v3",
     "allenai/IFBench_test", "sierra-research/tau2-bench", "tau-bench", "SWEBenchVerified", "lcb-v5",
+    "AIMEI", "AIMEII", "AIME_I", "aime-ii", "aimei",
 ]
 LEGIT_TRAIN_NAMES = [
     "nvidia/OpenMathInstruct-2", "agentica-org/DeepScaleR-Preview-Dataset", "open-r1/codeforces",
     "PrimeIntellect/verifiable-math-problems", "allenai/tulu-3-sft-mixture", "claimed-rows", "paid-ament",
     "mainstream-slice", "xaime-slice", "ugpqa", "tau2x", "gpqas", "HuggingFaceH4/ultrafeedback_binarized",
-    "airbnb/listings", "aimed-dataset", "AI-MO/NuminaMath-CoT", "terminal-sessions-train",
+    "airbnb/listings", "aimed-dataset", "aimeiser", "aimeinc", "AI-MO/NuminaMath-CoT", "terminal-sessions-train",
 ]
 
 
@@ -102,6 +103,9 @@ def test_every_spelling_of_a_held_out_name_is_refused_in_every_name_field(name):
         refuse_held_out(contract_for(b"x\n", dataset_id="train-slice"), {**CATALOG_CARD, "set_id": name})
     with pytest.raises(HeldOutEvalSet):
         refuse_held_out(contract_for(b"x\n", dataset_id="train-slice"), {**CATALOG_CARD, "source": name})
+    for key in ("dataset", "repo", "hf_id", "id"):   # every identifier a card can carry its name in
+        with pytest.raises(HeldOutEvalSet):
+            refuse_held_out(contract_for(b"x\n", dataset_id="train-slice"), {**CATALOG_CARD, key: name})
     if re.fullmatch(r"[A-Za-z0-9_.-]+", name):   # dataset ids are canonical identifiers
         with pytest.raises(HeldOutEvalSet):
             refuse_held_out(contract_for(b"x\n", dataset_id=name), CATALOG_CARD)
@@ -111,6 +115,11 @@ def test_every_spelling_of_a_held_out_name_is_refused_in_every_name_field(name):
 def test_legitimate_training_dataset_names_pass(name):
     refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "set_id": name})
     refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, "source": name} | {"source": CATALOG_CARD["source"], "name": name})
+
+
+@pytest.mark.parametrize("key", ["dataset", "repo", "hf_id", "id"])
+def test_legitimate_names_pass_in_the_identifier_card_keys_too(key):
+    refuse_held_out(contract_for(b"x\n"), {**CATALOG_CARD, key: "nvidia/OpenMathInstruct-2"})
 
 
 def test_benchmark_name_in_dataset_id_is_refused():

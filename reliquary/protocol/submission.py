@@ -437,6 +437,16 @@ class ServicePolicyAnnouncement(BaseModel):
         ServiceSchedule.from_dict(self.schedule, contract)
         if set(self.checkpoint) != {"checkpoint_n", "repo", "revision", "sha256"}:
             raise ValueError("announcement checkpoint fields are fixed")
+        import re
+        cp = self.checkpoint
+        if type(cp["checkpoint_n"]) is not int or not 0 <= cp["checkpoint_n"] <= 2**53 - 1:
+            raise ValueError("announcement checkpoint_n must be a non-negative integer")
+        if not isinstance(cp["repo"], str) or not 1 <= len(cp["repo"]) <= 256:
+            raise ValueError("announcement checkpoint repo must be a bounded string")
+        if not isinstance(cp["revision"], str) or not re.fullmatch(r"[0-9a-f]{40}", cp["revision"]):
+            raise ValueError("announcement checkpoint revision must be a 40-hex commit")
+        if not isinstance(cp["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", cp["sha256"]):
+            raise ValueError("announcement checkpoint sha256 must be 64-hex")
         from reliquary.protocol.service_contract import PUBLIC_SEED_POOL
         if any(env["sampling"]["kind"] == PUBLIC_SEED_POOL for env in contract.environments.values()) and not self.pool_randomness:
             raise ValueError("public pool requires its authoritative beacon")

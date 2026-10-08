@@ -6812,8 +6812,11 @@ class GrpoWindowBatcher:
         from reliquary.validator.admission import service_length_valid
 
         size = self._proof_embedding_size(proof_model)
-        environment = str(getattr(self, "service_environment", None)
-                          or getattr(request.rollouts[0], "env_name", ""))
+        environment = getattr(self, "service_environment", None)
+        if not environment:
+            # The validator's configuration fault, never the payload's: a miner-supplied env_name must not choose the bound.
+            raise RuntimeError("a service batcher has no service_environment")
+        environment = str(environment)
         for rollout in request.rollouts:
             commit = rollout.commit or {}
             tokens = list(commit.get("tokens") or [])

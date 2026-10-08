@@ -236,6 +236,14 @@ def test_pool_arg_errors():
                                    pool_subset="first", pool_pick=None)) == []
 
 
+def test_pool_pick_is_refused_with_the_window_seed_source():
+    errors = B.pool_arg_errors(_args(seed_source="window", randomness=None, pool_epoch=None,
+                                     pool_subset="first", pool_pick="lowest-agreement"))
+    assert len(errors) == 1 and "--pool-pick" in errors[0] and "seed-source pool" in errors[0]
+    assert B.pool_arg_errors(_args(seed_source="window", randomness=None, pool_epoch=None,
+                                   pool_subset="first", pool_pick=None)) == []
+
+
 def test_pool_is_built_once_when_given():
     pool = B.build_pool(_args(), prompt_idx=1)
     args = _args(contract=None)  # would crash if uniform_source rebuilt the pool

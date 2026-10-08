@@ -1,6 +1,8 @@
 # tests/unit/test_service_contract_v2.py
 import pytest
 
+from reliquary.protocol.release_contract import canonical_json_bytes
+
 from reliquary.protocol.service_contract import (
     SUPPORTED_V2_CAPABILITIES, ServiceContract, ServiceContractError,
 )
@@ -92,3 +94,35 @@ def test_public_seed_pool_renews_every_window_and_nothing_else_is_refused_for_it
     value["environments"][MATH]["sampling"]["renewal_windows"] = 0
     with pytest.raises(ServiceContractError, match="renewal_windows"):
         ServiceContract.from_dict(value)
+
+
+def test_schedule_refuses_active_without_shares_and_inactive_with_a_share():
+    contract = contract_v2(envs=(MATH, CODE, SCIENCE), shares={MATH: 6000, CODE: 4000, SCIENCE: 0})
+    current = initial_schedule(contract)
+    with pytest.raises(ScheduleError, match="explicit shares"):
+        next_schedule(contract, current, active=(MATH, SCIENCE))
+    # An inactive env (science) given a nonzero share, rebalancing the others to keep the sum.
+    with pytest.raises(ScheduleError, match="inactive environment .* share 0"):
+        next_schedule(contract, current, shares={MATH: 5000, CODE: 4000, SCIENCE: 1000})
+    raw = current.to_dict()
+    raw["environments"][SCIENCE]["active"] = 1  # active, share 0
+    with pytest.raises(ScheduleError, match="needs a positive share"):
+        ServiceSchedule.from_dict(raw, contract)
+
+
+@pytest.mark.parametrize("path, bad", [
+    (("visibility",), ["task"]),
+    (("visibility",), {"a": 1}),
+])
+def test_v2_unhashable_enums_are_contract_errors_not_type_errors(path, bad):
+    value = contract_v2_dict()
+    value[path[0]] = bad
+    with pytest.raises(ServiceContractError, match="visibility"):
+        ServiceContract(canonical_json_bytes(value))
+
+
+def test_v2_unhashable_sampling_kind_is_a_contract_error():
+    value = contract_v2_dict()
+    value["environments"][MATH]["sampling"]["kind"] = ["legacy/v1"]
+    with pytest.raises(ServiceContractError, match="sampling"):
+        ServiceContract(canonical_json_bytes(value))

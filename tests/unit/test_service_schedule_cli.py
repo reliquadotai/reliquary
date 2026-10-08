@@ -517,3 +517,23 @@ def test_cli_without_a_schedule_row_gives_an_operator_message_not_a_traceback(tm
     db.close()
     result = cli(tmp_path, "show", check=False)
     assert result.returncode != 0 and "no schedule" in result.stderr and "Traceback" not in result.stderr
+
+
+def test_an_unsafe_folder_is_reported_once_not_every_window(tmp_path, monkeypatch):
+    rt = runtime(tmp_path)
+    folder = tmp_path / "ops"
+    store = ScheduleRequestStore(folder)
+    store.submit(order_sha256=rt.contract.sha256, revision=0, cooldowns={MATH: 3})
+    folder.chmod(0o777)  # the status file cannot even be read back while the folder is unsafe
+    writes = []
+    real = ScheduleRequestStore.report
+    monkeypatch.setattr(ScheduleRequestStore, "report", lambda self, *a, **k: writes.append(k["detail"]) or real(self, *a, **k))
+    for window in (2, 3, 4, 5):
+        assert rt.apply_pending_schedule_request(store, window=window).revision == 0
+    assert len(writes) == 1 and "writable" in writes[0]
+    folder.chmod(0o700)
+    store.request_path.write_bytes(b"[1]")
+    store.request_path.chmod(0o600)
+    rt.apply_pending_schedule_request(store, window=6)
+    rt.apply_pending_schedule_request(store, window=7)
+    assert len(writes) == 2 and "object" in writes[1]

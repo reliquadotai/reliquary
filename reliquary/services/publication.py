@@ -263,7 +263,7 @@ class ObservationPublisher:
         self.disabled = False
         self._pages_written: set[int] = set()
         self._page_entries: dict[int, dict] = {}     # k -> head entry of closed page k (built once per process)
-        self._page_pending: dict[int, bytes] = {}    # k -> bytes not yet uploaded
+        self._page_pending: set[int] = set()         # k of the closed pages not yet uploaded (bytes are read at upload)
         self._remote_failures = 0
         self._calls = threading.Lock()       # held by every thread call: close() waits for the running one
         self._closed = False
@@ -368,8 +368,9 @@ class ObservationPublisher:
         return self.runtime.index_page(first, build)
 
     def _closed_page_entries(self, closed: int) -> list[dict]:
-        """Head entries of the first ``closed`` pages. Each page is read/built once per process; its bytes
-        are kept only until uploaded."""
+        """Head entries of the first ``closed`` pages. Each page is read/built once per process to learn its
+        digest; its bytes are NOT kept (a restart of a long run would otherwise hold every page): the upload
+        reads the stored page again."""
         for k in range(closed):
             if k in self._page_entries:
                 continue
@@ -379,7 +380,7 @@ class ObservationPublisher:
                                      "first_number": first, "last_number": first + PAGE_SEGMENTS - 1,
                                      "sha256": hashlib.sha256(body).hexdigest(), "size": len(body)}
             if k not in self._pages_written:
-                self._page_pending[k] = body
+                self._page_pending.add(k)
         return [self._page_entries[k] for k in range(closed)]
 
     def _head(self, last: int) -> tuple[bytes, dict]:
@@ -420,9 +421,12 @@ class ObservationPublisher:
         # Signing and canonicalisation run off the event loop. Pages first: the head references them.
         head_bytes, head = await self._thread(self._head, last)
         for k in sorted(self._page_pending):
-            await self.put(self._page_entries[k]["key"], self._page_pending[k], "application/json", SEGMENT_CACHE)
+            body = await self._thread(self._page_bytes, k)
+            if hashlib.sha256(body).hexdigest() != self._page_entries[k]["sha256"]:
+                raise RuntimeError(f"closed page {k} changed between its digest and its upload")
+            await self.put(self._page_entries[k]["key"], body, "application/json", SEGMENT_CACHE)
             self._pages_written.add(k)
-            del self._page_pending[k]
+            self._page_pending.discard(k)
         await self.put(index_key(self.run_id), head_bytes, "application/json", INDEX_CACHE)
         self._index_dirty = False
         return head

@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 # Per-row projection of ``batch`` applied while the archive is decoded (settlement's ``_count_rows``
 # reads exactly these keys): no prompt, ground truth or rollout is ever retained.
 SERVICE_ROW_FIELDS = {"batch": ("hotkey", "env_name", "prompt_idx")}
+# Maps replay reads as numbers: bounded while decoded (storage.list_recent_datasets), a map that is not
+# {short str: number} with at most 10 000 entries drops its archive (the consumer refuses ``None``).
+SERVICE_NUMBER_MAPS = ("service_pools_by_environment", "service_scale_by_environment")
+SERVICE_NESTED_NUMBER_MAPS = ("service_training_by_environment", "service_exploration_by_environment")
 SERVICE_ARCHIVE_FIELDS = ("batch", "service_payment_policy", "service_order_sha256", "service_schedule",
                           "service_schedule_sha256", "service_pools_by_environment", "service_picks_target",
                           "service_batch_slots", "service_training_by_environment",
@@ -216,6 +220,8 @@ class WeightOnlyValidator:
                 if fields != ("window_start", "window_status", "rewards_by_hotkey"):
                     # v2 service task only: keep no rollout data, replay counts rows by these keys.
                     extra["row_fields"] = SERVICE_ROW_FIELDS
+                    extra["number_map_fields"] = SERVICE_NUMBER_MAPS
+                    extra["nested_number_map_fields"] = SERVICE_NESTED_NUMBER_MAPS
                 archives = await storage.list_recent_datasets(
                     current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
@@ -332,23 +338,30 @@ class WeightOnlyValidator:
         picks, slots = geometry
         refusals = (ValueError, ArithmeticError, RecursionError, TypeError, KeyError, AttributeError)
 
-        def drop(archive, reason) -> None:
+        def drop(archive, reason, exc: BaseException | None = None) -> None:
             # R27: a bad v2 archive is treated as aborted (pays nothing); every validator sees the
             # same archives, so the drop is deterministic and the unpaid remainder burns as today.
+            # A TypeError/KeyError/AttributeError (also as the cause of the SettlementError that wraps
+            # it) is a code-shaped fault, not a plain refusal: its traceback is logged in full.
+            cause = exc if isinstance(exc, (TypeError, KeyError, AttributeError)) else getattr(exc, "__cause__", None)
+            detail = cause if isinstance(cause, (TypeError, KeyError, AttributeError)) else None
             logger.error("service task %s window %s dropped from weight replay: %s",
-                         archive.get("task_id"), archive.get("window_start"), reason)
+                         archive.get("task_id"), archive.get("window_start"), reason,
+                         exc_info=detail)
 
         chosen: dict[tuple[str, int], dict] = {}
         poisoned: set[tuple[str, int]] = set()
         out: list[dict] = []
+        seen_windows: dict[str, int] = {}
         for archive in archives:
             if not is_service(archive):       # legacy guard: never reaches the drop handling below
                 out.append(archive)
                 continue
+            seen_windows[str(archive.get("task_id"))] = seen_windows.get(str(archive.get("task_id")), 0) + 1
             try:
                 key = (str(archive["task_id"]), int(archive["window_start"]))
             except refusals as exc:
-                drop(archive, f"no usable window ({type(exc).__name__})")
+                drop(archive, f"no usable window ({type(exc).__name__})", exc)
                 continue
             if key in poisoned:
                 continue
@@ -362,7 +375,7 @@ class WeightOnlyValidator:
                 rank, held = canonical_json_bytes(archive), canonical_json_bytes(chosen[key])
             except refusals as exc:
                 # Either copy unrankable: drop the window whichever copy came first (order-free).
-                drop(archive, f"duplicate archives, one not canonical JSON ({type(exc).__name__})")
+                drop(archive, f"duplicate archives, one not canonical JSON ({type(exc).__name__})", exc)
                 del chosen[key]
                 poisoned.add(key)
                 continue
@@ -389,7 +402,7 @@ class WeightOnlyValidator:
                     rewards = service_archive_rewards(archive, contract, cap=cap, picks_target=picks,
                                                       batch_slots=slots)
                 except refusals as exc:
-                    drop(archive, f"{type(exc).__name__}: {exc}")
+                    drop(archive, f"{type(exc).__name__}: {exc}", exc)
                     continue
                 if not archive.get("batch") and not archive.get("service_exploration_by_environment"):
                     logger.warning("service task %s window %s paid nothing (no batch, no exploration)",
@@ -397,6 +410,12 @@ class WeightOnlyValidator:
             out.append({"task_id": archive["task_id"], "window_start": int(archive["window_start"]),
                         "window_status": "aborted" if aborted else archive.get("window_status", "completed"),
                         "rewards_by_hotkey": rewards})
+        kept = {str(row["task_id"]) for row in out if is_service(row)}
+        for task_id in sorted(set(seen_windows) - kept):
+            # Every window of the task dropped: the whole task pays nothing this epoch. One line, so the
+            # operator sees it without reading each drop above.
+            logger.error("service task %s: EVERY one of its %d archived v2 window(s) was dropped from weight "
+                         "replay; the task pays nothing this epoch", task_id, seen_windows[task_id])
         return sorted(out, key=lambda r: (int(r["window_start"]), str(r.get("task_id", ""))))
 
     @staticmethod

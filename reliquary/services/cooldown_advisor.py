@@ -21,11 +21,12 @@ NOTE = ("Recommendation only, never applied automatically; the observed in-zone 
 _POLICY_KEYS = ("margin_bps", "min_windows", "max_windows", "smoothing_bps", "hysteresis_windows",
                 "max_change_windows", "min_first_scans")
 _RAW_CEILING = 2 ** 53
+_INT_CEILING = 2 ** 63  # a 400-digit int would otherwise reach float arithmetic and raise OverflowError
 
 
 def _int(name: str, value, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _INT_CEILING:
+        raise ValueError(f"{name} must be an integer in [{minimum}, 2**63], got {str(value)[:40]!r}")
     return value
 
 
@@ -58,7 +59,8 @@ def _checked_previous(previous) -> tuple[float | None, int | None]:
         raise ValueError("previous must be a dict or None")
     ema, last = previous.get("ema_windows"), previous.get("recommended_windows")
     if ema is not None:
-        if isinstance(ema, bool) or not isinstance(ema, (int, float)) or not math.isfinite(ema) or ema < 0:
+        if isinstance(ema, bool) or not isinstance(ema, (int, float)) or abs(ema) > _INT_CEILING \
+                or not math.isfinite(ema) or ema < 0:
             raise ValueError(f"previous ema_windows invalid: {ema!r}")
         ema = float(ema)
     if last is not None:
@@ -77,7 +79,7 @@ def recommend_cooldown(*, policy: dict, population: int, first_scans: int, in_zo
     if in_zone_first > first_scans:
         raise ValueError("in_zone_first cannot exceed first_scans")
     if isinstance(consumption, bool) or not isinstance(consumption, (int, float)) \
-            or not math.isfinite(consumption) or consumption < 0:
+            or abs(consumption) > _INT_CEILING or not math.isfinite(consumption) or consumption < 0:
         raise ValueError(f"consumption must be a finite number >= 0, got {consumption!r}")
     consumption = float(consumption)
     prior_ema, last = _checked_previous(previous)

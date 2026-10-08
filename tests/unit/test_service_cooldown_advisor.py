@@ -117,3 +117,21 @@ def test_results_are_finite_and_json_safe():
     result = call()
     assert all(math.isfinite(v) for v in (result["p"], result["q"], result["ema_windows"]))
     assert json.loads(json.dumps(result, allow_nan=False)) == result
+
+
+@pytest.mark.parametrize("field", ["population", "first_scans", "in_zone_first"])
+def test_four_hundred_digit_ints_are_value_errors_not_overflow(field):
+    huge = 10 ** 400
+    kwargs = {"population": 10000, "first_scans": 200, "in_zone_first": 60, field: huge}
+    if field == "first_scans":
+        kwargs["in_zone_first"] = 60
+    with pytest.raises(ValueError):
+        call(**kwargs)
+    with pytest.raises(ValueError):
+        call(policy={**POLICY, "max_windows": huge})
+    with pytest.raises(ValueError):
+        call(previous={"ema_windows": 1.0, "recommended_windows": huge})
+    with pytest.raises(ValueError):
+        call(previous={"ema_windows": huge, "recommended_windows": 3})
+    with pytest.raises(ValueError):
+        call(consumption=huge)

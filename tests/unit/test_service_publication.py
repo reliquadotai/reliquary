@@ -424,6 +424,35 @@ def test_a_restart_rebuilds_byte_identical_pages(tmp_path, monkeypatch):
     assert next(b for k, b, _, _ in puts2 if k == page_key("r1", 1, 3)) == first   # signature included
 
 
+def test_a_restart_holds_no_page_bytes_between_digest_and_upload(tmp_path, monkeypatch):
+    small_pages(monkeypatch)
+    rt = runtime(tmp_path)
+    fill(rt, 10)                                  # three closed pages
+    puts = []
+    pub, _ = publisher(rt, puts)
+    while asyncio.run(pub.flush()) is not None:
+        pass
+    rt.close()
+    rt2 = build(tmp_path / "runtime.sqlite3")
+    puts2 = []
+    pub2, _ = publisher(rt2, puts2)
+    held = []
+    real_put = pub2.put
+
+    async def put(key_, body, content_type, cache_control):
+        if key_ != index_key("r1") and key_.endswith(".json"):
+            # while a page is being uploaded, no page bytes are buffered in the publisher
+            held.append(any(isinstance(v, bytes) for c in vars(pub2).values() if isinstance(c, dict) for v in c.values()))
+        await real_put(key_, body, content_type, cache_control)
+    pub2.put = put
+    asyncio.run(pub2.flush())
+    pages = [k for k, *_ in puts2 if k.endswith(".json") and k != index_key("r1")]
+    assert len(pages) == 3 and len(held) == 3
+    assert held == [False, False, False]
+    assert pub2._page_pending == set()
+    assert [b for k, b, *_ in puts2 if k in pages] == [b for k, b, *_ in puts if k in pages]   # same bytes as before
+
+
 def test_page_and_head_verification_refuses_malformed_documents(tmp_path, monkeypatch):
     small_pages(monkeypatch)
     rt = runtime(tmp_path)
@@ -727,13 +756,22 @@ def test_a_failed_remote_read_does_not_mark_the_check_done_and_ten_failures_are_
     assert not pub._checked and "10 consecutive failures" in caplog.text and puts == []
     # a remote that is ahead, read after the failures, still disables (the check really ran after them)
     raw, _ = remote_head(tmp_path, 1)
-    pub2, _ = publisher(rt, [], get=broken)
+    puts2 = []
+    pub2, _ = publisher(rt, puts2, get=broken)
     with pytest.raises(OSError):
         asyncio.run(pub2.flush())
-    assert not pub2._checked
-    pub2.get = getter(None)
-    asyncio.run(pub2.flush())
-    assert pub2._checked
+    assert not pub2._checked and not pub2.disabled
+    pub2.get = getter(raw)
+    assert asyncio.run(pub2.flush()) is None
+    assert pub2.disabled and puts2 == []
+    # and an absent remote, read after a failure, lets the same journal proceed
+    puts3 = []
+    pub3, _ = publisher(rt, puts3, get=broken)
+    with pytest.raises(OSError):
+        asyncio.run(pub3.flush())
+    pub3.get = getter(None)
+    asyncio.run(pub3.flush())
+    assert pub3._checked and not pub3.disabled and puts3
 
 
 def paged_remote(tmp_path, n, monkeypatch):

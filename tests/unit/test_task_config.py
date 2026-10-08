@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import pytest
 
 from reliquary.environment.abi import canonical_sha256
@@ -222,3 +223,27 @@ def test_inactive_declared_env_is_not_checked_but_active_env_still_is(monkeypatc
     monkeypatch.setattr("reliquary.environment.registry.ENVIRONMENT_SPECS", {MATH: bad}, raising=False)
     with pytest.raises(task_config.TaskConfigError, match="environment version"):
         task_config._service_env_caps(entry, cap=0.5)
+
+
+def test_a_service_entry_parses_its_contract_exactly_once(monkeypatch):
+    from reliquary.protocol.service_contract import ServiceContract
+    from reliquary.validator import task_config
+    from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2_dict
+    from tests.unit.test_service_task_registry import _service_entry
+
+    contract = contract_v2_dict(shares={MATH: 6000, CODE: 4000})
+    entry = _service_entry(contract)
+    specs = {name: type("Spec", (), {"environment_manifest_sha256": contract["environments"][name]["version"]})()
+             for name in (MATH, CODE)}
+    monkeypatch.setattr("reliquary.environment.registry.ENVIRONMENT_SPECS", {**specs}, raising=False)
+    real, calls = ServiceContract.from_dict, []
+    monkeypatch.setattr(ServiceContract, "from_dict", classmethod(lambda cls, v: calls.append(1) or real(v)))
+    generation = entry.contract
+    # The registry/profile round trip is other tests' job; only the contract parsing is counted here.
+    monkeypatch.setattr(task_config, "validate_registry", lambda entries: None)
+    entry = dataclasses.replace(entry, contract=None)
+    config = task_config.resolve_task_config(
+        {entry.task_id: entry}, entry.task_id, profile_id=entry.profile_id, generation_contract=generation)
+    assert len(calls) == 1
+    assert config.service_contract is not None
+    assert _resolve({"default": _entry()}).service_contract is None

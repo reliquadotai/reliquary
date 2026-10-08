@@ -811,12 +811,10 @@ def test_consumption_is_measured_per_env_and_smoothed(tmp_path):
     assert rt.record_consumption(9) == {} and rt.measured_consumption() == {}
 
 
-def test_removed_v1_entry_points_fail_closed_and_name_their_task(tmp_path):
+def test_the_removed_v1_entry_points_are_gone_not_stubbed(tmp_path):
     rt = runtime(tmp_path)
-    for call in (lambda: rt.view, lambda: rt.row_ids, lambda: rt.prepare_view(window=1),
-                 lambda: rt.training_pool({MATH: 1.0}), lambda: rt.record_verified({}), lambda: rt.snapshot()):
-        with pytest.raises(NotImplementedError, match="wired in Task 1"):
-            call()
+    for name in ("view", "row_ids", "prepare_view", "training_pool", "record_verified", "snapshot", "_unwired"):
+        assert not hasattr(rt, name), name                # nothing calls them; a stub would only hide a stale caller
     assert not hasattr(rt, "mark_unaudited")              # it would defeat the per-hotkey audit horizon
 
 
@@ -1709,3 +1707,17 @@ def test_m9_a_ban_binds_the_next_admission_from_memory_and_survives_a_restart(tm
     rt.db.close()
     again = build(tmp_path / "runtime.sqlite3")
     assert again.exploration_banned("cheat") is True                     # loaded at boot
+
+
+@pytest.mark.parametrize("field, bad, message", [
+    ("checkpoint_n", -1, "checkpoint_n"), ("checkpoint_n", "3", "checkpoint_n"), ("checkpoint_n", True, "checkpoint_n"),
+    ("repo", 5, "repo"), ("repo", "", "repo"),
+    ("revision", "abc", "40-hex"), ("revision", 7, "40-hex"),
+    ("sha256", "G" * 64, "64-hex"), ("sha256", ["a"], "64-hex"),
+])
+def test_announcement_checkpoint_values_are_type_checked(tmp_path, field, bad, message):
+    first = runtime(tmp_path).announcement(window=1, randomness=WINDOW_BEACON, environment=MATH)
+    ServicePolicyAnnouncement(**first)
+    first["checkpoint"] = {**first["checkpoint"], field: bad}
+    with pytest.raises(ValueError, match=message):
+        ServicePolicyAnnouncement(**first)

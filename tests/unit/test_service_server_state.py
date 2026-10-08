@@ -370,36 +370,116 @@ def test_the_service_refreshes_the_active_flag_and_keeps_the_last_value_on_failu
 
 
 @pytest.mark.asyncio
-async def test_the_control_heartbeat_refreshes_the_flag_every_beat(tmp_path, monkeypatch):
+async def test_the_control_heartbeat_refreshes_the_flag_without_waiting_for_it(tmp_path, monkeypatch):
     import asyncio
     rt = runtime_for(tmp_path)
     service = _service(rt)
     service._window_n = 500
-    service._control_store = SimpleNamespace(heartbeat=lambda window: None)
+    beats = []
+    service._control_store = SimpleNamespace(heartbeat=lambda window: beats.append(window))
     rt.active = lambda *a, **k: False
+    real_sleep = asyncio.sleep
     sleeps = []
 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
-        raise asyncio.CancelledError
+        await real_sleep(0.05)          # let the refresh task run
+        if len(sleeps) == 2:
+            raise asyncio.CancelledError
     monkeypatch.setattr("reliquary.validator.service.asyncio.sleep", fake_sleep)
     with pytest.raises(asyncio.CancelledError):
         await service._control_heartbeat()
-    assert service.server.service_runtime_active is False and sleeps == [5]
+    assert service.server.service_runtime_active is False and sleeps == [5, 5] and len(beats) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_lock_held_forever_never_stops_the_heartbeat_writes(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    rt = runtime_for(tmp_path)
+    service = _service(rt)
+    service._window_n = 7
+    service.SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS = 0.2
+    beats, release, entered = [], threading.Event(), threading.Event()
+    service._control_store = SimpleNamespace(heartbeat=lambda window: beats.append(window))
+
+    def stuck(*a, **k):
+        entered.set()
+        release.wait(10)
+        return True
+    rt.active = stuck
+    real_sleep = asyncio.sleep
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        await real_sleep(0.1)
+        if len(sleeps) == 4:
+            raise asyncio.CancelledError
+    monkeypatch.setattr("reliquary.validator.service.asyncio.sleep", fake_sleep)
+    import time
+    started = time.monotonic()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await service._control_heartbeat()
+    finally:
+        release.set()
+    assert time.monotonic() - started < 3, "the heartbeat waited behind the stuck refresh"
+    assert entered.is_set() and len(beats) == 4        # one write per beat although the refresh never returned
+
+
+@pytest.mark.asyncio
+async def test_a_slow_refresh_is_given_up_on_and_keeps_the_last_value(tmp_path, caplog):
+    import threading
+    rt = runtime_for(tmp_path)
+    service = _service(rt)
+    service.SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS = 0.1
+    service.server.set_service_runtime_active(True)
+    release = threading.Event()
+    rt.active = lambda *a, **k: (release.wait(5), False)[1]
+    try:
+        with caplog.at_level("WARNING"):
+            await service._refresh_service_active_bounded()
+    finally:
+        release.set()
+    assert "slow" in caplog.text and service.server.service_runtime_active is True
 
 
 def test_opening_and_the_boundary_both_refresh_the_flag():
-    import inspect
     from reliquary.validator.service import ValidationService
-    assert "_refresh_service_active()" in inspect.getsource(ValidationService._open_service_window)
-    assert "_refresh_service_active()" in inspect.getsource(ValidationService._service_window_boundary)
+    calls = []
+    plan = {"window": 5, "pools": {"m": 0.5}, "picks_target": 1, "batch_slots": 1, "env_mix": [("m", 1)],
+            "opened": False}
+    runtime = SimpleNamespace(open_window=lambda *a, **k: calls.append("open_window"),
+                              announcement=lambda **k: {"pool_randomness": k["randomness"]})
+    opener = SimpleNamespace(_service_runtime=runtime, _candidate_service_window=plan,
+                             _refresh_service_active=lambda: calls.append("refresh"))
+    ValidationService._open_service_window(opener, 5, "beacon")
+    assert calls == ["open_window", "refresh"] and plan["opened"] is True
+
+    calls.clear()
+    boundary = SimpleNamespace(_recover_leftover_service_windows=lambda window: ([], False),
+                               _refresh_service_active=lambda: calls.append("refresh"),
+                               _service_window_plan=lambda window: calls.append("plan") or {"window": window})
+    assert ValidationService._service_window_boundary(boundary, 6)["plan"] == {"window": 6}
+    assert calls == ["refresh", "plan"]
 
 
-def test_a_legacy_service_heartbeat_does_not_touch_a_runtime():
-    import inspect
+@pytest.mark.asyncio
+async def test_a_legacy_service_heartbeat_does_not_touch_a_runtime(monkeypatch):
+    import asyncio
     from reliquary.validator.service import ValidationService
-    assert 'getattr(self, "_service_runtime", None) is not None' in inspect.getsource(
-        ValidationService._control_heartbeat)
+    beats = []
+    legacy = SimpleNamespace(_window_n=3, _control_store=SimpleNamespace(heartbeat=lambda window: beats.append(window)),
+                             _service_runtime=None)
+    legacy._refresh_service_active_bounded = lambda: (_ for _ in ()).throw(AssertionError("refresh on a legacy task"))
+
+    async def fake_sleep(seconds):
+        raise asyncio.CancelledError
+    monkeypatch.setattr("reliquary.validator.service.asyncio.sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await ValidationService._control_heartbeat(legacy)
+    assert beats == [3]
 
 
 def test_state_503_carries_retry_after_on_both_routes(tmp_path):

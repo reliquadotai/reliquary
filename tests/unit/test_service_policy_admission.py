@@ -594,6 +594,7 @@ def _deep_service_batcher(request, announcement, verify):
                             verify_signature_fn=verify_commit_signature)
     batcher.current_checkpoint_hash = request.checkpoint_hash
     batcher.service_policy = announcement
+    batcher.service_environment = request.rollouts[0].env_name
     batcher.tokenizer.decode = lambda ids, **kwargs: "".join(
         "\\boxed{0}" if token == 2 else "" if token == 99 else "x" for token in ids
     )
@@ -822,3 +823,37 @@ def test_o1_a_the_length_rule_is_the_environments_bound_on_the_completion(signed
     request, announcement, _ = signed_request()
     rollout = request.rollouts[0]
     assert not service_length_valid(rollout.commit["tokens"], rollout.commit["rollout"], OMI)
+
+
+def test_service_length_valid_episode_branch_uses_the_episode_bound_not_the_completion_bound(monkeypatch):
+    from reliquary import constants
+    from reliquary.validator import admission
+    from reliquary.validator.admission import service_length_valid
+    monkeypatch.setattr(admission, "episode_limits_for_environment", lambda environment: (4, 10, 1000))
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, OMI, 1)
+    meta = {"prompt_length": 2, "episode": {"turns": []}, "completion_length": 8}
+    assert service_length_valid(list(range(10)), meta, OMI)          # 10 tokens fit the episode bound (the cap of 1 is not used)
+    assert not service_length_valid(list(range(11)), meta, OMI)
+    monkeypatch.setattr(admission, "episode_limits_for_environment", lambda environment: None)
+    assert not service_length_valid(list(range(10)), meta, OMI)       # no episode profile: falls back to the completion bound
+
+
+def test_service_length_valid_missing_prompt_length_is_zero_and_a_bad_one_is_refused(monkeypatch):
+    from reliquary import constants
+    from reliquary.validator.admission import service_length_valid
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, OMI, 5)
+    assert service_length_valid([1, 2, 3, 4, 5], {}, OMI)            # prompt_length defaults to 0: 5 completion tokens
+    assert not service_length_valid([1, 2, 3, 4, 5, 6], {}, OMI)
+    for bad in (-1, 6, "x", None, [1], 10 ** 400):
+        assert not service_length_valid([1, 2, 3, 4, 5], {"prompt_length": bad}, OMI), bad
+
+
+def test_service_length_valid_completion_length_claim_is_parsed_strictly(monkeypatch):
+    from reliquary import constants
+    from reliquary.validator.admission import service_length_valid
+    monkeypatch.setitem(constants.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV, OMI, 5)
+    tokens = [1, 2, 3, 4, 5]
+    assert service_length_valid(tokens, {"prompt_length": 0, "completion_length": "4"}, OMI)   # a numeric string is read as a number
+    assert not service_length_valid(tokens, {"prompt_length": 0, "completion_length": "6"}, OMI)
+    for bad in ("abc", None, [3], {"a": 1}, 10 ** 400):
+        assert not service_length_valid(tokens, {"prompt_length": 0, "completion_length": bad}, OMI), bad

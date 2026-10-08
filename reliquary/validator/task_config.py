@@ -147,9 +147,10 @@ def resolve_task_config(
     params = PriceParams(**{f: entry.params[f] for f in PRICE_PARAM_FIELDS})
     cap = float(entry.params["cap"])
     if entry.service_contract is not None:
+        contract = ServiceContract.from_dict(entry.service_contract)  # parsed once
         return TaskConfig(task_id=task_id, entry=entry, price_params=params, emission_cap=cap,
-                          env_caps=_service_env_caps(entry, cap=cap), verification=entry.verification,
-                          service_contract=ServiceContract.from_dict(entry.service_contract))
+                          env_caps=_service_env_caps(entry, cap=cap, contract=contract), verification=entry.verification,
+                          service_contract=contract)
     if entry.env_split is not None:
         env_caps = {
             environment: cap * float(share)
@@ -166,19 +167,18 @@ def resolve_task_config(
         emission_cap=cap,
         env_caps=env_caps,
         verification=entry.verification,
-        service_contract=(None if entry.service_contract is None else
-                          ServiceContract.from_dict(entry.service_contract)),
     )
 
 
-def _service_env_caps(entry: TaskEntry, *, cap: float) -> dict[str, float]:
+def _service_env_caps(entry: TaskEntry, *, cap: float, contract: ServiceContract | None = None) -> dict[str, float]:
     """A service task's initial per-env caps, from its contract's shares (the live
     schedule re-derives them every window)."""
     from reliquary.environment.registry import ENVIRONMENT_SPECS
 
-    contract = ServiceContract.from_dict(entry.service_contract)
     from reliquary.services.admission_policy import missing_box_problems
 
+    if contract is None:
+        contract = ServiceContract.from_dict(entry.service_contract)
     problems = missing_box_problems(contract)  # R22
     if problems:
         raise TaskConfigError(

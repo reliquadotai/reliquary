@@ -28,11 +28,11 @@ HELD_OUT_BENCHMARK_NAMES: tuple[str, ...] = (
 # Matching runs on ONE normal form (``normalise``): lowercase, every run of non [a-z0-9] -> "-".
 # Distinctive long names match with optional separators and no trailing boundary (``swebench``,
 # ``livecodebenchv6``, ``gpqadiamond``); short or common-word names (``aime``, ``lcb``, ``gpqa``,
-# ``tau2``) also need a trailing boundary: end, "-", a digit, "v<digit>" or a known suffix.
+# ``tau2``) also need a trailing boundary: end, "-", a digit, "v<digit>" or a known suffix (``aime`` also takes ``i`` / ``ii``: AIMEI, AIMEII).
 # Every pattern needs a leading boundary, so ``claimed`` / ``xaime`` are not found.
 _LONG = ("swe-?bench", "mmlu-?pro", "terminal-?bench", "live-?code-?bench", "bfcl", "ifbench",
          "if-?eval-?bench", "tau-?bench", "tau2-?bench")
-_SHORT = {"aime": r"(?=$|-|\d|v\d)", "lcb": r"(?=$|-|\d|v\d)", "tau-?2": r"(?=$|-|\d|bench)",
+_SHORT = {"aime": r"(?=$|-|\d|v\d|ii?(?:$|-))", "lcb": r"(?=$|-|\d|v\d)", "tau-?2": r"(?=$|-|\d|bench)",
           "gpqa": r"(?=$|-|\d|v\d|diamond|main|extended)"}
 
 HELD_OUT_BENCHMARKS = re.compile(
@@ -48,7 +48,7 @@ def normalise(name: str) -> str:
 def names_held_out_benchmark(name: str) -> bool:
     return HELD_OUT_BENCHMARKS.search(normalise(name)) is not None
 
-_NAME_FIELDS = ("set_id", "source", "env", "taskset", "name")
+_NAME_FIELDS = ("set_id", "source", "env", "taskset", "name", "dataset", "repo", "hf_id", "id")
 
 
 class HeldOutEvalSet(ValueError):

@@ -1660,3 +1660,11 @@ def test_o1_a_the_guard_names_an_oversize_rollout_and_an_out_of_range_id_apart(t
     with pytest.raises(ValueError, match="embedding"):
         b._service_pre_forward_guard(pending.request, _vocab_model(2))
     b._service_pre_forward_guard(pending.request, _vocab_model(100))
+
+
+def test_the_pre_forward_guard_never_takes_the_environment_from_the_payload(tmp_path):
+    rt, b, pending = _drawn(tmp_path)
+    b.service_environment = None
+    pending.request.rollouts[0].env_name = MATH      # the miner's claim must not stand in for the validator's
+    with pytest.raises(RuntimeError, match="no service_environment"):
+        b._service_pre_forward_guard(pending.request, _vocab_model(100))

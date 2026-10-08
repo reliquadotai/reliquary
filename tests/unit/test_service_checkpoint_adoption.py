@@ -367,3 +367,41 @@ def test_j1_a_restart_with_resume_from_an_ancestor_is_refused_at_the_boundary(tm
         ValidationService._service_window_plan(service, 4)
     assert _order(runtime) == before and runtime.checkpoint["revision"] == THIRD
     runtime.close()
+
+
+def test_a_refused_ancestor_leaves_the_operators_schedule_request_unapplied(tmp_path):
+    """Item 10: the lineage check comes BEFORE the schedule request is consumed for the window."""
+    runtime = _three_deep(tmp_path)
+    runtime.apply_pending_schedule_request = MagicMock(side_effect=AssertionError("request consumed before the lineage check"))
+    installed = SimpleNamespace(repo_id="models/test", revision=NEXT, checkpoint_n=1)
+    service = SimpleNamespace(
+        _service_runtime=runtime, _service_schedule_store=SimpleNamespace(take=lambda: None),
+        _checkpoint_store=SimpleNamespace(current_manifest=lambda: installed),
+        env_mix=[(MATH, 16), (CODE, 16)], _emission_cap=0.5,
+        _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
+        _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
+    )
+    with pytest.raises(ValueError, match="ancestor of the current lineage head"):
+        ValidationService._service_window_plan(service, 4)
+    runtime.apply_pending_schedule_request.assert_not_called()
+    runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revision, number, message", [
+    (NEXT, 1, "ancestor of the current lineage head"),
+    ("c" * 40, 9, "no adopted service lineage entry"),
+])
+async def test_boot_refuses_a_resume_target_outside_the_lineage_head(tmp_path, monkeypatch, revision, number, message):
+    """Item 10: the configured resume target is checked at start, before any weights are loaded."""
+    runtime = _three_deep(tmp_path)
+    monkeypatch.setattr("reliquary.validator.resume.resolve_resume_source",
+                        lambda source, **kw: (str(tmp_path / "weights"), number))
+    loaded = MagicMock(side_effect=AssertionError("weights loaded before the lineage check"))
+    service = SimpleNamespace(_resume_from=f"sha:{revision}", _service_runtime=runtime,
+                              _checkpoint_store=SimpleNamespace(repo_id="models/test"), _load_model_fn=loaded)
+    with pytest.raises(ValueError, match=message):
+        await ValidationService._apply_resume_from(service)
+    loaded.assert_not_called()
+    runtime.require_resumable(checkpoint_n=2, repo="models/test", revision=THIRD)   # the head itself is fine
+    runtime.close()

@@ -463,6 +463,18 @@ class ServiceRuntime:
             logger.exception("schedule request could not be processed (window %d)", window)
         return self.window_schedule(window)
 
+    def _report_invalid_once(self, store, detail: str, revision: int) -> None:
+        """Write the "invalid" status once per distinct detail. The status file cannot be read back
+        while the folder stays unsafe, so the last detail written is also remembered in memory."""
+        if getattr(self, "_last_invalid_detail", None) == detail:
+            return
+        status = None
+        with contextlib.suppress(ValueError, OSError):
+            status = store.status()
+        if not (status and status.get("request_id") == "invalid" and status.get("detail") == detail):
+            store.report("invalid", status="refused", detail=detail, revision=revision)
+        self._last_invalid_detail = detail
+
     def _consume_schedule_request(self, store, window: int, at: float, installed_version) -> None:
         from reliquary.services.schedule import check_request
         order = self.contract.sha256
@@ -470,26 +482,18 @@ class ServiceRuntime:
         try:
             request = store.take()
         except (ValueError, OSError) as exc:
-            detail = f"unreadable schedule request: {exc}"
-            status = None
-            with contextlib.suppress(ValueError, OSError):
-                status = store.status()
-            if not (status and status.get("request_id") == "invalid" and status.get("detail") == detail):
-                store.report("invalid", status="refused", detail=detail, revision=current.revision)
+            self._report_invalid_once(store, f"unreadable schedule request: {exc}", current.revision)
             return
         if request is None:
+            self._last_invalid_detail = None
             return
         request_id = request.get("request_id") if isinstance(request, dict) else None
         try:
             _identifier(request_id, "request_id")
         except ValueError as exc:
-            detail = f"invalid schedule request: {exc}"
-            status = None
-            with contextlib.suppress(ValueError, OSError):
-                status = store.status()
-            if not (status and status.get("request_id") == "invalid" and status.get("detail") == detail):
-                store.report("invalid", status="refused", detail=detail, revision=current.revision)
+            self._report_invalid_once(store, f"invalid schedule request: {exc}", current.revision)
             return
+        self._last_invalid_detail = None
         with self.lock:
             known = self.db.execute("SELECT status, detail, revision FROM service_schedule_requests "
                                     "WHERE order_id=? AND request_id=?", (order, request_id)).fetchone()
@@ -655,6 +659,19 @@ class ServiceRuntime:
         if parent_revision != head[0]:
             raise ValueError(f"service checkpoint {revision[:12]} is not a child of the current lineage "
                              f"checkpoint {head[0][:12]}")
+
+    def require_resumable(self, *, checkpoint_n: int, repo: str, revision: str) -> None:
+        """Boot-time, read-only twin of ``ensure_checkpoint``: refuse a resume target that
+        ``ensure_checkpoint`` would refuse at the first window boundary (an ancestor of the lineage
+        head, or a revision outside the lineage that is not the order's root)."""
+        root = self.contract.to_dict()["checkpoint"]
+        with self.lock:
+            row = self.db.execute("SELECT sha256 FROM service_checkpoints WHERE revision=? AND order_id=?",
+                                  (revision, self.contract.sha256)).fetchone()
+        if row is None and (revision != root["revision"] or repo != root["repo"]):
+            raise ValueError("resume checkpoint has no adopted service lineage entry")
+        self.require_adoptable(checkpoint_n=checkpoint_n, repo=repo, revision=revision,
+                               sha256=root["sha256"] if row is None else row[0], parent_revision=None)
 
     def ensure_checkpoint(self, *, checkpoint_n: int, repo: str, revision: str) -> dict:
         """Re-select an adopted revision (restart), or adopt the order's root checkpoint."""
@@ -1436,29 +1453,3 @@ class ServiceRuntime:
     def admin_events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
         with self.lock:
             return self.log.admin_events(after=after, limit=limit)
-
-    # --- v1 entry points, removed. Callers not rewired yet fail closed with a clear message. ---
-    @staticmethod
-    def _unwired(name: str, task: str):
-        raise NotImplementedError(f"ServiceRuntime.{name} was removed with the v1 service runtime; "
-                                  f"this caller is wired in {task}")
-
-    @property
-    def view(self):
-        self._unwired("view", "Task 10 (validator), Task 12 (batcher) and Task 13 (server)")
-
-    @property
-    def row_ids(self):
-        self._unwired("row_ids", "Task 10 (validator) and Task 12 (batcher)")
-
-    def prepare_view(self, *args, **kwargs):
-        self._unwired("prepare_view", "Task 10 (validator)")
-
-    def training_pool(self, *args, **kwargs):
-        self._unwired("training_pool", "Task 10 (validator)")
-
-    def record_verified(self, *args, **kwargs):
-        self._unwired("record_verified", "Task 12 (batcher)")
-
-    def snapshot(self, *args, **kwargs):
-        self._unwired("snapshot", "Task 13 (server)")

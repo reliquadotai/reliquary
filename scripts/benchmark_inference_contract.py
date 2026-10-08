@@ -264,6 +264,8 @@ def pool_arg_errors(args) -> list[str]:
     """Problems with the pool-mode arguments (empty when fine)."""
     errors = []
     if args.seed_source != "pool":
+        if getattr(args, "pool_pick", None) is not None:
+            errors.append("--pool-pick is only valid with --seed-source pool (it would be silently ignored)")
         return errors
     if args.contract is None or not args.pool_env:
         errors.append("--seed-source pool needs --contract and --pool-env")

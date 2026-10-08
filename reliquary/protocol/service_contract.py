@@ -210,7 +210,7 @@ def _validate_v2(value: dict) -> None:
             raise ServiceContractError(f"{name}.dataset.id: canonical identifier required")
         _integer(dataset["rows"], f"{name}.dataset.rows", 1, 2**31)
         sampling = env["sampling"]
-        if not isinstance(sampling, dict) or sampling.get("kind") not in _V2_SAMPLING:
+        if not isinstance(sampling, dict) or not isinstance(sampling.get("kind"), str) or sampling["kind"] not in _V2_SAMPLING:
             raise ServiceContractError(f"{name}: unknown sampling policy")
         params = _V2_SAMPLING[sampling["kind"]]
         _object(sampling, {"kind", *params}, f"{name}.sampling")
@@ -231,7 +231,7 @@ def _validate_v2(value: dict) -> None:
     limits = _object(value["limits"], {"max_groups", "max_tokens", "deadline_seconds"}, "limits")
     for name, amount in limits.items():
         _integer(amount, f"limits.{name}")
-    if value["visibility"] not in {"private", "task"}:
+    if not isinstance(value["visibility"], str) or value["visibility"] not in {"private", "task"}:
         raise ServiceContractError("unknown visibility")
 
 
