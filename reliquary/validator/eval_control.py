@@ -752,32 +752,20 @@ def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
 
 
 class OrderArchives:
-    """The settler's archives for order tasks: written only under a task this
-    process wired and named order-eval- or order-gen- (RELIQUARY_TASK_ID lists
-    no order task: they are all wired hot)."""
+    """The guard on the settler's period archives for order tasks
+    (``R2PeriodArchives(guard=...)``): written only under a task this process
+    wired and named order-eval- or order-gen- (RELIQUARY_TASK_ID lists no order
+    task: they are all wired hot)."""
 
-    def __init__(self, *, served: Callable[[], Any], upload=None, other_max=None) -> None:
-        from reliquary.validator.corpus_settlement import R2Archives
-
+    def __init__(self, *, served: Callable[[], Any]) -> None:
         self._served = served
-        self._other_max = other_max or R2Archives().other_max
-        self._upload = upload
 
-    async def other_max(self, task_id: str) -> int | None:
-        return await self._other_max(task_id)
-
-    async def write(self, task_id: str, window: int, data: dict) -> None:
+    def refuse_unserved(self, task_id: str) -> None:
         from reliquary.eval.prompt_source import is_order_job_id
 
         if not is_order_job_id(task_id) or task_id not in set(self._served()):
             raise RuntimeError(f"task {task_id!r} is not an order task this process serves; "
                                "refusing to archive")
-        if self._upload is None:
-            from reliquary.infrastructure import storage
-
-            await storage.upload_window_dataset(window, data, task_id=task_id)
-        else:
-            await self._upload(window, data, task_id)
 
 
 EvalArchives = OrderArchives
@@ -1029,10 +1017,14 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         prompt_job_for_spec,
         renderer_for_job,
     )
-    from reliquary.validator.corpus_settlement import (
-        SETTLE_FULL_LIST_SECONDS, CorpusSettler, settler_fed,
+    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
+    from reliquary.validator.corpus_validator import (
+        WINDOW_SETTLED,
+        build_corpus_audit_wiring,
+        window_settled,
     )
-    from reliquary.validator.corpus_validator import build_corpus_audit_wiring
 
     tokenizers: dict[ModelKey, tuple[Any, int]] = {}
     served: dict[str, Any] = {}
@@ -1060,6 +1052,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         from reliquary.eval.prompt_source import is_eval_source
 
         refusal = order_job_refusal(entry, job)
+        if refusal is None and window_settled(entry):
+            refusal = WINDOW_SETTLED
         if refusal is None:
             declared = await order_jobs.read(job.job_id)
             record = None
@@ -1094,10 +1088,13 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
                             is_banned=is_banned, stats=JobStats())
-        w.settler = CorpusSettler(task_id=entry.task_id, job_id=job.job_id, cap=cap,
-                                  records=records, archives=settle_archives,
-                                  on_settled=w.stats.settled,
-                                  full_list_every_seconds=SETTLE_FULL_LIST_SECONDS)
+        # Paid by period, as every corpus task (design 2026-10-03): a period
+        # closes once the auditor holds nothing undecided received in it.
+        w.settler = CorpusPeriodSettler(
+            task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
+            archives=R2PeriodArchives(guard=settle_archives),
+            oldest_pending=lambda: w.auditor.oldest_pending_received_at(),
+            on_settled=w.stats.settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS)
         w.auditor = eval_auditor(
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,

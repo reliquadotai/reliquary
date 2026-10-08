@@ -53,7 +53,7 @@ def judge_socket(run_dir: str | Path, index: int) -> Path:
     return Path(run_dir) / f"judge-{index}.sock"
 
 
-def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
+def plan_groups(value: str | None, jobs, *, front_only=(), ignored=()) -> list[list[str]]:
     """The job ids of each judge process. ``jobs`` is ``(task_id, job_id)``
     pairs; ``value`` names jobs by job id or task id, ``,`` inside a group and
     ``;`` between groups; ``*`` gives every job no group names its own process.
@@ -62,7 +62,12 @@ def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
     ``front_only`` are the job ids the front must judge itself (episode jobs:
     their grader, grade dispatcher and grade routes live in the front, judge
     processes host none). ``*`` leaves them there; a group naming one is
-    refused."""
+    refused.
+
+    ``ignored`` are the task and job ids left out of this validator (window
+    settled, ``corpus_validator.period_served``): a group naming one drops it
+    with an ERROR rather than refusing the start, and an emptied group goes."""
+    ignored = {str(name) for name in ignored}
     front_only = {str(j) for j in front_only}
     value = "*" if value is None or not value.strip() else value
     by_name: dict[str, str] = {}
@@ -83,6 +88,10 @@ def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
         for name in names:
             if name == "*":
                 raise ValueError(f"{JUDGES_ENV}: '*' must be a group of its own")
+            if name not in by_name and name in ignored:
+                logger.error("%s names %r, which this validator left out (window settled); "
+                             "ignored", JUDGES_ENV, name)
+                continue
             if name not in by_name:
                 raise ValueError(f"{JUDGES_ENV} names {name!r}, which this validator does not serve "
                                  f"(it serves {sorted({str(j) for _, j in jobs})})")
@@ -96,7 +105,8 @@ def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
                                  "a job is judged in exactly one process")
             placed.add(job_id)
             group.append(job_id)
-        groups.append(group)
+        if group:
+            groups.append(group)
     if star:
         groups += [[str(job_id)] for _, job_id in jobs
                    if str(job_id) not in placed and str(job_id) not in front_only]
@@ -435,10 +445,16 @@ async def run_corpus_split(*, served, netuid: int, http_host: str, http_port: in
     if remote_audit:
         raise RuntimeError("remote audit executors are not served by the split validator; "
                            "unset RELIQUARY_CORPUS_REMOTE_AUDIT or RELIQUARY_CORPUS_SPLIT")
+    from reliquary.validator.corpus_validator import period_served
+
+    served, dropped = period_served(served)
+    if not served:
+        raise RuntimeError("no period-settled corpus task to serve")
     checked = await preflight(served)
     # Before any child starts: an episode job is judged and graded in the front.
     groups = plan_groups(os.environ.get(JUDGES_ENV), checked.jobs,
-                         front_only=checked.episode_jobs)
+                         front_only=checked.episode_jobs,
+                         ignored={str(n) for e in dropped for n in (e.task_id, e.job_id)})
     run_dir = os.environ.get(DIR_ENV) or DEFAULT_RUN_DIR
     spec = SplitSpec(served=list(served), directory=checked.directory,
                      fingerprint=checked.fingerprint, proof=checked.proof, run_dir=run_dir,

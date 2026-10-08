@@ -80,6 +80,10 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
         # Served by the order control alone, whatever its model: two processes
         # auditing and settling one job would pay its records twice.
         return screened
+    from reliquary.validator.corpus_validator import WINDOW_SETTLED, window_settled
+
+    if window_settled(entry):
+        return REFUSED, WINDOW_SETTLED
     if generation_only and getattr(job, "episode", None) is not None:
         return REFUSED, "the pinned generation control serves single-turn generation jobs"
     if generation_only and getattr(job, "submit", None) != "scoped":
@@ -182,12 +186,15 @@ class CorpusJobSet:
                  clock: Callable[[], float] = time.time,
                  screen: Callable[[Any], tuple[str, str] | None] | None = None,
                  on_unwired: Callable[[Any], None] | None = None,
-                 finals=None, wire_retired: bool = False) -> None:
+                 finals=None, wire_retired: bool = False, autoclose=None) -> None:
         # ``screen(entry)`` decides from the entry alone, before any manifest
         # read; ``on_unwired(wiring)`` releases what a drained job held.
         # ``finals`` (``read_final_status``/``write_final_status``) keeps a
         # drained job's status across restarts; with ``wire_retired`` a retired
         # entry not yet drained is wired again (admission closed) to finish.
+        # ``autoclose`` (``corpus_autoclose.AutoClose``) sets a finished job's
+        # task cap to 0, looked for from the same loop as the refresh.
+        self._autoclose = autoclose
         self._screen = screen
         self._on_unwired = on_unwired
         self._finals = finals
@@ -423,6 +430,33 @@ class CorpusJobSet:
                 logger.exception("corpus job %s: releasing its wiring failed", job_id)
         logger.info("corpus job %s drained and unwired", job_id)
 
+    async def job_finished(self, job_id: str) -> dict | None:
+        """The job's status if it is finished, else None: admitting (not
+        retired, not paused), full (every prompt's slots taken, or every eval
+        prompt complete), nothing still being admitted, graded or replayed,
+        and drained (every submission audited, every verdict settled, so every
+        period closed and its archive written). Cheap checks first: the drain
+        check lists the job's records."""
+        wiring = self.served.get(job_id)
+        if (wiring is None or self.is_retired(job_id) or job_id in self._routes.paused
+                or self._drained is None):
+            return None
+        status = await self._compute_status(job_id)
+        full = (status.get("complete") is True if "complete" in status
+                else int(status.get("prompts_full", 0)) >= int(status.get("prompts_total", 1)))
+        if not full or self._routes.admission_pending(job_id):
+            return None
+        grader = getattr(wiring, "grader", None)
+        if grader is not None:
+            try:
+                if grader.oldest_unready_received_at() is not None:
+                    return None
+            except LookupError:
+                return None  # cannot tell yet what is still graded or replayed
+        if not await self._drained(wiring) or self._routes.admission_pending(job_id):
+            return None
+        return status
+
     async def _stop_jobs(self, job_id: str) -> None:
         """Cancel this job once, and retain ownership until its workers exit."""
         tasks = self._tasks.get(job_id, ())
@@ -564,6 +598,11 @@ class CorpusJobSet:
             while True:
                 if self.refreshing:
                     await self.refresh()
+                if self._autoclose is not None:
+                    try:
+                        await self._autoclose.maybe_run(self)
+                    except Exception:
+                        logger.exception("corpus autoclose pass failed; retrying later")
                 done, _ = await asyncio.wait({self._failure}, timeout=self._refresh_every)
                 if done:
                     self._failure.result()

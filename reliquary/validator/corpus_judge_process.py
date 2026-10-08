@@ -107,8 +107,11 @@ async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, sock
         JUDGE_POOL_CONNECTIONS, settle_forever, wire_job_judge,
     )
 
+    from reliquary.validator.corpus_validator import period_served
+
     store = BucketJobStore()
     jobs = []
+    served, _ = period_served(served)
     for entry, cap in served:
         job, _ = await store.read_job(str(entry.job_id))
         if job is None:
