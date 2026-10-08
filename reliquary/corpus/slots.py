@@ -6,12 +6,66 @@ only the prompts actually consumed may cost memory.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 
 # An eval job reopens a prompt's slot when a submission fails its audit, up to
 # this many attempts per prompt in all (as a multiple of its slots).
 ATTEMPTS_PER_SLOT = 3
+
+
+# How `GET .../open` writes `SlotLedger.open_bitmap`: base64 of the bytes, row
+# `prompt_start + i` at byte `i >> 3`, mask `0x80 >> (i & 7)`.
+OPEN_ENCODING = "bitmap-msb0-base64"
+
+
+@dataclass(frozen=True)
+class OpenMap:
+    """A job's open prompts as the validator answered them (``parse_open_map``)."""
+
+    prompt_start: int
+    prompt_count: int
+    open_count: int
+    bitmap: bytes
+
+    def is_open(self, index: int) -> bool:
+        """Whether SOURCE row ``index`` still had a slot; False outside the job."""
+        offset = int(index) - self.prompt_start
+        if not 0 <= offset < self.prompt_count:
+            return False
+        return bool(self.bitmap[offset >> 3] & (0x80 >> (offset & 7)))
+
+    def indices(self) -> list[int]:
+        return [self.prompt_start + offset for offset in range(self.prompt_count)
+                if self.bitmap[offset >> 3] & (0x80 >> (offset & 7))]
+
+
+def parse_open_map(body) -> OpenMap:
+    """Read a `GET .../open` answer, or raise ``ValueError`` on one this
+    reader cannot trust (another encoding, a bitmap shorter than its count)."""
+    if not isinstance(body, Mapping):
+        raise ValueError("the open map is not an object")
+    if body.get("encoding") != OPEN_ENCODING:
+        raise ValueError(f"unknown open map encoding {body.get('encoding')!r}")
+    numbers = []
+    for name in ("prompt_start", "prompt_count", "open_count"):
+        value = body.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"open map {name} is not a count: {value!r}")
+        numbers.append(value)
+    start, count, opened = numbers
+    if count <= 0 or opened > count:
+        raise ValueError(f"open map counts {opened} open of {count}")
+    try:
+        bitmap = base64.b64decode(body.get("open"), validate=True)
+    except (binascii.Error, TypeError, ValueError) as exc:
+        raise ValueError(f"open map bitmap is not base64: {exc}") from exc
+    if len(bitmap) != -(-count // 8):
+        raise ValueError(f"open map bitmap is {len(bitmap)} bytes for {count} prompts")
+    return OpenMap(start, count, opened, bitmap)
 
 
 class SlotExhausted(Exception):
