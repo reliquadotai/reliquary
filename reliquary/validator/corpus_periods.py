@@ -37,8 +37,6 @@ REPLAY_DEPTH = 24
 # this many caps (each archive holding at most one cap), so it must not change
 # without every weight setter first.
 CATCHUP_ENTRIES = 4
-# A pay below this fraction of its cap counts as finished (``tasks close``).
-CLOSE_THRESHOLD = 0.001
 
 
 # The highest cap a period task was paid at, written to its entry's params when
@@ -134,7 +132,6 @@ def replay(archives: Iterable[Mapping], current_period: int, *,
 
 __all__ = [
     "CATCHUP_ENTRIES",
-    "CLOSE_THRESHOLD",
     "PERIOD_ALPHA",
     "PERIOD_EPOCH",
     "PERIOD_EMA_N",

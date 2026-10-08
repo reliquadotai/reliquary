@@ -242,6 +242,11 @@ reliquary jobs create \
   field, so the contract body, and the merge with other jobs, is unchanged.
 - `--min-new-tokens` at least 16. Never 1: the terminator counts, and 1 pays a
   slot for an empty completion (the parser refuses below 2).
+- Every corpus task is paid by its own 72-minute drand periods
+  (`settlement: period-ema-v1`, design `docs/design/2026-10-03-sft-period-clock-design.md`),
+  written into the entry by `jobs create`. The old settlement by RL window is
+  gone for corpus tasks: `--settlement windows` is refused, and
+  `--fleet-knows-period-settlement` is accepted and ignored.
 - The price is pinned: `floor == cap`, paid per verified token. The carried
   contract gets an enforced toploc proof (the deployed defaults); the corpus
   validator refuses a contract without one.
@@ -767,11 +772,12 @@ reliquary corpus status ... --json          # the route's JSON as is
   For scale: one completion per prefill audited about 1.5k completion
   tokens/s against about 470 tokens/s generated per miner (2026-09-24). This
   is a throughput figure, not an admission limit.
-- **Archives**: one per RL window at most, under
-  `reliquary/tasks/corpus-<name>/dataset/window-<N>.json.gz`, where `<N>` is
-  the RL task's latest index, never above it.
+- **Archives**: one per closed period of work, under
+  `reliquary/corpus-periods/corpus-<name>/<work period>-<entry period>.json.gz`;
+  each records the cap it was settled under (`cap`), which is what it pays up
+  to, whatever the task's cap is later.
 - **Settlement state**: `reliquary/corpus/jobs/<job>/settlement.json`
-  (`last_window`, `pending` must return to null).
+  (`last_entry`; `pending` must return to null).
 - **RL untouched**: the RL task's weights are unchanged except for the lowered
   cap.
 - **Refusals**: validator logs `corpus submission refused` reasons; a
@@ -807,39 +813,52 @@ data. The file is written beside `--out` and swapped in only once complete.
 
 ## 7. Stop
 
-Retiring the task (`jobs cancel`) is a boot gate: once the corpus validator
-stops it can never start again on this task. Anything accepted but not yet
-audited, or audited but not yet settled, at that moment is never paid. Drain
-first, with the corpus validator still running:
+**A finished job closes itself.** Once its job is full (every slot taken:
+miners get `job_complete` and stop by themselves) and drained (every
+submission audited, every verdict settled, nothing still admitted, graded or
+replayed, the last period archive written), the corpus validator sets the
+task's cap to 0 in the registry, once, and logs it:
 
-1. **Stop new work.** Either the job completes (every slot filled: miners get
-   `job_complete` and stop by themselves), or, for an early stop, close
-   `<port>` to miners at the firewall while leaving the validator process
-   running (the auditor and the settler do not use the port). Miners then only
-   retry; nothing new is accepted.
-2. **Wait for every submission to be audited:**
+```
+corpus task corpus-<name> closed automatically: job <job> is full (N/N prompts) and drained (...); cap 0.1 -> 0, its earned tail keeps being paid
+```
 
-   ```bash
-   reliquary jobs status <job>     # until unaudited=0
-   ```
+There is no `tasks set-cap --cap 0` to run by hand any more. The cap only
+prices periods still to be worked: the archives already written keep paying,
+each up to the cap it was settled under (the registry keeps the highest cap
+the task had as `tail_cap`), until the tail runs out (99 % within 14 periods,
+about 17 h; nothing after 24 periods past the last entry). Nothing new is paid
+at cap 0. The share is free in the registry rule at once: reassigning it while
+the tail still pays can push the sum of what is paid above the pool for up to
+~29 h, which the weight setter's global clamp absorbs by scaling every miner
+down. Prefer to reassign once the tail has run out.
 
-   At about 1.5k tokens/s a backlog clears at that rate; a count that stops
-   moving means the auditor is failing (check the validator log).
-3. **Wait for the settlement that pays them:**
+- A job whose admission is paused (`tasks pause`) is never closed
+  automatically. Set `RELIQUARY_CORPUS_AUTOCLOSE=0` on the corpus validator to
+  turn the automatic close off.
+- The task is **not retired** automatically: a retired task still named in a
+  corpus validator's `RELIQUARY_TASK_ID` stops that validator from starting.
+  Take it out of `RELIQUARY_TASK_ID` (and `RELIQUARY_CORPUS_SPLIT_JUDGES`, and
+  the merged contract) at the next restart, then retire it:
 
-   ```bash
-   reliquary jobs status <job>     # until unsettled=0 pending=none, i.e. "drained: yes"
-   ```
+  ```bash
+  reliquary jobs status <job>          # drained: yes
+  reliquary tasks close --task-id corpus-<name>
+  ```
 
-   While the RL task is live the settler writes at most one archive per RL
-   window (about 16 min); when every other task is idle it advances at most
-   once per 16 min. Expect up to one RL window of wait after step 2.
-4. **Stop the corpus validator**, then retire the task:
+  `tasks close` sets the cap to 0 (if it is not already) and retires the
+  task; it refuses while the job is not drained, and no longer waits for the
+  tail (`--cut-tail` is accepted and ignored).
+- A corpus task still declared with the old window settlement is left out by
+  the corpus validator with an ERROR (never a crash) and its window archives
+  are no longer paid: close it.
 
-   ```bash
-   reliquary jobs cancel --job-id <job> --retired-at <drand-round>
-   ```
+**An early stop** (before the job is full): close `<port>` to miners at the
+firewall while leaving the validator process running (the auditor and the
+settler do not use the port), or pause admission (`tasks pause`). Wait for
+`reliquary jobs status <job>` to say `drained: yes` (at about 1.5k tokens/s an
+audit backlog clears at that rate; a count that stops moving means the auditor
+is failing), then `tasks close`. Anything accepted but not yet audited, or
+audited but not yet settled, when the task is retired is never paid.
 
-The manifest stays for export, and the task's EMA decays by itself. Raise the
-RL cap back with `tasks set-cap` only once the corpus task's EMA tail has
-decayed (section 1.3).
+The manifest stays for export.
