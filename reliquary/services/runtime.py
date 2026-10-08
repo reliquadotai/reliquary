@@ -10,6 +10,7 @@ import time
 
 from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
 from reliquary.protocol.service_contract import ServiceContract, _identifier, _integer
+from reliquary.services.admission_policy import service_signal_admits, validate_submission_policy  # noqa: F401
 from reliquary.services.observations import observation_id, observation_signal, validate_observation
 
 
@@ -23,58 +24,6 @@ SERVICE_PAYMENT_POLICY = "service-budgeted-exploration/v1"
 
 class ServicePolicyLimit(ValueError):
     """A proven group is outside the ordered policy, so it earns no entitlement."""
-
-
-def validate_submission_policy(request, announcement: dict | None) -> ServiceContract | None:
-    """The server's active announcement, never the miner, chooses the policy."""
-    from reliquary.protocol.service_submission import ServiceBinding, validate_service_rollout_bindings
-    from reliquary.protocol.seed_pool import PoolSelection, pool_from_service_policy, validate_rollout_selection
-
-    binding = getattr(request, "service_binding", None)
-    selection = getattr(request, "pool_selection", None)
-    metadata = [r.commit.get("rollout") or {} for r in request.rollouts]
-    if any(not isinstance(row, dict) for row in metadata):
-        raise ValueError("invalid rollout metadata")
-    if announcement is None:
-        if (binding is not None or selection is not None
-                or any(row.get("service_binding") is not None or row.get("seed_pool") is not None for row in metadata)):
-            raise ValueError("service metadata requires an active service task")
-        return None
-    contract = ServiceContract.from_dict(announcement["contract"])
-    contract.require_capabilities(set(announcement["supported_capabilities"]))
-    contract.require_capabilities(set(SUPPORTED_SERVICE_CAPABILITIES))
-    if binding is None:
-        raise ValueError("service task requires a signed service binding")
-    intent = ServiceBinding.from_dict(binding)
-    if intent.contract_sha256 != contract.sha256:
-        raise ValueError("service contract revision mismatch")
-    validate_service_rollout_bindings(intent, [r.commit for r in request.rollouts])
-    value = contract.to_dict()
-    if request.checkpoint_hash != value["checkpoint"]["revision"]:
-        raise ValueError("service checkpoint mismatch")
-    if {r.env_name for r in request.rollouts} != {value["environment"]["id"]}:
-        raise ValueError("service environment mismatch")
-    sampling = value["policies"]["sampling"]
-    if sampling["kind"] == "public-group-pool/v1":
-        pool = pool_from_service_policy(announcement, prompt_idx=request.prompt_idx,
-                                        checkpoint_hash=request.checkpoint_hash)
-        validate_rollout_selection(pool, PoolSelection.from_dict(selection), [r.commit for r in request.rollouts])
-    elif selection is not None or any(row.get("seed_pool") is not None for row in metadata):
-        raise ValueError("pool metadata is not allowed by this contract")
-    if intent.purpose == "exploration" and value["policies"]["reward"]["kind"] != "exploration-discount/v1":
-        raise ValueError("exploration is not enabled")
-    return contract
-
-
-def service_signal_admits(request, contract: ServiceContract, rewards: list[float], *, uncertain: bool = False) -> bool:
-    from reliquary.services.scoring import classify_signal
-    if uncertain:
-        return False
-    signal = classify_signal([round(r * 10000) / 10000 for r in rewards], expected=len(request.rollouts),
-                            sigma_min_bps=contract.to_dict()["scoring"]["sigma_min_bps"])
-    if request.service_binding["purpose"] == "training":
-        return signal.in_zone
-    return signal.category in {"uniform-low", "uniform-high", "uniform-intermediate"}
 
 
 class ServiceRuntime:

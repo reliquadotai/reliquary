@@ -9,11 +9,11 @@ from typing import Any, Mapping
 from reliquary.protocol.release_contract import canonical_json_bytes
 from reliquary.protocol.service_contract import ServiceContract
 
-POOL_SCHEMA = "public-group-pool/v1"
+POOL_SCHEMA = "public-group-pool/v2"
 SELECTION_SCHEMA = "public-group-selection/v1"
 ROLLOUT_SCHEMA = "public-group-rollout/v1"
 CAPABILITY = "public-group-pool/v1"
-DRAW_DOMAIN = b"public-group-draw/v1"
+DRAW_DOMAIN = b"public-group-draw/v2"
 PROOF_VERSION = "public-group-proof/v1"
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -66,28 +66,33 @@ def parse_rollout_binding(value: Any) -> tuple[PoolSelection, int]:
     return selection, index
 
 
-def pool_from_service_policy(value: Any, *, prompt_idx: int,
+_ANNOUNCEMENT_FIELDS = {"contract", "schedule", "checkpoint", "supported_capabilities", "pool_epoch", "pool_randomness"}
+
+
+def pool_from_service_policy(value: Any, *, environment: str, prompt_idx: int,
                              checkpoint_hash: str) -> SeedPool | None:
-    """Resolve the exact operator announcement, refusing unsupported policies."""
+    """Resolve the exact operator announcement for one env, refusing unsupported policies."""
     if value is None:
         return None
     if hasattr(value, "model_dump"):
         value = value.model_dump()
-    if not isinstance(value, dict) or set(value) != {"contract", "supported_capabilities", "pool_epoch", "pool_randomness"}:
+    if not isinstance(value, dict) or set(value) != _ANNOUNCEMENT_FIELDS:
         raise SeedPoolError("invalid service policy announcement")
     contract = ServiceContract.from_dict(value["contract"])
+    if contract.version != 2:
+        raise SeedPoolError("only service-contract/v2 announces public pools")
     supported = value["supported_capabilities"]
     if not isinstance(supported, list) or not 1 <= len(supported) <= 32 or any(not isinstance(x, str) or not 1 <= len(x) <= 256 for x in supported):
         raise SeedPoolError("bounded service capabilities required")
     contract.require_capabilities(set(supported))
-    policy = contract.to_dict()["policies"]["sampling"]
+    policy = contract.environment(environment)["sampling"]
     if policy["kind"] == "legacy/v1":
         return None
     if policy["kind"] != CAPABILITY:
         raise SeedPoolError("sampling policy is not implemented by this miner")
-    return SeedPool.from_contract(contract, prompt_idx=prompt_idx,
-                                  checkpoint_hash=checkpoint_hash,
-                                  pool_epoch=value["pool_epoch"], randomness=value["pool_randomness"])
+    return SeedPool.from_contract(contract, environment=environment, prompt_idx=prompt_idx,
+                                  checkpoint_hash=checkpoint_hash, pool_epoch=value["pool_epoch"],
+                                  randomness=value["pool_randomness"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +105,7 @@ class SeedPool:
     immutable manifest and validation compares its digest to the active one.
     """
     service_contract_sha256: str
-    context_sha256: str
+    environment: str
     prompt_idx: int
     checkpoint_hash: str
     pool_epoch: int
@@ -112,7 +117,8 @@ class SeedPool:
 
     def __post_init__(self) -> None:
         _sha(self.service_contract_sha256, "service_contract_sha256")
-        _sha(self.context_sha256, "context_sha256")
+        if not isinstance(self.environment, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_]{0,63}", self.environment):
+            raise SeedPoolError("environment: canonical environment id required")
         _integer(self.prompt_idx, "prompt_idx", 0, 2**53 - 1)
         if not isinstance(self.checkpoint_hash, str) or not 1 <= len(self.checkpoint_hash.encode()) <= 256:
             raise SeedPoolError("checkpoint_hash: nonempty bounded identity required")
@@ -124,18 +130,17 @@ class SeedPool:
         object.__setattr__(self, "_digest", hashlib.sha256(canonical_json_bytes(self.to_dict())).digest())
 
     @classmethod
-    def from_contract(cls, contract: ServiceContract, *, prompt_idx: int,
+    def from_contract(cls, contract: ServiceContract, *, environment: str, prompt_idx: int,
                       checkpoint_hash: str, pool_epoch: int, randomness: str) -> SeedPool:
-        policy = contract.to_dict()["policies"]["sampling"]
+        policy = contract.environment(environment)["sampling"]
         if policy["kind"] != CAPABILITY:
             raise SeedPoolError("only public-group-pool/v1 is supported")
-        return cls(contract.sha256, contract.context_sha256, prompt_idx,
-                   checkpoint_hash, pool_epoch, randomness, policy["group_size"],
-                   policy["pool_groups"], policy["renewal_windows"])
+        return cls(contract.sha256, environment, prompt_idx, checkpoint_hash, pool_epoch, randomness,
+                   policy["group_size"], policy["pool_groups"], policy["renewal_windows"])
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SeedPool:
-        names = {"service_contract_sha256", "context_sha256", "prompt_idx", "checkpoint_hash",
+        names = {"service_contract_sha256", "environment", "prompt_idx", "checkpoint_hash",
                  "pool_epoch", "randomness", "group_size", "pool_groups", "renewal_windows"}
         if not isinstance(value, dict) or set(value) != {"schema", *names} or value["schema"] != POOL_SCHEMA:
             raise SeedPoolError("unknown public group pool")
@@ -143,7 +148,7 @@ class SeedPool:
 
     def to_dict(self) -> dict:
         return {"schema": POOL_SCHEMA, "service_contract_sha256": self.service_contract_sha256,
-                "context_sha256": self.context_sha256, "prompt_idx": self.prompt_idx,
+                "environment": self.environment, "prompt_idx": self.prompt_idx,
                 "checkpoint_hash": self.checkpoint_hash, "pool_epoch": self.pool_epoch,
                 "randomness": self.randomness, "group_size": self.group_size,
                 "pool_groups": self.pool_groups, "renewal_windows": self.renewal_windows}

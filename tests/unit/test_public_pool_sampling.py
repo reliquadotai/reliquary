@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,23 +10,15 @@ from reliquary.miner.engine import MiningEngine
 from reliquary.miner.forced_seed_sampler import ForcedSeedLogitsProcessor
 from reliquary.miner.vllm_generation import ForcedSeedVLLMProcessor, forced_seed_extra_args
 from reliquary.protocol.seed_pool import SeedPool
-from reliquary.protocol.service_contract import ServiceContract
+from tests.unit.service_v2_fixtures import MATH, contract_v2
 
 
 def _contract(exploration=False):
-    value = json.loads((Path(__file__).parents[1] / "fixtures/service_contract_v1.json").read_text())
-    value["policies"]["sampling"] = {"kind": "public-group-pool/v1", "group_size": M_ROLLOUTS,
-                                     "pool_groups": 3, "renewal_windows": 2}
-    if exploration:
-        value["service_kind"] = "adaptive_training"
-        value["policies"]["checkpoint"] = {"kind": "trainer-driven/v1", "task_scoped": 1}
-        value["policies"]["reward"] = {"kind": "exploration-discount/v1", "divisor": 4,
-                                       "budget_bps": 1000, "refresh_windows": 2, "max_tokens_per_group": 1000000}
-    return ServiceContract.from_dict(value)
+    return contract_v2(pool_groups=3, exploration=1 if exploration else 0)
 
 
 def _pool():
-    return SeedPool.from_contract(_contract(), prompt_idx=7, checkpoint_hash="d" * 40,
+    return SeedPool.from_contract(_contract(), environment=MATH, prompt_idx=7, checkpoint_hash="d" * 40,
                                   pool_epoch=3, randomness="ab" * 32)
 
 
@@ -110,7 +100,7 @@ def test_cherry_pick_keeps_complete_group_and_original_candidate_ids():
                                             ([0.0, 1.0] * (M_ROLLOUTS // 2), "training")])
 def test_service_purpose_distinguishes_uniform_from_diverse_below_threshold(rewards, purpose):
     engine = _engine()
-    env = SimpleNamespace(compute_reward=lambda problem, text: float(text))
+    env = SimpleNamespace(name=MATH, compute_reward=lambda problem, text: float(text))
     generations = [{"tokens": [99, r], "prompt_length": 1} for r in rewards]
     result = engine._service_submission_binding({"contract": _contract(exploration=True).to_dict()},
                                                  generations, {}, env)
@@ -121,7 +111,7 @@ def test_service_purpose_distinguishes_uniform_from_diverse_below_threshold(rewa
 
 def test_unknown_reward_is_never_marked_exploration():
     engine = _engine()
-    env = SimpleNamespace(compute_reward=lambda problem, text: None)
+    env = SimpleNamespace(name=MATH, compute_reward=lambda problem, text: None)
     result = engine._service_submission_binding({"contract": _contract(exploration=True).to_dict()},
                                                  [{"tokens": [99, 0], "prompt_length": 1}] * M_ROLLOUTS, {}, env)
     assert result["purpose"] == "training"

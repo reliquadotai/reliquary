@@ -1782,9 +1782,10 @@ class GrpoWindowBatcher:
         )
         if self.service_policy is not None:
             from reliquary.protocol.service_contract import ServiceContract
-            from reliquary.services.runtime import service_signal_admits
+            from reliquary.services.admission_policy import service_signal_admits
             eligible = service_signal_admits(pending.request, ServiceContract.from_dict(self.service_policy["contract"]),
-                pending.rewards, uncertain=bool(pending.truncated_count or truncated_indices or pending.unboxed_count))
+                pending.rewards,
+                uncertain_indices=tuple(truncated_indices) + ((0,) if (pending.truncated_count or pending.unboxed_count) else ()))
         else:
             eligible = robust_utility_admits(
                 pending.rewards,
@@ -3819,7 +3820,7 @@ class GrpoWindowBatcher:
                 RejectReason.GENERATION_CONTRACT_MISMATCH,
                 "generation_contract",
             )
-        from reliquary.services.runtime import validate_submission_policy
+        from reliquary.services.admission_policy import validate_submission_policy
         try:
             validate_submission_policy(request, self.service_policy)
         except (ValueError, TypeError, KeyError):
@@ -4132,7 +4133,7 @@ class GrpoWindowBatcher:
                 **kwargs,
             )
 
-        from reliquary.services.runtime import validate_submission_policy
+        from reliquary.services.admission_policy import validate_submission_policy
         try:
             service_contract = validate_submission_policy(request, self.service_policy)
         except (ValueError, TypeError, KeyError):
@@ -4402,8 +4403,9 @@ class GrpoWindowBatcher:
             else is_in_zone(sigma, bootstrap=self.bootstrap)
         )
         if service_contract is not None:
-            from reliquary.services.runtime import service_signal_admits
-            in_zone = service_signal_admits(request, service_contract, rewards, uncertain=bool(unboxed_indices))
+            from reliquary.services.admission_policy import service_signal_admits
+            in_zone = service_signal_admits(request, service_contract, rewards,
+                                             uncertain_indices=tuple(unboxed_indices))
         if not in_zone:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
@@ -4718,7 +4720,7 @@ class GrpoWindowBatcher:
             )
             return None
 
-        from reliquary.services.runtime import validate_submission_policy
+        from reliquary.services.admission_policy import validate_submission_policy
         try:
             service_contract = validate_submission_policy(request, self.service_policy)
         except (ValueError, TypeError, KeyError):
@@ -4856,7 +4858,8 @@ class GrpoWindowBatcher:
             positions = policy_token_positions(list(commit.get("tokens") or []), commit.get("rollout") or {})
             if self.service_policy is not None and request.pool_selection is not None:
                 from reliquary.protocol.seed_pool import PoolSelection, pool_from_service_policy
-                pool = pool_from_service_policy(self.service_policy, prompt_idx=request.prompt_idx, checkpoint_hash=request.checkpoint_hash)
+                pool = pool_from_service_policy(self.service_policy, environment=request.rollouts[0].env_name,
+                                                prompt_idx=request.prompt_idx, checkpoint_hash=request.checkpoint_hash)
                 selection = PoolSelection.from_dict(request.pool_selection)
                 pool.validate_selection(selection, rollout_count=len(request.rollouts))
                 return [pool.uniform(selection.candidate_id, index, j) for j in range(len(positions))]
@@ -6053,7 +6056,7 @@ class GrpoWindowBatcher:
 
     def _record_service_proof(self, pending, verified) -> dict:
         from reliquary.protocol.release_contract import canonical_sha256
-        from reliquary.services.runtime import validate_submission_policy
+        from reliquary.services.admission_policy import validate_submission_policy
         contract = validate_submission_policy(pending.request, self.service_policy)
         if contract is None or contract.sha256 != self.service_runtime.contract.sha256:
             raise ValueError("proof service context no longer active")

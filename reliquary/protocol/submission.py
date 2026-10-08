@@ -414,6 +414,8 @@ class FillClosedWindowState(BaseModel):
 class ServicePolicyAnnouncement(BaseModel):
     model_config = ConfigDict(extra="forbid")
     contract: dict[str, Any]
+    schedule: dict[str, Any]
+    checkpoint: dict[str, Any]
     supported_capabilities: list[str] = Field(..., min_length=1, max_length=32)
     pool_epoch: int = Field(..., ge=0, le=2**53 - 1, strict=True)
     pool_randomness: str = Field(..., pattern=r"^(?:[0-9a-f]{64})?$", max_length=64)
@@ -421,11 +423,17 @@ class ServicePolicyAnnouncement(BaseModel):
     @model_validator(mode="after")
     def _validate_contract_capabilities(self):
         from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_schedule import ServiceSchedule
         contract = ServiceContract.from_dict(self.contract)
+        if contract.version != 2:
+            raise ValueError("RL announcements carry service-contract/v2")
         if any(not 1 <= len(capability) <= 256 for capability in self.supported_capabilities):
             raise ValueError("bounded capabilities required")
         contract.require_capabilities(set(self.supported_capabilities))
-        if contract.to_dict()["policies"]["sampling"]["kind"] == "public-group-pool/v1" and not self.pool_randomness:
+        ServiceSchedule.from_dict(self.schedule, contract)
+        if set(self.checkpoint) != {"checkpoint_n", "repo", "revision", "sha256"}:
+            raise ValueError("announcement checkpoint fields are fixed")
+        if any(env["sampling"]["kind"] == "public-group-pool/v1" for env in contract.environments.values()) and not self.pool_randomness:
             raise ValueError("public pool requires its authoritative beacon")
         return self
 

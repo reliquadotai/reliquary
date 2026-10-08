@@ -1,6 +1,4 @@
 from dataclasses import replace
-import json
-from pathlib import Path
 import time
 from types import SimpleNamespace
 
@@ -14,24 +12,32 @@ from reliquary.protocol.seed_pool import SeedPool
 from reliquary.protocol.service_contract import ServiceContract
 from reliquary.protocol.service_submission import ServiceBinding
 from reliquary.protocol.submission import BatchSubmissionRequest, RejectReason, RolloutSubmission
-from reliquary.services.runtime import SUPPORTED_SERVICE_CAPABILITIES, validate_submission_policy
+from reliquary.protocol.service_contract import SUPPORTED_V2_CAPABILITIES
+from reliquary.protocol.service_schedule import initial_schedule
+from reliquary.services.admission_policy import validate_submission_policy
+from tests.unit.service_v2_fixtures import CODE, contract_v2_dict
 from reliquary.validator.admission import (
     AdmissionContext, AdmissionReceiptBinding, AdmissionRuntimeMaterials,
     parse_and_validate_submission, score_and_finalize_submission,
 )
 
 
+OMI = "openmathinstruct"
+
+
 def _contract(pool=True):
-    value = json.loads((Path(__file__).parents[1] / "fixtures/service_contract_v1.json").read_text())
-    value["service_kind"] = "adaptive_training"
-    value["environment"]["id"] = "openmathinstruct"
-    value["policies"]["checkpoint"] = {"kind": "trainer-driven/v1", "task_scoped": 1}
-    value["policies"]["reward"] = {"kind": "exploration-discount/v1", "divisor": 4,
-                                   "budget_bps": 1000, "refresh_windows": 2, "max_tokens_per_group": 1000000}
-    if pool:
-        value["policies"]["sampling"] = {"kind": "public-group-pool/v1", "group_size": M_ROLLOUTS,
-                                         "pool_groups": 3, "renewal_windows": 2}
+    value = contract_v2_dict(envs=(OMI, CODE), pool_groups=3, missing_box="uncertain")
+    if not pool:
+        for env in value["environments"].values():
+            env["sampling"] = {"kind": "legacy/v1"}
     return ServiceContract.from_dict(value)
+
+
+def _announcement(contract, **changes):
+    return {"contract": contract.to_dict(), "schedule": initial_schedule(contract).to_dict(),
+            "checkpoint": {"checkpoint_n": 3, "repo": "models/test", "revision": "d" * 40, "sha256": "e" * 64},
+            "supported_capabilities": sorted(SUPPORTED_V2_CAPABILITIES),
+            "pool_epoch": 5, "pool_randomness": "ab" * 32, **changes}
 
 
 @pytest.fixture
@@ -41,9 +47,8 @@ def signed_request(monkeypatch):
     wallet = SimpleNamespace(hotkey=key)
     def make(*, pool=True, purpose="exploration", legacy=False):
         contract = _contract(pool)
-        announcement = {"contract": contract.to_dict(), "supported_capabilities": sorted(SUPPORTED_SERVICE_CAPABILITIES),
-                        "pool_epoch": 5, "pool_randomness": "ab" * 32}
-        seed_pool = SeedPool.from_contract(contract, prompt_idx=7, checkpoint_hash="d" * 40,
+        announcement = _announcement(contract)
+        seed_pool = SeedPool.from_contract(contract, environment=OMI, prompt_idx=7, checkpoint_hash="d" * 40,
                                           pool_epoch=5, randomness="ab" * 32) if pool and not legacy else None
         intent = ServiceBinding(contract.sha256, purpose)
         rollouts = []
@@ -252,16 +257,14 @@ def test_legacy_sampling_contract_cannot_accept_hidden_pool_metadata(signed_requ
 
 
 def test_announced_capability_cannot_enable_unsupported_draw_variant(signed_request):
+    from reliquary.protocol.service_contract import ServiceContractError
+
     request, announcement, _ = signed_request(pool=False)
     value = announcement["contract"]
-    value["policies"]["sampling"] = {"kind": "public-draw-pool/v1", "group_size": M_ROLLOUTS,
-                                     "pool_draws": M_ROLLOUTS + 1, "renewal_windows": 2}
-    contract = ServiceContract.from_dict(value)
-    request.service_binding = ServiceBinding(contract.sha256, "exploration").to_dict()
-    for index, rollout in enumerate(request.rollouts):
-        rollout.commit["rollout"]["service_binding"] = ServiceBinding(contract.sha256, "exploration").rollout_binding(index)
+    value["environments"][OMI]["sampling"] = {"kind": "public-draw-pool/v1", "group_size": M_ROLLOUTS,
+                                              "pool_draws": M_ROLLOUTS + 1, "renewal_windows": 2}
     announcement["supported_capabilities"].append("public-draw-pool/v1")
-    with pytest.raises(ValueError, match="runtime lacks capabilities"):
+    with pytest.raises(ServiceContractError):
         validate_submission_policy(request, announcement)
 
 

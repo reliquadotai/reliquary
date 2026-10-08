@@ -1,7 +1,4 @@
 import copy
-import json
-from pathlib import Path
-
 import pytest
 
 from reliquary.constants import M_ROLLOUTS
@@ -9,18 +6,17 @@ from reliquary.protocol.seed_pool import (
     PoolSelection, SeedPool, SeedPoolError, pool_from_service_policy,
     validate_rollout_selection,
 )
-from reliquary.protocol.service_contract import ServiceContract
+from reliquary.protocol.service_contract import SUPPORTED_V2_CAPABILITIES, ServiceContract
+from reliquary.protocol.service_schedule import initial_schedule
+from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2
 
 
-def _contract():
-    value = json.loads((Path(__file__).parents[1] / "fixtures/service_contract_v1.json").read_text())
-    value["policies"]["sampling"] = {"kind": "public-group-pool/v1", "group_size": M_ROLLOUTS,
-                                     "pool_groups": 3, "renewal_windows": 2}
-    return ServiceContract.from_dict(value)
+def _contract(**kw):
+    return contract_v2(pool_groups=3, **kw)
 
 
 def _pool(**changes):
-    context = {"prompt_idx": 7, "checkpoint_hash": "d" * 40, "pool_epoch": 3,
+    context = {"environment": MATH, "prompt_idx": 7, "checkpoint_hash": "d" * 40, "pool_epoch": 3,
                "randomness": "ab" * 32, **changes}
     return SeedPool.from_contract(_contract(), **context)
 
@@ -40,7 +36,7 @@ def test_public_identity_is_immutable_bounded_and_round_trips():
             pool.uniform(*args)
 
 
-@pytest.mark.parametrize("change", [{"prompt_idx": 8}, {"checkpoint_hash": "e" * 40},
+@pytest.mark.parametrize("change", [{"environment": CODE}, {"prompt_idx": 8}, {"checkpoint_hash": "e" * 40},
                                    {"pool_epoch": 4}, {"randomness": "cd" * 32}])
 def test_draws_are_bound_to_authoritative_context(change):
     assert _pool().sha256 != _pool(**change).sha256
@@ -69,22 +65,19 @@ def test_one_complete_candidate_retains_original_rollout_indices():
 
 def test_pool_resolution_requires_server_announcement_and_capabilities():
     contract = _contract()
-    capabilities = ["environment-reward/v1", "public-group-pool/v1", "all/v1", "static/v1", "frozen/v1", "legacy/v1"]
-    announcement = {"contract": contract.to_dict(), "supported_capabilities": capabilities,
-                    "pool_epoch": 3, "pool_randomness": "ab" * 32}
-    assert pool_from_service_policy(announcement, prompt_idx=7, checkpoint_hash="d" * 40) == _pool()
-    assert pool_from_service_policy(None, prompt_idx=7, checkpoint_hash="d" * 40) is None
+    capabilities = sorted(SUPPORTED_V2_CAPABILITIES)
+    announcement = {"contract": contract.to_dict(), "schedule": initial_schedule(contract).to_dict(),
+                    "checkpoint": {"checkpoint_n": 3, "repo": "models/test", "revision": "d" * 40, "sha256": "e" * 64},
+                    "supported_capabilities": capabilities, "pool_epoch": 3, "pool_randomness": "ab" * 32}
+    kw = {"environment": MATH, "prompt_idx": 7, "checkpoint_hash": "d" * 40}
+    assert pool_from_service_policy(announcement, **kw) == _pool()
+    assert pool_from_service_policy(None, **kw) is None
+    assert pool_from_service_policy(announcement, **{**kw, "environment": CODE}).environment == CODE
     invalid = {**announcement, "supported_capabilities": ["legacy/v1"]}
     with pytest.raises(ValueError):
-        pool_from_service_policy(invalid, prompt_idx=7, checkpoint_hash="d" * 40)
+        pool_from_service_policy(invalid, **kw)
     invalid = {**announcement, "pool_randomness": ""}
     with pytest.raises(SeedPoolError):
-        pool_from_service_policy(invalid, prompt_idx=7, checkpoint_hash="d" * 40)
-    draw_contract = contract.to_dict()
-    draw_contract["policies"]["sampling"] = {"kind": "public-draw-pool/v1", "group_size": M_ROLLOUTS,
-                                             "pool_draws": M_ROLLOUTS + 1, "renewal_windows": 2}
-    draw = ServiceContract.from_dict(draw_contract)
-    with pytest.raises(SeedPoolError, match="not implemented"):
-        pool_from_service_policy({**announcement, "contract": draw.to_dict(),
-                                  "supported_capabilities": [*capabilities, "public-draw-pool/v1"]},
-                                 prompt_idx=7, checkpoint_hash="d" * 40)
+        pool_from_service_policy(invalid, **kw)
+    with pytest.raises(SeedPoolError):
+        pool_from_service_policy({**announcement, "extra": 1}, **kw)

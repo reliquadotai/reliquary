@@ -971,8 +971,9 @@ class MiningEngine:
                 service_policy = getattr(state, "service_policy", None)
                 policy_value = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
                 from reliquary.protocol.seed_pool import pool_from_service_policy
+                from reliquary.constants import max_new_tokens_for_environment
                 seed_pool = pool_from_service_policy(
-                    service_policy,
+                    service_policy, environment=env_name,
                     prompt_idx=prompt_idx, checkpoint_hash=local_hash,
                 )
                 if environment_spec.interaction_mode == "episode":
@@ -990,7 +991,8 @@ class MiningEngine:
                     generations = self._generate_public_pool_rollouts(
                         problem, randomness, env=env, prompt_idx=prompt_idx,
                         checkpoint_hash=local_hash, seed_pool=seed_pool,
-                        max_exploration_tokens=policy_value["contract"]["limits"]["max_tokens"],
+                        max_exploration_tokens=(seed_pool.pool_groups * seed_pool.group_size
+                                            * max_new_tokens_for_environment(env.name)),
                     )
                 else:
                     generations = self._generate_m_rollouts(
@@ -1466,7 +1468,7 @@ class MiningEngine:
         signal = classify_signal(rewards, expected=M_ROLLOUTS,
                                  sigma_min_bps=value["scoring"]["sigma_min_bps"])
         purpose = "training"
-        if (value["policies"]["reward"]["kind"] == "exploration-discount/v1"
+        if (contract.environment(env.name)["exploration"] == 1
                 and signal.category in ("uniform-low", "uniform-high", "uniform-intermediate")):
             purpose = "exploration"
         return ServiceBinding(contract.sha256, purpose).to_dict()

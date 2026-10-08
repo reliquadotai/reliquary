@@ -624,7 +624,7 @@ def parse_and_validate_submission(
                     body_parse_ms=parse_ms,
                     preparation_started=started,
                 )
-            from reliquary.services.runtime import validate_submission_policy
+            from reliquary.services.admission_policy import validate_submission_policy
             try:
                 validate_submission_policy(request, context.service_policy)
             except (ValueError, TypeError, KeyError):
@@ -1155,10 +1155,10 @@ def score_and_finalize_submission(
                 else _in_zone(rewards, bootstrap=context.bootstrap)
             )
             if context.service_policy is not None:
-                from reliquary.services.runtime import service_signal_admits
+                from reliquary.services.admission_policy import service_signal_admits
                 from reliquary.protocol.service_contract import ServiceContract
                 in_zone = service_signal_admits(request, ServiceContract.from_dict(context.service_policy["contract"]),
-                                               rewards, uncertain=bool(uncertain_indices))
+                                               rewards, uncertain_indices=tuple(uncertain_indices))
             if not in_zone:
                 return result(
                     request=request,
