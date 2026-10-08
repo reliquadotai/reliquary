@@ -204,6 +204,9 @@ class GradeEvaluation(BaseModel):
             from reliquary.protocol.service_contract import ServiceContract
             ServiceContract.from_dict(self.service_contract)
         if self.source == "uploads":
+            if self.service_contract is not None:
+                raise ValueError("uploaded completions cannot be verified against a service contract: "
+                                 "their checkpoint and generation contract come from the same caller")
             if self.job_id is not None or not self.completion_keys:
                 raise ValueError("an uploads grading names completion_keys and no job_id")
             if self.provenance is None:

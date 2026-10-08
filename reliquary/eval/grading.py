@@ -449,7 +449,24 @@ async def collect_job_records(job, records, *, concurrency: int = READ_CONCURREN
               "audited": sum(1 for v in verdicts if v.get("audited")),
               "samples_by_prompt": dict(samples)}
     if include_generation_status:
-        result["generation_verified"] = bool(passing) and all(v.get("audited") is True for _, v, record in read if record is not None)
+        # A verdict with no ``audited`` key predates sampled audits: it counts as audited.
+        def audited(v):
+            return v.get("audited", True) is True
+
+        passed = [v for _, v, record in read if record is not None]
+        contributing = {v.get("hotkey") for v in passed}
+        tainted = {v.get("hotkey") for _, v, _ in read
+                   if v and ((not v.get("passed") and audited(v)) or v.get("reason") == "banned")}
+        if passed and all(audited(v) for v in passed):
+            status = "verified"
+        elif passed and not (contributing & tainted):
+            status = "sampled"
+        else:
+            status = "unverified"
+        # R11: only fully audited records prove generation. "sampled" (passing, not all audited,
+        # no contributing hotkey failed) is reported but does NOT count as verified.
+        result["generation_status"] = status
+        result["generation_verified"] = status == "verified"
     return result
 
 
@@ -488,6 +505,8 @@ class JobRows:
         self.verdicts = collected["verdicts"]
         self.audited = collected["audited"]
         self.generation_verified = collected.get("generation_verified") is True
+        self.generation_status = collected.get("generation_status",
+                                               "verified" if self.generation_verified else "unverified")
 
     async def __aiter__(self):
         from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
@@ -656,7 +675,8 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
         if service_contract is not None:
             from reliquary.services.mapping import export_grading_mapping
             output_paths += export_grading_mapping(directory, service_contract, sets, report,
-                                                   generation_verified=job_rows is not None and job_rows.generation_verified)
+                                                   generation_verified=job_rows is not None and job_rows.generation_verified,
+                                                   generation_audit=("sampled" if job_rows is not None and job_rows.generation_status == "sampled" else "full"))
         for path in output_paths:
             key = f"{prefix}/{path.name}"
             # Hashed before the upload, from the bytes uploaded.

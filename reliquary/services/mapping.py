@@ -42,7 +42,7 @@ def validate_grading_context(contract: ServiceContract, sets: dict, provenance: 
 
 
 def export_grading_mapping(directory: Path, contract: ServiceContract, sets: dict, report: dict,
-                           *, generation_verified: bool) -> list[Path]:
+                           *, generation_verified: bool, generation_audit: str = "full") -> list[Path]:
     import pyarrow.parquet as pq
 
     validate_grading_context(contract, sets, report["provenance"])
@@ -69,6 +69,7 @@ def export_grading_mapping(directory: Path, contract: ServiceContract, sets: dic
         })
     manifest = export_mapping(directory, contract, observations, expected_rows=len(sets[set_id][1]),
                               group_semantics="evaluation-samples-per-problem")
+    manifest["generation_audit"] = generation_audit
     manifest["provenance"] = {"source_kind": "evaluation-grading", "graded_sha256": source_digest,
                               "rl_group_comparable": False}
     (directory / "mapping-manifest.json").write_bytes(canonical_json_bytes(manifest))
