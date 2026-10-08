@@ -48,6 +48,8 @@ _MAX_CONSECUTIVE_FAILURES = 5
 # outage (503), and a proxy in front of the validator timing out or losing it
 # (502/504). A short outage must not count toward the permanent-failure halt.
 TRANSIENT_STATUSES = frozenset({502, 503, 504})
+# How long the read of a job's open prompts may take.
+OPEN_READ_TIMEOUT_SECONDS = 15.0
 
 
 class CorpusTransientFailure(Exception):
@@ -216,13 +218,22 @@ class HttpCorpusClient:
         """Step over a full prompt, or None from a validator without the route."""
         return _unless_absent(lambda: self._http.post(self._path("skip"), json=body))
 
+    def open_prompts(self) -> dict | None:
+        """Which prompts still have a slot (``slots.parse_open_map`` reads it),
+        or None from a validator without the route (404, 405) or a job too
+        large for a map (409). Its own short timeout: it is an optimisation,
+        and must not hold an episode back as long as a submit may take."""
+        return _unless_absent(
+            lambda: self._http.get(self._path("open"), timeout=OPEN_READ_TIMEOUT_SECONDS),
+            absent=(404, 405, 409))
 
-def _unless_absent(request_call):
+
+def _unless_absent(request_call, *, absent=(404, 409)):
     try:
         return issue_corpus_request(request_call)
     except CorpusPermanentFailure as exc:
         # 404: a validator from before the routes. 409: a job with no walk.
-        if exc.status in (404, 409):
+        if exc.status in absent:
             return None
         raise
 

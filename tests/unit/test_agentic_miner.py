@@ -390,3 +390,179 @@ def test_a_miner_on_non_xfs_docker_storage_is_warned_not_refused():
                                                      "(/var/lib/docker), not xfs")
     assert "ext2/ext3" in warning and "tolerance" in warning
     assert docker_storage_warning(refusal=lambda: None) is None
+
+
+# -- the open map: an episode is only started on a prompt that still has a slot --
+
+def _open_body(open_rows, job=JOB, **overrides):
+    import base64
+
+    from reliquary.corpus.slots import OPEN_ENCODING
+
+    bits = bytearray(-(-job.prompt_count // 8))
+    for row in open_rows:
+        offset = row - job.prompt_start
+        bits[offset >> 3] |= 0x80 >> (offset & 7)
+    return {"job_id": job.job_id, "prompt_start": job.prompt_start,
+            "prompt_count": job.prompt_count, "open_count": len(set(open_rows)), "as_of": 1.0,
+            "encoding": OPEN_ENCODING, "open": base64.b64encode(bytes(bits)).decode(), **overrides}
+
+
+class OpenClient(FakeClient):
+    """A validator with the open route: answers the queued maps, then repeats the last."""
+
+    def __init__(self, *maps, answers=None):
+        super().__init__(answers)
+        self._maps, self.open_reads = list(maps), 0
+
+    def open_prompts(self):
+        self.open_reads += 1
+        answer = self._maps.pop(0) if len(self._maps) > 1 else self._maps[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+def test_full_prompts_of_the_walk_are_skipped_not_run():
+    walk = _walk(40)
+    opened = set(walk[3:5] + walk[9:12])
+    client = OpenClient(_open_body(opened))
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=4, concurrency=1)
+    # The hotkey's own order, minus the full prompts: nothing is re-ordered.
+    expected = [index for index in walk if index in opened][:4]
+    assert runner.ran == expected
+    first = walk.index(expected[0])
+    assert counts["accepted"] == 4 and counts["skipped_full"] >= first
+    # The signed cursor stays the walk position that names the prompt.
+    assert [(b["cursor"], b["prompt_index"]) for b in client.bodies] == [
+        (cursor, index) for cursor, index in enumerate(walk) if index in opened][:4]
+
+
+def test_the_miner_stops_cleanly_when_nothing_is_open():
+    client = OpenClient(_open_body([]))
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=None)
+    assert runner.ran == [] and client.bodies == []
+    assert counts["no_open_prompt"] == 1 and counts["skipped_full"] == 0
+
+
+def test_a_validator_without_the_route_is_mined_as_before():
+    client = OpenClient(None)
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=5, concurrency=1)
+    assert runner.ran == _walk(5) and counts["accepted"] == 5 and "skipped_full" not in counts
+    # One probe, then silence: the absence is remembered for the run.
+    assert client.open_reads == 1
+
+
+def test_an_open_read_that_fails_does_not_stop_the_miner():
+    from reliquary.miner.corpus_miner import CorpusTransientFailure
+
+    client = OpenClient(CorpusTransientFailure("503"))
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=3, concurrency=1)
+    assert runner.ran == _walk(3) and counts["accepted"] == 3
+    assert counts["open_read_failed"] >= 1
+
+
+def test_a_map_of_another_job_is_ignored():
+    client = OpenClient(_open_body([], job_id="other-v1"))
+    counts, _, _ = _mine(runner := FakeRunner(), client=client, episodes=3, concurrency=1)
+    assert runner.ran == _walk(3) and counts["open_map_unusable"] == 1
+
+
+def test_a_retired_job_seen_on_the_open_read_halts_the_identity():
+    from reliquary.miner.corpus_miner import CorpusJobRetired
+
+    client = OpenClient(CorpusJobRetired("410"))
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=None)
+    assert runner.ran == [] and counts["halted"] == 1
+
+
+def test_the_map_is_read_again_only_once_it_is_old(monkeypatch):
+    from reliquary.miner import agentic_miner
+
+    walk = _walk(12)
+    now = [0.0]
+
+    class Clock(OpenClient):
+        def submit(self, body):
+            now[0] += 12.0            # each episode "takes" twelve seconds
+            return super().submit(body)
+
+    client = Clock(_open_body(walk), _open_body(walk[5:]))
+    monkeypatch.setattr(agentic_miner, "_clock", lambda: now[0])
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=5, concurrency=1)
+    # Read at 0 s; still fresh at 12 and 24 s; re-read at 36 s, before the 4th episode.
+    assert runner.ran[:3] == walk[:3]
+    assert all(index in walk[5:] for index in runner.ran[3:]) and len(runner.ran) == 5
+    assert client.open_reads == 2
+
+
+def test_a_map_that_empties_while_mining_stops_new_episodes(monkeypatch):
+    from reliquary.miner import agentic_miner
+
+    walk = _walk(6)
+    now = [0.0]
+
+    class Clock(OpenClient):
+        def submit(self, body):
+            now[0] += 20.0
+            return super().submit(body)
+
+    client = Clock(_open_body(walk), _open_body([]))
+    monkeypatch.setattr(agentic_miner, "_clock", lambda: now[0])
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=None, concurrency=1)
+    # Read at 0 s, fresh at 20 s, read again at 40 s: empty, so no third episode.
+    assert counts["no_open_prompt"] == 1 and len(runner.ran) == 2 and counts["accepted"] == 2
+
+
+def test_a_long_run_of_full_prompts_does_not_hold_the_loop(monkeypatch):
+    from reliquary.miner import agentic_miner
+
+    walk = _walk(400)
+    target = walk[-1]
+    first = walk.index(target)
+    monkeypatch.setattr(agentic_miner, "_OPEN_SCAN", 16)
+    client = OpenClient(_open_body([target]))
+    counts, client, _ = _mine(runner := FakeRunner(), client=client, episodes=1, concurrency=1)
+    assert runner.ran == [target] and counts["skipped_full"] == first
+
+
+def test_identities_share_one_read_of_the_map():
+    client = OpenClient(_open_body(range(JOB.prompt_start, JOB.prompt_start + JOB.prompt_count)))
+    a = Identity("5A", sign=lambda b: "s", episodes=2)
+    b = Identity("5B", sign=lambda b: "s", episodes=2)
+    counts, client, _ = _run([a, b], client=client)
+    assert counts["5A"]["accepted"] == counts["5B"]["accepted"] == 2 and client.open_reads == 1
+
+
+def test_the_http_client_reads_the_open_route_and_tolerates_its_absence():
+    import httpx
+    import pytest
+
+    from reliquary.miner.corpus_miner import (
+        CorpusJobRetired, CorpusPermanentFailure, HttpCorpusClient)
+
+    seen = []
+    answers = {}
+
+    def handle(request):
+        seen.append(request.url.path)
+        return answers["next"]
+
+    def client(job_id):
+        return HttpCorpusClient(
+            httpx.Client(transport=httpx.MockTransport(handle), base_url="http://v"), job_id=job_id)
+
+    answers["next"] = httpx.Response(200, json=_open_body([3]))
+    assert client("swe-v1").open_prompts()["open_count"] == 1
+    assert client(None).open_prompts()["open_count"] == 1
+    assert seen == ["/corpus/jobs/swe-v1/open", "/corpus/open"]
+    for status, detail in ((404, "Not Found"), (405, "Method Not Allowed"),
+                           (409, "corpus_job_open_too_large")):
+        answers["next"] = httpx.Response(status, json={"detail": detail})
+        assert client("swe-v1").open_prompts() is None
+    answers["next"] = httpx.Response(500, json={"detail": "corpus_ledger_corrupt"})
+    with pytest.raises(CorpusPermanentFailure):
+        client("swe-v1").open_prompts()
+    answers["next"] = httpx.Response(410, json={"detail": "job_retired"})
+    with pytest.raises(CorpusJobRetired):
+        client("swe-v1").open_prompts()

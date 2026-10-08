@@ -10,11 +10,24 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from reliquary.corpus.job import PROMPT_ORDER_FREE
+from reliquary.corpus.slots import OpenMap, parse_open_map
 from reliquary.corpus.trajectory import BuiltTrajectory, TrajectoryUnbuildable, build_trajectory
 from reliquary.corpus.walk import job_walk_index
 from reliquary.miner.corpus_miner import _HALT, CorpusJobRetired, CorpusMinerHalted, _retry
 
 logger = logging.getLogger(__name__)
+
+# How old the job's open map may be when an episode starts; older, it is read again.
+OPEN_MAX_AGE_SECONDS = 30.0
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+# Walk positions checked against the map before the launcher yields to the loop.
+_OPEN_SCAN = 1024
 
 
 @dataclass
@@ -94,6 +107,72 @@ def docker_storage_warning(*, refusal: Callable[[], str | None] | None = None) -
             f"tolerance (honest episodes can be voided). Put Docker's storage on xfs.")
 
 
+class OpenPrompts:
+    """The job's open prompts (``GET .../open``), shared by every identity and
+    read again once ``max_age`` old, so an episode (minutes of GPU and sandbox)
+    is not started on a prompt that would answer ``prompt_full``.
+
+    Only a filter: an unknown prompt is open. A validator without the route, a
+    map this miner cannot read or a failed read all leave the miner as it was
+    before the route existed. Used on a ``free`` job only: there the validator
+    does not check the cursor, so walk positions may be passed over.
+    """
+
+    def __init__(self, job, client, *, max_age: float = OPEN_MAX_AGE_SECONDS) -> None:
+        read = getattr(client, "open_prompts", None)
+        self._job = job
+        self._read = read if job.prompt_order == PROMPT_ORDER_FREE else None
+        self._max_age = max_age
+        self._map: OpenMap | None = None
+        self._read_at: float | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def exhausted(self) -> bool:
+        """The validator said no prompt has a slot left."""
+        return self._map is not None and self._map.open_count == 0
+
+    def is_open(self, prompt_index: int) -> bool:
+        return self._map is None or self._map.is_open(prompt_index)
+
+    async def refresh(self, counts: Counter) -> None:
+        """Read the map if there is none younger than ``max_age``. Raises only
+        ``CorpusJobRetired``: every other failure leaves no map (unfiltered)."""
+        if self._read is None:
+            return
+        async with self._lock:
+            if self._read is None:
+                return
+            if self._read_at is not None and _clock() - self._read_at < self._max_age:
+                return
+            try:
+                body = await asyncio.to_thread(self._read)
+            except CorpusJobRetired:
+                raise
+            except Exception as exc:
+                counts["open_read_failed"] += 1
+                logger.warning("the open prompts could not be read (%r): not filtering", exc)
+                self._map, self._read_at = None, _clock()
+                return
+            self._read_at = _clock()
+            if body is None:
+                logger.info("the validator does not serve the open prompts: not filtering")
+                self._map = self._read = None
+                return
+            try:
+                parsed = parse_open_map(body)
+                served = (body.get("job_id"), parsed.prompt_start, parsed.prompt_count)
+                mine = (self._job.job_id, self._job.prompt_start, self._job.prompt_count)
+                if served != mine:
+                    raise ValueError(f"it describes {served}, this miner mines {mine}")
+            except ValueError as exc:
+                counts["open_map_unusable"] += 1
+                logger.warning("the open prompts are unusable (%s): not filtering", exc)
+                self._map = self._read = None
+                return
+            self._map = parsed
+
+
 def _submit(client, body: dict, counts: Counter) -> dict:
     return _retry(lambda: client.submit(body), sleep=time.sleep, counts=counts,
                   max_consecutive_failures=5)
@@ -101,8 +180,10 @@ def _submit(client, body: dict, counts: Counter) -> dict:
 
 async def _mine_identity(*, job, identity: Identity, client, engine, runner, decode,
                          slots: asyncio.Semaphore, counts: Counter, stop: asyncio.Event,
-                         precheck=None) -> None:
+                         precheck=None, open_prompts: OpenPrompts | None = None) -> None:
     tasks: set[asyncio.Task] = set()
+    if open_prompts is None:
+        open_prompts = OpenPrompts(job, client)
     tag = identity.hotkey[:8]
 
     def halt() -> None:
@@ -192,8 +273,11 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                 except Exception:
                     logger.exception("dropping session %s failed", session_id)
 
-    cursor = 0
-    while not stop.is_set() and (identity.episodes is None or cursor < identity.episodes):
+    # `cursor` is this hotkey's walk position, and the validator of a free job
+    # (every episode job) does not check it: positions whose prompt is full
+    # are passed over, in the walk's own order. `started` counts episodes.
+    cursor = started = 0
+    while not stop.is_set() and (identity.episodes is None or started < identity.episodes):
         await slots.acquire()
         if stop.is_set():
             slots.release()
@@ -205,10 +289,39 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             stop.set()
             slots.release()
             break
+        # After the wait for a slot, which can last a whole episode: the map
+        # this start is decided on is at most OPEN_MAX_AGE_SECONDS old.
+        try:
+            await open_prompts.refresh(counts)
+        except CorpusJobRetired as exc:
+            counts["halted"] += 1
+            logger.error("%s stops: %s", tag, exc)
+            halt()
+            slots.release()
+            break
+        if open_prompts.exhausted:
+            # Running episodes finish and submit; each learns `job_complete` itself.
+            counts["no_open_prompt"] += 1
+            logger.info("no prompt of %s has a slot left: %s starts no more episodes",
+                        job.job_id, tag)
+            stop.set()
+            slots.release()
+            break
+        for _ in range(_OPEN_SCAN):
+            if open_prompts.is_open(job_walk_index(job, identity.hotkey, cursor)):
+                break
+            cursor += 1
+            counts["skipped_full"] += 1
+        else:
+            # A long run of full prompts: let the loop breathe, then go on.
+            slots.release()
+            await asyncio.sleep(0)
+            continue
         task = asyncio.create_task(one(cursor))
         task.add_done_callback(lambda _t: slots.release())
         tasks.add(task)
         cursor += 1
+        started += 1
     # return_exceptions: a cancelled or crashed episode never cancels its siblings.
     await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -219,13 +332,14 @@ async def mine_agentic(*, job, identities, client, engine, runners, decode,
     ``concurrency`` episodes run at once across them. ``precheck`` (see
     ``trajectory_precheck``) drops what the validator would refuse, unsigned."""
     slots = asyncio.Semaphore(concurrency)
+    open_prompts = OpenPrompts(job, client)
     counts = {identity.hotkey: Counter() for identity in identities}
     stops = {identity.hotkey: asyncio.Event() for identity in identities}
     outcomes = await asyncio.gather(*(
         _mine_identity(job=job, identity=identity, client=client, engine=engine,
                        runner=runners[harness_key(identity.harness_env)], decode=decode,
                        slots=slots, counts=counts[identity.hotkey], stop=stops[identity.hotkey],
-                       precheck=precheck)
+                       precheck=precheck, open_prompts=open_prompts)
         for identity in identities), return_exceptions=True)
     for identity, outcome in zip(identities, outcomes):
         if isinstance(outcome, BaseException):
@@ -301,5 +415,5 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
         engine.stop()
 
 
-__all__ = ["Identity", "build_trajectory_submission", "harness_key", "mine_agentic",
+__all__ = ["Identity", "OpenPrompts", "build_trajectory_submission", "harness_key", "mine_agentic",
            "run_agentic_miner", "serve_loopback", "trajectory_precheck"]
