@@ -23,10 +23,13 @@ from reliquary.validator.admission import (
 
 
 OMI = "openmathinstruct"
+POOL_SEEDS = 2 * M_ROLLOUTS
+SEEDS = tuple(range(1, POOL_SEEDS, 2))           # the default subset of these tests: every odd seed
+OTHER = tuple(range(M_ROLLOUTS))                 # another valid subset of the same pool
 
 
 def _contract(pool=True):
-    value = contract_v2_dict(envs=(OMI, CODE), pool_groups=3, missing_box="uncertain")
+    value = contract_v2_dict(envs=(OMI, CODE), missing_box="uncertain")
     if not pool:
         for env in value["environments"].values():
             env["sampling"] = {"kind": "legacy/v1"}
@@ -45,7 +48,7 @@ def signed_request(monkeypatch):
     monkeypatch.setattr(signatures, "bt", SimpleNamespace(Keypair=Keypair))
     key = Keypair.create_from_seed("0x" + "02" * 32)
     wallet = SimpleNamespace(hotkey=key)
-    def make(*, pool=True, purpose="exploration", legacy=False):
+    def make(*, pool=True, purpose="exploration", legacy=False, seeds=SEEDS):
         contract = _contract(pool)
         announcement = _announcement(contract)
         seed_pool = SeedPool.from_contract(contract, environment=OMI, prompt_idx=7, checkpoint_hash="d" * 40,
@@ -62,7 +65,7 @@ def signed_request(monkeypatch):
             if not legacy:
                 metadata["service_binding"] = intent.rollout_binding(index)
             if seed_pool is not None:
-                metadata["seed_pool"] = seed_pool.selection(1).rollout_binding(index)
+                metadata["seed_pool"] = seed_pool.selection(seeds).rollout_binding(index)
             commitments = [{"sketch": 0}] * len(tokens)
             if legacy:
                 signature = signatures.sign_commit_binding(tokens, "cd" * 16, "test", 1, commitments, wallet)
@@ -78,7 +81,7 @@ def signed_request(monkeypatch):
                                          merkle_root=_compute_merkle_root(rollouts), rollouts=rollouts,
                                          checkpoint_hash="d" * 40, drand_round=3, protocol_version=2, nonce="fresh",
                                          service_binding=intent.to_dict() if not legacy else None,
-                                         pool_selection=seed_pool.selection(1).to_dict() if seed_pool else None)
+                                         pool_selection=seed_pool.selection(seeds).to_dict() if seed_pool else None)
         _sign_envelope(request, wallet)
         return request, announcement, wallet
     return make
@@ -225,15 +228,111 @@ def test_only_server_pool_beacon_and_epoch_are_authoritative(signed_request):
         assert parsed.reject_stage == "service_contract"
 
 
-def test_resigned_envelope_cannot_hide_modified_candidate_proof(signed_request):
+def test_resigned_envelope_cannot_hide_reassigned_seeds(signed_request):
+    """Rollouts signed for one subset cannot be passed off as another subset's draws."""
     request, announcement, wallet = signed_request()
-    request.pool_selection["candidate_id"] = 2
-    for rollout in request.rollouts:
-        rollout.commit["rollout"]["seed_pool"]["candidate_id"] = 2
+    request.pool_selection["seeds"] = list(OTHER)
+    for index, rollout in enumerate(request.rollouts):
+        rollout.commit["rollout"]["seed_pool"]["seed_index"] = OTHER[index]
     _sign_envelope(request, wallet)
     parsed, _ = _parse(request, announcement)
     assert parsed.reject_reason is RejectReason.BAD_SIGNATURE
     assert parsed.reject_stage == "rollout_signature"
+
+
+@pytest.mark.parametrize("seeds", [SEEDS, OTHER, tuple(range(M_ROLLOUTS, POOL_SEEDS)),
+                                   (0, *range(M_ROLLOUTS + 1, POOL_SEEDS))])
+def test_any_m_distinct_seeds_of_the_pool_are_admitted(signed_request, seeds):
+    request, announcement, _ = signed_request(seeds=seeds)
+    parsed, _ = _parse(request, announcement)
+    assert parsed.reject_reason is None
+    assert request.pool_selection["seeds"] == list(seeds)
+
+
+def test_the_validated_selection_is_the_signed_one(signed_request):
+    """A consistent request for one subset under an envelope signed for another is refused."""
+    request, announcement, wallet = signed_request(seeds=OTHER)
+    genuine = dict(request.pool_selection)
+    request.pool_selection = {**genuine, "seeds": list(SEEDS)}
+    _sign_envelope(request, wallet)                      # the envelope now attests SEEDS
+    request.pool_selection = genuine                     # ...but the request carries OTHER
+    parsed, _ = _parse(request, announcement)
+    assert parsed.reject_reason is RejectReason.BAD_ENVELOPE_SIGNATURE
+
+
+@pytest.mark.parametrize("forge", ["duplicate", "unsorted", "out_of_range", "short", "long", "bool", "old_schema"])
+def test_non_canonical_selections_never_reach_the_proof_stage(signed_request, forge):
+    request, announcement, wallet = signed_request()
+    seeds = list(SEEDS)
+    if forge == "duplicate":
+        seeds[1] = seeds[0]
+    elif forge == "unsorted":
+        seeds[0], seeds[1] = seeds[1], seeds[0]
+    elif forge == "out_of_range":
+        seeds[-1] = POOL_SEEDS
+    elif forge == "short":
+        seeds = seeds[:-1]
+    elif forge == "long":
+        seeds = sorted(set(seeds) | {0})
+    elif forge == "bool":
+        seeds = [False, True, *seeds[2:]] if SEEDS[0] > 1 else [True, *seeds[1:]]
+    request.pool_selection = ({"schema": "public-group-selection/v1", "pool_sha256": request.pool_selection["pool_sha256"],
+                               "candidate_id": 1} if forge == "old_schema" else {**request.pool_selection, "seeds": seeds})
+    for index, rollout in enumerate(request.rollouts):
+        if forge != "old_schema" and index < len(seeds) and type(seeds[index]) is int and 0 <= seeds[index] < 128:
+            rollout.commit["rollout"]["seed_pool"]["seed_index"] = seeds[index]
+    with pytest.raises(ValueError):
+        validate_submission_policy(request, announcement)
+    with pytest.raises(ValueError):                       # the wire schema refuses it as well
+        BatchSubmissionRequest.model_validate(request.model_dump())
+
+
+def test_two_rollouts_cannot_claim_the_same_seed(signed_request):
+    request, announcement, wallet = signed_request()
+    first = request.rollouts[0].commit["rollout"]["seed_pool"]["seed_index"]
+    request.rollouts[1].commit["rollout"]["seed_pool"]["seed_index"] = first
+    _sign_envelope(request, wallet)
+    parsed, _ = _parse(request, announcement)
+    assert parsed.reject_reason is RejectReason.GENERATION_CONTRACT_MISMATCH
+    assert parsed.reject_stage == "service_contract"       # before signatures, long before proofs
+
+
+def test_validator_draws_each_rollout_from_its_seed_not_its_rank(signed_request):
+    from tests.unit.test_grpo_window_batcher import _prove_one
+
+    draws = {}
+    for seeds in (SEEDS, (0, *SEEDS[:-1])):               # SEEDS[k] sits at rank k, then at rank k + 1
+        request, announcement, _ = signed_request(seeds=seeds)
+        seen = []
+        def verifier(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
+            seen.append(seed_u_values)
+            return _service_proof(commit)
+        batcher = _deep_service_batcher(request, announcement, verifier)
+        assert _prove_one(batcher, request) is not None
+        pool = SeedPool.from_contract(_contract(), environment=OMI, prompt_idx=7, checkpoint_hash="d" * 40,
+                                      pool_epoch=5, randomness="ab" * 32)
+        assert seen == [[pool.uniform(seed, j) for j in range(CHALLENGE_K)] for seed in seeds]
+        draws[seeds] = dict(zip(seeds, seen))
+    for seed in SEEDS[:-1]:
+        assert draws[SEEDS][seed] == draws[(0, *SEEDS[:-1])][seed]
+
+
+def test_service_group_id_is_the_selection_digest_not_the_miner(signed_request):
+    from reliquary.protocol.seed_pool import PoolSelection
+    from reliquary.validator.batcher import GrpoWindowBatcher
+
+    def group_id(request):
+        return GrpoWindowBatcher._service_group_id(SimpleNamespace(request=request, selection_digest=b"\x01" * 32))
+    a, _, _ = signed_request(seeds=SEEDS)
+    b, _, _ = signed_request(seeds=SEEDS)
+    b.miner_hotkey, b.nonce, b.window_start = "another-miner", "another-nonce", 12
+    for index, rollout in enumerate(b.rollouts):
+        rollout.commit["tokens"][5] = 50 + index            # another miner's completions for the same seeds
+    c, _, _ = signed_request(seeds=OTHER)
+    assert group_id(a) == group_id(b) == PoolSelection.from_dict(a.pool_selection).sha256
+    assert group_id(c) != group_id(a)
+    legacy, _, _ = signed_request(pool=False)
+    assert group_id(legacy) not in (group_id(a), group_id(c))
 
 
 def test_legacy_valid_request_keeps_old_wire_and_refuses_hidden_service_metadata(signed_request):
@@ -250,8 +349,8 @@ def test_legacy_valid_request_keeps_old_wire_and_refuses_hidden_service_metadata
 
 def test_legacy_sampling_contract_cannot_accept_hidden_pool_metadata(signed_request):
     request, announcement, _ = signed_request(pool=False)
-    request.rollouts[0].commit["rollout"]["seed_pool"] = {"schema": "public-group-rollout/v1",
-        "pool_sha256": "aa" * 32, "candidate_id": 1, "rollout_index": 0}
+    request.rollouts[0].commit["rollout"]["seed_pool"] = {"schema": "public-seed-rollout/v2",
+        "pool_sha256": "aa" * 32, "seed_index": 1, "rollout_index": 0}
     with pytest.raises(ValueError, match="not allowed"):
         validate_submission_policy(request, announcement)
 

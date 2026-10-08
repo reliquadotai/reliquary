@@ -1,4 +1,31 @@
-"""Bounded public candidate groups with immutable sampling identities."""
+"""Public seed pools: 2 x M seeds per (env, prompt, pool epoch), any M of them make a group.
+
+The pool is the same for every miner. A miner over-generates and keeps the subset of
+``group_size`` distinct seeds it likes; there are no fixed candidate groups. What the miner
+controls is only WHICH seeds it submits, never what a seed draws:
+
+* the pool digest is fixed by (order, environment, prompt, checkpoint, pool epoch, beacon);
+* a seed's uniforms depend on (pool digest, seed index, token position) only -- not on the
+  rollout's rank in the group, not on the other chosen seeds, not on the hotkey;
+* a subset has exactly one encoding (strictly increasing seed indices), so the digest of the
+  selection is the group id and is equal for two miners who chose the same subset.
+
+Wire identities (bumped from the fixed-candidate-group design, which this replaces):
+
+====================  ===========================  =====================================
+constant              value                        was
+====================  ===========================  =====================================
+``CAPABILITY``        ``public-seed-pool/v3``      ``public-group-pool/v1``
+``POOL_SCHEMA``       ``public-seed-pool/v3``      ``public-group-pool/v2``
+``SELECTION_SCHEMA``  ``public-seed-selection/v2`` ``public-group-selection/v1``
+``ROLLOUT_SCHEMA``    ``public-seed-rollout/v2``   ``public-group-rollout/v1``
+``DRAW_DOMAIN``       ``public-seed-draw/v3``      ``public-group-draw/v2``
+====================  ===========================  =====================================
+
+``PROOF_VERSION`` and the commit/envelope signature domains keep their names: the signed bytes
+embed the canonical selection / rollout binding, whose schema strings changed, so a signature
+made for the old design cannot verify against the new one.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -7,14 +34,16 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from reliquary.protocol.release_contract import canonical_json_bytes
-from reliquary.protocol.service_contract import ServiceContract
+from reliquary.protocol.service_contract import PUBLIC_SEED_POOL, ServiceContract
 
-POOL_SCHEMA = "public-group-pool/v2"
-SELECTION_SCHEMA = "public-group-selection/v1"
-ROLLOUT_SCHEMA = "public-group-rollout/v1"
-CAPABILITY = "public-group-pool/v1"
-DRAW_DOMAIN = b"public-group-draw/v2"
+POOL_SCHEMA = "public-seed-pool/v3"
+SELECTION_SCHEMA = "public-seed-selection/v2"
+ROLLOUT_SCHEMA = "public-seed-rollout/v2"
+CAPABILITY = PUBLIC_SEED_POOL
+DRAW_DOMAIN = b"public-seed-draw/v3"
 PROOF_VERSION = "public-group-proof/v1"
+MAX_GROUP_SIZE = 64
+MAX_POOL_SEEDS = 2 * MAX_GROUP_SIZE
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -34,36 +63,78 @@ def _sha(value: Any, name: str) -> str:
     return value
 
 
+def _seed_subset(value: Any, *, pool_seeds: int = MAX_POOL_SEEDS, count: int | None = None) -> tuple[int, ...]:
+    """The one encoding of a subset: strictly increasing plain integers in ``[0, pool_seeds)``.
+
+    The length is checked before any element is looked at, so an oversized list costs nothing.
+    """
+    if type(value) not in (list, tuple):
+        raise SeedPoolError("seeds: a list of seed indices required")
+    if count is None:
+        if not 2 <= len(value) <= MAX_GROUP_SIZE:
+            raise SeedPoolError(f"seeds: between 2 and {MAX_GROUP_SIZE} seed indices required")
+    elif len(value) != count:
+        raise SeedPoolError(f"seeds: exactly {count} seed indices required")
+    previous = -1
+    for seed in value:
+        _integer(seed, "seed index", 0, pool_seeds - 1)
+        if seed <= previous:
+            raise SeedPoolError("seeds: distinct seed indices in strictly increasing order required")
+        previous = seed
+    return tuple(value)
+
+
 @dataclass(frozen=True, slots=True)
 class PoolSelection:
+    """The subset a miner submits: the pool digest and the chosen seed indices, ascending.
+
+    Rollout ``i`` of the group is the completion drawn from ``seeds[i]``. Bounds that depend
+    on the pool (exactly ``group_size`` seeds, each below ``pool_seeds``) are checked by
+    ``SeedPool.validate_selection``; this type alone guarantees the canonical encoding.
+    """
     pool_sha256: str
-    candidate_id: int
+    seeds: tuple[int, ...]
 
     def __post_init__(self) -> None:
         _sha(self.pool_sha256, "pool_sha256")
-        _integer(self.candidate_id, "candidate_id", 0, 1023)
+        object.__setattr__(self, "seeds", _seed_subset(self.seeds))
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> PoolSelection:
-        if not isinstance(value, dict) or set(value) != {"schema", "pool_sha256", "candidate_id"} or value["schema"] != SELECTION_SCHEMA:
-            raise SeedPoolError("unknown public group selection")
-        return cls(value["pool_sha256"], value["candidate_id"])
+        if (not isinstance(value, dict) or set(value) != {"schema", "pool_sha256", "seeds"}
+                or value["schema"] != SELECTION_SCHEMA or type(value["seeds"]) is not list):
+            raise SeedPoolError("unknown public seed selection")
+        return cls(value["pool_sha256"], value["seeds"])
 
     def to_dict(self) -> dict:
-        return {"schema": SELECTION_SCHEMA, "pool_sha256": self.pool_sha256, "candidate_id": self.candidate_id}
+        return {"schema": SELECTION_SCHEMA, "pool_sha256": self.pool_sha256, "seeds": list(self.seeds)}
+
+    @property
+    def sha256(self) -> str:
+        """The service group id: equal for every miner who chose this subset of this pool."""
+        return hashlib.sha256(canonical_json_bytes(self.to_dict())).hexdigest()
 
     def rollout_binding(self, rollout_index: int) -> dict:
-        _integer(rollout_index, "rollout_index", 0, 63)
+        _integer(rollout_index, "rollout_index", 0, len(self.seeds) - 1)
         return {"schema": ROLLOUT_SCHEMA, "pool_sha256": self.pool_sha256,
-                "candidate_id": self.candidate_id, "rollout_index": rollout_index}
+                "seed_index": self.seeds[rollout_index], "rollout_index": rollout_index}
 
 
-def parse_rollout_binding(value: Any) -> tuple[PoolSelection, int]:
-    if not isinstance(value, dict) or set(value) != {"schema", "pool_sha256", "candidate_id", "rollout_index"} or value["schema"] != ROLLOUT_SCHEMA:
-        raise SeedPoolError("unknown public group rollout binding")
-    selection = PoolSelection(value["pool_sha256"], value["candidate_id"])
-    index = _integer(value["rollout_index"], "rollout_index", 0, 63)
-    return selection, index
+@dataclass(frozen=True, slots=True)
+class RolloutSeed:
+    """One rollout's signed claim: which seed of which pool it drew, at which rank of its group."""
+    pool_sha256: str
+    seed_index: int
+    rollout_index: int
+
+
+def parse_rollout_binding(value: Any) -> RolloutSeed:
+    if (not isinstance(value, dict) or set(value) != {"schema", "pool_sha256", "seed_index", "rollout_index"}
+            or value["schema"] != ROLLOUT_SCHEMA):
+        raise SeedPoolError("unknown public seed rollout binding")
+    return RolloutSeed(_sha(value["pool_sha256"], "pool_sha256"),
+                       _integer(value["seed_index"], "seed_index", 0, MAX_POOL_SEEDS - 1),
+                       _integer(value["rollout_index"], "rollout_index", 0, MAX_GROUP_SIZE - 1))
 
 
 _ANNOUNCEMENT_FIELDS = {"contract", "schedule", "checkpoint", "supported_capabilities", "pool_epoch", "pool_randomness"}
@@ -97,12 +168,14 @@ def pool_from_service_policy(value: Any, *, environment: str, prompt_idx: int,
 
 @dataclass(frozen=True, slots=True)
 class SeedPool:
-    """An operator-published pool; the miner only chooses a candidate ID.
+    """An operator-published pool of ``pool_seeds == 2 * group_size`` public seeds.
 
     The beacon and epoch belong to the authoritative pool announcement. A new
     window does not silently change an existing pool's beacon. Publication and
     renewal are the caller's responsibility; generation accepts this exact
     immutable manifest and validation compares its digest to the active one.
+    Nothing a miner sends enters the digest, so a miner cannot grind beyond
+    the ``pool_seeds`` streams the pool defines.
     """
     service_contract_sha256: str
     environment: str
@@ -111,7 +184,7 @@ class SeedPool:
     pool_epoch: int
     randomness: str
     group_size: int
-    pool_groups: int
+    pool_seeds: int
     renewal_windows: int
     _digest: bytes = field(init=False, repr=False)
 
@@ -124,8 +197,10 @@ class SeedPool:
             raise SeedPoolError("checkpoint_hash: nonempty bounded identity required")
         _integer(self.pool_epoch, "pool_epoch", 0, 2**53 - 1)
         _sha(self.randomness, "randomness")
-        _integer(self.group_size, "group_size", 2, 64)
-        _integer(self.pool_groups, "pool_groups", 2, 1024)
+        _integer(self.group_size, "group_size", 2, MAX_GROUP_SIZE)
+        _integer(self.pool_seeds, "pool_seeds", 4, MAX_POOL_SEEDS)
+        if self.pool_seeds != 2 * self.group_size:
+            raise SeedPoolError("pool_seeds: the pool is exactly 2 x group_size seeds")
         _integer(self.renewal_windows, "renewal_windows", 1, 1000000)
         object.__setattr__(self, "_digest", hashlib.sha256(canonical_json_bytes(self.to_dict())).digest())
 
@@ -134,16 +209,16 @@ class SeedPool:
                       checkpoint_hash: str, pool_epoch: int, randomness: str) -> SeedPool:
         policy = contract.environment(environment)["sampling"]
         if policy["kind"] != CAPABILITY:
-            raise SeedPoolError("only public-group-pool/v1 is supported")
+            raise SeedPoolError(f"only {CAPABILITY} is supported")
         return cls(contract.sha256, environment, prompt_idx, checkpoint_hash, pool_epoch, randomness,
-                   policy["group_size"], policy["pool_groups"], policy["renewal_windows"])
+                   policy["group_size"], policy["pool_seeds"], policy["renewal_windows"])
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SeedPool:
         names = {"service_contract_sha256", "environment", "prompt_idx", "checkpoint_hash",
-                 "pool_epoch", "randomness", "group_size", "pool_groups", "renewal_windows"}
+                 "pool_epoch", "randomness", "group_size", "pool_seeds", "renewal_windows"}
         if not isinstance(value, dict) or set(value) != {"schema", *names} or value["schema"] != POOL_SCHEMA:
-            raise SeedPoolError("unknown public group pool")
+            raise SeedPoolError("unknown public seed pool")
         return cls(**{key: value[key] for key in names})
 
     def to_dict(self) -> dict:
@@ -151,42 +226,42 @@ class SeedPool:
                 "environment": self.environment, "prompt_idx": self.prompt_idx,
                 "checkpoint_hash": self.checkpoint_hash, "pool_epoch": self.pool_epoch,
                 "randomness": self.randomness, "group_size": self.group_size,
-                "pool_groups": self.pool_groups, "renewal_windows": self.renewal_windows}
+                "pool_seeds": self.pool_seeds, "renewal_windows": self.renewal_windows}
 
     @property
     def sha256(self) -> str:
         return self._digest.hex()
 
-    @property
-    def exploration_rollouts(self) -> int:
-        return self.pool_groups * self.group_size
-
-    def selection(self, candidate_id: int) -> PoolSelection:
-        _integer(candidate_id, "candidate_id", 0, self.pool_groups - 1)
-        return PoolSelection(self.sha256, candidate_id)
+    def selection(self, seeds) -> PoolSelection:
+        """The selection of ``seeds``: exactly ``group_size`` distinct pool seeds, ascending."""
+        return PoolSelection(self.sha256, _seed_subset(seeds, pool_seeds=self.pool_seeds, count=self.group_size))
 
     def validate_selection(self, selection: PoolSelection, *, rollout_count: int) -> None:
         if not isinstance(selection, PoolSelection) or selection.pool_sha256 != self.sha256:
             raise SeedPoolError("selection is not bound to the active pool")
-        _integer(selection.candidate_id, "candidate_id", 0, self.pool_groups - 1)
+        _seed_subset(selection.seeds, pool_seeds=self.pool_seeds, count=self.group_size)
         if type(rollout_count) is not int or rollout_count != self.group_size:
-            raise SeedPoolError("candidate must contain one complete canonical group")
+            raise SeedPoolError("a group is exactly one rollout per chosen seed")
 
     def validate_rollout_binding(self, binding: Any, selection: PoolSelection, rollout_index: int) -> None:
         self.validate_selection(selection, rollout_count=self.group_size)
         _integer(rollout_index, "rollout_index", 0, self.group_size - 1)
-        if not isinstance(binding, dict) or binding != selection.rollout_binding(rollout_index):
-            raise SeedPoolError("rollout identity differs from the selected public group")
+        expected = selection.rollout_binding(rollout_index)
+        if not isinstance(binding, dict) or binding != expected:
+            raise SeedPoolError("rollout identity differs from the selected seed at its position")
         # Dict equality considers True == 1; exact canonical bytes do not.
-        if canonical_json_bytes(binding) != canonical_json_bytes(selection.rollout_binding(rollout_index)):
+        if canonical_json_bytes(binding) != canonical_json_bytes(expected):
             raise SeedPoolError("rollout identity must use canonical integer fields")
 
-    def uniform(self, candidate_id: int, rollout_index: int, position: int) -> float:
-        _integer(candidate_id, "candidate_id", 0, self.pool_groups - 1)
-        _integer(rollout_index, "rollout_index", 0, self.group_size - 1)
+    def uniform(self, seed_index: int, position: int) -> float:
+        """The forced draw of seed ``seed_index`` at completion position ``position``.
+
+        ``sha256(DRAW_DOMAIN || pool digest (32) || seed_index (u32 BE) || position (u32 BE))``,
+        top 53 bits of the first 8 bytes, divided by 2**53. No rank, no hotkey, no selection.
+        """
+        _integer(seed_index, "seed_index", 0, self.pool_seeds - 1)
         _integer(position, "position", 0, 2**32 - 1)
-        message = (DRAW_DOMAIN + self._digest + candidate_id.to_bytes(4, "big")
-                   + rollout_index.to_bytes(4, "big") + position.to_bytes(4, "big"))
+        message = DRAW_DOMAIN + self._digest + seed_index.to_bytes(4, "big") + position.to_bytes(4, "big")
         # 53 bits ensure the floating-point result can never round up to 1.0.
         bits = int.from_bytes(hashlib.sha256(message).digest()[:8], "big") >> 11
         return bits / 2**53
@@ -194,9 +269,14 @@ class SeedPool:
 
 def validate_rollout_selection(pool: SeedPool, selection: PoolSelection,
                                commits: list[dict]) -> None:
+    """Refuse, before any proof work, a group that is not one rollout per chosen seed, in order.
+
+    Rollout ``i`` must carry exactly ``selection.rollout_binding(i)``; since the selection is
+    strictly increasing, two rollouts can never claim the same seed.
+    """
     pool.validate_selection(selection, rollout_count=len(commits))
     for index, commit in enumerate(commits):
         metadata = commit.get("rollout")
         if not isinstance(metadata, dict) or metadata.get("episode") is not None:
-            raise SeedPoolError("public group pool requires single-turn rollouts")
+            raise SeedPoolError("public seed pool requires single-turn rollouts")
         pool.validate_rollout_binding(metadata.get("seed_pool"), selection, index)

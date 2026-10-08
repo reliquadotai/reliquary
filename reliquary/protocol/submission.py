@@ -295,7 +295,11 @@ class BatchSubmissionRequest(BaseModel):
     def _validate_pool_selection(cls, value):
         if value is not None:
             from reliquary.protocol.seed_pool import PoolSelection
-            PoolSelection.from_dict(value)
+            # One seed per rollout out of the 2 x M pool: a longer, shorter or out-of-pool
+            # list never reaches admission.
+            seeds = PoolSelection.from_dict(value).seeds
+            if len(seeds) != M_ROLLOUTS or seeds[-1] >= 2 * M_ROLLOUTS:
+                raise ValueError(f"pool_selection must choose exactly {M_ROLLOUTS} of {2 * M_ROLLOUTS} seeds")
         return value
 
     @field_validator("service_binding")
@@ -433,7 +437,8 @@ class ServicePolicyAnnouncement(BaseModel):
         ServiceSchedule.from_dict(self.schedule, contract)
         if set(self.checkpoint) != {"checkpoint_n", "repo", "revision", "sha256"}:
             raise ValueError("announcement checkpoint fields are fixed")
-        if any(env["sampling"]["kind"] == "public-group-pool/v1" for env in contract.environments.values()) and not self.pool_randomness:
+        from reliquary.protocol.service_contract import PUBLIC_SEED_POOL
+        if any(env["sampling"]["kind"] == PUBLIC_SEED_POOL for env in contract.environments.values()) and not self.pool_randomness:
             raise ValueError("public pool requires its authoritative beacon")
         return self
 
@@ -899,7 +904,7 @@ class CommitModel(BaseModel):
             if v.service_binding is not None:
                 from reliquary.protocol.seed_pool import parse_rollout_binding
                 from reliquary.protocol.service_submission import parse_service_rollout_binding
-                if parse_rollout_binding(v.seed_pool)[1] != parse_service_rollout_binding(v.service_binding)[1]:
+                if parse_rollout_binding(v.seed_pool).rollout_index != parse_service_rollout_binding(v.service_binding)[1]:
                     raise ValueError("service and pool rollout indices differ")
         elif v.service_binding is not None:
             if info.data.get("proof_version") != "service-group-proof/v1":

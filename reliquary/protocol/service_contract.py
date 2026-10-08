@@ -151,10 +151,15 @@ _V2_REWARD = {"price_bps": (1, 10000), "cap_bps": (0, 10000), "audit_bps": (0, 1
 _V2_ADVICE = {"margin_bps": (1, 10000), "min_windows": (0, 1_000_000), "max_windows": (1, 1_000_000),
               "smoothing_bps": (1, 10000), "hysteresis_windows": (0, 1_000_000),
               "max_change_windows": (1, 1_000_000), "min_first_scans": (1, 1_000_000)}
-_V2_SAMPLING = {"legacy/v1": {}, "public-group-pool/v1": _POLICIES["sampling"]["public-group-pool/v1"]}
+# The pool of an env is ``pool_seeds`` public seeds, always exactly 2 x ``group_size``; a miner
+# submits any ``group_size`` distinct seeds of it (reliquary.protocol.seed_pool). The former
+# fixed-candidate-group policy ``public-group-pool/v1`` (``pool_groups``) is not a v2 policy.
+PUBLIC_SEED_POOL = "public-seed-pool/v3"
+_V2_SAMPLING = {"legacy/v1": {}, PUBLIC_SEED_POOL: {"group_size": (2, 64), "pool_seeds": (4, 128),
+                                                    "renewal_windows": (1, 1000000)}}
 SUPPORTED_V2_CAPABILITIES = frozenset({
     "environment-reward/v1", "trainer-driven/v1", "task-scoped/v1", "exploration-first-scan/v1",
-    "in-zone-rotation/v1", "public-group-pool/v1", "legacy/v1",
+    "in-zone-rotation/v1", PUBLIC_SEED_POOL, "legacy/v1",
 })
 
 
@@ -211,6 +216,8 @@ def _validate_v2(value: dict) -> None:
         _object(sampling, {"kind", *params}, f"{name}.sampling")
         for field_name, bounds in params.items():
             _integer(sampling[field_name], f"{name}.sampling.{field_name}", *bounds)
+        if sampling["kind"] == PUBLIC_SEED_POOL and sampling["pool_seeds"] != 2 * sampling["group_size"]:
+            raise ServiceContractError(f"{name}.sampling.pool_seeds must be exactly 2 x group_size")
         if type(env["exploration"]) is not int or env["exploration"] not in (0, 1):
             raise ServiceContractError(f"{name}.exploration must be 0 or 1")
         if env["missing_box"] not in ("uncertain", "graded"):

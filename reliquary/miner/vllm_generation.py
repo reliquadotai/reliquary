@@ -74,13 +74,13 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
                 if "public_pool" in forced:
                     from reliquary.protocol.seed_pool import SeedPool
                     pool = SeedPool.from_dict(forced["public_pool"])
-                    candidate = forced.get("candidate_id")
-                    pool.selection(candidate)
+                    seed_index = forced.get("seed_index")
+                    pool.uniform(seed_index, 0)  # refuses a seed outside the pool
                     if pool.prompt_idx != int(forced["prompt_idx"]) or pool.checkpoint_hash != str(forced["checkpoint_hash"]):
                         raise ValueError("vLLM request context differs from public pool")
-                    self._slots[slot].update(seed_pool=pool, candidate_id=candidate)
-                elif "candidate_id" in forced:
-                    raise ValueError("candidate_id requires public pool")
+                    self._slots[slot].update(seed_pool=pool, seed_index=seed_index)
+                elif "seed_index" in forced:
+                    raise ValueError("seed_index requires public pool")
         for moved in getattr(batch_update, "moved", ()):
             source, destination = _slot_index(moved[0]), _slot_index(moved[1])
             swap = "SWAP" in str(moved[2]).upper() if len(moved) > 2 else False
@@ -96,7 +96,7 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
         if not slots:
             return logits
         draws = [
-            (state["seed_pool"].uniform(state["candidate_id"], state["rollout_index"], state["offset"])
+            (state["seed_pool"].uniform(state["seed_index"], state["offset"])
              if "seed_pool" in state else
              u_at(state["randomness"], state["prompt_idx"], state["checkpoint_hash"],
                   state["rollout_index"], state["offset"]))
@@ -122,9 +122,13 @@ def _slot_index(value: Any) -> int:
 def forced_seed_extra_args(
     *, randomness: str, prompt_idx: int, checkpoint_hash: str,
     rollout_index: int, base_offset: int = 0, seed_pool=None,
-    candidate_id: int | None = None,
+    seed_index: int | None = None,
 ) -> dict[str, Any]:
-    """What one request tells the processor about its place in the draw."""
+    """What one request tells the processor about its place in the draw.
+
+    With a public seed pool the draw is the one of ``seed_index`` and does not
+    depend on ``rollout_index``.
+    """
     result = {
         FORCED_SEED_KEY: {
             "randomness": randomness,
@@ -135,10 +139,10 @@ def forced_seed_extra_args(
         }
     }
     if seed_pool is not None:
-        seed_pool.selection(candidate_id)
-        result[FORCED_SEED_KEY].update(public_pool=seed_pool.to_dict(), candidate_id=candidate_id)
-    elif candidate_id is not None:
-        raise ValueError("candidate_id requires public pool")
+        seed_pool.uniform(seed_index, 0)  # refuses a seed outside the pool
+        result[FORCED_SEED_KEY].update(public_pool=seed_pool.to_dict(), seed_index=seed_index)
+    elif seed_index is not None:
+        raise ValueError("seed_index requires public pool")
     return result
 
 
@@ -193,7 +197,7 @@ class VLLMRolloutGenerator:
     def generate(
         self, prompt_tokens: list[int], *, randomness: str, prompt_idx: int,
         checkpoint_hash: str, rollouts: int, max_new_tokens: int,
-        eos_ids: list[int], seed_pool=None, candidate_id: int | None = None,
+        eos_ids: list[int], seed_pool=None, seeds=None,
     ) -> list[list[int]]:
         """Completion token ids per rollout, truncated at their first stop token.
 
@@ -204,7 +208,12 @@ class VLLMRolloutGenerator:
         """
         sampling_params = self._sampling_params_class
         if seed_pool is not None:
-            seed_pool.validate_selection(seed_pool.selection(candidate_id), rollout_count=rollouts)
+            # Rollout ``index`` is drawn from pool seed ``seeds[index]``.
+            selection = seed_pool.selection(seeds)
+            seed_pool.validate_selection(selection, rollout_count=rollouts)
+            seeds = selection.seeds
+        elif seeds is not None:
+            raise ValueError("seeds require public pool")
         if sampling_params is None:
             from vllm import SamplingParams as sampling_params
 
@@ -217,7 +226,8 @@ class VLLMRolloutGenerator:
                 extra_args=forced_seed_extra_args(
                     randomness=randomness, prompt_idx=prompt_idx,
                     checkpoint_hash=checkpoint_hash, rollout_index=index,
-                    seed_pool=seed_pool, candidate_id=candidate_id,
+                    seed_pool=seed_pool,
+                    seed_index=seeds[index] if seed_pool is not None else None,
                 ),
             )
             for index in range(rollouts)

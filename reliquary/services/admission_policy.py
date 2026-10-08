@@ -1,7 +1,7 @@
 """Which service submissions a window admits. The server's announcement decides, never the miner."""
 from __future__ import annotations
 
-from reliquary.protocol.service_contract import SUPPORTED_V2_CAPABILITIES, ServiceContract
+from reliquary.protocol.service_contract import PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract
 
 UNIFORM = frozenset({"uniform-low", "uniform-high", "uniform-intermediate"})
 
@@ -43,7 +43,7 @@ def validate_submission_policy(request, announcement: dict | None) -> ServiceCon
     if environment not in schedule.active_environments():
         raise ValueError("service environment is not active")
     policy = contract.environment(environment)
-    if policy["sampling"]["kind"] == "public-group-pool/v1":
+    if policy["sampling"]["kind"] == PUBLIC_SEED_POOL:
         pool = pool_from_service_policy(announcement, environment=environment, prompt_idx=request.prompt_idx,
                                         checkpoint_hash=request.checkpoint_hash)
         validate_rollout_selection(pool, PoolSelection.from_dict(selection), commits)

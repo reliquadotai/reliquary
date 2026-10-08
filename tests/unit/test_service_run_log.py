@@ -8,14 +8,16 @@ from reliquary.constants import M_ROLLOUTS
 from reliquary.services.run_log import NotAnObservation, Observation, RunObservationLog
 
 ORDER = "a" * 64
+SEEDS = list(range(1, 2 * M_ROLLOUTS, 2))        # any M distinct seeds of the 2M pool, ascending
 
 
 def obs(*, env="reliquary_dapo_math_v1", prompt=7, group="g1", window=1, checkpoint_n=1,
-        rewards=(10000,) * (M_ROLLOUTS // 2) + (0,) * (M_ROLLOUTS - M_ROLLOUTS // 2), lane="training", hotkey="hk-1"):
+        rewards=(10000,) * (M_ROLLOUTS // 2) + (0,) * (M_ROLLOUTS - M_ROLLOUTS // 2), lane="training", hotkey="hk-1",
+        seeds=SEEDS):
     return Observation(environment=env, dataset_id=f"{env}-train", prompt_idx=prompt, group_id=group,
                        window=window, checkpoint_n=checkpoint_n, checkpoint_revision="c" * 40,
                        observed_at=100.0 + window, rewards_bps=tuple(rewards), lane=lane,
-                       candidate={"pool_sha256": "p" * 64, "candidate_id": 1}, hotkey=hotkey, token_count=1234)
+                       candidate={"pool_sha256": "p" * 64, "seeds": seeds}, hotkey=hotkey, token_count=1234)
 
 
 @pytest.fixture
@@ -60,7 +62,7 @@ def test_public_events_carry_no_hotkey_or_tokens(log):
     first = events[0]
     assert first["env"] == "reliquary_dapo_math_v1" and first["prompt_idx"] == 7
     assert first["checkpoint_n"] == 1 and first["window"] == 1 and len(first["rewards_bps"]) == M_ROLLOUTS
-    assert first["verdict"] == "in-zone" and first["candidate"]["candidate_id"] == 1
+    assert first["verdict"] == "in-zone" and first["candidate"] == {"pool_sha256": "p" * 64, "seeds": SEEDS}
     assert log.admin_events()[0][1]["hotkey"] == "hk-1"
 
 
@@ -156,13 +158,54 @@ def test_run_salt_is_persisted_and_ids_are_stable_across_reopen(tmp_path):
 def test_public_event_cannot_carry_hotkey_or_tokens_even_via_candidate(log):
     o = obs(hotkey="SECRET-HOTKEY")
     o = Observation(**{**{f: getattr(o, f) for f in o.__slots__},
-                       "candidate": {"pool_sha256": "p" * 64, "candidate_id": 1, "hotkey": "SECRET-HOTKEY",
+                       "candidate": {"pool_sha256": "p" * 64, "seeds": tuple(SEEDS), "candidate_id": 1,
+                                     "hotkey": "SECRET-HOTKEY",
                                      "tokens": [1, 2, 3], "token_ids": [4]}})
     with log.db:
         log.record(o, status="proven", proof="proven")
     raw = log.db.execute("SELECT group_concat(payload) FROM run_events").fetchone()[0]
     assert "SECRET-HOTKEY" not in raw and "tokens" not in raw and "token_ids" not in raw
-    assert log.events()[0][1]["candidate"] == {"pool_sha256": "p" * 64, "candidate_id": 1}
+    assert log.events()[0][1]["candidate"] == {"pool_sha256": "p" * 64, "seeds": SEEDS}
+
+
+def test_public_event_pairs_each_reward_with_its_seed(log):
+    rewards = tuple(10000 if i % 3 == 0 else 0 for i in range(M_ROLLOUTS))
+    with log.db:
+        log.record(obs(rewards=rewards, hotkey="SECRET-HOTKEY"), status="proven", proof="proven")
+    event = log.events()[0][1]
+    assert event["candidate"]["seeds"] == SEEDS and event["rewards_bps"] == list(rewards)
+    assert dict(zip(event["candidate"]["seeds"], event["rewards_bps"])) == dict(zip(SEEDS, rewards))
+    assert "hotkey" not in event and "SECRET-HOTKEY" not in str(event)
+    assert set(event["candidate"]) == {"pool_sha256", "seeds"}
+
+
+@pytest.mark.parametrize("seeds", [
+    SEEDS[:-1], SEEDS + [2 * M_ROLLOUTS - 2], SEEDS[::-1], [SEEDS[0]] * M_ROLLOUTS,
+    SEEDS[:-1] + [2 * M_ROLLOUTS], [-1] + SEEDS[1:], [True] + SEEDS[1:], [1.0] + SEEDS[1:],
+    ["1"] + SEEDS[1:], "seeds", {"0": 1}, None,
+])
+def test_seeds_that_do_not_pair_with_the_rewards_are_refused(log, seeds):
+    with pytest.raises(ValueError):
+        with log.db:
+            log.record(obs(seeds=seeds), status="proven", proof="proven")
+    assert log.events() == []
+
+
+def test_two_subsets_of_one_prompt_are_two_observations_one_first_scan(log):
+    other = list(range(M_ROLLOUTS))
+    with log.db:
+        a = log.record(obs(group="subset-a"), status="proven", proof="proven")
+        b = log.record(obs(group="subset-b", seeds=other), status="proven", proof="proven")
+    assert a.observation_id != b.observation_id and a.first_scan and not b.first_scan
+    assert [e["candidate"]["seeds"] for _, e in log.events()] == [SEEDS, other]
+
+
+def test_group_without_a_pool_has_no_candidate(log):
+    o = obs()
+    o = Observation(**{**{f: getattr(o, f) for f in o.__slots__}, "candidate": None})
+    with log.db:
+        log.record(o, status="proven", proof="proven")
+    assert log.events()[0][1]["candidate"] is None
 
 
 def test_settle_is_idempotent_and_refuses_another_order(log, tmp_path):

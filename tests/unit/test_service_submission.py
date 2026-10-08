@@ -9,6 +9,10 @@ from reliquary.protocol.signatures import build_commit_binding, build_envelope_b
 from reliquary.protocol.submission import BatchSubmissionRequest, CommitModel, GrpoBatchState, MinerState, RolloutSubmission, WindowState
 
 
+SEEDS = tuple(range(1, 2 * M_ROLLOUTS, 2))
+OTHER = tuple(range(M_ROLLOUTS))
+
+
 def _commit(index=0, *, service=True, pool=False):
     size = CHALLENGE_K + 1
     metadata = {"prompt_length": 1, "completion_length": size - 1, "success": False,
@@ -16,7 +20,7 @@ def _commit(index=0, *, service=True, pool=False):
     if service:
         metadata["service_binding"] = ServiceBinding("aa" * 32, "exploration").rollout_binding(index)
     if pool:
-        metadata["seed_pool"] = PoolSelection("bb" * 32, 1).rollout_binding(index)
+        metadata["seed_pool"] = PoolSelection("bb" * 32, SEEDS).rollout_binding(index)
     return {"tokens": list(range(size)), "commitments": [{}] * size,
             "proof_version": "public-group-proof/v1" if pool else "service-group-proof/v1" if service else "v7",
             "model": {"name": "test", "layer_index": 1}, "signature": "aa" * 64,
@@ -31,16 +35,28 @@ def _envelope(**changes):
 
 def test_service_and_pool_intent_changes_both_signed_domains():
     intent = ServiceBinding("aa" * 32, "exploration")
-    pool = PoolSelection("bb" * 32, 1)
+    pool = PoolSelection("bb" * 32, SEEDS)
     base = _envelope()
     bound = _envelope(service_binding=intent.to_dict())
     both = _envelope(service_binding=intent.to_dict(), pool_selection=pool.to_dict())
     assert len({base, bound, both, _envelope(pool_selection=pool.to_dict())}) == 4
     for change in (ServiceBinding("cc" * 32, "exploration"), ServiceBinding("aa" * 32, "training")):
         assert _envelope(service_binding=change.to_dict(), pool_selection=pool.to_dict()) != both
+    # the envelope attests the exact seed list: any other subset, or pool, is another message
+    for change in (PoolSelection("bb" * 32, OTHER), PoolSelection("bb" * 32, (0, *SEEDS[1:])),
+                   PoolSelection("cc" * 32, SEEDS)):
+        assert _envelope(service_binding=intent.to_dict(), pool_selection=change.to_dict()) != both
+        assert _envelope(pool_selection=change.to_dict()) != _envelope(pool_selection=pool.to_dict())
+    for forged in ({**pool.to_dict(), "seeds": list(SEEDS[::-1])}, {**pool.to_dict(), "seeds": [0, 0]},
+                   {"schema": "public-group-selection/v1", "pool_sha256": "bb" * 32, "candidate_id": 1}):
+        with pytest.raises(ValueError):
+            _envelope(service_binding=intent.to_dict(), pool_selection=forged)
     parts = ([1, 2], "ab" * 32, "test", 1, [{}, {}])
     signed = build_service_commit_binding(*parts, intent.rollout_binding(0), pool.rollout_binding(0))
     assert signed != build_commit_binding(*parts)
+    # the rollout signature attests the seed it drew
+    assert build_service_commit_binding(*parts, intent.rollout_binding(0),
+                                        PoolSelection("bb" * 32, OTHER).rollout_binding(0)) != signed
     for change in (intent.rollout_binding(1), ServiceBinding("aa" * 32, "training").rollout_binding(0)):
         if change["rollout_index"] == 1:
             with pytest.raises(ValueError):
@@ -118,16 +134,36 @@ def test_real_sr25519_service_proof_and_envelope_reject_mutated_intent(monkeypat
     assert not signatures.verify_commit_signature({**commit, "proof_version": "v7"}, key.ss58_address)
     if pool:
         altered = copy.deepcopy(commit)
-        altered["rollout"]["seed_pool"]["candidate_id"] = 2
+        altered["rollout"]["seed_pool"]["seed_index"] = SEEDS[0] + 1
         assert not signatures.verify_commit_signature(altered, key.ss58_address)
     fields = dict(miner_hotkey=key.ss58_address, window_start=4, prompt_idx=7,
                   merkle_root="aa" * 32, checkpoint_hash="d" * 40, drand_round=9,
                   randomness="ab" * 32, nonce="fresh",
                   service_binding=ServiceBinding("aa" * 32, "exploration").to_dict(),
-                  pool_selection=PoolSelection("bb" * 32, 1).to_dict() if pool else None)
+                  pool_selection=PoolSelection("bb" * 32, SEEDS).to_dict() if pool else None)
     sig = signatures.sign_envelope(wallet=wallet, **fields).hex()
     assert signatures.verify_envelope_signature(envelope_signature=sig, **fields)
     assert not signatures.verify_envelope_signature(envelope_signature=sig,
         **{**fields, "service_binding": ServiceBinding("aa" * 32, "training").to_dict()})
     assert not signatures.verify_envelope_signature(envelope_signature=sig,
         **{**fields, "service_binding": None})
+    if pool:
+        assert not signatures.verify_envelope_signature(envelope_signature=sig,
+            **{**fields, "pool_selection": PoolSelection("bb" * 32, OTHER).to_dict()})
+
+
+def test_request_schema_bounds_the_selection_to_one_seed_per_rollout():
+    commit = CommitModel.model_validate(_commit(service=False))
+    rollouts = [RolloutSubmission(tokens=commit.tokens, reward=0, commit=commit.model_dump(), env_name="math")
+                for _ in range(M_ROLLOUTS)]
+    def request(selection):
+        return BatchSubmissionRequest(miner_hotkey="hk", prompt_idx=7, window_start=4, merkle_root="aa" * 32,
+                                      rollouts=rollouts, checkpoint_hash="d" * 40, pool_selection=selection)
+    good = PoolSelection("bb" * 32, SEEDS).to_dict()
+    assert request(good).model_dump()["pool_selection"] == good
+    for seeds in (list(SEEDS[:-1]), sorted({0, *SEEDS}), list(range(64)), list(range(100000)),
+                  list(SEEDS[::-1]), [SEEDS[0]] * M_ROLLOUTS, [True, *SEEDS[1:]], [1.0, *SEEDS[1:]]):
+        with pytest.raises(ValueError):
+            request({**good, "seeds": seeds})
+    with pytest.raises(ValueError):
+        request({"schema": "public-group-selection/v1", "pool_sha256": "bb" * 32, "candidate_id": 1})

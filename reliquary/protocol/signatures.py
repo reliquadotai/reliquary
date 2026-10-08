@@ -144,8 +144,7 @@ def build_service_commit_binding(
     domain = SERVICE_COMMIT_DOMAIN
     if seed_pool is not None:
         from reliquary.protocol.seed_pool import parse_rollout_binding
-        _, pool_index = parse_rollout_binding(seed_pool)
-        if pool_index != original_index:
+        if parse_rollout_binding(seed_pool).rollout_index != original_index:
             raise ValueError("service and pool rollout indices differ")
         domain = PUBLIC_GROUP_COMMIT_DOMAIN
         parts = (*parts, canonical_json_bytes(seed_pool))

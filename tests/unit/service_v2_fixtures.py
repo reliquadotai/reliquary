@@ -12,7 +12,10 @@ CODE = "reliquary_code_v1"
 SCIENCE = "reliquary_science_v1"
 
 
-def contract_v2_dict(*, envs=(MATH, CODE), shares=None, exploration=1, pool_groups=2,
+_TWO_M = object()
+
+
+def contract_v2_dict(*, envs=(MATH, CODE), shares=None, exploration=1, pool_seeds=_TWO_M,
                      task_scoped=1, missing_box=None, visibility="task",
                      cooldown_windows=50, rows=1000) -> dict:
     if shares is None:
@@ -39,8 +42,10 @@ def contract_v2_dict(*, envs=(MATH, CODE), shares=None, exploration=1, pool_grou
             env: {
                 "version": hashlib.sha256(env.encode()).hexdigest(),
                 "dataset": {"id": f"{env}-train", "rows": rows},
-                "sampling": {"kind": "public-group-pool/v1", "group_size": M_ROLLOUTS,
-                             "pool_groups": pool_groups, "renewal_windows": 1},
+                # The pool is always 2 x M seeds; ``pool_seeds`` exists only to test the refusal.
+                "sampling": {"kind": "public-seed-pool/v3", "group_size": M_ROLLOUTS,
+                             "pool_seeds": 2 * M_ROLLOUTS if pool_seeds is _TWO_M else pool_seeds,
+                             "renewal_windows": 1},
                 "exploration": exploration,
                 "missing_box": missing_box or ("uncertain" if "math" in env else "graded"),
                 "cooldown_windows": cooldown_windows,

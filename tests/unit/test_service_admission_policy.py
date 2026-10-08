@@ -19,11 +19,14 @@ def announcement(contract, schedule=None):
             "pool_epoch": 5, "pool_randomness": "ab" * 32}
 
 
-def request(contract, *, env=MATH, purpose="training", candidate=1, checkpoint="a" * 40, pool_env=None):
+SEEDS = tuple(range(1, 2 * M_ROLLOUTS, 2))
+
+
+def request(contract, *, env=MATH, purpose="training", seeds=SEEDS, checkpoint="a" * 40, pool_env=None):
     pool = SeedPool.from_contract(contract, environment=pool_env or env, prompt_idx=7, checkpoint_hash=checkpoint,
                                   pool_epoch=5, randomness="ab" * 32)
     intent = ServiceBinding(contract.sha256, purpose)
-    selection = pool.selection(candidate)
+    selection = pool.selection(seeds)
     rollouts = [SimpleNamespace(env_name=env, commit={"rollout": {
         "service_binding": intent.rollout_binding(i), "seed_pool": selection.rollout_binding(i)}})
         for i in range(M_ROLLOUTS)]
@@ -68,7 +71,7 @@ def test_exploration_refused_where_the_env_disables_it():
 def test_pool_resolution_needs_the_env():
     contract = contract_v2()
     pool = pool_from_service_policy(announcement(contract), environment=CODE, prompt_idx=7, checkpoint_hash="a" * 40)
-    assert pool.environment == CODE and pool.pool_groups == 2
+    assert pool.environment == CODE and pool.pool_seeds == 2 * M_ROLLOUTS == 2 * pool.group_size
 
 
 def test_v1_announcement_is_refused():
@@ -81,3 +84,21 @@ def test_v1_announcement_is_refused():
         validate_submission_policy(SimpleNamespace(service_binding=None, pool_selection=None, rollouts=[]),
                                    {"contract": contract.to_dict(), "schedule": {}, "checkpoint": CHECKPOINT,
                                     "supported_capabilities": ["legacy/v1"], "pool_epoch": 0, "pool_randomness": ""})
+
+
+def test_any_subset_of_the_pool_is_accepted_and_its_rollouts_must_follow_it():
+    contract = contract_v2()
+    for seeds in (tuple(range(M_ROLLOUTS)), tuple(range(M_ROLLOUTS, 2 * M_ROLLOUTS)), SEEDS):
+        assert validate_submission_policy(request(contract, seeds=seeds), announcement(contract)) == contract
+    forged = request(contract)
+    forged.pool_selection = {**forged.pool_selection, "seeds": list(range(M_ROLLOUTS))}
+    with pytest.raises(ValueError):                      # rollouts drew other seeds than the selection says
+        validate_submission_policy(forged, announcement(contract))
+    twice = request(contract)
+    twice.rollouts[1].commit["rollout"]["seed_pool"]["seed_index"] = SEEDS[0]
+    with pytest.raises(ValueError):                      # two rollouts on one seed
+        validate_submission_policy(twice, announcement(contract))
+    missing = request(contract)
+    missing.pool_selection = None
+    with pytest.raises(ValueError):
+        validate_submission_policy(missing, announcement(contract))

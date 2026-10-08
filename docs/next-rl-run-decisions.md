@@ -131,10 +131,20 @@ validator's API is never hit by observation readers.
 - Later: an `active` mode that applies the recommendation by itself, switchable once
   its values have been validated over the run.
 
-## F. Seeds 2×M (#325): KEEP
+## F. Seeds 2×M (#325): KEEP, corrected by the user on 10-08
 
-The miner chooses between 2 candidate groups of 16. This is intended: over-generation
-pays off (the user is to supply the paper). Never allow choosing individual rollouts.
+- For each (env, prompt, window) the pool is 2×M public seeds (32 when M=16), the same
+  for every miner. There are no fixed candidate groups.
+- A miner builds its group from ANY M distinct seeds of the pool. Cherry-picking is
+  intended: miners over-generate and keep the subset they like (the user is to supply
+  the paper).
+- On the wire a group is the pool digest plus the chosen seed indices in increasing
+  order; rollout i is the i-th chosen seed, so one subset has one encoding.
+- A seed's forced draw depends on (pool, seed, token position) only, never on its rank in
+  the group nor on the hotkey: the same seed gives every miner the same draw.
+- The group id is the digest of that selection. Public observation events list the chosen
+  seeds next to the per-rollout rewards, so miners learn which seed gave which reward.
+- Prompt dedup and cooldown rules are unchanged.
 
 ## G. Several envs per task, one checkpoint lineage: DECIDED (07-10)
 

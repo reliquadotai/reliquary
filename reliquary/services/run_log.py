@@ -34,6 +34,7 @@ class Observation:
     observed_at: float
     rewards_bps: tuple[int, ...]
     lane: str
+    # None, or {"pool_sha256": ..., "seeds": [...]}: the chosen seed indices, ordered like rewards_bps.
     candidate: dict | None
     hotkey: str
     token_count: int
@@ -55,17 +56,30 @@ def observation_id(order_sha256: str, obs: Observation, run_salt: bytes) -> str:
                              "hotkey": obs.hotkey, "run_salt": run_salt.hex()})
 
 
-def _public_candidate(candidate: dict | None) -> dict | None:
-    """Only the two typed, non-identifying pool references may be published."""
+def _public_candidate(candidate: dict | None, rollouts: int) -> dict | None:
+    """Only the two typed, non-identifying pool references may be published.
+
+    ``seeds`` are the pool seed indices the miner chose, in the order of the per-rollout
+    rewards (``seeds[i]`` drew the rollout graded ``rewards_bps[i]``), so miners learn which
+    seed gave which reward. A list that cannot pair with the rewards is refused, not published.
+    """
     if candidate is None:
         return None
+    if not isinstance(candidate, dict):
+        raise ValueError("candidate must be the pool reference of the group")
     out: dict = {}
     pool = candidate.get("pool_sha256")
     if isinstance(pool, str):
         out["pool_sha256"] = pool
-    cid = candidate.get("candidate_id")
-    if type(cid) is int:
-        out["candidate_id"] = cid
+    seeds = candidate.get("seeds")
+    if type(seeds) not in (list, tuple) or len(seeds) != rollouts:
+        raise ValueError("candidate seeds must name one pool seed per rollout")
+    previous = -1
+    for seed in seeds:
+        if type(seed) is not int or not previous < seed < 2 * M_ROLLOUTS:
+            raise ValueError("candidate seeds must be distinct increasing indices of the 2 x M pool")
+        previous = seed
+    out["seeds"] = list(seeds)
     return out
 
 
@@ -116,7 +130,7 @@ class RunObservationLog:
                   "checkpoint_n": int(obs.checkpoint_n), "checkpoint": str(obs.checkpoint_revision),
                   "window": int(obs.window), "ts": float(obs.observed_at),
                   "rewards_bps": [int(v) for v in obs.rewards_bps], "verdict": category,
-                  "candidate": _public_candidate(obs.candidate), "lane": obs.lane,
+                  "candidate": _public_candidate(obs.candidate, len(obs.rewards_bps)), "lane": obs.lane,
                   "status": str(status), "proof": str(proof)}
         payload = canonical_json_bytes(public).decode()
         inserted = self.db.execute(

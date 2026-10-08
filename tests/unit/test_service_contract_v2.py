@@ -78,6 +78,6 @@ def test_cooldown_only_change_keeps_shares():
 
 
 def test_schedule_from_dict_refuses_another_order():
-    contract, other = contract_v2(), contract_v2(pool_groups=3)
+    contract, other = contract_v2(), contract_v2(cooldown_windows=51)
     with pytest.raises(ScheduleError, match="order"):
         ServiceSchedule.from_dict(initial_schedule(contract).to_dict(), other)

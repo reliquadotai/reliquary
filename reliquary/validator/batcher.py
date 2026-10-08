@@ -4862,7 +4862,8 @@ class GrpoWindowBatcher:
                                                 prompt_idx=request.prompt_idx, checkpoint_hash=request.checkpoint_hash)
                 selection = PoolSelection.from_dict(request.pool_selection)
                 pool.validate_selection(selection, rollout_count=len(request.rollouts))
-                return [pool.uniform(selection.candidate_id, index, j) for j in range(len(positions))]
+                # The draw belongs to the seed, not to the rollout's rank in the group.
+                return [pool.uniform(selection.seeds[index], j) for j in range(len(positions))]
             return [u_at(self.randomness, request.prompt_idx, request.checkpoint_hash, index, j)
                     for j in range(len(positions))]
 
@@ -6054,6 +6055,22 @@ class GrpoWindowBatcher:
         binding = getattr(pending.request, "service_binding", None)
         return self.service_runtime is not None and isinstance(binding, dict) and binding.get("purpose") == "exploration"
 
+    @staticmethod
+    def _service_group_id(pending) -> str:
+        """Group id of a service group.
+
+        With a public seed pool it is the digest of the selection (pool digest + chosen
+        seed indices): equal for two miners who chose the same subset, different for any
+        other subset, and free of the hotkey (the observation identity adds hotkey and run
+        salt). Without a pool it stays the digest of the rollouts themselves.
+        """
+        from reliquary.protocol.release_contract import canonical_sha256
+        selection = getattr(pending.request, "pool_selection", None)
+        if selection is not None:
+            from reliquary.protocol.seed_pool import PoolSelection
+            return PoolSelection.from_dict(selection).sha256
+        return canonical_sha256({"selection_digest": pending.selection_digest.hex()})
+
     def _record_service_proof(self, pending, verified) -> dict:
         from reliquary.protocol.release_contract import canonical_sha256
         from reliquary.services.admission_policy import validate_submission_policy
@@ -6064,7 +6081,7 @@ class GrpoWindowBatcher:
             from reliquary.services.runtime import ServicePolicyLimit
             raise ServicePolicyLimit("uncertain outcomes cannot become a verified service observation")
         commits = [r.commit for r in verified.rollouts]
-        identity = canonical_sha256(pending.request.pool_selection or {"selection_digest": pending.selection_digest.hex()})
+        identity = self._service_group_id(pending)
         row = {
             "schema": "prompt-observation/v1", "context_sha256": contract.context_sha256,
             "row_id": self.service_runtime.row_ids[pending.prompt_idx], "group_id": identity,

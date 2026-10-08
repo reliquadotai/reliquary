@@ -395,10 +395,33 @@ def _current_drand_round_at_send() -> int:
     return compute_current_drand_round(time.time(), ci["genesis_time"], ci["period"])
 
 
+def bind_public_seed_group(seed_pool, generations) -> list[dict]:
+    """Make any ``group_size`` generations of distinct pool seeds a submittable group.
+
+    Each generation must carry the ``seed_pool`` binding it was generated with
+    (whatever group and rank that was). The result is ordered by seed index and
+    every generation is rebound to its rank in the new selection, which is the
+    single canonical encoding of the subset. Duplicate seeds, a wrong count or a
+    binding of another pool raise ``ValueError``.
+    """
+    from reliquary.protocol.seed_pool import parse_rollout_binding
+
+    claimed = []
+    for generation in generations:
+        claim = parse_rollout_binding(generation.get("seed_pool"))
+        if claim.pool_sha256 != seed_pool.sha256:
+            raise ValueError("generation belongs to another public pool")
+        claimed.append((claim.seed_index, generation))
+    claimed.sort(key=lambda item: item[0])
+    selection = seed_pool.selection([seed for seed, _ in claimed])
+    return [dict(generation, seed_pool=selection.rollout_binding(index))
+            for index, (_, generation) in enumerate(claimed)]
+
+
 def _bft_assemble_rollouts(
     *, model, phase1_tensor, prompt_tokens, think_close_ids, force_ids,
     eos_ids, answer_budget, randomness, hotkey, prompt_idx, checkpoint_hash,
-    gen_kwargs=None, seed_pool=None, candidate_id=None,
+    gen_kwargs=None, seed_pool=None, seeds=None,
 ):
     """Budget-Forced Termination assembly.
 
@@ -467,7 +490,7 @@ def _bft_assemble_rollouts(
                 [len(p) for p in unfinished_primed], plen,
             ),
             start_len=width,
-            seed_pool=seed_pool, candidate_id=candidate_id,
+            seed_pool=seed_pool, seeds=seeds,
         )
         ans = model.generate(
             torch.tensor(rows, device=device),
@@ -617,12 +640,15 @@ class MiningEngine:
         pool_bindings = [generation.get("seed_pool") for generation in generations]
         pool_selection = None
         if any(binding is not None for binding in pool_bindings):
-            from reliquary.protocol.seed_pool import parse_rollout_binding
-            for index, binding in enumerate(pool_bindings):
-                selection, original_index = parse_rollout_binding(binding)
-                if original_index != index or pool_selection is not None and selection.to_dict() != pool_selection:
-                    raise ValueError("candidate rollouts must preserve their complete group identity")
-                pool_selection = selection.to_dict()
+            # The signed selection is rebuilt from what each rollout says it drew: rollout i
+            # carries the i-th chosen seed, so the list must already be strictly increasing.
+            from reliquary.protocol.seed_pool import PoolSelection, parse_rollout_binding
+            claims = [parse_rollout_binding(binding) for binding in pool_bindings]
+            if any(claim.rollout_index != index or claim.pool_sha256 != claims[0].pool_sha256
+                   for index, claim in enumerate(claims)):
+                raise ValueError("rollouts must be bound to one pool, in the order of their seeds")
+            pool_selection = PoolSelection(
+                claims[0].pool_sha256, [claim.seed_index for claim in claims]).to_dict()
         return BatchSubmissionRequest(
             miner_hotkey=self.wallet.hotkey.ss58_address,
             prompt_idx=prompt_idx,
@@ -971,7 +997,6 @@ class MiningEngine:
                 service_policy = getattr(state, "service_policy", None)
                 policy_value = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
                 from reliquary.protocol.seed_pool import pool_from_service_policy
-                from reliquary.constants import max_new_tokens_for_environment
                 seed_pool = pool_from_service_policy(
                     service_policy, environment=env_name,
                     prompt_idx=prompt_idx, checkpoint_hash=local_hash,
@@ -991,8 +1016,6 @@ class MiningEngine:
                     generations = self._generate_public_pool_rollouts(
                         problem, randomness, env=env, prompt_idx=prompt_idx,
                         checkpoint_hash=local_hash, seed_pool=seed_pool,
-                        max_exploration_tokens=(seed_pool.pool_groups * seed_pool.group_size
-                                            * max_new_tokens_for_environment(env.name)),
                     )
                 else:
                     generations = self._generate_m_rollouts(
@@ -1220,9 +1243,15 @@ class MiningEngine:
 
     def _generate_m_rollouts(
         self, problem, randomness, *, env_name: str | None = None,
-        prompt_idx: int, checkpoint_hash: str, seed_pool=None, candidate_id=None,
+        prompt_idx: int, checkpoint_hash: str, seed_pool=None, seeds=None,
     ) -> list[dict]:
         """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
+
+        With a public ``seed_pool``, ``seeds`` is any ``M_ROLLOUTS`` distinct seed
+        indices of the pool in ascending order: rollout ``i`` is drawn from
+        ``seeds[i]`` and comes back bound to it. A seed's draw does not depend on
+        the other seeds of the call, so two calls covering the whole pool
+        over-generate it (see ``choose_public_seed_group``).
 
         One .generate() with batch shape (M_ROLLOUTS, prompt_len) is ~5-7×
         faster on GPU than M_ROLLOUTS serial calls — the matmul tiling
@@ -1256,12 +1285,17 @@ class MiningEngine:
         )
 
         hotkey = self.wallet.hotkey.ss58_address
+        selection = None
         if seed_pool is not None:
-            seed_pool.validate_selection(seed_pool.selection(candidate_id), rollout_count=M_ROLLOUTS)
+            selection = seed_pool.selection(seeds)
+            seed_pool.validate_selection(selection, rollout_count=M_ROLLOUTS)
+            seeds = selection.seeds
             if seed_pool.prompt_idx != prompt_idx or seed_pool.checkpoint_hash != checkpoint_hash:
                 raise ValueError("public pool does not match generation context")
             if env_name is None or get_environment_spec(env_name).interaction_mode != "single_turn":
-                raise ValueError("public group pools are single-turn only")
+                raise ValueError("public seed pools are single-turn only")
+        elif seeds is not None:
+            raise ValueError("seeds require a public pool")
         # Resolved before the prompt is encoded: whether the template opens a
         # reasoning block is per environment, and the validator renders this
         # same prompt with the same lookup.
@@ -1309,14 +1343,14 @@ class MiningEngine:
                 rollouts=M_ROLLOUTS,
                 max_new_tokens=environment_cap,
                 eos_ids=sorted(eos_ids),
-                **({"seed_pool": seed_pool, "candidate_id": candidate_id} if seed_pool is not None else {}),
+                **({"seed_pool": seed_pool, "seeds": seeds} if seed_pool is not None else {}),
             )
             return [
                 {
                     "tokens": prompt_tokens + list(completion),
                     "prompt_length": prompt_length,
                     "forced": False,
-                    **({"seed_pool": seed_pool.selection(candidate_id).rollout_binding(index)} if seed_pool is not None else {}),
+                    **({"seed_pool": selection.rollout_binding(index)} if selection is not None else {}),
                 }
                 for index, completion in enumerate(completions)
             ]
@@ -1347,7 +1381,7 @@ class MiningEngine:
                 checkpoint_hash=checkpoint_hash,
                 rollout_indices=list(range(M_ROLLOUTS)),
                 base_offsets=[0] * M_ROLLOUTS, start_len=prompt_length,
-                seed_pool=seed_pool, candidate_id=candidate_id,
+                seed_pool=seed_pool, seeds=seeds,
             )
             outputs = self.vllm_model.generate(
                 input_tensor,
@@ -1374,11 +1408,11 @@ class MiningEngine:
                     randomness=randomness, hotkey=hotkey, prompt_idx=prompt_idx,
                     checkpoint_hash=checkpoint_hash,
                     gen_kwargs=phase2_kwargs,
-                    seed_pool=seed_pool, candidate_id=candidate_id,
+                    seed_pool=seed_pool, seeds=seeds,
                 )
-                if seed_pool is not None:
+                if selection is not None:
                     for index, generation in enumerate(assembled):
-                        generation["seed_pool"] = seed_pool.selection(candidate_id).rollout_binding(index)
+                        generation["seed_pool"] = selection.rollout_binding(index)
                 return assembled
         rollouts = []
         for i in range(M_ROLLOUTS):
@@ -1392,52 +1426,55 @@ class MiningEngine:
                 "prompt_length": prompt_length,
                 "forced": False,
             })
-        if seed_pool is not None:
+        if selection is not None:
             for index, generation in enumerate(rollouts):
-                generation["seed_pool"] = seed_pool.selection(candidate_id).rollout_binding(index)
+                generation["seed_pool"] = selection.rollout_binding(index)
         return rollouts
+
+    def choose_public_seed_group(self, seed_pool, generate, *, problem, env) -> list[dict]:
+        """HOOK -- which ``seed_pool.group_size`` seeds of the public pool this miner submits.
+
+        The pool holds ``seed_pool.pool_seeds`` (= 2 x group size) public seeds, the
+        same for every miner, and a group is ANY ``group_size`` distinct seeds of
+        it. ``generate(seeds)`` returns one generation per seed for ``group_size``
+        distinct ascending seed indices; a seed's completion is the same whatever
+        the other seeds of the call are.
+
+        This reference policy is deliberately the cheapest deterministic one: it
+        generates and returns the first ``group_size`` seeds and never looks at a
+        reward. A real miner replaces this method to over-generate and keep the
+        subset it prefers, e.g.::
+
+            low = generate(tuple(range(seed_pool.group_size)))
+            high = generate(tuple(range(seed_pool.group_size, seed_pool.pool_seeds)))
+            rewards = self._local_group_rewards(low + high, problem, env)
+            keep = ...  # any group_size of the 2 x group_size generations
+            return bind_public_seed_group(seed_pool, keep)
+
+        Return exactly ``group_size`` generations of distinct seeds, each still
+        carrying the ``seed_pool`` binding ``generate`` gave it. The caller orders
+        them by seed and rebinds them, so the returned order does not matter; a
+        duplicate seed or a wrong count is refused before anything is signed.
+        """
+        return generate(tuple(range(seed_pool.group_size)))
 
     def _generate_public_pool_rollouts(
         self, problem, randomness, *, env, prompt_idx: int, checkpoint_hash: str,
-        seed_pool, max_exploration_tokens: int,
+        seed_pool,
     ) -> list[dict]:
-        """Explore complete candidate groups; submit one with original IDs."""
-        from statistics import pvariance
-        from reliquary.constants import max_new_tokens_for_environment
-
-        seed_pool.validate_selection(seed_pool.selection(0), rollout_count=M_ROLLOUTS)
-        if type(max_exploration_tokens) is not int or max_exploration_tokens < 1:
-            raise ValueError("positive exploration token budget required")
-        best_group = None
-        best_variance = -1.0
-        used_tokens = 0
-        for candidate_id in range(seed_pool.pool_groups):
-            # Includes forced-answer tokens and injected terminators on BFT
-            # profiles, which can exceed the caller's phase-1 token setting.
-            cap = max_new_tokens_for_environment(env.name)
-            if used_tokens + seed_pool.group_size * cap > max_exploration_tokens:
-                if best_group is None:
-                    raise ValueError("exploration budget cannot cover one candidate group")
-                break
-            group = self._generate_m_rollouts(
+        """One group of the public pool, chosen by ``choose_public_seed_group``."""
+        def generate(seeds) -> list[dict]:
+            return self._generate_m_rollouts(
                 problem, randomness, env_name=env.name, prompt_idx=prompt_idx,
                 checkpoint_hash=checkpoint_hash, seed_pool=seed_pool,
-                candidate_id=candidate_id,
+                seeds=tuple(seeds),
             )
-            selection = seed_pool.selection(candidate_id)
-            seed_pool.validate_selection(selection, rollout_count=len(group))
-            for index, generation in enumerate(group):
-                seed_pool.validate_rollout_binding(generation.get("seed_pool"), selection, index)
-            used_tokens += sum(len(g["tokens"]) - g["prompt_length"] for g in group)
-            rewards = self._local_group_rewards(group, problem, env)
-            if any(reward is None for reward in rewards):
-                raise ValueError("candidate grader returned an unknown reward")
-            variance = pvariance(rewards)
-            if variance > best_variance:
-                best_group, best_variance = group, variance
-        if best_group is None:
-            raise ValueError("public pool has no generated candidate")
-        return best_group
+
+        chosen = self.choose_public_seed_group(seed_pool, generate, problem=problem, env=env)
+        group = bind_public_seed_group(seed_pool, chosen)
+        if len(group) != M_ROLLOUTS:
+            raise ValueError("public pool group size differs from the protocol group size")
+        return group
 
     def _local_group_rewards(self, generations, problem, env) -> list[float | None]:
         import math
