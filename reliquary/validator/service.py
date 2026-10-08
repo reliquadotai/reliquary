@@ -1212,6 +1212,8 @@ class ValidationService:
             emission_cap=self._emission_cap,
         )
         self.server.set_late_drop_callback(self.record_late_drop)
+        # A service run never names a not-yet-opened candidate window or its stage on /health.
+        self.server.service_health_redaction = self._service_runtime is not None
         self.server.configure_prompt_source_health(
             self._prompt_source_health_snapshot
         )

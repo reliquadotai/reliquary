@@ -316,6 +316,44 @@ def _is_mock_like(value: Any) -> bool:
     return type(value).__module__.startswith("unittest.mock")
 
 
+SERVICE_OBSERVATIONS_TOKEN_ENV = "RELIQUARY_SERVICE_OBSERVATIONS_TOKEN"
+SERVICE_OBSERVATIONS_MAX_PAGE = 1000
+
+
+def register_service_observations(app, active_batcher_fn) -> None:
+    """The ADMIN-ONLY observation log of a service run.
+
+    ``Authorization: Bearer <RELIQUARY_SERVICE_OBSERVATIONS_TOKEN>`` (constant-time compare).
+    No token configured: 404 whatever the request, so the route reveals nothing; a missing or
+    wrong token is 401 and is decided before the run is looked at. The events carry hotkeys:
+    they are for the operator only (the public publication is a static artifact). Events are
+    served raw, in sequence order: a reader keeps the LAST settle event per observation id.
+    """
+
+    @app.get("/service-observations")
+    async def service_observations(request: Request, after: int = 0, limit: int = 100):
+        import hmac
+
+        token = os.environ.get(SERVICE_OBSERVATIONS_TOKEN_ENV, "")
+        if not token:
+            raise HTTPException(status_code=404, detail="no_service_task")
+        supplied = request.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        batcher = active_batcher_fn()
+        runtime = getattr(batcher, "service_runtime", None) if batcher is not None else None
+        if runtime is None or _is_mock_like(runtime):
+            raise HTTPException(status_code=404, detail="no_service_task")
+        if after < 0 or not 1 <= limit <= SERVICE_OBSERVATIONS_MAX_PAGE:
+            raise HTTPException(status_code=400, detail="invalid_cursor")
+        events = await asyncio.to_thread(runtime.admin_events, after=after, limit=limit)
+        return {
+            "schema": "service-observation-admin/v1",
+            "watermark": events[-1][0] if events else after,
+            "events": [{"seq": seq, **event} for seq, event in events],
+        }
+
+
 def _protocol_contract_reject_reason(
     *,
     protocol_version: int,
@@ -1336,6 +1374,8 @@ class ValidatorServer:
         self._training_publish_state: dict[str, Any] = {}
         self._training_kl_reference_state: dict[str, Any] = {}
         self._last_committed_window_n = 0
+        # Service runs: /health never names a candidate (not yet opened) window or its stage.
+        self.service_health_redaction = False
         self._candidate_window_n: int | None = None
         self._window_preparation_stage: str | None = None
         self._last_window_preparation_failure: dict[str, Any] | None = None
@@ -1493,11 +1533,40 @@ class ValidatorServer:
 
     @staticmethod
     def _service_state_key(batcher):
+        """What a service batcher's served state depends on, from memory only.
+
+        The announcement is frozen per window and held by the batcher, so the schedule and
+        checkpoint come from it (no database read, no runtime lock on the request path).
+        """
         runtime = getattr(batcher, "service_runtime", None)
         if runtime is None or _is_mock_like(runtime):
             return None
-        view = runtime.view
-        return (runtime.contract.sha256, runtime.active(), view.revision if view is not None else None)
+        policy = getattr(batcher, "service_policy", None)
+        policy = policy if isinstance(policy, dict) else {}
+        schedule = policy.get("schedule")
+        checkpoint = policy.get("checkpoint")
+        return (
+            runtime.contract.sha256,
+            policy.get("pool_epoch"),
+            policy.get("pool_randomness"),
+            schedule.get("revision") if isinstance(schedule, dict) else None,
+            checkpoint.get("revision") if isinstance(checkpoint, dict) else None,
+            bool(runtime.active()),
+        )
+
+    @staticmethod
+    def _service_window_announced(batcher) -> bool:
+        """True unless this is a service batcher whose window the runtime has not announced.
+
+        ``ValidationService`` hands a batcher its announcement only after the runtime froze
+        the window (plan ``opened``); a service batcher without one for its own window is
+        never served (503), so a candidate window is not advertised.
+        """
+        runtime = getattr(batcher, "service_runtime", None)
+        if runtime is None or _is_mock_like(runtime):
+            return True
+        policy = getattr(batcher, "service_policy", None)
+        return isinstance(policy, dict) and policy.get("pool_epoch") == batcher.window_start
 
     def _state_cache_key(self, batcher) -> tuple:
         """Everything the /state payload depends on, for one batcher."""
@@ -3104,18 +3173,24 @@ class ValidatorServer:
             current_validator_state=getattr(self._current_state, "value", str(self._current_state)),
             current_window_n=batcher.window_start if batcher else None,
             last_committed_window_n=self._last_committed_window_n,
-            candidate_window_n=self._candidate_window_n,
-            window_preparation_stage=self._window_preparation_stage,
+            candidate_window_n=(
+                None if self.service_health_redaction else self._candidate_window_n
+            ),
+            window_preparation_stage=(
+                None if self.service_health_redaction else self._window_preparation_stage
+            ),
             last_window_preparation_failure=(
                 dict(self._last_window_preparation_failure)
                 if self._last_window_preparation_failure is not None
+                and not self.service_health_redaction
                 else None
             ),
             window_preparation_failures_total=(
                 self._window_preparation_failures_total
             ),
-            window_preparation_failures_by_stage=dict(
-                self._window_preparation_failures_by_stage
+            window_preparation_failures_by_stage=(
+                {} if self.service_health_redaction
+                else dict(self._window_preparation_failures_by_stage)
             ),
             window_preparation_failures_by_error=dict(
                 self._window_preparation_failures_by_error
@@ -5869,19 +5944,7 @@ class ValidatorServer:
                 )
             )
 
-        @app.get("/service-observations")
-        async def service_observations(after: int = 0, limit: int = 1000):
-            batcher = self.active_batcher
-            runtime = getattr(batcher, "service_runtime", None) if batcher is not None else None
-            if runtime is None:
-                raise HTTPException(status_code=404, detail="no_service_task")
-            # Private mappings are retrieved by the owner via the admin artifact route.
-            if runtime.contract.to_dict()["visibility"] != "task":
-                raise HTTPException(status_code=403, detail="private_service_observations")
-            try:
-                return runtime.snapshot(after=after, limit=limit)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail="invalid_cursor") from exc
+        register_service_observations(app, lambda: self.active_batcher)
 
         @app.get(
             "/state",
@@ -5934,6 +5997,8 @@ class ValidatorServer:
             # Hits are normally answered by ``_StateFastPathMiddleware`` before
             # the FastAPI stack; this in-handler check only serves requests
             # that raced a cache fill.
+            if not self._service_window_announced(batcher):
+                raise HTTPException(status_code=503, detail="no_active_window")
             cache_slot = f"{env or ''}|{window if window is not None else ''}"
             cache_key = self._state_cache_key(batcher)
             cached = self._state_response_cache.get(cache_slot)
@@ -5952,9 +6017,7 @@ class ValidatorServer:
                 state=self._current_state,
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
-                cooldown_prompts=(sorted(set(batcher.cooldown_prompts_snapshot) | set(batcher.service_runtime.view.blocked_indices()))
-                                  if getattr(batcher, "service_runtime", None) is not None and not _is_mock_like(batcher.service_runtime) and batcher.service_runtime.view is not None
-                                  else batcher.cooldown_prompts_snapshot),
+                cooldown_prompts=batcher.cooldown_prompts_snapshot,
                 valid_submissions=submission_count,
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
@@ -6036,6 +6099,10 @@ class ValidatorServer:
                     },
                 )
 
+            if not all(self._service_window_announced(b) for b in self._active_batchers.values()):
+                raise HTTPException(
+                    status_code=503, detail="no_active_window", headers={"Retry-After": "1"},
+                )
             first_batcher = next(iter(self._active_batchers.values()))
             environments: dict[str, MinerEnvironmentState] = {}
             for environment, batcher in sorted(self._active_batchers.items()):
@@ -6062,11 +6129,11 @@ class ValidatorServer:
                 if membership is None:
                     membership = set(batcher.cooldown_prompts_snapshot)
                 runtime = getattr(batcher, "service_runtime", None)
-                if runtime is not None and not _is_mock_like(runtime):
-                    membership = set(membership)
+                if runtime is not None and not _is_mock_like(runtime) and not runtime.active():
+                    # No eligibility mask: the only service-wide closure is an exhausted order.
                     lo, hi = prompt_range
-                    active = runtime.active()
-                    membership.update(idx for idx in range(lo, hi) if not active or (runtime.view is not None and not runtime.view.eligible(idx)))
+                    membership = set(membership)
+                    membership.update(range(lo, hi))
                 bitmap, cooldown_count = encode_cooldown_bitmap(membership, prompt_range)
                 productive_remaining = max(
                     0,

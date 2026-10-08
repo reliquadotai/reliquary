@@ -42,6 +42,15 @@ def lifecycle_fields(*, accepted, selected, selection_reason, reason, now):
         "proven_not_selected_before_window_close": "Proof passed, but this group did not receive a training seat before window closure.",
         "proof_not_completed_before_window_close": "The window closed without a completed proof for this candidate.",
         "picked_but_unpaid_incomplete_cross_environment_batch": "Picked locally, but the cross-environment batch was not durably completed.",
+        "already_scanned": "Accepted, but this prompt was already observed earlier in the run; no exploration payment.",
+        "exploration_banned": "Accepted, but this hotkey is barred from exploration payment after a failed audit.",
+        "exploration_cap_reached": "Accepted, but the per-environment exploration cap was reached; no payment.",
+        "exploration_unpaid": "Accepted, but no exploration entitlement applies to this group; no payment.",
+        "exploration_forfeited": "Exploration payment forfeited after a failed audit.",
+        "exploration_unaudited": "Selected for audit but not audited before the window closed; unpaid, no sanction.",
+        "exploration_audit_queued": "Selected for audit but not audited before the window closed; unpaid, no sanction.",
+        "exploration_window_closed": "Exploration observation arrived after the window closed; unpaid.",
+        "service_unproven_published": "In-zone but not robust; recorded as an observation, never trained or paid.",
         "not_selected_status_unavailable": "Not selected; the validator did not retain the detailed cause.",
     }
     return {

@@ -642,6 +642,10 @@ class Verdict(BaseModel):
     batch_index: int | None = None
     selection_target: int | None = None
     selected_count: int | None = None
+    # Service runs only (detail fields, absent from every legacy verdict).
+    service_contract_sha256: str | None = None
+    service_purpose: str | None = None
+    exploration_fraction: float | None = None
     # Optional observability fields. Older verdict records omit these; the
     # endpoint excludes nulls so legacy consumers keep seeing the compact shape
     # for entries that lack lifecycle metadata.
