@@ -110,7 +110,8 @@ def recommend_cooldown(*, policy: dict, population: int, first_scans: int, in_zo
         delta = target - last
         if abs(delta) <= policy["hysteresis_windows"]:
             target = last
-            reasons.append("hysteresis")
+            if delta:
+                reasons.append("hysteresis")
         elif abs(delta) > policy["max_change_windows"]:
             target = last + (policy["max_change_windows"] if delta > 0 else -policy["max_change_windows"])
             reasons.append("rate_limited")

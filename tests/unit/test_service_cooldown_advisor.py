@@ -1,3 +1,4 @@
+import json
 import math
 
 import pytest
@@ -39,6 +40,9 @@ def test_bounds_ema_hysteresis_and_rate_limit():
     same = call(policy=policy, first_scans=400, in_zone_first=124,
                 previous={**first, "recommended_windows": 30, "ema_windows": 30.0})
     assert same["recommended_windows"] == 30 and "hysteresis" in same["reasons"]
+    # A zero change is not damping: no hysteresis reason.
+    unchanged = call(policy=policy, previous={**first, "recommended_windows": 30, "ema_windows": 30.0})
+    assert unchanged["recommended_windows"] == 30 and "hysteresis" not in unchanged["reasons"]
     capped = call(policy={**POLICY, "max_windows": 20})
     assert capped["recommended_windows"] == 20 and "bounded" in capped["reasons"]
 
@@ -69,7 +73,8 @@ def test_insufficient_data_keeps_previous_recommendation_and_reports_it():
 
 
 def test_tiny_consumption_does_not_overflow():
-    result = call(consumption=1e-300, population=10**15)
+    # 5e-324 is the smallest float: the quotient really reaches inf before the ceiling clamp.
+    result = call(consumption=5e-324, population=10**15)
     assert result["status"] == "ok" and result["recommended_windows"] == POLICY["max_windows"]
 
 
@@ -111,3 +116,4 @@ def test_invalid_previous_raises_value_error():
 def test_results_are_finite_and_json_safe():
     result = call()
     assert all(math.isfinite(v) for v in (result["p"], result["q"], result["ema_windows"]))
+    assert json.loads(json.dumps(result, allow_nan=False)) == result

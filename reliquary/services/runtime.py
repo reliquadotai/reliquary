@@ -222,6 +222,8 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_training_journal(order_id TEXT NOT NULL, key INTEGER NOT NULL, window INTEGER NOT NULL, digest TEXT NOT NULL, groups TEXT NOT NULL, PRIMARY KEY(order_id,key));
                 CREATE TABLE IF NOT EXISTS service_training_stride(order_id TEXT PRIMARY KEY, stride INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_consumption(order_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL, q TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS service_cooldown_advice(environment TEXT PRIMARY KEY, window INTEGER NOT NULL, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS service_schedule_requests(order_id TEXT NOT NULL, request_id TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, revision INTEGER NOT NULL, window INTEGER NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, request_id));
             """)
             if "opened_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(service_windows)")}:
                 self.db.execute("ALTER TABLE service_windows ADD COLUMN opened_at REAL")
@@ -379,19 +381,147 @@ class ServiceRuntime:
         schedule = ServiceSchedule.from_dict(schedule.to_dict(), self.contract)  # same order, valid
         _identifier(request_id, "schedule request_id")
         _integer(window, "window", 0)
-        payload = schedule.canonical.decode()
         with self._txn():
-            known = self.db.execute("SELECT payload FROM service_schedules WHERE order_id=? AND request_id=?",
-                                    (self.contract.sha256, request_id)).fetchone()
-            if known is not None:
-                if known[0] != payload:
-                    raise ValueError("schedule request id was already used for another schedule")
-                return False
-            if schedule.revision != self._schedule().revision + 1:
-                raise ValueError("schedule revisions must increase by one")
-            self.db.execute("INSERT INTO service_schedules VALUES(?,?,?,?,?)",
-                            (self.contract.sha256, schedule.revision, request_id, window, payload))
+            return self._insert_schedule(schedule, request_id, window)
+
+    def _insert_schedule(self, schedule: ServiceSchedule, request_id: str, window: int) -> bool:
+        """``apply_schedule``'s body; the caller holds the write transaction."""
+        payload = schedule.canonical.decode()
+        known = self.db.execute("SELECT payload FROM service_schedules WHERE order_id=? AND request_id=?",
+                                (self.contract.sha256, request_id)).fetchone()
+        if known is not None:
+            if known[0] != payload:
+                raise ValueError("schedule request id was already used for another schedule")
+            return False
+        if schedule.revision != self._schedule().revision + 1:
+            raise ValueError("schedule revisions must increase by one")
+        self.db.execute("INSERT INTO service_schedules VALUES(?,?,?,?,?)",
+                        (self.contract.sha256, schedule.revision, request_id, window, payload))
         return True
+
+    def apply_pending_schedule_request(self, store, *, window: int, now: float | None = None,
+                                       installed_version=None) -> ServiceSchedule:
+        """Apply at most one new operator request from ``store`` and return the schedule ``window`` uses.
+
+        The request file is not trusted: it is validated here again (``schedule.check_request``:
+        schema, order, revision == current + 1, declared envs, shares, cooldown bounds, R7's
+        install/version check for each env that becomes active). A refused request is recorded
+        (SQLite and the store's status file) with its reason and changes nothing; this method never
+        raises for a bad, unreadable or replayed request, nor for a store I/O failure (logged).
+        An accepted one appends the next schedule revision and its request row in ONE transaction,
+        so a restart neither applies it twice nor loses it. R6: the envelope of an already open
+        window is frozen, so the answer for such a window stays its frozen schedule and the change
+        lands at the next window that opens.
+        """
+        _integer(window, "window", 0)
+        try:
+            self._consume_schedule_request(store, window, _instant(now), installed_version)
+        except Exception:  # an operator mistake or a broken disk must never stop the validator loop
+            logger.exception("schedule request could not be processed (window %d)", window)
+        return self.window_schedule(window)
+
+    def _consume_schedule_request(self, store, window: int, at: float, installed_version) -> None:
+        from reliquary.services.schedule import check_request
+        order = self.contract.sha256
+        current = self.schedule
+        try:
+            request = store.take()
+        except (ValueError, OSError) as exc:
+            detail = f"unreadable schedule request: {exc}"
+            status = None
+            with contextlib.suppress(ValueError, OSError):
+                status = store.status()
+            if not (status and status.get("request_id") == "invalid" and status.get("detail") == detail):
+                store.report("invalid", status="refused", detail=detail, revision=current.revision)
+            return
+        if request is None:
+            return
+        request_id = request.get("request_id") if isinstance(request, dict) else None
+        try:
+            _identifier(request_id, "request_id")
+        except ValueError as exc:
+            detail = f"invalid schedule request: {exc}"
+            status = None
+            with contextlib.suppress(ValueError, OSError):
+                status = store.status()
+            if not (status and status.get("request_id") == "invalid" and status.get("detail") == detail):
+                store.report("invalid", status="refused", detail=detail, revision=current.revision)
+            return
+        with self.lock:
+            known = self.db.execute("SELECT status, detail, revision FROM service_schedule_requests "
+                                    "WHERE order_id=? AND request_id=?", (order, request_id)).fetchone()
+            if known is None and self.db.execute("SELECT revision FROM service_schedules WHERE order_id=? "
+                                                 "AND request_id=?", (order, request_id)).fetchone():
+                known = ("applied", "applied earlier", current.revision)
+        if known is not None:
+            # Same request seen again (restart, or the file is still there): never apply twice.
+            status = None
+            with contextlib.suppress(ValueError, OSError):
+                status = store.status()
+            if not status or status.get("request_id") != request_id:
+                store.report(request_id, status=known[0], detail=known[1], revision=known[2])
+            return
+        try:
+            changed = check_request(request, contract=self.contract, current=current,
+                                    installed_version=installed_version)
+            status, detail = "applied", (f"applied during window {window}; it takes effect at the next "
+                                         f"window that opens (open windows keep their frozen schedule)")
+        except ValueError as exc:
+            changed, status, detail = None, "refused", str(exc)
+        except Exception as exc:  # defensive: a request must never be half applied
+            changed, status, detail = None, "refused", f"internal error while checking the request: {type(exc).__name__}"
+        with self._txn():
+            if changed is not None:
+                try:
+                    self._insert_schedule(changed, request_id, window)
+                except ValueError as exc:  # raced with another applier
+                    changed, status, detail = None, "refused", str(exc)
+            revision = changed.revision if changed is not None else self._schedule().revision
+            self.db.execute("INSERT INTO service_schedule_requests VALUES(?,?,?,?,?,?,?)",
+                            (order, request_id, status, detail, revision, window, at))
+        store.report(request_id, status=status, detail=detail, revision=revision)
+
+    # --- cooldown advice (decision E): recommendation only ---
+    def refresh_cooldown_advice(self, *, window: int, populations: dict[str, int]) -> dict[str, dict]:
+        """Recompute and store the cooldown recommendation of every env of the order.
+
+        Informational: it never touches the schedule, admission or settlement, and an advisor
+        failure (``ValueError``, ``OverflowError``, a bad population...) is stored as an error
+        entry (keeping the previous smoothed state), never raised.
+        """
+        from reliquary.services.cooldown_advisor import NOTE, recommend_cooldown
+        _integer(window, "window", 0)
+        advice, consumption = {}, self.measured_consumption()
+        for environment in self.contract.environments:
+            previous = None
+            try:
+                with self.lock:
+                    first, in_zone = self.log.first_scan_stats(environment)
+                    row = self.db.execute("SELECT payload FROM service_cooldown_advice WHERE environment=?",
+                                          (environment,)).fetchone()
+                previous = json.loads(row[0]) if row else None
+                result = recommend_cooldown(policy=self.contract.advice_policy,
+                                            population=int((populations or {}).get(environment, 0)),
+                                            first_scans=first, in_zone_first=in_zone,
+                                            consumption=float(consumption.get(environment, 0.0)),
+                                            previous=previous)
+            except Exception as exc:  # the advisor must never close admission
+                kept = previous if isinstance(previous, dict) else {}
+                result = {"status": "error", "reasons": [type(exc).__name__], "note": NOTE,
+                          "ema_windows": kept.get("ema_windows"),
+                          "recommended_windows": kept.get("recommended_windows")}
+            result["current_windows"] = self.schedule.cooldown_windows(environment)
+            advice[environment] = result
+            with self.lock, self.db:
+                self.db.execute("INSERT INTO service_cooldown_advice VALUES(?,?,?) ON CONFLICT(environment) "
+                                "DO UPDATE SET window=excluded.window, payload=excluded.payload",
+                                (environment, window, canonical_json_bytes(result).decode()))
+        return advice
+
+    def cooldown_advice(self) -> dict[str, dict]:
+        with self.lock:
+            return {env: json.loads(payload) for env, payload in
+                    self.db.execute("SELECT environment, payload FROM service_cooldown_advice")}
 
     # --- checkpoints ---
     def _checkpoint(self) -> dict:
@@ -986,6 +1116,8 @@ class ServiceRuntime:
                     exploration[env] = counts
             result = settle_window(archive=archive, envelope=envelope, contract=self.contract,
                                    exploration=exploration, aborted=aborted)
+            # Informational, not money: no field of FROZEN_ARCHIVE_FIELDS, ignored by validation.
+            result["service_cooldown_advice"] = self.cooldown_advice()
             # Lane consistency under the protocol geometry; the task-cap bound is weight replay's.
             validate_service_archive_v2(result, self.contract, cap=1.0, picks_target=picks, batch_slots=slots)
             digest = canonical_sha256(sorted(
