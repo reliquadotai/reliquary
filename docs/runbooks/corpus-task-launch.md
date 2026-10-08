@@ -363,8 +363,8 @@ One process on one H100 (the GRAIL validator's card is fine: nothing else of
 the RL service runs in it). It loads the job's checkpoint in bf16, refuses to
 start if the contract's model is not the job's checkpoint or the fingerprint
 differs, serves `GET /corpus/job`, `GET /corpus/cursor/{hotkey}`,
-`GET /corpus/next/{hotkey}`, `POST /corpus/skip` (§4.1) and
-`POST /corpus/submit`, audits accepted submissions per the job's `audit_*`
+`GET /corpus/next/{hotkey}`, `POST /corpus/skip` (§4.1), `GET /corpus/open`
+(§4.1.1) and `POST /corpus/submit`, audits accepted submissions per the job's `audit_*`
 parameters (§2.1 — `audit_q = 1.0`, the default, audits every one, as in V0)
 and settles every 60 s.
 
@@ -579,11 +579,13 @@ HTTP: `POST /corpus/submit` is unchanged and routes on the submission's
 `job_id` (a job this validator does not serve is refused `job_not_served`, its
 detail listing the served ids). `GET /corpus/jobs` lists the served jobs;
 `GET /corpus/jobs/<job>/job`, `GET /corpus/jobs/<job>/cursor/<hotkey>`,
-`GET /corpus/jobs/<job>/next/<hotkey>` and `POST /corpus/jobs/<job>/skip`
+`GET /corpus/jobs/<job>/next/<hotkey>`, `GET /corpus/jobs/<job>/open` and
+`POST /corpus/jobs/<job>/skip`
 answer for one of them (404 `corpus_job_not_served` otherwise), and
 `GET /corpus/jobs/<job>/contract` serves that job's own task contract (not
 the merge). The legacy `GET /corpus/job`, `GET /corpus/cursor/<hotkey>` and
-`GET /corpus/contract` and `GET /corpus/next/<hotkey>` answer for the first
+`GET /corpus/contract`, `GET /corpus/next/<hotkey>` and `GET /corpus/open`
+answer for the first
 id in `RELIQUARY_TASK_ID` (with one job, unchanged; the job-scoped routes work
 too); the legacy `POST /corpus/skip` routes on the body's `job_id`, as submit
 does.
@@ -671,6 +673,55 @@ and it generates only for a prompt with a slot left. Its counts gain `skipped` (
 (404), a `free` job (409) or a validator that cannot verify a skip, it mines exactly as before for the
 rest of the run. Older miners never call them and see no change: submit, its
 refusals and the cursor route are the same.
+
+#### 4.1.1 Which prompts still have a slot: open
+
+`next` and `skip` need a walk, so they do not exist on a `free` job, and every
+episode job is `free`: without a check an agentic miner runs a whole episode
+(minutes of GPU and sandbox) and only learns `prompt_full` on submit. Late in
+a job that is most episodes.
+
+`GET /corpus/jobs/<job>/open` (legacy `GET /corpus/open`, the default job)
+answers for ANY job, `free` or `miner_walk`:
+
+```json
+{"job_id": "swe-qwen38-27b-v1", "prompt_start": 0, "prompt_count": 9276,
+ "open_count": 1876, "as_of": 1791449000.2,
+ "encoding": "bitmap-msb0-base64", "open": "<base64>"}
+```
+
+- `open` is base64 of `ceil(prompt_count / 8)` bytes, one bit per SOURCE row:
+  row `prompt_start + i` is byte `i >> 3`, mask `0x80 >> (i & 7)`, set while
+  that prompt has at least one slot left (the ledger's `remaining > 0`, so a
+  slot an eval job reopened counts); the last byte is padded with zeros.
+  `open_count` is the number of set bits; 0 means the job is complete. In
+  Python: `bits = base64.b64decode(body["open"])`, then
+  `bits[i >> 3] & (0x80 >> (i & 7))` (`reliquary.corpus.slots.parse_open_map`).
+- The size is fixed by the job, never by how fragmented the open prompts are:
+  1.6 kB of JSON for 9 276 prompts, 17 kB for 100 000. A job of more than
+  2^20 prompts answers 409 `corpus_job_open_too_large` (its map would pass
+  128 KiB); a generated source that large is not walked this way.
+- `as_of` is the unix time the ledger was read. A read, like the cursor: no
+  signature, no write, nothing per hotkey. The validator builds the map at
+  most once per 5 s per job, off its event loop, from the ledger state it
+  already holds, and answers `Cache-Control: public, max-age=5`.
+- 404 `corpus_job_not_served` for a job this validator does not serve, 410
+  `job_retired` for a retired one; a paused job still answers.
+- It is a hint, not a reservation: a slot open in the map can be taken before
+  your episode ends, and submit still answers `prompt_full` then. Nothing in
+  admission changes.
+
+`reliquary corpus mine-agentic` reads it on its own: before starting an
+episode it uses a map at most 30 s old (read again otherwise, one read shared
+by every hotkey of the process), passes over the positions of each hotkey's
+walk whose prompt is full (count `skipped_full`) and starts no more episodes
+once `open_count` is 0 (count `no_open_prompt`). The order of each hotkey's
+walk is unchanged, only filtered, so miners still spread over the prompts
+instead of converging on the same ones. A `free` job's validator does not
+check the submission's `cursor`, so passing positions over needs no signed
+skip. Against a validator without the route (404, 405), or when the read
+fails, it mines exactly as before. `reliquary corpus mine` is unchanged: it
+has `next` and `skip`.
 
 ### 4.2 Your own status: audit state, failures, pay
 

@@ -212,3 +212,26 @@ def test_a_body_this_reader_cannot_trust_is_refused(bad):
             "open": base64.b64encode(b"\xff\xff\xf0").decode(), **bad}
     with pytest.raises(ValueError):
         parse_open_map(body)
+
+
+def test_the_miners_client_and_view_read_the_real_route(fake_r2, seeded_job):
+    from collections import Counter
+
+    from reliquary.miner.agentic_miner import OpenPrompts
+    from reliquary.miner.corpus_miner import HttpCorpusClient
+
+    job = _declare(fake_r2, prompt_start=100)
+    _seed(fake_r2, {100: 2, 101: 1, 119: 2})
+    app = FastAPI()
+    app.include_router(corpus_service.build_corpus_jobs_router({JOB: _router(seeded_job)}))
+    served = TestClient(app)
+
+    class _Http:  # the TestClient refuses httpx's per-request timeout
+        def get(self, path, timeout=None):
+            return served.get(path)
+
+    view = OpenPrompts(job, HttpCorpusClient(_Http(), job_id=JOB))
+    counts = Counter()
+    asyncio.run(view.refresh(counts))
+    assert [view.is_open(i) for i in (100, 101, 118, 119)] == [False, True, True, False]
+    assert not view.exhausted and counts == {}
