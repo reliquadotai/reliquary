@@ -103,7 +103,7 @@ def test_state_has_no_eligibility_mask_the_cooldown_is_the_batchers_alone(tmp_pa
 def test_miner_state_closes_everything_only_when_the_order_is_exhausted(tmp_path):
     rt = runtime_for(tmp_path)
     server, _ = service_server(rt)
-    rt.active = lambda *a, **k: False
+    server.set_service_runtime_active(False)
     state = MinerState.model_validate(TestClient(server.app).get("/miner-state").json())
     (env,) = state.environments.values()
     assert len(env.cooldown_prompts()) > 1
@@ -112,14 +112,15 @@ def test_miner_state_closes_everything_only_when_the_order_is_exhausted(tmp_path
 def test_state_key_tracks_contract_epoch_beacon_schedule_checkpoint_and_activity(tmp_path):
     rt = runtime_for(tmp_path)
     _, batcher = service_server(rt)
-    key = ValidatorServer._service_state_key(batcher)
+    server = ValidatorServer()
+    key = server._service_state_key(batcher)
     assert key[0] == rt.contract.sha256 and key[1] == 500 and key[2] == BEACON and key[5] is True
     assert key[4] == "d" * 40
     batcher.service_policy = dict(batcher.service_policy, pool_randomness="cd" * 32)
-    assert ValidatorServer._service_state_key(batcher) != key
-    rt.active = lambda *a, **k: False
-    assert ValidatorServer._service_state_key(batcher)[5] is False
-    assert ValidatorServer._service_state_key(SimpleNamespace(service_runtime=None)) is None
+    assert server._service_state_key(batcher) != key
+    server.set_service_runtime_active(False)
+    assert server._service_state_key(batcher)[5] is False
+    assert server._service_state_key(SimpleNamespace(service_runtime=None)) is None
 
 
 def test_legacy_state_bytes_are_byte_for_byte_the_golden_snapshot():
@@ -131,7 +132,7 @@ def test_legacy_state_bytes_are_byte_for_byte_the_golden_snapshot():
     client = TestClient(server.app)
     assert client.get("/state").content.decode() == LEGACY_STATE
     assert client.get("/state").content.decode() == LEGACY_STATE  # cached bytes identical
-    assert ValidatorServer._service_state_key(server.active_batcher) is None
+    assert server._service_state_key(server.active_batcher) is None
 
 
 # ---- /health never names the candidate window -------------------------------------------------
@@ -225,7 +226,8 @@ def test_observations_are_paginated_by_sequence_with_a_bounded_page(monkeypatch)
     assert [e["seq"] for e in second["events"]] == [3, 4, 5] and second["watermark"] == 5
     empty = client.get("/service-observations?after=5", headers=auth).json()
     assert empty == {"schema": "service-observation-admin/v1", "watermark": 5, "events": []}
-    for query in ("after=-1", "limit=0", "limit=1001", "limit=-3"):
+    for query in ("after=-1", "limit=0", "limit=1001", "limit=-3", f"after={10**30}", f"after={2**62 + 1}",
+                  "after=abc", "limit=abc", "after=1.5", "limit="):
         assert client.get(f"/service-observations?{query}", headers=auth).status_code == 400
     assert max(limit for _, limit in runtime.calls) <= 1000
 
@@ -252,11 +254,11 @@ def test_real_runtime_events_carry_hotkey_only_on_the_admin_route(tmp_path, monk
     client = TestClient(server.app)
     admin = client.get("/service-observations", headers={"Authorization": "Bearer secret"})
     assert admin.status_code == 200 and "5SecretHotkey" in admin.text
-    public = [client.get(path) for path in ("/state", "/miner-state", "/health", "/service-observations")]
-    for response in public:
-        assert "5SecretHotkey" not in response.text
-        assert not re.search(r"run_salt|run_meta", response.text)
-    assert public[-1].status_code == 401
+    assert rt.admin_events(after=0, limit=10), "the hotkey is really in the runtime's log"
+    for path, response in _call_every_public_get(server, client):
+        assert "5SecretHotkey" not in response.text, path
+        assert not re.search(r"run_salt|run_meta", response.text), path
+    assert client.get("/service-observations").status_code == 401
 
 
 # ---- accepted but unpaid groups: the response model ------------------------------------------
@@ -292,3 +294,179 @@ async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdi
     assert verdict["outcome_code"] == status
     assert not verdict["explanation"].startswith("Validator outcome:")  # a real, miner-facing sentence
     assert "draw" not in json.dumps(verdict).lower()
+
+
+# ---- review fixes (round 1) ------------------------------------------------------------------
+
+def _within(seconds, fn):
+    import threading
+    box = []
+    worker = threading.Thread(target=lambda: box.append(fn()), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), "the request blocked"
+    return box[0]
+
+
+def test_state_and_miner_state_do_not_wait_for_the_runtime_lock(tmp_path):
+    """I1: the request path reads a plain attribute; no lock, no SQLite."""
+    import threading
+    rt = runtime_for(tmp_path)
+    server, _ = service_server(rt)
+    client = TestClient(server.app)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with rt.lock:
+            held.set()
+            release.wait(30)
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    try:
+        for path in ("/state", "/miner-state"):
+            assert _within(5, lambda p=path: client.get(p)).status_code == 200
+    finally:
+        release.set()
+        holder.join(5)
+
+
+def test_state_request_never_calls_runtime_active(tmp_path):
+    rt = runtime_for(tmp_path)
+    server, _ = service_server(rt)
+
+    def boom(*a, **k):
+        raise AssertionError("runtime.active() on the request path")
+    rt.active = boom
+    client = TestClient(server.app)
+    assert client.get("/state").status_code == 200 and client.get("/miner-state").status_code == 200
+
+
+def _service(tmp_path_runtime):
+    from reliquary.validator.service import ValidationService
+    service = ValidationService.__new__(ValidationService)
+    service._service_runtime = tmp_path_runtime
+    service.server = ValidatorServer()
+    return service
+
+
+def test_the_service_refreshes_the_active_flag_and_keeps_the_last_value_on_failure(tmp_path):
+    rt = runtime_for(tmp_path)
+    service = _service(rt)
+    rt.active = lambda *a, **k: False
+    service._refresh_service_active()
+    assert service.server.service_runtime_active is False
+    rt.active = lambda *a, **k: True
+    service._refresh_service_active()
+    assert service.server.service_runtime_active is True
+
+    def broken(*a, **k):
+        raise RuntimeError("sqlite busy")
+    rt.active = broken
+    service._refresh_service_active()
+    assert service.server.service_runtime_active is True
+    service._service_runtime = None
+    service._refresh_service_active()  # a legacy service does nothing
+
+
+@pytest.mark.asyncio
+async def test_the_control_heartbeat_refreshes_the_flag_every_beat(tmp_path, monkeypatch):
+    import asyncio
+    rt = runtime_for(tmp_path)
+    service = _service(rt)
+    service._window_n = 500
+    service._control_store = SimpleNamespace(heartbeat=lambda window: None)
+    rt.active = lambda *a, **k: False
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise asyncio.CancelledError
+    monkeypatch.setattr("reliquary.validator.service.asyncio.sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await service._control_heartbeat()
+    assert service.server.service_runtime_active is False and sleeps == [5]
+
+
+def test_opening_and_the_boundary_both_refresh_the_flag():
+    import inspect
+    from reliquary.validator.service import ValidationService
+    assert "_refresh_service_active()" in inspect.getsource(ValidationService._open_service_window)
+    assert "_refresh_service_active()" in inspect.getsource(ValidationService._service_window_boundary)
+
+
+def test_a_legacy_service_heartbeat_does_not_touch_a_runtime():
+    import inspect
+    from reliquary.validator.service import ValidationService
+    assert 'getattr(self, "_service_runtime", None) is not None' in inspect.getsource(
+        ValidationService._control_heartbeat)
+
+
+def test_state_503_carries_retry_after_on_both_routes(tmp_path):
+    rt = runtime_for(tmp_path)
+    server, _ = service_server(rt, announce=False)
+    client = TestClient(server.app)
+    for path in ("/state", "/miner-state"):
+        response = client.get(path)
+        assert response.status_code == 503 and response.headers["Retry-After"] == "1", path
+
+
+def test_health_stays_ok_after_a_preparation_failure_in_a_service_run_but_not_in_a_legacy_one():
+    failure = {"candidate_window_n": 10, "stage": "prompt_manifest", "error_type": "RuntimeError", "ts": 1.0}
+
+    def status(redaction):
+        server = ValidatorServer()
+        server.service_health_redaction = redaction
+        server.set_window_preparation_state(last_committed_window_n=9, candidate_window_n=10, stage="prompt_manifest")
+        server.record_window_preparation_failure(failure)
+        return TestClient(server.app).get("/health").json()["status"]
+    assert status(True) == "ok"
+    assert status(False) == "degraded"  # legacy behaviour unchanged
+
+
+def test_observations_validate_the_cursor_after_the_token(monkeypatch):
+    monkeypatch.setenv(TOKEN_ENV, "secret")
+    client = observations_client(events_runtime())
+    for query in ("after=abc", "limit=abc", f"after={10**30}"):
+        assert client.get(f"/service-observations?{query}").status_code == 401  # never a 422 before auth
+        assert client.get(f"/service-observations?{query}", headers={"Authorization": "Bearer secret"}).status_code == 400
+    ok = client.get(f"/service-observations?after={2**62}", headers={"Authorization": "Bearer secret"})
+    assert ok.status_code == 200
+
+
+def _call_every_public_get(server, client):
+    """Call every GET route of the app (typical path parameters); return (path, response)."""
+    from fastapi.routing import APIRoute
+    results = []
+    for route in server.app.routes:
+        if not isinstance(route, APIRoute) or "GET" not in route.methods:
+            continue
+        path = re.sub(r"\{[^}]+\}", "5Typical", route.path)
+        results.append((route.path, client.get(path)))
+    return results
+
+
+def test_no_public_route_serves_the_runtime_events(tmp_path, monkeypatch):
+    """M6: every GET route is called with events()/admin_events() armed to fail; only the admin
+    route may reach admin_events, and none reaches the public events()."""
+    monkeypatch.setenv(TOKEN_ENV, "secret")
+    rt = runtime_for(tmp_path)
+    server, _ = service_server(rt)
+    reached = []
+
+    def arm(name):
+        def boom(*a, **k):
+            reached.append(name)
+            return []
+        return boom
+    rt.events = arm("events")
+    rt.admin_events = arm("admin_events")
+    client = TestClient(server.app, raise_server_exceptions=False)
+    results = _call_every_public_get(server, client)
+    paths = {path for path, _ in results}
+    assert {"/state", "/miner-state", "/health", "/service-observations"} <= paths
+    assert len(paths) >= 10
+    assert reached == [], "an unauthenticated GET reached the runtime event log"
+    assert "events" not in reached
+    admin = client.get("/service-observations", headers={"Authorization": "Bearer secret"})
+    assert admin.status_code == 200 and reached == ["admin_events"]

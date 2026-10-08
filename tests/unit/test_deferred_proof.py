@@ -202,7 +202,10 @@ def test_state_wire_contract_is_unchanged():
 
     assert "valid_submissions" in fields
     assert not fields & {"pending_submissions", "pending_count"}
-    assert set(_make_batcher().get_state().model_dump()) == fields
+    legacy = set(_make_batcher().get_state().model_dump())
+    # ``service_policy`` is optional and omitted from the legacy dump when None.
+    assert legacy == fields - {"service_policy"}
+    assert "service_policy" not in legacy
 
 
 def test_decision_ts_is_stamped_at_admission_not_at_proof():

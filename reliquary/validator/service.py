@@ -2880,6 +2880,7 @@ class ValidationService:
         """
         recovered, attempted = self._recover_leftover_service_windows(target_window)
         outcome: dict[str, Any] = {"recovered": recovered, "attempted": attempted, "plan": None, "error": None}
+        self._refresh_service_active()
         if attempted:
             try:
                 outcome["rotation_gate"] = self._fill_closed_rotation_store.load()
@@ -2968,6 +2969,7 @@ class ValidationService:
             raise RuntimeError(
                 f"service window {target_window} is announced with another beacon than its randomness"
             )
+        self._refresh_service_active()
         window["opened"] = True
         return announcements
 
@@ -7008,12 +7010,28 @@ class ValidationService:
         await asyncio.sleep(2.0)
         return True
 
+    def _refresh_service_active(self) -> None:
+        """Publish whether the service order is still active as a plain server attribute.
+
+        BLOCKING (runtime lock + SQLite): only ever called off the event loop or from the
+        window thread, never from a request. A failure keeps the last known value.
+        """
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None:
+            return
+        try:
+            self.server.set_service_runtime_active(runtime.active())
+        except Exception:
+            logger.exception("service order activity could not be refreshed; keeping the last value")
+
     async def _control_heartbeat(self) -> None:
         while True:
             try:
                 self._control_store.heartbeat(window=self._window_n)
             except OSError:
                 logger.exception("control heartbeat could not be persisted")
+            if getattr(self, "_service_runtime", None) is not None:
+                await asyncio.to_thread(self._refresh_service_active)
             await asyncio.sleep(5)
 
     async def run(self, subtensor) -> None:

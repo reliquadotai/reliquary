@@ -318,6 +318,7 @@ def _is_mock_like(value: Any) -> bool:
 
 SERVICE_OBSERVATIONS_TOKEN_ENV = "RELIQUARY_SERVICE_OBSERVATIONS_TOKEN"
 SERVICE_OBSERVATIONS_MAX_PAGE = 1000
+SERVICE_OBSERVATIONS_MAX_AFTER = 2**62
 
 
 def register_service_observations(app, active_batcher_fn) -> None:
@@ -331,7 +332,9 @@ def register_service_observations(app, active_batcher_fn) -> None:
     """
 
     @app.get("/service-observations")
-    async def service_observations(request: Request, after: int = 0, limit: int = 100):
+    async def service_observations(
+        request: Request, after: str | None = None, limit: str | None = None,
+    ):
         import hmac
 
         token = os.environ.get(SERVICE_OBSERVATIONS_TOKEN_ENV, "")
@@ -344,8 +347,14 @@ def register_service_observations(app, active_batcher_fn) -> None:
         runtime = getattr(batcher, "service_runtime", None) if batcher is not None else None
         if runtime is None or _is_mock_like(runtime):
             raise HTTPException(status_code=404, detail="no_service_task")
-        if after < 0 or not 1 <= limit <= SERVICE_OBSERVATIONS_MAX_PAGE:
+        try:
+            after_n = 0 if after is None else int(after)
+            limit_n = 100 if limit is None else int(limit)
+        except ValueError:
             raise HTTPException(status_code=400, detail="invalid_cursor")
+        if not 0 <= after_n <= SERVICE_OBSERVATIONS_MAX_AFTER or not 1 <= limit_n <= SERVICE_OBSERVATIONS_MAX_PAGE:
+            raise HTTPException(status_code=400, detail="invalid_cursor")
+        after, limit = after_n, limit_n
         events = await asyncio.to_thread(runtime.admin_events, after=after, limit=limit)
         return {
             "schema": "service-observation-admin/v1",
@@ -1376,6 +1385,9 @@ class ValidatorServer:
         self._last_committed_window_n = 0
         # Service runs: /health never names a candidate (not yet opened) window or its stage.
         self.service_health_redaction = False
+        # Plain attribute refreshed off the event loop by ValidationService (window open, each
+        # boundary, the 5 s heartbeat): the request path never takes the runtime lock or SQLite.
+        self.service_runtime_active = True
         self._candidate_window_n: int | None = None
         self._window_preparation_stage: str | None = None
         self._last_window_preparation_failure: dict[str, Any] | None = None
@@ -1531,12 +1543,15 @@ class ValidatorServer:
         self._verdict_persistence_error = False
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
-    @staticmethod
-    def _service_state_key(batcher):
+    def set_service_runtime_active(self, active: bool) -> None:
+        self.service_runtime_active = bool(active)
+
+    def _service_state_key(self, batcher):
         """What a service batcher's served state depends on, from memory only.
 
         The announcement is frozen per window and held by the batcher, so the schedule and
-        checkpoint come from it (no database read, no runtime lock on the request path).
+        checkpoint come from it (no database read, no runtime lock on the request path). Whether the order is still
+        active is the ``service_runtime_active`` attribute, refreshed off the event loop.
         """
         runtime = getattr(batcher, "service_runtime", None)
         if runtime is None or _is_mock_like(runtime):
@@ -1551,7 +1566,7 @@ class ValidatorServer:
             policy.get("pool_randomness"),
             schedule.get("revision") if isinstance(schedule, dict) else None,
             checkpoint.get("revision") if isinstance(checkpoint, dict) else None,
-            bool(runtime.active()),
+            bool(self.service_runtime_active),
         )
 
     @staticmethod
@@ -3138,6 +3153,7 @@ class ValidatorServer:
                 or (
                     self._candidate_window_n is not None
                     and self._last_window_preparation_failure is not None
+                    and not self.service_health_redaction
                 )
                 or (
                     self._registration_gate_enforced
@@ -5998,7 +6014,9 @@ class ValidatorServer:
             # the FastAPI stack; this in-handler check only serves requests
             # that raced a cache fill.
             if not self._service_window_announced(batcher):
-                raise HTTPException(status_code=503, detail="no_active_window")
+                raise HTTPException(
+                    status_code=503, detail="no_active_window", headers={"Retry-After": "1"},
+                )
             cache_slot = f"{env or ''}|{window if window is not None else ''}"
             cache_key = self._state_cache_key(batcher)
             cached = self._state_response_cache.get(cache_slot)
@@ -6129,7 +6147,7 @@ class ValidatorServer:
                 if membership is None:
                     membership = set(batcher.cooldown_prompts_snapshot)
                 runtime = getattr(batcher, "service_runtime", None)
-                if runtime is not None and not _is_mock_like(runtime) and not runtime.active():
+                if runtime is not None and not _is_mock_like(runtime) and not self.service_runtime_active:
                     # No eligibility mask: the only service-wide closure is an exhausted order.
                     lo, hi = prompt_range
                     membership = set(membership)
@@ -6168,7 +6186,7 @@ class ValidatorServer:
                         productive_remaining,
                         grading_remaining,
                     )
-                if runtime is not None and not _is_mock_like(runtime) and not runtime.active():
+                if runtime is not None and not _is_mock_like(runtime) and not self.service_runtime_active:
                     admission_remaining = 0
                 accepting_submissions = (
                     self._current_state is WindowState.OPEN
