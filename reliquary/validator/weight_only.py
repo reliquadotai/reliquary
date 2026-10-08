@@ -174,6 +174,11 @@ class WeightOnlyValidator:
         """
         from botocore.exceptions import ClientError
 
+        try:
+            declared, _ = await read_registry()
+        except Exception:
+            logger.exception("Task registry unreadable; abstaining from this epoch")
+            return False
         by_task: dict[str, list[dict]] = {}
         try:
             windows_by_task: dict[str, list[int]] = {}
@@ -191,6 +196,11 @@ class WeightOnlyValidator:
                 (max(w) for w in windows_by_task.values()), default=0
             ) + 1
             for task_id in windows_by_task:
+                if self._is_corpus_task(declared.get(task_id)):
+                    # A corpus task is paid by period only: the window archives
+                    # it wrote before stay in place, unread. They still count in
+                    # the horizon above, so RL reads exactly what it read.
+                    continue
                 archives = await storage.list_recent_datasets(
                     current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
@@ -208,11 +218,6 @@ class WeightOnlyValidator:
             # only the tasks we managed to see — worse than submitting
             # nothing. Abstain and let the next epoch retry the listing.
             logger.exception("Archive listing failed; abstaining from this epoch")
-            return False
-        try:
-            declared, _ = await read_registry()
-        except Exception:
-            logger.exception("Task registry unreadable; abstaining from this epoch")
             return False
         try:
             periods = await self._period_weights(declared)
@@ -353,6 +358,12 @@ class WeightOnlyValidator:
             if replayed:
                 weights[task_id] = replayed
         return weights
+
+    @staticmethod
+    def _is_corpus_task(entry) -> bool:
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+        return getattr(entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION
 
     @staticmethod
     def _merge_archives(by_task: Mapping[str, list[dict]]) -> list[dict]:
@@ -559,10 +570,10 @@ class WeightOnlyValidator:
             by_task.setdefault(record.get("task_id", ""), []).append(record)
 
         combined: dict[str, float] = {}
-        # Period-settled tasks arrive already replayed on their own clock, and
-        # are added to whatever window archives the same task still has (a job
-        # settled by window before its validator learnt periods): neither tail
-        # is dropped. The cap and the floor apply to the sum, as to every task.
+        # Period-settled tasks arrive already replayed on their own clock. A
+        # corpus task's window archives are no longer read (``submit_once``),
+        # so for one of them nothing is added here; a caller that passes both
+        # gets their sum. The cap and the floor apply to the sum, as to every task.
         periods = periods or {}
         for task_id in dict.fromkeys((*by_task, *periods)):
             ema = {}
