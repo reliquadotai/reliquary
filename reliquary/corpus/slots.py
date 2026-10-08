@@ -118,6 +118,26 @@ class SlotLedger:
             counts[self.prompt_state(self._prompt_start + offset)] += 1
         return counts
 
+    def open_bitmap(self) -> tuple[bytes, int]:
+        """Which prompts still have a slot, one bit per row, and how many do.
+
+        Bit ``i`` is row ``prompt_start + i``: byte ``i >> 3``, mask
+        ``0x80 >> (i & 7)``, set while ``remaining`` is positive; the last byte
+        is padded with zeros. Costs ``prompt_count`` bytes of scratch, so the
+        caller bounds the count (a generated source declares up to 1 << 31).
+        """
+        count, start, slots = self._prompt_count, self._prompt_start, self._slots_per_prompt
+        flags = bytearray(b"1") * count
+        failed = self._failed
+        for position, taken in self._consumed.items():
+            # No failure recorded (every job but an eval one): capacity is V.
+            if taken >= slots and (not failed or taken >= self.capacity(position)):
+                flags[position - start] = 48  # "0"
+        opened = flags.count(b"1")
+        padded = -(-count // 8) * 8
+        flags.extend(b"0" * (padded - count))
+        return int(flags, 2).to_bytes(padded // 8, "big"), opened
+
     def failed_snapshot(self) -> dict[int, list[str]]:
         return {index: sorted(ids) for index, ids in self._failed.items() if ids}
 
