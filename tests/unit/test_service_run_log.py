@@ -85,22 +85,38 @@ def test_first_scan_stats_count_only_first_scans(log):
     assert log.first_scan_stats("reliquary_dapo_math_v1") == (2, 1)
 
 
-def test_concurrent_first_observations_yield_exactly_one_first(tmp_path):
+def test_first_scan_is_unique_across_connections_racing_on_one_database(tmp_path):
+    """Twelve writers, each with its OWN connection to one file, all released at once on the same
+    never-scanned prompt: SQLite serialises them and the primary key of ``run_scans`` lets one win."""
     import threading
-    db = sqlite3.connect(tmp_path / "c.sqlite3", check_same_thread=False)
-    shared = RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
-    lock = threading.Lock()
-    results = []
+    path = tmp_path / "c.sqlite3"
+    RunObservationLog(sqlite3.connect(path), order_sha256=ORDER, sigma_min_bps=2400).db.close()  # schema + salt
+    writers = 12
+    barrier = threading.Barrier(writers)
+    results, errors = [], []
 
     def work(i):
-        with lock:
+        try:
+            db = sqlite3.connect(path, timeout=60)
+            mine = RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
+            barrier.wait()
             with db:
-                results.append(shared.record(obs(group=f"g{i}", hotkey=f"hk-{i}"), status="proven", proof="proven"))
+                results.append(mine.record(obs(group=f"g{i}", hotkey=f"hk-{i}"), status="proven", proof="proven"))
+            db.close()
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
 
-    threads = [threading.Thread(target=work, args=(i,)) for i in range(12)]
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(writers)]
     [t.start() for t in threads]
     [t.join() for t in threads]
-    assert sum(r.first_scan for r in results) == 1 and all(r.inserted for r in results)
+    assert errors == []
+    assert len({r.observation_id for r in results}) == writers and all(r.inserted for r in results)
+    assert sum(r.first_scan for r in results) == 1
+    check = sqlite3.connect(path)
+    winner = next(r.observation_id for r in results if r.first_scan)
+    assert check.execute("SELECT first_id FROM run_scans").fetchall() == [(winner,)]
+    assert check.execute("SELECT id FROM run_observations WHERE first_scan=1").fetchall() == [(winner,)]
+    assert check.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == writers
 
 
 def test_log_and_event_sequence_survive_reopen(tmp_path):
@@ -129,12 +145,19 @@ def test_two_miners_on_the_same_never_scanned_prompt_get_two_observations(log):
     assert a.first_scan and not b.first_scan
 
 
-def test_same_miner_retry_is_idempotent_with_no_integrity_error(log):
+def test_same_miner_retry_changes_nothing_and_publishes_nothing(log):
+    """A retry of the same submission (same identity) is answered from the stored row: no second
+    row (the unique id would raise IntegrityError on a plain INSERT), no second event, and the
+    retry's status/proof/ts are not written anywhere."""
     with log.db:
         a = log.record(obs(hotkey="hk-a"), status="proven", proof="proven")
-        again = log.record(obs(hotkey="hk-a"), status="proven", proof="proven")
+    before = log.db.execute("SELECT * FROM run_observations").fetchall(), log.events()
+    with log.db:
+        again = log.record(obs(hotkey="hk-a"), status="exploration_unpaid", proof="unproven", reason="cap")
     assert not again.inserted and again.first_scan and again.observation_id == a.observation_id
-    assert len(log.events()) == 1
+    assert (log.db.execute("SELECT * FROM run_observations").fetchall(), log.events()) == before
+    assert len(log.events()) == 1 and log.events()[0][1]["status"] == "proven"
+    assert log.db.execute("SELECT COUNT(*) FROM run_scans").fetchone()[0] == 1
 
 
 def test_run_salt_is_persisted_and_ids_are_stable_across_reopen(tmp_path):
@@ -215,9 +238,52 @@ def test_settle_is_idempotent_and_refuses_another_order(log, tmp_path):
         log.settle(r.observation_id, status="trained", proof="proven", at=2.0)
         log.settle(r.observation_id, status="exploration_unpaid", proof="proven", at=3.0)
     assert [e["type"] for _, e in log.events()] == ["observation", "settle", "settle"]
+    assert [e["ts"] for _, e in log.events()][1:] == [1.0, 3.0]
     foreign = RunObservationLog(log.db, order_sha256="b" * 64, sigma_min_bps=2400)
     with pytest.raises(ValueError, match="another order"):
         foreign.settle(r.observation_id, status="trained", proof="proven", at=1.0)
+    with pytest.raises(ValueError, match="unknown"):
+        log.settle("f" * 64, status="trained", proof="proven", at=1.0)
+
+
+def test_settle_dedup_looks_at_the_latest_settlement_only(log):
+    with log.db:
+        r = log.record(obs(), status="proven", proof="proven")
+        other = log.record(obs(prompt=8), status="proven", proof="proven")
+        for at, status in ((1.0, "a"), (2.0, "b"), (3.0, "a"), (4.0, "a")):
+            log.settle(r.observation_id, status=status, proof="proven", at=at)
+        log.settle(other.observation_id, status="a", proof="proven", at=5.0)   # another observation: its own history
+        log.settle(r.observation_id, status="a", proof="audited", at=6.0)      # same status, new proof: an event
+    mine = [(e["status"], e["proof"], e["ts"]) for _, e in log.events()
+            if e["type"] == "settle" and e["id"] == r.observation_id]
+    assert mine == [("a", "proven", 1.0), ("b", "proven", 2.0), ("a", "proven", 3.0), ("a", "audited", 6.0)]
+    assert sum(e["type"] == "settle" and e["id"] == other.observation_id for _, e in log.events()) == 1
+
+
+def test_constructor_refuses_an_open_transaction(tmp_path):
+    db = sqlite3.connect(tmp_path / "t.sqlite3")
+    db.execute("CREATE TABLE t(x)")
+    db.execute("INSERT INTO t VALUES(1)")
+    assert db.in_transaction
+    with pytest.raises(ValueError, match="transaction"):
+        RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
+    assert db.in_transaction                         # nothing was committed behind the caller's back
+    db.rollback()
+    assert db.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+    RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
+
+
+def test_reason_is_a_published_field_only_when_given(log):
+    with log.db:
+        log.record(obs(), status="proven", proof="proven")
+        log.record(obs(prompt=8, lane="exploration"), status="exploration_unpaid", proof="unproven", reason="cap")
+    plain, refused = [e for _, e in log.events()]
+    assert "reason" not in plain and refused["reason"] == "cap" and refused["status"] == "exploration_unpaid"
+    for bad in ("", "Cap", "has space", "x" * 41, 5, "hk:5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX"):
+        with pytest.raises(ValueError, match="reason"):
+            with log.db:
+                log.record(obs(prompt=9), status="exploration_unpaid", proof="unproven", reason=bad)
+    assert len(log.events()) == 2
 
 
 def test_too_many_rewards_is_not_an_observation(log):

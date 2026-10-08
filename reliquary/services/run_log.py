@@ -3,11 +3,15 @@
 The checkpoint, window and time are attributes. The log enforces no validity rule:
 it only answers "was this prompt ever scanned in this run" for exploration pay.
 Methods write without committing; the caller wraps them in ``with db:``.
+
+Exploration observations go through ``reliquary.services.exploration.record_exploration``, which
+records and reserves the pay in one transaction; ``record`` alone is for training observations.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -16,6 +20,8 @@ from reliquary.protocol.release_contract import canonical_json_bytes, canonical_
 from reliquary.services.scoring import classify_signal
 
 LANES = frozenset({"training", "exploration"})
+_MUTABLE = ("status", "proof", "ts", "reason")  # not evidence: a retry may differ on them
+_REASON = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
 
 class NotAnObservation(ValueError):
@@ -85,6 +91,8 @@ def _public_candidate(candidate: dict | None, rollouts: int) -> dict | None:
 
 class RunObservationLog:
     def __init__(self, db: sqlite3.Connection, *, order_sha256: str, sigma_min_bps: int):
+        if db.in_transaction:  # executescript/commit below would commit the caller's open transaction
+            raise ValueError("RunObservationLog must be constructed outside a transaction")
         self.db, self.order, self.sigma_min_bps = db, order_sha256, sigma_min_bps
         db.executescript("""
             CREATE TABLE IF NOT EXISTS run_meta(key TEXT PRIMARY KEY, value BLOB NOT NULL);
@@ -121,7 +129,11 @@ class RunObservationLog:
             raise NotAnObservation("incomplete group")
         return signal.category
 
-    def record(self, obs: Observation, *, status: str, proof: str) -> RecordResult:
+    def record(self, obs: Observation, *, status: str, proof: str, reason: str | None = None) -> RecordResult:
+        """Record one observation and publish it. ``reason`` (a short lowercase identifier, e.g. why
+        an exploration observation is unpaid) is published as its own field when given."""
+        if reason is not None and (not isinstance(reason, str) or _REASON.fullmatch(reason) is None):
+            raise ValueError("observation reason must be a short lowercase identifier")
         category = self._classify(obs)
         identity = observation_id(self.order, obs, self._salt)
         # Explicit, typed fields only: nothing a caller puts in ``candidate`` can add a key.
@@ -132,6 +144,8 @@ class RunObservationLog:
                   "rewards_bps": [int(v) for v in obs.rewards_bps], "verdict": category,
                   "candidate": _public_candidate(obs.candidate, len(obs.rewards_bps)), "lane": obs.lane,
                   "status": str(status), "proof": str(proof)}
+        if reason is not None:
+            public["reason"] = reason
         payload = canonical_json_bytes(public).decode()
         inserted = self.db.execute(
             "INSERT OR IGNORE INTO run_observations(id,order_id,environment,prompt_idx,window,lane,category,"
@@ -142,8 +156,8 @@ class RunObservationLog:
             existing = self.db.execute("SELECT public, first_scan FROM run_observations WHERE id=?",
                                        (identity,)).fetchone()
             stored = json.loads(existing[0])
-            if {k: v for k, v in stored.items() if k not in ("status", "proof", "ts")} != \
-                    {k: v for k, v in public.items() if k not in ("status", "proof", "ts")}:
+            if {k: v for k, v in stored.items() if k not in _MUTABLE} != \
+                    {k: v for k, v in public.items() if k not in _MUTABLE}:
                 raise ValueError("observation identity already exists with different evidence")
             return RecordResult(identity, False, bool(existing[1]), category)
         first = self.db.execute(
@@ -175,11 +189,14 @@ class RunObservationLog:
         if row[1] != self.order:
             raise ValueError("observation belongs to another order")
         for (payload,) in self.db.execute(
-                "SELECT payload FROM run_events WHERE order_id=? AND observation_id=?",
+                "SELECT payload FROM run_events WHERE order_id=? AND observation_id=? ORDER BY seq DESC",
                 (self.order, observation_id)):
             event = json.loads(payload)
-            if event.get("type") == "settle" and event.get("status") == status and event.get("proof") == proof:
-                return  # same settlement again: nothing new to publish
+            if event.get("type") != "settle":
+                continue
+            if event.get("status") == status and event.get("proof") == proof:
+                return  # same as the LATEST settlement: nothing new to publish
+            break  # an older identical settlement does not hide a change back (A, B, A)
         payload = canonical_json_bytes({"type": "settle", "id": observation_id, "window": int(row[0]),
                                         "status": str(status), "proof": str(proof), "ts": float(at)}).decode()
         self.db.execute("INSERT INTO run_events(order_id,observation_id,payload) VALUES(?,?,?)",
