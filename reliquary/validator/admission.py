@@ -1116,7 +1116,7 @@ def score_and_finalize_submission(
                 from reliquary.protocol.service_contract import ServiceContract
                 from reliquary.services.admission_policy import (
                     missing_box_is_uncertain,
-                    service_signal_admits,
+                    service_lane,
                 )
 
                 service_contract = ServiceContract.from_dict(
@@ -1142,6 +1142,9 @@ def score_and_finalize_submission(
             if (
                 ROBUST_TRUNCATION_UTILITY_ENABLED
                 and uncertain_indices
+                # The service path never ranks on this legacy-threshold utility (its lane is decided
+                # by the contract's threshold, and its order is arrival order).
+                and service_contract is None
             ):
                 from reliquary.validator.difficulty_auction import (
                     fractional_reward_lattice,
@@ -1193,13 +1196,19 @@ def score_and_finalize_submission(
                     )
                 else:
                     attainable_rewards = ()
-                in_zone = service_signal_admits(
-                    request,
-                    service_contract,
-                    rewards,
-                    uncertain_indices=uncertain_indices,
-                    attainable_rewards=attainable_rewards,
-                )
+                # The lane is the validator's call from the vector (the batcher decides it again
+                # from the same inputs); the worker only refuses what is no observation at all.
+                try:
+                    in_zone = service_lane(
+                        request,
+                        service_contract,
+                        rewards,
+                        truncated_indices=truncated_indices,
+                        uncertain_indices=uncertain_indices,
+                        attainable_rewards=attainable_rewards,
+                    ) is not None
+                except ValueError:
+                    in_zone = False
                 service_uncertainty = {
                     "truncated_indices": tuple(truncated_indices),
                     "uncertain_indices": tuple(uncertain_indices),

@@ -264,6 +264,14 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
 
 logger = logging.getLogger(__name__)
 
+# Published row statuses of the service lanes that are NOT trained (decision B/C, R8, R23).
+_SERVICE_EXPLORATION_STATUSES = frozenset({
+    "exploration_recording", "exploration_pending", "exploration_audit_queued", "exploration_audit_passed",
+    "exploration_forfeited", "exploration_unaudited", "exploration_unpaid", "exploration_banned",
+    "exploration_cap_reached", "exploration_window_closed", "already_scanned",
+    "service_unproven_recording", "service_unproven_published",
+})
+
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 180.0
 _STARTUP_HASH_REBUILD_CHUNK_WINDOWS = 16
@@ -1086,9 +1094,16 @@ class ValidationService:
                         f"proof device {device!r} has no model replica"
                     )
                 self._proof_models[device] = candidate
+            scheduler_environments = tuple(self.envs)
+            if self._service_runtime is not None:
+                # One live plan per scheduler environment: the exploration audits (priority 5) get a
+                # pseudo-environment each so they run beside the training plan, behind it.
+                from reliquary.validator.batcher import audit_scheduler_environment
+
+                scheduler_environments += tuple(audit_scheduler_environment(name) for name in self.envs)
             self.proof_scheduler = GlobalProofScheduler(
                 devices=normalized_devices,
-                environments=tuple(self.envs),
+                environments=scheduler_environments,
                 proof_callable=self._execute_scheduled_proof,
             )
 
@@ -2954,6 +2969,12 @@ class ValidationService:
         point: the settlement is the step just before ``finish``.
         """
         try:
+            # Normally a no-op (the seal drained and finalized already): never settle with an env's
+            # exploration still open.
+            for batcher in list(getattr(self, "_active_batchers", {}).values()):
+                if (getattr(batcher, "service_runtime", None) is not None
+                        and batcher.window_start == archive.get("window_start")):
+                    await asyncio.to_thread(batcher.finalize_service_exploration)
             return await asyncio.to_thread(runtime.reconcile_archive, archive)
         except Exception as exc:
             logger.error(
@@ -3851,6 +3872,95 @@ class ValidationService:
             )
         return len(refused) < len(picking)
 
+    async def _service_exploration_tick(self, batchers) -> None:
+        """One draw / audit-dispatch pass over the service batchers, off the event loop.
+
+        Rate limited (``SERVICE_EXPLORATION_TICK_SECONDS``): the draw fetches drand beacons.
+        """
+        from reliquary.constants import SERVICE_EXPLORATION_TICK_SECONDS
+
+        now = time.monotonic()
+        if now - getattr(self, "_service_exploration_tick_at", float("-inf")) < SERVICE_EXPLORATION_TICK_SECONDS:
+            return
+        self._service_exploration_tick_at = now
+        for batcher in batchers:
+            if getattr(batcher, "service_runtime", None) is None:
+                continue
+            try:
+                await asyncio.to_thread(batcher.service_exploration_tick)
+            except Exception:
+                logger.exception("service window %s: exploration tick failed",
+                                 getattr(batcher, "window_start", "?"))
+
+    async def _drain_service_exploration(self, batchers) -> None:
+        """The seal drain (R15), then the finalize of every env's exploration. Always bounded.
+
+        1. stop admitting exploration and record what was handed over;
+        2. wait at most ``SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS`` drand rounds for pending draws;
+        3. prove EVERY queued audit of a hotkey past probation, waiting at most
+           ``SERVICE_EXPLORATION_DRAIN_SECONDS`` in all (hotkeys still in probation are served
+           first-come only during the first ``SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS``);
+        4. finalize each env. A drain that hits its bound finalizes anyway: the groups left
+           unaudited are unpaid, a hotkey's later not-drawn rows then follow the per-hotkey audit
+           horizon (R15), and nobody is sanctioned. It never waits forever and nothing else waits
+           on it for longer than the bound.
+        """
+        from reliquary.constants import (
+            SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS,
+            SERVICE_EXPLORATION_DRAIN_SECONDS,
+            SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS,
+        )
+
+        runtime = getattr(self, "_service_runtime", None)
+        service_batchers = [b for b in batchers if getattr(b, "service_runtime", None) is not None]
+        if runtime is None or not service_batchers:
+            return
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            from reliquary.infrastructure import drand
+
+            period = float(drand.get_current_chain()["period"])
+        except Exception:
+            period = 3.0
+        draw_deadline = started + SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS * period + 1.0
+        try:
+            for batcher in service_batchers:
+                await asyncio.to_thread(batcher.close_service_exploration)
+            while True:
+                for batcher in service_batchers:
+                    await asyncio.to_thread(batcher.service_exploration_tick, drain=True)
+                now = loop.time()
+                waiting_draw = 0
+                waiting_audit = 0
+                waiting_probation = 0
+                for batcher in service_batchers:
+                    state = await asyncio.to_thread(batcher.exploration_drain_state)
+                    waiting_draw += state["pending_draw"]
+                    waiting_audit += state["past_probation"]
+                    waiting_probation += state["probation"]
+                draws_settled = waiting_draw == 0 or now >= draw_deadline
+                audits_settled = waiting_audit == 0 and (
+                    waiting_probation == 0 or now >= started + SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS)
+                if draws_settled and audits_settled:
+                    break
+                if now >= started + SERVICE_EXPLORATION_DRAIN_SECONDS:
+                    logger.error(
+                        "service exploration drain hit its bound (%.0f s) with %d draw(s), %d audit(s) of "
+                        "hotkeys past probation and %d of hotkeys in probation still waiting; finalizing: "
+                        "they end unaudited (unpaid, not sanctioned)",
+                        SERVICE_EXPLORATION_DRAIN_SECONDS, waiting_draw, waiting_audit, waiting_probation)
+                    break
+                await asyncio.sleep(0.5)
+        except Exception:
+            logger.exception("service exploration drain failed; finalizing what is there")
+        finally:
+            for batcher in service_batchers:
+                try:
+                    await asyncio.to_thread(batcher.finalize_service_exploration)
+                except Exception:
+                    logger.exception("service window %s: exploration finalize failed", batcher.window_start)
+
     async def _publish_committed_pick_verdicts(self, picking) -> None:
         try:
             assembler = getattr(self, "_fill_closed_assemblers", {}).get(int(picking[0].window_start))
@@ -3897,6 +4007,9 @@ class ValidationService:
             # rather than a tick later. Inert with the gate off.
             if self._drive_fill_closed_picks(batchers):
                 await self._publish_committed_pick_verdicts(batchers)
+            if self._service_runtime is not None:
+                # Audits run as they are drawn, so probation slots free up during the window.
+                await self._service_exploration_tick(batchers)
             for b in batchers:
                 # The hard ceiling ignores GPU readiness; only adaptive close
                 # is gated by it.
@@ -3926,9 +4039,12 @@ class ValidationService:
                 for b in batchers:
                     if not b.is_sealed():
                         b.force_seal("timeout")
+                await self._drain_service_exploration(batchers)
                 return "timeout"
 
             await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
+
+        await self._drain_service_exploration(batchers)
 
         drain_timeouts = await self._freeze_auction_populations(batchers)
         for env_name, timed_out in drain_timeouts.items():
@@ -4177,8 +4293,21 @@ class ValidationService:
                 rewarded = selected
             if not finalize and (not selected or row.get("verdict_selected_published")):
                 continue
-            if finalize and getattr(batcher, "service_runtime", None) is not None and row.get("status") == "exploration_verified":
-                rewarded = float(row.get("exploration_fraction", 0.0)) > 0.0
+            service_status = row.get("status")
+            service_observation = (
+                getattr(batcher, "service_runtime", None) is not None
+                and service_status in _SERVICE_EXPLORATION_STATUSES
+            )
+            if service_observation:
+                # Paid only if still entitled at the end: not drawn, or audited and passed, and the
+                # window did not abort. The archive's money is the runtime's; this is the miner's view.
+                payable = (
+                    finalize
+                    and service_status in {"exploration_pending", "exploration_audit_passed"}
+                    and float(row.get("exploration_fraction", 0.0)) > 0.0
+                    and not row.get("window_aborted")
+                )
+                rewarded = payable
             proof_reject = pending.reject_response
             accepted = proof_reject is None
             reason = (
@@ -4210,8 +4339,8 @@ class ValidationService:
                 elif selection_reason in {"queued_for_proof", "proof_pending"}:
                     selection_reason = "proof_not_completed_before_window_close"
 
-            if row.get("status") == "exploration_verified":
-                selection_reason = "exploration_reward_recorded" if rewarded else "exploration_verified_no_entitlement"
+            if service_observation:
+                selection_reason = "exploration_reward_recorded" if payable else str(service_status)
             from reliquary.validator.verifier import rewards_std
 
             try:
@@ -6410,6 +6539,10 @@ class ValidationService:
                 assembler,
             )
             recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
+            for batcher in batchers.values():
+                if getattr(batcher, "service_runtime", None) is not None:
+                    # No drain here (the window failed): what is open ends unaudited, unpaid.
+                    batcher.finalize_service_exploration()
             if getattr(self, "_service_runtime", None) is None:
                 archive = recovery.recover(
                     window_start, queue=self._training_payload_queue_ref(),
@@ -6442,8 +6575,9 @@ class ValidationService:
                 for name, batcher in batchers.items():
                     if archive.get("window_status") == "aborted":
                         for row in batcher.difficulty_auction_metadata_by_id.values():
-                            if row.get("status") == "exploration_verified":
+                            if row.get("status") in _SERVICE_EXPLORATION_STATUSES:
                                 row["exploration_fraction"] = 0.0
+                                row["window_aborted"] = True
                     records = self._auction_final_verdict_records(
                         batcher, paid_groups=[group for _, group in paid[name]],
                         batch_indices={(group.hotkey, group.prompt_idx, bytes(group.merkle_root)): index

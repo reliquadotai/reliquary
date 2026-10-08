@@ -36,6 +36,10 @@ class ProofMeasurements:
         payload = invocation.candidate.payload
         if not isinstance(payload, _ScheduledProofPayload):
             raise ProofWorkerUnavailable("measurement requires the complete batcher proof payload")
+        if payload.audit:
+            # An exploration audit runs on a pseudo-environment of its own and is not a training
+            # measurement: it is proven, never measured.
+            return execute(model)
         health, checkpoint = self.pool.health, self.pool._adopted
         if (health is None or checkpoint is None or invocation.checkpoint_revision != checkpoint.revision
                 or health.profile_id != PROTOCOL_PROFILE_ID

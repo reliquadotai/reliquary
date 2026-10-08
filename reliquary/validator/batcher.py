@@ -132,6 +132,7 @@ from reliquary.validator.prompt_content import (
 )
 from reliquary.validator.proof_scheduler import (
     CapacityAbortReason,
+    CheckpointNotReady,
     GlobalProofScheduler,
     ProofDecisionStatus,
     ProofPlan,
@@ -539,6 +540,7 @@ _NON_PRODUCTIVE_ADMISSION_STAGES = frozenset(
         "dedup",
         "logical_dedup",
         "zone",
+        "service_exploration_banned",
     }
 )
 
@@ -668,6 +670,11 @@ class PendingSubmission:
     uncertain_indices: tuple[int, ...] = ()
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
+    # Service policy only: the lane the validator chose from the vector ("training", "exploration",
+    # "unproven"), the id of the observation recorded for it, and the stage that rejected its proof.
+    service_lane: str | None = None
+    service_observation_id: str | None = None
+    proof_reject_stage: str | None = None
     # Completion-token telemetry retained for training, archives and recovery
     # of windows opened under the legacy token-weighted payment policy.
     eos_tokens: int = 0
@@ -889,13 +896,27 @@ class _ScheduledProofPayload:
     batcher: Any = field(repr=False)
     pending: PendingSubmission = field(repr=False)
     count_operator_debt: bool = True
+    # An exploration audit (service policy): same proof checks, own verdict, own plan.
+    audit: bool = False
 
     def execute(self, model: Any) -> ValidSubmission | None:
+        if self.audit:
+            return self.batcher._execute_exploration_audit(self.pending, model=model)
         return self.batcher._execute_scheduled_proof(
             self.pending,
             model=model,
             count_operator_debt=self.count_operator_debt,
         )
+
+
+def audit_scheduler_environment(environment: str) -> str:
+    """The proof scheduler's name for the exploration-audit plan of ``environment``.
+
+    The scheduler keeps ONE live plan per environment name, and the training plan of an env is live
+    for the whole window; the audits (priority 5) run on a pseudo-environment of their own so they
+    can be live at the same time and take only the capacity training leaves idle.
+    """
+    return f"{environment}::exploration-audit"
 
 
 @dataclass(frozen=True)
@@ -949,7 +970,7 @@ class GrpoWindowBatcher:
         self.window_start = window_start
         self.service_policy = None
         self.service_runtime = None
-        self.service_window_pool = 0.0
+        self._init_service_exploration_state()
         self.env = env
         self.batch_target = int(batch_target)
         if self.batch_target <= 0:
@@ -1786,15 +1807,20 @@ class GrpoWindowBatcher:
             else ()
         )
         if self.service_policy is not None:
-            from reliquary.protocol.service_contract import ServiceContract
-            from reliquary.services.admission_policy import service_signal_admits
-            eligible = service_signal_admits(
-                pending.request,
-                ServiceContract.from_dict(self.service_policy["contract"]),
-                pending.rewards,
-                uncertain_indices=pending.uncertain_indices,
-                attainable_rewards=pending.attainable_rewards,
-            )
+            # The lane is the validator's call from the graded vector, never the miner's
+            # declared purpose. Only a training-lane group goes on to the proof plan.
+            lane = self._service_lane_of(pending)
+            if lane is None:
+                self.difficulty_auction_metadata_by_id[id(pending)] = {
+                    "rank": None,
+                    "status": "utility_ineligible",
+                }
+                return
+            pending.service_lane = lane.lane
+            if lane.lane != "training":
+                self._admit_service_observation(pending, lane)
+                return
+            eligible = True
         else:
             eligible = robust_utility_admits(
                 pending.rewards,
@@ -2056,26 +2082,21 @@ class GrpoWindowBatcher:
                     if self.service_runtime is not None:
                         if pending is None:
                             raise RuntimeError("service proof has no bound pending request")
-                        from reliquary.services.runtime import ServicePolicyLimit
+                        # Every group that can be batched has a recorded training observation
+                        # first; a refused one is never batched (and says so, loudly).
                         try:
-                            result = self._record_service_proof(pending, decision.value)
-                        except ServicePolicyLimit:
-                            self.fill_state.release(environment)
-                            if row is not None:
-                                row["status"] = "service_policy_limit"
-                            continue
+                            receipt = self._service_training_receipt(pending, decision.value)
                         except BaseException:
                             self._accounted_arrival_decisions.discard(decision.job_id)
                             self._arrival_proof_meta[decision.job_id] = (rate, payload_bytes, receipt_id, pending)
                             raise
-                        if row is not None:
-                            row["service_observation_id"] = result["observation_id"]
-                            row["exploration_fraction"] = result["amount"]
-                        if self._service_exploration(pending):
+                        if receipt is None:
                             self.fill_state.release(environment)
                             if row is not None:
-                                row["status"] = "exploration_verified"
+                                row["status"] = "service_policy_limit"
                             continue
+                        if row is not None:
+                            row["service_observation_id"] = receipt
                     self.fill_state.record_proven(environment)
                     if row is not None:
                         self.difficulty_auction_metadata_by_id[
@@ -3834,11 +3855,12 @@ class GrpoWindowBatcher:
             validate_submission_policy(request, self.service_policy)
         except (ValueError, TypeError, KeyError):
             return False, RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract"
-        if self.service_runtime is not None and (
-            not self.service_runtime.active()
-            or (self.service_runtime.view is not None and not self.service_runtime.view.eligible(request.prompt_idx))
-        ):
-            return False, RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility"
+        if self.service_runtime is not None:
+            if not self.service_runtime.active():
+                return False, RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility"
+            refusal = self._service_admission_refusal(request)
+            if refusal is not None:
+                return False, refusal[0], refusal[1]
         if request.prompt_idx >= len(self.env):
             return False, RejectReason.BAD_PROMPT_IDX, "prompt"
         if self.prompt_range is not None:
@@ -4025,9 +4047,11 @@ class GrpoWindowBatcher:
             self._pending.append(pending)
             if FILL_CLOSED_ENABLED and self.fill_state is not None:
                 self._submit_arrival_proof(pending)
-            self._submissions_per_prompt.setdefault(
-                request.prompt_idx, []
-            ).append(pending)
+            if pending.service_lane in (None, "training"):
+                # An exploration / unproven observation takes no per-prompt training seat.
+                self._submissions_per_prompt.setdefault(
+                    request.prompt_idx, []
+                ).append(pending)
             self.last_valid_submission_at = self._time_fn()
             self.last_valid_submission_wall_ts = self._wall_clock()
             self.pending_count = len(self._pending)
@@ -4153,11 +4177,12 @@ class GrpoWindowBatcher:
             service_contract = validate_submission_policy(request, self.service_policy)
         except (ValueError, TypeError, KeyError):
             return reject(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract")
-        if self.service_runtime is not None and (
-            not self.service_runtime.active()
-            or (self.service_runtime.view is not None and not self.service_runtime.view.eligible(pi))
-        ):
-            return reject(RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility")
+        if self.service_runtime is not None:
+            if not self.service_runtime.active():
+                return reject(RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility")
+            refusal = self._service_admission_refusal(request)
+            if refusal is not None:
+                return reject(refusal[0], refusal[1])
         # Legacy environments stop after the trigger drand tier. Auction
         # environments intentionally collect for the full fixed deadline.
         if (
@@ -4407,7 +4432,7 @@ class GrpoWindowBatcher:
         )
         robust_utility = None
         attainable_rewards: tuple[float, ...] = ()
-        if ROBUST_TRUNCATION_UTILITY_ENABLED and unboxed_indices:
+        if ROBUST_TRUNCATION_UTILITY_ENABLED and unboxed_indices and service_contract is None:
             attainable_rewards = fractional_reward_lattice(1)
             robust_utility = robust_uncertain_reward_utility(
                 rewards,
@@ -4428,20 +4453,22 @@ class GrpoWindowBatcher:
             else is_in_zone(sigma, bootstrap=self.bootstrap)
         )
         if service_contract is not None:
-            from reliquary.services.admission_policy import service_signal_admits
+            from reliquary.services.admission_policy import service_lane
             # This path learns truncation from the proof only, so a missing box
             # is the one uncertainty it can see here; it exists on boxed
             # environments alone, whose lattice is declared.
             attainable_rewards = tuple(
                 _environment_policy(self.env, "attainable_rewards", ()) or ()
             )
-            in_zone = service_signal_admits(
+            # The lane is the validator's call from the vector; only a group that
+            # is no observation at all is refused here.
+            in_zone = service_lane(
                 request,
                 service_contract,
                 rewards,
                 uncertain_indices=unboxed_indices,
                 attainable_rewards=attainable_rewards,
-            )
+            ) is not None
         if not in_zone:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
@@ -4653,9 +4680,11 @@ class GrpoWindowBatcher:
             self._pending.append(pending)
             if FILL_CLOSED_ENABLED and self.fill_state is not None:
                 self._submit_arrival_proof(pending)
-            self._submissions_per_prompt.setdefault(
-                request.prompt_idx, []
-            ).append(pending)
+            if pending.service_lane in (None, "training"):
+                # An exploration / unproven observation takes no per-prompt training seat.
+                self._submissions_per_prompt.setdefault(
+                    request.prompt_idx, []
+                ).append(pending)
             self.last_valid_submission_at = self._time_fn()
             self.last_valid_submission_wall_ts = self._wall_clock()
             # Lock-free read in /state — see ``__init__`` for rationale.
@@ -4713,6 +4742,7 @@ class GrpoWindowBatcher:
         pending: PendingSubmission,
         *,
         model: Any | None = None,
+        audit: bool = False,
     ) -> ValidSubmission | None:
         """Prove one graded candidate on the GPU and run every proof-dependent
         gate. Returns the ``ValidSubmission`` on success, ``None`` on rejection.
@@ -4746,6 +4776,7 @@ class GrpoWindowBatcher:
             stage: str,
             **kwargs: Any,
         ) -> None:
+            pending.proof_reject_stage = stage
             pending.reject_response = self._reject(
                 reason,
                 hotkey=hk,
@@ -5266,7 +5297,13 @@ class GrpoWindowBatcher:
                     _rdict = rollout.commit.get("rollout")
                     if isinstance(_rdict, dict):
                         _rdict["truncated"] = True
-                    if truncated_count > max_truncated_per_submission:
+                    # R21: on the service path the robust rule prices every joint assignment of the
+                    # capped rollouts (training), or the group is published unpaid (exploration);
+                    # the legacy count limit applies to legacy tasks only.
+                    if (
+                        service_contract is None
+                        and truncated_count > max_truncated_per_submission
+                    ):
                         return reject(
                             RejectReason.BAD_TERMINATION,
                             "termination",
@@ -5838,7 +5875,7 @@ class GrpoWindowBatcher:
             # The proof is the authority on termination: a rollout it found cut
             # by the length cap is uncertain even if admission did not see it.
             from reliquary.services.admission_policy import (
-                service_signal_admits,
+                service_lane,
                 uncertain_rollout_indices,
             )
 
@@ -5854,14 +5891,20 @@ class GrpoWindowBatcher:
                 unboxed_indices=pending.uncertain_indices,
                 size=len(request.rollouts),
             )
-            if not service_signal_admits(
-                request,
-                service_contract,
-                rewards,
-                uncertain_indices=pending.uncertain_indices,
-                attainable_rewards=pending.attainable_rewards,
-            ):
-                return reject(RejectReason.OUT_OF_ZONE, "service_signal")
+            if not audit:
+                # A training proof: the group must still be a robust training group once the
+                # proof's own caps are counted. An audit proves the tokens only; what the group is
+                # worth was settled by the lane at admission.
+                lane = service_lane(
+                    request,
+                    service_contract,
+                    rewards,
+                    truncated_indices=pending.truncated_indices,
+                    uncertain_indices=pending.uncertain_indices,
+                    attainable_rewards=pending.attainable_rewards,
+                )
+                if lane is None or lane.lane != "training":
+                    return reject(RejectReason.OUT_OF_ZONE, "service_signal")
 
         # All checks passed.
         new_sub = ValidSubmission(
@@ -5962,6 +6005,9 @@ class GrpoWindowBatcher:
         # An exception is validator infrastructure failure; let the scheduler
         # abort the whole proof plane without blaming or displacing the miner.
         verified = self._verify_expensive(pending, model=model)
+        if verified is not None and self.service_runtime is not None:
+            # On this proof-worker thread, so the SQLite transaction never runs on the event loop.
+            self._prerecord_service_training(pending, verified)
         if verified is None and count_operator_debt and operator is not None:
             # Proof-stage rejects already add hotkey debt in ``_reject``.
             # Auction selection has historically charged one operator failure
@@ -6116,9 +6162,47 @@ class GrpoWindowBatcher:
                 return float(candidate)
         return 0.0
 
-    def _service_exploration(self, pending) -> bool:
-        binding = getattr(pending.request, "service_binding", None)
-        return self.service_runtime is not None and isinstance(binding, dict) and binding.get("purpose") == "exploration"
+    # ----------------------------------------------------------------------------------------------
+    # Service lanes (decisions A-C). Everything below is reached only when ``service_runtime`` is set.
+    # ----------------------------------------------------------------------------------------------
+
+    def _init_service_exploration_state(self) -> None:
+        self._exploration_lock = threading.RLock()
+        # Entitled observation id -> the group, kept (tokens included) until its audit or the finalize:
+        # the audit needs nothing from the miner after submission.
+        self._exploration_pending: dict[str, PendingSubmission] = {}
+        self._exploration_executor: ThreadPoolExecutor | None = None
+        self._exploration_closed = False
+        self._audit_closed = False
+        self._audit_plan_id: str | None = None
+        self._audit_handle: ProofPlanHandle | None = None
+        self._audit_rank = 0
+        self._audit_turn = 0
+        self._audit_submitted: set[str] = set()
+        self._audit_open: dict[str, str] = {}
+        self._audit_decisions_seen: set[str] = set()
+        self._audit_unavailable_logged = False
+        self._service_training_receipts: dict[int, str | None] = {}
+
+    # --- lane decision -------------------------------------------------------------------------
+
+    def _service_lane_of(self, pending):
+        """The validator's lane for a graded group, from its vector. None: not an observation."""
+        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.services.admission_policy import service_lane
+
+        contract = ServiceContract.from_dict(self.service_policy["contract"])
+        try:
+            return service_lane(
+                pending.request,
+                contract,
+                pending.rewards,
+                truncated_indices=pending.truncated_indices,
+                uncertain_indices=pending.uncertain_indices,
+                attainable_rewards=pending.attainable_rewards,
+            )
+        except ValueError:
+            return None
 
     @staticmethod
     def _service_group_id(pending) -> str:
@@ -6136,27 +6220,514 @@ class GrpoWindowBatcher:
             return PoolSelection.from_dict(selection).sha256
         return canonical_sha256({"selection_digest": pending.selection_digest.hex()})
 
-    def _record_service_proof(self, pending, verified) -> dict:
-        from reliquary.protocol.release_contract import canonical_sha256
+    @staticmethod
+    def _service_candidate(request) -> dict | None:
+        """The pool reference the runtime records: the digest and the chosen seeds (no wire schema key)."""
+        selection = getattr(request, "pool_selection", None)
+        if selection is None:
+            return None
+        from reliquary.protocol.seed_pool import PoolSelection
+        parsed = PoolSelection.from_dict(selection)
+        return {"pool_sha256": parsed.pool_sha256, "seeds": list(parsed.seeds)}
+
+    @staticmethod
+    def _service_token_count(request) -> int:
+        return sum(
+            len(r.commit["tokens"]) - int(r.commit["rollout"]["prompt_length"]) for r in request.rollouts
+        )
+
+    def _service_arrival_wall(self, pending) -> float:
+        """Validator wall clock at which the complete signed body was received.
+
+        Never a miner value. If the ingress did not stamp it, the instant of the admission decision
+        (later than the truth, which only pushes the audit draw to a later beacon).
+        """
+        telemetry = getattr(pending, "telemetry", None)
+        value = getattr(telemetry, "t_body_completed", None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+            return float(value)
+        fallback = pending.decision_ts
+        return float(fallback if fallback is not None else self._wall_clock())
+
+    def _set_service_row(self, pending, status: str, **extra) -> None:
+        with self._exploration_lock:
+            row = self.difficulty_auction_metadata_by_id.setdefault(id(pending), {"rank": None})
+            row.update({"status": status, **extra})
+
+    # --- observations that are not trained (exploration, R23) ------------------------------------
+
+    def _admit_service_observation(self, pending, lane) -> None:
+        """Hand an exploration / unproven group to the runtime, off the caller's thread.
+
+        The group never reserves fill-closed budget and never enters the training proof plan; the
+        productive admission budget is refunded. The SQLite transaction runs on a single worker
+        thread (arrival order), so the event loop never waits for an fsync.
+        """
+        pending.request._grading_refundable = True
+        if self.service_runtime is None:
+            # A service policy without a runtime cannot record anything: nothing is owed or published.
+            self._set_service_row(pending, "exploration_unavailable")
+            return
+        self._set_service_row(pending, "exploration_recording" if lane.lane == "exploration" else "service_unproven_recording")
+        with self._exploration_lock:
+            if self._exploration_closed:
+                self._set_service_row(pending, "exploration_window_closed")
+                return
+            if self._exploration_executor is None:
+                self._exploration_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="service-exploration")
+            executor = self._exploration_executor
+        executor.submit(self._record_service_observation, pending, lane, self._service_arrival_wall(pending))
+
+    def _record_service_observation(self, pending, lane, arrived_at: float) -> None:
+        from reliquary.services.admission_policy import exploration_pay_entitlement
+        from reliquary.services.runtime import ServicePolicyLimit
+
+        request = pending.request
+        context = f"{self.service_environment}/{pending.prompt_idx}/{pending.hotkey}"
+        try:
+            if lane.lane == "exploration":
+                # R5/R21/R24: any length-capped rollout makes the group unpaid ("truncated"), never a
+                # failed audit; the vector recorded is the one the lane classified.
+                entitlement = exploration_pay_entitlement(
+                    pending.rewards,
+                    truncated_indices=pending.truncated_indices,
+                    uncertain_indices=pending.uncertain_indices,
+                )
+                refuse = None if entitlement.entitled else entitlement.reason
+            else:
+                refuse = lane.reason  # R23: in zone as observed, not robust: published, unpaid, no scan
+            result = self.service_runtime.record_exploration(
+                environment=self.service_environment,
+                prompt_idx=pending.prompt_idx,
+                hotkey=pending.hotkey,
+                window=self.window_start,
+                rewards=list(lane.rewards),
+                group_id=self._service_group_id(pending),
+                candidate=self._service_candidate(request),
+                token_count=self._service_token_count(request),
+                arrived_at=arrived_at,
+                refuse=refuse,
+                uncertain=tuple(sorted(pending.uncertain_indices)),
+            )
+        except ValueError as exc:  # ServicePolicyLimit, NotAnObservation: a clean refusal
+            logger.error(
+                "service exploration group refused (%s: %s) %s observation=%s",
+                type(exc).__name__, exc, context, getattr(exc, "observation_id", None),
+            )
+            self._set_service_row(pending, "service_policy_limit")
+            return
+        except Exception:
+            logger.exception("service exploration group NOT recorded %s", context)
+            self._set_service_row(pending, "service_record_failed")
+            return
+        identity = result["observation_id"]
+        pending.service_observation_id = identity
+        if result["entitled"]:
+            with self._exploration_lock:
+                self._exploration_pending[identity] = pending
+            self._set_service_row(
+                pending, "exploration_pending",
+                service_observation_id=identity, exploration_fraction=result["amount"])
+            return
+        reason = result["reason"]
+        status = {
+            "already_scanned": "already_scanned",
+            "banned": "exploration_banned",
+            "cap": "exploration_cap_reached",
+            "not_robust": "service_unproven_published",
+        }.get(reason, "exploration_unpaid")
+        self._set_service_row(
+            pending, status, service_observation_id=identity, exploration_fraction=0.0,
+            service_unpaid_reason=reason)
+
+    def flush_service_admissions(self, timeout: float | None = 60.0) -> None:
+        """Wait until every exploration group handed to the runtime has been recorded."""
+        with self._exploration_lock:
+            executor = self._exploration_executor
+        if executor is not None:
+            executor.submit(lambda: None).result(timeout=timeout)
+
+    def close_service_exploration(self) -> None:
+        """Seal step 1: no more exploration is admitted; what was handed over is recorded."""
+        with self._exploration_lock:
+            self._exploration_closed = True
+        self.flush_service_admissions()
+
+    # --- training lane ---------------------------------------------------------------------------
+
+    def _record_service_training(self, pending, verified) -> str | None:
+        """Record a proven training group. None: refused, so the group must not be batched."""
         from reliquary.services.admission_policy import validate_submission_policy
+        from reliquary.services.runtime import ServicePolicyLimit
+
         contract = validate_submission_policy(pending.request, self.service_policy)
         if contract is None or contract.sha256 != self.service_runtime.contract.sha256:
-            raise ValueError("proof service context no longer active")
-        commits = [r.commit for r in verified.rollouts]
-        identity = self._service_group_id(pending)
-        row = {
-            "schema": "prompt-observation/v1", "context_sha256": contract.context_sha256,
-            "row_id": self.service_runtime.row_ids[pending.prompt_idx], "group_id": identity,
-            "expected_samples": len(verified.rollouts), "sample_ids": [f"rollout-{i}" for i in range(len(verified.rollouts))],
-            "rewards_bps": [round(r * 10000) for r in pending.rewards],
-            "tokens": [len(r.commit["tokens"]) - int(r.commit["rollout"]["prompt_length"]) for r in verified.rollouts],
-            "window": self.window_start, "verification": {"generation": "verified", "sampling": "verified", "grading": "graded"},
-            "source_sha256": canonical_sha256(commits),
-        }
-        return self.service_runtime.record_verified(
-            row, hotkey=verified.hotkey, purpose=pending.request.service_binding["purpose"],
-            window_pool=self.service_window_pool, slots=self.fill_state.snapshot()["budgets"][str(getattr(self.env, "name", ""))],
+            raise ValueError("proof service order no longer active")
+        try:
+            result = self.service_runtime.record_training(
+                environment=self.service_environment,
+                prompt_idx=pending.prompt_idx,
+                hotkey=verified.hotkey,
+                window=self.window_start,
+                rewards=list(pending.rewards),
+                group_id=self._service_group_id(pending),
+                candidate=self._service_candidate(pending.request),
+                token_count=self._service_token_count(pending.request),
+            )
+        except ServicePolicyLimit as exc:
+            logger.error(
+                "service training group NOT recorded and therefore NOT batched: env=%s prompt=%s "
+                "hotkey=%s observation=%s: %s",
+                self.service_environment, pending.prompt_idx, verified.hotkey,
+                exc.observation_id, exc,
+            )
+            return None
+        pending.service_observation_id = result["observation_id"]
+        return result["observation_id"]
+
+    def _prerecord_service_training(self, pending, verified) -> None:
+        """On the proof-worker thread, right after a passing arrival proof."""
+        if self.fill_state is None:
+            return
+        try:
+            receipt = self._record_service_training(pending, verified)
+        except Exception:
+            # The reconciliation retries inline; a failed record must not fault the proof plane.
+            logger.exception("service training record failed on the proof worker; it is retried at reconciliation")
+            return
+        self._service_training_receipts[id(pending)] = receipt
+
+    def _service_training_receipt(self, pending, verified) -> str | None:
+        missing = object()
+        receipt = self._service_training_receipts.pop(id(pending), missing)
+        if receipt is missing:
+            receipt = self._record_service_training(pending, verified)
+        return receipt
+
+    # --- audits ----------------------------------------------------------------------------------
+
+    def _audit_candidates(self, drain: bool, count: int) -> list[dict]:
+        """The next audits to hand to the scheduler, from the runtime's queue order.
+
+        While the window runs, one in every ``SERVICE_EXPLORATION_PROBATION_EVERY`` goes to a hotkey
+        still in probation when one waits, so newcomers see audits every window; while draining
+        (seal), hotkeys past probation come first, strictly.
+        """
+        from reliquary.constants import SERVICE_EXPLORATION_PROBATION_EVERY
+
+        queued = [
+            row for row in self.service_runtime.queued_audits(self.window_start, environment=self.service_environment)
+            if row["observation_id"] not in self._audit_submitted
+            and row["observation_id"] in self._exploration_pending
+        ]
+        seasoned = [row for row in queued if row["past_probation"]]
+        probation = [row for row in queued if not row["past_probation"]]
+        chosen: list[dict] = []
+        while len(chosen) < count and (seasoned or probation):
+            take_probation = bool(probation) and (
+                not seasoned
+                or (not drain and self._audit_turn % SERVICE_EXPLORATION_PROBATION_EVERY
+                    == SERVICE_EXPLORATION_PROBATION_EVERY - 1)
+            )
+            chosen.append((probation if take_probation else seasoned).pop(0))
+            self._audit_turn += 1
+        return chosen
+
+    def service_exploration_tick(self, *, drain: bool = False) -> None:
+        """Draw what can be drawn and hand the next audits to the (low-priority) audit plan.
+
+        Blocking (SQLite, drand fetch): call it off the event loop.
+        """
+        runtime = self.service_runtime
+        if runtime is None or getattr(self, "service_environment", None) is None:
+            return
+        try:
+            runtime.resolve_draws(self.window_start, environment=self.service_environment)
+        except Exception:
+            logger.exception("service window %s env %s: audit draws failed", self.window_start, self.service_environment)
+        self._reconcile_audit_decisions()
+        self._submit_audits(drain=drain)
+
+    def _submit_audits(self, *, drain: bool) -> None:
+        from reliquary.constants import (
+            FILL_CLOSED_MAX_SECONDS,
+            SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV,
+            SERVICE_EXPLORATION_AUDIT_INFLIGHT,
+            SERVICE_EXPLORATION_AUDIT_PRIORITY,
+            SERVICE_EXPLORATION_DRAIN_SECONDS,
         )
+
+        scheduler = self._proof_scheduler
+        with self._exploration_lock:
+            if self._audit_closed:
+                return
+            room = min(
+                SERVICE_EXPLORATION_AUDIT_INFLIGHT - len(self._audit_open),
+                SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV - len(self._audit_submitted),
+            )
+            if room <= 0:
+                return
+            if scheduler is None:
+                if not self._audit_unavailable_logged:
+                    self._audit_unavailable_logged = True
+                    logger.error("service window %s: no proof scheduler, exploration audits cannot run "
+                                 "(their groups end unaudited, unpaid)", self.window_start)
+                return
+            picked = self._audit_candidates(drain, room)
+            if not picked:
+                return
+            environment = str(self.service_environment)
+            candidates = []
+            for row in picked:
+                self._audit_rank += 1
+                job_id = f"{self.window_start}:{environment}:exploration-audit:{self._audit_rank}"
+                candidates.append(RankedProof(
+                    job_id=job_id,
+                    rank=self._audit_rank,
+                    prompt_key=("exploration-audit", row["observation_id"]),
+                    payload=_ScheduledProofPayload(
+                        batcher=self,
+                        pending=self._exploration_pending[row["observation_id"]],
+                        count_operator_debt=False,
+                        audit=True,
+                    ),
+                    resources=(),
+                    counts_toward_target=False,
+                ))
+            try:
+                if self._audit_plan_id is None:
+                    plan_id = f"{self.window_start}:{environment}:exploration-audit"
+                    self._audit_handle = scheduler.submit(ProofPlan(
+                        plan_id=plan_id,
+                        environment=audit_scheduler_environment(environment),
+                        checkpoint_revision=self.current_checkpoint_hash,
+                        candidates=tuple(candidates),
+                        # Observational candidates never count toward a target, so this target is never
+                        # reached: the plan stays open (an open-ended plan whose target is met retires
+                        # as soon as its queue drains), until ``finalize_service_exploration`` stops
+                        # its dispatch. ``complete_all`` cannot be used: it cannot be stopped.
+                        required_passes=SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV + 1,
+                        max_attempts=SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV,
+                        deadline_at=self.window_opened_at + FILL_CLOSED_MAX_SECONDS
+                        + SERVICE_EXPLORATION_DRAIN_SECONDS + 300.0,
+                        dispatch_deadline_at=self.window_opened_at + FILL_CLOSED_MAX_SECONDS
+                        + SERVICE_EXPLORATION_DRAIN_SECONDS,
+                        priority=SERVICE_EXPLORATION_AUDIT_PRIORITY,
+                        complete_all=False,
+                        allow_shortfall=True,
+                        open_ended=True,
+                    ))
+                    self._audit_plan_id = plan_id
+                else:
+                    scheduler.extend(self._audit_plan_id, candidates)
+            except CheckpointNotReady:
+                self._audit_rank -= len(candidates)
+                return  # transient: the next tick tries again
+            except (ProofPlanClosed, ValueError) as exc:
+                self._audit_rank -= len(candidates)
+                if not self._audit_unavailable_logged:
+                    self._audit_unavailable_logged = True
+                    logger.error("service window %s env %s: the audit plan cannot take work (%s: %s); "
+                                 "queued audits end unaudited, unpaid", self.window_start, environment,
+                                 type(exc).__name__, exc)
+                return
+            for candidate, row in zip(candidates, picked):
+                self._audit_submitted.add(row["observation_id"])
+                self._audit_open[candidate.job_id] = row["observation_id"]
+                self._set_service_row(self._exploration_pending[row["observation_id"]], "exploration_audit_queued")
+
+    def _reconcile_audit_decisions(self) -> None:
+        """Bookkeeping only: the verdicts were recorded by the audit callable itself."""
+        handle = self._audit_handle
+        if handle is None:
+            return
+        for decision in handle.decisions():
+            if decision.job_id in self._audit_decisions_seen:
+                continue
+            self._audit_decisions_seen.add(decision.job_id)
+            with self._exploration_lock:
+                identity = self._audit_open.pop(decision.job_id, None)
+            if identity is not None and decision.status not in (
+                ProofDecisionStatus.PASSED, ProofDecisionStatus.REJECTED
+            ):
+                # The proof never ran to a verdict (not needed, skipped, aborted, error): the row stays
+                # queued and ends unaudited at the finalize -- unpaid, never sanctioned.
+                logger.warning("service exploration audit %s ended %s without a verdict", identity, decision.status.value)
+
+    def audits_in_flight(self) -> int:
+        with self._exploration_lock:
+            return len(self._audit_open)
+
+    def exploration_drain_state(self) -> dict[str, int]:
+        """What the seal drain still waits for in this env: ``pending_draw``, and the audits that can still
+        run (queued, held by this batcher, within the budget, not yet handed over, or in flight) of hotkeys
+        past probation (``past_probation``) and of hotkeys in probation (``probation``)."""
+        from reliquary.constants import SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV
+
+        runtime = self.service_runtime
+        backlog = runtime.exploration_backlog(self.window_start, environment=self.service_environment)
+        queued = runtime.queued_audits(self.window_start, environment=self.service_environment)
+        with self._exploration_lock:
+            room = 0 if self._audit_closed else max(0, SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV - len(self._audit_submitted))
+            waiting = [r for r in queued if r["observation_id"] in self._exploration_pending
+                       and r["observation_id"] not in self._audit_submitted][:room]
+            in_flight = len(self._audit_open)
+        return {
+            "pending_draw": backlog["pending_draw"],
+            "past_probation": sum(r["past_probation"] for r in waiting) + in_flight,
+            "probation": sum(not r["past_probation"] for r in waiting),
+        }
+
+    def _execute_exploration_audit(self, pending, *, model) -> "ValidSubmission | None":
+        """The audit callable (a proof-worker thread): the same checks as a training proof, then the verdict."""
+        caps_at_admission = tuple(pending.truncated_indices)
+        verified = self._verify_expensive(pending, model=model, audit=True)
+        try:
+            self._conclude_exploration_audit(pending, verified, caps_at_admission)
+        finally:
+            with self._exploration_lock:
+                for job_id, identity in list(self._audit_open.items()):
+                    if identity == pending.service_observation_id:
+                        # The decision lands in the plan a moment later; do not hold a slot meanwhile.
+                        self._audit_open.pop(job_id, None)
+        return verified
+
+    # A proof that could not judge the group is not a verdict on the miner.
+    _AUDIT_INCONCLUSIVE_STAGES = frozenset({"service_contract", "service_proof_capability"})
+
+    def _conclude_exploration_audit(self, pending, verified, caps_at_admission) -> None:
+        identity = pending.service_observation_id
+        if identity is None:
+            logger.error("exploration audit of a group without an observation id: hotkey=%s prompt=%s",
+                         pending.hotkey, pending.prompt_idx)
+            return
+        if verified is not None:
+            if set(pending.truncated_indices) - set(caps_at_admission):
+                # R21: the proof found a cap the admission did not see. That is not a forgery and not a
+                # failure; the group cannot be paid on a termination the proof disputes, so it gets no
+                # verdict: it ends unaudited (unpaid, no ban).
+                logger.warning("exploration audit %s: the proof found a length-capped rollout; no verdict", identity)
+                self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0,
+                                      service_unpaid_reason="truncated")
+                return
+            passed = True
+        elif pending.proof_reject_stage in self._AUDIT_INCONCLUSIVE_STAGES:
+            logger.error("exploration audit %s inconclusive (%s); no verdict", identity, pending.proof_reject_stage)
+            return
+        else:
+            passed = False
+        outcome = self._apply_audit_verdict(identity, passed)
+        if outcome.passed:
+            self._set_service_row(pending, "exploration_audit_passed")
+        elif outcome.failed:
+            self._set_service_row(pending, "exploration_forfeited", exploration_fraction=0.0)
+            with self._exploration_lock:
+                lost = [self._exploration_pending[i] for i in outcome.forfeited if i in self._exploration_pending]
+            for other in lost:
+                self._set_service_row(other, "exploration_forfeited", exploration_fraction=0.0)
+        else:
+            logger.error("exploration audit verdict for %s (passed=%s) was not applied", identity, passed)
+            self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0)
+
+    def _apply_audit_verdict(self, identity: str, passed: bool):
+        """``record_audit`` with its explicit outcome acted on: a row still awaiting the verdict is retried."""
+        import time as _time
+
+        outcome = None
+        for attempt in range(3):
+            outcome = self.service_runtime.record_audit(identity, passed=passed)
+            if outcome.applied:
+                return outcome
+            rows = {r["observation_id"]: r for r in self.service_runtime.exploration_rows(
+                self.window_start, environment=self.service_environment)}
+            entry = rows.get(identity)
+            if entry is None or entry["audit"] != "queued" or entry["status"] != "reserved":
+                return outcome  # moot (finalized, forfeited, unknown): nothing to retry
+            _time.sleep(0.2 * (attempt + 1))
+        return outcome
+
+    # --- seal ------------------------------------------------------------------------------------
+
+    def _exploration_row_status(self, entry: dict) -> tuple[str, bool]:
+        """(published status, payable-if-nothing-else-changes) of one ledger row."""
+        if entry["status"] == "forfeited" or entry["audit"] == "failed":
+            return "exploration_forfeited", False
+        if entry["status"] in ("trained", "unpaid"):
+            return "exploration_unpaid", False
+        if entry["audit"] == "unaudited":
+            return "exploration_unaudited", False
+        if entry["audit"] == "passed":
+            return "exploration_audit_passed", True
+        if entry["audit"] == "queued":
+            return "exploration_audit_queued", True
+        return "exploration_pending", True
+
+    def _refresh_exploration_rows(self) -> None:
+        rows = {r["observation_id"]: r for r in self.service_runtime.exploration_rows(
+            self.window_start, environment=self.service_environment)}
+        with self._exploration_lock:
+            entitled = dict(self._exploration_pending)
+        for identity, pending in entitled.items():
+            entry = rows.get(identity)
+            if entry is None:
+                continue
+            status, payable = self._exploration_row_status(entry)
+            current = self.difficulty_auction_metadata_by_id.get(id(pending), {})
+            if status == "exploration_unaudited" and current.get("service_unpaid_reason") == "truncated":
+                payable = False
+            self._set_service_row(pending, status, **({} if payable else {"exploration_fraction": 0.0}))
+
+    def finalize_service_exploration(self) -> None:
+        """Seal step 3 (the drain is the caller's): stop the audits, freeze the env's exploration.
+
+        Idempotent. Whatever is still waiting for a draw or an audit becomes unaudited in the runtime
+        (unpaid, never sanctioned). A late audit verdict after this changes no row (R3).
+        """
+        runtime = self.service_runtime
+        if runtime is None or getattr(self, "service_environment", None) is None:
+            return
+        with self._exploration_lock:
+            self._exploration_closed = True
+            self._audit_closed = True
+            executor, self._exploration_executor = self._exploration_executor, None
+        if executor is not None:
+            executor.submit(lambda: None).result(timeout=60.0)
+            executor.shutdown(wait=True)
+        if self._audit_plan_id is not None and self._proof_scheduler is not None:
+            try:
+                # Queued work is released, work already running settles (its late verdict is the
+                # runtime's to judge, R3). A retired plan is a no-op.
+                self._proof_scheduler.stop_dispatch(self._audit_plan_id)
+            except (ValueError, ProofPlanClosed):
+                pass
+        self._reconcile_audit_decisions()
+        try:
+            runtime.finalize_exploration(self.window_start, environment=self.service_environment)
+        except Exception:
+            # reconcile_archive finalizes every env it finds open, so nothing is paid unaudited.
+            logger.exception("service window %s env %s: exploration finalize failed",
+                             self.window_start, self.service_environment)
+        try:
+            self._refresh_exploration_rows()
+        except Exception:
+            logger.exception("service window %s env %s: exploration row statuses not refreshed",
+                             self.window_start, self.service_environment)
+
+    def _service_admission_refusal(self, request) -> tuple[RejectReason, str] | None:
+        """A banned hotkey's declared exploration is refused before any grading is spent on it.
+
+        (The lane of an accepted group is decided from its vector, so a banned hotkey that declares
+        another purpose still lands in the exploration lane and is published unpaid ``banned``.)
+        """
+        binding = getattr(request, "service_binding", None) or {}
+        if (
+            self.service_runtime is not None
+            and binding.get("purpose") == "exploration"
+            and self.service_runtime.exploration_banned(request.miner_hotkey)
+        ):
+            return (RejectReason.RATE_LIMITED, "service_exploration_banned")
+        return None
 
     def _ranked_proof_for(
         self,
@@ -6194,7 +6765,7 @@ class GrpoWindowBatcher:
             ) + resources
         return RankedProof(
             job_id=f"{self.window_start}:{environment}:{tag}:{rank}",
-            counts_toward_target=not self._service_exploration(pending),
+            counts_toward_target=True,
             rank=rank,
             prompt_key=prompt_key,
             payload=_ScheduledProofPayload(

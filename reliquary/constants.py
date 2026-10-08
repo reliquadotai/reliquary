@@ -869,6 +869,23 @@ SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS = 50_000
 # A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
 # passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
 PROBATION_PENDING_LIMIT = 4
+# Exploration audits (decision C, R15). They run as they are drawn on a plan of their own at
+# ``SERVICE_EXPLORATION_AUDIT_PRIORITY``. At most ``..._INFLIGHT`` are handed to the proof scheduler at a
+# time, so the queue order (past-probation hotkeys first) is decided at the last moment; of every
+# ``..._PROBATION_EVERY`` audits handed over while the window runs, one goes to a hotkey still in
+# probation when one waits, so newcomers see audits every window.
+SERVICE_EXPLORATION_AUDIT_INFLIGHT = 2
+SERVICE_EXPLORATION_PROBATION_EVERY = 4
+SERVICE_EXPLORATION_TICK_SECONDS = 1.0
+# Seal drain. After the window seals the validator stops admitting exploration, waits at most
+# ``..._DRAW_WAIT_ROUNDS`` drand rounds for pending draws, proves EVERY queued audit of a hotkey past
+# probation (at most ``..._DRAIN_SECONDS`` in all) and lets hotkeys still in probation use only the first
+# ``..._DRAIN_PROBATION_SECONDS`` of that wait. Then it finalizes whatever is left as unaudited (unpaid,
+# never sanctioned), so a stuck proof can delay a window by the bound and never by more.
+SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS = 2
+SERVICE_EXPLORATION_DRAIN_SECONDS = float(_os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_SECONDS", "600"))
+SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS = float(
+    _os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS", "120"))
 
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.
