@@ -440,6 +440,10 @@ class ServicePolicyAnnouncement(BaseModel):
         from reliquary.protocol.service_contract import PUBLIC_SEED_POOL
         if any(env["sampling"]["kind"] == PUBLIC_SEED_POOL for env in contract.environments.values()) and not self.pool_randomness:
             raise ValueError("public pool requires its authoritative beacon")
+        for name, env in contract.environments.items():
+            if env["sampling"]["kind"] == PUBLIC_SEED_POOL and env["sampling"]["group_size"] != M_ROLLOUTS:
+                # a miner always submits M_ROLLOUTS rollouts: any other group_size would admit no group at all
+                raise ValueError(f"{name}: a public seed pool group_size must be M_ROLLOUTS")
         return self
 
 

@@ -32,6 +32,8 @@ def test_v2_has_no_checkpoint_bound_context():
     (lambda v: v["policies"].update(eligibility={"kind": "dataset-epoch/v1"}), "policies"),
     (lambda v: v["environments"].update({"Bad Name": v["environments"][MATH]}), "environment id"),
     (lambda v: v["environments"][MATH]["sampling"].update(kind="public-draw-pool/v1"), "sampling"),
+    (lambda v: v["environments"][MATH]["sampling"].update(renewal_windows=2), "renews every window"),
+    (lambda v: v["environments"][MATH]["sampling"].update(renewal_windows=1000000), "renews every window"),
 ])
 def test_v2_rejects_invalid_orders(mutate, message):
     value = contract_v2_dict()
@@ -81,3 +83,12 @@ def test_schedule_from_dict_refuses_another_order():
     contract, other = contract_v2(), contract_v2(cooldown_windows=51)
     with pytest.raises(ScheduleError, match="order"):
         ServiceSchedule.from_dict(initial_schedule(contract).to_dict(), other)
+
+
+def test_public_seed_pool_renews_every_window_and_nothing_else_is_refused_for_it():
+    value = contract_v2_dict()
+    assert value["environments"][MATH]["sampling"]["renewal_windows"] == 1
+    assert ServiceContract.from_dict(value).environment(MATH)["sampling"]["renewal_windows"] == 1
+    value["environments"][MATH]["sampling"]["renewal_windows"] = 0
+    with pytest.raises(ServiceContractError, match="renewal_windows"):
+        ServiceContract.from_dict(value)

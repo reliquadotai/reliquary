@@ -88,6 +88,11 @@ Decision:
     it).
   - Published observations carry `audited` / `pending` / `unproven`.
   - Always on, for free: validator-recomputed grading, prompt fidelity, length bounds.
+  - Audit rules in force:
+    - Probation counts passed audits: a hotkey stays at 100 % until 100 of its exploration groups have passed.
+    - A hotkey's not-drawn groups are paid only if its own drawn groups up to that round were audited; another hotkey's groups are never affected.
+    - Audits of hotkeys past probation run before audits of hotkeys in probation.
+    - Queued audits drain at seal, before the window is finalized; a group drawn but not audited is unpaid, never sanctioned.
 
 ## D. What is published to miners: DECIDED (07-10)
 
@@ -96,7 +101,7 @@ validator's API is never hit by observation readers.
 
 - **What:** for every verified group (training or exploration): env, prompt index,
   checkpoint, window, timestamp, **the 16 rewards** and the derived verdict (in-zone /
-  16/16 / 0/16), the chosen candidate group (2×M seeds), and the status (trained /
+  16/16 / 0/16), the chosen seed indices (M of the 2×M pool seeds, in the order of the rewards), and the status (trained /
   exploration paid / already scanned).
   - Rescans that are not proven are also published, marked **unproven**.
   - No hotkey, no tokens.

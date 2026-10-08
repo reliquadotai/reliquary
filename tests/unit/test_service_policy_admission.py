@@ -263,6 +263,9 @@ def test_the_validated_selection_is_the_signed_one(signed_request):
 @pytest.mark.parametrize("forge", ["duplicate", "unsorted", "out_of_range", "short", "long", "bool", "old_schema"])
 def test_non_canonical_selections_never_reach_the_proof_stage(signed_request, forge):
     request, announcement, wallet = signed_request()
+    # positive control: the same request, untouched, passes the very same parse path
+    parsed, _ = _parse(request, announcement)
+    assert parsed.reject_reason is None
     seeds = list(SEEDS)
     if forge == "duplicate":
         seeds[1] = seeds[0]
@@ -285,6 +288,10 @@ def test_non_canonical_selections_never_reach_the_proof_stage(signed_request, fo
         validate_submission_policy(request, announcement)
     with pytest.raises(ValueError):                       # the wire schema refuses it as well
         BatchSubmissionRequest.model_validate(request.model_dump())
+    # the real admission parse path
+    parsed, _ = _parse(request, announcement)
+    assert parsed.reject_reason is RejectReason.BAD_SCHEMA
+    assert parsed.reject_stage == "schema"                # at the schema stage, long before signatures and proofs
 
 
 def test_two_rollouts_cannot_claim_the_same_seed(signed_request):

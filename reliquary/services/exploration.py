@@ -12,12 +12,17 @@ Rules a reader of the public log can rely on:
 * Probation: a group is forced to audit while its hotkey has fewer than ``new_hotkey_audit_groups``
   groups whose audit PASSED (same order, any window, any env, still entitled). Forfeited, unaudited
   and not-drawn groups never count, so a hotkey whose forced groups are never audited stays forced.
-* Audit horizon: when a (window, env) is finalized, every group still waiting for its draw or for
-  its audit becomes ``unaudited``. If at least one DRAWN group was left unaudited, every
-  ``not_drawn`` group of that (window, env) whose draw round is >= the smallest draw round among
-  those drawn-unaudited groups becomes ``unaudited`` as well. A group is paid without an audit only
-  if every audit drawn up to its round was actually performed. ``unaudited`` is unpaid and never
-  sanctioned.
+* Audit horizon (per hotkey): when a (window, env) is finalized, every group still waiting for its
+  draw or for its audit becomes ``unaudited``. If a hotkey has at least one DRAWN group, not
+  forfeited, left unaudited, every ``not_drawn`` group OF THAT HOTKEY in that (window, env) whose
+  draw round is >= the smallest draw round among its drawn-unaudited groups becomes ``unaudited`` as
+  well. Another hotkey's groups are never affected, and a forfeited group sets no horizon (its
+  hotkey already lost the window). A group is paid without an audit only if every audit drawn for
+  its own hotkey up to its round was actually performed. ``unaudited`` is unpaid and never
+  sanctioned; nobody is banned by the horizon.
+* What the runtime owes: audits of hotkeys past probation run before audits of hotkeys still in
+  probation, and at seal the queued audits are drained (bounded wait, and up to 2 drand rounds for
+  pending draws) BEFORE ``finalize_exploration`` is called. The audit load is bounded by the cap.
 * First scans: an entitlement that ends unpaid for any reason (refused at admission, forfeited by
   a failed audit, ``unaudited`` at finalize, horizon included) gives its first scan back, so the
   prompt can be paid to a later observation. Only a paid entitlement keeps the prompt.
@@ -257,20 +262,21 @@ class ExplorationLedger:
         """Freeze a (window, env) and return every ``unaudited`` id of it (all unpaid, none sanctioned).
 
         Groups waiting for their draw or their audit become ``unaudited``; so does every
-        ``not_drawn`` group at or after the audit horizon (module docstring). The caller releases
+        ``not_drawn`` group of a hotkey at or after that hotkey's audit horizon (module docstring). The caller releases
         the first scan of every returned id in the same transaction (``finalize_exploration``).
         Calling it again changes nothing and returns the same ids.
         """
         scope = (self.order, window, environment)
         if not self.is_finalized(window, environment=environment):
-            horizon = self.db.execute(
-                "SELECT MIN(draw_round) FROM exploration_entitlements WHERE order_id=? AND window=? "
-                "AND environment=? AND audit='queued'", scope).fetchone()[0]
+            horizons = self.db.execute(
+                "SELECT hotkey, MIN(draw_round) FROM exploration_entitlements WHERE order_id=? AND window=? "
+                "AND environment=? AND audit='queued' AND status='reserved' GROUP BY hotkey", scope).fetchall()
             self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE order_id=? AND window=? "
                             "AND environment=? AND audit IN ('pending_draw','queued')", scope)
-            if horizon is not None:
+            for hotkey, horizon in horizons:
                 self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE order_id=? AND window=? "
-                                "AND environment=? AND audit='not_drawn' AND draw_round>=?", (*scope, horizon))
+                                "AND environment=? AND hotkey=? AND audit='not_drawn' AND draw_round>=?",
+                                (*scope, hotkey, horizon))
             self.db.execute("INSERT INTO exploration_finalized VALUES(?,?,?)", scope)
         return [r for r, in self.db.execute(
             "SELECT observation_id FROM exploration_entitlements WHERE order_id=? AND window=? "
@@ -278,7 +284,7 @@ class ExplorationLedger:
 
     def payable(self, window: int, *, environment: str) -> dict[str, int]:
         """``{hotkey: whole entitlements to pay}`` of a FINALIZED (window, env): still entitled and
-        either audited-and-passed or not drawn inside the audit horizon. Settlement prices them."""
+        either audited-and-passed or not drawn inside its hotkey's audit horizon. Settlement prices them."""
         if not self.is_finalized(window, environment=environment):
             raise ValueError("exploration is payable only once its (window, env) is finalized")
         return {hotkey: int(count) for hotkey, count in self.db.execute(

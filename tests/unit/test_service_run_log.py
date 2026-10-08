@@ -1,5 +1,6 @@
 # tests/unit/test_service_run_log.py
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -17,7 +18,7 @@ def obs(*, env="reliquary_dapo_math_v1", prompt=7, group="g1", window=1, checkpo
     return Observation(environment=env, dataset_id=f"{env}-train", prompt_idx=prompt, group_id=group,
                        window=window, checkpoint_n=checkpoint_n, checkpoint_revision="c" * 40,
                        observed_at=100.0 + window, rewards_bps=tuple(rewards), lane=lane,
-                       candidate={"pool_sha256": "p" * 64, "seeds": seeds}, hotkey=hotkey, token_count=1234)
+                       candidate={"pool_sha256": "ab" * 32, "seeds": seeds}, hotkey=hotkey, token_count=1234)
 
 
 @pytest.fixture
@@ -62,7 +63,7 @@ def test_public_events_carry_no_hotkey_or_tokens(log):
     first = events[0]
     assert first["env"] == "reliquary_dapo_math_v1" and first["prompt_idx"] == 7
     assert first["checkpoint_n"] == 1 and first["window"] == 1 and len(first["rewards_bps"]) == M_ROLLOUTS
-    assert first["verdict"] == "in-zone" and first["candidate"] == {"pool_sha256": "p" * 64, "seeds": SEEDS}
+    assert first["verdict"] == "in-zone" and first["candidate"] == {"pool_sha256": "ab" * 32, "seeds": SEEDS}
     assert log.admin_events()[0][1]["hotkey"] == "hk-1"
 
 
@@ -181,14 +182,14 @@ def test_run_salt_is_persisted_and_ids_are_stable_across_reopen(tmp_path):
 def test_public_event_cannot_carry_hotkey_or_tokens_even_via_candidate(log):
     o = obs(hotkey="SECRET-HOTKEY")
     o = Observation(**{**{f: getattr(o, f) for f in o.__slots__},
-                       "candidate": {"pool_sha256": "p" * 64, "seeds": tuple(SEEDS), "candidate_id": 1,
+                       "candidate": {"pool_sha256": "ab" * 32, "seeds": tuple(SEEDS), "candidate_id": 1,
                                      "hotkey": "SECRET-HOTKEY",
                                      "tokens": [1, 2, 3], "token_ids": [4]}})
     with log.db:
         log.record(o, status="proven", proof="proven")
     raw = log.db.execute("SELECT group_concat(payload) FROM run_events").fetchone()[0]
     assert "SECRET-HOTKEY" not in raw and "tokens" not in raw and "token_ids" not in raw
-    assert log.events()[0][1]["candidate"] == {"pool_sha256": "p" * 64, "seeds": SEEDS}
+    assert log.events()[0][1]["candidate"] == {"pool_sha256": "ab" * 32, "seeds": SEEDS}
 
 
 def test_public_event_pairs_each_reward_with_its_seed(log):
@@ -290,3 +291,18 @@ def test_too_many_rewards_is_not_an_observation(log):
     with pytest.raises(NotAnObservation):
         with log.db:
             log.record(obs(rewards=(10000, 0) * M_ROLLOUTS), status="proven", proof="proven")
+
+
+@pytest.mark.parametrize("pool", ["p" * 64, "AB" * 32, "ab" * 31, "ab" * 33, "", None, 5, b"ab" * 32, "ab" * 31 + "a\n"])
+def test_a_public_pool_hash_that_is_not_64_lowercase_hex_is_refused_not_published(log, pool):
+    candidate = {"pool_sha256": pool, "seeds": SEEDS}
+    with pytest.raises(ValueError, match="pool_sha256"):
+        with log.db:
+            log.record(replace(obs(), candidate=candidate), status="proven", proof="proven")
+    assert log.events() == []
+
+
+def test_a_candidate_without_a_pool_hash_is_refused(log):
+    with pytest.raises(ValueError, match="pool_sha256"):
+        with log.db:
+            log.record(replace(obs(), candidate={"seeds": SEEDS}), status="proven", proof="proven")

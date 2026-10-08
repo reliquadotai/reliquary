@@ -379,8 +379,8 @@ def test_late_failed_audit_after_finalize_bans_once_and_changes_no_row(tmp_path)
 
 def test_only_a_drawn_group_can_lead_to_a_late_ban(tmp_path):
     book = ledger(tmp_path)
-    reserve(book, 1, hotkey="paid", groups=0, draw_round=10)     # not drawn, before the horizon: paid
-    reserve(book, 2, hotkey="late", groups=0, draw_round=30)     # not drawn, after the horizon: unaudited
+    reserve(book, 1, hotkey="paid", groups=0, draw_round=10)     # not drawn, other hotkey: paid
+    reserve(book, 2, hotkey="drawn", groups=0, draw_round=30)    # same hotkey as 3, after its horizon: unaudited
     reserve(book, 3, hotkey="drawn", groups=100, draw_round=20)  # drawn, never audited
     with book.db:
         book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON if r < 99 else None, audit_bps=0)
@@ -393,55 +393,77 @@ def test_only_a_drawn_group_can_lead_to_a_late_ban(tmp_path):
     before = book.rows(1, environment="math")
     for i in (1, 2, 3, 4):
         assert audit(book, i, False, now=10.0, ban=100) == []
-    assert [h for h in ("paid", "late", "drawn", "waiting") if book.banned(h, 50.0)] == ["drawn"]
+    assert [h for h in ("paid", "drawn", "waiting") if book.banned(h, 50.0)] == ["drawn"]
     assert book.rows(1, environment="math") == before
 
 
-def horizon_window(book):
-    """old = past probation (drawn at 0 bps: never); new = in probation (always drawn)."""
-    reserve(book, 1, hotkey="old", groups=0, draw_round=10)
-    reserve(book, 2, hotkey="new", groups=100, draw_round=20)
-    reserve(book, 3, hotkey="old", groups=0, draw_round=25)
-    reserve(book, 4, hotkey="new", groups=100, draw_round=30)
-    reserve(book, 5, hotkey="old", groups=0, draw_round=30)
-    reserve(book, 6, hotkey="old2", groups=0, draw_round=40)
-    assert draw(book) == [oid(2), oid(4)]
+def mixed_hotkey(book, hotkey="A", *, first=1):
+    """A hotkey past probation (one audit passed) with a drawn row left unaudited at round 20, a
+    not-drawn row before it (15) and two after it (25, 30)."""
+    reserve(book, first, hotkey=hotkey, groups=1, draw_round=5)
+    assert draw(book) == [oid(first)]
+    audit(book, first, True)
+    reserve(book, first + 1, hotkey=hotkey, groups=1, draw_round=20)
+    assert draw(book, audit_bps=10000) == [oid(first + 1)]       # drawn by the rate, never audited
+    reserve(book, first + 2, hotkey=hotkey, groups=1, draw_round=15)
+    reserve(book, first + 3, hotkey=hotkey, groups=1, draw_round=25)
+    reserve(book, first + 4, hotkey=hotkey, groups=1, draw_round=30)
+    assert draw(book) == []                                      # 0 bps: not drawn
 
 
 def test_audit_horizon_honest_case_every_not_drawn_row_is_paid(tmp_path):
     book = ledger(tmp_path)
-    horizon_window(book)
-    audit(book, 2, True)
-    audit(book, 4, True)                                         # every drawn group was audited
+    mixed_hotkey(book)
+    audit(book, 2, True)                                         # every drawn group was audited
     assert finalize(book) == []
-    assert book.payable(1, environment="math") == {"new": 2, "old": 3, "old2": 1}
-    assert not any(book.banned(h, 1000.0) for h in ("old", "old2", "new"))
+    assert book.payable(1, environment="math") == {"A": 5}
+    assert not book.banned("A", 1000.0)
 
 
-def test_audit_horizon_a_drawn_group_left_unaudited_unpays_the_not_drawn_rows_from_its_round(tmp_path):
+def test_horizon_is_per_hotkey_a_drawn_group_left_unaudited_unpays_only_its_own_later_rows(tmp_path):
     book = ledger(tmp_path)
-    horizon_window(book)
-    audit(book, 2, True, now=1000.0)                             # round 20 audited; round 30 (row 4) left unaudited
+    mixed_hotkey(book, "A")                                      # rows 1..5, A's round 20 is left unaudited
+    reserve(book, 6, hotkey="B", groups=0, draw_round=10)
+    reserve(book, 7, hotkey="B", groups=0, draw_round=25)        # same (window, env), after A's horizon
+    reserve(book, 8, hotkey="B", groups=0, draw_round=40)
+    reserve(book, 9, hotkey="A", groups=1, draw_round=20)        # exactly the horizon round: unpaid too
+    assert draw(book) == []
     moved = finalize(book)
-    assert moved == [oid(4), oid(5), oid(6)]                     # the drawn one, and not-drawn rows of round >= 30
-    assert states(book) == {1: ("not_drawn", "reserved"), 2: ("passed", "reserved"), 3: ("not_drawn", "reserved"),
-                            4: ("unaudited", "reserved"), 5: ("unaudited", "reserved"), 6: ("unaudited", "reserved")}
-    assert book.payable(1, environment="math") == {"new": 1, "old": 2}   # rounds 10 and 25 < 30 stay paid
-    assert not any(book.banned(h, t) for h in ("old", "old2", "new") for t in (1000.0, 1000.0 + DAY / 2))
+    assert moved == [oid(2), oid(4), oid(5), oid(9)]             # A's drawn row and A's not-drawn rows >= 20
+    assert states(book) == {1: ("passed", "reserved"), 2: ("unaudited", "reserved"), 3: ("not_drawn", "reserved"),
+                            4: ("unaudited", "reserved"), 5: ("unaudited", "reserved"),
+                            6: ("not_drawn", "reserved"), 7: ("not_drawn", "reserved"), 8: ("not_drawn", "reserved"),
+                            9: ("unaudited", "reserved")}
+    assert book.payable(1, environment="math") == {"A": 2, "B": 3}   # A: rows 1 (passed) and 3 (round 15 < 20)
+    assert not any(book.banned(h, t) for h in ("A", "B") for t in (1000.0, 1000.0 + DAY / 2))
     assert book.db.execute("SELECT COUNT(*) FROM exploration_bans").fetchone()[0] == 0
     assert finalize(book) == moved                               # again: same ids, nothing moves
-    assert book.payable(1, environment="math") == {"new": 1, "old": 2}
+    assert book.payable(1, environment="math") == {"A": 2, "B": 3}
 
 
-def test_audit_horizon_is_the_smallest_unaudited_drawn_round_and_is_per_env(tmp_path):
+def test_a_forfeited_queued_row_sets_no_horizon_for_anyone(tmp_path):
     book = ledger(tmp_path)
-    horizon_window(book)                                         # nothing audited: horizon = round 20
-    reserve(book, 7, hotkey="old", env="code", groups=0, draw_round=90)
+    reserve(book, 1, hotkey="A", groups=100, draw_round=10)
+    reserve(book, 2, hotkey="A", groups=100, draw_round=40)
+    reserve(book, 3, hotkey="A", groups=0, draw_round=50)        # not drawn
+    reserve(book, 4, hotkey="B", groups=0, draw_round=60)
+    assert draw(book) == [oid(1), oid(2)]
+    assert audit(book, 1, False, now=10.0) == [oid(1), oid(2), oid(3)]   # row 2 is forfeited while still queued
+    assert states(book)[2] == ("queued", "forfeited")
+    assert finalize(book) == [oid(2)]                            # row 3 (round 50 >= 40) is NOT moved by a forfeited horizon
+    assert states(book)[3] == ("not_drawn", "forfeited")
+    assert book.payable(1, environment="math") == {"B": 1}
+
+
+def test_audit_horizon_is_per_env(tmp_path):
+    book = ledger(tmp_path)
+    mixed_hotkey(book, "A")
+    reserve(book, 7, hotkey="A", env="code", groups=0, draw_round=90)
     draw(book, env="code")
-    assert finalize(book) == [oid(2), oid(3), oid(4), oid(5), oid(6)]
-    assert book.payable(1, environment="math") == {"old": 1}     # only round 10 < 20
+    assert finalize(book) == [oid(2), oid(4), oid(5)]
+    assert book.payable(1, environment="math") == {"A": 2}
     assert finalize(book, env="code") == []
-    assert book.payable(1, environment="code") == {"old": 1}     # math's missing audits do not touch code
+    assert book.payable(1, environment="code") == {"A": 1}       # math's missing audit does not touch code
 
 
 def test_pending_draws_at_close_do_not_set_the_horizon(tmp_path):
@@ -477,7 +499,7 @@ PRICE, CAP = 0.1, 0.25                                           # two entitleme
 def obs(prompt, *, hotkey="hk", window=1, group=None, lane="exploration", env=ENV):
     return Observation(environment=env, dataset_id=f"{env}-train", prompt_idx=prompt, group_id=group or f"g{prompt}",
                        window=window, checkpoint_n=1, checkpoint_revision="c" * 40, observed_at=100.0,
-                       rewards_bps=(0,) * M_ROLLOUTS, lane=lane, candidate={"pool_sha256": "p" * 64, "seeds": SEEDS},
+                       rewards_bps=(0,) * M_ROLLOUTS, lane=lane, candidate={"pool_sha256": "ab" * 32, "seeds": SEEDS},
                        hotkey=hotkey, token_count=10)
 
 
@@ -655,7 +677,7 @@ def test_failed_audit_releases_the_first_scans_it_forfeits(pair):
 def test_finalize_releases_the_first_scan_of_every_unpaid_row_and_only_those(pair):
     log, book = pair
     paid = admit(pair, obs(1, hotkey="old"), groups=0, draw_round=10, cap=1.0)
-    drawn = admit(pair, obs(2, hotkey="new"), groups=100, draw_round=20, cap=1.0)
+    drawn = admit(pair, obs(2, hotkey="old"), groups=100, draw_round=20, cap=1.0)   # same hotkey: its horizon
     behind = admit(pair, obs(3, hotkey="old"), groups=0, draw_round=30, cap=1.0)
     with book.db:
         book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)

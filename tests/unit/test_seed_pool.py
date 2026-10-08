@@ -207,7 +207,13 @@ def test_draw_message_layout_is_pool_seed_position_only():
 
 def test_uniforms_are_distinct_bounded_and_refuse_bad_coordinates():
     pool = _pool()
-    assert pool.uniform(1, 3) == _pool().uniform(1, 3)
+    seed = M_ROLLOUTS                    # rank 0 of one subset, the last rank of another
+    first = pool.selection(tuple(range(M_ROLLOUTS, POOL_SEEDS)))
+    second = pool.selection((*range(M_ROLLOUTS - 1), seed))
+    assert first.seeds.index(seed) == 0 and second.seeds.index(seed) == M_ROLLOUTS - 1
+    assert pool.uniform(first.seeds[0], 3) == pool.uniform(second.seeds[-1], 3)
+    assert _pool(pool_epoch=4).uniform(seed, 3) != pool.uniform(seed, 3)     # another pool, another value
+    assert _pool(randomness="cd" * 32).uniform(seed, 3) != pool.uniform(seed, 3)
     assert len({pool.uniform(s, t) for s in range(POOL_SEEDS) for t in range(5)}) == POOL_SEEDS * 5
     assert all(0 <= pool.uniform(1, t) < 1 for t in range(256))
     for args in ((POOL_SEEDS, 0), (-1, 0), (0, -1), (True, 0), (0, True), (0.0, 0)):

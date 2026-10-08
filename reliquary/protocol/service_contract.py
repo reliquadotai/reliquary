@@ -218,6 +218,8 @@ def _validate_v2(value: dict) -> None:
             _integer(sampling[field_name], f"{name}.sampling.{field_name}", *bounds)
         if sampling["kind"] == PUBLIC_SEED_POOL and sampling["pool_seeds"] != 2 * sampling["group_size"]:
             raise ServiceContractError(f"{name}.sampling.pool_seeds must be exactly 2 x group_size")
+        if sampling["kind"] == PUBLIC_SEED_POOL and sampling["renewal_windows"] != 1:
+            raise ServiceContractError(f"{name}.sampling.renewal_windows must be 1: a public seed pool renews every window")
         if type(env["exploration"]) is not int or env["exploration"] not in (0, 1):
             raise ServiceContractError(f"{name}.exploration must be 0 or 1")
         if env["missing_box"] not in ("uncertain", "graded"):

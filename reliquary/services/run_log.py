@@ -62,6 +62,9 @@ def observation_id(order_sha256: str, obs: Observation, run_salt: bytes) -> str:
                              "hotkey": obs.hotkey, "run_salt": run_salt.hex()})
 
 
+_POOL_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
 def _public_candidate(candidate: dict | None, rollouts: int) -> dict | None:
     """Only the two typed, non-identifying pool references may be published.
 
@@ -75,8 +78,9 @@ def _public_candidate(candidate: dict | None, rollouts: int) -> dict | None:
         raise ValueError("candidate must be the pool reference of the group")
     out: dict = {}
     pool = candidate.get("pool_sha256")
-    if isinstance(pool, str):
-        out["pool_sha256"] = pool
+    if not isinstance(pool, str) or not _POOL_SHA256.fullmatch(pool):
+        raise ValueError("candidate pool_sha256 must be 64 lowercase hex characters")
+    out["pool_sha256"] = pool
     seeds = candidate.get("seeds")
     if type(seeds) not in (list, tuple) or len(seeds) != rollouts:
         raise ValueError("candidate seeds must name one pool seed per rollout")
