@@ -16,12 +16,14 @@ been enqueued here, or None:
 - after a new front (a new ``epoch``, the first one this judge sees included)
   or a queue overflow (``dropped``), None until a full listing of the store has
   enqueued every pending record;
+- while its id queue or an accepted body awaiting publication is pending,
+  None until the front can vouch for a complete cut again;
 - then the newest ``as_of`` received (the front's clock when a post emptied its
   queue: everything accepted before it was in that post or an earlier one).
 
 The auditor passes a record unaudited only once ``covered()`` reaches that
 record's receipt + hold + 405 s (every sibling that could catch it was
-accepted by then), so a stalled feed only delays the newest records.
+accepted by then). A cut replaces the prior one, including after a clock rollback.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import asyncio
 import collections
 import itertools
 import logging
+import math
 import os
 import secrets
 import time
@@ -112,6 +115,7 @@ class JudgeLink:
         self._wake: asyncio.Event | None = None
         self._failing_since: float | None = None
         self.posted = 0
+        self.pending_record_arrivals: dict[str, Mapping[str, float]] = {}
 
     def __len__(self) -> int:
         return len(self._queue)
@@ -133,7 +137,8 @@ class JudgeLink:
         for _, job_id, sid in chunk:
             ids.setdefault(job_id, []).append(sid)
         body = {"epoch": self.epoch, "dropped": drops > self._drops_sent, "ids": ids,
-                "as_of": cut if len(chunk) == len(self._queue) else None}
+                "as_of": (cut if len(chunk) == len(self._queue)
+                          and not any(self.pending_record_arrivals.values()) else None)}
         try:
             await self._client.post("/feed", body)
         except Exception as exc:  # noqa: BLE001 - the judge may be restarting
@@ -199,7 +204,7 @@ class ArrivalFeed:
 
     def covered(self) -> float | None:
         """Every id the front accepted before this instant is enqueued here;
-        None while a listing for the current front (or a drop) is pending."""
+        None while a listing or the front's complete cut is pending."""
         if self.epoch is None or self._listed != self._generation:
             return None
         return self.covered_until
@@ -235,8 +240,15 @@ class ArrivalFeed:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
         as_of = doc.get("as_of")
-        if as_of is not None:
-            self.covered_until = max(self.covered_until or 0.0, float(as_of))
+        self.covered_until = None
+        if isinstance(as_of, (int, float)) and not isinstance(as_of, bool):
+            try:
+                cut = float(as_of)
+            except OverflowError:
+                pass
+            else:
+                if math.isfinite(cut) and cut >= 0:
+                    self.covered_until = cut
 
     async def _list(self, generation: int) -> None:
         while generation == self._generation:

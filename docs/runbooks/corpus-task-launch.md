@@ -464,6 +464,29 @@ reliquary corpus ledgers migrate --job <job>    # <job>: migrated | v2 | absent
 A code rollback without step 2 is an outage of the corpus route, not a loss;
 running step 2 at any later point restores service.
 
+#### Durable accepted records (ledger v3)
+
+The dedicated corpus validator supports `RELIQUARY_CORPUS_DURABLE_RECORDS=1`.
+The default is `0`: upgrade every ledger reader and writer before enabling it.
+The standalone main-validator mount and eval control keep this writer disabled.
+Readers retain support for v1 and v2; an older binary cannot serve a v3 ledger.
+
+With the writer enabled, intake stages an immutable receipt outside the audit
+listing, then commits its hash and original receipt timestamp in the same ledger
+CAS that consumes the slot. Only committed references can publish canonical
+submissions. A verified canonical body is required before returning acceptance;
+an ambiguous write or failed publication returns a retryable storage response.
+Resend the identical signed submission to recover its acceptance without another
+slot. Startup and the existing job refresh loop also finish committed receipts.
+Unreferenced staged bodies do not count as submissions or become payable.
+
+`jobs status` reports `pending_records`; outstanding references prevent drain,
+retirement and a complete arrival-feed cut. Every ledger rewrite preserves these
+references. Downgrade refuses until they have been recovered. Disabling the writer
+does not downgrade an existing v3 ledger, and does not repair missing historical
+bodies. Retained staged objects should only be pruned after confirming that no
+committed ledger references them.
+
 ### 3.2 Several jobs on one validator (one card, one model load)
 
 A job has one prompt source. To generate, say, maths and code from the same
@@ -686,7 +709,7 @@ reliquary corpus status ... --json          # the route's JSON as is
 
   ```bash
   reliquary jobs status <job>
-  # <job>: submissions=N verdicts=M unaudited=N-M settled=S unsettled=M-S pending=none last_window=W
+  # <job>: submissions=N verdicts=M unaudited=N-M settled=S unsettled=M-S pending_records=0 pending=none last_window=W
   # drained: no
   ```
 

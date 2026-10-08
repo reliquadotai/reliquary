@@ -14,6 +14,16 @@ class Records:
     def __init__(self, drained=True):
         self.drained = drained
 
+    async def read_job(self, job_id):
+        from reliquary.corpus.job import parse_job
+        from tests.unit.test_corpus_service import _manifest
+
+        return parse_job({**_manifest(), "job_id": job_id}), None
+
+    async def read_ledgers(self, job_id):
+        return {"schema": "reliquary/corpus-ledgers/v2", "slots": {"0": 2},
+                "cursors": {}, "seen_pending": [], "seen_segments": []}, None
+
     async def list_submission_ids(self, job_id):
         return ["a", "b"]
 

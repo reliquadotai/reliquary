@@ -129,10 +129,9 @@ async def job_drained(*, auditor, records, job_id: str) -> bool:
     what `jobs status` prints as ``drained: yes``."""
     if await auditor.pending_ids():
         return False
-    verdicts = set(await records.list_verdict_ids(job_id))
-    state, _ = await records.read_settlement(job_id)
-    state = state or {}
-    return state.get("pending") is None and verdicts <= set(state.get("settled") or ())
+    from reliquary.validator.corpus_job_status import stored_job_counts
+
+    return (await stored_job_counts(records, job_id))["drained"]
 
 
 class JudgedStats:
@@ -263,6 +262,13 @@ class CorpusJobSet:
             await self._refresh()
 
     async def _refresh(self) -> None:
+        # Use the existing refresh loop for committed records whose publish
+        # or cleanup failed. Retired jobs must recover before their drain gate.
+        for job_id in list(self.served):
+            try:
+                await self._routes.recover_records(job_id)
+            except Exception:
+                logger.exception("corpus job %s: accepted record recovery failed; retrying", job_id)
         try:
             entries = await self._read_entries()
         except Exception:

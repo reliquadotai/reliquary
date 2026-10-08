@@ -1661,6 +1661,7 @@ def jobs_status(job_id: str = typer.Argument(...)) -> None:
         f"{job_id}: submissions={counts['submissions']} verdicts={counts['verdicts']} "
         f"unaudited={counts['unaudited']} settled={counts['settled']} "
         f"unsettled={counts['unsettled']} "
+        f"pending_records={counts['pending_records']} "
         f"pending={'none' if pending_window is None else pending_window} "
         f"last_window={'none' if last_window is None else last_window}"
     )
@@ -3293,9 +3294,10 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         )
     # Before the route serves, so its first write is not the one that pays
     # for sealing a v1 seen set.
-    from reliquary.validator.corpus_service import migrate_ledgers_at_startup
+    from reliquary.validator.corpus_service import migrate_ledgers_at_startup, recover_pending_records
 
     seen_index = await migrate_ledgers_at_startup(store, job)
+    await recover_pending_records(store, None, job)
 
     def encode(text: str) -> list[int]:
         encoded = tokenizer.encode(text, add_special_tokens=False)
