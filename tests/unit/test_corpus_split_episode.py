@@ -35,7 +35,8 @@ def _single_job():
 
 
 def _entry(task_id, job_id):
-    return SimpleNamespace(task_id=task_id, job_id=job_id, params={"cap": 0.1},
+    return SimpleNamespace(task_id=task_id, job_id=job_id,
+                           params={"cap": 0.1, "settlement": "period-ema-v1"},
                            mechanism="corpus-generation", status="active", retired_at=None,
                            contract=None)
 

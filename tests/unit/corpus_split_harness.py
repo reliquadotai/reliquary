@@ -403,7 +403,8 @@ def manifest(job_id: str, *, max_new_tokens: int = 32_768) -> dict:
 
 def entry(task_id: str, job_id: str, cap: float = 0.1, **audit) -> SimpleNamespace:
     params = {"cap": cap, "audit_q": 0.15, "audit_probation_submissions": 5,
-              "audit_hold_seconds": 3600.0, "audit_ban_after_failures": 1000, **audit}
+              "audit_hold_seconds": 3600.0, "audit_ban_after_failures": 1000,
+              "settlement": "period-ema-v1", **audit}
     return SimpleNamespace(task_id=task_id, job_id=job_id, mechanism="corpus-generation",
                            params=params, contract=None, status="active", retired_at=None)
 

@@ -94,7 +94,7 @@ def world(tmp_path, monkeypatch, registry):  # noqa: F811
 def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.eval_control import (
         EvalExecutorDirectory,
         PairedAuditDispatcher,
@@ -107,7 +107,7 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
         await asyncio.sleep(3600)
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", lambda self: idle(self))
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
     loaded = []
 
     def tokenizer_for(repo, revision):
@@ -217,7 +217,7 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
 
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.eval_control import (
         EvalExecutorDirectory,
         PairedAuditDispatcher,
@@ -234,7 +234,7 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "pending_ids", nothing)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", lambda self: idle(self))
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
 
     async def read_entries():
         return dict(registry["entries"])

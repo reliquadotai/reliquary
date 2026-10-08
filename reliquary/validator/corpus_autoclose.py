@@ -78,7 +78,9 @@ class AutoClose:
         self._write = write_cap_zero
         self._every = float(every_seconds)
         self._clock = clock
-        self._ran_at: float | None = None
+        # The first pass waits one interval: a start (and its tests) reads
+        # nothing more than it did, and a restarted validator has settled first.
+        self._ran_at: float | None = clock()
         # Jobs this process closed: never written again, whatever it reads.
         self.closed: set[str] = set()
 
@@ -124,6 +126,13 @@ class AutoClose:
                 continue
             self.closed.add(job_id)
             closed.append(task_id)
+            # This process's settler prices anything still settled at 0 now,
+            # without waiting for a registry refresh (none runs unless hot).
+            settler = getattr(wiring, "settler", None)
+            if callable(getattr(settler, "set_cap", None)):
+                settler.set_cap(0.0)
+            if hasattr(wiring, "cap"):
+                wiring.cap = 0.0
             logger.info(
                 "corpus task %s closed automatically: job %s is full (%s/%s prompts) and "
                 "drained (%s submissions, %s audited, %s passed, %s verified tokens, %s "

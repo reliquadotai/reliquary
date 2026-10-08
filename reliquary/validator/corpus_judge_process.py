@@ -2,7 +2,7 @@
 
 It judges and pays a group of jobs with exactly the code the single process
 runs (``wire_job_judge``: the scheduled ``CorpusAuditor`` and the fed
-``CorpusSettler``), with its forward on the GPU process and its arrivals from
+``CorpusPeriodSettler``), with its forward on the GPU process and its arrivals from
 the front's feed. Its unix socket takes the feed and answers the front's
 status reads; it serves nothing to miners.
 """

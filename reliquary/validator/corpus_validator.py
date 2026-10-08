@@ -904,7 +904,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
     from reliquary.validator.corpus_settlement import R2Archives
 
-    served, _ = period_served(list(jobs) if jobs is not None else [(entry, cap)])
+    served = list(jobs) if jobs is not None else [(entry, cap)]
     if not served and not generation_only:
         raise RuntimeError("the corpus control requires an initial job")
     from reliquary.eval.prompt_source import is_order_job_id
@@ -918,6 +918,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             raise RuntimeError(f"task {task_entry.task_id!r} is an order job (eval or "
                                "generation): the order control (eval control) serves it, "
                                "never the corpus control")
+    served, _ = period_served(served)
+    if not served and not generation_only:
+        raise RuntimeError("the corpus control has no period-settled job to serve")
     store = BucketJobStore()
     records = BucketRecordStore()
 

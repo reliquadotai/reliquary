@@ -123,7 +123,7 @@ def test_shared_generation_mode_never_loads_another_model_and_keeps_audit_rechec
     from reliquary.infrastructure import corpus_executor_store, corpus_job_store
     from reliquary.protocol import profiles
     from reliquary.shared import modeling
-    from reliquary.validator import corpus_auditor, corpus_feed, corpus_gpu, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_feed, corpus_gpu, corpus_period_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
     from tests.unit.test_corpus_audit_remote import _R2
     from tests.unit.test_corpus_multi_job_validator import _entry
@@ -166,7 +166,7 @@ def test_shared_generation_mode_never_loads_another_model_and_keeps_audit_rechec
     monkeypatch.setattr(corpus_gpu, "read_info", info)
     monkeypatch.setattr(corpus_feed.UdsClient, "get", gpu_info)
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", settle)
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", settle)
     scored = []
 
     class Scorer:

@@ -451,22 +451,24 @@ def test_the_auditor_counts_each_hotkeys_records_awaiting_a_verdict():
 
 
 def test_the_settler_reports_each_window_it_pays_and_survives_a_bad_subscriber():
-    from tests.unit.test_corpus_settlement import _Archives, _Records, _settler, _v
+    from tests.unit.test_corpus_settlement import NOW, RECEIVED, WORK, _Archives, _Records, _settler, _v
+    from reliquary.validator.corpus_periods import PERIOD_SECONDS
 
     records = _Records({"1" * 64: _v("A", 10), "2" * 64: _v("B", 30)})
-    settler = _settler(records, _Archives(46000))
+    archives = _Archives()
+    settler = _settler(records, archives)
     seen = []
     settler.on_window = lambda window, rewards: seen.append((window, rewards))
     asyncio.run(settler.settle_once())
-    assert seen == [(46000, pytest.approx({"A": 0.025, "B": 0.075}))]
+    assert seen == [(WORK, pytest.approx({"A": 0.025, "B": 0.075}))]
 
     def broken(window, rewards):
         raise RuntimeError("bug")
 
-    records.verdicts["3" * 64] = _v("A", 5)
-    settler = _settler(records, _Archives(46001))
+    records.verdicts["3" * 64] = _v("A", 5, received=RECEIVED + PERIOD_SECONDS)
+    settler = _settler(records, archives, now=NOW + PERIOD_SECONDS)
     settler.on_window = broken
-    assert asyncio.run(settler.settle_once()) == 46001
+    assert asyncio.run(settler.settle_once()) == WORK + 1
 
 
 def test_the_miners_document_is_mirrored_from_every_read_and_write():

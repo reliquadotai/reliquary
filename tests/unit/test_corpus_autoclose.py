@@ -30,7 +30,12 @@ def _entry(task_id="corpus-a", job_id="job-a", cap=0.1, status="active", admissi
 
 class _JobSet:
     def __init__(self, entries, finished=True):
-        self.served = {e.job_id: SimpleNamespace(entry=e) for e in entries}
+        self.served = {}
+        for e in entries:
+            settler = SimpleNamespace(caps=[])
+            settler.set_cap = settler.caps.append
+            self.served[e.job_id] = SimpleNamespace(entry=e, settler=settler,
+                                                    cap=e.params["cap"])
         self._finished = finished
         self.checked = []
 
@@ -76,6 +81,9 @@ def test_a_finished_job_sets_its_cap_to_zero_once(caplog):
     assert registry.entries["corpus-a"].params["cap"] == 0.0
     message = next(r.getMessage() for r in caplog.records if "closed automatically" in r.getMessage())
     assert "12345" in message and "0.1 -> 0" in message
+    # This process's settler prices anything settled from now on at 0.
+    assert job_set.served["job-a"].settler.caps == [0.0]
+    assert job_set.served["job-a"].cap == 0.0
     # Again in the same process: nothing written, not even checked.
     assert asyncio.run(auto.run_once(job_set)) == [] and registry.writes == [("corpus-a", "job-a")]
 
@@ -145,10 +153,13 @@ def test_passes_are_spaced_out():
                      every_seconds=600, clock=lambda: now[0])
     job_set = _JobSet([_entry()], finished=False)
     asyncio.run(auto.maybe_run(job_set))
-    now[0] = 300.0
+    assert job_set.checked == []  # the first pass waits one interval after the start
+    now[0] = 601.0
+    asyncio.run(auto.maybe_run(job_set))
+    now[0] = 900.0
     asyncio.run(auto.maybe_run(job_set))
     assert job_set.checked == ["job-a"]
-    now[0] = 601.0
+    now[0] = 1202.0
     asyncio.run(auto.maybe_run(job_set))
     assert job_set.checked == ["job-a", "job-a"]
 

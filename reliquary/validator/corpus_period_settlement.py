@@ -54,8 +54,8 @@ def oldest_of(*sources: Callable[[], float | None]) -> Callable[[], float | None
 
 
 class CorpusPeriodSettler:
-    """Same surface as ``CorpusSettler`` (observe, settle_once, set_cap,
-    settled_count, totals, on_settled, on_window) on the period clock.
+    """The corpus settler (observe, settle_once, set_cap, settled_count,
+    totals, on_settled, on_window), on the period clock.
 
     ``oldest_pending`` is the auditor's ``oldest_pending_received_at``: it
     returns when the oldest undecided submission was received (None if none) and
@@ -63,7 +63,7 @@ class CorpusPeriodSettler:
     its grader's ``oldest_unready_received_at`` (``oldest_of``), so a period
     closes only once everything received in it is graded (ruling P21).
 
-    ``ready(ids)``, as ``CorpusSettler``'s: which of ``ids`` may be paid now
+    ``ready(ids)``: which of ``ids`` may be paid now
     (an episode job's grader answers the graded ones); the others are left
     for a later call, never paid ungraded. None pays every verdict."""
 
@@ -93,7 +93,7 @@ class CorpusPeriodSettler:
         self.on_settled = on_settled
         self.on_window = None
 
-    # -- the feed, as CorpusSettler ------------------------------------------
+    # -- the feed ---------------------------------------------------------------
 
     def observe(self, submission_id: str, verdict=None) -> None:
         self._unsettled.add(submission_id)

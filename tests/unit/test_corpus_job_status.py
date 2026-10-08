@@ -54,31 +54,20 @@ def test_the_settler_persists_totals_once_per_settled_verdict():
 
     records = _Records({"1" * 64: _v("A", 10), "2" * 64: _v("B", 30, ok=False)})
     settled_ids = []
-    settler = _settler(records, _Archives(46000))
+    settler = _settler(records, _Archives())
     settler.on_settled = settled_ids.extend
     asyncio.run(settler.settle_once())
-    assert records.state["totals"] == {"verdicts": 2, "passed": 1, "verified_tokens": 10,
-                                       "complete": True}
+    assert records.state["totals"] == {"verdicts": 2, "passed": 1, "verified_tokens": 10}
     assert settler.totals == records.state["totals"] and sorted(settled_ids) == sorted(records.verdicts)
     records.verdicts["3" * 64] = _v("A", 5)
     records.fail_state_writes_after = 1  # the pending write lands, the finish crashes
-    archives = _Archives(46001)
+    archives = _Archives()
     crashed = _settler(records, archives)
     with pytest.raises(OSError):
         asyncio.run(crashed.settle_once())
     records.fail_state_writes_after = None
     asyncio.run(_settler(records, archives).settle_once())
     assert records.state["totals"]["verdicts"] == 3 and records.state["totals"]["passed"] == 2
-
-
-def test_a_job_settled_before_totals_existed_says_its_counts_are_incomplete():
-    from tests.unit.test_corpus_settlement import _Archives, _Records, _settler
-
-    records = _Records({})
-    records.state = {"settled": ["9" * 64], "last_window": 3}
-    settler = _settler(records, _Archives(None))
-    asyncio.run(settler.settle_once())
-    assert settler.totals["complete"] is False
 
 
 # --------------------------------------------------------------------------
@@ -254,7 +243,7 @@ def test_the_settler_keeps_the_count_it_settled():
     from tests.unit.test_corpus_settlement import _Archives, _Records, _settler, _v
 
     records = _Records({"1" * 64: _v("A", 10), "2" * 64: _v("B", 30)})
-    settler = _settler(records, _Archives(46000))
+    settler = _settler(records, _Archives())
     assert settler.settled_count is None
     asyncio.run(settler.settle_once())
     assert settler.settled_count == 2
@@ -274,7 +263,7 @@ def test_with_the_flags_off_boot_reads_no_verdict(
     import reliquary.protocol.profiles as profiles
     import reliquary.shared.modeling as modeling
     from reliquary.infrastructure import corpus_record_store
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
     from tests.unit.test_corpus_multi_job_validator import _Model, _entry
     from tests.unit.test_corpus_service import CHECKPOINT, _Tokenizer
@@ -302,7 +291,7 @@ def test_with_the_flags_off_boot_reads_no_verdict(
         return None
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", settle_once)
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", settle_once)
 
     class _Stop(Exception):
         pass
