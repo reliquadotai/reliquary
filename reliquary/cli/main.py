@@ -302,6 +302,12 @@ def build_corpus_task_entry(
     # none unless told to.
     if audit_params:
         params.update(audit_params)
+    # Outside the contract: how the task is paid, not how it generates. Every
+    # corpus task is paid by its own drand periods (design 2026-10-03); the
+    # window settlement is gone for corpus work.
+    from reliquary.shared.task_registry import SETTLEMENT_PERIOD_EMA
+
+    params["settlement"] = SETTLEMENT_PERIOD_EMA
     contract = _with_enforced_toploc(entry.contract, toploc_thresholds)
     return replace(
         entry,
@@ -1306,19 +1312,14 @@ def jobs_create(
     settlement: str = typer.Option(
         "period-ema-v1",
         "--settlement",
-        help="How the task is paid: period-ema-v1 (its own 72-minute drand periods, "
-        "design 2026-10-03) or windows (the RL window index, as tasks declared "
-        "before it). Every validator serving it must know period-ema-v1",
+        help="How the task is paid. Only period-ema-v1 (its own 72-minute drand "
+        "periods, design 2026-10-03): the window settlement was removed for corpus tasks",
     ),
     fleet_knows_period_settlement: bool = typer.Option(
         False,
         "--fleet-knows-period-settlement",
-        help=(
-            "Required with --settlement period-ema-v1 (the default). Confirms that "
-            "the corpus validator serving the job and every weight setter run a "
-            "binary that settles and replays period-ema-v1; an older one settles "
-            "it by window, or does not pay it at all."
-        ),
+        hidden=True,
+        help="Accepted and ignored: every validator now settles period-ema-v1.",
     ),
     fleet_knows_corpus_generation: bool = typer.Option(
         False,
@@ -1339,6 +1340,11 @@ def jobs_create(
         typer.echo(f"error: {task_id or job_id!r} is an order id: only the admin service "
                    "declares order jobs (POST /admin/v1/jobs)", err=True)
         raise typer.Exit(code=2)
+    if settlement != "period-ema-v1":
+        typer.echo(f"error: --settlement {settlement!r} was removed: a corpus task is paid "
+                   "only by period-ema-v1 (its own drand periods); omit --settlement",
+                   err=True)
+        raise typer.Exit(code=1)
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure.task_registry_store import (
         RegistryConflict,
@@ -1397,19 +1403,7 @@ def jobs_create(
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    if settlement not in ("period-ema-v1", "windows"):
-        typer.echo(f"error: --settlement is period-ema-v1 or windows, not {settlement!r}",
-                   err=True)
-        raise typer.Exit(code=1)
-    if settlement == "period-ema-v1" and not fleet_knows_period_settlement:
-        typer.echo("error: a period-ema-v1 job needs every validator to know it: pass "
-                   "--fleet-knows-period-settlement, or --settlement windows", err=True)
-        raise typer.Exit(code=1)
-    if settlement == "period-ema-v1":
-        from dataclasses import replace as _replace
-
-        # Outside the contract: how the task is paid, not how it generates.
-        entry = _replace(entry, params={**entry.params, "settlement": settlement})
+    del fleet_knows_period_settlement  # every validator settles period-ema-v1 now
 
     # Before either write, so a refusal leaves nothing behind. The guard is in
     # `task_registry` and does not know this CLI, so the flag is named here.

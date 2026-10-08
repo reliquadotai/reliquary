@@ -792,7 +792,11 @@ def test_an_operator_catalog_job_is_declared_byte_identically(admin):
     assert admin("POST", "/admin/v1/jobs", _job(thinking=True)).status_code == 201
     entry = admin.registry["entries"]["math-a"]
     manifest = json.loads(admin.bucket.objects["reliquary/corpus/jobs/math-a.json"][0])
-    document = {"manifest": manifest, "contract": entry.contract, "params": entry.params}
+    # Every corpus task is now paid by period: the settlement is the one
+    # param added since the pin; manifest, contract and the rest are unchanged.
+    assert entry.params["settlement"] == "period-ema-v1"
+    params = {k: v for k, v in entry.params.items() if k != "settlement"}
+    document = {"manifest": manifest, "contract": entry.contract, "params": params}
     digest = hashlib.sha256(json.dumps(document, sort_keys=True,
                                        separators=(",", ":")).encode()).hexdigest()
     assert digest == CATALOG_JOB_GOLDEN

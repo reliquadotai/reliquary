@@ -116,15 +116,37 @@ def test_jobs_create_declares_period_settlement_by_default(bucket, registry):  #
     assert registry["entries"]["corpus-run"].params["settlement"] == "period-ema-v1"
 
 
-def test_jobs_create_can_still_declare_window_settlement(bucket, registry):  # noqa: F811
+def test_jobs_create_refuses_window_settlement(bucket, registry):  # noqa: F811
     from typer.testing import CliRunner
 
     from reliquary.cli.main import app
 
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     result = CliRunner().invoke(app, _create_args(**{"--settlement": "windows"}))
+    assert result.exit_code != 0
+    assert "removed" in result.output and "period-ema-v1" in result.output
+    assert "corpus-run" not in registry["entries"]
+    assert [k for k in bucket.objects if k.endswith(".json")] == []
+
+
+def test_jobs_create_no_longer_needs_the_period_acknowledgement(bucket, registry):  # noqa: F811
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from tests.unit.test_jobs_cli import PERIOD_ACK
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    argv = [a for a in _create_args() if a != PERIOD_ACK]
+    result = CliRunner().invoke(app, argv)
     assert result.exit_code == 0, result.output
-    assert "settlement" not in registry["entries"]["corpus-run"].params
+    assert registry["entries"]["corpus-run"].params["settlement"] == "period-ema-v1"
+
+
+def test_every_corpus_entry_is_period_settled():
+    from tests.unit.test_corpus_task_declaration import _build
+
+    entry = _build()
+    assert entry.params["settlement"] == "period-ema-v1"
 
 
 def test_a_real_corpus_entry_takes_cap_zero_then_retires(bucket, registry):  # noqa: F811
@@ -151,13 +173,3 @@ async def _none():
     return {}
 
 
-def test_a_period_job_needs_the_fleet_acknowledgement(bucket, registry):  # noqa: F811
-    from typer.testing import CliRunner
-
-    from reliquary.cli.main import app
-
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    argv = [a for a in _create_args() if a != "--fleet-knows-period-settlement"]
-    result = CliRunner().invoke(app, argv)
-    assert result.exit_code == 1 and "--fleet-knows-period-settlement" in result.output
-    assert "corpus-run" not in registry["entries"]
