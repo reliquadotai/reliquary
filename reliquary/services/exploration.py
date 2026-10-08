@@ -48,6 +48,9 @@ class ExplorationLedger:
             CREATE INDEX IF NOT EXISTS exploration_window ON exploration_entitlements(order_id, window);
             CREATE TABLE IF NOT EXISTS exploration_hotkeys(
                 order_id TEXT NOT NULL, hotkey TEXT NOT NULL, groups INTEGER NOT NULL, PRIMARY KEY(order_id, hotkey));
+            CREATE TABLE IF NOT EXISTS exploration_finalized(
+                order_id TEXT NOT NULL, window INTEGER NOT NULL, environment TEXT NOT NULL,
+                PRIMARY KEY(order_id, window, environment));
             CREATE TABLE IF NOT EXISTS exploration_bans(
                 order_id TEXT NOT NULL, hotkey TEXT NOT NULL, until REAL NOT NULL, PRIMARY KEY(order_id, hotkey));
         """)
@@ -80,17 +83,22 @@ class ExplorationLedger:
                          int(draw_round), int(forced), "pending_draw", "reserved"))
         return {"amount": float(amount), "forced": forced, "draw_round": int(draw_round)}
 
-    def pending_draw_rounds(self, window: int) -> list[int]:
+    def is_finalized(self, window: int, *, environment: str) -> bool:
+        return self.db.execute("SELECT 1 FROM exploration_finalized WHERE order_id=? AND window=? AND environment=?",
+                               (self.order, window, environment)).fetchone() is not None
+
+    def pending_draw_rounds(self, window: int, *, environment: str) -> list[int]:
         return [r for r, in self.db.execute(
             "SELECT DISTINCT draw_round FROM exploration_entitlements WHERE order_id=? AND window=? "
-            "AND audit='pending_draw' ORDER BY draw_round", (self.order, window))]
+            "AND environment=? AND audit='pending_draw' ORDER BY draw_round", (self.order, window, environment))]
 
-    def resolve_draws(self, window: int, *, beacon_for_round: Callable[[int], str | None],
+    def resolve_draws(self, window: int, *, environment: str, beacon_for_round: Callable[[int], str | None],
                       audit_bps: int) -> list[str]:
         selected = []
         for identity, round_id, forced in self.db.execute(
                 "SELECT observation_id, draw_round, forced FROM exploration_entitlements WHERE order_id=? "
-                "AND window=? AND audit='pending_draw' ORDER BY rowid", (self.order, window)).fetchall():
+                "AND window=? AND environment=? AND audit='pending_draw' ORDER BY rowid",
+                (self.order, window, environment)).fetchall():
             beacon = beacon_for_round(round_id)
             if beacon is None:
                 continue
@@ -102,13 +110,21 @@ class ExplorationLedger:
                 selected.append(identity)
         return selected
 
+    def _ban(self, hotkey: str, now: float, ban_seconds: int) -> None:
+        self.db.execute("INSERT INTO exploration_bans VALUES(?,?,?) ON CONFLICT(order_id,hotkey) "
+                        "DO UPDATE SET until=MAX(until, excluded.until)", (self.order, hotkey, now + ban_seconds))
+
     def record_audit(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int) -> list[str]:
-        row = self.db.execute("SELECT window, hotkey FROM exploration_entitlements WHERE observation_id=?",
-                              (observation_id,)).fetchone()
+        row = self.db.execute("SELECT window, hotkey, environment, audit FROM exploration_entitlements "
+                              "WHERE observation_id=? AND order_id=?", (observation_id, self.order)).fetchone()
         if row is None:
             raise ValueError("unknown exploration entitlement")
-        state = self.db.execute("SELECT audit FROM exploration_entitlements WHERE observation_id=?",
-                                (observation_id,)).fetchone()[0]
+        window, hotkey, environment, state = row
+        if self.is_finalized(window, environment=environment):
+            # Frozen row: a late verdict changes nothing, but a failure is still sanctioned.
+            if not passed:
+                self._ban(hotkey, now, ban_seconds)
+            return []
         if state == ("passed" if passed else "failed"):
             return []
         if state != "queued":  # never audited, or already settled otherwise: no late flip, no late sanction
@@ -116,41 +132,45 @@ class ExplorationLedger:
         if passed:
             self.db.execute("UPDATE exploration_entitlements SET audit='passed' WHERE observation_id=?", (observation_id,))
             return []
-        window, hotkey = row
         self.db.execute("UPDATE exploration_entitlements SET audit='failed' WHERE observation_id=?", (observation_id,))
-        forfeited = [r for r, in self.db.execute(
-            "SELECT observation_id FROM exploration_entitlements WHERE order_id=? AND window=? AND hotkey=?",
-            (self.order, window, hotkey))]
-        self.db.execute("UPDATE exploration_entitlements SET status='forfeited' WHERE order_id=? AND window=? AND hotkey=?",
-                        (self.order, window, hotkey))
-        self.db.execute("INSERT INTO exploration_bans VALUES(?,?,?) ON CONFLICT(order_id,hotkey) "
-                        "DO UPDATE SET until=MAX(until, excluded.until)", (self.order, hotkey, now + ban_seconds))
+        # Every entitlement of the hotkey in this window, in every env not yet finalized.
+        open_rows = """FROM exploration_entitlements e WHERE e.order_id=? AND e.window=? AND e.hotkey=?
+                       AND NOT EXISTS (SELECT 1 FROM exploration_finalized f WHERE f.order_id=e.order_id
+                                       AND f.window=e.window AND f.environment=e.environment)"""
+        forfeited = [r for r, in self.db.execute(f"SELECT e.observation_id {open_rows}",
+                                                 (self.order, window, hotkey)).fetchall()]
+        for identity in forfeited:
+            self.db.execute("UPDATE exploration_entitlements SET status='forfeited' WHERE observation_id=?",
+                            (identity,))
+        self._ban(hotkey, now, ban_seconds)
         return forfeited
 
     def mark_unaudited(self, observation_id: str) -> None:
         self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE observation_id=? "
                         "AND audit IN ('pending_draw','queued')", (observation_id,))
 
-    def finalize_window(self, window: int) -> list[str]:
+    def finalize_window(self, window: int, *, environment: str) -> list[str]:
         moved = [r for r, in self.db.execute(
             "SELECT observation_id FROM exploration_entitlements WHERE order_id=? AND window=? "
-            "AND audit IN ('pending_draw','queued')", (self.order, window))]
+            "AND environment=? AND audit IN ('pending_draw','queued')", (self.order, window, environment)).fetchall()]
         for identity in moved:
             self.mark_unaudited(identity)
+        self.db.execute("INSERT OR IGNORE INTO exploration_finalized VALUES(?,?,?)", (self.order, window, environment))
         return moved
 
-    def payable(self, window: int) -> dict[str, dict[str, float]]:
-        result: dict[str, dict[str, float]] = {}
-        for environment, hotkey, amount in self.db.execute(
-                "SELECT environment, hotkey, amount FROM exploration_entitlements WHERE order_id=? AND window=? "
-                "AND status='reserved' AND audit IN ('not_drawn','passed') ORDER BY rowid", (self.order, window)):
-            bucket = result.setdefault(environment, {})
-            bucket[hotkey] = bucket.get(hotkey, 0.0) + amount
+    def payable(self, window: int, *, environment: str) -> dict[str, float]:
+        result: dict[str, float] = {}
+        for hotkey, amount in self.db.execute(
+                "SELECT hotkey, amount FROM exploration_entitlements WHERE order_id=? AND window=? "
+                "AND environment=? AND status='reserved' AND audit IN ('not_drawn','passed') ORDER BY rowid",
+                (self.order, window, environment)):
+            result[hotkey] = result.get(hotkey, 0.0) + amount
         return result
 
-    def rows(self, window: int) -> list[dict]:
+    def rows(self, window: int, *, environment: str) -> list[dict]:
         names = ("observation_id", "window", "environment", "hotkey", "prompt_idx", "amount",
                  "draw_round", "forced", "audit", "status")
         return [dict(zip(names, row)) for row in self.db.execute(
             "SELECT observation_id, window, environment, hotkey, prompt_idx, amount, draw_round, forced, audit, status "
-            "FROM exploration_entitlements WHERE order_id=? AND window=? ORDER BY rowid", (self.order, window))]
+            "FROM exploration_entitlements WHERE order_id=? AND window=? AND environment=? ORDER BY rowid",
+            (self.order, window, environment))]

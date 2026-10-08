@@ -205,3 +205,20 @@ def test_service_env_version_must_match_installed_manifest(monkeypatch):
     monkeypatch.setattr("reliquary.environment.registry.ENVIRONMENT_SPECS", specs, raising=False)
     with pytest.raises(task_config.TaskConfigError, match="environment version"):
         task_config._service_env_caps(entry, cap=0.5)
+
+
+def test_inactive_declared_env_is_not_checked_but_active_env_still_is(monkeypatch):
+    from reliquary.validator import task_config
+    from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2_dict
+    from tests.unit.test_service_task_registry import _service_entry
+    contract = contract_v2_dict(shares={MATH: 10000, CODE: 0})
+    entry = _service_entry(contract)
+    good = type("Spec", (), {"environment_manifest_sha256": contract["environments"][MATH]["version"]})()
+    # CODE is declared, share 0, and not installed at all: no refusal, cap 0.
+    monkeypatch.setattr("reliquary.environment.registry.ENVIRONMENT_SPECS", {MATH: good}, raising=False)
+    assert task_config._service_env_caps(entry, cap=0.5) == {MATH: pytest.approx(0.5), CODE: 0.0}
+    # An active env with a wrong version still refuses.
+    bad = type("Spec", (), {"environment_manifest_sha256": "0" * 64})()
+    monkeypatch.setattr("reliquary.environment.registry.ENVIRONMENT_SPECS", {MATH: bad}, raising=False)
+    with pytest.raises(task_config.TaskConfigError, match="environment version"):
+        task_config._service_env_caps(entry, cap=0.5)

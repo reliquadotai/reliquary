@@ -179,6 +179,9 @@ def _service_env_caps(entry: TaskEntry, *, cap: float) -> dict[str, float]:
     contract = ServiceContract.from_dict(entry.service_contract)
     caps = {}
     for name, env in contract.environments.items():
+        if env["share_bps"] <= 0:  # declared but inactive at launch (initial_schedule): no check, cap 0
+            caps[name] = 0.0
+            continue
         spec = ENVIRONMENT_SPECS.get(name)
         installed = getattr(spec, "environment_manifest_sha256", None)
         if installed != env["version"]:

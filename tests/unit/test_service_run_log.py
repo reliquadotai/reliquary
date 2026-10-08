@@ -117,3 +117,67 @@ def test_log_and_event_sequence_survive_reopen(tmp_path):
     assert not again.first_scan
     assert reopened.events()[:2] == before and [s for s, _ in reopened.events()] == [1, 2, 3]
     assert reopened.events(after=2)[0][0] == 3
+
+
+def test_two_miners_on_the_same_never_scanned_prompt_get_two_observations(log):
+    with log.db:
+        a = log.record(obs(hotkey="hk-a"), status="proven", proof="proven")
+        b = log.record(obs(hotkey="hk-b"), status="proven", proof="proven")
+    assert a.observation_id != b.observation_id and a.inserted and b.inserted
+    assert a.first_scan and not b.first_scan
+
+
+def test_same_miner_retry_is_idempotent_with_no_integrity_error(log):
+    with log.db:
+        a = log.record(obs(hotkey="hk-a"), status="proven", proof="proven")
+        again = log.record(obs(hotkey="hk-a"), status="proven", proof="proven")
+    assert not again.inserted and again.first_scan and again.observation_id == a.observation_id
+    assert len(log.events()) == 1
+
+
+def test_run_salt_is_persisted_and_ids_are_stable_across_reopen(tmp_path):
+    path = tmp_path / "s.sqlite3"
+    first = RunObservationLog(sqlite3.connect(path), order_sha256=ORDER, sigma_min_bps=2400)
+    with first.db:
+        a = first.record(obs(), status="proven", proof="proven")
+    salt = first.db.execute("SELECT value FROM run_meta WHERE key='run_salt'").fetchone()[0]
+    first.db.close()
+    again = RunObservationLog(sqlite3.connect(path), order_sha256=ORDER, sigma_min_bps=2400)
+    assert len(salt) == 32
+    with again.db:
+        b = again.record(obs(), status="proven", proof="proven")
+    assert not b.inserted and b.observation_id == a.observation_id
+    other = RunObservationLog(sqlite3.connect(tmp_path / "o.sqlite3"), order_sha256=ORDER, sigma_min_bps=2400)
+    with other.db:
+        c = other.record(obs(), status="proven", proof="proven")
+    assert c.observation_id != a.observation_id  # a different run has a different salt
+
+
+def test_public_event_cannot_carry_hotkey_or_tokens_even_via_candidate(log):
+    o = obs(hotkey="SECRET-HOTKEY")
+    o = Observation(**{**{f: getattr(o, f) for f in o.__slots__},
+                       "candidate": {"pool_sha256": "p" * 64, "candidate_id": 1, "hotkey": "SECRET-HOTKEY",
+                                     "tokens": [1, 2, 3], "token_ids": [4]}})
+    with log.db:
+        log.record(o, status="proven", proof="proven")
+    raw = log.db.execute("SELECT group_concat(payload) FROM run_events").fetchone()[0]
+    assert "SECRET-HOTKEY" not in raw and "tokens" not in raw and "token_ids" not in raw
+    assert log.events()[0][1]["candidate"] == {"pool_sha256": "p" * 64, "candidate_id": 1}
+
+
+def test_settle_is_idempotent_and_refuses_another_order(log, tmp_path):
+    with log.db:
+        r = log.record(obs(), status="proven", proof="proven")
+        log.settle(r.observation_id, status="trained", proof="proven", at=1.0)
+        log.settle(r.observation_id, status="trained", proof="proven", at=2.0)
+        log.settle(r.observation_id, status="exploration_unpaid", proof="proven", at=3.0)
+    assert [e["type"] for _, e in log.events()] == ["observation", "settle", "settle"]
+    foreign = RunObservationLog(log.db, order_sha256="b" * 64, sigma_min_bps=2400)
+    with pytest.raises(ValueError, match="another order"):
+        foreign.settle(r.observation_id, status="trained", proof="proven", at=1.0)
+
+
+def test_too_many_rewards_is_not_an_observation(log):
+    with pytest.raises(NotAnObservation):
+        with log.db:
+            log.record(obs(rewards=(10000, 0) * M_ROLLOUTS), status="proven", proof="proven")

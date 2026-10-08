@@ -7,6 +7,7 @@ Methods write without committing; the caller wraps them in ``with db:``.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 
@@ -46,15 +47,33 @@ class RecordResult:
     category: str
 
 
-def observation_id(order_sha256: str, obs: Observation) -> str:
+def observation_id(order_sha256: str, obs: Observation, run_salt: bytes) -> str:
+    """Per-submission identity: the hotkey and the secret run salt keep two miners on the same
+    pool selection distinct and keep a public id from being linked to a hotkey by enumeration."""
     return canonical_sha256({"order": order_sha256, "environment": obs.environment,
-                             "prompt_idx": obs.prompt_idx, "group_id": obs.group_id, "window": obs.window})
+                             "prompt_idx": obs.prompt_idx, "group_id": obs.group_id, "window": obs.window,
+                             "hotkey": obs.hotkey, "run_salt": run_salt.hex()})
+
+
+def _public_candidate(candidate: dict | None) -> dict | None:
+    """Only the two typed, non-identifying pool references may be published."""
+    if candidate is None:
+        return None
+    out: dict = {}
+    pool = candidate.get("pool_sha256")
+    if isinstance(pool, str):
+        out["pool_sha256"] = pool
+    cid = candidate.get("candidate_id")
+    if type(cid) is int:
+        out["candidate_id"] = cid
+    return out
 
 
 class RunObservationLog:
     def __init__(self, db: sqlite3.Connection, *, order_sha256: str, sigma_min_bps: int):
         self.db, self.order, self.sigma_min_bps = db, order_sha256, sigma_min_bps
         db.executescript("""
+            CREATE TABLE IF NOT EXISTS run_meta(key TEXT PRIMARY KEY, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_observations(
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, order_id TEXT NOT NULL,
                 environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL, window INTEGER NOT NULL,
@@ -69,10 +88,15 @@ class RunObservationLog:
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, observation_id TEXT NOT NULL,
                 payload TEXT NOT NULL);
         """)
+        db.execute("INSERT OR IGNORE INTO run_meta(key, value) VALUES('run_salt', ?)", (os.urandom(32),))
+        db.commit()
+        self._salt = bytes(db.execute("SELECT value FROM run_meta WHERE key='run_salt'").fetchone()[0])
 
     def _classify(self, obs: Observation) -> str:
         if obs.lane not in LANES:
             raise ValueError("unknown observation lane")
+        if len(obs.rewards_bps) > M_ROLLOUTS:
+            raise NotAnObservation("too many rewards for one group")
         rewards = []
         for value in obs.rewards_bps:
             if type(value) is not int or not 0 <= value <= 10000:
@@ -85,14 +109,24 @@ class RunObservationLog:
 
     def record(self, obs: Observation, *, status: str, proof: str) -> RecordResult:
         category = self._classify(obs)
-        identity = observation_id(self.order, obs)
-        public = {"type": "observation", "id": identity, "env": obs.environment, "dataset": obs.dataset_id,
-                  "prompt_idx": obs.prompt_idx, "checkpoint_n": obs.checkpoint_n,
-                  "checkpoint": obs.checkpoint_revision, "window": obs.window, "ts": obs.observed_at,
-                  "rewards_bps": list(obs.rewards_bps), "verdict": category, "candidate": obs.candidate,
-                  "lane": obs.lane, "status": status, "proof": proof}
-        existing = self.db.execute("SELECT public, first_scan FROM run_observations WHERE id=?", (identity,)).fetchone()
-        if existing is not None:
+        identity = observation_id(self.order, obs, self._salt)
+        # Explicit, typed fields only: nothing a caller puts in ``candidate`` can add a key.
+        public = {"type": "observation", "id": identity, "env": str(obs.environment),
+                  "dataset": str(obs.dataset_id), "prompt_idx": int(obs.prompt_idx),
+                  "checkpoint_n": int(obs.checkpoint_n), "checkpoint": str(obs.checkpoint_revision),
+                  "window": int(obs.window), "ts": float(obs.observed_at),
+                  "rewards_bps": [int(v) for v in obs.rewards_bps], "verdict": category,
+                  "candidate": _public_candidate(obs.candidate), "lane": obs.lane,
+                  "status": str(status), "proof": str(proof)}
+        payload = canonical_json_bytes(public).decode()
+        inserted = self.db.execute(
+            "INSERT OR IGNORE INTO run_observations(id,order_id,environment,prompt_idx,window,lane,category,"
+            "hotkey,token_count,first_scan,public) VALUES(?,?,?,?,?,?,?,?,?,0,?)",
+            (identity, self.order, obs.environment, obs.prompt_idx, obs.window, obs.lane, category,
+             obs.hotkey, obs.token_count, payload)).rowcount == 1
+        if not inserted:  # same submission again: idempotent retry, or the same id with other evidence
+            existing = self.db.execute("SELECT public, first_scan FROM run_observations WHERE id=?",
+                                       (identity,)).fetchone()
             stored = json.loads(existing[0])
             if {k: v for k, v in stored.items() if k not in ("status", "proof", "ts")} != \
                     {k: v for k, v in public.items() if k not in ("status", "proof", "ts")}:
@@ -101,12 +135,8 @@ class RunObservationLog:
         first = self.db.execute(
             "INSERT OR IGNORE INTO run_scans VALUES(?,?,?,?,?)",
             (self.order, obs.environment, obs.prompt_idx, identity, category)).rowcount == 1
-        payload = canonical_json_bytes(public).decode()
-        self.db.execute(
-            "INSERT INTO run_observations(id,order_id,environment,prompt_idx,window,lane,category,hotkey,token_count,first_scan,public)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (identity, self.order, obs.environment, obs.prompt_idx, obs.window, obs.lane, category,
-             obs.hotkey, obs.token_count, int(first), payload))
+        if first:
+            self.db.execute("UPDATE run_observations SET first_scan=1 WHERE id=?", (identity,))
         self.db.execute("INSERT INTO run_events(order_id,observation_id,payload) VALUES(?,?,?)",
                         (self.order, identity, payload))
         return RecordResult(identity, True, first, category)
@@ -124,11 +154,20 @@ class RunObservationLog:
         return released
 
     def settle(self, observation_id: str, *, status: str, proof: str, at: float) -> None:
-        row = self.db.execute("SELECT window FROM run_observations WHERE id=?", (observation_id,)).fetchone()
+        row = self.db.execute("SELECT window, order_id FROM run_observations WHERE id=?",
+                              (observation_id,)).fetchone()
         if row is None:
             raise ValueError("unknown observation")
-        payload = canonical_json_bytes({"type": "settle", "id": observation_id, "window": row[0],
-                                        "status": status, "proof": proof, "ts": at}).decode()
+        if row[1] != self.order:
+            raise ValueError("observation belongs to another order")
+        for (payload,) in self.db.execute(
+                "SELECT payload FROM run_events WHERE order_id=? AND observation_id=?",
+                (self.order, observation_id)):
+            event = json.loads(payload)
+            if event.get("type") == "settle" and event.get("status") == status and event.get("proof") == proof:
+                return  # same settlement again: nothing new to publish
+        payload = canonical_json_bytes({"type": "settle", "id": observation_id, "window": int(row[0]),
+                                        "status": str(status), "proof": str(proof), "ts": float(at)}).decode()
         self.db.execute("INSERT INTO run_events(order_id,observation_id,payload) VALUES(?,?,?)",
                         (self.order, observation_id, payload))
 
