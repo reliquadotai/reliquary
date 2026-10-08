@@ -1,5 +1,6 @@
 """Miner checkpoint activation binds number, repository, and immutable OID."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,7 +18,7 @@ REV_NEW = "a" * 40
 
 @pytest.mark.asyncio
 async def test_pull_when_remote_n_higher():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=5,
         checkpoint_repo_id=REPO,
         checkpoint_revision=REV_5,
@@ -42,7 +43,7 @@ async def test_pull_when_remote_n_higher():
 
 @pytest.mark.asyncio
 async def test_no_pull_when_local_identity_is_exact():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=5,
         checkpoint_repo_id=REPO,
         checkpoint_revision=REV_5,
@@ -65,7 +66,7 @@ async def test_no_pull_when_local_identity_is_exact():
 
 @pytest.mark.asyncio
 async def test_no_pull_before_first_publish():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=0,
         checkpoint_repo_id=None,
         checkpoint_revision=None,
@@ -88,7 +89,7 @@ async def test_no_pull_before_first_publish():
 
 @pytest.mark.asyncio
 async def test_partial_checkpoint_identity_is_rejected():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=3,
         checkpoint_repo_id=REPO,
         checkpoint_revision=None,
@@ -111,7 +112,7 @@ async def test_partial_checkpoint_identity_is_rejected():
 
 @pytest.mark.asyncio
 async def test_fresh_miner_joins_a_later_checkpoint():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=7,
         checkpoint_repo_id=REPO,
         checkpoint_revision=REV_7,
@@ -139,7 +140,7 @@ async def test_same_number_identity_rebinding_fails_closed(
     remote_repo,
     remote_revision,
 ):
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=5,
         checkpoint_repo_id=remote_repo,
         checkpoint_revision=remote_revision,
@@ -162,7 +163,7 @@ async def test_same_number_identity_rebinding_fails_closed(
 
 @pytest.mark.asyncio
 async def test_same_number_can_initialize_an_unknown_local_identity():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=5,
         checkpoint_repo_id=REPO,
         checkpoint_revision=REV_5,
@@ -183,7 +184,7 @@ async def test_same_number_can_initialize_an_unknown_local_identity():
 
 @pytest.mark.asyncio
 async def test_mutable_revision_is_rejected_before_download():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=5,
         checkpoint_repo_id=REPO,
         checkpoint_revision="main",
@@ -206,7 +207,7 @@ async def test_mutable_revision_is_rejected_before_download():
 
 @pytest.mark.asyncio
 async def test_loader_failure_does_not_advance_checkpoint_identity():
-    state = MagicMock(
+    state = SimpleNamespace(
         checkpoint_n=5,
         checkpoint_repo_id=REPO,
         checkpoint_revision=REV_NEW,

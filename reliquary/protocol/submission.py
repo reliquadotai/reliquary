@@ -18,6 +18,7 @@ from pydantic import (
     FiniteFloat,
     PrivateAttr,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -254,6 +255,8 @@ class BatchSubmissionRequest(BaseModel):
     # empty sig is rejected as BAD_ENVELOPE_SIGNATURE or silently accepted.
     envelope_signature: str = Field(default="", pattern=r"^[0-9a-fA-F]*$")
     runtime_fingerprint: RuntimeFingerprint | None = None
+    pool_selection: dict[str, Any] | None = None
+    service_binding: dict[str, Any] | None = None
     # Validator-only marker. It is absent from JSON and the public schema, so
     # adding it does not change the miner wire contract.
     _legacy_merkle_verified: bool = PrivateAttr(default=False)
@@ -286,6 +289,31 @@ class BatchSubmissionRequest(BaseModel):
         if not self.nonce.endswith(expected_suffix):
             raise ValueError("runtime_fingerprint must be bound to nonce")
         return self
+
+    @field_validator("pool_selection")
+    @classmethod
+    def _validate_pool_selection(cls, value):
+        if value is not None:
+            from reliquary.protocol.seed_pool import PoolSelection
+            PoolSelection.from_dict(value)
+        return value
+
+    @field_validator("service_binding")
+    @classmethod
+    def _validate_service_binding(cls, value):
+        if value is not None:
+            from reliquary.protocol.service_submission import ServiceBinding
+            ServiceBinding.from_dict(value)
+        return value
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_pool(self, handler):
+        value = handler(self)
+        if self.pool_selection is None:
+            value.pop("pool_selection", None)
+        if self.service_binding is None:
+            value.pop("service_binding", None)
+        return value
 
 
 class BatchSubmissionResponse(BaseModel):
@@ -383,6 +411,25 @@ class FillClosedWindowState(BaseModel):
         return self
 
 
+class ServicePolicyAnnouncement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    contract: dict[str, Any]
+    supported_capabilities: list[str] = Field(..., min_length=1, max_length=32)
+    pool_epoch: int = Field(..., ge=0, le=2**53 - 1, strict=True)
+    pool_randomness: str = Field(..., pattern=r"^(?:[0-9a-f]{64})?$", max_length=64)
+
+    @model_validator(mode="after")
+    def _validate_contract_capabilities(self):
+        from reliquary.protocol.service_contract import ServiceContract
+        contract = ServiceContract.from_dict(self.contract)
+        if any(not 1 <= len(capability) <= 256 for capability in self.supported_capabilities):
+            raise ValueError("bounded capabilities required")
+        contract.require_capabilities(set(self.supported_capabilities))
+        if contract.to_dict()["policies"]["sampling"]["kind"] == "public-group-pool/v1" and not self.pool_randomness:
+            raise ValueError("public pool requires its authoritative beacon")
+        return self
+
+
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
 
@@ -408,6 +455,14 @@ class GrpoBatchState(BaseModel):
     # value rather than recomputing locally, which guarantees byte-for-byte
     # agreement with the validator's verify path.
     randomness: str = ""
+    service_policy: ServicePolicyAnnouncement | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_service_policy(self, handler):
+        value = handler(self)
+        if self.service_policy is None:
+            value.pop("service_policy", None)
+        return value
 
 
 def encode_cooldown_bitmap(
@@ -520,6 +575,14 @@ class MinerState(BaseModel):
     generation_profile_id: str | None = Field(default=None, max_length=64)
     generation_contract: dict[str, Any] | None = None
     randomness: str = ""
+    service_policy: ServicePolicyAnnouncement | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_service_policy(self, handler):
+        value = handler(self)
+        if self.service_policy is None:
+            value.pop("service_policy", None)
+        return value
 
 
 class Verdict(BaseModel):
@@ -673,6 +736,33 @@ class RolloutMetadata(BaseModel):
     # Present only for Reliquary Episode v1. Keeping it nested preserves the
     # historical single-turn metadata fields and outer submission envelope.
     episode: "EpisodeMetadata | None" = None
+    seed_pool: dict[str, Any] | None = None
+    service_binding: dict[str, Any] | None = None
+
+    @field_validator("seed_pool")
+    @classmethod
+    def _validate_seed_pool(cls, value):
+        if value is not None:
+            from reliquary.protocol.seed_pool import parse_rollout_binding
+            parse_rollout_binding(value)
+        return value
+
+    @field_validator("service_binding")
+    @classmethod
+    def _validate_service_binding(cls, value):
+        if value is not None:
+            from reliquary.protocol.service_submission import parse_service_rollout_binding
+            parse_service_rollout_binding(value)
+        return value
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_pool(self, handler):
+        value = handler(self)
+        if self.seed_pool is None:
+            value.pop("seed_pool", None)
+        if self.service_binding is None:
+            value.pop("service_binding", None)
+        return value
 
 
 class EpisodeMetadata(BaseModel):
@@ -738,7 +828,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v7", "v8"]
+    proof_version: Literal["v7", "v8", "public-group-proof/v1", "service-group-proof/v1"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo
@@ -780,6 +870,8 @@ class CommitModel(BaseModel):
                 f"len(tokens)={len(tokens)}"
             )
         if v.episode is not None:
+            if v.seed_pool is not None or v.service_binding is not None:
+                raise ValueError("service group proofs do not support episodes")
             proof_version = info.data.get("proof_version")
             if proof_version != "v8":
                 raise ValueError("episode metadata requires GRAIL proof v8")
@@ -793,7 +885,18 @@ class CommitModel(BaseModel):
                     "episode token_logprobs must be full-sequence or assistant-only"
                 )
             return v
-        if info.data.get("proof_version") != "v7":
+        if v.seed_pool is not None:
+            if info.data.get("proof_version") != "public-group-proof/v1":
+                raise ValueError("public group metadata requires its signed proof version")
+            if v.service_binding is not None:
+                from reliquary.protocol.seed_pool import parse_rollout_binding
+                from reliquary.protocol.service_submission import parse_service_rollout_binding
+                if parse_rollout_binding(v.seed_pool)[1] != parse_service_rollout_binding(v.service_binding)[1]:
+                    raise ValueError("service and pool rollout indices differ")
+        elif v.service_binding is not None:
+            if info.data.get("proof_version") != "service-group-proof/v1":
+                raise ValueError("service metadata requires its signed proof version")
+        elif info.data.get("proof_version") != "v7":
             raise ValueError("single-turn metadata requires GRAIL proof v7")
         # Two layouts are accepted, matching ``verify_logprobs_claim`` in
         # ``validator/verifier.py``:

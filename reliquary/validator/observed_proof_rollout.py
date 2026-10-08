@@ -33,6 +33,9 @@ def observed_restart_checkpoint(pool):
     checkpoint = pool.health.checkpoint if pool.health is not None else None
     if not observed_live_requested() or not state_dir or checkpoint is None:
         raise ValueError("observed restart requires an adopted checkpoint and durable state")
+    from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
+
+    state_dir = active_checkpoint_namespace().local_path(state_dir)
     binding = (checkpoint.checkpoint_n, checkpoint.revision)
     gate = FillClosedRotationStore(state_dir).load()
     if gate is not None and (

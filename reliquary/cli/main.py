@@ -488,6 +488,8 @@ def _composed_task_entry(
 @tasks_app.command("create")
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
+    service_contract_file: Path = typer.Option(None, "--service-contract", exists=True, dir_okay=False, readable=True),
+    ack_service_fleet: bool = typer.Option(False, "--ack-service-fleet"),
     profile_id: str = typer.Option(
         None, "--profile-id", help="Compiled profile to pin; refused with --model"
     ),
@@ -643,6 +645,20 @@ def tasks_create(
                 env_split=_parse_env_split_option(env_split),
                 verification=verification,
             )
+        if service_contract_file is not None:
+            from dataclasses import replace
+            from reliquary.protocol.service_contract import ServiceContract
+            from reliquary.shared.strict_json import strict_json_loads
+            from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+            if not ack_service_fleet:
+                raise ValueError("service declaration requires --ack-service-fleet for upgraded registry readers")
+            if service_contract_file.stat().st_size > 65536:
+                raise ValueError("service contract exceeds 64 KiB")
+            contract = ServiceContract.from_dict(strict_json_loads(service_contract_file.read_bytes()))
+            entry = replace(entry, mechanism=MECHANISM_SERVICE_RL, service_contract=contract.to_dict(),
+                            params={**entry.params, "min_incentive_share": 0.0, "min_incentive_ramp_start": 0.0})
+        elif ack_service_fleet:
+            raise ValueError("--ack-service-fleet requires --service-contract")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -1595,10 +1611,17 @@ def jobs_export(
                     "change; pass --allow-incomplete to export what is final so far")
             quarantined = await _quarantined_grade_executors()
 
-            renderer = await asyncio.to_thread(agentic_swe.load_turn_renderer,
-                                               await asyncio.to_thread(_episode_tokenizer_dir, job))
-            source = await asyncio.to_thread(agentic_swe.load_swe_source,
-                                             job.episode.env.num_images)
+            from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+
+            signed_job = is_signed_sandbox(job)
+            tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
+            # A replay job renders with the loader's default tools, as it always did.
+            renderer = await asyncio.to_thread(
+                agentic_swe.load_turn_renderer, tokenizer_dir,
+                *((job.episode.sandbox.tools,) if signed_job else ()))
+            source = (agentic_swe.SignedSweSource(sandbox_split(job.episode)) if signed_job
+                      else await asyncio.to_thread(agentic_swe.load_swe_source,
+                                                   job.episode.env.num_images))
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,
@@ -2084,6 +2107,116 @@ def eval_run(
     typer.echo(json.dumps(result) if result is not None else "no evaluation task to claim")
 
 
+sandbox_app = typer.Typer(help="Signed-episode sandboxes (reliquary-sandbox machines)")
+sandbox_machines_app = typer.Typer(help="The machine directory in R2")
+sandbox_app.add_typer(sandbox_machines_app, name="machines")
+app.add_typer(sandbox_app, name="sandbox")
+
+
+def _sandbox_store_call(coroutine):
+    from reliquary.infrastructure.sandbox_store import MachineConflict
+
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        return asyncio.run(coroutine)
+    except (ValueError, MachineConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except ClientError as exc:
+        # The error code only: a storage message may echo request details.
+        code = exc.response.get("Error", {}).get("Code", "?")
+        typer.echo(f"error: R2 refused the request ({code})", err=True)
+        raise typer.Exit(code=1) from exc
+    except BotoCoreError as exc:                # credentials, endpoint, connection
+        typer.echo(f"error: R2 is unreachable ({type(exc).__name__})", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _echo_machine(document) -> None:
+    import json
+
+    if document is None:
+        typer.echo("error: no such machine", err=True)
+        raise typer.Exit(code=2)
+    typer.echo(json.dumps(document, sort_keys=True))
+
+
+@sandbox_machines_app.command("register")
+def sandbox_machine_register(
+    machine_id: str = typer.Option(..., "--machine-id"),
+    address: str = typer.Option(..., "--address", help="scheme://host[:port] miners reach"),
+    provider: str = typer.Option(..., "--provider"),
+    capacity: int = typer.Option(..., "--capacity", help="Concurrent episodes"),
+    key_id: str = typer.Option(..., "--key-id"),
+    public_key: str = typer.Option(..., "--public-key", help="base64 Ed25519 public key"),
+    valid_from: int = typer.Option(..., "--valid-from", help="unix seconds"),
+) -> None:
+    """Register a machine with its first signing key (create-only)."""
+    from reliquary.infrastructure import sandbox_store
+
+    document, _ = _sandbox_store_call(sandbox_store.register_machine(
+        machine_id=machine_id, address=address, provider=provider, capacity=capacity,
+        key_id=key_id, public_key_b64=public_key, valid_from=valid_from, now=_time.time()))
+    _echo_machine(document)
+
+
+@sandbox_machines_app.command("add-key")
+def sandbox_machine_add_key(machine_id: str = typer.Option(..., "--machine-id"),
+                            key_id: str = typer.Option(..., "--key-id"),
+                            public_key: str = typer.Option(..., "--public-key"),
+                            valid_from: int = typer.Option(..., "--valid-from")) -> None:
+    """Add a rotated key (switch the machine to it when it has no live episode)."""
+    from reliquary.infrastructure import sandbox_store
+
+    _echo_machine(_sandbox_store_call(sandbox_store.add_machine_key(
+        machine_id, key_id=key_id, public_key_b64=public_key, valid_from=valid_from)))
+
+
+@sandbox_machines_app.command("end-key")
+def sandbox_machine_end_key(
+    machine_id: str = typer.Option(..., "--machine-id"),
+    key_id: str = typer.Option(..., "--key-id"),
+    valid_until: int = typer.Option(..., "--valid-until", help=(
+        "unix seconds. Rotation: when the new key starts. COMPROMISE: the earliest time "
+        "the compromise is suspected, even in the past, with --compromise")),
+    compromise: bool = typer.Option(False, "--compromise", help=(
+        "The key is compromised: end it at --valid-until minus the verifier's clock skew "
+        "(CLOCK_SKEW_S, 30 s), since an open may precede its token by that much")),
+) -> None:
+    """End a key's validity; an end only ever moves earlier. On compromise, pass the
+    suspected compromise time with --compromise: the end becomes that time minus
+    CLOCK_SKEW_S, so no forged open stamped up to the skew before it verifies."""
+    from reliquary.infrastructure import sandbox_store
+
+    if compromise:
+        try:
+            valid_until = sandbox_store.compromise_valid_until(valid_until)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+    _echo_machine(_sandbox_store_call(sandbox_store.end_machine_key(
+        machine_id, key_id=key_id, valid_until=valid_until)))
+
+
+@sandbox_machines_app.command("status")
+def sandbox_machine_status(machine_id: str = typer.Option(..., "--machine-id"),
+                           status: str = typer.Option(..., "--status",
+                                                      help="active, draining or revoked"),
+                           reason: str = typer.Option(None, "--reason")) -> None:
+    from reliquary.infrastructure import sandbox_store
+
+    _echo_machine(_sandbox_store_call(sandbox_store.set_machine_status(machine_id, status, reason=reason)))
+
+
+@sandbox_machines_app.command("list")
+def sandbox_machine_list() -> None:
+    from reliquary.infrastructure import sandbox_store
+
+    for document in _sandbox_store_call(sandbox_store.list_machines()):
+        _echo_machine(document)
+
+
 corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
@@ -2528,10 +2661,20 @@ def corpus_mine_agentic(
     max_num_seqs: int = typer.Option(
         16, "--max-num-seqs",
         help="vLLM's concurrent sequences; lower it if turns fail as preempted (unprovable)"),
+    validator_hotkey: str = typer.Option(
+        None, "--validator-hotkey",
+        help="The validator's ss58 hotkey; signed-sandbox jobs sign their session requests "
+             "for it"),
+    max_live_per_job: int = typer.Option(
+        4, "--max-live-per-job", min=1,
+        help="Signed-sandbox jobs: live sessions at once for this hotkey on the job (match "
+             "the validator's per-job cap, 4 by default)"),
 ) -> None:
     """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
-    against a local vLLM with per-turn proofs. Needs Docker and the job's
-    pinned reliquary-swe, verifiers and renderers installed."""
+    against a local vLLM with per-turn proofs. Replay jobs need Docker and the
+    job's pinned reliquary-swe, verifiers and renderers installed. Signed-sandbox
+    jobs need no Docker: every tool call runs on the validator's sandbox machines
+    (they need `--validator-hotkey` and the reliquary[sandbox-miner] extra)."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
@@ -2571,27 +2714,57 @@ def corpus_mine_agentic(
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
     client.scoped_submit = submits_scoped(job)
-    refusal = episode_support_refusal(job.episode, need_verifiers=True)
+    from reliquary.corpus.job import is_signed_sandbox
+    from reliquary.environment.agentic_swe import sandbox_support_refusal
+
+    signed = is_signed_sandbox(job)
+    refusal = episode_support_refusal(job.episode, need_verifiers=True) or (
+        sandbox_support_refusal(job.episode, need_bridge=True) if signed else None)
     if refusal:
         typer.echo(f"error: {refusal}", err=True)
         raise typer.Exit(code=4)
-    from reliquary.miner.agentic_miner import docker_storage_warning
+    sessions = None
+    if signed:
+        from reliquary.miner.signed_episode import HttpSandboxSessions
 
-    warning = docker_storage_warning()
-    if warning:
-        typer.echo(warning, err=True)
+        if not validator_hotkey:
+            typer.echo("error: a signed-sandbox job needs --validator-hotkey (the validator's "
+                       "ss58 hotkey: session requests are signed for it)", err=True)
+            raise typer.Exit(code=2)
+        try:
+            sessions = HttpSandboxSessions(httpx.Client(base_url=validator_url, timeout=60.0),
+                                           validator_hotkey=validator_hotkey)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+    else:
+        from reliquary.miner.agentic_miner import docker_storage_warning
+
+        warning = docker_storage_warning()
+        if warning:
+            typer.echo(warning, err=True)
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
     if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
         typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)
         raise typer.Exit(code=4)
     identity = Identity(hotkey=wallet.hotkey.ss58_address,
                         sign=lambda body: sign_corpus_submission(wallet, body),
-                        episodes=episodes or None)
+                        episodes=episodes or None,
+                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
     counts = asyncio.run(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
-        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs))
+        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
+        sessions=sessions, max_live_per_job=max_live_per_job))
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
+    halted = [hotkey_ for hotkey_, c in counts.items()
+              if c.get("halted") or c.get("identity_crashed")]
+    if halted:
+        hint = (" (a bad_signature: is --validator-hotkey this validator's hotkey?)"
+                if any(c.get("session_refused:bad_signature") for c in counts.values()) else "")
+        typer.echo(f"error: mining stopped for {', '.join(h[:8] for h in halted)}{hint}",
+                   err=True)
+        raise typer.Exit(code=3)
 
 
 @corpus_app.command("status")
@@ -3866,6 +4039,7 @@ def validate(
                 ),
                 emission_cap=task_config.emission_cap,
                 price_params=task_config.price_params,
+                service_contract=task_config.service_contract,
                 env_caps=task_config.env_caps,
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,

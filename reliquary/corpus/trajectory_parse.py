@@ -160,3 +160,7 @@ def parse_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
         actions += [Action(name, arguments, observation)
                     for (name, arguments), observation in zip(calls, observations)]
     return ParsedTrajectory(tuple(turns), tuple(actions))
+
+
+# The span structure check, shared with the signed parser (`corpus.signed_parse`).
+check_span_structure = _check_spans

@@ -100,6 +100,12 @@ jobs:
             tests/unit/test_v1_cutover.py \
             tests/unit/test_trainer_publication_recovery.py \
             tests/unit/test_remote_proof_controller.py \
+            tests/unit/test_seed_pool.py \
+            tests/unit/test_public_pool_sampling.py \
+            tests/unit/test_service_runtime_view.py \
+            tests/unit/test_service_policy_admission.py \
+            tests/unit/test_service_checkpoint_adoption.py \
+            tests/unit/test_service_settlement.py \
             tests/integration/test_remote_proof_mtls.py
       - name: Check inherited V5 authenticity boundaries
         run: |

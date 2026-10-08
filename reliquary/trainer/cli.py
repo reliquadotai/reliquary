@@ -15,6 +15,7 @@ import time
 from typing import Mapping
 
 from reliquary.shared.checkpoint_identity import require_checkpoint_number
+from reliquary.shared.checkpoint_namespace import CheckpointNamespace, active_checkpoint_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +78,20 @@ def _r2_client():
     )
 
 
-def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool:
+def _download_checkpoint(client, bucket: str, revision: str, dest: Path,
+                         *, namespace: CheckpointNamespace | None = None) -> bool:
     """Pull or reuse the R2 snapshot; return False for immutable HF fallback
     when the revision is absent or the local directory has extra files."""
     from boto3.s3.transfer import TransferConfig
 
-    from reliquary.trainer.publisher import R2_CHECKPOINT_PREFIX, checkpoint_key, _file_identity
+    from reliquary.trainer.publisher import checkpoint_key, _file_identity
     from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
     from reliquary.shared.strict_json import strict_json_loads
     from reliquary.validator.control import write_json
 
     revision = require_immutable_checkpoint_revision(revision)
-    prefix = f"{R2_CHECKPOINT_PREFIX}/{revision}/"
+    namespace = namespace or active_checkpoint_namespace()
+    prefix = f"{namespace.checkpoint_prefix}/{revision}/"
     listed = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     contents = listed.get("Contents", [])
     while listed.get("IsTruncated"):
@@ -107,10 +110,12 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
     expected = {}
     for obj in contents:
         key = obj["Key"]
+        if not isinstance(key, str) or not key.startswith(prefix):
+            raise ValueError("checkpoint object escaped its namespace")
         filename = key[len(prefix):]
         if not filename:
             continue
-        checkpoint_key(revision, filename)
+        checkpoint_key(revision, filename, namespace=namespace)
         if filename.startswith(".") or (dest / filename).is_symlink():
             raise ValueError("checkpoint mirror contains an unsafe filename")
         expected[filename] = {"etag": obj.get("ETag"), "size": obj.get("Size")}
@@ -119,6 +124,8 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
         return False
     identity = {"bucket": bucket, "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),
                 "revision": revision, "objects": expected}
+    if namespace.scoped:
+        identity.update(namespace.identity)
     try:
         cached = strict_json_loads(marker.read_bytes())
         if (cached["identity"] == identity and set(cached["files"]) == set(expected)
@@ -220,14 +227,17 @@ def run_train_worker(*, shadow: bool = False) -> None:
     if not repo_id:
         raise SystemExit("RELIQUARY_HF_REPO_ID is required")
     bucket = os.getenv("R2_BUCKET_ID", "reliquary")
-    state_dir = Path(os.environ.get(
+    namespace = active_checkpoint_namespace()
+    state_root = Path(os.environ.get(
         "RELIQUARY_TRAINER_STATE_DIR", "/root/reliquary/trainer",
     ))
+    state_dir = namespace.local_path(state_root)
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
     early_publisher = TrainerPublisher(
-        repo_id=repo_id, staging_dir=str(state_dir / "staging"),
+        repo_id=repo_id, staging_dir=str(state_root / "staging"),
         tokenizer=None, r2_client=client, bucket=bucket,
+        namespace=namespace,
     )
     if not shadow:
         asyncio.run(early_publisher.recover_pending())
@@ -235,9 +245,17 @@ def run_train_worker(*, shadow: bool = False) -> None:
     # Journal payloads carry the run identity; only checkpoint manifests carry
     # repo_id. Requiring the manifest header on payloads rejects our own codec.
     payload_identity = active_training_identity() if PROTOCOL_VERSION >= 5 else {}
-    expected_identity = {**payload_identity, "repo_id": repo_id}
+    expected_identity = {**payload_identity, **namespace.identity, "repo_id": repo_id}
+    resume_candidate = None
+    resume_fetch = fetch
+    if namespace.scoped:
+        from reliquary.shared.strict_json import strict_json_loads
+
+        raw_candidate = fetch(namespace.candidate_manifest_key)
+        resume_candidate = strict_json_loads(raw_candidate) if raw_candidate is not None else None
+        resume_fetch = lambda key: (raw_candidate if key == namespace.candidate_manifest_key else fetch(key))
     revision, cursor, checkpoint_n = resolve_resume_point(
-        fetch,
+        resume_fetch,
         env=os.environ,
         expected_identity=expected_identity,
     )
@@ -252,13 +270,26 @@ def run_train_worker(*, shadow: bool = False) -> None:
         load_kwargs = {"revision": DEFAULT_BASE_MODEL_REVISION}
         tokenizer = load_tokenizer(model_path, **load_kwargs)
     else:
-        snapshot_dir = state_dir / "resume" / revision
+        snapshot_dir = namespace.child_path(state_dir, "resume", revision)
         started = time.monotonic()
-        if not _download_checkpoint(client, bucket, revision, snapshot_dir):
+        if not _download_checkpoint(client, bucket, revision, snapshot_dir, namespace=namespace):
             logger.info("R2 snapshot unavailable for %s; falling back to HF", revision)
             snapshot_dir = Path(_hf_download(repo_id, revision))
         logger.info("startup_stage=checkpoint_download elapsed_seconds=%.3f", time.monotonic() - started)
-        profile = validate_checkpoint_profile(snapshot_dir, required=True)
+        if namespace.scoped:
+            from reliquary.shared.strict_json import strict_json_loads
+            from reliquary.trainer.resume import validate_scoped_resume_snapshot
+
+            raw_manifest = fetch(namespace.candidate_manifest_key)
+            candidate = strict_json_loads(raw_manifest) if raw_manifest is not None else None
+            if candidate != resume_candidate:
+                raise PublicationConflict("scoped resume candidate changed during download")
+            profile = validate_scoped_resume_snapshot(
+                snapshot_dir, namespace=namespace, repo_id=repo_id,
+                revision=revision, checkpoint_n=checkpoint_n, candidate=resume_candidate,
+            )
+        else:
+            profile = validate_checkpoint_profile(snapshot_dir, required=True)
         # The PROFILE is authoritative for run state; the manifest cursor
         # was only a hint for which snapshot to fetch.
         profile_cursor = _profile_nonnegative_int(
@@ -336,11 +367,12 @@ def run_train_worker(*, shadow: bool = False) -> None:
     )
     publisher = TrainerPublisher(
         repo_id=repo_id,
-        staging_dir=str(state_dir / "staging"),
+        staging_dir=str(state_root / "staging"),
         tokenizer=tokenizer,
         r2_client=client,
         bucket=bucket,
         checkpoint_number_floor=checkpoint_n,
+        namespace=namespace,
     )
 
     publish_state = {"checkpoint_n": checkpoint_n}

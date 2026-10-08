@@ -21,6 +21,7 @@ from reliquary.shared.task_registry import (
     validate_registry,
 )
 from reliquary.validator.emission_price import PriceParams
+from reliquary.protocol.service_contract import ServiceContract
 
 
 class TaskConfigError(RuntimeError):
@@ -37,6 +38,7 @@ class TaskConfig:
     env_caps: dict[str, float]
     # The replica this task's validators verify with, or None to let each derive it.
     verification: str | None = None
+    service_contract: ServiceContract | None = None
 
 
 def resolve_task_config(
@@ -160,6 +162,8 @@ def resolve_task_config(
         emission_cap=cap,
         env_caps=env_caps,
         verification=entry.verification,
+        service_contract=(None if entry.service_contract is None else
+                          ServiceContract.from_dict(entry.service_contract)),
     )
 
 

@@ -66,7 +66,8 @@ def evaluation_prefix(eval_id: str) -> str:
 
 def request_digest(set_ids: Sequence[str], completion_keys: Sequence[str],
                    problems_per_set: Mapping[str, int],
-                   samples_per_set: Mapping[str, int], job_id: str | None = None) -> str:
+                   samples_per_set: Mapping[str, int], job_id: str | None = None,
+                   service_contract_sha256: str | None = None) -> str:
     """What makes two grade calls the same grading."""
     body = {"set_ids": list(set_ids), "completion_keys": list(completion_keys),
             "problems_per_set": {k: int(v) for k, v in sorted(problems_per_set.items())},
@@ -74,6 +75,8 @@ def request_digest(set_ids: Sequence[str], completion_keys: Sequence[str],
     if job_id is not None:
         # Only when set, so an uploads grading hashes as it always did.
         body["job_id"] = job_id
+    if service_contract_sha256 is not None:
+        body["service_contract_sha256"] = service_contract_sha256
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
@@ -419,7 +422,8 @@ async def upload_rows(platform, keys: Sequence[str], directory: Path):
 READ_CONCURRENCY = 16
 
 
-async def collect_job_records(job, records, *, concurrency: int = READ_CONCURRENCY) -> dict:
+async def collect_job_records(job, records, *, concurrency: int = READ_CONCURRENCY,
+                              include_generation_status: bool = False) -> dict:
     """An eval job's verdicts and passing (not voided) records, read
     ``concurrency`` at a time: ``{"passing": [(sid, record)], "verdicts",
     "audited", "samples_by_prompt"}``."""
@@ -441,9 +445,12 @@ async def collect_job_records(job, records, *, concurrency: int = READ_CONCURREN
     for _, record in passing:
         samples[int(record["prompt_index"])] += len(record["completions"])
     verdicts = [v for _, v, _ in read if v]
-    return {"passing": passing, "verdicts": len(verdicts),
-            "audited": sum(1 for v in verdicts if v.get("audited")),
-            "samples_by_prompt": dict(samples)}
+    result = {"passing": passing, "verdicts": len(verdicts),
+              "audited": sum(1 for v in verdicts if v.get("audited")),
+              "samples_by_prompt": dict(samples)}
+    if include_generation_status:
+        result["generation_verified"] = bool(passing) and all(v.get("audited") is True for _, v, record in read if record is not None)
+    return result
 
 
 def job_complete(job, collected: dict, samples: int, slots=None) -> bool:
@@ -480,6 +487,7 @@ class JobRows:
         self.hotkeys: set[str] = set()
         self.verdicts = collected["verdicts"]
         self.audited = collected["audited"]
+        self.generation_verified = collected.get("generation_verified") is True
 
     async def __aiter__(self):
         from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
@@ -517,7 +525,8 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                            open_taskset: Callable[[str, dict], Any] | None = None,
                            work_dir: str | Path | None = None,
                            clock: Callable[[], float] = time.time,
-                           bootstrap_seed: int = BOOTSTRAP_SEED) -> dict:
+                           bootstrap_seed: int = BOOTSTRAP_SEED,
+                           service_contract=None) -> dict:
     """Grade every completion and write the evaluation; the manifest. A grading
     whose manifest exists is returned as stored. The completions are the pod's
     uploads (``completion_keys``) or an eval job's passing records (``job_rows``)."""
@@ -528,9 +537,14 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     manifest_key = f"{prefix}/manifest.json"
     stored = await platform.get_json(manifest_key)
     if stored is not None:
+        if service_contract is not None and stored.get("service_contract_sha256") != service_contract.sha256:
+            raise GradeRequestError("grading exists under another service contract")
         return stored
     keys = validated_completion_keys(completion_keys) if job_rows is None else []
     sets = await load_sets(set_ids, problems_per_set, samples_per_set, subnet=subnet)
+    if service_contract is not None:
+        from reliquary.services.mapping import validate_grading_context
+        validate_grading_context(service_contract, sets, dict(provenance))
     require_sandboxes(sets, require_sandbox)
     selected: dict[str, tuple[str, dict, dict, int]] = {}
     for set_id, (card, rows) in sets.items():
@@ -638,7 +652,12 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
         report_path = directory / "report.json"
         report_path.write_text(json.dumps(report, sort_keys=True, indent=1))
         files = []
-        for path in (graded_path, report_path):
+        output_paths = [graded_path, report_path]
+        if service_contract is not None:
+            from reliquary.services.mapping import export_grading_mapping
+            output_paths += export_grading_mapping(directory, service_contract, sets, report,
+                                                   generation_verified=job_rows is not None and job_rows.generation_verified)
+        for path in output_paths:
             key = f"{prefix}/{path.name}"
             # Hashed before the upload, from the bytes uploaded.
             digest = await asyncio.to_thread(_sha256, path)
@@ -652,10 +671,12 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
         "schema": REPORT_SCHEMA, "eval_id": eval_id, "created_at": report["created_at"],
         "request_sha256": request_digest(
             set_ids, keys, problems_per_set, samples_per_set,
-            job_id=None if job_rows is None else job_rows.job.job_id),
+            job_id=None if job_rows is None else job_rows.job.job_id,
+            service_contract_sha256=None if service_contract is None else service_contract.sha256),
         "complete": report["complete"],
         "rows": sum(len(v) for v in per_problem.values()), "files": files,
         "keys": [f["key"] for f in files] + [manifest_key],
+        **({"service_contract_sha256": service_contract.sha256} if service_contract is not None else {}),
     }
     await platform.put_json(manifest_key, manifest)
     logger.info("eval %s graded: %d rows over %d sets", eval_id, manifest["rows"], len(sets))

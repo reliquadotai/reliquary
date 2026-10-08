@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 COMMIT_DOMAIN = b"grail-commit-v1"
 EPISODE_COMMIT_DOMAIN = b"grail-commit-v8-episode"
+PUBLIC_GROUP_COMMIT_DOMAIN = b"public-group-commit/v1"
+PUBLIC_GROUP_ENVELOPE_DOMAIN = b"public-group-envelope/v1"
+SERVICE_COMMIT_DOMAIN = b"service-group-commit/v1"
+SERVICE_ENVELOPE_DOMAIN = b"service-envelope/v1"
 
 # Domain separation tag for the per-request envelope signature. Distinct
 # from ``COMMIT_DOMAIN`` so a per-rollout commit signature can never be
@@ -98,6 +102,75 @@ def sign_commit_binding(
     return wallet.hotkey.sign(msg)  # type: ignore[union-attr]
 
 
+def build_public_group_commit_binding(
+    tokens: list[int], randomness_hex: str, model_name: str, layer_index: int,
+    commitments: list[dict], seed_pool: dict,
+) -> bytes:
+    from reliquary.protocol.release_contract import canonical_json_bytes
+    from reliquary.protocol.seed_pool import parse_rollout_binding
+
+    parse_rollout_binding(seed_pool)
+    base = build_commit_binding(tokens, randomness_hex, model_name, layer_index, commitments)
+    h = hashlib.sha256(PUBLIC_GROUP_COMMIT_DOMAIN)
+    for part in (base, canonical_json_bytes(seed_pool)):
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def sign_public_group_commit_binding(
+    tokens: list[int], randomness_hex: str, model_name: str, layer_index: int,
+    commitments: list[dict], seed_pool: dict, wallet,
+) -> bytes:
+    if bt is None:
+        raise ImportError("bittensor is required for commit signing")
+    if not hasattr(wallet, "hotkey") or not hasattr(wallet.hotkey, "sign"):
+        raise TypeError("Wallet must provide hotkey.sign()")
+    return wallet.hotkey.sign(build_public_group_commit_binding(
+        tokens, randomness_hex, model_name, layer_index, commitments, seed_pool,
+    ))
+
+
+def build_service_commit_binding(
+    tokens: list[int], randomness_hex: str, model_name: str, layer_index: int,
+    commitments: list[dict], service_binding: dict, seed_pool: dict | None = None,
+) -> bytes:
+    from reliquary.protocol.release_contract import canonical_json_bytes
+    from reliquary.protocol.service_submission import parse_service_rollout_binding
+
+    _, original_index = parse_service_rollout_binding(service_binding)
+    base = build_commit_binding(tokens, randomness_hex, model_name, layer_index, commitments)
+    parts = (base, canonical_json_bytes(service_binding))
+    domain = SERVICE_COMMIT_DOMAIN
+    if seed_pool is not None:
+        from reliquary.protocol.seed_pool import parse_rollout_binding
+        _, pool_index = parse_rollout_binding(seed_pool)
+        if pool_index != original_index:
+            raise ValueError("service and pool rollout indices differ")
+        domain = PUBLIC_GROUP_COMMIT_DOMAIN
+        parts = (*parts, canonical_json_bytes(seed_pool))
+    h = hashlib.sha256(domain)
+    for part in parts:
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def sign_service_commit_binding(
+    tokens: list[int], randomness_hex: str, model_name: str, layer_index: int,
+    commitments: list[dict], service_binding: dict, wallet,
+    seed_pool: dict | None = None,
+) -> bytes:
+    if bt is None:
+        raise ImportError("bittensor is required for commit signing")
+    if not hasattr(wallet, "hotkey") or not hasattr(wallet.hotkey, "sign"):
+        raise TypeError("Wallet must provide hotkey.sign()")
+    return wallet.hotkey.sign(build_service_commit_binding(
+        tokens, randomness_hex, model_name, layer_index, commitments,
+        service_binding, seed_pool,
+    ))
+
+
 def build_episode_commit_binding(
     tokens: list[int],
     randomness_hex: str,
@@ -164,9 +237,13 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
         sig = bytes.fromhex(commit["signature"])
         proof_version = commit.get("proof_version")
 
+        from reliquary.protocol.seed_pool import PROOF_VERSION
+        from reliquary.protocol.service_submission import PROOF_VERSION as SERVICE_PROOF_VERSION
         if proof_version not in (
             GRAIL_PROOF_VERSION,
             GRAIL_EPISODE_PROOF_VERSION,
+            PROOF_VERSION,
+            SERVICE_PROOF_VERSION,
         ):
             logger.debug("Invalid proof version: %s", proof_version)
             return False
@@ -179,7 +256,32 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
         model_name = model_info.get("name", "")
         layer_index = int(model_info.get("layer_index"))
 
-        if proof_version == GRAIL_EPISODE_PROOF_VERSION:
+        metadata = commit.get("rollout") or {}
+        if proof_version == PROOF_VERSION:
+            if metadata.get("episode") is not None:
+                return False
+            if metadata.get("service_binding") is not None:
+                if metadata.get("seed_pool") is None:
+                    return False
+                msg = build_service_commit_binding(
+                    tokens, randomness, model_name, layer_index, commitments,
+                    metadata["service_binding"], metadata["seed_pool"],
+                )
+            else:
+                msg = build_public_group_commit_binding(
+                    tokens, randomness, model_name, layer_index, commitments,
+                    metadata.get("seed_pool"),
+                )
+        elif proof_version == SERVICE_PROOF_VERSION:
+            if metadata.get("episode") is not None or metadata.get("seed_pool") is not None:
+                return False
+            msg = build_service_commit_binding(
+                tokens, randomness, model_name, layer_index, commitments,
+                metadata.get("service_binding"),
+            )
+        elif metadata.get("seed_pool") is not None or metadata.get("service_binding") is not None:
+            return False
+        elif proof_version == GRAIL_EPISODE_PROOF_VERSION:
             episode = (commit.get("rollout") or {}).get("episode")
             if not isinstance(episode, dict):
                 logger.debug("Episode v8 commit missing episode metadata")
@@ -220,6 +322,8 @@ def build_envelope_binding(
     nonce: str,
     protocol_version: int = 0,
     generation_profile_id: str = "",
+    pool_selection: dict | None = None,
+    service_binding: dict | None = None,
 ) -> bytes:
     """Build the canonical message bytes signed by the miner over the
     ``BatchSubmissionRequest`` envelope.
@@ -292,7 +396,23 @@ def build_envelope_binding(
         nonce_b,
     )
     h = hashlib.sha256()
-    if profile_b:
+    if service_binding is not None:
+        from reliquary.protocol.release_contract import canonical_json_bytes
+        from reliquary.protocol.service_submission import ServiceBinding
+        binding = ServiceBinding.from_dict(service_binding)
+        selection_bytes = b""
+        if pool_selection is not None:
+            from reliquary.protocol.seed_pool import PoolSelection
+            selection_bytes = canonical_json_bytes(PoolSelection.from_dict(pool_selection).to_dict())
+        h.update(SERVICE_ENVELOPE_DOMAIN)
+        parts = (*parts, protocol_b, profile_b, canonical_json_bytes(binding.to_dict()), selection_bytes)
+    elif pool_selection is not None:
+        from reliquary.protocol.release_contract import canonical_json_bytes
+        from reliquary.protocol.seed_pool import PoolSelection
+        selection = PoolSelection.from_dict(pool_selection)
+        h.update(PUBLIC_GROUP_ENVELOPE_DOMAIN)
+        parts = (*parts, protocol_b, profile_b, canonical_json_bytes(selection.to_dict()))
+    elif profile_b:
         h.update(ENVELOPE_DOMAIN_V3)
         parts = (*parts, protocol_b, profile_b)
     else:
@@ -317,6 +437,8 @@ def sign_envelope(
     nonce: str,
     protocol_version: int = 0,
     generation_profile_id: str = "",
+    pool_selection: dict | None = None,
+    service_binding: dict | None = None,
 ) -> bytes:
     """Sign the canonical envelope binding with the miner's hotkey keypair.
 
@@ -340,6 +462,8 @@ def sign_envelope(
         nonce=nonce,
         protocol_version=protocol_version,
         generation_profile_id=generation_profile_id,
+        pool_selection=pool_selection,
+        service_binding=service_binding,
     )
     return wallet.hotkey.sign(msg)  # type: ignore[union-attr]
 
@@ -357,6 +481,8 @@ def verify_envelope_signature(
     envelope_signature: str,
     protocol_version: int = 0,
     generation_profile_id: str = "",
+    pool_selection: dict | None = None,
+    service_binding: dict | None = None,
 ) -> bool:
     """Verify ``envelope_signature`` is a valid sr25519 sig of the canonical
     binding under the ``miner_hotkey`` public key.
@@ -389,6 +515,8 @@ def verify_envelope_signature(
             nonce=nonce,
             protocol_version=protocol_version,
             generation_profile_id=generation_profile_id,
+            pool_selection=pool_selection,
+            service_binding=service_binding,
         )
         keypair = bt.Keypair(ss58_address=miner_hotkey)  # type: ignore[union-attr]
         return bool(keypair.verify(data=msg, signature=sig_bytes))
@@ -488,6 +616,14 @@ CORPUS_DOMAIN = b"reliquary/corpus-submission/v1"
 # A trajectory is signed under its own domain, so its binding can never be
 # replayed as a single-turn submission's (or the other way round).
 CORPUS_TRAJECTORY_DOMAIN = b"reliquary/corpus-trajectory/v1"
+# A trajectory that carries a sandbox transcript: its own domain, plus the transcript's
+# digest as one more part. A trajectory without one binds exactly as before.
+CORPUS_SIGNED_TRAJECTORY_DOMAIN = b"reliquary/corpus-trajectory-signed/v1"
+
+
+def transcript_digest(transcript) -> bytes:
+    return hashlib.sha256(json.dumps(transcript, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, allow_nan=False).encode("utf-8")).digest()
 
 
 def _trajectory_parts(trajectory) -> list[bytes]:
@@ -536,8 +672,11 @@ def build_corpus_binding(request) -> bytes:
     ]
     trajectory = body.get("trajectory")
     if trajectory is not None:
-        domain = CORPUS_TRAJECTORY_DOMAIN
+        transcript = trajectory.get("transcript")
+        domain = CORPUS_TRAJECTORY_DOMAIN if transcript is None else CORPUS_SIGNED_TRAJECTORY_DOMAIN
         parts += _trajectory_parts(trajectory)
+        if transcript is not None:
+            parts.append(transcript_digest(transcript))
     else:
         domain = CORPUS_DOMAIN
         for completion in body["completions"]:
@@ -633,3 +772,82 @@ def verify_corpus_skip_signature(request) -> bool:
     except Exception as e:
         logger.debug("corpus skip signature verify failed: %s", e)
         return False
+
+
+# Sandbox session requests (plan 3), each under its own domain: an open never verifies
+# as a close, a submission or a skip.
+SANDBOX_OPEN_DOMAIN = b"reliquary/sandbox-session-open/v1"
+SANDBOX_CLOSE_DOMAIN = b"reliquary/sandbox-session-close/v1"
+
+
+def _bound(domain: bytes, parts: list[bytes]) -> bytes:
+    h = hashlib.sha256()
+    h.update(domain)
+    for part in parts:
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def _engagement_bytes(engagement) -> bytes:
+    present = {key: value for key, value in dict(engagement).items() if value is not None}
+    return json.dumps(present, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def _audience(validator_hotkey: str, path: str) -> list[bytes]:
+    """The request's audience: the validator's hotkey (ss58) and the HTTP path it is
+    posted to, so a signed request never verifies at another validator or route."""
+    return [str(validator_hotkey).encode("utf-8"), str(path).encode("utf-8")]
+
+
+def build_sandbox_open_binding(request, *, validator_hotkey: str, path: str) -> bytes:
+    body = _corpus_fields(request)
+    return _bound(SANDBOX_OPEN_DOMAIN, [
+        str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
+        int(body["at"]).to_bytes(8, "big", signed=False),
+        hashlib.sha256(_engagement_bytes(body["engagement"])).digest(),
+        *_audience(validator_hotkey, path)])
+
+
+def build_sandbox_close_binding(request, *, validator_hotkey: str, path: str) -> bytes:
+    body = _corpus_fields(request)
+    transcript = body.get("transcript")
+    return _bound(SANDBOX_CLOSE_DOMAIN, [
+        str(body["miner_hotkey"]).encode("utf-8"), str(body["request_id"]).encode("utf-8"),
+        int(body["at"]).to_bytes(8, "big", signed=False), str(body["session_id"]).encode("utf-8"),
+        str(body["reason"]).encode("utf-8"),
+        b"" if transcript is None else transcript_digest(transcript),
+        *_audience(validator_hotkey, path)])
+
+
+def verify_hotkey_signature(hotkey: str, binding: bytes, signature_hex: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    if bt is None:
+        return False
+    try:
+        signature = bytes.fromhex((signature_hex or "").strip().replace("0x", "").replace("0X", ""))
+    except ValueError:
+        return False
+    if not signature:
+        return False
+    try:
+        keypair = bt.Keypair(ss58_address=hotkey)  # type: ignore[union-attr]
+        return bool(keypair.verify(data=binding, signature=signature))
+    except Exception as e:
+        logger.debug("hotkey signature verify failed: %s", type(e).__name__)
+        return False
+
+
+def verify_sandbox_open_signature(request, *, validator_hotkey: str, path: str) -> bool:
+    body = _corpus_fields(request)
+    binding = build_sandbox_open_binding(request, validator_hotkey=validator_hotkey, path=path)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), binding,
+                                   str(body.get("signature") or ""))
+
+
+def verify_sandbox_close_signature(request, *, validator_hotkey: str, path: str) -> bool:
+    body = _corpus_fields(request)
+    binding = build_sandbox_close_binding(request, validator_hotkey=validator_hotkey, path=path)
+    return verify_hotkey_signature(str(body["miner_hotkey"]), binding,
+                                   str(body.get("signature") or ""))

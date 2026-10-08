@@ -1,0 +1,60 @@
+"""Final service verdicts describe the durable entitlement, including aborts."""
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from reliquary.validator.service import ValidationService
+from tests.unit.test_service_runtime import example
+
+
+def service_and_batcher():
+    contract, _ = example()
+    runtime = SimpleNamespace(contract=contract)
+    request = SimpleNamespace(merkle_root="e" * 64, service_binding={"purpose": "exploration"})
+    pending = SimpleNamespace(hotkey="fixture-miner", prompt_idx=0, merkle_root=b"a", request=request,
+                              reject_response=None, telemetry=None, rewards=[0.0, 0.0])
+    row = {"status": "exploration_verified", "exploration_fraction": 0.01, "proof_status": "passed"}
+    batcher = SimpleNamespace(window_start=1, difficulty_auction_enabled=True, service_runtime=runtime,
+                              difficulty_auction_metadata_by_id={id(pending): row}, env=SimpleNamespace(name="math"),
+                              pending_submissions=lambda: [pending], current_checkpoint_hash="d" * 40)
+    service = ValidationService.__new__(ValidationService)
+    service._service_runtime = runtime
+    service.server = SimpleNamespace(record_verdict=MagicMock(return_value={"record": True}),
+                                     persist_final_verdicts=MagicMock(), complete_final_verdict_window=MagicMock())
+    return service, batcher, row
+
+
+@pytest.mark.asyncio
+async def test_exploration_is_rewarded_without_being_selected_for_training():
+    service, batcher, _ = service_and_batcher()
+    await service._record_auction_final_verdicts(batcher, paid_groups=[])
+    args = service.server.record_verdict.call_args.kwargs
+    assert args["rewarded"] is True and args["selected_for_batch"] is False
+    assert args["selection_reason"] == "exploration_reward_recorded"
+    service.server.persist_final_verdicts.assert_called_once()
+
+
+def test_aborted_exploration_final_verdict_cannot_claim_its_burned_reward(monkeypatch, tmp_path):
+    import reliquary.validator.service as module
+    import reliquary.infrastructure.archive_queue as archive_module
+    service, batcher, row = service_and_batcher()
+    monkeypatch.setattr(module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(archive_module, "get_archive_queue", lambda: object())
+    service._active_batchers = {"math": batcher}
+    service._archive_enqueued_windows = set()
+    service._fill_closed_assemblers = {1: SimpleNamespace()}
+    service._fill_closed_assembler = None
+    service._close_and_commit_fill_closed_paid_side_effects = lambda *_: {"math": []}
+    service._training_payload_queue_ref = lambda: SimpleNamespace(queue_dir=tmp_path)
+    service._fill_closed_recovery_store = SimpleNamespace(quarantine_uncommitted=lambda *_: None,
+        recover=lambda *_args, **_kw: {"window_start": 1, "window_status": "aborted", "rewards_by_hotkey": {}})
+    service._fill_closed_rotation_store = SimpleNamespace(load=lambda: {})
+    service._cache_archived_hashes = lambda _: None
+    service._enqueue_aborted_window(failure_stage="fixture", failure_type="interrupted")
+    args = service.server.record_verdict.call_args.kwargs
+    assert args["rewarded"] is False and args["selected_for_batch"] is False
+    assert args["selection_reason"] == "exploration_verified_no_entitlement"
+    assert row["exploration_fraction"] == 0.0
+    service.server.persist_final_verdicts.assert_called_once()
+    service.server.complete_final_verdict_window.assert_called_once_with(1)

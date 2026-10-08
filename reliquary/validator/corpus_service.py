@@ -1003,6 +1003,9 @@ class _TurnEntry:
     enqueued: float
     # Run once the verdict is in, by a task the HTTP handler cannot cancel.
     settled: Callable[["_TurnResult"], Awaitable[None]] | None = None
+    # Run instead of `settled` when the entry gets no verdict at all (withdrawn
+    # before a turn took it, or its turn failed).
+    abandoned: Callable[[], Awaitable[None]] | None = None
     taken: bool = False
     finisher: asyncio.Task | None = None
     record_ref: dict[str, Any] | None = None
@@ -1276,12 +1279,14 @@ async def verify_ledgers(store: Any, job: JobSpec) -> dict[str, Any]:
     """Sizes of the stored ledger, after checking every segment it names
     (I2, I3). ``problems`` names an I1 violation by count: each accepted
     submission consumed one slot and added ``sampling.n`` digests, so the
-    seen set must hold exactly ``filled * n``."""
+    seen set must hold exactly ``filled * n`` (a signed-sandbox job's accept also
+    adds its session's seen key: ``filled * (n + 1)``)."""
+    from reliquary.corpus.job import is_signed_sandbox
     from reliquary.infrastructure.corpus_job_store import _encode
 
     snapshot, etag, state, index = await _loaded(store, job)
     seen = len(index) + len(state.pending)
-    expected = state.slots.filled * job.sampling.n
+    expected = state.slots.filled * (job.sampling.n + (1 if is_signed_sandbox(job) else 0))
     problems = []
     if seen != expected:
         problems.append(
@@ -1381,7 +1386,10 @@ def worst_case_body(job: JobSpec) -> int:
     completions at about 24 JSON bytes a token, plus the rendered prompt and
     slack; an episode job's trajectory is bounded by the minimum."""
     if job.episode is not None:
-        return MIN_SUBMIT_BODY_BYTES
+        from reliquary.corpus.job import is_signed_sandbox
+        from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
+
+        return MIN_SUBMIT_BODY_BYTES + (MAX_TRANSCRIPT_BYTES if is_signed_sandbox(job) else 0)
     sampling = job.sampling
     return max(MIN_SUBMIT_BODY_BYTES,
                sampling.n * sampling.max_new_tokens * 24 + MAX_RENDERED_PROMPT_CHARS + 64 * 1024)
@@ -1425,6 +1433,13 @@ def _capped_route(cap_for: Callable[[Request], int]) -> type[APIRoute]:
             return capped
 
     return CappedSubmitRoute
+
+
+def _retry_later(refusal) -> HTTPException:
+    """A transient intake refusal (stale sandbox directory, a session whose other
+    submission is in flight): retryable, nothing consumed."""
+    return HTTPException(status_code=503, detail=refusal.reason,
+                         headers={"Retry-After": str(int(refusal.retry_after))})
 
 
 def _body_too_large() -> JSONResponse:
@@ -1560,6 +1575,13 @@ def build_corpus_router(
         submission_id = corpus_submission_id(request)
         if episode_facts is not None:
             trajectory = request.trajectory.model_dump()
+            transcript = trajectory.get("transcript")
+            if transcript is None:
+                trajectory.pop("transcript", None)      # replay records stay as they were
+            elif isinstance(transcript.get("token"), dict):
+                # The token's signature is a bearer secret, never written to R2; the
+                # grader and the export read its claims only.
+                transcript["token"].pop("signature", None)
             # The prompt the audit prefills is the validator's own render,
             # never the miner's.
             trajectory["prompt_tokens"] = list(episode_facts.prompt_ids)
@@ -1670,6 +1692,10 @@ def build_corpus_router(
     async def submit_corpus(
         request: CorpusSubmissionRequest,
     ) -> CorpusSubmissionResponse:
+        # The intake's clock, read on arrival (a signed job's deadline is when the
+        # submission was received, not when its check ran).
+        intake_clock = getattr(episode_intake, "clock", None)
+        received = intake_clock() if intake_clock is not None else None
         # First, and before the store is touched at all: another job's work is
         # not this validator's to admit, record or eventually pay for.
         if request.job_id != job_id:
@@ -1722,9 +1748,14 @@ def build_corpus_router(
             if episode_intake is None:
                 logger.error("corpus job %s is an episode job but has no episode intake", job_id)
                 raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
-            # Every refusal here precedes any slot or cursor consumption.
-            outcome = await asyncio.to_thread(episode_intake.check, request)
+            # Every refusal here precedes any slot or cursor consumption. The
+            # signed intake's deadline is the time the submission arrived.
+            outcome = await (asyncio.to_thread(episode_intake.check, request, received=received)
+                             if received is not None
+                             else asyncio.to_thread(episode_intake.check, request))
             if not isinstance(outcome, IntakeFacts):
+                if getattr(outcome, "retry_after", None) is not None:
+                    raise _retry_later(outcome)
                 try:
                     reason = CorpusRejectReason(outcome.reason)
                 except ValueError:
@@ -1784,6 +1815,10 @@ def build_corpus_router(
                 if not text.ok:
                     return _refuse(CorpusRejectReason(text.reason), text.detail)
 
+        # A signed-sandbox session's seen key joins the turn's digests: recorded in the
+        # same compare-and-swap that consumes the slot (admit refuses it when seen).
+        session_key = getattr(episode_facts, "session_key", "") or None
+        seen_keys = [*digests, session_key] if session_key else list(digests)
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
         record = None
@@ -1830,21 +1865,47 @@ def build_corpus_router(
                               else [len(c.proofs) for c in request.completions]),
                 proof_chunk_tokens=None if episode_facts is not None else proof_chunk_tokens,
                 episode_checked=episode_facts is not None,
+                session_key=session_key,
             )
+
+        # A signed-sandbox session is claimed before the write and the claim ends
+        # exactly once: `accepted` after an accepting write, `release` otherwise.
+        claim_open = [False]
+
+        async def end_claim(accepted: bool) -> None:
+            if not claim_open[0]:
+                return
+            claim_open[0] = False
+            try:
+                if accepted:
+                    await episode_intake.accepted(episode_facts)
+                else:
+                    await episode_intake.release(episode_facts)
+            except Exception:
+                logger.exception("ending sandbox session %s's claim failed",
+                                 getattr(episode_facts, "session_id", "?"))
+
+        async def abandoned() -> None:
+            await end_claim(False)
 
         async def settled(turn: _TurnResult) -> None:
             # Outside the turn: the record is create-only and keyed by its own
             # id, so it needs no turn on the ledger. Run even if the miner hung
             # up, so a slot the ledger consumed always gets its record.
-            if turn.verdict is None or not turn.verdict.accepted:
-                return
-            timing.update(turn.timing)
-            mark = time.perf_counter()
-            if record is not None:
-                await recover_records(job)
-            else:
-                await _record_accepted(request, job_id, episode_facts)
-            timing["record_write"] = time.perf_counter() - mark
+            accepted = turn.verdict is not None and turn.verdict.accepted
+            try:
+                if not accepted:
+                    return
+                timing.update(turn.timing)
+                mark = time.perf_counter()
+                if record is not None:
+                    await recover_records(job)
+                else:
+                    await _record_accepted(request, job_id, episode_facts)
+                timing["record_write"] = time.perf_counter() - mark
+            finally:
+                # Whatever the record step does: the ledger's verdict decides.
+                await end_claim(accepted)
             timing["total"] = time.perf_counter() - started
             logger.info(
                 "corpus submission timing %s: %s attempts=%d batch=%d",
@@ -1854,8 +1915,18 @@ def build_corpus_router(
                 turn.batch,
             )
 
+        if session_key is not None:
+            refused = await episode_intake.claim(episode_facts)
+            if refused is not None:
+                if refused.retry_after is not None:
+                    raise _retry_later(refused)
+                return _refuse(CorpusRejectReason(refused.reason), refused.detail)
+            claim_open[0] = True
+
         try:
-            turn = await _take_turn(job, decide, digests, settled, record=record)
+            turn = await _take_turn(job, decide, seen_keys, settled,
+                                    abandoned if session_key is not None else None,
+                                    record=record)
         except asyncio.TimeoutError:
             logger.warning(
                 "corpus ledger turn for %s not granted within %.0f s (miner %s)",
@@ -2028,14 +2099,14 @@ def build_corpus_router(
         )
 
     async def _take_turn(job: JobSpec, decide, digests: Sequence[str],
-                         settled=None, *, record=None) -> "_TurnResult":
+                         settled=None, abandoned=None, *, record=None) -> "_TurnResult":
         """Queue one decision for the next ledger turn and wait for its
         verdict. Raises ``asyncio.TimeoutError`` when no turn takes it within
         ``ledger_lock_timeout`` (it is then withdrawn: nothing was consumed);
         once a turn has taken it, it waits for that turn as a lock holder did."""
         loop = asyncio.get_running_loop()
         entry = _TurnEntry(job, decide, digests, loop.create_future(), time.perf_counter(),
-                           settled, record=record)
+                           settled, abandoned, record=record)
         turn_queue.append(entry)
         _wake_committer()
         try:
@@ -2043,19 +2114,34 @@ def build_corpus_router(
         except BaseException:
             if not entry.taken:
                 turn_queue.remove(entry)
+                _abandon(entry)
                 await release_record(entry)
             raise
         if not done and not entry.taken:
             turn_queue.remove(entry)
+            _abandon(entry)
             await release_record(entry)
             raise asyncio.TimeoutError
         # Shielded: a request cancelled now must not cancel its turn's result
         # out from under the batch it shares, nor its record write.
         return await asyncio.shield(entry.finisher)
 
+    def _abandon(entry: _TurnEntry) -> None:
+        """An entry withdrawn before any turn took it: its `abandoned` runs in a task
+        of its own, since the handler withdrawing it may be cancelled."""
+        if entry.abandoned is not None:
+            task = asyncio.get_running_loop().create_task(entry.abandoned())
+            finishing.add(task)
+            task.add_done_callback(_finished)
+
     async def _finish(entry: _TurnEntry) -> _TurnResult:
         try:
             turn = await entry.future
+        except BaseException:
+            if entry.abandoned is not None:
+                await entry.abandoned()
+            raise
+        else:
             if entry.settled is not None:
                 await entry.settled(turn)
             return turn
@@ -2322,6 +2408,16 @@ def build_corpus_router(
         return job, await _read_state(job)
 
     router.ledger_state = ledger_state
+
+    async def slots_remaining(prompt_index: int) -> int | None:
+        """Slots this prompt still accepts, read fresh; None when the job is complete,
+        unknown or does not own the prompt (the sandbox session issuer's view)."""
+        job, state = await ledger_state()
+        if job is None or state is None or state.slots.is_complete or not job.owns(prompt_index):
+            return None
+        return state.slots.remaining(prompt_index)
+
+    router.slots_remaining = slots_remaining
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
     router.corpus_job = corpus_job

@@ -149,7 +149,12 @@ def _record_identity(job_id, submission_id, record) -> None:
             raise ValueError("Staged episode has invalid validator prompt tokens")
         trajectory = CorpusTrajectory.model_validate(raw, strict=True)
         count = sum(t.end - t.start for t in trajectory.turns)
-        if trajectory.model_dump() != raw:
+        native = trajectory.model_dump()
+        if native.get("transcript") is None:
+            # A replay record carries no transcript field at all (signed-sandbox
+            # records alone do), so its bytes stay what they were before.
+            native.pop("transcript", None)
+        if native != raw:
             raise ValueError("Staged trajectory differs from its native wire shape")
     if count != record["token_count"]:
         raise ValueError("Staged submission token count differs from its native body")

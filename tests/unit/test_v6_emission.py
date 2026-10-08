@@ -435,6 +435,7 @@ async def _archive_one_v6_window(
     )
 
     batcher = MagicMock()
+    batcher.service_runtime = None
     batcher.window_start = 42
     batcher.randomness = "0xdeadbeef"
     batcher.window_opened_at = 100.0

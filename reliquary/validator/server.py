@@ -1491,6 +1491,14 @@ class ValidatorServer:
         self._verdict_persistence_error = False
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
+    @staticmethod
+    def _service_state_key(batcher):
+        runtime = getattr(batcher, "service_runtime", None)
+        if runtime is None or _is_mock_like(runtime):
+            return None
+        view = runtime.view
+        return (runtime.contract.sha256, runtime.active(), view.revision if view is not None else None)
+
     def _state_cache_key(self, batcher) -> tuple:
         """Everything the /state payload depends on, for one batcher."""
         cp = self._current_checkpoint
@@ -1535,6 +1543,7 @@ class ValidatorServer:
             fill_collection_closed,
             fill_sealed,
             fill_admission_closed,
+            self._service_state_key(batcher),
         )
 
     def _miner_state_cache_key(self) -> tuple:
@@ -1547,6 +1556,7 @@ class ValidatorServer:
                     environment,
                     id(batcher),
                     int(batcher.window_start),
+                    self._service_state_key(batcher),
                     str(batcher.randomness),
                     getattr(batcher, "prompt_range", None),
                     float(batcher.window_opened_wall_ts),
@@ -3566,6 +3576,7 @@ class ValidatorServer:
             bootstrap=bool(getattr(batcher, "bootstrap", False)),
             enforce_envelope_signature=ENFORCE_ENVELOPE_SIGNATURE,
             enforce_legacy_merkle=LEGACY_MERKLE_ROOT_ENFORCE,
+            service_policy=(batcher.service_policy if isinstance(getattr(batcher, "service_policy", None), dict) else None),
         )
         self._admission_contexts[cache_key] = context
         return context
@@ -5058,6 +5069,8 @@ class ValidatorServer:
                     protocol_version=request.protocol_version,
                     generation_profile_id=request.generation_profile_id,
                     envelope_signature=request.envelope_signature,
+                    pool_selection=request.pool_selection,
+                    service_binding=request.service_binding,
                 )
                 if not envelope_signature_valid:
                     # CONNECTION-PRIMING DEFENCE — force socket teardown.
@@ -5856,6 +5869,20 @@ class ValidatorServer:
                 )
             )
 
+        @app.get("/service-observations")
+        async def service_observations(after: int = 0, limit: int = 1000):
+            batcher = self.active_batcher
+            runtime = getattr(batcher, "service_runtime", None) if batcher is not None else None
+            if runtime is None:
+                raise HTTPException(status_code=404, detail="no_service_task")
+            # Private mappings are retrieved by the owner via the admin artifact route.
+            if runtime.contract.to_dict()["visibility"] != "task":
+                raise HTTPException(status_code=403, detail="private_service_observations")
+            try:
+                return runtime.snapshot(after=after, limit=limit)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="invalid_cursor") from exc
+
         @app.get(
             "/state",
             response_model=GrpoBatchState,
@@ -5925,7 +5952,9 @@ class ValidatorServer:
                 state=self._current_state,
                 window_n=batcher.window_start,
                 anchor_block=batcher.window_start,
-                cooldown_prompts=batcher.cooldown_prompts_snapshot,
+                cooldown_prompts=(sorted(set(batcher.cooldown_prompts_snapshot) | set(batcher.service_runtime.view.blocked_indices()))
+                                  if getattr(batcher, "service_runtime", None) is not None and not _is_mock_like(batcher.service_runtime) and batcher.service_runtime.view is not None
+                                  else batcher.cooldown_prompts_snapshot),
                 valid_submissions=submission_count,
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
@@ -5946,6 +5975,7 @@ class ValidatorServer:
                     else None
                 ),
                 fill_closed=fill_closed,
+                service_policy=(batcher.service_policy if isinstance(getattr(batcher, "service_policy", None), dict) else None),
                 randomness=batcher.randomness,
             )
             excluded_fields: set[str] = set()
@@ -6031,6 +6061,12 @@ class ValidatorServer:
                 membership = getattr(batcher, "cooldown_prompts_membership", None)
                 if membership is None:
                     membership = set(batcher.cooldown_prompts_snapshot)
+                runtime = getattr(batcher, "service_runtime", None)
+                if runtime is not None and not _is_mock_like(runtime):
+                    membership = set(membership)
+                    lo, hi = prompt_range
+                    active = runtime.active()
+                    membership.update(idx for idx in range(lo, hi) if not active or (runtime.view is not None and not runtime.view.eligible(idx)))
                 bitmap, cooldown_count = encode_cooldown_bitmap(membership, prompt_range)
                 productive_remaining = max(
                     0,
@@ -6065,6 +6101,8 @@ class ValidatorServer:
                         productive_remaining,
                         grading_remaining,
                     )
+                if runtime is not None and not _is_mock_like(runtime) and not runtime.active():
+                    admission_remaining = 0
                 accepting_submissions = (
                     self._current_state is WindowState.OPEN
                     and not batcher.is_sealed()
@@ -6111,6 +6149,7 @@ class ValidatorServer:
                     else None
                 ),
                 randomness=first_batcher.randomness,
+                service_policy=(first_batcher.service_policy if isinstance(getattr(first_batcher, "service_policy", None), dict) else None),
             )
             body = payload.model_dump_json().encode("utf-8")
             if self._miner_state_cache_key() != cache_key:

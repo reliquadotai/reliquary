@@ -50,11 +50,54 @@ _MAX_CONSECUTIVE_FAILURES = 5
 TRANSIENT_STATUSES = frozenset({502, 503, 504})
 
 
+def retry_after_seconds(value) -> float | None:
+    """A `Retry-After` header in whole seconds, rounded up and at least 1; None when
+    absent or not a number of seconds (an HTTP date is not honoured, the caller's
+    own backoff applies)."""
+    import math
+
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return float(max(1, math.ceil(seconds)))
+
+
+_SECRET_KEYS = frozenset({"token", "transcript", "signature", "episode_key"})
+MAX_LOGGED_DETAIL_CHARS = 500
+
+
+def loggable_detail(detail) -> str:
+    """A refusal's detail for a log line: keys that can carry a session token or a
+    signed transcript are dropped, and the rest is truncated."""
+    def scrub(value, depth=0):
+        if depth > 4:
+            return "..."
+        if isinstance(value, dict):
+            return {key: ("<redacted>" if key in _SECRET_KEYS else scrub(item, depth + 1))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item, depth + 1) for item in value[:20]]
+        return value
+
+    if not detail:
+        return ""
+    text = str(scrub(detail))
+    return text if len(text) <= MAX_LOGGED_DETAIL_CHARS else text[:MAX_LOGGED_DETAIL_CHARS] + "..."
+
+
 class CorpusTransientFailure(Exception):
     """Ledger contention (HTTP 503) or a transport-level failure (timeout,
     connection error). The request that failed is idempotent -- it is either
     a cursor read or a signed, already-built submission -- so the caller
-    retries the SAME request rather than building a new one."""
+    retries the SAME request rather than building a new one, never before the
+    answer's `Retry-After` (`retry_after`)."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class CorpusPermanentFailure(Exception):
@@ -113,7 +156,9 @@ def issue_corpus_request(request_call):
     if response.status_code == 409 and _error_object(response).get("detail") == "job_paused":
         raise CorpusTransientFailure(f"409 job_paused from {response.request.url}")
     if response.status_code in TRANSIENT_STATUSES:
-        raise CorpusTransientFailure(f"{response.status_code} from {response.request.url}")
+        raise CorpusTransientFailure(
+            f"{response.status_code} from {response.request.url}",
+            retry_after=retry_after_seconds(response.headers.get("Retry-After")))
     if response.status_code >= 400:
         raise CorpusPermanentFailure(
             f"{response.status_code} from {response.request.url}",
@@ -297,13 +342,15 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
         except CorpusTransientFailure as exc:
             consecutive_permanent = 0
             delay = _TRANSIENT_BACKOFF_SECONDS[min(attempt, len(_TRANSIENT_BACKOFF_SECONDS) - 1)]
+            delay = max(delay, getattr(exc, "retry_after", None) or 0.0)
             logger.warning("corpus request hit a transient failure: %s; retrying in %.0fs", exc, delay)
             sleep(delay)
             attempt += 1
         except CorpusPermanentFailure as exc:
             consecutive_permanent += 1
             counts["permanent_failure"] += 1
-            logger.error("corpus request failed (status=%s): %s", exc.status, exc.detail or exc)
+            logger.error("corpus request failed (status=%s): %s", exc.status,
+                         loggable_detail(exc.detail) or exc)
             if consecutive_permanent >= max_consecutive_failures:
                 raise CorpusMinerHalted(
                     f"{consecutive_permanent} consecutive permanent failures: {exc}",
