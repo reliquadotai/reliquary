@@ -28,7 +28,11 @@ What a caller can rely on:
 * Settlement. ``reconcile_archive`` finalizes what is left, prices the ledger's integer
   entitlement counts with ``settle_window``, self-checks the result with
   ``validate_service_archive_v2`` under the protocol slot geometry, and freezes it. Calling it
-  again returns the same service fields; a verdict arriving after finalize changes nothing.
+  again returns the frozen service fields and disposition whatever the archive or the keyword says
+  (the first settlement is the truth; it never raises on that path); a verdict arriving after
+  finalize changes nothing.
+* Scans. A prompt with a counting training observation is scanned for the run; exploration on a
+  prompt trained in the same window is unpaid (``trained``, no sanction). See ``run_log``.
 
 Only ``service-contract/v2`` runs RL here; ``service-contract/v1`` (dataset mapping / curation)
 is refused.
@@ -57,7 +61,7 @@ from reliquary.services.exploration import (
     AUDIT_DRAW_ROUND_OFFSET, STATUS_FORFEITED, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger,
     apply_exploration_verdict, exploration_cap, exploration_price, finalize_exploration, record_exploration,
 )
-from reliquary.services.run_log import Observation, RunObservationLog, observation_id
+from reliquary.services.run_log import STATUS_PROVEN_UNPAID, Observation, RunObservationLog, observation_id
 from reliquary.services.settlement import SERVICE_PAYMENT_POLICY_V2, settle_window, validate_service_archive_v2
 
 logger = logging.getLogger(__name__)
@@ -104,6 +108,27 @@ class AuditOutcome:
     @property
     def applied(self) -> bool:
         return self.kind != "not_applied"
+
+
+_MAX_NUMBER = 1e15  # clocks, pools and rewards are far below; beyond it a number is not one of them
+
+
+def _finite(value) -> bool:
+    """True for a finite int/float within ``_MAX_NUMBER``. Never raises: ``math.isfinite`` and
+    ``float()`` raise OverflowError on a huge int, which would escape an ``except ValueError``."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return -_MAX_NUMBER <= value <= _MAX_NUMBER
+    return isinstance(value, float) and math.isfinite(value) and abs(value) <= _MAX_NUMBER
+
+
+def _instant(now) -> float:
+    """The validator-clock instant of a call (default: now). ValueError when it is not a clock value."""
+    value = time.time() if now is None else now
+    if not _finite(value):
+        raise ValueError("invalid service clock")
+    return float(value)
 
 
 class ServicePolicyLimit(ValueError):
@@ -177,9 +202,7 @@ class ServiceRuntime:
         self.qualification = json.loads(canonical_json_bytes(qualification))
         self._round_at = drand_round_at or _drand_round_at
         self.lock = threading.RLock()
-        instant = time.time() if now is None else now
-        if not math.isfinite(instant):
-            raise ValueError("invalid order clock")
+        instant = _instant(now)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
         try:
             self.db.execute("PRAGMA journal_mode=WAL")
@@ -191,7 +214,7 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_orders(id TEXT PRIMARY KEY, started REAL NOT NULL, clock REAL NOT NULL, groups INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, contract TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_checkpoints(order_id TEXT NOT NULL, revision TEXT NOT NULL, checkpoint_n INTEGER NOT NULL, repo TEXT NOT NULL, sha256 TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(order_id, revision));
                 CREATE TABLE IF NOT EXISTS service_schedules(order_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL, applied_window INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(order_id, revision), UNIQUE(order_id, request_id));
-                CREATE TABLE IF NOT EXISTS service_windows(order_id TEXT NOT NULL, window INTEGER NOT NULL, envelope TEXT NOT NULL, PRIMARY KEY(order_id, window));
+                CREATE TABLE IF NOT EXISTS service_windows(order_id TEXT NOT NULL, window INTEGER NOT NULL, envelope TEXT NOT NULL, opened_at REAL, PRIMARY KEY(order_id, window));
                 CREATE TABLE IF NOT EXISTS service_pools(order_id TEXT NOT NULL, window INTEGER NOT NULL, randomness TEXT NOT NULL, PRIMARY KEY(order_id, window));
                 CREATE TABLE IF NOT EXISTS service_draw_beacons(order_id TEXT NOT NULL, round INTEGER NOT NULL, randomness TEXT NOT NULL, PRIMARY KEY(order_id, round));
                 CREATE TABLE IF NOT EXISTS service_settled(order_id TEXT NOT NULL, window INTEGER NOT NULL, aborted INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(order_id, window));
@@ -199,6 +222,8 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_training_stride(order_id TEXT PRIMARY KEY, stride INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_consumption(order_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL, q TEXT NOT NULL);
             """)
+            if "opened_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(service_windows)")}:
+                self.db.execute("ALTER TABLE service_windows ADD COLUMN opened_at REAL")
             with self.db:
                 self.db.execute("BEGIN IMMEDIATE")
                 if self.db.execute("SELECT 1 FROM service_orders WHERE id<>? LIMIT 1", (contract.sha256,)).fetchone():
@@ -254,9 +279,7 @@ class ServiceRuntime:
                 raise ValueError("service consumption projection conflicts with its journal key")
 
     def active(self, *, now: float | None = None) -> bool:
-        instant = time.time() if now is None else now
-        if not math.isfinite(instant):
-            raise ValueError("invalid order clock")
+        instant = _instant(now)
         with self.lock, self.db:
             start, previous = self.db.execute("SELECT started,clock FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()
             instant = max(instant, previous)
@@ -414,7 +437,8 @@ class ServiceRuntime:
         return self.adopt(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=root["sha256"])
 
     # --- windows ---
-    def open_window(self, window: int, *, pools: dict, picks_target: int, batch_slots: int) -> dict:
+    def open_window(self, window: int, *, pools: dict, picks_target: int, batch_slots: int,
+                    now: float | None = None) -> dict:
         """Freeze the envelope of ``window`` and return it.
 
         ``pools`` is ``{env: absolute emission fraction}`` for exactly the active envs of the
@@ -422,8 +446,14 @@ class ServiceRuntime:
         (the one archive validation and weight replay use). Opening an already frozen window with
         the same pools and geometry returns the FROZEN envelope (its schedule and checkpoint, not
         the current ones): this is the restart path. Anything else is refused.
+
+        Windows open in increasing order: a window lower than the highest frozen one is refused
+        unless it is itself frozen (restart), so an old window can never be born with the latest
+        schedule. The opening instant (``now``, validator clock) is stored with the frozen row, first
+        one wins: an exploration group cannot claim an arrival before it (``record_exploration``).
         """
         _integer(window, "window", 0)
+        instant = _instant(now)
         if (picks_target, batch_slots) != protocol_slot_geometry() or type(picks_target) is not int \
                 or type(batch_slots) is not int:
             raise ValueError("service window slot geometry differs from the protocol's")
@@ -432,7 +462,7 @@ class ServiceRuntime:
         given = {}
         for env in sorted(pools):
             value = pools[env]
-            if not isinstance(env, str) or type(value) not in (int, float) or not math.isfinite(value) \
+            if not isinstance(env, str) or type(value) not in (int, float) or not _finite(value) \
                     or not 0 <= value <= 1:
                 raise ValueError("invalid service window pool")
             given[env] = float(value)
@@ -445,6 +475,9 @@ class ServiceRuntime:
                 if envelope["pools"] != given:
                     raise ValueError("service window envelope is already frozen")
                 return envelope
+            highest = self.db.execute("SELECT MAX(window) FROM service_windows WHERE order_id=?", (order,)).fetchone()[0]
+            if highest is not None and window < highest:
+                raise ValueError(f"service windows open in increasing order: window {highest} is already frozen")
             schedule = self._schedule()
             if set(given) != set(schedule.active_environments()):
                 raise ValueError("window pools must cover exactly the active environments")
@@ -455,8 +488,8 @@ class ServiceRuntime:
                         "schedule_sha256": schedule.sha256, "pools": given,
                         "picks_target": picks_target, "batch_slots": batch_slots,
                         "checkpoint": self._checkpoint()}
-            self.db.execute("INSERT INTO service_windows VALUES(?,?,?)",
-                            (order, window, canonical_json_bytes(envelope).decode()))
+            self.db.execute("INSERT INTO service_windows(order_id, window, envelope, opened_at) VALUES(?,?,?,?)",
+                            (order, window, canonical_json_bytes(envelope).decode(), instant))
             return envelope
 
     def _envelope(self, window: int) -> dict:
@@ -541,13 +574,13 @@ class ServiceRuntime:
             raise ValueError("prompt index is outside the ordered dataset")
         if not isinstance(hotkey, str) or not 1 <= len(hotkey) <= 256:
             raise ValueError("invalid service hotkey")
-        if type(token_count) is not int or token_count < 0:
+        if type(token_count) is not int or not 0 <= token_count < 2**62:
             raise ValueError("invalid service token count")
         if type(rewards) not in (list, tuple):
             raise ValueError("rewards must be the list of graded rollout rewards")
         bps = []
         for reward in rewards:
-            if type(reward) not in (int, float) or not math.isfinite(reward) or not 0 <= reward <= 1:
+            if type(reward) not in (int, float) or not _finite(reward) or not 0 <= reward <= 1:
                 raise ValueError("rewards must be finite numbers in [0, 1]")
             bps.append(round(reward * 10000))
         _sha(group_id, "group_id")
@@ -591,10 +624,10 @@ class ServiceRuntime:
         (nothing written) when the order is inactive, the window is unknown / settled, the env is
         not in the window, or the evidence is not an observation.
         """
-        instant = time.time() if now is None else now
         context = {"environment": environment, "prompt_idx": prompt_idx, "window": window,
                    "group_id": group_id, "hotkey": hotkey}
         try:
+            instant = _instant(now)
             if not self.active(now=instant):  # outside the transaction: active() commits its clock
                 raise ServicePolicyLimit("service order is inactive")
             with self._txn():
@@ -606,7 +639,7 @@ class ServiceRuntime:
                 if result.inserted:
                     self.db.execute("UPDATE service_orders SET groups=groups+1, tokens=tokens+? WHERE id=?",
                                     (token_count, self.contract.sha256))
-        except ValueError as exc:  # NotAnObservation, seeds/rewards mismatch, conflicting evidence, ...
+        except (ValueError, OverflowError) as exc:  # NotAnObservation, conflicting evidence, a huge number, ...
             refusal = self._refused(exc, "training", context)
             if refusal is exc:
                 raise
@@ -624,28 +657,34 @@ class ServiceRuntime:
 
         ``arrived_at`` is the VALIDATOR-clock time the submission arrived (default: now; never a
         miner-supplied value, and never later than now). The audit draw round is the drand round
-        of that instant + 2, so its beacon does not exist when the group is committed.
+        of that instant + 2, so its beacon does not exist when the group is committed. An arrival
+        before the window was opened (``open_window``'s stored instant) is refused: a group cannot
+        pick a past round whose beacon is already public.
 
         Returns ``{"observation_id", "inserted", "first_scan", "entitled", "amount", "status",
         "reason", "forced_audit", "draw_round"}``. ``status`` is ``exploration_pending`` when one
         entitlement is reserved (``amount`` is its nominal price, before any proportional scale),
         else ``exploration_unpaid`` with ``reason``: ``already_scanned`` (first arrival on the
         (env, prompt) wins, whatever the group id), ``banned``, ``cap``, ``finalized``,
-        ``zero_price``, ``order_inactive``, ``exploration_disabled``, ``token_limit`` or
-        ``replay``. An unpaid observation is published and never holds the prompt's first scan.
+        ``zero_price``, ``probation_limit``, ``order_inactive``, ``exploration_disabled``,
+        ``token_limit`` or ``replay``. ``already_scanned`` also covers a prompt with a training
+        observation in the run. An entitlement whose prompt is trained in the same window ends
+        unpaid at finalize (``trained``). An unpaid observation is published and never holds the
+        prompt's first scan.
         Raises ``ServicePolicyLimit`` (nothing written, logged) when the group is not an
         observation or the window cannot take it.
         """
-        instant = time.time() if now is None else now
         context = {"environment": environment, "prompt_idx": prompt_idx, "window": window,
                    "group_id": group_id, "hotkey": hotkey}
         reward = self.contract.reward_policy
         try:
+            instant = _instant(now)
             arrival = instant if arrived_at is None else arrived_at
-            if type(arrival) not in (int, float) or not math.isfinite(arrival):
+            if type(arrival) not in (int, float) or not _finite(arrival):
                 raise ValueError("invalid arrival time")
+            arrival = min(float(arrival), instant)
             try:
-                draw_round = int(self._round_at(min(float(arrival), float(instant)))) + AUDIT_DRAW_ROUND_OFFSET
+                draw_round = int(self._round_at(arrival)) + AUDIT_DRAW_ROUND_OFFSET
             except RuntimeError as exc:  # no drand clock: the audit cannot be drawn, so nothing is owed
                 raise ValueError(f"audit draw round is unknown: {exc}") from exc
             active = self.active(now=instant)  # outside the transaction: active() commits its clock
@@ -655,6 +694,10 @@ class ServiceRuntime:
                                         window=window, rewards=rewards, group_id=group_id, candidate=candidate,
                                         token_count=token_count, lane="exploration", now=instant)
                 context["observation_id"] = self._observation_id(obs)
+                opened = self.db.execute("SELECT opened_at FROM service_windows WHERE order_id=? AND window=?",
+                                         (self.contract.sha256, window)).fetchone()[0]
+                if opened is not None and arrival < opened:
+                    raise ValueError("arrival time precedes the opening of the window")
                 refuse = None
                 if not active:
                     refuse = "order_inactive"
@@ -671,7 +714,7 @@ class ServiceRuntime:
                     cap=exploration_cap(pool, cap_bps=reward["cap_bps"]),
                     draw_round=draw_round, new_hotkey_audit_groups=reward["new_hotkey_audit_groups"],
                     now=instant, refuse=refuse)
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             refusal = self._refused(exc, "exploration", context)
             if refusal is exc:
                 raise
@@ -715,7 +758,7 @@ class ServiceRuntime:
         round uses, in every window and after a restart (table ``service_draw_beacons``).
         Fetching happens outside the lock and outside any transaction.
         """
-        instant = time.time() if now is None else now
+        instant = _instant(now)
         order = self.contract.sha256
         with self.lock:
             environments = self._environments(window, environment)
@@ -760,7 +803,9 @@ class ServiceRuntime:
         Rows drawn for audit, still entitled, in a (window, env) not yet finalized. Hotkeys past
         probation (``passed_audits >= new_hotkey_audit_groups``) come first, then ascending draw
         round, then reservation order. Each row: ``observation_id``, ``environment``, ``hotkey``,
-        ``prompt_idx``, ``draw_round``, ``forced``, ``past_probation``.
+        ``prompt_idx``, ``draw_round``, ``forced``, ``past_probation``. A row whose prompt already
+        has a training observation in the window is left out: finalize will make it unpaid
+        (``trained``, R17), so it needs no audit.
         """
         threshold = self.contract.reward_policy["new_hotkey_audit_groups"]
         with self.lock:
@@ -768,8 +813,9 @@ class ServiceRuntime:
             for env in self._environments(window, environment):
                 if self.ledger.is_finalized(window, environment=env):
                     continue
+                trained = self.log.trained_prompts(window, env)
                 for position, row in enumerate(self.ledger.rows(window, environment=env)):
-                    if row["audit"] != "queued" or row["status"] != "reserved":
+                    if row["audit"] != "queued" or row["status"] != "reserved" or row["prompt_idx"] in trained:
                         continue
                     hotkey = row["hotkey"]
                     if hotkey not in seasoned:
@@ -786,7 +832,9 @@ class ServiceRuntime:
             pending = 0
             for env in self._environments(window, environment):
                 if not self.ledger.is_finalized(window, environment=env):
+                    trained = self.log.trained_prompts(window, env)
                     pending += sum(row["audit"] == "pending_draw" and row["status"] == "reserved"
+                                   and row["prompt_idx"] not in trained
                                    for row in self.ledger.rows(window, environment=env))
         queued = self.queued_audits(window, environment=environment)
         return {"pending_draw": pending, "queued": len(queued),
@@ -800,8 +848,9 @@ class ServiceRuntime:
         """Apply one audit verdict; return an ``AuditOutcome`` (passed / failed + forfeited ids / not_applied).
 
         One transaction: the verdict, the release of every forfeited first scan and the public
-        settle events (``exploration_pending`` / ``audited`` on a pass; ``exploration_forfeited``
-        for every id forfeited in an env not yet finalized, ``failed`` for the audited one). No paid
+        settle events (``exploration_pending`` / ``audited`` on a pass of a row still entitled;
+        ``exploration_forfeited`` for every id forfeited in an env not yet finalized -- also when the
+        failure itself is late, on a row of a finalized env --, ``failed`` for the audited one). No paid
         status is published here: pay is only known at finalize. A verdict on a (window, env)
         already finalized changes none of its rows and publishes nothing for them; a late failure on
         a drawn group still bans and forfeits the hotkey's entitlements in the envs of that window
@@ -812,21 +861,22 @@ class ServiceRuntime:
         """
         if type(passed) is not bool:
             raise ValueError("an audit verdict is a boolean")
-        instant = time.time() if now is None else now
         try:
+            instant = _instant(now)
             with self._txn():
                 kind, forfeited = apply_exploration_verdict(
                     self.log, self.ledger, identity, passed=passed, now=instant,
                     ban_seconds=self.contract.reward_policy["ban_seconds"])
                 if kind == "passed":
                     entry = self._entitlement_row(identity)
-                    if not self.ledger.is_finalized(entry[0], environment=entry[1]):
+                    # Only a row still entitled is "pending": never after its forfeit (M1).
+                    if entry[3] == "reserved" and not self.ledger.is_finalized(entry[0], environment=entry[1]):
                         self.log.settle(identity, status=STATUS_PENDING, proof="audited", at=instant)
                 for lost in forfeited:
                     entry = self._entitlement_row(lost)
                     if not self.ledger.is_finalized(entry[0], environment=entry[1]):
                         self.log.settle(lost, status=STATUS_FORFEITED, proof=_PROOF[entry[2]], at=instant)
-        except (ValueError, sqlite3.OperationalError) as exc:
+        except (ValueError, OverflowError, sqlite3.OperationalError) as exc:
             logger.error("exploration audit verdict not applied for observation %s (passed=%s): %s: %s",
                          identity, passed, type(exc).__name__, exc)
             return AuditOutcome("not_applied")
@@ -835,8 +885,10 @@ class ServiceRuntime:
     def _finalize_env(self, window: int, environment: str, *, aborted: bool, at: float) -> list[str]:
         """THE one place a (window, env) is finalized. Runs inside the caller's transaction.
 
-        Every id whose first scan is released gets its settle event (``exploration_unpaid``, or
-        ``exploration_forfeited`` for a row a failed audit already forfeited).
+        Every id whose first scan is released gets its settle event (``exploration_unpaid``, with
+        reason ``trained`` for a row whose prompt was trained in this window (R17), or
+        ``exploration_forfeited`` for a row a failed audit already forfeited). The release itself is
+        ``RunObservationLog.release_first_scan``, called by the ledger entry point.
         """
         # The single call site of the ledger's finalize. ``aborted`` is the one transition allowed on a
         # (window, env) the batcher already finalized before it knew the window was aborted.
@@ -846,11 +898,12 @@ class ServiceRuntime:
         for identity in released:
             row = rows[identity]  # a forfeited row keeps its label (R8), whatever its audit became
             self.log.settle(identity, status=STATUS_FORFEITED if row["status"] == "forfeited" else STATUS_UNPAID,
-                            proof=_PROOF[row["audit"]], at=at)
+                            proof=_PROOF[row["audit"]], at=at,
+                            reason="trained" if row["status"] == "trained" else None)
         return released
 
     def finalize_exploration(self, window: int, *, environment: str, now: float | None = None) -> list[str]:
-        """Freeze the exploration of one (window, env); return the ids left unaudited (unpaid).
+        """Freeze the exploration of one (window, env); return the ids left unpaid by it.
 
         SEAL CONTRACT (the caller's, before calling this): stop admitting exploration groups for
         the env; keep calling ``resolve_draws`` until ``pending_draw_rounds`` is empty or 2 drand
@@ -861,12 +914,14 @@ class ServiceRuntime:
 
         What is still waiting for its draw or its audit becomes ``unaudited``: unpaid, never
         sanctioned, and a hotkey's not-drawn rows at or after its first drawn-unaudited round are
-        unpaid too (per-hotkey audit horizon, R15). Their first scans are released and their
+        unpaid too (per-hotkey audit horizon, R15). Before that, in the same transaction, every
+        entitlement whose prompt has a training observation in this window becomes unpaid with
+        reason ``trained`` (R17: no sanction, no horizon). Their first scans are released and their
         ``exploration_unpaid`` settle events published, in this transaction. Idempotent. After
         it the rows never change: a later verdict pays nothing and takes nothing back.
         ``reconcile_archive`` finalizes whatever env was not, so a restart cannot pay an unaudited row.
         """
-        instant = time.time() if now is None else now
+        instant = _instant(now)
         with self._txn():
             self._environments(window, environment)
             return self._finalize_env(window, environment, aborted=False, at=instant)
@@ -882,49 +937,94 @@ class ServiceRuntime:
         service fields and publish the final settle events (``trained`` / ``proven_unpaid``,
         ``exploration_paid`` / ``exploration_unpaid`` / ``exploration_forfeited``).
 
-        Later calls recompute and must reproduce the frozen fields exactly (same archive in, same
-        bytes out); they publish nothing. An aborted window (``aborted=True`` or an archive whose
-        ``window_status`` is ``aborted``) pays no exploration and releases its first scans.
-        Every ``batch`` row must carry ``env_name`` (an env of the envelope) and a string
-        ``hotkey``; anything else raises (``SettlementError``) and freezes nothing.
+        Later calls return the caller's archive stamped with the FROZEN service fields and the
+        frozen disposition: the first settlement is the truth. Same archive in, same bytes out.
+        A later call that disagrees (another disposition, another batch, an archive that cannot be
+        settled) is logged at error level and still gets the frozen answer; it never raises and
+        publishes nothing, so a restart recovery that rebuilds the window differently cannot brick
+        the validator. An aborted window (``aborted=True`` or an archive whose ``window_status`` is
+        ``aborted``) pays no exploration, releases its first scans, and its training observations
+        stop counting as scans (they settle ``proven_unpaid``: nothing was trained).
+        On the FIRST call every ``batch`` row must carry ``env_name`` (an env of the envelope) and a
+        string ``hotkey``; anything else raises (``SettlementError``) and freezes nothing.
         """
         if type(aborted) is not bool or not isinstance(archive, dict):
             raise ValueError("invalid service settlement disposition")
         window = _integer(archive.get("window_start"), "window", 0)
         aborted = aborted or archive.get("window_status") == "aborted"
-        instant = time.time() if now is None else now
+        instant = _instant(now)
         picks, slots = protocol_slot_geometry()
         order = self.contract.sha256
         with self._txn():
             envelope = self._envelope(window)
             settled = self.db.execute("SELECT aborted, payload FROM service_settled WHERE order_id=? AND window=?",
                                       (order, window)).fetchone()
-            if settled is not None and settled[0] != int(aborted):
-                raise ValueError("service window settlement disposition is frozen")
-            if settled is None:
-                for env in sorted(envelope["pools"]):
-                    if not self.ledger.is_finalized(window, environment=env):
-                        waiting = sum(row["audit"] in ("pending_draw", "queued")
-                                      for row in self.ledger.rows(window, environment=env))
-                        if waiting:
-                            logger.warning("service window %d env %s settles with %d exploration group(s) "
-                                           "never audited (unpaid)", window, env, waiting)
-                    self._finalize_env(window, env, aborted=aborted, at=instant)
-            exploration = {}
+            if settled is not None:
+                return self._frozen_result(archive, window, envelope, bool(settled[0]), json.loads(settled[1]),
+                                           aborted)
             for env in sorted(envelope["pools"]):
-                counts = self.ledger.payable(window, environment=env)
-                if counts:
-                    exploration[env] = counts
+                if not self.ledger.is_finalized(window, environment=env):
+                    waiting = sum(row["audit"] in ("pending_draw", "queued")
+                                  for row in self.ledger.rows(window, environment=env))
+                    if waiting:
+                        logger.warning("service window %d env %s settles with %d exploration group(s) "
+                                       "never audited (unpaid)", window, env, waiting)
+                # Also for an env the caller finalized: abort, and R17 for a late training group.
+                self._finalize_env(window, env, aborted=aborted, at=instant)
             result = settle_window(archive=archive, envelope=envelope, contract=self.contract,
-                                   exploration=exploration, aborted=aborted)
+                                   exploration=self._payable(window, envelope), aborted=aborted)
             # Lane consistency under the protocol geometry; the task-cap bound is weight replay's.
             validate_service_archive_v2(result, self.contract, cap=1.0, picks_target=picks, batch_slots=slots)
-            frozen = canonical_json_bytes({key: result[key] for key in FROZEN_ARCHIVE_FIELDS}).decode()
-            if settled is None:
-                self.db.execute("INSERT INTO service_settled VALUES(?,?,?,?)", (order, window, int(aborted), frozen))
-                self._emit_settle_events(window, envelope, archive, aborted, instant)
-            elif settled[1] != frozen:
-                raise ValueError("service window reward map is already frozen")
+            record = {"fields": {key: result[key] for key in FROZEN_ARCHIVE_FIELDS},
+                      "delta": result["service_training_recomputed_delta"],
+                      "window_status": result.get("window_status")}
+            self.db.execute("INSERT INTO service_settled VALUES(?,?,?,?)",
+                            (order, window, int(aborted), canonical_json_bytes(record).decode()))
+            self._emit_settle_events(window, envelope, archive, aborted, instant)
+        return result
+
+    def _payable(self, window: int, envelope: dict) -> dict:
+        exploration = {}
+        for env in sorted(envelope["pools"]):
+            counts = self.ledger.payable(window, environment=env)
+            if counts:
+                exploration[env] = counts
+        return exploration
+
+    def _frozen_result(self, archive: dict, window: int, envelope: dict, frozen_aborted: bool, record: dict,
+                       aborted: bool) -> dict:
+        """A settled window: the caller's archive stamped with what the first settlement froze.
+
+        Never raises and writes nothing. A disagreement with the first settlement is an error log.
+        """
+        if "fields" not in record:  # a row written before the disposition was stored with it
+            record = {"fields": record, "delta": 0.0, "window_status": None}
+        fields = record["fields"]
+        if aborted != frozen_aborted:
+            logger.error("service window %d is already settled as %s; a later settlement as %s is ignored "
+                         "(the first settlement stands)", window, "aborted" if frozen_aborted else "not aborted",
+                         "aborted" if aborted else "not aborted")
+        else:
+            try:
+                again = settle_window(archive=archive, envelope=envelope, contract=self.contract,
+                                      exploration=self._payable(window, envelope), aborted=frozen_aborted)
+                same = canonical_json_bytes({key: again[key] for key in FROZEN_ARCHIVE_FIELDS}) == \
+                    canonical_json_bytes(fields)
+            except Exception as exc:  # the frozen answer is returned whatever this archive is
+                logger.error("service window %d is already settled; the archive of a later settlement cannot "
+                             "be settled (%s: %s) and is ignored", window, type(exc).__name__, exc)
+            else:
+                if not same:
+                    logger.error("service window %d is already settled; a later settlement computes another "
+                                 "reward map and is ignored (the first settlement stands)", window)
+        result = {**archive, **fields, "service_training_recomputed_delta": record["delta"]}
+        if frozen_aborted:
+            result["window_status"] = "aborted"
+        elif result.get("window_status") == "aborted":  # the window was NOT aborted: its first status stands
+            if record["window_status"] is None:
+                result.pop("window_status")
+            else:
+                result["window_status"] = record["window_status"]
         return result
 
     def _emit_settle_events(self, window: int, envelope: dict, archive: dict, aborted: bool, at: float) -> None:
@@ -941,16 +1041,19 @@ class ServiceRuntime:
                 trained = paid.get(key, 0) > 0
                 if trained:
                     paid[key] -= 1
-                self.log.settle(row["id"], status="trained" if trained else "proven_unpaid", proof="proven", at=at)
+                # proven_unpaid: proven, not trained (left out of the batch, or the window aborted).
+                # The log stops counting it as a scan of its prompt.
+                self.log.settle(row["id"], status="trained" if trained else STATUS_PROVEN_UNPAID, proof="proven", at=at)
             elif row["id"] in ledger:
                 entry = ledger[row["id"]]
                 if entry["status"] == "forfeited":
                     status = STATUS_FORFEITED
-                elif aborted or entry["audit"] == "unaudited":
+                elif aborted or entry["status"] != "reserved" or entry["audit"] == "unaudited":
                     status = STATUS_UNPAID
                 else:
                     status = STATUS_PAID
-                self.log.settle(row["id"], status=status, proof=_PROOF[entry["audit"]], at=at)
+                self.log.settle(row["id"], status=status, proof=_PROOF[entry["audit"]], at=at,
+                                reason="trained" if entry["status"] == "trained" else None)
             # An exploration observation without an entitlement was published unpaid, with its reason.
 
     # --- publication / admin reads ---

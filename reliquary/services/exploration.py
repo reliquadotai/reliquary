@@ -24,13 +24,21 @@ Rules a reader of the public log can rely on:
   probation, and at seal the queued audits are drained (bounded wait, and up to 2 drand rounds for
   pending draws) BEFORE ``finalize_exploration`` is called. The audit load is bounded by the cap.
 * First scans: an entitlement that ends unpaid for any reason (refused at admission, forfeited by
-  a failed audit, ``unaudited`` at finalize, horizon included) gives its first scan back, so the
-  prompt can be paid to a later observation. Only a paid entitlement keeps the prompt.
+  a failed audit, ``unaudited`` at finalize, horizon included, ``trained``, aborted window) gives its
+  first scan back through ``RunObservationLog.release_first_scan``, the one place that decides what
+  the prompt becomes: still scanned if a counting training observation of it exists in the run,
+  else free, so it can be paid to a later observation. A prompt with a training observation is
+  scanned: an exploration observation of it is refused ``already_scanned``.
+* Trained in the same window (R17): at finalize of a (window, env), every entitlement still
+  ``reserved`` whose prompt has a training-lane observation recorded in that window (any hotkey,
+  before or after) becomes ``trained``: unpaid, never sanctioned, no ban, no probation lost. It sets
+  no audit horizon and needs no audit. Exploration is paid for prompts nobody trains in the window.
 * Once a (window, env) is finalized its rows never change: no reservation, no draw, no forfeit, no
   release. A failed audit that arrives late bans once (only for a group that was drawn) and forfeits
-  the hotkey's entitlements in the envs of that window not yet finalized (R3). The one transition
-  allowed after finalize is ``aborted=True`` (an aborted window pays no exploration): every row still
-  ``reserved`` becomes ``unpaid`` and gives its first scan back.
+  the hotkey's entitlements in the envs of that window not yet finalized (R3). Two transitions
+  are allowed after finalize, both only towards unpaid: ``aborted=True`` (an aborted window pays no
+  exploration: every row still ``reserved`` becomes ``unpaid``) and R17 for a training observation
+  recorded after the env was finalized (``trained``). Each gives its first scan back.
 * Probation cap: a hotkey still in probation holds at most ``PROBATION_PENDING_LIMIT`` reserved rows
   whose audit has not passed per (window, env); beyond that it is refused (``probation_limit``).
 """
@@ -312,7 +320,8 @@ class ExplorationLedger:
         self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE observation_id=? "
                         "AND order_id=? AND audit IN ('pending_draw','queued')", (observation_id, self.order))
 
-    def finalize_window(self, window: int, *, environment: str, aborted: bool = False) -> list[str]:
+    def finalize_window(self, window: int, *, environment: str, aborted: bool = False,
+                        trained_prompts=()) -> list[str]:
         """Freeze a (window, env) and return every unpaid id of it (none sanctioned).
 
         Groups waiting for their draw or their audit become ``unaudited``; so does every
@@ -325,8 +334,17 @@ class ExplorationLedger:
         ``aborted=True`` is the one transition allowed on an already finalized (window, env): the
         window pays no exploration, so every row still ``reserved`` becomes ``unpaid`` (``payable``
         is then empty) and is returned too. Idempotent.
+
+        ``trained_prompts`` (R17): the prompts of this env with a training-lane observation recorded
+        in this window. Every row still ``reserved`` on one of them becomes ``trained`` (unpaid, no
+        sanction) BEFORE the audit horizon is computed, so it sets no horizon, and is returned too.
+        Applied on every call, so a training observation recorded after the env was finalized still
+        voids the row as long as the caller finalizes again before reading ``payable``.
         """
         scope = (self.order, window, environment)
+        for prompt in sorted({int(p) for p in trained_prompts}):
+            self.db.execute("UPDATE exploration_entitlements SET status='trained' WHERE order_id=? AND window=? "
+                            "AND environment=? AND prompt_idx=? AND status='reserved'", (*scope, prompt))
         if not self.is_finalized(window, environment=environment):
             horizons = self.db.execute(
                 "SELECT hotkey, MIN(draw_round) FROM exploration_entitlements WHERE order_id=? AND window=? "
@@ -344,7 +362,8 @@ class ExplorationLedger:
                             "AND environment=? AND status='reserved'", scope)
         return [r for r, in self.db.execute(
             "SELECT observation_id FROM exploration_entitlements WHERE order_id=? AND window=? "
-            "AND environment=? AND (audit='unaudited' OR status='unpaid') ORDER BY rowid", scope).fetchall()]
+            "AND environment=? AND (audit='unaudited' OR status IN ('unpaid','trained')) ORDER BY rowid",
+            scope).fetchall()]
 
     def payable(self, window: int, *, environment: str) -> dict[str, int]:
         """``{hotkey: whole entitlements to pay}`` of a FINALIZED (window, env): still entitled and
@@ -460,7 +479,8 @@ def record_exploration(log: "RunObservationLog", ledger: ExplorationLedger, obs:
     it is published ``exploration_unpaid`` with the reason (``already_scanned``, ``banned`` at
     ``now``, ``finalized``, ``zero_price``, ``cap``, or the caller's ``refuse`` for its own
     eligibility rules) and, if it took the prompt's first scan, the scan is released: an unpaid
-    observation never burns a prompt. A replay of the same submission writes nothing and reports
+    observation never burns a prompt. A prompt with a training observation in the run is scanned
+    (``already_scanned``), whoever held its first scan. A replay of the same submission writes nothing and reports
     the entitlement it already holds, if any (reason ``"replay"`` otherwise).
 
     ``amount`` is ``exploration_price`` and ``cap`` is ``exploration_cap`` of the window's frozen
@@ -521,9 +541,15 @@ def finalize_exploration(log: "RunObservationLog", ledger: ExplorationLedger, wi
     """Finalize a (window, env) and release the first scan of every unpaid id, atomically.
 
     ``aborted=True`` also works on an already finalized (window, env): every row still reserved
-    becomes unpaid and gives its first scan back (see ``ExplorationLedger.finalize_window``)."""
+    becomes unpaid and gives its first scan back (see ``ExplorationLedger.finalize_window``).
+
+    R17 is applied here, in the same transaction and before the audit horizon: the entitlements
+    whose prompt has a training-lane observation in this window (``log.trained_prompts``) end
+    ``trained`` (unpaid, no sanction); their scan is re-seated on the training observation by
+    ``log.release_first_scan``."""
     with _Atomic(_same_store(log, ledger)):
-        unaudited = ledger.finalize_window(window, environment=environment, aborted=aborted)
+        unaudited = ledger.finalize_window(window, environment=environment, aborted=aborted,
+                                           trained_prompts=log.trained_prompts(window, environment))
         for identity in unaudited:
             log.release_first_scan(identity)
         return unaudited

@@ -40,8 +40,9 @@ def build(path, contract=None, **kw):
     return ServiceRuntime(path, contract, qualification_v2(contract), now=0, drand_round_at=drand_round)
 
 
-def open_window(rt, window, pools=None):
-    envelope = rt.open_window(window, pools=pools or {MATH: POOL, CODE: POOL}, picks_target=PICKS, batch_slots=SLOTS)
+def open_window(rt, window, pools=None, now=0.0):
+    envelope = rt.open_window(window, pools=pools or {MATH: POOL, CODE: POOL}, picks_target=PICKS, batch_slots=SLOTS,
+                              now=now)
     rt.announcement(window=window, randomness=WINDOW_BEACON)
     return envelope
 
@@ -462,10 +463,10 @@ def test_reconcile_pays_from_the_envelope_self_validates_and_is_idempotent(tmp_p
     assert final[paid["observation_id"]] == ("exploration_paid", "audited")
     assert final[won["observation_id"]] == ("trained", "proven")
     assert final[lost["observation_id"]] == ("proven_unpaid", "proven")
-    with pytest.raises(ValueError, match="frozen"):       # another batch for a settled window
-        rt.reconcile_archive(archive(batch=[("a", MATH, 20), ("b", MATH, 21)]))
-    with pytest.raises(ValueError, match="disposition"):
-        rt.reconcile_archive(given, aborted=True)
+    # Another batch or another disposition for a settled window: the frozen money, never a raise (I2).
+    assert frozen(rt.reconcile_archive(archive(batch=[("a", MATH, 20), ("b", MATH, 21)]))) == frozen(first)
+    assert frozen(rt.reconcile_archive(given, aborted=True)) == frozen(first)
+    assert len(events(rt)) == before
     with pytest.raises(ServicePolicyLimit, match="settled"):
         explore(rt, prompt=30, now=12_001.0)
     with pytest.raises(ServicePolicyLimit, match="settled"):
@@ -542,8 +543,8 @@ def test_aborted_window_pays_no_exploration_and_gives_its_first_scans_back(tmp_p
     assert not any(e["status"] in ("exploration_paid", "trained") for e in events(rt, "settle"))
     assert rt.log.is_scanned(MATH, 1) is False
     validate_service_archive_v2(result, rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
-    with pytest.raises(ValueError, match="disposition"):
-        rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), aborted=False)
+    later = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), aborted=False)   # frozen as aborted (I2)
+    assert later["window_status"] == "aborted" and frozen(later) == frozen(result)
     # An archive that says "aborted" is aborted, whatever the keyword.
     rt2 = runtime(tmp_path / "second")
     audited(rt2, explore(rt2, hotkey="x"))
@@ -871,3 +872,448 @@ def test_n2_n11_a_late_failure_forfeits_the_other_open_env_and_says_so(tmp_path)
     assert events(rt, "settle", code["observation_id"])[-1]["status"] == "exploration_forfeited"
     assert rt.record_audit(math["observation_id"], passed=True, now=10_110.0) == AuditOutcome("not_applied")
     assert rt.record_audit(code["observation_id"], passed=True, now=10_120.0).kind == "not_applied"
+
+
+# ---------------------------------------------------------------- Task 7 review: I1, R17, I2, M1-M5
+
+def settle_event(rt, result):
+    return events(rt, "settle", result["observation_id"])[-1]
+
+
+def scan_holder(rt, prompt, env=MATH):
+    row = rt.db.execute("SELECT first_id FROM run_scans WHERE environment=? AND prompt_idx=?", (env, prompt)).fetchone()
+    return None if row is None else row[0]
+
+
+def release_unaudited(rt, held):
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)          # never drawn, never audited
+
+
+def release_failed_audit(rt, held):
+    assert audited(rt, held, passed=False).failed
+
+
+def release_horizon(rt, held):
+    # "a" leaves probation, then holds a drawn row never audited: its later not-drawn row is unpaid too.
+    assert [r["audit"] for r in rt.ledger.rows(1, environment=MATH)] == ["passed", "queued", "not_drawn"]
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    assert [r["audit"] for r in rt.ledger.rows(1, environment=MATH)] == ["passed", "unaudited", "unaudited"]
+
+
+def release_aborted(rt, held):
+    rt.reconcile_archive(archive(), aborted=True, now=10_050.0)
+
+
+def release_late_failure(rt, held):
+    # the hotkey's CODE row was finalized drawn-unaudited; its late failure forfeits the open MATH row
+    code = explore(rt, hotkey="a", prompt=90, env=CODE)
+    draw(rt)
+    rt.finalize_exploration(1, environment=CODE, now=10_040.0)
+    outcome = rt.record_audit(code["observation_id"], passed=False, now=10_050.0)
+    assert outcome.failed and held["observation_id"] in outcome.forfeited
+
+
+@pytest.mark.parametrize("release", [release_unaudited, release_failed_audit, release_horizon, release_aborted,
+                                     release_late_failure])
+def test_i1_a_trained_prompt_stays_scanned_whatever_releases_the_exploration_that_saw_it_first(tmp_path, release):
+    """I1: A's exploration holds the scan of P, B trains P (another window), A ends unpaid -> P stays scanned."""
+    contract = reward_contract(new_hotkey_audit_groups=1, audit_bps=0) if release is release_horizon else None
+    rt = runtime(tmp_path, contract=contract)
+    if release is release_horizon:
+        passing = explore(rt, hotkey="a", prompt=50, now=100.0)
+        explore(rt, hotkey="a", prompt=51, now=100.0)                    # drawn (probation), never audited
+        draw(rt, now=200.0)
+        assert rt.record_audit(passing["observation_id"], passed=True, now=200.0).passed   # out of probation
+    held = explore(rt, hotkey="a", prompt=7, now=300.0)
+    if release is release_horizon:
+        draw(rt)
+    assert held["entitled"] and scan_holder(rt, 7) == held["observation_id"]
+    open_window(rt, 2)
+    trained = train(rt, hotkey="b", prompt=7, window=2, now=310.0)
+    assert trained["inserted"] and trained["first_scan"] is False
+    release(rt, held)
+    audit, status = rt.ledger.state(held["observation_id"])
+    assert status != "reserved" or audit == "unaudited"                 # A's row ended unpaid
+    assert rt.log.is_scanned(MATH, 7) is True                           # NOT "never scanned" again
+    assert scan_holder(rt, 7) == trained["observation_id"]              # re-seated on the training observation
+    assert rt.log.first_scan_stats(MATH)[0] >= 1 and rt.log.first_scan_stats(MATH)[1] == 1   # counted, in-zone
+    again = explore(rt, hotkey="c", prompt=7, window=2, now=10_060.0)
+    assert (again["entitled"], again["reason"]) == (False, "already_scanned")
+    # ...and it stays so once the training window is settled as trained
+    rt.reconcile_archive(archive(window=2, batch=[("b", MATH, 7)]), now=10_100.0)
+    open_window(rt, 3)
+    assert explore(rt, hotkey="d", prompt=7, window=3, now=10_200.0)["reason"] == "already_scanned"
+
+
+def test_i1_without_any_training_observation_a_released_prompt_is_free_again(tmp_path):
+    rt = runtime(tmp_path)
+    held = explore(rt, hotkey="a", prompt=7)
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    assert rt.log.is_scanned(MATH, 7) is False and scan_holder(rt, 7) is None
+    assert settle_event(rt, held)["status"] == "exploration_unpaid" and "reason" not in settle_event(rt, held)
+
+
+def test_i1_the_scan_is_seated_on_the_earliest_surviving_training_observation(tmp_path):
+    rt = runtime(tmp_path)
+    held = explore(rt, hotkey="a", prompt=7)
+    open_window(rt, 2)
+    open_window(rt, 3)
+    first = train(rt, hotkey="b", prompt=7, window=2, now=310.0)
+    second = train(rt, hotkey="c", prompt=7, window=3, now=320.0)
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    assert scan_holder(rt, 7) == first["observation_id"]
+    # window 2 aborts: it trained nothing, its observation stops counting; window 3's takes the seat
+    rt.reconcile_archive(archive(window=2), aborted=True, now=10_100.0)
+    assert scan_holder(rt, 7) == second["observation_id"] and rt.log.is_scanned(MATH, 7)
+    assert settle_event(rt, first)["status"] == "proven_unpaid"
+    assert held["observation_id"] != scan_holder(rt, 7)
+
+
+def test_an_aborted_window_trains_nothing_so_its_training_observations_do_not_keep_the_prompt(tmp_path):
+    rt = runtime(tmp_path)
+    alone = train(rt, hotkey="b", prompt=7)                             # holds the scan of 7
+    held = explore(rt, hotkey="a", prompt=8)
+    train(rt, hotkey="b", prompt=8, now=130.0)                          # 8: exploration first, then trained
+    assert scan_holder(rt, 7) == alone["observation_id"]
+    result = rt.reconcile_archive(archive(batch=[("b", MATH, 7), ("b", MATH, 8)]), aborted=True, now=10_100.0)
+    assert result["window_status"] == "aborted"
+    assert {e["status"] for e in events(rt, "settle") if e["proof"] == "proven"} == {"proven_unpaid"}
+    assert settle_event(rt, held)["status"] == "exploration_unpaid"
+    assert rt.log.is_scanned(MATH, 7) is False and rt.log.is_scanned(MATH, 8) is False
+    open_window(rt, 2)
+    for prompt in (7, 8):                                               # both are first scans again
+        later = explore(rt, hotkey="c", prompt=prompt, window=2, now=10_200.0)
+        assert later["entitled"] and later["first_scan"]
+
+
+def test_a_proven_group_left_out_of_the_batch_does_not_keep_the_prompt_a_trained_one_does(tmp_path):
+    rt = runtime(tmp_path)
+    won = train(rt, hotkey="a", prompt=20)
+    lost = train(rt, hotkey="b", prompt=21)
+    assert rt.log.is_scanned(MATH, 21)                                  # scanned while it may still be trained
+    assert explore(rt, hotkey="x", prompt=21)["reason"] == "already_scanned"
+    rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_100.0)
+    assert settle_event(rt, won)["status"] == "trained" and settle_event(rt, lost)["status"] == "proven_unpaid"
+    assert rt.log.is_scanned(MATH, 20) is True and rt.log.is_scanned(MATH, 21) is False
+    open_window(rt, 2)
+    assert explore(rt, hotkey="x", prompt=20, window=2, now=10_200.0)["reason"] == "already_scanned"
+    assert explore(rt, hotkey="x", prompt=21, window=2, now=10_200.0)["entitled"] is True
+
+
+LOW, HIGH = range(M_ROLLOUTS), range(M_ROLLOUTS, 2 * M_ROLLOUTS)
+
+
+@pytest.mark.parametrize("trainer", ["x", "other"], ids=["same-hotkey-both-lanes", "two-hotkeys"])
+def test_r17_exploration_on_a_prompt_trained_in_the_same_window_is_unpaid_without_sanction(tmp_path, trainer):
+    """One operator, 32 public seeds of P: an all-fail subset sent as exploration, an in-zone subset
+    sent for training. Paid: the training group only (never 1.15 groups)."""
+    rt = runtime(tmp_path)
+    probe = explore(rt, hotkey="x", prompt=7, seeds=LOW)                # exploration FIRST: entitled for now
+    clean = explore(rt, hotkey="x", prompt=8)
+    assert probe["entitled"] and probe["first_scan"]
+    trained = train(rt, hotkey=trainer, prompt=7, seeds=HIGH, now=130.0)
+    assert trained["inserted"] and trained["first_scan"] is False
+    draw(rt)
+    assert [row["prompt_idx"] for row in rt.queued_audits(1)] == [8]    # the doomed row needs no audit
+    assert rt.exploration_backlog(1)["queued"] == 1
+    assert rt.record_audit(clean["observation_id"], passed=True, now=10_000.0).passed
+    released = rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    assert released == [probe["observation_id"]]
+    settle = settle_event(rt, probe)
+    assert (settle["status"], settle["reason"]) == ("exploration_unpaid", "trained")
+    assert rt.ledger.payable(1, environment=MATH) == {"x": 1}           # prompt 8 only
+    assert rt.ledger.rows(1, environment=MATH)[0]["status"] == "trained"
+    assert not rt.exploration_banned("x", now=10_051.0)                 # no sanction
+    assert rt.ledger.passed_audits("x") == 1                            # probation neither lost nor gained
+    assert scan_holder(rt, 7) == trained["observation_id"]              # the scan moved to the training group
+    result = rt.reconcile_archive(archive(batch=[(trainer, MATH, 7)]), now=10_100.0)
+    assert result["service_exploration_by_environment"] == {MATH: {"x": 1}}
+    total = sum(result["rewards_by_hotkey"].values())
+    assert total == pytest.approx(POOL / T + PRICE)                     # one training group + prompt 8
+    settle = settle_event(rt, probe)                                    # the final status says why, still
+    assert (settle["status"], settle["reason"]) == ("exploration_unpaid", "trained")
+    assert not any(e["status"] == "exploration_paid" and e["id"] == probe["observation_id"] for e in events(rt))
+    validate_service_archive_v2(result, rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
+
+
+def test_r17_training_first_then_exploration_is_refused_at_once(tmp_path):
+    rt = runtime(tmp_path)
+    train(rt, hotkey="x", prompt=7, seeds=HIGH)
+    for hotkey in ("x", "other"):
+        late = explore(rt, hotkey=hotkey, prompt=7, seeds=LOW, now=130.0)
+        assert (late["entitled"], late["status"], late["reason"]) == (False, "exploration_unpaid", "already_scanned")
+    assert rt.ledger.rows(1, environment=MATH) == []
+
+
+def test_r17_a_voided_row_sets_no_audit_horizon(tmp_path):
+    rt = runtime(tmp_path, contract=reward_contract(new_hotkey_audit_groups=1, audit_bps=0))
+    seasoned = explore(rt, hotkey="x", prompt=1, now=100.0)             # forced (probation)
+    doomed = explore(rt, hotkey="x", prompt=7, now=110.0)               # forced too: drawn, will stay queued
+    draw(rt)
+    assert rt.record_audit(seasoned["observation_id"], passed=True, now=10_000.0).passed
+    behind = explore(rt, hotkey="x", prompt=9, now=10_010.0)            # past probation, later round: not drawn
+    draw(rt, now=20_000.0)
+    train(rt, hotkey="t", prompt=7, now=20_010.0)
+    assert [r["audit"] for r in rt.ledger.rows(1, environment=MATH)] == ["passed", "queued", "not_drawn"]
+    released = rt.finalize_exploration(1, environment=MATH, now=20_050.0)
+    assert released == [doomed["observation_id"]]                       # NOT the row behind it
+    assert rt.ledger.payable(1, environment=MATH) == {"x": 2}
+    assert settle_event(rt, doomed)["reason"] == "trained" and behind["entitled"]
+    assert not rt.exploration_banned("x", now=20_051.0)
+
+
+def test_r17_also_catches_a_training_group_recorded_after_the_env_was_finalized(tmp_path):
+    rt = runtime(tmp_path)
+    probe = explore(rt, hotkey="x", prompt=7, seeds=LOW)
+    audited(rt, probe)
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    assert rt.ledger.payable(1, environment=MATH) == {"x": 1}
+    train(rt, hotkey="x", prompt=7, seeds=HIGH, now=10_060.0)           # the window is not settled yet
+    result = rt.reconcile_archive(archive(batch=[("x", MATH, 7)]), now=10_100.0)
+    assert result["service_exploration_by_environment"] == {}
+    assert result["rewards_by_hotkey"] == {"x": pytest.approx(POOL / T)}
+    settle = settle_event(rt, probe)
+    assert (settle["status"], settle["proof"], settle["reason"]) == ("exploration_unpaid", "audited", "trained")
+
+
+def test_same_hotkey_with_two_subsets_of_one_prompt_is_two_observations_and_one_first_scan(tmp_path):
+    rt = runtime(tmp_path)
+    first = explore(rt, hotkey="x", prompt=7, seeds=LOW)
+    second = explore(rt, hotkey="x", prompt=7, seeds=HIGH, now=130.0)
+    assert second["observation_id"] != first["observation_id"] and second["inserted"]
+    assert first["entitled"] and (second["entitled"], second["reason"]) == (False, "already_scanned")
+    assert len(rt.ledger.rows(1, environment=MATH)) == 1 and len(events(rt, "observation")) == 2
+    assert events(rt, "observation", second["observation_id"])[0]["candidate"]["seeds"] == list(HIGH)
+
+
+def test_m1_a_pass_on_a_row_forfeited_meanwhile_publishes_nothing(tmp_path):
+    rt = runtime(tmp_path)
+    bad = explore(rt, hotkey="cheat", prompt=1)
+    good = explore(rt, hotkey="cheat", prompt=2)
+    draw(rt)
+    assert rt.record_audit(bad["observation_id"], passed=False, now=10_000.0).failed
+    assert settle_event(rt, good)["status"] == "exploration_forfeited"
+    count = len(events(rt))
+    assert rt.record_audit(good["observation_id"], passed=True, now=10_001.0) == AuditOutcome("not_applied")
+    assert len(events(rt)) == count                                     # no pending/audited after the forfeit
+    assert settle_event(rt, good)["status"] == "exploration_forfeited"
+
+
+def test_m1_the_runtime_itself_never_publishes_pending_for_a_row_that_is_not_entitled(tmp_path, monkeypatch):
+    rt = runtime(tmp_path)
+    bad = explore(rt, hotkey="cheat", prompt=1)
+    good = explore(rt, hotkey="cheat", prompt=2)
+    draw(rt)
+    rt.record_audit(bad["observation_id"], passed=False, now=10_000.0)
+    count = len(events(rt))
+    monkeypatch.setattr(runtime_module, "apply_exploration_verdict", lambda *a, **k: ("passed", []))
+    rt.record_audit(good["observation_id"], passed=True, now=10_001.0)   # even if the ledger said "passed"
+    assert len(events(rt)) == count
+
+
+HUGE = 10**400
+
+
+def test_m3_a_huge_integer_is_a_clean_refusal_everywhere(tmp_path):
+    rt = runtime(tmp_path)
+    group_id, candidate = group(rt)
+    base = dict(environment=MATH, prompt_idx=7, hotkey="a", window=1, rewards=ZERO, group_id=group_id,
+                candidate=candidate, token_count=10, now=120.0)
+    bad = [dict(base, now=HUGE), dict(base, rewards=[HUGE] * M_ROLLOUTS), dict(base, token_count=HUGE),
+           dict(base, window=HUGE), dict(base, prompt_idx=HUGE), dict(base, now=-HUGE)]
+    for kwargs in bad:
+        with pytest.raises(ServicePolicyLimit):
+            rt.record_exploration(**kwargs)
+        with pytest.raises(ServicePolicyLimit):
+            rt.record_training(**kwargs)
+        assert not rt.db.in_transaction
+    for arrival in (HUGE, -HUGE, float("inf"), "soon", True):
+        with pytest.raises(ServicePolicyLimit):
+            rt.record_exploration(**base, arrived_at=arrival)
+    for pools in ({MATH: HUGE, CODE: POOL}, {MATH: -HUGE, CODE: POOL}):
+        with pytest.raises(ValueError):
+            rt.open_window(2, pools=pools, picks_target=PICKS, batch_slots=SLOTS, now=1.0)
+    with pytest.raises(ValueError):
+        rt.open_window(2, pools={MATH: POOL, CODE: POOL}, picks_target=PICKS, batch_slots=SLOTS, now=HUGE)
+    with pytest.raises(ValueError):
+        rt.active(now=HUGE)
+    assert rt.record_audit("f" * 64, passed=True, now=HUGE) == AuditOutcome("not_applied")
+    assert events(rt) == [] and not rt.db.in_transaction
+    assert rt.record_exploration(**base)["entitled"] is True            # the runtime is intact
+
+
+def test_m4_windows_open_in_increasing_order_and_a_frozen_one_reopens(tmp_path):
+    rt = runtime(tmp_path)                                              # window 1
+    first = rt.envelope(1)
+    changed = next_schedule(rt.contract, rt.schedule, active=(MATH,), shares={MATH: 10000})
+    rt.apply_schedule(changed, request_id="r1", window=1)
+    five = rt.open_window(5, pools={MATH: 0.5}, picks_target=PICKS, batch_slots=SLOTS, now=10.0)
+    assert five["schedule"]["revision"] == 1
+    for window in (2, 4):                                               # an old window born with the new schedule
+        with pytest.raises(ValueError, match="increasing order"):
+            rt.open_window(window, pools={MATH: 0.5}, picks_target=PICKS, batch_slots=SLOTS, now=11.0)
+        with pytest.raises(ServicePolicyLimit):
+            rt.envelope(window)
+    # restart: an already frozen window, even an old one, gives its frozen envelope back
+    assert rt.open_window(1, pools={MATH: POOL, CODE: POOL}, picks_target=PICKS, batch_slots=SLOTS, now=12.0) == first
+    assert rt.open_window(5, pools={MATH: 0.5}, picks_target=PICKS, batch_slots=SLOTS, now=12.0) == five
+    assert rt.open_window(6, pools={MATH: 0.5}, picks_target=PICKS, batch_slots=SLOTS, now=13.0)["schedule"]["revision"] == 1
+
+
+def test_m5_an_arrival_before_the_window_opened_is_refused(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    rt = build(path)
+    rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
+    open_window(rt, 1, now=1_000.0)
+    with pytest.raises(ServicePolicyLimit, match="precedes the opening"):
+        explore(rt, prompt=1, now=1_200.0, arrived_at=999.0)            # would pick a round already public
+    with pytest.raises(ServicePolicyLimit, match="precedes the opening"):
+        explore(rt, prompt=1, now=990.0)                                # the clamp to now cannot go below it either
+    assert events(rt) == [] and rt.ledger.rows(1, environment=MATH) == []
+    assert explore(rt, prompt=1, now=1_200.0, arrived_at=1_000.0)["draw_round"] == drand_round(1_000.0) + 2
+    # the opening instant is the FIRST one, and it survives a restart and a reopen
+    rt.close()
+    rt = build(path)
+    open_window(rt, 1, now=5_000.0)
+    assert rt.db.execute("SELECT opened_at FROM service_windows WHERE window=1").fetchone()[0] == 1_000.0
+    assert explore(rt, prompt=2, now=5_100.0, arrived_at=1_500.0)["entitled"] is True
+    with pytest.raises(ServicePolicyLimit, match="precedes the opening"):
+        explore(rt, prompt=3, now=5_100.0, arrived_at=999.9)
+
+
+# ---------------------------------------------------------------- I2: the first settlement is the truth
+
+def test_i2_a_crash_after_settlement_then_a_recovery_that_rebuilds_the_window_aborted_cannot_brick(tmp_path, monkeypatch):
+    path = tmp_path / "runtime.sqlite3"
+    rt = runtime(tmp_path)
+    paid = explore(rt, hotkey="x", prompt=1)
+    audited(rt, paid)
+    train(rt, prompt=20, hotkey="a")
+    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
+    first = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_100.0)   # settled, not aborted...
+    assert first["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T), "x": pytest.approx(PRICE)}
+    count = len(events(rt))
+    rt.close()                                                          # ...then the validator dies
+
+    rt = build(path)                                                    # restart: fill_closed_recovery.recover
+    errors = []
+    monkeypatch.setattr(runtime_module.logger, "error", lambda *args: errors.append(args))
+    rebuilt = {"window_start": 1, "window_status": "aborted", "batch": [], "rewards_by_hotkey": {},
+               "failure_stage": "active_window_recovery"}
+    for _ in range(2):                                                  # at every start, not only the first
+        recovered = rt.reconcile_archive(rebuilt, aborted=True, now=20_000.0)
+        assert frozen(recovered) == frozen(first)                       # byte-identical frozen money
+        assert recovered["window_status"] == "complete"                 # the frozen disposition: NOT aborted
+        assert recovered["failure_stage"] == "active_window_recovery" and recovered["batch"] == []
+        assert recovered["service_training_recomputed_delta"] == first["service_training_recomputed_delta"]
+    assert len(errors) == 2 and "already settled" in errors[0][0]
+    assert len(events(rt)) == count and not rt.db.in_transaction        # nothing published, nothing written
+    assert rt.log.is_scanned(MATH, 1) and rt.log.is_scanned(MATH, 20)   # paid scans are not given back
+    assert rt.db.execute("SELECT aborted FROM service_settled WHERE window=1").fetchone()[0] == 0
+    # a recovered-partial archive (same disposition, another batch) and one that cannot even be settled
+    partial = rt.reconcile_archive({**rebuilt, "window_status": "recovered_partial"}, now=20_100.0)
+    assert frozen(partial) == frozen(first) and partial["window_status"] == "recovered_partial"
+    broken = rt.reconcile_archive({"window_start": 1, "batch": [{"hotkey": 5}], "rewards_by_hotkey": {}}, now=20_200.0)
+    assert frozen(broken) == frozen(first) and len(errors) == 4
+    # the same archive as the first time: same bytes, and no error
+    assert json.dumps(rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=20_300.0), sort_keys=True) == \
+        json.dumps(first, sort_keys=True)
+    assert len(errors) == 4
+    rt.close()
+
+
+def test_i2_a_window_frozen_as_aborted_stays_aborted(tmp_path, monkeypatch):
+    rt = runtime(tmp_path)
+    audited(rt, explore(rt, hotkey="x", prompt=1))
+    train(rt, prompt=20, hotkey="a")
+    first = rt.reconcile_archive(archive(), aborted=True, now=10_100.0)
+    errors = []
+    monkeypatch.setattr(runtime_module.logger, "error", lambda *args: errors.append(args))
+    later = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_200.0)
+    assert later["window_status"] == "aborted" and frozen(later) == frozen(first) and later["rewards_by_hotkey"] == {}
+    assert len(errors) == 1 and rt.log.is_scanned(MATH, 20) is False
+
+
+# ---------------------------------------------------------------- restart
+
+def test_restart_reuses_the_stored_draw_beacon_whatever_the_new_beacon_source_says(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    contract = reward_contract(new_hotkey_audit_groups=0, audit_bps=5000)   # the beacon decides
+    rt = runtime(tmp_path, contract=contract)
+    for prompt in range(12):
+        explore(rt, prompt=prompt, hotkey=f"h{prompt % 6}", now=120.0)       # all at draw round 42
+    half = [prompt for prompt in range(6)]
+    # Draw the first six rows only (the others are held back as if their env pass had not run yet).
+    rt.db.execute("UPDATE exploration_entitlements SET draw_round=99 WHERE prompt_idx>=6")
+    rt.db.commit()
+    rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=200.0)
+    before = {r["prompt_idx"]: r["audit"] for r in rt.ledger.rows(1, environment=MATH) if r["prompt_idx"] in half}
+    assert set(before.values()) <= {"queued", "not_drawn"}
+    rt.db.execute("UPDATE exploration_entitlements SET draw_round=42 WHERE prompt_idx>=6")
+    rt.db.commit()
+    ids = {r["prompt_idx"]: r["observation_id"] for r in rt.ledger.rows(1, environment=MATH)}
+    rt.close()
+
+    from reliquary.services.exploration import audit_selected
+    rt = build(path, contract)
+    asked = []
+    other = "ee" * 32                                                       # the reopened source disagrees
+    assert other != BEACON
+    rt.resolve_draws(1, beacon_for_round=lambda r: asked.append(r) or other, now=10_000.0)
+    assert asked == []                                                      # round 42 is stored: never asked again
+    assert rt.db.execute("SELECT round, randomness FROM service_draw_beacons").fetchall() == [(42, BEACON)]
+    after = {r["prompt_idx"]: r["audit"] for r in rt.ledger.rows(1, environment=MATH)}
+    assert {p: after[p] for p in half} == before                            # drawn rows did not move
+    expected = {p: ("queued" if audit_selected(beacon_randomness=BEACON, observation_id=ids[p], audit_bps=5000,
+                                               forced=False) else "not_drawn") for p in range(12)}
+    assert after == expected                                                # every draw used the STORED beacon
+    with_other = {p: ("queued" if audit_selected(beacon_randomness=other, observation_id=ids[p], audit_bps=5000,
+                                                 forced=False) else "not_drawn") for p in range(12)}
+    assert with_other != expected                                           # (the other beacon draws differently)
+    rt.close()
+
+
+def test_restart_between_finalize_and_reconcile_settles_what_was_finalized(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    rt = runtime(tmp_path)
+    paid = explore(rt, hotkey="x", prompt=1, now=120.0)
+    lost = explore(rt, hotkey="y", prompt=2, now=9_000.0)                # never drawn
+    rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=200.0)
+    rt.record_audit(paid["observation_id"], passed=True, now=201.0)
+    train(rt, prompt=20, hotkey="a")
+    for env in (MATH, CODE):
+        rt.finalize_exploration(1, environment=env, now=9_100.0)
+    count = len(events(rt))
+    rt.close()
+
+    rt = build(path)
+    assert rt.ledger.is_finalized(1, environment=MATH) and rt.ledger.payable(1, environment=MATH) == {"x": 1}
+    assert rt.queued_audits(1) == [] and rt.pending_draw_rounds(1) == []
+    assert rt.record_audit(lost["observation_id"], passed=True, now=9_200.0) == AuditOutcome("not_applied")
+    result = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=9_300.0)
+    assert result["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T), "x": pytest.approx(PRICE)}
+    assert settle_event(rt, paid)["status"] == "exploration_paid"
+    assert settle_event(rt, lost)["status"] == "exploration_unpaid"
+    assert len(events(rt)) == count + 2                                  # exploration_paid + trained, nothing twice
+    assert rt.log.is_scanned(MATH, 1) and not rt.log.is_scanned(MATH, 2)
+    rt.close()
+
+
+def test_a_legacy_sampling_env_records_and_pays_without_a_pool_selection(tmp_path):
+    value = contract_v2_dict()
+    value["environments"][CODE]["sampling"] = {"kind": "legacy/v1"}
+    rt = runtime(tmp_path, contract=ServiceContract.from_dict(value))
+    assert rt.seed_pool(environment=CODE, prompt_idx=3, window=1) is None
+    assert rt.seed_pool(environment=MATH, prompt_idx=3, window=1) is not None
+    base = dict(environment=CODE, prompt_idx=3, window=1, group_id="1" * 64, candidate=None, token_count=10)
+    probe = rt.record_exploration(**base, hotkey="x", rewards=ZERO, now=120.0)
+    assert probe["entitled"] and probe["first_scan"]
+    assert events(rt, "observation", probe["observation_id"])[0]["candidate"] is None
+    won = rt.record_training(**dict(base, prompt_idx=4, group_id="2" * 64), hotkey="a", rewards=HALF, now=121.0)
+    assert won["inserted"] and won["first_scan"]
+    with pytest.raises(ServicePolicyLimit, match="no public seed pool"):   # a selection where there is no pool
+        rt.record_exploration(**dict(base, prompt_idx=5, candidate=group(rt)[1]), hotkey="x", rewards=ZERO, now=122.0)
+    audited(rt, probe)
+    result = rt.reconcile_archive(archive(batch=[("a", CODE, 4)]), now=10_100.0)
+    assert result["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T), "x": pytest.approx(PRICE)}
+    validate_service_archive_v2(result, rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)

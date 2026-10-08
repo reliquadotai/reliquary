@@ -71,6 +71,11 @@ Decision:
   Nothing is burned and no fixed reserve is taken.
 - Not paid: unusable groups (grading error, incomplete).
 - To code: replace #327's fixed reserve b + divisor d + burned remainder with this model.
+- Scan rules in force:
+  - A prompt with a training observation is scanned: exploration on it earns nothing, whoever saw it first.
+  - A proven group that ends untrained (left out of the batch, or its window aborted) does not count as a scan.
+  - Exploration on a prompt trained in the same window is unpaid (published `exploration_unpaid`, reason `trained`).
+  - That case carries no sanction: no ban, no forfeit, no probation lost.
 
 ## C. Verifying exploration groups: DECIDED (07-10)
 

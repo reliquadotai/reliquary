@@ -4,6 +4,17 @@ The checkpoint, window and time are attributes. The log enforces no validity rul
 it only answers "was this prompt ever scanned in this run" for exploration pay.
 Methods write without committing; the caller wraps them in ``with db:``.
 
+What "scanned" means (table ``run_scans``, one row per scanned (env, prompt)):
+
+* a prompt with a COUNTING training-lane observation is scanned, for the rest of the run;
+* a prompt whose first scan is held by an exploration observation is scanned for as long as that
+  observation may still be paid; when it ends unpaid for any reason its scan is released, and the
+  prompt then stays scanned if a counting training observation of it exists (the scan is re-seated
+  on the earliest one), else it is free again. ``release_first_scan`` is the ONE place that decides.
+* A training observation counts from the moment it is recorded (proven) until it is settled
+  ``proven_unpaid``: a proven group that was not trained (left out of the batch, or its window
+  aborted -- an aborted window trained nothing) stops counting and gives the prompt back.
+
 Exploration observations go through ``reliquary.services.exploration.record_exploration``, which
 records and reserves the pay in one transaction; ``record`` alone is for training observations.
 """
@@ -22,6 +33,8 @@ from reliquary.services.scoring import classify_signal
 LANES = frozenset({"training", "exploration"})
 _MUTABLE = ("status", "proof", "ts", "reason")  # not evidence: a retry may differ on them
 _REASON = re.compile(r"[a-z][a-z0-9_]{0,39}")
+# Settle status of a training observation that was proven but not trained: it does not count as a scan.
+STATUS_PROVEN_UNPAID = "proven_unpaid"
 
 
 class NotAnObservation(ValueError):
@@ -104,8 +117,10 @@ class RunObservationLog:
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, order_id TEXT NOT NULL,
                 environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL, window INTEGER NOT NULL,
                 lane TEXT NOT NULL, category TEXT NOT NULL, hotkey TEXT NOT NULL, token_count INTEGER NOT NULL,
-                first_scan INTEGER NOT NULL, public TEXT NOT NULL);
+                first_scan INTEGER NOT NULL, public TEXT NOT NULL, untrained INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS run_observations_window ON run_observations(order_id, window);
+            CREATE INDEX IF NOT EXISTS run_observations_prompt
+                ON run_observations(order_id, environment, prompt_idx);
             CREATE TABLE IF NOT EXISTS run_scans(
                 order_id TEXT NOT NULL, environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
                 first_id TEXT NOT NULL, category TEXT NOT NULL,
@@ -114,6 +129,8 @@ class RunObservationLog:
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, observation_id TEXT NOT NULL,
                 payload TEXT NOT NULL);
         """)
+        if "untrained" not in {row[1] for row in db.execute("PRAGMA table_info(run_observations)")}:
+            db.execute("ALTER TABLE run_observations ADD COLUMN untrained INTEGER NOT NULL DEFAULT 0")
         db.execute("INSERT OR IGNORE INTO run_meta(key, value) VALUES('run_salt', ?)", (os.urandom(32),))
         db.commit()
         self._salt = bytes(db.execute("SELECT value FROM run_meta WHERE key='run_salt'").fetchone()[0])
@@ -177,13 +194,48 @@ class RunObservationLog:
         return self.db.execute("SELECT 1 FROM run_scans WHERE order_id=? AND environment=? AND prompt_idx=?",
                                (self.order, environment, prompt_idx)).fetchone() is not None
 
+    def _seat(self, environment: str, prompt_idx: int) -> None:
+        """If the prompt has no scan, seat it on its earliest counting training observation (if any)."""
+        row = self.db.execute(
+            "SELECT id, category FROM run_observations WHERE order_id=? AND environment=? AND prompt_idx=? "
+            "AND lane='training' AND untrained=0 ORDER BY seq LIMIT 1",
+            (self.order, environment, prompt_idx)).fetchone()
+        if row is not None and self.db.execute(
+                "INSERT OR IGNORE INTO run_scans VALUES(?,?,?,?,?)",
+                (self.order, environment, prompt_idx, row[0], row[1])).rowcount == 1:
+            self.db.execute("UPDATE run_observations SET first_scan=1 WHERE id=?", (row[0],))
+
     def release_first_scan(self, observation_id: str) -> bool:
-        """A forfeited (failed-audit) first scan does not count as a scan."""
+        """THE release of a first scan: every path that leaves an observation unpaid ends here.
+
+        The observation stops holding the scan of its (env, prompt). The prompt is then scanned iff
+        a counting training-lane observation of it exists in the run (any window, any hotkey,
+        recorded before or after): the scan is re-seated on the earliest one. Otherwise the prompt
+        is free again and a later exploration observation can be paid for it.
+
+        Which training observations count (module docstring): every one that is not settled
+        ``proven_unpaid``. So the training observations of an ABORTED window never keep a prompt:
+        the window trained nothing, its settlement marks them all ``proven_unpaid``. A counting
+        training observation is never released (returns False, nothing changes).
+
+        Returns True when ``observation_id`` held the scan and no longer does. Idempotent.
+        """
+        row = self.db.execute("SELECT environment, prompt_idx, lane, untrained FROM run_observations "
+                              "WHERE id=? AND order_id=?", (observation_id, self.order)).fetchone()
+        if row is None or (row[2] == "training" and not row[3]):
+            return False
         released = self.db.execute("DELETE FROM run_scans WHERE order_id=? AND first_id=?",
                                    (self.order, observation_id)).rowcount == 1
         if released:
             self.db.execute("UPDATE run_observations SET first_scan=0 WHERE id=?", (observation_id,))
+        self._seat(row[0], row[1])
         return released
+
+    def trained_prompts(self, window: int, environment: str) -> set[int]:
+        """Prompts of ``environment`` with a counting training-lane observation recorded in ``window``."""
+        return {r for r, in self.db.execute(
+            "SELECT DISTINCT prompt_idx FROM run_observations WHERE order_id=? AND window=? AND environment=? "
+            "AND lane='training' AND untrained=0", (self.order, window, environment))}
 
     def claim_first_scan(self, observation_id: str) -> bool:
         """Give the first scan of its (env, prompt) to an already recorded observation that does not
@@ -206,26 +258,43 @@ class RunObservationLog:
                               (observation_id, self.order)).fetchone()
         return None if row is None else json.loads(row[0]).get("reason")
 
-    def settle(self, observation_id: str, *, status: str, proof: str, at: float) -> None:
-        row = self.db.execute("SELECT window, order_id FROM run_observations WHERE id=?",
-                              (observation_id,)).fetchone()
+    def settle(self, observation_id: str, *, status: str, proof: str, at: float,
+               reason: str | None = None) -> None:
+        """Publish a settle event (idempotent on the latest status, proof and reason).
+
+        A TRAINING observation settled ``proven_unpaid`` stops counting as a scan: if it held the
+        prompt's scan, the scan moves to the next counting training observation or the prompt is
+        free again. Any other status makes it count (again)."""
+        if reason is not None and (not isinstance(reason, str) or _REASON.fullmatch(reason) is None):
+            raise ValueError("settle reason must be a short lowercase identifier")
+        row = self.db.execute("SELECT window, order_id, lane, environment, prompt_idx FROM run_observations "
+                              "WHERE id=?", (observation_id,)).fetchone()
         if row is None:
             raise ValueError("unknown observation")
         if row[1] != self.order:
             raise ValueError("observation belongs to another order")
+        if row[2] == "training":
+            untrained = status == STATUS_PROVEN_UNPAID
+            self.db.execute("UPDATE run_observations SET untrained=? WHERE id=?", (int(untrained), observation_id))
+            if untrained:
+                self.release_first_scan(observation_id)
+            else:
+                self._seat(row[3], row[4])
         for (payload,) in self.db.execute(
                 "SELECT payload FROM run_events WHERE order_id=? AND observation_id=? ORDER BY seq DESC",
                 (self.order, observation_id)):
             event = json.loads(payload)
             if event.get("type") != "settle":
                 continue
-            if event.get("status") == status and event.get("proof") == proof:
+            if event.get("status") == status and event.get("proof") == proof and event.get("reason") == reason:
                 return  # same as the LATEST settlement: nothing new to publish
             break  # an older identical settlement does not hide a change back (A, B, A)
-        payload = canonical_json_bytes({"type": "settle", "id": observation_id, "window": int(row[0]),
-                                        "status": str(status), "proof": str(proof), "ts": float(at)}).decode()
+        public = {"type": "settle", "id": observation_id, "window": int(row[0]),
+                  "status": str(status), "proof": str(proof), "ts": float(at)}
+        if reason is not None:
+            public["reason"] = reason
         self.db.execute("INSERT INTO run_events(order_id,observation_id,payload) VALUES(?,?,?)",
-                        (self.order, observation_id, payload))
+                        (self.order, observation_id, canonical_json_bytes(public).decode()))
 
     def events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
         rows = self.db.execute("SELECT seq,payload FROM run_events WHERE order_id=? AND seq>? ORDER BY seq LIMIT ?",
@@ -240,6 +309,8 @@ class RunObservationLog:
         return result
 
     def first_scan_stats(self, environment: str) -> tuple[int, int]:
+        """``(scanned prompts, of which in-zone)`` of an env. A trained prompt is always counted: it
+        holds a scan row (its own, or the exploration observation's that saw the prompt first)."""
         row = self.db.execute(
             "SELECT COUNT(*), SUM(CASE WHEN category='in-zone' THEN 1 ELSE 0 END) FROM run_scans "
             "WHERE order_id=? AND environment=?", (self.order, environment)).fetchone()

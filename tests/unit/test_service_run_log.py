@@ -306,3 +306,86 @@ def test_a_candidate_without_a_pool_hash_is_refused(log):
     with pytest.raises(ValueError, match="pool_sha256"):
         with log.db:
             log.record(replace(obs(), candidate={"seeds": SEEDS}), status="proven", proof="proven")
+
+
+# ---- Task 7 review: I1 (a trained prompt is scanned), settle reason ----
+
+ENV = "reliquary_dapo_math_v1"
+ZERO = (0,) * M_ROLLOUTS
+
+
+def holder(log, prompt=7):
+    row = log.db.execute("SELECT first_id FROM run_scans WHERE environment=? AND prompt_idx=?", (ENV, prompt)).fetchone()
+    return None if row is None else row[0]
+
+
+def test_release_reseats_the_scan_on_the_earliest_counting_training_observation(log):
+    with log.db:
+        probe = log.record(obs(rewards=ZERO, lane="exploration", hotkey="a"), status="exploration_pending", proof="pending")
+        early = log.record(obs(group="t1", window=2, hotkey="b"), status="proven", proof="proven")
+        late = log.record(obs(group="t2", window=3, hotkey="c"), status="proven", proof="proven")
+    assert probe.first_scan and not early.first_scan and not late.first_scan
+    assert log.first_scan_stats(ENV) == (1, 0)                    # the trained prompt is counted (first scan: out-of-zone)
+    with log.db:
+        assert log.release_first_scan(probe.observation_id) is True
+    assert log.is_scanned(ENV, 7) and holder(log) == early.observation_id
+    assert log.first_scan_stats(ENV) == (1, 1)
+    flags = {r["id"]: r["first_scan"] for r in log.window_observations(1) + log.window_observations(2) + log.window_observations(3)}
+    assert flags == {probe.observation_id: False, early.observation_id: True, late.observation_id: False}
+    with log.db:                                                  # idempotent; a counting training scan is never released
+        assert log.release_first_scan(probe.observation_id) is False
+        assert log.release_first_scan(early.observation_id) is False
+        assert log.release_first_scan("f" * 64) is False
+    assert holder(log) == early.observation_id
+    with log.db:                                                  # an exploration observation on it is not a first scan
+        again = log.record(obs(group="g9", rewards=ZERO, lane="exploration", hotkey="d", window=4),
+                           status="exploration_unpaid", proof="unproven", reason="already_scanned")
+    assert not again.first_scan
+
+
+def test_a_training_observation_settled_proven_unpaid_stops_counting_as_a_scan(log):
+    with log.db:
+        first = log.record(obs(group="t1", window=1, hotkey="b"), status="proven", proof="proven")
+        second = log.record(obs(group="t2", window=2, hotkey="c"), status="proven", proof="proven")
+    assert log.trained_prompts(1, ENV) == {7} and log.trained_prompts(2, ENV) == {7} and log.trained_prompts(3, ENV) == set()
+    with log.db:
+        log.settle(first.observation_id, status="proven_unpaid", proof="proven", at=5.0)
+    assert holder(log) == second.observation_id                   # moved to the next counting one
+    assert log.trained_prompts(1, ENV) == set() and log.trained_prompts(2, ENV) == {7}
+    with log.db:
+        log.settle(second.observation_id, status="proven_unpaid", proof="proven", at=6.0)
+    assert not log.is_scanned(ENV, 7) and holder(log) is None      # nothing trained it: free again
+    with log.db:
+        log.settle(second.observation_id, status="trained", proof="proven", at=7.0)
+    assert holder(log) == second.observation_id                   # "trained" counts
+    with log.db:                                                  # an exploration status on an exploration row: no effect
+        probe = log.record(obs(prompt=8, rewards=ZERO, lane="exploration"), status="exploration_pending", proof="pending")
+        log.settle(probe.observation_id, status="proven_unpaid", proof="unproven", at=8.0)
+    assert holder(log, 8) == probe.observation_id
+
+
+def test_settle_publishes_its_reason_and_is_idempotent_on_it(log):
+    with log.db:
+        r = log.record(obs(rewards=ZERO, lane="exploration"), status="exploration_pending", proof="pending")
+        log.settle(r.observation_id, status="exploration_unpaid", proof="unproven", at=1.0)
+        log.settle(r.observation_id, status="exploration_unpaid", proof="unproven", at=2.0, reason="trained")
+        log.settle(r.observation_id, status="exploration_unpaid", proof="unproven", at=3.0, reason="trained")
+    settles = [e for _, e in log.events() if e["type"] == "settle"]
+    assert [e.get("reason") for e in settles] == [None, "trained"] and "reason" not in settles[0]
+    assert set(settles[1]) == {"type", "id", "window", "status", "proof", "ts", "reason"}
+    for bad in ("Trained", "", "x" * 41, 5):
+        with pytest.raises(ValueError, match="reason"):
+            log.settle(r.observation_id, status="exploration_unpaid", proof="unproven", at=4.0, reason=bad)
+
+
+def test_a_log_file_written_before_the_untrained_column_is_upgraded(tmp_path):
+    db = sqlite3.connect(tmp_path / "old.sqlite3")
+    db.executescript("""CREATE TABLE run_observations(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, order_id TEXT NOT NULL,
+        environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL, window INTEGER NOT NULL,
+        lane TEXT NOT NULL, category TEXT NOT NULL, hotkey TEXT NOT NULL, token_count INTEGER NOT NULL,
+        first_scan INTEGER NOT NULL, public TEXT NOT NULL);""")
+    old = RunObservationLog(db, order_sha256=ORDER, sigma_min_bps=2400)
+    with old.db:
+        r = old.record(obs(), status="proven", proof="proven")
+    assert old.trained_prompts(1, ENV) == {7} and r.first_scan

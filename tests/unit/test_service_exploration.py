@@ -964,3 +964,92 @@ def test_n10_the_entry_point_refuses_with_probation_limit_publishes_unpaid_and_r
     assert admit(pair, obs(60, hotkey="vet"), cap=10.0, groups=0).first_scan   # past probation: not limited
     for p in range(70, 80):
         assert admit(pair, obs(p, hotkey="vet"), cap=10.0, groups=0).first_scan
+
+
+# ---- Task 7 review: I1 + R17 ----
+
+def trained(log, prompt, *, window=1, hotkey="trainer", env=ENV):
+    half = (10000,) * (M_ROLLOUTS // 2) + (0,) * (M_ROLLOUTS - M_ROLLOUTS // 2)
+    with log.db:
+        return log.record(Observation(
+            environment=env, dataset_id=f"{env}-train", prompt_idx=prompt, group_id=f"t{prompt}-{window}-{hotkey}",
+            window=window, checkpoint_n=1, checkpoint_revision="c" * 40, observed_at=100.0, rewards_bps=half,
+            lane="training", candidate={"pool_sha256": "ab" * 32, "seeds": SEEDS}, hotkey=hotkey, token_count=10),
+            status="proven", proof="proven")
+
+
+def scan_of(log, prompt, env=ENV):
+    row = log.db.execute("SELECT first_id FROM run_scans WHERE environment=? AND prompt_idx=?", (env, prompt)).fetchone()
+    return None if row is None else row[0]
+
+
+def test_r17_ledger_voids_rows_on_trained_prompts_before_the_horizon_and_only_reserved_ones(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1, hotkey="old", groups=0, draw_round=10)
+    reserve(book, 2, hotkey="old", groups=100, draw_round=20)       # forced: drawn, never audited
+    reserve(book, 3, hotkey="old", groups=0, draw_round=30)         # behind it
+    reserve(book, 4, hotkey="cheat", groups=100, draw_round=40)
+    reserve(book, 5, hotkey="cheat", groups=100, draw_round=41)
+    reserve(book, 99, hotkey="old", env="code", groups=0)
+    draw(book)
+    audit(book, 4, False)                                           # 4 and 5 forfeited
+    with book.db:
+        unpaid = book.finalize_window(1, environment="math", trained_prompts={2, 5, 99})
+    assert unpaid == [oid(2), oid(5)]                               # 3 is NOT behind a horizon: 2 set none
+    rows = {r["prompt_idx"]: (r["audit"], r["status"]) for r in book.rows(1, environment="math")}
+    assert rows[2] == ("unaudited", "trained") and rows[3] == ("not_drawn", "reserved")
+    assert rows[5][1] == "forfeited"                                # a forfeited row keeps its label
+    assert book.payable(1, environment="math") == {"old": 2}
+    assert not book.banned("old", 10**9)
+    with book.db:                                                   # idempotent
+        assert book.finalize_window(1, environment="math", trained_prompts={2, 5, 99}) == unpaid
+    # a training group recorded after the env was finalized: the second allowed transition
+    with book.db:
+        assert book.finalize_window(1, environment="math", trained_prompts={1, 2}) == [oid(1), oid(2), oid(5)]
+    assert book.payable(1, environment="math") == {"old": 1}
+    assert [r["status"] for r in book.rows(1, environment="code")] == ["reserved"]   # the other env is untouched
+
+
+def test_r17_entry_point_voids_and_reseats_the_scan_on_the_training_observation(pair):
+    log, book = pair
+    probe = admit(pair, obs(1, hotkey="x"), cap=1.0)
+    other = admit(pair, obs(2, hotkey="x"), cap=1.0)
+    elsewhere = trained(log, 2, window=2)                           # another window: not R17's business
+    here = trained(log, 1)                                          # same window, after the exploration
+    assert not here.first_scan and scan_of(log, 1) == probe.observation_id
+    with book.db:
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+    apply_exploration_audit(log, book, other.observation_id, passed=True, now=10.0, ban_seconds=DAY)
+    unpaid = finalize_exploration(log, book, 1, environment=ENV)
+    assert unpaid == [probe.observation_id]
+    assert book.state(probe.observation_id)[1] == "trained" and book.payable(1, environment=ENV) == {"x": 1}
+    assert scan_of(log, 1) == here.observation_id and log.is_scanned(ENV, 1)
+    assert scan_of(log, 2) == other.observation_id                  # paid: it keeps its own first scan
+    assert not book.banned("x", 10**9) and book.passed_audits("x") == 1
+    assert admit(pair, obs(1, hotkey="late", window=2, group="other"), cap=1.0).reason == "already_scanned"
+    assert elsewhere.inserted
+
+
+@pytest.mark.parametrize("path", ["forfeit", "unaudited", "aborted"])
+def test_i1_every_release_path_keeps_a_trained_prompt_scanned(pair, path):
+    log, book = pair
+    held = admit(pair, obs(1, hotkey="a"), cap=1.0)
+    seat = trained(log, 1, window=2, hotkey="b")
+    free = admit(pair, obs(2, hotkey="a"), cap=1.0)                 # nobody trains prompt 2
+    if path == "forfeit":
+        with book.db:
+            book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+        apply_exploration_audit(log, book, held.observation_id, passed=False, now=10.0, ban_seconds=DAY)
+    else:
+        finalize_exploration(log, book, 1, environment=ENV, aborted=path == "aborted")
+    assert scan_of(log, 1) == seat.observation_id and log.is_scanned(ENV, 1)
+    assert not log.is_scanned(ENV, 2) and free.first_scan
+    later = admit(pair, obs(1, hotkey="c", window=3, group="again"), cap=1.0, now=10.0 + 2 * DAY)
+    assert (later.status, later.reason, later.first_scan) == ("exploration_unpaid", "already_scanned", False)
+
+
+def test_i1_an_admission_refusal_on_a_trained_prompt_leaves_the_training_scan_alone(pair):
+    log, book = pair
+    seat = trained(log, 1)
+    refused = admit(pair, obs(1, hotkey="a"), refuse="token_limit")
+    assert refused.reason == "already_scanned" and scan_of(log, 1) == seat.observation_id
