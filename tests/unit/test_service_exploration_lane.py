@@ -1337,7 +1337,7 @@ def test_b2_an_exception_inside_the_audit_proof_is_that_rows_horizon_and_no_ban(
     rt, b, pending = _drawn(tmp_path)
 
     def boom(p, model=None, audit=False):
-        raise RuntimeError("payload makes the forward pass crash")
+        raise ValueError("payload makes the forward pass crash")
     b._verify_expensive = boom
     assert b._execute_exploration_audit(pending, model=None) is None        # does not propagate
     identity = pending.service_observation_id
@@ -1417,3 +1417,162 @@ async def test_b2b_window_sealed_at_full_length_drain_bound_with_the_plan_runnin
     assert b.audits_can_progress() is False                     # at the end the clock alone says "cannot"
     rows = [r for r in rt.ledger.rows(1, environment=MATH) if r["observation_id"] != passed_id]
     assert rows and {rt.ledger.unaudited_reason(r["observation_id"]) for r in rows} == {"unaudited"}
+
+
+# ---------------------------------------------------------------- Fix round 3: N3 (fault class), N1, N2, N4, _prove_ranked
+
+@pytest.mark.parametrize("exc", [ValueError("x"), TypeError("x"), KeyError("x"), IndexError("x"), AttributeError("x"),
+                                 OverflowError("x")])
+def test_n3_payload_attributable_exception_types_are_the_rows_horizon(tmp_path, exc):
+    rt, b, pending = _drawn(tmp_path)
+    b._verify_expensive = lambda p, model=None, audit=False: (_ for _ in ()).throw(exc)
+    assert b._execute_exploration_audit(pending, model=None) is None
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "unaudited"
+
+
+def test_n3_the_proof_codes_own_malformed_submission_types_are_the_horizon(tmp_path):
+    from reliquary.protocol.release_contract import ReleaseContractError
+    from reliquary.protocol.seed_pool import SeedPoolError
+    from reliquary.protocol.service_contract import ServiceContractError
+    for n, exc in enumerate((ServiceContractError("x"), ReleaseContractError("x"), SeedPoolError("x"))):
+        rt, b, pending = _drawn(tmp_path / str(n))
+        b._verify_expensive = lambda p, model=None, audit=False, e=exc: (_ for _ in ()).throw(e)
+        assert b._execute_exploration_audit(pending, model=None) is None
+        assert rt.ledger.unaudited_reason(pending.service_observation_id) == "unaudited"
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("CUDA out of memory"), MemoryError(), BrokenPipeError("pipe"),
+                                 OSError("io"), TimeoutError("slow"), asyncio.CancelledError()])
+def test_n3_an_infrastructure_exception_is_validator_lost_no_horizon_and_propagates(tmp_path, exc):
+    rt, b, pending = _drawn(tmp_path)
+    b._verify_expensive = lambda p, model=None, audit=False: (_ for _ in ()).throw(exc)
+    with pytest.raises(type(exc)):
+        b._execute_exploration_audit(pending, model=None)
+    identity = pending.service_observation_id
+    assert rt.ledger.unaudited_reason(identity) == "validator_lost"       # no horizon for an honest hotkey
+    assert not rt.exploration_banned("hk")
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_unaudited"
+    assert not b._audit_open
+
+
+def test_n3_the_class_comes_from_the_type_never_from_the_message(tmp_path):
+    rt, b, pending = _drawn(tmp_path)
+    b._verify_expensive = lambda p, model=None, audit=False: (_ for _ in ()).throw(ValueError("CUDA out of memory"))
+    assert b._execute_exploration_audit(pending, model=None) is None
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "unaudited"
+    rt2, b2, pending2 = _drawn(tmp_path / "b")
+    b2._verify_expensive = lambda p, model=None, audit=False: (_ for _ in ()).throw(RuntimeError("malformed payload"))
+    with pytest.raises(RuntimeError):
+        b2._execute_exploration_audit(pending2, model=None)
+    assert rt2.ledger.unaudited_reason(pending2.service_observation_id) == "validator_lost"
+
+
+def test_n3_a_cuda_fault_in_an_audit_reaches_the_scheduler_like_a_training_proof_fault(tmp_path):
+    rt = make_runtime(tmp_path, _seasoned_contract())
+    scheduler = _real_scheduler(None, None)
+    try:
+        b = make_batcher(rt, scheduler=scheduler)
+        row = arrive(b, make_pending(rt, hotkey="honest", prompt=1))
+        identity = row["service_observation_id"]
+
+        def prove(p, model=None, audit=False):
+            raise RuntimeError("CUDA out of memory")
+        b._verify_expensive = prove
+        ready(rt)
+        from reliquary.validator.proof_scheduler import SchedulerState
+        assert _wait(lambda: (tick(b), scheduler.state is SchedulerState.FAULTED)[1])
+        assert rt.ledger.unaudited_reason(identity) == "validator_lost"
+        assert not rt.exploration_banned("honest")
+        assert b.audits_can_progress() is False or scheduler.state is SchedulerState.FAULTED
+    finally:
+        scheduler.close()
+
+
+def test_n1_a_concluded_audit_leaves_no_token_list_in_the_handle_nor_in_any_pending(tmp_path):
+    rt = make_runtime(tmp_path, _seasoned_contract())
+    scheduler = _real_scheduler(None, None)
+    try:
+        b = make_batcher(rt, scheduler=scheduler)
+        row = arrive(b, make_pending(rt, hotkey="honest", prompt=1))
+        identity = row["service_observation_id"]
+        pending = b._exploration_pending[identity]
+        b._verify_expensive = lambda p, model=None, audit=False: SimpleNamespace(
+            hotkey=p.hotkey, rollouts=list(p.request.rollouts), completion_texts=["t"] * M_ROLLOUTS)
+        ready(rt)
+        assert _wait(lambda: (tick(b), b.difficulty_auction_metadata_by_id[id(pending)]["status"]
+                              == "exploration_audit_passed")[1])
+        assert _wait(lambda: len(b._audit_handle.decisions()) == 1)
+        (decision,) = b._audit_handle.decisions()
+        assert decision.value is not None and decision.value.rollouts == [] and decision.value.completion_texts == []
+        for held in list(b._pending) + list(b._exploration_pending.values()):
+            assert held.request.rollouts == []
+    finally:
+        scheduler.close()
+
+
+def test_n2_drawn_rows_never_audited_hold_no_token_list_after_the_finalize(tmp_path):
+    rt, b, pending = _drawn(tmp_path)                       # drawn and handed to the (mock) plan, which never runs it
+    assert len(pending.request.rollouts) == M_ROLLOUTS
+    (job_id,) = list(b._audit_open)
+    b._proof_scheduler.submit.return_value.decisions.return_value = (
+        SimpleNamespace(job_id=job_id, status=ProofDecisionStatus.NOT_NEEDED),)     # released by stop_dispatch
+    b.finalize_service_exploration(audits_could_run=True)
+    assert pending.request.rollouts == []
+    for held in list(b._pending) + list(b._exploration_pending.values()):
+        assert not _token_lists(held.request)
+
+
+def test_n2_a_row_whose_audit_is_running_keeps_its_tokens_until_that_audit_ends(tmp_path):
+    rt, b, pending = _drawn(tmp_path)
+    assert b._audit_open                                    # handed over, "running"
+    b.finalize_service_exploration(audits_could_run=True)
+    assert len(pending.request.rollouts) == M_ROLLOUTS
+
+
+def test_n4_a_published_row_overwritten_after_a_recorded_verdict_gets_its_fraction_back_at_the_finalize(tmp_path):
+    rt, b, pending = _drawn(tmp_path)
+    identity = pending.service_observation_id
+    amount = next(r["amount"] for r in rt.exploration_rows(1, environment=MATH) if r["observation_id"] == identity)
+    assert amount > 0
+    real = b._set_service_row
+    armed = {"on": True}
+
+    def flaky(p, status, **kw):
+        if armed["on"] and status == "exploration_audit_passed":
+            armed["on"] = False
+            raise ValueError("raised after the verdict was recorded")
+        return real(p, status, **kw)
+    b._set_service_row = flaky
+    b._verify_expensive = lambda p, model=None, audit=False: SimpleNamespace(hotkey=p.hotkey)
+    assert b._execute_exploration_audit(pending, model=None) is None
+    row = b.difficulty_auction_metadata_by_id[id(pending)]
+    assert row["status"] == "exploration_unaudited" and row["exploration_fraction"] == 0.0
+    b.finalize_service_exploration(audits_could_run=True)
+    row = b.difficulty_auction_metadata_by_id[id(pending)]
+    assert row["status"] == "exploration_audit_passed" and row["exploration_fraction"] == amount
+
+
+def test_n_gap_prove_ranked_keeps_legacy_and_training_entries_and_skips_a_service_non_training_one(fill_closed, tmp_path):
+    rt = make_runtime(tmp_path)
+    b = make_batcher(rt)
+    legacy = make_pending(rt, prompt=1, hotkey="l", rewards=HALF, prompt_content_sha256="a" * 64)
+    legacy.service_lane = None
+    training = make_pending(rt, prompt=2, hotkey="t", rewards=HALF, prompt_content_sha256="b" * 64)
+    training.service_lane = "training"
+    explo = make_pending(rt, prompt=3, hotkey="x", rewards=HALF, prompt_content_sha256="c" * 64)
+    explo.service_lane = "exploration"
+    explo.request.rollouts = []
+    for p in (legacy, explo, training):
+        p.telemetry = None
+    b._pending = [legacy, explo, training]
+    b.seal_randomness = "ee" * 32
+    seen = []
+
+    def capture(*, ranked, candidate_rows, operator_by_id):
+        seen.extend(p for p, _ in ranked)
+        return 0, [], set(), set(), set(), None
+    b._proof_scheduler = MagicMock()
+    b._prove_ranked_scheduled = capture
+    b._prove_ranked()
+    assert sorted(id(p) for p in seen) == sorted([id(legacy), id(training)])
+    assert b._pending == [legacy, explo, training]

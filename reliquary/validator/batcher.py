@@ -6743,11 +6743,27 @@ class GrpoWindowBatcher:
         try:
             verified = self._verify_expensive(pending, model=model, audit=True)
             self._conclude_exploration_audit(pending, verified, caps_at_admission)
-        except Exception:
-            logger.exception("exploration audit %s: the proof raised; this row ends unaudited (horizon), "
-                             "nothing else is affected", identity)
-            self._mark_audit_error(pending)
+        except BaseException as exc:
+            # N3: the class is decided from the exception TYPE only. A malformed payload (the proof code's own
+            # malformed-submission types are ValueError subclasses: ServiceContractError, ReleaseContractError,
+            # SeedPoolError, ScheduleError, pydantic errors) is this row's own horizon. Anything else is the
+            # validator's own fault (CUDA, dead proof worker, pipe, timeout, cancellation): never the miner's.
             verified = None
+            if self._is_payload_fault(exc):
+                logger.exception("exploration audit %s: the proof raised on the payload; this row ends "
+                                 "unaudited (horizon), nothing else is affected", identity)
+                self._mark_audit_error(pending)
+            else:
+                logger.exception("exploration audit %s: the proof plane failed (%s); this row ends "
+                                 "validator_lost (no horizon) and the fault goes to the scheduler",
+                                 identity, type(exc).__name__)
+                self._mark_validator_lost(identity)
+                try:
+                    self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0)
+                except Exception:
+                    logger.exception("service window %s: row %s not marked after a plane fault",
+                                     self.window_start, identity)
+                raise
         finally:
             with self._exploration_lock:
                 for job_id, open_identity in list(self._audit_open.items()):
@@ -6755,6 +6771,29 @@ class GrpoWindowBatcher:
                         # The decision lands in the plan a moment later; do not hold a slot meanwhile.
                         self._audit_open.pop(job_id, None)
             self._release_observation_payload(pending)  # the audit is over: its bytes are no longer held
+        return self._strip_audit_result(verified)
+
+    # Exceptions a crafted payload can provoke inside the proof; a subclass of an infrastructure type
+    # (RuntimeError, OSError, MemoryError, TimeoutError) is always the validator's.
+    _PAYLOAD_FAULTS = (ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError)
+    _PLANE_FAULTS = (RuntimeError, OSError, MemoryError, TimeoutError)
+
+    @classmethod
+    def _is_payload_fault(cls, exc: BaseException) -> bool:
+        return isinstance(exc, cls._PAYLOAD_FAULTS) and not isinstance(exc, cls._PLANE_FAULTS)
+
+    @staticmethod
+    def _strip_audit_result(verified):
+        """N1: the scheduler keeps a decision's value until the handle is dropped; an audit only needs the
+        pass/fail, so the result carries no token list."""
+        if verified is None:
+            return None
+        for name in ("rollouts", "completion_texts", "utility_rollouts"):
+            if hasattr(verified, name):
+                try:
+                    setattr(verified, name, [])
+                except Exception:
+                    pass
         return verified
 
     def _mark_audit_error(self, pending) -> None:
@@ -6894,7 +6933,9 @@ class GrpoWindowBatcher:
             current = self.difficulty_auction_metadata_by_id.get(id(pending), {})
             if status == "exploration_unaudited" and current.get("service_unpaid_reason") == "truncated":
                 payable = False
-            self._set_service_row(pending, status, **({} if payable else {"exploration_fraction": 0.0}))
+            # N4: a payable row gets its fraction back from the ledger (an audit that raised after its
+            # verdict was recorded had zeroed it); an unpayable one is zero.
+            self._set_service_row(pending, status, exploration_fraction=float(entry["amount"]) if payable else 0.0)
 
     def finalize_service_exploration(self, *, audits_could_run: bool | None = None) -> None:
         """Seal step 3 (the drain is the caller's): stop the audits, freeze the env's exploration.
@@ -6939,6 +6980,16 @@ class GrpoWindowBatcher:
         except Exception:
             logger.exception("service window %s env %s: exploration row statuses not refreshed",
                              self.window_start, self.service_environment)
+        # N2: whatever was drawn but never audited (or never drawn) keeps no token list past the seal. An
+        # audit still running keeps its own payload until it ends (it releases it itself).
+        with self._exploration_lock:
+            leftover = [p for i, p in self._exploration_pending.items() if i not in self._audit_open.values()]
+        for pending in leftover:
+            try:
+                self._release_observation_payload(pending)
+            except Exception:
+                logger.exception("service window %s: payload of %s not released at the seal",
+                                 self.window_start, pending.service_observation_id)
 
     def _service_admission_refusal(self, request) -> tuple[RejectReason, str] | None:
         """A banned hotkey's declared exploration is refused before any grading is spent on it.
