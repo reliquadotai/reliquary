@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import reliquary.validator.service as service_module
-from tests.unit.rl_tripwires import ARMED, rl_service_tripwires  # noqa: F401  (autouse in this module)
+from tests.unit.rl_tripwires import ARMED, RUNTIME_ONLY, real_entry, rl_service_tripwires  # noqa: F401  (autouse in this module)
 
 REPO = Path(__file__).parents[2]
 ROOT = REPO / "reliquary"
@@ -94,6 +94,24 @@ LEGACY_AND_CORPUS_SUITES = (
 )
 
 
+def _child_env() -> dict:
+    """Only what the suites need: no RELIQUARY_* switch (a profile or an operator's setting must not leak in)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _limit_child_memory() -> None:
+    """The same address-space cap as the parent run (common rules: ulimit -v 16000000 KiB)."""
+    import resource
+    limit = 16_000_000 * 1024
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if soft == resource.RLIM_INFINITY or soft > limit:
+        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+
+
+@pytest.mark.skipif(os.environ.get("RELIQUARY_PROTOCOL_PROFILE", "default") not in ("", "default"),
+                    reason="the armed legacy/corpus suites run once, under the default protocol profile only")
 @pytest.mark.parametrize("suite", LEGACY_AND_CORPUS_SUITES)
 def test_the_legacy_and_corpus_suites_pass_with_every_service_entry_point_armed(suite):
     """The suite runs in a child pytest with ``-p tests.unit.rl_tripwires``: an autouse fixture arms every entry
@@ -102,23 +120,37 @@ def test_the_legacy_and_corpus_suites_pass_with_every_service_entry_point_armed(
     done = subprocess.run(
         [sys.executable, "-m", "pytest", f"tests/unit/{suite}", "-q", "-p", "no:cacheprovider",
          "-p", "tests.unit.rl_tripwires"],
-        cwd=REPO, capture_output=True, text=True, timeout=600, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        cwd=REPO, capture_output=True, text=True, timeout=600, env=_child_env(), preexec_fn=_limit_child_memory)
     tail = (done.stdout + done.stderr)[-3000:]
     assert done.returncode == 0, tail
     assert " passed" in done.stdout and "skipped" not in done.stdout.splitlines()[-1], tail
 
 
 def test_the_tripwires_really_fire_and_record(rl_service_tripwires):
-    """Guard of the guard: a call is refused AND recorded, so a caller that swallows the error is still caught."""
-    from reliquary.services.admission_policy import service_lane
-    from reliquary.services.runtime import ServiceRuntime
+    """Guard of the guard: EVERY armed entry point is refused AND recorded (so a caller that swallows the error
+    is still caught), and the runtime-only ones are recorded only on an instance that has a runtime."""
+    from tests.unit.rl_tripwires import _resolve
 
-    for call in (lambda: service_lane(None, None, []), lambda: ServiceRuntime("x", None, {})):
+    for module_name, dotted in ARMED:
+        owner, attr = _resolve(module_name, dotted)
+        armed = owner.__dict__[attr]
+        function = armed.__func__ if isinstance(armed, (staticmethod, classmethod)) else armed
+        before = len(rl_service_tripwires)
         with pytest.raises(AssertionError, match="ran for a legacy"):
-            call()
-    assert len(rl_service_tripwires) == 2
+            function()
+        assert len(rl_service_tripwires) == before + 1, f"{module_name}.{dotted} did not record"
+        assert rl_service_tripwires[-1] == f"{module_name}.{dotted}"
     rl_service_tripwires.clear()
-    assert len(ARMED) >= 15
+
+    for module_name, dotted in RUNTIME_ONLY:
+        owner, attr = _resolve(module_name, dotted)
+        with pytest.raises(AssertionError, match="with a service runtime"):
+            owner.__dict__[attr](SimpleNamespace(_service_runtime=object()))
+        assert rl_service_tripwires == [f"{module_name}.{dotted}"]
+        rl_service_tripwires.clear()
+        owner.__dict__[attr](SimpleNamespace(_service_runtime=None, _signer_client=None))   # legacy: the real early return
+        assert rl_service_tripwires == []
+    assert len(ARMED) >= 27 and len(RUNTIME_ONLY) == 2
 
 
 # ------------------------------------------------------------------ the legacy boot
@@ -205,7 +237,12 @@ def test_the_legacy_cooldown_horizon_is_unchanged():
 def test_a_legacy_only_stream_replays_to_the_numbers_the_tree_before_this_work_produced():
     """The golden file holds the stream AND the weights ``WeightOnlyValidator._replay_ema`` returned at
     adce8966 (the merge base, no service code) for it: per-task caps engaged, an aborted window, pruned
-    dust and a status-less old archive. The same stream goes through today's chain unchanged."""
+    dust and a status-less old archive. The same stream goes through today's chain unchanged.
+
+    How the golden was generated (to regenerate or audit it): ``git archive adce8966 reliquary | tar -x -C <empty dir>``,
+    then with that tree first on ``sys.path`` call ``WeightOnlyValidator._replay_ema(archives, caps=caps)`` (and once
+    with no ``caps`` for ``weights_uncapped``) on the ``archives`` / ``caps`` stored in this very file's JSON; the
+    two weight maps are what that old tree returned. Never regenerate it from today's tree."""
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     golden = json.loads(GOLDEN_REPLAY.read_text())
@@ -227,14 +264,15 @@ def test_a_service_task_declared_but_silent_leaves_a_legacy_stream_byte_identica
     """A registry that DECLARES a v2 task next to the legacy ones changes nothing for a stream without its windows."""
     from reliquary.validator.weight_only import WeightOnlyValidator
     from tests.unit.test_service_weight_replay import TASK, declared
-
-    golden = json.loads(GOLDEN_REPLAY.read_text())
-    registry = declared(extra={task: SimpleNamespace(mechanism="auction", service_contract=None, params={"cap": cap})
-                         for task, cap in golden["caps"].items()})
-    validated = WeightOnlyValidator._validated_service_archives(golden["archives"], registry)
-    assert sorted(map(id, validated)) == sorted(map(id, golden["archives"]))
-    assert WeightOnlyValidator._replay_ema(validated, caps=golden["caps"],
-                                           service_tasks=frozenset({TASK})) == golden["weights"]
+    # Declaring a v2 task parses its contract (that is what a declaration is); nothing else may run.
+    with real_entry("reliquary.protocol.service_contract", "ServiceContract.from_dict"):
+        golden = json.loads(GOLDEN_REPLAY.read_text())
+        registry = declared(extra={task: SimpleNamespace(mechanism="auction", service_contract=None, params={"cap": cap})
+                             for task, cap in golden["caps"].items()})
+        validated = WeightOnlyValidator._validated_service_archives(golden["archives"], registry)
+        assert sorted(map(id, validated)) == sorted(map(id, golden["archives"]))
+        assert WeightOnlyValidator._replay_ema(validated, caps=golden["caps"],
+                                               service_tasks=frozenset({TASK})) == golden["weights"]
 
 
 def test_the_weight_only_validator_reads_a_legacy_task_with_the_legacy_projection(monkeypatch):
@@ -248,10 +286,12 @@ def test_the_weight_only_validator_reads_a_legacy_task_with_the_legacy_projectio
         seen[task_id] = (fields, kw)
         return []
 
-    wov, _ = wire(monkeypatch, [], [], declared())
+    with real_entry("reliquary.protocol.service_contract", "ServiceContract.from_dict"):
+        wov, _ = wire(monkeypatch, [], [], declared())
     monkeypatch.setattr(weight_only.storage, "list_recent_datasets", recent)
     import asyncio
-    asyncio.run(wov.submit_once())
+    with real_entry("reliquary.protocol.service_contract", "ServiceContract.from_dict"):
+        asyncio.run(wov.submit_once())            # parses the declared v2 contract, nothing else of the stack
     assert seen["default"] == (("window_start", "window_status", "rewards_by_hotkey"), {})
     assert seen[TASK][1] and "number_map_fields" in seen[TASK][1]
 

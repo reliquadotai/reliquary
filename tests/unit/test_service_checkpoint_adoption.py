@@ -400,8 +400,10 @@ async def test_boot_refuses_a_resume_target_outside_the_lineage_head(tmp_path, m
     loaded = MagicMock(side_effect=AssertionError("weights loaded before the lineage check"))
     service = SimpleNamespace(_resume_from=f"sha:{revision}", _service_runtime=runtime,
                               _checkpoint_store=SimpleNamespace(repo_id="models/test"), _load_model_fn=loaded)
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match=message) as refused:
         await ValidationService._apply_resume_from(service)
+    # M3: the operator is told which revision to resume from (the full lineage head).
+    assert f"resume from the lineage head {THIRD}" in str(refused.value)
     loaded.assert_not_called()
     runtime.require_resumable(checkpoint_n=2, repo="models/test", revision=THIRD)   # the head itself is fine
     runtime.close()

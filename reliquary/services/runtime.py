@@ -668,10 +668,16 @@ class ServiceRuntime:
         with self.lock:
             row = self.db.execute("SELECT sha256 FROM service_checkpoints WHERE revision=? AND order_id=?",
                                   (revision, self.contract.sha256)).fetchone()
+            head = self.db.execute("SELECT revision FROM service_checkpoints WHERE order_id=? ORDER BY seq DESC LIMIT 1",
+                                   (self.contract.sha256,)).fetchone()
+        hint = f"; resume from the lineage head {head[0]}" if head is not None else ""
         if row is None and (revision != root["revision"] or repo != root["repo"]):
-            raise ValueError("resume checkpoint has no adopted service lineage entry")
-        self.require_adoptable(checkpoint_n=checkpoint_n, repo=repo, revision=revision,
-                               sha256=root["sha256"] if row is None else row[0], parent_revision=None)
+            raise ValueError("resume checkpoint has no adopted service lineage entry" + hint)
+        try:
+            self.require_adoptable(checkpoint_n=checkpoint_n, repo=repo, revision=revision,
+                                   sha256=root["sha256"] if row is None else row[0], parent_revision=None)
+        except ValueError as exc:
+            raise ValueError(f"{exc}{hint}") from exc
 
     def ensure_checkpoint(self, *, checkpoint_n: int, repo: str, revision: str) -> dict:
         """Re-select an adopted revision (restart), or adopt the order's root checkpoint."""

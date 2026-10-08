@@ -429,6 +429,48 @@ async def test_a_runtime_lock_held_forever_never_stops_the_heartbeat_writes(tmp_
 
 
 @pytest.mark.asyncio
+async def test_a_stuck_runtime_lock_never_stacks_refresh_worker_threads(tmp_path, monkeypatch):
+    """Several heartbeat cycles over a lock that never frees: ONE worker thread in all, then a new one only
+    after the stuck one returned (the flag is cleared inside the thread)."""
+    import asyncio
+    import threading
+    rt = runtime_for(tmp_path)
+    service = _service(rt)
+    service._window_n = 7
+    service.SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS = 0.15
+    service._control_store = SimpleNamespace(heartbeat=lambda window: None)
+    release, entries = threading.Event(), []
+
+    def stuck(*a, **k):
+        entries.append(threading.get_ident())
+        release.wait(10)
+        return True
+    rt.active = stuck
+    real_sleep = asyncio.sleep
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        await real_sleep(0.1)
+        if len(sleeps) == 8:
+            raise asyncio.CancelledError
+    monkeypatch.setattr("reliquary.validator.service.asyncio.sleep", fake_sleep)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await service._control_heartbeat()
+        assert len(entries) == 1, f"{len(entries)} refresh workers stacked behind one stuck lock"
+    finally:
+        release.set()
+    for _ in range(50):                       # the stuck worker returns: the flag is cleared, a new refresh may run
+        if not service._service_refresh_in_flight:
+            break
+        await real_sleep(0.05)
+    assert service._service_refresh_in_flight is False
+    rt.active = lambda: True
+    await service._refresh_service_active_bounded()
+
+
+@pytest.mark.asyncio
 async def test_a_slow_refresh_is_given_up_on_and_keeps_the_last_value(tmp_path, caplog):
     import threading
     rt = runtime_for(tmp_path)

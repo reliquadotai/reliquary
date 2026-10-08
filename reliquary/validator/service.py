@@ -7043,9 +7043,18 @@ class ValidationService:
     async def _refresh_service_active_bounded(self) -> None:
         """``_refresh_service_active`` off the event loop, given up on after a few seconds (the
         thread may still finish; the last published value is kept meanwhile)."""
+        if getattr(self, "_service_refresh_in_flight", False):
+            return  # a worker thread is still stuck on the runtime lock: never stack a second one behind it
+        self._service_refresh_in_flight = True
+
+        def work() -> None:
+            try:
+                self._refresh_service_active()
+            finally:
+                self._service_refresh_in_flight = False
+
         try:
-            await asyncio.wait_for(asyncio.to_thread(self._refresh_service_active),
-                                   self.SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS)
+            await asyncio.wait_for(asyncio.to_thread(work), self.SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             logger.warning("service order activity refresh is slow (runtime busy); keeping the last value")
 

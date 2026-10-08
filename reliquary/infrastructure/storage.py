@@ -349,7 +349,12 @@ PROJECTED_KEY_MAX_LENGTH = 256
 PROJECTED_MAP_MAX_ENTRIES = 10_000
 
 
+INVALID_PROJECTION = "invalid"  # marker a consumer refuses (``None`` would read as "absent")
+
+
 def _projectable_value(value) -> bool:
+    # Floats are dropped on purpose: a row key the consumer needs (prompt_idx, hotkey, env_name) is an int or a
+    # string, so a float is either forged or irrelevant, and dropping it makes the consumer refuse the row.
     if isinstance(value, bool):
         return False
     return isinstance(value, int) or (isinstance(value, str) and len(value) <= PROJECTED_KEY_MAX_LENGTH)
@@ -401,7 +406,8 @@ async def list_recent_datasets(
 
     ``row_fields`` (only with ``fields``): ``{field: keys}`` projects each row of the list
     ``field`` to ``keys`` right after decoding, so the rows' bulk is never retained. A non-dict
-    row becomes ``None`` and so does a non-list value (the consumer refuses both); a row value is
+    row becomes ``None``; a non-list value becomes the string ``"invalid"`` (NOT ``None``, which a consumer may
+    read as an absent field, e.g. an empty batch); the consumer refuses both; a row value is
     kept only if it is an int or a string of at most ``PROJECTED_KEY_MAX_LENGTH`` characters.
     ``number_map_fields`` (only with ``fields``): each such field must be a map of at most
     ``PROJECTED_MAP_MAX_ENTRIES`` string keys (each at most ``PROJECTED_KEY_MAX_LENGTH`` long) to
@@ -443,7 +449,7 @@ async def list_recent_datasets(
                 for field, keys in (row_fields or {}).items():
                     if field in projected:
                         rows = projected[field]
-                        projected[field] = None if not isinstance(rows, list) else [
+                        projected[field] = INVALID_PROJECTION if not isinstance(rows, list) else [
                             {k: row[k] for k in keys if k in row and _projectable_value(row[k])}
                             if isinstance(row, dict) else None
                             for row in rows

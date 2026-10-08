@@ -445,7 +445,7 @@ async def test_projection_refuses_what_the_row_and_map_bounds_forbid():
 
     # batch: not a list -> None; row values: str of at most 256 chars or int, nothing else.
     bad = {**record, "batch": {"hotkey": "a"}}
-    assert (await _through_storage(bad, **kw))[0]["batch"] is None
+    assert (await _through_storage(bad, **kw))[0]["batch"] == "invalid"       # never None: None reads as an empty batch
     rows = [{"hotkey": "h" * 257, "env_name": MATH, "prompt_idx": True},
             {"hotkey": "h" * 256, "env_name": ["x"], "prompt_idx": 5}]
     (projected,) = await _through_storage({**record, "batch": rows}, **kw)
@@ -472,3 +472,19 @@ async def test_projection_refuses_what_the_row_and_map_bounds_forbid():
         {**record, "service_pools_by_environment": {f"e{i}": 0.0 for i in range(10_000)}}, **kw)
     assert len(ten_thousand["service_pools_by_environment"]) == 10_000          # the bound is inclusive
     assert check([{**projected, "task_id": TASK}]) == []                        # a None map drops the archive (logged)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_batch", [{"hotkey": "a"}, "rows", 7, True])
+async def test_a_non_list_batch_with_zero_training_and_exploration_pay_is_dropped_not_paid_exploration_only(bad_batch):
+    """I1: the projection of a non-list batch must not read as an empty batch."""
+    record = settled(rows=(), exploration={CODE: {"x": 1}})
+    assert record["batch"] == [] and record["service_exploration_by_environment"]
+    kw = dict(fields=("window_start", "window_status", "rewards_by_hotkey") + weight_only.SERVICE_ARCHIVE_FIELDS,
+              row_fields=weight_only.SERVICE_ROW_FIELDS, number_map_fields=weight_only.SERVICE_NUMBER_MAPS,
+              nested_number_map_fields=weight_only.SERVICE_NESTED_NUMBER_MAPS)
+    (good,) = await _through_storage(record, **kw)
+    (paid,) = check([{**good, "task_id": TASK}])         # control: an honest empty batch with exploration pays
+    assert set(paid["rewards_by_hotkey"]) == {"x"}
+    (projected,) = await _through_storage({**record, "batch": bad_batch}, **kw)
+    assert check([{**projected, "task_id": TASK}]) == []
