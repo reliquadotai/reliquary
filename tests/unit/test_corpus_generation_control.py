@@ -202,10 +202,10 @@ def test_shared_generation_mode_never_loads_another_model_and_keeps_audit_rechec
             assert self.app.state.corpus_jobs._finals is not None
             assert bool(self.app.state.corpus_jobs.served) == initial_jobs
             for wiring in self.app.state.corpus_jobs.served.values():
-                assert wiring.settler._archives._served_only
-                wiring.settler._archives.refuse_unserved(wiring.entry.task_id)
+                assert wiring.settler._archives._guard._served_only
+                wiring.settler._archives._guard.refuse_unserved(wiring.entry.task_id)
                 with pytest.raises(RuntimeError, match="refusing to archive"):
-                    wiring.settler._archives.refuse_unserved("corpus-legacy")
+                    wiring.settler._archives._guard.refuse_unserved("corpus-legacy")
             assert await remote._local_scores([{"tokens": [1, 2], "prompt_len": 1, "proofs": []}]) == [("ok", ())]
             raise Stop()
 

@@ -263,21 +263,56 @@ def get_raw(root: Path, key: str) -> bytes | None:
 
 
 class FileArchives:
-    """``R2Archives`` on disk; every write is logged, so a test can see a
-    window paid twice with different rewards."""
+    """The settler's archive guard: the harness serves every task it names."""
 
     def __init__(self, *, served=None, **kw) -> None:
-        self._dir = _root() / "archives"
+        pass
 
-    async def other_max(self, task_id: str):
+    def refuse_unserved(self, task_id: str) -> None:
         return None
 
-    async def write(self, task_id: str, window: int, data: dict) -> None:
+
+class FilePeriodArchives:
+    """``R2PeriodArchives`` on disk: ``<task>-<work>-<entry>.json``; every write
+    is logged, so a test can see a period paid twice with different rewards."""
+
+    def __init__(self, guard=None) -> None:
+        self._dir = _root() / "archives"
+
+    def _path(self, task_id: str, work: int, entry: int) -> Path:
+        return self._dir / f"{task_id}-{int(work)}-{int(entry)}.json"
+
+    async def write(self, task_id: str, work: int, entry: int, document: dict) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
-        (self._dir / f"{task_id}-{int(window)}.json").write_text(json.dumps(data, sort_keys=True))
+        path = self._path(task_id, work, entry)
+        if path.exists():
+            if json.loads(path.read_text()) != json.loads(json.dumps(document)):
+                raise RuntimeError(f"period archive {task_id} {work}-{entry} already holds "
+                                   "another document")
+            return
+        path.write_text(json.dumps(document, sort_keys=True))
         with open(self._dir / "writes.jsonl", "a") as log:
-            log.write(json.dumps({"task": task_id, "window": int(window), "pid": os.getpid(),
-                                  "rewards": data["rewards_by_hotkey"]}, sort_keys=True) + "\n")
+            log.write(json.dumps({"task": task_id, "window": int(work), "pid": os.getpid(),
+                                  "rewards": document["rewards_by_hotkey"]},
+                                 sort_keys=True) + "\n")
+
+    async def read(self, task_id: str, work: int, entry: int):
+        path = self._path(task_id, work, entry)
+        return json.loads(path.read_text()) if path.exists() else None
+
+    async def list(self, task_id: str):
+        found = []
+        for path in self._dir.glob(f"{task_id}-*.json") if self._dir.exists() else ():
+            rest = path.stem[len(task_id) + 1:].split("-")
+            if len(rest) == 2 and all(part.isdigit() for part in rest):
+                found.append((int(rest[0]), int(rest[1])))
+        return sorted(found)
+
+
+# A harness run lasts minutes: periods of PERIOD_SECONDS seconds, closed after
+# SLACK_SECONDS, stand for drand's 72 minutes and the 420 s accept slack.
+PERIOD_SECONDS = 10
+SLACK_SECONDS = 2.0
 
 
 # -- the stand-ins every child installs ------------------------------------
@@ -357,6 +392,19 @@ def install(single: bool = False) -> None:
     for module in (job_store, record_store, storage):
         module.get_s3_client = client
     corpus_settlement.R2Archives = FileArchives
+    from reliquary.infrastructure import corpus_period_store
+    from reliquary.validator import corpus_period_settlement, corpus_periods
+
+    corpus_period_store.R2PeriodArchives = FilePeriodArchives
+    corpus_periods.PERIOD_SECONDS = PERIOD_SECONDS
+    real_settler = corpus_period_settlement.CorpusPeriodSettler
+
+    class _FastSettler(real_settler):
+        def __init__(self, **kw):
+            kw.setdefault("slack_seconds", SLACK_SECONDS)
+            super().__init__(**kw)
+
+    corpus_period_settlement.CorpusPeriodSettler = _FastSettler
     corpus_validator.drand_beacon = _beacon
     corpus_validator.LazyRoundAt = lambda: round_at
     modeling.load_tokenizer = lambda path: fakes.Tokenizer()

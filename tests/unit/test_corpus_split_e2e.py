@@ -86,14 +86,29 @@ def _outcome(root):
         verdicts = {sid: _key(v) for sid, v in h.listed(root, job, "verdicts").items()}
         archives = {}
         for path in sorted((root / "archives").glob(f"corpus-{job.split('-')[0]}-*.json")):
-            archives[path.stem] = json.loads(path.read_text())["rewards_by_hotkey"]
+            # Keyed by work period: the entry period depends on when it settled.
+            archives[path.stem.rsplit("-", 1)[0]] = json.loads(path.read_text())["rewards_by_hotkey"]
         out[job] = (verdicts, archives, sorted(h.settlement(root, job).get("settled") or []))
     return out
 
 
+def _wait_stable(read, quiet_seconds, timeout, what):
+    """Until ``read()`` returns the same value for ``quiet_seconds``."""
+    deadline = time.monotonic() + timeout
+    last, since = read(), time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        now = read()
+        if now != last:
+            last, since = now, time.monotonic()
+        elif time.monotonic() - since >= quiet_seconds:
+            return
+    raise AssertionError(f"timed out waiting for {what} to settle down")
+
+
 def _settled_all(root, job):
     state = h.settlement(root, job)
-    return state.get("last_window") is not None and not state.get("pending")
+    return state.get("last_entry") is not None and not state.get("pending")
 
 
 def _run_single(root, served, *, settle_every):
@@ -106,7 +121,7 @@ def _run_single(root, served, *, settle_every):
 def test_the_split_writes_the_single_process_verdicts_and_archives(bucket, tmp_path):
     """Same records, same received times, one beacon: the single process and
     the split (math in a judge process, code in the front) write the same
-    verdicts and pay the same window."""
+    verdicts and pay the same periods."""
     root, _ = bucket
     now = time.time()
     ids = _seed(root, now=now, old=120, fresh=60)
@@ -121,6 +136,10 @@ def test_the_split_writes_the_single_process_verdicts_and_archives(bucket, tmp_p
     try:
         _wait(judged_enough, 120, "the single process's verdicts")
         _wait(lambda: all(_settled_all(root, j) for j in (MATH, CODE)), 120, "its settlement")
+        # Periods close one after another as their records are decided: wait
+        # until nothing more can settle (the fresh undrawn records wait their
+        # hold, past this run), i.e. two settle passes change nothing.
+        _wait_stable(lambda: _outcome(root), settle_every * 2 + 5, 240, "its settlement")
     finally:
         process.kill()
         process.join(10)
@@ -140,7 +159,7 @@ def test_the_split_writes_the_single_process_verdicts_and_archives(bucket, tmp_p
                         settle_every_seconds=settle_every, auditor_kwargs=AUDITOR)
     with h.SupervisorThread(spec):
         _wait(judged_enough, 120, "the split's verdicts")
-        _wait(lambda: all(_settled_all(root, j) for j in (MATH, CODE)), 120, "its settlement")
+        _wait(lambda: _outcome(root) == single, 240, "the split's settlement")
     split = _outcome(root)
 
     for job in (MATH, CODE):
@@ -205,7 +224,7 @@ def _invariants(root, *, killed=()):
         state = h.settlement(root, job)
         settled = state.get("settled") or []
         assert len(settled) == len(set(settled)) and set(settled) <= set(verdict_docs), job
-    # A window archived again after a crash pays the same rewards.
+    # A period archived again after a crash pays the same rewards.
     by_window = collections.defaultdict(set)
     for line in (root / "archives" / "writes.jsonl").read_text().splitlines():
         doc = json.loads(line)

@@ -448,8 +448,6 @@ async def run_corpus_split(*, served, netuid: int, http_host: str, http_port: in
     from reliquary.validator.corpus_validator import period_served
 
     served, dropped = period_served(served)
-    if not served:
-        raise RuntimeError("no period-settled corpus task to serve")
     checked = await preflight(served)
     # Before any child starts: an episode job is judged and graded in the front.
     groups = plan_groups(os.environ.get(JUDGES_ENV), checked.jobs,
