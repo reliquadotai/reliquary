@@ -23,7 +23,8 @@ def envelope(contract, pools, *, picks=PICKS, slots=SLOTS):
 
 def archive(rows):
     return {"window_start": 3, "window_status": "complete",
-            "batch": [{"hotkey": h, "env_name": e} for h, e in rows], "rewards_by_hotkey": {}}
+            "batch": [{"hotkey": h, "env_name": e, "prompt_idx": i} for i, (h, e) in enumerate(rows)],
+            "rewards_by_hotkey": {}}
 
 
 def settle(rows, pools, exploration, *, contract=None, aborted=False, picks=PICKS, slots=SLOTS):
@@ -280,7 +281,7 @@ def test_ledger_cap_and_settlement_cap_are_the_same_test(tmp_path):
             while book.reserve(window=1, environment=MATH, observation_id=f"{i:064x}", hotkey=f"h{i % 3}", prompt_idx=i,
                                amount=price, cap=cap, draw_round=5, new_hotkey_audit_groups=0) is not None:
                 i += 1
-            book.resolve_draws(1, environment=MATH, beacon_for_round=lambda r: "ab" * 32, audit_bps=0)
+            book.resolve_draws(1, environment=MATH, beacon_for_round=lambda r: "ab" * 32, audit_bps=0, run_salt=b"s" * 32)
             book.finalize_window(1, environment=MATH)
         assert i == 1000 * picks * slots // 1500                 # 10 % of the pool in 15 % units
         counts = book.payable(1, environment=MATH)
@@ -509,3 +510,40 @@ def test_settle_refuses_an_envelope_whose_schedule_digest_is_not_its_schedule():
     e["schedule_sha256"] = "0" * 64
     with pytest.raises(SettlementError, match="digest"):
         settle_window(archive=archive([]), envelope=e, contract=contract, exploration={}, aborted=False)
+
+
+# ---- round 3: m5, m9 ----
+
+def test_m9_every_paid_row_needs_an_integer_prompt_idx_at_settle_and_at_validate():
+    good = settle([("a", MATH)], {MATH: 0.4, CODE: 0.4}, {})
+    validate(good)
+    for value in (None, "0", True, 0.0, [0]):
+        record = json.loads(json.dumps(good))
+        if value is None:
+            del record["batch"][0]["prompt_idx"]
+        else:
+            record["batch"][0]["prompt_idx"] = value
+        with pytest.raises(SettlementError, match="prompt_idx"):
+            validate(record)
+        contract = contract_v2()
+        with pytest.raises(SettlementError, match="prompt_idx"):
+            settle_window(archive={"batch": record["batch"]}, envelope=envelope(contract, {MATH: 0.4, CODE: 0.4}),
+                          contract=contract, exploration={}, aborted=False)
+
+
+def test_m5_an_unexpected_error_inside_settlement_is_logged_with_its_traceback(monkeypatch, caplog):
+    from reliquary.services import settlement
+
+    def defect(*args, **kwargs):
+        return {}["our own bug"]
+    monkeypatch.setattr(settlement, "_compute", defect)
+    with caplog.at_level("ERROR", logger="reliquary.services.settlement"):
+        with pytest.raises(SettlementError, match="KeyError"):
+            settle([("a", MATH)], {MATH: 0.4, CODE: 0.4}, {})
+    (record,) = [r for r in caplog.records if r.name == "reliquary.services.settlement"]
+    assert record.exc_info is not None and record.exc_info[0] is KeyError and "defect" in caplog.text
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="reliquary.services.settlement"):   # a plain refusal is not an exception log
+        with pytest.raises(SettlementError):
+            settle([("a", "reliquary_other_v1")], {MATH: 0.4, CODE: 0.4}, {})
+    assert caplog.records == []

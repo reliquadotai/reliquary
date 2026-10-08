@@ -1000,28 +1000,32 @@ def test_a_proven_group_left_out_of_the_batch_keeps_its_prompt_scanned_in_a_norm
 LOW, HIGH = range(M_ROLLOUTS), range(M_ROLLOUTS, 2 * M_ROLLOUTS)
 
 
-@pytest.mark.parametrize("trainer", ["x", "other"], ids=["same-hotkey-both-lanes", "two-hotkeys"])
-def test_r17_exploration_on_a_prompt_trained_in_the_same_window_is_unpaid_without_sanction(tmp_path, trainer):
-    """One operator, 32 public seeds of P: an all-fail subset sent as exploration, an in-zone subset
-    sent for training. Paid: the training group only (never 1.15 groups)."""
+@pytest.mark.parametrize("trainer, train_seeds", [("x", HIGH), ("other", HIGH), ("x", LOW), ("other", LOW)],
+                         ids=["same-hotkey-two-subsets", "two-hotkeys", "same-hotkey-SAME-subset", "two-hotkeys-same-subset"])
+def test_r17_exploration_on_a_prompt_trained_in_the_same_window_is_unpaid_without_sanction(tmp_path, trainer, train_seeds):
+    """One operator, 32 public seeds of P: a subset sent as exploration, a subset (another, or the
+    very same one: C1) sent for training. Paid: the training group only (never 1.15 groups)."""
     rt = runtime(tmp_path)
     probe = explore(rt, hotkey="x", prompt=7, seeds=LOW)                # exploration FIRST: entitled for now
     clean = explore(rt, hotkey="x", prompt=8)
     assert probe["entitled"] and probe["first_scan"]
-    trained = train(rt, hotkey=trainer, prompt=7, seeds=HIGH, now=130.0)
+    trained = train(rt, hotkey=trainer, prompt=7, seeds=train_seeds, rewards=ZERO if train_seeds is LOW else HALF,
+                    now=130.0)                                          # the same subset has the same rewards
     assert trained["inserted"] and trained["first_scan"] is False
+    assert trained["observation_id"] != probe["observation_id"]         # the lane is part of the identity
     draw(rt)
-    assert [row["prompt_idx"] for row in rt.queued_audits(1)] == [8]    # the doomed row needs no audit
-    assert rt.exploration_backlog(1)["queued"] == 1
+    assert [row["prompt_idx"] for row in rt.queued_audits(1)] == [7, 8]  # R17 voids the pay, not the audit
+    assert rt.exploration_backlog(1)["queued"] == 2
     assert rt.record_audit(clean["observation_id"], passed=True, now=10_000.0).passed
+    assert rt.record_audit(probe["observation_id"], passed=True, now=10_000.0).passed
     released = rt.finalize_exploration(1, environment=MATH, now=10_050.0)
     assert released == [probe["observation_id"]]
     settle = settle_event(rt, probe)
-    assert (settle["status"], settle["reason"]) == ("exploration_unpaid", "trained")
+    assert (settle["status"], settle["proof"], settle["reason"]) == ("exploration_unpaid", "audited", "trained")
     assert rt.ledger.payable(1, environment=MATH) == {"x": 1}           # prompt 8 only
     assert rt.ledger.rows(1, environment=MATH)[0]["status"] == "trained"
     assert not rt.exploration_banned("x", now=10_051.0)                 # no sanction
-    assert rt.ledger.passed_audits("x") == 1                            # probation neither lost nor gained
+    assert rt.ledger.passed_audits("x") == 2                            # a passed audit stays a passed audit
     assert scan_holder(rt, 7) == trained["observation_id"]              # the scan moved to the training group
     result = rt.reconcile_archive(archive(batch=[(trainer, MATH, 7)]), now=10_100.0)
     assert result["service_exploration_by_environment"] == {MATH: {"x": 1}}
@@ -1029,34 +1033,87 @@ def test_r17_exploration_on_a_prompt_trained_in_the_same_window_is_unpaid_withou
     assert total == pytest.approx(POOL / T + PRICE)                     # one training group + prompt 8
     settle = settle_event(rt, probe)                                    # the final status says why, still
     assert (settle["status"], settle["reason"]) == ("exploration_unpaid", "trained")
+    assert settle_event(rt, trained)["status"] == "trained"
     assert not any(e["status"] == "exploration_paid" and e["id"] == probe["observation_id"] for e in events(rt))
     validate_service_archive_v2(result, rt.contract, cap=1.0, picks_target=PICKS, batch_slots=SLOTS)
 
 
-def test_r17_training_first_then_exploration_is_refused_at_once(tmp_path):
+@pytest.mark.parametrize("explore_seeds", [LOW, HIGH], ids=["other-subset", "SAME-subset"])
+def test_r17_training_first_then_exploration_is_refused_at_once(tmp_path, explore_seeds):
     rt = runtime(tmp_path)
-    train(rt, hotkey="x", prompt=7, seeds=HIGH)
+    trained = train(rt, hotkey="x", prompt=7, seeds=HIGH)
     for hotkey in ("x", "other"):
-        late = explore(rt, hotkey=hotkey, prompt=7, seeds=LOW, now=130.0)
+        late = explore(rt, hotkey=hotkey, prompt=7, seeds=explore_seeds, rewards=HALF if explore_seeds is HIGH else ZERO,
+                       now=130.0)
         assert (late["entitled"], late["status"], late["reason"]) == (False, "exploration_unpaid", "already_scanned")
+        assert late["inserted"] and late["observation_id"] != trained["observation_id"]
     assert rt.ledger.rows(1, environment=MATH) == []
+    result = rt.reconcile_archive(archive(batch=[("x", MATH, 7)]), now=10_100.0)
+    assert result["rewards_by_hotkey"] == {"x": pytest.approx(POOL / T)}
 
 
-def test_r17_a_voided_row_sets_no_audit_horizon(tmp_path):
+def seasoned_hotkey_with_a_drawn_row_on_a_prompt_it_then_trains(tmp_path):
     rt = runtime(tmp_path, contract=reward_contract(new_hotkey_audit_groups=1, audit_bps=0))
-    seasoned = explore(rt, hotkey="x", prompt=1, now=100.0)             # forced (probation)
-    doomed = explore(rt, hotkey="x", prompt=7, now=110.0)               # forced too: drawn, will stay queued
+    passed = explore(rt, hotkey="x", prompt=1, now=100.0)               # forced (probation)
+    drawn = explore(rt, hotkey="x", prompt=7, now=110.0)                # forced too: drawn, stays queued
     draw(rt)
-    assert rt.record_audit(seasoned["observation_id"], passed=True, now=10_000.0).passed
+    assert rt.record_audit(passed["observation_id"], passed=True, now=10_000.0).passed
     behind = explore(rt, hotkey="x", prompt=9, now=10_010.0)            # past probation, later round: not drawn
     draw(rt, now=20_000.0)
-    train(rt, hotkey="t", prompt=7, now=20_010.0)
+    train(rt, hotkey="x", prompt=7, seeds=HIGH, now=20_010.0)           # "I trained it, do not audit it"
     assert [r["audit"] for r in rt.ledger.rows(1, environment=MATH)] == ["passed", "queued", "not_drawn"]
-    released = rt.finalize_exploration(1, environment=MATH, now=20_050.0)
-    assert released == [doomed["observation_id"]]                       # NOT the row behind it
-    assert rt.ledger.payable(1, environment=MATH) == {"x": 2}
-    assert settle_event(rt, doomed)["reason"] == "trained" and behind["entitled"]
+    return rt, passed, drawn, behind
+
+
+def test_c2_training_a_drawn_prompt_does_not_take_it_out_of_the_audit_queue_nor_hide_the_horizon(tmp_path):
+    rt, passed, drawn, behind = seasoned_hotkey_with_a_drawn_row_on_a_prompt_it_then_trains(tmp_path)
+    assert [row["observation_id"] for row in rt.queued_audits(1)] == [drawn["observation_id"]]
+    assert rt.exploration_backlog(1) == {"pending_draw": 0, "queued": 1, "queued_past_probation": 1}
+    released = rt.finalize_exploration(1, environment=MATH, now=20_050.0)   # the audit was never run
+    assert released == [drawn["observation_id"], behind["observation_id"]]  # the row behind it is unpaid too
+    assert rt.ledger.payable(1, environment=MATH) == {"x": 1}
+    assert settle_event(rt, drawn)["reason"] == "trained" and "reason" not in settle_event(rt, behind)
     assert not rt.exploration_banned("x", now=20_051.0)
+    # and the late verdict of that row still bans
+    assert rt.record_audit(drawn["observation_id"], passed=False, now=20_100.0).failed
+    assert rt.exploration_banned("x", now=20_101.0)
+
+
+def test_c2_a_drawn_row_on_a_trained_prompt_can_still_fail_its_audit(tmp_path):
+    rt, passed, drawn, behind = seasoned_hotkey_with_a_drawn_row_on_a_prompt_it_then_trains(tmp_path)
+    outcome = rt.record_audit(drawn["observation_id"], passed=False, now=20_020.0)
+    assert outcome.failed and set(outcome.forfeited) == {r["observation_id"] for r in (passed, drawn, behind)}
+    assert rt.exploration_banned("x", now=20_021.0)
+    rt.finalize_exploration(1, environment=MATH, now=20_050.0)
+    assert rt.ledger.payable(1, environment=MATH) == {}
+    assert settle_event(rt, behind)["status"] == "exploration_forfeited"
+
+
+def test_m6_a_probationer_holds_four_pending_rows_per_window_over_all_envs(tmp_path):
+    from reliquary.constants import PROBATION_PENDING_LIMIT
+    rt = runtime(tmp_path)
+    held = [explore(rt, hotkey="new", prompt=i, env=(MATH, CODE)[i % 2]) for i in range(PROBATION_PENDING_LIMIT)]
+    assert all(r["entitled"] for r in held) and PROBATION_PENDING_LIMIT == 4
+    for env in (MATH, CODE):
+        over = explore(rt, hotkey="new", prompt=50, env=env)
+        assert (over["entitled"], over["reason"]) == (False, "probation_limit")
+    assert len(rt.ledger.rows(1, environment=MATH)) + len(rt.ledger.rows(1, environment=CODE)) == 4
+    assert explore(rt, hotkey="someone", prompt=50)["entitled"] is True
+    open_window(rt, 2)
+    assert explore(rt, hotkey="new", prompt=60, window=2, now=130.0)["entitled"] is True   # per window
+
+
+def test_m9_a_paid_row_without_an_integer_prompt_idx_settles_nothing(tmp_path):
+    rt = runtime(tmp_path)
+    train(rt, prompt=20, hotkey="a")
+    for row in ({"hotkey": "a", "env_name": MATH}, {"hotkey": "a", "env_name": MATH, "prompt_idx": "20"},
+                {"hotkey": "a", "env_name": MATH, "prompt_idx": True}, {"hotkey": "a", "env_name": MATH, "prompt_idx": 20.0}):
+        with pytest.raises(SettlementError, match="prompt_idx"):
+            rt.reconcile_archive({"window_start": 1, "batch": [row], "rewards_by_hotkey": {}}, now=10_100.0)
+    assert rt.db.execute("SELECT COUNT(*) FROM service_settled").fetchone()[0] == 0 and events(rt, "settle") == []
+    result = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=10_200.0)
+    assert result["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T)}
+    assert [e["status"] for e in events(rt, "settle")] == ["trained"]   # paid and published agree
 
 
 def test_r17_also_catches_a_training_group_recorded_after_the_env_was_finalized(tmp_path):
@@ -1298,41 +1355,65 @@ def test_i2_a_window_settled_aborted_then_called_not_aborted_is_a_valid_archive_
 
 # ---------------------------------------------------------------- restart
 
-def test_restart_reuses_the_stored_draw_beacon_whatever_the_new_beacon_source_says(tmp_path):
+def test_restart_reuses_the_stored_draw_beacon_and_the_run_salt_whatever_the_new_beacon_source_says(tmp_path):
+    from reliquary.services.exploration import audit_selected
     path = tmp_path / "runtime.sqlite3"
-    contract = reward_contract(new_hotkey_audit_groups=0, audit_bps=5000)   # the beacon decides
+    contract = reward_contract(new_hotkey_audit_groups=0, audit_bps=5000)   # the beacon and the salt decide
     rt = runtime(tmp_path, contract=contract)
-    for prompt in range(12):
-        explore(rt, prompt=prompt, hotkey=f"h{prompt % 6}", now=120.0)       # all at draw round 42
-    half = [prompt for prompt in range(6)]
-    # Draw the first six rows only (the others are held back as if their env pass had not run yet).
-    rt.db.execute("UPDATE exploration_entitlements SET draw_round=99 WHERE prompt_idx>=6")
+    n = min(CAP_COUNT, 20)
+    keys = [(env, prompt) for env in (MATH, CODE) for prompt in range(n)]
+    for env, prompt in keys:
+        explore(rt, env=env, prompt=prompt, hotkey=f"h{prompt % 6}", now=120.0)   # all at draw round 42
+    early = [key for key in keys if key[1] < n // 2]
+    # Draw the first half only (the others are held back as if their pass had not run yet).
+    rt.db.execute("UPDATE exploration_entitlements SET draw_round=99 WHERE prompt_idx>=?", (n // 2,))
     rt.db.commit()
     rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=200.0)
-    before = {r["prompt_idx"]: r["audit"] for r in rt.ledger.rows(1, environment=MATH) if r["prompt_idx"] in half}
-    assert set(before.values()) <= {"queued", "not_drawn"}
-    rt.db.execute("UPDATE exploration_entitlements SET draw_round=42 WHERE prompt_idx>=6")
+
+    def state(runtime_):
+        return {(r["environment"], r["prompt_idx"]): r["audit"] for env in (MATH, CODE)
+                for r in runtime_.ledger.rows(1, environment=env)}
+    before = {key: state(rt)[key] for key in early}
+    assert set(before.values()) == {"queued", "not_drawn"}
+    rt.db.execute("UPDATE exploration_entitlements SET draw_round=42")
     rt.db.commit()
-    ids = {r["prompt_idx"]: r["observation_id"] for r in rt.ledger.rows(1, environment=MATH)}
+    ids = {(r["environment"], r["prompt_idx"]): r["observation_id"] for env in (MATH, CODE)
+           for r in rt.ledger.rows(1, environment=env)}
+    salt = rt.log.run_salt
     rt.close()
 
-    from reliquary.services.exploration import audit_selected
     rt = build(path, contract)
+    assert rt.log.run_salt == salt and len(salt) == 32                      # persisted, not re-rolled
     asked = []
     other = "ee" * 32                                                       # the reopened source disagrees
-    assert other != BEACON
     rt.resolve_draws(1, beacon_for_round=lambda r: asked.append(r) or other, now=10_000.0)
     assert asked == []                                                      # round 42 is stored: never asked again
     assert rt.db.execute("SELECT round, randomness FROM service_draw_beacons").fetchall() == [(42, BEACON)]
-    after = {r["prompt_idx"]: r["audit"] for r in rt.ledger.rows(1, environment=MATH)}
-    assert {p: after[p] for p in half} == before                            # drawn rows did not move
-    expected = {p: ("queued" if audit_selected(beacon_randomness=BEACON, observation_id=ids[p], audit_bps=5000,
-                                               forced=False) else "not_drawn") for p in range(12)}
-    assert after == expected                                                # every draw used the STORED beacon
-    with_other = {p: ("queued" if audit_selected(beacon_randomness=other, observation_id=ids[p], audit_bps=5000,
-                                                 forced=False) else "not_drawn") for p in range(12)}
-    assert with_other != expected                                           # (the other beacon draws differently)
+    after = state(rt)
+    assert {key: after[key] for key in early} == before                     # drawn rows did not move
+
+    def selection(beacon, run_salt):
+        return {key: ("queued" if audit_selected(beacon_randomness=beacon, observation_id=ids[key], audit_bps=5000,
+                                                 forced=False, run_salt=run_salt) else "not_drawn") for key in keys}
+    assert after == selection(BEACON, salt)                                 # every draw: STORED beacon, run salt
+    assert after != selection(other, salt)                                  # (the other beacon draws differently)
+    # R18: the public inputs (beacon, ids) do not give the selection without the secret salt
+    assert after != selection(BEACON, b"\x00" * 32) and after != selection(BEACON, bytes(reversed(salt)))
     rt.close()
+
+
+def test_r18_two_runs_draw_different_rows_for_the_same_public_inputs(tmp_path):
+    from reliquary.services.exploration import audit_selected
+    salts = []
+    for name in ("one", "two"):
+        rt = runtime(tmp_path / name)
+        salts.append(rt.log.run_salt)
+        rt.close()
+    assert salts[0] != salts[1]
+    ids = [f"{i:064x}" for i in range(400)]
+    drawn = [{i for i in ids if audit_selected(beacon_randomness=BEACON, observation_id=i, audit_bps=1500,
+                                               forced=False, run_salt=salt)} for salt in salts]
+    assert drawn[0] != drawn[1] and all(20 < len(d) < 110 for d in drawn)
 
 
 def test_restart_between_finalize_and_reconcile_settles_what_was_finalized(tmp_path):
@@ -1340,6 +1421,7 @@ def test_restart_between_finalize_and_reconcile_settles_what_was_finalized(tmp_p
     rt = runtime(tmp_path)
     paid = explore(rt, hotkey="x", prompt=1, now=120.0)
     lost = explore(rt, hotkey="y", prompt=2, now=9_000.0)                # never drawn
+    queued = explore(rt, hotkey="z", prompt=3, now=120.0)                # drawn, left queued at finalize
     rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=200.0)
     rt.record_audit(paid["observation_id"], passed=True, now=201.0)
     train(rt, prompt=20, hotkey="a")
@@ -1349,14 +1431,19 @@ def test_restart_between_finalize_and_reconcile_settles_what_was_finalized(tmp_p
     rt.close()
 
     rt = build(path)
-    assert rt.ledger.is_finalized(1, environment=MATH) and rt.ledger.payable(1, environment=MATH) == {"x": 1}
     assert rt.queued_audits(1) == [] and rt.pending_draw_rounds(1) == []
     assert rt.record_audit(lost["observation_id"], passed=True, now=9_200.0) == AuditOutcome("not_applied")
+    # a late PASS after the reopen: the (window, env) is still finalized, the row stays unpaid
+    assert rt.record_audit(queued["observation_id"], passed=True, now=9_200.0) == AuditOutcome("not_applied")
+    assert rt.ledger.state(queued["observation_id"]) == ("unaudited", "reserved")
+    late = explore(rt, hotkey="w", prompt=4, now=9_250.0)
+    assert (late["entitled"], late["reason"]) == (False, "finalized")
+    assert rt.ledger.payable(1, environment=MATH) == {"x": 1}
     result = rt.reconcile_archive(archive(batch=[("a", MATH, 20)]), now=9_300.0)
     assert result["rewards_by_hotkey"] == {"a": pytest.approx(POOL / T), "x": pytest.approx(PRICE)}
     assert settle_event(rt, paid)["status"] == "exploration_paid"
-    assert settle_event(rt, lost)["status"] == "exploration_unpaid"
-    assert len(events(rt)) == count + 2                                  # exploration_paid + trained, nothing twice
+    assert settle_event(rt, lost)["status"] == settle_event(rt, queued)["status"] == "exploration_unpaid"
+    assert len(events(rt)) == count + 3                 # w's observation, exploration_paid, trained: nothing twice
     assert rt.log.is_scanned(MATH, 1) and not rt.log.is_scanned(MATH, 2)
     rt.close()
 

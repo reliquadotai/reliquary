@@ -31,8 +31,11 @@ Rules a reader of the public log can rely on:
   scanned: an exploration observation of it is refused ``already_scanned``.
 * Trained in the same window (R17): at finalize of a (window, env), every entitlement still
   ``reserved`` whose prompt has a training-lane observation recorded in that window (any hotkey,
-  before or after) becomes ``trained``: unpaid, never sanctioned, no ban, no probation lost. It sets
-  no audit horizon and needs no audit. Exploration is paid for prompts nobody trains in the window.
+  before or after) becomes ``trained``: unpaid, never sanctioned, no ban, no probation lost. R17
+  voids the PAY only, never the audit: a drawn row on a trained prompt stays in the audit queue,
+  can still fail (ban and forfeit, as any failure), and if it is left unaudited it sets its
+  hotkey's audit horizon like any other drawn unaudited row. Training a prompt is no way out of
+  an audit.
 * Once a (window, env) is finalized its rows never change: no reservation, no draw, no forfeit, no
   release. A failed audit that arrives late bans once (only for a group that was drawn) and forfeits
   the hotkey's entitlements in the envs of that window not yet finalized (R3). Two transitions
@@ -40,7 +43,10 @@ Rules a reader of the public log can rely on:
   exploration: every row still ``reserved`` becomes ``unpaid``) and R17 for a training observation
   recorded after the env was finalized (``trained``). Each gives its first scan back.
 * Probation cap: a hotkey still in probation holds at most ``PROBATION_PENDING_LIMIT`` reserved rows
-  whose audit has not passed per (window, env); beyond that it is refused (``probation_limit``).
+  whose audit has not passed per WINDOW, all envs together; beyond that it is refused
+  (``probation_limit``).
+* Audit draw (R18): keyed with the secret run salt, so a miner cannot tell which of its rows are
+  drawn (``audit_selected``).
 """
 from __future__ import annotations
 
@@ -56,7 +62,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from reliquary.services.run_log import Observation, RunObservationLog
 
 AUDIT_DRAW_ROUND_OFFSET = 2
-_AUDIT_DOMAIN = b"reliquary-exploration-audit/v1"
+_AUDIT_DOMAIN = b"reliquary-exploration-audit/v2"
 _EPS = 1e-12
 
 STATUS_PENDING = "exploration_pending"
@@ -89,17 +95,27 @@ def exploration_within_cap(count: int, *, price: float, cap: float) -> bool:
     return count * price <= cap + _EPS
 
 
-def audit_selected(*, beacon_randomness: str, observation_id: str, audit_bps: int, forced: bool) -> bool:
+def audit_selected(*, beacon_randomness: str, observation_id: str, audit_bps: int, forced: bool,
+                   run_salt: bytes) -> bool:
+    """Whether a group is drawn for audit (R18).
+
+    ``sha256(domain, beacon of the group's draw round, observation id, run salt)`` against the
+    rate. The beacon and the id are public, the run salt is the validator's secret
+    (``RunObservationLog.run_salt``): a miner cannot compute which of its rows are drawn. It is a
+    pure function of persisted values, so a restart draws the same rows. ``forced`` (probation)
+    is always drawn."""
     if forced:
         return True
     if audit_bps <= 0:
         return False
+    if not isinstance(run_salt, (bytes, bytearray)) or len(run_salt) != 32:
+        raise ValueError("audit draw needs the 32-byte run salt")
     if not isinstance(beacon_randomness, str):
         raise ValueError("audit beacon must be 32 bytes of hex")
     beacon = bytes.fromhex(beacon_randomness)
     if len(beacon) != 32:
         raise ValueError("audit beacon must be exactly 32 bytes")
-    digest = hashlib.sha256(_AUDIT_DOMAIN + beacon + bytes.fromhex(observation_id)).digest()
+    digest = hashlib.sha256(_AUDIT_DOMAIN + beacon + bytes.fromhex(observation_id) + bytes(run_salt)).digest()
     return int.from_bytes(digest[:8], "big") / 2**64 < audit_bps / 10000
 
 
@@ -183,9 +199,9 @@ class ExplorationLedger:
             raise ValueError("exploration price changed inside a (window, env)")
         if new_hotkey_audit_groups is not None and self.passed_audits(hotkey) < new_hotkey_audit_groups:
             holding = self.db.execute(
-                "SELECT COUNT(*) FROM exploration_entitlements WHERE order_id=? AND window=? AND environment=? "
+                "SELECT COUNT(*) FROM exploration_entitlements WHERE order_id=? AND window=? "
                 "AND hotkey=? AND status='reserved' AND audit NOT IN ('passed','unaudited','failed')",
-                (self.order, window, environment, hotkey)).fetchone()[0]
+                (self.order, window, hotkey)).fetchone()[0]
             if holding >= PROBATION_PENDING_LIMIT:
                 return "probation_limit"
         used = self.db.execute(
@@ -225,7 +241,7 @@ class ExplorationLedger:
             "AND environment=? AND audit='pending_draw' ORDER BY draw_round", (self.order, window, environment))]
 
     def resolve_draws(self, window: int, *, environment: str, beacon_for_round: Callable[[int], str | None],
-                      audit_bps: int) -> list[str]:
+                      audit_bps: int, run_salt: bytes) -> list[str]:
         if self.is_finalized(window, environment=environment):
             return []
         selected = []
@@ -237,7 +253,7 @@ class ExplorationLedger:
             if beacon is None:
                 continue
             chosen = audit_selected(beacon_randomness=beacon, observation_id=identity,
-                                    audit_bps=audit_bps, forced=bool(forced))
+                                    audit_bps=audit_bps, forced=bool(forced), run_salt=run_salt)
             self.db.execute("UPDATE exploration_entitlements SET audit=?, drawn=? WHERE observation_id=?",
                             ("queued" if chosen else "not_drawn", int(chosen), identity))
             if chosen:
@@ -337,7 +353,8 @@ class ExplorationLedger:
 
         ``trained_prompts`` (R17): the prompts of this env with a training-lane observation recorded
         in this window. Every row still ``reserved`` on one of them becomes ``trained`` (unpaid, no
-        sanction) BEFORE the audit horizon is computed, so it sets no horizon, and is returned too.
+        sanction) and is returned too. Its audit is untouched: if it was drawn and is left
+        unaudited it sets its hotkey's horizon like any other row.
         Applied on every call, so a training observation recorded after the env was finalized still
         voids the row as long as the caller finalizes again before reading ``payable``.
         """
@@ -348,8 +365,8 @@ class ExplorationLedger:
         if not self.is_finalized(window, environment=environment):
             horizons = self.db.execute(
                 "SELECT hotkey, MIN(draw_round) FROM exploration_entitlements WHERE order_id=? AND window=? "
-                "AND environment=? AND drawn=1 AND audit IN ('queued','unaudited') AND status='reserved' "
-                "GROUP BY hotkey", scope).fetchall()
+                "AND environment=? AND drawn=1 AND audit IN ('queued','unaudited') "
+                "AND status IN ('reserved','trained') GROUP BY hotkey", scope).fetchall()
             self.db.execute("UPDATE exploration_entitlements SET audit='unaudited' WHERE order_id=? AND window=? "
                             "AND environment=? AND audit IN ('pending_draw','queued')", scope)
             for hotkey, horizon in horizons:

@@ -37,6 +37,7 @@ included) are malformed, and the public entry points turn any arithmetic or shap
 """
 from __future__ import annotations
 
+import logging
 import math
 
 from reliquary.protocol.service_contract import ServiceContract
@@ -44,6 +45,8 @@ from reliquary.protocol.service_schedule import ServiceSchedule
 from reliquary.services.exploration import (
     exploration_cap, exploration_price, exploration_within_cap, finite_amount, training_group_price,
 )
+
+logger = logging.getLogger(__name__)
 
 SERVICE_PAYMENT_POLICY_V2 = "service-first-scan-exploration/v1"
 _EPS = 1e-12
@@ -105,6 +108,8 @@ def _count_rows(batch, pools: dict[str, float]) -> dict[str, dict[str, int]]:
         env, hotkey = row.get("env_name"), row.get("hotkey")
         if not isinstance(env, str) or env not in pools or not isinstance(hotkey, str):
             raise SettlementError("paid group outside the window envelope")
+        if type(row.get("prompt_idx")) is not int:  # pay and the published status are matched on it
+            raise SettlementError("paid group has no integer prompt_idx")
         counts[env][hotkey] = counts[env].get(hotkey, 0) + 1
     return counts
 
@@ -180,6 +185,8 @@ def settle_window(*, archive: dict, envelope: dict, contract: ServiceContract,
     except SettlementError:
         raise
     except (ArithmeticError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as exc:
+        # Usually a malformed input, but possibly a defect of ours: keep the traceback visible.
+        logger.exception("service settlement failed on an unexpected %s", type(exc).__name__)
         raise SettlementError(f"malformed service settlement input: {type(exc).__name__}") from exc
 
 

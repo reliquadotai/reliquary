@@ -14,6 +14,7 @@ from reliquary.services.run_log import Observation, RunObservationLog
 ORDER = "a" * 64
 BEACON = "cd" * 32
 DAY = 86400
+SALT = b"\x07" * 32
 
 
 def oid(i: int) -> str:
@@ -34,28 +35,28 @@ def test_audit_draw_follows_the_beacon_and_the_id_and_a_forced_row_ignores_both(
     ids = [hashlib.sha256(str(i).encode()).hexdigest() for i in range(4000)]
 
     def drawn(beacon):
-        return {i for i in ids if audit_selected(beacon_randomness=beacon, observation_id=i, audit_bps=1500, forced=False)}
+        return {i for i in ids if audit_selected(beacon_randomness=beacon, observation_id=i, audit_bps=1500, forced=False, run_salt=SALT)}
 
     first, other = drawn("ab" * 32), drawn("ba" * 32)
     assert first == drawn("ab" * 32)                      # deterministic
     assert 450 < len(first) < 750 and 450 < len(other) < 750
     assert first != other and len(first & other) < 250    # another beacon is another draw (independent: ~90 shared)
     assert 0 < len(first) < len(ids)                      # and it depends on the id
-    # the exact rule, recomputed here: sha256(domain || beacon || id), top 64 bits against the rate
+    # the exact rule, recomputed here: sha256(domain || beacon || id || run salt), top 64 bits against the rate
     for i in ids[:200]:
-        digest = hashlib.sha256(b"reliquary-exploration-audit/v1" + bytes.fromhex("ab" * 32) + bytes.fromhex(i)).digest()
+        digest = hashlib.sha256(b"reliquary-exploration-audit/v2" + bytes.fromhex("ab" * 32) + bytes.fromhex(i) + SALT).digest()
         assert (i in first) == (int.from_bytes(digest[:8], "big") / 2**64 < 0.15)
     # forced: selected whatever the beacon, the id or the rate (even a beacon that is not one)
-    assert all(audit_selected(beacon_randomness=b, observation_id=i, audit_bps=0, forced=True)
+    assert all(audit_selected(beacon_randomness=b, observation_id=i, audit_bps=0, forced=True, run_salt=SALT)
                for i in ids[:50] for b in ("ab" * 32, "ba" * 32, ""))
-    assert not any(audit_selected(beacon_randomness="ab" * 32, observation_id=i, audit_bps=0, forced=False) for i in ids[:50])
-    assert all(audit_selected(beacon_randomness="ab" * 32, observation_id=i, audit_bps=10000, forced=False) for i in ids[:50])
+    assert not any(audit_selected(beacon_randomness="ab" * 32, observation_id=i, audit_bps=0, forced=False, run_salt=SALT) for i in ids[:50])
+    assert all(audit_selected(beacon_randomness="ab" * 32, observation_id=i, audit_bps=10000, forced=False, run_salt=SALT) for i in ids[:50])
 
 
 @pytest.mark.parametrize("beacon", ["", "ab" * 31, "ab" * 33, "zz" * 32, "ab" * 31 + "a", None, b"\x00" * 32])
 def test_audit_beacon_must_be_exactly_32_bytes(beacon):
     with pytest.raises(ValueError):
-        audit_selected(beacon_randomness=beacon, observation_id=oid(1), audit_bps=1500, forced=False)
+        audit_selected(beacon_randomness=beacon, observation_id=oid(1), audit_bps=1500, forced=False, run_salt=SALT)
 
 
 def ledger(tmp_path):
@@ -71,7 +72,7 @@ def reserve(book, i, *, hotkey="hk", env="math", cap=1.0, amount=0.1, window=1, 
 
 def draw(book, *, env="math", window=1, audit_bps=0, beacon=BEACON):
     with book.db:
-        return book.resolve_draws(window, environment=env, beacon_for_round=lambda r: beacon, audit_bps=audit_bps)
+        return book.resolve_draws(window, environment=env, beacon_for_round=lambda r: beacon, audit_bps=audit_bps, run_salt=SALT)
 
 
 def audit(book, i, passed, *, now=1000.0, ban=DAY):
@@ -238,7 +239,7 @@ def test_draw_waits_for_its_beacon(tmp_path):
     reserve(book, 1, groups=0)
     assert book.pending_draw_rounds(1, environment="math") == [51]
     with book.db:
-        assert book.resolve_draws(1, environment="math", beacon_for_round=lambda r: None, audit_bps=1500) == []
+        assert book.resolve_draws(1, environment="math", beacon_for_round=lambda r: None, audit_bps=1500, run_salt=SALT) == []
     assert book.rows(1, environment="math")[0]["audit"] == "pending_draw"
 
 
@@ -253,17 +254,17 @@ def test_ledger_survives_reopen_and_draws_are_identical_after_it(tmp_path):
     assert reopened.rows(1, environment="math")[0]["status"] == "reserved"
     beacons = {50 + i: hashlib.sha256(str(i % 7).encode()).hexdigest() for i in ids}
     with reopened.db:
-        selected = reopened.resolve_draws(1, environment="math", beacon_for_round=beacons.get, audit_bps=1500)
+        selected = reopened.resolve_draws(1, environment="math", beacon_for_round=beacons.get, audit_bps=1500, run_salt=SALT)
     # what a ledger that never closed, or any replayer, computes from the public inputs
     expected = [oid(i) for i in ids if audit_selected(beacon_randomness=beacons[50 + i], observation_id=oid(i),
-                                                      audit_bps=1500, forced=False)]
+                                                      audit_bps=1500, forced=False, run_salt=SALT)]
     assert selected == expected and 10 < len(selected) < 60
     reopened.db.close()
     again = ledger(tmp_path)
     assert [r["observation_id"] for r in again.rows(1, environment="math") if r["audit"] == "queued"] == expected
     assert [r["observation_id"] for r in again.rows(1, environment="math") if r["drawn"]] == expected
     with again.db:
-        assert again.resolve_draws(1, environment="math", beacon_for_round=beacons.get, audit_bps=10000) == []
+        assert again.resolve_draws(1, environment="math", beacon_for_round=beacons.get, audit_bps=10000, run_salt=SALT) == []
 
 
 def test_reserve_is_idempotent_and_late_audits_cannot_flip(tmp_path):
@@ -384,10 +385,10 @@ def test_only_a_drawn_group_can_lead_to_a_late_ban(tmp_path):
     reserve(book, 2, hotkey="drawn", groups=0, draw_round=30)    # same hotkey as 3, after its horizon: unaudited
     reserve(book, 3, hotkey="drawn", groups=100, draw_round=20)  # drawn, never audited
     with book.db:
-        book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON if r < 99 else None, audit_bps=0)
+        book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON if r < 99 else None, audit_bps=0, run_salt=SALT)
     reserve(book, 4, hotkey="waiting", groups=100, draw_round=99)  # still waiting for its draw at close
     with book.db:
-        book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON if r < 99 else None, audit_bps=0)
+        book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON if r < 99 else None, audit_bps=0, run_salt=SALT)
     finalize(book)
     assert states(book) == {1: ("not_drawn", "reserved"), 2: ("unaudited", "reserved"),
                             3: ("unaudited", "reserved"), 4: ("unaudited", "reserved")}
@@ -472,7 +473,7 @@ def test_pending_draws_at_close_do_not_set_the_horizon(tmp_path):
     reserve(book, 1, groups=0, draw_round=10)
     reserve(book, 2, groups=0, draw_round=20)
     with book.db:
-        book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON if r == 20 else None, audit_bps=0)
+        book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON if r == 20 else None, audit_bps=0, run_salt=SALT)
     assert finalize(book) == [oid(1)]                            # never drawn: unaudited as before
     assert book.payable(1, environment="math") == {"hk": 1}      # the not-drawn row of round 20 is paid
 
@@ -550,7 +551,7 @@ def refused_by_finalize(pair):
 def refused_by_ban(pair):
     first = admit(pair, obs(50), now=100.0)
     with pair[1].db:
-        pair[1].resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+        pair[1].resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     apply_exploration_audit(*pair, first.observation_id, passed=False, now=100.0, ban_seconds=DAY)
     return {"now": 100.0 + DAY - 1}
 
@@ -662,7 +663,7 @@ def test_failed_audit_releases_the_first_scans_it_forfeits(pair):
     b = admit(pair, obs(2))
     other = admit(pair, obs(3, hotkey="honest"), cap=1.0)
     with book.db:
-        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     forfeited = apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
     assert set(forfeited) == {a.observation_id, b.observation_id}
     assert not log.is_scanned(ENV, 1) and not log.is_scanned(ENV, 2) and log.is_scanned(ENV, 3)
@@ -681,7 +682,7 @@ def test_finalize_releases_the_first_scan_of_every_unpaid_row_and_only_those(pai
     drawn = admit(pair, obs(2, hotkey="old"), groups=100, draw_round=20, cap=1.0)   # same hotkey: its horizon
     behind = admit(pair, obs(3, hotkey="old"), groups=0, draw_round=30, cap=1.0)
     with book.db:
-        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     waiting = admit(pair, obs(4, hotkey="old"), groups=0, draw_round=99, cap=1.0)
     unaudited = finalize_exploration(log, book, 1, environment=ENV)
     assert unaudited == [drawn.observation_id, behind.observation_id, waiting.observation_id]
@@ -779,7 +780,7 @@ def test_n2_the_entry_point_releases_the_first_scans_a_late_failure_forfeits(pai
     b = admit(pair, obs(2, env="code"), cap=1.0)
     for env in ("math", "code"):
         with book.db:
-            book.resolve_draws(1, environment=env, beacon_for_round=lambda r: BEACON, audit_bps=0)
+            book.resolve_draws(1, environment=env, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     finalize_exploration(log, book, 1, environment="math")
     assert not log.is_scanned("math", 1) and log.is_scanned("code", 2)
     forfeited = apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
@@ -825,7 +826,7 @@ def test_n3_aborted_finalize_gives_every_first_scan_back_and_only_aborted_does(p
     other = admit(pair, obs(2, env="code"), groups=0, cap=1.0)
     for env in (ENV, "code"):
         with book.db:
-            book.resolve_draws(1, environment=env, beacon_for_round=lambda r: BEACON, audit_bps=0)
+            book.resolve_draws(1, environment=env, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     assert finalize_exploration(log, book, 1, environment=ENV) == []
     assert log.is_scanned(ENV, 1) and book.payable(1, environment=ENV) == {"hk": 1}
     assert finalize_exploration(log, book, 1, environment=ENV, aborted=True) == [paid.observation_id]
@@ -879,7 +880,7 @@ def test_n6_a_replay_reports_the_state_of_the_row_now(pair):
     b = admit(pair, obs(2), cap=1.0)
     c = admit(pair, obs(3, hotkey="honest"), cap=1.0)
     with book.db:
-        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     again = admit(pair, obs(1), cap=1.0)
     assert again.status == "exploration_pending" and again.entitlement == a.entitlement
     apply_exploration_audit(log, book, a.observation_id, passed=False, now=10.0, ban_seconds=DAY)
@@ -900,7 +901,7 @@ def test_n6_a_group_refused_for_cap_and_resubmitted_with_room_is_a_new_attempt(p
     again = admit(pair, obs(3, hotkey="c"))
     assert (again.reason, again.status) == ("cap", "exploration_unpaid")   # still full: the refusal, not "replay"
     with book.db:
-        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     apply_exploration_audit(log, book, first.observation_id, passed=False, now=10.0, ban_seconds=DAY)
     retry = admit(pair, obs(3, hotkey="c"), now=20.0)            # room again (a's row was forfeited)
     assert retry.observation_id == third.observation_id and not retry.inserted
@@ -922,19 +923,24 @@ def test_n6_a_cap_refused_retry_loses_to_someone_who_took_the_prompt_meanwhile(p
     assert (retry.reason, retry.status, retry.first_scan) == ("already_scanned", "exploration_unpaid", False)
 
 
-def test_n10_a_probationer_holds_at_most_the_limit_of_unpassed_rows_per_window_env(tmp_path):
+def test_n10_a_probationer_holds_at_most_the_limit_of_unpassed_rows_per_window_all_envs_together(tmp_path):
     book = ledger(tmp_path)
-    for i in range(1, PROBATION_PENDING_LIMIT + 1):
+    half = PROBATION_PENDING_LIMIT // 2
+    for i in range(1, half + 1):
         assert reserve(book, i, groups=100) is not None
-    assert reserve(book, 50, groups=100) is None
-    assert book.refusal(window=1, environment="math", hotkey="hk", amount=0.1, cap=1.0, now=0.0,
-                        new_hotkey_audit_groups=100) == "probation_limit"
-    assert reserve(book, 51, groups=100, env="code") is not None            # per env
-    assert reserve(book, 52, groups=100, window=2) is not None              # and per window
+    for i in range(half + 1, PROBATION_PENDING_LIMIT + 1):
+        assert reserve(book, i, groups=100, env="code") is not None         # one probationer, 2 envs, 1 window
+    for env in ("math", "code", "science"):                                 # 4 in the window, whatever the env
+        assert reserve(book, 50, groups=100, env=env) is None
+        assert book.refusal(window=1, environment=env, hotkey="hk", amount=0.1, cap=1.0, now=0.0,
+                            new_hotkey_audit_groups=100) == "probation_limit"
+    assert len(book.rows(1, environment="math")) + len(book.rows(1, environment="code")) == PROBATION_PENDING_LIMIT
+    assert reserve(book, 52, groups=100, window=2) is not None              # per window
     assert reserve(book, 53, groups=100, hotkey="other") is not None        # and per hotkey
     draw(book)
-    audit(book, 1, True)                                         # a passed audit frees a slot
-    assert reserve(book, 54, groups=100) is not None
+    draw(book, env="code")
+    audit(book, 1, True)                                         # a passed audit frees a slot, in any env
+    assert reserve(book, 54, groups=100, env="code") is not None
     assert reserve(book, 55, groups=100) is None
 
 
@@ -983,31 +989,62 @@ def scan_of(log, prompt, env=ENV):
     return None if row is None else row[0]
 
 
-def test_r17_ledger_voids_rows_on_trained_prompts_before_the_horizon_and_only_reserved_ones(tmp_path):
+def test_r17_ledger_voids_the_pay_of_reserved_rows_on_trained_prompts_and_never_their_audit(tmp_path):
     book = ledger(tmp_path)
     reserve(book, 1, hotkey="old", groups=0, draw_round=10)
     reserve(book, 2, hotkey="old", groups=100, draw_round=20)       # forced: drawn, never audited
     reserve(book, 3, hotkey="old", groups=0, draw_round=30)         # behind it
     reserve(book, 4, hotkey="cheat", groups=100, draw_round=40)
     reserve(book, 5, hotkey="cheat", groups=100, draw_round=41)
+    reserve(book, 6, hotkey="clean", groups=0, draw_round=5)
     reserve(book, 99, hotkey="old", env="code", groups=0)
     draw(book)
     audit(book, 4, False)                                           # 4 and 5 forfeited
     with book.db:
-        unpaid = book.finalize_window(1, environment="math", trained_prompts={2, 5, 99})
-    assert unpaid == [oid(2), oid(5)]                               # 3 is NOT behind a horizon: 2 set none
+        unpaid = book.finalize_window(1, environment="math", trained_prompts={2, 5, 6, 99})
+    # C2: training prompt 2 does not hide its lost audit: row 3 is behind the horizon row 2 sets
+    assert unpaid == [oid(2), oid(3), oid(5), oid(6)]
     rows = {r["prompt_idx"]: (r["audit"], r["status"]) for r in book.rows(1, environment="math")}
-    assert rows[2] == ("unaudited", "trained") and rows[3] == ("not_drawn", "reserved")
+    assert rows[2] == ("unaudited", "trained") and rows[3] == ("unaudited", "reserved")
+    assert rows[6] == ("not_drawn", "trained")                      # a not-drawn row: pay voided, nothing else
     assert rows[5][1] == "forfeited"                                # a forfeited row keeps its label
-    assert book.payable(1, environment="math") == {"old": 2}
-    assert not book.banned("old", 10**9)
+    assert book.payable(1, environment="math") == {"old": 1}
+    assert not book.banned("old", 10**9) and not book.banned("clean", 10**9)
     with book.db:                                                   # idempotent
-        assert book.finalize_window(1, environment="math", trained_prompts={2, 5, 99}) == unpaid
+        assert book.finalize_window(1, environment="math", trained_prompts={2, 5, 6, 99}) == unpaid
     # a training group recorded after the env was finalized: the second allowed transition
     with book.db:
-        assert book.finalize_window(1, environment="math", trained_prompts={1, 2}) == [oid(1), oid(2), oid(5)]
-    assert book.payable(1, environment="math") == {"old": 1}
+        assert book.finalize_window(1, environment="math", trained_prompts={1, 2}) == [oid(i) for i in (1, 2, 3, 5, 6)]
+    assert book.payable(1, environment="math") == {}
     assert [r["status"] for r in book.rows(1, environment="code")] == ["reserved"]   # the other env is untouched
+    # the audit of the voided drawn row still bites, even late: ban, and the open env is forfeited
+    assert audit(book, 2, False) == [oid(99)]
+    assert book.banned("old", 1000.0 + DAY - 1)
+
+
+def test_r18_the_audit_draw_is_keyed_with_the_run_salt(tmp_path):
+    ids = [hashlib.sha256(str(i).encode()).hexdigest() for i in range(2000)]
+
+    def drawn(salt):
+        return {i for i in ids if audit_selected(beacon_randomness=BEACON, observation_id=i, audit_bps=1500,
+                                                 forced=False, run_salt=salt)}
+    mine, other = drawn(SALT), drawn(b"\x08" * 32)
+    assert mine == drawn(SALT) and 200 < len(mine) < 400 and 200 < len(other) < 400
+    assert mine != other and len(mine & other) < 120             # independent draws (~45 shared), not the same one
+    for bad in (None, b"", b"x" * 31, "s" * 32):
+        with pytest.raises(ValueError, match="run salt"):
+            audit_selected(beacon_randomness=BEACON, observation_id=ids[0], audit_bps=1500, forced=False, run_salt=bad)
+    # the ledger draws with the salt it is given, and with nothing else
+    book = ledger(tmp_path)
+    for i in range(1, 41):
+        reserve(book, i, hotkey=f"h{i}", groups=0, draw_round=50, cap=100.0)
+    with book.db:
+        selected = book.resolve_draws(1, environment="math", beacon_for_round=lambda r: BEACON, audit_bps=5000,
+                                      run_salt=b"\x08" * 32)
+    assert selected == [oid(i) for i in range(1, 41) if audit_selected(
+        beacon_randomness=BEACON, observation_id=oid(i), audit_bps=5000, forced=False, run_salt=b"\x08" * 32)]
+    assert selected != [oid(i) for i in range(1, 41) if audit_selected(
+        beacon_randomness=BEACON, observation_id=oid(i), audit_bps=5000, forced=False, run_salt=SALT)]
 
 
 def test_r17_entry_point_voids_and_reseats_the_scan_on_the_training_observation(pair):
@@ -1018,7 +1055,7 @@ def test_r17_entry_point_voids_and_reseats_the_scan_on_the_training_observation(
     here = trained(log, 1)                                          # same window, after the exploration
     assert not here.first_scan and scan_of(log, 1) == probe.observation_id
     with book.db:
-        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+        book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
     apply_exploration_audit(log, book, other.observation_id, passed=True, now=10.0, ban_seconds=DAY)
     unpaid = finalize_exploration(log, book, 1, environment=ENV)
     assert unpaid == [probe.observation_id]
@@ -1038,7 +1075,7 @@ def test_i1_every_release_path_keeps_a_trained_prompt_scanned(pair, path):
     free = admit(pair, obs(2, hotkey="a"), cap=1.0)                 # nobody trains prompt 2
     if path == "forfeit":
         with book.db:
-            book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0)
+            book.resolve_draws(1, environment=ENV, beacon_for_round=lambda r: BEACON, audit_bps=0, run_salt=SALT)
         apply_exploration_audit(log, book, held.observation_id, passed=False, now=10.0, ban_seconds=DAY)
     else:
         finalize_exploration(log, book, 1, environment=ENV, aborted=path == "aborted")

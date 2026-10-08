@@ -19,7 +19,8 @@ What a caller can rely on:
   batcher holds never changes between admission and a deferred proof.
 * Observations. One transaction per observation. Exploration goes through
   ``exploration.record_exploration`` only (record + reservation + first-scan release together).
-  Pay is keyed on (env, prompt), never on the group id. The audit draw round is the drand round
+  Pay is keyed on (env, prompt), never on the group id. The audit draw is keyed with the run's
+  secret salt (R18): no miner can tell which of its rows are drawn. The audit draw round is the drand round
   of the VALIDATOR-clock arrival + 2. A refusal is a ``ServicePolicyLimit``: nothing was written.
 * Audits. ``queued_audits`` lists what to audit (hotkeys past probation first, then by draw
   round) straight from the ledger rows, so it survives a restart. ``record_audit`` applies a
@@ -614,7 +615,7 @@ class ServiceRuntime:
         return ServicePolicyLimit(f"service observation refused: {exc}")
 
     def _observation_id(self, obs: Observation) -> str:
-        return observation_id(self.contract.sha256, obs, self.log._salt)
+        return observation_id(self.contract.sha256, obs, self.log.run_salt)
 
     def record_training(self, *, environment, prompt_idx, hotkey, window, rewards, group_id, candidate,
                         token_count, now=None) -> dict:
@@ -795,7 +796,8 @@ class ServiceRuntime:
                 if round_id in rounds}
             for env in environments:
                 selected.extend(self.ledger.resolve_draws(window, environment=env, beacon_for_round=stored.get,
-                                                          audit_bps=self.contract.reward_policy["audit_bps"]))
+                                                          audit_bps=self.contract.reward_policy["audit_bps"],
+                                                          run_salt=self.log.run_salt))
         return selected
 
     def queued_audits(self, window: int, *, environment: str | None = None) -> list[dict]:
@@ -804,9 +806,8 @@ class ServiceRuntime:
         Rows drawn for audit, still entitled, in a (window, env) not yet finalized. Hotkeys past
         probation (``passed_audits >= new_hotkey_audit_groups``) come first, then ascending draw
         round, then reservation order. Each row: ``observation_id``, ``environment``, ``hotkey``,
-        ``prompt_idx``, ``draw_round``, ``forced``, ``past_probation``. A row whose prompt already
-        has a training observation in the window is left out: finalize will make it unpaid
-        (``trained``, R17), so it needs no audit.
+        ``prompt_idx``, ``draw_round``, ``forced``, ``past_probation``. A row whose prompt was
+        trained in the window is listed like any other: R17 voids its pay, not its audit.
         """
         threshold = self.contract.reward_policy["new_hotkey_audit_groups"]
         with self.lock:
@@ -814,9 +815,8 @@ class ServiceRuntime:
             for env in self._environments(window, environment):
                 if self.ledger.is_finalized(window, environment=env):
                     continue
-                trained = self.log.trained_prompts(window, env)
                 for position, row in enumerate(self.ledger.rows(window, environment=env)):
-                    if row["audit"] != "queued" or row["status"] != "reserved" or row["prompt_idx"] in trained:
+                    if row["audit"] != "queued" or row["status"] != "reserved":
                         continue
                     hotkey = row["hotkey"]
                     if hotkey not in seasoned:
@@ -833,9 +833,7 @@ class ServiceRuntime:
             pending = 0
             for env in self._environments(window, environment):
                 if not self.ledger.is_finalized(window, environment=env):
-                    trained = self.log.trained_prompts(window, env)
                     pending += sum(row["audit"] == "pending_draw" and row["status"] == "reserved"
-                                   and row["prompt_idx"] not in trained
                                    for row in self.ledger.rows(window, environment=env))
         queued = self.queued_audits(window, environment=environment)
         return {"pending_draw": pending, "queued": len(queued),
@@ -917,7 +915,8 @@ class ServiceRuntime:
         sanctioned, and a hotkey's not-drawn rows at or after its first drawn-unaudited round are
         unpaid too (per-hotkey audit horizon, R15). Before that, in the same transaction, every
         entitlement whose prompt has a training observation in this window becomes unpaid with
-        reason ``trained`` (R17: no sanction, no horizon). Their first scans are released and their
+        reason ``trained`` (R17: no sanction; its audit still counts for the horizon). Their first
+        scans are released and their
         ``exploration_unpaid`` settle events published, in this transaction. Idempotent. After
         it the rows never change: a later verdict pays nothing and takes nothing back.
         ``reconcile_archive`` finalizes whatever env was not, so a restart cannot pay an unaudited row.
@@ -955,8 +954,9 @@ class ServiceRuntime:
         of that window is logged at error level (table ``service_settled`` keeps both), and the
         public settle events follow the latest answer (nothing is published when nothing changed).
         An aborted window (``aborted=True`` or an archive whose ``window_status`` is ``aborted``)
-        pays no exploration. Every ``batch`` row must carry ``env_name`` (an env of the envelope)
-        and a string ``hotkey``; anything else raises (``SettlementError``) and stores nothing.
+        pays no exploration. Every ``batch`` row must carry ``env_name`` (an env of the envelope),
+        a string ``hotkey`` and an integer ``prompt_idx``; anything else raises
+        (``SettlementError``) and stores nothing.
         """
         if type(aborted) is not bool or not isinstance(archive, dict):
             raise ValueError("invalid service settlement disposition")

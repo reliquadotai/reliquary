@@ -395,3 +395,14 @@ def test_a_log_file_written_before_the_untrained_column_is_upgraded(tmp_path):
     with old.db:
         r = old.record(obs(), status="proven", proof="proven")
     assert old.trained_prompts(1, ENV) == {7} and r.first_scan
+
+
+def test_c1_the_lane_is_part_of_the_observation_identity(log):
+    with log.db:
+        probe = log.record(obs(rewards=ZERO, lane="exploration"), status="exploration_pending", proof="pending")
+        proven = log.record(obs(rewards=ZERO, lane="training"), status="proven", proof="proven")   # same everything else
+        again = log.record(obs(rewards=ZERO, lane="training"), status="proven", proof="proven")
+    assert proven.inserted and proven.observation_id != probe.observation_id
+    assert again.observation_id == proven.observation_id and not again.inserted
+    assert log.trained_prompts(1, ENV) == {7} and len(log.window_observations(1)) == 2
+    assert len(log.run_salt) == 32

@@ -68,10 +68,12 @@ class RecordResult:
 
 def observation_id(order_sha256: str, obs: Observation, run_salt: bytes) -> str:
     """Per-submission identity: the hotkey and the secret run salt keep two miners on the same
-    pool selection distinct and keep a public id from being linked to a hotkey by enumeration."""
+    pool selection distinct and keep a public id from being linked to a hotkey by enumeration.
+    The lane is part of it: the same hotkey sending the same selection for training and as
+    exploration makes two observations, never one that hides the other."""
     return canonical_sha256({"order": order_sha256, "environment": obs.environment,
                              "prompt_idx": obs.prompt_idx, "group_id": obs.group_id, "window": obs.window,
-                             "hotkey": obs.hotkey, "run_salt": run_salt.hex()})
+                             "hotkey": obs.hotkey, "lane": obs.lane, "run_salt": run_salt.hex()})
 
 
 _POOL_SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -133,6 +135,11 @@ class RunObservationLog:
         db.execute("INSERT OR IGNORE INTO run_meta(key, value) VALUES('run_salt', ?)", (os.urandom(32),))
         db.commit()
         self._salt = bytes(db.execute("SELECT value FROM run_meta WHERE key='run_salt'").fetchone()[0])
+
+    @property
+    def run_salt(self) -> bytes:
+        """The run's 32 secret bytes (persisted): observation ids and audit draws are keyed with it."""
+        return self._salt
 
     def _classify(self, obs: Observation) -> str:
         if obs.lane not in LANES:
