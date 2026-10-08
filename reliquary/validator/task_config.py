@@ -177,6 +177,13 @@ def _service_env_caps(entry: TaskEntry, *, cap: float) -> dict[str, float]:
     from reliquary.environment.registry import ENVIRONMENT_SPECS
 
     contract = ServiceContract.from_dict(entry.service_contract)
+    from reliquary.services.admission_policy import missing_box_problems
+
+    problems = missing_box_problems(contract)  # R22
+    if problems:
+        raise TaskConfigError(
+            f"task {entry.task_id!r} sets missing_box away from the by-type default (math: uncertain, "
+            f"every other env: graded): " + "; ".join(problems))
     caps = {}
     for name, env in contract.environments.items():
         if env["share_bps"] <= 0:  # declared but inactive at launch (initial_schedule): no check, cap 0

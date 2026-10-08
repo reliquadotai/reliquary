@@ -69,6 +69,9 @@ STATUS_PENDING = "exploration_pending"
 STATUS_UNPAID = "exploration_unpaid"
 STATUS_FORFEITED = "exploration_forfeited"
 REFUSAL_REASONS = ("already_scanned", "banned", "finalized", "zero_price", "probation_limit", "cap")
+# A refusal that is about the hotkey's or the env's room, not about the group: when the same submission
+# comes back and room exists it is a new attempt (never a replay of the stale refusal).
+RETRYABLE_REFUSALS = ("cap", "probation_limit")
 MAX_AMOUNT = 1e12  # a pool, price or cap above this is not money; it also keeps every product finite
 
 
@@ -465,7 +468,7 @@ def _replayed(log: "RunObservationLog", ledger: ExplorationLedger, result, *, ob
                                       STATUS_UNPAID, "replay", None)
         return ExplorationOutcome(result.observation_id, False, result.first_scan, result.category,
                                   STATUS_PENDING, None, ledger.entitlement(result.observation_id))
-    if log.refusal_reason(result.observation_id) != "cap" or refuse is not None:
+    if log.refusal_reason(result.observation_id) not in RETRYABLE_REFUSALS or refuse is not None:
         return ExplorationOutcome(result.observation_id, False, result.first_scan, result.category,
                                   STATUS_UNPAID, "replay", None)
     if log.is_scanned(obs.environment, obs.prompt_idx):
@@ -554,7 +557,7 @@ def apply_exploration_audit(log: "RunObservationLog", ledger: ExplorationLedger,
 
 
 def finalize_exploration(log: "RunObservationLog", ledger: ExplorationLedger, window: int, *,
-                         environment: str, aborted: bool = False) -> list[str]:
+                         environment: str, aborted: bool = False, extra_trained=()) -> list[str]:
     """Finalize a (window, env) and release the first scan of every unpaid id, atomically.
 
     ``aborted=True`` also works on an already finalized (window, env): every row still reserved
@@ -563,10 +566,13 @@ def finalize_exploration(log: "RunObservationLog", ledger: ExplorationLedger, wi
     R17 is applied here, in the same transaction and before the audit horizon: the entitlements
     whose prompt has a training-lane observation in this window (``log.trained_prompts``) end
     ``trained`` (unpaid, no sanction); their scan is re-seated on the training observation by
-    ``log.release_first_scan``."""
+    ``log.release_first_scan``. ``extra_trained`` are prompts the caller knows were trained in this
+    window (the archive's batch): they join the set, so a training group the log lost cannot let an
+    exploration row on the same prompt be paid as well."""
     with _Atomic(_same_store(log, ledger)):
-        unaudited = ledger.finalize_window(window, environment=environment, aborted=aborted,
-                                           trained_prompts=log.trained_prompts(window, environment))
+        unaudited = ledger.finalize_window(
+            window, environment=environment, aborted=aborted,
+            trained_prompts=set(log.trained_prompts(window, environment)) | set(extra_trained))
         for identity in unaudited:
             log.release_first_scan(identity)
         return unaudited

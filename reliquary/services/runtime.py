@@ -47,6 +47,7 @@ import math
 import re
 import sqlite3
 import threading
+from types import SimpleNamespace
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +58,9 @@ from reliquary.protocol.service_contract import (
     PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract, _identifier, _integer, _sha,
 )
 from reliquary.protocol.service_schedule import ServiceSchedule, initial_schedule
-from reliquary.services.admission_policy import service_signal_admits, validate_submission_policy  # noqa: F401
+from reliquary.services.admission_policy import (  # noqa: F401
+    missing_box_problems, service_signal_admits, validate_submission_policy,
+)
 from reliquary.services.exploration import (
     AUDIT_DRAW_ROUND_OFFSET, STATUS_FORFEITED, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger,
     apply_exploration_verdict, exploration_cap, exploration_price, finalize_exploration, record_exploration,
@@ -133,7 +136,10 @@ def _instant(now) -> float:
 
 
 class ServicePolicyLimit(ValueError):
-    """A group is outside the ordered policy: it is refused, nothing is recorded, nothing is owed."""
+    """A group is outside the ordered policy: it is refused, nothing is recorded, nothing is owed.
+
+    ``observation_id`` is the id the group would have had, when it could be computed (for logs)."""
+    observation_id: str | None = None
 
 
 def protocol_slot_geometry() -> tuple[int, int]:
@@ -198,6 +204,9 @@ class ServiceRuntime:
             raise ValueError("the RL service runtime needs service-contract/v2; "
                              "service-contract/v1 adaptive_training is refused")
         contract.require_capabilities(set(SUPPORTED_V2_CAPABILITIES))
+        problems = missing_box_problems(contract)  # R22: the type of an env decides what a missing box is
+        if problems:
+            raise ValueError("the order's missing_box differs from the by-type default: " + "; ".join(problems))
         _validate_qualification(qualification, contract)
         self.contract = self.order_contract = contract
         self.qualification = json.loads(canonical_json_bytes(qualification))
@@ -780,7 +789,7 @@ class ServiceRuntime:
 
     # --- observations (decisions A, B) ---
     def _observation(self, envelope: dict, *, environment, prompt_idx, hotkey, window, rewards, group_id,
-                     candidate, token_count, lane, now) -> Observation:
+                     candidate, token_count, lane, now, uncertain=()) -> Observation:
         """Check one group against the frozen window and build its observation. ValueError = refuse."""
         if environment not in envelope["pools"]:
             raise ServicePolicyLimit("environment is not active in this window")
@@ -820,15 +829,28 @@ class ServiceRuntime:
                            group_id=group_id, window=window, checkpoint_n=checkpoint["checkpoint_n"],
                            checkpoint_revision=checkpoint["revision"], observed_at=float(now),
                            rewards_bps=tuple(bps), lane=lane, candidate=candidate, hotkey=hotkey,
-                           token_count=token_count)
+                           token_count=token_count, uncertain=tuple(uncertain))
 
     def _refused(self, exc: BaseException, lane: str, context: dict):
         """R10: a group that does not become an observation is refused loudly, never dropped silently."""
+        if "observation_id" not in context:
+            # Refused before an observation could be built (settled window, unknown env, ...): the id
+            # it WOULD have had is still a function of its public fields and the run salt.
+            try:
+                context["observation_id"] = observation_id(self.contract.sha256, SimpleNamespace(
+                    environment=context["environment"], prompt_idx=context["prompt_idx"],
+                    group_id=context["group_id"], window=context["window"], hotkey=context["hotkey"],
+                    lane=lane), self.log.run_salt)
+            except Exception:  # an id is only for the log line
+                pass
         if isinstance(exc, ServicePolicyLimit):
             logger.warning("service %s group outside the policy (%s): %s", lane, exc, context)
+            exc.observation_id = context.get("observation_id")
             return exc
         logger.error("service %s observation refused (%s: %s): %s", lane, type(exc).__name__, exc, context)
-        return ServicePolicyLimit(f"service observation refused: {exc}")
+        refusal = ServicePolicyLimit(f"service observation refused: {exc}")
+        refusal.observation_id = context.get("observation_id")
+        return refusal
 
     def _observation_id(self, obs: Observation) -> str:
         return observation_id(self.contract.sha256, obs, self.log.run_salt)
@@ -869,7 +891,8 @@ class ServiceRuntime:
             return self.ledger.banned(hotkey, time.time() if now is None else now)
 
     def record_exploration(self, *, environment, prompt_idx, hotkey, window, rewards, group_id, candidate,
-                           token_count, arrived_at: float | None = None, now=None) -> dict:
+                           token_count, arrived_at: float | None = None, now=None, refuse: str | None = None,
+                           uncertain=()) -> dict:
         """Record an exploration group and reserve its first-scan pay, in one transaction.
 
         ``arrived_at`` is the VALIDATOR-clock time the submission arrived (default: now; never a
@@ -906,7 +929,8 @@ class ServiceRuntime:
                 envelope = self._envelope(window)
                 obs = self._observation(envelope, environment=environment, prompt_idx=prompt_idx, hotkey=hotkey,
                                         window=window, rewards=rewards, group_id=group_id, candidate=candidate,
-                                        token_count=token_count, lane="exploration", now=instant)
+                                        token_count=token_count, lane="exploration", now=instant,
+                                        uncertain=uncertain)
                 context["observation_id"] = self._observation_id(obs)
                 opened = self.db.execute("SELECT opened_at FROM service_windows WHERE order_id=? AND window=?",
                                          (self.contract.sha256, window)).fetchone()[0]
@@ -916,13 +940,13 @@ class ServiceRuntime:
                     draw_round = int(self._round_at(arrival)) + AUDIT_DRAW_ROUND_OFFSET
                 except RuntimeError as exc:  # no drand clock: the audit cannot be drawn, so nothing is owed
                     raise ValueError(f"audit draw round is unknown: {exc}") from exc
-                refuse = None
                 if not active:
                     refuse = "order_inactive"
                 elif self.contract.environment(environment)["exploration"] != 1:
                     refuse = "exploration_disabled"
                 elif token_count > reward["max_tokens_per_group"]:
                     refuse = "token_limit"
+                # else: the caller's own reason, if any, stays
                 # Price and cap come from the frozen envelope pool that settle_window will receive.
                 pool = envelope["pools"][environment]
                 outcome = record_exploration(
@@ -1043,6 +1067,13 @@ class ServiceRuntime:
                         "forced": bool(row["forced"]), "past_probation": seasoned[hotkey]}))
         return [row for _, row in sorted(rows, key=lambda item: item[0])]
 
+    def exploration_rows(self, window: int, *, environment: str) -> list[dict]:
+        """The ledger rows of one (window, env): ``observation_id``, ``hotkey``, ``prompt_idx``, ``status``
+        (reserved / forfeited / trained / unpaid), ``audit`` (pending_draw / queued / passed / failed /
+        not_drawn / unaudited), ``draw_round``, ``forced``. For the batcher's published row statuses."""
+        with self.lock:
+            return list(self.ledger.rows(window, environment=environment))
+
     def exploration_backlog(self, window: int, *, environment: str | None = None) -> dict[str, int]:
         """What the seal still waits for: ``{"pending_draw", "queued", "queued_past_probation"}``."""
         with self.lock:
@@ -1097,7 +1128,8 @@ class ServiceRuntime:
             return AuditOutcome("not_applied")
         return AuditOutcome(kind, tuple(forfeited))
 
-    def _finalize_env(self, window: int, environment: str, *, aborted: bool, at: float) -> list[str]:
+    def _finalize_env(self, window: int, environment: str, *, aborted: bool, at: float,
+                      extra_trained=()) -> list[str]:
         """THE one place a (window, env) is finalized. Runs inside the caller's transaction.
 
         Every id whose first scan is released gets its settle event (``exploration_unpaid``, with
@@ -1108,7 +1140,7 @@ class ServiceRuntime:
         # The single call site of the ledger's finalize. ``aborted`` is the one transition allowed on a
         # (window, env) the batcher already finalized before it knew the window was aborted.
         released = list(finalize_exploration(self.log, self.ledger, window, environment=environment,
-                                             aborted=aborted))
+                                             aborted=aborted, extra_trained=extra_trained))
         rows = {row["observation_id"]: row for row in self.ledger.rows(window, environment=environment)}
         for identity in released:
             row = rows[identity]  # a forfeited row keeps its label (R8), whatever its audit became
@@ -1185,6 +1217,12 @@ class ServiceRuntime:
             envelope = self._envelope(window)
             settled = self.db.execute("SELECT aborted, payload FROM service_settled WHERE order_id=? AND window=?",
                                       (order, window)).fetchone()
+            # Defence in depth (R17): a prompt the caller's batch trains is trained in this window,
+            # whether or not the log holds its training observation.
+            batch_prompts: dict[str, set[int]] = {}
+            for row in archive.get("batch") or []:
+                if isinstance(row, dict) and type(row.get("prompt_idx")) is int:
+                    batch_prompts.setdefault(str(row.get("env_name")), set()).add(row["prompt_idx"])
             if settled is None or aborted:
                 for env in sorted(envelope["pools"]):
                     if not self.ledger.is_finalized(window, environment=env):
@@ -1194,7 +1232,8 @@ class ServiceRuntime:
                             logger.warning("service window %d env %s settles with %d exploration group(s) "
                                            "never audited (unpaid)", window, env, waiting)
                     # Also for an env the caller finalized: abort, and R17 for a late training group.
-                    self._finalize_env(window, env, aborted=aborted, at=instant)
+                    self._finalize_env(window, env, aborted=aborted, at=instant,
+                                       extra_trained=batch_prompts.get(env, ()))
             exploration = {}
             for env in sorted(envelope["pools"]):
                 counts = self.ledger.payable(window, environment=env)

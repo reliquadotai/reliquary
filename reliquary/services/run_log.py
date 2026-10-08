@@ -33,6 +33,9 @@ from reliquary.services.scoring import classify_signal
 LANES = frozenset({"training", "exploration"})
 _MUTABLE = ("status", "proof", "ts", "reason")  # not evidence: a retry may differ on them
 _REASON = re.compile(r"[a-z][a-z0-9_]{0,39}")
+# What an observation id is made of. Bumped whenever ``observation_id`` changes; a run file stamped with
+# another value (or an unstamped one that already holds observations) is refused, never reinterpreted.
+IDENTITY_VERSION = "observation-id/v3"
 STATUS_PROVEN_UNPAID = "proven_unpaid"  # settle status of a training group proven but not paid
 
 
@@ -56,6 +59,9 @@ class Observation:
     candidate: dict | None
     hotkey: str
     token_count: int
+    # Rollout positions whose reward is not trusted (cut by the length cap, or no box where that is
+    # uncertain). Published when non-empty so a reader can tell an unboxed 0 from a wrong 0 (R23).
+    uncertain: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +138,15 @@ class RunObservationLog:
         """)
         if "untrained" not in {row[1] for row in db.execute("PRAGMA table_info(run_observations)")}:
             db.execute("ALTER TABLE run_observations ADD COLUMN untrained INTEGER NOT NULL DEFAULT 0")
+        stamped = db.execute("SELECT value FROM run_meta WHERE key='identity_version'").fetchone()
+        if stamped is None:
+            if db.execute("SELECT 1 FROM run_observations LIMIT 1").fetchone():
+                raise ValueError("this run file holds observations written before identities were versioned; "
+                                 "use a new run")
+            db.execute("INSERT INTO run_meta(key, value) VALUES('identity_version', ?)", (IDENTITY_VERSION.encode(),))
+        elif bytes(stamped[0]).decode() != IDENTITY_VERSION:
+            raise ValueError(f"this run file uses observation identity {bytes(stamped[0]).decode()!r}, "
+                             f"this build uses {IDENTITY_VERSION!r}; use a new run")
         db.execute("INSERT OR IGNORE INTO run_meta(key, value) VALUES('run_salt', ?)", (os.urandom(32),))
         db.commit()
         self._salt = bytes(db.execute("SELECT value FROM run_meta WHERE key='run_salt'").fetchone()[0])
@@ -173,6 +188,12 @@ class RunObservationLog:
                   "status": str(status), "proof": str(proof)}
         if reason is not None:
             public["reason"] = reason
+        if obs.uncertain:
+            positions = list(obs.uncertain)
+            if (any(type(i) is not int or not 0 <= i < len(obs.rewards_bps) for i in positions)
+                    or positions != sorted(set(positions))):
+                raise ValueError("uncertain positions must be increasing indices of the group's rollouts")
+            public["uncertain"] = positions
         payload = canonical_json_bytes(public).decode()
         inserted = self.db.execute(
             "INSERT OR IGNORE INTO run_observations(id,order_id,environment,prompt_idx,window,lane,category,"
