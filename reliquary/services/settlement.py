@@ -267,7 +267,20 @@ def validate_service_archive_v2(record: dict, contract: ServiceContract, *, cap:
         raise SettlementError(f"malformed service archive: {type(exc).__name__}") from exc
 
 
-def _validate(record: dict, contract: ServiceContract, *, cap: float, picks_target: int, batch_slots: int) -> None:
+def service_archive_rewards(record: dict, contract: ServiceContract, *, cap: float,
+                            picks_target: int, batch_slots: int) -> dict[str, float]:
+    """Validate ``record`` and return the reward map RECOMPUTED from its batch rows, exploration
+    counts and pools (the single source weight replay pays from). Only ``SettlementError`` escapes."""
+    try:
+        return _validate(record, contract, cap=cap, picks_target=picks_target, batch_slots=batch_slots)
+    except SettlementError:
+        raise
+    except (ArithmeticError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as exc:
+        raise SettlementError(f"malformed service archive: {type(exc).__name__}") from exc
+
+
+def _validate(record: dict, contract: ServiceContract, *, cap: float, picks_target: int,
+              batch_slots: int) -> dict[str, float]:
     """Refuse (``SettlementError``) an archive whose service money cannot be recomputed.
 
     ``cap`` is the task's emission cap; ``picks_target`` / ``batch_slots`` are the slot geometry the
@@ -325,3 +338,4 @@ def _validate(record: dict, contract: ServiceContract, *, cap: float, picks_targ
             raise SettlementError("service env pool is not conserved")
     if not _same_map(rewards, want_rewards):
         raise SettlementError("rewards_by_hotkey differs from the recomputed service lanes")
+    return {h: want_rewards[h] for h in sorted(want_rewards)}
