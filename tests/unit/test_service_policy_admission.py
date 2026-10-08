@@ -28,8 +28,8 @@ SEEDS = tuple(range(1, POOL_SEEDS, 2))           # the default subset of these t
 OTHER = tuple(range(M_ROLLOUTS))                 # another valid subset of the same pool
 
 
-def _contract(pool=True):
-    value = contract_v2_dict(envs=(OMI, CODE), missing_box="uncertain")
+def _contract(pool=True, missing_box="uncertain"):
+    value = contract_v2_dict(envs=(OMI, CODE), missing_box=missing_box)
     if not pool:
         for env in value["environments"].values():
             env["sampling"] = {"kind": "legacy/v1"}
@@ -48,8 +48,8 @@ def signed_request(monkeypatch):
     monkeypatch.setattr(signatures, "bt", SimpleNamespace(Keypair=Keypair))
     key = Keypair.create_from_seed("0x" + "02" * 32)
     wallet = SimpleNamespace(hotkey=key)
-    def make(*, pool=True, purpose="exploration", legacy=False, seeds=SEEDS):
-        contract = _contract(pool)
+    def make(*, pool=True, purpose="exploration", legacy=False, seeds=SEEDS, missing_box="uncertain"):
+        contract = _contract(pool, missing_box)
         announcement = _announcement(contract)
         seed_pool = SeedPool.from_contract(contract, environment=OMI, prompt_idx=7, checkpoint_hash="d" * 40,
                                           pool_epoch=5, randomness="ab" * 32) if pool and not legacy else None
@@ -150,18 +150,110 @@ def test_training_uses_the_contract_threshold_in_the_actual_grader(signed_reques
     assert prepared.rewards == [1.0] + [0.0] * (M_ROLLOUTS - 1)
 
 
-@pytest.mark.parametrize("purpose", ["training", "exploration"])
-def test_service_grading_refuses_unboxed_outcomes_on_both_lanes(signed_request, purpose):
-    request, announcement, wallet = signed_request(purpose=purpose)
-    correct = M_ROLLOUTS // 2 if purpose == "training" else 0
+def _graded(signed_request, *, purpose, correct, missing_box="uncertain", unboxed=(M_ROLLOUTS - 1,)):
+    """Grade a group in the real admission worker: ``correct`` right answers first, the rest
+    wrong, and the rollouts in ``unboxed`` properly terminated without any box."""
+    request, announcement, wallet = signed_request(purpose=purpose, missing_box=missing_box)
     for index, rollout in enumerate(request.rollouts):
-        rollout.reward = float(index < correct)
+        rollout.reward = float(index < correct and index not in unboxed)
     _sign_envelope(request, wallet)
     parsed, context = _parse(request, announcement)
+    assert parsed.reject_reason is None
     texts = [f"Derivation number {i}. \\boxed{{{4 if i < correct else 5}}}" for i in range(M_ROLLOUTS)]
+    for index in unboxed:
+        texts[index] = f"Unfinished derivation {index} without a final answer."
+    materials = AdmissionRuntimeMaterials(canonical_prompt_tokens=[1], problem={"ground_truth": "4"}, completion_texts=texts)
+    return score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5)
+
+
+def test_training_admits_an_in_zone_math_group_with_one_unboxed_rollout(signed_request):
+    prepared = _graded(signed_request, purpose="training", correct=M_ROLLOUTS // 2)
+    assert prepared.reject_reason is None
+    assert prepared.uncertain_indices == (M_ROLLOUTS - 1,)
+    assert prepared.truncated_indices == ()
+    assert prepared.unboxed_count == 1
+    assert prepared.attainable_rewards == (0.0, 1.0)
+    assert prepared.rewards[-1] == 0.0
+
+
+def test_training_refuses_a_math_group_whose_only_failure_is_unboxed(signed_request):
+    """All right but one, and that one has no box: it may have been right, i.e. a uniform group."""
+    prepared = _graded(signed_request, purpose="training", correct=M_ROLLOUTS)
+    assert prepared.rewards == [1.0] * (M_ROLLOUTS - 1) + [0.0]
+    assert prepared.reject_reason is RejectReason.OUT_OF_ZONE
+    assert prepared.reject_stage == "zone"
+
+
+def test_the_same_group_where_a_missing_box_is_a_plain_zero_is_in_zone(signed_request):
+    """Science rule (``missing_box: graded``): same texts, same rewards, no uncertainty."""
+    prepared = _graded(signed_request, purpose="training", correct=M_ROLLOUTS, missing_box="graded")
+    assert prepared.rewards == [1.0] * (M_ROLLOUTS - 1) + [0.0]
+    assert prepared.reject_reason is None
+    assert prepared.uncertain_indices == ()
+    assert prepared.unboxed_count == 0
+
+
+@pytest.mark.parametrize("missing_box", ["uncertain", "graded"])
+def test_a_length_capped_rollout_is_uncertain_in_every_environment(signed_request, monkeypatch, missing_box):
+    import reliquary.validator.admission as admission
+    monkeypatch.setattr(admission, "truncated_rollout_indices", lambda request, context: (M_ROLLOUTS - 1,))
+    wrong = _graded(signed_request, purpose="training", correct=M_ROLLOUTS - 1, missing_box=missing_box, unboxed=())
+    assert wrong.rewards == [1.0] * (M_ROLLOUTS - 1) + [0.0]
+    assert wrong.reject_reason is RejectReason.OUT_OF_ZONE     # the capped failure may have been a success
+    half = _graded(signed_request, purpose="training", correct=M_ROLLOUTS // 2, missing_box=missing_box, unboxed=())
+    assert half.reject_reason is None
+    assert half.truncated_indices == (M_ROLLOUTS - 1,)
+    assert half.uncertain_indices == (M_ROLLOUTS - 1,)
+    assert half.truncated_count == 1
+
+
+def test_exploration_keeps_an_observation_with_an_unboxed_rollout(signed_request):
+    prepared = _graded(signed_request, purpose="exploration", correct=0)
+    assert prepared.reject_reason is None
+    assert prepared.rewards == [0.0] * M_ROLLOUTS
+    assert prepared.uncertain_indices == (M_ROLLOUTS - 1,)
+    assert prepared.truncated_indices == ()
+    in_zone = _graded(signed_request, purpose="exploration", correct=M_ROLLOUTS // 2)
+    assert in_zone.reject_reason is RejectReason.OUT_OF_ZONE
+
+
+def test_the_worker_derives_the_lattice_without_the_legacy_flag(signed_request, monkeypatch):
+    """The service rule must not depend on a legacy profile switch to know the lattice."""
+    import reliquary.validator.admission as admission
+    monkeypatch.setattr(admission, "ROBUST_TRUNCATION_UTILITY_ENABLED", False)
+    prepared = _graded(signed_request, purpose="training", correct=M_ROLLOUTS // 2)
+    assert prepared.reject_reason is None
+    assert prepared.attainable_rewards == (0.0, 1.0)
+    assert prepared.robust_utility is None
+
+
+def test_legacy_grading_never_reaches_the_service_rule(signed_request, monkeypatch):
+    import reliquary.services.admission_policy as policy
+    import reliquary.validator.admission as admission
+
+    def unreachable(*args, **kwargs):
+        raise AssertionError("service policy code reached without a service policy")
+
+    for name in ("service_signal_admits", "missing_box_is_uncertain", "uncertain_rollout_indices",
+                 "exploration_pay_entitlement"):
+        monkeypatch.setattr(policy, name, unreachable)
+    request, _, wallet = signed_request(pool=False, legacy=True)
+    for index, rollout in enumerate(request.rollouts):
+        rollout.reward = float(index < M_ROLLOUTS // 2)
+    _sign_envelope(request, wallet)
+    parsed, context = _parse(request, None)
+    assert parsed.reject_reason is None
+    texts = [f"Derivation number {i}. \\boxed{{{4 if i < M_ROLLOUTS // 2 else 5}}}" for i in range(M_ROLLOUTS)]
     texts[-1] = "Unfinished derivation without a final answer."
     materials = AdmissionRuntimeMaterials(canonical_prompt_tokens=[1], problem={"ground_truth": "4"}, completion_texts=texts)
-    assert score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5).reject_reason is RejectReason.OUT_OF_ZONE
+    seen = {}
+    for answer_format in ("boxed", "boxed_or_trailing_number"):
+        monkeypatch.setattr(admission, "MATH_ANSWER_FORMAT", answer_format)
+        prepared = score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5)
+        assert prepared.reject_reason is None
+        assert prepared.uncertain_indices == () and prepared.truncated_indices == ()   # service-only fields
+        seen[answer_format] = prepared.unboxed_count
+    assert seen == {"boxed": 1, "boxed_or_trailing_number": 0}                         # the rule of main
 
 
 @pytest.mark.parametrize("bootstrap", [False, True])
@@ -186,37 +278,124 @@ def test_arrival_gate_reuses_the_service_threshold_before_reserving(bootstrap, t
     assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == int(eligible)
 
 
-@pytest.mark.parametrize("purpose", ["training", "exploration"])
-@pytest.mark.parametrize("uncertain_field", ["truncated_count", "unboxed_count"])
-def test_uncertain_service_arrivals_never_reserve_capacity(purpose, uncertain_field):
+def _arrival(purpose, rewards, *, service=True, **fields):
     from reliquary.validator.batcher import FillState
     from tests.unit.test_grpo_window_batcher import _make_batcher
     from tests.unit.test_prove_on_arrival import _pending_stub
 
     batcher = _make_batcher()
-    batcher.service_policy = {"contract": _contract(pool=False).to_dict()}
+    if service:
+        batcher.service_policy = {"contract": _contract(pool=False).to_dict()}
     batcher.fill_state = FillState(budgets={"openmathinstruct": 4}, picks_target=16)
-    batcher._extend_proof_plan = lambda candidates: pytest.fail("uncertain group dispatched")
-    rewards = [0.0, 1.0] * (M_ROLLOUTS // 2) if purpose == "training" else [0.0] * M_ROLLOUTS
+    extended = []
+    batcher._extend_proof_plan = lambda candidates: extended.extend(candidates)
     pending = _pending_stub(1, rewards=rewards)
     pending.request = SimpleNamespace(service_binding={"purpose": purpose}, rollouts=[None] * M_ROLLOUTS)
-    setattr(pending, uncertain_field, 1)
+    for name, value in fields.items():
+        setattr(pending, name, value)
     batcher._submit_arrival_proof(pending)
-    assert batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"] == 0
+    reserved = batcher.fill_state.snapshot()["in_flight"]["openmathinstruct"]
+    assert reserved == int(bool(extended))
+    return reserved
 
 
-@pytest.mark.parametrize("purpose", ["training", "exploration"])
-def test_deep_uncertainty_cannot_be_journaled_as_a_verified_signal(signed_request, purpose):
-    from reliquary.services.runtime import ServicePolicyLimit
+HALF = [1.0] * (M_ROLLOUTS // 2) + [0.0] * (M_ROLLOUTS - M_ROLLOUTS // 2)
+BINARY = (0.0, 1.0)
+
+
+@pytest.mark.parametrize("counts", [{"truncated_count": 1}, {"unboxed_count": 1}])
+def test_a_training_arrival_with_one_uncertain_rollout_reserves_capacity(counts):
+    assert _arrival("training", HALF, uncertain_indices=(M_ROLLOUTS - 1,), attainable_rewards=BINARY, **counts) == 1
+
+
+def test_a_training_arrival_the_uncertainty_could_collapse_reserves_nothing():
+    only_success_uncertain = [1.0] + [0.0] * (M_ROLLOUTS - 1)
+    assert _arrival("training", only_success_uncertain, uncertain_indices=(0,), attainable_rewards=BINARY,
+                    truncated_count=1) == 0
+    assert _arrival("training", only_success_uncertain) == 1
+
+
+def test_the_arrival_gate_uses_the_real_uncertain_rollouts_not_a_placeholder():
+    """Rollout 0 is the only success and is certain; the uncertain one is a failure elsewhere.
+    A gate that marked index 0 uncertain whenever a count was set would refuse this group."""
+    rewards = [1.0] + [0.0] * (M_ROLLOUTS - 1)
+    assert _arrival("training", rewards, uncertain_indices=(5,), attainable_rewards=BINARY,
+                    truncated_count=1, unboxed_count=1) == 1
+    # counts alone carry no index: nothing is uncertain for the rule
+    assert _arrival("training", rewards, truncated_count=1, unboxed_count=1) == 1
+    # the legacy single index is not what the service rule reads
+    assert _arrival("training", rewards, truncated_index=0, attainable_rewards=BINARY) == 1
+
+
+def test_a_training_arrival_without_a_lattice_cannot_carry_uncertainty():
+    assert _arrival("training", HALF, uncertain_indices=(M_ROLLOUTS - 1,)) == 0
+
+
+def test_an_exploration_arrival_with_an_uncertain_rollout_is_still_an_observation():
+    assert _arrival("exploration", [0.0] * M_ROLLOUTS, uncertain_indices=(3,), truncated_indices=(3,),
+                    attainable_rewards=BINARY, truncated_count=1) == 1
+    assert _arrival("exploration", HALF, uncertain_indices=(3,), attainable_rewards=BINARY) == 0
+
+
+def test_the_worker_result_reaches_the_pending_group_with_its_indices():
+    from reliquary.validator.admission import PreparedSubmission
+    from tests.unit.test_grpo_window_batcher import _make_batcher, _request
+
+    batcher = _make_batcher()
+    request = _request(prompt_idx=21, hotkey="hk")
+    prepared = PreparedSubmission(request=request, completion_texts=[], rewards=[r.reward for r in request.rollouts],
+                                  rollout_hashes=[], selection_digest=None, prompt_content_sha256="a" * 64,
+                                  target_content_sha256="b" * 64, truncated_count=1, truncated_indices=(2,),
+                                  uncertain_indices=(2, 5), attainable_rewards=BINARY)
+    assert batcher.accept_prepared_submission(prepared).accepted
+    pending = batcher.pending_submissions()[-1]
+    assert (pending.truncated_indices, pending.uncertain_indices) == ((2,), (2, 5))
+    assert pending.attainable_rewards == BINARY
+    plain = PreparedSubmission(request=_request(prompt_idx=22, hotkey="hk2"), completion_texts=[],
+                               rewards=[r.reward for r in request.rollouts], rollout_hashes=[], selection_digest=None,
+                               prompt_content_sha256="c" * 64, target_content_sha256="b" * 64)
+    assert batcher.accept_prepared_submission(plain).accepted
+    pending = batcher.pending_submissions()[-1]
+    assert (pending.truncated_indices, pending.uncertain_indices) == ((), ())
+
+
+def test_the_legacy_arrival_gate_never_reaches_the_service_rule(monkeypatch):
+    import reliquary.services.admission_policy as policy
+    import reliquary.validator.batcher as batcher_module
+
+    def unreachable(*args, **kwargs):
+        raise AssertionError("service policy code reached without a service policy")
+
+    for name in ("service_signal_admits", "missing_box_is_uncertain", "uncertain_rollout_indices",
+                 "exploration_pay_entitlement"):
+        monkeypatch.setattr(policy, name, unreachable)
+    calls = []
+    real = batcher_module.robust_utility_admits
+
+    def spy(rewards, **kwargs):
+        calls.append(kwargs)
+        return real(rewards, **kwargs)
+
+    monkeypatch.setattr(batcher_module, "robust_utility_admits", spy)
+    from reliquary.constants import SIGMA_MIN
+    # legacy reads its own single index and ignores the service-only fields
+    assert _arrival("training", HALF, service=False, truncated_index=M_ROLLOUTS - 1, truncated_count=1,
+                    uncertain_indices=(0, 1, 2)) == 1
+    assert calls == [{"sigma_min": SIGMA_MIN, "truncated_indices": (M_ROLLOUTS - 1,),
+                      "attainable_rewards": (0.0, 1.0)}]
+
+
+def test_a_verified_group_with_uncertain_rollouts_is_no_longer_refused_at_the_journal(signed_request):
+    """The proof stage decided with the robust rule; the journal step has no veto of its own left."""
     from tests.unit.test_grpo_window_batcher import _make_batcher
 
-    request, announcement, _ = signed_request(purpose=purpose)
+    request, announcement, _ = signed_request(purpose="training")
     batcher = _make_batcher()
     batcher.service_policy = announcement
     batcher.service_runtime = SimpleNamespace(contract=ServiceContract.from_dict(announcement["contract"]))
     pending = SimpleNamespace(request=request)
-    verified = SimpleNamespace(truncated_count=1, unboxed_count=0)
-    with pytest.raises(ServicePolicyLimit, match="uncertain outcomes"):
+    verified = SimpleNamespace(truncated_count=1, unboxed_count=1)
+    with pytest.raises(AttributeError, match="rollouts"):       # it went past the old veto, into the row build
         batcher._record_service_proof(pending, verified)
 
 
@@ -408,15 +587,16 @@ def _service_proof(commit, **changes):
     return ProofResult(**values)
 
 
-@pytest.mark.parametrize("purpose", ["training", "exploration"])
-def test_service_cap_discovered_by_proof_cannot_become_a_scheduler_pass(signed_request, monkeypatch, purpose):
+def _proved_with_a_cap(signed_request, monkeypatch, *, purpose, correct, capped=True, unboxed=(),
+                       missing_box="uncertain"):
+    """Prove a group through the in-process path. ``capped``: the proof alone finds the last
+    rollout cut by the length cap. ``unboxed``: rollouts that terminated without any box."""
     from reliquary.validator import batcher as batcher_module
     from tests.unit.test_grpo_window_batcher import _prove_one
 
-    request, announcement, wallet = signed_request(purpose=purpose)
-    if purpose == "training":
-        for index, rollout in enumerate(request.rollouts):
-            rollout.reward = float(index < M_ROLLOUTS // 2)
+    request, announcement, wallet = signed_request(purpose=purpose, missing_box=missing_box)
+    for index, rollout in enumerate(request.rollouts):
+        rollout.reward = float(index < correct and index not in unboxed)
     _sign_envelope(request, wallet)
     def verifier(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
         return _service_proof(commit)
@@ -425,14 +605,69 @@ def test_service_cap_discovered_by_proof_cannot_become_a_scheduler_pass(signed_r
         index = next((i for i in range(M_ROLLOUTS) if 10 + i in ids), None)
         if index is None:
             return "".join("\\boxed{0}" if token == 2 else "" if token == 99 else "x" for token in ids)
-        correct = purpose == "training" and index < M_ROLLOUTS // 2
-        return f"Derivation number {index} {'CORRECT' if correct else 'wrong'}. \\boxed{{0}}"
+        return f"Derivation number {index} {'CORRECT' if index < correct else 'wrong'}. \\boxed{{0}}"
     batcher.tokenizer.decode = decode
-    # Simulate cap status learned only from the expensive proof. Legacy allows
-    # one such truncation; the service must reject before returning PASSED.
-    monkeypatch.setattr(batcher_module, "is_cap_truncation", lambda commit, *args, **kwargs: commit is request.rollouts[-1].commit)
-    assert _prove_one(batcher, request) is None
+    graded_text = batcher._completion_text
+    def completion_text(rollout):
+        index = next(i for i, candidate in enumerate(request.rollouts) if candidate is rollout)
+        return f"wrong {index}, and no final answer" if index in unboxed else graded_text(rollout)
+    batcher._completion_text = completion_text
+    monkeypatch.setattr(batcher_module, "is_cap_truncation",
+                        lambda commit, *args, **kwargs: capped and commit is request.rollouts[-1].commit)
+    result = _prove_one(batcher, request)
+    pending = batcher.pending_submissions()[-1] if batcher.pending_submissions() else None
+    return result, batcher, pending
+
+
+def test_a_cap_found_by_the_proof_no_longer_sinks_a_robust_training_group(signed_request, monkeypatch):
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
+                                                  correct=M_ROLLOUTS // 2)
+    assert result is not None
+    assert batcher.reject_counts.get(RejectReason.OUT_OF_ZONE.value, 0) == 0
+    assert pending.truncated_indices == (M_ROLLOUTS - 1,)
+    assert pending.uncertain_indices == (M_ROLLOUTS - 1,)
+    assert result.truncated_count == 1
+
+
+def test_a_cap_found_by_the_proof_refuses_a_training_group_it_could_collapse(signed_request, monkeypatch):
+    """All right but the last, which the proof finds cut: it may have been right too."""
+    result, batcher, _ = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
+                                            correct=M_ROLLOUTS - 1)
+    assert result is None
     assert batcher.reject_counts[RejectReason.OUT_OF_ZONE.value] == 1
+
+
+def test_in_process_missing_box_follows_the_contract(signed_request, monkeypatch):
+    """Direct (non worker) path: all right but one, which terminated without a box."""
+    last = (M_ROLLOUTS - 1,)
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
+                                                  correct=M_ROLLOUTS, capped=False, unboxed=last)
+    assert result is None                                         # maths: it may have been right
+    assert pending is None                                        # refused at admission, before any proof
+    assert batcher.reject_counts[RejectReason.OUT_OF_ZONE.value] == 1
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
+                                                  correct=M_ROLLOUTS, capped=False, unboxed=last,
+                                                  missing_box="graded")
+    assert result is not None                                     # plain zero: 15/16 is in zone
+    assert pending.uncertain_indices == () and pending.unboxed_count == 0
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="training",
+                                                  correct=M_ROLLOUTS // 2, capped=False, unboxed=last)
+    assert result is not None                                     # maths, robust to that rollout
+    assert pending.uncertain_indices == last and pending.truncated_indices == ()
+    assert pending.attainable_rewards == (0.0, 1.0)
+
+
+def test_a_cap_found_by_the_proof_keeps_the_exploration_observation_and_marks_it(signed_request, monkeypatch):
+    """Published, and recognisable as unpaid: the cut rollout is recorded for the pay decision."""
+    from reliquary.services.admission_policy import exploration_pay_entitlement
+
+    result, batcher, pending = _proved_with_a_cap(signed_request, monkeypatch, purpose="exploration", correct=0)
+    assert result is not None
+    assert batcher.reject_counts.get(RejectReason.OUT_OF_ZONE.value, 0) == 0
+    assert pending.truncated_indices == (M_ROLLOUTS - 1,)
+    pay = exploration_pay_entitlement(pending.rewards, truncated_indices=pending.truncated_indices,
+                                      uncertain_indices=pending.uncertain_indices)
+    assert (pay.entitled, pay.reason) == (False, "truncated")
 
 
 @pytest.mark.parametrize("pool", [False, True])

@@ -661,6 +661,11 @@ class PendingSubmission:
     truncated_count: int = 0
     truncated_index: int | None = None
     unboxed_count: int = 0
+    # Service policy only (empty otherwise): rollouts cut by the length cap, and
+    # rollouts whose reward is not trusted (those, plus a missing box where the
+    # contract makes it uncertain).
+    truncated_indices: tuple[int, ...] = ()
+    uncertain_indices: tuple[int, ...] = ()
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
     # Completion-token telemetry retained for training, archives and recovery
@@ -1783,9 +1788,13 @@ class GrpoWindowBatcher:
         if self.service_policy is not None:
             from reliquary.protocol.service_contract import ServiceContract
             from reliquary.services.admission_policy import service_signal_admits
-            eligible = service_signal_admits(pending.request, ServiceContract.from_dict(self.service_policy["contract"]),
+            eligible = service_signal_admits(
+                pending.request,
+                ServiceContract.from_dict(self.service_policy["contract"]),
                 pending.rewards,
-                uncertain_indices=tuple(truncated_indices) + ((0,) if (pending.truncated_count or pending.unboxed_count) else ()))
+                uncertain_indices=pending.uncertain_indices,
+                attainable_rewards=pending.attainable_rewards,
+            )
         else:
             eligible = robust_utility_admits(
                 pending.rewards,
@@ -3934,6 +3943,12 @@ class GrpoWindowBatcher:
             truncated_count=int(getattr(prepared, "truncated_count", 0) or 0),
             truncated_index=getattr(prepared, "truncated_index", None),
             unboxed_count=int(getattr(prepared, "unboxed_count", 0) or 0),
+            truncated_indices=tuple(
+                getattr(prepared, "truncated_indices", ()) or ()
+            ),
+            uncertain_indices=tuple(
+                getattr(prepared, "uncertain_indices", ()) or ()
+            ),
             attainable_rewards=tuple(
                 getattr(prepared, "attainable_rewards", ()) or ()
             ),
@@ -4369,15 +4384,25 @@ class GrpoWindowBatcher:
                     or 0
                 )
             )
+        if service_contract is None:
+            missing_box_uncertain = _environment_policy(
+                self.env, "final_answer_policy"
+            ) == "boxed"
+        else:
+            from reliquary.services.admission_policy import (
+                missing_box_is_uncertain,
+            )
+
+            missing_box_uncertain = missing_box_is_uncertain(
+                str(getattr(self.env, "name", "")), service_contract
+            )
         unboxed_indices = (
             tuple(
                 index
                 for index, text in enumerate(completion_texts)
                 if is_missing_final_answer_box(text)
             )
-            if _environment_policy(
-                self.env, "final_answer_policy"
-            ) == "boxed"
+            if missing_box_uncertain
             else ()
         )
         robust_utility = None
@@ -4404,8 +4429,19 @@ class GrpoWindowBatcher:
         )
         if service_contract is not None:
             from reliquary.services.admission_policy import service_signal_admits
-            in_zone = service_signal_admits(request, service_contract, rewards,
-                                             uncertain_indices=tuple(unboxed_indices))
+            # This path learns truncation from the proof only, so a missing box
+            # is the one uncertainty it can see here; it exists on boxed
+            # environments alone, whose lattice is declared.
+            attainable_rewards = tuple(
+                _environment_policy(self.env, "attainable_rewards", ()) or ()
+            )
+            in_zone = service_signal_admits(
+                request,
+                service_contract,
+                rewards,
+                uncertain_indices=unboxed_indices,
+                attainable_rewards=attainable_rewards,
+            )
         if not in_zone:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
 
@@ -4494,6 +4530,9 @@ class GrpoWindowBatcher:
             request=request,
             rewards=list(rewards),
             unboxed_count=len(unboxed_indices),
+            uncertain_indices=(
+                tuple(unboxed_indices) if service_contract is not None else ()
+            ),
             attainable_rewards=attainable_rewards,
             robust_utility=robust_utility,
             drand_round=request.drand_round,
@@ -5795,8 +5834,34 @@ class GrpoWindowBatcher:
             truncated_flags,
         )
 
-        if service_contract is not None and (truncated_count or pending.truncated_count or pending.unboxed_count):
-            return reject(RejectReason.OUT_OF_ZONE, "service_signal")
+        if service_contract is not None:
+            # The proof is the authority on termination: a rollout it found cut
+            # by the length cap is uncertain even if admission did not see it.
+            from reliquary.services.admission_policy import (
+                service_signal_admits,
+                uncertain_rollout_indices,
+            )
+
+            proven_truncated = tuple(
+                index for index, cut in enumerate(truncated_flags) if cut
+            )
+            pending.truncated_indices = uncertain_rollout_indices(
+                truncated_indices=(*pending.truncated_indices, *proven_truncated),
+                size=len(request.rollouts),
+            )
+            pending.uncertain_indices = uncertain_rollout_indices(
+                truncated_indices=pending.truncated_indices,
+                unboxed_indices=pending.uncertain_indices,
+                size=len(request.rollouts),
+            )
+            if not service_signal_admits(
+                request,
+                service_contract,
+                rewards,
+                uncertain_indices=pending.uncertain_indices,
+                attainable_rewards=pending.attainable_rewards,
+            ):
+                return reject(RejectReason.OUT_OF_ZONE, "service_signal")
 
         # All checks passed.
         new_sub = ValidSubmission(
@@ -6077,9 +6142,6 @@ class GrpoWindowBatcher:
         contract = validate_submission_policy(pending.request, self.service_policy)
         if contract is None or contract.sha256 != self.service_runtime.contract.sha256:
             raise ValueError("proof service context no longer active")
-        if verified.truncated_count or verified.unboxed_count:
-            from reliquary.services.runtime import ServicePolicyLimit
-            raise ServicePolicyLimit("uncertain outcomes cannot become a verified service observation")
         commits = [r.commit for r in verified.rollouts]
         identity = self._service_group_id(pending)
         row = {

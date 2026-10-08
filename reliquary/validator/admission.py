@@ -167,6 +167,11 @@ class PreparedSubmission:
     # Math completions with no box score zero, but are uncertain for auction
     # eligibility so deleting a box cannot manufacture useful variance.
     unboxed_count: int = 0
+    # Service policy only (empty otherwise): which rollouts the length cap cut,
+    # and which have an untrusted reward (those, plus a missing box where the
+    # contract makes it uncertain).
+    truncated_indices: tuple[int, ...] = ()
+    uncertain_indices: tuple[int, ...] = ()
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
     # Completion-token telemetry used by training, archives and legacy-window
@@ -1101,16 +1106,32 @@ def score_and_finalize_submission(
 
             rewards = [float(rollout.reward) for rollout in request.rollouts]
             truncated_indices = truncated_rollout_indices(request, context)
+            service_contract = None
+            if context.service_policy is None:
+                missing_box_uncertain = (
+                    environment_spec.final_answer_policy == "boxed"
+                    and MATH_ANSWER_FORMAT == "boxed"
+                )
+            else:
+                from reliquary.protocol.service_contract import ServiceContract
+                from reliquary.services.admission_policy import (
+                    missing_box_is_uncertain,
+                    service_signal_admits,
+                )
+
+                service_contract = ServiceContract.from_dict(
+                    context.service_policy["contract"]
+                )
+                missing_box_uncertain = missing_box_is_uncertain(
+                    context.environment, service_contract
+                )
             unboxed_indices = (
                 tuple(
                     index
                     for index, text in enumerate(materials.completion_texts)
                     if is_missing_final_answer_box(text)
                 )
-                if (
-                    environment_spec.final_answer_policy == "boxed"
-                    and (MATH_ANSWER_FORMAT == "boxed" or context.service_policy is not None)
-                )
+                if missing_box_uncertain
                 else ()
             )
             uncertain_indices = tuple(
@@ -1154,11 +1175,35 @@ def score_and_finalize_submission(
                 if robust_utility is not None
                 else _in_zone(rewards, bootstrap=context.bootstrap)
             )
-            if context.service_policy is not None:
-                from reliquary.services.admission_policy import service_signal_admits
-                from reliquary.protocol.service_contract import ServiceContract
-                in_zone = service_signal_admits(request, ServiceContract.from_dict(context.service_policy["contract"]),
-                                               rewards, uncertain_indices=tuple(uncertain_indices))
+            service_uncertainty: dict[str, Any] = {}
+            if service_contract is not None:
+                # The lattice is derived whether or not a rollout is uncertain
+                # yet: the proof may still find a length-capped rollout, and an
+                # environment whose lattice is unknown gets none (the policy
+                # then refuses any group with an uncertain rollout).
+                if environment_spec.attainable_rewards:
+                    attainable_rewards = environment_spec.attainable_rewards
+                elif materials.effective_reward_materials:
+                    from reliquary.validator.difficulty_auction import (
+                        fractional_reward_lattice,
+                    )
+
+                    attainable_rewards = fractional_reward_lattice(
+                        len(materials.effective_reward_materials)
+                    )
+                else:
+                    attainable_rewards = ()
+                in_zone = service_signal_admits(
+                    request,
+                    service_contract,
+                    rewards,
+                    uncertain_indices=uncertain_indices,
+                    attainable_rewards=attainable_rewards,
+                )
+                service_uncertainty = {
+                    "truncated_indices": tuple(truncated_indices),
+                    "uncertain_indices": tuple(uncertain_indices),
+                }
             if not in_zone:
                 return result(
                     request=request,
@@ -1237,6 +1282,7 @@ def score_and_finalize_submission(
                 unboxed_count=len(unboxed_indices),
                 attainable_rewards=attainable_rewards,
                 robust_utility=robust_utility,
+                **service_uncertainty,
                 eos_tokens=count_eos_completion_tokens(request, context),
                 body_parse_ms=parsed.body_parse_ms,
                 preparation_ms=(
