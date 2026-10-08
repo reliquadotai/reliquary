@@ -292,7 +292,8 @@ class WeightOnlyValidator:
         be worked (the settler pays them under it), so lowering it, to 0 when
         the job is finished, lets what was earned run out. Each archive is one
         period's pay, and ``_replay_ema`` bounds the task at
-        ``CATCHUP_ENTRIES`` such caps on that ground. An archive moved to an earlier entry (``replaces_entry_period``,
+        ``CATCHUP_ENTRIES`` such caps on that ground. An archive moved to an
+        earlier entry (``replaces_entry_period``,
         scripts/requeue_period_archives.py) hides the one it replaces, should
         that one still be listed."""
         from reliquary.validator import corpus_periods as cp
