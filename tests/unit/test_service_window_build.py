@@ -59,7 +59,8 @@ def _service(monkeypatch, tmp_path, contract=None, *, loaded=None, cap=CAP, revi
     monkeypatch.setattr("reliquary.constants.EMISSION_PRICE_ARMED", False)
     contract = contract or contract_v2()
     folder = tmp_path / "service"
-    folder.mkdir(exist_ok=True)
+    folder.mkdir(mode=0o700, exist_ok=True)
+    folder.chmod(0o700)   # the request folder must not be group/other-writable whatever the umask
     svc = _build_late_drop_service()
     names = list(loaded if loaded is not None else
                  [name for name in (MATH, CODE, SCIENCE) if name in contract.environments])

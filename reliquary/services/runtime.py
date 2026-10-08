@@ -491,10 +491,12 @@ class ServiceRuntime:
         """
         from reliquary.services.cooldown_advisor import NOTE, recommend_cooldown
         _integer(window, "window", 0)
-        advice, consumption = {}, self.measured_consumption()
+        advice, consumption = {}, None
         for environment in self.contract.environments:
             previous = None
             try:
+                if consumption is None:
+                    consumption = self.measured_consumption()
                 with self.lock:
                     first, in_zone = self.log.first_scan_stats(environment)
                     row = self.db.execute("SELECT payload FROM service_cooldown_advice WHERE environment=?",
@@ -512,10 +514,13 @@ class ServiceRuntime:
                           "recommended_windows": kept.get("recommended_windows")}
             result["current_windows"] = self.schedule.cooldown_windows(environment)
             advice[environment] = result
-            with self.lock, self.db:
-                self.db.execute("INSERT INTO service_cooldown_advice VALUES(?,?,?) ON CONFLICT(environment) "
-                                "DO UPDATE SET window=excluded.window, payload=excluded.payload",
-                                (environment, window, canonical_json_bytes(result).decode()))
+            try:
+                with self.lock, self.db:
+                    self.db.execute("INSERT INTO service_cooldown_advice VALUES(?,?,?) ON CONFLICT(environment) "
+                                    "DO UPDATE SET window=excluded.window, payload=excluded.payload",
+                                    (environment, window, canonical_json_bytes(result).decode()))
+            except Exception:  # informational: a storage failure must not reach the validator loop
+                logger.exception("cooldown advice of %s could not be stored (window %d)", environment, window)
         return advice
 
     def cooldown_advice(self) -> dict[str, dict]:
@@ -1116,8 +1121,13 @@ class ServiceRuntime:
                     exploration[env] = counts
             result = settle_window(archive=archive, envelope=envelope, contract=self.contract,
                                    exploration=exploration, aborted=aborted)
-            # Informational, not money: no field of FROZEN_ARCHIVE_FIELDS, ignored by validation.
-            result["service_cooldown_advice"] = self.cooldown_advice()
+            # Informational, not money: no field of FROZEN_ARCHIVE_FIELDS, ignored by validation. The
+            # advice is a snapshot taken at the window's FIRST settlement and kept in its settled
+            # record, so a re-settlement (or a restart) returns the same bytes.
+            snapshot = json.loads(settled[1]).get("cooldown_advice") if settled is not None else None
+            if snapshot is None:
+                snapshot = self.cooldown_advice()
+            result["service_cooldown_advice"] = snapshot
             # Lane consistency under the protocol geometry; the task-cap bound is weight replay's.
             validate_service_archive_v2(result, self.contract, cap=1.0, picks_target=picks, batch_slots=slots)
             digest = canonical_sha256(sorted(
@@ -1133,7 +1143,8 @@ class ServiceRuntime:
                                  window, digest, previous)
             self.db.execute("INSERT INTO service_settled VALUES(?,?,?,?) ON CONFLICT(order_id, window) DO UPDATE SET "
                             "aborted=excluded.aborted, payload=excluded.payload",
-                            (order, window, int(aborted), canonical_json_bytes({"batch_sha256": digest}).decode()))
+                            (order, window, int(aborted), canonical_json_bytes({"batch_sha256": digest,
+                                                  "cooldown_advice": snapshot}).decode()))
             self.log.set_window_aborted(window, aborted)
             self._emit_settle_events(window, envelope, archive, aborted, instant)
         return result

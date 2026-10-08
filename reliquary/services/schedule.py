@@ -44,6 +44,18 @@ class ScheduleRefused(ValueError):
 
 # ---------------------------------------------------------------- file store
 
+class UnsafeLocation(ValueError):
+    """The folder or request file has the wrong owner or can be written by others."""
+
+
+def _check_owner_and_mode(info, label: str) -> None:
+    """The operator's folder and request file belong to the validator's user and nobody else can write them."""
+    if info.st_uid != os.geteuid():
+        raise UnsafeLocation(f"{label} is not owned by the user running the validator (uid {os.geteuid()})")
+    if info.st_mode & 0o022:
+        raise UnsafeLocation(f"{label} is writable by group or others")
+
+
 def _read_json_file(folder: Path, name: str):
     """Strict JSON of ``folder/name`` or None if absent. Refuses symlinks, non-regular files,
     group/world-writable files, files over ``MAX_FILE_BYTES`` and anything but strict JSON."""
@@ -52,6 +64,7 @@ def _read_json_file(folder: Path, name: str):
     except FileNotFoundError:
         return None
     try:
+        _check_owner_and_mode(os.fstat(directory), f"folder {folder}")
         try:
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
                          dir_fd=directory)
@@ -65,8 +78,7 @@ def _read_json_file(folder: Path, name: str):
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"{name} is not a regular file")
-        if info.st_mode & 0o022:
-            raise ValueError(f"{name} is writable by group or others")
+        _check_owner_and_mode(info, name)
         if info.st_size > MAX_FILE_BYTES:
             raise ValueError(f"{name} is larger than {MAX_FILE_BYTES} bytes")
         raw = handle.read(MAX_FILE_BYTES + 1)
@@ -100,7 +112,11 @@ class ScheduleRequestStore:
         self.write(request)
         return request
 
+    def _ensure_folder(self) -> None:
+        self.folder.mkdir(mode=0o700, parents=True, exist_ok=True)   # umask may only narrow it
+
     def write(self, request: dict) -> None:
+        self._ensure_folder()
         write_json(self.request_path, request)  # temp file + fsync + rename + directory fsync
 
     def take(self) -> dict | None:
@@ -112,6 +128,7 @@ class ScheduleRequestStore:
         return value
 
     def report(self, request_id: str, *, status: str, detail: str, revision: int) -> None:
+        self._ensure_folder()
         write_json(self.status_path, {"request_id": request_id, "status": status, "detail": detail,
                                       "revision": revision, "at": time.time()})
 
@@ -213,9 +230,11 @@ def read_runtime(db: sqlite3.Connection) -> dict:
     if row is None:
         raise SystemExit("error: the runtime database holds no order yet")
     contract = ServiceContract.from_dict(json.loads(row[1]))
-    schedule = ServiceSchedule.from_dict(json.loads(db.execute(
-        "SELECT payload FROM service_schedules WHERE order_id=? ORDER BY revision DESC LIMIT 1", (row[0],)).fetchone()[0]),
-        contract)
+    latest = db.execute(
+        "SELECT payload FROM service_schedules WHERE order_id=? ORDER BY revision DESC LIMIT 1", (row[0],)).fetchone()
+    if latest is None:
+        raise SystemExit("error: the runtime database holds no schedule yet (the validator has not started this order)")
+    schedule = ServiceSchedule.from_dict(json.loads(latest[0]), contract)
     requests = {}
     with contextlib.suppress(sqlite3.OperationalError):
         for rid, status, detail, revision, window in db.execute(
@@ -235,12 +254,31 @@ def _pairs(values: list[str] | None, option: str) -> dict[str, int] | None:
     result = {}
     for item in values:
         name, _, number = item.partition("=")
-        if not name or not number.isdigit():
+        if not name or not (number.isascii() and number.isdigit()):
             raise SystemExit(f"error: {option} expects env=integer, got {item!r}")
         if name in result:
             raise SystemExit(f"error: {option} given twice for {name}")
         result[name] = int(number)
     return result
+
+
+def _unhandled_request(store: ScheduleRequestStore, known: dict):
+    """The request file's content if the runtime has neither applied nor refused its id, else None.
+
+    A file that cannot be read safely raises ValueError, except for content problems, which are
+    returned as ``{"unreadable": reason}`` (an unsafe owner or mode is always refused) (the validator will refuse it too; ``--replace`` clears it).
+    """
+    try:
+        pending = store.take()
+    except UnsafeLocation:
+        raise
+    except ValueError as exc:
+        return {"unreadable": str(exc)}
+    if pending is None:
+        return None
+    if isinstance(pending, dict) and pending.get("request_id") in known:
+        return None
+    return pending
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -255,6 +293,8 @@ def main(argv: list[str] | None = None) -> None:
     setter.add_argument("--active", help="comma-separated environments that run (needs --share for each)")
     setter.add_argument("--share", action="append", help="env=bps (active shares sum to 10000)")
     setter.add_argument("--cooldown", action="append", help="env=windows")
+    setter.add_argument("--replace", action="store_true",
+                        help="overwrite a pending request the validator has not handled yet (it is printed)")
     args = parser.parse_args(argv)
     if not args.folder:
         raise SystemExit(f"error: --folder (or ${FOLDER_ENV}) is required")
@@ -271,8 +311,25 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError as exc:
             print(f"error: request refused: {exc}", file=sys.stderr)
             raise SystemExit(2)
+        try:
+            unhandled = _unhandled_request(store, state["requests"])
+        except ValueError as exc:
+            print(f"error: request refused: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        if unhandled is not None and not args.replace:
+            print("error: request refused: a pending request has not been handled by the validator yet "
+                  f"(id {unhandled.get('request_id') if isinstance(unhandled, dict) else None}); "
+                  "use --replace to overwrite it. Pending request: "
+                  + json.dumps(unhandled, sort_keys=True), file=sys.stderr)
+            raise SystemExit(2)
+        if unhandled is not None:
+            print("replacing the unhandled request: " + json.dumps(unhandled, sort_keys=True), file=sys.stderr,
+                  flush=True)
         store.write(request)
-        print(json.dumps({"written": request, "applies": "at the next window boundary"}, indent=2, sort_keys=True))
+        out = {"written": request, "applies": "at the next window boundary"}
+        if unhandled is not None:
+            out["replaced"] = unhandled
+        print(json.dumps(out, indent=2, sort_keys=True))
         return
     try:
         pending = store.take()

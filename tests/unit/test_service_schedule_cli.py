@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from reliquary.protocol.release_contract import canonical_json_bytes
 from reliquary.services.schedule import REQUEST_SCHEMA, ScheduleRequestStore, build_request
 from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2
 from tests.unit.test_service_runtime_v2 import (
@@ -209,7 +210,7 @@ def test_unsafe_request_files_are_refused_without_being_followed(tmp_path):
     rt = runtime(tmp_path)
     folder = tmp_path / "ops"
     store = ScheduleRequestStore(folder)
-    folder.mkdir()
+    folder.mkdir(mode=0o700)
     outside = tmp_path / "outside.json"
     outside.write_text(json.dumps(raw_request(rt)))
     outside.chmod(0o600)
@@ -389,9 +390,130 @@ def test_advice_is_informational_in_the_archive_and_never_enters_settlement(tmp_
     first = rt.reconcile_archive(archive(1))
     assert set(first["service_cooldown_advice"]) == {MATH, CODE}
     rt.refresh_cooldown_advice(window=2, populations={MATH: 6000, CODE: 5})
+    assert rt.cooldown_advice() != first["service_cooldown_advice"]       # the live advice moved on...
     second = rt.reconcile_archive(archive(1))
-    assert second["service_cooldown_advice"] != first["service_cooldown_advice"]
+    assert canonical_json_bytes(second) == canonical_json_bytes(first)    # ...the window's snapshot did not (I2)
     assert frozen(first) == frozen(second)                                  # money does not follow the advice
     picks, slots = protocol_slot_geometry()
     second["service_cooldown_advice"] = {"garbage": float("nan")}
     validate_service_archive_v2(second, rt.contract, cap=1.0, picks_target=picks, batch_slots=slots)
+
+
+def test_the_advice_snapshot_of_a_window_survives_a_restart_and_a_refresh(tmp_path, monkeypatch):
+    advisor(monkeypatch, lambda **kw: {"status": "ok", "reasons": [], "recommended_windows": kw["population"]})
+    rt = runtime(tmp_path)
+    rt.refresh_cooldown_advice(window=1, populations={MATH: 5, CODE: 5})
+    first = rt.reconcile_archive(archive(1))
+    contract = rt.contract
+    rt.close()
+    rt = build(tmp_path / "runtime.sqlite3", contract)
+    rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
+    rt.refresh_cooldown_advice(window=2, populations={MATH: 777, CODE: 888})
+    again = rt.reconcile_archive(archive(1))
+    assert canonical_json_bytes(again) == canonical_json_bytes(first)
+    assert again["service_cooldown_advice"][MATH]["recommended_windows"] == 5
+    assert rt.cooldown_advice()[MATH]["recommended_windows"] == 777
+
+
+def test_an_advice_refresh_never_raises_even_if_consumption_or_the_table_fails(tmp_path):
+    rt = runtime(tmp_path)
+
+    def boom():
+        raise RuntimeError("consumption unreadable")
+
+    rt.measured_consumption = boom
+    advice = rt.refresh_cooldown_advice(window=2, populations={MATH: 5, CODE: 5})
+    assert {a["status"] for a in advice.values()} == {"error"}
+    del rt.measured_consumption
+    rt.db.execute("DROP TABLE service_cooldown_advice")
+    advice = rt.refresh_cooldown_advice(window=3, populations={MATH: 5, CODE: 5})     # the upsert fails: logged
+    assert set(advice) == {MATH, CODE}
+
+
+# ---------------------------------------------------------------- review fixes (I1, M1, M3, M4)
+
+def test_cli_set_refuses_to_destroy_an_unhandled_pending_request(tmp_path):
+    rt = runtime(tmp_path)
+    first = json.loads(cli(tmp_path, "set", "--cooldown", f"{MATH}=12").stdout)["written"]
+    result = cli(tmp_path, "set", "--cooldown", f"{MATH}=13", check=False)
+    assert result.returncode != 0 and first["request_id"] in result.stderr and "--replace" in result.stderr
+    assert json.loads((tmp_path / "schedule-request.json").read_text()) == first        # untouched
+    replaced = cli(tmp_path, "set", "--cooldown", f"{MATH}=13", "--replace")
+    assert first["request_id"] in replaced.stderr and '"cooldowns"' in replaced.stderr
+    new = json.loads((tmp_path / "schedule-request.json").read_text())
+    assert new["request_id"] != first["request_id"] and new["cooldowns"] == {MATH: 13}
+    assert json.loads(replaced.stdout)["replaced"] == first
+    # Once the validator has handled the request, a new one needs no --replace.
+    rt.apply_pending_schedule_request(ScheduleRequestStore(tmp_path), window=2)
+    assert cli(tmp_path, "set", "--cooldown", f"{MATH}=14", check=False).returncode == 0
+
+
+@pytest.mark.parametrize("target", ["folder", "file"])
+@pytest.mark.parametrize("fault", ["group_writable", "foreign_owner"])
+def test_request_folder_and_file_must_be_owned_and_not_writable_by_others(tmp_path, monkeypatch, target, fault):
+    rt = runtime(tmp_path)
+    folder = tmp_path / "ops"
+    store = ScheduleRequestStore(folder)
+    folder.mkdir()
+    folder.chmod(0o700)
+    request = submit(rt, store, cooldowns={MATH: 12})
+    victim = folder if target == "folder" else store.request_path
+    real_geteuid = os.geteuid
+    if fault == "group_writable":
+        victim.chmod(0o770 if target == "folder" else 0o660)
+    else:
+        monkeypatch.setattr(os, "geteuid", lambda: real_geteuid() + 1)
+    # runtime: a recorded refusal, no crash, nothing applied
+    assert rt.apply_pending_schedule_request(store, window=2).revision == 0
+    assert rt.schedule.revision == 0
+    monkeypatch.undo()
+    status = json.loads(store.status_path.read_text())
+    detail = status["detail"]
+    assert status["status"] == "refused" and ("writable" in detail or "owned" in detail)
+    # CLI: a clear refusal, exit non-zero, request file untouched
+    before = store.request_path.read_bytes()
+    if fault == "foreign_owner":
+        result = _cli_as_foreign_user(folder, ["set", "--cooldown", f"{MATH}=13", "--replace"])
+    else:
+        result = cli(folder, "--db", str(tmp_path / "runtime.sqlite3"), "set", "--cooldown", f"{MATH}=13",
+                     "--replace", check=False)
+    assert result.returncode != 0 and ("writable" in result.stderr or "owned" in result.stderr), result.stderr
+    assert store.request_path.read_bytes() == before
+
+
+def _cli_as_foreign_user(folder, command):
+    code = ("import os,sys; os.geteuid = lambda: os.getuid() + 1; "
+            "from reliquary.services.schedule import main; main(sys.argv[1:])")
+    return subprocess.run([sys.executable, "-c", code, "--folder", str(folder), "--db",
+                           str(folder.parent / "runtime.sqlite3"), *command], capture_output=True, text=True,
+                          cwd=ROOT)
+
+
+def test_foreign_owner_is_named_in_the_refusal(tmp_path, monkeypatch):
+    rt = runtime(tmp_path)
+    store = ScheduleRequestStore(tmp_path)
+    submit(rt, store, cooldowns={MATH: 12})
+    real_geteuid = os.geteuid
+    monkeypatch.setattr(os, "geteuid", lambda: real_geteuid() + 1)
+    with pytest.raises(ValueError, match="owned"):
+        store.take()
+
+
+def test_pairs_reject_non_ascii_digits():
+    from reliquary.services.schedule import _pairs
+    assert _pairs(["a=12"], "--share") == {"a": 12}
+    with pytest.raises(SystemExit):
+        _pairs(["a=\u0663"], "--share")          # ARABIC-INDIC DIGIT THREE passes str.isdigit()
+    with pytest.raises(SystemExit):
+        _pairs(["a=\u00b2"], "--share")          # superscript two: isdigit() but int() fails
+
+
+def test_cli_without_a_schedule_row_gives_an_operator_message_not_a_traceback(tmp_path):
+    import sqlite3
+    runtime(tmp_path).close()
+    db = sqlite3.connect(tmp_path / "runtime.sqlite3")
+    db.execute("DELETE FROM service_schedules")
+    db.commit()
+    db.close()
+    result = cli(tmp_path, "show", check=False)
+    assert result.returncode != 0 and "no schedule" in result.stderr and "Traceback" not in result.stderr
