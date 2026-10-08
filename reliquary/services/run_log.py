@@ -336,6 +336,11 @@ class RunObservationLog:
                                (self.order, after, limit)).fetchall()
         return [(seq, json.loads(payload)) for seq, payload in rows]
 
+    def seq_range(self, *, after: int = 0, limit: int = 1000) -> tuple[int | None, int | None]:
+        """``(first, last)`` seq of the next ``limit`` events after ``after``, by SQL (no payload parsed)."""
+        return self.db.execute("SELECT MIN(seq), MAX(seq) FROM (SELECT seq FROM run_events WHERE order_id=? AND seq>? "
+                               "ORDER BY seq LIMIT ?)", (self.order, after, limit)).fetchone()
+
     def admin_events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
         result = []
         for seq, event in self.events(after=after, limit=limit):

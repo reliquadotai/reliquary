@@ -238,6 +238,7 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_consumption(order_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL, q TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_cooldown_advice(environment TEXT PRIMARY KEY, window INTEGER NOT NULL, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_segments(number INTEGER PRIMARY KEY, first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL, flush_at REAL NOT NULL, sha256 TEXT, size INTEGER, windows TEXT, checkpoints TEXT, committed INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS service_index_pages(first_number INTEGER PRIMARY KEY, body BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_schedule_requests(order_id TEXT NOT NULL, request_id TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, revision INTEGER NOT NULL, window INTEGER NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, request_id));
             """)
             if "opened_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(service_windows)")}:
@@ -1395,10 +1396,10 @@ class ServiceRuntime:
                 return {"number": row[0], "first_seq": row[1], "last_seq": row[2], "flush_at": row[3]}
             last_seq, last_number = self.db.execute(
                 "SELECT COALESCE(MAX(last_seq),0), COALESCE(MAX(number),0) FROM service_segments").fetchone()
-            events = self.log.events(after=last_seq, limit=max_events)
-            if not events:
+            first, last = self.log.seq_range(after=last_seq, limit=max_events)
+            if first is None:
                 return None
-            plan = {"number": last_number + 1, "first_seq": events[0][0], "last_seq": events[-1][0],
+            plan = {"number": last_number + 1, "first_seq": first, "last_seq": last,
                     "flush_at": _instant(now)}
             self.db.execute("INSERT INTO service_segments(number, first_seq, last_seq, flush_at) VALUES(?,?,?,?)",
                             (plan["number"], plan["first_seq"], plan["last_seq"], plan["flush_at"]))
@@ -1409,12 +1410,28 @@ class ServiceRuntime:
             self.db.execute("UPDATE service_segments SET sha256=?, size=?, windows=?, checkpoints=?, committed=1 "
                             "WHERE number=?", (sha256, size, json.dumps(windows), json.dumps(checkpoints), number))
 
-    def published_segments(self) -> list[dict]:
+    def index_page(self, first_number: int, build) -> bytes:
+        """The signed bytes of the closed index page starting at ``first_number``. The first build is
+        stored (a signature is not reproducible), so a restart serves the very same bytes."""
+        with self._txn():
+            row = self.db.execute("SELECT body FROM service_index_pages WHERE first_number=?", (first_number,)).fetchone()
+            if row is not None:
+                return bytes(row[0])
+            body = build()
+            self.db.execute("INSERT INTO service_index_pages(first_number, body) VALUES(?,?)", (first_number, body))
+            return body
+
+    def published_segments(self, *, first_number: int = 1, last_number: int | None = None) -> list[dict]:
         with self.lock:
             rows = self.db.execute("SELECT number, first_seq, last_seq, sha256, size, windows, checkpoints "
-                                   "FROM service_segments WHERE committed=1 ORDER BY number").fetchall()
+                                   "FROM service_segments WHERE committed=1 AND number>=? AND number<=? ORDER BY number",
+                                   (first_number, last_number if last_number is not None else 2 ** 62)).fetchall()
         return [{"number": r[0], "first_seq": r[1], "last_seq": r[2], "sha256": r[3], "size": r[4],
                  "windows": json.loads(r[5]), "checkpoints": json.loads(r[6])} for r in rows]
+
+    def last_published_number(self) -> int:
+        with self.lock:
+            return self.db.execute("SELECT COALESCE(MAX(number),0) FROM service_segments WHERE committed=1").fetchone()[0]
 
     def admin_events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
         with self.lock:

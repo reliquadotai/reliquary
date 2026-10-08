@@ -204,6 +204,20 @@ async def upload_bytes(key: str, body: bytes, *, content_type: str, cache_contro
     return True
 
 
+async def download_bytes(key: str, **client_kwargs) -> bytes | None:
+    """The raw bytes of an object; None only when it does not exist (any other failure raises)."""
+    from botocore.exceptions import ClientError
+
+    try:
+        async with get_s3_client(**client_kwargs) as client:
+            bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+            return await _read_object_body(await client.get_object(Bucket=bucket, Key=key))
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code", "") in {"NoSuchKey", "404", "NotFound"}:
+            return None
+        raise
+
+
 async def download_json(
     key: str,
     *,

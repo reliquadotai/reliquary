@@ -947,6 +947,7 @@ class ValidationService:
             self._service_schedule_store = ScheduleRequestStore(folder)
         self.wallet = wallet
         self._signer_client = signer_client
+        self._require_publication_signer()
         self._network_proof = getattr(proof_worker_pool, "is_remote", False) is True
         if self._network_proof:
             from reliquary.constants import DETACHED_TRAINER
@@ -7597,14 +7598,25 @@ class ValidationService:
             logger.warning("service observations are not published: the hotkey lives in the remote signer, "
                            "which does not sign observation indexes")
             return
-        from reliquary.services.publication import ObservationPublisher, r2_put
+        from reliquary.services.publication import ObservationPublisher, r2_get, r2_put
 
         namespace = active_checkpoint_namespace()
         self._observation_stop = asyncio.Event()
+        self._observation_publisher = ObservationPublisher(
+            runtime, run_id=namespace.run_id, task_id=namespace.task_id, wallet=self.wallet,
+            put=r2_put(bucket), get=r2_get(bucket))
         self._observation_task = asyncio.create_task(
-            ObservationPublisher(runtime, run_id=namespace.run_id, task_id=namespace.task_id,
-                                 wallet=self.wallet, put=r2_put(bucket)).run(self._observation_stop),
-            name="service_observation_publisher")
+            self._observation_publisher.run(self._observation_stop), name="service_observation_publisher")
+
+    def _require_publication_signer(self) -> None:
+        """Refuse to boot when observation publication is configured but the hotkey is in a remote
+        signer (which does not sign observation indexes): never run silently without the log."""
+        if (getattr(self, "_service_runtime", None) is not None and os.environ.get("RELIQUARY_OBSERVATIONS_BUCKET")
+                and self._signer_client is not None):
+            raise ValueError(
+                "RELIQUARY_OBSERVATIONS_BUCKET is set but the validator uses a remote signer, which cannot sign "
+                "the observation index. Either run with a local hotkey, or add a signer operation for "
+                "observation indexes; or unset RELIQUARY_OBSERVATIONS_BUCKET to run without publication.")
 
     async def _stop_observation_publication(self) -> None:
         task = getattr(self, "_observation_task", None)
@@ -7615,6 +7627,10 @@ class ValidationService:
             await asyncio.wait_for(task, timeout=5)
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             task.cancel()
+        # The runtime is closed right after: wait for a thread call still running on it.
+        publisher = getattr(self, "_observation_publisher", None)
+        if publisher is not None:
+            await publisher.close()
 
     async def _serve_axon_on_chain(self, subtensor) -> None:
         """Publish this validator's axon (ip:port) to the chain metagraph.
