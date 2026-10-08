@@ -798,12 +798,22 @@ class ValidationService:
         if active_checkpoint_namespace().scoped and not DETACHED_TRAINER:
             raise ValueError("task-scoped checkpoints require the detached trainer")
         self._service_runtime = None
+        self._service_schedule_store = None
+        # The next service window as prepared at the boundary (None for every other task).
+        self._candidate_service_window: dict[str, Any] | None = None
+        self._candidate_service_pools: dict[str, float] | None = None
         if service_contract is not None:
             from reliquary.constants import FILL_CLOSED_ENABLED, PIPELINED_WINDOWS, ENFORCE_ENVELOPE_SIGNATURE
             from reliquary.services.runtime import ServiceRuntime
+            from reliquary.services.schedule import ScheduleRequestStore
             from reliquary.shared.strict_json import strict_json_loads
+            if getattr(service_contract, "version", None) != 2:
+                raise ValueError("RL service tasks need service-contract/v2")
             if not DETACHED_TRAINER or not FILL_CLOSED_ENABLED or PIPELINED_WINDOWS or not ENFORCE_ENVELOPE_SIGNATURE:
                 raise ValueError("service policies require signed, serial fill-closed detached execution")
+            if not use_drand:
+                # The window's public seed pool and the audit draws are drand beacons.
+                raise ValueError("service policies require drand window randomness")
             namespace = active_checkpoint_namespace()
             namespace.require_policy(service_contract.to_dict()["policies"]["checkpoint"])
             if not namespace.scoped:
@@ -821,6 +831,9 @@ class ValidationService:
             folder = Path(os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")) / "service-policies" / namespace.task_id / namespace.run_id
             folder.mkdir(parents=True, exist_ok=True)
             self._service_runtime = ServiceRuntime(folder / "runtime.sqlite3", service_contract, qualification)
+            # The operator's schedule requests live beside the runtime database
+            # (``python -m reliquary.services.schedule --folder <this folder>``).
+            self._service_schedule_store = ScheduleRequestStore(folder)
         self.wallet = wallet
         self._signer_client = signer_client
         self._network_proof = getattr(proof_worker_pool, "is_remote", False) is True
@@ -919,6 +932,17 @@ class ValidationService:
         self.env_targets = {
             str(name): int(target) for name, target in self.env_mix
         }
+        # The envs of the window being built or running. Only a service task
+        # ever narrows it (to its schedule's active envs).
+        self._window_env_mix: list[tuple[str, int]] = list(self.env_mix)
+        if self._service_runtime is not None:
+            # R7: what must be installed is what the PERSISTED schedule runs now,
+            # not only what the order activated at launch.
+            try:
+                self._require_service_environments(self._service_runtime.schedule)
+            except BaseException:
+                self._service_runtime.close()
+                raise
 
         # Legacy accessor — archive code and tests grew up around single-env.
         # Points to the first env in the mix; consumers needing all envs
@@ -1001,6 +1025,15 @@ class ValidationService:
             )
             for name in self.envs
         }
+        if self._service_runtime is not None:
+            # A service env cools down for what its live schedule says, so the
+            # history restored at startup is kept over that horizon.
+            schedule = self._service_runtime.schedule
+            for name in self.envs:
+                if name in self._service_runtime.contract.environments:
+                    horizon = schedule.cooldown_windows(name)
+                    self._cooldown_per_env[name] = CooldownMap(cooldown_windows=horizon)
+                    self._content_cooldown_per_env[name] = ContentCooldownMap(cooldown_windows=horizon)
         self._content_cooldown_health: dict[str, Any] = {
             "complete": False,
             "source": "not_restored",
@@ -1619,7 +1652,6 @@ class ValidationService:
             checkpoint_digest = None
             if service_runtime is not None:
                 from reliquary.protocol.release_contract import canonical_sha256
-                from reliquary.protocol.service_contract import ServiceContract
                 from reliquary.shared.strict_json import strict_json_loads
                 from reliquary.trainer.publisher import PUBLICATION_RECEIPT
                 receipt = strict_json_loads((staged_dir / PUBLICATION_RECEIPT).read_bytes())
@@ -1628,11 +1660,9 @@ class ValidationService:
                         or not isinstance(receipt.get("files"), dict) or not receipt["files"]):
                     raise ValueError("service checkpoint publication receipt mismatch")
                 checkpoint_digest = canonical_sha256(receipt["files"])
-                candidate = service_runtime.order_contract.to_dict()
-                if candidate["checkpoint"]["repo"] != repo_id:
+                # One order, one checkpoint lineage: the repository never changes.
+                if service_runtime.contract.to_dict()["checkpoint"]["repo"] != repo_id:
                     raise ValueError("service checkpoint repository mismatch")
-                candidate["checkpoint"] = {"repo": repo_id, "revision": revision, "sha256": checkpoint_digest}
-                ServiceContract.from_dict(candidate)
             # Persist the trainer cursor binding before changing the active
             # checkpoint. Readiness also requires the active manifest to equal
             # this candidate, so a failed swap remains closed; a crash after a
@@ -1656,8 +1686,16 @@ class ValidationService:
                 revision,
             )
             if service_runtime is not None:
-                service_runtime.record_consumption(manifest["trained_window_cursor"])
-                service_runtime.adopt(repo=repo_id, revision=revision, sha256=checkpoint_digest)
+                # SQLite commits (fsync): off the event loop, like the install above.
+                await asyncio.to_thread(
+                    service_runtime.record_consumption, manifest["trained_window_cursor"],
+                )
+                await asyncio.to_thread(
+                    functools.partial(
+                        service_runtime.adopt, checkpoint_n=checkpoint_n, repo=repo_id,
+                        revision=revision, sha256=checkpoint_digest,
+                    )
+                )
             self._checkpoint_n = checkpoint_n
             self.server.set_current_checkpoint(entry)
             intake.mark_installed(revision, staged_dir)
@@ -2521,6 +2559,226 @@ class ValidationService:
 
 
 
+    # ----- service-contract/v2 window wiring. Reached only with a service runtime. -----
+
+    def _service_installed_version(self, name: str) -> str | None:
+        from reliquary.services.schedule import default_installed_version
+
+        return default_installed_version(name)
+
+    def _service_environment_problem(self, name: str) -> str | None:
+        """Why this validator cannot run service environment ``name`` (None: it can)."""
+        from reliquary.services.runtime import protocol_slot_geometry
+
+        declared = self._service_runtime.contract.environments.get(name)
+        if declared is None:
+            return "is not declared by the order"
+        env = self.envs.get(name)
+        if env is None:
+            return "is not loaded by this validator"
+        if self._service_installed_version(name) != declared["version"]:
+            return "is installed at another version than the one the order pins"
+        # A rollout's env_name is the name of the env that served the prompt and
+        # graded it: the batcher reads ``env.name``, the archive the mix key.
+        if getattr(env, "name", None) != name:
+            return "is loaded under another name"
+        try:
+            rows = len(env)
+        except Exception:
+            return "has no dataset size"
+        if rows != declared["dataset"]["rows"]:
+            return "has another dataset size than the order"
+        # R9: the group count per pick is the protocol's, whatever the share.
+        if self.env_targets.get(name) != protocol_slot_geometry()[1]:
+            return "has a group count per pick that differs from the protocol's"
+        return None
+
+    def _require_service_environments(self, schedule) -> None:
+        """R7: every ACTIVE env of ``schedule`` is loaded, at the pinned version."""
+        problems = [
+            f"{name} {problem}"
+            for name in schedule.active_environments()
+            if (problem := self._service_environment_problem(name)) is not None
+        ]
+        if problems:
+            raise ValueError(
+                "service schedule activates environments this validator cannot "
+                "run: " + "; ".join(problems)
+            )
+
+    def _service_activation_version(self, name: str) -> str | None:
+        """What the runtime's activation check sees as the installed version of ``name``.
+
+        None (refused: not installed) unless this process can really run it, so a
+        request can never switch on an env the next window could not build.
+        """
+        installed = self._service_installed_version(name)
+        problem = self._service_environment_problem(name)
+        if problem is None:
+            return installed
+        logger.error("service environment %s cannot be activated: it %s", name, problem)
+        declared = self._service_runtime.contract.environments.get(name) or {}
+        return installed if installed != declared.get("version") else None
+
+    def _service_window_pool(self, schedule, env_order: list[str]) -> dict[str, float]:
+        """Each active env's pool: the task cap times its live share, then its price."""
+        declared = {
+            env: self._emission_cap * schedule.share_bps(env) / 10000
+            for env in env_order
+        }
+        pools = self._window_pool_for(env_order, declared=declared)
+        if not isinstance(pools, dict):
+            return dict(declared)
+        return {env: float(pools[env]) for env in env_order}
+
+    def _service_window_plan(self, target_window: int) -> dict[str, Any]:
+        """The boundary work of one service window. BLOCKING (SQLite commits):
+        ``_prepare_service_window`` runs it in a worker thread.
+
+        Order: the operator's pending schedule request is applied first (it lands
+        on this window unless the window is already frozen, R6), then the
+        installed checkpoint is selected in the order's lineage, then the window
+        is derived from the schedule it will freeze: active envs, their constant
+        group count per pick, pool = cap x share (x price).
+        A window the runtime froze earlier (failed open, restart) is rebuilt
+        from its envelope, never re-derived from the latest schedule.
+        """
+        from reliquary.services.runtime import ServicePolicyLimit, protocol_slot_geometry
+
+        runtime = self._service_runtime
+        target_window = int(target_window)
+        cp = self._checkpoint_store.current_manifest()
+        root = runtime.contract.to_dict()["checkpoint"]
+        if cp is None or not cp.revision or cp.repo_id != root["repo"]:
+            raise ValueError("service checkpoint repository mismatch")
+        schedule = runtime.apply_pending_schedule_request(
+            self._service_schedule_store,
+            window=target_window,
+            installed_version=self._service_activation_version,
+        )
+        runtime.ensure_checkpoint(
+            checkpoint_n=int(cp.checkpoint_n), repo=cp.repo_id, revision=cp.revision,
+        )
+        self._require_service_environments(schedule)
+        active = set(schedule.active_environments())
+        env_mix = [(name, target) for name, target in self.env_mix if name in active]
+        env_order = [name for name, _ in env_mix]
+        try:
+            envelope = runtime.envelope(target_window)
+        except ServicePolicyLimit:
+            envelope = None
+        if envelope is None:
+            pools = self._service_window_pool(schedule, env_order)
+        else:
+            if envelope["checkpoint"]["revision"] != cp.revision:
+                raise ValueError(
+                    f"service window {target_window} is frozen on checkpoint "
+                    f"{envelope['checkpoint']['revision'][:12]} but "
+                    f"{cp.revision[:12]} is installed"
+                )
+            if set(envelope["pools"]) != set(env_order):
+                raise ValueError(
+                    f"service window {target_window} is frozen on other environments"
+                )
+            pools = {name: float(envelope["pools"][name]) for name in env_order}
+        picks_target, batch_slots = protocol_slot_geometry()
+        return {
+            "window": target_window,
+            "schedule": schedule,
+            "env_mix": env_mix,
+            "pools": pools,
+            "checkpoint_revision": cp.revision,
+            "picks_target": picks_target,
+            "batch_slots": batch_slots,
+            "opened": False,
+        }
+
+    async def _prepare_service_window(self) -> None:
+        """Window boundary of a service task, before the next window is built."""
+        if self._candidate_window_n is None:
+            self._candidate_window_n = self._window_n + 1
+        target_window = int(self._candidate_window_n)
+        self._candidate_service_window = None
+        self._candidate_service_pools = None
+        self._set_window_preparation_stage("service_schedule")
+        try:
+            self._candidate_service_window = await asyncio.to_thread(
+                self._service_window_plan, target_window,
+            )
+        except Exception as exc:
+            logger.error(
+                "service window %d: boundary preparation failed (%s: %s); the "
+                "window is not opened and is retried",
+                target_window, type(exc).__name__, exc, exc_info=True,
+            )
+            raise
+
+    def _open_service_window(self, target_window: int, randomness: str) -> dict[str, dict]:
+        """Freeze the window in the runtime, then announce it. BLOCKING (SQLite).
+
+        Returns one announcement per active env. Called before any batcher holds
+        its randomness, so before any admission and before the recovery record.
+        """
+        runtime = self._service_runtime
+        window = self._candidate_service_window
+        if window is None or window["window"] != target_window:
+            raise RuntimeError("service window was not prepared at the boundary")
+        runtime.open_window(
+            target_window,
+            pools=dict(window["pools"]),
+            picks_target=window["picks_target"],
+            batch_slots=window["batch_slots"],
+            # The validator's wall clock, the one exploration arrivals are stamped with.
+            now=time.time(),
+        )
+        announcements = {
+            name: runtime.announcement(
+                environment=name, window=target_window, randomness=randomness,
+            )
+            for name, _ in window["env_mix"]
+        }
+        window["opened"] = True
+        return announcements
+
+    async def _settle_service_archive(self, runtime, archive: dict) -> dict:
+        """The seal's settlement call, off the event loop.
+
+        A failure is logged with its window and re-raised: the caller's handler
+        then archives the window from its durable journal receipts instead
+        (``_enqueue_aborted_window``), which settles it again from well-formed
+        rows. Nothing was enqueued for the window at this point.
+        """
+        try:
+            return await asyncio.to_thread(runtime.reconcile_archive, archive)
+        except Exception as exc:
+            logger.error(
+                "service window %s: settlement failed at seal (%s: %s); the window "
+                "is archived from its durable receipts instead",
+                archive.get("window_start"), type(exc).__name__, exc, exc_info=True,
+            )
+            raise
+
+    async def _refresh_service_cooldown_advice(self, window: int) -> None:
+        """After a window settled: recompute the cooldown recommendation. Never raises."""
+        runtime = self._service_runtime
+        try:
+            await asyncio.to_thread(
+                functools.partial(
+                    runtime.refresh_cooldown_advice,
+                    window=int(window),
+                    populations={
+                        name: int(spec["dataset"]["rows"])
+                        for name, spec in runtime.contract.environments.items()
+                    },
+                )
+            )
+        except Exception as exc:
+            logger.error(
+                "service window %s: cooldown advice refresh failed (%s: %s); the "
+                "previous recommendation stays",
+                window, type(exc).__name__, exc, exc_info=True,
+            )
+
     def _open_window(self) -> None:
         """Prepare one legacy window without exposing it to HTTP yet."""
         if self._candidate_window_n is None:
@@ -2560,20 +2818,37 @@ class ValidationService:
         cp = self._checkpoint_store.current_manifest()
         cp_hash = cp.revision if cp else ""
         runtime = getattr(self, "_service_runtime", None)
+        # The envs of THIS window. A service task runs the envs its schedule has
+        # active (R9: each at the profile's constant group count per pick); every
+        # other task runs its whole mix, as it always has.
+        window_env_mix = list(self.env_mix)
+        window_envs = self.envs
+        service_window = None
         if runtime is not None:
-            if len(self.envs) != 1 or next(iter(self.envs)) != runtime.contract.to_dict()["environment"]["id"]:
-                raise ValueError("service V1 requires one qualified environment per task")
-            if cp is None or cp.repo_id != runtime.contract.to_dict()["checkpoint"]["repo"]:
-                raise ValueError("service checkpoint repository mismatch")
-            if cp_hash != runtime.contract.to_dict()["checkpoint"]["revision"]:
-                saved = runtime.db.execute("SELECT contract FROM service_contexts WHERE order_id=?", (runtime.order_contract.sha256,)).fetchall()
-                from reliquary.protocol.service_contract import ServiceContract
-                contracts = [ServiceContract.from_dict(json.loads(r[0])) for r in saved]
-                match = next((c for c in contracts if c.to_dict()["checkpoint"]["revision"] == cp_hash), None)
-                if match is None:
-                    raise ValueError("active checkpoint has no qualified service context")
-                checkpoint = match.to_dict()["checkpoint"]
-                runtime.adopt(repo=checkpoint["repo"], revision=checkpoint["revision"], sha256=checkpoint["sha256"])
+            # Built from the plan the boundary prepared off the event loop: no
+            # runtime call (SQLite) happens here.
+            service_window = getattr(self, "_candidate_service_window", None)
+            if (
+                service_window is None
+                or service_window["window"] != target_window
+                or service_window["checkpoint_revision"] != cp_hash
+            ):
+                raise RuntimeError("service window was not prepared at the boundary")
+            window_env_mix = list(service_window["env_mix"])
+            window_envs = {name: self.envs[name] for name, _ in window_env_mix}
+            if not window_envs:
+                raise ValueError("service window has no active environment")
+            for env_name in window_envs:
+                # R6: a cooldown change builds a FRESH map for this window; the
+                # map a previous window was built with is never mutated.
+                horizon = service_window["schedule"].cooldown_windows(env_name)
+                for maps in (self._cooldown_per_env, self._content_cooldown_per_env):
+                    current = maps[env_name]
+                    if current.cooldown_windows != horizon:
+                        maps[env_name] = current.with_cooldown_windows(horizon)
+                        if getattr(self, "_cooldown_map", None) is current:
+                            self._cooldown_map = maps[env_name]
+        self._window_env_mix = window_env_mix
         if self.proof_scheduler is not None and not (
             cp_hash
             and self.proof_scheduler.state is SchedulerState.RUNNING
@@ -2602,7 +2877,7 @@ class ValidationService:
             FillState(
                 budgets={
                     env_name: FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
-                    for env_name in self.envs
+                    for env_name in window_envs
                 },
                 picks_target=FILL_CLOSED_PICKS_PER_WINDOW,
             )
@@ -2622,7 +2897,7 @@ class ValidationService:
         fill_closed_assembler = (
             FillClosedBatchAssembler(
                 window_start=target_window,
-                env_order=[name for name, _ in self.env_mix],
+                env_order=[name for name, _ in window_env_mix],
                 enqueue_fn=self._write_fill_closed_training_payload,
                 tombstone_fn=self._write_fill_closed_training_tombstone,
                 # R20: one window's whole emission budget. The assembler
@@ -2630,14 +2905,14 @@ class ValidationService:
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
                 # Each environment's cap, scaled by its own price when armed.
-                window_pool=(runtime.training_pool(self._window_pool_for([name for name, _ in self.env_mix]))
+                window_pool=(dict(service_window["pools"])
                              if runtime is not None else self._window_pool_for([name for name, _ in self.env_mix])),
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
             else None
         )
-        for env_name, env in self.envs.items():
+        for env_name, env in window_envs.items():
             open_kwargs = {
                 "window_start": target_window,
                 "env": env,
@@ -2695,28 +2970,27 @@ class ValidationService:
             )
             batcher.current_checkpoint_hash = cp_hash
             if runtime is not None:
-                runtime.prepare_view(window=target_window, distinct_groups_per_window=runtime.measured_consumption())
-                from reliquary.validator.cooldown import CooldownMap, ContentCooldownMap
-                for map_name, map_type in (("_cooldown_per_env", CooldownMap), ("_content_cooldown_per_env", ContentCooldownMap)):
-                    maps = getattr(self, map_name)
-                    changed = map_type(runtime.view.cooldown_windows)
-                    changed.import_state(maps[env_name].export_state())
-                    maps[env_name] = changed
-                # The service epoch covers the frozen source; historical profiles retain their slice policy.
+                # The order covers the whole ordered dataset; historical profiles retain their slice policy.
                 batcher.prompt_range = (0, len(env))
                 batcher._experimental_prompt_range = batcher.prompt_range
-                batcher._cooldown = self._cooldown_per_env[env_name]
-                batcher._content_cooldown = self._content_cooldown_per_env[env_name]
-                batcher.cooldown_prompts_membership = frozenset(batcher._cooldown.current_cooldown_set(target_window))
-                batcher.cooldown_prompts_snapshot = sorted(batcher.cooldown_prompts_membership)
-                if len(env) != len(runtime.row_ids):
-                    raise ValueError("qualified source index map differs from active dataset length")
                 batcher.service_runtime = runtime
-                original_pool = self._window_pool_for([env_name])
-                batcher.service_window_pool = original_pool[env_name] if isinstance(original_pool, dict) else original_pool
+                batcher.service_environment = env_name
             if shared_fill_state is not None:
                 batcher.fill_state = shared_fill_state
             batchers[env_name] = batcher
+        if runtime is not None:
+            # The envelope the runtime freezes carries what the assembler pays
+            # from, slot for slot: same pools, protocol geometry.
+            if fill_closed_assembler is None:
+                raise RuntimeError("service window requires the fill-closed assembler")
+            if fill_closed_assembler.picks_target != service_window["picks_target"]:
+                raise ValueError("service window pick target differs from the protocol's")
+            pools = {
+                name: fill_closed_assembler.pool_for(name) for name in window_envs
+            }
+            if pools != service_window["pools"]:
+                raise ValueError("service window pools differ from the assembler's")
+            self._candidate_service_pools = pools
         self._candidate_fill_closed_assembler = fill_closed_assembler
         return batchers
 
@@ -2772,6 +3046,19 @@ class ValidationService:
                     remainder,
                 )
             recovery = getattr(self, "_fill_closed_recovery_store", None)
+            if getattr(self, "_service_runtime", None) is not None:
+                # The runtime froze and announced this window before its recovery
+                # record exists and before any batcher is exposed.
+                service_window = getattr(self, "_candidate_service_window", None)
+                if (
+                    service_window is None
+                    or service_window["window"] != candidate_window
+                    or not service_window["opened"]
+                    or recovery is None
+                ):
+                    raise RuntimeError(
+                        "service window was not opened in the runtime before activation"
+                    )
             if recovery is not None:
                 checkpoint = self._checkpoint_store.current_manifest()
                 revision = next(
@@ -2785,7 +3072,12 @@ class ValidationService:
                     candidate_window,
                     checkpoint_n=checkpoint.checkpoint_n,
                     revision=revision,
-                    targets=dict(self.env_mix),
+                    # A service window journals the envs its schedule runs.
+                    targets=dict(
+                        self._window_env_mix
+                        if getattr(self, "_service_runtime", None) is not None
+                        else self.env_mix
+                    ),
                     # The assembler's own declared total, not ``_emission_cap``
                     # re-derived: ``finish()`` compares this against the number
                     # the archive reports with exact float equality, and a map
@@ -3523,13 +3815,26 @@ class ValidationService:
                     activation_nonce=activation_nonce,
                 )
 
+        service_announcements = None
+        if getattr(self, "_service_runtime", None) is not None:
+            # Freeze, then announce, with the drand-bound window randomness and
+            # before any batcher holds it. A failure leaves nothing open.
+            try:
+                service_announcements = await asyncio.to_thread(
+                    self._open_service_window, int(target_window), randomness,
+                )
+            except Exception as exc:
+                logger.error(
+                    "service window %d: the runtime could not open it (%s: %s); "
+                    "the window is not opened and is retried",
+                    int(target_window), type(exc).__name__, exc, exc_info=True,
+                )
+                raise
+
         for batcher in self._active_batchers.values():
             batcher.randomness = randomness
-            runtime = getattr(batcher, "service_runtime", None)
-            if runtime is not None:
-                runtime.open_window(target_window, window_pool=batcher.service_window_pool,
-                                    slots=FILL_CLOSED_ADMISSION_BUDGET_PER_ENV)
-                batcher.service_policy = runtime.announcement(window=target_window, randomness=randomness)
+            if service_announcements is not None:
+                batcher.service_policy = service_announcements[batcher.service_environment]
 
         self._set_window_preparation_stage("prompt_manifest")
         try:
@@ -4661,16 +4966,18 @@ class ValidationService:
         self._publish_price_view(shadow, price_params)
         return shadow
 
-    def _window_pool_for(self, env_order: list[str]):
+    def _window_pool_for(self, env_order: list[str], *, declared=None):
         """What each environment of a new window may pay: its cap, scaled by its price.
 
         Returns the declared pool object itself while every price is at its cap, so
         an unpriced window is identical to one built before the price was armed.
+        ``declared`` is given only by a service window (its live shares).
         """
         from reliquary.constants import EMISSION_PRICE_ARMED
         from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
-        declared = self._env_caps or self._emission_cap
+        if declared is None:
+            declared = self._env_caps or self._emission_cap
         if not EMISSION_PRICE_ARMED or not env_order:
             return declared
         if isinstance(declared, dict) and any(env not in declared for env in env_order):
@@ -4773,7 +5080,11 @@ class ValidationService:
                     assembler.window_pool if assembler is not None else self._emission_cap
                 ),
                 places_per_window=(
-                    assembler.picks_target * B_BATCH * len(self.env_mix)
+                    assembler.picks_target * B_BATCH * len(
+                        self._window_env_mix
+                        if getattr(self, "_service_runtime", None) is not None
+                        else self.env_mix
+                    )
                     if assembler is not None else None
                 ),
                 # Quicknet's 3 s period until the chain info has been fetched.
@@ -5575,7 +5886,7 @@ class ValidationService:
         }
         runtime = getattr(first_batcher, "service_runtime", None)
         if runtime is not None:
-            archive = runtime.reconcile_archive(archive)
+            archive = await self._settle_service_archive(runtime, archive)
         await asyncio.to_thread(
             self._utility_telemetry.write_window,
             window=int(first_batcher.window_start),
@@ -6398,6 +6709,8 @@ class ValidationService:
                     }:
                         await asyncio.sleep(FILL_CLOSED_ROTATION_POLL_SECONDS)
                         continue
+                    if self._service_runtime is not None:
+                        await self._prepare_service_window()
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
                     self._set_window_preparation_stage("admission_pools")
@@ -6628,6 +6941,10 @@ class ValidationService:
                         await self._train_and_publish(
                             window_status=window_status,
                         )
+                        if self._service_runtime is not None:
+                            await self._refresh_service_cooldown_advice(
+                                self._window_n
+                            )
 
                     # Persist the cooldown on a fixed window cadence, independent
                     # of the publish cadence (which can stall): keeps the snapshot

@@ -7,6 +7,7 @@ become tombstones. A complete archive is retained until its queue commit.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from pathlib import Path
@@ -37,6 +38,9 @@ from reliquary.validator.token_rewards import (
     split_environment_pool,
     split_fixed_environment_pool,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _valid_window_pool(value: object) -> bool:
@@ -327,5 +331,16 @@ class FillClosedRecoveryStore:
             "training_quarantine": {"quarantined": False, "reasons": [], "metrics": {}},
         }
         if service_runtime is not None:
-            archive = service_runtime.reconcile_archive(archive, aborted=not bool(rows))
+            # Reached only while no archive of this window was committed (see the
+            # first lines): a committed one is re-enqueued as it is, never settled
+            # again. The rows come from validated journal receipts.
+            try:
+                archive = service_runtime.reconcile_archive(archive, aborted=not bool(rows))
+            except Exception as exc:
+                logger.error(
+                    "service window %d: recovery could not settle it (%s: %s); its "
+                    "record is kept and nothing is archived",
+                    window, type(exc).__name__, exc,
+                )
+                raise
         return self.finish(window, archive, archives)
