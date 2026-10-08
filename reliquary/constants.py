@@ -860,6 +860,13 @@ if FILL_CLOSED_TARGET_GROUPS_PER_ENV != FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH:
     raise ValueError("fill-closed target must equal picks per window * B_BATCH within the journal range")
 _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
 
+# Next RL run (service-contract/v2). Inert unless a service task is configured.
+SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV", str(FILL_CLOSED_TARGET_GROUPS_PER_ENV)))
+SERVICE_EXPLORATION_AUDIT_PRIORITY = 5
+SERVICE_OBSERVATION_FLUSH_SECONDS = 60
+SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS = 50_000
+
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.
 #

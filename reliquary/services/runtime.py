@@ -1,115 +1,217 @@
-"""Opt-in service policy state, using the existing window/proof/weight clocks."""
+"""Opt-in RL service state (service-contract/v2), on the existing window/proof/weight clocks.
+
+``ServiceRuntime`` is the validator-side state of one RL service order. It composes three
+modules over ONE SQLite connection (WAL), serialized by ``ServiceRuntime.lock``:
+
+* ``run_log.RunObservationLog``    the run-wide observation log (never reset on adoption);
+* ``exploration.ExplorationLedger`` first-scan exploration pay and its sampled audit;
+* ``settlement``                    the per-window money (proportional split) and its validation.
+
+What a caller can rely on:
+
+* Window envelope. ``open_window`` freezes, per window: the order hash, the schedule in force
+  (and its hash), one pool per ACTIVE env exactly, the slot geometry and the checkpoint. A
+  schedule applied later takes effect at the next ``open_window``; an env deactivated mid-window
+  stays in the running envelope and its entitlements still settle. Every amount, cap and price
+  handed to the ledger comes from that frozen envelope, the same one ``settle_window`` receives.
+* Announcement. ``announcement`` is the v2 ``ServicePolicyAnnouncement`` built from the frozen
+  envelope plus the window's beacon; the first beacon stored for a window wins, so the policy a
+  batcher holds never changes between admission and a deferred proof.
+* Observations. One transaction per observation. Exploration goes through
+  ``exploration.record_exploration`` only (record + reservation + first-scan release together).
+  Pay is keyed on (env, prompt), never on the group id. The audit draw round is the drand round
+  of the VALIDATOR-clock arrival + 2. A refusal is a ``ServicePolicyLimit``: nothing was written.
+* Audits. ``queued_audits`` lists what to audit (hotkeys past probation first, then by draw
+  round) straight from the ledger rows, so it survives a restart. ``record_audit`` applies a
+  verdict, releases the forfeited first scans and publishes their settle events atomically.
+* Seal. See ``finalize_exploration`` for the contract the batcher owes before settlement.
+* Settlement. ``reconcile_archive`` finalizes what is left, prices the ledger's integer
+  entitlement counts with ``settle_window``, self-checks the result with
+  ``validate_service_archive_v2`` under the protocol slot geometry, and freezes it. Calling it
+  again returns the same service fields; a verdict arriving after finalize changes nothing.
+
+Only ``service-contract/v2`` runs RL here; ``service-contract/v1`` (dataset mapping / curation)
+is refused.
+"""
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import math
-from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
+from typing import Callable
 
-from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
-from reliquary.protocol.service_contract import ServiceContract, _identifier, _integer
+from reliquary.protocol.release_contract import canonical_json_bytes
+from reliquary.protocol.service_contract import (
+    PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract, _identifier, _integer, _sha,
+)
+from reliquary.protocol.service_schedule import ServiceSchedule, initial_schedule
 from reliquary.services.admission_policy import service_signal_admits, validate_submission_policy  # noqa: F401
-from reliquary.services.observations import observation_id, observation_signal, validate_observation
+from reliquary.services.exploration import (
+    AUDIT_DRAW_ROUND_OFFSET, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger, apply_exploration_audit,
+    exploration_cap, exploration_price, finalize_exploration, record_exploration,
+)
+from reliquary.services.run_log import Observation, RunObservationLog, observation_id
+from reliquary.services.settlement import SERVICE_PAYMENT_POLICY_V2, settle_window, validate_service_archive_v2
 
+logger = logging.getLogger(__name__)
 
-SUPPORTED_SERVICE_CAPABILITIES = frozenset({
-    "environment-reward/v1", "legacy/v1", "public-group-pool/v1", "all/v1",
-    "dataset-epoch/v1", "static/v1", "adaptive-rotation/v1", "trainer-driven/v1",
-    "task-scoped/v1", "exploration-discount/v1",
-})
-SERVICE_PAYMENT_POLICY = "service-budgeted-exploration/v1"
+SUPPORTED_SERVICE_CAPABILITIES = SUPPORTED_V2_CAPABILITIES
+SERVICE_PAYMENT_POLICY = SERVICE_PAYMENT_POLICY_V2
+QUALIFICATION_SCHEMA = "service-runtime-qualification/v2"
+STATUS_FORFEITED = "exploration_forfeited"
+STATUS_PAID = "exploration_paid"
+_EPS = 1e-12
+_BEACON = re.compile(r"[0-9a-f]{64}")
+# Published proof label of an entitlement, from its audit state in the ledger (R8).
+_PROOF = {"passed": "audited", "failed": "failed", "pending_draw": "pending", "queued": "pending",
+          "not_drawn": "unproven", "unaudited": "unproven"}
+# What a settled window freezes. ``service_training_recomputed_delta`` is informational
+# (it compares with the caller's own map) and is not part of the frozen money.
+FROZEN_ARCHIVE_FIELDS = (
+    "service_payment_policy", "service_order_sha256", "service_schedule", "service_schedule_sha256",
+    "service_pools_by_environment", "service_picks_target", "service_batch_slots",
+    "service_training_by_environment", "service_exploration_by_environment",
+    "service_scale_by_environment", "rewards_by_hotkey",
+)
 
 
 class ServicePolicyLimit(ValueError):
-    """A proven group is outside the ordered policy, so it earns no entitlement."""
+    """A group is outside the ordered policy: it is refused, nothing is recorded, nothing is owed."""
+
+
+def protocol_slot_geometry() -> tuple[int, int]:
+    """``(picks_target, batch_slots)`` of one env in one window, from the protocol constants."""
+    from reliquary.constants import B_BATCH, FILL_CLOSED_PICKS_PER_WINDOW
+    return int(FILL_CLOSED_PICKS_PER_WINDOW), int(B_BATCH)
+
+
+def validate_service_archive(record: dict, contract: ServiceContract, *, cap: float,
+                             picks_target: int | None = None, batch_slots: int | None = None) -> None:
+    """``validate_service_archive_v2`` under the protocol slot geometry unless one is given.
+
+    Kept under its old name for weight replay, which catches ``ValueError`` and abstains.
+    """
+    picks, slots = protocol_slot_geometry()
+    validate_service_archive_v2(record, contract, cap=cap,
+                                picks_target=picks if picks_target is None else picks_target,
+                                batch_slots=slots if batch_slots is None else batch_slots)
+
+
+def _drand_round_at(instant: float) -> int:
+    """The drand round current at ``instant`` (same rule as ``corpus_close.current_drand_round``)."""
+    from reliquary.infrastructure import drand
+
+    chain = drand.get_current_chain()
+    genesis, period = chain.get("genesis_time"), chain.get("period")
+    if genesis is None or not period:
+        raise RuntimeError("drand chain info is not known yet")
+    return int(math.floor((instant - genesis) / period)) + 1
+
+
+def _verified_beacon(round_id: int):
+    from reliquary.infrastructure import drand
+    return drand.get_verified_beacon(round_id)
+
+
+def _validate_qualification(qualification: dict, contract: ServiceContract) -> None:
+    from reliquary.constants import M_ROLLOUTS
+    if (not isinstance(qualification, dict) or qualification.get("schema") != QUALIFICATION_SCHEMA
+            or qualification.get("qualified") is not True):
+        raise ValueError("runtime qualification is required")
+    if qualification.get("contract_sha256") != contract.sha256:
+        raise ValueError("runtime qualification contract mismatch")
+    _identifier(qualification.get("qualification_id"), "qualification_id")
+    if qualification.get("group_size") != M_ROLLOUTS:
+        raise ValueError("runtime qualification group size differs from the active profile")
+    for name, env in contract.environments.items():
+        if env["sampling"]["kind"] == PUBLIC_SEED_POOL and env["sampling"]["group_size"] != M_ROLLOUTS:
+            raise ValueError(f"runtime qualification group size differs from the seed pool of {name}")
+    try:
+        _sha(qualification.get("forced_seed_report_sha256"), "forced_seed_report_sha256")
+    except ValueError as exc:
+        raise ValueError(f"runtime qualification needs its forced-seed report: {exc}") from exc
 
 
 class ServiceRuntime:
-    """One qualified controller per task/run. SQLite preserves caps across contexts."""
+    """One qualified controller per task/run, over one SQLite file."""
 
-    def __init__(self, path: str | Path, contract: ServiceContract, qualification: dict, *, now: float | None = None):
-        value = contract.to_dict()
-        if value["service_kind"] != "adaptive_training":
-            raise ValueError("validator requires an adaptive training service")
-        contract.require_capabilities(set(SUPPORTED_SERVICE_CAPABILITIES))
-        if value["scoring"]["weights_bps"] != {"reward": 10000}:
-            raise ValueError("runtime has no qualified multi-metric reward adapter")
-        if not isinstance(qualification, dict) or qualification.get("schema") != "service-runtime-qualification/v1" or qualification.get("qualified") is not True:
-            raise ValueError("runtime qualification is required")
-        if qualification.get("contract_sha256") != contract.sha256:
-            raise ValueError("runtime qualification contract mismatch")
-        for field in ("dataset", "checkpoint", "environment", "generation_contract_sha256"):
-            if qualification.get(field) != value[field]:
-                raise ValueError(f"runtime qualification {field} mismatch")
-        _identifier(qualification.get("qualification_id"), "qualification_id")
-        capabilities = qualification.get("supported_capabilities")
-        if not isinstance(capabilities, list) or any(not isinstance(c, str) for c in capabilities):
-            raise ValueError("invalid qualification capabilities")
-        contract.require_capabilities(set(capabilities))
-        rows = qualification.get("row_ids")
-        if not isinstance(rows, list) or not rows or len(rows) > 1_000_000:
-            raise ValueError("qualification needs bounded source row IDs in prompt index order")
-        for row in rows:
-            _identifier(row, "row_id")
-        if len(set(rows)) != len(rows):
-            raise ValueError("qualification needs unique source row IDs in prompt index order")
-        self.row_ids = tuple(rows)
-        initial_cursor = qualification.get("initial_journal_cursor", -1)
-        if type(initial_cursor) is not int or initial_cursor < -1:
-            raise ValueError("invalid qualified initial journal cursor")
-        self.order_contract = contract
-        self.contract = contract
+    def __init__(self, path: str | Path, contract: ServiceContract, qualification: dict, *,
+                 now: float | None = None, drand_round_at: Callable[[float], int] | None = None):
+        if not isinstance(contract, ServiceContract) or contract.version != 2:
+            raise ValueError("the RL service runtime needs service-contract/v2; "
+                             "service-contract/v1 adaptive_training is refused")
+        contract.require_capabilities(set(SUPPORTED_V2_CAPABILITIES))
+        _validate_qualification(qualification, contract)
+        self.contract = self.order_contract = contract
         self.qualification = json.loads(canonical_json_bytes(qualification))
+        self._round_at = drand_round_at or _drand_round_at
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS service_orders(id TEXT PRIMARY KEY, started REAL NOT NULL, clock REAL NOT NULL, groups INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS service_contexts(id TEXT PRIMARY KEY, order_id TEXT NOT NULL, contract TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS service_pools(context TEXT NOT NULL, epoch INTEGER NOT NULL, randomness TEXT NOT NULL, PRIMARY KEY(context,epoch));
-            CREATE TABLE IF NOT EXISTS service_observations(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, order_id TEXT NOT NULL, context TEXT NOT NULL, payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS service_payments(order_id TEXT NOT NULL, context TEXT NOT NULL, row_id TEXT NOT NULL, refresh INTEGER NOT NULL, window INTEGER NOT NULL, hotkey TEXT NOT NULL, amount REAL NOT NULL, PRIMARY KEY(order_id,context,row_id,refresh));
-            CREATE TABLE IF NOT EXISTS service_settled(order_id TEXT NOT NULL, window INTEGER NOT NULL, aborted INTEGER NOT NULL, PRIMARY KEY(order_id,window));
-            CREATE TABLE IF NOT EXISTS service_settlement_maps(order_id TEXT NOT NULL, window INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(order_id,window));
-            CREATE TABLE IF NOT EXISTS service_training_journal(order_id TEXT NOT NULL, key INTEGER NOT NULL, window INTEGER NOT NULL, digest TEXT NOT NULL, groups TEXT NOT NULL, PRIMARY KEY(order_id,key));
-            CREATE TABLE IF NOT EXISTS service_training_stride(order_id TEXT PRIMARY KEY, stride INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS service_consumption(order_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL, q INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS service_windows(order_id TEXT NOT NULL, window INTEGER NOT NULL, context TEXT NOT NULL, envelope TEXT NOT NULL, PRIMARY KEY(order_id,window));
-        """)
         instant = time.time() if now is None else now
         if not math.isfinite(instant):
             raise ValueError("invalid order clock")
+        self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
         try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='service_contexts'").fetchone():
+                raise ValueError("existing service task/run journal belongs to another order "
+                                 "(v1 runtime); use a new run")
+            self.db.executescript("""
+                CREATE TABLE IF NOT EXISTS service_orders(id TEXT PRIMARY KEY, started REAL NOT NULL, clock REAL NOT NULL, groups INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, contract TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS service_checkpoints(order_id TEXT NOT NULL, revision TEXT NOT NULL, checkpoint_n INTEGER NOT NULL, repo TEXT NOT NULL, sha256 TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(order_id, revision));
+                CREATE TABLE IF NOT EXISTS service_schedules(order_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL, applied_window INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(order_id, revision), UNIQUE(order_id, request_id));
+                CREATE TABLE IF NOT EXISTS service_windows(order_id TEXT NOT NULL, window INTEGER NOT NULL, envelope TEXT NOT NULL, PRIMARY KEY(order_id, window));
+                CREATE TABLE IF NOT EXISTS service_pools(order_id TEXT NOT NULL, window INTEGER NOT NULL, randomness TEXT NOT NULL, PRIMARY KEY(order_id, window));
+                CREATE TABLE IF NOT EXISTS service_draw_beacons(order_id TEXT NOT NULL, round INTEGER NOT NULL, randomness TEXT NOT NULL, PRIMARY KEY(order_id, round));
+                CREATE TABLE IF NOT EXISTS service_settled(order_id TEXT NOT NULL, window INTEGER NOT NULL, aborted INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(order_id, window));
+                CREATE TABLE IF NOT EXISTS service_training_journal(order_id TEXT NOT NULL, key INTEGER NOT NULL, window INTEGER NOT NULL, digest TEXT NOT NULL, groups TEXT NOT NULL, PRIMARY KEY(order_id,key));
+                CREATE TABLE IF NOT EXISTS service_training_stride(order_id TEXT PRIMARY KEY, stride INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS service_consumption(order_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL, q TEXT NOT NULL);
+            """)
             with self.db:
                 self.db.execute("BEGIN IMMEDIATE")
                 if self.db.execute("SELECT 1 FROM service_orders WHERE id<>? LIMIT 1", (contract.sha256,)).fetchone():
                     raise ValueError("existing service task/run journal belongs to another order; use a new run")
-                self.db.execute("INSERT OR IGNORE INTO service_orders(id,started,clock) VALUES(?,?,?)", (contract.sha256, instant, instant))
+                self.db.execute("INSERT OR IGNORE INTO service_orders(id,started,clock,contract) VALUES(?,?,?,?)",
+                                (contract.sha256, instant, instant, contract.canonical.decode()))
                 self.db.execute("UPDATE service_orders SET clock=MAX(clock,?) WHERE id=?", (instant, contract.sha256))
+                self.db.execute("INSERT OR IGNORE INTO service_schedules VALUES(?,0,'initial',0,?)",
+                                (contract.sha256, initial_schedule(contract).canonical.decode()))
+            # Boot only, outside any transaction: both constructors refuse an open one.
+            self.log = RunObservationLog(self.db, order_sha256=contract.sha256,
+                                         sigma_min_bps=contract.to_dict()["scoring"]["sigma_min_bps"])
+            self.ledger = ExplorationLedger(self.db, order_sha256=contract.sha256)
+            self.db.commit()
         except BaseException:
             self.db.close()
             raise
-        self._remember_context(contract)
-        self.view = None
-
-    def _retire_view(self):
-        """Release live projections; historical contexts remain in SQLite."""
-        view, self.view = self.view, None
-        if view is not None:
-            with view._lock:
-                if view.eligibility is not None:
-                    view.eligibility.close()
 
     def close(self):
         with self.lock:
-            try:
-                self._retire_view()
-            finally:
-                self.db.close()
+            self.db.close()
 
+    @contextlib.contextmanager
+    def _txn(self):
+        """One write transaction on the shared connection, under the runtime lock."""
+        with self.lock:
+            if self.db.in_transaction:
+                raise RuntimeError("service runtime transaction is already open")
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self.db.rollback()
+                raise
+            else:
+                self.db.commit()
+
+    # --- trainer journal and order clock (unchanged) ---
     def record_training_journal(self, key: int, data: bytes, *, is_tombstone: bool, batches: dict, stride: int):
         """A telemetry projection after the existing payload queue's durable commit."""
         import hashlib
@@ -126,188 +228,6 @@ class ServiceRuntime:
             if previous != row[2:]:
                 raise ValueError("service consumption projection conflicts with its journal key")
 
-    def record_consumption(self, cursor: int) -> int:
-        """Only an adopted trainer cursor turns enqueued groups into measured Q."""
-        _integer(cursor, "consumed trainer cursor", 0)
-        initial = self.qualification.get("initial_journal_cursor", -1)
-        if type(initial) is not int or initial < -1:
-            raise ValueError("invalid qualified initial journal cursor")
-        with self.lock, self.db:
-            state = self.db.execute("SELECT cursor,q FROM service_consumption WHERE order_id=?", (self.order_contract.sha256,)).fetchone()
-            previous, q = state if state is not None else (initial, 0)
-            if cursor < previous:
-                raise ValueError("trainer consumption cursor moved backwards")
-            if cursor == previous:
-                return q
-            config = self.db.execute("SELECT stride FROM service_training_stride WHERE order_id=?", (self.order_contract.sha256,)).fetchone()
-            stride = config[0] if config is not None else None
-            if stride is None:
-                q = 0
-            else:
-                first_window, last_window = (previous + 1) // stride, (cursor + 1) // stride - 1
-                if last_window >= first_window:
-                    rows = self.db.execute("SELECT key,window,groups FROM service_training_journal WHERE order_id=? AND key>=? AND key<? ORDER BY key", (self.order_contract.sha256, first_window * stride, (last_window + 1) * stride)).fetchall()
-                    # Only complete consumed windows qualify Q. Missing facts cannot invent throughput.
-                    if len(rows) != (last_window - first_window + 1) * stride:
-                        q = 0
-                    else:
-                        windows = {}
-                        for _, window, payload in rows:
-                            windows.setdefault(window, set()).update(json.loads(payload))
-                        q = sum(len(groups) for groups in windows.values()) // len(windows)
-            self.db.execute("INSERT INTO service_consumption VALUES(?,?,?) ON CONFLICT(order_id) DO UPDATE SET cursor=excluded.cursor,q=excluded.q", (self.order_contract.sha256, cursor, q))
-            return q
-
-    def measured_consumption(self) -> int:
-        with self.lock:
-            row = self.db.execute("SELECT q FROM service_consumption WHERE order_id=?", (self.order_contract.sha256,)).fetchone()
-            return row[0] if row is not None else 0
-
-    def prepare_view(self, *, window: int, distinct_groups_per_window: int = 0,
-                     now: float | None = None):
-        """Project verified facts before exposing the exact adopted context.
-
-        The operator-approved runtime qualification supplies the source index
-        map and RL provenance. Checkpoint staging/adoption and shared order
-        limits remain owned by this controller's caller.
-        """
-        import os
-        from reliquary.constants import M_ROLLOUTS
-        from reliquary.services.eligibility import EligibilityStore, _time
-        from reliquary.services.runtime_view import ServicePolicyView
-
-        _integer(window, "window", 0)
-        _integer(distinct_groups_per_window, "distinct_groups_per_window", 0)
-        instant = _time(time.time() if now is None else now)
-        with self.lock:
-            clock = self.db.execute("SELECT clock FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()[0]
-            instant = max(instant, clock)
-            with self.db:
-                self.db.execute("UPDATE service_orders SET clock=? WHERE id=?", (instant, self.order_contract.sha256))
-            value = self.contract.to_dict()
-            group_size = _integer(self.qualification.get("group_size"), "qualified group_size", 2, 65536)
-            if group_size != M_ROLLOUTS or value["policies"]["sampling"].get("group_size", group_size) != group_size:
-                if self.view is not None:
-                    self.view.close_admission()
-                raise ValueError("qualified group size differs from the active runtime/ordered sampling")
-            view = self.view
-            if view is not None and view.contract.context_sha256 != self.contract.context_sha256:
-                self._retire_view()
-                view = None
-            if view is None:
-                store = None
-                if value["policies"]["eligibility"]["kind"] == "dataset-epoch/v1":
-                    filename = self.db.execute("PRAGMA database_list").fetchone()[2]
-                    path = Path(filename).parent / "eligibility.sqlite3" if filename else ":memory:"
-                    store = EligibilityStore(path, self.contract, self.row_ids)
-                    try:
-                        store.qualify_feed({"context_sha256": self.contract.context_sha256,
-                                            "generation_verified": True, "sampling_verified": True,
-                                            "rl_group_comparable": True, "group_size": group_size,
-                                            "source": "verified-service-groups",
-                                            "qualification_id": self.qualification["qualification_id"],
-                                            "qualified_order_sha256": self.order_contract.sha256})
-                        view = ServicePolicyView(self.contract, self.row_ids, store)
-                    except BaseException:
-                        store.close()
-                        raise
-                else:
-                    view = ServicePolicyView(self.contract, self.row_ids)
-            self.view = view
-            view._lock.acquire()
-            try:
-                if view.eligibility is not None:
-                    store = view.eligibility
-                    cursor = self.db.execute(
-                        "SELECT seq,payload FROM service_observations WHERE order_id=? AND context=? AND seq>? ORDER BY seq",
-                        (self.order_contract.sha256, self.contract.context_sha256, getattr(view, "_projection_seq", 0)))
-                    pending = cursor.fetchone()
-                    if store._current() is None:
-                        start = self.db.execute("SELECT started FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()[0]
-                        store.begin(window=json.loads(pending[1])["window"] if pending is not None else window, now=start)
-                    # Global observation IDs make already projected work a
-                    # no-op across epochs. A missing older fact beyond the
-                    # durable frontier fails closed; it cannot be reassigned
-                    # to a newer epoch merely to repair coverage.
-                    clock = store.db.execute("SELECT last_now FROM eligibility_contexts WHERE context=?", (self.contract.context_sha256,)).fetchone()[0]
-                    while pending is not None:
-                        sequence, payload = pending
-                        store.record(json.loads(payload), now=clock)
-                        # This cache only avoids repeated parsing within a
-                        # live context. Restart always replays the durable
-                        # journal and relies on the store's global dedupe.
-                        view._projection_seq = sequence
-                        pending = cursor.fetchone()
-                population = panel = None
-                panel_path = os.environ.get("RELIQUARY_SERVICE_PANEL")
-                if panel_path and value["policies"]["cooldown"]["kind"] == "adaptive-rotation/v1":
-                    path = Path(panel_path)
-                    if not path.is_absolute() or not path.is_file():
-                        raise ValueError("service panel must be an absolute regular file")
-                    with path.open("rb") as handle:
-                        raw = handle.read(4 * 1024 * 1024 + 1)
-                    if len(raw) > 4 * 1024 * 1024:
-                        raise ValueError("service panel exceeds its file size bound")
-                    document = json.loads(raw)
-                    if not isinstance(document, dict) or set(document) != {"population", "panel"}:
-                        raise ValueError("service panel requires population and panel")
-                    population, panel = document["population"], document["panel"]
-                    if not isinstance(panel, dict) or panel.get("group_size") != group_size:
-                        raise ValueError("service panel group differs from the qualified runtime")
-                    source_rows = set(self.row_ids)
-                    if not isinstance(panel.get("observations"), list) or any(
-                        not isinstance(row, dict) or row.get("row_id") not in source_rows
-                        for row in panel["observations"]
-                    ):
-                        raise ValueError("service panel row is absent from the qualified source map")
-                view.refresh(window=window, now=instant, population=population, panel=panel,
-                             distinct_groups_per_window=distinct_groups_per_window)
-                # Context-local epochs cannot reopen the original order's
-                # consumed budget or deadline after checkpoint adoption.
-                start, clock, groups, tokens = self.db.execute(
-                    "SELECT started,clock,groups,tokens FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()
-                limits = self.order_contract.to_dict()["limits"]
-                if (max(instant, clock) >= start + limits["deadline_seconds"]
-                        or groups >= limits["max_groups"] or tokens >= limits["max_tokens"]):
-                    view.close_admission()
-                return view
-            except BaseException:
-                view.close_admission()
-                raise
-            finally:
-                view._lock.release()
-
-    def _remember_context(self, contract):
-        with self.lock, self.db:
-            self.db.execute("INSERT OR IGNORE INTO service_contexts VALUES(?,?,?)",
-                            (contract.context_sha256, self.order_contract.sha256, contract.canonical.decode()))
-
-    def adopt(self, *, repo: str, revision: str, sha256: str):
-        with self.lock:
-            value = self.order_contract.to_dict()
-            if repo != value["checkpoint"]["repo"]:
-                raise ValueError("adoption cannot change checkpoint repository")
-            value["checkpoint"] = {"repo": repo, "revision": revision, "sha256": sha256}
-            contract = ServiceContract.from_dict(value)
-            self._remember_context(contract)
-            if contract.context_sha256 != self.contract.context_sha256:
-                self._retire_view()
-            self.contract = contract
-            return contract
-
-    def announcement(self, *, window: int, randomness: str) -> dict:
-        sampling = self.contract.to_dict()["policies"]["sampling"]
-        stride = sampling.get("renewal_windows", 1)
-        _integer(window, "window", 0)
-        epoch = window // stride
-        from reliquary.protocol.service_contract import _sha
-        _sha(randomness, "pool randomness")
-        with self.lock, self.db:
-            self.db.execute("INSERT OR IGNORE INTO service_pools VALUES(?,?,?)", (self.contract.context_sha256, epoch, randomness))
-            beacon = self.db.execute("SELECT randomness FROM service_pools WHERE context=? AND epoch=?", (self.contract.context_sha256, epoch)).fetchone()[0]
-        return {"contract": self.contract.to_dict(), "supported_capabilities": sorted(SUPPORTED_SERVICE_CAPABILITIES),
-                "pool_epoch": epoch, "pool_randomness": beacon}
-
     def active(self, *, now: float | None = None) -> bool:
         instant = time.time() if now is None else now
         if not math.isfinite(instant):
@@ -320,192 +240,729 @@ class ServiceRuntime:
             groups, tokens = self.db.execute("SELECT groups,tokens FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()
             return instant < start + limits["deadline_seconds"] and groups < limits["max_groups"] and tokens < limits["max_tokens"]
 
-    def record_verified(self, row: dict, *, hotkey: str, purpose: str, window_pool: float, slots: int, now: float | None = None) -> dict:
-        """Called only after the proof scheduler's authoritative PASSED decision."""
-        value = validate_observation(row, self.contract)
-        group_size = _integer(self.qualification.get("group_size"), "qualified group_size", 2, 65536)
-        if value["expected_samples"] != group_size:
-            raise ValueError("service observation differs from the qualified group size")
-        if value["verification"] != {"generation": "verified", "sampling": "verified", "grading": "graded"}:
-            raise ValueError("authoritative service observations require complete verification")
-        if value["row_id"] not in self.row_ids or purpose not in {"training", "exploration"}:
-            raise ValueError("unknown service row or purpose")
-        signal = observation_signal(value, self.contract)
-        if (purpose == "training" and not signal.in_zone) or (purpose == "exploration" and signal.category not in {"uniform-low", "uniform-high", "uniform-intermediate"}):
-            raise ValueError("signal does not match signed service purpose")
-        _integer(slots, "exploration slots", 1)
-        _identifier(hotkey, "service hotkey")
-        if type(window_pool) not in (int, float) or not math.isfinite(window_pool) or not 0 <= window_pool <= 1:
-            raise ValueError("invalid absolute window pool")
-        identity, payload = observation_id(value), canonical_json_bytes(value).decode()
+    def record_consumption(self, cursor: int) -> dict[str, float]:
+        """Only an adopted trainer cursor turns enqueued groups into measured Q, per env.
+
+        Q is the number of distinct prompts the trainer consumed per window, smoothed (EMA) with
+        the order's ``smoothing_bps``. Missing journal facts yield ``{}``: never invented throughput.
+        """
+        _integer(cursor, "consumed trainer cursor", 0)
+        initial = self.qualification.get("initial_journal_cursor", -1)
+        if type(initial) is not int or initial < -1:
+            raise ValueError("invalid qualified initial journal cursor")
+        order = self.contract.sha256
+        alpha = self.contract.advice_policy["smoothing_bps"] / 10000
+        with self._txn():
+            state = self.db.execute("SELECT cursor,q FROM service_consumption WHERE order_id=?", (order,)).fetchone()
+            previous, q = (state[0], json.loads(state[1])) if state is not None else (initial, {})
+            if cursor < previous:
+                raise ValueError("trainer consumption cursor moved backwards")
+            if cursor == previous:
+                return q
+            config = self.db.execute("SELECT stride FROM service_training_stride WHERE order_id=?", (order,)).fetchone()
+            if config is None:
+                q = {}
+            else:
+                stride = config[0]
+                first_window, last_window = (previous + 1) // stride, (cursor + 1) // stride - 1
+                if last_window >= first_window:
+                    rows = self.db.execute(
+                        "SELECT key,window,groups FROM service_training_journal WHERE order_id=? AND key>=? AND key<? ORDER BY key",
+                        (order, first_window * stride, (last_window + 1) * stride)).fetchall()
+                    # Only complete consumed windows qualify Q. Missing facts cannot invent throughput.
+                    if len(rows) != (last_window - first_window + 1) * stride:
+                        q = {}
+                    else:
+                        windows: dict[int, set] = {}
+                        for _, window, payload in rows:
+                            windows.setdefault(window, set()).update(json.loads(payload))
+                        counts = {env: 0 for env in self.contract.environments}
+                        for identities in windows.values():
+                            for identity in identities:
+                                env = identity.rsplit(":", 1)[0]
+                                if env in counts:
+                                    counts[env] += 1
+                        measured = {env: count / len(windows) for env, count in counts.items()}
+                        q = {env: (alpha * value + (1 - alpha) * q[env]) if env in q else value
+                             for env, value in sorted(measured.items())}
+            self.db.execute("INSERT INTO service_consumption VALUES(?,?,?) ON CONFLICT(order_id) DO UPDATE SET "
+                            "cursor=excluded.cursor,q=excluded.q", (order, cursor, canonical_json_bytes(q).decode()))
+            return q
+
+    def measured_consumption(self) -> dict[str, float]:
         with self.lock:
-            active = self.active(now=now)
-            self.db.execute("BEGIN IMMEDIATE")
-            try:
-                frozen = self.db.execute("SELECT context,envelope FROM service_windows WHERE order_id=? AND window=?",
-                                         (self.order_contract.sha256, value["window"])).fetchone()
-                if frozen is None:
-                    raise ServicePolicyLimit("service observation has no frozen window envelope")
-                envelope = json.loads(frozen[1])
-                if (frozen[0] != self.contract.context_sha256 or envelope["contract"] != self.contract.to_dict()
-                        or envelope["window_pool"] != window_pool or envelope["slots"] != slots):
-                    raise ServicePolicyLimit("service observation differs from its frozen window envelope")
-                existing = self.db.execute("SELECT payload FROM service_observations WHERE id=?", (identity,)).fetchone()
-                if existing is not None:
-                    if existing[0] != payload:
-                        raise ServicePolicyLimit("observation identity conflict")
-                    self.db.commit()
-                    if self.view is not None:
-                        self.view.observe(value, window=value["window"], now=time.time() if now is None else now)
-                    return {"inserted": False, "amount": 0.0, "observation_id": identity}
-                if not active:
-                    started, clock = self.db.execute("SELECT started,clock FROM service_orders WHERE id=?",
-                                                    (self.order_contract.sha256,)).fetchone()
-                    if clock >= started + self.order_contract.to_dict()["limits"]["deadline_seconds"]:
-                        raise ServicePolicyLimit("service order deadline reached")
-                    raise ServicePolicyLimit("service order budget exhausted")
-                used_groups, used_tokens = self.db.execute("SELECT groups,tokens FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()
-                limits = self.order_contract.to_dict()["limits"]
-                if used_groups >= limits["max_groups"] or used_tokens + sum(value["tokens"]) > limits["max_tokens"]:
-                    raise ServicePolicyLimit("service order budget exhausted")
-                if self.db.execute("SELECT 1 FROM service_settled WHERE order_id=? AND window=?",
-                                   (self.order_contract.sha256, value["window"])).fetchone():
-                    raise ServicePolicyLimit("window has already settled")
-                amount = 0.0
-                policy = self.contract.to_dict()["policies"]["reward"]
-                if purpose == "exploration":
-                    if policy["kind"] != "exploration-discount/v1" or sum(value["tokens"]) > policy["max_tokens_per_group"]:
-                        raise ServicePolicyLimit("exploration group is outside its budget")
-                    window = value["window"]
-                    refresh = window // policy["refresh_windows"]
-                    count = self.db.execute("SELECT COUNT(*) FROM service_payments WHERE order_id=? AND window=?", (self.order_contract.sha256, window)).fetchone()[0]
-                    if count < slots:
-                        amount = window_pool * policy["budget_bps"] / 10000 / slots / policy["divisor"]
-                        inserted = self.db.execute("INSERT OR IGNORE INTO service_payments VALUES(?,?,?,?,?,?,?)", (self.order_contract.sha256, self.contract.context_sha256, value["row_id"], refresh, window, hotkey, amount)).rowcount
-                        if not inserted:
-                            amount = 0.0
-                self.db.execute("INSERT INTO service_observations(id,order_id,context,payload) VALUES(?,?,?,?)", (identity, self.order_contract.sha256, self.contract.context_sha256, payload))
-                self.db.execute("UPDATE service_orders SET groups=groups+1,tokens=tokens+? WHERE id=?", (sum(value["tokens"]), self.order_contract.sha256))
-                self.db.commit()
-            except BaseException:
-                self.db.rollback()
-                raise
-            if self.view is not None:
-                self.view.observe(value, window=value["window"], now=time.time() if now is None else now)
-        return {"inserted": True, "amount": amount, "observation_id": identity}
+            row = self.db.execute("SELECT q FROM service_consumption WHERE order_id=?", (self.contract.sha256,)).fetchone()
+            return json.loads(row[0]) if row is not None else {}
 
-    def open_window(self, window: int, *, window_pool: float, slots: int):
+    # --- schedule (decisions E, G; R6) ---
+    def _schedule(self) -> ServiceSchedule:
+        payload = self.db.execute("SELECT payload FROM service_schedules WHERE order_id=? ORDER BY revision DESC LIMIT 1",
+                                  (self.contract.sha256,)).fetchone()[0]
+        return ServiceSchedule.from_dict(json.loads(payload), self.contract)
+
+    @property
+    def schedule(self) -> ServiceSchedule:
+        """The latest applied schedule: the one the NEXT ``open_window`` will freeze."""
+        with self.lock:
+            return self._schedule()
+
+    def window_schedule(self, window: int) -> ServiceSchedule:
+        """The schedule frozen in ``window``'s envelope, or the latest one if it is not open yet.
+
+        A caller rebuilding a window after a restart derives its pools from this one.
+        """
+        with self.lock:
+            row = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?",
+                                  (self.contract.sha256, window)).fetchone()
+            if row is None:
+                return self._schedule()
+            return ServiceSchedule.from_dict(json.loads(row[0])["schedule"], self.contract)
+
+    def apply_schedule(self, schedule: ServiceSchedule, *, request_id: str, window: int) -> bool:
+        """Append the next schedule revision. It never touches an open window's envelope (R6).
+
+        ``window`` is the window during which the request was applied (recorded for the operator);
+        the revision takes effect at the next ``open_window``. Returns False for a request id
+        already applied with the same schedule.
+        """
+        if not isinstance(schedule, ServiceSchedule):
+            raise ValueError("a ServiceSchedule is required")
+        schedule = ServiceSchedule.from_dict(schedule.to_dict(), self.contract)  # same order, valid
+        _identifier(request_id, "schedule request_id")
         _integer(window, "window", 0)
-        _integer(slots, "slots", 1)
-        if type(window_pool) not in (int, float) or not math.isfinite(window_pool) or not 0 <= window_pool <= 1:
-            raise ValueError("invalid service window envelope")
-        payload = canonical_json_bytes({"contract": self.contract.to_dict(), "window_pool": window_pool, "slots": slots}).decode()
-        with self.lock, self.db:
-            self.db.execute("INSERT OR IGNORE INTO service_windows VALUES(?,?,?,?)", (self.order_contract.sha256, window, self.contract.context_sha256, payload))
-            saved = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?", (self.order_contract.sha256, window)).fetchone()[0]
-            if saved != payload:
-                raise ValueError("service window envelope is already frozen")
+        payload = schedule.canonical.decode()
+        with self._txn():
+            known = self.db.execute("SELECT payload FROM service_schedules WHERE order_id=? AND request_id=?",
+                                    (self.contract.sha256, request_id)).fetchone()
+            if known is not None:
+                if known[0] != payload:
+                    raise ValueError("schedule request id was already used for another schedule")
+                return False
+            if schedule.revision != self._schedule().revision + 1:
+                raise ValueError("schedule revisions must increase by one")
+            self.db.execute("INSERT INTO service_schedules VALUES(?,?,?,?,?)",
+                            (self.contract.sha256, schedule.revision, request_id, window, payload))
+        return True
 
-    def reconcile_archive(self, archive: dict, *, aborted: bool = False) -> dict:
-        """Compose with the selected-group journal before its existing durable enqueue."""
-        if type(aborted) is not bool:
+    # --- checkpoints ---
+    def _checkpoint(self) -> dict:
+        row = self.db.execute("SELECT checkpoint_n, repo, revision, sha256 FROM service_checkpoints WHERE order_id=? "
+                              "ORDER BY seq DESC LIMIT 1", (self.contract.sha256,)).fetchone()
+        if row is None:
+            raise ValueError("no service checkpoint has been adopted")
+        return {"checkpoint_n": row[0], "repo": row[1], "revision": row[2], "sha256": row[3]}
+
+    @property
+    def checkpoint(self) -> dict:
+        with self.lock:
+            return self._checkpoint()
+
+    def adopt(self, *, checkpoint_n: int, repo: str, revision: str, sha256: str) -> dict:
+        """Make ``revision`` the current checkpoint of the lineage. Observations are not reset."""
+        _integer(checkpoint_n, "checkpoint_n", 0)
+        if repo != self.contract.to_dict()["checkpoint"]["repo"]:
+            raise ValueError("adoption cannot change checkpoint repository")
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("checkpoint revision must be an immutable 40-hex commit")
+        _sha(sha256, "checkpoint sha256")
+        order = self.contract.sha256
+        with self._txn():
+            known = self.db.execute("SELECT checkpoint_n, sha256 FROM service_checkpoints WHERE order_id=? AND revision=?",
+                                    (order, revision)).fetchone()
+            if known is not None and known != (checkpoint_n, sha256):
+                raise ValueError("checkpoint revision was already adopted with another identity")
+            seq = self.db.execute("SELECT COALESCE(MAX(seq),0)+1 FROM service_checkpoints WHERE order_id=?", (order,)).fetchone()[0]
+            self.db.execute("INSERT INTO service_checkpoints VALUES(?,?,?,?,?,?) ON CONFLICT(order_id, revision) "
+                            "DO UPDATE SET seq=excluded.seq", (order, revision, checkpoint_n, repo, sha256, seq))
+            return self._checkpoint()
+
+    def ensure_checkpoint(self, *, checkpoint_n: int, repo: str, revision: str) -> dict:
+        """Re-select an adopted revision (restart), or adopt the order's root checkpoint."""
+        with self.lock:
+            row = self.db.execute("SELECT sha256 FROM service_checkpoints WHERE revision=? AND order_id=?",
+                                  (revision, self.contract.sha256)).fetchone()
+        if row is not None:
+            return self.adopt(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=row[0])
+        root = self.contract.to_dict()["checkpoint"]
+        if revision != root["revision"] or repo != root["repo"]:
+            raise ValueError("active checkpoint has no adopted service lineage entry")
+        return self.adopt(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=root["sha256"])
+
+    # --- windows ---
+    def open_window(self, window: int, *, pools: dict, picks_target: int, batch_slots: int) -> dict:
+        """Freeze the envelope of ``window`` and return it.
+
+        ``pools`` is ``{env: absolute emission fraction}`` for exactly the active envs of the
+        schedule in force; ``picks_target`` / ``batch_slots`` must be the protocol slot geometry
+        (the one archive validation and weight replay use). Opening an already frozen window with
+        the same pools and geometry returns the FROZEN envelope (its schedule and checkpoint, not
+        the current ones): this is the restart path. Anything else is refused.
+        """
+        _integer(window, "window", 0)
+        if (picks_target, batch_slots) != protocol_slot_geometry() or type(picks_target) is not int \
+                or type(batch_slots) is not int:
+            raise ValueError("service window slot geometry differs from the protocol's")
+        if not isinstance(pools, dict):
+            raise ValueError("window pools must be a map of environments")
+        given = {}
+        for env in sorted(pools):
+            value = pools[env]
+            if not isinstance(env, str) or type(value) not in (int, float) or not math.isfinite(value) \
+                    or not 0 <= value <= 1:
+                raise ValueError("invalid service window pool")
+            given[env] = float(value)
+        order = self.contract.sha256
+        with self._txn():
+            saved = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?",
+                                    (order, window)).fetchone()
+            if saved is not None:
+                envelope = json.loads(saved[0])
+                if envelope["pools"] != given:
+                    raise ValueError("service window envelope is already frozen")
+                return envelope
+            schedule = self._schedule()
+            if set(given) != set(schedule.active_environments()):
+                raise ValueError("window pools must cover exactly the active environments")
+            for env, value in given.items():
+                if value > schedule.share_bps(env) / 10000 + _EPS:
+                    raise ValueError("service window pool exceeds the environment's share")
+            envelope = {"order_sha256": order, "schedule": schedule.to_dict(),
+                        "schedule_sha256": schedule.sha256, "pools": given,
+                        "picks_target": picks_target, "batch_slots": batch_slots,
+                        "checkpoint": self._checkpoint()}
+            self.db.execute("INSERT INTO service_windows VALUES(?,?,?)",
+                            (order, window, canonical_json_bytes(envelope).decode()))
+            return envelope
+
+    def _envelope(self, window: int) -> dict:
+        row = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?",
+                              (self.contract.sha256, window)).fetchone()
+        if row is None:
+            raise ServicePolicyLimit("service window has no frozen envelope")
+        return json.loads(row[0])
+
+    def envelope(self, window: int) -> dict:
+        with self.lock:
+            return self._envelope(window)
+
+    def _environments(self, window: int, environment: str | None) -> list[str]:
+        pools = self._envelope(window)["pools"]
+        if environment is None:
+            return sorted(pools)
+        if environment not in pools:
+            raise ServicePolicyLimit("environment is not active in this window")
+        return [environment]
+
+    def _settled(self, window: int) -> bool:
+        return self.db.execute("SELECT 1 FROM service_settled WHERE order_id=? AND window=?",
+                               (self.contract.sha256, window)).fetchone() is not None
+
+    def announcement(self, *, window: int, randomness: str, environment: str | None = None) -> dict:
+        """The v2 ``ServicePolicyAnnouncement`` of ``window`` (same for every env of the window).
+
+        Built from the frozen envelope (schedule, checkpoint) and the window's pool beacon:
+        ``pool_epoch`` is the window (a public seed pool renews every window, R16) and
+        ``randomness`` must be the window's beacon, unknown before the window opens. The first
+        beacon stored for a window wins, so the answer is stable for the life of the window,
+        across calls and restarts. ``environment``, if given, must be active in the window.
+        """
+        from reliquary.protocol.submission import ServicePolicyAnnouncement
+
+        _sha(randomness, "pool randomness")
+        with self._txn():
+            envelope = self._envelope(window)
+            if environment is not None and environment not in envelope["pools"]:
+                raise ServicePolicyLimit("environment is not active in this window")
+            self.db.execute("INSERT OR IGNORE INTO service_pools VALUES(?,?,?)", (self.contract.sha256, window, randomness))
+            beacon = self.db.execute("SELECT randomness FROM service_pools WHERE order_id=? AND window=?",
+                                     (self.contract.sha256, window)).fetchone()[0]
+        if beacon != randomness:
+            logger.warning("service window %d keeps its first pool beacon; a later one was ignored", window)
+        value = {"contract": self.contract.to_dict(), "schedule": envelope["schedule"],
+                 "checkpoint": envelope["checkpoint"],
+                 "supported_capabilities": sorted(SUPPORTED_V2_CAPABILITIES),
+                 "pool_epoch": window, "pool_randomness": beacon}
+        ServicePolicyAnnouncement(**value)  # never hand out a policy the protocol refuses
+        return value
+
+    def seed_pool(self, *, environment: str, prompt_idx: int, window: int):
+        """The announced public seed pool of (env, prompt, window), or None for a legacy-sampling env."""
+        with self.lock:
+            return self._seed_pool(self._envelope(window), window, environment, prompt_idx)
+
+    def _seed_pool(self, envelope: dict, window: int, environment: str, prompt_idx: int):
+        from reliquary.protocol.seed_pool import SeedPool
+
+        if self.contract.environment(environment)["sampling"]["kind"] != PUBLIC_SEED_POOL:
+            return None
+        row = self.db.execute("SELECT randomness FROM service_pools WHERE order_id=? AND window=?",
+                              (self.contract.sha256, window)).fetchone()
+        if row is None:
+            raise ServicePolicyLimit("service window has no announced seed pool")
+        return SeedPool.from_contract(self.contract, environment=environment, prompt_idx=prompt_idx,
+                                      checkpoint_hash=envelope["checkpoint"]["revision"], pool_epoch=window,
+                                      randomness=row[0])
+
+    # --- observations (decisions A, B) ---
+    def _observation(self, envelope: dict, *, environment, prompt_idx, hotkey, window, rewards, group_id,
+                     candidate, token_count, lane, now) -> Observation:
+        """Check one group against the frozen window and build its observation. ValueError = refuse."""
+        if environment not in envelope["pools"]:
+            raise ServicePolicyLimit("environment is not active in this window")
+        if self._settled(window):
+            raise ServicePolicyLimit("window has already settled")
+        policy = self.contract.environment(environment)
+        if type(prompt_idx) is not int or not 0 <= prompt_idx < policy["dataset"]["rows"]:
+            raise ValueError("prompt index is outside the ordered dataset")
+        if not isinstance(hotkey, str) or not 1 <= len(hotkey) <= 256:
+            raise ValueError("invalid service hotkey")
+        if type(token_count) is not int or token_count < 0:
+            raise ValueError("invalid service token count")
+        if type(rewards) not in (list, tuple):
+            raise ValueError("rewards must be the list of graded rollout rewards")
+        bps = []
+        for reward in rewards:
+            if type(reward) not in (int, float) or not math.isfinite(reward) or not 0 <= reward <= 1:
+                raise ValueError("rewards must be finite numbers in [0, 1]")
+            bps.append(round(reward * 10000))
+        _sha(group_id, "group_id")
+        pool = self._seed_pool(envelope, window, environment, prompt_idx)
+        if pool is None:
+            if candidate is not None:
+                raise ValueError("this environment has no public seed pool")
+        else:
+            # The group id IS the selection digest of the pool announced for this window.
+            if not isinstance(candidate, dict) or set(candidate) != {"pool_sha256", "seeds"}:
+                raise ValueError("a public seed pool group needs its pool selection")
+            if candidate["pool_sha256"] != pool.sha256:
+                raise ValueError("selection is not bound to the window's announced pool")
+            selection = pool.selection(candidate["seeds"])
+            if selection.sha256 != group_id:
+                raise ValueError("group id is not the digest of the pool selection")
+            candidate = {"pool_sha256": pool.sha256, "seeds": list(selection.seeds)}
+        checkpoint = envelope["checkpoint"]
+        return Observation(environment=environment, dataset_id=policy["dataset"]["id"], prompt_idx=prompt_idx,
+                           group_id=group_id, window=window, checkpoint_n=checkpoint["checkpoint_n"],
+                           checkpoint_revision=checkpoint["revision"], observed_at=float(now),
+                           rewards_bps=tuple(bps), lane=lane, candidate=candidate, hotkey=hotkey,
+                           token_count=token_count)
+
+    def _refused(self, exc: BaseException, lane: str, context: dict):
+        """R10: a group that does not become an observation is refused loudly, never dropped silently."""
+        if isinstance(exc, ServicePolicyLimit):
+            logger.warning("service %s group outside the policy (%s): %s", lane, exc, context)
+            return exc
+        logger.error("service %s observation refused (%s: %s): %s", lane, type(exc).__name__, exc, context)
+        return ServicePolicyLimit(f"service observation refused: {exc}")
+
+    def _observation_id(self, obs: Observation) -> str:
+        return observation_id(self.contract.sha256, obs, self.log._salt)
+
+    def record_training(self, *, environment, prompt_idx, hotkey, window, rewards, group_id, candidate,
+                        token_count, now=None) -> dict:
+        """Record a PROVEN training group as an observation (it takes the prompt's first scan).
+
+        Returns ``{"observation_id", "first_scan", "inserted"}``. Raises ``ServicePolicyLimit``
+        (nothing written) when the order is inactive, the window is unknown / settled, the env is
+        not in the window, or the evidence is not an observation.
+        """
+        instant = time.time() if now is None else now
+        context = {"environment": environment, "prompt_idx": prompt_idx, "window": window,
+                   "group_id": group_id, "hotkey": hotkey}
+        try:
+            if not self.active(now=instant):  # outside the transaction: active() commits its clock
+                raise ServicePolicyLimit("service order is inactive")
+            with self._txn():
+                obs = self._observation(self._envelope(window), environment=environment, prompt_idx=prompt_idx,
+                                        hotkey=hotkey, window=window, rewards=rewards, group_id=group_id,
+                                        candidate=candidate, token_count=token_count, lane="training", now=instant)
+                context["observation_id"] = self._observation_id(obs)
+                result = self.log.record(obs, status="proven", proof="proven")
+                if result.inserted:
+                    self.db.execute("UPDATE service_orders SET groups=groups+1, tokens=tokens+? WHERE id=?",
+                                    (token_count, self.contract.sha256))
+        except ValueError as exc:  # NotAnObservation, seeds/rewards mismatch, conflicting evidence, ...
+            refusal = self._refused(exc, "training", context)
+            if refusal is exc:
+                raise
+            raise refusal from exc
+        return {"observation_id": result.observation_id, "first_scan": result.first_scan,
+                "inserted": result.inserted}
+
+    def exploration_banned(self, hotkey: str, *, now: float | None = None) -> bool:
+        with self.lock:
+            return self.ledger.banned(hotkey, time.time() if now is None else now)
+
+    def record_exploration(self, *, environment, prompt_idx, hotkey, window, rewards, group_id, candidate,
+                           token_count, arrived_at: float | None = None, now=None) -> dict:
+        """Record an exploration group and reserve its first-scan pay, in one transaction.
+
+        ``arrived_at`` is the VALIDATOR-clock time the submission arrived (default: now; never a
+        miner-supplied value, and never later than now). The audit draw round is the drand round
+        of that instant + 2, so its beacon does not exist when the group is committed.
+
+        Returns ``{"observation_id", "inserted", "first_scan", "entitled", "amount", "status",
+        "reason", "forced_audit", "draw_round"}``. ``status`` is ``exploration_pending`` when one
+        entitlement is reserved (``amount`` is its nominal price, before any proportional scale),
+        else ``exploration_unpaid`` with ``reason``: ``already_scanned`` (first arrival on the
+        (env, prompt) wins, whatever the group id), ``banned``, ``cap``, ``finalized``,
+        ``zero_price``, ``order_inactive``, ``exploration_disabled``, ``token_limit`` or
+        ``replay``. An unpaid observation is published and never holds the prompt's first scan.
+        Raises ``ServicePolicyLimit`` (nothing written, logged) when the group is not an
+        observation or the window cannot take it.
+        """
+        instant = time.time() if now is None else now
+        context = {"environment": environment, "prompt_idx": prompt_idx, "window": window,
+                   "group_id": group_id, "hotkey": hotkey}
+        reward = self.contract.reward_policy
+        try:
+            arrival = instant if arrived_at is None else arrived_at
+            if type(arrival) not in (int, float) or not math.isfinite(arrival):
+                raise ValueError("invalid arrival time")
+            try:
+                draw_round = int(self._round_at(min(float(arrival), float(instant)))) + AUDIT_DRAW_ROUND_OFFSET
+            except RuntimeError as exc:  # no drand clock: the audit cannot be drawn, so nothing is owed
+                raise ValueError(f"audit draw round is unknown: {exc}") from exc
+            active = self.active(now=instant)  # outside the transaction: active() commits its clock
+            with self._txn():
+                envelope = self._envelope(window)
+                obs = self._observation(envelope, environment=environment, prompt_idx=prompt_idx, hotkey=hotkey,
+                                        window=window, rewards=rewards, group_id=group_id, candidate=candidate,
+                                        token_count=token_count, lane="exploration", now=instant)
+                context["observation_id"] = self._observation_id(obs)
+                refuse = None
+                if not active:
+                    refuse = "order_inactive"
+                elif self.contract.environment(environment)["exploration"] != 1:
+                    refuse = "exploration_disabled"
+                elif token_count > reward["max_tokens_per_group"]:
+                    refuse = "token_limit"
+                # Price and cap come from the frozen envelope pool that settle_window will receive.
+                pool = envelope["pools"][environment]
+                outcome = record_exploration(
+                    self.log, self.ledger, obs,
+                    amount=exploration_price(pool, picks_target=envelope["picks_target"],
+                                             batch_slots=envelope["batch_slots"], price_bps=reward["price_bps"]),
+                    cap=exploration_cap(pool, cap_bps=reward["cap_bps"]),
+                    draw_round=draw_round, new_hotkey_audit_groups=reward["new_hotkey_audit_groups"],
+                    now=instant, refuse=refuse)
+        except ValueError as exc:
+            refusal = self._refused(exc, "exploration", context)
+            if refusal is exc:
+                raise
+            raise refusal from exc
+        held = outcome.entitlement
+        return {"observation_id": outcome.observation_id, "inserted": outcome.inserted,
+                "first_scan": outcome.first_scan, "entitled": held is not None,
+                "amount": held["amount"] if held else 0.0, "status": outcome.status, "reason": outcome.reason,
+                "forced_audit": bool(held and held["forced"]),
+                "draw_round": held["draw_round"] if held else None}
+
+    # --- audits (decision C, R15) ---
+    def pending_draw_rounds(self, window: int, *, environment: str | None = None) -> list[int]:
+        """Draw rounds some entitlement of the window still waits for (all envs unless one is named)."""
+        with self.lock:
+            return sorted({round_id for env in self._environments(window, environment)
+                           for round_id in self.ledger.pending_draw_rounds(window, environment=env)})
+
+    def _beacon_randomness(self, round_id: int, value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):  # drand.get_verified_beacon: must be the beacon of exactly this round
+            if value.get("round") != round_id:
+                logger.error("audit beacon for round %d names round %r; ignored", round_id, value.get("round"))
+                return None
+            value = value.get("randomness")
+        if not isinstance(value, str) or _BEACON.fullmatch(value) is None:
+            logger.error("audit beacon for round %d is not 32 bytes of lowercase hex; ignored", round_id)
+            return None
+        return value
+
+    def resolve_draws(self, window: int, *, environment: str | None = None, beacon_for_round=None,
+                      now: float | None = None) -> list[str]:
+        """Draw the audits whose round has passed; return the ids newly queued for audit.
+
+        ``beacon_for_round(round)`` returns the VERIFIED beacon of exactly that round: either the
+        dict of ``drand.get_verified_beacon`` (its ``round`` is checked) or its randomness hex, or
+        None when it is not available yet. Default: ``drand.get_verified_beacon``. A round later
+        than the validator clock's current round is never asked for, so "latest" can never stand
+        in for a future round. The first beacon stored for a round is the one every draw of that
+        round uses, in every window and after a restart (table ``service_draw_beacons``).
+        Fetching happens outside the lock and outside any transaction.
+        """
+        instant = time.time() if now is None else now
+        order = self.contract.sha256
+        with self.lock:
+            environments = self._environments(window, environment)
+            rounds = sorted({round_id for env in environments
+                             for round_id in self.ledger.pending_draw_rounds(window, environment=env)})
+            known = {round_id for round_id in rounds if self.db.execute(
+                "SELECT 1 FROM service_draw_beacons WHERE order_id=? AND round=?", (order, round_id)).fetchone()}
+        if not rounds:
+            return []
+        try:
+            current = int(self._round_at(float(instant)))
+        except RuntimeError as exc:
+            logger.error("service audit draws wait: no drand clock (%s)", exc)
+            return []
+        fetch = beacon_for_round or _verified_beacon
+        fresh: dict[int, str] = {}
+        for round_id in rounds:
+            if round_id in known or round_id > current:
+                continue
+            try:
+                randomness = self._beacon_randomness(round_id, fetch(round_id))
+            except Exception:
+                logger.exception("audit beacon for round %d could not be fetched", round_id)
+                continue
+            if randomness is not None:
+                fresh[round_id] = randomness
+        selected: list[str] = []
+        with self._txn():
+            for round_id, randomness in fresh.items():
+                self.db.execute("INSERT OR IGNORE INTO service_draw_beacons VALUES(?,?,?)", (order, round_id, randomness))
+            stored = {round_id: randomness for round_id, randomness in self.db.execute(
+                "SELECT round, randomness FROM service_draw_beacons WHERE order_id=?", (order,))
+                if round_id in rounds}
+            for env in environments:
+                selected.extend(self.ledger.resolve_draws(window, environment=env, beacon_for_round=stored.get,
+                                                          audit_bps=self.contract.reward_policy["audit_bps"]))
+        return selected
+
+    def queued_audits(self, window: int, *, environment: str | None = None) -> list[dict]:
+        """The audits to run, in the order to run them. Rebuilt from the ledger on every call.
+
+        Rows drawn for audit, still entitled, in a (window, env) not yet finalized. Hotkeys past
+        probation (``passed_audits >= new_hotkey_audit_groups``) come first, then ascending draw
+        round, then reservation order. Each row: ``observation_id``, ``environment``, ``hotkey``,
+        ``prompt_idx``, ``draw_round``, ``forced``, ``past_probation``.
+        """
+        threshold = self.contract.reward_policy["new_hotkey_audit_groups"]
+        with self.lock:
+            rows, seasoned = [], {}
+            for env in self._environments(window, environment):
+                if self.ledger.is_finalized(window, environment=env):
+                    continue
+                for position, row in enumerate(self.ledger.rows(window, environment=env)):
+                    if row["audit"] != "queued" or row["status"] != "reserved":
+                        continue
+                    hotkey = row["hotkey"]
+                    if hotkey not in seasoned:
+                        seasoned[hotkey] = self.ledger.passed_audits(hotkey) >= threshold
+                    rows.append(((not seasoned[hotkey], row["draw_round"], env, position), {
+                        "observation_id": row["observation_id"], "environment": env, "hotkey": hotkey,
+                        "prompt_idx": row["prompt_idx"], "draw_round": row["draw_round"],
+                        "forced": bool(row["forced"]), "past_probation": seasoned[hotkey]}))
+        return [row for _, row in sorted(rows, key=lambda item: item[0])]
+
+    def exploration_backlog(self, window: int, *, environment: str | None = None) -> dict[str, int]:
+        """What the seal still waits for: ``{"pending_draw", "queued", "queued_past_probation"}``."""
+        with self.lock:
+            pending = 0
+            for env in self._environments(window, environment):
+                if not self.ledger.is_finalized(window, environment=env):
+                    pending += sum(row["audit"] == "pending_draw" and row["status"] == "reserved"
+                                   for row in self.ledger.rows(window, environment=env))
+        queued = self.queued_audits(window, environment=environment)
+        return {"pending_draw": pending, "queued": len(queued),
+                "queued_past_probation": sum(row["past_probation"] for row in queued)}
+
+    def _entitlement_row(self, identity: str) -> tuple | None:
+        return self.db.execute("SELECT window, environment, audit, status FROM exploration_entitlements "
+                               "WHERE observation_id=? AND order_id=?", (identity, self.contract.sha256)).fetchone()
+
+    def record_audit(self, identity: str, *, passed: bool, now: float | None = None) -> list[str]:
+        """Apply one audit verdict; return the ids forfeited by a failure (their first scans are released).
+
+        One transaction: the verdict, the release of every forfeited first scan, and the public
+        settle events (``exploration_pending`` / ``audited`` on a pass; ``exploration_forfeited``
+        for every forfeited id, ``failed`` for the audited one). No paid status is published here:
+        pay is only known at finalize. A verdict on a (window, env) already finalized changes no
+        row and publishes nothing; a late failure on a drawn group still bans (R3).
+
+        Never raises on a verdict it cannot apply (unknown id, row not awaiting an audit, SQLite
+        busy): it logs at error level with the observation id and returns ``[]``.
+        """
+        if type(passed) is not bool:
+            raise ValueError("an audit verdict is a boolean")
+        instant = time.time() if now is None else now
+        try:
+            with self._txn():
+                row = self._entitlement_row(identity)
+                if row is None:
+                    raise ValueError("unknown exploration entitlement")
+                frozen = self.ledger.is_finalized(row[0], environment=row[1])
+                forfeited = apply_exploration_audit(self.log, self.ledger, identity, passed=passed, now=instant,
+                                                    ban_seconds=self.contract.reward_policy["ban_seconds"])
+                if not frozen:
+                    if passed:
+                        self.log.settle(identity, status=STATUS_PENDING, proof="audited", at=instant)
+                    for lost in forfeited:
+                        self.log.settle(lost, status=STATUS_FORFEITED, proof=_PROOF[self._entitlement_row(lost)[2]],
+                                        at=instant)
+        except (ValueError, sqlite3.OperationalError) as exc:
+            logger.error("exploration audit verdict not applied for observation %s (passed=%s): %s: %s",
+                         identity, passed, type(exc).__name__, exc)
+            return []
+        return forfeited
+
+    def _finalize_env(self, window: int, environment: str, *, aborted: bool, at: float) -> list[str]:
+        """THE one place a (window, env) is finalized. Runs inside the caller's transaction.
+
+        Every id whose first scan is released gets its settle event (``exploration_unpaid``, or
+        ``exploration_forfeited`` for a row a failed audit already forfeited).
+        """
+        # The single call site of the ledger's finalize: an ``aborted=aborted`` keyword goes here.
+        released = list(finalize_exploration(self.log, self.ledger, window, environment=environment))
+        if aborted:
+            # An aborted window pays no exploration: no entitlement of it may keep a first scan.
+            # (To drop once ``finalize_exploration`` takes ``aborted`` and does this itself.)
+            for row in self.ledger.rows(window, environment=environment):
+                if row["status"] == "reserved" and row["audit"] != "unaudited":
+                    self.log.release_first_scan(row["observation_id"])
+                    released.append(row["observation_id"])
+        rows = {row["observation_id"]: row for row in self.ledger.rows(window, environment=environment)}
+        for identity in released:
+            row = rows[identity]  # a forfeited row keeps its label (R8), whatever its audit became
+            self.log.settle(identity, status=STATUS_FORFEITED if row["status"] == "forfeited" else STATUS_UNPAID,
+                            proof=_PROOF[row["audit"]], at=at)
+        return released
+
+    def finalize_exploration(self, window: int, *, environment: str, now: float | None = None) -> list[str]:
+        """Freeze the exploration of one (window, env); return the ids left unaudited (unpaid).
+
+        SEAL CONTRACT (the caller's, before calling this): stop admitting exploration groups for
+        the env; keep calling ``resolve_draws`` until ``pending_draw_rounds`` is empty or 2 drand
+        rounds have passed since the last admission; run the audits of ``queued_audits`` in its
+        order and report each with ``record_audit`` -- EVERY queued row of a hotkey past probation
+        must be audited, rows of hotkeys in probation as far as a bounded wait allows; then call
+        this. ``exploration_backlog`` tells what is left.
+
+        What is still waiting for its draw or its audit becomes ``unaudited``: unpaid, never
+        sanctioned, and a hotkey's not-drawn rows at or after its first drawn-unaudited round are
+        unpaid too (per-hotkey audit horizon, R15). Their first scans are released and their
+        ``exploration_unpaid`` settle events published, in this transaction. Idempotent. After
+        it the rows never change: a later verdict pays nothing and takes nothing back.
+        ``reconcile_archive`` finalizes whatever env was not, so a restart cannot pay an unaudited row.
+        """
+        instant = time.time() if now is None else now
+        with self._txn():
+            self._environments(window, environment)
+            return self._finalize_env(window, environment, aborted=False, at=instant)
+
+    # --- settlement (decision B) ---
+    def reconcile_archive(self, archive: dict, *, aborted: bool = False, now: float | None = None) -> dict:
+        """Stamp the service money on a window archive, self-check it, and freeze it.
+
+        First call for a window, in one transaction: finalize every env of the frozen envelope
+        (a no-op for those the caller finalized after draining audits), read the ledger's integer
+        entitlement counts, ``settle_window`` (proportional split per env), validate the result
+        with ``validate_service_archive_v2`` under the protocol slot geometry, store the frozen
+        service fields and publish the final settle events (``trained`` / ``proven_unpaid``,
+        ``exploration_paid`` / ``exploration_unpaid`` / ``exploration_forfeited``).
+
+        Later calls recompute and must reproduce the frozen fields exactly (same archive in, same
+        bytes out); they publish nothing. An aborted window (``aborted=True`` or an archive whose
+        ``window_status`` is ``aborted``) pays no exploration and releases its first scans.
+        Every ``batch`` row must carry ``env_name`` (an env of the envelope) and a string
+        ``hotkey``; anything else raises (``SettlementError``) and freezes nothing.
+        """
+        if type(aborted) is not bool or not isinstance(archive, dict):
             raise ValueError("invalid service settlement disposition")
         window = _integer(archive.get("window_start"), "window", 0)
-        with self.lock, self.db:
-            self.db.execute("BEGIN IMMEDIATE")
-            frozen = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?", (self.order_contract.sha256, window)).fetchone()
-            if frozen is None:
-                raise ValueError("service recovery has no frozen window envelope")
-            envelope = json.loads(frozen[0])
-            settled = self.db.execute("SELECT aborted FROM service_settled WHERE order_id=? AND window=?", (self.order_contract.sha256, window)).fetchone()
+        aborted = aborted or archive.get("window_status") == "aborted"
+        instant = time.time() if now is None else now
+        picks, slots = protocol_slot_geometry()
+        order = self.contract.sha256
+        with self._txn():
+            envelope = self._envelope(window)
+            settled = self.db.execute("SELECT aborted, payload FROM service_settled WHERE order_id=? AND window=?",
+                                      (order, window)).fetchone()
             if settled is not None and settled[0] != int(aborted):
                 raise ValueError("service window settlement disposition is frozen")
+            if settled is None:
+                for env in sorted(envelope["pools"]):
+                    if not self.ledger.is_finalized(window, environment=env):
+                        waiting = sum(row["audit"] in ("pending_draw", "queued")
+                                      for row in self.ledger.rows(window, environment=env))
+                        if waiting:
+                            logger.warning("service window %d env %s settles with %d exploration group(s) "
+                                           "never audited (unpaid)", window, env, waiting)
+                    self._finalize_env(window, env, aborted=aborted, at=instant)
             exploration = {}
-            if not aborted:
-                for hotkey, amount in self.db.execute("SELECT hotkey,amount FROM service_payments WHERE order_id=? AND window=?", (self.order_contract.sha256, window)):
-                    exploration[hotkey] = exploration.get(hotkey, 0.0) + amount
-            result = dict(archive)
-            service_fields = {"service_payment_policy": SERVICE_PAYMENT_POLICY,
-                              "service_order_contract": self.order_contract.to_dict(),
-                              "service_context_contract": envelope["contract"],
-                              "service_window_pool": envelope["window_pool"],
-                              "service_exploration_slots": envelope["slots"],
-                              "exploration_rewards_by_hotkey": exploration}
-            enriched = any(key in archive for key in service_fields)
-            if enriched and any(archive.get(key) != value for key, value in service_fields.items()):
-                raise ValueError("service archive differs from its frozen settlement")
-            rewards = archive.get("rewards_by_hotkey", {})
-            if not isinstance(rewards, dict) or any(
-                not isinstance(k, str) or type(v) not in (int, float) or not math.isfinite(v) or v < 0
-                for k, v in rewards.items()
-            ):
-                raise ValueError("invalid service reward fraction")
-            rewards = dict(rewards)
-            if not enriched:
-                for hotkey, amount in exploration.items():
-                    rewards[hotkey] = rewards.get(hotkey, 0.0) + amount
-            result.update(**service_fields, rewards_by_hotkey=rewards)
-            validate_service_archive(result, self.order_contract, cap=envelope["window_pool"])
-            monetary = canonical_json_bytes({**service_fields, "rewards_by_hotkey": rewards}).decode()
-            previous = self.db.execute("SELECT payload FROM service_settlement_maps WHERE order_id=? AND window=?",
-                                       (self.order_contract.sha256, window)).fetchone()
-            if previous is not None and previous[0] != monetary:
+            for env in sorted(envelope["pools"]):
+                counts = self.ledger.payable(window, environment=env)
+                if counts:
+                    exploration[env] = counts
+            result = settle_window(archive=archive, envelope=envelope, contract=self.contract,
+                                   exploration=exploration, aborted=aborted)
+            # Lane consistency under the protocol geometry; the task-cap bound is weight replay's.
+            validate_service_archive_v2(result, self.contract, cap=1.0, picks_target=picks, batch_slots=slots)
+            frozen = canonical_json_bytes({key: result[key] for key in FROZEN_ARCHIVE_FIELDS}).decode()
+            if settled is None:
+                self.db.execute("INSERT INTO service_settled VALUES(?,?,?,?)", (order, window, int(aborted), frozen))
+                self._emit_settle_events(window, envelope, archive, aborted, instant)
+            elif settled[1] != frozen:
                 raise ValueError("service window reward map is already frozen")
-            # Validate the complete map before freezing either settlement row.
-            self.db.execute("INSERT OR IGNORE INTO service_settled VALUES(?,?,?)", (self.order_contract.sha256, window, int(aborted)))
-            self.db.execute("INSERT OR IGNORE INTO service_settlement_maps VALUES(?,?,?)", (self.order_contract.sha256, window, monetary))
-            return result
+        return result
 
-    def snapshot(self, *, after: int = 0, limit: int = 1000) -> dict:
-        _integer(after, "after", 0)
-        _integer(limit, "limit", 1, 10000)
+    def _emit_settle_events(self, window: int, envelope: dict, archive: dict, aborted: bool, at: float) -> None:
+        paid: dict[tuple, int] = {}
+        if not aborted:
+            for row in archive.get("batch") or []:
+                key = (row.get("env_name"), row.get("prompt_idx"), row.get("hotkey"))
+                paid[key] = paid.get(key, 0) + 1
+        ledger = {row["observation_id"]: row for env in envelope["pools"]
+                  for row in self.ledger.rows(window, environment=env)}
+        for row in self.log.window_observations(window):
+            if row["lane"] == "training":
+                key = (row["environment"], row["prompt_idx"], row["hotkey"])
+                trained = paid.get(key, 0) > 0
+                if trained:
+                    paid[key] -= 1
+                self.log.settle(row["id"], status="trained" if trained else "proven_unpaid", proof="proven", at=at)
+            elif row["id"] in ledger:
+                entry = ledger[row["id"]]
+                if entry["status"] == "forfeited":
+                    status = STATUS_FORFEITED
+                elif aborted or entry["audit"] == "unaudited":
+                    status = STATUS_UNPAID
+                else:
+                    status = STATUS_PAID
+                self.log.settle(row["id"], status=status, proof=_PROOF[entry["audit"]], at=at)
+            # An exploration observation without an entitlement was published unpaid, with its reason.
+
+    # --- publication / admin reads ---
+    def events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
         with self.lock:
-            rows = self.db.execute("SELECT seq,payload FROM service_observations WHERE order_id=? AND context=? AND seq>? ORDER BY seq LIMIT ?", (self.order_contract.sha256, self.contract.context_sha256, after, limit)).fetchall()
-        return {"schema": "service-observation-delta/v1", "contract_sha256": self.contract.sha256,
-                "context_sha256": self.contract.context_sha256, "watermark": rows[-1][0] if rows else after,
-                "observations": [json.loads(row[1]) for row in rows]}
+            return self.log.events(after=after, limit=limit)
 
-    def training_pool(self, original):
-        policy = self.contract.to_dict()["policies"]["reward"]
-        fraction = 1 - policy["budget_bps"] / 10000 if policy["kind"] == "exploration-discount/v1" else 1.0
-        return {k: v * fraction for k, v in original.items()} if isinstance(original, dict) else original * fraction
+    def admin_events(self, *, after: int = 0, limit: int = 1000) -> list[tuple[int, dict]]:
+        with self.lock:
+            return self.log.admin_events(after=after, limit=limit)
 
+    # --- v1 entry points, removed. Callers not rewired yet fail closed with a clear message. ---
+    @staticmethod
+    def _unwired(name: str, task: str):
+        raise NotImplementedError(f"ServiceRuntime.{name} was removed with the v1 service runtime; "
+                                  f"this caller is wired in {task}")
 
-def validate_service_archive(record: dict, ordered: ServiceContract, *, cap: float) -> None:
-    """Weight readers reject incompatible service journals before assigning money."""
-    if type(cap) not in (int, float) or not math.isfinite(cap) or not 0 <= cap <= 1 + 1e-12:
-        raise ValueError("invalid service archive cap")
-    if record.get("service_payment_policy") != SERVICE_PAYMENT_POLICY:
-        raise ValueError("service archive payment policy is missing or unsupported")
-    root = ServiceContract.from_dict(record.get("service_order_contract"))
-    context = ServiceContract.from_dict(record.get("service_context_contract"))
-    if root != ordered:
-        raise ValueError("service archive belongs to another order revision")
-    expected, actual = root.to_dict(), context.to_dict()
-    if expected["checkpoint"]["repo"] != actual["checkpoint"]["repo"]:
-        raise ValueError("service checkpoint repository changed")
-    expected.pop("checkpoint")
-    actual.pop("checkpoint")
-    if expected != actual:
-        raise ValueError("service context changes more than its adopted checkpoint")
-    pool = record.get("service_window_pool")
-    if type(pool) not in (int, float) or not math.isfinite(pool) or not 0 <= pool <= cap + 1e-12:
-        raise ValueError("service archive exceeds its declared absolute envelope")
-    _integer(record.get("service_exploration_slots"), "service exploration slots", 1)
-    rewards, exploration = record.get("rewards_by_hotkey"), record.get("exploration_rewards_by_hotkey")
-    if not isinstance(rewards, dict) or not isinstance(exploration, dict):
-        raise ValueError("service archive reward maps are required")
-    for values in (rewards, exploration):
-        if any(not isinstance(k, str) or type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= pool + 1e-12
-               for k, v in values.items()):
-            raise ValueError("invalid service reward fraction")
-    if any(v > rewards.get(k, 0) + 1e-12 for k, v in exploration.items()):
-        raise ValueError("exploration is absent from the authoritative reward map")
-    policy = context.to_dict()["policies"]["reward"]
-    reserve = pool * policy["budget_bps"] / 10000 if policy["kind"] == "exploration-discount/v1" else 0
-    discounted = reserve / policy["divisor"] if reserve else 0
-    training = math.fsum(rewards.values()) - math.fsum(exploration.values())
-    if math.fsum(exploration.values()) > discounted + 1e-12 or training > pool - reserve + 1e-12:
-        raise ValueError("service reward lane exceeds its reserved fraction")
-    if record.get("window_status") == "aborted" and exploration:
-        raise ValueError("aborted service window cannot award exploration")
+    @property
+    def view(self):
+        self._unwired("view", "Task 10 (validator), Task 12 (batcher) and Task 13 (server)")
+
+    @property
+    def row_ids(self):
+        self._unwired("row_ids", "Task 10 (validator) and Task 12 (batcher)")
+
+    def prepare_view(self, *args, **kwargs):
+        self._unwired("prepare_view", "Task 10 (validator)")
+
+    def training_pool(self, *args, **kwargs):
+        self._unwired("training_pool", "Task 10 (validator)")
+
+    def record_verified(self, *args, **kwargs):
+        self._unwired("record_verified", "Task 12 (batcher)")
+
+    def snapshot(self, *args, **kwargs):
+        self._unwired("snapshot", "Task 13 (server)")
