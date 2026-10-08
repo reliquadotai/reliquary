@@ -311,6 +311,7 @@ async def list_recent_datasets(
     strict: bool = False,
     task_id: str | None = None,
     fields: tuple[str, ...] | None = None,
+    row_fields: dict[str, tuple[str, ...]] | None = None,
     **client_kwargs,
 ) -> list[dict]:
     """Download last *n* window archives from the flat R2 prefix in ascending order.
@@ -321,6 +322,10 @@ async def list_recent_datasets(
 
     Used by the validator at startup to reconstruct ``CooldownMap`` state
     and replay the EMA.
+
+    ``row_fields`` (only with ``fields``): ``{field: keys}`` projects each row of the list
+    ``field`` to ``keys`` right after decoding, so the rows' bulk is never retained. A non-dict
+    row becomes ``None`` and a non-list value is kept as is (the consumer refuses both).
     """
     from botocore.exceptions import ClientError
 
@@ -350,11 +355,18 @@ async def list_recent_datasets(
                     raise ValueError(
                         f"archive {key} does not bind window {window_start}"
                     )
-                return (
-                    data if fields is None else {
-                        field: data[field] for field in fields if field in data
-                    }
-                )
+                if fields is None:
+                    return data
+                projected = {field: data[field] for field in fields if field in data}
+                del data
+                for field, keys in (row_fields or {}).items():
+                    rows = projected.get(field)
+                    if isinstance(rows, list):
+                        projected[field] = [
+                            {k: row[k] for k in keys if k in row} if isinstance(row, dict) else None
+                            for row in rows
+                        ]
+                return projected
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 if code in ("NoSuchKey", "404"):

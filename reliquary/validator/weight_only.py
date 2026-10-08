@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 # What replay fetches of a service (v2) archive on top of the three legacy fields. ``batch`` is
 # needed because the money is recomputed from the paid rows; the cooldown advice, the recomputed
 # delta, the context and the archive's own ``randomness`` are deliberately NOT read.
+# Per-row projection of ``batch`` applied while the archive is decoded (settlement's ``_count_rows``
+# reads exactly these keys): no prompt, ground truth or rollout is ever retained.
+SERVICE_ROW_FIELDS = {"batch": ("hotkey", "env_name", "prompt_idx")}
 SERVICE_ARCHIVE_FIELDS = ("batch", "service_payment_policy", "service_order_sha256", "service_schedule",
                           "service_schedule_sha256", "service_pools_by_environment", "service_picks_target",
                           "service_batch_slots", "service_training_by_environment",
@@ -209,12 +212,17 @@ class WeightOnlyValidator:
                 fields = ("window_start", "window_status", "rewards_by_hotkey")
                 if getattr(declared.get(task_id), "mechanism", None) == MECHANISM_SERVICE_RL:
                     fields += SERVICE_ARCHIVE_FIELDS
+                extra = {}
+                if fields != ("window_start", "window_status", "rewards_by_hotkey"):
+                    # v2 service task only: keep no rollout data, replay counts rows by these keys.
+                    extra["row_fields"] = SERVICE_ROW_FIELDS
                 archives = await storage.list_recent_datasets(
                     current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
                     task_id=task_id,
                     # The replay reads only these; the task comes from the R2 prefix.
                     fields=fields,
+                    **extra,
                 )
                 # A task whose last window fell out of the shared horizon
                 # contributes nothing, and must not be counted as an
@@ -261,8 +269,8 @@ class WeightOnlyValidator:
         from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
         try:
             archives = self._validated_service_archives(archives, declared)
-        except ValueError as exc:  # SettlementError included: a refusal abstains, it never crashes
-            logger.error("Service archive validation failed (%s); abstaining from weights", exc)
+        except ValueError as exc:  # only an unusable registry entry/contract; bad archives are dropped inside
+            logger.error("Service task registry entry unusable (%s); abstaining from weights", exc)
             return False
         logger.info(
             "Replaying %d archives across %d task(s): %s",
@@ -300,8 +308,10 @@ class WeightOnlyValidator:
         fields replay pays from, with ``rewards_by_hotkey`` REPLACED by the recomputed map.
 
         ``geometry`` is ``(picks_target, batch_slots)``, the protocol's unless a test gives one. The
-        task cap is the registry's, not the runtime self-check's 1.0. Raises ``SettlementError``
-        (a ``ValueError``) on the first refusal; the caller abstains. A window present twice for
+        task cap is the registry's, not the runtime self-check's 1.0. An unusable registry entry,
+        contract or cap raises ``SettlementError`` (a ``ValueError``; the caller abstains). An archive
+        that fails validation is DROPPED (pays nothing, logged at error, ruling R27): only that
+        (task, window); legacy archives never reach this handling. A window present twice for
         one service task keeps ONE archive (the smallest canonical JSON, a rule every validator
         applies alike) and logs it; they are never summed. An aborted archive pays nothing at all
         (``_replay_ema`` skips it); a non-aborted archive with neither paid rows nor exploration
@@ -320,38 +330,70 @@ class WeightOnlyValidator:
             from reliquary.services.runtime import protocol_slot_geometry
             geometry = protocol_slot_geometry()
         picks, slots = geometry
+        refusals = (ValueError, ArithmeticError, RecursionError, TypeError, KeyError, AttributeError)
+
+        def drop(archive, reason) -> None:
+            # R27: a bad v2 archive is treated as aborted (pays nothing); every validator sees the
+            # same archives, so the drop is deterministic and the unpaid remainder burns as today.
+            logger.error("service task %s window %s dropped from weight replay: %s",
+                         archive.get("task_id"), archive.get("window_start"), reason)
+
         chosen: dict[tuple[str, int], dict] = {}
+        poisoned: set[tuple[str, int]] = set()
         out: list[dict] = []
         for archive in archives:
-            if not is_service(archive):
+            if not is_service(archive):       # legacy guard: never reaches the drop handling below
                 out.append(archive)
                 continue
             try:
                 key = (str(archive["task_id"]), int(archive["window_start"]))
-            except (KeyError, TypeError, ValueError, OverflowError) as exc:
-                raise SettlementError("service archive has no window") from exc
+            except refusals as exc:
+                drop(archive, f"no usable window ({type(exc).__name__})")
+                continue
+            if key in poisoned:
+                continue
+            if key not in chosen:
+                chosen[key] = archive
+                continue
+            # A real duplicate: the canonical JSON is needed only here, to keep the same one everywhere.
+            logger.warning("service task %s window %d has several archives; keeping one deterministically",
+                           key[0], key[1])
             try:
-                rank = canonical_json_bytes(archive)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise SettlementError("service archive is not canonical JSON") from exc
-            if key in chosen:
-                logger.warning("service task %s window %d has several archives; keeping one deterministically",
-                               key[0], key[1])
-                if rank >= canonical_json_bytes(chosen[key]):
-                    continue
-            chosen[key] = archive
-        for archive in chosen.values():
-            entry = declared[archive["task_id"]]
+                rank, held = canonical_json_bytes(archive), canonical_json_bytes(chosen[key])
+            except refusals as exc:
+                # Either copy unrankable: drop the window whichever copy came first (order-free).
+                drop(archive, f"duplicate archives, one not canonical JSON ({type(exc).__name__})")
+                del chosen[key]
+                poisoned.add(key)
+                continue
+            if rank < held:
+                chosen[key] = archive
+        contracts: dict[str, tuple[Any, float]] = {}
+        for (task_id, _), archive in chosen.items():
+            if task_id in contracts:
+                continue
+            entry = declared[task_id]
             try:
-                contract = ServiceContract.from_dict(entry.service_contract)
-                cap = float(entry.params["cap"])
-            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                contracts[task_id] = (ServiceContract.from_dict(entry.service_contract), float(entry.params["cap"]))
+            except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as exc:
                 raise SettlementError("service task has no usable contract or cap") from exc
-            rewards = service_archive_rewards(archive, contract, cap=cap, picks_target=picks, batch_slots=slots)
+            if not 0 < contracts[task_id][1] <= 1:     # NaN fails too; a registry fault, not an archive's
+                raise SettlementError("service task has no usable contract or cap")
+        for archive in chosen.values():
+            contract, cap = contracts[archive["task_id"]]
             aborted = archive.get("window_status") == "aborted"
-            if not aborted and not archive.get("batch") and not archive.get("service_exploration_by_environment"):
-                logger.warning("service task %s window %s paid nothing (no batch, no exploration)",
-                               archive["task_id"], archive["window_start"])
+            if aborted:
+                rewards = {}      # pays nothing: no recomputation (M1)
+            else:
+                try:
+                    rewards = service_archive_rewards(archive, contract, cap=cap, picks_target=picks,
+                                                      batch_slots=slots)
+                except refusals as exc:
+                    drop(archive, f"{type(exc).__name__}: {exc}")
+                    continue
+                if not archive.get("batch") and not archive.get("service_exploration_by_environment"):
+                    logger.warning("service task %s window %s paid nothing (no batch, no exploration)",
+                                   archive["task_id"], archive["window_start"])
             out.append({"task_id": archive["task_id"], "window_start": int(archive["window_start"]),
                         "window_status": "aborted" if aborted else archive.get("window_status", "completed"),
                         "rewards_by_hotkey": rewards})

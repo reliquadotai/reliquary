@@ -92,11 +92,12 @@ def test_aborted_archive_pays_nothing_at_all_training_included():
     assert ema == {}
 
 
-def test_aborted_archive_awarding_exploration_is_refused():
+def test_aborted_archive_is_not_recomputed_even_when_inconsistent():
     record = settled()
     record["window_status"] = "aborted"
-    with pytest.raises(SettlementError):
-        check([record])
+    record["rewards_by_hotkey"]["a"] = 99.0             # would fail validation; an aborted one pays nothing anyway
+    (out,) = check([record])
+    assert out["window_status"] == "aborted" and out["rewards_by_hotkey"] == {}
 
 
 def test_empty_non_aborted_window_pays_nothing_and_is_not_a_refusal():
@@ -138,18 +139,69 @@ FORGERIES = {
 
 
 @pytest.mark.parametrize("name", sorted(FORGERIES))
-def test_forged_archive_is_refused_without_raising_anything_but_valueerror(name):
+def test_forged_archive_is_dropped_and_logged_at_error_not_raised(name, monkeypatch):
+    logged = []
+    monkeypatch.setattr(weight_only.logger, "error", lambda msg, *a, **k: logged.append(msg % a))
     record = mutate(FORGERIES[name])
-    with pytest.raises(ValueError):
-        check([record])
+    assert check([record]) == []
+    assert len(logged) == 1 and TASK in logged[0] and "window 3" in logged[0]
 
 
-def test_a_forgery_in_a_mixed_stream_refuses_the_service_task_only_through_valueerror():
+def test_a_forgery_drops_only_its_own_window_legacy_and_other_windows_survive():
     legacy = {"task_id": "default", "window_start": 3, "rewards_by_hotkey": {"l": 0.1}}
+    good = settled(window=4)
+    bad = mutate(FORGERIES["scale"])
+    out = check([legacy, bad, good])
+    assert out[0] is legacy and [(r["task_id"], r["window_start"]) for r in out] == [("default", 3), (TASK, 4)]
+    assert check([good, bad]) == check([bad, good])           # deterministic
+
+
+def deep(depth=1500):
+    node = []
+    for _ in range(depth):
+        node = [node]
+    return node
+
+
+@pytest.mark.parametrize("poison", [
+    lambda r: r.update(batch=[1, "x", None]),                            # non-dict rows
+    lambda r: r.update(service_pools_by_environment={MATH: 10**400}),    # OverflowError
+    lambda r: r.update(service_exploration_by_environment={CODE: {"x": 10**400}}),
+    lambda r: r.update(rewards_by_hotkey=deep()),
+    lambda r: r.update(window_start="three"),
+    lambda r: r.pop("window_start"),
+], ids=range(6))
+def test_nothing_but_a_clean_drop_escapes_a_hostile_archive(poison):
+    record = mutate(poison)
+    assert check([record]) == []
+    assert check([record, record]) == []        # also as a duplicate pair (same object twice)
+
+
+def test_a_hostile_duplicate_drops_the_window_whatever_the_order():
     good = settled()
-    assert check([legacy, good])[0] is legacy                           # legacy passes through
-    with pytest.raises(ValueError):
-        check([legacy, mutate(FORGERIES["scale"])])
+    bad = copy.deepcopy(good)
+    bad["batch"][0]["junk"] = deep()
+    assert check([good, bad]) == [] == check([bad, good])
+    assert len(check([good, bad, settled(window=4)])) == 1
+
+
+def test_canonical_json_is_not_computed_without_a_duplicate(monkeypatch):
+    import reliquary.protocol.release_contract as rc
+
+    real = rc.canonical_json_bytes
+
+    def boom(value):
+        if isinstance(value, dict) and "window_start" in value:
+            raise AssertionError("canonical JSON computed for a unique window")
+        return real(value)
+
+    monkeypatch.setattr(rc, "canonical_json_bytes", boom)
+    assert len(check([settled(), settled(window=4)])) == 2
+
+
+def test_an_aborted_archive_needs_only_to_be_recognisable():
+    assert check([{"task_id": TASK, "window_start": 3, "window_status": "aborted"}])[0]["rewards_by_hotkey"] == {}
+    assert check([{"task_id": TASK, "window_status": "aborted"}]) == []     # no window: dropped
 
 
 def test_legacy_archive_is_passed_through_untouched():
@@ -162,9 +214,8 @@ def test_legacy_archive_is_passed_through_untouched():
 def test_task_cap_is_the_registry_cap_not_one():
     record = settled()
     check([record], declared(cap=0.5))
-    with pytest.raises(SettlementError, match="cap"):
-        check([record], declared(cap=0.4))          # pools 0.25 each exceed 0.4 * 50 %
-    for bad in (0, float("nan"), 2.0, "x", None):
+    assert check([record], declared(cap=0.4)) == []       # pools 0.25 each exceed 0.4 * 50 %: archive dropped
+    for bad in (0, float("nan"), 2.0, "x", None, 10**400):          # an unusable registry cap abstains
         with pytest.raises(ValueError):
             check([record], declared(cap=bad))
 
@@ -241,11 +292,38 @@ async def test_submit_once_pays_a_v2_task_and_a_legacy_task_in_one_epoch(monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["scale", "training_map", "missing_prompt_idx", "nan_pool", "exploration_over_cap"])
-async def test_submit_once_abstains_on_a_forged_service_archive(monkeypatch, name):
-    legacy = [{"task_id": "default", "window_start": 3, "rewards_by_hotkey": {"l": 0.4}}]
+async def test_submit_once_drops_a_forged_service_archive_and_pays_the_rest(monkeypatch, name):
+    legacy = [{"task_id": "default", "window_start": 3, "window_status": "complete", "rewards_by_hotkey": {"l": 0.4}}]
     wov, sent = wire(monkeypatch, [mutate(FORGERIES[name])], legacy, declared())
-    assert await wov.submit_once() is False
-    assert sent == []
+    assert await wov.submit_once() is True
+    (weights,) = sent
+    assert set(weights) == {"l"}
+
+
+@pytest.mark.asyncio
+async def test_submit_once_survives_a_hostile_archive_and_abstains_on_an_unusable_registry(monkeypatch):
+    legacy = [{"task_id": "default", "window_start": 3, "window_status": "complete", "rewards_by_hotkey": {"l": 0.4}}]
+    hostile = mutate(lambda r: r.update(rewards_by_hotkey=deep()))
+    wov, sent = wire(monkeypatch, [hostile], legacy, declared())
+    assert await wov.submit_once() is True and set(sent[0]) == {"l"}
+    decl = declared()
+    decl[TASK].params = {"cap": 10**400}
+    wov, sent = wire(monkeypatch, [settled()], legacy, decl)
+    assert await wov.submit_once() is False and sent == []
+
+
+@pytest.mark.asyncio
+async def test_submit_once_asks_for_row_projection_for_service_tasks_only(monkeypatch):
+    seen = {}
+    wov, _ = wire(monkeypatch, [settled()], [], declared())
+
+    async def recent(current_window, n, *, task_id=None, fields=None, **kw):
+        seen[task_id] = kw
+        return []
+
+    monkeypatch.setattr(weight_only.storage, "list_recent_datasets", recent)
+    await wov.submit_once()
+    assert seen["default"] == {} and seen[TASK] == {"row_fields": {"batch": ("hotkey", "env_name", "prompt_idx")}}
 
 
 @pytest.mark.asyncio
@@ -269,3 +347,64 @@ def test_replay_pays_the_recomputed_value_even_when_the_archived_one_is_within_t
     exact = check([copy.deepcopy(record)])[0]["rewards_by_hotkey"]
     record["rewards_by_hotkey"]["a"] += 5e-13                  # inside the 1e-12 tolerance: accepted...
     assert check([record])[0]["rewards_by_hotkey"] == exact    # ...but never what is paid
+
+
+# ---- I3: the batch is projected where the archive is decoded
+
+async def _through_storage(record, **kw):
+    import gzip
+    from unittest.mock import AsyncMock, patch
+    from reliquary.infrastructure.storage import list_recent_datasets
+
+    body = gzip.compress(json.dumps({k: v for k, v in record.items() if k != "task_id"}).encode())
+
+    async def get_object(Bucket, Key):
+        class _Body:
+            async def read(self):
+                return body
+
+            def close(self):
+                pass
+
+        return {"Body": _Body()}
+
+    client = AsyncMock()
+    client.get_object = get_object
+    ctx = AsyncMock()
+    ctx.__aenter__.return_value = client
+    ctx.__aexit__.return_value = None
+    with patch("reliquary.infrastructure.storage.get_s3_client", return_value=ctx):
+        return await list_recent_datasets(current_window=record["window_start"] + 1, n=1, **kw)
+
+
+@pytest.mark.asyncio
+async def test_projected_batch_rows_hold_only_the_three_keys_and_pay_the_same():
+    record = settled(rows=(("a", MATH), ("b", CODE), ("a", MATH)))
+    for i, row in enumerate(record["batch"]):
+        row.update(prompt="P" * 5000, ground_truth="42", rollouts=[{"text": "t" * 5000, "tokens": [1] * 500}], k=4, i=i)
+    fields = ("window_start", "window_status", "rewards_by_hotkey") + weight_only.SERVICE_ARCHIVE_FIELDS
+    (projected,) = await _through_storage(record, fields=fields, row_fields=weight_only.SERVICE_ROW_FIELDS)
+    assert len(projected["batch"]) == 3
+    for row in projected["batch"]:
+        assert set(row) == {"hotkey", "env_name", "prompt_idx"}
+    assert "rollouts" not in json.dumps(projected["batch"]) and len(json.dumps(projected)) < 0.2 * len(json.dumps(record))
+    (full,) = check([record])
+    (small,) = check([{**projected, "task_id": TASK}])
+    assert small == full and full["rewards_by_hotkey"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_projection_is_exactly_as_before():
+    record = {"window_start": 7, "window_status": "complete", "rewards_by_hotkey": {"l": 1.0},
+              "batch": [{"hotkey": "l", "prompt": "big", "rollouts": [1]}]}
+    legacy = ("window_start", "window_status", "rewards_by_hotkey")
+    assert await _through_storage(record, fields=legacy) == [{k: record[k] for k in legacy}]
+    assert (await _through_storage(record))[0]["batch"] == record["batch"]       # no fields: whole archive
+
+
+@pytest.mark.asyncio
+async def test_row_projection_keeps_non_dict_rows_refusable_without_their_bulk():
+    record = settled()
+    record["batch"] = [{"hotkey": "a", "env_name": MATH, "prompt_idx": 1, "x": "y"}, "z" * 10_000, 5]
+    (projected,) = await _through_storage(record, fields=("window_start", "batch"), row_fields={"batch": ("hotkey",)})
+    assert projected["batch"] == [{"hotkey": "a"}, None, None]
