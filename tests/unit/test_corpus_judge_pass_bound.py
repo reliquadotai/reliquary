@@ -8,6 +8,7 @@ restart (110k pending) wrote nothing for 50+ minutes."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -74,6 +75,9 @@ def _backlog_run(monkeypatch, *, rows, tokens, n=3000):
                 first_verdict["at"] = sim.virtual_clock() - start
         feeder.cancel()
         runner.cancel()
+        for task in (feeder, runner):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         backlog = {"%064x" % (i + 1) for i in range(n)}
         return store, backlog
 

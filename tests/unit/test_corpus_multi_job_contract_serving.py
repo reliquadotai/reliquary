@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from reliquary.validator.corpus_validator import build_corpus_app, build_corpus_jobs_app
 from tests.unit.test_corpus_service import (  # noqa: F401
-    _Tokenizer, _r2_client, fake_r2, seeded_job,
+    _Tokenizer, _manifest, _r2_client, fake_r2, seeded_job,
 )
 
 MATH = {"model_id": "org/Frozen", "profile_id": "corpus-math", "proofs": [{"scheme": "toploc-v1"}]}
@@ -81,10 +81,8 @@ def test_one_job_serves_its_contract_on_both_paths(seeded_job):
 # --------------------------------------------------------------------------
 
 
-JOBS = {
-    "math-v1": {"job_id": "math-v1", "checkpoint_repo": "org/M", "checkpoint_revision": "r1"},
-    "code-v1": {"job_id": "code-v1", "checkpoint_repo": "org/M", "checkpoint_revision": "r1"},
-}
+JOBS = {job_id: {**_manifest(), "job_id": job_id, "checkpoint_repo": "org/M", "checkpoint_revision": "r1"}
+        for job_id in ("math-v1", "code-v1")}
 CONTRACTS = {
     "math-v1": {"model_id": "org/M", "model_revision": "r1", "profile_id": "corpus-math",
                 "proofs": [{"scheme": "toploc-v1", "mode": "enforce"}]},
@@ -143,7 +141,7 @@ def _mine(monkeypatch, tmp_path, *args):
     monkeypatch.setattr(httpx, "Client", lambda **kw: real_client(transport=transport,
                                                                   base_url=kw["base_url"]))
     monkeypatch.setattr(os, "execv", _execv)
-    result = CliRunner().invoke(cli.app, ["corpus", "mine", "--validator-url", "http://v", *args])
+    result = CliRunner().invoke(cli.app, ["--debug", "corpus", "mine", "--validator-url", "http://v", *args])
     return result, execs, seen, _Restarted
 
 
