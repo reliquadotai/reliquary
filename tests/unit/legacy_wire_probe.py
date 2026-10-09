@@ -1,7 +1,7 @@
 """What a legacy RL task, a single-turn v2 order and a corpus job put on the wire and on disk, as digests.
 
 ``probe()`` runs the same inputs through the reliquary tree that is first on ``sys.path`` and returns JSON-able
-values. ``tests/unit/data/legacy_wire_1c6930f4.json`` holds what it returned for the tree BEFORE plan 2C (the
+values. ``tests/unit/data/legacy_wire_1c6930f4.json`` holds what it returned for the tree BEFORE signed episodes (the
 phase 2 base 1c6930f4); ``test_episode_inertness`` compares today's tree with it.
 
 It only calls APIs both trees have, with inputs from test helpers that are byte-identical in both trees

@@ -1,4 +1,4 @@
-"""Admission of a signed-episode group, no GPU (plan 2C, Task 7)."""
+"""Admission of a signed-episode group, no GPU."""
 import copy
 import dataclasses
 from types import SimpleNamespace
@@ -299,7 +299,7 @@ def test_a_renderer_error_on_miner_tokens_is_a_refusal(tmp_path):
     refused(outcome, RejectReason.BAD_TOKENS, "episode_parse")
 
 
-# --- Fix round 1 (adversarial review of Task 7) ---------------------------------------------------------
+# --- group admission edge cases ------------------------------------------------------------
 
 def _last_turn(w, index=0):
     """(tokens, the last span's absolute start, the last completion) of rollout ``index``."""
@@ -457,7 +457,7 @@ def test_the_prompt_cache_follows_the_source_version(tmp_path):
 
 @pytest.mark.parametrize("bad", ["float", "string", "bool", "before_prompt", "not_a_list", "empty"])
 def test_assistant_spans_are_read_as_the_proof_reads_them(tmp_path, bad):
-    # I1b: int() coercion let [2.0, 12], ["2", 12], [True, ..] through admission that the proof refuses.
+    # int() coercion let [2.0, 12], ["2", 12], [True, ..] through admission that the proof refuses.
     w = world(tmp_path)
     episode = w.group.request.rollouts[0].commit["rollout"]["episode"]
     first = list(episode["assistant_spans"][0])

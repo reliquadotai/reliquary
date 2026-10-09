@@ -1,4 +1,4 @@
-"""Admission wiring for signed-episode groups (plan 2C, Task 8)."""
+"""Admission wiring for signed-episode groups."""
 import asyncio
 import dataclasses
 import inspect
@@ -1060,7 +1060,7 @@ def test_the_book_indexes_sessions_by_precommit(tmp_path, monkeypatch):
     assert asyncio.run(env.issuer.claim_all(ids[1:], hotkey="5Hot", received=NOW, precommit_sha256=sha)) is None
 
 
-# -- review round 3 ---------------------------------------------------------------------------------------
+# -- in-flight caps --------------------------------------------------------------------------------
 
 def test_the_in_flight_cap_is_per_operator_across_its_hotkeys(tmp_path, monkeypatch):
     """One operator holds at most ``MAX_CHECKS_RUNNING - 1`` checks in flight across all its hotkeys."""

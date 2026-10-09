@@ -1,4 +1,4 @@
-"""POST /rl/episodes/precommit (plan 2C, Task 4)."""
+"""POST /rl/episodes/precommit."""
 import time
 
 import httpx

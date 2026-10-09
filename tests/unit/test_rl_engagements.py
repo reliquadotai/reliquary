@@ -1,4 +1,4 @@
-"""RL sandbox sessions bound to an episode precommit (plan 2C, Task 5)."""
+"""RL sandbox sessions bound to an episode precommit."""
 import asyncio
 from types import SimpleNamespace
 

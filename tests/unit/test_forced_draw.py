@@ -1,4 +1,4 @@
-"""The miner's forced draw over an episode's model tokens (plan 2C, Task 13)."""
+"""The miner's forced draw over an episode's model tokens."""
 import asyncio
 import sys
 import threading

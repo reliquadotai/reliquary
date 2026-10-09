@@ -280,7 +280,7 @@ def test_a_service_task_declared_but_silent_leaves_a_legacy_stream_byte_identica
 
 
 def test_the_weight_only_validator_reads_a_legacy_task_with_the_legacy_projection(monkeypatch):
-    """Item 13's bounds are fetch options of a SERVICE task only: a legacy task is asked for what it always was."""
+    """The bounds are fetch options of a SERVICE task only: a legacy task is asked for what it always was."""
     from reliquary.validator import weight_only
     from tests.unit.test_service_weight_replay import TASK, declared, wire
 

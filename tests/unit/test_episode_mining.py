@@ -1,4 +1,4 @@
-"""The episode-group miner's production entry point: the per-window loop and its wiring (plan 2C, Task 15b).
+"""The episode-group miner's production entry point: the per-window loop and its wiring.
 CPU only: fake vLLM core, proof model and validator; the generate app, the forced engine, the draws, the
 RL precommit client, the verdict poll and the group miner are the real ones."""
 import asyncio

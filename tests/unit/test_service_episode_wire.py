@@ -1,4 +1,4 @@
-"""The signed-episode wire (plan 2C, Task 2): precommit, engagement, commit metadata, bindings."""
+"""The signed-episode wire: precommit, engagement, commit metadata, bindings."""
 import copy
 import json
 from types import SimpleNamespace
@@ -376,7 +376,7 @@ def test_a_signed_episode_never_verifies_under_another_proof_version():
     assert not verify_commit_signature(moved, keypair.ss58_address)
 
 
-# Fixed inputs, digests computed on the tree before plan 2C Task 2 (5dd82b56): legacy and single-turn v2
+# Fixed inputs, digests computed on the tree before signed episodes (5dd82b56): legacy and single-turn v2
 # commits must keep binding to exactly these bytes.
 _SEED_POOL = {"schema": "public-seed-rollout/v2",
               "pool_sha256": "2b1728b34ff4a702376e6d1515f159ecd007c6a98e0268225a4829e3faa57cb6",

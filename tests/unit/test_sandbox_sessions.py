@@ -387,7 +387,7 @@ def test_a_restart_keeps_the_aborted_cap(tmp_path, monkeypatch):
 
 
 
-# -- fix round 1 ---------------------------------------------------------------------
+# -- one live session per prompt --------------------------------------------------
 
 def test_a_hotkey_holds_one_live_session_per_prompt(tmp_path):
     env = build(tmp_path, remaining=5)
@@ -465,13 +465,13 @@ def test_a_lapsed_session_is_never_paid(tmp_path):
     assert not sessions.session_submittable(LAPSED)
     assert env.book.get(grant.session_id).state == LAPSED
     assert env.store.documents[grant.session_id]["state"] == LAPSED
-    # a lapsed session is paid only through an on-time claim (task 11 fix round)
+    # a lapsed session is paid only through an on-time claim
     assert asyncio.run(env.issuer.claim(grant.session_id, hotkey="5Hot")).reason == \
         "session_not_submittable"
 
 
 def test_a_voided_session_is_never_paid(tmp_path):
-    """Amended ruling 3: a drained machine is our fault, so the miner keeps its open
+    """A drained machine is our fault, so the miner keeps its open
     refund and opens again; its voided session's late graded submission is not paid."""
     env = build(tmp_path)
     grant = open_(env)
@@ -645,10 +645,10 @@ def test_the_swe_task_resolver_cache_is_bounded_and_not_on_the_class():
 
 
 
-# -- fix round 2 ---------------------------------------------------------------------
+# -- an open_failed close is never paid later ----------------------------------------
 
 def test_an_open_failed_close_can_never_be_paid_later(tmp_path):
-    """Probe 7: hold a graded transcript, close `open_failed` to free the slot, let
+    """Hold a graded transcript, close `open_failed` to free the slot, let
     another miner take it, then submit. The late submission is refused, and the other
     miner's reservation stands."""
     env = build(tmp_path, remaining=1)
@@ -681,7 +681,7 @@ def test_only_a_live_or_graded_closed_session_becomes_submitted_in_the_store():
                                                        ABORTED, VOIDED, LAPSED}
 
 
-# -- the intake's claim (task 11) -----------------------------------------------------
+# -- the intake's claim -------------------------------------------------------
 
 def claim(env, grant, hotkey="5Hot"):
     return asyncio.run(env.issuer.claim(grant.session_id, hotkey=hotkey))
@@ -764,7 +764,7 @@ def test_a_released_claim_lets_drain_and_lapse_act_again(tmp_path):
     assert claim(env, grant).reason == "session_not_submittable"
 
 
-# -- fix round (task 11) --------------------------------------------------------------
+# -- claim time-to-live -------------------------------------------------------
 
 def test_a_claim_older_than_its_ttl_no_longer_freezes_the_session(tmp_path, caplog):
     policy = SandboxPolicy(claim_ttl_s=100)
@@ -884,7 +884,7 @@ def test_the_paid_session_snapshot_follows_restore_and_prune(tmp_path):
     assert book.submitted_ids() == frozenset()
 
 
-# -- withdraw (task 14 review) ----------------------------------------------------------
+# -- withdraw -------------------------------------------------------
 
 def test_a_withdraw_frees_the_slot_and_the_live_caps(tmp_path):
     policy = SandboxPolicy(max_live_per_hotkey=1, max_live_per_hotkey_job=1)
@@ -1001,7 +1001,7 @@ def test_a_withdraw_is_signed_apart_from_a_final():
         build_sandbox_close_binding({**body, "reason": "final"}, **kw)
 
 
-# -- final review: I1 (store errors are retryable), I2 (no slow I/O under the lock) ----
+# -- store errors are retryable; no slow I/O under the lock ----
 
 def _with_view(env, *, slots=None, resolve=None, banned=None):
     async def default_resolve(index):
@@ -1023,7 +1023,7 @@ def _with_view(env, *, slots=None, resolve=None, banned=None):
 ])
 @pytest.mark.parametrize("where", ["slots", "banned"])
 def test_a_store_error_during_an_open_is_a_retryable_ledger_refusal(tmp_path, error, where):
-    """I1: never a bare 500 (which the miner counts toward stopping the hotkey)."""
+    """Never a bare 500 (which the miner counts toward stopping the hotkey)."""
     env = build(tmp_path)
 
     async def failing(_):
@@ -1048,7 +1048,7 @@ def test_a_task_that_cannot_be_resolved_is_a_retryable_refusal(tmp_path):
 
 
 def test_a_claim_is_not_delayed_by_a_slow_open(tmp_path):
-    """I2: the ledger read, the ban check and the task resolution run before the issuer
+    """The ledger read, the ban check and the task resolution run before the issuer
     lock, so an intake's claim never waits behind them."""
     import time as _time
 

@@ -3350,7 +3350,7 @@ def test_accept_in_range_passes_range_gate(monkeypatch):
     assert resp.reason != RejectReason.PROMPT_OUT_OF_RANGE
 
 
-# ---- forced-seed group gate (Task 5) -------------------------------------
+# ---- forced-seed group gate ---------------------------------------------
 
 
 def _grail_with_seed_counts(n_stoch: int, n_match: int):

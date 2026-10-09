@@ -1,12 +1,12 @@
-"""Tripwires on every entry point of the next-RL-run service stack (phase 1) and of signed episodes (plan 2C).
+"""Tripwires on every entry point of the next-RL-run service stack (phase 1) and of signed episodes.
 
-A legacy RL task and a corpus job must never reach them; a single-turn v2 order never reaches the plan 2C ones. ``rl_service_tripwires`` is autouse where it is
+A legacy RL task and a corpus job must never reach them; a single-turn v2 order never reaches the signed-episode ones. ``rl_service_tripwires`` is autouse where it is
 imported: it replaces each entry point by a wrapper that RAISES and RECORDS the call, and fails the test
 afterwards if anything was recorded (a caller that swallows the exception does not hide it).
 
 Used two ways: ``from tests.unit.rl_tripwires import rl_service_tripwires`` in a test module (armed for that
 module only), and ``pytest -p tests.unit.rl_tripwires <legacy test file>`` (``test_next_rl_run_inertness``
-reruns the legacy and corpus suites that way). ``tests.unit.episode_tripwires`` arms the plan 2C entry points
+reruns the legacy and corpus suites that way). ``tests.unit.episode_tripwires`` arms the signed-episode entry points
 only (``EPISODE_ARMED`` and ``EPISODE_CONDITIONAL``), for the single-turn v2 suites that legitimately run the phase 1
 stack (``test_episode_inertness``).
 """
@@ -73,7 +73,7 @@ ARMED = (
     ("reliquary.validator.batcher", "GrpoWindowBatcher._classify_audit_failure"),
 )
 
-# Plan 2C (signed episodes in the v2 path): never reached by a legacy task, a single-turn order or a corpus job.
+# Signed episodes in the v2 path: never reached by a legacy task, a single-turn order or a corpus job.
 EPISODE_ARMED = (
     ("reliquary.services.runtime", "ServiceRuntime.record_episode_precommit"),
     ("reliquary.services.runtime", "ServiceRuntime.episode_precommit"),
@@ -125,7 +125,7 @@ def _batcher_hands_back(args, kwargs, result):
         pending is not None and self._signed_episode_pending(pending))
 
 
-# Plan 2C entry points a legacy task, a single-turn order or a corpus job DOES call, where the new code returns
+# Signed-episode entry points a legacy task, a single-turn order or a corpus job DOES call, where the new code returns
 # at once: wrapped, run for real, and recorded only when ``predicate(args, kwargs, result)`` says the episode
 # branch was taken. Both the defining module and the name a caller imported are wrapped.
 EPISODE_CONDITIONAL = (
@@ -221,13 +221,13 @@ def arm_entry_points(monkeypatch, calls: list[str], armed) -> None:
 
 
 def arm_episode(monkeypatch, calls: list[str]) -> None:
-    """The plan 2C entry points only (a single-turn v2 order legitimately runs the phase 1 stack)."""
+    """The signed-episode entry points only (a single-turn v2 order legitimately runs the phase 1 stack)."""
     arm_entry_points(monkeypatch, calls, EPISODE_ARMED)
     arm_conditional(monkeypatch, calls, EPISODE_CONDITIONAL)
 
 
 def arm_legacy(monkeypatch, calls: list[str]) -> None:
-    """Every entry point, phase 1 and plan 2C: what a legacy RL task or a corpus job runs under."""
+    """Every entry point, phase 1 and signed-episode: what a legacy RL task or a corpus job runs under."""
     arm_entry_points(monkeypatch, calls, ARMED)
 
     for module_name, dotted in RUNTIME_ONLY:

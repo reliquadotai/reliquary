@@ -1,5 +1,5 @@
 # tests/unit/episode_v2_fixtures.py
-"""Builders for signed-episode environments in the v2 service RL path (phase 2, plan 2C)."""
+"""Builders for signed-episode environments in the v2 service RL path (phase 2)."""
 from __future__ import annotations
 
 import time
@@ -102,7 +102,7 @@ PROMPT_TEXT = "Write 42 to /work/answer.txt."
 
 
 class FixedSource:
-    """An episode task source with one prompt for every task (plan 2A provides the real ones)."""
+    """An episode task source with one prompt for every task (the real ones are provided elsewhere)."""
 
     def __init__(self, text: str = PROMPT_TEXT, rows: int = 1000, image: str | None = None) -> None:
         self.text, self.rows, self.image = text, rows, image

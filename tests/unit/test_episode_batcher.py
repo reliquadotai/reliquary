@@ -1,4 +1,4 @@
-"""The batcher proves, audits and releases signed-episode groups (plan 2C, Task 10)."""
+"""The batcher proves, audits and releases signed-episode groups."""
 import dataclasses
 from types import SimpleNamespace
 
@@ -341,7 +341,7 @@ def test_every_stage_the_episode_check_rejects_at_is_classified():
     assert TEXT != TERM
 
 
-# --- Task 10 carries (binding list): pre-forward stop set, telemetry, texts, debt, seed coverage. ---------
+# --- pre-forward stop set, telemetry, texts, debt, seed coverage. ----------------------------------------
 
 def test_a_turn_ending_on_a_stop_the_proof_does_not_check_is_no_verdict_before_the_forward(tmp_path, monkeypatch):
     _eos(monkeypatch, {99})                    # the turns end on TERM, outside the proof's stop set
@@ -434,7 +434,7 @@ def test_the_restored_content_cooldown_digests_a_signed_episode_prompt_verbatim(
         EPISODE, batcher_module._render_environment_prompt(env, ChatTokenizer(), TASK))
 
 
-# --- Fix round 1: every unjudged training-lane outcome hands the group back; validator faults stay ours. ---
+# --- every unjudged training-lane outcome hands the group back; validator faults stay ours. ---
 
 def _hooked(w):
     calls = []
@@ -589,7 +589,7 @@ def test_the_hook_fires_once_per_group_whatever_its_memory_address(tmp_path):
     assert len(again_calls) == 1 and len(calls) == 30
 
 
-# --- Fix round 2: a policy-limit refusal and a buffer left at the window close hand the group back. ---
+# --- a policy-limit refusal and a buffer left at the window close hand the group back. ---
 
 def test_a_passed_group_the_reward_policy_refuses_is_handed_back(tmp_path, monkeypatch):
     from reliquary.validator.proof_scheduler import ProofDecisionStatus
@@ -652,7 +652,7 @@ def test_a_group_left_in_the_arrival_buffer_is_handed_back_when_the_window_close
     assert calls == [(w.pending, "validator_lost")]
 
 
-# --- Fix round 3: the miner's own resource-limit skip stays consumed; capacity abort and the seal flag hand back. ---
+# --- the miner's own resource-limit skip stays consumed; capacity abort and the seal flag hand back. ---
 
 def test_a_resource_limit_skip_is_the_miners_fault_and_is_not_handed_back(tmp_path, monkeypatch):
     from reliquary.validator.proof_scheduler import ProofDecisionStatus

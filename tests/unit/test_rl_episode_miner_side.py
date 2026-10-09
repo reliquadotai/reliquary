@@ -1,4 +1,4 @@
-"""The miner side of RL episodes: routes, runner hooks, the stop, the signed-episode commit (plan 2C, Task 14)."""
+"""The miner side of RL episodes: routes, runner hooks, the stop, the signed-episode commit."""
 import asyncio
 import dataclasses
 from types import SimpleNamespace
@@ -394,7 +394,7 @@ def test_an_honest_miners_commit_passes_the_validators_proof_on_cpu():
         build_signed_episode_commit(**{**honest.kwargs, "episode": other})
 
 
-# -- fix round 1 ----------------------------------------------------------------------------------------------
+# -- metadata and stop admission ----------------------------------------------------------------------
 
 
 def test_the_metadata_takes_only_a_stop_episode_stop_admitted():

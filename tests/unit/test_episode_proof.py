@@ -1,4 +1,4 @@
-"""TOPLOC over every model span and the per-turn forced stop pick (plan 2C, Task 9). CPU, mocked forward."""
+"""TOPLOC over every model span and the per-turn forced stop pick. CPU, mocked forward."""
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -261,7 +261,7 @@ def test_an_older_worker_s_answer_has_no_stop_verdict():
 
 
 def test_the_stop_pick_depends_on_the_u_at_its_model_token_offset():
-    # I2: a stop row near 0.5 on STOP makes the verdict depend on u; row t-1 and offset j must both be right.
+    # A stop row near 0.5 on STOP makes the verdict depend on u; row t-1 and offset j must both be right.
     logits, tokens, hidden = _episode()
     end = SPANS[0][1]
     row = torch.full((VOCAB,), -10.0)
@@ -297,7 +297,7 @@ def test_a_signed_episode_has_no_natural_close_diagnostic():
     assert result.natural_close_pick_ok is None
 
 
-# --- Task 10 carries: the failed turn's CDF distance (telemetry), no BFT carve-out for a signed episode. ---
+# --- the failed turn's CDF distance (telemetry), no BFT carve-out for a signed episode. ---
 
 def test_a_failed_stop_pick_reports_its_cdf_distance_as_telemetry():
     logits, tokens, hidden = _episode(stop_rows=(OTHER, STOP))

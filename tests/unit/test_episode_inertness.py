@@ -1,15 +1,15 @@
-"""Plan 2C is inert for legacy RL tasks, single-turn v2 orders and corpus jobs (Task 16).
+"""Signed episodes are inert for legacy RL tasks, single-turn v2 orders and corpus jobs.
 
 What this file proves, behaviourally:
 
-* a cold import of every legacy, single-turn v2 and corpus entry point loads no plan 2C module;
-* every plan 2C entry point is a tripwire (``tests/unit/rl_tripwires.py``: ``EPISODE_ARMED`` raise and record,
+* a cold import of every legacy, single-turn v2 and corpus entry point loads no signed-episode module;
+* every signed-episode entry point is a tripwire (``tests/unit/rl_tripwires.py``: ``EPISODE_ARMED`` raise and record,
   ``EPISODE_CONDITIONAL`` record when a shared function takes its episode branch). The legacy and corpus suites
   run under ALL tripwires (``test_next_rl_run_inertness``); here the single-turn v2 suites, the suites of the
-  shared modules plan 2C edited and the corpus miner / sandbox suites rerun in a child pytest under the plan 2C
+  shared modules signed episodes edited and the corpus miner / sandbox suites rerun in a child pytest under the signed-episode
   ones (``-p tests.unit.episode_tripwires``: they legitimately run the phase 1 stack);
 * what a legacy task, a single-turn v2 order and a corpus job put on the wire and on disk is byte for byte what the
-  tree before plan 2C (1c6930f4) produced (``tests/unit/legacy_wire_probe.py``, golden
+  tree before signed episodes (1c6930f4) produced (``tests/unit/legacy_wire_probe.py``, golden
   ``tests/unit/data/legacy_wire_1c6930f4.json``), with ONE known exception pinned exactly: a remote proof worker's
   result now carries three ``episode_stop_*`` keys (null for every legacy proof);
 * the corpus validator keeps refusing RL engagements, its routes, its session keys and store prefix.
@@ -39,7 +39,7 @@ REPO = Path(__file__).parents[2]
 GOLDEN = Path(__file__).parent / "data" / "legacy_wire_1c6930f4.json"
 DEFAULT_PROFILE = os.environ.get("RELIQUARY_PROTOCOL_PROFILE", "default") in ("", "default")
 
-# Every module plan 2C added (the precommit wire, the RL session engagements and routes, the admission and intake
+# Every module signed-episode added (the precommit wire, the RL session engagements and routes, the admission and intake
 # of a group, the validator wiring, the environment, the miner). ``reliquary.protocol.episode_retry`` is not one of
 # them on purpose: the legacy server imports it (a frozenset of stage names, it imports nothing).
 EPISODE_MODULES = (
@@ -53,7 +53,7 @@ EPISODE_MODULES = (
 
 @pytest.fixture
 def legacy_wires(monkeypatch):
-    """Every tripwire, phase 1 and plan 2C: a legacy RL task or a corpus job."""
+    """Every tripwire, phase 1 and signed-episode: a legacy RL task or a corpus job."""
     calls: list[str] = []
     rl_tripwires.arm_legacy(monkeypatch, calls)
     yield calls
@@ -62,7 +62,7 @@ def legacy_wires(monkeypatch):
 
 @pytest.fixture
 def episode_wires(monkeypatch):
-    """The plan 2C tripwires only: a single-turn v2 order (which runs the phase 1 stack)."""
+    """The signed-episode tripwires only: a single-turn v2 order (which runs the phase 1 stack)."""
     calls: list[str] = []
     rl_tripwires.arm_episode(monkeypatch, calls)
     yield calls
@@ -146,7 +146,7 @@ def test_a_single_turn_rollout_still_takes_no_episode(legacy_wires):
 
 
 def test_no_registered_environment_is_a_signed_episode_one():
-    """Plan 2C adds the mode, not an env: every registered env keeps its mode and manifest (golden below)."""
+    """Signed episodes add the mode, not an env: every registered env keeps its mode and manifest (golden below)."""
     from reliquary.environment.registry import ENVIRONMENT_SPECS
 
     assert {spec.interaction_mode for spec in ENVIRONMENT_SPECS.values()} <= {"single_turn", "episode"}
@@ -210,7 +210,7 @@ def test_the_corpus_sandbox_wiring_is_the_corpus_one(legacy_wires, tmp_path):
 
 
 def test_a_corpus_session_never_enters_the_rl_precommit_index(legacy_wires):
-    """``SessionBook.add`` parses every record's engagement as an RL one (plan 2C); a corpus engagement is never
+    """``SessionBook.add`` parses every record's engagement as an RL one; a corpus engagement is never
     one, so a corpus book's index stays empty and its bookkeeping is the corpus one."""
     from reliquary.corpus.signed_reasons import corpus_engagement
     from reliquary.sandbox.sessions import SandboxPolicy, SessionBook, SessionRecord
@@ -226,7 +226,7 @@ def test_a_corpus_session_never_enters_the_rl_precommit_index(legacy_wires):
     assert len(book.records()) == 3
 
 
-# ------------------------------------------------------------------ bytes against the tree before plan 2C
+# ------------------------------------------------------------------ bytes against the tree before signed episodes
 
 def test_a_payload_without_signed_episodes_keeps_its_header(legacy_wires):
     from tests.unit.test_training_payload_codec import _payload_bytes
@@ -275,8 +275,8 @@ EPISODE_PROOF_KEYS = ("episode_stop_cdf_miss", "episode_stop_first_bad_turn", "e
 @needs_default_profile
 @pytest.mark.parametrize("which", ["proof_values", "proof_values_toploc"])
 def test_a_legacy_proof_result_crosses_the_remote_wire(which, legacy_wires):
-    """Today's validator reads what a worker before plan 2C wrote, into the same verdict, and a worker of today writes
-    those very bytes back: the three ``episode_stop_*`` keys are omitted while None, so a controller before plan 2C
+    """Today's validator reads what a worker before signed episodes wrote, into the same verdict, and a worker of today writes
+    those very bytes back: the three ``episode_stop_*`` keys are omitted while None, so a controller before signed episodes
     (``extra="forbid"``) still accepts a legacy proof result."""
     from reliquary.validator.remote_proof_protocol import ProofValues, canonical_bytes
     from tests.unit import legacy_wire_probe
@@ -290,9 +290,9 @@ def test_a_legacy_proof_result_crosses_the_remote_wire(which, legacy_wires):
     assert legacy_wire_probe.proof_wire()[which] == old
 
 
-# ------------------------------------------------------------------ the suites, rerun under the plan 2C tripwires
+# ------------------------------------------------------------------ the suites, rerun under the signed-episode tripwires
 
-# Suites that never declare a signed-episode env: the single-turn v2 order, the shared modules plan 2C edited
+# Suites that never declare a signed-episode env: the single-turn v2 order, the shared modules signed episodes edited
 # (payload, submission wire and signatures, remote proof, TOPLOC, verifier, Episode v1, profiles) and the corpus
 # miner / sandbox. The legacy and corpus suites of ``test_next_rl_run_inertness`` run under ALL tripwires there.
 EPISODE_ARMED_SUITES = (
@@ -334,7 +334,7 @@ def test_the_suites_pass_with_every_episode_entry_point_armed(suite):
 
 
 def test_the_episode_tripwires_really_fire_and_record(episode_wires):
-    """Guard of the guard: every plan 2C entry point is refused AND recorded; a conditional one runs for real when
+    """Guard of the guard: every signed-episode entry point is refused AND recorded; a conditional one runs for real when
     its episode branch is not taken (nothing recorded) and is recorded when it is."""
     from reliquary.protocol.service_contract import supported_v2_capabilities
     from reliquary.shared import training_payload

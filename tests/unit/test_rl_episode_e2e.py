@@ -1,4 +1,4 @@
-"""Plan 2C end to end on CPU (Task 17): two real episode miners (the ``reliquary mine-episodes`` loop:
+"""Signed episodes end to end on CPU: two real episode miners (the ``reliquary mine-episodes`` loop:
 ``run_episode_miner`` -> ``EpisodeGroupMiner``) against this validator's real RL side, in one window.
 
 Real: reliquary-sandbox's gateway over ``FakeBoxes`` on 127.0.0.1 (real routes, signing, grading); the RL

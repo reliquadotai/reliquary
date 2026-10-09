@@ -1,4 +1,4 @@
-"""The trainer's view of a signed episode (plan 2C, Task 11)."""
+"""The trainer's view of a signed episode."""
 import copy
 import io
 import json

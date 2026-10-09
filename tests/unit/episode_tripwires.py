@@ -1,4 +1,4 @@
-"""Tripwires on the plan 2C (signed episode) entry points ONLY, for the suites of a single-turn v2 order: they run
+"""Tripwires on the signed-episode (signed episode) entry points ONLY, for the suites of a single-turn v2 order: they run
 the phase 1 service stack on purpose, and must never reach an episode entry point.
 
 ``pytest -p tests.unit.episode_tripwires <suite>`` arms ``EPISODE_ARMED`` (raise and record) and

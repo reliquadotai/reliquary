@@ -1,4 +1,4 @@
-"""The runtime's episode precommits (plan 2C, Task 3)."""
+"""The runtime's episode precommits."""
 import time
 
 import pytest

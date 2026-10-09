@@ -1,4 +1,4 @@
-"""The signed_episode interaction mode (plan 2C, Task 6)."""
+"""The signed_episode interaction mode."""
 import dataclasses
 
 import pytest

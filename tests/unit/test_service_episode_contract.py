@@ -1,4 +1,4 @@
-"""Episode environments in service-contract/v2 (plan 2C, Task 1)."""
+"""Episode environments in service-contract/v2."""
 import pytest
 
 from reliquary.protocol.service_contract import (

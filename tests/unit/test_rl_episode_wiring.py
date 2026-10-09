@@ -1,4 +1,4 @@
-"""The RL validator's sandbox side (plan 2C, Task 12) and the deferred items it closes."""
+"""The RL validator's sandbox side."""
 import asyncio
 import dataclasses
 import json
@@ -70,12 +70,12 @@ def test_the_services_serve_the_rl_routes_and_one_checker_per_episode_env(tmp_pa
     assert services.intake.environments == (EPISODE,) == services.environments
     assert set(services.issuer._engagements) == {"rl_precommit"}
     engagements = services.issuer._engagements["rl_precommit"]
-    # item 11: the precommit age is read from the runtime's own row
+    # the precommit age is read from the runtime's own row
     assert engagements._recorded_at == rt.episode_precommit_recorded_at
 
 
 def test_the_rl_policy_holds_every_group_in_flight_and_scales_its_caps(tmp_path):
-    """Item 7: max_live_per_hotkey >= (2M + 1) per group in flight; the hourly-open and daily-abort caps
+    """``max_live_per_hotkey`` >= (2M + 1) per group in flight; the hourly-open and daily-abort caps
     are scaled with it."""
     services, rt = _services(tmp_path)
     pool = rt.contract.episode_policy(EPISODE).pool_seeds
@@ -91,7 +91,7 @@ def test_the_rl_policy_holds_every_group_in_flight_and_scales_its_caps(tmp_path)
 
 
 async def test_start_restores_the_rl_sessions_and_fails_closed(tmp_path):
-    """Item 10: the RL store is read back before serving; a store that cannot be read stops the start."""
+    """The RL store is read back before serving; a store that cannot be read stops the start."""
     store = MemorySessionStore()
     services, _ = _services(tmp_path, store=store)
     record = _record("s-restored", sha="a" * 64)
@@ -194,11 +194,11 @@ async def test_an_episode_order_mounts_its_routes_and_its_intake(tmp_path, monke
         assert service.server._episode_intake is service._episode_services.intake
         assert len(service._episode_tasks) == 3            # fleet, session maintenance, precommit pruning
         intake = service._episode_services.intake
-        # item 13 wiring: the intake takes groups only for a window this process noted
+        # wiring: the intake takes groups only for a window this process noted
         assert intake._window_open(5) is False
         service._note_episode_window(5, resumed=False)
         assert intake._window_open(5) is True
-        # item 2 wiring: the retention the service computes
+        # wiring: the retention the service computes
         assert service._episode_services.precommit_retention_s == service._episode_precommit_retention_s()
     finally:
         await service._stop_episode_services()
@@ -216,7 +216,7 @@ async def test_an_episode_order_refuses_to_start_without_its_key_or_toploc(tmp_p
 
 
 async def test_an_episode_order_refuses_to_start_without_the_cooldown_hook(tmp_path, monkeypatch):
-    """Item 1: the hook is asserted at boot (no silent fail-open)."""
+    """The hook is asserted at boot (no silent fail-open)."""
     monkeypatch.setattr("reliquary.protocol.profiles.toploc_proof", lambda profile: TOPLOC_DEPLOYED_DEFAULTS)
     service = _service(tmp_path, monkeypatch, runtime=episode_runtime(tmp_path / "rt"))
     service._service_runtime.task_in_cooldown = None
@@ -246,7 +246,7 @@ async def test_an_episode_order_refuses_to_start_when_an_episode_env_is_not_a_re
 
 
 async def test_an_episode_order_refuses_to_start_when_a_renderer_stop_is_not_proven(tmp_path, monkeypatch):
-    """Item 14: a renderer stop outside the proof's stop set refuses the start."""
+    """a renderer stop outside the proof's stop set refuses the start."""
     monkeypatch.setattr("reliquary.protocol.profiles.toploc_proof", lambda profile: TOPLOC_DEPLOYED_DEFAULTS)
     service = _service(tmp_path, monkeypatch, runtime=episode_runtime(tmp_path / "rt"), stops={TERM})
     with pytest.raises(ValueError, match="outside the proof's stop set"):
@@ -254,7 +254,7 @@ async def test_an_episode_order_refuses_to_start_when_a_renderer_stop_is_not_pro
 
 
 def test_the_stop_sets_must_agree():
-    """Item 14: renderer stops within the proof's, and the remote worker's set equal to the batcher's."""
+    """renderer stops within the proof's, and the remote worker's set equal to the batcher's."""
     assert episode_stop_set_refusal({EPISODE: STOPS}, STOPS) is None
     assert episode_stop_set_refusal({EPISODE: STOPS}, STOPS | {7}, STOPS | {7}) is None
     assert "outside" in episode_stop_set_refusal({EPISODE: STOPS}, {TERM})
@@ -298,7 +298,7 @@ def test_the_current_window_is_the_announced_service_window_this_process_opened(
 
 
 def test_a_window_frozen_before_this_process_opened_it_takes_no_episode(tmp_path):
-    """Item 13: a restart never resumes a window for episode intake; an earlier open of this process does."""
+    """A restart never resumes a window for episode intake; an earlier open of this process does."""
     rt = episode_runtime(tmp_path)
     service = ValidationService.__new__(ValidationService)
     assert ValidationService._service_window_frozen(rt, 1) is True
@@ -315,7 +315,7 @@ def test_a_window_frozen_before_this_process_opened_it_takes_no_episode(tmp_path
 
 
 def test_the_service_opens_a_window_for_episodes_only_when_it_froze_it(tmp_path):
-    """Item 13 through the real ``_open_service_window``."""
+    """A restart through the real ``_open_service_window``."""
     rt = episode_runtime(tmp_path)                                       # window 1 frozen "before the restart"
     service = ValidationService.__new__(ValidationService)
     service._service_runtime = rt
@@ -335,7 +335,7 @@ def test_the_service_opens_a_window_for_episodes_only_when_it_froze_it(tmp_path)
 
 
 def test_an_episode_group_of_a_resumed_window_is_refused_before_any_check(tmp_path):
-    """Item 13 at the intake."""
+    """The same rule at the intake."""
     from tests.unit.test_episode_intake import admit, world
 
     w = world(tmp_path, intake_kwargs={"window_open": lambda window: False})
@@ -374,7 +374,7 @@ def _stopping_service(calls, *, fail=None):
 
 
 async def test_the_episode_services_stop_after_the_proof_plane_and_the_server():
-    """I1: late hand-backs (from the proof plane's last verdicts) still find the services running."""
+    """late hand-backs (from the proof plane's last verdicts) still find the services running."""
     calls = []
     await _stopping_service(calls)._stop_serving()
     assert calls == ["observations", "proof_scheduler", "server", "episode_services", "runtime"]
@@ -385,7 +385,7 @@ async def test_the_episode_services_stop_after_the_proof_plane_and_the_server():
 
 
 def test_the_validators_prompt_cooldown_hook_reads_its_live_maps():
-    """Item 1 (replaces the source-grep test): the hook the runtime gets, against real CooldownMaps."""
+    """The hook the runtime gets, against real CooldownMaps."""
     service = ValidationService.__new__(ValidationService)
     cooling = CooldownMap(cooldown_windows=3)
     cooling.record_batched(7, window=10)
@@ -398,7 +398,7 @@ def test_the_validators_prompt_cooldown_hook_reads_its_live_maps():
     assert service._episode_task_in_cooldown(EPISODE, 7, 11) is False
 
 
-# --- item 6: a stalled window opens no session ---
+# --- a stalled window opens no session ---
 def test_a_session_is_refused_when_its_window_is_older_than_the_longest_window(tmp_path):
     from reliquary.constants import FILL_CLOSED_MAX_SECONDS
     from tests.unit.sandbox_fixtures import NOW
@@ -418,7 +418,7 @@ def test_a_session_is_refused_when_its_window_is_older_than_the_longest_window(t
     assert asyncio.run(terms.terms("5Hot", engagement(env.precommit, 0))).reason == "precommit_stale"
 
 
-# --- item 5 (+ fix round 1, I2/I3/I3b): the precommit route is bounded before its signature check ---
+# --- the precommit route is bounded before its signature check ---
 ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 CHARLIE = "5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y"
 DAVE = "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy"
@@ -474,7 +474,7 @@ def _endpoint(router):
 
 
 def test_the_precommit_route_rate_limits_each_hotkey_once_it_signed(tmp_path):
-    """I2: a signed request over the hotkey's minute is refused before its signature is verified."""
+    """a signed request over the hotkey's minute is refused before its signature is verified."""
     rt = episode_runtime(tmp_path)
     calls = []
     client = _precommit_client(rt, verify=_signed_only(calls), max_per_minute=2)
@@ -486,7 +486,7 @@ def test_the_precommit_route_rate_limits_each_hotkey_once_it_signed(tmp_path):
 
 
 def test_unsigned_requests_claiming_a_hotkey_do_not_spend_its_rate(tmp_path):
-    """I2: 30 unsigned requests naming H, then H's signed one goes through."""
+    """30 unsigned requests naming H, then H's signed one goes through."""
     rt = episode_runtime(tmp_path)
     client = _precommit_client(rt, verify=_signed_only([]))
     junk = [client.post(f"{RL_PREFIX}/episodes/precommit", json=_precommit_body(rt)) for _ in range(30)]
@@ -496,7 +496,7 @@ def test_unsigned_requests_claiming_a_hotkey_do_not_spend_its_rate(tmp_path):
 
 
 def test_an_unregistered_hotkey_is_refused_before_its_signature_and_never_tracked(tmp_path):
-    """I2 + I3b: the in-memory registration check runs first; an unregistered hotkey costs no verify and
+    """the in-memory registration check runs first; an unregistered hotkey costs no verify and
     takes no place among the tracked hotkeys (capped: the oldest is forgotten)."""
     from reliquary.validator.corpus_registration import NOT_REGISTERED
 
@@ -543,7 +543,7 @@ async def test_the_precommit_route_bounds_the_requests_it_verifies_at_once(tmp_p
 
 
 async def test_slow_bodies_do_not_hold_the_precommit_routes_verification_slots(tmp_path):
-    """I3: the bound covers decode + verify, not the body read: 8 slow bodies, then an honest one."""
+    """the bound covers decode + verify, not the body read: 8 slow bodies, then an honest one."""
     rt = episode_runtime(tmp_path)
     endpoint = _endpoint(_precommit_router(rt, verify=_signed_only([])))
     arrive = asyncio.Event()
@@ -624,7 +624,7 @@ async def test_the_open_route_bounds_the_opens_it_verifies_at_once_but_not_their
     assert (await asyncio.wait_for(slow, 5)).status_code == 403
 
 
-# --- item 2: precommit rows retention ---
+# --- precommit rows retention ---
 def _settle(rt, window):
     with rt._txn():
         rt.db.execute("INSERT INTO service_settled VALUES(?,?,?,?)", (rt.contract.sha256, window, 0, "{}"))
@@ -661,7 +661,7 @@ async def test_the_services_prune_what_no_held_session_names(tmp_path):
     assert rt.episode_precommit(gone.sha256) is None and rt.episode_precommit(held.sha256) == held
 
 
-# --- the hand-back hook (items 16 and the Task 10 carry) ---
+# --- the hand-back hook ---
 def _record(session_id, *, sha, hotkey="5Hot", state=SUBMITTED, seed=0, expires_at=None, issued_at=None):
     from reliquary.protocol.service_episode import rl_engagement
     from reliquary.sandbox.sessions import SessionRecord
@@ -855,7 +855,7 @@ def test_a_v2_order_without_episode_envs_never_loads_the_sandbox_package(tmp_pat
 
 
 def test_the_nested_eos_of_a_remote_config_joins_the_boot_check_but_not_the_legacy_stop_set():
-    """I5 (ruling): the legacy proxies stay as before (flat config, nested eos unseen by the batcher's
+    """the legacy proxies stay as before (flat config, nested eos unseen by the batcher's
     resolver); only the episode boot check reads the nested ``text_config`` eos."""
     from reliquary.shared.modeling import resolve_eos_token_ids
     from reliquary.validator.remote_proof import RemoteProofPool
@@ -879,7 +879,7 @@ def test_the_nested_eos_of_a_remote_config_joins_the_boot_check_but_not_the_lega
     assert proof == {TERM, EOT, 9} and remote == {TERM, EOT, 9}                    # the boot check sees it
 
 
-# --- item 17: nothing published carries a transcript ---
+# --- nothing published carries a transcript ---
 async def test_the_window_archive_and_journal_carry_no_signed_episode_transcript(monkeypatch, tmp_path):
     from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
     from tests.unit import test_legacy_archive_golden as golden
@@ -898,7 +898,7 @@ async def test_the_window_archive_and_journal_carry_no_signed_episode_transcript
         return dataclasses.replace(group, completion_texts=[""] * len(group.rollouts))
 
     monkeypatch.setattr(golden, "_valid_submission", signed_submission)
-    # The training payload's own strip is Task 11's (test_episode_training); this legacy-profile harness
+    # The training payload's own strip is tested in test_episode_training; this legacy-profile harness
     # cannot encode an episode payload, so the encoder is stubbed and only told what it would encode.
     encoded = []
     monkeypatch.setattr("reliquary.validator.fill_closed_batch_assembler.encode_training_payload",

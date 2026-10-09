@@ -1,4 +1,4 @@
-"""The episode-group miner (plan 2C, Task 15)."""
+"""The episode-group miner."""
 import asyncio
 import inspect
 from types import SimpleNamespace
