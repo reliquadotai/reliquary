@@ -477,8 +477,7 @@ def _decision(job_id, status, value=None):
                            finished_at=None, value=value)
 
 
-@pytest.mark.parametrize("status", ["NOT_NEEDED", "SKIPPED_PROMPT_CLAIMED", "SKIPPED_RESOURCE_LIMIT",
-                                    "CAPACITY_ABORTED", "ERROR"])
+@pytest.mark.parametrize("status", ["NOT_NEEDED", "SKIPPED_PROMPT_CLAIMED", "CAPACITY_ABORTED", "ERROR"])
 def test_a_scheduler_decision_without_a_verdict_hands_the_group_back(tmp_path, monkeypatch, status):
     from reliquary.validator.proof_scheduler import ProofDecisionStatus
 
@@ -622,3 +621,68 @@ def test_a_group_left_in_the_arrival_buffer_is_handed_back_when_the_window_close
     w.b._seal_v6_proof_plan()
     w.b._seal_v6_proof_plan()                                           # a second poll hands nothing back again
     assert calls == [(w.pending, "validator_lost")]
+
+
+# --- Fix round 3: the miner's own resource-limit skip stays consumed; capacity abort and the seal flag hand back. ---
+
+def test_a_resource_limit_skip_is_the_miners_fault_and_is_not_handed_back(tmp_path, monkeypatch):
+    from reliquary.validator.proof_scheduler import ProofDecisionStatus
+
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+    w.b.fill_state.reserve(EPISODE)
+    w.b._arrival_proof_meta["job-1"] = (None, 0, "", w.pending)
+    w.b._open_proof_plan_handle = SimpleNamespace(
+        decisions=lambda: [_decision("job-1", ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT)], done=lambda: False)
+    w.b._reconcile_fill_state_decisions(EPISODE)
+    assert calls == []
+
+
+def test_a_capacity_abort_close_hands_back_the_buffered_groups(tmp_path, monkeypatch):
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_BOUNDED_PROOFS", False)
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    w.b.difficulty_auction_enabled = True
+    calls = _hooked(w)
+    w.b.fill_state.may_admit = lambda environment: False
+    _buffer(w)
+    w.b.proof_capacity_aborted = True
+    assert w.b.poll_deadline() is True
+    assert calls == [(w.pending, "validator_lost")]
+
+
+def test_a_group_handed_back_is_not_pre_recorded_as_proven(tmp_path, monkeypatch):
+    _eos(monkeypatch, {TERM})
+    w = world(tmp_path, _stub())
+    w.b.service_runtime = object()
+    recorded = []
+    w.b._prerecord_service_training = lambda pending, verified: recorded.append(pending)
+    w.b._verify_expensive = lambda pending, model=None: object()
+    w.b._execute_scheduled_proof(w.pending, model=None, count_operator_debt=True)
+    assert recorded == [w.pending]                       # a normal proof still records
+    w.pending.episode_inconclusive_notified = True       # released: no "proven" row next to a released session
+    recorded.clear()
+    w.b._execute_scheduled_proof(w.pending, model=None, count_operator_debt=True)
+    assert recorded == []
+
+
+def test_a_plan_closed_with_the_seal_flag_set_hands_every_buffered_group_back(tmp_path, monkeypatch):
+    import copy
+
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+    other = copy.copy(w.pending)
+
+    def closed(candidates):
+        w.b._seal_flag.set()              # the seal lands while this candidate is being extended
+        raise batcher_module.ProofPlanClosed("sealed")
+
+    w.b._extend_proof_plan = closed
+    _buffer(w)
+    w.b._arrival_proof_buffer.append(batcher_module._BufferedArrivalProof(
+        pending=other, rate=None, payload_bytes=0, receipt_id="", sequence=2))
+    w.b._drain_arrival_proof_buffer(EPISODE)
+    assert w.b._arrival_proof_buffer == []
+    assert {id(p) for p, _ in calls} == {id(w.pending), id(other)} and len(calls) == 2

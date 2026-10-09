@@ -2272,8 +2272,12 @@ class GrpoWindowBatcher:
                     )
                 else:
                     self.fill_state.release(environment)
-                    if decision.status is not ProofDecisionStatus.REJECTED:
-                        # Plan 2C: settled without a verdict (not needed, claimed, limit, aborted, error).
+                    if decision.status not in (
+                        ProofDecisionStatus.REJECTED,
+                        ProofDecisionStatus.SKIPPED_RESOURCE_LIMIT,
+                    ):
+                        # Plan 2C: settled without a verdict (not needed, claimed, aborted, error). A resource-limit
+                        # skip is the miner's own proof-failure debt: its sessions stay consumed.
                         unjudged.append(pending)
         for pending in policy_refused:
             self._episode_proof_inconclusive(pending, "policy_limit")
@@ -3175,6 +3179,7 @@ class GrpoWindowBatcher:
             # Reconcile on every observation path, including strict mode.
             self._reconcile_fill_state_decisions(environment)
             if self.proof_capacity_aborted:
+                self._hand_back_buffered_arrivals()
                 self._burn_unpicked_proven_groups()
                 self._seal_flag.set()
                 return True
@@ -6312,7 +6317,12 @@ class GrpoWindowBatcher:
             # Plan 2C: a signed-episode group whose proof raised or was aborted is handed back (no verdict).
             self._episode_proof_inconclusive(pending, "validator_lost")
             raise
-        if verified is not None and self.service_runtime is not None:
+        if (
+            verified is not None
+            and self.service_runtime is not None
+            # a group already handed back has released sessions: no "proven" row next to them
+            and not getattr(pending, "episode_inconclusive_notified", False)
+        ):
             # On this proof-worker thread, so the SQLite transaction never runs on the event loop.
             self._prerecord_service_training(pending, verified)
         # Plan 2C: a signed-episode group the proof could not judge (validator side) is handed back and
