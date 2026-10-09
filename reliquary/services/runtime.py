@@ -140,6 +140,16 @@ class ServicePolicyLimit(ValueError):
     observation_id: str | None = None
 
 
+
+class EpisodePrecommitRefused(ValueError):
+    """An episode precommit the frozen window does not allow (plan 2C); nothing was written. ``reason`` is
+    the wire reason; ``existing`` names the live precommit of the same (hotkey, env, task, window)."""
+
+    def __init__(self, reason: str, existing: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.existing = existing
+
 def protocol_slot_geometry() -> tuple[int, int]:
     """``(picks_target, batch_slots)`` of one env in one window, from the protocol constants."""
     from reliquary.constants import B_BATCH, FILL_CLOSED_PICKS_PER_WINDOW
@@ -203,6 +213,8 @@ class ServiceRuntime:
         self.qualification = json.loads(canonical_json_bytes(qualification))
         self._round_at = drand_round_at or _drand_round_at
         self.lock = threading.RLock()
+        # Installed by the validator, which owns the per-env prompt cooldown maps (plan 2C).
+        self.task_in_cooldown: Callable[[str, int, int], bool] | None = None
         instant = _instant(now)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
         try:
@@ -227,6 +239,7 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_index_pages(first_number INTEGER PRIMARY KEY, body BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_schedule_requests(order_id TEXT NOT NULL, request_id TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, revision INTEGER NOT NULL, window INTEGER NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, request_id));
                 CREATE TABLE IF NOT EXISTS service_pending_install(order_id TEXT PRIMARY KEY, revision TEXT NOT NULL, receipt TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS service_episode_precommits(order_id TEXT NOT NULL, sha256 TEXT NOT NULL, window INTEGER NOT NULL, environment TEXT NOT NULL, task_index INTEGER NOT NULL, hotkey TEXT NOT NULL, body TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, sha256), UNIQUE(order_id, window, environment, task_index, hotkey));
             """)
             if "opened_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(service_windows)")}:
                 self.db.execute("ALTER TABLE service_windows ADD COLUMN opened_at REAL")
@@ -853,6 +866,10 @@ class ServiceRuntime:
                 raise ServicePolicyLimit(f"service window {window} is settled; its envelope is permanent")
             if self.log.window_observations(window):
                 raise ServicePolicyLimit(f"service window {window} has observations; its envelope is permanent")
+            if self.db.execute("SELECT 1 FROM service_episode_precommits WHERE order_id=? AND window=? LIMIT 1",
+                               (order, window)).fetchone():
+                raise ServicePolicyLimit(f"service window {window} has episode precommits; its envelope is "
+                                         f"permanent")
             for env in sorted(json.loads(saved[0])["pools"]):
                 if self.ledger.rows(window, environment=env) or self.ledger.is_finalized(window, environment=env):
                     raise ServicePolicyLimit(f"service window {window} has exploration ledger rows; "
@@ -937,6 +954,77 @@ class ServiceRuntime:
         return SeedPool.from_contract(self.contract, environment=environment, prompt_idx=prompt_idx,
                                       checkpoint_hash=envelope["checkpoint"]["revision"], pool_epoch=window,
                                       randomness=row[0])
+
+    # --- episode precommits (plan 2C, spec 4.1.2) ---
+    def record_episode_precommit(self, precommit, *, now: float | None = None) -> tuple[bool, str]:
+        """Record a miner's precommit against the FROZEN window: this order, an env of the window with
+        an episode policy, a task of its dataset, the window's checkpoint and the task's announced pool.
+        ``(created, sha256)``; the same precommit again is ``(False, sha256)``. A refusal raises
+        ``EpisodePrecommitRefused`` and writes nothing. One live precommit per (hotkey, env, task,
+        window). A task in cooldown for its env in that window is refused (``task_in_cooldown``) so no
+        session is spent on it; the cooldown state lives in the validator, which installs
+        ``task_in_cooldown(environment, task_index, window) -> bool``. BLOCKING (SQLite): the route
+        runs it in a thread."""
+        from reliquary.protocol.service_episode import EpisodePrecommit
+
+        if not isinstance(precommit, EpisodePrecommit):
+            raise TypeError("an EpisodePrecommit is required")
+        instant = _instant(now)
+        order = self.contract.sha256
+        if precommit.order != order:
+            raise EpisodePrecommitRefused("order_mismatch")
+        environments = self.contract.environments
+        if (precommit.environment not in environments
+                or self.contract.episode_policy(precommit.environment) is None):
+            raise EpisodePrecommitRefused("environment_not_episode")
+        if precommit.task_index >= environments[precommit.environment]["dataset"]["rows"]:
+            raise EpisodePrecommitRefused("task_out_of_range")
+        digest = precommit.sha256
+        body = canonical_json_bytes(precommit.to_dict()).decode()
+        with self._txn():
+            try:
+                envelope = self._envelope(precommit.window)
+            except ServicePolicyLimit:
+                raise EpisodePrecommitRefused("window_not_open") from None
+            if self._settled(precommit.window):
+                raise EpisodePrecommitRefused("window_closed")
+            if precommit.environment not in envelope["pools"]:
+                raise EpisodePrecommitRefused("environment_not_active")
+            if precommit.checkpoint != envelope["checkpoint"]["revision"]:
+                raise EpisodePrecommitRefused("checkpoint_mismatch")
+            try:
+                pool = self._seed_pool(envelope, precommit.window, precommit.environment, precommit.task_index)
+            except ServicePolicyLimit:
+                raise EpisodePrecommitRefused("window_not_open") from None
+            if pool is None or pool.sha256 != precommit.pool_sha256:
+                raise EpisodePrecommitRefused("pool_mismatch")
+            existing = self.db.execute(
+                "SELECT sha256 FROM service_episode_precommits WHERE order_id=? AND window=? AND environment=? "
+                "AND task_index=? AND hotkey=?",
+                (order, precommit.window, precommit.environment, precommit.task_index, precommit.hotkey),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] == digest:
+                    return False, digest
+                raise EpisodePrecommitRefused("precommit_exists", existing[0])
+            probe = self.task_in_cooldown
+            if probe is not None and probe(precommit.environment, precommit.task_index, precommit.window):
+                raise EpisodePrecommitRefused("task_in_cooldown")
+            self.db.execute("INSERT INTO service_episode_precommits VALUES(?,?,?,?,?,?,?,?)",
+                            (order, digest, precommit.window, precommit.environment, precommit.task_index,
+                             precommit.hotkey, body, instant))
+        return True, digest
+
+    def episode_precommit(self, sha256: str):
+        """The precommit recorded under ``sha256`` in this order (any window), or None."""
+        from reliquary.protocol.service_episode import EpisodePrecommit
+
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return None
+        with self.lock:
+            row = self.db.execute("SELECT body FROM service_episode_precommits WHERE order_id=? AND sha256=?",
+                                  (self.contract.sha256, sha256)).fetchone()
+        return None if row is None else EpisodePrecommit.from_dict(json.loads(row[0]))
 
     # --- observations (decisions A, B) ---
     def _observation(self, envelope: dict, *, environment, prompt_idx, hotkey, window, rewards, group_id,

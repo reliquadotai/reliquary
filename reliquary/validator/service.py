@@ -1184,6 +1184,12 @@ class ValidationService:
                     horizon = schedule.cooldown_windows(name)
                     self._cooldown_per_env[name] = CooldownMap(cooldown_windows=horizon)
                     self._content_cooldown_per_env[name] = ContentCooldownMap(cooldown_windows=horizon)
+            # An episode precommit on a task in cooldown is refused by the runtime (plan 2C): the
+            # maps are looked up at call time, a new window may have replaced them.
+            self._service_runtime.task_in_cooldown = (
+                lambda environment, task_index, window: environment in self._cooldown_per_env
+                and self._cooldown_per_env[environment].is_in_cooldown(task_index, window)
+            )
         self._content_cooldown_health: dict[str, Any] = {
             "complete": False,
             "source": "not_restored",
