@@ -1,22 +1,36 @@
-"""Sandboxed OpenCode worker.
+"""Sandboxed code worker.
 
 The worker runs untrusted miner code inside gVisor. It does not receive
 hidden assertions or expected values. Each request contains only the code,
 an entrypoint, and public call arguments; the trusted grader server compares
 the returned primitive value against the hidden expected value.
+
+A ``"mode": "stdio"`` request runs a whole program on one stdin instead, in a
+child forked for that request alone, through the ``run`` of the guest source
+the request carries (the packaged environment's own ``judge/guest.py``, read by
+the trusted side from its verified wheel). The reply is what the program
+printed; the trusted side compares it.
 """
 
 from __future__ import annotations
 
 import ast
+import base64
 import builtins
 import contextlib
 import faulthandler
+import glob
+import hashlib
 import inspect
 import io
 import json
 import math
+import os
+import resource
+import select
+import signal
 import sys
+import time
 from typing import Any
 
 
@@ -329,6 +343,224 @@ def evaluate_call(
             return None, "runtime_error"
 
 
+# Stdio mode. The wall clock sits above the CPU limit: a program is judged on
+# its CPU, and the wall clock only catches one that idles (sleep, deadlock).
+STDIO_WALL_FACTOR = 2.0
+STDIO_WALL_SLACK_S = 1.0
+# What a program may address, as the package's own runner grants it. The
+# sandbox's hard limit wins when it is lower.
+STDIO_MEMORY_BYTES = 2 << 30
+# Bytes read past the output cap before the rest is dropped: the result line
+# and its JSON escaping.
+STDIO_READ_SLACK = 1 << 20
+STDIO_DRAIN_S = 0.5
+# Raw stdout bytes per reply line: 40 KB once in base64, under the 64 KiB a
+# single line may carry out of runsc (see `_reply_in_chunks`).
+STDIO_CHUNK_BYTES = 30_000
+# CPU seconds under which a program killed by the wall clock idled, when the
+# run queue cannot be read (gVisor): measured at ~0.02 s for a sleeping one.
+STDIO_IDLE_CPU_S = 0.1
+_GUEST_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _guest_run(source: str):
+    """The guest's ``run``, compiled once per distinct source."""
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    namespace = _GUEST_CACHE.get(digest)
+    if namespace is None:
+        namespace = {"__name__": "reliquary_stdio_guest"}
+        exec(compile(source, "<guest>", "exec"), namespace)
+        if not callable(namespace.get("run")):
+            raise ValueError("guest source defines no run()")
+        _GUEST_CACHE.clear()
+        _GUEST_CACHE[digest] = namespace
+    return namespace["run"]
+
+
+def _lower_limit(which: int, value: int) -> None:
+    _, hard = resource.getrlimit(which)
+    if hard != resource.RLIM_INFINITY:
+        value = min(value, hard)
+    resource.setrlimit(which, (value, value))
+
+
+def _run_queue_wait_s(pid: int) -> float | None:
+    """Seconds every thread of ``pid`` waited runnable but not running, or
+    None when nothing could be read (as in the package's runner)."""
+    total, read = 0, 0
+    for path in glob.glob(f"/proc/{pid}/task/*/schedstat"):
+        try:
+            with open(path, "rb") as handle:
+                total += int(handle.read().split()[1])
+            read += 1
+        except (OSError, ValueError, IndexError):
+            continue
+    return total / 1e9 if read else None
+
+
+def _child(run, write_fd: int, code: str, stdin_text: str, output_cap: int,
+           time_limit_s: float) -> None:
+    """In the fork: no fd but the result pipe, the CPU limit, then the guest."""
+    try:
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        os.closerange(3, write_fd)
+        os.closerange(write_fd + 1, 1 << 16)
+        cpu = math.ceil(time_limit_s) + 1
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+        _lower_limit(resource.RLIMIT_AS, STDIO_MEMORY_BYTES)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+        result = run(code, stdin_text, output_cap)
+        payload = ("\n" + json.dumps(result) + "\n").encode("utf-8")
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(write_fd, view):]
+        os._exit(0)
+    except BaseException:
+        os._exit(1)
+
+
+def run_stdio(
+    guest_source: str,
+    code: str,
+    stdin_text: str,
+    output_cap: int,
+    time_limit_s: float,
+) -> dict[str, Any]:
+    """Run ``code`` on ``stdin_text`` in a fresh fork; status, stdout, CPU.
+
+    The statuses and their order are the package runner's: CPU time and exit
+    status come from the kernel (``wait4``), never from the child, which shares
+    the result pipe with the submission and could forge it.
+    """
+    if sys.flags.hash_randomization:
+        # Set and dict orders of strings would differ between replays.
+        return {"status": "grader_error", "stdout": "", "cpu_seconds": 0.0}
+    run = _guest_run(guest_source)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        _child(run, write_fd, code, stdin_text, output_cap, time_limit_s)
+    os.close(write_fd)
+    chunks: list[bytes] = []
+    kept, keep = 0, output_cap + STDIO_READ_SLACK
+    deadline = time.monotonic() + STDIO_WALL_FACTOR * time_limit_s + STDIO_WALL_SLACK_S
+    wall_fired, run_queue_wait, eof = False, None, False
+    try:
+        while True:
+            reaped, status, usage = os.wait4(pid, os.WNOHANG)
+            if reaped:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Read before the kill, while the pid is still this child's.
+                run_queue_wait = _run_queue_wait_s(pid)
+                wall_fired = True
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+                _, status, usage = os.wait4(pid, 0)
+                break
+            if eof:
+                time.sleep(min(remaining, 0.005))
+                continue
+            ready, _, _ = select.select([read_fd], [], [], min(remaining, 0.05))
+            if ready:
+                block = os.read(read_fd, 65536)
+                if not block:
+                    eof = True
+                elif kept < keep:
+                    chunks.append(block)
+                    kept += len(block)
+        # Whatever the submission left in its session dies with it.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, signal.SIGKILL)
+        drain_until = time.monotonic() + STDIO_DRAIN_S
+        while not eof and time.monotonic() < drain_until:
+            ready, _, _ = select.select([read_fd], [], [], STDIO_DRAIN_S)
+            if not ready:
+                break
+            block = os.read(read_fd, 65536)
+            if not block:
+                break
+            if kept < keep:
+                chunks.append(block)
+                kept += len(block)
+    finally:
+        os.close(read_fd)
+    exit_code = os.waitstatus_to_exitcode(status)
+    cpu = usage.ru_utime + usage.ru_stime
+
+    def verdict(name: str, stdout: str = "") -> dict[str, Any]:
+        return {"status": name, "stdout": stdout, "cpu_seconds": cpu}
+
+    if exit_code == -signal.SIGXCPU or cpu > time_limit_s:
+        return verdict("timeout")
+    if wall_fired and exit_code != 0:
+        # Runnable longer than its limit but not run: the host starved it, no
+        # verdict. Otherwise it idled (sleep, deadlock): the program's failure.
+        if run_queue_wait is not None:
+            starved = cpu + run_queue_wait > time_limit_s
+        else:
+            # gVisor has no schedstat. Idle is then a program that used almost
+            # no CPU in a whole wall window, which a starved one would only do
+            # on a host oversubscribed many times over.
+            starved = cpu > STDIO_IDLE_CPU_S
+        return verdict("harness_overload" if starved else "timeout")
+    if exit_code == -signal.SIGKILL:
+        return verdict("timeout")
+    if exit_code != 0:
+        return verdict("runtime_error")
+    try:
+        line = b"".join(chunks).decode("utf-8", errors="replace").rstrip().rsplit("\n", 1)[-1]
+        result = json.loads(line)
+        name, text = str(result["status"]), str(result["stdout"])
+    except (ValueError, KeyError, TypeError, IndexError):
+        return verdict("runtime_error")
+    if name not in {"ok", "output_limit", "runtime_error", "forbidden_import"}:
+        return verdict("runtime_error")
+    return verdict(name, text if name == "ok" else "")
+
+
+def _reply_in_chunks(resp: dict[str, Any]) -> None:
+    """A header line, then the stdout in base64 lines, each sent only when the
+    server asks for it.
+
+    Measured under runsc (release-20260928.0): a line past 64 KiB written to
+    the donated stdout pipe stalls after the first 64 KiB and never arrives.
+    Each chunk is under that and is written into a pipe the server has
+    emptied, so no write ever has to wait.
+    """
+    data = str(resp.pop("stdout", "")).encode("utf-8")
+    pieces = [data[i:i + STDIO_CHUNK_BYTES] for i in range(0, len(data), STDIO_CHUNK_BYTES)]
+    resp["stdout_chunks"] = len(pieces)
+    sys.__stdout__.write(json.dumps(resp) + "\n")
+    sys.__stdout__.flush()
+    for piece in pieces:
+        if sys.stdin.readline().strip() != "next":
+            return  # the server gave up on this reply
+        sys.__stdout__.write(base64.b64encode(piece).decode("ascii") + "\n")
+        sys.__stdout__.flush()
+
+
+def _stdio_request(req: dict[str, Any]) -> dict[str, Any]:
+    guest, code, stdin_text = req.get("guest"), req.get("code"), req.get("stdin")
+    output_cap, time_limit_s = req.get("output_cap"), req.get("time_limit_s")
+    if (
+        not isinstance(guest, str) or not guest
+        or not isinstance(code, str)
+        or not isinstance(stdin_text, str)
+        or not isinstance(output_cap, int) or isinstance(output_cap, bool)
+        or output_cap <= 0
+        or not isinstance(time_limit_s, (int, float)) or isinstance(time_limit_s, bool)
+        or not math.isfinite(time_limit_s) or time_limit_s <= 0
+    ):
+        return {"status": "bad_request", "stdout": "", "cpu_seconds": 0.0}
+    return run_stdio(guest, code, stdin_text, output_cap, float(time_limit_s))
+
+
 def _serve_stdin() -> None:
     for line in sys.stdin:
         line = line.strip()
@@ -336,6 +568,9 @@ def _serve_stdin() -> None:
             continue
         try:
             req = json.loads(line)
+            if req.get("mode") == "stdio":
+                _reply_in_chunks({"req_id": req.get("req_id", ""), **_stdio_request(req)})
+                continue
             output, status = evaluate_call(
                 req.get("code", ""),
                 req.get("entry", {}),
