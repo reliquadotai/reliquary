@@ -46,7 +46,7 @@ class EpisodeEnv:
 
 
 def _stub(*, toploc_checked=True, toploc_passed=True, stops=True, seen=None, uniforms=None, cdf_miss=None,
-          seed_short=0):
+          seed_short=0, toploc_reason=None):
     def verify(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
         if seen is not None:
             seen.append(commit)
@@ -55,21 +55,25 @@ def _stub(*, toploc_checked=True, toploc_passed=True, stops=True, seen=None, uni
         count = len(policy_token_positions(commit["tokens"], commit["rollout"]))
         return ProofResult(all_passed=True, passed=1, checked=1, has_sparse_outputs=True,
                            toploc_checked=toploc_checked, toploc_passed=toploc_passed,
-                           episode_stop_picks_ok=stops, seed_n_positions=count - seed_short,
+                           toploc_reason=toploc_reason, episode_stop_picks_ok=stops, seed_n_positions=count - seed_short,
                            episode_stop_first_bad_turn=0 if stops is False else None,
                            episode_stop_cdf_miss=cdf_miss,
                            completion_chosen_probs=[0.5] * count)
     return verify
 
 
-def world(tmp_path, verify, *, contract=None):
+def world(tmp_path, verify, *, contract=None, admitted=False):
     rt = episode_runtime(tmp_path / "rt", contract)
     validator, machine = episode_signers(tmp_path / "keys")
     group = episode_group(rt.contract, validator=validator, machine=machine)
     request = batch_request(group)
-    for rollout in request.rollouts:
-        rollout._validated_assistant_spans = tuple(
-            tuple(span) for span in rollout.commit["rollout"]["episode"]["assistant_spans"])
+    if admitted:
+        # The spans come out of the real admission (``finish_prepared``), never copied from the payload.
+        _admit(request, group, rt.contract, validator=validator, machine=machine)
+    else:
+        for rollout in request.rollouts:
+            rollout._validated_assistant_spans = tuple(
+                tuple(span) for span in rollout.commit["rollout"]["episode"]["assistant_spans"])
     b = _make_batcher(window_start=1, env=EpisodeEnv(), verify_commitment_proofs_fn=verify)
     b.service_runtime, b.service_environment = rt, EPISODE
     b.service_policy = rt.announcement(window=1, randomness=WINDOW_BEACON, environment=EPISODE)
@@ -77,6 +81,24 @@ def world(tmp_path, verify, *, contract=None):
     pending = PendingSubmission(hotkey="5Hot", prompt_idx=TASK, request=request, rewards=list(group.rewards),
                                 drand_round=0, merkle_root=b"\0" * 32, selection_digest=b"\0" * 32)
     return SimpleNamespace(rt=rt, b=b, pending=pending, request=request, group=group)
+
+
+def _admit(request, group, contract, *, validator, machine):
+    from reliquary.validator.episode_admission import EpisodeGroupChecker, EpisodeGroupFacts, finish_prepared
+    from tests.unit.sandbox_fixtures import NOW, directory
+    from tests.unit.episode_v2_fixtures import FixedSource
+    from tests.unit.test_trajectory_parse import FakeRenderer
+
+    checker = EpisodeGroupChecker(policy=contract.episode_policy(EPISODE), renderer=FakeRenderer(),
+                                  source=FixedSource(), chunk_tokens=32)
+    facts = checker.check(request, precommit=group.precommit, directory=directory(machine),
+                          token_verifier=attest.Ed25519TokenVerifier({validator.key_id: validator.public_key_b64}),
+                          seen=frozenset(), received=NOW + 100)
+    assert isinstance(facts, EpisodeGroupFacts), facts
+    prepared = SimpleNamespace(request=request, rewards=[], completion_texts=[], episode_pending=True,
+                               reject_reason=None, reject_stage=None)
+    finish_prepared(prepared, facts, contract)
+    assert prepared.reject_reason is None
 
 
 def _eos(monkeypatch, ids):
@@ -108,6 +130,9 @@ def test_the_proof_never_receives_the_transcript_nor_a_carve_out(tmp_path, monke
 @pytest.mark.parametrize("stub, eos, stage, reason", [
     (dict(toploc_checked=False), {TERM}, "service_proof_capability", RejectReason.GENERATION_CONTRACT_MISMATCH),
     (dict(toploc_passed=False), {TERM}, "toploc", RejectReason.TOPLOC_FAIL),
+    # A shadow TOPLOC that raised (the validator's own error) is no verdict, never a deterministic failure.
+    (dict(toploc_passed=False, toploc_reason="error:ValueError"), {TERM}, "service_proof_capability",
+     RejectReason.GENERATION_CONTRACT_MISMATCH),
     (dict(stops=False), {TERM}, "termination", RejectReason.BAD_TERMINATION),
     (dict(stops=None), {TERM}, "service_proof_capability", RejectReason.GENERATION_CONTRACT_MISMATCH),
     # The turns end on TERM, a stop the proof does not check, and not at their cap: no verdict.
@@ -121,12 +146,36 @@ def test_a_signed_episode_proof_needs_toploc_and_its_stop_picks(tmp_path, monkey
     assert w.b.reject_counts[reason.value] >= 1
 
 
-def test_a_proof_with_toploc_and_stops_goes_on_to_the_phase_one_gates(tmp_path, monkeypatch):
+def _spy_refusal(monkeypatch):
+    calls = []
+    real = batcher_module.signed_episode_proof_refusal
+
+    def spy(proof, tokens, spans, eos_ids, **limits):
+        out = real(proof, tokens, spans, eos_ids, **limits)
+        calls.append((list(spans), limits, out))
+        return out
+
+    monkeypatch.setattr(batcher_module, "signed_episode_proof_refusal", spy)
+    return calls
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_a_proof_with_toploc_and_stops_goes_on_to_the_phase_one_gates(tmp_path, monkeypatch, admitted):
     _eos(monkeypatch, {TERM})
-    w = world(tmp_path, _stub())
+    seen = []
+    w = world(tmp_path, _stub(seen=seen), admitted=admitted)
+    calls = _spy_refusal(monkeypatch)
     w.b._verify_expensive(w.pending)
     assert w.pending.proof_reject_stage not in {
         "service_proof_capability", "toploc", "termination", "episode_replay_binding", "service_contract"}
+    # The episode gate judged every proven rollout, on the admission's spans under the contract's limits.
+    policy = w.rt.contract.episode_policy(EPISODE)
+    assert len(calls) == len(seen) >= 1
+    for index, (spans, limits, out) in enumerate(calls):
+        assert out is None
+        assert spans == [tuple(s) for s in w.request.rollouts[index]._validated_assistant_spans]
+        assert limits == dict(max_tokens_per_turn=policy.max_tokens_per_turn,
+                              max_episode_tokens=policy.max_episode_tokens)
 
 
 def test_without_a_toploc_contract_a_signed_episode_is_no_verdict_before_the_forward(tmp_path, monkeypatch):
@@ -215,11 +264,22 @@ def test_the_reward_policy_counts_model_tokens_only(tmp_path):
         len(r.tokens) - r.commit["rollout"]["prompt_length"] for r in w.request.rollouts)
 
 
-def test_an_unpaid_exploration_episode_group_drops_its_transcripts(tmp_path):
+def test_an_episode_group_is_recognised_by_its_env_or_by_its_rollouts(tmp_path):
+    # By its env's mode, even once an exploration group's payload (its transcripts) was released.
     w = world(tmp_path, _stub())
+    calls = []
+    w.b.episode_proof_inconclusive = lambda pending, stage: calls.append(stage)
     w.pending.service_lane = "exploration"
     w.b._release_observation_payload(w.pending)
     assert w.request.rollouts == []
+    w.b._episode_proof_inconclusive(w.pending, "validator_lost")
+    assert calls == ["validator_lost"]
+    # By its rollouts' signed schema, whatever env the batcher serves.
+    other = world(tmp_path / "other", _stub())
+    legacy = _make_batcher()
+    legacy.episode_proof_inconclusive = lambda pending, stage: calls.append(stage)
+    legacy._episode_proof_inconclusive(other.pending, "service_proof_capability")
+    assert calls == ["validator_lost", "service_proof_capability"]
 
 
 def test_an_inconclusive_proof_hands_the_group_back_a_failed_one_does_not(tmp_path, monkeypatch):
@@ -372,3 +432,159 @@ def test_the_restored_content_cooldown_digests_a_signed_episode_prompt_verbatim(
     assert contents.recorded == {prompt_content_sha256(EPISODE, PROMPT_TEXT): 7}
     assert prompt_content_sha256(EPISODE, PROMPT_TEXT) == prompt_content_sha256(
         EPISODE, batcher_module._render_environment_prompt(env, ChatTokenizer(), TASK))
+
+
+# --- Fix round 1: every unjudged training-lane outcome hands the group back; validator faults stay ours. ---
+
+def _hooked(w):
+    calls = []
+    w.b.episode_proof_inconclusive = lambda pending, stage: calls.append((pending, stage))
+    return calls
+
+
+def test_a_shadow_toploc_error_is_no_verdict_in_the_table():
+    spans, tokens = [(2, 5)], [0, 0, 5, 5, TERM]
+    errored = SimpleNamespace(toploc_checked=True, toploc_passed=False, toploc_reason="error:ValueError",
+                              episode_stop_picks_ok=True)
+    assert signed_episode_proof_refusal(errored, tokens, spans, {TERM}) == (
+        RejectReason.GENERATION_CONTRACT_MISMATCH, "service_proof_capability")
+    forged = SimpleNamespace(toploc_checked=True, toploc_passed=False, toploc_reason="exp_mismatch",
+                             episode_stop_picks_ok=True)
+    assert signed_episode_proof_refusal(forged, tokens, spans, {TERM}) == (RejectReason.TOPLOC_FAIL, "toploc")
+
+
+def test_a_proof_that_raises_hands_the_group_back_and_still_raises(tmp_path, monkeypatch):
+    _eos(monkeypatch, {TERM})
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("proof plane down")
+
+    w = world(tmp_path, broken)
+    calls = _hooked(w)
+    with pytest.raises(RuntimeError, match="proof plane down"):
+        w.b._execute_scheduled_proof(w.pending, model=w.b.model, count_operator_debt=True)
+    assert calls == [(w.pending, "validator_lost")]
+    assert w.b._operator_proof_failure_debt_for_hotkey("5Hot") == 0
+
+
+def _arrival(w, monkeypatch, *, budget=4, picks_target=4):
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    w.b.fill_state = batcher_module.FillState(budgets={EPISODE: budget}, picks_target=picks_target)
+
+
+def _decision(job_id, status, value=None):
+    return SimpleNamespace(job_id=job_id, status=status, reason=None, details={}, started_at=None,
+                           finished_at=None, value=value)
+
+
+@pytest.mark.parametrize("status", ["NOT_NEEDED", "SKIPPED_PROMPT_CLAIMED", "SKIPPED_RESOURCE_LIMIT",
+                                    "CAPACITY_ABORTED", "ERROR"])
+def test_a_scheduler_decision_without_a_verdict_hands_the_group_back(tmp_path, monkeypatch, status):
+    from reliquary.validator.proof_scheduler import ProofDecisionStatus
+
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+    w.b.fill_state.reserve(EPISODE)
+    w.b._arrival_proof_meta["job-1"] = (None, 0, "", w.pending)
+    w.b._open_proof_plan_handle = SimpleNamespace(
+        decisions=lambda: [_decision("job-1", getattr(ProofDecisionStatus, status))], done=lambda: False)
+    w.b._reconcile_fill_state_decisions(EPISODE)
+    w.b._reconcile_fill_state_decisions(EPISODE)
+    assert calls == [(w.pending, "validator_lost")]
+
+
+def test_a_rejected_decision_does_not_hand_the_group_back(tmp_path, monkeypatch):
+    from reliquary.validator.proof_scheduler import ProofDecisionStatus
+
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+    w.b.fill_state.reserve(EPISODE)
+    w.b._arrival_proof_meta["job-1"] = (None, 0, "", w.pending)
+    w.b._open_proof_plan_handle = SimpleNamespace(
+        decisions=lambda: [_decision("job-1", ProofDecisionStatus.REJECTED)], done=lambda: False)
+    w.b._reconcile_fill_state_decisions(EPISODE)
+    assert calls == []          # a miner-fault rejection: its sessions stay consumed
+
+
+def _buffer(w):
+    w.b._arrival_proof_buffer.append(batcher_module._BufferedArrivalProof(
+        pending=w.pending, rate=None, payload_bytes=0, receipt_id="", sequence=1))
+
+
+@pytest.mark.parametrize("why", ["target_reached", "dispatch_deadline", "window_closed"])
+def test_a_buffered_group_settled_without_a_proof_is_handed_back(tmp_path, monkeypatch, why):
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch, picks_target=1)
+    calls = _hooked(w)
+    if why == "target_reached":
+        monkeypatch.setattr(batcher_module, "B_BATCH", 1)
+        w.b.fill_state.reserve(EPISODE)
+        w.b.fill_state.record_proven(EPISODE)
+    elif why == "dispatch_deadline":
+        w.b.window_opened_at = w.b._time_fn() - batcher_module.FILL_CLOSED_PROOF_DISPATCH_SECONDS - 1
+    else:
+        w.b._seal_flag.set()
+    _buffer(w)
+    w.b._drain_arrival_proof_buffer(EPISODE)
+    assert w.b._arrival_proof_buffer == []
+    assert calls == [(w.pending, "validator_lost")]
+
+
+def test_a_buffered_group_that_never_reaches_the_plan_is_handed_back(tmp_path, monkeypatch):
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+
+    def closed(candidates):
+        raise RuntimeError("plan gone")
+
+    w.b._extend_proof_plan = closed
+    _buffer(w)
+    with pytest.raises(RuntimeError, match="plan gone"):
+        w.b._drain_arrival_proof_buffer(EPISODE)
+    assert calls == [(w.pending, "validator_lost")]
+    # One that reached the plan is not: its proof will judge it.
+    extended = []
+    ok = world(tmp_path / "ok", _stub())
+    _arrival(ok, monkeypatch)
+    ok_calls = _hooked(ok)
+    ok.b._extend_proof_plan = lambda candidates: extended.extend(candidates)
+    _buffer(ok)
+    ok.b._drain_arrival_proof_buffer(EPISODE)
+    assert len(extended) == 1 and ok_calls == []
+
+
+def test_an_unreadable_episode_policy_is_the_validators_fault(tmp_path, monkeypatch):
+    _eos(monkeypatch, {TERM})
+    w = world(tmp_path, _stub())
+    from reliquary.protocol.service_contract import ServiceContract
+
+    def unreadable(self, name):
+        raise KeyError(name)
+
+    monkeypatch.setattr(ServiceContract, "episode_policy", unreadable)
+    with pytest.raises(RuntimeError, match="episode policy"):
+        w.b._service_pre_forward_guard(w.request, w.b.model)
+    with pytest.raises(RuntimeError):
+        w.b._verify_expensive(w.pending)          # never a BAD_TOKENS service_length refusal
+    assert w.pending.proof_reject_stage is None
+
+
+def test_the_hook_fires_once_per_group_whatever_its_memory_address(tmp_path):
+    w = world(tmp_path, _stub())
+    calls = []
+    w.b.episode_proof_inconclusive = lambda pending, stage: calls.append(stage)     # keeps no reference
+    for _ in range(30):                         # freed groups: CPython reuses their ids
+        pending = SimpleNamespace(hotkey="h", request=None)
+        w.b._episode_proof_inconclusive(pending, "validator_lost")
+        w.b._episode_proof_inconclusive(pending, "validator_lost")
+        del pending
+    assert len(calls) == 30
+    # And once across the batchers that see it (the flag is on the group, not on a batcher).
+    again = world(tmp_path / "again", _stub())
+    again_calls = _hooked(again)
+    again.b._episode_proof_inconclusive(w.pending, "validator_lost")
+    w.b._episode_proof_inconclusive(w.pending, "validator_lost")
+    assert len(again_calls) == 1 and len(calls) == 30
