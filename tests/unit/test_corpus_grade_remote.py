@@ -6,7 +6,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from reliquary.validator import corpus_grade_remote
+from reliquary.validator import corpus_audit_remote, corpus_grade_remote
 from reliquary.validator.corpus_audit_remote import ExecutorDirectory, LeaseRefused, token_sha256
 from reliquary.validator.corpus_grade_protocol import (
     MAX_ACTIONS,
@@ -215,17 +215,34 @@ async def test_three_errors_resolve_as_an_error():
     assert got.status == "error" and not d.quarantined
 
 
-async def test_an_expired_lease_strikes_and_three_strikes_quarantine():
+async def test_three_expired_leases_bench_the_executor_never_quarantine_it():
+    # A box that died mid-lease is not a liar: nothing it graded is redone
+    # (no quarantine, no listener), it only takes no lease for a while.
     clock = _Clock()
     quarantined = []
     d = await _dispatcher(recheck=1.0, clock=clock, quarantined=quarantined)
+    heard = []
+
+    async def listener(eid):
+        heard.append(eid)
+
+    d.subscribe(listener)
     for _ in range(3):
         asyncio.ensure_future(d.decide(_item()))
         await asyncio.sleep(0)
         assert d.claim("g3") is not None
         clock.now += 10_000
         await d.sweep()
-    assert "g3" in d.quarantined and quarantined == ["g3"]
+    await asyncio.sleep(0)
+    assert not d.quarantined and quarantined == [] and heard == []
+    asyncio.ensure_future(d.decide(_item(submission_id="f" * 64)))
+    await asyncio.sleep(0)
+    assert d.claim("g3") is None                       # benched
+    assert d.claim("g0") is not None                   # the others are not
+    clock.now += corpus_audit_remote.EXPIRY_BENCH_SECONDS + 1
+    asyncio.ensure_future(d.decide(_item(submission_id="e" * 64)))
+    await asyncio.sleep(0)
+    assert d.claim("g3") is not None                   # back once the bench is over
 
 
 @pytest.mark.parametrize("mode,status", [("grade", "timeout"), ("replay", "timeout")])

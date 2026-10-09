@@ -392,7 +392,8 @@ class RemoteGradeDispatcher(ExecutorLeases):
         self._contact(executor_id)
         self._claimed_at[executor_id] = self._clock()
         self._wrong_env.discard(executor_id)          # it claims on this control's env
-        if executor_id in self.quarantined or self._held(executor_id) >= self._max_leases:
+        if (executor_id in self.quarantined or self._is_benched(executor_id)
+                or self._held(executor_id) >= self._max_leases):
             return None
         if self._provider(executor_id) is None:
             logger.error("grade executor %s has no provider_id; never leased", executor_id)
@@ -507,8 +508,7 @@ class RemoteGradeDispatcher(ExecutorLeases):
             # Counted like a sweep would have: an expiry, then elsewhere.
             self._take_back(lease, expired=True)
             if self._strike(executor_id):
-                self._spawn(self.quarantine(executor_id,
-                                            f"{self._strikes_limit} grade leases expired in a row"))
+                self._bench(executor_id, f"{self._strikes_limit} grade leases expired in a row")
             raise LeaseRefused(410, "lease_expired")
         answer = result.results[0]
         work.failed_at[executor_id] = self._clock()   # until its vote counts
