@@ -16,6 +16,7 @@ from reliquary.shared.training_payload import (
     encode_tombstone,
     encode_training_payload,
 )
+from reliquary.trainer.publisher import MIRROR_COMPLETE
 from reliquary.trainer.journal import WindowJournal
 from reliquary.trainer.worker import TrainerWorker
 from reliquary.validator.checkpoint_intake import (
@@ -59,6 +60,7 @@ class _StubPublisher:
         self.store[
             f"reliquary/checkpoints/{revision}/model.safetensors"
         ] = b"weights-" + revision.encode()
+        self.store[f"reliquary/checkpoints/{revision}/{MIRROR_COMPLETE}"] = b"{}"
         self.store[CANDIDATE_MANIFEST_KEY] = json.dumps({
             "checkpoint_n": self.n,
             "repo_id": "org/repo",

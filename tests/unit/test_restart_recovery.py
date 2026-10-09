@@ -2,6 +2,7 @@
 import asyncio
 import gzip
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -69,7 +70,10 @@ async def test_archive_failure_cancels_other_downloads_before_client_close(monke
 def test_trainer_cache_reuses_bytes_and_recovers_corruption_or_interruption(tmp_path):
     from reliquary.trainer.cli import _download_checkpoint
 
-    objects = {"config.json": b"{}", "model.safetensors": b"model-bytes"}
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    objects = {"config.json": b"{}", "model.safetensors": b"model-bytes",
+               MIRROR_COMPLETE: b"{}"}
     calls = []
     revision = "a" * 40
 
@@ -215,3 +219,30 @@ async def test_content_snapshot_startup_does_not_wait_for_remote_mirror(monkeypa
     assert await value._snapshot_content_cooldown(mirror=False)
     assert _read_gzip_json(_content_cooldown_local_path(TRAINING_RUN_ID))["snapshot_window"] == 5
     upload.assert_not_awaited()
+
+
+def test_trainer_resume_ignores_a_mirror_without_its_completion_marker(tmp_path):
+    """Weights are mirrored after the manifest; a mirror whose publisher died
+    on a lost host stays incomplete, so resume must fall back to HF."""
+    from reliquary.trainer.cli import _download_checkpoint
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    revision = "a" * 40
+    objects = {"config.json": b"{}", "reliquary_publication.json": b"{}"}
+
+    def client_for(objects):
+        def download(bucket, key, filename, **kwargs):
+            Path(filename).write_bytes(objects[key.rsplit("/", 1)[1]])
+
+        return SimpleNamespace(
+            list_objects_v2=lambda **kw: {"Contents": [
+                {"Key": kw["Prefix"] + name, "Size": len(value), "ETag": name}
+                for name, value in objects.items()
+            ]}, download_file=download,
+        )
+
+    assert _download_checkpoint(client_for(objects), "bucket", revision, tmp_path) is False
+    complete = {**objects, "model.safetensors": b"w", MIRROR_COMPLETE: b"{}"}
+    assert _download_checkpoint(client_for(complete), "bucket", revision, tmp_path)
+    assert (tmp_path / "model.safetensors").read_bytes() == b"w"
+    assert not (tmp_path / MIRROR_COMPLETE).exists()

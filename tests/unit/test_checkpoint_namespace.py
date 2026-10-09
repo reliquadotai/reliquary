@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from reliquary.shared.checkpoint_namespace import CheckpointNamespace, active_checkpoint_namespace
-from reliquary.trainer.publisher import TrainerPublisher, checkpoint_key
+from reliquary.trainer.publisher import MIRROR_COMPLETE, TrainerPublisher, checkpoint_key
 from reliquary.trainer.resume import resolve_resume_point, validate_scoped_resume_snapshot
 from reliquary.validator.checkpoint_intake import CheckpointIntake
 from reliquary.validator.checkpoint_profile import (
@@ -99,7 +99,7 @@ def test_two_tasks_and_runs_publish_and_resume_the_same_checkpoint_independently
         intake.mark_installed(REV, staged_dir)
         assert intake.installed_checkpoint_n == 1
     assert len({scope.candidate_manifest_key for scope in scopes}) == 3
-    assert len(r2.uploads) == 3 * 3  # weights, profile, receipt
+    assert len(r2.uploads) == 3 * 4  # weights, profile, receipt, mirror-complete marker
 
 
 @pytest.mark.parametrize("alter", ["profile", "cursor", "receipt"])
@@ -184,7 +184,11 @@ def test_scoped_recovery_after_candidate_commit_is_exactly_once(tmp_path):
     recovered = _publisher(tmp_path, r2, scope, heads, [])
     assert asyncio.run(recovered.recover_pending())["revision"] == REV
     assert not recovered.has_pending()
-    assert len(r2.uploads) == upload_count
+    # Only the weights deferred past the manifest, then the marker: metadata
+    # already mirrored before the commit is never sent twice.
+    assert [key.rsplit("/", 1)[1] for key, _ in r2.uploads[upload_count:]] == [
+        "model.safetensors", MIRROR_COMPLETE,
+    ]
     assert asyncio.run(recovered.recover_pending()) is None
 
 
@@ -260,6 +264,7 @@ def test_scoped_cache_marker_and_miner_identity_are_not_reused_between_runs(monk
     a, b = CheckpointNamespace("task", "run-a"), CheckpointNamespace("task", "run-b")
     for scope in (a, b):
         r2.objects[checkpoint_key(REV, "config.json", namespace=scope)] = b"{}"
+        r2.objects[checkpoint_key(REV, MIRROR_COMPLETE, namespace=scope)] = b"{}"
     cache = tmp_path / "cache"
     assert _download_checkpoint(r2, "b", REV, cache, namespace=a)
     assert _download_checkpoint(r2, "b", REV, cache, namespace=b)

@@ -557,3 +557,74 @@ def test_recovery_still_detects_a_changed_snapshot(tmp_path):
 
     with pytest.raises(PublicationConflict, match="content changed"):
         asyncio.run(_publisher(tmp_path, r2, []).recover_pending())
+
+
+class _OrderedR2(_R2):
+    """Records every mirror write and the manifest put, in order."""
+
+    def __init__(self, fail_on=None):
+        super().__init__()
+        self.events = []
+        self.fail_on = fail_on
+
+    def upload_file(self, path, bucket, key, Config=None):
+        if self.fail_on and key.endswith(self.fail_on):
+            self.fail_on = None
+            raise OSError("mirror interrupted")
+        super().upload_file(path, bucket, key, Config=Config)
+        self.events.append(key.rsplit("/", 1)[1])
+
+    def put_object(self, Bucket, Key, Body, **kw):
+        super().put_object(Bucket, Key, Body, **kw)
+        self.events.append(Key.rsplit("/", 1)[1])
+
+
+def _publish(pub):
+    return asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=5,
+            lr_schedule_step=80,
+            trained_window_cursor=30110,
+            reason="cadence",
+        )
+    )
+
+
+def test_manifest_is_published_before_the_weight_mirror(tmp_path):
+    """The controller needs only metadata; weights mirror off its critical path."""
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    r2 = _OrderedR2()
+    _publish(_publisher(tmp_path, r2, []))
+
+    manifest_at = r2.events.index("candidate-manifest.json")
+    weights_at = r2.events.index("model.safetensors")
+    assert manifest_at < weights_at
+    assert all(
+        r2.events.index(name) < manifest_at
+        for name in r2.events
+        if name.endswith(".json") and name not in {
+            "candidate-manifest.json", MIRROR_COMPLETE,
+        }
+    )
+    assert r2.events[-1] == MIRROR_COMPLETE
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) in r2.objects
+
+
+def test_recovery_finishes_a_weight_mirror_interrupted_after_the_manifest(tmp_path):
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    r2 = _OrderedR2(fail_on="model.safetensors")
+    with pytest.raises(OSError, match="mirror interrupted"):
+        _publish(_publisher(tmp_path, r2, []))
+    assert CANDIDATE_MANIFEST_KEY in r2.objects
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) not in r2.objects
+
+    recovered = asyncio.run(_publisher(tmp_path, r2, []).recover_pending())
+
+    assert recovered["revision"] == REV_1
+    assert checkpoint_key(REV_1, "model.safetensors") in r2.objects
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) in r2.objects
+    assert _staging_empty(tmp_path)

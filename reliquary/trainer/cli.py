@@ -84,7 +84,7 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path,
     when the revision is absent or the local directory has extra files."""
     from boto3.s3.transfer import TransferConfig
 
-    from reliquary.trainer.publisher import checkpoint_key, _file_identity
+    from reliquary.trainer.publisher import MIRROR_COMPLETE, checkpoint_key, _file_identity
     from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
     from reliquary.shared.strict_json import strict_json_loads
     from reliquary.validator.control import write_json
@@ -100,6 +100,12 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path,
         contents.extend(listed.get("Contents", []))
     if not contents:
         return False
+    # Weights are mirrored after the manifest; only the marker proves they all landed.
+    complete_key = prefix + MIRROR_COMPLETE
+    if not any(obj.get("Key") == complete_key for obj in contents):
+        logger.warning("Checkpoint mirror for %s is incomplete; using HF fallback", revision)
+        return False
+    contents = [obj for obj in contents if obj.get("Key") != complete_key]
     config = TransferConfig(
         multipart_threshold=32 * 1024 * 1024,
         multipart_chunksize=32 * 1024 * 1024,

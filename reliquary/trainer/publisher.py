@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 from typing import Any, Callable
 import uuid
 
@@ -44,6 +45,12 @@ WEIGHT_PATTERNS = (
     "model.safetensors", "model.safetensors.index.json", "model-*.safetensors",
     "pytorch_model.bin", "pytorch_model.bin.index.json", "pytorch_model-*.bin",
 )
+# Weight blobs are mirrored AFTER the candidate manifest: the controller stages
+# only metadata, so the multi-gigabyte upload stays off the rotation path.
+# MIRROR_COMPLETE is written last; any reader that needs the weights from the
+# mirror must see it first.
+MIRROR_DEFERRED_SUFFIXES = (".safetensors", ".bin")
+MIRROR_COMPLETE = "reliquary_mirror_complete.json"
 
 
 class PublicationConflict(RuntimeError):
@@ -531,6 +538,9 @@ class TrainerPublisher:
         if await asyncio.to_thread(self._hf_head, self.repo_id) != revision:
             raise PublicationConflict("HF HEAD changed before candidate publication")
         manifest = {**transaction["manifest"], "revision": revision}
+        weights = [name for name in sorted(transaction["files"])
+                   if name.endswith(MIRROR_DEFERRED_SUFFIXES)]
+        metadata = [name for name in sorted(transaction["files"]) if name not in weights]
         current, etag = await asyncio.to_thread(self._read_candidate)
         if current != manifest:
             if (
@@ -541,15 +551,7 @@ class TrainerPublisher:
                 raise PublicationConflict(
                     "candidate manifest advanced or changed during publication"
                 )
-            config = _multipart_transfer_config()
-            for name in sorted(transaction["files"]):
-                await asyncio.to_thread(
-                    self._r2.upload_file,
-                    str(snapshot / name),
-                    self._bucket,
-                    checkpoint_key(revision, name, namespace=self.namespace),
-                    Config=config,
-                )
+            await self._mirror_files(snapshot, revision, metadata)
             if await asyncio.to_thread(self._hf_head, self.repo_id) != revision:
                 raise PublicationConflict("HF HEAD changed during mirror upload")
             condition = {"IfNoneMatch": "*"} if etag is None else {"IfMatch": etag}
@@ -559,6 +561,12 @@ class TrainerPublisher:
                 Key=self.namespace.candidate_manifest_key,
                 Body=json.dumps(manifest, sort_keys=True).encode(),
                 **condition,
+            )
+        if transaction["state"] != "committed":
+            # Idempotent: recovery replays it until the transaction commits.
+            await self._mirror_files(snapshot, revision, weights)
+            await asyncio.to_thread(
+                self._upload_mirror_complete, revision, sorted(transaction["files"]),
             )
         transaction["state"] = "committed"
         write_json(self._pending, transaction)
@@ -580,6 +588,30 @@ class TrainerPublisher:
             revision,
         )
         return manifest
+
+    async def _mirror_files(self, snapshot: Path, revision: str, names: list[str]) -> None:
+        config = _multipart_transfer_config()
+        for name in names:
+            await asyncio.to_thread(
+                self._r2.upload_file,
+                str(snapshot / name),
+                self._bucket,
+                checkpoint_key(revision, name, namespace=self.namespace),
+                Config=config,
+            )
+
+    def _upload_mirror_complete(self, revision: str, files: list[str]) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / MIRROR_COMPLETE
+            marker.write_bytes(
+                json.dumps({"revision": revision, "files": files}, sort_keys=True).encode()
+            )
+            self._r2.upload_file(
+                str(marker),
+                self._bucket,
+                checkpoint_key(revision, MIRROR_COMPLETE, namespace=self.namespace),
+                Config=_multipart_transfer_config(),
+            )
 
     def _existing_mirror_revisions(self) -> list[str]:
         # Bound deletion candidates BEFORE this publication. A later publisher's

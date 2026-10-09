@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from reliquary.trainer.publisher import MIRROR_COMPLETE
 from reliquary.validator.checkpoint_intake import (
     CANDIDATE_MANIFEST_KEY,
     CheckpointIntake,
@@ -139,6 +140,7 @@ def test_stage_downloads_validates_and_flags_ready(tmp_path):
         files={
             f"reliquary/checkpoints/{REV_7}/model.safetensors": b"weights",
             f"reliquary/checkpoints/{REV_7}/config.json": b"{}",
+            f"reliquary/checkpoints/{REV_7}/{MIRROR_COMPLETE}": b"{}",
         },
     )
     validated = []
@@ -171,8 +173,9 @@ def test_stage_failure_degrades_to_staleness(tmp_path):
 def test_install_taken_checkpoint_while_successor_is_pending(tmp_path, pending):
     next_revision = "8" * 40
     r2 = _R2(files={
-        f"reliquary/checkpoints/{rev}/model.safetensors": b"weights"
+        f"reliquary/checkpoints/{rev}/{name}": b"weights"
         for rev in (REV_7, next_revision)
+        for name in ("model.safetensors", MIRROR_COMPLETE)
     })
     intake = CheckpointIntake(
         r2_client=r2, bucket="b", staging_dir=str(tmp_path),
@@ -311,6 +314,7 @@ def _mirror(revision=REV_7):
         f"{base}/model.safetensors.index.json": b"{}",
         f"{base}/config.json": b"{}",
         f"{base}/reliquary_protocol_profile.json": b"{}",
+        f"{base}/{MIRROR_COMPLETE}": b"{}",
     }
 
 
@@ -345,3 +349,34 @@ def test_stage_leaves_weights_in_the_mirror_when_told_not_to_fetch_them(tmp_path
         "reliquary_protocol_profile.json",
     ]
     assert seen == [sorted(f.name for f in path.iterdir())]  # validated what was staged
+
+
+def test_stage_waits_for_the_mirror_marker_before_fetching_weights(tmp_path):
+    """The trainer publishes the manifest before its weights land in the
+    mirror; a weight-fetching intake must not stage a half-mirrored snapshot."""
+    files = {k: v for k, v in _mirror().items()
+             if not k.endswith(("model.safetensors", MIRROR_COMPLETE))}
+    r2 = _R2(manifest=_manifest(), files=files)
+    intake = CheckpointIntake(
+        r2_client=r2, bucket="b", staging_dir=str(tmp_path),
+        validate_fn=lambda p: {"ok": True},
+    )
+    assert intake.stage(_manifest()) is False
+    assert intake.poll() == _manifest()  # retried on the next poll
+
+    r2.files = _mirror()
+    assert intake.stage(_manifest()) is True
+    _, path = intake.take_staged()
+    assert (path / "model.safetensors").read_bytes() == b"weights"
+    assert not (path / MIRROR_COMPLETE).exists()
+
+
+def test_metadata_only_stage_does_not_wait_for_the_weight_mirror(tmp_path):
+    intake = CheckpointIntake(
+        r2_client=_R2(manifest=_manifest(), files={
+            k: v for k, v in _mirror().items() if not k.endswith((".safetensors", ".bin"))
+        }),
+        bucket="b", staging_dir=str(tmp_path), fetch_weights=False,
+        validate_fn=lambda p: {"ok": True},
+    )
+    assert intake.stage(_manifest()) is True

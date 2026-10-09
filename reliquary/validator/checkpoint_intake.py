@@ -86,6 +86,10 @@ def _multipart_transfer_config():
 WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin")
 
 
+class _MirrorPending(RuntimeError):
+    """The candidate is published but its weight mirror is not complete yet."""
+
+
 class CheckpointIntake:
     def __init__(
         self,
@@ -288,6 +292,15 @@ class CheckpointIntake:
             contents = listed.get("Contents", [])
             if not contents:
                 raise RuntimeError(f"R2 mirror has no objects under {prefix}")
+            from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+            complete_key = prefix + MIRROR_COMPLETE
+            if self._fetch_weights and not any(
+                obj.get("Key") == complete_key for obj in contents
+            ):
+                # Weights land after the manifest; poll() offers it again.
+                raise _MirrorPending(f"weight mirror for {revision[:12]} still uploading")
+            contents = [obj for obj in contents if obj.get("Key") != complete_key]
             config = _multipart_transfer_config()
             dest.mkdir(parents=True, exist_ok=True)
             for obj in contents:
@@ -338,6 +351,10 @@ class CheckpointIntake:
                 expected_receipt_manifest = {k: v for k, v in manifest.items() if k != "revision"}
                 if receipt.get("manifest") != expected_receipt_manifest:
                     raise ValueError("candidate snapshot publication receipt mismatch")
+        except _MirrorPending as exc:
+            self.last_error = str(exc)
+            logger.info("checkpoint staging deferred: %s", exc)
+            return False
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             logger.exception(
