@@ -192,6 +192,13 @@ async def test_an_episode_order_mounts_its_routes_and_its_intake(tmp_path, monke
         assert PATHS <= _paths(service.server.app)
         assert service.server._episode_intake is service._episode_services.intake
         assert len(service._episode_tasks) == 3            # fleet, session maintenance, precommit pruning
+        intake = service._episode_services.intake
+        # item 13 wiring: the intake takes groups only for a window this process noted
+        assert intake._window_open(5) is False
+        service._note_episode_window(5, resumed=False)
+        assert intake._window_open(5) is True
+        # item 2 wiring: the retention the service computes
+        assert service._episode_services.precommit_retention_s == service._episode_precommit_retention_s()
     finally:
         await service._stop_episode_services()
     assert service._episode_services is None and service._episode_tasks == []
@@ -319,12 +326,41 @@ def test_an_episode_group_of_a_resumed_window_is_refused_before_any_check(tmp_pa
     assert claim is not None
 
 
-def test_the_service_starts_the_rl_side_before_serving_and_stops_it():
+def test_the_service_starts_the_rl_side_before_serving():
     import inspect
 
     source = inspect.getsource(ValidationService.run)
     assert source.index('startup_step("episode_services"') < source.index("await self.server.start()")
-    assert "await self._stop_episode_services()" in source
+    assert "await self._stop_serving()" in source
+
+
+def _stopping_service(calls, *, fail=None):
+    service = ValidationService.__new__(ValidationService)
+
+    def step(name):
+        async def run():
+            calls.append(name)
+            if name == fail:
+                raise RuntimeError(name)
+        return run
+
+    service._stop_observation_publication = step("observations")
+    service._close_proof_scheduler = step("proof_scheduler")
+    service._stop_episode_services = step("episode_services")
+    service.server = SimpleNamespace(stop=step("server"))
+    service._service_runtime = SimpleNamespace(close=lambda: calls.append("runtime"))
+    return service
+
+
+async def test_the_episode_services_stop_after_the_proof_plane_and_the_server():
+    """I1: late hand-backs (from the proof plane's last verdicts) still find the services running."""
+    calls = []
+    await _stopping_service(calls)._stop_serving()
+    assert calls == ["observations", "proof_scheduler", "server", "episode_services", "runtime"]
+    calls = []
+    with pytest.raises(RuntimeError):
+        await _stopping_service(calls, fail="server")._stop_serving()
+    assert calls == ["observations", "proof_scheduler", "server", "episode_services", "runtime"]
 
 
 def test_the_validators_prompt_cooldown_hook_reads_its_live_maps():
@@ -361,72 +397,148 @@ def test_a_session_is_refused_when_its_window_is_older_than_the_longest_window(t
     assert asyncio.run(terms.terms("5Hot", engagement(env.precommit, 0))).reason == "precommit_stale"
 
 
-# --- item 5: the precommit route is bounded before its signature check ---
-def _precommit_client(rt, *, verify, **kwargs):
+# --- item 5 (+ fix round 1, I2/I3/I3b): the precommit route is bounded before its signature check ---
+ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+CHARLIE = "5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y"
+DAVE = "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy"
+
+
+def _recorded(value):
+    return True, "a" * 64
+
+
+def _precommit_router(rt, *, verify, record=_recorded, **kwargs):
     from reliquary.sandbox.rl_routes import build_episode_precommit_router
 
+    return build_episode_precommit_router(
+        record=record, current_window=lambda: 1, validator_hotkey=VALIDATOR_SS58,
+        policy=SandboxPolicy(), verify=verify, **kwargs)
+
+
+def _precommit_client(rt, *, verify, **kwargs):
     app = FastAPI()
-    app.include_router(build_episode_precommit_router(
-        record=rt.record_episode_precommit, current_window=lambda: 1, validator_hotkey=VALIDATOR_SS58,
-        policy=SandboxPolicy(), verify=verify, **kwargs))
+    app.include_router(_precommit_router(rt, verify=verify, **kwargs))
     return TestClient(app)
 
 
-def _precommit_body(rt):
-    precommit = episode_precommit(rt.contract, hotkey=VALIDATOR_SS58)
-    return {"miner_hotkey": VALIDATOR_SS58, "at": int(time.time()), "precommit": precommit.to_dict(),
-            "signature": "00"}
+def _precommit_body(rt, hotkey=VALIDATOR_SS58, signature="00"):
+    precommit = episode_precommit(rt.contract, hotkey=hotkey)
+    return {"miner_hotkey": hotkey, "at": int(time.time()), "precommit": precommit.to_dict(),
+            "signature": signature}
 
 
-def test_the_precommit_route_rate_limits_each_hotkey_before_verifying(tmp_path):
+def _signed_only(calls):
+    def verify(hotkey, precommit, *, signature, **kwargs):
+        calls.append(hotkey)
+        return signature == "good"
+    return verify
+
+
+class _Body:
+    """A request whose body arrives when ``gate`` is set (at once without one)."""
+
+    headers = {}
+
+    def __init__(self, raw, gate=None):
+        self.raw, self.gate = raw, gate
+
+    async def stream(self):
+        if self.gate is not None:
+            await self.gate.wait()
+        yield self.raw
+
+
+def _endpoint(router):
+    return next(route.endpoint for route in router.routes)
+
+
+def test_the_precommit_route_rate_limits_each_hotkey_once_it_signed(tmp_path):
+    """I2: a signed request over the hotkey's minute is refused before its signature is verified."""
     rt = episode_runtime(tmp_path)
-    verified = []
-    client = _precommit_client(rt, verify=lambda *a, **k: verified.append(1) or False, max_per_minute=2)
-    answers = [client.post(f"{RL_PREFIX}/episodes/precommit", json=_precommit_body(rt)) for _ in range(3)]
-    assert [a.status_code for a in answers] == [403, 403, 429]
+    calls = []
+    client = _precommit_client(rt, verify=_signed_only(calls), max_per_minute=2)
+    answers = [client.post(f"{RL_PREFIX}/episodes/precommit", json=_precommit_body(rt, signature="good"))
+               for _ in range(3)]
+    assert [a.status_code for a in answers] == [200, 200, 429]
     assert answers[2].json()["reason"] == "precommit_rate" and int(answers[2].headers["Retry-After"]) >= 1
-    assert len(verified) == 2                                             # the third never reached the verify
+    assert len(calls) == 2                                                # the third never reached the verify
 
 
-async def test_the_precommit_route_bounds_the_requests_it_reads_and_verifies_at_once(tmp_path):
-    from reliquary.sandbox.rl_routes import build_episode_precommit_router
+def test_unsigned_requests_claiming_a_hotkey_do_not_spend_its_rate(tmp_path):
+    """I2: 30 unsigned requests naming H, then H's signed one goes through."""
+    rt = episode_runtime(tmp_path)
+    client = _precommit_client(rt, verify=_signed_only([]))
+    junk = [client.post(f"{RL_PREFIX}/episodes/precommit", json=_precommit_body(rt)) for _ in range(30)]
+    assert {a.status_code for a in junk} == {403}
+    signed = client.post(f"{RL_PREFIX}/episodes/precommit", json=_precommit_body(rt, signature="good"))
+    assert signed.status_code == 200, signed.json()
+
+
+def test_an_unregistered_hotkey_is_refused_before_its_signature_and_never_tracked(tmp_path):
+    """I2 + I3b: the in-memory registration check runs first; an unregistered hotkey costs no verify and
+    takes no place among the tracked hotkeys (capped: the oldest is forgotten)."""
+    from reliquary.validator.corpus_registration import NOT_REGISTERED
 
     rt = episode_runtime(tmp_path)
-    router = build_episode_precommit_router(
-        record=rt.record_episode_precommit, current_window=lambda: 1, validator_hotkey=VALIDATOR_SS58,
-        policy=SandboxPolicy(), verify=lambda *a, **k: False, max_preauth=1)
-    endpoint = next(route.endpoint for route in router.routes)
-    release = asyncio.Event()
-    body = json.dumps(_precommit_body(rt)).encode()
+    calls = []
 
-    class Body:
-        headers = {}
+    async def registration(hotkey):
+        return NOT_REGISTERED if hotkey == DAVE else None
 
-        def __init__(self, gate=None):
-            self.gate = gate
+    client = _precommit_client(rt, verify=_signed_only(calls), registration=registration, max_per_minute=1,
+                               max_tracked_hotkeys=1)
+    post = lambda hotkey: client.post(f"{RL_PREFIX}/episodes/precommit",  # noqa: E731
+                                      json=_precommit_body(rt, hotkey=hotkey, signature="good"))
+    assert post(ALICE).status_code == 200
+    for _ in range(5):
+        answer = post(DAVE)
+        assert answer.status_code == 403 and answer.json()["reason"] == "hotkey_not_registered"
+    assert calls == [ALICE]                                               # Dave was never verified
+    assert post(ALICE).status_code == 429                                 # ... nor tracked: Alice still is
+    assert post(CHARLIE).status_code == 200                               # one more tracked hotkey ...
+    assert post(ALICE).status_code == 200                                 # ... and the oldest is forgotten
 
-        async def stream(self):
-            if self.gate is not None:
-                await self.gate.wait()
-            yield body
 
-    first = asyncio.ensure_future(endpoint(Body(release)))
+async def test_the_precommit_route_bounds_the_requests_it_verifies_at_once(tmp_path):
+    from reliquary.validator.corpus_registration import NOT_REGISTERED
+
+    rt = episode_runtime(tmp_path)
+    held = asyncio.Event()
+
+    async def registration(hotkey):                                       # inside the bound: holds its slot
+        await held.wait()
+        return NOT_REGISTERED
+
+    endpoint = _endpoint(_precommit_router(rt, verify=_signed_only([]), registration=registration,
+                                           max_preauth=1))
+    raw = json.dumps(_precommit_body(rt)).encode()
+    first = asyncio.ensure_future(endpoint(_Body(raw)))
     await asyncio.sleep(0.05)
-    busy = await asyncio.wait_for(endpoint(Body()), 5)
+    busy = await asyncio.wait_for(endpoint(_Body(raw)), 5)
     assert busy.status_code == 503 and json.loads(busy.body)["reason"] == "precommit_busy"
-    release.set()
+    held.set()
     assert (await asyncio.wait_for(first, 5)).status_code == 403
-    assert (await asyncio.wait_for(endpoint(Body()), 5)).status_code == 403     # the slot is free again
+    assert (await asyncio.wait_for(endpoint(_Body(raw)), 5)).status_code == 403     # the slot is free again
+
+
+async def test_slow_bodies_do_not_hold_the_precommit_routes_verification_slots(tmp_path):
+    """I3: the bound covers decode + verify, not the body read: 8 slow bodies, then an honest one."""
+    rt = episode_runtime(tmp_path)
+    endpoint = _endpoint(_precommit_router(rt, verify=_signed_only([])))
+    arrive = asyncio.Event()
+    slow = [asyncio.ensure_future(endpoint(_Body(json.dumps(_precommit_body(rt)).encode(), arrive)))
+            for _ in range(8)]
+    await asyncio.sleep(0.05)
+    honest = await asyncio.wait_for(
+        endpoint(_Body(json.dumps(_precommit_body(rt, signature="good")).encode())), 5)
+    assert honest.status_code == 200, json.loads(honest.body)
+    arrive.set()
+    assert {(await asyncio.wait_for(task, 5)).status_code for task in slow} <= {403, 503}
 
 
 async def test_the_precommit_route_bounds_the_time_its_body_has(tmp_path):
-    from reliquary.sandbox.rl_routes import build_episode_precommit_router
-
     rt = episode_runtime(tmp_path)
-    router = build_episode_precommit_router(
-        record=rt.record_episode_precommit, current_window=lambda: 1, validator_hotkey=VALIDATOR_SS58,
-        policy=SandboxPolicy(), verify=lambda *a, **k: True, body_timeout_s=0.2)
-    endpoint = next(route.endpoint for route in router.routes)
+    endpoint = _endpoint(_precommit_router(rt, verify=lambda *a, **k: True, body_timeout_s=0.2))
 
     class SlowBody:
         headers = {}
@@ -439,6 +551,56 @@ async def test_the_precommit_route_bounds_the_time_its_body_has(tmp_path):
     answer = await endpoint(SlowBody())
     assert answer.status_code == 408 and json.loads(answer.body)["reason"] == "body_timeout"
     assert time.monotonic() - started < 2
+
+
+# --- M2: the RL open route is bounded like the precommit route ---
+async def test_the_rl_open_route_bounds_the_time_its_body_has(tmp_path):
+    services, _ = _services(tmp_path, open_body_timeout_s=0.2)
+    endpoint = next(route.endpoint for route in services.routers[0].routes
+                    if route.path == f"{RL_PREFIX}/sandbox/sessions")
+
+    class SlowBody:
+        headers = {}
+
+        async def stream(self):
+            await asyncio.sleep(5)
+            yield b"{}"
+
+    started = time.monotonic()
+    answer = await endpoint(SlowBody())
+    assert answer.status_code == 408 and json.loads(answer.body)["reason"] == "body_timeout"
+    assert time.monotonic() - started < 2
+
+
+async def test_the_open_route_bounds_the_opens_it_verifies_at_once_but_not_their_bodies():
+    from reliquary.sandbox.routes import build_sandbox_sessions_router
+    from reliquary.validator.corpus_registration import NOT_REGISTERED
+
+    held = asyncio.Event()
+
+    async def registration(hotkey):
+        await held.wait()
+        return NOT_REGISTERED
+
+    router = build_sandbox_sessions_router(
+        SimpleNamespace(), policy=SandboxPolicy(), validator_hotkey=VALIDATOR_SS58, prefix=RL_PREFIX,
+        verify_open=lambda *a, **k: True, registration=registration, max_preauth_opens=1,
+        open_body_timeout_s=5.0)
+    endpoint = next(route.endpoint for route in router.routes if route.path == f"{RL_PREFIX}/sandbox/sessions")
+    raw = json.dumps({"miner_hotkey": ALICE, "at": int(time.time()), "request_id": "a" * 32,
+                      "engagement": {"kind": "rl_precommit", "precommit": {"seed_index": 0}},
+                      "signature": "00"}).encode()
+    arrive = asyncio.Event()
+    slow = asyncio.ensure_future(endpoint(_Body(raw, arrive)))           # a slow body holds no slot
+    await asyncio.sleep(0.05)
+    first = asyncio.ensure_future(endpoint(_Body(raw)))                    # held in its slot
+    await asyncio.sleep(0.05)
+    busy = await asyncio.wait_for(endpoint(_Body(raw)), 5)
+    assert busy.status_code == 503 and json.loads(busy.body)["reason"] == "open_busy", json.loads(busy.body)
+    held.set()
+    assert (await asyncio.wait_for(first, 5)).status_code == 403
+    arrive.set()
+    assert (await asyncio.wait_for(slow, 5)).status_code == 403
 
 
 # --- item 2: precommit rows retention ---
@@ -550,14 +712,16 @@ async def test_a_handed_back_group_is_scheduled_without_blocking_and_marked_in_b
     await services.stop()
 
 
-def test_a_handed_back_session_is_not_counted_against_the_miners_open_rate():
+def test_a_handed_back_session_still_counts_against_the_miners_open_rate():
+    """M1: a hand-back gives no opens back (the sessions were opened; only the yield/quota excludes them)."""
     book = SessionBook(SandboxPolicy(max_opens_per_hour=2))
     now = int(time.time())
     for n in range(2):
         book.add(_record(f"s-{n}", sha="c" * 64, seed=n, issued_at=now - 60))
     assert book.open_refusal("5Hot", now).reason == "open_rate_cap"
-    book.get("s-0").closed_status = HANDED_BACK
-    assert book.open_refusal("5Hot", now) is None
+    for n in range(2):
+        book.get(f"s-{n}").closed_status = HANDED_BACK
+    assert book.open_refusal("5Hot", now).reason == "open_rate_cap"
 
 
 async def test_the_store_takes_a_hand_back_and_nothing_else_on_a_submitted_record():
@@ -573,11 +737,115 @@ async def test_the_store_takes_a_hand_back_and_nothing_else_on_a_submitted_recor
         await store.update(dataclasses.replace(handed, machine_id="other").to_document())
 
 
-def test_the_service_hands_its_episode_batchers_to_the_services():
-    import inspect
+async def test_the_service_hands_its_episode_batchers_to_the_services(monkeypatch, tmp_path):
+    """M3: the real ``_build_window_batchers`` installs the hand-back hook on episode-env batchers only."""
+    from tests.unit.service_v2_fixtures import CODE, MATH
+    from tests.unit.test_service_window_build import _open
+    from tests.unit.test_service_window_build import _service as window_service
 
-    source = inspect.getsource(ValidationService._build_window_batchers)
-    assert "batcher.episode_proof_inconclusive = episode_services.batcher_hook(env_name, target_window)" in source
+    svc = window_service(monkeypatch, tmp_path)
+    hooks = []
+
+    def batcher_hook(environment, window):
+        hooks.append((environment, window))
+        return ("hook", environment, window)
+
+    svc._episode_services = SimpleNamespace(environments=(MATH,), batcher_hook=batcher_hook)
+    batchers = await _open(svc, activate=False)
+    assert batchers[MATH].episode_proof_inconclusive == ("hook", MATH, 1)
+    assert batchers[CODE].episode_proof_inconclusive is None
+    assert hooks == [(MATH, 1)]
+
+
+async def test_the_rl_registration_reads_the_servers_gate():
+    from reliquary.validator.corpus_registration import NOT_REGISTERED
+    from reliquary.validator.rl_sandbox_wiring import rl_registration
+
+    reasons = {"a": None, "b": RejectReason.HOTKEY_NOT_REGISTERED, "c": RejectReason.REGISTRATION_UNAVAILABLE}
+
+    async def gate(hotkey):
+        return reasons[hotkey]
+
+    registration = rl_registration(SimpleNamespace(_registration_reject_reason=gate))
+    assert [await registration(h) for h in "abc"] == [None, NOT_REGISTERED, "unavailable"]
+
+
+def test_the_mounted_precommit_route_asks_the_servers_registration_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr("reliquary.protocol.profiles.toploc_proof", lambda profile: TOPLOC_DEPLOYED_DEFAULTS)
+    rt = episode_runtime(tmp_path / "rt")
+    service = _service(tmp_path, monkeypatch, runtime=rt)
+    asked = []
+
+    async def gate(hotkey):
+        asked.append(hotkey)
+        return RejectReason.HOTKEY_NOT_REGISTERED
+
+    service.server._registration_reject_reason = gate
+
+    async def start():
+        await service._start_episode_services()
+        for task in service._episode_tasks:
+            task.cancel()
+
+    asyncio.run(start())
+    answer = TestClient(service.server.app).post(f"{RL_PREFIX}/episodes/precommit", json=_precommit_body(rt))
+    assert answer.status_code == 403 and answer.json()["reason"] == "hotkey_not_registered"
+    assert asked == [VALIDATOR_SS58]
+
+
+def test_the_precommit_retention_covers_the_longest_episode_cooldown():
+    from reliquary.constants import FILL_CLOSED_MAX_SECONDS
+    from reliquary.validator.rl_sandbox_wiring import MIN_PRECOMMIT_RETENTION_S
+
+    service = ValidationService.__new__(ValidationService)
+    horizons = {"a": 3, "b": 10_000}
+    service._service_runtime = SimpleNamespace(
+        contract=SimpleNamespace(episode_environments=("a", "b")),
+        schedule=SimpleNamespace(cooldown_windows=lambda name: horizons[name]))
+    assert service._episode_precommit_retention_s() == 10_000 * FILL_CLOSED_MAX_SECONDS
+    horizons["b"] = 1
+    assert service._episode_precommit_retention_s() == MIN_PRECOMMIT_RETENTION_S
+
+
+def test_a_v2_order_without_episode_envs_never_loads_the_sandbox_package(tmp_path):
+    """M3: a validator with no signed-episode env never imports reliquary_sandbox."""
+    import subprocess
+    import sys
+
+    script = (
+        "import asyncio, sys, pathlib\n"
+        "import pytest\n"
+        "from tests.unit.test_service_window_build import _open, _service\n"
+        "assert 'reliquary_sandbox' not in sys.modules\n"
+        "mp = pytest.MonkeyPatch()\n"
+        "svc = _service(mp, pathlib.Path(sys.argv[1]))\n"
+        "assert not svc._service_runtime.contract.episode_environments\n"
+        "async def main():\n"
+        "    await svc._start_episode_services()\n"
+        "    await _open(svc)\n"
+        "asyncio.run(main())\n"
+        "assert getattr(svc, '_episode_services', None) is None\n"
+        "print('LOADED' if 'reliquary_sandbox' in sys.modules else 'CLEAN')\n")
+    root = Path(__file__).resolve().parents[2]
+    done = subprocess.run([sys.executable, "-c", script, str(tmp_path)], cwd=root, capture_output=True,
+                          text=True, timeout=300)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.strip().splitlines()[-1] == "CLEAN"
+
+
+def test_the_remote_proof_proxies_expose_the_nested_text_config():
+    """I5: item 14 is config only: the proxy's ``text_config`` is a namespace, so its eos is seen."""
+    from reliquary.shared.modeling import resolve_eos_token_ids
+    from reliquary.validator.remote_proof import RemoteProofPool
+
+    pool = RemoteProofPool.__new__(RemoteProofPool)
+    pool.pipeline_depth = 1
+    pool.health = SimpleNamespace(slots=[SimpleNamespace(device_id="s0")],
+                                  config={"eos_token_id": TERM, "text_config": {"eos_token_id": 9}},
+                                  generation_config={"eos_token_id": [TERM]})
+    proxy = pool.proxies()["s0"]
+    assert resolve_eos_token_ids(proxy, SimpleNamespace(eos_token_id=EOT)) == {TERM, EOT, 9}
+    assert pool.health.config["text_config"] == {"eos_token_id": 9}                # the health is untouched
 
 
 # --- item 17: nothing published carries a transcript ---

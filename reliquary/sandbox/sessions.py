@@ -518,11 +518,9 @@ class SessionBook:
         live = sum(1 for r in mine if self._holds(r, now))
         if live >= policy.max_live_per_hotkey:
             return Refusal("live_cap", {"live": live, "max": policy.max_live_per_hotkey})
-        # A session handed back (plan 2C: its group was not judged, for the validator's reason) is not
-        # the miner's to count.
+        # A session handed back (plan 2C) still counts: it was opened (only plan 2D's yield excludes it).
         counted = sorted(r.issued_at for r in mine
-                         if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED)
-                         and r.closed_status != HANDED_BACK)
+                         if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED))
         opens = len(counted)
         if opens >= policy.max_opens_per_hour:     # retry when enough of them leave the hour
             return Refusal("open_rate_cap", {"opens": opens, "max": policy.max_opens_per_hour},
@@ -1039,7 +1037,8 @@ class SessionIssuer:
         """Plan 2C: the paid group of this precommit was not judged by the proof, for a reason of the
         validator's own. Its ``submitted`` sessions stay ``submitted`` (never paid, never claimed
         again: the precommit stays taken, no same-window retry) and are marked handed back (closed
-        status), in the book and the store, so that no cap or quota counts them against the miner.
+        status), in the book and the store, so that plan 2D's yield and quota do not count them against
+        the miner (the hourly open cap still does: they were opened).
         Returns the sessions marked now (none twice)."""
         marked: list[SessionRecord] = []
         async with self._lock:

@@ -7769,16 +7769,24 @@ class ValidationService:
                     await asyncio.wait_for(task, timeout=5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+            await self._stop_serving()
+            telemetry.finish()
+
+    async def _stop_serving(self) -> None:
+        """Shutdown order: the proof plane and the server first, then the episode services (a late
+        hand-back from the proof's last verdicts still finds them, and is awaited, bounded, before the
+        issuer and its store close), the runtime last; each step runs even when an earlier one failed."""
+        try:
+            await self._stop_observation_publication()
+            await self._close_proof_scheduler()
+            await self.server.stop()
+        finally:
             try:
-                await self._stop_observation_publication()
                 await self._stop_episode_services()
-                await self._close_proof_scheduler()
-                await self.server.stop()
             finally:
                 runtime = getattr(self, "_service_runtime", None)
                 if runtime is not None:
                     runtime.close()
-            telemetry.finish()
 
     def _start_observation_publication(self) -> None:
         """Signed static publication of the run observation log (decision D). Off unless this is a

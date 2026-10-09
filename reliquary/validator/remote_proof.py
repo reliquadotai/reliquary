@@ -45,6 +45,15 @@ def executor_mode() -> str:
 _LANE = "~"
 
 
+def _config_namespace(config):
+    """A worker's reported config as attributes, its nested ``text_config`` too (the EOS resolver reads
+    ``config.text_config.eos_token_id`` by attribute, as on a real multimodal config)."""
+    fields = dict(config)
+    if isinstance(fields.get("text_config"), dict):
+        fields["text_config"] = SimpleNamespace(**fields["text_config"])
+    return SimpleNamespace(**fields)
+
+
 class RemoteProofPool:
     is_remote = True
 
@@ -251,7 +260,7 @@ class RemoteProofPool:
     def proxies(self):
         if not self.health:
             raise ProofWorkerUnavailable("remote proof pool has not started")
-        return {d: ProofModelProxy(d, SimpleNamespace(**self.health.config),
+        return {d: ProofModelProxy(d, _config_namespace(self.health.config),
                                    SimpleNamespace(**self.health.generation_config))
                 for d in self.dispatch_devices}
 

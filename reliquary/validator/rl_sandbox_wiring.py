@@ -70,7 +70,11 @@ def rl_sandbox_policy(base: SandboxPolicy, pool_seeds: int, *,
 
 def stop_ids_from_metadata(config: Mapping | None, generation_config: Mapping | None, tokenizer) -> set[int]:
     """The EOS set ``shared.modeling.resolve_eos_token_ids`` derives, from a remote proof worker's
-    reported metadata (plain dicts, nested ``text_config`` included) and the local tokenizer."""
+    reported metadata (plain dicts, nested ``text_config`` included) and the local tokenizer.
+
+    Config only (item 14): the worker reports its config and generation config, not its tokenizer's
+    eos, so the comparison with the batcher's set (whose proxies carry the same metadata) checks the
+    configs; the real model's nested ``text_config`` eos is to be checked in remote mode before deploy."""
     from reliquary.shared.modeling import _iter_token_ids
 
     eos: set[int] = set()
@@ -241,7 +245,8 @@ def build_rl_episode_services(
     precommit_retention_s: float = MIN_PRECOMMIT_RETENTION_S,
     registration=None, quota: SessionQuota | None = None, outcomes: SessionOutcomes | None = None,
     signer=None, store_kwargs=None, session_store=None, read_documents=None, fetch_report=None,
-    clock: Callable[[], float] = time.time,
+    clock: Callable[[], float] = time.time, open_body_timeout_s: float | None = None,
+    max_preauth_opens: int | None = None,
 ) -> RlEpisodeServices:
     """``environments``: the order's episode envs as loaded (``SignedEpisodeEnvironment``; their
     ``source`` is plan 2A's); ``renderer_for(policy)``: the turn renderer of the policy's tokenizer over
@@ -254,7 +259,7 @@ def build_rl_episode_services(
     from reliquary.infrastructure import sandbox_store
     from reliquary.sandbox import require_sandbox
     from reliquary.sandbox.fleet import Fleet, http_fetch_report
-    from reliquary.sandbox.rl_routes import build_episode_precommit_router
+    from reliquary.sandbox.rl_routes import BODY_TIMEOUT_S, MAX_PREAUTH, build_episode_precommit_router
     from reliquary.sandbox.routes import build_sandbox_sessions_router
 
     require_sandbox()
@@ -302,7 +307,10 @@ def build_rl_episode_services(
     sessions_router = build_sandbox_sessions_router(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=RL_PREFIX, registration=registration,
         clock=clock, max_concurrent_closes=config.close_concurrency,
-        close_body_timeout_s=config.close_body_timeout_s, max_preauth_closes=config.close_preauth_concurrency)
+        close_body_timeout_s=config.close_body_timeout_s, max_preauth_closes=config.close_preauth_concurrency,
+        # the opens are bounded like the precommits (fix round 1, M2)
+        open_body_timeout_s=BODY_TIMEOUT_S if open_body_timeout_s is None else open_body_timeout_s,
+        max_preauth_opens=MAX_PREAUTH if max_preauth_opens is None else max_preauth_opens)
     precommit_router = build_episode_precommit_router(
         record=runtime.record_episode_precommit, current_window=current_window,
         validator_hotkey=validator_hotkey, policy=policy, prefix=RL_PREFIX, registration=registration,

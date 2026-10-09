@@ -107,7 +107,7 @@ REFUSAL_STATUS: dict[str, int] = {
     # this validator cannot answer now: retry
     "sandbox_capacity": 503, "directory_unavailable": 503, "store_unavailable": 503,
     "ledger_unavailable": 503, "task_unavailable": 503, "registration_unavailable": 503,
-    "close_busy": 503, "job_not_ready": 503,
+    "close_busy": 503, "open_busy": 503, "job_not_ready": 503,
     "internal_error": 500,
 }
 UNMAPPED_STATUS = 409
@@ -172,15 +172,18 @@ async def _read_bounded(request: Request, cap: int) -> bytes:
     return b"".join(chunks)
 
 
+async def _read_within(request: Request, cap: int, deadline_s: float | None = None) -> bytes:
+    if deadline_s is None:
+        return await _read_bounded(request, cap)
+    try:
+        return await asyncio.wait_for(_read_bounded(request, cap), deadline_s)
+    except TimeoutError:
+        raise _Refused(_refuse("body_timeout", {"max_seconds": deadline_s})) from None
+
+
 async def _parse(request: Request, model: type[BaseModel], cap: int,
                  deadline_s: float | None = None) -> Any:
-    if deadline_s is None:
-        raw = await _read_bounded(request, cap)
-    else:
-        try:
-            raw = await asyncio.wait_for(_read_bounded(request, cap), deadline_s)
-        except TimeoutError:
-            raise _Refused(_refuse("body_timeout", {"max_seconds": deadline_s})) from None
+    raw = await _read_within(request, cap, deadline_s)
     # Up to MAX_CLOSE_BODY_BYTES of JSON and its model: off the event loop.
     return await asyncio.to_thread(_decode, raw, model)
 
@@ -220,7 +223,17 @@ def build_sandbox_sessions_router(
     close_wait_s: float | None = None,
     close_body_timeout_s: float | None = CLOSE_BODY_TIMEOUT_S,
     max_preauth_closes: int | None = MAX_PREAUTH_CLOSES,
+    open_body_timeout_s: float | None = None,
+    max_preauth_opens: int | None = None,
 ) -> APIRouter:
+    """``open_body_timeout_s`` / ``max_preauth_opens`` (None: unbounded, the corpus routes): an open's
+    body must arrive within that time (408 ``body_timeout``), and at most that many opens are decoded
+    and authenticated at once, after their body is read (one more is refused ``open_busy``, 503)."""
+    if max_preauth_opens is not None and max_preauth_opens <= 0:
+        raise ValueError("max_preauth_opens must be positive")
+    if open_body_timeout_s is not None and not (math.isfinite(open_body_timeout_s) and open_body_timeout_s > 0):
+        raise ValueError("open_body_timeout_s must be a positive number of seconds")
+    open_preauth = None if max_preauth_opens is None else asyncio.Semaphore(max_preauth_opens)
     if max_concurrent_closes is not None and max_concurrent_closes <= 0:
         raise ValueError("max_concurrent_closes must be positive")
     if max_preauth_closes is not None and max_preauth_closes <= 0:
@@ -291,8 +304,18 @@ def build_sandbox_sessions_router(
     @router.post(open_path)
     async def open_session(http: Request) -> JSONResponse:
         async def step() -> JSONResponse:
-            request, hotkey = await _parse(http, SandboxSessionOpenRequest, MAX_OPEN_BODY_BYTES)
-            await gate(request, hotkey, verify_open, open_path)
+            if open_preauth is None:
+                request, hotkey = await _parse(http, SandboxSessionOpenRequest, MAX_OPEN_BODY_BYTES,
+                                               open_body_timeout_s)
+                await gate(request, hotkey, verify_open, open_path)
+            else:
+                # The body is read holding nothing; the decode and the signature check are bounded.
+                raw = await _read_within(http, MAX_OPEN_BODY_BYTES, open_body_timeout_s)
+                if open_preauth.locked():
+                    return refuse("open_busy", {"max_concurrent": max_preauth_opens})
+                async with open_preauth:
+                    request, hotkey = await asyncio.to_thread(_decode, raw, SandboxSessionOpenRequest)
+                    await gate(request, hotkey, verify_open, open_path)
             outcome = await issuer.open(
                 hotkey=hotkey, request_id=request.request_id,
                 engagement=request.engagement.model_dump(exclude_none=True))
