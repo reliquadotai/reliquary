@@ -1,0 +1,215 @@
+{
+ "corpus_sessions": {
+  "document": "{\"checkpoint\": \"cccccccccccccccccccccccccccccccccccccccc\", \"closed_at\": null, \"closed_status\": null, \"engagement\": \"corpus:job-7:3\", \"engagement_sha256\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"env\": \"swe\", \"expires_at\": 1800003600, \"hotkey\": \"5Hot\", \"index\": 3, \"issued_at\": 1800000000, \"job_id\": \"job-7\", \"kind\": \"corpus\", \"machine_id\": \"m-1\", \"prompt_index\": 3, \"request_id\": \"r-1\", \"schema\": \"reliquary/sandbox-session/v1\", \"session_id\": \"s-1\", \"split\": \"train\", \"state\": \"live\", \"token_sha256\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}",
+  "engagement": "corpus:job-7:3",
+  "round_trip": true,
+  "session_key": "reliquary/sandbox/sessions/20270115/s-1.json",
+  "session_prefix": "reliquary/sandbox/sessions/"
+ },
+ "environments": {
+  "manifest_sha256": "18432f913c2913fe18db6fe66a74dc30976a3f6b6d0b6c17af80a86e1a80483e",
+  "modes": {
+   "envscaler_tools_v1": "episode",
+   "opencodeinstruct": "single_turn",
+   "openmathinstruct": "single_turn",
+   "reliquary_code_v1": "single_turn",
+   "reliquary_dapo_math_v1": "single_turn",
+   "reliquary_hard_math_v1": "single_turn",
+   "reliquary_instruction_following_v1": "single_turn",
+   "reliquary_logic_v2": "single_turn",
+   "reliquary_retrieval_tools_v1": "episode",
+   "reliquary_science_v1": "single_turn",
+   "reliquary_stateful_tools_v1": "episode",
+   "reliquary_stateful_tools_v2": "episode",
+   "reliquary_telecom_solo_v1": "episode",
+   "reliquary_workspace_tools_v1": "episode",
+   "reliquarylogic_v1": "single_turn",
+   "reliquaryverifiable_v1": "single_turn"
+  },
+  "per_env": {
+   "envscaler_tools_v1": "44da7ddbd0f6d373f28f2c7a11b105ef2996b630860a2f56a7800adc19307906",
+   "opencodeinstruct": "26eff4b0af6941a2667353450ebafccf8a25b0e1c913b7f293f9ac70814ecdc4",
+   "openmathinstruct": "5cab5454039b040e0f91352725c3dc138d0891e0cbd073bf431a3ac436e67076",
+   "reliquary_code_v1": "e6f2fa79ca5f0170403d09a697e82e06439c7aa0c924abec601296619e85c0ce",
+   "reliquary_dapo_math_v1": "f69391d91ed5d6b61950cd63793bd3c5f5e9060611f53c5210e2d28b054dbcc4",
+   "reliquary_hard_math_v1": "577c6410270599c0d61cd3f6f97e59ef40a432cbc50009f88bda0fde7166719d",
+   "reliquary_instruction_following_v1": "7b55db2a06a38926a5237f59abb903cabb60b74ac9e07410c180015e58639214",
+   "reliquary_logic_v2": "21dd8d8c754064fea60b33ee8e90d996f9c241c04c79269e27bf141b7a014e8f",
+   "reliquary_retrieval_tools_v1": "f5553799a1e60788c8cf1c780bd55321da3078ce2a9f5bd910df6bcc593ab62a",
+   "reliquary_science_v1": "c5e8db15905337285844a87436b0b9ab52eb0d3c9439c39694d7434c58c0d1ca",
+   "reliquary_stateful_tools_v1": "5e5d9091d989b7b6b51fff57d4e0599152158621573feccd0e6e75e3967a5267",
+   "reliquary_stateful_tools_v2": "7427cb4965d385957c5003c2e15f944dd72b7787873c6724f13deea794be45d7",
+   "reliquary_telecom_solo_v1": "01abefb72f8609db645b4065f7f211ed5594a7a3c7611436504e6e58b5dbf307",
+   "reliquary_workspace_tools_v1": "222b65976b8c0689c1e216704ce5c97da44ead17a156ae6469bcfc9b6fb257b4",
+   "reliquarylogic_v1": "62b514a44e0f0fcb53c1a08fd086fd38d0aaeb221cfc37601b9df1ca5efca6a1",
+   "reliquaryverifiable_v1": "0560554eddf3feb4497385e7052ce379e8c4d67b787ed00f11deabeb42b57ebe"
+  }
+ },
+ "payload": {
+  "historical_episode_v1_decoded": "c8e9cfdeb3699495e618b9df4abfaaeb8c269932a63a509e4965f7c031e8c2f8",
+  "single_turn_arrays": {
+   "env_names": "813533d594cb88f5cb8b0df8c8572a8af66642f2623603bdedebc8a668b577b7",
+   "has_pi_old": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+   "miner_lp_flat": "dae5928b160c5aebcac25818ba8c849b715dc851d36848cc08d3caa06633dd81",
+   "miner_lp_off": "3fa2415a39dc835c27349fd2aee0da8ba62c1a4f6fa513a95847827d93d0993a",
+   "pi_old_flat": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "pi_old_off": "2c34ce1df23b838c5abf2a7f6437cca3d3067ed509ff25f11df6b11b582b51eb",
+   "rewards": "36792d4294ab97ffc9d1b5ce9ac14710bf4a1ee587c1b55c51bb7ea9fe01902f",
+   "tokens_flat": "9ca6769dc056d24b20e27d88df9fb4c6d74bd371eed040ea9e845f2ad081c394",
+   "tokens_off": "75892ba0b844187c0f9ec3f7bdb9a4d2baf5ee6fa44694ff755daa5fd3a5fbd3"
+  },
+  "single_turn_decoded": "b5ccdb986c855dbac958488536f80d2eba19dc7292c26c62966f85534d7edf20",
+  "single_turn_header": {
+   "checkpoint_revision": "rev-abc",
+   "env_order": [
+    "openmathinstruct",
+    "opencodeinstruct"
+   ],
+   "groups": [
+    {
+     "env": "openmathinstruct",
+     "n_rollouts": 2,
+     "prompt_idx": 11
+    },
+    {
+     "env": "opencodeinstruct",
+     "n_rollouts": 2,
+     "prompt_idx": 22
+    }
+   ],
+   "rollout_meta": [
+    {
+     "completion_length": 4,
+     "forced": false,
+     "prompt_length": 7,
+     "truncated": false
+    },
+    {
+     "completion_length": 6,
+     "forced": true,
+     "prompt_length": 7,
+     "truncated": false
+    },
+    {
+     "completion_length": 5,
+     "forced": false,
+     "prompt_length": 7,
+     "truncated": false
+    },
+    {
+     "completion_length": 3,
+     "forced": false,
+     "prompt_length": 7,
+     "truncated": true
+    }
+   ],
+   "schema_version": 1,
+   "termination_paths": [
+    null,
+    null,
+    null,
+    null
+   ],
+   "validated_spans": [
+    null,
+    null,
+    null,
+    null
+   ],
+   "window_quarantine": {
+    "quarantined": false,
+    "reasons": []
+   },
+   "window_start": 30100
+  }
+ },
+ "proof_wire": {
+  "proof_input": {
+   "with_toploc": [
+    "00e2fbc792d33258a8d01254b1ea5c5f8bcfdb683581064ba2cbb83f4bd646c0",
+    "4073d4c2cc0f21b6616b7b9f802e3f322a9b023b7e562116ace5d8cd85eca609"
+   ],
+   "without_toploc": [
+    "5d8d9b39a8f09dc600f466105cb144b78e6d3cae52b8d87bcebeb85cf6cc27ae",
+    "5215957a5d90335425c9aa336e55908927ed2046822ba7d6e906f7354f930e6f"
+   ]
+  },
+  "proof_values": "{\"all_passed\":true,\"challenge_lp_indices\":[3,5],\"challenge_lp_values\":[-0.5,-1.5],\"checked\":8,\"completion_argmax_ids\":[7,7,7,7,7,7,7,7],\"completion_argmax_probs\":[0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95],\"completion_chosen_probs\":[0.9,0.9,0.9,0.9,0.9,0.9,0.9,0.9],\"completion_entropies\":[],\"has_sparse_outputs\":true,\"hidden_delta_f16_b64\":null,\"hidden_dim\":0,\"hidden_end_completion_offset\":null,\"hidden_start_f16_b64\":null,\"natural_close_pick_cdf_miss\":null,\"natural_close_pick_ok\":null,\"p_stop\":0.125,\"passed\":8,\"representation_shift_l2\":null,\"seed_first_hard_mismatch_offset\":null,\"seed_max_cdf_miss\":0.0,\"seed_n_boundary_match\":0,\"seed_n_deterministic_hard_mismatch\":0,\"seed_n_hard_mismatch\":0,\"seed_n_match\":5,\"seed_n_miss_gt_0_01\":0,\"seed_n_miss_gt_0_05\":0,\"seed_n_miss_gt_0_10\":0,\"seed_n_positions\":0,\"seed_n_stochastic\":6,\"sketch_diff_max\":17,\"terminal_pick_cdf_miss\":null,\"terminal_pick_ok\":true,\"toploc_checked\":false,\"toploc_passed\":false,\"toploc_reason\":null,\"toploc_worst_exp\":0,\"toploc_worst_mant_mean\":0.0,\"toploc_worst_mant_median\":0.0}",
+  "proof_values_toploc": "{\"all_passed\":true,\"challenge_lp_indices\":[3,5],\"challenge_lp_values\":[-0.5,-1.5],\"checked\":8,\"completion_argmax_ids\":[7,7,7,7,7,7,7,7],\"completion_argmax_probs\":[0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95],\"completion_chosen_probs\":[0.9,0.9,0.9,0.9,0.9,0.9,0.9,0.9],\"completion_entropies\":[],\"has_sparse_outputs\":true,\"hidden_delta_f16_b64\":null,\"hidden_dim\":0,\"hidden_end_completion_offset\":null,\"hidden_start_f16_b64\":null,\"natural_close_pick_cdf_miss\":null,\"natural_close_pick_ok\":null,\"p_stop\":0.125,\"passed\":8,\"representation_shift_l2\":null,\"seed_first_hard_mismatch_offset\":null,\"seed_max_cdf_miss\":0.0,\"seed_n_boundary_match\":0,\"seed_n_deterministic_hard_mismatch\":0,\"seed_n_hard_mismatch\":0,\"seed_n_match\":5,\"seed_n_miss_gt_0_01\":0,\"seed_n_miss_gt_0_05\":0,\"seed_n_miss_gt_0_10\":0,\"seed_n_positions\":0,\"seed_n_stochastic\":6,\"sketch_diff_max\":17,\"terminal_pick_cdf_miss\":null,\"terminal_pick_ok\":true,\"toploc_checked\":true,\"toploc_passed\":false,\"toploc_reason\":\"exp_mismatch\",\"toploc_worst_exp\":0,\"toploc_worst_mant_mean\":0.0,\"toploc_worst_mant_median\":0.0}"
+ },
+ "signature_messages": {
+  "grail_episode_missing": [
+   false,
+   null
+  ],
+  "grail_episode_v1": [
+   true,
+   "009697e7035aac0211300d9d79936ff525668b40de826c6745a16e90e5cec469"
+  ],
+  "grail_single_turn": [
+   true,
+   "dfb9b0225a8cfa10582444a5b9a6ebfc1478194d0edda725b79af3c4db56ee67"
+  ],
+  "grail_with_pool": [
+   false,
+   null
+  ],
+  "public_pool": [
+   true,
+   "14ecb12f34b307f80df1464dd74b8729c4ff64411459d8dd80913ac5e36d602e"
+  ],
+  "public_pool_episode_v1": [
+   false,
+   null
+  ],
+  "public_pool_service": [
+   true,
+   "269f14db69ab7068c98ef657111896c1fe597986dacda2707319b30a466b0503"
+  ],
+  "public_pool_service_no_pool": [
+   false,
+   null
+  ],
+  "service": [
+   true,
+   "50ffcfb312c840a8babb438d1fa0630f9fa23d48342442f2151a9a6f465762d7"
+  ],
+  "service_episode_v1": [
+   false,
+   null
+  ],
+  "unknown_version": [
+   false,
+   null
+  ]
+ },
+ "single_turn_v2": {
+  "announcement": "b6253805ae0784432b38285260f873400f477be09a59e41ce932cb5c50d1647c",
+  "contract_bytes": "5d586e63cbfd5d525bba75b94661900738f96cdc54ffbc72d8ebc26f44288b7c",
+  "contract_sha256": "5d586e63cbfd5d525bba75b94661900738f96cdc54ffbc72d8ebc26f44288b7c",
+  "envelope": "faddb7c44b8cb59dbe046b56cdcedd479e26c845c6c50d10d5ff3975c6808d69",
+  "events": "c3960bbf48a39011ee88f3d47346a495020d3b60dd845c3949002a04b617fc9b",
+  "explored": "6d396386cf2114fc71637452d5baaff66f4d6ac5a8ce9d45681bb21af768c024",
+  "supported_capabilities": [
+   "environment-reward/v1",
+   "exploration-first-scan/v1",
+   "in-zone-rotation/v1",
+   "legacy/v1",
+   "public-seed-pool/v3",
+   "task-scoped/v1",
+   "trainer-driven/v1"
+  ],
+  "trained": "97ef4d875bf1972f47ea960225918640642a2c87d93586d3f86da6791de49728"
+ },
+ "submission": {
+  "cap_accepted": false,
+  "episode_v1_meta": "82a5c986d1ca137c43082424ddfe5c4fc92a23660bd74cc851986038b469a2ff",
+  "over_cap_refused": [
+   true,
+   true
+  ],
+  "request_dump": "3073acfc072fb2aadb9215e479298d8d7edf149465d0067af7ceff85bf215d31",
+  "request_json": "ece2a13f62103758e8dde8b6f27163892da2334e9759b7de7c5ec5a64e743f08",
+  "single_turn_meta": "{\"prompt_length\":4,\"completion_length\":32,\"success\":true,\"total_reward\":1.0,\"advantage\":0.0,\"token_logprobs\":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],\"forced\":false,\"force_span\":null,\"truncated\":false,\"episode\":null}"
+ }
+}

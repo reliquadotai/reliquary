@@ -16,6 +16,8 @@ other half, that the new code does not RUN:
 from __future__ import annotations
 
 import ast
+import asyncio
+import inspect
 import json
 import os
 import subprocess
@@ -148,9 +150,11 @@ def test_the_tripwires_really_fire_and_record(rl_service_tripwires):
             owner.__dict__[attr](SimpleNamespace(_service_runtime=object()))
         assert rl_service_tripwires == [f"{module_name}.{dotted}"]
         rl_service_tripwires.clear()
-        owner.__dict__[attr](SimpleNamespace(_service_runtime=None, _signer_client=None))   # legacy: the real early return
+        result = owner.__dict__[attr](SimpleNamespace(_service_runtime=None, _signer_client=None))   # legacy: the real early return
+        if inspect.iscoroutine(result):
+            assert asyncio.run(result) is None
         assert rl_service_tripwires == []
-    assert len(ARMED) >= 27 and len(RUNTIME_ONLY) == 2
+    assert len(ARMED) >= 27 + 36 and len(RUNTIME_ONLY) == 3
 
 
 # ------------------------------------------------------------------ the legacy boot

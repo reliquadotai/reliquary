@@ -1,17 +1,21 @@
-"""Tripwires on every entry point of the next-RL-run service stack (phase 1).
+"""Tripwires on every entry point of the next-RL-run service stack (phase 1) and of signed episodes (plan 2C).
 
-A legacy RL task and a corpus job must never reach them. ``rl_service_tripwires`` is autouse where it is
+A legacy RL task and a corpus job must never reach them; a single-turn v2 order never reaches the plan 2C ones. ``rl_service_tripwires`` is autouse where it is
 imported: it replaces each entry point by a wrapper that RAISES and RECORDS the call, and fails the test
 afterwards if anything was recorded (a caller that swallows the exception does not hide it).
 
 Used two ways: ``from tests.unit.rl_tripwires import rl_service_tripwires`` in a test module (armed for that
 module only), and ``pytest -p tests.unit.rl_tripwires <legacy test file>`` (``test_next_rl_run_inertness``
-reruns the legacy and corpus suites that way).
+reruns the legacy and corpus suites that way). ``tests.unit.episode_tripwires`` arms the plan 2C entry points
+only (``EPISODE_ARMED`` and ``EPISODE_CONDITIONAL``), for the single-turn v2 suites that legitimately run the phase 1
+stack (``test_episode_inertness``).
 """
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
+import inspect
 
 import pytest
 
@@ -69,10 +73,94 @@ ARMED = (
     ("reliquary.validator.batcher", "GrpoWindowBatcher._classify_audit_failure"),
 )
 
+# Plan 2C (signed episodes in the v2 path): never reached by a legacy task, a single-turn order or a corpus job.
+EPISODE_ARMED = (
+    ("reliquary.services.runtime", "ServiceRuntime.record_episode_precommit"),
+    ("reliquary.services.runtime", "ServiceRuntime.episode_precommit"),
+    ("reliquary.services.runtime", "ServiceRuntime.episode_precommit_sha"),
+    ("reliquary.services.runtime", "ServiceRuntime.episode_precommit_recorded_at"),
+    ("reliquary.services.runtime", "ServiceRuntime.prune_episode_precommits"),
+    ("reliquary.protocol.service_episode", "EpisodePrecommit.from_dict"),
+    ("reliquary.protocol.service_episode", "episode_commit_material"),
+    ("reliquary.protocol.signatures", "build_service_episode_commit_binding"),
+    ("reliquary.protocol.signatures", "build_episode_precommit_binding"),
+    ("reliquary.protocol.toploc_proof", "span_proofs_b64"),
+    ("reliquary.sandbox.rl_engagements", "RlEpisodeEngagements.terms"),
+    ("reliquary.sandbox.sessions", "SessionIssuer.claim_all"),
+    ("reliquary.sandbox.sessions", "SessionIssuer.persist_submitted"),
+    ("reliquary.sandbox.sessions", "SessionIssuer.submitted_all"),
+    ("reliquary.sandbox.sessions", "SessionIssuer.hand_back"),
+    ("reliquary.sandbox.sessions", "SessionBook.engagement_held"),
+    ("reliquary.sandbox.sessions", "SessionBook.of_precommit"),
+    ("reliquary.sandbox.sessions", "SessionBook.precommits_held"),
+    ("reliquary.validator.episode_admission", "EpisodeGroupChecker.check"),
+    ("reliquary.validator.episode_admission", "finish_prepared"),
+    ("reliquary.validator.episode_intake", "EpisodeGroupIntake.admit"),
+    ("reliquary.validator.rl_sandbox_wiring", "build_rl_episode_services"),
+    ("reliquary.validator.toploc_check", "toploc_span_verdict"),
+    ("reliquary.validator.verifier", "_episode_stop_picks"),
+    ("reliquary.validator.batcher", "signed_episode_proof_refusal"),
+    ("reliquary.validator.batcher", "signed_episode_unchecked_turn"),
+    ("reliquary.validator.remote_proof", "_config_namespace"),
+    ("reliquary.validator.server", "ValidatorServer._admit_episode_group"),
+    ("reliquary.validator.server", "ValidatorServer._persist_episode_claim"),
+    ("reliquary.validator.server", "ValidatorServer._start_episode_settlement"),
+    ("reliquary.validator.service", "ValidationService._episode_task_in_cooldown"),
+    ("reliquary.validator.service", "ValidationService._note_episode_window"),
+    ("reliquary.validator.service", "ValidationService._current_service_window"),
+    ("reliquary.validator.service", "ValidationService._episode_stop_sets"),
+    ("reliquary.validator.service", "ValidationService._episode_precommit_retention_s"),
+    ("reliquary.validator.service", "ValidationService._default_episode_renderer"),
+)
+ARMED = ARMED + EPISODE_ARMED
+
+
+def _kw(args, kwargs, name, position):
+    return kwargs[name] if name in kwargs else (args[position] if len(args) > position else None)
+
+
+def _batcher_hands_back(args, kwargs, result):
+    self, pending = args[0], _kw(args, kwargs, "pending", 1)
+    return self.episode_proof_inconclusive is not None or (
+        pending is not None and self._signed_episode_pending(pending))
+
+
+# Plan 2C entry points a legacy task, a single-turn order or a corpus job DOES call, where the new code returns
+# at once: wrapped, run for real, and recorded only when ``predicate(args, kwargs, result)`` says the episode
+# branch was taken. Both the defining module and the name a caller imported are wrapped.
+EPISODE_CONDITIONAL = (
+    ("reliquary.validator.service", "ValidationService._start_episode_services",
+     lambda a, k, r: getattr(getattr(getattr(a[0], "_service_runtime", None), "contract", None),
+                             "episode_environments", ())),
+    ("reliquary.validator.service", "ValidationService._stop_episode_services",
+     lambda a, k, r: getattr(a[0], "_episode_services", None) is not None),
+    ("reliquary.validator.batcher", "GrpoWindowBatcher._episode_proof_inconclusive", _batcher_hands_back),
+    ("reliquary.validator.verifier", "signed_episode_spans", lambda a, k, r: r is not None),
+    ("reliquary.validator.server", "_episode_admission_fields", lambda a, k, r: bool(r)),
+    ("reliquary.validator.admission", "service_length_valid",
+     lambda a, k, r: k.get("episode_max_tokens") is not None),
+    ("reliquary.protocol.service_contract", "ServiceContract.episode_policy", lambda a, k, r: r is not None),
+    ("reliquary.protocol.service_contract", "supported_v2_capabilities",
+     lambda a, k, r: "signed-sandbox-episode/v1" in r),
+    ("reliquary.services.admission_policy", "supported_v2_capabilities",
+     lambda a, k, r: "signed-sandbox-episode/v1" in r),
+    ("reliquary.services.runtime", "supported_v2_capabilities",
+     lambda a, k, r: "signed-sandbox-episode/v1" in r),
+    ("reliquary.protocol.seed_pool", "validate_rollout_selection", lambda a, k, r: bool(k.get("signed_episodes"))),
+    ("reliquary.protocol.service_submission", "validate_service_rollout_bindings",
+     lambda a, k, r: bool(k.get("signed_episodes"))),
+    ("reliquary.shared.training_payload", "_is_signed_episode", lambda a, k, r: bool(r)),
+    ("reliquary.miner.corpus_generate_server", "GenerateEngine.__init__", lambda a, k, r: k.get("draws") is not None),
+    ("reliquary.miner.engine", "_single_turn_envs", lambda a, k, r: r[0] is not a[0]),
+    ("reliquary.infrastructure.sandbox_store", "R2SessionStore.__init__",
+     lambda a, k, r: k.get("prefix", "reliquary/sandbox/sessions/") != "reliquary/sandbox/sessions/"),
+)
+
 # Entry points a legacy boot / window DOES call, returning at once when there is no runtime: they are wrapped,
 # not blocked, and recorded only when called on an instance that has a service runtime.
 RUNTIME_ONLY = (
     ("reliquary.validator.service", "ValidationService._start_observation_publication"),
+    ("reliquary.validator.service", "ValidationService._start_episode_services"),
     ("reliquary.validator.service", "ValidationService._refresh_service_active"),
 )
 
@@ -85,23 +173,62 @@ def _resolve(module_name: str, dotted: str):
     return owner, attr
 
 
-@pytest.fixture(autouse=True)
-def rl_service_tripwires(monkeypatch):
-    calls: list[str] = []
+def arm_conditional(monkeypatch, calls: list[str], conditional) -> None:
+    """Wrap each ``(module, dotted, predicate)``: the real code runs, and the call is recorded (and refused)
+    when the predicate says it took the episode branch. Coroutine functions stay coroutine functions."""
+    for module_name, dotted, predicate in conditional:
+        owner, attr = _resolve(module_name, dotted)
+        real = owner.__dict__.get(attr, getattr(owner, attr))
+        is_static = isinstance(real, staticmethod)
+        function = real.__func__ if is_static else real
+        label = f"{module_name}.{dotted}"
 
-    def arm(label: str, owner, attr: str) -> None:
+        def make(label, function, predicate):
+            def check(args, kwargs, result):
+                if predicate(args, kwargs, result):
+                    calls.append(label)
+                    raise AssertionError(f"{label} took its episode branch for a legacy RL task / single-turn "
+                                         f"order / corpus job")
+                return result
+
+            if inspect.iscoroutinefunction(function):
+                async def conditional_async(*args, **kwargs):
+                    return check(args, kwargs, await function(*args, **kwargs))
+                return functools.wraps(function)(conditional_async)
+
+            def conditional(*args, **kwargs):
+                return check(args, kwargs, function(*args, **kwargs))
+            return functools.wraps(function)(conditional)
+        wrapped = make(label, function, predicate)
+        monkeypatch.setattr(owner, attr, staticmethod(wrapped) if is_static else wrapped)
+
+
+def arm_entry_points(monkeypatch, calls: list[str], armed) -> None:
+    """Replace each ``(module, dotted)`` by a wrapper that RAISES and RECORDS the call."""
+    for module_name, dotted in armed:
+        owner, attr = _resolve(module_name, dotted)
+        label = f"{module_name}.{dotted}"
         original = owner.__dict__.get(attr, getattr(owner, attr))
         is_static = isinstance(original, (staticmethod, classmethod))
         _ORIGINALS[label] = (owner, attr, original)
 
-        def tripwire(*args, **kwargs):
-            calls.append(label)
-            raise AssertionError(f"{label} ran for a legacy RL task / corpus job")
-        monkeypatch.setattr(owner, attr, staticmethod(tripwire) if is_static else tripwire)
+        def make(label):
+            def tripwire(*args, **kwargs):
+                calls.append(label)
+                raise AssertionError(f"{label} ran for a legacy RL task / corpus job")
+            return tripwire
+        monkeypatch.setattr(owner, attr, staticmethod(make(label)) if is_static else make(label))
 
-    for module_name, dotted in ARMED:
-        owner, attr = _resolve(module_name, dotted)
-        arm(f"{module_name}.{dotted}", owner, attr)
+
+def arm_episode(monkeypatch, calls: list[str]) -> None:
+    """The plan 2C entry points only (a single-turn v2 order legitimately runs the phase 1 stack)."""
+    arm_entry_points(monkeypatch, calls, EPISODE_ARMED)
+    arm_conditional(monkeypatch, calls, EPISODE_CONDITIONAL)
+
+
+def arm_legacy(monkeypatch, calls: list[str]) -> None:
+    """Every entry point, phase 1 and plan 2C: what a legacy RL task or a corpus job runs under."""
+    arm_entry_points(monkeypatch, calls, ARMED)
 
     for module_name, dotted in RUNTIME_ONLY:
         owner, attr = _resolve(module_name, dotted)
@@ -116,6 +243,10 @@ def rl_service_tripwires(monkeypatch):
             return runtime_only
         monkeypatch.setattr(owner, attr, make(f"{module_name}.{dotted}", real_method))
 
+    # Wrapped once: an entry point already armed or runtime-only keeps that (stricter) wrapper here.
+    stricter = set(ARMED) | set(RUNTIME_ONLY)
+    arm_conditional(monkeypatch, calls, [c for c in EPISODE_CONDITIONAL if (c[0], c[1]) not in stricter])
+
     # The legacy admission path does call this one, with no policy: it must answer "no policy".
     policy = importlib.import_module("reliquary.services.admission_policy")
     real_policy = policy.validate_submission_policy
@@ -127,5 +258,10 @@ def rl_service_tripwires(monkeypatch):
         return result
     monkeypatch.setattr(policy, "validate_submission_policy", policy_must_stay_none)
 
+
+@pytest.fixture(autouse=True)
+def rl_service_tripwires(monkeypatch):
+    calls: list[str] = []
+    arm_legacy(monkeypatch, calls)
     yield calls
     assert not calls, f"RL service entry points were reached: {sorted(set(calls))}"
