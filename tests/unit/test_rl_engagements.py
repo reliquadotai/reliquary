@@ -44,6 +44,8 @@ def build(tmp_path, *, store=None, quota=None, limits=None, precommits=None, on_
     precommit = episode_precommit(CONTRACT, hotkey=HOTKEY)
     precommits_ = {precommit.sha256: precommit}
     current = {"window": 1}
+    recorded = {precommit.sha256: float(NOW)}
+    wall = {"now": float(NOW)}
 
     async def resolve(index):
         if on_resolve is not None:
@@ -53,14 +55,15 @@ def build(tmp_path, *, store=None, quota=None, limits=None, precommits=None, on_
     views = {EPISODE: EpisodeEnvironmentView(policy=POLICY, resolve_task=resolve)}
     ids = iter(f"s-{tmp_path.name}-{n}" for n in range(10_000))
     engagements = RlEpisodeEngagements(precommits=precommits or precommits_.get, environments=views.get,
-                                       current_window=lambda: current["window"], book=book, quota=quota)
+                                       current_window=lambda: current["window"], book=book, quota=quota,
+                                       recorded_at=recorded.get, clock=lambda: wall["now"])
     issuer = SessionIssuer(
         book=book, store=store if store is not None else MemorySessionStore(),
         fleet=FakeFleet(directory(machine)), signer=validator,
         token_verifier=attest.Ed25519TokenVerifier({"v1": validator.public_key_b64}),
         engagements={"rl_precommit": engagements}, policy=policy, clock=Clock(),
         new_session_id=lambda: next(ids))
-    return SimpleNamespace(issuer=issuer, book=book, precommit=precommit, current=current,
+    return SimpleNamespace(issuer=issuer, book=book, precommit=precommit, current=current, recorded=recorded, wall=wall,
                            validator=validator, machine=machine)
 
 
@@ -131,7 +134,7 @@ def test_only_our_faults_free_a_seed(tmp_path):
 
     asyncio.run(drain())
     assert env.book.get(drained.session_id).state == VOIDED
-    assert isinstance(open_(env, 4, request_id="4" * 32), Grant)
+    assert open_(env, 4, request_id="4" * 32).reason == "engagement_taken"        # a drain frees nothing (M1)
 
 
 @pytest.mark.parametrize("window", [2, None])
@@ -255,3 +258,48 @@ def test_the_corpus_stub_is_untouched():
 
     refused = asyncio.run(RlPrecommitEngagements().terms(HOTKEY, {"kind": "rl_precommit"}))
     assert refused.reason == "engagement_kind_unsupported"
+
+
+def test_a_drain_frees_no_seed_whatever_the_miner_left_open(tmp_path):
+    env = build(tmp_path)
+    good, left = open_(env, 1), open_(env, 2)
+    assert close(env, good, "graded")["state"] == "closed_graded"
+
+    async def drain():
+        env.issuer.void_machine(MACHINE)
+        await asyncio.sleep(0)
+
+    asyncio.run(drain())
+    assert env.book.get(left.session_id).state == VOIDED
+    assert open_(env, 1, request_id="1" * 32).reason == "engagement_taken"
+    assert open_(env, 2, request_id="2" * 32).reason == "engagement_taken"
+
+
+def test_a_seed_is_freed_by_an_abort_only_once(tmp_path):
+    env = build(tmp_path)
+    assert close(env, open_(env, 1), "aborted")["state"] == ABORTED
+    second = open_(env, 1, request_id="1" * 32)
+    assert isinstance(second, Grant)
+    assert close(env, second, "aborted")["state"] == ABORTED
+    assert open_(env, 1, request_id="2" * 32).reason == "engagement_taken"
+    assert isinstance(open_(env, 2), Grant)                       # another seed keeps its own count
+
+
+def test_a_precommit_recorded_more_than_24h_ago_opens_nothing(tmp_path):
+    env = build(tmp_path)
+    env.wall["now"] = NOW + 86_400
+    assert isinstance(open_(env, 0), Grant)
+    env.wall["now"] = NOW + 86_401
+    assert open_(env, 1).reason == "precommit_stale"
+    env.wall["now"] = NOW
+    env.recorded.clear()                                          # no recorded age: fail closed
+    assert open_(env, 2).reason == "precommit_stale"
+
+
+def test_a_session_longer_than_the_restore_horizon_is_refused_at_open(tmp_path):
+    over = 86_400 - SandboxPolicy().open_window_s
+    env = build(tmp_path, limits={"wall_s": over + 1})
+    refused = open_(env, 0)
+    assert refused.reason == "session_too_long" and not env.book._sessions
+    env = build(tmp_path / "ok", limits={"wall_s": over})
+    assert isinstance(open_(env, 0), Grant)

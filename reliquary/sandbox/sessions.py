@@ -206,8 +206,8 @@ class EngagementTerms:
     # it under the lock when the prompt's reservations moved since the first read.
     refresh_slots: Callable[[], Awaitable[int | None | Refusal]] | None = field(
         default=None, repr=False, compare=False)
-    # Plan 2C: at most one session per engagement (an RL seed) unless every earlier one was aborted
-    # or voided (our fault); checked under the issuer lock. Corpus terms leave it False.
+    # Plan 2C: at most one session per engagement (an RL seed) unless the only earlier one was aborted
+    # (machine-signed, at most once); a drain never frees it. Checked under the issuer lock. Corpus: False.
     exclusive: bool = False
     # Plan 2C: the terms' cheap preconditions read again under the issuer lock (the RL precommit's
     # window may have turned while the task resolved): a Refusal refuses the open. Corpus: None.
@@ -462,10 +462,18 @@ class SessionBook:
                    if r.job_id == job_id and r.prompt_index == prompt_index and self._holds(r, now))
 
     def engagement_held(self, engagement: str) -> bool:
-        """Plan 2C: whether a session of ``engagement`` exists in a state that consumes it (every state
-        but ``aborted`` and ``voided``, which are our fault: the miner may open it again)."""
-        return any(r.engagement == engagement and r.state not in (ABORTED, VOIDED)
-                   for r in self._sessions.values())
+        """Plan 2C: whether an exclusive (RL) engagement is consumed. Only a machine-signed ``aborted``
+        frees it, and at most ONCE: a ``voided`` session (a drain frees what the miner left ``live``, so
+        it would be a selective re-roll) and every other state keep it taken, and so does a second
+        ``aborted`` record of the same engagement."""
+        aborted = 0
+        for r in self._sessions.values():
+            if r.engagement != engagement:
+                continue
+            if r.state != ABORTED:
+                return True
+            aborted += 1
+        return aborted >= 2
 
     def submitted_ids(self) -> frozenset[str]:
         """Safe from any thread: an immutable set, kept up to date by `settle`."""
