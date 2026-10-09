@@ -87,6 +87,7 @@ def test_rows_are_the_completions_of_passing_submissions_with_no_hotkey():
     assert rows[0]["accepted"] is None and rows[0]["score"] is None
     assert counts == {"verdicts": 6, "passing_submissions": 4, "missing_records": 0,
                       "completions": 8, "rows": 8, "rows_accepted": None,
+                      "duplicate_completion": None,
                       "unfinished": {"unfinished_no_eos": 0, "unclosed_think": 0,
                                      "multiple_think_close": 0}}
 

@@ -176,6 +176,7 @@ async def _bounded(calls, gate: asyncio.Semaphore) -> list:
 
 
 async def delivery_rows(*, job, records, counts: dict, grade=None,
+                        seen: set[bytes] | None = None,
                         concurrency: int = READ_CONCURRENCY,
                         window: int = READ_WINDOW) -> AsyncIterator[dict]:
     """One row per finished completion of every passing submission, in
@@ -184,15 +185,21 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
     No hotkey: the delivery is the work, not who did it. An unfinished
     completion (``unfinished_reason``: no EOS, or a thinking block not closed
     exactly once) is left out before grading and counted under ``unfinished``
-    by reason. ``grade`` annotates (``accepted``, ``score``) and never drops a
-    row. ``counts`` is filled in as the rows go.
+    by reason. With ``seen`` (``is_duplicate``), a completion already seen, in
+    this job or in the ones ``seen`` was filled from, is left out too, before
+    grading, and counted as ``duplicate_completion``. ``grade`` annotates
+    (``accepted``, ``score``) and never drops a row. ``counts`` is filled in as
+    the rows go.
     """
-    from reliquary.corpus.export import new_unfinished_counts, thinking_render, unfinished_reason
+    from reliquary.corpus.export import (
+        is_duplicate, new_unfinished_counts, thinking_render, unfinished_reason,
+    )
 
     thinking = thinking_render(job)
     ids = list(await records.list_verdict_ids(job.job_id))
     counts.update(verdicts=len(ids), passing_submissions=0, missing_records=0, completions=0,
-                  unfinished=new_unfinished_counts(), rows=0,
+                  unfinished=new_unfinished_counts(),
+                  duplicate_completion=0 if seen is not None else None, rows=0,
                   rows_accepted=0 if grade is not None else None)
     gate = asyncio.Semaphore(concurrency)
     for start in range(0, len(ids), window):
@@ -214,6 +221,9 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
                                            thinking=thinking)
                 if reason is not None:
                     counts["unfinished"][reason] += 1
+                    continue
+                if is_duplicate(completion, seen):
+                    counts["duplicate_completion"] += 1
                     continue
                 rows.append({
                     "job_id": job.job_id, "submission_id": sid,
@@ -490,7 +500,8 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           sft_only: bool = False,
                           quarantined: Collection[str] | None = None,
                           instruction_source=None, instruction_note: str | None = None,
-                          keep_rejected: bool = False) -> dict:
+                          keep_rejected: bool = False, dedupe: bool = False,
+                          dedupe_against: Collection[str] = ()) -> dict:
     """Write ``deliveries/{delivery_id}/``: the shards, ``report.json``, then
     ``manifest.json``. A delivery whose manifest exists is returned as stored.
 
@@ -499,12 +510,23 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     correctness filter); the Parquet rows carry ``accepted``/``score`` either
     way. Unfinished completions are never delivered.
 
+    ``dedupe`` delivers a completion once (by ``completion_fingerprint``):
+    the first copy in verdict-id order, and none already in a passing
+    submission of a job in ``dedupe_against`` (which implies ``dedupe``), e.g.
+    a v2 job on the prompts of its v1.
+
     An episode job is delivered as episode rows (``episode_rows``): it needs
     its pinned ``renderer``, its task ``source`` and the registry's
     ``quarantined`` grade executors."""
     episode = getattr(job, "episode", None) is not None
     if keep_rejected and (episode or grade is None):
         raise ValueError("keep_rejected needs a grader: it keeps what the filter rejects")
+    dedupe_against = sorted(set(dedupe_against))
+    if job.job_id in dedupe_against:
+        raise ValueError("a delivery cannot be deduplicated against itself")
+    dedupe = dedupe or bool(dedupe_against)
+    if episode and dedupe:
+        raise ValueError("an episode delivery is not deduplicated by completion")
     if episode and (renderer is None or source is None or quarantined is None):
         raise ValueError("an episode job is exported with its pinned renderer, its task source "
                          "and the quarantined grade executors")
@@ -567,6 +589,12 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
         instruction["omitted"][reason] = instruction["omitted"].get(reason, 0) + 1
 
     counts: dict = {}
+    seen = None
+    if dedupe:
+        from reliquary.corpus.export import job_fingerprints
+
+        seen = await job_fingerprints(records, dedupe_against, concurrency=concurrency)
+    fingerprints_against = len(seen) if seen is not None else 0
     try:
         shard_max_bytes = min(shard_max_bytes, getattr(sink, "max_file_bytes", shard_max_bytes))
         writer = _ShardWriter(directory, max_bytes=shard_max_bytes,
@@ -578,7 +606,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                              concurrency=concurrency, window=window)
                 if episode else
                 delivery_rows(job=job, records=records, counts=counts, grade=grade,
-                              concurrency=concurrency, window=window))
+                              seen=seen, concurrency=concurrency, window=window))
         async for row in rows:
             await writer.add(row)
             if instruction_reason is not None:
@@ -624,6 +652,11 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
         "shards": len(shards),
         "instruction": instruction,
     }
+    if dedupe:
+        from reliquary.corpus.export import DEDUPE_KEY
+
+        report["dedupe"] = {"within_job": True, "against": dedupe_against,
+                            "fingerprints_against": fingerprints_against, "key": DEDUPE_KEY}
     await sink.put_json(report_key, report)
     from reliquary.protocol.release_contract import canonical_sha256
 

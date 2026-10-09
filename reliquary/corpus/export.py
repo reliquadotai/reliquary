@@ -11,6 +11,8 @@ reason."""
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
 
@@ -56,14 +58,64 @@ def new_unfinished_counts() -> dict:
     return dict.fromkeys(UNFINISHED_REASONS, 0)
 
 
-async def export_rows(*, job, records, grade=None, counts: dict | None = None):
+DEDUPE_KEY = "sha256(token_ids)"
+
+
+def completion_fingerprint(completion) -> bytes:
+    """What makes two completions the same one: their token ids (the proven
+    form; one tokenizer per model), else their text."""
+    tokens = completion.get("tokens")
+    body = ("t:" + ",".join(str(int(t)) for t in tokens) if tokens
+            else "s:" + completion.get("text", ""))
+    return hashlib.sha256(body.encode()).digest()
+
+
+async def job_fingerprints(records, job_ids, *, concurrency: int = 16) -> set[bytes]:
+    """The fingerprints of every completion of the passing submissions of
+    ``job_ids``: what their deliveries could hold, for a later job on the same
+    prompts to leave out."""
+    gate = asyncio.Semaphore(concurrency)
+
+    async def read(call):
+        async with gate:
+            return await call
+
+    seen: set[bytes] = set()
+    for job_id in job_ids:
+        ids = list(await records.list_verdict_ids(job_id))
+        verdicts = await asyncio.gather(*(read(records.read_verdict(job_id, s)) for s in ids))
+        passing = [s for s, v in zip(ids, verdicts) if v and v.get("passed")]
+        found = await asyncio.gather(*(read(records.read_submission(job_id, s))
+                                       for s in passing))
+        for record in found:
+            for completion in (record or {}).get("completions") or ():
+                seen.add(completion_fingerprint(completion))
+    return seen
+
+
+def is_duplicate(completion, seen: set[bytes] | None) -> bool:
+    """With ``seen`` (None: no dedupe), whether ``completion`` was seen; a new
+    one is added, so a later copy is the duplicate."""
+    if seen is None:
+        return False
+    fingerprint = completion_fingerprint(completion)
+    if fingerprint in seen:
+        return True
+    seen.add(fingerprint)
+    return False
+
+
+async def export_rows(*, job, records, grade=None, counts: dict | None = None,
+                      seen: set[bytes] | None = None):
     """One row per finished completion of every passing submission. ``counts``,
-    when given, is filled in as the rows go."""
+    when given, is filled in as the rows go. ``seen`` (``is_duplicate``)
+    dedupes: a completion already in it is left out."""
     thinking = thinking_render(job)
     if counts is None:
         counts = {}
     counts.update(completions=0, rows=0, rows_accepted=0 if grade is not None else None,
-                  unfinished=new_unfinished_counts())
+                  unfinished=new_unfinished_counts(),
+                  duplicate_completion=0 if seen is not None else None)
     for submission_id in await records.list_verdict_ids(job.job_id):
         verdict = await records.read_verdict(job.job_id, submission_id)
         if not verdict or not verdict.get("passed"):
@@ -85,6 +137,9 @@ async def export_rows(*, job, records, grade=None, counts: dict | None = None):
                                        thinking=thinking)
             if reason is not None:
                 counts["unfinished"][reason] += 1
+                continue
+            if is_duplicate(completion, seen):
+                counts["duplicate_completion"] += 1
                 continue
             row = {
                 "prompt": record["rendered_prompt"],

@@ -395,3 +395,42 @@ def test_jobs_export_leaves_unfinished_completions_out_and_writes_its_counts(
     sidecar = json.loads((tmp_path / "dataset.jsonl.counts.json").read_text())
     assert sidecar["exported"] == 1
     assert sidecar["counts"]["unfinished"]["unfinished_no_eos"] == 1
+
+
+def test_jobs_export_dedupe_against_another_job(jobs, records, tmp_path):
+    jobs["math-v1"] = _job_spec(job_id="math-v1")
+    jobs["math-v2"] = _job_spec(job_id="math-v2")
+    by_job = {
+        "math-v1": {"1" * 64: {"hotkey": "A", "prompt_index": 3, "rendered_prompt": "q3",
+                               "completions": [{"text": "old", "tokens": [1, 151645]}]}},
+        "math-v2": {"2" * 64: {"hotkey": "A", "prompt_index": 3, "rendered_prompt": "q3",
+                               "completions": [{"text": "old", "tokens": [1, 151645]},
+                                               {"text": "new", "tokens": [2, 151645]},
+                                               {"text": "new", "tokens": [2, 151645]}]}},
+    }
+
+    async def list_ids(job_id):
+        return sorted(by_job[job_id])
+
+    async def read_verdict(job_id, sid):
+        return {"passed": True}
+
+    async def read_submission(job_id, sid):
+        return by_job[job_id][sid]
+
+    records.list_verdict_ids, records.read_verdict = list_ids, read_verdict
+    records.read_submission = read_submission
+    out = tmp_path / "dataset.jsonl"
+
+    result = CliRunner().invoke(app, ["jobs", "export", "math-v2", "--out", str(out),
+                                      "--dedupe-against", "math-v1"])
+
+    assert result.exit_code == 0, result.output
+    assert [r["completion"] for r in _read_lines(out)] == ["new"]
+    sidecar = json.loads((tmp_path / "dataset.jsonl.counts.json").read_text())
+    assert sidecar["counts"]["duplicate_completion"] == 2
+    assert sidecar["dedupe_against"] == ["math-v1"]
+
+    refused = CliRunner().invoke(app, ["jobs", "export", "math-v2", "--out", str(out),
+                                       "--dedupe-against", "math-ghost"])
+    assert refused.exit_code != 0 and "math-ghost" in refused.output

@@ -873,3 +873,14 @@ def test_keep_rejected_without_a_filter_to_apply_is_refused(admin):
     assert response.status_code == 422
     assert "keep_rejected" in response.json()["detail"]
     assert not (admin.platform / "deliveries" / "order-keep").exists()
+
+
+def test_a_delivery_dedupes_against_a_known_job_in_scope(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    path = "/admin/v1/jobs/math-a/deliveries"
+    for body, detail in (({"dedupe_against": ["math-a"]}, "dedupe_against_itself"),
+                         ({"dedupe_against": ["math-ghost"]}, "dedupe_against_unknown"),
+                         ({"dedupe_against": ["other-a"]}, "outside_admin_scope")):
+        response = admin("POST", path, {"delivery_id": "order-dedupe", **body})
+        assert response.status_code in (409, 422) and detail in response.json()["detail"]
+    assert not (admin.platform / "deliveries" / "order-dedupe").exists()

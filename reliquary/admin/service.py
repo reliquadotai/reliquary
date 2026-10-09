@@ -164,6 +164,10 @@ class CreateDelivery(BaseModel):
     # Keep the finished completions the filter rejects (annotated) in the
     # instruction shards: an SFT without the correctness filter.
     keep_rejected: bool = False
+    # Deliver a completion once within the job and never one already in a
+    # passing submission of these jobs (a v2 on the prompts of its v1).
+    dedupe: bool = False
+    dedupe_against: list[str] = Field(default_factory=list, max_length=16)
 
 
 class Provenance(BaseModel):
@@ -920,6 +924,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if job is None:
             raise HTTPException(status_code=404, detail="job_unknown")
+        for other in body.dedupe_against:
+            in_scope(other)
+            if other == job_id:
+                raise HTTPException(status_code=422, detail="dedupe_against_itself")
+            try:
+                known, _ = await job_store.read_job(other)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if known is None:
+                raise HTTPException(status_code=422, detail=f"dedupe_against_unknown: {other}")
         accepts = getattr(deliveries, "accepts_delivery_id", None)
         if accepts is not None and not accepts(delivery_id):
             raise HTTPException(status_code=503, detail="delivery_namespace_not_configured")
@@ -974,7 +988,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 job=job, records=records, sink=deliveries, delivery_id=delivery_id,
                 grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
                 instruction_source=instruction_source, instruction_note=instruction_note,
-                keep_rejected=body.keep_rejected)))
+                keep_rejected=body.keep_rejected, dedupe=body.dedupe,
+                dedupe_against=body.dedupe_against)))
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
