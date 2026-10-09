@@ -598,6 +598,9 @@ class SessionBook:
 
 def _rl_precommit_of(record: SessionRecord) -> str | None:
     """The precommit an RL session's engagement names, or None (not an RL engagement)."""
+    # Only an RL engagement is parsed: a corpus engagement never loads the plan 2C module.
+    if not record.engagement.startswith("rl:"):
+        return None
     from reliquary.protocol.service_episode import EpisodeWireError, parse_rl_engagement
 
     try:

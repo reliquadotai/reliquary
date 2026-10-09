@@ -1265,3 +1265,21 @@ def test_a_failed_re_read_is_a_retryable_ledger_refusal(tmp_path):
 
     refused = asyncio.run(main())
     assert (refused.reason, refused.retry_after) == ("ledger_unavailable", 10)
+
+
+def test_a_corpus_engagement_never_loads_the_rl_module():
+    import subprocess
+    import sys
+    code = (
+        "import sys\n"
+        "from reliquary.sandbox.sessions import SandboxPolicy, SessionBook, SessionRecord\n"
+        "book = SessionBook(SandboxPolicy())\n"
+        "rec = SessionRecord(session_id='s', hotkey='h', request_id='r', engagement_sha256='e', kind='corpus',\n"
+        "    engagement='corpus:job:1', env='x', split='train', index=0, checkpoint='c', job_id='j',\n"
+        "    prompt_index=0, machine_id='m', issued_at=0, expires_at=1, token_sha256='t')\n"
+        "book.add(rec)\n"
+        "book.add(rec)\n"
+        "assert 'reliquary.protocol.service_episode' not in sys.modules\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

@@ -255,7 +255,7 @@ def test_a_malformed_signed_episode_fails_toploc():
 def test_an_older_worker_s_answer_has_no_stop_verdict():
     logits, tokens, hidden = _episode()
     values = ProofValues.from_kernel(_verify(_commit(tokens, hidden), logits, hidden)).model_dump()
-    del values["episode_stop_picks_ok"], values["episode_stop_first_bad_turn"]
+    values.pop("episode_stop_picks_ok", None), values.pop("episode_stop_first_bad_turn", None)
     back = ProofValues.model_validate(values).to_kernel()
     assert back.episode_stop_picks_ok is None and back.episode_stop_first_bad_turn is None
 
@@ -316,3 +316,16 @@ def test_a_signed_episode_never_exempts_a_forced_span_from_the_seed_check():
     commit["rollout"].update(forced=True, force_span=[SPANS[0][0], SPANS[0][1]])
     result = _verify(commit, logits, hidden)
     assert result.seed_n_positions == len(POSITIONS)
+
+
+def test_a_signed_episode_result_still_carries_the_stop_keys_and_a_legacy_one_omits_them():
+    logits, tokens, hidden = _episode()
+    signed = ProofValues.from_kernel(_verify(_commit(tokens, hidden), logits, hidden))
+    assert signed.episode_stop_picks_ok is not None
+    dumped = signed.model_dump()
+    assert dumped["episode_stop_picks_ok"] is signed.episode_stop_picks_ok  # set keys stay; only None ones go
+    assert not [k for k in dumped if k.startswith("episode_stop_") and dumped[k] is None]
+    legacy = signed.model_copy(update={"episode_stop_picks_ok": None, "episode_stop_first_bad_turn": None,
+                                       "episode_stop_cdf_miss": None})
+    assert not [k for k in legacy.model_dump() if k.startswith("episode_stop_")]
+    assert ProofValues.model_validate(legacy.model_dump()).to_kernel().episode_stop_picks_ok is None

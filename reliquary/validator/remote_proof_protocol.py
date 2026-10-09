@@ -11,7 +11,7 @@ import zlib
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
 
 from reliquary.protocol.toploc_wire import ProofB64
 from reliquary.shared.checkpoint_identity import canonical_checkpoint_identity
@@ -218,6 +218,9 @@ class ProofRequest(WireModel):
         return self
 
 
+_EPISODE_STOP_FIELDS = ("episode_stop_picks_ok", "episode_stop_first_bad_turn", "episode_stop_cdf_miss")
+
+
 class ProofValues(WireModel):
     all_passed: bool
     passed: Count
@@ -261,6 +264,15 @@ class ProofValues(WireModel):
     episode_stop_picks_ok: bool | None = None
     episode_stop_first_bad_turn: Count | None = None
     episode_stop_cdf_miss: Probability | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_episode_stop(self, handler):
+        # A legacy proof result is byte-identical to the pre-2C wire: the three keys appear only when set.
+        data = handler(self)
+        for name in _EPISODE_STOP_FIELDS:
+            if data.get(name) is None:
+                data.pop(name, None)
+        return data
 
     @model_validator(mode="after")
     def aligned(self):

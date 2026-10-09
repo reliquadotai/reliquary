@@ -275,9 +275,9 @@ EPISODE_PROOF_KEYS = ("episode_stop_cdf_miss", "episode_stop_first_bad_turn", "e
 @needs_default_profile
 @pytest.mark.parametrize("which", ["proof_values", "proof_values_toploc"])
 def test_a_legacy_proof_result_crosses_the_remote_wire(which, legacy_wires):
-    """Today's validator reads what a worker before plan 2C wrote, into the same verdict. A worker of today writes
-    the old bytes plus exactly three null ``episode_stop_*`` keys (``ProofValues`` dumps every field): a
-    controller before plan 2C refuses that (``extra="forbid"``), so the controller is upgraded first (report)."""
+    """Today's validator reads what a worker before plan 2C wrote, into the same verdict, and a worker of today writes
+    those very bytes back: the three ``episode_stop_*`` keys are omitted while None, so a controller before plan 2C
+    (``extra="forbid"``) still accepts a legacy proof result."""
     from reliquary.validator.remote_proof_protocol import ProofValues, canonical_bytes
     from tests.unit import legacy_wire_probe
 
@@ -286,11 +286,8 @@ def test_a_legacy_proof_result_crosses_the_remote_wire(which, legacy_wires):
     kernel = values.to_kernel()
     assert (kernel.episode_stop_picks_ok, kernel.episode_stop_first_bad_turn, kernel.episode_stop_cdf_miss) == (
         None, None, None)
-    assert {k: v for k, v in json.loads(canonical_bytes(values.model_dump())).items()
-            if k not in EPISODE_PROOF_KEYS} == json.loads(old)
-    now = json.loads(legacy_wire_probe.proof_wire()[which])
-    assert {k: now.pop(k) for k in EPISODE_PROOF_KEYS} == dict.fromkeys(EPISODE_PROOF_KEYS)
-    assert now == json.loads(old)
+    assert canonical_bytes(values.model_dump()).decode() == old
+    assert legacy_wire_probe.proof_wire()[which] == old
 
 
 # ------------------------------------------------------------------ the suites, rerun under the plan 2C tripwires
