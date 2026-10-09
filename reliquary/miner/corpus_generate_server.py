@@ -90,6 +90,9 @@ class GenerateEngine:
         self._sessions: dict[str, SessionLog] = {}
         self._lock = threading.Lock()
         self._inflight: dict[str, str] = {}  # request id -> session id
+        # Forced sessions with a turn running OR resolved but not logged yet, and those with a logged turn.
+        self._busy: set[str] = set()
+        self._started: set[str] = set()
         self._dropped: OrderedDict[str, None] = OrderedDict()
         self._step_failures = 0
         self.healthy = True
@@ -176,8 +179,9 @@ class GenerateEngine:
     # -- the event loop side ---------------------------------------------------
 
     async def generate(self, session_id: str, prompt_ids: list[int], max_tokens: int | None) -> dict:
+        # A forced turn ignores the client's cap: the job's budget alone bounds an RL episode's turn.
         cap = min(self._per_turn, self.max_total_tokens - len(prompt_ids),
-                  max_tokens if max_tokens else self._per_turn)
+                  max_tokens if max_tokens and self._draws is None else self._per_turn)
         if not self.healthy:
             raise RuntimeError("the generate engine is unhealthy (repeated engine step failures)")
         if cap < 1:
@@ -189,7 +193,7 @@ class GenerateEngine:
             if binding is None:
                 raise ValueError("this session has no forced draw: an RL episode turn needs its seed")
             with self._lock:  # before the prompt is noted; checked again where the turn is registered
-                self._refuse_concurrent_turn(session_id)
+                self._refuse_unusable_session(session_id)
         self._note_prompt(session_id, prompt_ids)
         request_id = secrets.token_hex(16)
         loop = asyncio.get_running_loop()
@@ -197,49 +201,70 @@ class GenerateEngine:
         draw = None
         with self._lock:
             if binding is not None:
-                self._refuse_concurrent_turn(session_id)
+                self._refuse_unusable_session(session_id)
                 draw = binding.extra_args(self._model_tokens(session_id))
+                self._busy.add(session_id)
             self._pending[request_id] = (loop, future)
             self._inflight[request_id] = session_id
-        if draw is None:
-            self._inbox.put(("add", request_id, list(prompt_ids), cap))
-        else:
-            self._inbox.put(("add", request_id, list(prompt_ids), cap, draw))
         try:
-            done: Finished = await future
-        except BaseException:  # cancelled (client gone): free the engine slot
+            if draw is None:
+                self._inbox.put(("add", request_id, list(prompt_ids), cap))
+            else:
+                self._inbox.put(("add", request_id, list(prompt_ids), cap, draw))
+            try:
+                done: Finished = await future
+            except BaseException:  # cancelled (client gone): free the engine slot
+                with self._lock:
+                    self._pending.pop(request_id, None)
+                    self._inflight.pop(request_id, None)
+                self._inbox.put(("abort", request_id))
+                raise
+            if done.error is not None:
+                raise RuntimeError(done.error)
             with self._lock:
-                self._pending.pop(request_id, None)
-                self._inflight.pop(request_id, None)
-            self._inbox.put(("abort", request_id))
-            raise
-        if done.error is not None:
-            raise RuntimeError(done.error)
-        with self._lock:
-            if session_id in self._dropped:
-                raise RuntimeError("the session was dropped while the turn ran")
-            log = self._sessions.setdefault(session_id, SessionLog())
-            log.turns.append(GeneratedTurn(tuple(prompt_ids), done.completion_ids, done.proofs))
-            log.touched = self._clock()
+                if session_id in self._dropped:
+                    raise RuntimeError("the session was dropped while the turn ran")
+                log = self._sessions.setdefault(session_id, SessionLog())
+                log.turns.append(GeneratedTurn(tuple(prompt_ids), done.completion_ids, done.proofs))
+                log.touched = self._clock()
+                if binding is not None:
+                    self._started.add(session_id)
+        finally:
+            if binding is not None:  # a forced session is busy until its turn is logged (or has failed)
+                with self._lock:
+                    self._busy.discard(session_id)
         return {"request_id": request_id, "choices": [{
             "index": 0, "token_ids": list(done.completion_ids),
             "logprobs": {"content": [{"token": f"token_id:{t}", "logprob": lp}
                                      for t, lp in zip(done.completion_ids, done.logprobs)]},
             "finish_reason": done.finish_reason}]}
 
-    def _refuse_concurrent_turn(self, session_id: str) -> None:
-        # Under ``self._lock``. A forced turn's draw starts after the session's model tokens: two turns of one session
-        # in flight would both start at the same position.
-        if session_id in self._inflight.values():
+    def _refuse_unusable_session(self, session_id: str) -> None:
+        # Under ``self._lock``. A forced turn's draw starts after the session's model tokens: two turns of one
+        # session in flight (or one not logged yet) would start at the same position, and a session whose log
+        # is gone would restart at 0.
+        if session_id in self._busy:
             raise ValueError("a turn of this session is already running: the forced draw takes one "
                              "turn at a time")
+        log = self._sessions.get(session_id)
+        if session_id in self._started and (log is None or not log.turns):
+            raise ValueError("this forced session lost its log: its draw cannot continue")
+
+    def _forget_forced(self, session_id: str) -> None:
+        # Under ``self._lock``: the session is gone, so is its binding.
+        self._started.discard(session_id)
+        if self._draws is not None:
+            self._draws.drop(session_id)
 
     def _note_prompt(self, session_id: str, prompt_ids: list[int]) -> None:
         now = self._clock()
         with self._lock:
             if session_id in self._dropped:
                 raise ValueError("this session was dropped")
-            for stale in [s for s, log in self._sessions.items() if now - log.touched > self._ttl]:
+            for stale in [s for s, log in self._sessions.items()
+                          if now - log.touched > self._ttl and s not in self._busy]:
+                if self._sessions[stale].turns:
+                    self._forget_forced(stale)
                 del self._sessions[stale]
             log = self._sessions.setdefault(session_id, SessionLog(touched=now))
             log.touched = now
@@ -251,6 +276,7 @@ class GenerateEngine:
 
     def take_session(self, session_id: str) -> SessionLog | None:
         with self._lock:
+            self._forget_forced(session_id)
             return self._sessions.pop(session_id, None)
 
     def model_tokens(self, session_id: str) -> int:
@@ -266,6 +292,7 @@ class GenerateEngine:
     def drop_session(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
+            self._forget_forced(session_id)
             self._dropped[session_id] = None
             while len(self._dropped) > _DROPPED_KEPT:
                 self._dropped.popitem(last=False)

@@ -20,9 +20,6 @@ class DrawBinding:
     def __post_init__(self) -> None:
         self.pool.uniform(self.seed_index, 0)            # refuses a seed outside the pool
 
-    def uniforms(self, base_offset: int, count: int) -> list[float]:
-        return [self.pool.uniform(self.seed_index, base_offset + j) for j in range(count)]
-
     def extra_args(self, base_offset: int) -> dict:
         """The vLLM request's ``extra_args`` for ``ForcedSeedVLLMProcessor``: the public pool, the seed
         and the turn's first model-token position."""
