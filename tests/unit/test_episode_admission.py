@@ -1,0 +1,279 @@
+"""Admission of a signed-episode group, no GPU (plan 2C, Task 7)."""
+import copy
+import dataclasses
+from types import SimpleNamespace
+
+import pytest
+
+attest = pytest.importorskip("reliquary_sandbox.attest")
+
+from reliquary.protocol.submission import RejectReason  # noqa: E402
+from reliquary.validator.episode_admission import (  # noqa: E402
+    EpisodeGroupChecker, EpisodeGroupFacts, EpisodeRefusal, finish_prepared,
+)
+from tests.unit.episode_v2_fixtures import (  # noqa: E402
+    EPISODE, FixedSource, batch_request, episode_contract, episode_group, episode_precommit, episode_signers,
+    play_episode,
+)
+from tests.unit.sandbox_fixtures import NOW, directory  # noqa: E402
+from tests.unit.test_trajectory_parse import TEXT, FakeRenderer  # noqa: E402
+
+CONTRACT = episode_contract()
+POLICY = CONTRACT.episode_policy(EPISODE)
+RECEIVED = NOW + 100
+
+
+def world(tmp_path, **group_kwargs):
+    validator, machine = episode_signers(tmp_path)
+    group = episode_group(CONTRACT, validator=validator, machine=machine, **group_kwargs)
+    verifier = attest.Ed25519TokenVerifier({validator.key_id: validator.public_key_b64})
+
+    def check(*, request=None, precommit=group.precommit, seen=(), received=RECEIVED, policy=POLICY,
+              source=None):
+        checker = EpisodeGroupChecker(policy=policy, renderer=FakeRenderer(), source=source or FixedSource(),
+                                      chunk_tokens=32)
+        return checker.check(group.request if request is None else request, precommit=precommit,
+                             directory=directory(machine), token_verifier=verifier, seen=frozenset(seen),
+                             received=received)
+
+    return SimpleNamespace(group=group, check=check, validator=validator, machine=machine)
+
+
+def refused(outcome, reason, stage):
+    assert isinstance(outcome, EpisodeRefusal), outcome
+    assert (outcome.reason, outcome.stage) == (reason, stage), outcome
+    return outcome
+
+
+def test_an_honest_group_gives_the_final_records_rewards(tmp_path):
+    w = world(tmp_path)
+    facts = w.check()
+    assert isinstance(facts, EpisodeGroupFacts), facts
+    assert list(facts.rewards) == w.group.rewards
+    assert facts.session_ids == tuple(f"s-{seed}" for seed in w.group.selection.seeds)
+    assert facts.spans == tuple(tuple(tuple(s) for s in r.commit["rollout"]["episode"]["assistant_spans"])
+                                for r in w.group.request.rollouts)
+    assert facts.model_tokens == len(w.group.request.rollouts) * (11 + 10)
+
+
+def test_an_episode_cut_by_a_limit_is_a_normal_episode(tmp_path):
+    # The last turn runs exactly to the per-turn cap with no stop token: the harness stopped it.
+    w = world(tmp_path, last=[TEXT] * 11, stop="context_length")
+    facts = w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=11))
+    assert isinstance(facts, EpisodeGroupFacts), facts
+    assert list(facts.rewards) == w.group.rewards
+
+
+def test_the_max_turns_stop_needs_exactly_max_turns(tmp_path):
+    w = world(tmp_path, stop="max_turns")
+    assert isinstance(w.check(policy=dataclasses.replace(POLICY, max_turns=2)), EpisodeGroupFacts)
+    refused(w.check(policy=dataclasses.replace(POLICY, max_turns=3)), RejectReason.BAD_TOKENS, "episode_parse")
+
+
+def test_a_seed_swapped_between_sessions_is_refused(tmp_path):
+    w = world(tmp_path)
+    rollouts = w.group.request.rollouts
+    first, second = rollouts[0].commit["rollout"]["episode"], rollouts[1].commit["rollout"]["episode"]
+    first["transcript"], second["transcript"] = second["transcript"], first["transcript"]
+    refused(w.check(), RejectReason.REWARD_MISMATCH, "episode_transcript")
+
+
+def test_a_transcript_of_another_hotkey_or_precommit_is_refused(tmp_path):
+    w = world(tmp_path)
+    for other in (episode_precommit(CONTRACT, hotkey="5Another"), episode_precommit(CONTRACT, hotkey="5Hot", window=2)):
+        request = copy.deepcopy(w.group.request)
+        _, _, foreign = play_episode(validator=w.validator, machine=w.machine, precommit=other,
+                                     seed=w.group.selection.seeds[0], session_id="s-x", reward=1.0)
+        request.rollouts[0].commit["rollout"]["episode"]["transcript"] = foreign
+        refused(w.check(request=request), RejectReason.REWARD_MISMATCH, "episode_transcript")
+
+
+def test_a_modified_tool_output_is_refused(tmp_path):
+    w = world(tmp_path)
+    records = w.group.request.rollouts[0].commit["rollout"]["episode"]["transcript"]["records"]
+    records[1]["body"]["output"] = "forged"
+    refused(w.check(), RejectReason.REWARD_MISMATCH, "episode_transcript")
+
+
+def test_a_forged_observation_token_is_refused(tmp_path):
+    w = world(tmp_path)
+    commit = w.group.request.rollouts[0].commit
+    first_end = commit["rollout"]["episode"]["assistant_spans"][0][1]
+    commit["tokens"][first_end + 2] += 1                  # inside the tool-output segment
+    refused(w.check(), RejectReason.BAD_TOKENS, "episode_parse")
+
+
+def test_an_old_checkpoint_is_refused_without_a_proof_stage(tmp_path):
+    w = world(tmp_path)
+    request = copy.deepcopy(w.group.request)
+    request.checkpoint_hash = "e" * 40
+    refused(w.check(request=request), RejectReason.WRONG_CHECKPOINT, "episode_checkpoint")
+    # A precommit recorded at another checkpoint than the group's.
+    stale = dataclasses.replace(w.group.precommit, checkpoint="e" * 40)
+    for rollout in w.group.request.rollouts:
+        rollout.commit["rollout"]["episode"]["precommit_sha256"] = stale.sha256
+    refused(w.check(precommit=stale), RejectReason.WRONG_CHECKPOINT, "episode_checkpoint")
+
+
+def test_a_paid_session_cannot_be_paid_again(tmp_path):
+    w = world(tmp_path)
+    refused(w.check(seen={"s-0"}), RejectReason.HASH_DUPLICATE, "episode_session_reused")
+
+
+def test_a_late_group_is_refused(tmp_path):
+    w = world(tmp_path)
+    refused(w.check(received=NOW + 4500 + attest.GRADING_GRACE_S + 1), RejectReason.PRECOMMIT_EXPIRED,
+            "episode_deadline")
+
+
+def test_record_zero_must_name_the_contracts_env_package_and_tools(tmp_path):
+    w = world(tmp_path)
+    refused(w.check(policy=dataclasses.replace(POLICY, env_package="reliquary-swe==9.9.9")),
+            RejectReason.REWARD_MISMATCH, "episode_record0")
+    refused(w.check(policy=dataclasses.replace(POLICY, tools=("bash",))), RejectReason.REWARD_MISMATCH,
+            "episode_record0")
+
+
+def test_the_prompt_is_the_validators_own_render(tmp_path):
+    w = world(tmp_path)
+    refused(w.check(source=FixedSource(text="Another task.")), RejectReason.PROMPT_MISMATCH, "episode_prompt")
+    # Same length, other content: the tokens themselves are compared, not only the prompt's length.
+    refused(w.check(source=FixedSource(text="Write 43 to /work/answer.txt.")), RejectReason.PROMPT_MISMATCH,
+            "episode_prompt")
+
+
+def test_the_contracts_episode_length_binds(tmp_path):
+    w = world(tmp_path)
+    refused(w.check(policy=dataclasses.replace(POLICY, max_episode_tokens=40)), RejectReason.BAD_TOKENS,
+            "episode_length")
+
+
+def test_the_precommit_must_be_this_groups(tmp_path):
+    w = world(tmp_path)
+    refused(w.check(precommit=None), RejectReason.PRECOMMIT_INVALID, "episode_precommit")
+    other_task = episode_precommit(CONTRACT, hotkey="5Hot", task=4)
+    refused(w.check(precommit=other_task), RejectReason.PRECOMMIT_INVALID, "episode_precommit")
+    request = copy.deepcopy(w.group.request)
+    request.rollouts[0].commit["rollout"]["episode"]["seed_index"] += 1
+    refused(w.check(request=request), RejectReason.PRECOMMIT_INVALID, "episode_precommit")
+
+
+def test_an_ungraded_final_is_never_in_a_group(tmp_path):
+    from tests.unit.sandbox_fixtures import transcript
+
+    w = world(tmp_path)
+    rollout = w.group.request.rollouts[0]
+    claims = attest.SessionClaims.from_dict(rollout.commit["rollout"]["episode"]["transcript"]["token"]["claims"])
+    rollout.commit["rollout"]["episode"]["transcript"] = transcript(w.validator, w.machine, claims,
+                                                                     status="box_failed")
+    refused(w.check(), RejectReason.REWARD_MISMATCH, "episode_transcript")
+
+
+def test_one_proof_per_span_chunk(tmp_path):
+    w = world(tmp_path)
+    w.group.request.rollouts[0].commit["toploc_proofs"].append("AAAA")
+    refused(w.check(), RejectReason.BAD_SCHEMA, "episode_proof_shape")
+
+
+def test_finishing_sets_rewards_spans_and_the_lane(tmp_path):
+    w = world(tmp_path)
+    request = batch_request(w.group)
+    facts = w.check(request=request)
+    prepared = SimpleNamespace(request=request, rewards=[], completion_texts=[], episode_pending=True,
+                               reject_reason=None, reject_stage=None, truncated_indices=(1,),
+                               uncertain_indices=(1,), attainable_rewards=(0.5,))
+    finish_prepared(prepared, facts, CONTRACT)
+    assert prepared.rewards == w.group.rewards and prepared.episode_pending is False
+    assert prepared.reject_reason is None
+    assert (prepared.truncated_indices, prepared.uncertain_indices) == ((), ())
+    for rollout, spans, reward in zip(request.rollouts, facts.spans, w.group.rewards):
+        assert rollout._validated_assistant_spans == spans and rollout.reward == reward
+        assert rollout.commit["rollout"]["total_reward"] == reward
+
+
+def test_a_uniform_group_is_exploration_not_a_refusal(tmp_path):
+    from reliquary.constants import M_ROLLOUTS
+
+    w = world(tmp_path, rewards=[0.0] * M_ROLLOUTS)
+    request = batch_request(w.group)
+    prepared = SimpleNamespace(request=request, rewards=[], completion_texts=[], episode_pending=True,
+                               reject_reason=None, reject_stage=None)
+    finish_prepared(prepared, w.check(request=request), CONTRACT)
+    assert prepared.reject_reason is None and prepared.rewards == [0.0] * M_ROLLOUTS
+
+
+def test_a_group_mixing_two_precommits_is_refused(tmp_path):
+    # An episode of another precommit of the same miner (another task) inside this group.
+    w = world(tmp_path)
+    other = episode_precommit(CONTRACT, hotkey="5Hot", task=4)
+    request = copy.deepcopy(w.group.request)
+    seed = w.group.selection.seeds[1]
+    _, _, foreign = play_episode(validator=w.validator, machine=w.machine, precommit=other, seed=seed,
+                                 session_id="s-other", reward=1.0)
+    episode = request.rollouts[1].commit["rollout"]["episode"]
+    episode["precommit_sha256"], episode["transcript"] = other.sha256, foreign
+    refused(w.check(request=request), RejectReason.PRECOMMIT_INVALID, "episode_precommit")
+    # Naming the group's precommit with the other precommit's transcript fails the engagement binding.
+    request.rollouts[1].commit["rollout"]["episode"]["precommit_sha256"] = w.group.precommit.sha256
+    refused(w.check(request=request), RejectReason.REWARD_MISMATCH, "episode_transcript")
+
+
+def test_the_same_session_twice_in_a_group_is_refused(tmp_path):
+    w = world(tmp_path)
+    request = copy.deepcopy(w.group.request)
+    request.rollouts[1].commit["rollout"]["episode"]["transcript"] = copy.deepcopy(
+        request.rollouts[0].commit["rollout"]["episode"]["transcript"])
+    refused(w.check(request=request), RejectReason.REWARD_MISMATCH, "episode_transcript")
+
+
+def test_the_precommit_must_be_of_this_order_and_env(tmp_path):
+    w = world(tmp_path)
+    request = copy.deepcopy(w.group.request)
+    request.service_binding = {**request.service_binding, "contract_sha256": "0" * 64}
+    refused(w.check(request=request), RejectReason.PRECOMMIT_INVALID, "episode_precommit")
+    request = copy.deepcopy(w.group.request)
+    request.rollouts[2].env_name = "openmathinstruct"
+    refused(w.check(request=request), RejectReason.PRECOMMIT_INVALID, "episode_precommit")
+
+
+def test_declared_lengths_must_be_the_episodes(tmp_path):
+    w = world(tmp_path)
+    for field_name, delta in (("prompt_length", 1), ("completion_length", -1)):
+        request = copy.deepcopy(w.group.request)
+        request.rollouts[0].commit["rollout"][field_name] += delta
+        refused(w.check(request=request), RejectReason.BAD_TOKENS, "episode_length")
+
+
+def test_a_forged_transcript_never_reads_as_a_stale_checkpoint(tmp_path):
+    # Another checkpoint AND a tampered record: the forgery decides the reason, not the milder one.
+    from reliquary.protocol.service_episode import rl_engagement
+    from tests.unit.episode_v2_fixtures import ENV_PACKAGE, SPLIT
+    from tests.unit.sandbox_fixtures import claims, transcript
+
+    w = world(tmp_path)
+    precommit, seed = w.group.precommit, w.group.selection.seeds[0]
+    session = claims(session_id="s-0", hotkey=precommit.hotkey, engagement=rl_engagement(1, precommit.sha256, seed),
+                     split=SPLIT, index=precommit.task_index, checkpoint="e" * 40, issued_at=NOW,
+                     expires_at=NOW + 4500)
+    foreign = transcript(w.validator, w.machine, session, reward=1.0, env_package=ENV_PACKAGE,
+                         calls=[{"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": "ok"}])
+    request = copy.deepcopy(w.group.request)
+    request.rollouts[0].commit["rollout"]["episode"]["transcript"] = copy.deepcopy(foreign)
+    refused(w.check(request=request), RejectReason.WRONG_CHECKPOINT, "episode_checkpoint")
+    foreign["records"][1]["body"]["output"] = "forged"
+    request.rollouts[0].commit["rollout"]["episode"]["transcript"] = foreign
+    refused(w.check(request=request), RejectReason.REWARD_MISMATCH, "episode_transcript")
+
+
+def test_a_renderer_error_on_miner_tokens_is_a_refusal(tmp_path):
+    class Raising(FakeRenderer):
+        def tool_calls(self, completion_ids):
+            raise ValueError("undecodable")
+
+    w = world(tmp_path)
+    validator, machine = w.validator, w.machine
+    checker = EpisodeGroupChecker(policy=POLICY, renderer=Raising(), source=FixedSource(), chunk_tokens=32)
+    outcome = checker.check(w.group.request, precommit=w.group.precommit, directory=directory(machine),
+                            token_verifier=attest.Ed25519TokenVerifier({validator.key_id: validator.public_key_b64}),
+                            seen=frozenset(), received=RECEIVED)
+    refused(outcome, RejectReason.BAD_TOKENS, "episode_parse")

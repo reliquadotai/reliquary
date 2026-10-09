@@ -146,3 +146,90 @@ def register_episode_env(monkeypatch) -> None:
 
     monkeypatch.setattr(registry, "ENVIRONMENT_SPECS",
                         MappingProxyType({**registry.ENVIRONMENT_SPECS, EPISODE: episode_spec()}))
+
+
+def episode_signers(tmp_path):
+    """(validator, machine) Ed25519 signers, as the sandbox tests build them."""
+    from tests.unit.sandbox_fixtures import signer
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    return signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1")
+
+
+def play_episode(*, validator, machine, precommit, seed, session_id, reward, calls=1, output="ok",
+                 last=None, issued_at=None):
+    """One honest two-turn episode in the fake renderer's ids (``tests.unit.test_trajectory_parse``):
+    turn 1 makes ``calls`` bash calls, each answered by one signed call record; turn 2 (``last``,
+    default nine text tokens and the terminator) ends it. Returns ``(tokens, spans, transcript)``:
+    tokens with the prompt, absolute spans, the gateway-signed transcript (graded ``reward``)."""
+    from reliquary_sandbox.observation import render_observation
+
+    from reliquary.corpus.signed_parse import signed_records
+    from reliquary.protocol.service_episode import rl_engagement
+    from tests.unit.sandbox_fixtures import NOW, claims, transcript
+    from tests.unit.test_trajectory_parse import CALL, TERM, TEXT, FakeRenderer
+
+    renderer = FakeRenderer()
+    issued_at = NOW if issued_at is None else issued_at
+    prompt = renderer.initial_ids(PROMPT_TEXT)
+    first = [TEXT] * 9 + [CALL] * calls + [TERM]
+    session = claims(session_id=session_id, hotkey=precommit.hotkey,
+                     engagement=rl_engagement(precommit.window, precommit.sha256, seed), split=SPLIT,
+                     index=precommit.task_index, checkpoint=precommit.checkpoint, issued_at=issued_at,
+                     expires_at=issued_at + 4500)
+    signed = transcript(validator, machine, session, status="graded", reward=float(reward),
+                        env_package=ENV_PACKAGE,
+                        calls=[{"turn": 0, "k": k, "arguments": {"command": f"c{k}"}, "output": output}
+                               for k in range(calls)])
+    observations = [render_observation(body.to_dict()) for body in signed_records(signed).calls]
+    full = renderer.next_prompt(prompt, first, observations)
+    tokens = full + (list(last) if last is not None else [TEXT] * 9 + [TERM])
+    spans = [(len(prompt), len(prompt) + len(first)), (len(full), len(tokens))]
+    return tokens, spans, signed
+
+
+def half_rewards() -> list[float]:
+    from reliquary.constants import M_ROLLOUTS
+
+    return [1.0] * (M_ROLLOUTS // 2) + [0.0] * (M_ROLLOUTS - M_ROLLOUTS // 2)
+
+
+def episode_group(contract, *, validator, machine, hotkey="5Hot", rewards=None, seeds=None, task=TASK,
+                  window=1, calls=1, last=None, stop="agent_completed"):
+    """M honest episodes of one precommit, one per chosen seed (rollout i plays seed i of the selection)."""
+    from types import SimpleNamespace
+
+    from reliquary.constants import M_ROLLOUTS
+    from reliquary.protocol.service_submission import ServiceBinding
+
+    pool = episode_pool(contract, task=task, window=window)
+    precommit = episode_precommit(contract, hotkey=hotkey, task=task, window=window)
+    selection = pool.selection(list(range(M_ROLLOUTS)) if seeds is None else list(seeds))
+    rewards = half_rewards() if rewards is None else list(rewards)
+    rollouts = []
+    for index, seed in enumerate(selection.seeds):
+        tokens, spans, signed = play_episode(validator=validator, machine=machine, precommit=precommit, seed=seed,
+                                             session_id=f"s-{seed}", reward=rewards[index], calls=calls, last=last)
+        episode = signed_episode_metadata(precommit_sha256=precommit.sha256, seed_index=seed, spans=spans,
+                                          transcript=signed, stop=stop)
+        commit = signed_episode_commit(tokens=tokens, spans=spans, episode=episode, selection=selection,
+                                       index=index, contract=contract)
+        rollouts.append(SimpleNamespace(tokens=tokens, reward=0.0, commit=commit, env_name=EPISODE))
+    request = SimpleNamespace(
+        miner_hotkey=hotkey, prompt_idx=task, window_start=window, checkpoint_hash=REVISION,
+        pool_selection=selection.to_dict(), rollouts=rollouts,
+        service_binding=ServiceBinding(contract.sha256, "training").to_dict())
+    return SimpleNamespace(request=request, precommit=precommit, selection=selection, pool=pool, rewards=rewards)
+
+
+def batch_request(group):
+    """The group as a real ``BatchSubmissionRequest`` (its rollouts take private attributes)."""
+    from reliquary.protocol.submission import BatchSubmissionRequest, RolloutSubmission
+
+    request = group.request
+    return BatchSubmissionRequest(
+        miner_hotkey=request.miner_hotkey, prompt_idx=request.prompt_idx, window_start=request.window_start,
+        merkle_root="00" * 32, checkpoint_hash=request.checkpoint_hash, pool_selection=request.pool_selection,
+        service_binding=request.service_binding,
+        rollouts=[RolloutSubmission(tokens=r.tokens, reward=r.reward, commit=r.commit, env_name=r.env_name)
+                  for r in request.rollouts])
