@@ -833,8 +833,9 @@ def test_a_v2_order_without_episode_envs_never_loads_the_sandbox_package(tmp_pat
     assert done.stdout.strip().splitlines()[-1] == "CLEAN"
 
 
-def test_the_remote_proof_proxies_expose_the_nested_text_config():
-    """I5: item 14 is config only: the proxy's ``text_config`` is a namespace, so its eos is seen."""
+def test_the_nested_eos_of_a_remote_config_joins_the_boot_check_but_not_the_legacy_stop_set():
+    """I5 (ruling): the legacy proxies stay as before (flat config, nested eos unseen by the batcher's
+    resolver); only the episode boot check reads the nested ``text_config`` eos."""
     from reliquary.shared.modeling import resolve_eos_token_ids
     from reliquary.validator.remote_proof import RemoteProofPool
 
@@ -843,9 +844,18 @@ def test_the_remote_proof_proxies_expose_the_nested_text_config():
     pool.health = SimpleNamespace(slots=[SimpleNamespace(device_id="s0")],
                                   config={"eos_token_id": TERM, "text_config": {"eos_token_id": 9}},
                                   generation_config={"eos_token_id": [TERM]})
-    proxy = pool.proxies()["s0"]
-    assert resolve_eos_token_ids(proxy, SimpleNamespace(eos_token_id=EOT)) == {TERM, EOT, 9}
+    proxies = pool.proxies()
+    tok = SimpleNamespace(eos_token_id=EOT)
+    assert resolve_eos_token_ids(proxies["s0"], tok) == {TERM, EOT}               # legacy: as at 703bee9a
     assert pool.health.config["text_config"] == {"eos_token_id": 9}                # the health is untouched
+
+    service = ValidationService.__new__(ValidationService)
+    service.tokenizer = tok
+    service._proof_models = proxies
+    service._proof_worker_pool = pool
+    service.verify_model = None
+    proof, remote = service._episode_stop_sets()
+    assert proof == {TERM, EOT, 9} and remote == {TERM, EOT, 9}                    # the boot check sees it
 
 
 # --- item 17: nothing published carries a transcript ---

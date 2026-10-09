@@ -7868,6 +7868,13 @@ class ValidationService:
         health = getattr(pool, "health", None) if pool is not None else None
         proxies = list((getattr(self, "_proof_models", None) or {}).values())
         model = proxies[0] if pool is not None and proxies else getattr(self, "verify_model", None)
+        if pool is not None and proxies and getattr(model, "config", None) is not None:
+            # Episode boot check only (item 14): the proxy's flat config read with its nested text_config
+            # as attributes; the legacy batcher keeps resolving its stop set from the proxy as it is.
+            from reliquary.validator.remote_proof import _config_namespace
+
+            model = SimpleNamespace(config=_config_namespace(model.config),
+                                    generation_config=getattr(model, "generation_config", None))
         proof = {int(t) for t in (resolve_eos_token_ids(model, self.tokenizer) or ())}
         remote = None
         if health is not None:
