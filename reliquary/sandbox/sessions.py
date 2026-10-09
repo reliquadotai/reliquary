@@ -206,6 +206,12 @@ class EngagementTerms:
     # it under the lock when the prompt's reservations moved since the first read.
     refresh_slots: Callable[[], Awaitable[int | None | Refusal]] | None = field(
         default=None, repr=False, compare=False)
+    # Plan 2C: at most one session per engagement (an RL seed) unless every earlier one was aborted
+    # or voided (our fault); checked under the issuer lock. Corpus terms leave it False.
+    exclusive: bool = False
+    # Plan 2C: the terms' cheap preconditions read again under the issuer lock (the RL precommit's
+    # window may have turned while the task resolved): a Refusal refuses the open. Corpus: None.
+    still_valid: Callable[[], Refusal | None] | None = field(default=None, repr=False, compare=False)
 
 
 class EngagementBook(Protocol):
@@ -455,6 +461,12 @@ class SessionBook:
         return sum(1 for r in self._sessions.values()
                    if r.job_id == job_id and r.prompt_index == prompt_index and self._holds(r, now))
 
+    def engagement_held(self, engagement: str) -> bool:
+        """Plan 2C: whether a session of ``engagement`` exists in a state that consumes it (every state
+        but ``aborted`` and ``voided``, which are our fault: the miner may open it again)."""
+        return any(r.engagement == engagement and r.state not in (ABORTED, VOIDED)
+                   for r in self._sessions.values())
+
     def submitted_ids(self) -> frozenset[str]:
         """Safe from any thread: an immutable set, kept up to date by `settle`."""
         return self._submitted
@@ -671,6 +683,12 @@ class SessionIssuer:
                                                        terms.prompt_index, now))
             if refusal is not None:
                 return refusal
+            if terms.still_valid is not None:
+                refusal = terms.still_valid()
+                if refusal is not None:
+                    return refusal
+            if terms.exclusive and self.book.engagement_held(terms.engagement):
+                return Refusal("engagement_taken", {"engagement": terms.engagement})
             if terms.slots_remaining is not None:
                 remaining = terms.slots_remaining
                 moved = generation != self.book.generation(terms.job_id, terms.prompt_index)

@@ -345,6 +345,8 @@ async def list_machines(**client_kwargs) -> list[dict]:
 # -- session documents ------------------------------------------------------------
 
 SESSION_PREFIX = "reliquary/sandbox/sessions/"
+# Plan 2C: the RL validator's sessions, apart from the corpus validator's (neither restores the other's).
+RL_SESSION_PREFIX = "reliquary/sandbox/rl-sessions/"
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DAY = 86400
 
@@ -400,11 +402,11 @@ def _day(at: int) -> str:
     return time.strftime("%Y%m%d", time.gmtime(int(at)))
 
 
-def session_key(session_id: str, expires_at: int) -> str:
+def session_key(session_id: str, expires_at: int, prefix: str = SESSION_PREFIX) -> str:
     """Bucketed by the day the token expires, so a restart lists a few days, not all."""
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         raise ValueError(f"session id {session_id!r} is not a name")
-    return f"{SESSION_PREFIX}{_day(expires_at)}/{session_id}.json"
+    return f"{prefix}{_day(expires_at)}/{session_id}.json"
 
 
 def _without_secrets(document: Mapping) -> dict:
@@ -417,18 +419,19 @@ def _without_secrets(document: Mapping) -> dict:
 class R2SessionStore:
     """One document per issued token: claims, machine, state; never the signature."""
 
-    def __init__(self, **client_kwargs) -> None:
+    def __init__(self, *, prefix: str = SESSION_PREFIX, **client_kwargs) -> None:
+        self._prefix = prefix
         self._kw = client_kwargs
 
     async def create(self, document: Mapping) -> None:
         document = _without_secrets(document)
-        key = session_key(document["session_id"], document["expires_at"])
+        key = session_key(document["session_id"], document["expires_at"], self._prefix)
         if not await _put(key, document, None, **dict(self._kw)):
             raise SessionStoreConflict(f"session {document['session_id']} already exists")
 
     async def update(self, document: Mapping) -> None:
         document = _without_secrets(document)
-        key = session_key(document["session_id"], document["expires_at"])
+        key = session_key(document["session_id"], document["expires_at"], self._prefix)
         for attempt in range(WRITE_ATTEMPTS):
             if attempt:
                 await _backoff(attempt)
@@ -447,7 +450,7 @@ class R2SessionStore:
         a JSON object is logged and left out."""
         keys: list[str] = []
         for offset in (-2, -1, 0, 1):
-            keys += await _list_keys(f"{SESSION_PREFIX}{_day(now + offset * _DAY)}/",
+            keys += await _list_keys(f"{self._prefix}{_day(now + offset * _DAY)}/",
                                      **dict(self._kw))
         found = []
         for key, document in await _read_all(keys, **self._kw):

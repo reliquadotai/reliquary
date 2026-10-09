@@ -90,6 +90,8 @@ REFUSAL_STATUS: dict[str, int] = {
     "job_not_signed": 409, "prompt_mismatch": 409, "prompt_unavailable": 409,
     "job_complete": 409, "request_reused": 409, "request_conflict": 409,
     "engagement_kind_unsupported": 409, "transcript_invalid": 409,
+    # plan 2C: an RL seed already consumed (emitted only for exclusive, i.e. RL, engagements)
+    "engagement_taken": 409,
     # the intake's claim on a session (issuer.claim); `session_claimed` is retried
     "session_submitted": 409, "session_not_submittable": 409, "session_expired": 409,
     "session_claimed": 503, "session_busy": 503,
