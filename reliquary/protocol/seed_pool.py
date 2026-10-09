@@ -283,9 +283,9 @@ def validate_rollout_selection(pool: SeedPool, selection: PoolSelection,
             raise SeedPoolError("public seed pool requires single-turn rollouts")
         episode = metadata.get("episode")
         if signed_episodes:
-            from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+            from reliquary.protocol.submission import is_signed_episode
 
-            if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
+            if not is_signed_episode(metadata):
                 raise SeedPoolError("this environment takes signed episodes")
             seed = episode.get("seed_index")
             if type(seed) is not int or seed != selection.seeds[index]:

@@ -833,12 +833,12 @@ def test_a_checker_of_another_contract_refuses_until_rebuilt(tmp_path):
     stale = EpisodeGroupChecker(policy=dataclasses.replace(POLICY, max_turns=POLICY.max_turns + 1),
                                 renderer=FakeRenderer(), source=FixedSource(), chunk_tokens=32)
     good = w.intake._checkers[EPISODE]
-    w.intake.set_checkers({EPISODE: stale})
+    w.intake._checkers = {EPISODE: stale}
     prepared, claim = admit(w)
     assert claim is None and w.sessions.claimed == []
     assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.GENERATION_CONTRACT_MISMATCH,
                                                                "episode_policy_stale")
-    w.intake.set_checkers({EPISODE: good})
+    w.intake._checkers = {EPISODE: good}
     w.prepared.reject_reason = w.prepared.reject_stage = None
     prepared, claim = admit(w)
     assert prepared.reject_reason is None and claim is not None
@@ -979,17 +979,6 @@ def test_submitted_records_are_stored_before_the_batcher_takes_the_group(tmp_pat
     assert asyncio.run(env.issuer.persist_submitted(group)) == 3
     asyncio.run(env.issuer.submitted_all(group))
     assert writes == [] and all(env.book.get(i).state == SUBMITTED for i in group)
-
-
-def test_the_checker_builder_renders_the_contracts_tools(monkeypatch):
-    from reliquary.environment import agentic_swe
-    from reliquary.validator.episode_intake import build_episode_checker
-
-    seen = {}
-    monkeypatch.setattr(agentic_swe, "load_turn_renderer",
-                        lambda path, tools: seen.update(path=path, tools=tools) or FakeRenderer())
-    checker = build_episode_checker(POLICY, checkpoint_dir="/ck", source=FixedSource(), chunk_tokens=32)
-    assert seen == {"path": "/ck", "tools": tuple(POLICY.tools)} and checker.policy == POLICY
 
 
 def test_one_paid_group_per_precommit_even_on_disjoint_seeds(tmp_path):

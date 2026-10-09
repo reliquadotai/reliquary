@@ -179,7 +179,6 @@ EPISODE_BUDGET_CEILINGS = {
     "max_calls": 4096, "per_call_timeout_s": 3600, "cpu_s": 3600, "wall_s": 4 * 3600,
     "memory_bytes": 8 * 1024**3, "pids": 65536, "disk_bytes": 10 * 1024**3,
 }
-MAX_EPISODE_TURNS = 256
 _EPISODE_FIELDS = frozenset({"kind", "sandbox_env", "split", "env_package", "tools", "max_turns",
                              "max_tokens_per_turn", "max_episode_tokens", "budgets"})
 _SANDBOX_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}\Z")
@@ -201,7 +200,9 @@ def _validate_episode(name: str, env: dict) -> None:
             or tools != sorted(set(tools)) or not set(tools) <= EPISODE_TOOLS):
         raise ServiceContractError(
             f"{name}.episode.tools: a sorted, unique, non-empty subset of {sorted(EPISODE_TOOLS)}")
-    _integer(episode["max_turns"], f"{name}.episode.max_turns", 1, MAX_EPISODE_TURNS)
+    from reliquary.protocol.submission import MAX_SIGNED_EPISODE_TURNS
+
+    _integer(episode["max_turns"], f"{name}.episode.max_turns", 1, MAX_SIGNED_EPISODE_TURNS)
     _integer(episode["max_tokens_per_turn"], f"{name}.episode.max_tokens_per_turn", 1, MAX_EPISODE_TOKENS)
     _integer(episode["max_episode_tokens"], f"{name}.episode.max_episode_tokens", 2, MAX_EPISODE_TOKENS)
     if episode["max_tokens_per_turn"] >= episode["max_episode_tokens"]:

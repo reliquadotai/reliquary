@@ -94,6 +94,8 @@ from reliquary.protocol.submission import (
     RejectReason,
     RolloutSubmission,
     WindowState,
+    episode_without_transcript,
+    is_signed_episode,
 )
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.admission import robust_utility_admits
@@ -507,17 +509,10 @@ def _with_toploc_spec(commit: dict, profile) -> dict:
     return {**commit, "toploc_spec": toploc.to_contract()}
 
 
-def _is_signed_episode_meta(meta: Any) -> bool:
-    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
-
-    episode = meta.get("episode") if isinstance(meta, dict) else None
-    return isinstance(episode, dict) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA
-
-
 def _is_signed_episode_group(pending: Any) -> bool:
     """A pending group of signed episodes (plan 2C): any of its rollouts carries the signed schema."""
     request = getattr(pending, "request", None)
-    return any(_is_signed_episode_meta((getattr(r, "commit", None) or {}).get("rollout"))
+    return any(is_signed_episode((getattr(r, "commit", None) or {}).get("rollout"))
                for r in (getattr(request, "rollouts", None) or ()))
 
 
@@ -533,11 +528,10 @@ def _proof_commit(commit: dict, profile) -> dict:
     miner's commit is never mutated (admission re-reads it; the payload release drops it)."""
     out = _with_toploc_spec(commit, profile)
     meta = commit.get("rollout")
-    if not _is_signed_episode_meta(meta):
+    if not is_signed_episode(meta):
         return out
-    episode = meta["episode"]
-    proof_meta = {k: v for k, v in meta.items() if k not in _SIGNED_EPISODE_PROOF_DROPPED_META}
-    proof_meta["episode"] = {k: v for k, v in episode.items() if k != "transcript"}
+    proof_meta = episode_without_transcript(
+        {k: v for k, v in meta.items() if k not in _SIGNED_EPISODE_PROOF_DROPPED_META})
     return {**out, "rollout": proof_meta}
 
 
@@ -5022,7 +5016,7 @@ class GrpoWindowBatcher:
         completion_texts = [
             # Plan 2C: a signed episode has no completion text (its admission gave "", its reward is the
             # signed final record's); never a decode of the trajectory and its tool outputs.
-            "" if _is_signed_episode_meta((rollout.commit or {}).get("rollout"))
+            "" if is_signed_episode((rollout.commit or {}).get("rollout"))
             else self._completion_text(rollout)
             for rollout in request.rollouts
         ]
@@ -5159,7 +5153,7 @@ class GrpoWindowBatcher:
         profile = _active_profile()
         signed_episode_policy = None
         if service_contract is not None and any(
-            _is_signed_episode_meta((r.commit or {}).get("rollout")) for r in request.rollouts
+            is_signed_episode((r.commit or {}).get("rollout")) for r in request.rollouts
         ):
             try:
                 signed_episode_policy = self._service_window_contract().episode_policy(
@@ -5197,7 +5191,7 @@ class GrpoWindowBatcher:
                         RejectReason.REWARD_MISMATCH,
                         "episode_replay_binding",
                     )
-                if _is_signed_episode_meta(_seed_meta):
+                if is_signed_episode(_seed_meta):
                     # Plan 2C, before any forward: prove exactly the spans the admission checked, under
                     # the window contract's turn limits, with a TOPLOC contract to judge every span.
                     from reliquary.validator.verifier import signed_episode_spans
@@ -6669,7 +6663,7 @@ class GrpoWindowBatcher:
         for r in request.rollouts:
             meta = r.commit["rollout"]
             spans = getattr(r, "_validated_assistant_spans", None)
-            if spans is not None and _is_signed_episode_meta(meta):
+            if spans is not None and is_signed_episode(meta):
                 total += sum(int(end) - int(start) for start, end in spans)
             else:
                 total += len(r.commit["tokens"]) - int(meta["prompt_length"])
@@ -7171,7 +7165,7 @@ class GrpoWindowBatcher:
             raise RuntimeError("a service batcher has no service_environment")
         environment = str(environment)
         episode_max_tokens = None
-        if any(_is_signed_episode_meta((r.commit or {}).get("rollout")) for r in request.rollouts):
+        if any(is_signed_episode((r.commit or {}).get("rollout")) for r in request.rollouts):
             # Plan 2C: a signed episode is bounded by its contract's episode limit (refused without one).
             try:
                 episode = self._service_window_contract().episode_policy(environment)

@@ -21,6 +21,7 @@ from typing import Any
 
 from reliquary.constants import CODE_ADMISSION_WALL_SECONDS, MATH_ADMISSION_WALL_SECONDS
 from reliquary.protocol.episode_retry import RETRYABLE_STAGES
+from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
 from reliquary.protocol.submission import RejectReason
 from reliquary.sandbox.rl_engagements import NoOutcomes, SessionOutcomes
 from reliquary.validator.episode_admission import EpisodeGroupChecker, EpisodeRefusal, finish_prepared
@@ -51,14 +52,14 @@ _CLAIM_REFUSALS = {
 # Every intake together: transcript checks running at once (threads of their own). A check is not
 # interruptible: a cancelled admission's check keeps its slot until its thread returns. Saturated, a
 # group is refused retryably (WORKER_DROPPED, refunded: the validator's capacity, not the miner's doing).
-MAX_CHECKS_RUNNING = 3
+MAX_CHECKS_RUNNING = GROUPS_IN_FLIGHT + 1
 # Transcript checks (signatures, a renderer parse of M episodes): per hotkey, started per minute; per
 # OPERATOR (all its hotkeys together), in flight at once (until the check's thread returns, even when
 # the admission stopped waiting for it: one operator never holds more than ``max_checks_in_flight`` of
 # the global slots, one is always left to the others). A refusal before the checker (unserved env, stale
 # directory) does not count.
 DEFAULT_MAX_CHECKS_PER_MINUTE = 30
-DEFAULT_MAX_CHECKS_IN_FLIGHT = MAX_CHECKS_RUNNING - 1
+DEFAULT_MAX_CHECKS_IN_FLIGHT = GROUPS_IN_FLIGHT
 _CHECKS_RUNNING = threading.BoundedSemaphore(MAX_CHECKS_RUNNING)
 _CHECK_THREADS = ThreadPoolExecutor(max_workers=MAX_CHECKS_RUNNING, thread_name_prefix="episode-check")
 # The longest admission deadline the server gives a group (``ValidatorServer._admission_wall_seconds``)
@@ -104,17 +105,6 @@ def _precommit_sha(request) -> str:
     return value if isinstance(value, str) else ""
 
 
-def build_episode_checker(policy, *, checkpoint_dir: str, source, chunk_tokens: int) -> EpisodeGroupChecker:
-    """The checker of one episode env: the turn renderer of the policy's checkpoint over the CONTRACT's
-    tools (``policy.tools``), the env's task source. Rebuild it (``EpisodeGroupIntake.set_checkers``)
-    whenever the contract or the task source changes: the checker caches rendered prompts per task."""
-    from reliquary.environment import agentic_swe
-
-    return EpisodeGroupChecker(policy=policy,
-                               renderer=agentic_swe.load_turn_renderer(checkpoint_dir, tools=tuple(policy.tools)),
-                               source=source, chunk_tokens=chunk_tokens)
-
-
 class EpisodeGroupIntake:
     """``directory(now)``: the machine directory, or None while it is stale (``fleet.directory_if_ready``);
     ``token_verifier``: THIS validator's own session-token keys only (the tokens it issued; never a key
@@ -158,10 +148,6 @@ class EpisodeGroupIntake:
     @property
     def environments(self) -> tuple[str, ...]:
         return tuple(sorted(self._checkers))
-
-    def set_checkers(self, checkers: Mapping[str, EpisodeGroupChecker]) -> None:
-        """Replace every checker (a new contract or task source)."""
-        self._checkers = dict(checkers)
 
     def _rate_refusal(self, hotkey: str, operator: str) -> tuple[str, dict] | None:
         """None, and one more check of ``operator`` in flight (``_check_ended`` ends it); else the
@@ -385,4 +371,4 @@ class EpisodeGroupIntake:
 
 __all__ = ["ADMISSION_DEADLINE_S", "CLAIM_HOLD_WALLS", "CLAIM_TTL_MARGIN", "CheckProgress", "DEFAULT_MAX_CHECKS_IN_FLIGHT",
            "DEFAULT_MAX_CHECKS_PER_MINUTE", "MAX_CHECKS_RUNNING", "RETRYABLE_STAGES", "EpisodeClaim",
-           "EpisodeGroupIntake", "build_episode_checker"]
+           "EpisodeGroupIntake"]

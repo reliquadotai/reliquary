@@ -62,9 +62,9 @@ def validate_service_rollout_bindings(binding: ServiceBinding | dict,
             raise ValueError("service group bindings require single-turn rollouts")
         episode = metadata.get("episode")
         if signed_episodes:
-            from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+            from reliquary.protocol.submission import is_signed_episode
 
-            if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
+            if not is_signed_episode(metadata):
                 raise ValueError("this environment takes signed episodes")
         elif episode is not None:
             raise ValueError("service group bindings require single-turn rollouts")

@@ -29,13 +29,14 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
 from reliquary.sandbox.rl_engagements import (
     EpisodeEnvironmentView, NoOutcomes, OpenQuota, RlEpisodeEngagements, SessionOutcomes, SessionQuota,
 )
 from reliquary.sandbox.sessions import SandboxPolicy, SessionBook, SessionIssuer
 from reliquary.validator.corpus_registration import NOT_REGISTERED
 from reliquary.validator.episode_admission import EpisodeGroupChecker
-from reliquary.validator.episode_intake import DEFAULT_MAX_CHECKS_IN_FLIGHT, EpisodeGroupIntake
+from reliquary.validator.episode_intake import EpisodeGroupIntake
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,7 @@ RESTORE_ATTEMPTS = 3
 RESTORE_TIMEOUT_S = 60.0
 RESTORE_BACKOFF_S = 5.0
 STOP_TIMEOUT_S = 10.0
-# Episode groups of one hotkey in flight at once (the intake's per-operator check cap): each holds its
-# 2M pool sessions plus one being reopened after a signed abort.
-RL_GROUPS_IN_FLIGHT = DEFAULT_MAX_CHECKS_IN_FLIGHT
+RL_GROUPS_IN_FLIGHT = GROUPS_IN_FLIGHT     # the intake's per-operator check cap
 PRECOMMIT_PRUNE_SECONDS = 3600.0
 MIN_PRECOMMIT_RETENTION_S = 2 * 86_400
 

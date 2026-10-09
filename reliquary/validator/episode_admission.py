@@ -44,7 +44,7 @@ from reliquary.corpus.checks import (
 from reliquary.corpus.signed_parse import parse_signed_trajectory
 from reliquary.corpus.trajectory_parse import TrajectoryRefused
 from reliquary.protocol.service_episode import rl_engagement
-from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA, RejectReason
+from reliquary.protocol.submission import RejectReason, is_signed_episode
 from reliquary.protocol.toploc import MIN_CHUNK_TOKENS, span_chunk_count
 
 
@@ -175,7 +175,7 @@ class EpisodeGroupChecker:
         meta = commit.get("rollout") or {}
         episode = meta.get("episode")
         where = {"rollout": index}
-        if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
+        if not is_signed_episode(meta):
             return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_schema", where)
         seed_index = episode.get("seed_index")
         if (episode.get("precommit_sha256") != precommit.sha256 or type(seed_index) is not int

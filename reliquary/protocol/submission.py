@@ -858,6 +858,21 @@ SIGNED_EPISODE_SCHEMA = "reliquary/signed-episode/v1"
 MAX_SIGNED_EPISODE_TURNS = 256
 
 
+def is_signed_episode(meta: Any) -> bool:
+    """Whether rollout metadata carries a signed episode (``rollout.episode`` of schema signed-episode/v1)."""
+    episode = meta.get("episode") if isinstance(meta, dict) else None
+    return isinstance(episode, dict) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA
+
+
+def episode_without_transcript(meta: dict) -> dict:
+    """A copy of rollout metadata whose signed episode no longer carries its transcript (what the proof
+    worker, the training payload and every log receive)."""
+    out = dict(meta)
+    if is_signed_episode(out):
+        out["episode"] = {key: value for key, value in out["episode"].items() if key != "transcript"}
+    return out
+
+
 class SignedEpisodeMetadata(BaseModel):
     """A signed-sandbox episode inside a v2 service rollout (phase 2, plan 2C).
 

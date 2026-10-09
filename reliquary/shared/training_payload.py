@@ -142,11 +142,10 @@ def _pi_old_for_encode(rollout: Any, completion_length: int) -> list[float] | No
 
 
 def _is_signed_episode(meta: dict) -> bool:
-    """A plan-2C signed episode (lazy import: the trainer process stays light)."""
-    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+    """A signed episode (lazy import: the trainer process stays light)."""
+    from reliquary.protocol.submission import is_signed_episode
 
-    episode = meta.get("episode")
-    return isinstance(episode, dict) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA
+    return is_signed_episode(meta)
 
 
 def encode_training_payload(
@@ -191,9 +190,11 @@ def encode_training_payload(
                 miner_lp = list(meta.pop("token_logprobs", []) or [])
                 signed = _is_signed_episode(meta)
                 if signed:
+                    from reliquary.protocol.submission import episode_without_transcript
+
                     # The trainer reads tokens, spans, rewards and pi_old; never the transcript (MiBs,
                     # and it carries a session token). The miner's commit is left untouched.
-                    meta["episode"] = {k: v for k, v in meta["episode"].items() if k != "transcript"}
+                    meta = episode_without_transcript(meta)
                 rollout_checkpoints.append(str(checkpoint_revision) if signed else None)
                 completion_length = int(meta.get("completion_length", 0) or 0)
                 rollout_meta.append(meta)

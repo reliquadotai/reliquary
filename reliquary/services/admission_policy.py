@@ -32,12 +32,11 @@ def validate_submission_policy(request, announcement: dict | None, *, parsed=Non
     if any(not isinstance(row, dict) for row in metadata):
         raise ValueError("invalid rollout metadata")
     if announcement is None:
-        from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+        from reliquary.protocol.submission import is_signed_episode
 
         if (binding is not None or selection is not None
                 or any(row.get("service_binding") is not None or row.get("seed_pool") is not None for row in metadata)
-                or any(isinstance(row.get("episode"), dict)
-                       and row["episode"].get("schema_version") == SIGNED_EPISODE_SCHEMA for row in metadata)):
+                or any(is_signed_episode(row) for row in metadata)):
             raise ValueError("service metadata requires an active service task")
         return None
     contract, schedule = parse_service_announcement(announcement) if parsed is None else parsed

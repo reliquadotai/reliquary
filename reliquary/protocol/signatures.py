@@ -293,9 +293,9 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
         if proof_version == PROOF_VERSION:
             episode = metadata.get("episode")
             if episode is not None:
-                from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+                from reliquary.protocol.submission import is_signed_episode
 
-                if (not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA
+                if (not is_signed_episode(metadata)
                         or metadata.get("service_binding") is None or metadata.get("seed_pool") is None):
                     return False
                 msg = build_service_episode_commit_binding(
@@ -328,10 +328,10 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
             if not isinstance(episode, dict):
                 logger.debug("Episode v8 commit missing episode metadata")
                 return False
-            from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+            from reliquary.protocol.submission import is_signed_episode
 
-            if episode.get("schema_version") == SIGNED_EPISODE_SCHEMA:
-                return False   # plan 2C: a signed episode is only ever a public-pool service rollout
+            if is_signed_episode(commit.get("rollout")):
+                return False   # a signed episode is only ever a public-pool service rollout
             msg = build_episode_commit_binding(
                 tokens,
                 randomness,

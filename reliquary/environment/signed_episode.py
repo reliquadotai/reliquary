@@ -23,7 +23,9 @@ class EpisodeTaskSource(Protocol):
 
 class SignedEpisodeEnvironment:
     validator_authoritative_reward = True
-    interaction_mode = "signed_episode"     # what the registry entry says, for an env held unregistered
+    # The registry entry's mode, repeated for the batcher's fallback on a name the registry does not know (a
+    # test env); admission reads the registry only and refuses an unregistered env's groups.
+    interaction_mode = "signed_episode"
 
     def __init__(self, name: str, source: EpisodeTaskSource) -> None:
         self.name = name

@@ -362,7 +362,7 @@ def service_length_valid(
     its profile's ``max_episode_tokens``; a signed episode, plan 2C: its contract's ``episode_max_tokens``,
     and it is refused without one). Shared by admission and the proof's pre-forward guard, so an oversize
     payload is refused before it can reach the GPU."""
-    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+    from reliquary.protocol.submission import is_signed_episode
 
     meta = meta or {}
     try:
@@ -372,7 +372,7 @@ def service_length_valid(
     if prompt_length < 0 or prompt_length > len(tokens):
         return False
     episode = meta.get("episode")
-    if isinstance(episode, dict) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA:
+    if is_signed_episode(meta):
         return episode_max_tokens is not None and 0 < prompt_length < len(tokens) <= episode_max_tokens
     if isinstance(episode, dict):
         limits = episode_limits_for_environment(environment)
@@ -471,7 +471,7 @@ def submission_interaction_matches(request: BatchSubmissionRequest, environment:
     """Bind wire episode metadata to the registered environment before grading: a single-turn env takes
     no episode, an Episode v1 env only Episode v1 metadata, a signed-episode env (plan 2C) only signed
     episodes."""
-    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+    from reliquary.protocol.submission import is_signed_episode
 
     try:
         mode = get_environment_spec(environment).interaction_mode
@@ -486,7 +486,7 @@ def submission_interaction_matches(request: BatchSubmissionRequest, environment:
             continue
         if not isinstance(value, dict):
             return False
-        if (value.get("schema_version") == SIGNED_EPISODE_SCHEMA) != (mode == "signed_episode"):
+        if is_signed_episode(meta) != (mode == "signed_episode"):
             return False
     return True
 

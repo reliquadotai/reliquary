@@ -546,11 +546,11 @@ def signed_episode_spans(rollout_meta: dict[str, Any], seq_len: int) -> list[tup
     """Plan 2C: the model spans of a signed episode; None for any other rollout, ``[]`` when malformed
     (no proof passes an empty span list). Read strictly: integer pairs, ordered, non-empty,
     non-overlapping, inside the sequence and after the declared prompt."""
-    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+    from reliquary.protocol.submission import is_signed_episode
 
-    episode = rollout_meta.get("episode") if isinstance(rollout_meta, dict) else None
-    if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
+    if not is_signed_episode(rollout_meta):
         return None
+    episode = rollout_meta["episode"]
     raw_spans = episode.get("assistant_spans")
     if not isinstance(raw_spans, (list, tuple)):
         return []

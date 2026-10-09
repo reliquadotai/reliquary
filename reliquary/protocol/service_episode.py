@@ -9,9 +9,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from reliquary.protocol.release_contract import canonical_json_bytes
-from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+from reliquary.protocol.submission import (  # noqa: F401  (re-exported)
+    SIGNED_EPISODE_SCHEMA, episode_without_transcript, is_signed_episode,
+)
 
 PRECOMMIT_SCHEMA = "reliquary/episode-precommit/v1"
+# Episode groups of one operator in flight at once: the validator's per-operator check cap, which the
+# miner never exceeds. Each group holds its 2M pool sessions plus one being reopened after a signed abort.
+GROUPS_IN_FLIGHT = 2
 RL_ENGAGEMENT_PREFIX = "rl"
 MAX_SAFE_INTEGER = 2**53 - 1
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -105,12 +110,6 @@ def parse_rl_engagement(text: Any) -> tuple[int, str, int]:
             _uint(int(parts[3]), "seed_index", MAX_ENGAGEMENT_SEED))
 
 
-def is_signed_episode(meta: Any) -> bool:
-    """Whether rollout metadata carries a signed episode (``rollout.episode`` of schema signed-episode/v1)."""
-    episode = meta.get("episode") if isinstance(meta, Mapping) else None
-    return isinstance(episode, Mapping) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA
-
-
 def episode_commit_material(episode: Any) -> bytes:
     """The bytes a commit signature binds for its episode: every field but the transcript in canonical
     JSON, then the transcript's digest (the corpus binding's digest, so both sides hash one way)."""
@@ -125,11 +124,3 @@ def episode_commit_material(episode: Any) -> bytes:
     return canonical_json_bytes(rest) + transcript_digest(episode["transcript"])
 
 
-def episode_without_transcript(meta: Mapping) -> dict:
-    """A copy of rollout metadata whose signed episode no longer carries its transcript (what the proof
-    worker, the training payload and every log receive)."""
-    out = dict(meta)
-    episode = out.get("episode")
-    if isinstance(episode, Mapping) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA:
-        out["episode"] = {key: value for key, value in episode.items() if key != "transcript"}
-    return out

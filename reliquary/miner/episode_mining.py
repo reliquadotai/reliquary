@@ -39,11 +39,10 @@ from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
+
 logger = logging.getLogger(__name__)
 
-GROUPS_IN_FLIGHT = 2
-"""Episode groups of one operator in flight at once: the validator's per-operator cap
-(``rl_sandbox_wiring.RL_GROUPS_IN_FLIGHT``)."""
 STATE_POLL_S = 2.0
 PICK_DRAWS = 64
 EXIT_CHECKPOINT_CHANGED = 75
