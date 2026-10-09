@@ -688,6 +688,31 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
 
+    @app.get("/corpus/pay")
+    async def corpus_pay() -> dict:
+        # Public: an estimate of what each active period job pays per verified
+        # token, recomputed at most once a minute (`corpus_pay`).
+        job_set = getattr(app.state, "corpus_jobs", None)
+        if job_set is None:
+            raise HTTPException(status_code=503, detail="corpus_pay_unavailable")
+        board = getattr(app.state, "corpus_pay", None)
+        if board is None:
+            from reliquary.validator.corpus_pay import PayBoard
+
+            board = app.state.corpus_pay = PayBoard(job_set)
+        try:
+            return await board.pay()
+        except Exception as exc:
+            logger.warning("corpus pay unavailable: %r", exc)
+            raise HTTPException(status_code=503, detail="corpus_pay_unavailable") from exc
+
+    async def stop_pay_board() -> None:
+        board = getattr(app.state, "corpus_pay", None)
+        if board is not None:
+            await board.close()
+
+    app.router.on_shutdown.append(stop_pay_board)
+
     tasks_cache: dict = {}
 
     async def read_tasks() -> dict:
