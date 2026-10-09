@@ -6821,8 +6821,10 @@ class GrpoWindowBatcher:
         caps_at_admission = tuple(pending.truncated_indices)
         verified = None
         try:
+            started = self._time_fn()
             verified = self._verify_expensive(pending, model=model, audit=True)
-            self._conclude_exploration_audit(pending, verified, caps_at_admission, model=model)
+            self._conclude_exploration_audit(pending, verified, caps_at_admission, model=model,
+                                             first_pass_seconds=max(0.0, self._time_fn() - started))
         except BaseException as exc:
             # N3: the class is decided from the exception TYPE only. A malformed payload (the proof code's own
             # malformed-submission types are ValueError subclasses: ServiceContractError, ReleaseContractError,
@@ -6931,7 +6933,7 @@ class GrpoWindowBatcher:
     # replay spans admission should have bound are missing, an admission-side state problem, not evidence.
     _AUDIT_INCONCLUSIVE_STAGES = frozenset({"service_contract", "service_proof_capability", "episode_replay_binding"})
 
-    def _classify_audit_failure(self, pending, *, model) -> str:
+    def _classify_audit_failure(self, pending, *, model, first_pass_seconds: float = 0.0) -> str:
         """R31 amended: the class of a failed exploration audit is that of its STRONGEST failure.
 
         The proof stops at the first failing gate, and the miner controls the order (a genuine rollout 0 with
@@ -6949,10 +6951,25 @@ class GrpoWindowBatcher:
         failure_class = audit_failure_class(stage, scope)
         if failure_class != AUDIT_FAILURE_STATISTICAL:
             return failure_class
+        from reliquary.constants import (
+            FILL_CLOSED_MAX_SECONDS,
+            SERVICE_EXPLORATION_DRAIN_SECONDS,
+        )
+
+        remaining = (self.window_opened_at + FILL_CLOSED_MAX_SECONDS + SERVICE_EXPLORATION_DRAIN_SECONDS + 300.0
+                     - self._time_fn())
+        if remaining <= 0 or remaining < first_pass_seconds:
+            # L3: the audit plan's hard deadline would cut the second pass off; the verdict stands as it is.
+            logger.warning("exploration audit %s: %.1f s left before the audit plan's deadline, less than one "
+                           "proof (%.1f s); no classification pass, the %s failure stays statistical",
+                           identity, remaining, first_pass_seconds, stage)
+            return failure_class
         pending.proof_classify_stage = pending.proof_classify_scope = None
         try:
             self._verify_expensive(pending, model=model, audit=True, classify_only=True)
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             if self._is_payload_fault(exc):
                 logger.error("exploration audit %s: the classification pass raised on the payload (%s) after a "
                              "%s failure: deterministic", identity, type(exc).__name__, stage)
@@ -6972,7 +6989,8 @@ class GrpoWindowBatcher:
                      identity, stage, second, second_scope, strongest)
         return strongest
 
-    def _conclude_exploration_audit(self, pending, verified, caps_at_admission, *, model=None) -> None:
+    def _conclude_exploration_audit(self, pending, verified, caps_at_admission, *, model=None,
+                                    first_pass_seconds: float = 0.0) -> None:
         from reliquary.services.exploration import audit_failure_class
 
         identity = pending.service_observation_id
@@ -7008,7 +7026,7 @@ class GrpoWindowBatcher:
             return
         else:
             passed = False
-            failure_class = self._classify_audit_failure(pending, model=model)
+            failure_class = self._classify_audit_failure(pending, model=model, first_pass_seconds=first_pass_seconds)
         if not passed:
             logger.error("exploration audit %s failed at %s (scope %s): %s failure", identity,
                          pending.proof_reject_stage, getattr(pending, "proof_reject_scope", None), failure_class)
@@ -7019,8 +7037,14 @@ class GrpoWindowBatcher:
             self._set_service_row(pending, "exploration_forfeited", exploration_fraction=0.0)
             with self._exploration_lock:
                 lost = [self._exploration_pending[i] for i in outcome.forfeited if i in self._exploration_pending]
+            with self._exploration_lock:
+                still_auditing = set(self._audit_open.values())
             for other in lost:
                 self._set_service_row(other, "exploration_forfeited", exploration_fraction=0.0)
+                if other.service_observation_id in still_auditing:
+                    # L1: its own audit is running or queued and will be classed from its own evidence; that
+                    # audit's ``finally`` releases the tokens.
+                    continue
                 self._release_observation_payload(other)
         else:
             logger.error("exploration audit verdict for %s (passed=%s) was not applied", identity, passed)

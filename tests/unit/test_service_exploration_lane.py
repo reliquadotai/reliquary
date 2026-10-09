@@ -2035,3 +2035,93 @@ def test_r31_minor_episode_replay_binding_is_no_verdict_no_forfeit_no_sanction(t
     assert rt.ledger.audit_log("hk") == []
     assert rt.ledger.unaudited_reason(pending.service_observation_id) == "validator_lost"
     assert b.difficulty_auction_metadata_by_id[id(sibling)]["status"] != "exploration_forfeited"
+
+
+# ---------------------------------------------------------------- R31 round 3 (L1, L3, L4)
+
+def test_r31_l1_a_forfeit_does_not_empty_the_tokens_of_a_sibling_whose_audit_is_still_open(tmp_path):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    sibling = make_pending(rt, hotkey="hk", prompt=9)
+    arrive(b, sibling)
+    ready(rt)
+    tick(b)
+    b._audit_open["job-b"] = sibling.service_observation_id           # B's audit is queued / running
+    _audit_scoped(b, pending, stage="logprob")                         # A fails: the window is forfeited
+    assert b.difficulty_auction_metadata_by_id[id(sibling)]["status"] == "exploration_forfeited"
+    assert len(sibling.request.rollouts) == M_ROLLOUTS                 # B keeps its tokens
+    assert id(sibling) not in b._payload_released
+    calls = []
+    _audit_scoped(b, sibling, stage="logprob", second=("toploc", None), calls=calls)   # B's own evidence
+    assert [c[0] for c in calls] == [False, True]
+    assert calls[1][2] and all(calls[1][2])                            # second pass saw real tokens
+    assert not sibling.request.rollouts                                # released by B's own finally
+    assert id(sibling) in b._payload_released
+
+
+def test_r31_l1_a_forfeited_sibling_without_an_open_audit_is_still_released(tmp_path):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    sibling = make_pending(rt, hotkey="hk", prompt=9)
+    arrive(b, sibling)
+    ready(rt)
+    tick(b)
+    b._audit_open.pop(next(j for j, i in b._audit_open.items() if i == sibling.service_observation_id), None)
+    _audit_scoped(b, pending, stage="logprob")
+    assert not sibling.request.rollouts and id(sibling) in b._payload_released
+
+
+def _near_deadline(b, monkeypatch, remaining, first_pass=100.0):
+    from reliquary.constants import FILL_CLOSED_MAX_SECONDS, SERVICE_EXPLORATION_DRAIN_SECONDS
+    end = b.window_opened_at + FILL_CLOSED_MAX_SECONDS + SERVICE_EXPLORATION_DRAIN_SECONDS + 300.0
+    state = {"now": end - remaining - first_pass}
+    monkeypatch.setattr(b, "_time_fn", lambda: state["now"])
+    return state
+
+
+@pytest.mark.parametrize("remaining, ran", [(50.0, False), (150.0, True)])
+def test_r31_l3_no_second_pass_when_less_than_one_proof_remains_before_the_plan_deadline(
+        tmp_path, monkeypatch, caplog, remaining, ran):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    state = _near_deadline(b, monkeypatch, remaining)                  # the first pass takes 100 s
+    calls = []
+
+    def prove(p, model=None, audit=False, classify_only=False):
+        calls.append(classify_only)
+        if not classify_only:
+            state["now"] += 100.0
+            p.proof_reject_stage = "logprob"
+        else:
+            p.proof_classify_stage = "toploc"
+        return None
+    b._verify_expensive = prove
+    with caplog.at_level(logging.WARNING, logger="reliquary.validator.batcher"):
+        b._execute_exploration_audit(pending, model=None)
+    assert calls == ([False, True] if ran else [False])
+    assert rt.exploration_banned("hk") is ran
+    assert rt.ledger.audit_log("hk")[-1]["failure_class"] == ("deterministic" if ran else "statistical")
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+    assert any("no classification pass" in r.getMessage() for r in caplog.records) is (not ran)
+
+
+def test_r31_l3_no_second_pass_after_the_plan_deadline_even_for_an_instant_first_pass(tmp_path, monkeypatch):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    _near_deadline(b, monkeypatch, -1.0, first_pass=0.0)
+    calls = []
+    _audit_scoped(b, pending, stage="logprob", second=("toploc", None), calls=calls)
+    assert [c[0] for c in calls] == [False]
+    assert not rt.exploration_banned("hk")
+
+
+@pytest.mark.parametrize("exc", [asyncio.CancelledError(), GeneratorExit(), AssertionError("x")])
+def test_r31_l4_a_base_exception_in_the_second_pass_keeps_the_first_pass_class(tmp_path, exc):
+    rt, b, pending, sibling = _classified(tmp_path, stage="logprob", second=exc)
+    assert not rt.exploration_banned("hk")
+    assert rt.ledger.audit_log("hk")[-1]["failure_class"] == "statistical"
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), SystemExit(1)])
+def test_r31_l4_keyboard_interrupt_and_system_exit_propagate(tmp_path, exc):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    with pytest.raises(type(exc)):
+        _audit_scoped(b, pending, stage="logprob", second=exc)
+    assert rt.ledger.audit_log("hk") == []
