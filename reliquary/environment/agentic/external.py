@@ -561,6 +561,24 @@ def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any
     """
     if split not in ("train", "eval", "qualification"):
         raise ValueError("unsupported external environment split")
+    artifact, (module,) = _import_verified(
+        spec, lambda artifact: [artifact["entrypoints"]["replay"].partition(":")[0]])
+    entrypoint = artifact["entrypoints"]["replay"]
+    backend_type = getattr(module, entrypoint.partition(":")[2], None)
+    if not callable(backend_type):
+        raise TypeError(f"external replay entrypoint is not callable: {entrypoint}")
+    return backend_type() if split == "train" else backend_type(split=split)
+
+
+def import_external_modules(
+    spec: EnvironmentSpec, module_names: Sequence[str]
+) -> tuple[Mapping[str, Any], list[Any]]:
+    """The artifact and the named modules of a wheel, imported from its
+    verified bytes only (as the replay entrypoint is), without building it."""
+    return _import_verified(spec, lambda _artifact: list(module_names))
+
+
+def _import_verified(spec: EnvironmentSpec, module_names_of) -> tuple[Mapping[str, Any], list[Any]]:
     with _IMPORT_LOCK:
         artifact = verify_external_artifact(spec)
         distribution = importlib.metadata.distribution(spec.external_distribution or "")
@@ -590,17 +608,16 @@ def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any
         loader = _ArtifactSourceLoader(
             package, sources, spec.environment_manifest_sha256, resources
         )
-        entrypoint = artifact["entrypoints"]["replay"]
-        module_name, _, attribute_name = entrypoint.partition(":")
+        names = module_names_of(artifact)
+        for name in names:
+            if name != package and not name.startswith(package + "."):
+                raise ValueError(f"module {name!r} is not in package {package!r}")
         sys.meta_path.insert(0, loader)
         try:
-            module = importlib.import_module(module_name)
+            modules = [importlib.import_module(name) for name in names]
         finally:
             sys.meta_path.remove(loader)
-        backend_type = getattr(module, attribute_name, None)
-        if not callable(backend_type):
-            raise TypeError(f"external replay entrypoint is not callable: {entrypoint}")
-        return backend_type() if split == "train" else backend_type(split=split)
+        return artifact, modules
 
 
 class ExternalAnswerEnvironment:
@@ -693,6 +710,13 @@ class ExternalAnswerEnvironment:
         return materials
 
     def compute_reward(self, problem: dict, completion: str) -> float:
+        if self._spec.contract_version == "reliquary/stdio-program/v1":
+            # The wheel's grade runs the program in a local subprocess. Here
+            # it is scored from its materials, in the sandbox, or not at all.
+            raise TypeError(
+                f"{self.name} is graded in the sandbox from its materials, "
+                "never by its wheel on this host"
+            )
         index = problem.get("generator_index")
         if (not isinstance(index, int) or isinstance(index, bool) or index < 0
                 or problem != self.get_problem(index) or not isinstance(completion, str)):
@@ -744,6 +768,7 @@ __all__ = [
     "ARTIFACT_SCHEMA",
     "ExternalEpisodeEnvironment",
     "ExternalAnswerEnvironment",
+    "import_external_modules",
     "load_external_backend",
     "load_external_answer_environment",
     "load_external_episode_environment",

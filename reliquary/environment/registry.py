@@ -56,6 +56,7 @@ EXTERNAL_SINGLE_TURN_CONTRACTS = frozenset(
         "reliquary/boxed-answer/v1",
         "reliquary/checked-answer/v1",
         "reliquary/python-cases/v1",
+        "reliquary/stdio-program/v1",
     }
 )
 
@@ -78,10 +79,12 @@ def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
 
     **Hands over materials.** The wheel supplies the cases; this repository
     executes them and computes the reward, so there is no foreign reward to
-    bound and the lattice is derived here from the case count. It is the shape
-    a code environment needs, and it is the shape that keeps execution inside
-    the sandbox: a package that graded its own Python would be running
-    model-written code behind its own rlimits instead of behind gVisor.
+    bound. The lattice is derived here from the case count, or is binary when
+    the reward is all-or-nothing over the cases (a whole program on stdin
+    tests). It is the shape a code environment needs, and it is the shape that
+    keeps execution inside the sandbox: a package that graded its own Python
+    would be running model-written code behind its own rlimits instead of
+    behind gVisor.
 
     Nothing else is admitted. A wheel that both graded itself and declared a
     fractional lattice would be handing back a number this repository has no
@@ -91,13 +94,12 @@ def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
     binary = (
         spec.reward_lattice_policy == "binary-v1"
         and spec.attainable_rewards == (0.0, 1.0)
-        and spec.reward_materializer_method is None
     )
-    if binary:
+    if binary and spec.reward_materializer_method is None:
         return
     materials = (
         spec.reward_materializer_method == EXTERNAL_REWARD_MATERIALIZER
-        and not spec.attainable_rewards
+        and (binary or not spec.attainable_rewards)
     )
     if not materials:
         raise ValueError(
