@@ -59,6 +59,18 @@ def test_storage_failure_is_redacted_and_debug_retains_details(monkeypatch):
     assert isinstance(debug.exception, RuntimeError)
 
 
+def test_missing_operator_dependency_has_actionable_error(monkeypatch):
+    async def broken(**kwargs):
+        raise ModuleNotFoundError("private-library-detail")
+
+    monkeypatch.setattr("reliquary.infrastructure.task_registry_store.read_registry", broken)
+    result = CliRunner().invoke(app, ["tasks", "list", "--json"])
+    assert result.exit_code == 1 and result.stdout == ""
+    error = json.loads(result.stderr)["error"]
+    assert error["code"] == "dependency_missing" and "[operator]" in error["message"]
+    assert "private-library-detail" not in result.stderr
+
+
 def test_nonexistent_job_is_not_certified_drained(bucket, monkeypatch):
     records = _StatusRecords([], [], {})
 

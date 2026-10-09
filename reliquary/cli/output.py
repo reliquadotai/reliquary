@@ -63,6 +63,11 @@ class CLIGroup(TyperGroup):
                 raise
             if isinstance(exc, ValueError):
                 fail(str(exc), code="invalid_input", exit_code=2)
+            if isinstance(exc, ModuleNotFoundError):
+                fail("A runtime dependency is missing. Install this release with the "
+                     "[operator] extra for operator commands; use --debug for local details. "
+                     "Inspect persisted status before repeating a write.",
+                     code="dependency_missing")
             # Library exceptions can contain credentials or remote response bodies.
             fail(f"{type(exc).__name__}: operation failed; use --debug for details. "
                  "Inspect persisted status before repeating a write.")

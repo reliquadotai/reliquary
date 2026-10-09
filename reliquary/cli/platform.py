@@ -31,7 +31,11 @@ class PlatformError(RuntimeError):
     def __init__(self, code: str, *, key: str | None = None, status: int | None = None, job_id: str | None = None, job=None):
         self.code, self.status, self.job = code, status, job
         message = f"Platform request failed: {code}."
-        if code == "outcome_unknown":
+        if code == "credential_required":
+            message += " Set RELIQUARY_API_KEY (or JOBS_API_KEY) to a scoped workspace key."
+        elif code == "invalid_origin_or_timeout":
+            message += " Use a bare HTTPS origin (HTTP loopback for local development) and a timeout in (0, 120] seconds."
+        elif code == "outcome_unknown":
             message += f" Request key: {key}. Inspect status and reconcile with the same input and key; do not retry with a new key."
         elif code in ("revision_conflict", "stale_revision", "http_409"):
             message += " Read the current job revision before reviewing another control request."

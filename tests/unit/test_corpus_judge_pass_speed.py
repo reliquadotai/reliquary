@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import threading
@@ -172,6 +173,8 @@ def _caught_run(monkeypatch, *, n=3000):
         runner = asyncio.ensure_future(auditor.run())
         await asyncio.sleep(1800)
         runner.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner
         return store
 
     try:
