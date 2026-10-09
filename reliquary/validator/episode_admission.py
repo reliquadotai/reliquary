@@ -220,86 +220,98 @@ class EpisodeGroupChecker:
                          opened=opened, final=final, calls=tuple(result.calls))
 
     def _shape(self, index, verified, prompt_ids):
-        policy = self.policy
+        refusal = episode_shape_refusal(
+            self.policy, self._renderer, prompt_ids=prompt_ids, tokens=verified.tokens, spans=verified.spans,
+            stop=verified.stop, calls=verified.calls, opened=verified.opened, final=verified.final,
+            min_chunk_tokens=self._min_chunk)
         where = {"rollout": index}
-        commit, tokens, spans, opened, final = (verified.commit, verified.tokens, verified.spans, verified.opened,
-                                                verified.final)
-        offset = len(prompt_ids)
-        relative = [(start - offset, end - offset) for start, end in spans]
-        completion = tokens[offset:]
-        structure = check_turn_spans(relative, len(completion), policy.max_turns)
-        if not structure.ok:
-            return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_turns",
-                                  {**where, "check": structure.reason, "detail": dict(structure.detail)})
-        try:
-            parse_signed_trajectory(self._renderer, prompt_ids=prompt_ids, tokens=completion, spans=relative,
-                                    stop=verified.stop, max_turns=policy.max_turns, calls=list(verified.calls),
-                                    offered=opened.tools, final=final)
-        except TrajectoryRefused as refused:
-            return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {**where, "check": refused.reason})
-        except (ValueError, TypeError, KeyError, IndexError) as error:
-            # The renderer on miner-chosen tokens: a refusal, never an exception out of admission.
-            return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse",
-                                  {**where, "check": type(error).__name__})
-        renderer = self._renderer
-        checks = (
-            (RejectReason.BAD_TOKENS, "episode_turns",
-             lambda: check_short_turns(relative, self._min_chunk)),
-            (RejectReason.BAD_TOKENS, "episode_length",
-             lambda: check_turn_budget(relative, prompt_len=offset, length=len(completion),
-                                       max_tokens_per_turn=policy.max_tokens_per_turn,
-                                       max_total_tokens=policy.max_episode_tokens)),
-            (RejectReason.BAD_TERMINATION, "episode_termination",
-             lambda: check_turn_termination(completion, relative, prompt_len=offset,
-                                            terminator_id=renderer.terminator_id, stop_ids=renderer.stop_ids,
-                                            max_tokens_per_turn=policy.max_tokens_per_turn,
-                                            max_total_tokens=policy.max_episode_tokens)),
-        )
-        for wire, stage, run in checks:
-            outcome = run()
-            if not outcome.ok:
-                return EpisodeRefusal(wire, stage, {**where, "check": outcome.reason, "detail": dict(outcome.detail)})
-        try:
-            why = self._limit_not_reached(verified, prompt_ids)
-        except (ValueError, TypeError, KeyError, IndexError) as error:
-            return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {**where, "check": type(error).__name__})
-        if why is not None:
-            return EpisodeRefusal(RejectReason.BAD_TERMINATION, "episode_termination",
-                                  {**where, "check": "bad_stop", "stop": verified.stop, "why": why})
-        proofs = commit.get("toploc_proofs")
-        expected_proofs = sum(span_chunk_count(end - start, self._chunk, self._min_chunk) for start, end in relative)
+        if refusal is not None:
+            return EpisodeRefusal(refusal.reason, refusal.stage, {**where, **refusal.detail})
+        proofs = verified.commit.get("toploc_proofs")
+        expected_proofs = sum(span_chunk_count(end - start, self._chunk, self._min_chunk)
+                              for start, end in verified.spans)
         if not isinstance(proofs, list) or len(proofs) != expected_proofs:
             return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_proof_shape", {**where, "expected": expected_proofs})
         return None
 
-    def _limit_not_reached(self, verified, prompt_ids) -> str | None:
-        """Why a ``context_length`` / ``max_turns`` stop is not a limit the harness really hit, or None.
-        Runs after ``parse_signed_trajectory`` (the last turn's sent calls are the transcript's last call
-        records, in order) and the termination check."""
-        policy, renderer, stop = self.policy, self._renderer, verified.stop
-        if stop == "max_turns":
-            return None if len(verified.spans) == policy.max_turns else "fewer model turns than max_turns"
-        if stop != "context_length":
-            return None
-        tokens = verified.tokens
-        start, end = verified.spans[-1]
-        if end == policy.max_episode_tokens:                # span length == max_episode_tokens - start (absolute)
-            return None                                     # (a) the turn ran to the EPISODE cap, not a per-turn cap
-        last = tokens[start:end]
-        if not last or last[-1] != renderer.terminator_id:
-            return "the last turn neither reached the episode cap nor ended on the turn terminator"
-        pairs = list(renderer.tool_calls(last))
-        if not pairs:
-            return "a turn without calls ends the episode: agent_completed, not context_length"
-        plans = [plan_call(name, arguments, verified.opened.tools) for name, arguments in pairs]
-        sends = sum(1 for position in sent_positions(plans) if position is not None)
-        records = iter(verified.calls[len(verified.calls) - sends:] if sends else ())
-        observations = [plan.observation if isinstance(plan, Refuse) else render_observation(next(records).to_dict())
-                         for plan in plans]
-        following = renderer.next_prompt(tokens[:start], last, observations)
-        if following is not None and len(following) > policy.max_episode_tokens:
-            return None                                     # (b) the observations overflow the episode
-        return "the next prompt fits in max_episode_tokens: the harness would have gone on"
+
+def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, calls, opened, final,
+                          min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> EpisodeRefusal | None:
+    """Steps 7-9 of one episode, pure and GPU-free: the validator's admission and the miner (before it
+    submits) run this one definition. ``tokens`` start with ``prompt_ids`` (the validator's own render);
+    ``spans`` are absolute; ``calls``, ``opened`` and ``final`` are the verified transcript's call bodies,
+    record 0 and final body (``verify_transcript``). Returns the refusal (its detail without the rollout
+    index) or None."""
+    offset = len(prompt_ids)
+    relative = [(start - offset, end - offset) for start, end in spans]
+    completion = tokens[offset:]
+    structure = check_turn_spans(relative, len(completion), policy.max_turns)
+    if not structure.ok:
+        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_turns",
+                              {"check": structure.reason, "detail": dict(structure.detail)})
+    try:
+        parse_signed_trajectory(renderer, prompt_ids=prompt_ids, tokens=completion, spans=relative,
+                                stop=stop, max_turns=policy.max_turns, calls=list(calls),
+                                offered=opened.tools, final=final)
+    except TrajectoryRefused as refused:
+        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": refused.reason})
+    except (ValueError, TypeError, KeyError, IndexError) as error:
+        # The renderer on miner-chosen tokens: a refusal, never an exception out of admission.
+        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": type(error).__name__})
+    checks = (
+        (RejectReason.BAD_TOKENS, "episode_turns",
+         lambda: check_short_turns(relative, min_chunk_tokens)),
+        (RejectReason.BAD_TOKENS, "episode_length",
+         lambda: check_turn_budget(relative, prompt_len=offset, length=len(completion),
+                                   max_tokens_per_turn=policy.max_tokens_per_turn,
+                                   max_total_tokens=policy.max_episode_tokens)),
+        (RejectReason.BAD_TERMINATION, "episode_termination",
+         lambda: check_turn_termination(completion, relative, prompt_len=offset,
+                                        terminator_id=renderer.terminator_id, stop_ids=renderer.stop_ids,
+                                        max_tokens_per_turn=policy.max_tokens_per_turn,
+                                        max_total_tokens=policy.max_episode_tokens)),
+    )
+    for wire, stage, run in checks:
+        outcome = run()
+        if not outcome.ok:
+            return EpisodeRefusal(wire, stage, {"check": outcome.reason, "detail": dict(outcome.detail)})
+    try:
+        why = _limit_not_reached(policy, renderer, tokens=tokens, spans=spans, stop=stop, calls=tuple(calls),
+                                 opened=opened)
+    except (ValueError, TypeError, KeyError, IndexError) as error:
+        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": type(error).__name__})
+    if why is not None:
+        return EpisodeRefusal(RejectReason.BAD_TERMINATION, "episode_termination",
+                              {"check": "bad_stop", "stop": stop, "why": why})
+    return None
+
+
+def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened) -> str | None:
+    """Why a ``context_length`` / ``max_turns`` stop is not a limit the harness really hit, or None.
+    Runs after ``parse_signed_trajectory`` (the last turn's sent calls are the transcript's last call
+    records, in order) and the termination check."""
+    if stop == "max_turns":
+        return None if len(spans) == policy.max_turns else "fewer model turns than max_turns"
+    if stop != "context_length":
+        return None
+    start, end = spans[-1]
+    if end == policy.max_episode_tokens:                # span length == max_episode_tokens - start (absolute)
+        return None                                     # (a) the turn ran to the EPISODE cap, not a per-turn cap
+    last = tokens[start:end]
+    if not last or last[-1] != renderer.terminator_id:
+        return "the last turn neither reached the episode cap nor ended on the turn terminator"
+    pairs = list(renderer.tool_calls(last))
+    if not pairs:
+        return "a turn without calls ends the episode: agent_completed, not context_length"
+    plans = [plan_call(name, arguments, opened.tools) for name, arguments in pairs]
+    sends = sum(1 for position in sent_positions(plans) if position is not None)
+    records = iter(calls[len(calls) - sends:] if sends else ())
+    observations = [plan.observation if isinstance(plan, Refuse) else render_observation(next(records).to_dict())
+                     for plan in plans]
+    following = renderer.next_prompt(tokens[:start], last, observations)
+    if following is not None and len(following) > policy.max_episode_tokens:
+        return None                                     # (b) the observations overflow the episode
+    return "the next prompt fits in max_episode_tokens: the harness would have gone on"
 
 
 def finish_prepared(prepared, facts: EpisodeGroupFacts, contract) -> None:
@@ -329,4 +341,5 @@ def finish_prepared(prepared, facts: EpisodeGroupFacts, contract) -> None:
         prepared.reject_stage = "zone"
 
 
-__all__ = ["EpisodeGroupChecker", "EpisodeGroupFacts", "EpisodeRefusal", "finish_prepared"]
+__all__ = ["EpisodeGroupChecker", "EpisodeGroupFacts", "EpisodeRefusal", "episode_shape_refusal",
+           "finish_prepared"]

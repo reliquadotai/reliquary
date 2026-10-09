@@ -14,10 +14,12 @@ from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO  # noqa: E402
 from reliquary.corpus.trajectory import GeneratedTurn  # noqa: E402
 from reliquary.environment import forced_sampling as fs  # noqa: E402
 from reliquary.miner.episode_commit import (  # noqa: E402
-    build_signed_episode_commit, episode_metadata, episode_sequence, episode_stop,
+    AdmittedStop, build_signed_episode_commit, episode_metadata, episode_sequence, episode_stop,
+    withdraw_inadmissible,
 )
 from reliquary.miner.rl_episode_client import (  # noqa: E402
-    HttpRlEpisodes, RlSignedEpisodeRunner, rl_transcript_refusal, signed_precommit_body, signed_rl_open_request,
+    HttpRlEpisodes, RlSignedEpisodeRunner, check_engine_caps, rl_transcript_refusal, signed_precommit_body,
+    signed_rl_open_request,
 )
 from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF  # noqa: E402
 from reliquary.protocol.sandbox_session import SessionRefused, sandbox_open_path  # noqa: E402
@@ -337,7 +339,9 @@ def _honest_commit():
     second = _turn(model, prompt + first + observation, pool, seed, len(first), 12)
     tokens, spans = episode_sequence([GeneratedTurn(tuple(prompt), tuple(first), ()),
                                       GeneratedTurn(tuple(prompt + first + observation), tuple(second), ())])
-    episode = episode_metadata(precommit_sha256="e" * 64, seed_index=seed, spans=spans, stop="max_turns",
+    stop = episode_stop("max_turns", tokens=tokens, spans=spans, max_turns=2, max_tokens_per_turn=12,
+                        max_episode_tokens=100, stop_ids=frozenset())
+    episode = episode_metadata(precommit_sha256="e" * 64, seed_index=seed, spans=spans, stop=stop,
                                transcript={"token": {}, "records": []})
     randomness = "cd" * 32
     kwargs = dict(model=model, verifier=GRAILVerifier(hidden_dim=model.config.hidden_size), tokens=tokens,
@@ -378,3 +382,327 @@ def test_an_honest_miners_commit_passes_the_validators_proof_on_cpu():
              + [list(honest.spans[-1])]}
     with pytest.raises(ValueError):
         build_signed_episode_commit(**{**honest.kwargs, "episode": other})
+
+
+# -- fix round 1 ----------------------------------------------------------------------------------------------
+
+
+def test_the_metadata_takes_only_a_stop_episode_stop_admitted():
+    closed = [9] * 5 + [1, 1, 3] + [9, 9] + [1, 2]
+    spans = [(5, 8), (10, 12)]
+    stop = _stop("agent_completed", closed, spans)
+    assert isinstance(stop, AdmittedStop)
+    episode = episode_metadata(precommit_sha256="e" * 64, seed_index=1, spans=spans, stop=stop, transcript={})
+    assert episode["stop"] == "agent_completed" and type(episode["stop"]) is str
+    for raw in ("agent_completed", "context_length", "max_turns", "error", None, AdmittedStop("episode_closed")):
+        with pytest.raises(ValueError):
+            episode_metadata(precommit_sha256="e" * 64, seed_index=1, spans=spans, stop=raw, transcript={})
+
+
+def test_the_engine_caps_must_be_the_policys():
+    caps = dict(max_total_tokens=POLICY.max_episode_tokens, max_tokens_per_turn=POLICY.max_tokens_per_turn,
+                max_model_len=POLICY.max_episode_tokens)
+    check_engine_caps(POLICY, **caps)
+    for name in caps:
+        for wrong in (caps[name] - 1, caps[name] + 1):
+            with pytest.raises(ValueError, match=name):
+                check_engine_caps(POLICY, **{**caps, name: wrong})
+    with pytest.raises(ValueError):
+        check_engine_caps(dataclasses.replace(POLICY, max_tokens_per_turn=1), **{**caps, "max_tokens_per_turn": True})
+
+
+# Episodes of any turn shape, in the fake renderer's ids, and the validator's check of a group of them.
+
+def _play_turns(validator, machine, precommit, seed, *, turns, reward):
+    """``turns``: [(text tokens, calls, last token)]; each call is signed by the gateway."""
+    from reliquary_sandbox.observation import render_observation
+
+    from reliquary.corpus.signed_parse import signed_records
+    from reliquary.protocol.service_episode import rl_engagement
+    from tests.unit.episode_v2_fixtures import ENV_PACKAGE, PROMPT_TEXT, SPLIT
+    from tests.unit.sandbox_fixtures import claims, transcript
+    from tests.unit.test_trajectory_parse import CALL, TEXT, FakeRenderer
+
+    renderer = FakeRenderer()
+    session = claims(session_id=f"s-{seed}", hotkey=precommit.hotkey,
+                     engagement=rl_engagement(precommit.window, precommit.sha256, seed), split=SPLIT,
+                     index=precommit.task_index, checkpoint=precommit.checkpoint, issued_at=NOW,
+                     expires_at=NOW + 4500)
+    signed = transcript(validator, machine, session, status="graded", reward=float(reward),
+                        env_package=ENV_PACKAGE,
+                        calls=[{"turn": t, "k": k, "arguments": {"command": f"c{k}"}, "output": "ok"}
+                               for t, (_, calls, _) in enumerate(turns) for k in range(calls)])
+    bodies = iter(signed_records(signed).calls)
+    tokens, spans = renderer.initial_ids(PROMPT_TEXT), []
+    for t, (text, calls, last) in enumerate(turns):
+        completion = [TEXT] * text + [CALL] * calls + [last]
+        start = len(tokens)
+        spans.append((start, start + len(completion)))
+        if t + 1 < len(turns):
+            observations = [render_observation(next(bodies).to_dict()) for _ in range(calls)]
+            tokens = renderer.next_prompt(tokens, completion, observations)
+        else:
+            tokens = tokens + completion
+    return tokens, spans, signed
+
+
+def _group(tmp_path, turns, *, stop="agent_completed"):
+    from reliquary.constants import M_ROLLOUTS
+    from tests.unit.episode_v2_fixtures import (
+        episode_pool, half_rewards, signed_episode_commit, signed_episode_metadata,
+    )
+
+    validator, machine = episode_signers(tmp_path)
+    pool = episode_pool(CONTRACT)
+    precommit = episode_precommit(CONTRACT, hotkey="5Hot")
+    selection = pool.selection(list(range(M_ROLLOUTS)))
+    rewards, rollouts = half_rewards(), []
+    for index, seed in enumerate(selection.seeds):
+        tokens, spans, signed = _play_turns(validator, machine, precommit, seed, turns=turns, reward=rewards[index])
+        episode = signed_episode_metadata(precommit_sha256=precommit.sha256, seed_index=seed, spans=spans,
+                                          transcript=signed, stop=stop)
+        commit = signed_episode_commit(tokens=tokens, spans=spans, episode=episode, selection=selection,
+                                       index=index, contract=CONTRACT)
+        rollouts.append(SimpleNamespace(tokens=tokens, reward=0.0, commit=commit, env_name=EPISODE))
+    request = SimpleNamespace(
+        miner_hotkey="5Hot", prompt_idx=precommit.task_index, window_start=precommit.window,
+        checkpoint_hash=precommit.checkpoint, pool_selection=selection.to_dict(), rollouts=rollouts,
+        service_binding=ServiceBinding(CONTRACT.sha256, "training").to_dict())
+    return SimpleNamespace(request=request, precommit=precommit, validator=validator, machine=machine)
+
+
+def _validator_check(group, *, policy=POLICY, prompt=None):
+    from reliquary.validator.episode_admission import EpisodeGroupChecker
+    from tests.unit.episode_v2_fixtures import FixedSource
+    from tests.unit.sandbox_fixtures import directory
+    from tests.unit.test_trajectory_parse import FakeRenderer
+
+    source = FixedSource() if prompt is None else FixedSource(text=prompt)
+    checker = EpisodeGroupChecker(policy=policy, renderer=FakeRenderer(), source=source, chunk_tokens=32)
+    verifier = attest.Ed25519TokenVerifier({group.validator.key_id: group.validator.public_key_b64})
+    return checker.check(group.request, precommit=group.precommit, directory=directory(group.machine),
+                         token_verifier=verifier, seen=frozenset(), received=NOW + 100)
+
+
+def _miner_screen(group, *, raw, policy=POLICY, prompt=None):
+    """The miner's screen of the group's episodes, as ``mine_task`` holds them: (kept seeds, released seeds)."""
+    from tests.unit.episode_v2_fixtures import PROMPT_TEXT
+    from tests.unit.test_trajectory_parse import FakeRenderer
+
+    released, outcomes = [], []
+    for rollout in group.request.rollouts:
+        episode = rollout.commit["rollout"]["episode"]
+        tokens, spans = rollout.commit["tokens"], episode["assistant_spans"]
+        session = SimpleNamespace(turns=[GeneratedTurn(tuple(tokens[:start]), tuple(tokens[start:end]), ())
+                                         for start, end in spans])
+
+        async def release(seed=episode["seed_index"]):
+            released.append(seed)
+
+        result = SimpleNamespace(ok=True, transcript=episode["transcript"], stop=raw, release=release)
+        outcomes.append(SimpleNamespace(seed_index=episode["seed_index"], result=result, session=session))
+    kept = asyncio.run(withdraw_inadmissible(outcomes, policy=policy, renderer=FakeRenderer(),
+                                             prompt=PROMPT_TEXT if prompt is None else prompt))
+    return kept, released
+
+
+HONEST = [(9, 1, 1), (9, 0, 1)]          # (text, calls, last token): TERM = 1, EOT = 2
+
+
+def test_an_honest_episode_passes_the_miners_screen_and_the_validator(tmp_path):
+    from reliquary.validator.episode_admission import EpisodeGroupFacts
+
+    group = _group(tmp_path, HONEST)
+    assert isinstance(_validator_check(group), EpisodeGroupFacts)
+    kept, released = _miner_screen(group, raw="agent_completed")
+    assert released == [] and len(kept) == len(group.request.rollouts)
+    outcome, admissible = kept[0]
+    assert admissible.stop == "agent_completed" and isinstance(admissible.stop, AdmittedStop)
+    assert admissible.tokens == group.request.rollouts[0].commit["tokens"]
+
+
+def _refused_by_both(group, *, raw, policy=POLICY, miner_prompt=None, validator_prompt=None):
+    from reliquary.validator.episode_admission import EpisodeRefusal
+
+    outcome = _validator_check(group, policy=policy, prompt=validator_prompt)
+    assert isinstance(outcome, EpisodeRefusal), outcome
+    kept, released = _miner_screen(group, raw=raw, policy=policy, prompt=miner_prompt)
+    assert kept == [] and sorted(released) == sorted(r.commit["rollout"]["episode"]["seed_index"]
+                                                     for r in group.request.rollouts)
+    return outcome
+
+
+def test_an_episode_the_validator_refuses_is_withdrawn_before_the_choice(tmp_path):
+    from reliquary.protocol.submission import RejectReason
+
+    # The prompt is not the validator's render of the task.
+    group = _group(tmp_path / "prompt", HONEST)
+    assert _refused_by_both(group, raw="agent_completed", miner_prompt="Another task.",
+                            validator_prompt="Another task.").stage == "episode_prompt"
+    # Same length, other content: the prompt tokens themselves are compared.
+    same_length = "Write 43 to /work/answer.txt."
+    assert _refused_by_both(group, raw="agent_completed", miner_prompt=same_length,
+                            validator_prompt=same_length).stage == "episode_prompt"
+    # An observation token that is not the re-render of its signed call record.
+    group = _group(tmp_path / "observation", HONEST)
+    for rollout in group.request.rollouts:
+        first_end = rollout.commit["rollout"]["episode"]["assistant_spans"][0][1]
+        rollout.commit["tokens"][first_end + 2] += 1
+    assert _refused_by_both(group, raw="agent_completed").stage == "episode_parse"
+    # Three short turns.
+    group = _group(tmp_path / "short", [(2, 1, 1), (2, 1, 1), (2, 1, 1), (9, 0, 1)])
+    outcome = _refused_by_both(group, raw="agent_completed")
+    assert (outcome.reason, outcome.stage, outcome.detail["check"]) == (
+        RejectReason.BAD_TOKENS, "episode_turns", "short_turns"), outcome
+    # An earlier turn ended on eos, not on the turn terminator.
+    group = _group(tmp_path / "eos", [(9, 1, 2), (9, 0, 1)])
+    outcome = _refused_by_both(group, raw="agent_completed")
+    assert (outcome.stage, outcome.detail["check"]) == ("episode_termination", "bad_termination"), outcome
+    # A closed last turn labelled context_length whose next prompt still fits under the cap.
+    group = _group(tmp_path / "context", [(9, 1, 1), (9, 1, 1)], stop="context_length")
+    outcome = _refused_by_both(group, raw="context_length")
+    assert (outcome.stage, outcome.detail["check"]) == ("episode_termination", "bad_stop")
+
+
+def _next_prompt_length(group):
+    from reliquary_sandbox.observation import render_observation
+
+    from reliquary.corpus.signed_parse import signed_records
+    from tests.unit.test_trajectory_parse import FakeRenderer
+
+    commit = group.request.rollouts[0].commit
+    tokens = commit["tokens"]
+    start, end = commit["rollout"]["episode"]["assistant_spans"][-1]
+    observation = render_observation(signed_records(commit["rollout"]["episode"]["transcript"]).calls[-1].to_dict())
+    return len(FakeRenderer().next_prompt(tokens[:start], tokens[start:end], [observation]))
+
+
+def test_a_next_prompt_exactly_at_the_cap_withdraws_the_episode(tmp_path):
+    """The endpoint refuses a prompt that leaves no room with a 400 whose text verifiers does not read as a
+    context-length error (its pre-flight only rejects a prompt LONGER than max_model_len), so the harness
+    ends in an error: whatever the label, the miner never submits the episode, and the validator would
+    refuse it as context_length (the next prompt fits)."""
+    import httpx
+    import openai
+    from verifiers.legacy.clients.openai_chat_completions_client import handle_openai_overlong_prompt
+    from verifiers.legacy.errors import OverlongPromptError
+
+    from reliquary.miner.corpus_generate_server import GenerateEngine
+    from reliquary.validator.episode_admission import EpisodeGroupFacts
+
+    group = _group(tmp_path, [(9, 1, 1), (9, 1, 1)], stop="context_length")
+    at_cap = _next_prompt_length(group)
+    engine = GenerateEngine(None, max_total_tokens=at_cap, max_tokens_per_turn=POLICY.max_tokens_per_turn)
+    with pytest.raises(ValueError) as error:
+        asyncio.run(engine.generate("s-0", [7] * at_cap, None))
+
+    @handle_openai_overlong_prompt
+    async def endpoint():
+        request = httpx.Request("POST", "http://127.0.0.1:1/inference/v1/generate")
+        response = httpx.Response(400, json={"detail": str(error.value)}, request=request)
+        raise openai.BadRequestError(str(error.value), response=response, body=None)
+
+    with pytest.raises(openai.BadRequestError) as raised:
+        asyncio.run(endpoint())
+    assert not isinstance(raised.value, OverlongPromptError)
+    capped = dataclasses.replace(POLICY, max_episode_tokens=at_cap)
+    for raw in ("error", "context_length", "agent_completed"):
+        kept, released = _miner_screen(group, raw=raw, policy=capped)
+        assert kept == [] and len(released) == len(group.request.rollouts), raw
+    _refused_by_both(group, raw="context_length", policy=capped)
+    # One token more and the next prompt overflows: verifiers' context_length, admitted by both.
+    over = dataclasses.replace(POLICY, max_episode_tokens=at_cap - 1)
+    assert isinstance(_validator_check(group, policy=over), EpisodeGroupFacts)
+    kept, released = _miner_screen(group, raw="context_length", policy=over)
+    assert released == [] and [a.stop for _, a in kept] == ["context_length"] * len(kept)
+
+
+# The RL open: a throttled seed is reopened (same seed) after its wait, within the window.
+
+class ScriptedSessions(RlSessions):
+    def __init__(self, grant, script):
+        super().__init__(grant)
+        self.script = list(script)
+
+    def open(self, body):
+        self.opened.append(body)
+        if self.script:
+            raise self.script.pop(0)
+        return self.grant
+
+
+def _scripted(tmp_path, script, **kwargs):
+    validator, machine = episode_signers(tmp_path)
+    precommit = episode_precommit(CONTRACT, hotkey=MINER.ss58_address)
+    _, _, transcript = play_episode(validator=validator, machine=machine, precommit=precommit, seed=2,
+                                    session_id="s-1", reward=1.0)
+    sessions = ScriptedSessions({"session_id": "s-1", "token": transcript["token"], "gateway_url": "http://g:1",
+                                 "expires_at": NOW + 4500}, script)
+    now = [0.0]
+
+    async def sleep(seconds):
+        now[0] += seconds
+
+    _, runner = _runner(sessions, runner_factory=lambda url: Harness(transcript, b""),
+                        clock=lambda: NOW + 10 + now[0], monotonic=lambda: now[0], sleep=sleep,
+                        new_request_id=lambda: "c" * 32, **kwargs)
+    return sessions, runner, now
+
+
+def test_a_throttled_seed_is_reopened_after_its_retry_after(tmp_path):
+    script = [SessionRefused("job_live_cap", retry_after=7.0, status=429),
+              SessionRefused("open_busy", retry_after=5.0, status=503),
+              SessionRefused("environment_not_served", retry_after=3.0, status=503),
+              SessionRefused("sandbox_capacity", status=503)]
+    sessions, runner, now = _scripted(tmp_path, script)
+
+    async def go():
+        async with runner:
+            return await runner.run(2)
+
+    result = asyncio.run(go())
+    assert result.ok, result.error
+    assert [body["engagement"]["precommit"]["seed_index"] for body in sessions.opened] == [2] * 5
+    assert now[0] >= 7 + 5 + 3 and runner._unavailable == 0
+
+
+def test_the_rl_named_throttles_never_stop_the_hotkey(tmp_path):
+    script = [SessionRefused("environment_not_served", retry_after=1.0, status=503) for _ in range(12)]
+    sessions, runner, _ = _scripted(tmp_path, script)
+
+    async def go():
+        async with runner:
+            return await runner.run(2)
+
+    assert asyncio.run(go()).ok and len(sessions.opened) == 13
+
+
+@pytest.mark.parametrize("reason", ["precommit_unknown", "precommit_stale", "seed_out_of_pool", "engagement_taken",
+                                    "session_too_long"])
+def test_a_final_refusal_ends_the_seed_and_holds_no_other_open(tmp_path, reason):
+    sessions, runner, now = _scripted(tmp_path, [SessionRefused(reason, status=409)])
+
+    async def go():
+        async with runner:
+            with pytest.raises(SessionRefused) as refused:
+                await runner.run(2)
+            assert refused.value.reason == reason
+            assert runner._not_before <= now[0]               # no exponential hold on the next seed's open
+            return await runner.run(2)
+
+    assert asyncio.run(go()).ok
+    assert len(sessions.opened) == 2 and now[0] == 0.0
+
+
+def test_reopening_is_bounded_by_the_window(tmp_path):
+    script = [SessionRefused("open_busy", retry_after=100.0, status=503) for _ in range(10)]
+    sessions, runner, now = _scripted(tmp_path, script, open_until=NOW + 10 + 250)
+
+    async def go():
+        async with runner:
+            with pytest.raises(SessionRefused) as refused:
+                await runner.run(2)
+            return refused.value
+
+    assert asyncio.run(go()).reason == "open_busy"
+    assert len(sessions.opened) == 3 and now[0] == 200.0

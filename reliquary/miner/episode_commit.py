@@ -5,10 +5,19 @@ proofs per model span; the signature binds the service binding, the pool binding
 transcript by digest)."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 UNOBSERVED_STOPS = ("max_turns", "context_length")
+ADMITTED_STOPS = ("agent_completed", *UNOBSERVED_STOPS)
+
+
+class AdmittedStop(str):
+    """A stop ``episode_stop`` computed: the only stop ``episode_metadata`` signs (never a raw label)."""
 
 
 def episode_sequence(turns: Sequence[Any]) -> tuple[list[int], list[tuple[int, int]]]:
@@ -47,7 +56,14 @@ def episode_stop(raw: Any, *, tokens: Sequence[int], spans: Sequence[tuple[int, 
       last turn cut at the per-turn cap elsewhere is admitted only as the ``max_turns``-th turn.
     * Otherwise (a closed last turn) ``agent_completed`` and ``context_length`` (verifiers' overlong
       NEXT prompt) are kept; the validator checks the rest (calls, closed reasoning, the overflow)."""
-    if not spans or raw not in ("agent_completed", *UNOBSERVED_STOPS):
+    stop = _mapped_stop(raw, tokens=tokens, spans=spans, max_turns=max_turns,
+                        max_tokens_per_turn=max_tokens_per_turn, max_episode_tokens=max_episode_tokens,
+                        stop_ids=stop_ids)
+    return None if stop is None else AdmittedStop(stop)
+
+
+def _mapped_stop(raw, *, tokens, spans, max_turns, max_tokens_per_turn, max_episode_tokens, stop_ids):
+    if not spans or raw not in ADMITTED_STOPS:
         return None
     start, end = spans[-1]
     if end != len(tokens) or end > max_episode_tokens:
@@ -64,13 +80,93 @@ def episode_stop(raw: Any, *, tokens: Sequence[int], spans: Sequence[tuple[int, 
     return raw
 
 
-def episode_metadata(*, precommit_sha256: str, seed_index: int, spans, stop: str, transcript: dict) -> dict:
-    """``rollout.episode`` of a signed-episode commit; ``stop`` is ``episode_stop``'s, not the raw one."""
+def episode_metadata(*, precommit_sha256: str, seed_index: int, spans, stop: AdmittedStop,
+                     transcript: dict) -> dict:
+    """``rollout.episode`` of a signed-episode commit; ``stop`` is ``episode_stop``'s (ValueError for a raw
+    label or anything else)."""
     from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
 
+    if not isinstance(stop, AdmittedStop) or str(stop) not in ADMITTED_STOPS:
+        raise ValueError(f"the stop {stop!r} is not one episode_stop admitted")
     return {"schema_version": SIGNED_EPISODE_SCHEMA, "precommit_sha256": precommit_sha256,
             "seed_index": int(seed_index), "assistant_spans": [[int(s), int(e)] for s, e in spans],
-            "stop": stop, "transcript": transcript}
+            "stop": str(stop), "transcript": transcript}
+
+
+def episode_refusal(*, policy, renderer, prompt: str, tokens: Sequence[int], spans: Sequence[tuple[int, int]],
+                    stop: Any, transcript: Any, min_chunk_tokens: int | None = None) -> str | None:
+    """Why the validator's admission would refuse this episode at its token level, or None: the episode
+    length, prompt fidelity (``renderer.initial_ids(prompt)``, the validator's own render) and the
+    admission's own ``episode_shape_refusal`` (spans, §5.C parse, short turns, budgets, termination, a
+    limit stop really reached). ``renderer`` is the miner's turn renderer of the policy's checkpoint over
+    the CONTRACT's tools (``agentic_swe.load_turn_renderer(dir, tools=tuple(policy.tools))``, as the
+    validator builds it); ``stop`` is ``episode_stop``'s (None is refused). The transcript's signatures
+    and bindings are ``rl_transcript_refusal``'s, checked when the episode ended."""
+    from reliquary.corpus.signed_parse import signed_records
+    from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
+    from reliquary.validator.episode_admission import episode_shape_refusal
+
+    if stop is None:
+        return "episode_stop: no stop the validator admits"
+    tokens = [int(token) for token in tokens]
+    spans = [(int(start), int(end)) for start, end in spans]
+    if len(tokens) > policy.max_episode_tokens:
+        return f"episode_length: {len(tokens)} tokens > {policy.max_episode_tokens}"
+    prompt_ids = list(renderer.initial_ids(prompt))
+    if not spans or spans[0][0] != len(prompt_ids) or tokens[:len(prompt_ids)] != prompt_ids:
+        return "episode_prompt: the prompt tokens are not the validator's render"
+    try:
+        found = signed_records(transcript)
+    except (KeyError, TypeError, ValueError) as error:
+        return f"episode_transcript: {type(error).__name__}"
+    refused = episode_shape_refusal(
+        policy, renderer, prompt_ids=prompt_ids, tokens=tokens, spans=spans, stop=str(stop), calls=found.calls,
+        opened=found, final=found.final,
+        min_chunk_tokens=MIN_CHUNK_TOKENS if min_chunk_tokens is None else int(min_chunk_tokens))
+    return None if refused is None else f"{refused.stage}: {refused.detail}"
+
+
+@dataclass(frozen=True)
+class AdmissibleEpisode:
+    """What the miner signs for one episode it keeps: its sequence and the admitted stop."""
+
+    tokens: list[int]
+    spans: list[tuple[int, int]]
+    stop: AdmittedStop
+
+
+async def withdraw_inadmissible(outcomes, *, policy, renderer, prompt: str,
+                                min_chunk_tokens: int | None = None) -> list[tuple[Any, AdmissibleEpisode]]:
+    """Before ``choose_episodes``: each outcome (``seed_index``, ``result``: ``EpisodeResult``, ``session``:
+    the generate session's log) the validator would admit, with its sequence and stop; every other one is
+    withdrawn at once (``result.release()``: its slot and the hotkey's caps are freed), so no group is ever
+    built of an episode the validator refuses."""
+    kept: list[tuple[Any, AdmissibleEpisode]] = []
+    for outcome in outcomes:
+        result, session = outcome.result, outcome.session
+        why = None
+        try:
+            if not getattr(result, "ok", False) or result.transcript is None or session is None:
+                raise ValueError("no graded episode")
+            tokens, spans = episode_sequence(session.turns)
+            stop = episode_stop(result.stop, tokens=tokens, spans=spans, max_turns=policy.max_turns,
+                                max_tokens_per_turn=policy.max_tokens_per_turn,
+                                max_episode_tokens=policy.max_episode_tokens, stop_ids=renderer.stop_ids)
+            why = episode_refusal(policy=policy, renderer=renderer, prompt=prompt, tokens=tokens, spans=spans,
+                                  stop=stop, transcript=result.transcript, min_chunk_tokens=min_chunk_tokens)
+        except (ValueError, TypeError, KeyError, IndexError) as error:
+            why = f"{type(error).__name__}: {error}"
+        if why is None:
+            kept.append((outcome, AdmissibleEpisode(tokens, spans, stop)))
+            continue
+        logger.info("seed %s withdrawn: the validator would refuse it (%s)", outcome.seed_index, why)
+        release = getattr(result, "release", None)
+        if release is not None:
+            try:
+                await release()
+            except Exception:
+                logger.exception("withdrawing the episode of seed %s failed", outcome.seed_index)
+    return kept
 
 
 def build_signed_episode_commit(*, model, verifier, tokens: Sequence[int], spans: Sequence[tuple[int, int]],
@@ -116,4 +212,5 @@ def build_signed_episode_commit(*, model, verifier, tokens: Sequence[int], spans
             "toploc_proofs": span_proofs_b64(hidden, spans, chunk_tokens=toploc.chunk_tokens, topk=toploc.topk)}
 
 
-__all__ = ["build_signed_episode_commit", "episode_metadata", "episode_sequence", "episode_stop"]
+__all__ = ["ADMITTED_STOPS", "AdmissibleEpisode", "AdmittedStop", "build_signed_episode_commit", "episode_metadata",
+           "episode_refusal", "episode_sequence", "episode_stop", "withdraw_inadmissible"]

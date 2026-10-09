@@ -9,18 +9,41 @@ The runner's ``EpisodeResult.stop`` is the harness's raw stop condition: before 
 the episode's token cap ``agent_completed``; the validator wants ``context_length``)."""
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Mapping
 from types import SimpleNamespace
 from typing import Any
 
 from reliquary.miner.signed_episode import (
-    GRADING_GRACE_S, HttpSandboxSessions, SignedSweEpisodeRunner, _claims_of, _compact, _NoKeys,
+    GRADING_GRACE_S, OPEN_WINDOW_S, THROTTLED, VALIDATOR_THROTTLES, HttpSandboxSessions, SignedSweEpisodeRunner,
+    _claims_of, _compact, _NoKeys,
 )
-from reliquary.protocol.sandbox_session import sandbox_open_path
+from reliquary.protocol.sandbox_session import SessionRefused, sandbox_open_path
 from reliquary.protocol.signatures import build_episode_precommit_binding, build_sandbox_open_binding
 
+logger = logging.getLogger(__name__)
+
 RL_PREFIX = "/rl"
+RL_THROTTLES = VALIDATOR_THROTTLES | {"open_busy", "environment_not_served"}
+"""The RL routes' named 503s: the validator is serving (an unserved env may be loading); the seed is reopened."""
+RL_FINAL_REFUSALS = frozenset({"precommit_unknown", "precommit_stale", "seed_out_of_pool", "engagement_taken",
+                               "session_too_long"})
+"""The RL engagement book's own 4xx: the seed is the miner's to change, never reopened."""
+
+
+def check_engine_caps(policy, *, max_total_tokens: int, max_tokens_per_turn: int, max_model_len: int) -> None:
+    """At startup: the generate engine's caps and the harness's context length are the contract's episode
+    policy, or ValueError. An engine cap above the policy plays turns the validator refuses; one below it
+    cuts episodes the validator reads as a miner's early stop (its limit rules use the policy's caps)."""
+    wrong = {name: (int(got), int(want)) for name, got, want in (
+        ("max_total_tokens", max_total_tokens, policy.max_episode_tokens),
+        ("max_tokens_per_turn", max_tokens_per_turn, policy.max_tokens_per_turn),
+        ("max_model_len", max_model_len, policy.max_episode_tokens),
+    ) if isinstance(got, bool) or int(got) != int(want)}
+    if wrong:
+        raise ValueError("the episode engine's caps are not the contract's episode policy: "
+                         + ", ".join(f"{name} {got} != {want}" for name, (got, want) in wrong.items()))
 
 
 def signed_precommit_body(*, precommit, sign_binding: Callable[[bytes], str], now: float,
@@ -122,11 +145,12 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
     with the RL binding before it is kept."""
 
     requires_text_state = False
+    validator_throttles = RL_THROTTLES
 
     def __init__(self, *, policy, precommit, prompt: str, hotkey: str, sign_binding, sessions, model_name: str,
                  renderer_model_dir: str, generate_url: str, sampling, harness_env: dict | None = None,
                  runner_factory=None, clock: Callable[[], float] = time.time, max_live: int | None = None,
-                 **kwargs) -> None:
+                 open_until: float | None = None, **kwargs) -> None:
         if precommit.hotkey != hotkey:
             raise ValueError("the precommit names another hotkey than the runner's")
         if precommit.environment != policy.environment:
@@ -137,6 +161,32 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                          source=_TaskPrompt(prompt), runner_factory=runner_factory, clock=clock,
                          max_live=max_live or policy.pool_seeds, **kwargs)
         self._policy, self._precommit = policy, precommit
+        self._open_until = open_until
+
+    async def _open(self, index: int, slot) -> dict:
+        """The seed's open; a throttled one (429, 503, a named throttle) is sent again for the SAME seed once
+        its Retry-After has passed, while that is before ``open_until`` (the window; by default
+        OPEN_WINDOW_S from the first send). Any other refusal ends the seed."""
+        until = self._open_until if self._open_until is not None else self._clock() + OPEN_WINDOW_S
+        while True:
+            try:
+                return await super()._open(index, slot)
+            except SessionRefused as refused:
+                reopen = (not slot.keep and refused.reason not in RL_FINAL_REFUSALS
+                          and refused.reason != "validator_unavailable"
+                          and (refused.status in THROTTLED or refused.reason in RL_THROTTLES))
+                wait = max(0.0, self._not_before - self._monotonic())
+                if not reopen or self._clock() + wait >= until:
+                    raise
+                logger.info("seed %d open throttled (%s): reopened in %.0f s", index, refused.reason, wait)
+
+    def _note_refusal(self, refused: SessionRefused) -> SessionRefused:
+        # A 409 is about this seed (taken, out of the pool, a stale precommit): the other seeds' opens
+        # are not held behind it.
+        if refused.status == 409 and not refused.retry_after:
+            self._unavailable = 0
+            return refused
+        return super()._note_refusal(refused)
 
     def _open_body(self, index: int, request_id: str) -> dict:
         return signed_rl_open_request(hotkey=self._hotkey, precommit_sha256=self._precommit.sha256,
@@ -149,5 +199,5 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                                      seed_index=index, now=now)
 
 
-__all__ = ["HttpRlEpisodes", "RL_PREFIX", "RlSignedEpisodeRunner", "rl_transcript_refusal",
-           "signed_precommit_body", "signed_rl_open_request"]
+__all__ = ["HttpRlEpisodes", "RL_FINAL_REFUSALS", "RL_PREFIX", "RL_THROTTLES", "RlSignedEpisodeRunner",
+           "check_engine_caps", "rl_transcript_refusal", "signed_precommit_body", "signed_rl_open_request"]

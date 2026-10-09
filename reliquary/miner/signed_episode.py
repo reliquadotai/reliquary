@@ -311,6 +311,8 @@ class SignedSweEpisodeRunner:
 
     # Plan 2C: a corpus episode submits its graded state as a text diff; an RL episode submits none.
     requires_text_state = True
+    # The named 503s that say the validator is serving, only busy (a subclass adds its routes' own).
+    validator_throttles = VALIDATOR_THROTTLES
 
     def _transcript_refusal(self, transcript, index: int, now: float):
         """The validator's transcript checks this miner can run (a subclass binds its own engagement)."""
@@ -384,7 +386,7 @@ class SignedSweEpisodeRunner:
             self._backoff += 1
             self._hold_opens(min(MAX_BACKOFF_S, 2.0 ** (self._backoff - 1)))
         not_serving = (refused.status is None or refused.status == 404
-                       or (refused.status >= 500 and refused.reason not in VALIDATOR_THROTTLES))
+                       or (refused.status >= 500 and refused.reason not in self.validator_throttles))
         if not not_serving:
             self._unavailable = 0
             return refused
