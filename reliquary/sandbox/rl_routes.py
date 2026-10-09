@@ -6,15 +6,21 @@ session for that task; the runtime records it against the frozen window
 (``ServiceRuntime.record_episode_precommit``, in a thread). Its digest is what every session of the
 group names (``rl:{window}:{precommit}:{seed}``).
 
-The body is read bounded and parsed off the loop with the sandbox routes' own helpers; every refusal
-is ``{"reason", "detail"}``. A window that is not open (no announced pool, between windows) is a
-retryable 503; anything else the miner must change is a 4xx."""
+The body is read bounded (in size, and in time: ``body_timeout_s``) and parsed off the loop with the
+sandbox routes' own helpers; every refusal is ``{"reason", "detail"}``. A window that is not open (no
+announced pool, between windows) is a retryable 503; anything else the miner must change is a 4xx.
+
+The signature check (sr25519) runs before the hotkey is known to be registered, so it is bounded: at
+most ``max_preauth`` requests are read and verified at once (one more is refused ``precommit_busy``,
+503, before its body is read), and each claimed hotkey gets ``max_per_minute`` requests a rolling
+minute (``precommit_rate``, 429, counted before the verification)."""
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -34,7 +40,12 @@ PRECOMMIT_STATUS: dict[str, int] = {
     "window_closed": 409, "order_mismatch": 409, "environment_not_episode": 409,
     "environment_not_active": 409, "task_out_of_range": 409, "checkpoint_mismatch": 409,
     "pool_mismatch": 409, "precommit_exists": 409, "task_in_cooldown": 409,
+    "precommit_rate": 429, "precommit_busy": 503,
 }
+BODY_TIMEOUT_S = 10.0
+MAX_PER_MINUTE = 30
+MAX_PREAUTH = 8
+_MAX_TRACKED_HOTKEYS = 4096
 
 
 def episode_precommit_path(prefix: str = "/rl") -> str:
@@ -55,7 +66,7 @@ def _refusal(reason: str, detail: dict | None = None, retry_after: float | None 
     if status is None:
         return _refuse(reason, detail, retry_after)
     headers = {"Cache-Control": "no-store"}
-    if status == 503:
+    if status in (429, 503):
         headers["Retry-After"] = str(max(1, math.ceil(retry_after or 1)))
     return JSONResponse(status_code=status, content={"reason": reason, "detail": dict(detail or {})},
                         headers=headers)
@@ -67,23 +78,53 @@ def build_episode_precommit_router(
     verify: Callable[..., bool] = verify_episode_precommit_signature,
     registration: Callable[[str], Awaitable[str | None]] | None = None,
     clock: Callable[[], float] = time.time,
+    body_timeout_s: float = BODY_TIMEOUT_S, max_per_minute: int = MAX_PER_MINUTE,
+    max_preauth: int = MAX_PREAUTH,
 ) -> APIRouter:
     """``record``: ``ServiceRuntime.record_episode_precommit`` (blocking, run in a thread);
-    ``current_window``: the service window admissions are open for, or None between windows."""
+    ``current_window``: the service window admissions are open for, or None between windows. It is
+    called on the event loop: it must read memory only (never the runtime's SQLite)."""
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
+    if not (body_timeout_s > 0 and max_per_minute > 0 and max_preauth > 0):
+        raise ValueError("the precommit route's bounds must be positive")
     router = APIRouter()
     path = episode_precommit_path(prefix)
     retry_s = policy.retry_after_s
+    preauth = asyncio.Semaphore(max_preauth)
+    recent: dict[str, deque] = {}
+
+    def rate_refusal(hotkey: str) -> JSONResponse | None:
+        now = float(clock())
+        times = recent.setdefault(hotkey, deque())
+        while times and times[0] <= now - 60.0:
+            times.popleft()
+        if len(times) >= max_per_minute:
+            return _refusal("precommit_rate", {"max_per_minute": max_per_minute},
+                            times[0] + 60.0 - now)
+        times.append(now)
+        if len(recent) > _MAX_TRACKED_HOTKEYS:           # forget idle hotkeys
+            for key in [k for k, v in recent.items() if not v or v[-1] <= now - 60.0]:
+                recent.pop(key, None)
+        return None
 
     @router.post(path)
     async def precommit(http: Request) -> JSONResponse:
+        if preauth.locked():
+            return _refusal("precommit_busy", {"max_concurrent": max_preauth}, retry_s)
+        async with preauth:
+            return await handle(http)
+
+    async def handle(http: Request) -> JSONResponse:
         from reliquary.protocol.service_episode import EpisodePrecommit, EpisodeWireError
         from reliquary.services.runtime import EpisodePrecommitRefused
 
         try:
-            request, hotkey = await _parse(http, EpisodePrecommitRequest, MAX_OPEN_BODY_BYTES)
+            request, hotkey = await _parse(http, EpisodePrecommitRequest, MAX_OPEN_BODY_BYTES, body_timeout_s)
+            limited = rate_refusal(hotkey)
+            if limited is not None:
+                return limited
             now = int(clock())
             if abs(now - request.at) > policy.request_skew_s:
                 return _refuse("stale_request", {"max_skew_s": policy.request_skew_s, "now": now})
@@ -133,5 +174,5 @@ def build_episode_precommit_router(
     return router
 
 
-__all__ = ["EpisodePrecommitRequest", "PRECOMMIT_STATUS", "build_episode_precommit_router",
+__all__ = ["BODY_TIMEOUT_S", "MAX_PER_MINUTE", "MAX_PREAUTH", "EpisodePrecommitRequest", "PRECOMMIT_STATUS", "build_episode_precommit_router",
            "episode_precommit_path"]

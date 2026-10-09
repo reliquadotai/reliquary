@@ -963,8 +963,9 @@ class ServiceRuntime:
         ``EpisodePrecommitRefused`` and writes nothing. One live precommit per (hotkey, env, task,
         window). A task in cooldown for its env in that window is refused (``task_in_cooldown``) so no
         session is spent on it; the cooldown state lives in the validator, which installs
-        ``task_in_cooldown(environment, task_index, window) -> bool``. BLOCKING (SQLite): the route
-        runs it in a thread."""
+        ``task_in_cooldown(environment, task_index, window) -> bool``. Only the PROMPT cooldown (task
+        index) is consulted, not the content-digest cooldown: a task whose prompt TEXT is cooling down under
+        another index is not refused here (the batcher's own checks still apply at admission). BLOCKING (SQLite): the route runs it in a thread."""
         from reliquary.protocol.service_episode import EpisodePrecommit
 
         if not isinstance(precommit, EpisodePrecommit):
@@ -1025,6 +1026,42 @@ class ServiceRuntime:
             row = self.db.execute("SELECT body FROM service_episode_precommits WHERE order_id=? AND sha256=?",
                                   (self.contract.sha256, sha256)).fetchone()
         return None if row is None else EpisodePrecommit.from_dict(json.loads(row[0]))
+
+    def episode_precommit_recorded_at(self, sha256: str) -> float | None:
+        """When the precommit recorded under ``sha256`` was recorded (validator clock), or None."""
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return None
+        with self.lock:
+            row = self.db.execute("SELECT at FROM service_episode_precommits WHERE order_id=? AND sha256=?",
+                                  (self.contract.sha256, sha256)).fetchone()
+        return None if row is None else float(row[0])
+
+    def episode_precommit_sha(self, *, window: int, environment: str, task_index: int,
+                              hotkey: str) -> str | None:
+        """The digest of the one precommit of (window, env, task, hotkey), or None."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT sha256 FROM service_episode_precommits WHERE order_id=? AND window=? AND environment=? "
+                "AND task_index=? AND hotkey=?",
+                (self.contract.sha256, int(window), str(environment), int(task_index), str(hotkey))).fetchone()
+        return None if row is None else str(row[0])
+
+    def prune_episode_precommits(self, *, before: float, keep=frozenset()) -> int:
+        """Forget the precommits of SETTLED windows recorded before ``before``, except those in ``keep``
+        (the ones a session the issuer still holds names). An unsettled window's precommits stay (they
+        keep its envelope permanent). Returns how many rows went. BLOCKING (SQLite)."""
+        order = self.contract.sha256
+        kept = {sha for sha in keep if isinstance(sha, str)}
+        with self._txn():
+            rows = self.db.execute(
+                "SELECT p.sha256 FROM service_episode_precommits p JOIN service_settled s "
+                "ON s.order_id=p.order_id AND s.window=p.window WHERE p.order_id=? AND p.at<?",
+                (order, float(before))).fetchall()
+            gone = [sha for (sha,) in rows if sha not in kept]
+            for sha in gone:
+                self.db.execute("DELETE FROM service_episode_precommits WHERE order_id=? AND sha256=?",
+                                (order, sha))
+        return len(gone)
 
     # --- observations (decisions A, B) ---
     def _observation(self, envelope: dict, *, environment, prompt_idx, hotkey, window, rewards, group_id,

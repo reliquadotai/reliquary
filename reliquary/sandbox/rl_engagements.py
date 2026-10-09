@@ -10,6 +10,9 @@ A session of an RL episode group names ``rl:{window}:{precommit}:{seed}``. Its t
   only a machine-signed ``aborted`` final frees a seed, once per precommit seed; a drain (``voided``
   frees what the miner left live: a selective re-roll), a failed open, an expiry, a box failure, a lapse
   or a withdrawal consume it, so a miner cannot re-roll a draw;
+* a precommit whose window started more than ``FILL_CLOSED_MAX_SECONDS`` + ``WINDOW_AGE_MARGIN_S`` ago
+  (or whose start this validator does not know) opens nothing (``precommit_stale``): a stalled window
+  never outlives the book's memory of its taken seeds;
 * a precommit recorded more than 24 h ago opens nothing (``precommit_stale``) and a session's
   ``wall_s + open_window_s`` stays within 24 h, so the book's taken seeds (kept ~25 h) outlive every
   session of a precommit;
@@ -21,7 +24,11 @@ The token binds hotkey, engagement (precommit + seed), env, split, index (the ta
 window's); admission checks every one with ``verify_transcript``.
 
 Sessions are stored under ``sandbox_store.RL_SESSION_PREFIX`` (the wiring passes it), so a restart of
-the RL validator reads its taken seeds back and a corpus validator never restores them."""
+the RL validator reads its taken seeds back and a corpus validator never restores them.
+
+Seed exclusivity holds within ONE RL validator process: the check runs on its in-memory book under its
+issuer lock, and the store has no create-only marker per (precommit, seed). Never run two replicas of an
+RL validator on one session store."""
 from __future__ import annotations
 
 import asyncio
@@ -42,6 +49,7 @@ _ENGAGEMENT_KEYS = frozenset({"kind", "precommit"})
 _PRECOMMIT_KEYS = frozenset({"precommit_sha256", "seed_index"})
 MAX_PRECOMMIT_AGE_S = 86_400          # the book forgets a taken seed ~25 h after its session closed
 MAX_SESSION_SPAN_S = 86_400           # wall_s + open_window_s
+WINDOW_AGE_MARGIN_S = 900             # past the longest window (FILL_CLOSED_MAX_SECONDS)
 
 
 class SessionQuota(Protocol):
@@ -66,10 +74,19 @@ class SessionOutcomes(Protocol):
     def group_settled(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],
                       accepted: bool) -> None: ...
 
+    def group_handed_back(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],
+                          stage: str) -> None:
+        """An accepted group the proof could not judge for a reason of the validator's own: unpaid,
+        unsanctioned; its sessions must not count against the miner's yield or quota."""
+
 
 class NoOutcomes:
     def group_settled(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],
                       accepted: bool) -> None:
+        return None
+
+    def group_handed_back(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],
+                          stage: str) -> None:
         return None
 
 
@@ -88,10 +105,13 @@ class RlEpisodeEngagements:
                  environments: Callable[[str], EpisodeEnvironmentView | None],
                  current_window: Callable[[], int | None], book: SessionBook,
                  recorded_at: Callable[[str], float | None],
-                 quota: SessionQuota | None = None, clock: Callable[[], float] = time.time) -> None:
+                 quota: SessionQuota | None = None, clock: Callable[[], float] = time.time,
+                 window_started_at: Callable[[int], float | None] | None = None) -> None:
         """``recorded_at(sha256)``: when the runtime recorded the precommit (its row's ``at``), or None
-        (then nothing opens: fail closed)."""
+        (then nothing opens: fail closed). ``window_started_at(window)``: when this validator opened the
+        window (in memory), or None (then nothing opens); None as a callable skips the check (tests)."""
         self._precommits = precommits
+        self._window_started_at = window_started_at
         self._recorded_at = recorded_at
         self._clock = clock
         self._environments = environments
@@ -100,9 +120,15 @@ class RlEpisodeEngagements:
         self._quota = quota or OpenQuota()
 
     def _stale(self, window: int) -> Refusal | None:
+        from reliquary.constants import FILL_CLOSED_MAX_SECONDS
+
         current = self._current_window()
         if current is None or window != current:
             return Refusal("precommit_stale", {"window": current})
+        if self._window_started_at is not None:
+            started = self._window_started_at(window)
+            if started is None or float(self._clock()) - float(started) > FILL_CLOSED_MAX_SECONDS + WINDOW_AGE_MARGIN_S:
+                return Refusal("precommit_stale", {"window": current, "why": "the window is too old"})
         return None
 
     async def terms(self, hotkey: str, engagement: Mapping[str, Any]) -> EngagementTerms | Refusal:
@@ -174,5 +200,5 @@ class RlEpisodeEngagements:
             budgets=budgets, exclusive=True, still_valid=lambda: self._stale(window))
 
 
-__all__ = ["EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements", "SessionOutcomes",
+__all__ = ["WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements", "SessionOutcomes",
            "SessionQuota"]

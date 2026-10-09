@@ -122,7 +122,10 @@ class EpisodeGroupIntake:
     ``release_claim``, ``submitted``); ``seen()``: an immutable snapshot of the paid session ids
     (``SessionBook.submitted_ids``: restored from the durable store at start); ``precommits(sha)``:
     ``ServiceRuntime.episode_precommit`` (thread-safe: called off the loop). A checker whose policy is
-    not the window contract's refuses its groups (``episode_policy_stale``) until it is rebuilt."""
+    not the window contract's refuses its groups (``episode_policy_stale``) until it is rebuilt.
+    ``window_open(window)``: whether this validator takes episode groups for that window (False for a
+    window it resumed after a restart: what the batcher accepted before is lost with its memory, so no
+    group of it is taken again: ``episode_window_resumed``); None takes every window (tests)."""
 
     def __init__(self, *, checkers: Mapping[str, EpisodeGroupChecker], precommits: Callable[[str], Any],
                  directory: Callable[[float], Any | None], token_verifier, sessions,
@@ -130,7 +133,8 @@ class EpisodeGroupIntake:
                  max_checks_per_minute: int = DEFAULT_MAX_CHECKS_PER_MINUTE,
                  max_checks_in_flight: int = DEFAULT_MAX_CHECKS_IN_FLIGHT,
                  clock: Callable[[], float] = time.monotonic,
-                 admission_deadline_s: float = ADMISSION_DEADLINE_S) -> None:
+                 admission_deadline_s: float = ADMISSION_DEADLINE_S,
+                 window_open: Callable[[int], bool] | None = None) -> None:
         ttl = getattr(getattr(sessions, "policy", None), "claim_ttl_s", None)
         if not isinstance(ttl, (int, float)) or ttl < CLAIM_TTL_MARGIN * float(admission_deadline_s):
             raise ValueError(f"the session claim ttl ({ttl!r} s) must be at least {CLAIM_TTL_MARGIN}x the "
@@ -149,6 +153,7 @@ class EpisodeGroupIntake:
         self._in_flight: dict[str, int] = {}
         self._in_flight_lock = threading.Lock()         # a check's thread ends its count
         self._tasks: set[asyncio.Task] = set()
+        self._window_open = window_open
 
     @property
     def environments(self) -> tuple[str, ...]:
@@ -238,6 +243,8 @@ class EpisodeGroupIntake:
         ``operator``: the receipt's (the in-flight cap's key; the hotkey when unknown). ``progress``:
         filled in for a caller that may cut this call (``CheckProgress.ran_past``)."""
         request = prepared.request
+        if self._window_open is not None and not self._window_open(getattr(request, "window_start", None)):
+            return self._refuse(prepared, RejectReason.WINDOW_NOT_ACTIVE, "episode_window_resumed")
         checker = self._checkers.get(environment)
         if checker is None:
             return self._refuse(prepared, RejectReason.GENERATION_CONTRACT_MISMATCH, "episode_unserved")

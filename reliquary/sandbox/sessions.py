@@ -106,6 +106,7 @@ SESSION_SCHEMA = "reliquary/sandbox-session/v1"
 LIVE, CLOSED_GRADED, SUBMITTED = _store.SESSION_LIVE, _store.SESSION_CLOSED_GRADED, _store.SESSION_SUBMITTED
 CLOSED, ABORTED, VOIDED, LAPSED = (_store.SESSION_CLOSED, _store.SESSION_ABORTED,
                                    _store.SESSION_VOIDED, _store.SESSION_LAPSED)
+HANDED_BACK = _store.SESSION_HANDED_BACK          # plan 2C: a ``submitted`` session's closed status
 STATES = frozenset(SESSION_TRANSITIONS)
 HOLDING = frozenset({LIVE, CLOSED_GRADED})
 WITHDRAW, WITHDRAWN = "withdraw", "withdrawn"         # the close reason, the closed status
@@ -500,6 +501,13 @@ class SessionBook:
             aborted += 1
         return aborted >= 2
 
+    def precommits_held(self, now: int) -> frozenset[str]:
+        """Plan 2C: the precommits a session still needs (one of its sessions is held, or claimed by a
+        group in flight): their runtime rows must stay."""
+        return frozenset(sha for sha, ids in self._by_precommit.items()
+                         if any(s in self._claimed or (s in self._sessions and self._holds(self._sessions[s], now))
+                                for s in ids))
+
     def submitted_ids(self) -> frozenset[str]:
         """Safe from any thread: an immutable set, kept up to date by `settle`."""
         return self._submitted
@@ -510,8 +518,11 @@ class SessionBook:
         live = sum(1 for r in mine if self._holds(r, now))
         if live >= policy.max_live_per_hotkey:
             return Refusal("live_cap", {"live": live, "max": policy.max_live_per_hotkey})
+        # A session handed back (plan 2C: its group was not judged, for the validator's reason) is not
+        # the miner's to count.
         counted = sorted(r.issued_at for r in mine
-                         if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED))
+                         if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED)
+                         and r.closed_status != HANDED_BACK)
         opens = len(counted)
         if opens >= policy.max_opens_per_hour:     # retry when enough of them leave the hour
             return Refusal("open_rate_cap", {"opens": opens, "max": policy.max_opens_per_hour},
@@ -1024,6 +1035,25 @@ class SessionIssuer:
                 self._stored_submitted.discard(session_id)
         await asyncio.gather(*(self._persist(record) for record in records))
 
+    async def hand_back(self, precommit_sha256: str, *, hotkey: str) -> tuple[str, ...]:
+        """Plan 2C: the paid group of this precommit was not judged by the proof, for a reason of the
+        validator's own. Its ``submitted`` sessions stay ``submitted`` (never paid, never claimed
+        again: the precommit stays taken, no same-window retry) and are marked handed back (closed
+        status), in the book and the store, so that no cap or quota counts them against the miner.
+        Returns the sessions marked now (none twice)."""
+        marked: list[SessionRecord] = []
+        async with self._lock:
+            now = int(self._clock())
+            for record in self.book.of_precommit(precommit_sha256):
+                if record.hotkey != hotkey or record.state != SUBMITTED or record.closed_status == HANDED_BACK:
+                    continue
+                record.closed_status, record.closed_at = HANDED_BACK, now
+                marked.append(record)
+        writes = [self._spawn(self._persist(replace(record))) for record in marked]
+        if writes:
+            await asyncio.shield(asyncio.gather(*writes))
+        return tuple(record.session_id for record in marked)
+
     def void_machine(self, machine_id: str) -> None:
         records = self.book.void_machine(machine_id, int(self._clock()))
         for record in records:
@@ -1103,7 +1133,7 @@ class SessionIssuer:
         return False
 
 
-__all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "LAPSED", "LIVE", "SUBMITTED", "VOIDED",
+__all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "HANDED_BACK", "LAPSED", "LIVE", "SUBMITTED", "VOIDED",
            "CorpusEngagements", "EngagementBook", "EngagementTerms", "Grant", "JobNotReady", "Refusal",
            "RlPrecommitEngagements", "SandboxPolicy", "SessionBook", "SessionIssuer",
            "SessionRecord", "SignedJobView", "engagement_digest", "session_submittable"]

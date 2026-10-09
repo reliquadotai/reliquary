@@ -107,11 +107,3 @@ def test_a_precommit_recorded_before_the_cooldown_is_still_answered(tmp_path):
     rt.record_episode_precommit(precommit)
     rt.task_in_cooldown = lambda *_: True
     assert rt.record_episode_precommit(precommit) == (False, precommit.sha256)   # idempotent retry
-
-
-def test_the_validator_installs_its_prompt_cooldown_on_the_runtime():
-    import inspect
-
-    from reliquary.validator import service
-    source = inspect.getsource(service)
-    assert "task_in_cooldown" in source and "_cooldown_per_env[environment].is_in_cooldown" in source

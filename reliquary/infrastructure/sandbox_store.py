@@ -386,12 +386,29 @@ class SessionStoreConflict(RuntimeError):
     stored state may not move to the new one."""
 
 
+# Plan 2C: the closed status of an RL session whose paid group the proof could not judge for a reason
+# of the validator's own (``submitted`` stays: never paid, never resubmitted; plan 2D's quota skips it).
+SESSION_HANDED_BACK = "handed_back"
+
+
+def _is_hand_back(stored: Mapping, document: Mapping) -> bool:
+    """A ``submitted`` record rewritten with only its closed status (and time) set to handed back."""
+    if stored.get("state") != SESSION_SUBMITTED or document.get("state") != SESSION_SUBMITTED:
+        return False
+    if document.get("closed_status") != SESSION_HANDED_BACK:
+        return False
+    same = set(stored) - {"closed_status", "closed_at"}
+    return set(document) == set(stored) and all(stored[k] == document[k] for k in same)
+
+
 def _check_replace(stored: Any, document: Mapping) -> bool:
     """True to write, False when the stored document is already this one; raises when
     the stored state may not move to the new state."""
     if stored == document:
         return False
     current = stored.get("state") if isinstance(stored, Mapping) else None
+    if isinstance(stored, Mapping) and _is_hand_back(stored, document):
+        return True
     if not session_transition_allowed(current, document.get("state")):
         raise SessionStoreConflict(f"session {document['session_id']}: stored state "
                                    f"{current!r} may not become {document.get('state')!r}")

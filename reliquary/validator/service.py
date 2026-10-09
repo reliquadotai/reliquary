@@ -1186,10 +1186,7 @@ class ValidationService:
                     self._content_cooldown_per_env[name] = ContentCooldownMap(cooldown_windows=horizon)
             # An episode precommit on a task in cooldown is refused by the runtime (plan 2C): the
             # maps are looked up at call time, a new window may have replaced them.
-            self._service_runtime.task_in_cooldown = (
-                lambda environment, task_index, window: environment in self._cooldown_per_env
-                and self._cooldown_per_env[environment].is_in_cooldown(task_index, window)
-            )
+            self._service_runtime.task_in_cooldown = self._episode_task_in_cooldown
         self._content_cooldown_health: dict[str, Any] = {
             "complete": False,
             "source": "not_restored",
@@ -3030,6 +3027,8 @@ class ValidationService:
         window = self._candidate_service_window
         if window is None or window["window"] != target_window:
             raise RuntimeError("service window was not prepared at the boundary")
+        episodes = getattr(self, "_episode_services", None) is not None
+        resumed = episodes and self._service_window_frozen(runtime, target_window)
         runtime.open_window(
             target_window,
             pools=dict(window["pools"]),
@@ -3038,6 +3037,8 @@ class ValidationService:
             # The validator's wall clock, the one exploration arrivals are stamped with.
             now=time.time(),
         )
+        if episodes:
+            self._note_episode_window(target_window, resumed=resumed)
         announcements = {
             name: runtime.announcement(
                 environment=name, window=target_window, randomness=randomness,
@@ -3310,6 +3311,10 @@ class ValidationService:
                 batcher._experimental_prompt_range = batcher.prompt_range
                 batcher.service_runtime = runtime
                 batcher.service_environment = env_name
+                episode_services = getattr(self, "_episode_services", None)
+                if episode_services is not None and env_name in episode_services.environments:
+                    # Plan 2C: an inconclusive proof hands the group's sessions back (non-blocking).
+                    batcher.episode_proof_inconclusive = episode_services.batcher_hook(env_name, target_window)
             if shared_fill_state is not None:
                 batcher.fill_state = shared_fill_state
             batchers[env_name] = batcher
@@ -7248,6 +7253,7 @@ class ValidationService:
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
         await startup_step("registration", self._refresh_registered_hotkeys(force=True, reason="startup"))
+        await startup_step("episode_services", self._start_episode_services())
         await self.server.start()
         await startup_step("activation_checkpoint", self._apply_resume_from())
         # Authenticate the pinned activation checkpoint before normal bootstrap
@@ -7765,6 +7771,7 @@ class ValidationService:
                     pass
             try:
                 await self._stop_observation_publication()
+                await self._stop_episode_services()
                 await self._close_proof_scheduler()
                 await self.server.stop()
             finally:
@@ -7796,6 +7803,142 @@ class ValidationService:
             put=r2_put(bucket), get=r2_get(bucket))
         self._observation_task = asyncio.create_task(
             self._observation_publisher.run(self._observation_stop), name="service_observation_publisher")
+
+    # --- plan 2C: the RL validator's signed-sandbox side ---
+    def _episode_task_in_cooldown(self, environment: str, task_index: int, window: int) -> bool:
+        """The runtime's precommit cooldown hook (prompt cooldown only): the per-env maps are read at call
+        time, a new window may have replaced them."""
+        maps = self._cooldown_per_env
+        return environment in maps and maps[environment].is_in_cooldown(task_index, window)
+
+    @staticmethod
+    def _service_window_frozen(runtime, window: int) -> bool:
+        """Whether ``window``'s envelope is already frozen (before this open). BLOCKING (SQLite)."""
+        from reliquary.services.runtime import ServicePolicyLimit
+
+        try:
+            runtime.envelope(window)
+        except ServicePolicyLimit:
+            return False
+        return True
+
+    def _note_episode_window(self, window: int, *, resumed: bool) -> None:
+        """Episode intake opens only for a window this process froze; one it found frozen (a restart, or
+        an earlier attempt of this process that failed after the freeze) stays closed to it."""
+        opened = self.__dict__.setdefault("_episode_windows_opened", {})
+        if resumed and window not in opened:
+            logger.warning("service window %d was frozen before this process opened it: no episode "
+                           "precommit, session or group is taken for it", window)
+            return
+        opened.setdefault(int(window), time.time())
+        for old in sorted(opened)[:-4]:
+            del opened[old]
+
+    def _episode_window_started_at(self, window: int) -> float | None:
+        return (getattr(self, "_episode_windows_opened", None) or {}).get(window)
+
+    def _current_service_window(self) -> int | None:
+        """Plan 2C: the service window episode admissions are open for: the active batchers' frozen
+        announcement, if this process opened that window; None between windows or for a resumed one.
+        Memory only (it is read on the event loop by the routes)."""
+        server = getattr(self, "server", None)
+        if server is None:
+            return None
+        for batcher in server._active_batcher_values():
+            if isinstance(getattr(batcher, "service_policy", None), dict):
+                window = int(batcher.window_start)
+                return window if self._episode_window_started_at(window) is not None else None
+        return None
+
+    def _episode_stop_sets(self) -> tuple[set[int], set[int] | None]:
+        """(the batcher's stop set, a remote proof worker's or None): what the proof checks a turn's
+        stop against, from the model the batchers prove with."""
+        from reliquary.shared.modeling import resolve_eos_token_ids
+        from reliquary.validator.rl_sandbox_wiring import stop_ids_from_metadata
+
+        pool = getattr(self, "_proof_worker_pool", None)
+        health = getattr(pool, "health", None) if pool is not None else None
+        proxies = list((getattr(self, "_proof_models", None) or {}).values())
+        model = proxies[0] if pool is not None and proxies else getattr(self, "verify_model", None)
+        proof = {int(t) for t in (resolve_eos_token_ids(model, self.tokenizer) or ())}
+        remote = None
+        if health is not None:
+            remote = stop_ids_from_metadata(health.config, health.generation_config, self.tokenizer)
+        return proof, remote
+
+    def _episode_precommit_retention_s(self) -> float:
+        """At least the longest prompt cooldown horizon of an episode env, in the longest window time."""
+        from reliquary.constants import FILL_CLOSED_MAX_SECONDS
+        from reliquary.validator.rl_sandbox_wiring import MIN_PRECOMMIT_RETENTION_S
+
+        runtime = self._service_runtime
+        horizon = 0
+        for name in runtime.contract.episode_environments:
+            try:
+                horizon = max(horizon, int(runtime.schedule.cooldown_windows(name)))
+            except Exception:
+                continue
+        return max(float(MIN_PRECOMMIT_RETENTION_S), horizon * float(FILL_CLOSED_MAX_SECONDS))
+
+    async def _start_episode_services(self) -> None:
+        """Plan 2C: the RL validator's signed-sandbox side, only when the order has signed-episode envs:
+        the /rl routes on this server, the episode intake on its admission path, the RL sessions restored,
+        the fleet, session and precommit-retention loops started. Refuses to start without the sandbox
+        key settings, without a TOPLOC proof in the protocol profile (an episode is proven span by span),
+        without the runtime's cooldown hook, or when a renderer stop is outside the proof's stop set."""
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None or not runtime.contract.episode_environments:
+            return
+        from reliquary.constants import ACTIVE_PROTOCOL_PROFILE
+        from reliquary.protocol.profiles import toploc_proof
+        from reliquary.validator.rl_sandbox_wiring import build_rl_episode_services, rl_registration
+        from reliquary.validator.sandbox_wiring import SandboxValidatorConfig
+
+        toploc = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+        if toploc is None:
+            raise ValueError("signed episodes are proven by TOPLOC, and the protocol profile names none")
+        if getattr(runtime, "task_in_cooldown", None) is None:
+            raise ValueError("the runtime has no prompt-cooldown hook: episode precommits would ignore it")
+        config = SandboxValidatorConfig.from_env()
+        if config is None:
+            raise ValueError("set RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE and RELIQUARY_SANDBOX_VALIDATOR_KEY_ID "
+                             "to serve signed-episode environments")
+        environments = {name: self.envs[name] for name in runtime.contract.episode_environments
+                        if name in self.envs}
+        renderer_for = getattr(self, "_episode_renderer_for", None) or self._default_episode_renderer
+        proof_stops, remote_stops = self._episode_stop_sets()
+        services = build_rl_episode_services(
+            config, validator_hotkey=self.wallet.hotkey.ss58_address, runtime=runtime,
+            environments=environments, renderer_for=renderer_for,
+            current_window=self._current_service_window, chunk_tokens=toploc.chunk_tokens,
+            window_started_at=self._episode_window_started_at,
+            proof_stop_ids=proof_stops, remote_stop_ids=remote_stops,
+            precommit_retention_s=self._episode_precommit_retention_s(),
+            registration=rl_registration(self.server))
+        for router in services.routers:
+            self.server.app.include_router(router)
+        await services.start()
+        self.server._episode_intake = services.intake
+        self._episode_services = services
+        self._episode_tasks = [asyncio.create_task(job) for job in services.background()]
+
+    def _default_episode_renderer(self, policy):
+        """The turn renderer of the policy's tokenizer over the env's tools (the §5.C parse)."""
+        from reliquary.environment.agentic_swe import load_turn_renderer
+
+        return load_turn_renderer(str(getattr(self.tokenizer, "name_or_path", "")), tools=tuple(policy.tools))
+
+    async def _stop_episode_services(self) -> None:
+        tasks = list(getattr(self, "_episode_tasks", None) or [])
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._episode_tasks = []
+        services = getattr(self, "_episode_services", None)
+        if services is not None:
+            await services.stop()
+            self._episode_services = None
 
     def _require_publication_signer(self) -> None:
         """Refuse to boot when observation publication is configured but the hotkey is in a remote
