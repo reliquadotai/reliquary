@@ -50,14 +50,45 @@ def prune_checkpoint_cache(repo_id, protected):
             strategy.execute()
 
 
+def _hub_published_commits(repo_id: str):
+    """Yield (commit id, title) of the public repo's main, newest first, lazily."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils._pagination import paginate
+
+    api = HfApi(token=False)
+    for item in paginate(
+        f"{api.endpoint}/api/models/{repo_id}/commits/main",
+        headers=api._build_hf_headers(token=False), params={},
+    ):
+        yield item["id"], item["title"]
+
+
+def _scan_published_commits(source, repo_id: str, verified: list) -> list:
+    """Full main history, reading only the commits newer than ``verified``.
+
+    A commit id covers its ancestors, so once the scan meets a commit seen by
+    the previous scan, everything below it is that scan's tail. A rewritten
+    history never meets one and is read in full.
+    """
+    position = {commit_id: index for index, (commit_id, _) in enumerate(verified)}
+    fresh = []
+    for commit_id, title in source(repo_id):
+        if commit_id in position:
+            return fresh + verified[position[commit_id]:]
+        fresh.append((commit_id, title))
+    return fresh
+
+
 class ProofBackend:
     """The only production backend: reuse the deployed batch=1 proof kernels."""
 
-    def __init__(self, pool):
+    def __init__(self, pool, *, commit_source=_hub_published_commits):
         self.pool = pool
         self.devices = pool.devices
         self._descriptions = {}
         self._anchor_revision = None
+        self._commit_source = commit_source
+        self._published = {}  # repo_id -> [(commit id, title)] of the last scan
 
     def describe(self, device):
         description = self.pool.describe(device)
@@ -73,7 +104,7 @@ class ProofBackend:
         return [self._descriptions.get(d) or self.describe(d) for d in self.devices]
 
     def adopt(self, checkpoint: CheckpointBinding):
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import hf_hub_download
         from pathlib import Path
         from reliquary.validator.resume import checkpoint_n_from_commit_title
         from reliquary.validator.checkpoint_profile import (
@@ -82,11 +113,15 @@ class ProofBackend:
 
         # Metadata and weights are resolved only from this immutable public
         # repo/OID. A controller path is never interpreted on the GPU host.
-        commits = HfApi(token=False).list_repo_commits(repo_id=checkpoint.repo_id)
-        matches = [c for c in commits if c.commit_id == checkpoint.revision]
-        if len(matches) != 1 or checkpoint_n_from_commit_title(matches[0].title) != checkpoint.checkpoint_n:
+        commits = _scan_published_commits(
+            self._commit_source, checkpoint.repo_id,
+            self._published.get(checkpoint.repo_id, []),
+        )
+        self._published[checkpoint.repo_id] = commits
+        matches = [title for commit_id, title in commits if commit_id == checkpoint.revision]
+        if len(matches) != 1 or checkpoint_n_from_commit_title(matches[0]) != checkpoint.checkpoint_n:
             raise ValueError("checkpoint number does not match published revision")
-        if sum(checkpoint_n_from_commit_title(c.title) == checkpoint.checkpoint_n for c in commits) != 1:
+        if sum(checkpoint_n_from_commit_title(title) == checkpoint.checkpoint_n for _, title in commits) != 1:
             raise ValueError("published checkpoint number is ambiguous")
         path = hf_hub_download(checkpoint.repo_id, CHECKPOINT_PROFILE_NAME,
                                revision=checkpoint.revision, token=False)
