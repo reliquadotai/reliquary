@@ -225,7 +225,8 @@ def test_a_refused_order_entry_is_named_in_the_control_status(monkeypatch):
     monkeypatch.setattr(profiles, "toploc_proof", lambda p: SimpleNamespace(mode="enforce"))
     entry, job = _gen_entry_and_job()
     entry = SimpleNamespace(task_id="order-gen-1", job_id="order-gen-1", status="active",
-                            mechanism="corpus-generation", params={"cap": 0.02},
+                            mechanism="corpus-generation",
+                            params={"cap": 0.02, "settlement": "period-ema-v1"},
                             contract={**entry.contract, "model_architecture": "Mamba"})
 
     async def read_entries():
@@ -452,35 +453,31 @@ def test_a_ban_voids_a_generation_orders_pending_records():
     assert remote.scored == []
 
 
-# sha256 of the canonical (archive, settlement state) of the run below.
-GEN_SETTLEMENT_GOLDEN = "43cfeb8bb6080be61a8ece38d081b08016780f9c9408880c623e50fcbe5894af"
+# sha256 of the canonical (archive, settlement state) of the run below, on the
+# period settler that pays every corpus task since 2026-10-08.
+GEN_SETTLEMENT_GOLDEN = "7b6222ab6128d107f306f9e988b1f4d4d715269e814e7c785e5b12244b1c8566"
 
 
 def test_a_generation_order_settles_through_the_order_archives():
-    from reliquary.validator.corpus_settlement import CorpusSettler
     from reliquary.validator.eval_control import OrderArchives
-    from tests.unit.test_corpus_settlement import _Records, _v
+    from tests.unit.test_corpus_settlement import WORK, _Archives, _Records, _settler, _v
 
     # Audited passes, an unaudited pass after its hold, and a failure.
     verdicts = {"1" * 64: {**_v("A", 10), "audited": True},
                 "2" * 64: {**_v("B", 30), "audited": False},
                 "3" * 64: {**_v("C", 900, ok=False), "audited": True}}
     records = _Records(verdicts)
-    written = {}
+    guard = OrderArchives(served=lambda: {"order-gen-1"})
 
-    async def upload(window, data, task_id):
-        written[(task_id, window)] = data
+    class _Guarded(_Archives):
+        async def write(self, task_id, work, entry, document):
+            guard.refuse_unserved(task_id)
+            await super().write(task_id, work, entry, document)
 
-    async def other_max(task_id):
-        return 46000
-
-    archives = OrderArchives(served=lambda: {"order-gen-1"}, upload=upload,
-                             other_max=other_max)
-    settler = CorpusSettler(task_id="order-gen-1", job_id="order-gen-1", cap=0.02,
-                            records=records, archives=archives, stall_seconds=100.0,
-                            clock=lambda: 5.0)
-    assert asyncio.run(settler.settle_once()) == 46000
-    archive = written[("order-gen-1", 46000)]
+    archives = _Guarded()
+    settler = _settler(records, archives, task_id="order-gen-1", job_id="order-gen-1", cap=0.02)
+    assert asyncio.run(settler.settle_once()) == WORK
+    archive = archives.written[WORK]
     assert archive["rewards_by_hotkey"] == pytest.approx({"A": 0.005, "B": 0.015})
     digest = hashlib.sha256(json.dumps({"archive": archive, "state": records.state},
                                        sort_keys=True, separators=(",", ":")).encode()
@@ -541,7 +538,7 @@ def test_slot_reopening_is_off_by_default():
 def test_an_order_job_finishes_across_a_restart(world, monkeypatch):  # noqa: F811
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.eval_control import (
         EvalExecutorDirectory,
         PairedAuditDispatcher,
@@ -562,7 +559,7 @@ def test_an_order_job_finishes_across_a_restart(world, monkeypatch):  # noqa: F8
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "pending_ids", pending_ids)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", lambda self: idle(self))
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
 
     async def read_entries():
         return dict(entries["entries"])

@@ -331,6 +331,7 @@ def _corpus_entry_this_binary_can_resolve(job_id):
 
     params = asdict(PRODUCTION_PRICE_PARAMS)
     params["cap"] = params["floor"] = 0.3
+    params["settlement"] = "period-ema-v1"
     return TaskEntry(
         task_id=PROCESS_TASK_ID,
         profile_id=PROTOCOL_PROFILE_ID,

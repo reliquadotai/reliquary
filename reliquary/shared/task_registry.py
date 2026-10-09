@@ -51,6 +51,13 @@ PRICE_PARAM_FIELDS = (
 # its own task, and absent keys fall back to the protocol-wide floor.
 INCENTIVE_FLOOR_FIELDS = ("min_incentive_share", "min_incentive_ramp_start")
 
+# How a corpus task is paid (``validator.corpus_periods``, which names the same
+# value): by its own drand periods. The only settlement a corpus task has.
+SETTLEMENT_PERIOD_EMA = "period-ema-v1"
+# A period task's highest cap paid, kept when its cap is lowered so the pay it
+# already earned is not cut (``validator.corpus_periods.pay_ceiling``).
+TAIL_CAP_PARAM = "tail_cap"
+
 # Float addition of exact decimals is not exact; 1.0 must not fail by 1e-16.
 _SUM_TOLERANCE = 1e-9
 
@@ -176,6 +183,10 @@ def validate_entry(entry: TaskEntry) -> None:
     cap = _number(entry.params["cap"], "cap")
     if not 0.0 <= cap <= 1.0:
         raise RegistryError(f"cap must be between 0.0 and 1.0, got {cap}")
+    if TAIL_CAP_PARAM in entry.params:
+        tail = _number(entry.params[TAIL_CAP_PARAM], TAIL_CAP_PARAM)
+        if not 0.0 <= tail <= 1.0:
+            raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
         raise RegistryError(f"floor {floor} exceeds cap {cap}")
@@ -371,6 +382,16 @@ def set_cap(
         # hand out budget that is still being paid.
         raise RegistryError(f"task {task_id!r} is {entry.status}; its cap cannot change")
     params = {**entry.params, "cap": float(cap)}
+    old_cap = _number(entry.params.get("cap"), "cap")
+    if (entry.mechanism == MECHANISM_CORPUS_GENERATION
+            and entry.params.get("settlement") == SETTLEMENT_PERIOD_EMA
+            and float(cap) < old_cap):
+        # Its archives were paid under the old cap and still owe their tail:
+        # the weight setter keeps paying them up to the highest cap the task
+        # had (``corpus_periods.pay_ceiling``). The new cap prices only the
+        # periods still to be worked; at 0, none.
+        params[TAIL_CAP_PARAM] = max(
+            old_cap, _number(entry.params.get(TAIL_CAP_PARAM, 0.0), TAIL_CAP_PARAM))
     if floor is not None:
         params["floor"] = float(floor)
     elif entry.mechanism == MECHANISM_CORPUS_GENERATION:

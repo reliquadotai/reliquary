@@ -42,7 +42,7 @@ def entry(cap=0.04, settlement="period-ema-v1", status="active", mechanism="corp
                            status=status, params=params)
 
 
-def run(e, *, paying=0.0, drained=True, cut_tail=False):
+def run(e, *, paying=0.0, drained=True):
     calls = []
 
     async def registry():
@@ -57,7 +57,7 @@ def run(e, *, paying=0.0, drained=True, cut_tail=False):
     async def retire(task_id, at):
         calls.append(("retire", task_id, at))
 
-    message = asyncio.run(close_task("eval-a", cut_tail=cut_tail, read_registry=registry,
+    message = asyncio.run(close_task("eval-a", read_registry=registry,
                                      records=Records(drained), period_weights=weights,
                                      set_cap=set_cap, retire=retire, drand_round=lambda: 99))
     return message, calls
@@ -69,9 +69,10 @@ def test_a_drained_decayed_period_task_closes():
     assert "free" in message
 
 
-def test_a_task_still_paying_what_it_earned_does_not_close():
-    with pytest.raises(TaskNotClosable, match="still pays"):
-        run(entry(), paying=0.01)
+def test_a_task_still_paying_what_it_earned_closes_and_says_its_tail_runs_on():
+    message, calls = run(entry(), paying=0.01)
+    assert calls == [("cap", "eval-a", 0.0), ("retire", "eval-a", 99)]
+    assert "tail" in message and "0.010000" in message and "RELIQUARY_TASK_ID" in message
 
 
 def test_an_undrained_job_does_not_close():
@@ -79,11 +80,27 @@ def test_an_undrained_job_does_not_close():
         run(entry(), drained=False)
 
 
-def test_a_window_settled_task_closes_only_when_told_to_cut_its_tail():
-    with pytest.raises(TaskNotClosable, match="--cut-tail"):
-        run(entry(settlement=None))
-    _, calls = run(entry(settlement=None), cut_tail=True)
+def test_a_window_settled_task_closes_with_nothing_to_cut():
+    _, calls = run(entry(settlement=None))
     assert calls == [("cap", "eval-a", 0.0), ("retire", "eval-a", 99)]
+
+
+def test_the_cli_still_accepts_cut_tail(monkeypatch):
+    from typer.testing import CliRunner
+
+    import reliquary.validator.corpus_close as corpus_close
+    from reliquary.cli.main import app
+
+    seen = []
+
+    async def close(task_id):
+        seen.append(task_id)
+        return "closed"
+
+    monkeypatch.setattr(corpus_close, "close_task", close)
+    result = CliRunner().invoke(app, ["tasks", "close", "--task-id", "eval-a", "--cut-tail"])
+    assert result.exit_code == 0, result.output
+    assert seen == ["eval-a"]
 
 
 def test_only_corpus_tasks_close():
@@ -116,15 +133,37 @@ def test_jobs_create_declares_period_settlement_by_default(bucket, registry):  #
     assert registry["entries"]["corpus-run"].params["settlement"] == "period-ema-v1"
 
 
-def test_jobs_create_can_still_declare_window_settlement(bucket, registry):  # noqa: F811
+def test_jobs_create_refuses_window_settlement(bucket, registry):  # noqa: F811
     from typer.testing import CliRunner
 
     from reliquary.cli.main import app
 
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     result = CliRunner().invoke(app, _create_args(**{"--settlement": "windows"}))
+    assert result.exit_code != 0
+    assert "removed" in result.output and "period-ema-v1" in result.output
+    assert "corpus-run" not in registry["entries"]
+    assert [k for k in bucket.objects if k.endswith(".json")] == []
+
+
+def test_jobs_create_no_longer_needs_the_period_acknowledgement(bucket, registry):  # noqa: F811
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from tests.unit.test_jobs_cli import PERIOD_ACK
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    argv = [a for a in _create_args() if a != PERIOD_ACK]
+    result = CliRunner().invoke(app, argv)
     assert result.exit_code == 0, result.output
-    assert "settlement" not in registry["entries"]["corpus-run"].params
+    assert registry["entries"]["corpus-run"].params["settlement"] == "period-ema-v1"
+
+
+def test_every_corpus_entry_is_period_settled():
+    from tests.unit.test_corpus_task_declaration import _build
+
+    entry = _build()
+    assert entry.params["settlement"] == "period-ema-v1"
 
 
 def test_a_real_corpus_entry_takes_cap_zero_then_retires(bucket, registry):  # noqa: F811
@@ -145,19 +184,11 @@ def test_a_real_corpus_entry_takes_cap_zero_then_retires(bucket, registry):  # n
                            drand_round=lambda: 7))
     closed = registry["entries"]["corpus-run"]
     assert closed.params["cap"] == 0.0 and closed.status == "retired"
+    # The cap it was paid at stays the bound of its earned tail.
+    assert closed.params["tail_cap"] == 0.30
 
 
 async def _none():
     return {}
 
 
-def test_a_period_job_needs_the_fleet_acknowledgement(bucket, registry):  # noqa: F811
-    from typer.testing import CliRunner
-
-    from reliquary.cli.main import app
-
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    argv = [a for a in _create_args() if a != "--fleet-knows-period-settlement"]
-    result = CliRunner().invoke(app, argv)
-    assert result.exit_code == 1 and "--fleet-knows-period-settlement" in result.output
-    assert "corpus-run" not in registry["entries"]

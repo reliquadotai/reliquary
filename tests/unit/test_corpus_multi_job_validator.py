@@ -24,7 +24,8 @@ from tests.unit.test_corpus_validator import _profile, fixed_drand_chain, wired_
 
 def _entry(task_id, job_id, cap=0.1, **params):
     return SimpleNamespace(task_id=task_id, job_id=job_id, mechanism="corpus-generation",
-                           params={"cap": cap, **params}, contract=None)
+                           params={"cap": cap, "settlement": "period-ema-v1", **params},
+                           contract=None)
 
 
 def _job(job_id, **kw):
@@ -237,7 +238,7 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
     import reliquary.protocol.profiles as profiles
     import reliquary.protocol.signatures as signatures
     import reliquary.shared.modeling as modeling
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
     from reliquary.validator.corpus_judge_threads import JudgeThreads
 
@@ -282,7 +283,7 @@ def booted(seeded_job, fake_r2, wired_records, fixed_drand_chain, monkeypatch):
         return None
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", run)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", settle_once)
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", settle_once)
 
     class _Server:
         def __init__(self, config):

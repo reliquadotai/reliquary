@@ -54,8 +54,8 @@ def oldest_of(*sources: Callable[[], float | None]) -> Callable[[], float | None
 
 
 class CorpusPeriodSettler:
-    """Same surface as ``CorpusSettler`` (observe, settle_once, set_cap,
-    settled_count, totals, on_settled, on_window) on the period clock.
+    """The corpus settler (observe, settle_once, set_cap, settled_count,
+    totals, on_settled, on_window), on the period clock.
 
     ``oldest_pending`` is the auditor's ``oldest_pending_received_at``: it
     returns when the oldest undecided submission was received (None if none) and
@@ -63,7 +63,7 @@ class CorpusPeriodSettler:
     its grader's ``oldest_unready_received_at`` (``oldest_of``), so a period
     closes only once everything received in it is graded (ruling P21).
 
-    ``ready(ids)``, as ``CorpusSettler``'s: which of ``ids`` may be paid now
+    ``ready(ids)``: which of ``ids`` may be paid now
     (an episode job's grader answers the graded ones); the others are left
     for a later call, never paid ungraded. None pays every verdict."""
 
@@ -93,7 +93,7 @@ class CorpusPeriodSettler:
         self.on_settled = on_settled
         self.on_window = None
 
-    # -- the feed, as CorpusSettler ------------------------------------------
+    # -- the feed ---------------------------------------------------------------
 
     def observe(self, submission_id: str, verdict=None) -> None:
         self._unsettled.add(submission_id)
@@ -159,11 +159,20 @@ class CorpusPeriodSettler:
                 + sum(int(v["token_count"]) for v in passed)}
 
     def _archive(self, pending: dict) -> dict:
-        return {"schema": PERIOD_ARCHIVE_SCHEMA, "task_id": self._task_id,
-                "job_id": self._job_id, "mechanism": "corpus-generation",
-                "work_period": pending["work_period"], "entry_period": pending["entry_period"],
-                "rewards_by_hotkey": dict(pending["rewards"]),
-                "tokens": pending["tokens"], "verdicts": len(pending["ids"])}
+        document = {"schema": PERIOD_ARCHIVE_SCHEMA, "task_id": self._task_id,
+                    "job_id": self._job_id, "mechanism": "corpus-generation",
+                    "work_period": pending["work_period"],
+                    "entry_period": pending["entry_period"],
+                    "rewards_by_hotkey": dict(pending["rewards"]),
+                    "tokens": pending["tokens"], "verdicts": len(pending["ids"])}
+        if "cap" in pending:
+            # The cap this period was paid under: the weight setter pays the
+            # archive up to it whatever the registry's cap is by then, so
+            # lowering the cap never cuts pay already earned. A pending
+            # archive recorded by an older binary has none, and is written
+            # exactly as it would have been.
+            document["cap"] = pending["cap"]
+        return document
 
     async def _entry(self, work: int, due: int) -> int:
         """Where a new archive of ``work`` enters: from ``due`` on, beside at
@@ -264,8 +273,9 @@ class CorpusPeriodSettler:
             new_tokens = sum(int(v["token_count"]) for v in batch if v.get("passed"))
             earlier = int((state.get("period_tokens") or {}).get(str(period), 0))
             totals = self._add(state["totals"], batch)
-            if new_tokens <= 0:
-                # Nothing payable (spec: that period's cap burns); never reconsidered.
+            if new_tokens <= 0 or self._cap <= 0:
+                # Nothing payable (spec: that period's cap burns), or a cap of 0:
+                # the task is closed to new pay. Never reconsidered.
                 state = {**state, "settled": await self._off(_union, state["settled"], ids),
                          "totals": totals}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
@@ -284,7 +294,7 @@ class CorpusPeriodSettler:
             # ahead of every later period's pay.
             entry = await self._entry(period, cp.period_of(now, genesis) + 1)
             state = {**state, "last_entry": entry, "pending": {
-                "work_period": period, "entry_period": entry,
+                "work_period": period, "entry_period": entry, "cap": self._cap,
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
                 "period_tokens": earlier + new_tokens}}
             etag = await self._records.write_settlement(self._job_id, state, etag)

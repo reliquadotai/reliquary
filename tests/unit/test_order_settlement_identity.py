@@ -1,9 +1,10 @@
-"""Dataset orders on any model: settlement of existing jobs is byte-identical.
+"""Dataset orders on any model: settlement of a job is byte-identical.
 
-Pinned on the base commit (7753e5e4) before any any-model change: the archive
-and the settlement state the unchanged ``CorpusSettler`` writes for a fixed set
-of verdicts, and the manifest and task contract the admin writes for an
-operator catalog job and an eval job. A digest moving here is a payment change.
+The archive and the settlement state the period settler writes for a fixed set
+of verdicts (every corpus task, orders included, is paid by period since
+2026-10-08; the window ``CorpusSettler`` pinned here before is gone), and the
+manifest and task contract the admin writes for an operator catalog job and an
+eval job (tests/unit/test_admin_*). A digest moving here is a payment change.
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ import json
 
 from tests.unit.test_corpus_settlement import _Archives, _Records, _settler, _v
 
-# sha256 of the canonical JSON, computed on 7753e5e4.
-SETTLEMENT_GOLDEN = "89f814beac311229a14961fee681e372ead3db6497dce73eaabddaa4432f104f"
+# sha256 of the canonical JSON, computed when the period settler took over (2026-10-08).
+SETTLEMENT_GOLDEN = "4a56f422de86aacb2de4c94cfe809dffe237d41473f0af728bc715094d47f465"
 
 
 def _canonical(document) -> str:
@@ -26,8 +27,8 @@ def _canonical(document) -> str:
 def _settled() -> dict:
     records = _Records({"1" * 64: _v("A", 10), "2" * 64: _v("B", 30),
                         "3" * 64: _v("C", 900, ok=False), "4" * 64: _v("A", 7)})
-    archives = _Archives(46000)
-    asyncio.run(_settler(records, archives, now=5.0).settle_once())
+    archives = _Archives()
+    asyncio.run(_settler(records, archives).settle_once())
     return {"archives": archives.written, "state": records.state}
 
 

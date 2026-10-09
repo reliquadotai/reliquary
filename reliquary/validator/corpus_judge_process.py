@@ -2,7 +2,7 @@
 
 It judges and pays a group of jobs with exactly the code the single process
 runs (``wire_job_judge``: the scheduled ``CorpusAuditor`` and the fed
-``CorpusSettler``), with its forward on the GPU process and its arrivals from
+``CorpusPeriodSettler``), with its forward on the GPU process and its arrivals from
 the front's feed. Its unix socket takes the feed and answers the front's
 status reads; it serves nothing to miners.
 """
@@ -107,8 +107,11 @@ async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, sock
         JUDGE_POOL_CONNECTIONS, settle_forever, wire_job_judge,
     )
 
+    from reliquary.validator.corpus_validator import period_served
+
     store = BucketJobStore()
     jobs = []
+    served, _ = period_served(served)
     for entry, cap in served:
         job, _ = await store.read_job(str(entry.job_id))
         if job is None:

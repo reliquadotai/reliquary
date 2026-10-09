@@ -306,25 +306,56 @@ def build_corpus_audit_wiring(*, entry, job, records):
     return params, miner_states, is_banned, drand_beacon, LazyRoundAt()
 
 
+WINDOW_SETTLED = ("it is settled by RL window, which corpus tasks no longer are (design "
+                  "2026-10-03): it is not served and its window archives are no longer paid; "
+                  "close it (`reliquary tasks close`) and take it out of RELIQUARY_TASK_ID")
+
+
+def window_settled(entry) -> bool:
+    """A corpus task declared before every corpus task was period-settled."""
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+    from reliquary.validator.corpus_periods import is_period_task
+
+    return (getattr(entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION
+            and not is_period_task(entry))
+
+
+def period_served(served):
+    """``served`` (``(entry, cap)`` pairs) split into the period-settled ones,
+    served, and the window-settled entries, left out with an ERROR each: a
+    stale RELIQUARY_TASK_ID naming one must not stop the others."""
+    kept, dropped = [], []
+    for entry, cap in served:
+        if window_settled(entry):
+            logger.error("corpus task %s (job %s) left out: %s",
+                         getattr(entry, "task_id", "?"), getattr(entry, "job_id", "?"),
+                         WINDOW_SETTLED)
+            dropped.append(entry)
+        else:
+            kept.append((entry, cap))
+    return kept, dropped
+
+
 def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof, model,
                    tokenizer, gpu_lock=None, remote=None, scorer=None, vocab_size=None,
                    arrivals_covered=None, auditor_kwargs=None) -> None:
     """One job's auditor, settler and status books, on ``w`` (which carries
     ``entry``, ``job``, ``cap`` and ``stats``): what judges and pays the job,
-    in whichever process runs it.
+    in whichever process runs it. Only a period-settled job: a window-settled
+    one is refused (``ValueError``).
 
     ``records`` is the route-side store (the ban check, the status books);
     ``judge_records`` the judges' own (connections and codec threads).
     ``scorer``/``vocab_size`` stand for ``model`` in a process that has none.
     """
+    if window_settled(w.entry):
+        raise ValueError(f"corpus task {w.entry.task_id!r}: {WINDOW_SETTLED}")
     from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_miner_states import MinerStates
     from reliquary.validator.corpus_miner_status import (
         MinerBook, feed, proof_thresholds, read_recent_windows,
     )
-    from reliquary.validator.corpus_settlement import (
-        SETTLE_FULL_LIST_SECONDS, CorpusSettler, settler_fed,
-    )
+    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
 
     params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
         entry=w.entry, job=w.job, records=records
@@ -346,32 +377,23 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in
     # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
     # Fed by the auditor: the store is listed only as the net.
-    from reliquary.validator.corpus_periods import is_period_task
+    #
+    # Paid on its own clock (design 2026-10-03): closes a period when the
+    # auditor holds nothing undecided received in it -- and, for an episode
+    # job, its grader nothing ungraded or held (ruling P21).
+    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
 
     grader = getattr(w, "grader", None)
-    if is_period_task(w.entry):
-        # Paid on its own clock (design 2026-10-03): closes a period when the
-        # auditor holds nothing undecided received in it -- and, for an episode
-        # job, its grader nothing ungraded or held (ruling P21).
-        from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
-        from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
-
-        sources = [lambda: w.auditor.oldest_pending_received_at()]
-        if grader is not None:
-            sources.append(lambda: grader.oldest_unready_received_at())
-        w.settler = CorpusPeriodSettler(
-            task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap, records=judge_records,
-            archives=R2PeriodArchives(guard=archives), oldest_pending=oldest_of(*sources),
-            on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-            executor=judge_threads.codec,
-            ready=grader.ready if grader is not None else None)
-    else:
-        w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
-                                  records=judge_records, archives=archives,
-                                  on_settled=on_settled,
-                                  full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-                                  executor=judge_threads.codec,
-                                  ready=grader.ready if grader is not None else None)
+    sources = [lambda: w.auditor.oldest_pending_received_at()]
+    if grader is not None:
+        sources.append(lambda: grader.oldest_unready_received_at())
+    w.settler = CorpusPeriodSettler(
+        task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap, records=judge_records,
+        archives=R2PeriodArchives(guard=archives), oldest_pending=oldest_of(*sources),
+        on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
+        executor=judge_threads.codec,
+        ready=grader.ready if grader is not None else None)
     w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                               tokenizer=tokenizer, proof=proof, params=params,
                               miner_states=MinerStates(judge_records, w.job.job_id),
@@ -896,6 +918,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             raise RuntimeError(f"task {task_entry.task_id!r} is an order job (eval or "
                                "generation): the order control (eval control) serves it, "
                                "never the corpus control")
+    served, _ = period_served(served)
+    if not served and not generation_only:
+        raise RuntimeError("the corpus control has no period-settled job to serve")
     store = BucketJobStore()
     records = BucketRecordStore()
 
@@ -1289,6 +1314,21 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     async def drained(w) -> bool:
         return await job_drained(auditor=w.auditor, records=records, job_id=w.job.job_id)
 
+    from reliquary.validator.corpus_autoclose import AutoClose, autoclose_enabled
+
+    autoclose = None
+    if autoclose_enabled() and not intake_only and not generation_only:
+        # A finished job's task goes to cap 0 by itself (its earned tail keeps
+        # being paid); the admin service's orders keep their own lifecycle.
+        async def registry_entries():
+            if read_registry is not None:
+                return await read_registry()
+            from reliquary.infrastructure.task_registry_store import read_registry as read
+
+            found, _ = await read()
+            return found
+
+        autoclose = AutoClose(read_entries=registry_entries)
     job_set = CorpusJobSet(
         routes=app.state.corpus_routes, router_for=app.state.corpus_router_for,
         wire=wire_hot,
@@ -1305,6 +1345,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         wire_retired=generation_only,
         refresh_every_seconds=(refresh_every_seconds if refresh_every_seconds is not None
                                else JOB_REFRESH_SECONDS),
+        autoclose=autoclose,
     )
     app.state.corpus_jobs = job_set
     app.state.corpus_unserved = unserved

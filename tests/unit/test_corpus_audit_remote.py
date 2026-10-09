@@ -565,16 +565,8 @@ def test_a_quarantine_reaudits_every_pass_its_executor_scored_and_penalises_the_
     assert set(records.voided) == {cheat}
     assert states.states["5Hot"].confirmed_failures  # the same path as a failed audit
     # The settler pays nothing for a voided pass.
-    from reliquary.validator.corpus_settlement import CorpusSettler
-
-    class _Archives:
-        written = {}
-
-        async def other_max(self, task_id):
-            return None
-
-        async def write(self, task_id, window, data):
-            self.written[window] = data
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+    from tests.unit.test_corpus_settlement import _Archives
 
     records.verdicts = {cheat: records.verdicts[cheat]}
     records.state, records.etag = {}, None
@@ -587,10 +579,13 @@ def test_a_quarantine_reaudits_every_pass_its_executor_scored_and_penalises_the_
         return "e"
 
     records.read_settlement, records.write_settlement = read_settlement, write_settlement
-    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
-                            archives=_Archives(), clock=lambda: 0.0)
+    archives = _Archives()
+    # Every period of the verdict closed: genesis 0, the clock far past it.
+    settler = CorpusPeriodSettler(task_id="t", job_id="j", cap=0.1, records=records,
+                                  archives=archives, oldest_pending=lambda: None,
+                                  genesis=lambda: 0.0, clock=lambda: 1e12)
     asyncio.run(settler.settle_once())
-    assert _Archives.written == {} and records.state["settled"] == [cheat]
+    assert archives.written == {} and records.state["settled"] == [cheat]
 
 
 def test_without_a_connected_executor_the_auditor_runs_locally():
@@ -694,7 +689,7 @@ def test_the_validator_mounts_the_executor_routes_only_when_asked(
     import reliquary.protocol.profiles as profiles
     import reliquary.shared.modeling as modeling
     from reliquary.infrastructure import corpus_executor_store
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
     from tests.unit.test_corpus_multi_job_validator import _Model, _entry
     from tests.unit.test_corpus_service import CHECKPOINT, _Tokenizer as _ServiceTokenizer
@@ -716,7 +711,7 @@ def test_the_validator_mounts_the_executor_routes_only_when_asked(
         return None
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", settle_once)
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", settle_once)
     seen = {}
 
     class _Server:
