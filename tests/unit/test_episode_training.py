@@ -104,6 +104,60 @@ def test_a_signed_episode_without_checkpoints_is_refused(episode_protocol):
         decode_training_payload(_replace_payload_header(blob, rollout_checkpoints=None))
 
 
+def _signed_blob(mutate=None):
+    rollout = _episode_rollout()
+    if mutate:
+        mutate(rollout)
+    group = SimpleNamespace(rollouts=[rollout], prompt_idx=3)
+    return encode_training_payload({ENV: [group]}, window_start=30100, checkpoint_revision="rev-ep",
+                                   env_order=[ENV], env_targets={ENV: 16},
+                                   window_quarantine={"quarantined": False, "reasons": []})
+
+
+def test_spans_without_a_signed_episode_are_refused(episode_protocol):
+    from tests.unit.test_training_payload_codec import _replace_payload_header
+
+    blob = _signed_blob()
+    header = _header(blob)
+    meta = [{k: v for k, v in m.items() if k != "episode"} for m in header["rollout_meta"]]
+    with pytest.raises(ValueError, match="assistant spans"):
+        decode_training_payload(_replace_payload_header(blob, rollout_meta=meta, rollout_checkpoints=[None]))
+
+
+def test_a_short_span_list_is_refused(episode_protocol):
+    from tests.unit.test_training_payload_codec import _replace_payload_header
+
+    with pytest.raises(ValueError, match="assistant spans"):
+        decode_training_payload(_replace_payload_header(_signed_blob(), assistant_spans=[]))
+
+
+def test_a_signed_episode_with_null_spans_is_refused(episode_protocol):
+    from tests.unit.test_training_payload_codec import _replace_payload_header
+
+    with pytest.raises(ValueError, match="assistant spans"):
+        decode_training_payload(_replace_payload_header(_signed_blob(), assistant_spans=[None]))
+
+
+def test_encoding_a_signed_episode_without_validated_spans_raises(episode_protocol):
+    with pytest.raises(ValueError, match="assistant spans"):
+        _signed_blob(lambda r: setattr(r, "_validated_assistant_spans", None))
+
+
+@pytest.mark.parametrize("spans", [
+    [[4, 10], [14, 21]],          # past the end of the tokens
+    [[4, 10], [9, 20]],           # overlapping
+    [[14, 20], [4, 10]],          # not increasing
+    [[2, 10], [14, 20]],          # inside the prompt
+    [[4, 4]],                     # empty
+    [[-1, 10]], [[4.0, 10]], [[True, 10]], [[4, 10, 12]], [],
+])
+def test_malformed_episode_spans_are_refused(episode_protocol, spans):
+    from tests.unit.test_training_payload_codec import _replace_payload_header
+
+    with pytest.raises(ValueError, match="assistant spans"):
+        decode_training_payload(_replace_payload_header(_signed_blob(), assistant_spans=[spans]))
+
+
 def _tiny():
     config = AutoConfig.for_model(
         "qwen3", vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
@@ -130,3 +184,28 @@ def test_the_loss_reads_model_tokens_only():
     assert n_a == n_b == len(MODEL_POSITIONS)
     assert torch.allclose(ppo_a, ppo_b) and torch.allclose(kl_a, kl_b)      # tool-output claims never read
     assert not torch.allclose(ppo_a, ppo_c)                                  # a model position's claim is
+
+
+def test_tool_only_tokens_receive_no_embedding_gradient():
+    reset_training_state()
+    config = AutoConfig.for_model(
+        "qwen3", vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=256, eos_token_id=2,
+        tie_word_embeddings=False)
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_config(config).to(torch.float32).eval()
+    ref = copy.deepcopy(model).eval()
+    for parameter in ref.parameters():
+        parameter.requires_grad = False
+    # Tool output after the last model span: causal attention keeps it out of every model position's loss.
+    tail_only_ids = [200, 201, 202, 203]
+    rollout = _episode_rollout(pi_old=True)
+    rollout.commit["tokens"] = TOKENS + tail_only_ids
+    rollout.commit["rollout"]["completion_length"] = len(TOKENS) + len(tail_only_ids) - 4
+    model_ids = sorted({TOKENS[t] for t in MODEL_POSITIONS})
+    ppo, kl, n = _rollout_loss(model, ref, rollout, 1.0, torch.device("cpu"))
+    assert n == len(MODEL_POSITIONS)
+    (ppo + kl).backward()
+    grad = model.get_input_embeddings().weight.grad
+    assert grad[tail_only_ids].abs().sum().item() == 0.0
+    assert grad[model_ids].abs().sum().item() > 0.0
