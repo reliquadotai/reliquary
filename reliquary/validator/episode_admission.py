@@ -1,8 +1,10 @@
 """Admission of a signed-episode group in the v2 service RL path (phase 2, plan 2C; spec §4.1.6). No GPU.
 
-Per episode, cheapest first:
-1. the precommit: recorded, this hotkey's, env's, task's, window's, checkpoint's and pool's; the episode
-   names it and its own chosen seed;
+Per group: the precommit (recorded, this hotkey's, order's, env's, task's, window's, checkpoint's and
+pool's) and a selection of exactly the contract's ``group_size`` seeds of its pool. Then every episode
+passes steps 1-6 (signatures and chains, cheap) before ANY episode is parsed through the renderer
+(steps 7-9), and one session twice in the group is refused between the two passes:
+1. the episode names the precommit and its own chosen seed (an ``int``, never a bool);
 2. the contract's per-env maximum episode length (set at qualification from the trainer's memory);
 3. prompt fidelity: the prompt tokens are the validator's own render of the task prompt;
 4. ``verify_transcript`` with every RL binding (hotkey, engagement ``rl:{window}:{precommit}:{seed}``,
@@ -12,19 +14,27 @@ Per episode, cheapest first:
 7. the span structure and §5.C (``parse_signed_trajectory``): the model's calls are the signed records,
    every observation is their rendering, token for token;
 8. the turn shape: short turns, the contract's turn and episode budgets, termination (a stop token or
-   exactly the cap), one TOPLOC proof per span chunk.
+   exactly the cap), one TOPLOC proof per span chunk;
+9. a limit stop is a limit really reached: ``max_turns`` needs exactly ``policy.max_turns`` model turns;
+   ``context_length`` needs the last turn either cut exactly at its cap
+   ``min(max_tokens_per_turn, max_episode_tokens - its absolute start)``, or ended on the turn terminator
+   with the next prompt (its calls' observations rendered) longer than ``max_episode_tokens``. Anything
+   else is a miner ending its episode early (an in-zone vector for free).
 
 The reward is the final record's. An episode cut by a turn or token limit is a normal episode: its box
-was graded on its final state, so nothing here is "uncertain". A refusal reuses an existing wire reason
-(an older miner parses the enum) and names its check in the stage."""
+was graded on its final state, so nothing here is "uncertain". The spec's §5.D state/diff check does not
+apply to RL: no diff is trained and the reward is the machine-signed final record's, so no state is
+compared here. A refusal reuses an existing wire reason (an older miner parses the enum) and names its
+check in the stage."""
 from __future__ import annotations
 
 import functools
+from array import array
 from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from reliquary_sandbox.attest import GRADING_GRACE_S, Expected, Reason, verify_transcript
-from reliquary_sandbox.observation import TOOLS_VERSIONS
+from reliquary_sandbox.observation import TOOLS_VERSIONS, Refuse, plan_call, render_observation, sent_positions
 
 from reliquary.corpus.checks import (
     check_short_turns, check_turn_budget, check_turn_spans, check_turn_termination,
@@ -53,6 +63,20 @@ class EpisodeGroupFacts:
     model_tokens: int
 
 
+@dataclass(frozen=True)
+class _Verified:
+    """One episode after pass 1 (signatures, chain, bindings, deadline, record 0)."""
+
+    commit: dict
+    stop: object
+    tokens: list
+    spans: list
+    claims: object
+    opened: object
+    final: object
+    calls: tuple
+
+
 _TRANSCRIPT_REASONS = {
     Reason.CHECKPOINT_MISMATCH: (RejectReason.WRONG_CHECKPOINT, "episode_checkpoint"),
     Reason.SESSION_REUSED: (RejectReason.HASH_DUPLICATE, "episode_session_reused"),
@@ -71,10 +95,16 @@ class EpisodeGroupChecker:
         self._source = source
         self._chunk = int(chunk_tokens)
         self._min_chunk = int(min_chunk_tokens)
-        self._prompt_ids = functools.lru_cache(maxsize=4096)(self._render_prompt)
+        self._prompt_cache = functools.lru_cache(maxsize=256)(self._render_prompt)
 
-    def _render_prompt(self, task_index: int) -> tuple[int, ...]:
-        return tuple(self._renderer.initial_ids(self._source.prompt(task_index)))
+    def _render_prompt(self, source_key, task_index: int) -> array:
+        return array("i", self._renderer.initial_ids(self._source.prompt(task_index)))
+
+    def _prompt_ids(self, task_index: int) -> list[int]:
+        """The validator's own render of the task prompt, cached by (source identity and version, task)."""
+        source = self._source
+        key = (id(source), getattr(source, "version", None), getattr(source, "split", None))
+        return list(self._prompt_cache(key, task_index))
 
     def check(self, request, *, precommit, directory, token_verifier, seen: Collection[str],
               received: float) -> EpisodeGroupFacts | EpisodeRefusal:
@@ -100,6 +130,11 @@ class EpisodeGroupChecker:
             selection = PoolSelection.from_dict(request.pool_selection)
         except (SeedPoolError, TypeError):
             return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_selection", {})
+        # The contract's group_size (pool_seeds is exactly 2 x group_size, service_contract): a second
+        # guard behind the service policy's selection check.
+        if len(selection.seeds) != policy.pool_seeds // 2:
+            return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_selection",
+                                  {"seeds": len(selection.seeds), "group_size": policy.pool_seeds // 2})
         if selection.pool_sha256 != precommit.pool_sha256 or len(selection.seeds) != len(request.rollouts):
             return EpisodeRefusal(RejectReason.PRECOMMIT_INVALID, "episode_precommit",
                                   {"why": "the selection is not of the precommitted pool"})
@@ -107,26 +142,32 @@ class EpisodeGroupChecker:
             prompt_ids = self._prompt_ids(int(request.prompt_idx))
         except Exception:
             return EpisodeRefusal(RejectReason.WORKER_DROPPED, "episode_prompt_source", {})
-        rewards: list[float] = []
-        sessions: list[str] = []
-        spans_out: list[tuple[tuple[int, int], ...]] = []
-        model_tokens = 0
+        # Pass 1, cheap: every transcript's signatures and chain before any renderer parse.
+        verified = []
         for index, (rollout, seed) in enumerate(zip(request.rollouts, selection.seeds)):
-            outcome = self._episode(index, rollout, seed, precommit, prompt_ids, directory, token_verifier,
-                                    seen, received)
+            outcome = self._verify(index, rollout, seed, precommit, prompt_ids, directory, token_verifier,
+                                   seen, received)
             if isinstance(outcome, EpisodeRefusal):
                 return outcome
-            reward, session_id, spans = outcome
-            rewards.append(reward)
-            sessions.append(session_id)
-            spans_out.append(spans)
-            model_tokens += sum(end - start for start, end in spans)
+            verified.append(outcome)
+        sessions = [episode.claims.session_id for episode in verified]
         if len(set(sessions)) != len(sessions):
             return EpisodeRefusal(RejectReason.HASH_DUPLICATE, "episode_session_reused",
                                   {"why": "one session twice in the group"})
+        # Pass 2: the token-level parse and the turn shape.
+        rewards: list[float] = []
+        spans_out: list[tuple[tuple[int, int], ...]] = []
+        model_tokens = 0
+        for index, episode in enumerate(verified):
+            refusal = self._shape(index, episode, prompt_ids)
+            if refusal is not None:
+                return refusal
+            rewards.append(float(episode.final.reward))
+            spans_out.append(tuple(episode.spans))
+            model_tokens += sum(end - start for start, end in episode.spans)
         return EpisodeGroupFacts(tuple(rewards), tuple(sessions), tuple(spans_out), model_tokens)
 
-    def _episode(self, index, rollout, seed, precommit, prompt_ids, directory, token_verifier, seen, received):
+    def _verify(self, index, rollout, seed, precommit, prompt_ids, directory, token_verifier, seen, received):
         policy = self.policy
         commit = rollout.commit or {}
         meta = commit.get("rollout") or {}
@@ -134,7 +175,9 @@ class EpisodeGroupChecker:
         where = {"rollout": index}
         if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
             return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_schema", where)
-        if episode.get("precommit_sha256") != precommit.sha256 or episode.get("seed_index") != seed:
+        seed_index = episode.get("seed_index")
+        if (episode.get("precommit_sha256") != precommit.sha256 or type(seed_index) is not int
+                or seed_index != seed):
             return EpisodeRefusal(RejectReason.PRECOMMIT_INVALID, "episode_precommit", where)
         tokens = list(commit.get("tokens") or [])
         if len(tokens) > policy.max_episode_tokens:
@@ -145,7 +188,7 @@ class EpisodeGroupChecker:
         except (TypeError, ValueError):
             return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_schema", where)
         offset = len(prompt_ids)
-        if not spans or spans[0][0] != offset or tuple(tokens[:offset]) != tuple(prompt_ids):
+        if not spans or spans[0][0] != offset or tokens[:offset] != prompt_ids:
             return EpisodeRefusal(RejectReason.PROMPT_MISMATCH, "episode_prompt", where)
         # The declared lengths every later stage slices the tokens with (proof, pi_old, payload).
         if meta.get("prompt_length") != offset or meta.get("completion_length") != len(tokens) - offset:
@@ -171,6 +214,15 @@ class EpisodeGroupChecker:
         if (opened.tools_version not in TOOLS_VERSIONS or tuple(opened.tools) != tuple(policy.tools)
                 or opened.env_package != policy.env_package):
             return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_record0", where)
+        return _Verified(commit=commit, stop=episode.get("stop"), tokens=tokens, spans=spans, claims=claims,
+                         opened=opened, final=final, calls=tuple(result.calls))
+
+    def _shape(self, index, verified, prompt_ids):
+        policy = self.policy
+        where = {"rollout": index}
+        commit, tokens, spans, opened, final = (verified.commit, verified.tokens, verified.spans, verified.opened,
+                                                verified.final)
+        offset = len(prompt_ids)
         relative = [(start - offset, end - offset) for start, end in spans]
         completion = tokens[offset:]
         structure = check_turn_spans(relative, len(completion), policy.max_turns)
@@ -179,7 +231,7 @@ class EpisodeGroupChecker:
                                   {**where, "check": structure.reason, "detail": dict(structure.detail)})
         try:
             parse_signed_trajectory(self._renderer, prompt_ids=prompt_ids, tokens=completion, spans=relative,
-                                    stop=episode.get("stop"), max_turns=policy.max_turns, calls=result.calls,
+                                    stop=verified.stop, max_turns=policy.max_turns, calls=list(verified.calls),
                                     offered=opened.tools, final=final)
         except TrajectoryRefused as refused:
             return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {**where, "check": refused.reason})
@@ -205,11 +257,48 @@ class EpisodeGroupChecker:
             outcome = run()
             if not outcome.ok:
                 return EpisodeRefusal(wire, stage, {**where, "check": outcome.reason, "detail": dict(outcome.detail)})
+        try:
+            why = self._limit_not_reached(verified, prompt_ids)
+        except (ValueError, TypeError, KeyError, IndexError) as error:
+            return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {**where, "check": type(error).__name__})
+        if why is not None:
+            return EpisodeRefusal(RejectReason.BAD_TERMINATION, "episode_termination",
+                                  {**where, "check": "bad_stop", "stop": verified.stop, "why": why})
         proofs = commit.get("toploc_proofs")
         expected_proofs = sum(span_chunk_count(end - start, self._chunk, self._min_chunk) for start, end in relative)
         if not isinstance(proofs, list) or len(proofs) != expected_proofs:
             return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_proof_shape", {**where, "expected": expected_proofs})
-        return float(final.reward), claims.session_id, tuple(spans)
+        return None
+
+    def _limit_not_reached(self, verified, prompt_ids) -> str | None:
+        """Why a ``context_length`` / ``max_turns`` stop is not a limit the harness really hit, or None.
+        Runs after ``parse_signed_trajectory`` (the last turn's sent calls are the transcript's last call
+        records, in order) and the termination check."""
+        policy, renderer, stop = self.policy, self._renderer, verified.stop
+        if stop == "max_turns":
+            return None if len(verified.spans) == policy.max_turns else "fewer model turns than max_turns"
+        if stop != "context_length":
+            return None
+        tokens = verified.tokens
+        start, end = verified.spans[-1]
+        cap = min(policy.max_tokens_per_turn, policy.max_episode_tokens - start)
+        if end - start == cap:
+            return None                                     # (a) the turn ran exactly to its cap
+        last = tokens[start:end]
+        if not last or last[-1] != renderer.terminator_id:
+            return "the last turn neither reached its cap nor ended on the turn terminator"
+        pairs = list(renderer.tool_calls(last))
+        if not pairs:
+            return "a turn without calls ends the episode: agent_completed, not context_length"
+        plans = [plan_call(name, arguments, verified.opened.tools) for name, arguments in pairs]
+        sends = sum(1 for position in sent_positions(plans) if position is not None)
+        records = iter(verified.calls[len(verified.calls) - sends:] if sends else ())
+        observations = [plan.observation if isinstance(plan, Refuse) else render_observation(next(records).to_dict())
+                         for plan in plans]
+        following = renderer.next_prompt(tokens[:start], last, observations)
+        if following is not None and len(following) > policy.max_episode_tokens:
+            return None                                     # (b) the observations overflow the episode
+        return "the next prompt fits in max_episode_tokens: the harness would have gone on"
 
 
 def finish_prepared(prepared, facts: EpisodeGroupFacts, contract) -> None:

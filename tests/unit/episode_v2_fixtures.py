@@ -157,11 +157,13 @@ def episode_signers(tmp_path):
 
 
 def play_episode(*, validator, machine, precommit, seed, session_id, reward, calls=1, output="ok",
-                 last=None, issued_at=None):
+                 last=None, issued_at=None, last_calls=0):
     """One honest two-turn episode in the fake renderer's ids (``tests.unit.test_trajectory_parse``):
     turn 1 makes ``calls`` bash calls, each answered by one signed call record; turn 2 (``last``,
-    default nine text tokens and the terminator) ends it. Returns ``(tokens, spans, transcript)``:
-    tokens with the prompt, absolute spans, the gateway-signed transcript (graded ``reward``)."""
+    default nine text tokens, ``last_calls`` calls and the terminator) ends it; the gateway signed a
+    record for each of ``last_calls`` (a turn cut by a limit after its calls ran). Returns
+    ``(tokens, spans, transcript)``: tokens with the prompt, absolute spans, the gateway-signed
+    transcript (graded ``reward``)."""
     from reliquary_sandbox.observation import render_observation
 
     from reliquary.corpus.signed_parse import signed_records
@@ -180,10 +182,12 @@ def play_episode(*, validator, machine, precommit, seed, session_id, reward, cal
     signed = transcript(validator, machine, session, status="graded", reward=float(reward),
                         env_package=ENV_PACKAGE,
                         calls=[{"turn": 0, "k": k, "arguments": {"command": f"c{k}"}, "output": output}
-                               for k in range(calls)])
-    observations = [render_observation(body.to_dict()) for body in signed_records(signed).calls]
+                               for k in range(calls)]
+                        + [{"turn": 1, "k": k, "arguments": {"command": f"c{k}"}, "output": output}
+                           for k in range(last_calls)])
+    observations = [render_observation(body.to_dict()) for body in signed_records(signed).calls[:calls]]
     full = renderer.next_prompt(prompt, first, observations)
-    tokens = full + (list(last) if last is not None else [TEXT] * 9 + [TERM])
+    tokens = full + (list(last) if last is not None else [TEXT] * 9 + [CALL] * last_calls + [TERM])
     spans = [(len(prompt), len(prompt) + len(first)), (len(full), len(tokens))]
     return tokens, spans, signed
 
@@ -195,7 +199,7 @@ def half_rewards() -> list[float]:
 
 
 def episode_group(contract, *, validator, machine, hotkey="5Hot", rewards=None, seeds=None, task=TASK,
-                  window=1, calls=1, last=None, stop="agent_completed"):
+                  window=1, calls=1, last=None, stop="agent_completed", last_calls=0):
     """M honest episodes of one precommit, one per chosen seed (rollout i plays seed i of the selection)."""
     from types import SimpleNamespace
 
@@ -209,7 +213,8 @@ def episode_group(contract, *, validator, machine, hotkey="5Hot", rewards=None, 
     rollouts = []
     for index, seed in enumerate(selection.seeds):
         tokens, spans, signed = play_episode(validator=validator, machine=machine, precommit=precommit, seed=seed,
-                                             session_id=f"s-{seed}", reward=rewards[index], calls=calls, last=last)
+                                             session_id=f"s-{seed}", reward=rewards[index], calls=calls, last=last,
+                                             last_calls=last_calls)
         episode = signed_episode_metadata(precommit_sha256=precommit.sha256, seed_index=seed, spans=spans,
                                           transcript=signed, stop=stop)
         commit = signed_episode_commit(tokens=tokens, spans=spans, episode=episode, selection=selection,
