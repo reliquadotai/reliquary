@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
 from reliquary.validator.corpus_audit import score_sequences
 from reliquary.validator.corpus_audit_protocol import AuditResult
+from reliquary.validator import corpus_audit_remote
 from reliquary.validator.corpus_audit_remote import (
     ExecutorDirectory,
     LeaseRefused,
@@ -300,7 +301,9 @@ def test_an_executor_holds_at_most_two_leases():
     asyncio.run(go())
 
 
-def test_three_expired_leases_in_a_row_quarantine_the_executor():
+def test_three_expired_leases_in_a_row_bench_the_executor_not_quarantine_it():
+    # Ruling P26's spirit: an expiry says the box died or fell behind, not that
+    # its scores were wrong. Benched (no lease for a while), never quarantined.
     model = _tiny(0)
 
     async def go():
@@ -316,7 +319,14 @@ def test_three_expired_leases_in_a_row_quarantine_the_executor():
             h.clock.now += 301
             h.dispatcher.heartbeat("pod-2")
             await h.dispatcher.sweep()
-        assert [q[0] for q in h.quarantined] == ["pod-1"]
+        assert h.quarantined == [] and "pod-1" not in h.dispatcher.quarantined
+        tasks.append(asyncio.ensure_future(h.dispatcher.score(_items(model, n=1))))
+        await asyncio.sleep(0)
+        h.dispatcher.heartbeat("pod-1")
+        assert h.dispatcher.claim("pod-1") is None          # benched
+        h.clock.now += corpus_audit_remote.EXPIRY_BENCH_SECONDS + 1
+        h.dispatcher.heartbeat("pod-1")
+        assert h.dispatcher.claim("pod-1") is not None      # back after the bench
         for task in tasks:
             task.cancel()
 
