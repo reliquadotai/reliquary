@@ -12,7 +12,7 @@ from reliquary.validator.episode_admission import (  # noqa: E402
     EpisodeGroupChecker, EpisodeGroupFacts, EpisodeRefusal, finish_prepared,
 )
 from tests.unit.episode_v2_fixtures import (  # noqa: E402
-    EPISODE, FixedSource, batch_request, episode_contract, episode_group, episode_precommit, episode_signers,
+    EPISODE, FIRST_TURN_TEXT, FixedSource, batch_request, episode_contract, episode_group, episode_precommit, episode_signers,
     play_episode,
 )
 from tests.unit.sandbox_fixtures import NOW, directory  # noqa: E402
@@ -54,7 +54,7 @@ def test_an_honest_group_gives_the_final_records_rewards(tmp_path):
     assert facts.session_ids == tuple(f"s-{seed}" for seed in w.group.selection.seeds)
     assert facts.spans == tuple(tuple(tuple(s) for s in r.commit["rollout"]["episode"]["assistant_spans"])
                                 for r in w.group.request.rollouts)
-    assert facts.model_tokens == len(w.group.request.rollouts) * (11 + 10)
+    assert facts.model_tokens == len(w.group.request.rollouts) * (FIRST_TURN_TEXT + 2 + 10)
 
 
 def test_an_episode_cut_by_a_limit_is_a_normal_episode(tmp_path):
@@ -148,6 +148,24 @@ def test_the_contracts_episode_length_binds(tmp_path):
     w = world(tmp_path)
     refused(w.check(policy=dataclasses.replace(POLICY, max_episode_tokens=40)), RejectReason.BAD_TOKENS,
             "episode_length")
+
+
+def test_an_episode_too_short_for_the_logprob_challenge_is_refused(tmp_path, monkeypatch):
+    # Below CHALLENGE_K model tokens the proof's log-prob check cannot run, and away from temperature 1 it
+    # is required: the episode would fail at proof, so admission refuses it on its shape (the miner too).
+    from reliquary.constants import CHALLENGE_K
+    from reliquary.validator import episode_admission
+    from tests.unit.test_trajectory_parse import TERM
+
+    first = FIRST_TURN_TEXT + 1 + 1                     # the fixture's first turn: text, one call, TERM
+    short = world(tmp_path / "short", last=[TEXT] * (CHALLENGE_K - first - 2) + [TERM])
+    outcome = refused(short.check(), RejectReason.BAD_TOKENS, "episode_length")
+    assert outcome.detail["check"] == "too_few_model_tokens", outcome
+    monkeypatch.setattr(episode_admission, "T_PROTO", 1.0)
+    assert isinstance(short.check(), EpisodeGroupFacts)
+    monkeypatch.undo()
+    exact = world(tmp_path / "exact", last=[TEXT] * (CHALLENGE_K - first - 1) + [TERM])
+    assert isinstance(exact.check(), EpisodeGroupFacts)
 
 
 def test_the_precommit_must_be_this_groups(tmp_path):
@@ -313,14 +331,15 @@ def test_an_honest_cap_hit_after_calls_is_admitted(tmp_path):
 
 
 def test_a_per_turn_cap_hit_far_from_the_episode_cap_is_refused(tmp_path):
-    # Ruling: a per-turn cap is no episode limit, an honest harness goes on to the next turn.
+    # A per-turn cap is no episode limit: an honest harness goes on to the next turn.
     from tests.unit.test_trajectory_parse import CALL
 
-    w = world(tmp_path, last=[TEXT] * 10 + [CALL], last_calls=1, stop="context_length")
-    refused(w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=11)), RejectReason.BAD_TERMINATION,
+    cap = FIRST_TURN_TEXT + 2                           # the first turn's length: only the last turn is capped
+    w = world(tmp_path, last=[TEXT] * (cap - 1) + [CALL], last_calls=1, stop="context_length")
+    refused(w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=cap)), RejectReason.BAD_TERMINATION,
             "episode_termination")
-    w = world(tmp_path / "plain", last=[TEXT] * 11, stop="context_length")
-    refused(w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=11)), RejectReason.BAD_TERMINATION,
+    w = world(tmp_path / "plain", last=[TEXT] * cap, stop="context_length")
+    refused(w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=cap)), RejectReason.BAD_TERMINATION,
             "episode_termination")
 
 

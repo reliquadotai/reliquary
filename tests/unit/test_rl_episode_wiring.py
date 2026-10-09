@@ -31,8 +31,8 @@ from reliquary.validator.rl_sandbox_wiring import (  # noqa: E402
 from reliquary.validator.sandbox_wiring import SandboxValidatorConfig  # noqa: E402
 from reliquary.validator.service import ValidationService  # noqa: E402
 from tests.unit.episode_v2_fixtures import (  # noqa: E402
-    EPISODE, WINDOW_BEACON, episode_precommit, episode_runtime, episode_signers,
-    make_test_episode_env,
+    EPISODE, WINDOW_BEACON, episode_precommit, episode_runtime, episode_signers, episode_spec,
+    make_test_episode_env, register_episode_env,
 )
 from tests.unit.test_trajectory_parse import EOT, TERM, FakeRenderer  # noqa: E402
 
@@ -163,6 +163,7 @@ def _service(tmp_path, monkeypatch, *, runtime, key=True, stops=STOPS):
     async def registered(hotkey):
         return None
 
+    register_episode_env(monkeypatch)
     service = ValidationService.__new__(ValidationService)
     service._service_runtime = runtime
     if runtime is not None:
@@ -220,6 +221,26 @@ async def test_an_episode_order_refuses_to_start_without_the_cooldown_hook(tmp_p
     service = _service(tmp_path, monkeypatch, runtime=episode_runtime(tmp_path / "rt"))
     service._service_runtime.task_in_cooldown = None
     with pytest.raises(ValueError, match="cooldown"):
+        await service._start_episode_services()
+    assert getattr(service, "_episode_services", None) is None
+
+
+async def test_an_episode_order_refuses_to_start_when_an_episode_env_is_not_a_registered_signed_episode(
+        tmp_path, monkeypatch):
+    from types import MappingProxyType
+
+    from reliquary.environment import registry
+
+    monkeypatch.setattr("reliquary.protocol.profiles.toploc_proof", lambda profile: TOPLOC_DEPLOYED_DEFAULTS)
+    service = _service(tmp_path, monkeypatch, runtime=episode_runtime(tmp_path / "rt"))
+    single_turn = dataclasses.replace(episode_spec(), interaction_mode="single_turn")
+    monkeypatch.setattr(registry, "ENVIRONMENT_SPECS",
+                        MappingProxyType({**registry.ENVIRONMENT_SPECS, EPISODE: single_turn}))
+    with pytest.raises(ValueError, match="not a registered signed-episode environment"):
+        await service._start_episode_services()
+    monkeypatch.setattr(registry, "ENVIRONMENT_SPECS",
+                        MappingProxyType({k: v for k, v in registry.ENVIRONMENT_SPECS.items() if k != EPISODE}))
+    with pytest.raises(ValueError, match="not a registered signed-episode environment"):
         await service._start_episode_services()
     assert getattr(service, "_episode_services", None) is None
 

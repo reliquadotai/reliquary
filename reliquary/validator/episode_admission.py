@@ -14,7 +14,8 @@ passes steps 1-6 (signatures and chains, cheap) before ANY episode is parsed thr
 7. the span structure and §5.C (``parse_signed_trajectory``): the model's calls are the signed records,
    every observation is their rendering, token for token;
 8. the turn shape: short turns, the contract's turn and episode budgets, termination (a stop token or
-   exactly the cap), one TOPLOC proof per span chunk;
+   exactly the cap), one TOPLOC proof per span chunk, and at least CHALLENGE_K model tokens when the
+   protocol temperature is not 1 (the proof's log-prob check needs them);
 9. a limit stop is a limit really reached: ``max_turns`` needs exactly ``policy.max_turns`` model turns;
    ``context_length`` needs the last turn either cut exactly at its cap
    ``min(max_tokens_per_turn, max_episode_tokens - its absolute start)``, or ended on the turn terminator
@@ -36,6 +37,7 @@ from dataclasses import dataclass, field
 from reliquary_sandbox.attest import GRADING_GRACE_S, Expected, Reason, verify_transcript
 from reliquary_sandbox.observation import TOOLS_VERSIONS, Refuse, plan_call, render_observation, sent_positions
 
+from reliquary.constants import CHALLENGE_K, T_PROTO
 from reliquary.corpus.checks import (
     check_short_turns, check_turn_budget, check_turn_spans, check_turn_termination,
 )
@@ -283,6 +285,11 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
     if why is not None:
         return EpisodeRefusal(RejectReason.BAD_TERMINATION, "episode_termination",
                               {"check": "bad_stop", "stop": stop, "why": why})
+    # Away from temperature 1 the proof's log-prob check is required, and it needs CHALLENGE_K model tokens.
+    model_tokens = sum(end - start for start, end in relative)
+    if T_PROTO != 1.0 and model_tokens < CHALLENGE_K:
+        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_length",
+                              {"check": "too_few_model_tokens", "model_tokens": model_tokens, "min": CHALLENGE_K})
     return None
 
 

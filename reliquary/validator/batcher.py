@@ -998,6 +998,7 @@ class _ProvenGroup:
     payload_bytes: int
     receipt_id: str
     picked: bool = False
+    pending: Any = field(default=None, repr=False)      # handed back when no pick takes a signed episode
     sequence: int = field(default_factory=lambda: next(_proven_group_sequence))
 
 
@@ -2268,6 +2269,8 @@ class GrpoWindowBatcher:
                             rate=rate,
                             payload_bytes=payload_bytes,
                             receipt_id=receipt_id,
+                            pending=(pending if pending is not None
+                                     and self._signed_episode_pending(pending) else None),
                         )
                     )
                 else:
@@ -2522,6 +2525,10 @@ class GrpoWindowBatcher:
                 self._burned_unpicked_groups,
                 self._burned_unpicked_eos_tokens,
             )
+        # A signed-episode group no pick took is not the miner's fault: its sessions are handed back.
+        for group in burned:
+            if group.pending is not None:
+                self._episode_proof_inconclusive(group.pending, "unpicked")
 
     def _record_upload_precommit_rejection_locked(self, reason: str) -> None:
         self._upload_precommit_rejections[reason] = (

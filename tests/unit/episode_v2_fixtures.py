@@ -156,10 +156,14 @@ def episode_signers(tmp_path):
     return signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1")
 
 
+FIRST_TURN_TEXT = 20
+
+
 def play_episode(*, validator, machine, precommit, seed, session_id, reward, calls=1, output="ok",
                  last=None, issued_at=None, last_calls=0):
     """One honest two-turn episode in the fake renderer's ids (``tests.unit.test_trajectory_parse``):
-    turn 1 makes ``calls`` bash calls, each answered by one signed call record; turn 2 (``last``,
+    turn 1 (twenty text tokens, so the default episode has exactly CHALLENGE_K model tokens) makes
+    ``calls`` bash calls, each answered by one signed call record; turn 2 (``last``,
     default nine text tokens, ``last_calls`` calls and the terminator) ends it; the gateway signed a
     record for each of ``last_calls`` (a turn cut by a limit after its calls ran). Returns
     ``(tokens, spans, transcript)``: tokens with the prompt, absolute spans, the gateway-signed
@@ -174,7 +178,7 @@ def play_episode(*, validator, machine, precommit, seed, session_id, reward, cal
     renderer = FakeRenderer()
     issued_at = NOW if issued_at is None else issued_at
     prompt = renderer.initial_ids(PROMPT_TEXT)
-    first = [TEXT] * 9 + [CALL] * calls + [TERM]
+    first = [TEXT] * FIRST_TURN_TEXT + [CALL] * calls + [TERM]
     session = claims(session_id=session_id, hotkey=precommit.hotkey,
                      engagement=rl_engagement(precommit.window, precommit.sha256, seed), split=SPLIT,
                      index=precommit.task_index, checkpoint=precommit.checkpoint, issued_at=issued_at,

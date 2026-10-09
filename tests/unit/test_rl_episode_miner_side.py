@@ -273,6 +273,7 @@ def test_the_mapped_stop_passes_the_validators_admission(tmp_path):
     """The validator's own checker on the stop ``episode_stop`` gives for honest limit hits."""
     from reliquary.protocol.submission import RejectReason
     from reliquary.validator.episode_admission import EpisodeGroupFacts, EpisodeRefusal
+    from tests.unit.episode_v2_fixtures import FIRST_TURN_TEXT
     from tests.unit.test_episode_admission import world
     from tests.unit.test_trajectory_parse import TEXT, FakeRenderer
 
@@ -292,14 +293,15 @@ def test_the_mapped_stop_passes_the_validators_admission(tmp_path):
     assert isinstance(raw_outcome, EpisodeRefusal), raw_outcome
     stop, outcome = admitted(w, capped, "agent_completed")
     assert stop == "context_length" and isinstance(outcome, EpisodeGroupFacts), outcome
-    # Cut at the per-turn cap on the last allowed turn.
-    w = world(tmp_path / "b", last=[TEXT] * 11, stop="agent_completed")
-    limited = dataclasses.replace(POLICY, max_tokens_per_turn=11, max_turns=2)
+    # Cut at the per-turn cap on the last allowed turn (the cap is the first turn's length).
+    cap = FIRST_TURN_TEXT + 2
+    w = world(tmp_path / "b", last=[TEXT] * cap, stop="agent_completed")
+    limited = dataclasses.replace(POLICY, max_tokens_per_turn=cap, max_turns=2)
     stop, outcome = admitted(w, limited, "agent_completed")
     assert stop == "max_turns" and isinstance(outcome, EpisodeGroupFacts), outcome
     # The same cut before the last allowed turn: nothing the validator admits, so nothing is submitted.
-    w = world(tmp_path / "c", last=[TEXT] * 11, stop="agent_completed")
-    early = dataclasses.replace(POLICY, max_tokens_per_turn=11, max_turns=3)
+    w = world(tmp_path / "c", last=[TEXT] * cap, stop="agent_completed")
+    early = dataclasses.replace(POLICY, max_tokens_per_turn=cap, max_turns=3)
     assert admitted(w, early, "agent_completed")[0] is None
     for label in ("agent_completed", "context_length", "max_turns"):
         for rollout in w.group.request.rollouts:
@@ -514,7 +516,7 @@ def _miner_screen(group, *, raw, policy=POLICY, prompt=None):
     return kept, released
 
 
-HONEST = [(9, 1, 1), (9, 0, 1)]          # (text, calls, last token): TERM = 1, EOT = 2
+HONEST = [(20, 1, 1), (9, 0, 1)]         # (text, calls, last token): TERM = 1, EOT = 2; CHALLENGE_K model tokens
 
 
 def test_an_honest_episode_passes_the_miners_screen_and_the_validator(tmp_path):
@@ -570,6 +572,11 @@ def test_an_episode_the_validator_refuses_is_withdrawn_before_the_choice(tmp_pat
     group = _group(tmp_path / "context", [(9, 1, 1), (9, 1, 1)], stop="context_length")
     outcome = _refused_by_both(group, raw="context_length")
     assert (outcome.stage, outcome.detail["check"]) == ("episode_termination", "bad_stop")
+    # An honest episode with fewer model tokens than the proof's log-prob challenge needs.
+    group = _group(tmp_path / "few", [(9, 1, 1), (9, 0, 1)])
+    outcome = _refused_by_both(group, raw="agent_completed")
+    assert (outcome.reason, outcome.stage, outcome.detail["check"]) == (
+        RejectReason.BAD_TOKENS, "episode_length", "too_few_model_tokens"), outcome
 
 
 def _next_prompt_length(group):
@@ -598,7 +605,7 @@ def test_a_next_prompt_exactly_at_the_cap_withdraws_the_episode(tmp_path):
     from reliquary.miner.corpus_generate_server import GenerateEngine
     from reliquary.validator.episode_admission import EpisodeGroupFacts
 
-    group = _group(tmp_path, [(9, 1, 1), (9, 1, 1)], stop="context_length")
+    group = _group(tmp_path, [(20, 1, 1), (9, 1, 1)], stop="context_length")
     at_cap = _next_prompt_length(group)
     engine = GenerateEngine(None, max_total_tokens=at_cap, max_tokens_per_turn=POLICY.max_tokens_per_turn)
     with pytest.raises(ValueError) as error:

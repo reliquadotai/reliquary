@@ -7898,14 +7898,21 @@ class ValidationService:
     async def _start_episode_services(self) -> None:
         """Plan 2C: the RL validator's signed-sandbox side, only when the order has signed-episode envs:
         the /rl routes on this server, the episode intake on its admission path, the RL sessions restored,
-        the fleet, session and precommit-retention loops started. Refuses to start without the sandbox
-        key settings, without a TOPLOC proof in the protocol profile (an episode is proven span by span),
-        without the runtime's cooldown hook, or when a renderer stop is outside the proof's stop set."""
+        the fleet, session and precommit-retention loops started. Refuses to start when an env with an
+        episode block is not a registered signed-episode env, without the sandbox key settings, without a
+        TOPLOC proof in the protocol profile (an episode is proven span by span), without the runtime's
+        cooldown hook, or when a renderer stop is outside the proof's stop set."""
         runtime = getattr(self, "_service_runtime", None)
         if runtime is None or not runtime.contract.episode_environments:
             return
         from reliquary.constants import ACTIVE_PROTOCOL_PROFILE
+        from reliquary.environment.registry import ENVIRONMENT_SPECS
         from reliquary.protocol.profiles import toploc_proof
+
+        for name in runtime.contract.episode_environments:
+            spec = ENVIRONMENT_SPECS.get(name)
+            if spec is None or spec.interaction_mode != "signed_episode":
+                raise ValueError(f"{name} has an episode block but is not a registered signed-episode environment")
         from reliquary.validator.rl_sandbox_wiring import build_rl_episode_services, rl_registration
         from reliquary.validator.sandbox_wiring import SandboxValidatorConfig
 

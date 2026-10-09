@@ -609,6 +609,35 @@ def test_a_passed_group_the_reward_policy_refuses_is_handed_back(tmp_path, monke
     assert w.b.fill_state.snapshot()["proven"][EPISODE] == 0
 
 
+def _proven(tmp_path, monkeypatch):
+    from reliquary.validator.proof_scheduler import ProofDecisionStatus
+
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+    w.b.service_runtime = object()
+    w.b._service_training_receipt = lambda pending, value: "obs-1"
+    w.b.fill_state.reserve(EPISODE)
+    w.b._arrival_proof_meta["job-1"] = (None, 0, "", w.pending)
+    w.b._open_proof_plan_handle = SimpleNamespace(
+        decisions=lambda: [_decision("job-1", ProofDecisionStatus.PASSED, value=object())], done=lambda: False)
+    w.b._reconcile_fill_state_decisions(EPISODE)
+    assert len(w.b._proven_groups[EPISODE]) == 1 and calls == []
+    return w, calls
+
+
+def test_a_proven_group_no_pick_took_is_handed_back_at_the_close(tmp_path, monkeypatch):
+    w, calls = _proven(tmp_path / "unpicked", monkeypatch)
+    w.b._burn_unpicked_proven_groups()
+    w.b._burn_unpicked_proven_groups()                                  # once per window
+    assert calls == [(w.pending, "unpicked")]
+    assert w.b._operator_proof_failure_debt_for_hotkey("5Hot") == 0
+    picked, calls = _proven(tmp_path / "picked", monkeypatch)
+    picked.b._proven_groups[EPISODE][0].picked = True
+    picked.b._burn_unpicked_proven_groups()
+    assert calls == []                                                  # trained: its sessions stay paid
+
+
 def test_a_group_left_in_the_arrival_buffer_is_handed_back_when_the_window_closes(tmp_path, monkeypatch):
     w = world(tmp_path, _stub())
     _arrival(w, monkeypatch)
