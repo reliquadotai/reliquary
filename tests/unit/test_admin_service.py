@@ -211,6 +211,65 @@ def test_signed_catalog_and_scoped_task_contracts(admin):
     assert admin("GET", "/admin/v1/tasks/default").status_code == 409
 
 
+def test_task_catalog_keeps_descriptor_but_withholds_an_absent_external_package(admin, monkeypatch):
+    import importlib.metadata
+    from reliquary.protocol.environment_catalog import environment_body_contract
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    environment = "reliquary_science_v1"
+    distribution = importlib.metadata.distribution
+
+    def installed(name):
+        if name == "reliquary-science":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return distribution(name)
+
+    monkeypatch.setattr(importlib.metadata, "distribution", installed)
+    before = dict(admin.bucket.objects)
+    reply = admin("GET", "/admin/v1/task-catalog")
+    assert reply.status_code == 200, reply.text
+    sources = {row["environment"]: row for row in reply.json()["environments"]}
+    source = sources[environment]
+    assert source["legacy_generation_supported"] is False
+    assert source["qualified_generation_supported"] is False
+    assert source["contract"] == environment_body_contract(environment)
+    assert source["contract_sha256"] == canonical_sha256(source["contract"])
+    assert sources[SOURCE]["legacy_generation_supported"] is True
+    assert admin.bucket.objects == before
+
+
+@pytest.mark.parametrize("error", [None, ValueError("artifact digest mismatch"), PermissionError(),
+                                   TypeError("artifact distribution must be an object")])
+def test_task_catalog_support_depends_on_verified_external_artifact(admin, monkeypatch, error):
+    from reliquary.environment.agentic import external
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    environment = "reliquary_logic_v2"
+    checked = []
+
+    def verify(spec):
+        checked.append(spec)
+        if spec.name == environment and error is not None:
+            raise error
+        return {}
+
+    monkeypatch.setattr(external, "verify_external_artifact", verify)
+    reply = admin("GET", "/admin/v1/task-catalog")
+    assert reply.status_code == 200, reply.text
+    sources = {row["environment"]: row for row in reply.json()["environments"]}
+    assert ENVIRONMENT_SPECS[environment] in checked
+    assert all(spec.interaction_mode == "single_turn" for spec in checked)
+    assert sources[environment]["legacy_generation_supported"] is (error is None)
+    assert sources[environment]["qualified_generation_supported"] is (error is None)
+    assert sources[SOURCE]["legacy_generation_supported"] is True
+    error = ValueError("artifact digest mismatch") if error is None else None
+    reply = admin("GET", "/admin/v1/task-catalog")
+    assert reply.status_code == 200, reply.text
+    source = next(row for row in reply.json()["environments"] if row["environment"] == environment)
+    assert source["legacy_generation_supported"] is (error is None)
+    assert source["qualified_generation_supported"] is (error is None)
+
+
 def test_reviewed_zero_cap_manifest_is_read_only_then_created_and_replayed(admin):
     from reliquary.protocol.release_contract import canonical_sha256
 

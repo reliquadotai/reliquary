@@ -656,6 +656,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.get("/task-catalog")
     async def task_catalog() -> dict:
+        from reliquary.environment.agentic.external import verify_external_artifact
         from reliquary.environment.registry import ENVIRONMENT_SPECS
         from reliquary.eval.qualification import order_environment_refusal
         from reliquary.protocol.environment_catalog import (
@@ -667,12 +668,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         environments = []
         for name in sorted(set(ENVIRONMENT_CATALOG) & set(ENVIRONMENT_SPECS)):
             spec = ENVIRONMENT_SPECS[name]
+            supported = spec.interaction_mode == "single_turn"
+            if supported and spec.external_distribution is not None:
+                try:
+                    await asyncio.to_thread(verify_external_artifact, spec)
+                except (OSError, TypeError, ValueError):
+                    supported = False
             contract = environment_body_contract(name)
             environments.append({
                 "environment": name, "interaction_mode": spec.interaction_mode,
                 "contract": contract, "contract_sha256": canonical_sha256(contract),
-                "legacy_generation_supported": spec.interaction_mode == "single_turn",
-                "qualified_generation_supported": order_environment_refusal(name) is None,
+                "legacy_generation_supported": supported,
+                "qualified_generation_supported": supported and order_environment_refusal(name) is None,
             })
         return {"schema": "subnet-task-catalog/v1", "task_prefix": task_prefix,
                 "pool_max": float(pool_max), "zero_cap_supported": True,
