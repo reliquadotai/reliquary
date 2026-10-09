@@ -245,7 +245,11 @@ def test_a_malformed_signed_episode_fails_toploc():
     commit["rollout"]["episode"]["assistant_spans"] = [[2, 12], [10, 25]]
     result = _verify(commit, logits, hidden)
     assert result.toploc_checked and not result.toploc_passed and result.toploc_reason == "no_spans"
-    assert result.episode_stop_picks_ok is None
+    # Fail closed on the stop check too, even with no TOPLOC spec to judge the spans.
+    assert result.episode_stop_picks_ok is False and result.episode_stop_first_bad_turn is None
+    commit["toploc_spec"] = None
+    result = _verify(commit, logits, hidden)
+    assert result.episode_stop_picks_ok is False and result.episode_stop_first_bad_turn is None
 
 
 def test_an_older_worker_s_answer_has_no_stop_verdict():
@@ -254,3 +258,40 @@ def test_an_older_worker_s_answer_has_no_stop_verdict():
     del values["episode_stop_picks_ok"], values["episode_stop_first_bad_turn"]
     back = ProofValues.model_validate(values).to_kernel()
     assert back.episode_stop_picks_ok is None and back.episode_stop_first_bad_turn is None
+
+
+def test_the_stop_pick_depends_on_the_u_at_its_model_token_offset():
+    # I2: a stop row near 0.5 on STOP makes the verdict depend on u; row t-1 and offset j must both be right.
+    logits, tokens, hidden = _episode()
+    end = SPANS[0][1]
+    row = torch.full((VOCAB,), -10.0)
+    row[STOP] = 0.0
+    row[OTHER] = 0.0
+    logits[end - 2] = row
+    offset = POSITIONS.index(end - 1)
+    probs = fs.warp(row, t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    u_stop = next(u for u in (0.1, 0.9) if fs.pick(probs, u) == STOP)
+    u_other = next(u for u in (0.1, 0.9) if fs.pick(probs, u) != STOP)
+    tokens[end - 1] = STOP
+    seeds = list(U)
+    seeds[offset] = u_stop
+
+    def run(values):
+        model = MagicMock()
+        model.parameters.return_value = iter([torch.zeros(1)])
+        with patch("reliquary.shared.forward.forward_single_layer", return_value=(hidden[None], logits[None])), \
+                patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN), \
+                patch.object(verifier, "resolve_eos_token_ids", lambda model, tokenizer: {STOP}):
+            return verifier.verify_commitment_proofs(_commit(tokens, hidden), model, RANDOMNESS, seed_u_values=values)
+
+    assert run(seeds).episode_stop_picks_ok is True
+    seeds[offset] = u_other
+    flipped = run(seeds)
+    assert flipped.episode_stop_picks_ok is False and flipped.episode_stop_first_bad_turn == 0
+
+
+def test_a_signed_episode_has_no_natural_close_diagnostic():
+    logits, tokens, hidden = _episode()
+    with patch.object(verifier, "_gpu_natural_close_forced_pick_diagnostics", return_value=(True, 0.0)):
+        result = _verify(_commit(tokens, hidden), logits, hidden)
+    assert result.natural_close_pick_ok is None

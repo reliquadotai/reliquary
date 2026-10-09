@@ -952,18 +952,24 @@ def verify_commitment_proofs(
                 (fs0, fs1),
             )
             )
-        (
-            natural_close_pick_ok,
-            natural_close_pick_cdf_miss,
-        ) = _gpu_natural_close_forced_pick_diagnostics(
-            logits_gpu, tokens, prompt_length, completion_length, seq_len,
-            tokenizer, seed_u_values, rollout_meta,
-        )
+        if signed_spans is not None:
+            natural_close_pick_ok, natural_close_pick_cdf_miss = None, None
+        else:
+            (
+                natural_close_pick_ok,
+                natural_close_pick_cdf_miss,
+            ) = _gpu_natural_close_forced_pick_diagnostics(
+                logits_gpu, tokens, prompt_length, completion_length, seq_len,
+                tokenizer, seed_u_values, rollout_meta,
+            )
         if signed_spans:
             episode_stop_picks_ok, episode_stop_first_bad_turn = _episode_stop_picks(
                 logits_gpu, tokens, signed_spans, policy_positions,
                 _eos_set_from_model(model, tokenizer), seed_u_values,
             )
+        elif signed_spans is not None:
+            # A malformed signed episode: fail closed, with or without a TOPLOC spec to judge it.
+            episode_stop_picks_ok, episode_stop_first_bad_turn = False, None
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
     if signed_spans is not None:

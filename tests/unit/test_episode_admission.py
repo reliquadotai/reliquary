@@ -434,3 +434,21 @@ def test_the_prompt_cache_follows_the_source_version(tmp_path):
     assert isinstance(check(), EpisodeGroupFacts)
     source.text, source.version = "Another task.", 2
     refused(check(), RejectReason.PROMPT_MISMATCH, "episode_prompt")
+
+
+@pytest.mark.parametrize("bad", ["float", "string", "bool", "before_prompt", "not_a_list", "empty"])
+def test_assistant_spans_are_read_as_the_proof_reads_them(tmp_path, bad):
+    # I1b: int() coercion let [2.0, 12], ["2", 12], [True, ..] through admission that the proof refuses.
+    w = world(tmp_path)
+    episode = w.group.request.rollouts[0].commit["rollout"]["episode"]
+    first = list(episode["assistant_spans"][0])
+    episode["assistant_spans"][0] = {
+        "float": [float(first[0]), first[1]], "string": [str(first[0]), first[1]],
+        "bool": [True, first[1]], "before_prompt": [first[0] - 1, first[1]],
+    }.get(bad, first)
+    if bad == "not_a_list":
+        episode["assistant_spans"] = "2,12"
+    if bad == "empty":
+        episode["assistant_spans"] = []
+    outcome = w.check()
+    assert isinstance(outcome, EpisodeRefusal) and outcome.stage in ("episode_schema", "episode_prompt")

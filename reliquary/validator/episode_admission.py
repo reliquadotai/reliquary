@@ -183,12 +183,14 @@ class EpisodeGroupChecker:
         if len(tokens) > policy.max_episode_tokens:
             return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_length",
                                   {**where, "tokens": len(tokens), "max": policy.max_episode_tokens})
-        try:
-            spans = [(int(start), int(end)) for start, end in episode.get("assistant_spans") or ()]
-        except (TypeError, ValueError):
-            return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_schema", where)
+        # The proof's own strict reader (exact ints, ordered, after the declared prompt): one definition.
+        from reliquary.validator.verifier import signed_episode_spans
+
         offset = len(prompt_ids)
-        if not spans or spans[0][0] != offset or tokens[:offset] != prompt_ids:
+        spans = signed_episode_spans({**meta, "prompt_length": offset}, len(tokens))
+        if not spans:
+            return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_schema", where)
+        if spans[0][0] != offset or tokens[:offset] != prompt_ids:
             return EpisodeRefusal(RejectReason.PROMPT_MISMATCH, "episode_prompt", where)
         # The declared lengths every later stage slices the tokens with (proof, pi_old, payload).
         if meta.get("prompt_length") != offset or meta.get("completion_length") != len(tokens) - offset:
