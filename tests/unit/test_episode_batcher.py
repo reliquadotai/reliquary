@@ -588,3 +588,37 @@ def test_the_hook_fires_once_per_group_whatever_its_memory_address(tmp_path):
     again.b._episode_proof_inconclusive(w.pending, "validator_lost")
     w.b._episode_proof_inconclusive(w.pending, "validator_lost")
     assert len(again_calls) == 1 and len(calls) == 30
+
+
+# --- Fix round 2: a policy-limit refusal and a buffer left at the window close hand the group back. ---
+
+def test_a_passed_group_the_reward_policy_refuses_is_handed_back(tmp_path, monkeypatch):
+    from reliquary.validator.proof_scheduler import ProofDecisionStatus
+
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+    w.b.service_runtime = object()
+    w.b._service_training_receipt = lambda pending, value: None      # service_policy_limit, no receipt
+    w.b.fill_state.reserve(EPISODE)
+    w.b._arrival_proof_meta["job-1"] = (None, 0, "", w.pending)
+    w.b._open_proof_plan_handle = SimpleNamespace(
+        decisions=lambda: [_decision("job-1", ProofDecisionStatus.PASSED, value=object())], done=lambda: False)
+    w.b._reconcile_fill_state_decisions(EPISODE)
+    w.b._reconcile_fill_state_decisions(EPISODE)
+    assert calls == [(w.pending, "policy_limit")]
+    assert w.b.fill_state.snapshot()["proven"][EPISODE] == 0
+
+
+def test_a_group_left_in_the_arrival_buffer_is_handed_back_when_the_window_closes(tmp_path, monkeypatch):
+    w = world(tmp_path, _stub())
+    _arrival(w, monkeypatch)
+    calls = _hooked(w)
+    # the admission budget is spent, so the buffer keeps the group
+    w.b.fill_state.may_admit = lambda environment: False
+    _buffer(w)
+    w.b._drain_arrival_proof_buffer(EPISODE)
+    assert calls == [] and len(w.b._arrival_proof_buffer) == 1          # still waiting, not settled
+    w.b._seal_v6_proof_plan()
+    w.b._seal_v6_proof_plan()                                           # a second poll hands nothing back again
+    assert calls == [(w.pending, "validator_lost")]

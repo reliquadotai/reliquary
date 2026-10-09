@@ -1907,6 +1907,7 @@ class GrpoWindowBatcher:
         ``fill_state`` (in particular ``in_flight``) reflects the plan's
         outcome right away in the common case.
         """
+        self._hand_back_buffered_arrivals()
         if self._proof_scheduler is None or self._open_proof_plan_id is None:
             return
         try:
@@ -1918,6 +1919,16 @@ class GrpoWindowBatcher:
             pass
         environment = str(getattr(self.env, "name", ""))
         self._reconcile_fill_state_decisions(environment)
+
+    def _hand_back_buffered_arrivals(self) -> None:
+        """Plan 2C: the window is closing; whatever still sits in the arrival buffer (admission budget
+        exhausted, or any other unsettled state) will never be proved: hand it back (once per group)."""
+        if self.fill_state is None:
+            return
+        with self.fill_state.lock:
+            left = [b.pending for b in self._arrival_proof_buffer]
+        for pending in left:
+            self._episode_proof_inconclusive(pending, "validator_lost")
 
     def _submit_arrival_proof(self, pending: PendingSubmission) -> None:
         """Validate and buffer one graded body for the qualification plan.
@@ -2183,6 +2194,7 @@ class GrpoWindowBatcher:
         if handle is None:
             return
         unjudged: list[Any] = []
+        policy_refused: list[Any] = []
         with self.fill_state.lock:
             for decision in handle.decisions():
                 if decision.job_id in self._accounted_arrival_decisions:
@@ -2240,6 +2252,8 @@ class GrpoWindowBatcher:
                             self.fill_state.release(environment)
                             if row is not None:
                                 row["status"] = "service_policy_limit"
+                            # Plan 2C: it passed, the validator's reward policy refused it: not the miner's fault.
+                            policy_refused.append(pending)
                             continue
                         if row is not None:
                             row["service_observation_id"] = receipt
@@ -2261,6 +2275,8 @@ class GrpoWindowBatcher:
                     if decision.status is not ProofDecisionStatus.REJECTED:
                         # Plan 2C: settled without a verdict (not needed, claimed, limit, aborted, error).
                         unjudged.append(pending)
+        for pending in policy_refused:
+            self._episode_proof_inconclusive(pending, "policy_limit")
         for pending in unjudged:           # outside the fill-state lock: the hook calls the session owner
             self._episode_proof_inconclusive(pending, "validator_lost")
         if handle.done():
@@ -7345,6 +7361,8 @@ class GrpoWindowBatcher:
     def _episode_proof_inconclusive(self, pending, stage: str) -> None:
         """Plan 2C: hand a signed-episode group that the proof could not judge to the session owner
         (once per group, never raising into the proof plane)."""
+        # A hand-back only releases sessions; a seal audit that later proves the group and FAILS still
+        # sanctions (forgery is forgery): `_apply_audit_verdict` is not gated on this hand-back.
         hook = self.episode_proof_inconclusive
         if hook is None or pending is None or not self._signed_episode_pending(pending):
             return
