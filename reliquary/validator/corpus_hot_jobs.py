@@ -302,6 +302,9 @@ class CorpusJobSet:
                 logger.info("corpus task %s cap %s -> %s", task_id, wiring.cap, cap)
                 wiring.cap = cap
                 wiring.settler.set_cap(cap)
+            from reliquary.validator.corpus_period_settlement import apply_max_price
+
+            apply_max_price(wiring, entry)
         for task_id, entry in corpus.items():
             if task_id in by_task or task_id in self._passed_over:
                 continue
@@ -484,6 +487,7 @@ class CorpusJobSet:
         stats = wiring.stats
         settled = getattr(wiring.settler, "settled_count", 0)
         totals = getattr(wiring.settler, "totals", None)
+        last_period = getattr(wiring.settler, "last_period", None)
         link = getattr(wiring, "judge_link", None)
         if link is not None:
             # Judged in another process: its counts come from there.
@@ -492,6 +496,7 @@ class CorpusJobSet:
                 raise RuntimeError(f"the judge of {job_id} does not serve it")
             stats = JudgedStats(wiring.stats, judged["unsettled"])
             settled, totals = judged["settled_count"], judged["totals"]
+            last_period = judged.get("last_period")
         status = job_status(job_id=job_id, job=job or wiring.job, slots=state.slots,
                             stats=stats, settled=settled, totals=totals,
                             retired=self.is_retired(job_id), drained=drained)
@@ -500,6 +505,14 @@ class CorpusJobSet:
             # An episode job: grading holds payment, so its backlog is public.
             status = {**status, "grading": grader.status()}
         status["admission"] = "paused" if job_id in self._routes.paused else "open"
+        if getattr(wiring, "cap", None) is not None:
+            from reliquary.validator import corpus_periods as cp
+            from reliquary.validator.corpus_job_status import pay_status
+
+            price = (wiring.price if hasattr(wiring, "price")
+                     else cp.price_view(getattr(getattr(wiring, "entry", None), "params", None)))
+            status["pay"] = pay_status(cap=float(wiring.cap), price=price,
+                                       last_period=last_period)
         return status
 
     async def status(self, job_id: str) -> dict | None:

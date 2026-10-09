@@ -41,7 +41,8 @@ def build_judge_app(served: Mapping[str, Any], feed) -> FastAPI:
     async def stats(job_id: str) -> dict:
         w = wiring(job_id)
         return {"unsettled": list(w.stats.unsettled()),
-                "settled_count": w.settler.settled_count, "totals": w.settler.totals}
+                "settled_count": w.settler.settled_count, "totals": w.settler.totals,
+                "last_period": getattr(w.settler, "last_period", None)}
 
     @app.get("/jobs/{job_id}/miners/{hotkey}")
     async def miner(job_id: str, hotkey: str) -> dict:
@@ -70,6 +71,8 @@ def registry_reader() -> Callable[[], Awaitable[Mapping[str, Any]]]:
 async def refresh_caps(served: Mapping[str, Any], read_entries, every_seconds: float) -> None:
     """The registry's cap of each job judged here, applied to its settler as
     the single process's job set does (the front's copy is for its status)."""
+    from reliquary.validator.corpus_period_settlement import apply_max_price
+
     while True:
         await asyncio.sleep(every_seconds)
         try:
@@ -86,6 +89,7 @@ async def refresh_caps(served: Mapping[str, Any], read_entries, every_seconds: f
                 logger.info("corpus task %s cap %s -> %s", w.entry.task_id, w.cap, cap)
                 w.cap = cap
                 w.settler.set_cap(cap)
+            apply_max_price(w, entry)
 
 
 async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, socket_path: str,

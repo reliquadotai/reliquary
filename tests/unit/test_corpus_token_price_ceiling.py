@@ -290,3 +290,81 @@ def test_a_cap_alone_sends_no_price(monkeypatch):
     result, calls = _cli(monkeypatch, "--cap", "0.2")
     assert result.exit_code == 0, result.output
     assert calls[0][1] == 0.2 and "token_price" not in calls[0][2]
+
+
+# -- the hot refresh and the public status ---------------------------------------------
+
+
+def _wiring(params, settler=None):
+    entry = SimpleNamespace(task_id="corpus-x", job_id="job-x", params=params)
+    return SimpleNamespace(entry=entry, cap=params["cap"], settler=settler)
+
+
+def test_a_price_change_in_the_registry_reaches_the_running_settler():
+    from reliquary.validator.corpus_period_settlement import apply_max_price
+
+    set_to = []
+    settler = SimpleNamespace(set_max_price=set_to.append)
+    base = {"cap": 0.1, "settlement": cp.SETTLEMENT_PERIOD_EMA}
+    w = _wiring(base, settler)
+    apply_max_price(w, SimpleNamespace(task_id="corpus-x", params=base))
+    assert set_to == [] and w.price is None
+    priced = {**base, **cp.price_params(0.9, 147.6, 1.0)}
+    apply_max_price(w, SimpleNamespace(task_id="corpus-x", params=priced))
+    apply_max_price(w, SimpleNamespace(task_id="corpus-x", params=priced))
+    apply_max_price(w, SimpleNamespace(task_id="corpus-x", params=base))
+    assert set_to == [pytest.approx(0.9e-6 / 147.6), None]
+
+
+def test_the_judge_process_refresh_applies_the_price(monkeypatch):
+    from reliquary.validator import corpus_judge_process as judge
+
+    set_to = []
+    base = {"cap": 0.1, "settlement": cp.SETTLEMENT_PERIOD_EMA}
+    w = _wiring(base, SimpleNamespace(set_cap=lambda c: None, set_max_price=set_to.append))
+    w.job = SimpleNamespace(job_id="job-x")
+    priced = SimpleNamespace(task_id="corpus-x", job_id="job-x", status="active",
+                             params={**base, **cp.price_params(0.9, 147.6, 1.0)})
+
+    async def entries():
+        return {"corpus-x": priced}
+
+    async def go():
+        task = asyncio.create_task(judge.refresh_caps({"job-x": w}, entries, 0.001))
+        while not set_to:
+            await asyncio.sleep(0.001)
+        task.cancel()
+
+    asyncio.run(go())
+    assert set_to == [pytest.approx(0.9e-6 / 147.6)]
+
+
+def test_the_status_shows_the_ceiling_and_the_price_last_paid():
+    from reliquary.validator.corpus_job_status import pay_status
+
+    view = cp.price_view({"cap": 0.15, **cp.price_params(0.9, 147.6, 1.0)})
+    paid = 2_000_000 * 0.9e-6 / 147.6  # price bound: paid exactly the ceiling
+    pay = pay_status(cap=0.15, price=view, last_period={
+        "work_period": 7, "verified_tokens": 2_000_000, "paid": paid})
+    assert pay["max_price_alpha_per_mtoken"] == 0.9
+    assert pay["last_period"]["paid_alpha_per_mtoken"] == pytest.approx(0.9)
+    unpriced = pay_status(cap=0.15, price=None, last_period={
+        "work_period": 7, "verified_tokens": 1_000_000, "paid": 0.15})
+    assert unpriced["max_price_alpha_per_mtoken"] is None
+    assert unpriced["last_period"]["paid_pool_share_per_mtoken"] == pytest.approx(0.15)
+    assert unpriced["last_period"]["paid_alpha_per_mtoken"] is None
+
+
+def test_the_public_job_status_carries_the_pay_block():
+    from tests.unit.test_corpus_job_status import _set
+
+    job_set, _, _ = _set({0: 1}, now=[10_000.0])
+    wiring = job_set.served["job-b"]
+    wiring.cap = 0.15
+    wiring.entry.params = {"cap": 0.15, "settlement": cp.SETTLEMENT_PERIOD_EMA,
+                           **cp.price_params(0.9, 147.6, 1.0)}
+    wiring.settler.last_period = {"work_period": 7, "verified_tokens": 1_000_000,
+                                  "paid": 0.9e-6 * 1_000_000 / 147.6}
+    pay = asyncio.run(job_set.status("job-b"))["pay"]
+    assert pay["cap"] == 0.15 and pay["max_price_alpha_per_mtoken"] == 0.9
+    assert pay["last_period"]["paid_alpha_per_mtoken"] == pytest.approx(0.9)
