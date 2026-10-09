@@ -1028,6 +1028,7 @@ class SessionIssuer:
         records = self.book.void_machine(machine_id, int(self._clock()))
         for record in records:
             self._tokens.pop(record.session_id, None)
+            self._stored_submitted.discard(record.session_id)
             task = asyncio.get_running_loop().create_task(self._persist(record))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -1056,6 +1057,7 @@ class SessionIssuer:
             lapsed = self.book.lapse(now)
             for record in lapsed:
                 self._tokens.pop(record.session_id, None)
+                self._stored_submitted.discard(record.session_id)
             self.book.prune(now)
             self._stored_submitted = {i for i in self._stored_submitted if self.book.get(i) is not None}
             for hotkey in [h for h, times in self._refused_opens.items()

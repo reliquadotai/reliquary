@@ -1311,4 +1311,38 @@ def test_the_stored_submitted_set_is_pruned_with_the_book(tmp_path):
     env.clock.now = NOW + 26 * 3600
     asyncio.run(env.issuer.maintain())
     assert env.book.get(old) is None and env.book.get(kept) is not None
-    assert env.issuer._stored_submitted == {kept}
+    assert old not in env.issuer._stored_submitted         # kept lapsed too: no longer stored as submitted
+    assert kept not in env.issuer._stored_submitted
+
+
+def test_a_lapsed_session_is_no_longer_counted_as_stored_submitted(tmp_path):
+    from reliquary.protocol.service_episode import rl_engagement
+    from reliquary.sandbox.sessions import LAPSED, SUBMITTED
+
+    env, ids = _issuer_with_sessions(tmp_path, 1)
+    sha = "9" * 64
+    record = dataclasses.replace(env.book.get(ids[0]), engagement=rl_engagement(1, sha, 0),
+                                 kind="rl_precommit")
+    env.book.add(record)
+    env.store.documents[ids[0]] = record.to_document()
+
+    async def scenario():
+        assert await env.issuer.claim_all(ids, hotkey="5Hot", received=NOW, precommit_sha256=sha) is None
+        assert await env.issuer.persist_submitted(ids) == 1
+        assert env.store.documents[ids[0]]["state"] == SUBMITTED
+        env.clock.now = NOW + 26 * 3600
+        await env.issuer.maintain()
+        assert env.book.get(ids[0]).state == LAPSED
+        assert ids[0] not in env.issuer._stored_submitted      # the stored claim no longer stands
+        calls = []
+        real_update = env.store.update
+
+        async def counting(document):
+            calls.append(document["state"])
+            return await real_update(document)
+
+        env.store.update = counting
+        await env.issuer.persist_submitted(ids)
+        assert calls == [SUBMITTED]                             # rewritten, not counted as stored
+
+    asyncio.run(scenario())
