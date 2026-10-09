@@ -1353,6 +1353,24 @@ _PROFILE_VALUES = (
                 # No cooldown override: 2,481,806 prompts at 16 a window outlast
                 # the global horizon, which is what that horizon was sized for.
             ),
+            "reliquary_competitive_code_v1": EnvironmentProfile(
+                # The package's own default, not yet measured on this policy:
+                # twice the sibling's, since an algorithm comes before the
+                # program.
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="fenced_python",
+                batch_target=8,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/stdio-program/v1",
+                environment_manifest_sha256=(
+                    "0589dc2f13c21d8ff6a67d24dd2b8c68e54b706f696267a349158bbd891093d9"
+                ),
+                # One pass through the 2,718-problem RL share at 8 a window.
+                prompt_cooldown_windows=340,
+            ),
             "reliquary_telecom_solo_v1": EnvironmentProfile(
                 # For an episode this is the whole transcript, as `max_episode_tokens`.
                 max_new_tokens=49152,

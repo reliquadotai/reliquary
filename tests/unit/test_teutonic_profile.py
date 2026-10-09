@@ -19,13 +19,14 @@ def test_the_profile_speaks_to_an_instruct_policy() -> None:
     assert len(PROFILE.model_revision) == 40
 
 
-def test_it_declares_exactly_the_six_packaged_environments() -> None:
+def test_it_declares_exactly_the_seven_packaged_environments() -> None:
     assert set(PROFILE.environments) == {
         "reliquary_dapo_math_v1",
         "reliquary_science_v1",
         "reliquary_hard_math_v1",
         "reliquary_instruction_following_v1",
         "reliquary_code_v1",
+        "reliquary_competitive_code_v1",
         "reliquary_telecom_solo_v1",
     }
 
@@ -52,6 +53,8 @@ def test_the_measured_budgets() -> None:
     assert envs["reliquary_hard_math_v1"].max_new_tokens == 32768
     assert envs["reliquary_instruction_following_v1"].max_new_tokens == 8192
     assert envs["reliquary_code_v1"].max_new_tokens == 8192
+    # Not measured: the package's default until the 8k/16k/32k band says.
+    assert envs["reliquary_competitive_code_v1"].max_new_tokens == 16384
 
 
 def test_telecom_is_an_episode_in_the_dialect_the_policy_was_tuned_in() -> None:

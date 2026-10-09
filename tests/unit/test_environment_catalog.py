@@ -33,6 +33,7 @@ EXPECTED_PROVENANCE = {
     "reliquary_hard_math_v1": TEUTONIC,
     "reliquary_instruction_following_v1": TEUTONIC,
     "reliquary_code_v1": TEUTONIC,
+    "reliquary_competitive_code_v1": TEUTONIC,
     "reliquary_telecom_solo_v1": TEUTONIC,
 }
 
@@ -51,6 +52,7 @@ GOLDEN_BODY_SHA256 = {
     "reliquary_hard_math_v1": "45997d290e97777a0cec48f13acdd1dbee52bff41e3049d12cc02314092535ba",
     "reliquary_instruction_following_v1": "6d6040473b809d87367198dec14eae5d72232b8c2ff3a773b81b7b51c1f0fbab",
     "reliquary_code_v1": "0724aa4fa09254d27547d757d8b77a7a0fbe6d3a78f8c9522be0ed23a27b4509",
+    "reliquary_competitive_code_v1": "f6a580bf4b865bf59c7166dc526256ea3434bfb849a0f9bb84632e192485a56f",
     "reliquary_telecom_solo_v1": "5d7ec17b0250dc935a43fdf38a6873f34053caa460546b35331dde5870f9556a",
 }
 

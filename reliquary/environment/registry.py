@@ -777,6 +777,34 @@ _SPEC_VALUES = (
         external_artifact_resource="reliquary_code/artifact.json",
     ),
     EnvironmentSpec(
+        # Competitive programming: a whole program read from stdin, passing
+        # every hidden test or nothing. The package supplies the statements
+        # and the tests through `admission_reward_cases`; the program runs
+        # here, in the grading service's gVisor workers, through the package's
+        # own `judge.guest.run`, and its output is compared on this side with
+        # the package's `outputs_match`. The package's `grade` is never called
+        # on a validator: it runs the program in a local subprocess.
+        name="reliquary_competitive_code_v1",
+        factory_path=(
+            "reliquary_competitive_code.environment:CompetitiveCodeEnvironment"
+        ),
+        scorer_path="reliquary.environment.stdio_program:score_stdio_program",
+        validator_authoritative_reward=True,
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="fenced_python",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/stdio-program/v1",
+        reward_materializer_method="admission_reward_cases",
+        environment_manifest_sha256=(
+            "0589dc2f13c21d8ff6a67d24dd2b8c68"
+            "e54b706f696267a349158bbd891093d9"
+        ),
+        external_distribution="reliquary-competitive-code",
+        external_artifact_resource="reliquary_competitive_code/artifact.json",
+    ),
+    EnvironmentSpec(
         # Telecom support tickets in tau2-bench's solo mode, graded on the
         # device and the carrier's records after the last call — nothing the
         # model writes reaches the score, only what it did. Binary: one failed
