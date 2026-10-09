@@ -54,6 +54,11 @@ def validate_submission_policy(request, announcement: dict | None, *, parsed=Non
     signed = (contract.version == 2 and isinstance(named, str)
               and "episode" in (contract.environments.get(named) or {}))
     validate_service_rollout_bindings(intent, commits, signed_episodes=signed)
+    if signed:
+        # The wire caps a signed episode at the corpus trajectory cap; the order caps it at its own limit.
+        limit = contract.episode_policy(named).max_episode_tokens
+        if any(row.get("completion_length", 0) > limit for row in metadata):
+            raise ValueError("a signed episode is over the order's max_episode_tokens")
     if request.checkpoint_hash != announcement["checkpoint"]["revision"]:
         raise ValueError("service checkpoint mismatch")
     environments = {r.env_name for r in request.rollouts}

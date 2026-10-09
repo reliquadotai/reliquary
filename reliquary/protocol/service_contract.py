@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from reliquary.protocol.corpus_submission import MAX_TRAJECTORY_TOKENS
 from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
 
 SCHEMA = "service-contract/v1"
@@ -168,7 +169,16 @@ EPISODE_CAPABILITY = "signed-sandbox-episode/v1"
 EPISODE_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s", "memory_bytes", "pids",
                          "disk_bytes")
 EPISODE_TOOLS = frozenset({"bash", "edit"})
-MAX_EPISODE_TOKENS = 1 << 20
+# One episode is one corpus trajectory: its tokens stay under the corpus trajectory cap.
+MAX_EPISODE_TOKENS = MAX_TRAJECTORY_TOKENS
+# Ceilings of each session budget: the smaller of the review's bound and the sandbox service's own
+# maximum (reliquary_sandbox_service/settings.py: episode_max_calls le 100_000, episode_max_call_timeout_s
+# le 24 h, episode_max_pids le 65536, and the defaults of episode_max_cpu_s 3600, episode_max_wall_s 4 h,
+# episode_max_memory_bytes 8 GiB, episode_max_disk_bytes 10 GiB, which have no hard "le").
+EPISODE_BUDGET_CEILINGS = {
+    "max_calls": 4096, "per_call_timeout_s": 3600, "cpu_s": 3600, "wall_s": 4 * 3600,
+    "memory_bytes": 8 * 1024**3, "pids": 65536, "disk_bytes": 10 * 1024**3,
+}
 MAX_EPISODE_TURNS = 256
 _EPISODE_FIELDS = frozenset({"kind", "sandbox_env", "split", "env_package", "tools", "max_turns",
                              "max_tokens_per_turn", "max_episode_tokens", "budgets"})
@@ -198,7 +208,8 @@ def _validate_episode(name: str, env: dict) -> None:
         raise ServiceContractError(f"{name}.episode: a turn must fit inside the episode")
     budgets = _object(episode["budgets"], set(EPISODE_BUDGET_FIELDS), f"{name}.episode.budgets")
     for field_name in EPISODE_BUDGET_FIELDS:
-        _integer(budgets[field_name], f"{name}.episode.budgets.{field_name}")
+        _integer(budgets[field_name], f"{name}.episode.budgets.{field_name}", 1,
+                 EPISODE_BUDGET_CEILINGS[field_name])
     if env["sampling"]["kind"] != PUBLIC_SEED_POOL:
         raise ServiceContractError(f"{name}: an episode environment draws from a public seed pool")
     if env["missing_box"] != "graded":

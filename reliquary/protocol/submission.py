@@ -24,6 +24,7 @@ from pydantic import (
 )
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
+from reliquary.protocol.corpus_submission import MAX_TRAJECTORY_TOKENS
 from reliquary.protocol.toploc_wire import ProofB64, proof_volume_error
 from reliquary.shared.runtime_fingerprint import runtime_profile_hash
 
@@ -751,7 +752,9 @@ class RolloutMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prompt_length: int = Field(..., ge=0)
-    completion_length: int = Field(..., gt=0, le=MAX_NEW_TOKENS_PROTOCOL_CAP)
+    # Widened to the corpus trajectory cap for signed episodes only (see _completion_cap); every other
+    # rollout keeps MAX_NEW_TOKENS_PROTOCOL_CAP.
+    completion_length: int = Field(..., gt=0, le=MAX_TRAJECTORY_TOKENS)
     success: bool
     total_reward: FiniteFloat
     advantage: FiniteFloat
@@ -770,6 +773,14 @@ class RolloutMetadata(BaseModel):
     episode: "EpisodeMetadata | SignedEpisodeMetadata | None" = None
     seed_pool: dict[str, Any] | None = None
     service_binding: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _completion_cap(self):
+        if (not isinstance(self.episode, SignedEpisodeMetadata)
+                and self.completion_length > MAX_NEW_TOKENS_PROTOCOL_CAP):
+            raise ValueError(
+                f"completion_length must be less than or equal to {MAX_NEW_TOKENS_PROTOCOL_CAP}")
+        return self
 
     @field_validator("seed_pool")
     @classmethod
@@ -862,7 +873,7 @@ class SignedEpisodeMetadata(BaseModel):
     precommit_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
     seed_index: int = Field(..., ge=0, le=127, strict=True)
     assistant_spans: list[list[StrictInt]] = Field(..., min_length=1, max_length=MAX_SIGNED_EPISODE_TURNS)
-    stop: str = Field(..., min_length=1, max_length=32)
+    stop: str = Field(..., pattern=r"^[a-z_]{1,32}$")
     transcript: dict[str, Any]
 
     @model_validator(mode="after")

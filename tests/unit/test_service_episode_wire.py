@@ -15,7 +15,8 @@ from reliquary.protocol.signatures import build_service_episode_commit_binding
 from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA, CommitModel
 from reliquary.services.admission_policy import validate_submission_policy
 from tests.unit.episode_v2_fixtures import (
-    EPISODE, REVISION, TASK, WINDOW_BEACON, episode_contract, episode_pool, episode_precommit,
+    EPISODE, REVISION, TASK, WINDOW_BEACON, episode_block, episode_contract, episode_contract_dict,
+    episode_pool, episode_precommit,
     episode_runtime, signed_episode_commit, signed_episode_metadata,
 )
 from tests.unit.service_v2_fixtures import MATH
@@ -440,3 +441,134 @@ def test_only_a_signed_episode_has_commit_material():
     legacy_shaped = {**commits[0]["rollout"]["episode"], "schema_version": "reliquary/episode/v1"}
     with pytest.raises(EpisodeWireError):
         episode_commit_material(legacy_shaped)
+
+
+def _long_commit(contract, completion):
+    """A signed-episode commit with ``completion`` tokens after a 5-token prompt (stub proofs)."""
+    pool = episode_pool(contract)
+    selection = pool.selection(list(range(pool.group_size)))
+    tokens = list(range(5 + completion))
+    spans = [(5, len(tokens))]
+    commits = [signed_episode_commit(
+        tokens=tokens, spans=spans, selection=selection, index=index, contract=contract,
+        episode=signed_episode_metadata(precommit_sha256="e" * 64, seed_index=seed, spans=spans,
+                                        transcript=copy.deepcopy(TRANSCRIPT)))
+        for index, seed in enumerate(selection.seeds)]
+    return selection, commits
+
+
+def _long_contract():
+    from reliquary.protocol.service_contract import ServiceContract
+
+    return ServiceContract.from_dict(episode_contract_dict(episode=episode_block(max_episode_tokens=40000)))
+
+
+def test_a_long_signed_episode_is_accepted_under_a_contract_allowing_it(tmp_path):
+    contract = _long_contract()
+    selection, commits = _long_commit(contract, 40000)
+    assert CommitModel.model_validate(commits[0]).rollout.completion_length == 40000
+    announcement = episode_runtime(tmp_path, contract).announcement(window=1, randomness=WINDOW_BEACON)
+    assert validate_submission_policy(_request(contract, selection, commits), announcement).sha256 == contract.sha256
+
+
+def test_a_signed_episode_over_the_contract_limit_is_refused(tmp_path):
+    contract = _long_contract()
+    selection, commits = _long_commit(contract, 40001)
+    CommitModel.model_validate(commits[0])          # the wire allows it, the order does not
+    announcement = episode_runtime(tmp_path, contract).announcement(window=1, randomness=WINDOW_BEACON)
+    with pytest.raises(ValueError, match="max_episode_tokens"):
+        validate_submission_policy(_request(contract, selection, commits), announcement)
+
+
+def test_a_signed_episode_is_bounded_by_the_trajectory_cap_on_the_wire():
+    contract = _long_contract()
+    _, commits = _long_commit(contract, 60001)
+    with pytest.raises(ValueError, match="completion_length"):
+        CommitModel.model_validate(commits[0])
+
+
+def test_a_legacy_rollout_keeps_its_completion_cap():
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    contract = _long_contract()
+    for completion, ok in ((MAX_NEW_TOKENS_PROTOCOL_CAP, True), (MAX_NEW_TOKENS_PROTOCOL_CAP + 1, False)):
+        _, commits = _long_commit(contract, completion)
+        commit = commits[0]
+        for key in ("episode", "seed_pool", "service_binding"):
+            commit["rollout"].pop(key)
+        commit["proof_version"] = "v7"
+        commit["rollout"]["token_logprobs"] = [-1.0] * len(commit["tokens"])
+        if ok:
+            CommitModel.model_validate(commit)
+        else:
+            with pytest.raises(ValueError, match="completion_length"):
+                CommitModel.model_validate(commit)
+
+
+def _math_group():
+    """Episode commits built on MATH's own pool and selection: only the env gate can refuse them."""
+    from reliquary.protocol.seed_pool import SeedPool
+
+    contract = episode_contract()
+    pool = SeedPool.from_contract(contract, environment=MATH, prompt_idx=TASK, checkpoint_hash=REVISION,
+                                  pool_epoch=1, randomness=WINDOW_BEACON)
+    selection = pool.selection(list(range(pool.group_size)))
+    commits = [signed_episode_commit(
+        tokens=TOKENS, spans=SPANS, selection=selection, index=index, contract=contract,
+        episode=signed_episode_metadata(precommit_sha256="e" * 64, seed_index=seed, spans=SPANS,
+                                        transcript=copy.deepcopy(TRANSCRIPT)))
+        for index, seed in enumerate(selection.seeds)]
+    return contract, selection, commits
+
+
+def test_a_single_turn_environment_refuses_signed_episodes_through_the_env_gate(tmp_path):
+    contract, selection, commits = _math_group()
+    announcement = episode_runtime(tmp_path, contract).announcement(window=1, randomness=WINDOW_BEACON)
+    with pytest.raises(ValueError, match="single-turn"):
+        validate_submission_policy(_request(contract, selection, commits, env=MATH), announcement)
+
+
+def test_a_v1_contract_does_not_touch_the_environments_block():
+    from reliquary.protocol.service_submission import ServiceBinding as Binding
+
+    class V1:
+        version = 1
+        sha256 = "ab" * 32
+
+        @property
+        def environments(self):
+            raise AssertionError("environments read on a v1 contract")
+
+        def environment(self, name):
+            raise ValueError("reached the per-environment policy")
+
+    _, _, selection, commits = _group_commits()
+    for index, commit in enumerate(commits):
+        del commit["rollout"]["episode"]
+        commit["rollout"]["service_binding"] = Binding(V1.sha256, "training").rollout_binding(index)
+    request = _request(SimpleNamespace(sha256=V1.sha256), selection, commits)
+    request.service_binding = Binding(V1.sha256, "training").to_dict()
+    schedule = SimpleNamespace(active_environments=lambda: {EPISODE})
+    announcement = {"checkpoint": {"revision": REVISION}}
+    with pytest.raises(ValueError, match="reached the per-environment policy"):
+        validate_submission_policy(request, announcement, parsed=(V1(), schedule))
+
+
+def test_the_engagement_bounds_are_the_same_both_ways():
+    sha = "e" * 64
+    assert parse_rl_engagement(rl_engagement(0, sha, 127)) == (0, sha, 127)
+    with pytest.raises(EpisodeWireError):
+        rl_engagement(1, sha, 128)
+    with pytest.raises(EpisodeWireError):
+        parse_rl_engagement(f"rl:1:{sha}:128")
+    with pytest.raises(EpisodeWireError):
+        parse_rl_engagement(f"rl:{2**53}:{sha}:1")
+    assert parse_rl_engagement(f"rl:{2**53 - 1}:{sha}:1")[0] == 2**53 - 1
+
+
+@pytest.mark.parametrize("stop", ["agent\x00", "agent\n", "Agent", "agent-completed", "a" * 33, "", "agent completed"])
+def test_the_episode_stop_condition_is_a_bounded_lowercase_token(stop):
+    _, _, _, commits = _group_commits()
+    commits[0]["rollout"]["episode"]["stop"] = stop
+    with pytest.raises(ValueError):
+        CommitModel.model_validate(commits[0])

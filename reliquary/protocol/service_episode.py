@@ -33,10 +33,14 @@ def _sha(value: Any, name: str) -> str:
     return value
 
 
-def _uint(value: Any, name: str) -> int:
-    if type(value) is not int or not 0 <= value <= MAX_SAFE_INTEGER:
-        raise EpisodeWireError(f"{name}: non-negative integer required")
+def _uint(value: Any, name: str, high: int = MAX_SAFE_INTEGER) -> int:
+    if type(value) is not int or not 0 <= value <= high:
+        raise EpisodeWireError(f"{name}: integer in [0, {high}] required")
     return value
+
+
+# A pool has at most 128 seeds (service_contract pool_seeds); SignedEpisodeMetadata.seed_index is le=127.
+MAX_ENGAGEMENT_SEED = 127
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +91,7 @@ def rl_engagement(window: int, precommit_sha256: str, seed_index: int) -> str:
     """The engagement a session token names: ``rl:{window}:{precommit}:{seed}`` (spec §4.1.3)."""
     _uint(window, "window")
     _sha(precommit_sha256, "precommit_sha256")
-    _uint(seed_index, "seed_index")
+    _uint(seed_index, "seed_index", MAX_ENGAGEMENT_SEED)
     return f"{RL_ENGAGEMENT_PREFIX}:{window}:{precommit_sha256}:{seed_index}"
 
 
@@ -97,7 +101,8 @@ def parse_rl_engagement(text: Any) -> tuple[int, str, int]:
     if (len(parts) != 4 or parts[0] != RL_ENGAGEMENT_PREFIX or not _DIGITS.fullmatch(parts[1])
             or not _DIGITS.fullmatch(parts[3])):
         raise EpisodeWireError("not an RL engagement")
-    return int(parts[1]), _sha(parts[2], "precommit_sha256"), int(parts[3])
+    return (_uint(int(parts[1]), "window"), _sha(parts[2], "precommit_sha256"),
+            _uint(int(parts[3]), "seed_index", MAX_ENGAGEMENT_SEED))
 
 
 def is_signed_episode(meta: Any) -> bool:

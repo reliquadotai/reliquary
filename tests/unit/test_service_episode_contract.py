@@ -2,7 +2,7 @@
 import pytest
 
 from reliquary.protocol.service_contract import (
-    EPISODE_CAPABILITY, SUPPORTED_V2_CAPABILITIES, ServiceContract, ServiceContractError,
+    EPISODE_BUDGET_CEILINGS, EPISODE_BUDGET_FIELDS, EPISODE_CAPABILITY, MAX_EPISODE_TOKENS, SUPPORTED_V2_CAPABILITIES, ServiceContract, ServiceContractError,
     supported_v2_capabilities,
 )
 from reliquary.protocol.submission import ServicePolicyAnnouncement
@@ -78,7 +78,22 @@ def test_an_episode_reward_is_graded_never_uncertain():
         ServiceContract.from_dict(value)
 
 
-def test_the_runtime_refuses_an_episode_longer_than_the_protocol_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr("reliquary.constants.max_new_tokens_for_environment", lambda environment: 1024)
-    with pytest.raises(ValueError, match="max_episode_tokens"):
-        episode_runtime(tmp_path)
+@pytest.mark.parametrize("field", EPISODE_BUDGET_FIELDS)
+def test_each_session_budget_is_bounded_by_its_ceiling(field):
+    ceiling = EPISODE_BUDGET_CEILINGS[field]
+    ServiceContract.from_dict(episode_contract_dict(episode=episode_block(budgets={**BUDGETS, field: ceiling})))
+    with pytest.raises(ServiceContractError, match=field):
+        ServiceContract.from_dict(
+            episode_contract_dict(episode=episode_block(budgets={**BUDGETS, field: ceiling + 1})))
+
+
+def test_the_budget_ceilings_cover_every_budget_field_and_fit_the_fixture():
+    assert set(EPISODE_BUDGET_CEILINGS) == set(EPISODE_BUDGET_FIELDS)
+    assert all(BUDGETS[name] <= EPISODE_BUDGET_CEILINGS[name] for name in BUDGETS)
+
+
+def test_an_episode_is_bounded_by_the_corpus_trajectory_cap():
+    assert MAX_EPISODE_TOKENS == 60000
+    ServiceContract.from_dict(episode_contract_dict(episode=episode_block(max_episode_tokens=60000)))
+    with pytest.raises(ServiceContractError, match="max_episode_tokens"):
+        ServiceContract.from_dict(episode_contract_dict(episode=episode_block(max_episode_tokens=60001)))

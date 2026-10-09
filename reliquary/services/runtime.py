@@ -197,14 +197,7 @@ class ServiceRuntime:
         problems = missing_box_problems(contract)  # R22: the type of an env decides what a missing box is
         if problems:
             raise ValueError("the order's missing_box differs from the by-type default: " + "; ".join(problems))
-        from reliquary.constants import max_new_tokens_for_environment
-        for name in contract.episode_environments:
-            # A whole episode travels as one rollout: its schema bound is the env's completion cap.
-            policy = contract.episode_policy(name)
-            cap = max_new_tokens_for_environment(name)
-            if policy.max_episode_tokens > cap:
-                raise ValueError(f"{name}: max_episode_tokens {policy.max_episode_tokens} is above the "
-                                 f"protocol's completion cap {cap}")
+        # An episode's length is bounded by the contract itself (MAX_EPISODE_TOKENS) and by the wire.
         _validate_qualification(qualification, contract)
         self.contract = self.order_contract = contract
         self.qualification = json.loads(canonical_json_bytes(qualification))
