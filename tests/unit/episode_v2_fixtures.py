@@ -96,3 +96,53 @@ def signed_episode_commit(*, tokens, spans, episode, selection, index, contract,
                         "seed_pool": selection.rollout_binding(index),
                         "service_binding": ServiceBinding(contract.sha256, purpose).rollout_binding(index)},
             "toploc_proofs": proofs}
+
+
+PROMPT_TEXT = "Write 42 to /work/answer.txt."
+
+
+class FixedSource:
+    """An episode task source with one prompt for every task (plan 2A provides the real ones)."""
+
+    def __init__(self, text: str = PROMPT_TEXT, rows: int = 1000, image: str | None = None) -> None:
+        self.text, self.rows, self.image = text, rows, image
+
+    def __len__(self) -> int:
+        return self.rows
+
+    def prompt(self, index: int) -> str:
+        return self.text
+
+    async def resolve(self, index: int):
+        from reliquary_sandbox_service.episodes.testing import FAKE_IMAGE
+
+        from reliquary.sandbox.tasks import ResolvedTask
+
+        return ResolvedTask(self.image or FAKE_IMAGE, {})
+
+
+def make_test_episode_env():
+    from reliquary.environment.signed_episode import SignedEpisodeEnvironment
+
+    return SignedEpisodeEnvironment(EPISODE, FixedSource())
+
+
+def episode_spec():
+    from reliquary.environment.registry import EnvironmentSpec
+
+    return EnvironmentSpec(
+        name=EPISODE, factory_path="tests.unit.episode_v2_fixtures:make_test_episode_env",
+        scorer_path="reliquary.environment.signed_episode:signed_episode_scorer",
+        validator_authoritative_reward=True, admission_resource_class="sandbox",
+        termination_policy="eos_or_cap", final_answer_policy="text",
+        reward_lattice_policy="final-record/v1", attainable_rewards=(),
+        contract_version="reliquary/signed-episode/v1", interaction_mode="signed_episode")
+
+
+def register_episode_env(monkeypatch) -> None:
+    from types import MappingProxyType
+
+    from reliquary.environment import registry
+
+    monkeypatch.setattr(registry, "ENVIRONMENT_SPECS",
+                        MappingProxyType({**registry.ENVIRONMENT_SPECS, EPISODE: episode_spec()}))

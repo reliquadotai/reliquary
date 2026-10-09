@@ -64,7 +64,7 @@ EXTERNAL_SINGLE_TURN_CONTRACTS = frozenset(
 # spec that asked for anything else would silently get no materials at all —
 # `getattr` would return None and the lattice would collapse to a single point.
 EXTERNAL_REWARD_MATERIALIZER = "admission_reward_cases"
-InteractionMode = Literal["single_turn", "episode"]
+InteractionMode = Literal["single_turn", "episode", "signed_episode"]
 
 
 def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
@@ -189,8 +189,12 @@ class EnvironmentSpec:
             "text",
         ):
             raise ValueError("unknown final-answer policy")
-        if self.interaction_mode not in ("single_turn", "episode"):
+        if self.interaction_mode not in ("single_turn", "episode", "signed_episode"):
             raise ValueError("unknown interaction mode")
+        if self.interaction_mode == "signed_episode" and (
+                self.admission_resource_class != "sandbox" or not self.validator_authoritative_reward
+                or self.external_distribution is not None):
+            raise ValueError("a signed-episode environment is sandboxed, validator-scored and installed")
         if self.interaction_mode == "episode":
             if not self.episode_replay_path or not self.renderer_id:
                 raise ValueError(
@@ -279,6 +283,8 @@ class EnvironmentSpec:
     ) -> list[float]:
         if self.interaction_mode == "episode":
             raise TypeError("episode environments must be scored by replay")
+        if self.interaction_mode == "signed_episode":
+            raise TypeError("signed episodes are scored by their final record")
         if self.external_distribution and problem.get("environment") != self.name:
             raise ValueError("external answer problem environment mismatch")
         scorer = _import_attribute(self.scorer_path)
@@ -313,6 +319,11 @@ class EnvironmentSpec:
                 "interaction_mode": "episode",
                 "episode_schema": "reliquary/episode/v1",
                 "renderer_id": self.renderer_id,
+            })
+        if self.interaction_mode == "signed_episode":
+            manifest.update({
+                "interaction_mode": "signed_episode",
+                "episode_schema": "reliquary/signed-episode/v1",
             })
         return manifest
 
