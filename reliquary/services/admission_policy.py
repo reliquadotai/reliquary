@@ -32,8 +32,12 @@ def validate_submission_policy(request, announcement: dict | None, *, parsed=Non
     if any(not isinstance(row, dict) for row in metadata):
         raise ValueError("invalid rollout metadata")
     if announcement is None:
+        from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
         if (binding is not None or selection is not None
-                or any(row.get("service_binding") is not None or row.get("seed_pool") is not None for row in metadata)):
+                or any(row.get("service_binding") is not None or row.get("seed_pool") is not None for row in metadata)
+                or any(isinstance(row.get("episode"), dict)
+                       and row["episode"].get("schema_version") == SIGNED_EPISODE_SCHEMA for row in metadata)):
             raise ValueError("service metadata requires an active service task")
         return None
     contract, schedule = parse_service_announcement(announcement) if parsed is None else parsed
@@ -43,7 +47,13 @@ def validate_submission_policy(request, announcement: dict | None, *, parsed=Non
     if intent.contract_sha256 != contract.sha256:
         raise ValueError("service contract revision mismatch")
     commits = [r.commit for r in request.rollouts]
-    validate_service_rollout_bindings(intent, commits)
+    names = {r.env_name for r in request.rollouts}
+    named = next(iter(names)) if len(names) == 1 else None
+    # Plan 2C: an env whose contract entry has an episode block takes signed episodes, and only those.
+    # A v1 contract has no environments block, hence no episode env.
+    signed = (contract.version == 2 and isinstance(named, str)
+              and "episode" in (contract.environments.get(named) or {}))
+    validate_service_rollout_bindings(intent, commits, signed_episodes=signed)
     if request.checkpoint_hash != announcement["checkpoint"]["revision"]:
         raise ValueError("service checkpoint mismatch")
     environments = {r.env_name for r in request.rollouts}
@@ -56,7 +66,7 @@ def validate_submission_policy(request, announcement: dict | None, *, parsed=Non
     if policy["sampling"]["kind"] == PUBLIC_SEED_POOL:
         pool = pool_from_service_policy(announcement, environment=environment, prompt_idx=request.prompt_idx,
                                         checkpoint_hash=request.checkpoint_hash)
-        validate_rollout_selection(pool, PoolSelection.from_dict(selection), commits)
+        validate_rollout_selection(pool, PoolSelection.from_dict(selection), commits, signed_episodes=signed)
     elif selection is not None or any(row.get("seed_pool") is not None for row in metadata):
         raise ValueError("pool metadata is not allowed by this contract")
     if intent.purpose == "exploration" and policy["exploration"] != 1:

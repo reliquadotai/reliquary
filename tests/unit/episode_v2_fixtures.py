@@ -52,3 +52,47 @@ def episode_runtime(tmp_path, contract=None, *, window=1) -> ServiceRuntime:
                    batch_slots=slots, now=time.time() - 5)
     rt.announcement(window=window, randomness=WINDOW_BEACON)
     return rt
+
+
+from reliquary.protocol.seed_pool import SeedPool  # noqa: E402
+
+
+def episode_pool(contract, *, task=TASK, window=1, randomness=WINDOW_BEACON, checkpoint=REVISION) -> SeedPool:
+    """The public pool of (EPISODE, task, window), exactly as the runtime announces it."""
+    return SeedPool.from_contract(contract, environment=EPISODE, prompt_idx=task, checkpoint_hash=checkpoint,
+                                  pool_epoch=window, randomness=randomness)
+
+
+def episode_precommit(contract, *, hotkey, task=TASK, window=1):
+    from reliquary.protocol.service_episode import EpisodePrecommit
+
+    return EpisodePrecommit(order=contract.sha256, window=window, environment=EPISODE, task_index=task,
+                            checkpoint=REVISION,
+                            pool_sha256=episode_pool(contract, task=task, window=window).sha256, hotkey=hotkey)
+
+
+def signed_episode_metadata(*, precommit_sha256, seed_index, spans, transcript, stop="agent_completed") -> dict:
+    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
+    return {"schema_version": SIGNED_EPISODE_SCHEMA, "precommit_sha256": precommit_sha256,
+            "seed_index": seed_index, "assistant_spans": [list(span) for span in spans], "stop": stop,
+            "transcript": transcript}
+
+
+def signed_episode_commit(*, tokens, spans, episode, selection, index, contract, purpose="training",
+                          chunk_tokens=32, signature="aa", randomness="cd" * 32) -> dict:
+    """A commit dict shaped like the miner's (stub proofs: one per span chunk, never checked here)."""
+    from reliquary.protocol.service_submission import ServiceBinding
+    from reliquary.protocol.toploc import span_chunk_count
+
+    model_tokens = sum(end - start for start, end in spans)
+    proofs = ["AAAA"] * sum(span_chunk_count(end - start, chunk_tokens) for start, end in spans)
+    return {"tokens": list(tokens), "commitments": [{} for _ in tokens],
+            "proof_version": "public-group-proof/v1", "model": {"name": "model", "layer_index": -1},
+            "signature": signature, "beacon": {"randomness": randomness},
+            "rollout": {"prompt_length": spans[0][0], "completion_length": len(tokens) - spans[0][0],
+                        "success": False, "total_reward": 0.0, "advantage": 0.0,
+                        "token_logprobs": [-1.0] * model_tokens, "episode": episode,
+                        "seed_pool": selection.rollout_binding(index),
+                        "service_binding": ServiceBinding(contract.sha256, purpose).rollout_binding(index)},
+            "toploc_proofs": proofs}

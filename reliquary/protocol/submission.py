@@ -17,6 +17,7 @@ from pydantic import (
     Field,
     FiniteFloat,
     PrivateAttr,
+    StrictInt,
     field_validator,
     model_serializer,
     model_validator,
@@ -766,7 +767,7 @@ class RolloutMetadata(BaseModel):
 
     # Present only for Reliquary Episode v1. Keeping it nested preserves the
     # historical single-turn metadata fields and outer submission envelope.
-    episode: "EpisodeMetadata | None" = None
+    episode: "EpisodeMetadata | SignedEpisodeMetadata | None" = None
     seed_pool: dict[str, Any] | None = None
     service_binding: dict[str, Any] | None = None
 
@@ -842,6 +843,79 @@ class EpisodeMetadata(BaseModel):
         return sum(int(end) - int(start) for start, end in self.assistant_spans)
 
 
+SIGNED_EPISODE_SCHEMA = "reliquary/signed-episode/v1"
+MAX_SIGNED_EPISODE_TURNS = 256
+
+
+class SignedEpisodeMetadata(BaseModel):
+    """A signed-sandbox episode inside a v2 service rollout (phase 2, plan 2C).
+
+    ``assistant_spans`` are the model's turns as ``[start, end)`` in ``tokens`` (the prompt
+    included), ``stop`` the harness's stop condition, ``transcript`` the gateway's signed
+    transcript. Nothing here is trusted: admission re-derives every binding from the
+    transcript and the precommit, and the proof re-checks every model token. Integers are
+    strict (no bool, float or numeric string), so the signed bytes have one encoding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["reliquary/signed-episode/v1"]
+    precommit_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    seed_index: int = Field(..., ge=0, le=127, strict=True)
+    assistant_spans: list[list[StrictInt]] = Field(..., min_length=1, max_length=MAX_SIGNED_EPISODE_TURNS)
+    stop: str = Field(..., min_length=1, max_length=32)
+    transcript: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _spans_and_transcript_are_bounded(self):
+        import json
+
+        from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
+
+        previous = 1
+        for span in self.assistant_spans:
+            if len(span) != 2:
+                raise ValueError("assistant spans are [start, end] integer pairs")
+            start, end = span
+            if start < previous or end <= start:
+                raise ValueError("assistant spans must be sorted, non-empty and after the prompt")
+            previous = end
+        # The transcript_digest encoding (non-finite floats refused, as the signature binding refuses them).
+        size = len(json.dumps(self.transcript, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                              allow_nan=False).encode("utf-8"))
+        if size > MAX_TRANSCRIPT_BYTES:
+            raise ValueError(f"the transcript is over {MAX_TRANSCRIPT_BYTES} bytes")
+        return self
+
+    @property
+    def assistant_token_count(self) -> int:
+        return sum(end - start for start, end in self.assistant_spans)
+
+
+def _check_signed_episode_commit(meta: "RolloutMetadata", tokens: list[int], proof_version: Any) -> None:
+    """Plan 2C: a signed episode is a service rollout of a public seed pool, drawn from its own seed."""
+    from reliquary.protocol.seed_pool import parse_rollout_binding
+    from reliquary.protocol.service_submission import parse_service_rollout_binding
+
+    episode = meta.episode
+    if meta.seed_pool is None or meta.service_binding is None:
+        raise ValueError("a signed episode is a service rollout of a public seed pool")
+    if proof_version != "public-group-proof/v1":
+        raise ValueError("a signed episode requires the public group proof version")
+    pool = parse_rollout_binding(meta.seed_pool)
+    if pool.rollout_index != parse_service_rollout_binding(meta.service_binding)[1]:
+        raise ValueError("service and pool rollout indices differ")
+    if pool.seed_index != episode.seed_index:
+        raise ValueError("a signed episode is drawn from its own pool seed")
+    if meta.forced or meta.force_span is not None:
+        raise ValueError("a signed episode has no forced span")
+    if episode.assistant_spans[0][0] != meta.prompt_length:
+        raise ValueError("the first assistant span starts right after the prompt")
+    if episode.assistant_spans[-1][1] != len(tokens):
+        raise ValueError("the last assistant span ends the tokens")
+    if len(meta.token_logprobs) not in (len(tokens), episode.assistant_token_count):
+        raise ValueError("episode token_logprobs must be full-sequence or assistant-only")
+
+
 # Resolve the intentional forward declaration while keeping the historical
 # RolloutMetadata field order and serialized shape unchanged.
 RolloutMetadata.model_rebuild()
@@ -900,6 +974,9 @@ class CommitModel(BaseModel):
                 f"completion_length({v.completion_length}) must equal "
                 f"len(tokens)={len(tokens)}"
             )
+        if isinstance(v.episode, SignedEpisodeMetadata):
+            _check_signed_episode_commit(v, tokens, info.data.get("proof_version"))
+            return v
         if v.episode is not None:
             if v.seed_pool is not None or v.service_binding is not None:
                 raise ValueError("service group proofs do not support episodes")

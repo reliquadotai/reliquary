@@ -49,15 +49,24 @@ def parse_service_rollout_binding(value: Any) -> tuple[ServiceBinding, int]:
 
 
 def validate_service_rollout_bindings(binding: ServiceBinding | dict,
-                                     commits: list[dict]) -> None:
-    """Require the exact envelope intent and original index on every rollout."""
+                                     commits: list[dict], *, signed_episodes: bool = False) -> None:
+    """Require the exact envelope intent and original index on every rollout. ``signed_episodes``
+    (plan 2C): every rollout carries a signed episode; otherwise none may carry any episode."""
     if isinstance(binding, dict):
         binding = ServiceBinding.from_dict(binding)
     if not isinstance(binding, ServiceBinding) or not 2 <= len(commits) <= 64:
         raise ValueError("bounded complete service group required")
     for index, commit in enumerate(commits):
         metadata = commit.get("rollout")
-        if not isinstance(metadata, dict) or metadata.get("episode") is not None:
+        if not isinstance(metadata, dict):
+            raise ValueError("service group bindings require single-turn rollouts")
+        episode = metadata.get("episode")
+        if signed_episodes:
+            from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
+            if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
+                raise ValueError("this environment takes signed episodes")
+        elif episode is not None:
             raise ValueError("service group bindings require single-turn rollouts")
         actual, original_index = parse_service_rollout_binding(metadata.get("service_binding"))
         if actual != binding or original_index != index:

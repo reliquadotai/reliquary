@@ -26,6 +26,8 @@ PUBLIC_GROUP_COMMIT_DOMAIN = b"public-group-commit/v1"
 PUBLIC_GROUP_ENVELOPE_DOMAIN = b"public-group-envelope/v1"
 SERVICE_COMMIT_DOMAIN = b"service-group-commit/v1"
 SERVICE_ENVELOPE_DOMAIN = b"service-envelope/v1"
+# Plan 2C: a public-pool service rollout that carries a signed episode binds the episode too.
+SERVICE_EPISODE_COMMIT_DOMAIN = b"service-episode-commit/v1"
 
 # Domain separation tag for the per-request envelope signature. Distinct
 # from ``COMMIT_DOMAIN`` so a per-rollout commit signature can never be
@@ -170,6 +172,38 @@ def sign_service_commit_binding(
     ))
 
 
+def build_service_episode_commit_binding(
+    tokens: list[int], randomness_hex: str, model_name: str, layer_index: int,
+    commitments: list[dict], service_binding: dict, seed_pool: dict, episode: dict,
+) -> bytes:
+    """Plan 2C: the service commit binding of a public-pool rollout plus its signed episode (every
+    field in canonical JSON and the digest of its transcript), under its own domain."""
+    from reliquary.protocol.service_episode import episode_commit_material
+
+    if seed_pool is None:
+        raise ValueError("a signed episode is a rollout of a public seed pool")
+    base = build_service_commit_binding(tokens, randomness_hex, model_name, layer_index, commitments,
+                                        service_binding, seed_pool)
+    h = hashlib.sha256(SERVICE_EPISODE_COMMIT_DOMAIN)
+    for part in (base, episode_commit_material(episode)):
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+def sign_service_episode_commit_binding(
+    tokens: list[int], randomness_hex: str, model_name: str, layer_index: int,
+    commitments: list[dict], service_binding: dict, seed_pool: dict, episode: dict, wallet,
+) -> bytes:
+    if bt is None:
+        raise ImportError("bittensor is required for commit signing")
+    if not hasattr(wallet, "hotkey") or not hasattr(wallet.hotkey, "sign"):
+        raise TypeError("Wallet must provide hotkey.sign()")
+    return wallet.hotkey.sign(build_service_episode_commit_binding(
+        tokens, randomness_hex, model_name, layer_index, commitments, service_binding, seed_pool, episode,
+    ))
+
+
 def build_episode_commit_binding(
     tokens: list[int],
     randomness_hex: str,
@@ -257,9 +291,18 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
 
         metadata = commit.get("rollout") or {}
         if proof_version == PROOF_VERSION:
-            if metadata.get("episode") is not None:
-                return False
-            if metadata.get("service_binding") is not None:
+            episode = metadata.get("episode")
+            if episode is not None:
+                from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
+                if (not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA
+                        or metadata.get("service_binding") is None or metadata.get("seed_pool") is None):
+                    return False
+                msg = build_service_episode_commit_binding(
+                    tokens, randomness, model_name, layer_index, commitments,
+                    metadata["service_binding"], metadata["seed_pool"], episode,
+                )
+            elif metadata.get("service_binding") is not None:
                 if metadata.get("seed_pool") is None:
                     return False
                 msg = build_service_commit_binding(
@@ -285,6 +328,10 @@ def verify_commit_signature(commit: dict, wallet_address: str) -> bool:
             if not isinstance(episode, dict):
                 logger.debug("Episode v8 commit missing episode metadata")
                 return False
+            from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
+            if episode.get("schema_version") == SIGNED_EPISODE_SCHEMA:
+                return False   # plan 2C: a signed episode is only ever a public-pool service rollout
             msg = build_episode_commit_binding(
                 tokens,
                 randomness,
@@ -850,3 +897,40 @@ def verify_sandbox_close_signature(request, *, validator_hotkey: str, path: str)
     binding = build_sandbox_close_binding(request, validator_hotkey=validator_hotkey, path=path)
     return verify_hotkey_signature(str(body["miner_hotkey"]), binding,
                                    str(body.get("signature") or ""))
+
+
+# Plan 2C: an episode precommit, signed by the miner for one validator and route (same audience rule
+# as the sandbox session requests). The precommit is re-parsed strictly and bound in its canonical
+# form, so it has exactly one signed encoding.
+EPISODE_PRECOMMIT_DOMAIN = b"reliquary/episode-precommit/v1"
+
+
+def build_episode_precommit_binding(precommit, *, at: int, validator_hotkey: str, path: str) -> bytes:
+    """``precommit``: an ``EpisodePrecommit`` or its ``to_dict()``; EpisodeWireError if malformed."""
+    from reliquary.protocol.release_contract import canonical_json_bytes
+    from reliquary.protocol.service_episode import EpisodePrecommit
+
+    if not isinstance(precommit, EpisodePrecommit):
+        precommit = EpisodePrecommit.from_dict(precommit)
+    if type(at) is not int:
+        raise TypeError("at: integer seconds required")
+    return _bound(EPISODE_PRECOMMIT_DOMAIN, [
+        canonical_json_bytes(precommit.to_dict()), at.to_bytes(8, "big", signed=False),
+        *_audience(validator_hotkey, path)])
+
+
+def verify_episode_precommit_signature(hotkey: str, precommit, *, at: int, signature: str,
+                                       validator_hotkey: str, path: str) -> bool:
+    """False on any failure (malformed precommit, or one naming another hotkey, included);
+    fail-closed without bittensor."""
+    from reliquary.protocol.service_episode import EpisodePrecommit
+
+    try:
+        parsed = precommit if isinstance(precommit, EpisodePrecommit) else EpisodePrecommit.from_dict(precommit)
+        if parsed.hotkey != hotkey:
+            return False
+        binding = build_episode_precommit_binding(parsed, at=at, validator_hotkey=validator_hotkey,
+                                                  path=path)
+    except (TypeError, ValueError, OverflowError, KeyError):
+        return False
+    return verify_hotkey_signature(hotkey, binding, signature)

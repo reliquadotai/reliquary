@@ -268,15 +268,28 @@ class SeedPool:
 
 
 def validate_rollout_selection(pool: SeedPool, selection: PoolSelection,
-                               commits: list[dict]) -> None:
+                               commits: list[dict], *, signed_episodes: bool = False) -> None:
     """Refuse, before any proof work, a group that is not one rollout per chosen seed, in order.
 
     Rollout ``i`` must carry exactly ``selection.rollout_binding(i)``; since the selection is
-    strictly increasing, two rollouts can never claim the same seed.
+    strictly increasing, two rollouts can never claim the same seed. ``signed_episodes`` (plan 2C):
+    the env's groups are signed episodes, so every rollout carries one, drawn from its own chosen
+    seed; otherwise no rollout may carry any episode.
     """
     pool.validate_selection(selection, rollout_count=len(commits))
     for index, commit in enumerate(commits):
         metadata = commit.get("rollout")
-        if not isinstance(metadata, dict) or metadata.get("episode") is not None:
+        if not isinstance(metadata, dict):
+            raise SeedPoolError("public seed pool requires single-turn rollouts")
+        episode = metadata.get("episode")
+        if signed_episodes:
+            from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
+            if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
+                raise SeedPoolError("this environment takes signed episodes")
+            seed = episode.get("seed_index")
+            if type(seed) is not int or seed != selection.seeds[index]:
+                raise SeedPoolError("an episode is not the one of its chosen seed")
+        elif episode is not None:
             raise SeedPoolError("public seed pool requires single-turn rollouts")
         pool.validate_rollout_binding(metadata.get("seed_pool"), selection, index)
