@@ -1846,6 +1846,11 @@ class ValidationService:
                 # I2: kept in memory before the install, so a failed adoption is healed at the next
                 # boundary (``ensure_checkpoint`` with this receipt) instead of stalling the order.
                 self._service_installed_receipt = (revision, receipt)
+                # N1: and on disk, in the runtime SQLite, BEFORE the install: a failed adoption ends this
+                # process (FatalProofPlaneError), and the restarted one heals from this row.
+                await asyncio.to_thread(
+                    functools.partial(service_runtime.record_pending_install, revision=revision, receipt=receipt)
+                )
             entry = await asyncio.to_thread(
                 self._checkpoint_store.install_external,
                 checkpoint_n,

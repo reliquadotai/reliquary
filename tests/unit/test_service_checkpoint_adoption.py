@@ -450,12 +450,10 @@ async def test_a_crash_after_install_before_adopt_heals_at_the_next_boundary(tmp
     assert service._checkpoint_store.current.revision == NEXT                    # installed ...
     assert runtime.db.execute("SELECT COUNT(*) FROM service_checkpoints").fetchone()[0] == 1   # ... never adopted
     assert service._service_installed_receipt == (NEXT, receipt)
+    assert runtime.pending_install() == (NEXT, receipt)                         # N1: persisted before the install
     monkeypatch.setattr(runtime, "adopt", real_adopt)
     installed = SimpleNamespace(repo_id="models/test", revision=NEXT, checkpoint_n=1)
-    # Without the receipt the old refusal stands (the order would stall) ...
-    with pytest.raises(ValueError, match="no adopted service lineage entry"):
-        ValidationService._service_window_plan(_boundary_service(runtime, installed), 2)
-    # ... with it, the next boundary adopts the installed child of the head, loudly.
+    # With the receipt, the next boundary adopts the installed child of the head, loudly.
     from reliquary.services import runtime as runtime_module
     warnings = []
     monkeypatch.setattr(runtime_module.logger, "warning", lambda *args: warnings.append(args[0] % args[1:]))
@@ -465,6 +463,7 @@ async def test_a_crash_after_install_before_adopt_heals_at_the_next_boundary(tmp
     assert runtime.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT,
                                   "sha256": canonical_sha256(FILES)}
     assert any("healed" in message for message in warnings)
+    assert runtime.pending_install() is None                                    # cleared by the adoption
     runtime.close()
     # A restart reads the same lineage: the healed head is re-selected, idempotent.
     restarted = build(path, now=1)
@@ -526,3 +525,86 @@ async def test_boot_accepts_an_unadopted_child_of_the_head_with_its_receipt_and_
     assert service._service_installed_receipt == (NEXT, receipt)
     assert runtime.checkpoint["revision"] == ROOT                                # adopted at the boundary, not here
     runtime.close()
+
+
+# ---- N1: the heal survives the restart that a failed adoption forces -------------------------------------
+
+def test_n1_the_persisted_install_heals_in_a_new_runtime_without_any_receipt_and_is_cleared(tmp_path):
+    path = tmp_path / "runtime.sqlite3"
+    runtime = build(path)
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    receipt = {"parent_revision": ROOT, "manifest": {"checkpoint_n": 1, "repo_id": "models/test"}, "files": FILES}
+    runtime.record_pending_install(revision=NEXT, receipt=receipt)
+    runtime.close()                                                              # the process dies here
+    restarted = build(path, now=1)
+    assert restarted.pending_install() == (NEXT, receipt)
+    restarted.require_resumable(checkpoint_n=1, repo="models/test", revision=NEXT)   # the boot twin agrees
+    assert restarted.ensure_checkpoint(checkpoint_n=1, repo="models/test", revision=NEXT)["revision"] == NEXT
+    assert restarted.checkpoint["sha256"] == canonical_sha256(FILES)
+    assert restarted.pending_install() is None
+    restarted.close()
+
+
+def test_n1_without_a_persisted_install_for_that_revision_the_refusal_stands(tmp_path):
+    runtime = build(tmp_path / "runtime.sqlite3")
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    with pytest.raises(ValueError, match="no adopted service lineage entry"):
+        runtime.ensure_checkpoint(checkpoint_n=1, repo="models/test", revision=NEXT)
+    receipt = {"parent_revision": ROOT, "manifest": {"checkpoint_n": 1, "repo_id": "models/test"}, "files": FILES}
+    runtime.record_pending_install(revision=THIRD, receipt=receipt)            # another revision's row
+    with pytest.raises(ValueError, match="no adopted service lineage entry"):
+        runtime.ensure_checkpoint(checkpoint_n=1, repo="models/test", revision=NEXT)
+    assert runtime.checkpoint["revision"] == ROOT
+    runtime.close()
+
+
+@pytest.mark.parametrize("case", ["not_a_child", "other_number", "no_files"])
+def test_n1_a_persisted_receipt_goes_through_the_same_heal_checks(tmp_path, case):
+    path = tmp_path / "runtime.sqlite3"
+    runtime = build(path)
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    receipt = {"parent_revision": ROOT, "manifest": {"checkpoint_n": 1, "repo_id": "models/test"}, "files": FILES}
+    if case == "not_a_child":
+        receipt["parent_revision"] = "9" * 40
+    elif case == "other_number":
+        receipt["manifest"]["checkpoint_n"] = 7
+    else:
+        receipt["files"] = {}
+    runtime.record_pending_install(revision=NEXT, receipt=receipt)
+    runtime.close()
+    restarted = build(path, now=1)
+    with pytest.raises(ValueError):
+        restarted.ensure_checkpoint(checkpoint_n=1, repo="models/test", revision=NEXT)
+    with pytest.raises(ValueError):
+        restarted.require_resumable(checkpoint_n=1, repo="models/test", revision=NEXT)
+    assert restarted.checkpoint["revision"] == ROOT
+    restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_n1_a_failed_adoption_heals_at_the_first_boundary_of_a_new_validation_service(tmp_path, monkeypatch):
+    from tests.unit.test_service_window_build import _boot, _bootable_contract, _persisted_folder
+
+    contract = _bootable_contract()
+    folder = _persisted_folder(tmp_path)
+    folder.chmod(0o700)                                                          # the operator's folder mode
+    path = folder / "runtime.sqlite3"
+    runtime = ServiceRuntime(path, contract, qualification_v2(contract), now=0)
+    runtime.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=ROOT)
+    service, manifest, stage, receipt = staged_service(tmp_path, runtime)
+    monkeypatch.setattr(runtime, "adopt", MagicMock(side_effect=OSError("crash between install and adopt")))
+    with pytest.raises(FatalProofPlaneError):
+        await ValidationService._swap_staged_checkpoint(service, 1)
+    assert service._checkpoint_store.current.revision == NEXT                    # installed, never adopted
+    runtime.close()                                                              # the process restarts
+
+    svc = _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])          # the real constructor, scoped
+    assert svc._service_installed_receipt is None                                # the memory is gone
+    installed = SimpleNamespace(repo_id="models/test", revision=NEXT, checkpoint_n=1)
+    svc._checkpoint_store = SimpleNamespace(current_manifest=lambda: installed)
+    plan = svc._service_window_plan(2)                                           # the first boundary
+    assert plan["checkpoint_revision"] == NEXT
+    assert svc._service_runtime.checkpoint == {"checkpoint_n": 1, "repo": "models/test", "revision": NEXT,
+                                               "sha256": canonical_sha256(FILES)}
+    assert svc._service_runtime.pending_install() is None
+    svc._service_runtime.close()

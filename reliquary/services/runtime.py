@@ -224,6 +224,7 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_segments(number INTEGER PRIMARY KEY, first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL, flush_at REAL NOT NULL, sha256 TEXT, size INTEGER, windows TEXT, checkpoints TEXT, committed INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS service_index_pages(first_number INTEGER PRIMARY KEY, body BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_schedule_requests(order_id TEXT NOT NULL, request_id TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, revision INTEGER NOT NULL, window INTEGER NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, request_id));
+                CREATE TABLE IF NOT EXISTS service_pending_install(order_id TEXT PRIMARY KEY, revision TEXT NOT NULL, receipt TEXT NOT NULL);
             """)
             if "opened_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(service_windows)")}:
                 self.db.execute("ALTER TABLE service_windows ADD COLUMN opened_at REAL")
@@ -602,11 +603,53 @@ class ServiceRuntime:
                                        "ORDER BY seq DESC LIMIT 1", (order,)).fetchone()
                 if head[0] != revision:
                     raise ValueError(_ANCESTOR_REFUSED.format(revision[:12], head[0][:12]))
+                self._clear_pending_install(revision)
                 return self._checkpoint()
             seq = self.db.execute("SELECT COALESCE(MAX(seq),0)+1 FROM service_checkpoints WHERE order_id=?", (order,)).fetchone()[0]
             self.db.execute("INSERT INTO service_checkpoints VALUES(?,?,?,?,?,?)",
                             (order, revision, checkpoint_n, repo, sha256, seq))
+            # N1: the install this adoption completes is no longer pending (same transaction).
+            self._clear_pending_install(revision)
             return self._checkpoint()
+
+    def record_pending_install(self, *, revision: str, receipt: dict) -> None:
+        """N1: persist ``(revision, publication receipt)`` BEFORE the checkpoint store installs ``revision``.
+
+        A crash between the install and ``adopt`` leaves the store on a revision the lineage does not
+        know, and the in-memory receipt dies with the process. ``ensure_checkpoint`` (called without a
+        receipt at the next boundary, after a restart) reads this row and heals the adoption under the
+        same checks (``_healable_digest``). One row per order: the latest install; ``adopt`` of that
+        revision clears it."""
+        if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("checkpoint revision must be an immutable 40-hex commit")
+        if not isinstance(receipt, dict):
+            raise ValueError("a pending install needs its publication receipt")
+        body = canonical_json_bytes(receipt).decode()
+        with self._txn():
+            self.db.execute("INSERT INTO service_pending_install VALUES(?,?,?) ON CONFLICT(order_id) "
+                            "DO UPDATE SET revision=excluded.revision, receipt=excluded.receipt",
+                            (self.contract.sha256, revision, body))
+
+    def pending_install(self) -> tuple[str, dict] | None:
+        """N1: the persisted ``(revision, receipt)`` of an install not yet adopted, or None."""
+        with self.lock:
+            row = self.db.execute("SELECT revision, receipt FROM service_pending_install WHERE order_id=?",
+                                  (self.contract.sha256,)).fetchone()
+        if row is None:
+            return None
+        try:
+            receipt = json.loads(row[1])
+        except ValueError:
+            return None
+        return (row[0], receipt) if isinstance(receipt, dict) else None
+
+    def _persisted_receipt(self, revision: str) -> dict | None:
+        pending = self.pending_install()
+        return pending[1] if pending is not None and pending[0] == revision else None
+
+    def _clear_pending_install(self, revision: str) -> None:
+        self.db.execute("DELETE FROM service_pending_install WHERE order_id=? AND revision=?",
+                        (self.contract.sha256, revision))
 
     def require_adoptable(self, *, checkpoint_n: int, repo: str, revision: str, sha256: str,
                           parent_revision) -> None:
@@ -667,6 +710,8 @@ class ServiceRuntime:
                                    (self.contract.sha256,)).fetchone()
         hint = f"; resume from the lineage head {head[0]}" if head is not None else ""
         if row is None and (revision != root["revision"] or repo != root["repo"]):
+            if receipt is None:
+                receipt = self._persisted_receipt(revision)   # N1: an install a crash left unadopted
             if receipt is not None:
                 try:
                     self._healable_digest(checkpoint_n=checkpoint_n, repo=repo, revision=revision, receipt=receipt)
@@ -688,6 +733,8 @@ class ServiceRuntime:
         I2 heal: an ACTIVE revision the lineage does not know (a crash between the install and
         ``adopt``) is adopted when ``receipt`` -- its trainer publication receipt -- proves it is the
         next link: see ``_healable_digest``. Logged at warning. Anything else is refused as before.
+        N1: without a ``receipt`` (a restarted process), the receipt persisted by
+        ``record_pending_install`` for this revision is used, under the same checks.
         """
         with self.lock:
             row = self.db.execute("SELECT sha256 FROM service_checkpoints WHERE revision=? AND order_id=?",
@@ -696,6 +743,8 @@ class ServiceRuntime:
             return self.adopt(checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=row[0])
         root = self.contract.to_dict()["checkpoint"]
         if revision != root["revision"] or repo != root["repo"]:
+            if receipt is None:
+                receipt = self._persisted_receipt(revision)
             if receipt is None:
                 raise ValueError("active checkpoint has no adopted service lineage entry")
             digest = self._healable_digest(checkpoint_n=checkpoint_n, repo=repo, revision=revision, receipt=receipt)

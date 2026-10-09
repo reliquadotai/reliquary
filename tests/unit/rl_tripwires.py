@@ -62,6 +62,7 @@ ARMED = (
     ("reliquary.validator.service", "ValidationService._service_window_plan"),
     ("reliquary.validator.service", "ValidationService._enqueue_aborted_service_window"),
     ("reliquary.services.runtime", "ServiceRuntime.ensure_checkpoint"),
+    ("reliquary.services.runtime", "ServiceRuntime.record_pending_install"),
     ("reliquary.services.runtime", "ServiceRuntime.apply_pending_schedule_request"),
     ("reliquary.validator.batcher", "GrpoWindowBatcher._service_pre_forward_guard"),
 )
