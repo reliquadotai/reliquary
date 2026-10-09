@@ -309,6 +309,13 @@ class SignedSweEpisodeRunner:
         self._unavailable = 0           # consecutive "not serving" refusals
         self._unconfirmed: list[_Unconfirmed] = []
 
+    # Plan 2C: a corpus episode submits its graded state as a text diff; an RL episode submits none.
+    requires_text_state = True
+
+    def _transcript_refusal(self, transcript, index: int, now: float):
+        """The validator's transcript checks this miner can run (a subclass binds its own engagement)."""
+        return transcript_refusal(transcript, job=self._job, hotkey=self._hotkey, index=index, now=now)
+
     async def __aenter__(self) -> SignedSweEpisodeRunner:
         return self
 
@@ -569,13 +576,15 @@ class SignedSweEpisodeRunner:
             # as EpisodeClosed is a TaskError trace).
             return await unusable(result.error or (
                 f"the sandbox episode ended {status} ({final.get('reason')})"))
-        try:
-            final_diff = (result.state or b"").decode("utf-8")
-        except UnicodeDecodeError:
-            return await unusable("the graded state is not UTF-8: no diff can match it")
+        if self.requires_text_state:
+            try:
+                final_diff = (result.state or b"").decode("utf-8")
+            except UnicodeDecodeError:
+                return await unusable("the graded state is not UTF-8: no diff can match it")
+        else:
+            final_diff = ""
         now = self._clock()
-        refusal = await asyncio.to_thread(transcript_refusal, transcript, job=self._job,
-                                          hotkey=self._hotkey, index=index, now=now)
+        refusal = await asyncio.to_thread(self._transcript_refusal, transcript, index, now)
         if refusal is not None:
             reason, detail = refusal
             return await unusable(f"the validator would refuse the transcript: {reason} {detail}")
