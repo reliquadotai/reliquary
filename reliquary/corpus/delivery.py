@@ -489,14 +489,22 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           clock: Callable[[], float] = time.time, renderer=None, source=None,
                           sft_only: bool = False,
                           quarantined: Collection[str] | None = None,
-                          instruction_source=None, instruction_note: str | None = None) -> dict:
+                          instruction_source=None, instruction_note: str | None = None,
+                          keep_rejected: bool = False) -> dict:
     """Write ``deliveries/{delivery_id}/``: the shards, ``report.json``, then
     ``manifest.json``. A delivery whose manifest exists is returned as stored.
+
+    ``keep_rejected`` keeps the finished completions ``grade`` rejects in the
+    instruction shards instead of omitting them (an SFT without the
+    correctness filter); the Parquet rows carry ``accepted``/``score`` either
+    way. Unfinished completions are never delivered.
 
     An episode job is delivered as episode rows (``episode_rows``): it needs
     its pinned ``renderer``, its task ``source`` and the registry's
     ``quarantined`` grade executors."""
     episode = getattr(job, "episode", None) is not None
+    if keep_rejected and (episode or grade is None):
+        raise ValueError("keep_rejected needs a grader: it keeps what the filter rejects")
     if episode and (renderer is None or source is None or quarantined is None):
         raise ValueError("an episode job is exported with its pinned renderer, its task source "
                          "and the quarantined grade executors")
@@ -536,11 +544,14 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                    "source": {"supported": instruction_reason is None,
                               "reason": instruction_reason},
                    "filter_applied": grade is not None,
-                   "policy": ("accepted_completions" if grade is not None
-                              else "audited_passing_completions"),
+                   "policy": ("audited_passing_completions" if grade is None
+                              else "finished_completions_annotated" if keep_rejected
+                              else "accepted_completions"),
                    "limits": {"bytes_per_shard": INSTRUCTION_MAX_BYTES,
                               "rows_per_shard": INSTRUCTION_MAX_ROWS,
                               "utf16_units_per_field": INSTRUCTION_MAX_UTF16}}
+    if keep_rejected:
+        instruction["rejected_kept"] = 0
 
     async def uploaded(path: Path, rows: int) -> None:
         digest = await asyncio.to_thread(_sha256, path)
@@ -572,7 +583,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
             await writer.add(row)
             if instruction_reason is not None:
                 omitted(instruction_reason)
-            elif grade is not None and row["accepted"] is not True:
+            elif grade is not None and row["accepted"] is not True and not keep_rejected:
                 omitted("filter_rejected")
             else:
                 from reliquary.validator.corpus_service import CorpusPromptSourceError
@@ -591,6 +602,8 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                 else:
                     await instructions.add(task.prompt, row["completion"])
                     instruction["rows"] += 1
+                    if keep_rejected and row["accepted"] is not True:
+                        instruction["rejected_kept"] += 1
         await writer.close()
         await instructions.close()
     finally:
@@ -603,7 +616,8 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
              "note": ("graded_success and replay_certified" if sft_only
                       else "every replay-certified trajectory")} if episode
             else {"applied": True, "grader_id": job.filter.grader_id,
-                  "threshold": job.filter.threshold} if grade is not None
+                  "threshold": job.filter.threshold, "keep_rejected": keep_rejected}
+            if grade is not None
             else {"applied": False, "note": filter_note or (
                 "the declared filter was not applied" if job.filter is not None
                 else "the job declares no filter")}),

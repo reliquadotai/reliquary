@@ -161,6 +161,9 @@ class CreateDelivery(BaseModel):
     model_config = ConfigDict(extra="forbid")
     delivery_id: str | None = None
     apply_filter: bool = True
+    # Keep the finished completions the filter rejects (annotated) in the
+    # instruction shards: an SFT without the correctness filter.
+    keep_rejected: bool = False
 
 
 class Provenance(BaseModel):
@@ -960,13 +963,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     grade = await asyncio.to_thread(job_grader, job)
                 except ValueError as exc:
                     note = str(exc)
+            if body.keep_rejected and grade is None:
+                raise HTTPException(status_code=422, detail="keep_rejected needs the job's "
+                                    "filter applied: " + (note or "apply_filter is off or the "
+                                                          "job declares no filter"))
             instruction_source, instruction_note = await asyncio.to_thread(
                 instruction_source_for_job, job)
             # Long: run beside the request; the caller polls with the same id.
             exports[delivery_id] = (job_id, asyncio.ensure_future(export_delivery(
                 job=job, records=records, sink=deliveries, delivery_id=delivery_id,
                 grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
-                instruction_source=instruction_source, instruction_note=instruction_note)))
+                instruction_source=instruction_source, instruction_note=instruction_note,
+                keep_rejected=body.keep_rejected)))
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 

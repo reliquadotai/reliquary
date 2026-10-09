@@ -1,14 +1,17 @@
 """Only finished completions are delivered: EOS last, and in a thinking render
-exactly one ``</think>``. The filter grades the answer after it."""
+exactly one ``</think>``. The filter grades the answer after it, and a
+delivery may keep the finished-but-wrong traces, annotated, instead of
+omitting them."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from reliquary.corpus.delivery import delivery_rows
+from reliquary.corpus.delivery import LocalDirectorySink, delivery_rows, export_delivery
 from reliquary.corpus.export import (
     UNFINISHED_REASONS,
     answer_text,
@@ -134,6 +137,60 @@ def test_a_direct_render_needs_eos_but_no_think_close():
     assert [r["completion"] for r in rows] == ["Answer in three words."]
     assert counts["unfinished"] == {"unfinished_no_eos": 1, "unclosed_think": 0,
                                     "multiple_think_close": 0}
+
+
+# --------------------------------------------------------------------------
+# export_delivery: report counts and the keep-rejected option
+# --------------------------------------------------------------------------
+
+
+class _RawSource:
+    def task_for(self, index):
+        return SimpleNamespace(prompt=f"Raw question {index}?", metadata={})
+
+
+def _deliver(tmp_path, *, job, **kw):
+    sink = LocalDirectorySink(tmp_path / "bucket")
+    manifest = asyncio.run(export_delivery(
+        job=job, records=_Records(THINKING_COMPLETIONS), sink=sink, delivery_id="d1",
+        work_dir=tmp_path / "work", clock=lambda: 1.0, instruction_source=_RawSource(), **kw))
+    root = tmp_path / "bucket" / "deliveries" / "d1"
+    report = json.loads((root / "report.json").read_text())
+    instructions = [json.loads(line) for shard in manifest["instruction_shards"]
+                    for line in (tmp_path / "bucket" / shard["key"]).read_text().splitlines()]
+    return manifest, report, instructions
+
+
+FILTERED = {"filter": SimpleNamespace(grader_id="hard-math", threshold=1.0)}
+
+
+def test_a_filtered_delivery_omits_the_wrong_and_reports_the_unfinished(tmp_path):
+    manifest, report, instructions = _deliver(tmp_path, job=_job(**FILTERED), grade=_right)
+    assert manifest["rows"] == 2
+    assert report["counts"]["unfinished"] == {"unfinished_no_eos": 1, "unclosed_think": 1,
+                                              "multiple_think_close": 1}
+    assert report["filter"]["keep_rejected"] is False
+    assert report["instruction"]["policy"] == "accepted_completions"
+    assert report["instruction"]["omitted"] == {"filter_rejected": 1}
+    assert [r["prompt"] for r in instructions] == ["Raw question 0?"]
+
+
+def test_keep_rejected_delivers_finished_wrong_traces_annotated(tmp_path):
+    manifest, report, instructions = _deliver(tmp_path, job=_job(**FILTERED), grade=_right,
+                                              keep_rejected=True)
+    assert manifest["rows"] == 2
+    assert report["filter"]["applied"] is True and report["filter"]["keep_rejected"] is True
+    assert report["instruction"]["policy"] == "finished_completions_annotated"
+    assert report["instruction"]["omitted"] == {}
+    assert report["instruction"]["rejected_kept"] == 1
+    assert [r["prompt"] for r in instructions] == ["Raw question 0?", "Raw question 1?"]
+    # Unfinished traces are never kept, whatever the option.
+    assert report["counts"]["unfinished"]["unfinished_no_eos"] == 1
+
+
+def test_keep_rejected_without_a_grader_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="keep_rejected"):
+        _deliver(tmp_path, job=_job(), keep_rejected=True)
 
 
 # --------------------------------------------------------------------------

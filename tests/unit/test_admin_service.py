@@ -860,3 +860,16 @@ def test_an_operator_catalog_job_is_declared_byte_identically(admin):
                                        separators=(",", ":")).encode()).hexdigest()
     assert digest == CATALOG_JOB_GOLDEN
 
+
+def test_keep_rejected_without_a_filter_to_apply_is_refused(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    sid = "1" * 64
+    admin.records.verdicts = {sid: {"passed": True}}
+    admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
+    response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                     {"delivery_id": "order-keep", "keep_rejected": True})
+    assert response.status_code == 422
+    assert "keep_rejected" in response.json()["detail"]
+    assert not (admin.platform / "deliveries" / "order-keep").exists()
