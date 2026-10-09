@@ -1557,6 +1557,12 @@ def jobs_export(
     was exported and what was left out (ungraded, held, voided, uncertified,
     unparseable...), when, and the quarantined executors it held.
 
+    A single-turn job writes only finished completions (EOS last and, in a
+    thinking render, one `</think>`); `--apply-filter` grades the answer after
+    `</think>` and annotates every row, keeping the wrong ones unless
+    `--only-accepted`. Its counts (left-out completions by reason) go to stderr
+    and `{out}.counts.json` too.
+
     Written to a temporary file beside `--out` and swapped in with
     `os.replace` only once the export completes, so a mid-stream failure (the
     record store, the grader) never leaves a truncated, valid-looking dataset
@@ -1600,7 +1606,8 @@ def jobs_export(
                                 quarantined=quarantined)
         else:
             grade = _job_grader(job) if apply_filter else None
-            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade)
+            counts = {}
+            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade, counts=counts)
         temporary = f"{out}.{os.getpid()}.tmp"
         written = 0
         try:
@@ -1623,6 +1630,15 @@ def jobs_export(
                     "counts": counts, "exported_at": _time.time(),
                     "quarantined_executors": list(quarantined),
                 }
+                side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
+                with open(side_temporary, "w", encoding="utf-8") as handle:
+                    json.dump(sidecar, handle, sort_keys=True, indent=1)
+                os.replace(side_temporary, f"{out}.counts.json")
+                typer.echo(json.dumps(counts, sort_keys=True), err=True)
+            else:
+                sidecar = {"job_id": job_id, "filter_applied": apply_filter,
+                           "only_accepted": only_accepted, "exported": written,
+                           "counts": counts, "exported_at": _time.time()}
                 side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
                 with open(side_temporary, "w", encoding="utf-8") as handle:
                     json.dump(sidecar, handle, sort_keys=True, indent=1)

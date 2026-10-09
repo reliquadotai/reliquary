@@ -21,6 +21,9 @@ from reliquary.corpus.delivery import (
 )
 
 
+EOS = 99
+
+
 def _sid(i: int) -> str:
     return f"{i:064x}"
 
@@ -36,7 +39,9 @@ class _Records:
             if i not in missing:
                 self.subs[sid] = {
                     "hotkey": f"HK{i}", "prompt_index": i, "rendered_prompt": f"q{i}",
-                    "completions": [{"text": f"{i}-{c}-" + "z" * text_len, "tokens": [1, 2, c]}
+                    # Finished: EOS last, the thinking block closed once.
+                    "completions": [{"text": f"{i}-{c}-</think>" + "z" * text_len,
+                                     "tokens": [1, c, EOS]}
                                     for c in range(2)],
                 }
         self.in_flight = self.peak = 0
@@ -60,7 +65,7 @@ class _Records:
         return await self._track(self.subs.get(sid))
 
 
-JOB = SimpleNamespace(job_id="math-v1", filter=None,
+JOB = SimpleNamespace(job_id="math-v1", filter=None, eos_token_id=EOS,
                       to_contract=lambda: {"job_id": "math-v1", "prompt_count": 30})
 
 
@@ -80,8 +85,10 @@ def test_rows_are_the_completions_of_passing_submissions_with_no_hotkey():
     assert all("hotkey" not in r and "HK" not in json.dumps(r) for r in rows)
     assert rows[0]["prompt"] == "q0" and rows[0]["completion_tokens"] == 3
     assert rows[0]["accepted"] is None and rows[0]["score"] is None
-    assert counts == {"verdicts": 6, "passing_submissions": 4, "missing_records": 0, "rows": 8,
-                      "rows_accepted": None}
+    assert counts == {"verdicts": 6, "passing_submissions": 4, "missing_records": 0,
+                      "completions": 8, "rows": 8, "rows_accepted": None,
+                      "unfinished": {"unfinished_no_eos": 0, "unclosed_think": 0,
+                                     "multiple_think_close": 0}}
 
 
 def test_a_passing_verdict_without_its_record_is_skipped_and_counted():

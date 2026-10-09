@@ -510,7 +510,7 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin, monkeypa
     sid = "1" * 64
     admin.records.verdicts = {sid: {"passed": True}}
     admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
-                                "completions": [{"text": "a", "tokens": [1]}]}}
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
     admin.records.settlement = {"settled": [sid], "pending": None}
     first = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-1"})
     assert first.status_code == 202 and first.json()["state"] == "running"
@@ -614,7 +614,7 @@ def test_a_missing_raw_source_preserves_the_original_admin_delivery(admin, monke
     sid = "1" * 64
     admin.records.verdicts = {sid: {"passed": True}}
     admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
-                                "completions": [{"text": "a", "tokens": [1]}]}}
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
     admin.records.settlement = {"settled": [sid], "pending": None}
     path, body = "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-raw-missing"}
     assert admin("POST", path, body).status_code == 202
@@ -859,3 +859,4 @@ def test_an_operator_catalog_job_is_declared_byte_identically(admin):
     digest = hashlib.sha256(json.dumps(document, sort_keys=True,
                                        separators=(",", ":")).encode()).hexdigest()
     assert digest == CATALOG_JOB_GOLDEN
+

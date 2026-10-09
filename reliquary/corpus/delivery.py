@@ -178,14 +178,21 @@ async def _bounded(calls, gate: asyncio.Semaphore) -> list:
 async def delivery_rows(*, job, records, counts: dict, grade=None,
                         concurrency: int = READ_CONCURRENCY,
                         window: int = READ_WINDOW) -> AsyncIterator[dict]:
-    """One row per completion of every passing submission, in verdict-id order.
+    """One row per finished completion of every passing submission, in
+    verdict-id order.
 
-    No hotkey: the delivery is the work, not who did it. ``grade`` annotates
-    (``accepted``, ``score``) and never drops a row. ``counts`` is filled in as
-    the rows go.
+    No hotkey: the delivery is the work, not who did it. An unfinished
+    completion (``unfinished_reason``: no EOS, or a thinking block not closed
+    exactly once) is left out before grading and counted under ``unfinished``
+    by reason. ``grade`` annotates (``accepted``, ``score``) and never drops a
+    row. ``counts`` is filled in as the rows go.
     """
+    from reliquary.corpus.export import new_unfinished_counts, thinking_render, unfinished_reason
+
+    thinking = thinking_render(job)
     ids = list(await records.list_verdict_ids(job.job_id))
-    counts.update(verdicts=len(ids), passing_submissions=0, missing_records=0, rows=0,
+    counts.update(verdicts=len(ids), passing_submissions=0, missing_records=0, completions=0,
+                  unfinished=new_unfinished_counts(), rows=0,
                   rows_accepted=0 if grade is not None else None)
     gate = asyncio.Semaphore(concurrency)
     for start in range(0, len(ids), window):
@@ -202,6 +209,12 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
                 continue
             counts["passing_submissions"] += 1
             for index, completion in enumerate(record["completions"]):
+                counts["completions"] += 1
+                reason = unfinished_reason(completion, eos_token_id=job.eos_token_id,
+                                           thinking=thinking)
+                if reason is not None:
+                    counts["unfinished"][reason] += 1
+                    continue
                 rows.append({
                     "job_id": job.job_id, "submission_id": sid,
                     "prompt_index": int(record["prompt_index"]), "completion_index": index,

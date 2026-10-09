@@ -14,9 +14,10 @@ class _Records:
     def __init__(self):
         self.subs = {
             "1" * 64: {"hotkey": "A", "prompt_index": 3, "rendered_prompt": "q3",
-                       "completions": [{"text": "yes", "tokens": [1]}, {"text": "no", "tokens": [2]}]},
+                       "completions": [{"text": "yes", "tokens": [1, 151645]},
+                                       {"text": "no", "tokens": [2, 151645]}]},
             "2" * 64: {"hotkey": "B", "prompt_index": 4, "rendered_prompt": "q4",
-                       "completions": [{"text": "x", "tokens": [3]}]},
+                       "completions": [{"text": "x", "tokens": [3, 151645]}]},
         }
         self.verdicts = {"1" * 64: {"passed": True}, "2" * 64: {"passed": False}}
 
@@ -32,6 +33,7 @@ class _Records:
 
 class _Job:
     job_id = "math-v1"
+    eos_token_id = 151645
 
 
 def _collect(**kw):
@@ -197,9 +199,10 @@ def test_jobs_export_writes_one_row_per_completion_of_passed_submissions(
     jobs["math-v1"] = _job_spec()
     records.subs = {
         "1" * 64: {"hotkey": "A", "prompt_index": 3, "rendered_prompt": "q3",
-                   "completions": [{"text": "yes", "tokens": [1]}, {"text": "no", "tokens": [2]}]},
+                   "completions": [{"text": "yes", "tokens": [1, 151645]},
+                                   {"text": "no", "tokens": [2, 151645]}]},
         "2" * 64: {"hotkey": "B", "prompt_index": 4, "rendered_prompt": "q4",
-                   "completions": [{"text": "x", "tokens": [3]}]},
+                   "completions": [{"text": "x", "tokens": [3, 151645]}]},
     }
     records.verdicts = {"1" * 64: {"passed": True}, "2" * 64: {"passed": False}}
     out = tmp_path / "dataset.jsonl"
@@ -221,7 +224,8 @@ def test_jobs_export_with_apply_filter_annotates_every_row(jobs, records, env_sp
     jobs["math-v1"] = _job_spec(filter_=Filter(grader_id="fake-grader", threshold=0.5))
     records.subs = {
         "1" * 64: {"hotkey": "A", "prompt_index": 0, "rendered_prompt": "q0",
-                   "completions": [{"text": "yes", "tokens": [1]}, {"text": "no", "tokens": [2]}]},
+                   "completions": [{"text": "yes", "tokens": [1, 151645]},
+                                   {"text": "no", "tokens": [2, 151645]}]},
     }
     records.verdicts = {"1" * 64: {"passed": True}}
     out = tmp_path / "dataset.jsonl"
@@ -243,7 +247,8 @@ def test_jobs_export_only_accepted_drops_the_rejected_rows(jobs, records, env_sp
     jobs["math-v1"] = _job_spec(filter_=Filter(grader_id="fake-grader", threshold=0.5))
     records.subs = {
         "1" * 64: {"hotkey": "A", "prompt_index": 0, "rendered_prompt": "q0",
-                   "completions": [{"text": "yes", "tokens": [1]}, {"text": "no", "tokens": [2]}]},
+                   "completions": [{"text": "yes", "tokens": [1, 151645]},
+                                   {"text": "no", "tokens": [2, 151645]}]},
     }
     records.verdicts = {"1" * 64: {"passed": True}}
     out = tmp_path / "dataset.jsonl"
@@ -309,9 +314,9 @@ def test_jobs_export_mid_stream_failure_leaves_no_file_or_temp_file_behind(
     jobs["math-v1"] = _job_spec()
     records.subs = {
         "1" * 64: {"hotkey": "A", "prompt_index": 3, "rendered_prompt": "q3",
-                   "completions": [{"text": "yes", "tokens": [1]}]},
+                   "completions": [{"text": "yes", "tokens": [1, 151645]}]},
         "2" * 64: {"hotkey": "B", "prompt_index": 4, "rendered_prompt": "q4",
-                   "completions": [{"text": "x", "tokens": [3]}]},
+                   "completions": [{"text": "x", "tokens": [3, 151645]}]},
     }
     records.verdicts = {"1" * 64: {"passed": True}, "2" * 64: {"passed": True}}
     real_read_submission = records.read_submission
@@ -353,7 +358,7 @@ def test_jobs_export_of_a_started_job_carries_and_grades_source_indices(
         )
         records.subs = {
             "1" * 64: {"hotkey": "A", "prompt_index": 503, "rendered_prompt": "q503",
-                       "completions": [{"text": "yes", "tokens": [1]}]},
+                       "completions": [{"text": "yes", "tokens": [1, 151645]}]},
         }
         records.verdicts = {"1" * 64: {"passed": True}}
         out = tmp_path / "dataset.jsonl"
@@ -369,3 +374,24 @@ def test_jobs_export_of_a_started_job_carries_and_grades_source_indices(
         (503, "q503", True)
     ]
     assert asked == [503]
+
+
+def test_jobs_export_leaves_unfinished_completions_out_and_writes_its_counts(
+    jobs, records, tmp_path
+):
+    jobs["math-v1"] = _job_spec()
+    records.subs = {
+        "1" * 64: {"hotkey": "A", "prompt_index": 3, "rendered_prompt": "q3",
+                   "completions": [{"text": "done", "tokens": [1, 151645]},
+                                   {"text": "cut at the cap", "tokens": [1, 2]}]},
+    }
+    records.verdicts = {"1" * 64: {"passed": True}}
+    out = tmp_path / "dataset.jsonl"
+
+    result = CliRunner().invoke(app, ["jobs", "export", "math-v1", "--out", str(out)])
+
+    assert result.exit_code == 0, result.output
+    assert [r["completion"] for r in _read_lines(out)] == ["done"]
+    sidecar = json.loads((tmp_path / "dataset.jsonl.counts.json").read_text())
+    assert sidecar["exported"] == 1
+    assert sidecar["counts"]["unfinished"]["unfinished_no_eos"] == 1
