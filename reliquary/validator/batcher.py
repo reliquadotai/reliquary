@@ -754,6 +754,10 @@ class ValidSubmission:
     utility_rollouts: list[dict[str, Any]] = field(default_factory=list)
     # Completion-token telemetry carried from ``PendingSubmission``.
     eos_tokens: int = 0
+    # Problem text read at proof time, so the archive never re-reads a lazily
+    # fetched dataset on the event loop. None = not captured (fallback reads).
+    archive_prompt: str | None = None
+    archive_ground_truth: str | None = None
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -5979,6 +5983,8 @@ class GrpoWindowBatcher:
             prompt_content_sha256=pending.prompt_content_sha256,
             target_content_sha256=pending.target_content_sha256,
             task_family=pending.task_family,
+            archive_prompt=problem.get("prompt", ""),
+            archive_ground_truth=problem.get("ground_truth", ""),
             generator_version=pending.generator_version,
             operation_id=pending.operation_id,
             difficulty=pending.difficulty,

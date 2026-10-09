@@ -6022,7 +6022,13 @@ class ValidationService:
 
             for paid_batch_index, s in zip(paid_batch_indices, env_batch):
                 try:
-                    problem = env_obj.get_problem(s.prompt_idx)
+                    if getattr(s, "archive_prompt", None) is not None:
+                        problem = {
+                            "prompt": s.archive_prompt,
+                            "ground_truth": s.archive_ground_truth or "",
+                        }
+                    else:
+                        problem = env_obj.get_problem(s.prompt_idx)
                 except Exception:
                     # A lazy-dataset fetch failure must not abort the whole
                     # window's archive — keep the entry (prompt_idx/rewards are
