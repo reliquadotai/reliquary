@@ -162,6 +162,68 @@ SUPPORTED_V2_CAPABILITIES = frozenset({
     "in-zone-rotation/v1", PUBLIC_SEED_POOL, "legacy/v1",
 })
 
+# Phase 2 (plan 2C): an env whose groups are signed-sandbox episodes. The capability is announced only
+# for an order that has such an env (``supported_v2_capabilities``), so a single-turn order keeps its bytes.
+EPISODE_CAPABILITY = "signed-sandbox-episode/v1"
+EPISODE_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s", "memory_bytes", "pids",
+                         "disk_bytes")
+EPISODE_TOOLS = frozenset({"bash", "edit"})
+MAX_EPISODE_TOKENS = 1 << 20
+MAX_EPISODE_TURNS = 256
+_EPISODE_FIELDS = frozenset({"kind", "sandbox_env", "split", "env_package", "tools", "max_turns",
+                             "max_tokens_per_turn", "max_episode_tokens", "budgets"})
+_SANDBOX_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}\Z")
+_ENV_PACKAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}==[A-Za-z0-9][A-Za-z0-9.+_!-]{0,127}\Z")
+
+
+def _validate_episode(name: str, env: dict) -> None:
+    """The ``episode`` block of one v2 env: what record 0 must name, the limits, the session budgets."""
+    episode = _object(env["episode"], set(_EPISODE_FIELDS), f"{name}.episode")
+    if episode["kind"] != EPISODE_CAPABILITY:
+        raise ServiceContractError(f"{name}.episode.kind must be {EPISODE_CAPABILITY}")
+    for field_name in ("sandbox_env", "split"):
+        if not isinstance(episode[field_name], str) or not _SANDBOX_NAME.fullmatch(episode[field_name]):
+            raise ServiceContractError(f"{name}.episode.{field_name}: sandbox identifier required")
+    if not isinstance(episode["env_package"], str) or not _ENV_PACKAGE.fullmatch(episode["env_package"]):
+        raise ServiceContractError(f"{name}.episode.env_package must be name==version")
+    tools = episode["tools"]
+    if (type(tools) is not list or not tools or any(not isinstance(tool, str) for tool in tools)
+            or tools != sorted(set(tools)) or not set(tools) <= EPISODE_TOOLS):
+        raise ServiceContractError(
+            f"{name}.episode.tools: a sorted, unique, non-empty subset of {sorted(EPISODE_TOOLS)}")
+    _integer(episode["max_turns"], f"{name}.episode.max_turns", 1, MAX_EPISODE_TURNS)
+    _integer(episode["max_tokens_per_turn"], f"{name}.episode.max_tokens_per_turn", 1, MAX_EPISODE_TOKENS)
+    _integer(episode["max_episode_tokens"], f"{name}.episode.max_episode_tokens", 2, MAX_EPISODE_TOKENS)
+    if episode["max_tokens_per_turn"] >= episode["max_episode_tokens"]:
+        raise ServiceContractError(f"{name}.episode: a turn must fit inside the episode")
+    budgets = _object(episode["budgets"], set(EPISODE_BUDGET_FIELDS), f"{name}.episode.budgets")
+    for field_name in EPISODE_BUDGET_FIELDS:
+        _integer(budgets[field_name], f"{name}.episode.budgets.{field_name}")
+    if env["sampling"]["kind"] != PUBLIC_SEED_POOL:
+        raise ServiceContractError(f"{name}: an episode environment draws from a public seed pool")
+    if env["missing_box"] != "graded":
+        raise ServiceContractError(f"{name}: an episode's reward is its final record's; missing_box is graded")
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeEnvPolicy:
+    """The ``episode`` block of one env, typed (plan 2C)."""
+
+    environment: str
+    sandbox_env: str
+    split: str
+    env_package: str
+    tools: tuple[str, ...]
+    max_turns: int
+    max_tokens_per_turn: int
+    max_episode_tokens: int
+    budgets: tuple[tuple[str, int], ...]
+    pool_seeds: int
+
+    def budgets_dict(self) -> dict[str, int]:
+        return dict(self.budgets)
+
+
 
 def _validate_v2(value: dict) -> None:
     _object(value, _V2_FIELDS, "contract")
@@ -202,8 +264,11 @@ def _validate_v2(value: dict) -> None:
     for name, env in environments.items():
         if not isinstance(name, str) or not _ENV_ID.fullmatch(name):
             raise ServiceContractError(f"invalid environment id {name!r}")
-        _object(env, {"version", "dataset", "sampling", "exploration", "missing_box",
-                      "cooldown_windows", "share_bps"}, f"environment {name}")
+        env_fields = {"version", "dataset", "sampling", "exploration", "missing_box",
+                      "cooldown_windows", "share_bps"}
+        if isinstance(env, dict) and "episode" in env:
+            env_fields = env_fields | {"episode"}
+        _object(env, env_fields, f"environment {name}")
         _sha(env["version"], f"{name}.version")
         dataset = _object(env["dataset"], {"id", "rows"}, f"{name}.dataset")
         if not isinstance(dataset["id"], str) or not _DATASET_ID.fullmatch(dataset["id"]) or ".." in dataset["id"]:
@@ -226,6 +291,8 @@ def _validate_v2(value: dict) -> None:
             raise ServiceContractError(f"{name}.missing_box must be uncertain or graded")
         _integer(env["cooldown_windows"], f"{name}.cooldown_windows", 0, 1_000_000)
         total += _integer(env["share_bps"], f"{name}.share_bps", 0, 10000)
+        if "episode" in env:
+            _validate_episode(name, env)
     if total != 10000:
         raise ServiceContractError("environment share_bps must sum to 10000")
     limits = _object(value["limits"], {"max_groups", "max_tokens", "deadline_seconds"}, "limits")
@@ -290,6 +357,26 @@ class ServiceContract:
             raise ServiceContractError(f"environment {name!r} is not in this order")
         return environments[name]
 
+    def episode_policy(self, name: str) -> EpisodeEnvPolicy | None:
+        """The env's signed-episode policy, or None for a single-turn env."""
+        env = self.environment(name)
+        episode = env.get("episode")
+        if episode is None:
+            return None
+        return EpisodeEnvPolicy(
+            environment=name, sandbox_env=episode["sandbox_env"], split=episode["split"],
+            env_package=episode["env_package"], tools=tuple(episode["tools"]),
+            max_turns=episode["max_turns"], max_tokens_per_turn=episode["max_tokens_per_turn"],
+            max_episode_tokens=episode["max_episode_tokens"],
+            budgets=tuple((field_name, episode["budgets"][field_name]) for field_name in EPISODE_BUDGET_FIELDS),
+            pool_seeds=env["sampling"]["pool_seeds"])
+
+    @property
+    def episode_environments(self) -> tuple[str, ...]:
+        if self.version != 2:
+            return ()
+        return tuple(sorted(name for name, env in self.environments.items() if "episode" in env))
+
     @property
     def reward_policy(self) -> dict:
         return self._v2()["policies"]["reward"]
@@ -315,6 +402,7 @@ class ServiceContract:
                         *(env["sampling"]["kind"] for env in value["environments"].values())}
             if policies["checkpoint"]["task_scoped"] == 1:
                 required.add("task-scoped/v1")
+            required |= {env["episode"]["kind"] for env in value["environments"].values() if "episode" in env}
         else:
             required = {value["scoring"]["kind"], *(p["kind"] for p in value["policies"].values())}
             if value["policies"]["checkpoint"].get("task_scoped") == 1:
@@ -341,3 +429,11 @@ def _decode(raw: bytes) -> dict:
 
 def parse_service_contract(raw: bytes) -> ServiceContract:
     return ServiceContract(raw)
+
+
+def supported_v2_capabilities(contract: ServiceContract) -> frozenset[str]:
+    """What a v2 runtime supports and announces for ``contract``: the v2 set, plus the episode capability
+    only when the order has an episode env (a single-turn order's announcement keeps its exact bytes)."""
+    if contract.version == 2 and contract.episode_environments:
+        return SUPPORTED_V2_CAPABILITIES | {EPISODE_CAPABILITY}
+    return SUPPORTED_V2_CAPABILITIES

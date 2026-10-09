@@ -55,7 +55,7 @@ from typing import Callable
 
 from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
 from reliquary.protocol.service_contract import (
-    PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract, _identifier, _integer, _sha,
+    PUBLIC_SEED_POOL, ServiceContract, _identifier, _integer, _sha, supported_v2_capabilities,
 )
 from reliquary.protocol.service_schedule import ServiceSchedule, initial_schedule
 from reliquary.services.admission_policy import missing_box_problems
@@ -193,10 +193,18 @@ class ServiceRuntime:
         if not isinstance(contract, ServiceContract) or contract.version != 2:
             raise ValueError("the RL service runtime needs service-contract/v2; "
                              "service-contract/v1 adaptive_training is refused")
-        contract.require_capabilities(set(SUPPORTED_V2_CAPABILITIES))
+        contract.require_capabilities(set(supported_v2_capabilities(contract)))
         problems = missing_box_problems(contract)  # R22: the type of an env decides what a missing box is
         if problems:
             raise ValueError("the order's missing_box differs from the by-type default: " + "; ".join(problems))
+        from reliquary.constants import max_new_tokens_for_environment
+        for name in contract.episode_environments:
+            # A whole episode travels as one rollout: its schema bound is the env's completion cap.
+            policy = contract.episode_policy(name)
+            cap = max_new_tokens_for_environment(name)
+            if policy.max_episode_tokens > cap:
+                raise ValueError(f"{name}: max_episode_tokens {policy.max_episode_tokens} is above the "
+                                 f"protocol's completion cap {cap}")
         _validate_qualification(qualification, contract)
         self.contract = self.order_contract = contract
         self.qualification = json.loads(canonical_json_bytes(qualification))
@@ -914,7 +922,7 @@ class ServiceRuntime:
             logger.warning("service window %d keeps its first pool beacon; a later one was ignored", window)
         value = {"contract": self.contract.to_dict(), "schedule": envelope["schedule"],
                  "checkpoint": envelope["checkpoint"],
-                 "supported_capabilities": sorted(SUPPORTED_V2_CAPABILITIES),
+                 "supported_capabilities": sorted(supported_v2_capabilities(self.contract)),
                  "pool_epoch": window, "pool_randomness": beacon}
         ServicePolicyAnnouncement(**value)  # never hand out a policy the protocol refuses
         return value

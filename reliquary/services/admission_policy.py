@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from reliquary.protocol.service_contract import PUBLIC_SEED_POOL, SUPPORTED_V2_CAPABILITIES, ServiceContract
+from reliquary.protocol.service_contract import PUBLIC_SEED_POOL, ServiceContract, supported_v2_capabilities
 
 
 def parse_service_announcement(announcement: dict, *, contract: ServiceContract | None = None):
@@ -17,7 +17,7 @@ def parse_service_announcement(announcement: dict, *, contract: ServiceContract 
     if contract.version != 2:
         raise ValueError("only service-contract/v2 runs RL")
     contract.require_capabilities(set(announcement["supported_capabilities"]))
-    contract.require_capabilities(set(SUPPORTED_V2_CAPABILITIES))
+    contract.require_capabilities(set(supported_v2_capabilities(contract)))
     return contract, ServiceSchedule.from_dict(announcement["schedule"], contract)
 
 
