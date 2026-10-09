@@ -317,6 +317,8 @@ class EpisodeGroupMiner:
         runner = self._runner_factory(policy, precommit, prompt=prompt, open_until=open_until)
         played: list[EpisodeOutcome] = []
         held: list[EpisodeOutcome] = []        # kept episodes not yet submitted nor withdrawn
+        chosen: list[EpisodeOutcome] = []
+        sent = {"pending": False}              # the validator holds the chosen group, its verdict unknown
         async with runner:
             try:
                 await self._play(runner, precommit, pool, played, open_until=open_until)
@@ -333,7 +335,7 @@ class EpisodeGroupMiner:
                 response = await self._send(contract, policy, pool, precommit, chosen, admissible,
                                             randomness=randomness, environment=environment,
                                             task_index=int(task_index), window=int(window), checkpoint=checkpoint,
-                                            open_until=open_until)
+                                            open_until=open_until, sent=sent)
                 # Held until the group's verdict: admitted -> submitted; anything else -> withdrawn below.
                 if response is not None and response.accepted:
                     for outcome in chosen:
@@ -343,7 +345,11 @@ class EpisodeGroupMiner:
                 return response
             finally:
                 # Whatever ended the task (a refusal, an error, a cancellation): every episode not submitted
-                # is withdrawn, so its session and the hotkey's caps are freed now.
+                # is withdrawn, so its session and the hotkey's caps are freed now. A group the validator
+                # holds whose verdict is unknown (poll timeout, cancellation) is never withdrawn under its
+                # grading: its episodes stay held and lapse on their own.
+                if sent["pending"]:
+                    held = [outcome for outcome in held if all(outcome is not c for c in chosen)]
                 await self._release(played + held)
 
     def _chosen(self, held: list[EpisodeOutcome], group_size: int, *, sigma_min_bps: int) -> list[EpisodeOutcome]:
@@ -364,7 +370,7 @@ class EpisodeGroupMiner:
 
     async def _send(self, contract, policy, pool, precommit, chosen, admissible, *, randomness: str,
                     environment: str, task_index: int, window: int, checkpoint: str,
-                    open_until: float | None = None) -> GroupVerdict | None:
+                    open_until: float | None = None, sent: dict | None = None) -> GroupVerdict | None:
         from reliquary.constants import ACTIVE_PROTOCOL_PROFILE, FORCED_SEED_PROTOCOL_VERSION
         from reliquary.miner.engine import _compute_merkle_root
         from reliquary.miner.episode_commit import episode_metadata
@@ -402,7 +408,7 @@ class EpisodeGroupMiner:
         submit_by = min((float(o.result.submit_by) for o in chosen if o.result.submit_by is not None),
                         default=None)
         return await self._deliver(request, submit_by=submit_by, open_until=open_until,
-                                   label=precommit.sha256[:12])
+                                   label=precommit.sha256[:12], sent=sent)
 
     async def _await_verdict(self, window: int, merkle_root: str, *, until: float,
                              after_ts: float | None) -> Mapping | None:
@@ -430,12 +436,13 @@ class EpisodeGroupMiner:
             interval = min(interval * 1.5, VERDICT_POLL_MAX_S)
 
     async def _deliver(self, request, *, submit_by: float | None, open_until: float | None,
-                       label: str) -> GroupVerdict | None:
+                       label: str, sent: dict | None = None) -> GroupVerdict | None:
         """Send the group and wait for its verdict; send it again (a new envelope each time) after a
         resendable refusal (``protocol.episode_retry``) or a 503, while before ``submit_by`` and the window's
         end. None when it could not be sent at all."""
         from reliquary.miner.signed_episode import SUBMIT_TRANSIT_S
 
+        sent = {} if sent is None else sent
         outcome: GroupVerdict | None = None
         seen_ts: float | None = None
         for attempt in range(1, SUBMIT_ATTEMPTS + 1):
@@ -447,15 +454,22 @@ class EpisodeGroupMiner:
             reason = _reason(getattr(response, "reason", None))
             wait = SUBMIT_RETRY_S * attempt
             if reason == "submitted":
-                # A queue receipt: the verdict comes from the validator's verdict record.
-                # The earlier of the validator's own grading deadline and the window's end, plus the transit.
-                bounds = [bound for bound in (submit_by, open_until) if bound is not None]
-                until = (min(bounds) + SUBMIT_TRANSIT_S if bounds else self._clock() + VERDICT_WAIT_S)
+                # A queue receipt: the verdict comes from the validator's verdict record. The validator
+                # grades until the group's own deadline (submit_by): the window's end only stops sending.
+                sent["pending"] = True
+                if submit_by is not None:
+                    until = submit_by + SUBMIT_TRANSIT_S
+                elif open_until is not None:
+                    until = open_until + SUBMIT_TRANSIT_S
+                else:
+                    until = self._clock() + VERDICT_WAIT_S
                 verdict = await self._await_verdict(request.window_start, request.merkle_root, until=until,
                                                     after_ts=seen_ts)
                 if verdict is None:
-                    logger.warning("precommit %s: no verdict before the grading deadline", label)
+                    # Still held: never withdrawn under a grading that may yet admit it.
+                    logger.warning("precommit %s: no verdict before the grading deadline; episodes left held", label)
                     return GroupVerdict(False, "submitted")
+                sent["pending"] = False
                 if verdict.get("ts") is not None:
                     seen_ts = float(verdict["ts"])
                 outcome = GroupVerdict(verdict.get("accepted") is True, _reason(verdict.get("reason")),

@@ -5,9 +5,15 @@ Each poll reads the RL validator's ``/miner-state``: the window, its randomness,
 and, per environment, the prompt range, the cooldown and whether it accepts groups. It picks
 (environment, task) among the configured signed-episode environments (never a task in cooldown, nor one
 this miner already took in the window) and runs at most ``groups_in_flight`` (<= 2, the validator's
-per-operator cap) ``EpisodeGroupMiner.mine_task`` at once. When the announced checkpoint changes, the
-groups in flight are cancelled (their episodes are withdrawn) and the stack (vLLM generate engine, HF
-proof model) is rebuilt on the new revision.
+per-operator cap) ``EpisodeGroupMiner.mine_task`` at once. When the announced checkpoint (revision) or
+order (contract sha) changes, no new group starts, the groups in flight are drained (bounded by
+``drain_s``, then cancelled), the stack is closed and the process exits with ``EXIT_CHECKPOINT_CHANGED``
+(75): the miner runs under a supervisor that restarts it (systemd ``Restart=always``, a docker restart
+policy), and the new process loads the new checkpoint and re-checks the order's env package pin. vLLM
+and the proof model are never reloaded in-process.
+
+Harness secrets (API keys the episode harness needs) belong in ``--harness-env-file`` (or the
+supervisor's environment file), never on the command line, where ``ps`` shows them.
 
 The stack (``build_episode_stack``): one ``ForcedDraws`` shared by the miner and the forced
 ``GenerateEngine(VllmTurnCore(...))`` served on loopback; the renderer of the policy's tools; the engine
@@ -25,8 +31,10 @@ import asyncio
 import contextlib
 import gc
 import logging
+import math
 import random
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,6 +46,20 @@ GROUPS_IN_FLIGHT = 2
 (``rl_sandbox_wiring.RL_GROUPS_IN_FLIGHT``)."""
 STATE_POLL_S = 2.0
 PICK_DRAWS = 64
+EXIT_CHECKPOINT_CHANGED = 75
+"""The process exit code on a new checkpoint or order: "restart me" (EX_TEMPFAIL) for the supervisor."""
+DRAIN_S = 600.0
+"""How long the groups in flight may finish after a checkpoint change before they are cancelled."""
+OUTCOMES_KEPT = 256
+BUILD_BACKOFF_S = 5.0
+BUILD_BACKOFF_MAX_S = 300.0
+SECONDS_PER_WAVE = 300.0
+"""Default time one wave of live sessions (an episode played to its end) is expected to take."""
+
+
+class CheckpointChanged(Exception):
+    """The announced checkpoint or order changed: the process must restart (``EXIT_CHECKPOINT_CHANGED``)."""
+    exit_code = EXIT_CHECKPOINT_CHANGED
 
 
 @dataclass(frozen=True)
@@ -52,10 +74,18 @@ class EpisodeWindow:
     cooldowns: Mapping[str, frozenset[int]] = field(default_factory=dict)
     ranges: Mapping[str, tuple[int, int]] = field(default_factory=dict)
     accepting: Mapping[str, bool] = field(default_factory=dict)
+    contract_sha: str = ""
+    opened_at: float | None = None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """What the stack is built for: a change of either needs a restart."""
+        return self.revision, self.contract_sha
 
 
 def episode_window(state) -> EpisodeWindow | None:
     """The open window of a ``MinerState``, or None (not open, no randomness or no announcement yet)."""
+    from reliquary.protocol.service_contract import ServiceContract
     from reliquary.protocol.submission import WindowState
 
     if state is None or state.state != WindowState.OPEN or not state.randomness:
@@ -72,7 +102,9 @@ def episode_window(state) -> EpisodeWindow | None:
         repo=str(checkpoint["repo"]), revision=str(checkpoint["revision"]),
         cooldowns={name: frozenset(env.cooldown_prompts()) for name, env in environments.items()},
         ranges={name: (int(env.prompt_range[0]), int(env.prompt_range[1])) for name, env in environments.items()},
-        accepting={name: bool(env.accepting_submissions) for name, env in environments.items()})
+        accepting={name: bool(env.accepting_submissions) for name, env in environments.items()},
+        contract_sha=ServiceContract.from_dict(announcement["contract"]).sha256,
+        opened_at=(None if state.window_opened_at is None else float(state.window_opened_at)))
 
 
 def pick_episode_task(view: EpisodeWindow, *, environments: Sequence[str], sizes: Mapping[str, int],
@@ -136,15 +168,50 @@ def parse_episode_environments(value: str) -> tuple[str, ...]:
     return names
 
 
-def parse_harness_env(values: Sequence[str]) -> dict[str, str]:
-    """``--harness-env KEY=VALUE`` (repeatable)."""
+def parse_harness_env(values: Sequence[str], *, env_file: str | None = None) -> dict[str, str]:
+    """``--harness-env-file`` (KEY=VALUE lines, ``#`` comments; where secrets belong) then
+    ``--harness-env KEY=VALUE`` (repeatable; it wins over the file)."""
     parsed = {}
+    if env_file:
+        with open(env_file, encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle]
+        for line in lines:
+            if not line or line.startswith("#"):
+                continue
+            key, sep, val = line.removeprefix("export ").partition("=")
+            if not sep or not key.strip():
+                raise ValueError(f"{env_file}: KEY=VALUE lines only")
+            parsed[key.strip()] = val.strip()
     for item in values:
         key, sep, val = item.partition("=")
         if not sep or not key.strip():
             raise ValueError(f"--harness-env takes KEY=VALUE, not {item!r}")
         parsed[key.strip()] = val
     return parsed
+
+
+def short_window_warning(view: EpisodeWindow, *, environments: Sequence[str], max_live: int | None,
+                         groups_in_flight: int, seconds_per_wave: float) -> str | None:
+    """Why the announced collection window looks too short for ``groups_in_flight`` groups of 2M seeds at
+    ``max_live`` live sessions per group (groups run side by side: ceil(2M / max_live) waves of
+    ``seconds_per_wave`` each), or None."""
+    from reliquary.protocol.seed_pool import pool_from_service_policy
+
+    if view.open_until is None or view.opened_at is None or seconds_per_wave <= 0:
+        return None
+    window_s = view.open_until - view.opened_at
+    for name in environments:
+        pool = pool_from_service_policy(view.announcement, environment=name, prompt_idx=0,
+                                        checkpoint_hash=view.revision)
+        if pool is None:
+            continue
+        live = int(max_live or pool.pool_seeds)
+        needed = math.ceil(pool.pool_seeds / live) * float(seconds_per_wave)
+        if window_s < needed:
+            return (f"{name}: the collection window is {window_s:.0f} s, {groups_in_flight} groups x "
+                    f"{pool.pool_seeds} seeds at max_live {live} need about {needed:.0f} s "
+                    f"({seconds_per_wave:.0f} s per wave): groups will be cut at the window end")
+    return None
 
 
 def env_package_refusal(policy, *, identity_of: Callable[[str], str] | None = None,
@@ -318,6 +385,8 @@ class EpisodeMinerConfig:
     harness_env: dict | None = None
     gpu_memory_utilization: float | None = None
     max_num_seqs: int = 16
+    seconds_per_wave: float = SECONDS_PER_WAVE
+    drain_s: float = DRAIN_S
 
     def __post_init__(self) -> None:
         if not self.environments:
@@ -417,7 +486,7 @@ async def build_episode_stack(view: EpisodeWindow, *, config: EpisodeMinerConfig
             check_engine_caps(policy, **engine_caps)       # vLLM's own context length included
         engine = GenerateEngine(core, max_total_tokens=total, max_tokens_per_turn=per_turn, draws=draws)
         engine.start()
-        closers.append(engine.stop)
+        closers.append(lambda: asyncio.to_thread(engine.stop))       # it joins a thread: off the event loop
         server, serving = await deps.serve(build_generate_app(engine, model_name=view.repo), config.generate_port)
 
         async def stop_serving() -> None:
@@ -464,15 +533,21 @@ async def build_episode_stack(view: EpisodeWindow, *, config: EpisodeMinerConfig
 
 
 class EpisodeMiningLoop:
-    """Poll the window; (re)build the stack on the announced checkpoint; keep up to ``groups_in_flight``
+    """Poll the window; build the stack on the announced checkpoint once; keep up to ``groups_in_flight``
     groups mining. ``read_state()`` -> ``MinerState`` (or None); ``build_stack(window)`` -> ``EpisodeStack``
-    (it raises to refuse to start); ``sizes(environment)`` -> tasks the miner's source holds."""
+    (a ValueError is a refusal to start and ends the loop; any other error is logged and the build retried
+    at a later poll, with a bounded backoff); ``sizes(environment)`` -> tasks the miner's source holds.
+    A new (revision, contract sha) drains the groups in flight (``drain_s``, then cancelled) and raises
+    ``CheckpointChanged``: the process exits and its supervisor restarts it on the new checkpoint;
+    ``preflight(window)`` (optional) says beforehand why the restarted miner would refuse that order."""
 
     def __init__(self, *, environments: Sequence[str], read_state: Callable[[], Awaitable[Any]],
                  build_stack: Callable[[EpisodeWindow], Awaitable[EpisodeStack]],
                  sizes: Callable[[str], int], groups_in_flight: int = GROUPS_IN_FLIGHT,
                  rng: random.Random | None = None, clock: Callable[[], float] = time.time,
-                 sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep, poll_s: float = STATE_POLL_S) -> None:
+                 sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep, poll_s: float = STATE_POLL_S,
+                 drain_s: float = DRAIN_S, preflight: Callable[[EpisodeWindow], str | None] | None = None,
+                 max_live: int | None = None, seconds_per_wave: float = SECONDS_PER_WAVE) -> None:
         if not 1 <= int(groups_in_flight) <= GROUPS_IN_FLIGHT:
             raise ValueError(f"groups in flight must be 1..{GROUPS_IN_FLIGHT} (the validator's per-operator cap)")
         self._environments = tuple(environments)
@@ -484,17 +559,25 @@ class EpisodeMiningLoop:
         self._clock = clock
         self._sleep = sleep
         self._poll_s = float(poll_s)
+        self._drain_s = float(drain_s)
+        self._preflight = preflight
+        self._max_live = max_live
+        self._seconds_per_wave = float(seconds_per_wave)
         self.stack: EpisodeStack | None = None
+        self.stack_key: tuple[str, str] | None = None
+        self._next_build_at = 0.0
+        self._build_backoff = BUILD_BACKOFF_S
         self._inflight: dict[asyncio.Task, tuple[int, str, int]] = {}
         self._taken: set[tuple[int, str, int]] = set()
-        self.outcomes: list[tuple[tuple[int, str, int], Any]] = []
+        self.outcomes: deque[tuple[tuple[int, str, int], Any]] = deque(maxlen=OUTCOMES_KEPT)
 
     @property
     def in_flight(self) -> list[tuple[int, str, int]]:
         return list(self._inflight.values())
 
     async def step(self) -> EpisodeWindow | None:
-        """One poll: the window read (or None)."""
+        """One poll: the window read (or None). Raises ``CheckpointChanged`` (after the drain) on a new
+        checkpoint or order, and a build's ValueError (refusal to start)."""
         try:
             state = await self._read_state()
         except Exception as exc:
@@ -503,20 +586,59 @@ class EpisodeMiningLoop:
         view = episode_window(state)
         if view is None:
             return None
-        if self.stack is None or self.stack.revision != view.revision:
-            await self._reload(view)
+        if self.stack is None:
+            if not await self._build(view):
+                return None
+        elif view.key != self.stack_key:
+            await self._restart(view)
         self._fill(view)
         return view
 
-    async def _reload(self, view: EpisodeWindow) -> None:
-        if self.stack is not None:
-            logger.info("checkpoint %s announced: groups in flight cancelled, engine and proof model reloaded",
-                        view.revision[:12])
+    async def _build(self, view: EpisodeWindow) -> bool:
+        if self._clock() < self._next_build_at:
+            return False
+        try:
+            stack = await self._build_stack(view)
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.exception("building the episode stack failed (%r); retried in %.0f s", exc, self._build_backoff)
+            self._next_build_at = self._clock() + self._build_backoff
+            self._build_backoff = min(self._build_backoff * 2, BUILD_BACKOFF_MAX_S)
+            return False
+        self.stack, self.stack_key = stack, view.key
+        self._build_backoff, self._next_build_at = BUILD_BACKOFF_S, 0.0
+        try:
+            warning = short_window_warning(view, environments=self._environments, max_live=self._max_live,
+                                           groups_in_flight=self._cap, seconds_per_wave=self._seconds_per_wave)
+        except Exception:
+            logger.exception("checking the collection window failed")
+            warning = None
+        if warning:
+            logger.warning("!!! COLLECTION WINDOW TOO SHORT !!! %s", warning)
+        return True
+
+    async def _restart(self, view: EpisodeWindow) -> None:
+        logger.warning("checkpoint %s / order %s announced (was %s / %s): draining %d groups, then exit %d "
+                       "for the supervisor to restart the miner", view.revision[:12], view.contract_sha[:12],
+                       *(part[:12] for part in self.stack_key), len(self._inflight), EXIT_CHECKPOINT_CHANGED)
+        if self._preflight is not None:
+            try:
+                refusal = self._preflight(view)
+            except Exception as exc:
+                refusal = repr(exc)
+            if refusal:
+                logger.error("the restarted miner will refuse the new order: %s", refusal)
+        await self._drain()
+        raise CheckpointChanged(f"checkpoint {view.revision} / order {view.contract_sha} announced")
+
+    async def _drain(self) -> None:
+        tasks = list(self._inflight)
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=self._drain_s)
+            if pending:
+                logger.warning("%d groups still in flight after %.0f s: cancelled", len(pending), self._drain_s)
         await self._cancel_inflight()
-        old, self.stack = self.stack, None
-        if old is not None:
-            await old.close()
-        self.stack = await self._build_stack(view)
 
     def _sizes_of(self, view: EpisodeWindow) -> dict[str, int]:
         from reliquary.protocol.service_contract import ServiceContract
@@ -558,8 +680,8 @@ class EpisodeMiningLoop:
         if task.cancelled():
             outcome: Any = "cancelled"
         elif task.exception() is not None:
-            outcome = task.exception()
-            logger.warning("group %s ended: %r", key, outcome)
+            outcome = repr(task.exception())          # no traceback frames kept alive
+            logger.warning("group %s ended: %s", key, outcome)
         else:
             outcome = task.result()
             logger.info("group %s: %s", key, outcome)
@@ -573,7 +695,8 @@ class EpisodeMiningLoop:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run(self, *, stop: asyncio.Event | None = None) -> None:
-        """Until ``stop`` is set (or forever). A stack that cannot be built ends the loop with its error."""
+        """Until ``stop`` is set (or forever). A refusal to start (ValueError) ends the loop with its error,
+        a new checkpoint or order with ``CheckpointChanged``."""
         try:
             while stop is None or not stop.is_set():
                 await self.step()
@@ -627,12 +750,27 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
             return build_episode_stack(view, config=config, wallet=wallet, hotkey=hotkey, sign_binding=sign_binding,
                                        task_prompt=prompts, deps=deps)
 
+        package_refusal = deps.package_refusal if deps is not None else env_package_refusal
+
+        def preflight(view: EpisodeWindow) -> str | None:
+            # The new order's pins, checked now: the restarted miner would refuse to start on them.
+            from reliquary.protocol.service_contract import ServiceContract
+
+            try:
+                _episode_policies(ServiceContract.from_dict(view.announcement["contract"]), config.environments,
+                                  package_refusal)
+            except ValueError as exc:
+                return str(exc)
+            return None
+
+        loop_kwargs = {"preflight": preflight, "max_live": config.max_live, "drain_s": config.drain_s,
+                       "seconds_per_wave": config.seconds_per_wave, **loop_kwargs}
         loop = EpisodeMiningLoop(environments=config.environments, read_state=read_state, build_stack=build,
                                  sizes=prompts.size, groups_in_flight=config.groups_in_flight, **loop_kwargs)
         await loop.run(stop=stop)
 
 
-__all__ = ["EpisodeMinerConfig", "EpisodeMiningLoop", "EpisodeStack", "EpisodeStackDeps", "EpisodeTaskPrompts",
+__all__ = ["CheckpointChanged", "EXIT_CHECKPOINT_CHANGED", "EpisodeMinerConfig", "EpisodeMiningLoop", "EpisodeStack", "EpisodeStackDeps", "EpisodeTaskPrompts",
            "EpisodeWindow", "GROUPS_IN_FLIGHT", "build_episode_stack", "env_package_refusal", "episode_window",
            "miner_state_reader", "parse_episode_environments", "parse_harness_env", "pick_episode_task",
-           "run_episode_miner"]
+           "run_episode_miner", "short_window_warning"]

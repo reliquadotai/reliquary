@@ -478,19 +478,7 @@ def test_resending_stops_at_the_grading_deadline(tmp_path):
     assert w.runner.submitted == [] and sorted(w.runner.released) == list(range(2 * M_ROLLOUTS))
 
 
-def test_a_verdict_that_never_comes_is_waited_for_until_the_grading_deadline_then_withdrawn(tmp_path):
-    from reliquary.miner.signed_episode import SUBMIT_TRANSIT_S
-
-    clock = Clock()
-    w = world(tmp_path, alternating(2 * M_ROLLOUTS), pending=10 ** 6, submit_by=NOW + 30, clock=clock,
-              proof_budget_s=0.0)
-    response = w.mine()
-    assert not response.accepted and response.reason == "submitted"
-    assert len(w.submitted) == 1 and clock.now >= NOW + 30 + SUBMIT_TRANSIT_S
-    assert w.runner.submitted == [] and sorted(w.runner.released) == list(range(2 * M_ROLLOUTS))
-
-
-def test_the_verdict_poll_ends_at_the_window_end_when_it_comes_first_and_backs_off_to_15_s(tmp_path):
+def test_a_verdict_that_never_comes_is_waited_for_until_the_grading_deadline_and_the_group_left_held(tmp_path):
     from reliquary.miner.episode_group_miner import VERDICT_POLL_MAX_S
     from reliquary.miner.signed_episode import SUBMIT_TRANSIT_S
 
@@ -499,9 +487,37 @@ def test_the_verdict_poll_ends_at_the_window_end_when_it_comes_first_and_backs_o
               proof_budget_s=0.0)
     response = w.mine(open_until=NOW + 200)
     assert not response.accepted and response.reason == "submitted"
-    assert NOW + 200 + SUBMIT_TRANSIT_S <= clock.now < NOW + 3000       # the window's end, not submit_by
+    assert len(w.submitted) == 1 and clock.now == NOW + 3000 + SUBMIT_TRANSIT_S     # submit_by, not the window end
     assert max(w.slept) == VERDICT_POLL_MAX_S and w.slept[:3] == [2.0, 3.0, 4.5]
-    assert sorted(w.runner.released) == list(range(2 * M_ROLLOUTS))
+    # The poll timed out: the chosen group is neither submitted nor withdrawn (it lapses on its own);
+    # only the episodes not sent are withdrawn.
+    assert w.runner.submitted == [] and sorted(w.runner.released) == list(range(M_ROLLOUTS, 2 * M_ROLLOUTS))
+
+
+def test_a_group_graded_past_the_window_end_plus_transit_still_gets_its_verdict(tmp_path):
+    from reliquary.miner.signed_episode import SUBMIT_TRANSIT_S
+
+    clock = Clock()
+    w = world(tmp_path, alternating(2 * M_ROLLOUTS), pending=25, submit_by=NOW + 3000, clock=clock,
+              proof_budget_s=0.0)
+    response = w.mine(open_until=NOW + 200)
+    assert response.accepted, response
+    assert clock.now > NOW + 200 + SUBMIT_TRANSIT_S                 # the verdict came after the window end + transit
+    assert w.runner.submitted == list(range(M_ROLLOUTS))
+    assert sorted(w.runner.released) == list(range(M_ROLLOUTS, 2 * M_ROLLOUTS))
+
+
+def test_a_group_cancelled_while_its_verdict_is_pending_is_not_withdrawn(tmp_path):
+    w = world(tmp_path, alternating(2 * M_ROLLOUTS), pending=10 ** 6)
+
+    async def cancelled(seconds):
+        raise asyncio.CancelledError
+
+    w.miner._sleep = cancelled
+    with pytest.raises(asyncio.CancelledError):
+        w.mine()
+    assert len(w.submitted) == 1 and w.runner.submitted == []
+    assert sorted(w.runner.released) == list(range(M_ROLLOUTS, 2 * M_ROLLOUTS))
 
 
 def test_seeds_still_playing_are_cut_before_the_grading_deadline(tmp_path):

@@ -492,61 +492,190 @@ def test_no_group_starts_past_the_windows_end(tmp_path):
     assert built[0].started == []
 
 
-def test_a_checkpoint_change_cancels_the_groups_and_reloads_engine_and_proof_model(tmp_path):
+def changed_order(state):
+    """The same checkpoint, another order (its env package pin moved)."""
+    announcement = state.service_policy.model_dump()
+    contract = json.loads(json.dumps(announcement["contract"]))
+    contract["environments"][EPISODE]["episode"]["env_package"] = "moved-package==9.9.9"
+    return state.model_copy(update={"service_policy": {**announcement, "contract": contract}})
+
+
+def test_a_checkpoint_change_drains_the_groups_then_exits_75_and_builds_no_second_stack(tmp_path):
     rt = episode_runtime(tmp_path / "rt")
     states = [miner_state(rt)]
-    loop, built = loop_world(rt, states)
+    loop, built = loop_world(rt, states, drain_s=5.0)
 
     async def scenario():
         await loop.step()
-        await loop.step()                     # same checkpoint: no rebuild
+        await loop.step()                     # same checkpoint: nothing rebuilt
         await asyncio.sleep(0.01)
         assert len(built) == 1 and len(loop.in_flight) == 2
         states[0] = miner_state(rt, revision=REVISION_B)
-        await loop.step()
-        await asyncio.sleep(0.01)
-        assert len(loop.in_flight) == 2
-        await loop._cancel_inflight()
+        asyncio.get_running_loop().call_later(0.05, built[0].gate.set)     # the groups finish while draining
+        with pytest.raises(em.CheckpointChanged) as raised:
+            await asyncio.wait_for(loop.run(), timeout=10)
+        return raised.value
 
-    asyncio.run(scenario())
-    first, second = built
-    assert first.closed and sorted(first.cancelled) == sorted(s[2] for s in first.started)
-    assert second.revision == REVISION_B and len(second.started) == 2 and not second.closed
+    error = asyncio.run(scenario())
+    assert error.exit_code == em.EXIT_CHECKPOINT_CHANGED == 75
+    first, = built                            # no second stack in-process: the restarted process builds it
+    assert first.closed and first.cancelled == [] and len(first.started) == 2
+    assert [outcome for _, outcome in loop.outcomes] == ["done", "done"]   # drained, not cancelled
 
 
-def test_a_checkpoint_change_rebuilds_the_real_stack_on_the_new_revision(tmp_path, monkeypatch):
-    register_episode_env(monkeypatch)
-    w = World(tmp_path)
-    states = [miner_state(w.rt, prompt_range=(0, 10), cooldown=set(range(10)))]   # no task: only the stack
-
-    async def read_state():
-        return states[0]
-
-    async def build(view):
-        return await em.build_episode_stack(view, config=config(), wallet=WALLET, hotkey=MINER.ss58_address,
-                                            sign_binding=lambda b: "", task_prompt=lambda e, t: "", deps=w.deps)
-
-    loop = em.EpisodeMiningLoop(environments=[EPISODE], read_state=read_state, build_stack=build,
-                                sizes=lambda name: 1000)
+def test_a_drain_that_runs_out_cancels_the_groups(tmp_path):
+    rt = episode_runtime(tmp_path / "rt")
+    states = [miner_state(rt)]
+    loop, built = loop_world(rt, states, drain_s=0.05)
 
     async def scenario():
         await loop.step()
-        states[0] = miner_state(w.rt, prompt_range=(0, 10), cooldown=set(range(10)), revision=REVISION_B)
-        await loop.step()
-        await loop.stack.close()
+        await asyncio.sleep(0.01)
+        states[0] = miner_state(rt, revision=REVISION_B)
+        with pytest.raises(em.CheckpointChanged):
+            await loop.step()
+        # Cancelled and awaited before the exit, not left for the event loop's shutdown.
+        assert loop.in_flight == [] and sorted(built[0].cancelled) == sorted(s[2] for s in built[0].started)
 
     asyncio.run(scenario())
-    assert w.downloads[1][1] == REVISION_B and w.downloads[0][1] != REVISION_B
-    assert w.events == ["core", "serve", "model", "release_model", "release_core",
-                        "core", "serve", "model", "release_model", "release_core"]
-    assert [m.directory for m in w.models] == ["/ckpt/" + w.downloads[0][1][:8], "/ckpt/eeeeeeee"]
-    assert all(s.should_exit for s in w.servers)
+    assert len(built) == 1 and len(built[0].started) == 2
+
+
+def test_a_new_order_on_the_same_checkpoint_restarts_and_its_package_pin_is_rechecked(tmp_path):
+    rt = episode_runtime(tmp_path / "rt")
+    states = [miner_state(rt)]
+    pinned = em.episode_window(states[0])
+    checked = []
+
+    def preflight(view):
+        checked.append(view.key)
+        from reliquary.protocol.service_contract import ServiceContract
+
+        installed = ServiceContract.from_dict(pinned.announcement["contract"]).episode_policy(EPISODE).env_package
+        try:
+            em._episode_policies(ServiceContract.from_dict(view.announcement["contract"]), [EPISODE],
+                                 lambda policy: None if policy.env_package == installed else "pin moved")
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    loop, built = loop_world(rt, states, drain_s=1.0, preflight=preflight)
+
+    async def scenario():
+        await loop.step()
+        await loop.step()
+        states[0] = changed_order(states[0])
+        view = em.episode_window(states[0])
+        assert view.revision == pinned.revision and view.contract_sha != pinned.contract_sha
+        with pytest.raises(em.CheckpointChanged):
+            await loop.step()
+        return view
+
+    view = asyncio.run(scenario())
+    assert checked == [view.key] and len(built) == 1
+
+
+def test_a_build_that_fails_otherwise_than_by_refusal_is_retried_with_backoff(tmp_path):
+    rt = episode_runtime(tmp_path / "rt")
+    clock = SimpleNamespace(now=1000.0)
+    attempts = []
+
+    async def read_state():
+        return miner_state(rt, cooldown=set(range(10)), prompt_range=(0, 10))
+
+    async def build(view):
+        attempts.append(clock.now)
+        if len(attempts) < 3:
+            raise OSError("hub unreachable")
+        return Blocking(view.revision)
+
+    loop = em.EpisodeMiningLoop(environments=[EPISODE], read_state=read_state, build_stack=build,
+                                sizes=lambda name: 1000, clock=lambda: clock.now)
+
+    async def scenario():
+        assert await loop.step() is None                   # failed: logged, not raised
+        assert await loop.step() is None                   # backing off: not retried at once
+        clock.now += em.BUILD_BACKOFF_S
+        assert await loop.step() is None                   # second failure: the backoff doubles
+        clock.now += em.BUILD_BACKOFF_S
+        assert await loop.step() is None
+        clock.now += em.BUILD_BACKOFF_S
+        assert await loop.step() is not None and loop.stack is not None
+
+    asyncio.run(scenario())
+    assert attempts == [1000.0, 1000.0 + em.BUILD_BACKOFF_S, 1000.0 + 3 * em.BUILD_BACKOFF_S]
+
+
+def test_the_group_outcomes_kept_are_bounded_and_hold_no_traceback(tmp_path):
+    rt = episode_runtime(tmp_path / "rt")
+    loop, _ = loop_world(rt, [miner_state(rt)])
+
+    async def boom():
+        raise RuntimeError("sandbox gone")
+
+    async def scenario():
+        for index in range(em.OUTCOMES_KEPT + 7):
+            task = asyncio.ensure_future(boom())
+            loop._inflight[task] = (1, EPISODE, index)
+            task.add_done_callback(loop._finished)
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert len(loop.outcomes) == em.OUTCOMES_KEPT
+    assert loop.outcomes[-1] == ((1, EPISODE, em.OUTCOMES_KEPT + 6), "RuntimeError('sandbox gone')")
+    assert all(isinstance(outcome, str) for _, outcome in loop.outcomes)
+
+
+def test_a_collection_window_too_short_for_the_pool_is_warned_about_at_startup(tmp_path, caplog):
+    rt = episode_runtime(tmp_path / "rt")
+    import dataclasses
+
+    short = miner_state(rt, open_until=time.time() + 590)           # opened ~10 s ago
+    view = dataclasses.replace(em.episode_window(short), opened_at=1000.0, open_until=1600.0)   # a 600 s window
+    seeds = 2 * M_ROLLOUTS
+    kwargs = dict(environments=[EPISODE], groups_in_flight=2, seconds_per_wave=300.0)
+    assert em.short_window_warning(view, max_live=None, **kwargs) is None           # one wave of 300 s
+    assert em.short_window_warning(view, max_live=seeds // 2, **kwargs) is None     # two waves: 600 s
+    warning = em.short_window_warning(view, max_live=seeds // 2 - 1, **kwargs)      # three waves: 900 s
+    assert warning and "900" in warning and f"{seeds} seeds" in warning
+    loop, _ = loop_world(rt, [short], max_live=1, seconds_per_wave=300.0)
+    with caplog.at_level("WARNING", logger=em.__name__):
+        asyncio.run(loop.step())
+    assert "COLLECTION WINDOW TOO SHORT" in caplog.text and loop.stack is not None   # a warning, not a refusal
+
+
+def test_the_real_stack_closes_in_order_and_stops_the_engine_off_the_event_loop(tmp_path, monkeypatch):
+    import threading
+
+    from reliquary.miner.corpus_generate_server import GenerateEngine
+
+    register_episode_env(monkeypatch)
+    w = World(tmp_path)
+    stopped_on = []
+    stop = GenerateEngine.stop
+
+    def recorded_stop(self):
+        stopped_on.append(threading.current_thread() is threading.main_thread())
+        stop(self)
+
+    monkeypatch.setattr(GenerateEngine, "stop", recorded_stop)
+    view = em.episode_window(miner_state(w.rt))
+
+    async def scenario():
+        stack = await em.build_episode_stack(view, config=config(), wallet=WALLET, hotkey=MINER.ss58_address,
+                                             sign_binding=lambda b: "", task_prompt=lambda e, t: "", deps=w.deps)
+        await stack.close()
+
+    asyncio.run(scenario())
+    assert w.events == ["core", "serve", "model", "release_model", "release_core"]
+    assert stopped_on == [False] and all(s.should_exit for s in w.servers)
 
 
 # -- the CLI ------------------------------------------------------------------------------------------------
 
 
-def test_the_cli_maps_its_flags_and_refuses_a_single_turn_env(monkeypatch):
+def test_the_cli_maps_its_flags_and_refuses_a_single_turn_env(monkeypatch, tmp_path):
     from typer.testing import CliRunner
 
     from reliquary.cli.main import app
@@ -578,6 +707,22 @@ def test_the_cli_maps_its_flags_and_refuses_a_single_turn_env(monkeypatch):
     too_many = runner.invoke(app, ["mine-episodes", "--episode-envs", EPISODE, "--validator-url", URL,
                                    "--validator-hotkey", VALIDATOR.ss58_address, "--groups-in-flight", "3"])
     assert too_many.exit_code == 2
+    secrets = tmp_path / "harness.env"
+    secrets.write_text("# harness secrets\nexport API_KEY=sk-file\nA=from-file\n\n")
+    result = runner.invoke(app, ["mine-episodes", "--episode-envs", EPISODE, "--validator-url", URL,
+                                 "--validator-hotkey", VALIDATOR.ss58_address, "--harness-env-file", str(secrets),
+                                 "--harness-env", "A=1", "--seconds-per-wave", "120"])
+    assert result.exit_code == 0, result.output
+    assert seen["config"].harness_env == {"API_KEY": "sk-file", "A": "1"}       # the command line wins
+    assert seen["config"].seconds_per_wave == 120.0
+
+    async def restart(*, config, wallet):
+        raise em.CheckpointChanged("checkpoint e announced")
+
+    monkeypatch.setattr(em, "run_episode_miner", restart)
+    restarted = runner.invoke(app, ["mine-episodes", "--episode-envs", EPISODE, "--validator-url", URL,
+                                    "--validator-hotkey", VALIDATOR.ss58_address])
+    assert restarted.exit_code == 75 and "restart" in restarted.output
 
 
 def test_the_legacy_miner_paths_do_not_import_the_episode_miner():

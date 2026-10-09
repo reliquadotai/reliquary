@@ -3444,7 +3444,15 @@ def mine_episodes(
         2, "--groups-in-flight", min=1, max=2,
         help="Episode groups mined at once (at most 2: the validator's per-operator cap)"),
     harness_env: list[str] = typer.Option(
-        [], "--harness-env", help="KEY=VALUE passed to the episode harness (repeatable)"),
+        [], "--harness-env",
+        help="KEY=VALUE passed to the episode harness (repeatable; no secrets here: ps shows them)"),
+    harness_env_file: str = typer.Option(
+        "", "--harness-env-file",
+        help="File of KEY=VALUE lines for the episode harness: where its secrets (API keys) belong"),
+    seconds_per_wave: float = typer.Option(
+        300.0, "--seconds-per-wave",
+        help="Expected time of one wave of live sessions: a collection window shorter than the pool's "
+             "waves at --max-live is warned about at startup"),
     gpu_memory_utilization: float = typer.Option(
         0.6, "--gpu-memory-utilization",
         help="vLLM's share of the GPU; the HF proof model takes the rest of the same GPU"),
@@ -3454,7 +3462,11 @@ def mine_episodes(
     """Mine signed-episode groups on the RL validator: per window, precommit a task, play its public seed
     pool against a local forced-draw vLLM (sandbox tool calls on the validator's machines), and submit
     one proved group. Needs the reliquary[sandbox-miner] extra and the order's pinned env package. The
-    legacy `mine` never mines these environments."""
+    legacy `mine` never mines these environments.
+
+    Run it under a supervisor that restarts it (systemd Restart=always, a docker restart policy): on a
+    new checkpoint or order it drains its groups and exits with code 75 to be restarted on it. Exit 2:
+    bad flags; exit 4: refusal to start (an env, its package pin or the engine caps)."""
     from reliquary.miner.episode_mining import (
         EpisodeMinerConfig,
         parse_episode_environments,
@@ -3467,9 +3479,10 @@ def mine_episodes(
             environments=parse_episode_environments(episode_envs), validator_url=validator_url.rstrip("/"),
             validator_hotkey=validator_hotkey, generate_port=generate_port,
             checkpoint_dir=checkpoint_dir or None, max_live=max_live or None, groups_in_flight=groups_in_flight,
-            harness_env=parse_harness_env(harness_env) or None,
-            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs)
-    except ValueError as exc:
+            harness_env=parse_harness_env(harness_env, env_file=harness_env_file or None) or None,
+            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
+            seconds_per_wave=seconds_per_wave)
+    except (ValueError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     import bittensor as bt
@@ -3482,6 +3495,9 @@ def mine_episodes(
     wallet = bt.Wallet(**wallet_kwargs)
     try:
         asyncio.run(episode_mining.run_episode_miner(config=config, wallet=wallet))
+    except episode_mining.CheckpointChanged as exc:   # restart me on the new checkpoint (supervisor)
+        typer.echo(f"restart: {exc}", err=True)
+        raise typer.Exit(code=episode_mining.EXIT_CHECKPOINT_CHANGED) from exc
     except ValueError as exc:   # a refusal to start: an env, its package or the engine caps
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=4) from exc
