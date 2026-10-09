@@ -104,11 +104,43 @@ def test_missing_operator_mode_and_unqualified_default_are_refused(rollout, monk
     observed.assert_proof_start_authorized({"qualified": True}, None, "")
 
 
-def test_no_extra_slots_or_unadopted_checkpoint(rollout):
-    rollout.pool.health.slots *= 2
+def _second_slot(rollout, **changes):
+    first = rollout.pool.health.slots[0]
+    first.device_id = "cuda:0#0"
+    rollout.manifest["identity"]["device_id"] = "cuda:0#0"
+    rollout.pool.health.slots.append(SimpleNamespace(**{**vars(first), "device_id": "cuda:0#1", **changes}))
+
+
+def test_slots_sharing_one_gpu_need_their_count_pinned(rollout):
+    _second_slot(rollout)
+    rollout.save()
+    with pytest.raises(ValueError, match="identity mismatch"):
+        observed.authorize_observed_live(rollout.pool, rollout.revision)
+    rollout.manifest["identity"]["proof_slots"] = 2
+    rollout.save()
+    report = observed.authorize_observed_live(rollout.pool, rollout.revision)
+    assert report["identity"]["proof_slots"] == 2
+    rollout.pool.health.slots.pop()
+    with pytest.raises(ValueError, match="identity mismatch"):
+        observed.authorize_observed_live(rollout.pool, rollout.revision)
+
+
+@pytest.mark.parametrize("changes", [{"device_uuid": "gpu-2"}, {"physical_device": "cuda:1"},
+    {"revision": "9" * 40}])
+def test_slots_must_share_one_gpu_and_the_checkpoint(rollout, changes):
+    _second_slot(rollout, **changes)
+    rollout.manifest["identity"]["proof_slots"] = 2
+    rollout.save()
+    with pytest.raises(ValueError, match="one GPU|slot checkpoint"):
+        observed.authorize_observed_live(rollout.pool, rollout.revision)
+
+
+def test_no_slots_or_unadopted_checkpoint(rollout):
+    slots = rollout.pool.health.slots
+    rollout.pool.health.slots = []
     with pytest.raises(ValueError, match="one GPU"):
         observed.authorize_observed_live(rollout.pool, rollout.revision)
-    rollout.pool.health.slots = rollout.pool.health.slots[:1]
+    rollout.pool.health.slots = slots
     rollout.pool.health.checkpoint = None
     with pytest.raises(ValueError, match="adopted"):
         observed.authorize_observed_live(rollout.pool, rollout.revision)
