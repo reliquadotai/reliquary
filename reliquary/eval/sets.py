@@ -70,6 +70,15 @@ CORPUS_RANGES: tuple[UsedRange, ...] = (
               "logic-qwen38-27b-v1"),
 )
 
+# Rows a source keeps for RL alone: no corpus job may take them, whatever it
+# declares. reliquary_competitive_code_v1 shares train by problem identity
+# (the package's `layout.use_of`), SFT first then RL, as its environment.toml
+# `[data]` declares: SFT [0, 4181), RL [4181, 6899).
+RL_ONLY_RANGES: tuple[UsedRange, ...] = (
+    UsedRange("rl", "reliquary_competitive_code_v1", "train", 4181, 2718,
+              "competitive-code RL share"),
+)
+
 _CODE_LENGTH = 2_481_806
 _CODE_HELD_OUT = 100_000
 
@@ -147,6 +156,9 @@ SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
     "reliquary_logic_v2": ("reliquary-logic-generator-v2", "reliquary_logic_v2"),
     "reliquary_instruction_following_v1": ("nvidia/Nemotron-Cascade-2-RL-data:IF-RL",
                                            "reliquary_instruction_following_v1"),
+    "reliquary_competitive_code_v1": (
+        "ReliquaryForge/competitive-code-curated@1f6e4f12",
+        "reliquary_competitive_code_v1"),
 }
 
 
@@ -180,6 +192,12 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
             raise ValueError(
                 f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
                 f"{held.env!r} evaluation set; this job's [{job.start}, {job.end}) reaches them"
+            )
+    for reserved in RL_ONLY_RANGES:
+        if lineage(source)[1] == lineage(reserved.source)[1] and overlaps(job, reserved):
+            raise ValueError(
+                f"rows [{reserved.start}, {reserved.end}) of {source!r} are the RL share "
+                f"({reserved.what}); this job's [{job.start}, {job.end}) reaches them"
             )
 
 
@@ -465,6 +483,7 @@ __all__ = [
     "open_source",
     "overlaps",
     "prompt_sha256",
+    "RL_ONLY_RANGES",
     "refuse_held_out_overlap",
     "rl_ranges",
     "validated_set_id",

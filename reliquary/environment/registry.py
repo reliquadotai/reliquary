@@ -56,6 +56,7 @@ EXTERNAL_SINGLE_TURN_CONTRACTS = frozenset(
         "reliquary/boxed-answer/v1",
         "reliquary/checked-answer/v1",
         "reliquary/python-cases/v1",
+        "reliquary/stdio-program/v1",
     }
 )
 
@@ -78,10 +79,12 @@ def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
 
     **Hands over materials.** The wheel supplies the cases; this repository
     executes them and computes the reward, so there is no foreign reward to
-    bound and the lattice is derived here from the case count. It is the shape
-    a code environment needs, and it is the shape that keeps execution inside
-    the sandbox: a package that graded its own Python would be running
-    model-written code behind its own rlimits instead of behind gVisor.
+    bound. The lattice is derived here from the case count, or is binary when
+    the reward is all-or-nothing over the cases (a whole program on stdin
+    tests). It is the shape a code environment needs, and it is the shape that
+    keeps execution inside the sandbox: a package that graded its own Python
+    would be running model-written code behind its own rlimits instead of
+    behind gVisor.
 
     Nothing else is admitted. A wheel that both graded itself and declared a
     fractional lattice would be handing back a number this repository has no
@@ -91,13 +94,12 @@ def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
     binary = (
         spec.reward_lattice_policy == "binary-v1"
         and spec.attainable_rewards == (0.0, 1.0)
-        and spec.reward_materializer_method is None
     )
-    if binary:
+    if binary and spec.reward_materializer_method is None:
         return
     materials = (
         spec.reward_materializer_method == EXTERNAL_REWARD_MATERIALIZER
-        and not spec.attainable_rewards
+        and (binary or not spec.attainable_rewards)
     )
     if not materials:
         raise ValueError(
@@ -773,6 +775,34 @@ _SPEC_VALUES = (
         ),
         external_distribution="reliquary-code",
         external_artifact_resource="reliquary_code/artifact.json",
+    ),
+    EnvironmentSpec(
+        # Competitive programming: a whole program read from stdin, passing
+        # every hidden test or nothing. The package supplies the statements
+        # and the tests through `admission_reward_cases`; the program runs
+        # here, in the grading service's gVisor workers, through the package's
+        # own `judge.guest.run`, and its output is compared on this side with
+        # the package's `outputs_match`. The package's `grade` is never called
+        # on a validator: it runs the program in a local subprocess.
+        name="reliquary_competitive_code_v1",
+        factory_path=(
+            "reliquary_competitive_code.environment:CompetitiveCodeEnvironment"
+        ),
+        scorer_path="reliquary.environment.stdio_program:score_stdio_program",
+        validator_authoritative_reward=True,
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="fenced_python",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/stdio-program/v1",
+        reward_materializer_method="admission_reward_cases",
+        environment_manifest_sha256=(
+            "0589dc2f13c21d8ff6a67d24dd2b8c68"
+            "e54b706f696267a349158bbd891093d9"
+        ),
+        external_distribution="reliquary-competitive-code",
+        external_artifact_resource="reliquary_competitive_code/artifact.json",
     ),
     EnvironmentSpec(
         # Telecom support tickets in tau2-bench's solo mode, graded on the

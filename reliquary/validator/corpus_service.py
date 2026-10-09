@@ -273,6 +273,15 @@ class SingleTurnPromptJob:
                 f"prompt source {self._job.prompt_source!r} returned no prompt "
                 f"text for row {position}"
             )
+        # A source that shares train between SFT and RL marks each row's use
+        # (by problem identity, so a range typo cannot move it): a corpus job
+        # sells SFT data and is never served an RL row.
+        use = problem.get("use")
+        if use is not None and use != "sft":
+            raise CorpusPromptSourceError(
+                f"row {position} of {self._job.prompt_source!r} is in its "
+                f"{use!r} share, kept for RL; a corpus job is never served it"
+            )
         # The row's identity here is its index: fidelity compares the prompt
         # text, and carrying the environment's own id would only add a way for
         # a source to hand back something `EpisodeTask` refuses.
