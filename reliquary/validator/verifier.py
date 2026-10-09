@@ -144,6 +144,10 @@ class ProofResult:
     toploc_worst_exp: int = 0
     toploc_worst_mant_mean: float = 0.0
     toploc_worst_mant_median: float = 0.0
+    # Plan 2C, signed episodes only: every model turn ending on a stop token ends on the forced pick.
+    # None: no such turn checked, or not a signed episode.
+    episode_stop_picks_ok: bool | None = None
+    episode_stop_first_bad_turn: int | None = None
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -536,6 +540,68 @@ def policy_token_positions(
     )
 
 
+def signed_episode_spans(rollout_meta: dict[str, Any], seq_len: int) -> list[tuple[int, int]] | None:
+    """Plan 2C: the model spans of a signed episode; None for any other rollout, ``[]`` when malformed
+    (no proof passes an empty span list). Read strictly: integer pairs, ordered, non-empty,
+    non-overlapping, inside the sequence and after the declared prompt."""
+    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
+    episode = rollout_meta.get("episode") if isinstance(rollout_meta, dict) else None
+    if not isinstance(episode, dict) or episode.get("schema_version") != SIGNED_EPISODE_SCHEMA:
+        return None
+    raw_spans = episode.get("assistant_spans")
+    if not isinstance(raw_spans, (list, tuple)):
+        return []
+    try:
+        prompt_length = int(rollout_meta.get("prompt_length", 0))
+    except (TypeError, ValueError, OverflowError):
+        return []
+    spans: list[tuple[int, int]] = []
+    previous = max(1, prompt_length)
+    for raw in raw_spans:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            return []
+        if not all(type(value) is int for value in raw):
+            return []
+        start, end = raw
+        if start < previous or end <= start or end > seq_len:
+            return []
+        spans.append((start, end))
+        previous = end
+    return spans
+
+
+def _episode_stop_picks(
+    logits_gpu: Any,
+    tokens: list[int],
+    spans: list[tuple[int, int]],
+    policy_positions: list[int],
+    stop_ids: set[int],
+    seed_u_values: list[float],
+) -> tuple[bool | None, int | None]:
+    """Plan 2C: each model turn that ends on a stop token (a natural stop or a tool-call stop) must end
+    on the forced pick ``pick(warp(logits[t - 1]), u_j)``, ``j`` its model-token offset in the episode.
+    A turn cut by its cap ends on no stop: the admission's structural check (exactly the cap) covers it.
+    ``(True, None)`` when every checked turn passed, ``(False, turn)`` at the first that did not (a stop
+    the u-stream does not reach fails too), ``(None, None)`` when no turn ended on a stop."""
+    if not stop_ids:
+        return None, None
+    offset_of = {position: offset for offset, position in enumerate(policy_positions)}
+    checked = False
+    for turn, (_start, end) in enumerate(spans):
+        t = end - 1
+        if int(tokens[t]) not in stop_ids:
+            continue
+        offset = offset_of.get(t)
+        if offset is None or offset >= len(seed_u_values):
+            return False, turn
+        exact, _ = _forced_pick_diagnostics(logits_gpu[t - 1], int(tokens[t]), seed_u_values[offset])
+        checked = True
+        if not exact:
+            return False, turn
+    return (True, None) if checked else (None, None)
+
+
 def proof_challenge_indices(
     tokens: list[int],
     rollout_meta: dict[str, Any],
@@ -741,6 +807,7 @@ def verify_commitment_proofs(
     policy_positions = policy_token_positions(tokens, rollout_meta)
 
     seq_len = len(tokens)
+    signed_spans = signed_episode_spans(rollout_meta, seq_len)
     capture_utility = utility_telemetry_enabled()
 
     # SECURITY: Always use the validator's independently-computed randomness.
@@ -823,6 +890,8 @@ def verify_commitment_proofs(
     terminal_pick_cdf_miss = None
     natural_close_pick_ok = None
     natural_close_pick_cdf_miss = None
+    episode_stop_picks_ok = None
+    episode_stop_first_bad_turn = None
     if seed_u_values is not None:
         valid_t = policy_positions
         # Exclude BFT-injected force_span tokens: validator-accepted but not
@@ -890,11 +959,21 @@ def verify_commitment_proofs(
             logits_gpu, tokens, prompt_length, completion_length, seq_len,
             tokenizer, seed_u_values, rollout_meta,
         )
+        if signed_spans:
+            episode_stop_picks_ok, episode_stop_first_bad_turn = _episode_stop_picks(
+                logits_gpu, tokens, signed_spans, policy_positions,
+                _eos_set_from_model(model, tokenizer), seed_u_values,
+            )
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
-    from reliquary.validator.toploc_check import toploc_verdict
+    if signed_spans is not None:
+        from reliquary.validator.toploc_check import toploc_span_verdict
 
-    toploc = toploc_verdict(hidden_states, commit, prompt_length)
+        toploc = toploc_span_verdict(hidden_states, commit, signed_spans)
+    else:
+        from reliquary.validator.toploc_check import toploc_verdict
+
+        toploc = toploc_verdict(hidden_states, commit, prompt_length)
     if capture_utility:
         (
             hidden_start_f16_b64,
@@ -983,6 +1062,8 @@ def verify_commitment_proofs(
         toploc_worst_exp=0 if toploc is None else int(toploc.worst_exp),
         toploc_worst_mant_mean=0.0 if toploc is None else float(toploc.worst_mant_mean),
         toploc_worst_mant_median=0.0 if toploc is None else float(toploc.worst_mant_median),
+        episode_stop_picks_ok=episode_stop_picks_ok,
+        episode_stop_first_bad_turn=episode_stop_first_bad_turn,
     )
 
 
