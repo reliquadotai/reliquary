@@ -208,7 +208,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install torch==2.7.0 \
   --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[operator,dev]"
 
 pytest -q \
   --ignore=tests/gpu \
@@ -225,6 +225,7 @@ running an operator workload.
 
 | Guide | Purpose |
 | --- | --- |
+| [CLI](docs/cli.md) | Installation, package checks and local catalog inspection |
 | [Concepts](docs/concepts.md) | Current mechanism, incentives, verification, and economics |
 | [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
 | [Validating](docs/validating.md) | Weight-only and trainer deployment |

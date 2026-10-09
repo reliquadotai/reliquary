@@ -477,10 +477,8 @@ def test_jobs_cancel_retires_the_entry_and_leaves_the_manifest(bucket, registry)
     assert _manifest_keys(bucket) == ["reliquary/corpus/jobs/swe-v1.json"]
 
 
-def test_jobs_cancel_says_it_is_a_boot_gate_and_not_a_stop(bucket, registry):
-    """`status` is checked by `resolve_task_config` at startup and `admit()`
-    never reads it, so a validator already serving this job keeps admitting.
-    The operator acts on this sentence, so it has to be the true one."""
+def test_jobs_cancel_requires_observed_drain_after_refresh(bucket, registry):
+    """Retirement is acknowledged before controllers refresh and work drains."""
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     assert CliRunner().invoke(app, _create_args()).exit_code == 0
 
@@ -489,9 +487,8 @@ def test_jobs_cancel_says_it_is_a_boot_gate_and_not_a_stop(bucket, registry):
     )
 
     assert result.exit_code == 0, result.output
-    assert "already running" in result.output
-    assert "restarts" in result.output
-    # The word the old output used, which an operator reads as "it has stopped".
+    assert "refresh" in result.output
+    assert "drain" in result.output and "jobs status" in result.output
     assert "cancelled" not in result.output.lower()
 
 

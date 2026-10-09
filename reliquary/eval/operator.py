@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import re
 import secrets
+import tempfile
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -25,8 +29,8 @@ GRADED_FILES = ("report.json", "manifest.json", "graded.parquet")
 
 
 class AdminError(RuntimeError):
-    def __init__(self, method: str, path: str, status: int, detail: Any) -> None:
-        super().__init__(f"{method} {path}: {status} {detail}")
+    def __init__(self, method: str, path: str, status: int | None, detail: Any) -> None:
+        super().__init__(f"{method} {path}: {status if status is not None else 'network'} {detail}")
         self.status, self.detail = status, detail
 
 
@@ -35,8 +39,43 @@ class AdminClient:
 
     def __init__(self, base_url: str, secret: bytes, *, http: httpx.Client | None = None,
                  timeout: float = 120.0) -> None:
+        try:
+            origin = urlsplit(base_url)
+            port = origin.port
+        except (TypeError, ValueError):
+            raise ValueError("administrator endpoint requires an HTTPS origin or HTTP loopback") from None
+        if (not origin.hostname or origin.username is not None or origin.password is not None
+                or "?" in base_url or "#" in base_url or origin.path not in {"", "/"}
+                or port is not None and port == 0
+                or not (origin.scheme == "https" or origin.scheme == "http"
+                        and origin.hostname in {"127.0.0.1", "::1", "localhost"})):
+            raise ValueError("administrator endpoint requires an HTTPS origin or HTTP loopback")
+        self._base_url = base_url.rstrip("/")
         self._secret = secret
-        self._http = http or httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+        self._owns_http = http is None
+        self._http = http or httpx.Client(base_url=self._base_url, timeout=timeout,
+                                         trust_env=False, follow_redirects=False)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._owns_http:
+            self._http.close()
+
+    def _error(self, method: str, path: str, status: int | None, detail: Any) -> AdminError:
+        detail = str(detail)
+        secret = self._secret.decode("utf-8", errors="ignore")
+        if secret:
+            detail = detail.replace(secret, "[redacted]")
+        detail = detail[:300]
+        if method.upper() not in ("GET", "HEAD", "OPTIONS") and (
+                status is None or status >= 500 or 200 <= status < 300):
+            detail += "; request outcome is unknown, check status before retrying"
+        return AdminError(method, path, status, detail)
 
     def request(self, method: str, path: str, body: Any = None) -> httpx.Response:
         from reliquary.admin.auth import (
@@ -48,18 +87,26 @@ class AdminClient:
         headers = {TIMESTAMP_HEADER: stamp, NONCE_HEADER: nonce,
                    SIGNATURE_HEADER: sign_request(self._secret, stamp, nonce, method, path, data),
                    "content-type": "application/json"}
-        return self._http.request(method, path, content=data, headers=headers)
+        try:
+            return self._http.request(method, f"{self._base_url}{path}", content=data,
+                                      headers=headers, follow_redirects=False)
+        except httpx.RequestError as exc:
+            raise self._error(method, path, None, type(exc).__name__) from None
 
     def json(self, method: str, path: str, body: Any = None,
              ok: tuple[int, ...] = (200, 201, 202)) -> dict:
         response = self.request(method, path, body)
+        try:
+            answer = response.json()
+        except ValueError:
+            raise self._error(method, path, response.status_code,
+                              "administrator returned a non-JSON response") from None
+        if not isinstance(answer, dict):
+            raise self._error(method, path, response.status_code,
+                              "administrator returned a JSON value instead of an object")
         if response.status_code not in ok:
-            try:
-                detail = response.json().get("detail")
-            except ValueError:
-                detail = response.text[:300]
-            raise AdminError(method, path, response.status_code, detail)
-        return response.json()
+            raise self._error(method, path, response.status_code, answer.get("detail"))
+        return answer
 
 
 def split_model(spec: str) -> tuple[str, str]:
@@ -98,7 +145,7 @@ def default_job_id(prefix: str, revision: str, set_id: str, count: int, samples:
 def checked_job_id(job_id: str) -> str:
     from reliquary.corpus.job import JOB_ID_RE
 
-    if not JOB_ID_RE.match(job_id):
+    if not isinstance(job_id, str) or JOB_ID_RE.fullmatch(job_id) is None:
         raise ValueError(f"job id {job_id!r} is not [a-z0-9-], at most 63 characters")
     return job_id
 
@@ -119,7 +166,7 @@ def read_set_card(set_id: str, store=None) -> dict:
 def _wait(client: AdminClient, qualification_ids: list[str], *, poll_seconds: float,
           timeout_seconds: float, sleep: Callable[[float], None],
           log: Callable[[str], None], clock: Callable[[], float]) -> dict[str, dict]:
-    from reliquary.eval.qualification import TERMINAL
+    from reliquary.eval.qualification import PENDING, TERMINAL
 
     deadline = clock() + timeout_seconds
     done: dict[str, dict] = {}
@@ -130,6 +177,9 @@ def _wait(client: AdminClient, qualification_ids: list[str], *, poll_seconds: fl
                 continue
             record = client.json("GET", f"/admin/v1/qualifications/{qid}")
             status = record.get("status")
+            if status != PENDING and status not in TERMINAL:
+                raise AdminError("GET", f"/admin/v1/qualifications/{qid}", 200,
+                                 "administrator returned an unknown qualification state")
             if last.get(qid) != status:
                 log(f"qualification {qid}: {status}")
                 last[qid] = status
@@ -137,10 +187,17 @@ def _wait(client: AdminClient, qualification_ids: list[str], *, poll_seconds: fl
                 done[qid] = record
         if len(done) == len(qualification_ids):
             return done
-        if clock() > deadline:
+        remaining = deadline - clock()
+        if remaining <= 0:
             raise TimeoutError(f"qualifications still running after {timeout_seconds:.0f} s: "
-                               f"{sorted(set(qualification_ids) - set(done))}")
-        sleep(poll_seconds)
+                               f"{sorted(set(qualification_ids) - set(done))}; rerun the same command to resume")
+        sleep(min(poll_seconds, remaining))
+
+
+def _check_wait_options(poll_seconds: float, timeout_seconds: float) -> None:
+    for name, value in (("poll_seconds", poll_seconds), ("timeout_seconds", timeout_seconds)):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be a positive finite number")
 
 
 def create_evaluations(client: AdminClient, *, cards: list[dict], model: str, revision: str,
@@ -150,6 +207,7 @@ def create_evaluations(client: AdminClient, *, cards: list[dict], model: str, re
                        job_id: str | None = None, completions: int = 32,
                        prefix: str = "order-", poll_seconds: float = 30.0,
                        timeout_seconds: float = 6 * 3600.0, attempt: int = 0,
+                       wait: bool = True,
                        sleep: Callable[[float], None] = time.sleep,
                        log: Callable[[str], None] = print,
                        clock: Callable[[], float] = time.monotonic) -> list[dict]:
@@ -159,7 +217,11 @@ def create_evaluations(client: AdminClient, *, cards: list[dict], model: str, re
     is refused or fails qualification gets no job, and the error names why.
     Every id is derived and checked before anything is requested, so a rerun
     finds what the first run made and a bad id never costs a qualification.
-    A failed qualification stays failed under its id: ``attempt`` asks again."""
+    A failed qualification stays failed under its id: ``attempt`` asks again.
+    With ``wait=False``, only request qualifications; rerun to declare the jobs."""
+    _check_wait_options(poll_seconds, timeout_seconds)
+    if len({card["set_id"] for card in cards}) != len(cards):
+        raise ValueError("each --set must be distinct")
     if job_id is not None and len(cards) != 1:
         raise ValueError("--job-id names one job: give one set")
     if completions * max_new_tokens > 64 * 32768:
@@ -175,13 +237,17 @@ def create_evaluations(client: AdminClient, *, cards: list[dict], model: str, re
                       "max_new_tokens": max_new_tokens, "thinking": thinking}
         qid = qualification_id_for(prefix, {**conditions, "completions": completions,
                                             "attempt": attempt})
+        job_conditions = conditions if seed is None else {**conditions, "seed": seed}
         name = checked_job_id(job_id or default_job_id(prefix, revision, card["set_id"],
-                                                       problems, samples, conditions))
+                                                       problems, samples, job_conditions))
         plans.append((card, problems, qid, conditions, name))
     for card, _, qid, conditions, _ in plans:
         client.json("POST", "/admin/v1/qualifications", {
             "qualification_id": qid, **conditions, "completions": completions})
         log(f"qualification {qid} requested for {card['set_id']}")
+    if not wait:
+        return [{"job_id": name, "set_id": card["set_id"], "qualification_id": qid,
+                 "state": "qualification_requested"} for card, _, qid, _, name in plans]
     records = _wait(client, [plan[2] for plan in plans], poll_seconds=poll_seconds,
                     timeout_seconds=timeout_seconds, sleep=sleep, log=log, clock=clock)
     created = []
@@ -212,39 +278,93 @@ def create_evaluations(client: AdminClient, *, cards: list[dict], model: str, re
 def grade_job(client: AdminClient, job_id: str, *, out: str | Path | None = None,
               eval_id: str | None = None, allow_incomplete: bool = False,
               poll_seconds: float = 10.0, timeout_seconds: float = 6 * 3600.0,
+              wait: bool = True,
               sleep: Callable[[float], None] = time.sleep,
               clock: Callable[[], float] = time.monotonic) -> dict:
-    """Grade a drained eval job and, with ``out``, write its three files there."""
+    """Grade a drained eval job and download a verified bundle into a new or empty directory.
+
+    With ``wait=False``, return immediately if grading is still running."""
+    from reliquary.corpus.delivery import validated_delivery_id
     from reliquary.eval.prompt_source import parse_eval_source
 
-    status = client.json("GET", f"/admin/v1/jobs/{job_id}/status")
-    manifest = status["manifest"]
-    source = parse_eval_source(manifest["prompt_source"])
-    samples = int(manifest["slots_per_prompt"]) * int(manifest["sampling"]["n"])
-    eval_id = eval_id or job_id
+    _check_wait_options(poll_seconds, timeout_seconds)
+    job_id = checked_job_id(job_id)
+    eval_id = validated_delivery_id(job_id if eval_id is None else eval_id)
+    directory = Path(out) if out is not None else None
+    if directory is not None and (directory.is_symlink() or directory.exists() and (
+            not directory.is_dir() or any(directory.iterdir()))):
+        raise ValueError("--out must be a new or empty directory; existing results are kept")
+    status_path = f"/admin/v1/jobs/{job_id}/status"
+    status = client.json("GET", status_path)
+    try:
+        manifest = status["manifest"]
+        source = parse_eval_source(manifest["prompt_source"])
+        samples = int(manifest["slots_per_prompt"]) * int(manifest["sampling"]["n"])
+    except (KeyError, TypeError, ValueError):
+        raise AdminError("GET", status_path, 200,
+                         "administrator returned an invalid evaluation job status") from None
     body = {"source": "job", "job_id": job_id, "set_ids": [source.set_id],
             "problems_per_set": {source.set_id: source.count},
             "samples_per_set": {source.set_id: samples}, "allow_incomplete": allow_incomplete}
     deadline = clock() + timeout_seconds
     while True:
-        response = client.request("POST", f"/admin/v1/evaluations/{eval_id}/grade", body)
-        if response.status_code == 200:
-            answer = response.json()
+        answer = client.json("POST", f"/admin/v1/evaluations/{eval_id}/grade", body,
+                             ok=(200, 202))
+        if answer.get("state") == "done":
             break
-        if response.status_code != 202:
-            raise AdminError("POST", f"/admin/v1/evaluations/{eval_id}/grade",
-                             response.status_code, response.json().get("detail"))
-        if clock() > deadline:
-            raise TimeoutError(f"grading {eval_id} still running after {timeout_seconds:.0f} s")
-        sleep(poll_seconds)
-    if out is not None:
-        directory = Path(out)
-        directory.mkdir(parents=True, exist_ok=True)
-        for name in GRADED_FILES:
-            response = client.request("GET", f"/admin/v1/evaluations/{eval_id}/files/{name}")
-            if response.status_code != 200:
-                raise AdminError("GET", name, response.status_code, response.text[:300])
-            (directory / name).write_bytes(response.content)
+        if answer.get("state") != "running":
+            raise AdminError("POST", f"/admin/v1/evaluations/{eval_id}/grade", 202,
+                             "administrator returned an unknown grading state")
+        if not wait:
+            return answer
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise TimeoutError(f"grading {eval_id} still running after {timeout_seconds:.0f} s; "
+                               "rerun the same command to resume")
+        sleep(min(poll_seconds, remaining))
+    if directory is not None:
+        from reliquary.eval.grading import REPORT_SCHEMA
+
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f".{directory.name}-", dir=directory.parent) as scratch:
+            staged = Path(scratch) / "result"
+            staged.mkdir()
+            for name in GRADED_FILES:
+                path = f"/admin/v1/evaluations/{eval_id}/files/{name}"
+                response = client.request("GET", path)
+                if response.status_code != 200:
+                    raise AdminError("GET", path, response.status_code, "evaluation file download failed")
+                (staged / name).write_bytes(response.content)
+            downloaded = json.loads((staged / "manifest.json").read_bytes())
+            report = json.loads((staged / "report.json").read_bytes())
+            if (not isinstance(downloaded, dict) or not isinstance(report, dict)
+                    or downloaded.get("schema") != REPORT_SCHEMA or downloaded.get("eval_id") != eval_id
+                    or report.get("eval_id") != eval_id):
+                raise ValueError("downloaded evaluation identity does not match the requested result")
+            files = downloaded.get("files")
+            if (not isinstance(files, list) or len(files) != 2
+                    or not all(isinstance(f, dict) and isinstance(f.get("name"), str) for f in files)
+                    or {f["name"] for f in files} != {
+                        "report.json", "graded.parquet"}):
+                raise ValueError("downloaded evaluation manifest must describe both result files")
+            for file in files:
+                content = (staged / file["name"]).read_bytes()
+                if len(content) != file.get("bytes") or hashlib.sha256(content).hexdigest() != file.get("sha256"):
+                    raise ValueError(f"downloaded {file['name']} does not match its manifest")
+            for name in GRADED_FILES:
+                with (staged / name).open("rb") as file:
+                    os.fsync(file.fileno())
+            staged_fd = os.open(staged, os.O_RDONLY)
+            try:
+                os.fsync(staged_fd)
+            finally:
+                os.close(staged_fd)
+            staged.replace(directory)
+            parent_fd = os.open(directory.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
     return answer
 
 

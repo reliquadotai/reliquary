@@ -19,6 +19,30 @@ def test_a_matching_contract_is_saved_for_the_job(tmp_path):
     assert path.parent == tmp_path and "code-v1" in path.name
 
 
+@pytest.mark.parametrize("job_id", [None, "", "INVALID", "two words", "x" * 64])
+def test_contract_cache_requires_a_valid_job_id(tmp_path, job_id):
+    job = SimpleNamespace(**{**vars(JOB), "job_id": job_id})
+    with pytest.raises(CorpusContractError, match="invalid job id"):
+        save_served_contract(CONTRACT, job, tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_failed_contract_replace_preserves_previous_complete_file(monkeypatch, tmp_path):
+    import os
+
+    path = save_served_contract(CONTRACT, JOB, tmp_path)
+    previous = path.read_bytes()
+
+    def refuse(*args):
+        raise OSError("replace unavailable")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(OSError, match="replace unavailable"):
+        save_served_contract({**CONTRACT, "extra": "new"}, JOB, tmp_path)
+    assert path.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [path]
+
+
 @pytest.mark.parametrize("change", [
     {"model_id": "org/Other"},
     {"model_revision": "r2"},
@@ -39,8 +63,10 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
 
     from reliquary.cli import main as cli
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+    from tests.unit.test_corpus_export import _job_spec
 
-    job = {"job_id": "code-v1", "checkpoint_repo": "org/M", "checkpoint_revision": "r1"}
+    job = {**_job_spec(job_id="code-v1").to_contract(),
+           "checkpoint_repo": "org/M", "checkpoint_revision": "r1"}
     served = {"/corpus/job": job, "/corpus/contract": CONTRACT}
     requested = []
 
@@ -64,6 +90,12 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
             requested.append(path)
             return _Response(served[path])
 
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
     class _Restarted(Exception):
         pass
 
@@ -80,7 +112,7 @@ def test_corpus_mine_without_a_contract_fetches_it_and_restarts(monkeypatch, tmp
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     monkeypatch.setattr("httpx.Client", _Client)
     monkeypatch.setattr(os, "execv", _execv)
-    result = CliRunner().invoke(cli.app, ["corpus", "mine", "--validator-url", "http://v"])
+    result = CliRunner().invoke(cli.app, ["--debug", "corpus", "mine", "--validator-url", "http://v"])
     assert isinstance(result.exception, _Restarted), result.output
     (_, _, contract_path), = execs
     assert json.loads(open(contract_path).read()) == CONTRACT

@@ -41,6 +41,7 @@ reliquary-infra/inventory/known_hosts
 *.integration-private.*
 /reports/private/
 *.private.*
+/cli-readiness-private.*
 
 # Generated ML and research artifacts
 /wandb/

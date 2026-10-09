@@ -1,9 +1,11 @@
 """Tests for the CLI's grader auto-launch helpers."""
 
 import os
+import json
 import socket
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -71,8 +73,10 @@ def test_ensure_grader_launches_safe_remote_rollout_mode(
     reachability = iter([False, True])
 
     class _Process:
+        pid = 42
+
         def poll(self):
-            return 1
+            return None
 
     def _popen(cmd, **kwargs):
         calls.append((cmd, kwargs))
@@ -95,7 +99,7 @@ def test_ensure_grader_launches_safe_remote_rollout_mode(
         "https://cpu-exec.internal:8443",
     )
     monkeypatch.setenv("RELIQUARY_GRADER_EXECUTOR_MODE", mode)
-    main._grader_proc = None
+    monkeypatch.setattr(main, "_grader_proc", None)
 
     main._ensure_grader_running()
 
@@ -104,3 +108,96 @@ def test_ensure_grader_launches_safe_remote_rollout_mode(
     assert ("--use-runsc" in cmd) is expects_runsc
     assert kwargs["env"]["RELIQUARY_GRADER_EXECUTOR_MODE"] == mode
     assert kwargs["env"]["RELIQUARY_GRADER_EXECUTOR_URL"].startswith("https://")
+
+
+@pytest.mark.parametrize("exit_code", [0, 17, None])
+def test_required_grader_startup_failure_raises_and_cleans_up(monkeypatch, exit_code):
+    from reliquary.cli import main
+
+    calls = []
+
+    class Process:
+        pid = 42
+        code = exit_code
+
+        def poll(self):
+            return self.code
+
+        def terminate(self):
+            calls.append("terminate")
+            self.code = 0
+
+        def wait(self, timeout):
+            calls.append("wait")
+
+    clock = iter([0, 1, 16])
+    monkeypatch.setattr(main._time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(main._time, "sleep", lambda _: None)
+    monkeypatch.setattr(main, "_grader_is_running", lambda *a, **k: False)
+    monkeypatch.setattr(main.subprocess, "Popen", lambda *a, **k: Process())
+    monkeypatch.setattr(main, "_grader_proc", None)
+    monkeypatch.setenv("RELIQUARY_GRADER_EXECUTOR_URL", "https://executor.example")
+    monkeypatch.setenv("RELIQUARY_GRADER_EXECUTOR_MODE", "remote")
+
+    with pytest.raises(RuntimeError, match="exited during startup|not ready within"):
+        main._ensure_grader_running()
+    assert main._grader_proc is None
+    assert calls == (["terminate", "wait"] if exit_code is None else [])
+
+
+def test_existing_incompatible_grader_is_refused_without_launch(monkeypatch):
+    from reliquary.cli import main
+
+    monkeypatch.setattr(main, "_grader_is_running", lambda *a, **k: not k)
+    monkeypatch.setattr(main.subprocess, "Popen", lambda *a, **k: pytest.fail("unexpected launch"))
+    monkeypatch.delenv("RELIQUARY_GRADER_EXECUTOR_URL", raising=False)
+    with pytest.raises(RuntimeError, match="incompatible readiness"):
+        main._ensure_grader_running(use_runsc=True)
+
+
+@pytest.mark.parametrize("change,expected", [
+    ({}, True), ({"updated_at": 0}, False), ({"workers_alive": 0}, False),
+    ({"sandbox_backend": "python"}, False), ({"execution_backend": "remote"}, False),
+    ({"shutdown_complete": True}, False), ({"server_pid": 9}, False),
+])
+def test_grader_readiness_checks_published_backend_and_workers(monkeypatch, tmp_path, change, expected):
+    from reliquary.cli import main
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+    health = {"updated_at": time.time(), "execution_backend": "local",
+              "sandbox_backend": "runsc", "workers_alive": 1,
+              "server_pid": 42, "shutdown_complete": False, **change}
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps(health))
+    monkeypatch.setenv("GRADER_HEALTH_PATH", str(path))
+    monkeypatch.delenv("RELIQUARY_GRADER_RUNTIME_ID", raising=False)
+    monkeypatch.setattr(main._socket, "socket", lambda *a: Socket())
+    assert main._grader_is_running("unused", expected_backend="local",
+                                   expected_sandbox="runsc", expected_pid=42) is expected
+
+
+def test_remote_grader_readiness_does_not_require_local_workers(monkeypatch, tmp_path):
+    from reliquary.cli import main
+
+    health = {"updated_at": time.time(), "execution_backend": "remote",
+              "sandbox_backend": "remote", "workers_alive": 0,
+              "shutdown_complete": False}
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps(health))
+    monkeypatch.setenv("GRADER_HEALTH_PATH", str(path))
+    monkeypatch.delenv("RELIQUARY_GRADER_RUNTIME_ID", raising=False)
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(main._socket, "socket", lambda *a: MagicMock())
+    assert main._grader_is_running("unused", expected_backend="remote", expected_sandbox="remote")

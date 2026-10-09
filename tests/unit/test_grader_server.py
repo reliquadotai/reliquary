@@ -46,6 +46,21 @@ def _case(entry=None, args=None, expected=3):
     }
 
 
+@pytest.mark.parametrize("sandbox_backend", ["python", "runsc", "remote"])
+def test_health_reports_the_configured_sandbox_without_starting_workers(sandbox_backend):
+    from unittest.mock import MagicMock
+    from reliquary.environment.grader.server import GraderServer, runsc_worker_argv
+
+    server = GraderServer(
+        pool_size=0,
+        worker_argv=runsc_worker_argv("unused") if sandbox_backend == "runsc" else None,
+        sandbox_executor=MagicMock() if sandbox_backend == "remote" else None,
+    )
+    health = server.health_snapshot()
+    assert health["sandbox_backend"] == sandbox_backend
+    assert health["workers_alive"] == 0
+
+
 def _request(sock_path: str, code: str, cases: list[dict], timeout_s: float = 5.0) -> dict:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(10.0)
