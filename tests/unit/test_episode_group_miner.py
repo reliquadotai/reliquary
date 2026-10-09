@@ -413,7 +413,7 @@ def test_the_kept_episodes_stay_held_until_the_verdict_behind_the_queue_receipt(
     response = w.mine()
     assert response.accepted and response.verdict["reason"] == "accepted"
     (request,) = w.submitted
-    assert w.validator.polls == [(1, request.merkle_root)] * 4 and w.slept == [2.0] * 3
+    assert w.validator.polls == [(1, request.merkle_root)] * 4 and w.slept == [2.0, 3.0, 4.5]   # backing off
     assert seen == [([], [])] * 4            # nothing submitted nor withdrawn while the verdict was pending
     assert w.runner.submitted == list(range(M_ROLLOUTS))
     assert sorted(w.runner.released) == list(range(M_ROLLOUTS, 2 * M_ROLLOUTS))
@@ -488,6 +488,20 @@ def test_a_verdict_that_never_comes_is_waited_for_until_the_grading_deadline_the
     assert not response.accepted and response.reason == "submitted"
     assert len(w.submitted) == 1 and clock.now >= NOW + 30 + SUBMIT_TRANSIT_S
     assert w.runner.submitted == [] and sorted(w.runner.released) == list(range(2 * M_ROLLOUTS))
+
+
+def test_the_verdict_poll_ends_at_the_window_end_when_it_comes_first_and_backs_off_to_15_s(tmp_path):
+    from reliquary.miner.episode_group_miner import VERDICT_POLL_MAX_S
+    from reliquary.miner.signed_episode import SUBMIT_TRANSIT_S
+
+    clock = Clock()
+    w = world(tmp_path, alternating(2 * M_ROLLOUTS), pending=10 ** 6, submit_by=NOW + 3000, clock=clock,
+              proof_budget_s=0.0)
+    response = w.mine(open_until=NOW + 200)
+    assert not response.accepted and response.reason == "submitted"
+    assert NOW + 200 + SUBMIT_TRANSIT_S <= clock.now < NOW + 3000       # the window's end, not submit_by
+    assert max(w.slept) == VERDICT_POLL_MAX_S and w.slept[:3] == [2.0, 3.0, 4.5]
+    assert sorted(w.runner.released) == list(range(2 * M_ROLLOUTS))
 
 
 def test_seeds_still_playing_are_cut_before_the_grading_deadline(tmp_path):

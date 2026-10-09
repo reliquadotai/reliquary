@@ -44,6 +44,8 @@ PRECOMMIT_ATTEMPTS = 4
 PRECOMMIT_MIN_BACKOFF_S = 2.0
 """The least wait before a throttled precommit is sent again (a 503 may name no Retry-After)."""
 VERDICT_POLL_S = 2.0
+VERDICT_POLL_MAX_S = 15.0
+"""The verdict is polled every VERDICT_POLL_S at first, then 1.5 x longer each time, up to VERDICT_POLL_MAX_S."""
 VERDICT_WAIT_S = 600.0
 """How long a verdict is polled for when the group names no grading deadline and the window no end."""
 PROOF_BUDGET_S = 120.0
@@ -406,6 +408,7 @@ class EpisodeGroupMiner:
                              after_ts: float | None) -> Mapping | None:
         """The group's verdict once it is known (admitted, or refused), or None past ``until``. A verdict
         recorded at or before ``after_ts`` (validator clock) answers an earlier send of the same group."""
+        interval = VERDICT_POLL_S
         while True:
             try:
                 body = await self._verdicts(window, merkle_root)
@@ -420,9 +423,11 @@ class EpisodeGroupMiner:
                          ) or verdict.get("is_final") is True
                 if fresh and known:
                     return verdict
-            if self._clock() >= until:
+            now = self._clock()
+            if now >= until:
                 return None
-            await self._sleep(VERDICT_POLL_S)
+            await self._sleep(min(interval, until - now))
+            interval = min(interval * 1.5, VERDICT_POLL_MAX_S)
 
     async def _deliver(self, request, *, submit_by: float | None, open_until: float | None,
                        label: str) -> GroupVerdict | None:
@@ -443,12 +448,9 @@ class EpisodeGroupMiner:
             wait = SUBMIT_RETRY_S * attempt
             if reason == "submitted":
                 # A queue receipt: the verdict comes from the validator's verdict record.
-                if submit_by is not None:
-                    until = submit_by + SUBMIT_TRANSIT_S       # the validator's own grading deadline
-                elif open_until is not None:
-                    until = open_until + SUBMIT_TRANSIT_S
-                else:
-                    until = self._clock() + VERDICT_WAIT_S
+                # The earlier of the validator's own grading deadline and the window's end, plus the transit.
+                bounds = [bound for bound in (submit_by, open_until) if bound is not None]
+                until = (min(bounds) + SUBMIT_TRANSIT_S if bounds else self._clock() + VERDICT_WAIT_S)
                 verdict = await self._await_verdict(request.window_start, request.merkle_root, until=until,
                                                     after_ts=seen_ts)
                 if verdict is None:

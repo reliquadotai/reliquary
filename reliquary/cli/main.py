@@ -3423,6 +3423,70 @@ def mine(
     asyncio.run(_run())
 
 
+@app.command("mine-episodes")
+def mine_episodes(
+    episode_envs: str = typer.Option(
+        ..., "--episode-envs", help="Comma-separated signed-episode environments to mine"),
+    validator_url: str = typer.Option(..., "--validator-url", help="The RL validator's URL"),
+    validator_hotkey: str = typer.Option(
+        ..., "--validator-hotkey",
+        help="The RL validator's ss58 hotkey: precommits and session opens are signed for it"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    generate_port: int = typer.Option(8012, "--generate-port", help="Loopback port of the generate endpoint"),
+    checkpoint_dir: str = typer.Option(
+        "", "--checkpoint-dir",
+        help="Where announced checkpoints are downloaded (huggingface_hub's cache by default)"),
+    max_live: int = typer.Option(
+        0, "--max-live", min=0, help="Live sessions per group (0 = every seed of the pool at once)"),
+    groups_in_flight: int = typer.Option(
+        2, "--groups-in-flight", min=1, max=2,
+        help="Episode groups mined at once (at most 2: the validator's per-operator cap)"),
+    harness_env: list[str] = typer.Option(
+        [], "--harness-env", help="KEY=VALUE passed to the episode harness (repeatable)"),
+    gpu_memory_utilization: float = typer.Option(
+        0.6, "--gpu-memory-utilization",
+        help="vLLM's share of the GPU; the HF proof model takes the rest of the same GPU"),
+    max_num_seqs: int = typer.Option(16, "--max-num-seqs", help="vLLM's concurrent sequences"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Mine signed-episode groups on the RL validator: per window, precommit a task, play its public seed
+    pool against a local forced-draw vLLM (sandbox tool calls on the validator's machines), and submit
+    one proved group. Needs the reliquary[sandbox-miner] extra and the order's pinned env package. The
+    legacy `mine` never mines these environments."""
+    from reliquary.miner.episode_mining import (
+        EpisodeMinerConfig,
+        parse_episode_environments,
+        parse_harness_env,
+    )
+
+    setup_logging(log_level)
+    try:
+        config = EpisodeMinerConfig(
+            environments=parse_episode_environments(episode_envs), validator_url=validator_url.rstrip("/"),
+            validator_hotkey=validator_hotkey, generate_port=generate_port,
+            checkpoint_dir=checkpoint_dir or None, max_live=max_live or None, groups_in_flight=groups_in_flight,
+            harness_env=parse_harness_env(harness_env) or None,
+            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    import bittensor as bt
+
+    from reliquary.miner import episode_mining
+
+    wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+    if wallet_path:
+        wallet_kwargs["path"] = wallet_path
+    wallet = bt.Wallet(**wallet_kwargs)
+    try:
+        asyncio.run(episode_mining.run_episode_miner(config=config, wallet=wallet))
+    except ValueError as exc:   # a refusal to start: an env, its package or the engine caps
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+
+
 async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=None):
     """Bind the corpus submission route to the one job this task declares.
 
