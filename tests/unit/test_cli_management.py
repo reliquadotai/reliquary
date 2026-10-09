@@ -71,6 +71,16 @@ def test_missing_operator_dependency_has_actionable_error(monkeypatch):
     assert "private-library-detail" not in result.stderr
 
 
+def test_interruption_has_json_error_and_shell_signal_exit(monkeypatch):
+    async def interrupted(**kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("reliquary.infrastructure.task_registry_store.read_registry", interrupted)
+    result = CliRunner().invoke(app, ["tasks", "list", "--json"])
+    assert result.exit_code == 130 and result.stdout == ""
+    assert json.loads(result.stderr)["error"]["code"] == "interrupted"
+
+
 def test_nonexistent_job_is_not_certified_drained(bucket, monkeypatch):
     records = _StatusRecords([], [], {})
 

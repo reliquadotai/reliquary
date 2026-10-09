@@ -87,6 +87,8 @@ Failures emit an error object on stderr and exit nonzero. Scripts should
 check the exit status before reading `data`; progress messages can also
 appear on stderr. Use command-specific help to find supported flags.
 `envs show` retains its existing plain JSON format.
+Interrupted management commands return exit 130; retain the original IDs
+and request keys and check status before repeating a write.
 
 ```bash
 reliquary tasks list --json

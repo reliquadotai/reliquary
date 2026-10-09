@@ -52,8 +52,11 @@ class CLIGroup(TyperGroup):
     def invoke(self, ctx):
         try:
             return super().invoke(ctx)
-        except (typer.Exit, typer.Abort):
+        except typer.Exit:
             raise
+        except (KeyboardInterrupt, typer.Abort):
+            fail("Interrupted. Check persisted status and retain the original IDs and "
+                 "idempotency keys before retrying.", code="interrupted", exit_code=130)
         except UsageError as exc:
             if not ctx.meta.get("json"):
                 raise
