@@ -105,6 +105,7 @@ from reliquary.constants import (
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.environment.registry import get_environment_spec
 from reliquary.infrastructure.process_health import collect_process_health
+from reliquary.protocol.episode_retry import RETRYABLE_STAGES as _EPISODE_RETRYABLE_STAGES
 from reliquary.protocol.legacy_merkle import (
     legacy_submission_merkle_matches,
 )
@@ -288,12 +289,9 @@ class _QueuedAuctionSubmission:
 # At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
 VERDICT_CAP_PER_HOTKEY = 200
 
-# Plan 2C: ``episode_intake.RETRYABLE_STAGES`` (kept equal by a test; not imported, so a legacy
-# validator never loads the episode modules): an episode refusal the miner may retry at once reserves
-# no (operator, prompt) identity.
-_EPISODE_RETRYABLE_STAGES = frozenset({"episode_group_in_flight", "episode_session_busy", "episode_directory",
-                                       "episode_checker_busy", "episode_persist_failed",
-                                       "episode_checks_in_flight"})
+# Plan 2C: an episode refusal the miner may retry at once reserves no (operator, prompt) identity. The
+# shared protocol set ``_EPISODE_RETRYABLE_STAGES`` (imports nothing: a legacy validator never loads the
+# episode modules).
 # Plan 2C: how long a clean shutdown waits for episode settlements in flight before cutting them.
 EPISODE_DRAIN_S = 10.0
 

@@ -350,14 +350,26 @@ def pick_env_and_prompt(
     raise RuntimeError("pick_env_and_prompt: all envs fully in cooldown")
 
 
-def _single_turn_mined_spec(env_name: str):
-    """The spec of an env this engine mines; a signed-episode env (plan 2C) is refused: it is mined by
-    ``reliquary.miner.episode_group_miner.EpisodeGroupMiner``, never as single-turn text."""
-    environment_spec = get_environment_spec(env_name)
-    if environment_spec.interaction_mode == "signed_episode":
-        raise ValueError(f"{env_name} is a signed-episode environment: it is mined by "
+def _single_turn_envs(envs: dict, mix: list) -> tuple[dict, list]:
+    """``envs`` and ``mix`` without the signed-episode envs (plan 2C): those are mined by
+    ``reliquary.miner.episode_group_miner.EpisodeGroupMiner``, never as single-turn text. ValueError when
+    none is left."""
+    def signed(name: str) -> bool:
+        try:
+            return get_environment_spec(name).interaction_mode == "signed_episode"
+        except ValueError:          # not a registered env: this engine's own business
+            return False
+
+    left_out = sorted(name for name in envs if signed(name))
+    if not left_out:
+        return envs, mix            # untouched (the same objects)
+    logger.warning("signed-episode environments %s are not mined by the single-turn engine "
+                   "(EpisodeGroupMiner mines them)", left_out)
+    kept = {name: env for name, env in envs.items() if name not in left_out}
+    if not kept:
+        raise ValueError("no single-turn environment to mine: signed-episode environments are mined by "
                          "reliquary.miner.episode_group_miner.EpisodeGroupMiner")
-    return environment_spec
+    return kept, [(name, weight) for name, weight in mix if name not in left_out]
 
 
 def _compute_merkle_root(rollouts) -> str:
@@ -584,13 +596,11 @@ class MiningEngine:
         self._initial_checkpoint_identity = initial_checkpoint_identity
 
         if envs is not None and mix is not None:
-            self.envs = envs
-            self.mix = mix
-            self.env = next(iter(envs.values()))  # legacy fallback
+            self.envs, self.mix = _single_turn_envs(envs, mix)
+            self.env = next(iter(self.envs.values()))  # legacy fallback
         else:
             assert env is not None, "must pass either env or envs+mix"
-            self.envs = {env.name: env}
-            self.mix = [(env.name, 1)]
+            self.envs, self.mix = _single_turn_envs({env.name: env}, [(env.name, 1)])
             self.env = env
         self._cooldown_per_env: dict[str, set[int]] = {n: set() for n in self.envs}
         self._observations = None
@@ -1010,9 +1020,9 @@ class MiningEngine:
                     continue
                 env_name, prompt_idx = picked
 
-                environment_spec = _single_turn_mined_spec(env_name)
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
+                environment_spec = get_environment_spec(env_name)
                 service_policy = getattr(state, "service_policy", None)
                 policy_value = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
                 from reliquary.protocol.seed_pool import pool_from_service_policy

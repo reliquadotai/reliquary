@@ -571,7 +571,8 @@ class SignedSweEpisodeRunner:
 
         async def unusable(error: str) -> EpisodeResult:
             await self._end(session_id, slot, closing, transcript)
-            return EpisodeResult(trace_id, "", stop, False, None, error=error)
+            return EpisodeResult(trace_id, "", stop, False, None, error=error,
+                                 final_status=status if status != "graded" else None)
 
         if result.error or status != "graded":
             # Unpaid: not graded, or the run did not complete (a gateway close raised

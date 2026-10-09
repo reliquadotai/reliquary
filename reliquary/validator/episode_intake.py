@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from reliquary.constants import CODE_ADMISSION_WALL_SECONDS, MATH_ADMISSION_WALL_SECONDS
+from reliquary.protocol.episode_retry import RETRYABLE_STAGES
 from reliquary.protocol.submission import RejectReason
 from reliquary.sandbox.rl_engagements import NoOutcomes, SessionOutcomes
 from reliquary.validator.episode_admission import EpisodeGroupChecker, EpisodeRefusal, finish_prepared
@@ -46,8 +47,7 @@ _CLAIM_REFUSALS = {
 # Every other episode refusal (a bad transcript, ``episode_rate``: the per-minute budget,
 # ``episode_timeout``: the miner's own check ran past the deadline) keeps it reserved for the window
 # like any refused group.
-RETRYABLE_STAGES = frozenset({"episode_group_in_flight", "episode_session_busy", "episode_directory",
-                              "episode_checker_busy", "episode_persist_failed", "episode_checks_in_flight"})
+# The set lives in ``reliquary.protocol.episode_retry`` (the miner resends on the same stages).
 # Every intake together: transcript checks running at once (threads of their own). A check is not
 # interruptible: a cancelled admission's check keeps its slot until its thread returns. Saturated, a
 # group is refused retryably (WORKER_DROPPED, refunded: the validator's capacity, not the miner's doing).

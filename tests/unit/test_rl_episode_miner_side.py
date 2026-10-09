@@ -162,8 +162,8 @@ class RlSessions:
 
 
 class Harness:
-    def __init__(self, transcript, state):
-        self.transcript, self.state, self.runs = transcript, state, []
+    def __init__(self, transcript, state, status="graded"):
+        self.transcript, self.state, self.runs, self.status = transcript, state, [], status
 
     async def __aenter__(self):
         return self
@@ -175,17 +175,17 @@ class Harness:
         self.runs.append(prompt)
         trace = SimpleNamespace(id="t-1", stop_condition="agent_completed")
         return SimpleNamespace(trace=trace, state=self.state, transcript=self.transcript, refusals=(), error=None,
-                               final={"body": {"status": "graded", "reward": 1.0, "reason": None}})
+                               final={"body": {"status": self.status, "reward": 1.0, "reason": None}})
 
 
-def _play(tmp_path, *, seed, state=b"\xff\xfe not text", run_seed=None):
+def _play(tmp_path, *, seed, state=b"\xff\xfe not text", run_seed=None, status="graded"):
     validator, machine = episode_signers(tmp_path)
     precommit = episode_precommit(CONTRACT, hotkey=MINER.ss58_address)
     _, _, transcript = play_episode(validator=validator, machine=machine, precommit=precommit, seed=seed,
                                     session_id="s-1", reward=1.0)
     sessions = RlSessions({"session_id": "s-1", "token": transcript["token"], "gateway_url": "http://g:1",
                            "expires_at": NOW + 4500})
-    harness = Harness(transcript, state)
+    harness = Harness(transcript, state, status)
     _, runner = _runner(sessions, runner_factory=lambda url: harness, clock=lambda: NOW + 10,
                         new_request_id=lambda: "c" * 32)
 
@@ -207,6 +207,14 @@ def test_an_rl_episode_is_kept_whatever_its_graded_state_and_closed_final(tmp_pa
     asyncio.run(result.release())
     assert [body["reason"] for _, body in sessions.closed] == ["final", "withdraw"]
     assert sessions.closed[1][1]["transcript"] == transcript
+
+
+def test_an_aborted_episode_carries_its_final_status_and_is_closed_final(tmp_path):
+    result, sessions, _, transcript = _play(tmp_path, seed=2, status="aborted")
+    assert not result.ok and result.final_status == "aborted"
+    assert [(sid, body["reason"]) for sid, body in sessions.closed] == [("s-1", "final")]
+    graded, _, _, _ = _play(tmp_path / "graded", seed=2)
+    assert graded.final_status is None
 
 
 def test_an_rl_transcript_of_another_seed_is_withdrawn_at_once(tmp_path):
