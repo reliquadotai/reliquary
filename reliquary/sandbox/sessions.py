@@ -106,7 +106,7 @@ SESSION_SCHEMA = "reliquary/sandbox-session/v1"
 LIVE, CLOSED_GRADED, SUBMITTED = _store.SESSION_LIVE, _store.SESSION_CLOSED_GRADED, _store.SESSION_SUBMITTED
 CLOSED, ABORTED, VOIDED, LAPSED = (_store.SESSION_CLOSED, _store.SESSION_ABORTED,
                                    _store.SESSION_VOIDED, _store.SESSION_LAPSED)
-HANDED_BACK = _store.SESSION_HANDED_BACK          # plan 2C: a ``submitted`` session's closed status
+HANDED_BACK = _store.SESSION_HANDED_BACK          # a ``submitted`` session's closed status
 STATES = frozenset(SESSION_TRANSITIONS)
 HOLDING = frozenset({LIVE, CLOSED_GRADED})
 WITHDRAW, WITHDRAWN = "withdraw", "withdrawn"         # the close reason, the closed status
@@ -207,10 +207,10 @@ class EngagementTerms:
     # it under the lock when the prompt's reservations moved since the first read.
     refresh_slots: Callable[[], Awaitable[int | None | Refusal]] | None = field(
         default=None, repr=False, compare=False)
-    # Plan 2C: at most one session per engagement (an RL seed) unless the only earlier one was aborted
+    # At most one session per engagement (an RL seed) unless the only earlier one was aborted
     # (machine-signed, at most once); a drain never frees it. Checked under the issuer lock. Corpus: False.
     exclusive: bool = False
-    # Plan 2C: the terms' cheap preconditions read again under the issuer lock (the RL precommit's
+    # The terms' cheap preconditions read again under the issuer lock (the RL precommit's
     # window may have turned while the task resolved): a Refusal refuses the open. Corpus: None.
     still_valid: Callable[[], Refusal | None] | None = field(default=None, repr=False, compare=False)
 
@@ -405,7 +405,7 @@ class SessionBook:
         # (submitted, closed, withdrawn, aborted, lapsed, voided): an open whose free-
         # slot read predates a bump reads the ledger again under the issuer lock.
         self._generations: dict[tuple[Any, Any], int] = {}
-        # Plan 2C: precommit sha256 -> ids of the RL sessions whose engagement names it (the group
+        # Precommit sha256 -> ids of the RL sessions whose engagement names it (the group
         # claim's one-paid-group-per-precommit check reads it under the issuer lock, no full scan).
         self._by_precommit: dict[str, set[str]] = {}
 
@@ -471,7 +471,7 @@ class SessionBook:
                 del self._by_precommit[sha]
 
     def of_precommit(self, precommit_sha256: str) -> tuple[SessionRecord, ...]:
-        """Plan 2C: the RL sessions whose engagement names this precommit (an index, not a scan)."""
+        """The RL sessions whose engagement names this precommit (an index, not a scan)."""
         ids = self._by_precommit.get(precommit_sha256, ())
         return tuple(self._sessions[s] for s in sorted(ids) if s in self._sessions)
 
@@ -488,7 +488,7 @@ class SessionBook:
                    if r.job_id == job_id and r.prompt_index == prompt_index and self._holds(r, now))
 
     def engagement_held(self, engagement: str) -> bool:
-        """Plan 2C: whether an exclusive (RL) engagement is consumed. Only a machine-signed ``aborted``
+        """Whether an exclusive (RL) engagement is consumed. Only a machine-signed ``aborted``
         frees it, and at most ONCE: a ``voided`` session (a drain frees what the miner left ``live``, so
         it would be a selective re-roll) and every other state keep it taken, and so does a second
         ``aborted`` record of the same engagement."""
@@ -502,7 +502,7 @@ class SessionBook:
         return aborted >= 2
 
     def precommits_held(self, now: int) -> frozenset[str]:
-        """Plan 2C: the precommits a session still needs (one of its sessions is held, or claimed by a
+        """The precommits a session still needs (one of its sessions is held, or claimed by a
         group in flight): their runtime rows must stay."""
         return frozenset(sha for sha, ids in self._by_precommit.items()
                          if any(s in self._claimed or (s in self._sessions and self._holds(self._sessions[s], now))
@@ -518,7 +518,7 @@ class SessionBook:
         live = sum(1 for r in mine if self._holds(r, now))
         if live >= policy.max_live_per_hotkey:
             return Refusal("live_cap", {"live": live, "max": policy.max_live_per_hotkey})
-        # A session handed back (plan 2C) still counts: it was opened (only plan 2D's yield excludes it).
+        # A session handed back still counts: it was opened (only the yield accounting excludes it).
         counted = sorted(r.issued_at for r in mine
                          if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED))
         opens = len(counted)
@@ -598,7 +598,7 @@ class SessionBook:
 
 def _rl_precommit_of(record: SessionRecord) -> str | None:
     """The precommit an RL session's engagement names, or None (not an RL engagement)."""
-    # Only an RL engagement is parsed: a corpus engagement never loads the plan 2C module.
+    # Only an RL engagement is parsed: a corpus engagement never loads the RL episode module.
     if not record.engagement.startswith("rl:"):
         return None
     from reliquary.protocol.service_episode import EpisodeWireError, parse_rl_engagement
@@ -630,7 +630,7 @@ class SessionIssuer:
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
         self._refused_opens: dict[str, list[int]] = {}     # hotkey -> refusal times
-        # Plan 2C: sessions whose ``submitted`` record is stored ahead of the book (``persist_submitted``).
+        # Sessions whose ``submitted`` record is stored ahead of the book (``persist_submitted``).
         self._stored_submitted: set[str] = set()
 
     @property
@@ -902,12 +902,12 @@ class SessionIssuer:
 
     async def claim_all(self, session_ids: Sequence[str], *, hotkey: str, received: float | None = None,
                         precommit_sha256: str | None = None) -> tuple[str, Refusal] | None:
-        """Plan 2C: an episode group's sessions, all or none, under ONE hold of the issuer lock (no
+        """An episode group's sessions, all or none, under ONE hold of the issuer lock (no
         close, drain, lapse or other claim interleaves): None when every one is now claimed, else the
         first session refused and why (each session ``claim`` checks), with nothing left claimed by
         this call. A session named twice is refused (``session_claimed``) on its second mention.
 
-        ``precommit_sha256`` (ruling: at most ONE paid group per precommit): the precommit is taken with
+        ``precommit_sha256`` (at most ONE paid group per precommit): the precommit is taken with
         its sessions. Any OTHER session of that precommit (an RL engagement naming it) already
         ``submitted`` refuses the group (``precommit_submitted``: another group of it was paid, even on
         disjoint seeds); one freshly claimed by a group in flight refuses it retryably
@@ -978,7 +978,7 @@ class SessionIssuer:
             await self._persist(record)
 
     async def persist_submitted(self, session_ids: Sequence[str]) -> int:
-        """Plan 2C, before the batcher takes an episode group: each claimed session's ``submitted``
+        """Before the batcher takes an episode group: each claimed session's ``submitted``
         record is written (together), the book left as it is. Returns how many are stored (a session
         stored so by an earlier attempt counts without a write). One is enough to keep the precommit
         taken across a restart (``claim_all``'s precommit check). If the batcher then refuses the
@@ -1016,7 +1016,7 @@ class SessionIssuer:
         return task
 
     async def submitted_all(self, session_ids: Sequence[str]) -> None:
-        """Plan 2C: an accepted episode group's sessions, all moved to ``submitted`` under ONE hold of the
+        """An accepted episode group's sessions, all moved to ``submitted`` under ONE hold of the
         issuer lock (no reader sees part of the group paid), then every record not already stored by
         ``persist_submitted`` written before this returns (the writes run together). A restart reads
         them back, so the precommit stays taken (``claim_all``)."""
@@ -1037,10 +1037,10 @@ class SessionIssuer:
         await asyncio.gather(*(self._persist(record) for record in records))
 
     async def hand_back(self, precommit_sha256: str, *, hotkey: str) -> tuple[str, ...]:
-        """Plan 2C: the paid group of this precommit was not judged by the proof, for a reason of the
+        """The paid group of this precommit was not judged by the proof, for a reason of the
         validator's own. Its ``submitted`` sessions stay ``submitted`` (never paid, never claimed
         again: the precommit stays taken, no same-window retry) and are marked handed back (closed
-        status), in the book and the store, so that plan 2D's yield and quota do not count them against
+        status), in the book and the store, so that the yield accounting and the quota do not count them against
         the miner (the hourly open cap still does: they were opened).
         Returns the sessions marked now (none twice)."""
         marked: list[SessionRecord] = []

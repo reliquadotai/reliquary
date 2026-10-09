@@ -48,7 +48,7 @@ class Finished:
 
 
 class TurnCore(Protocol):
-    # A forced engine (plan 2C) calls ``add(..., draw=extra_args)``: its core takes a ``draw``
+    # A forced engine calls ``add(..., draw=extra_args)``: its core takes a ``draw``
     # keyword; a core without one keeps serving every non-forced engine.
     def add(self, request_id: str, prompt_ids: list[int], max_tokens: int) -> None: ...
 
@@ -79,7 +79,7 @@ class GenerateEngine:
     def __init__(self, core: TurnCore, *, max_total_tokens: int, max_tokens_per_turn: int,
                  session_ttl_seconds: float = 7200.0, clock=time.monotonic, draws=None) -> None:
         self._core = core
-        # Plan 2C: ``forced_draw.ForcedDraws`` for an RL episode miner; None keeps free sampling.
+        # ``forced_draw.ForcedDraws`` for an RL episode miner; None keeps free sampling.
         self._draws = draws
         self.max_total_tokens = int(max_total_tokens)
         self._per_turn = int(max_tokens_per_turn)
@@ -280,7 +280,7 @@ class GenerateEngine:
             return self._sessions.pop(session_id, None)
 
     def model_tokens(self, session_id: str) -> int:
-        """Model tokens this session has generated so far, over its turns (plan 2C: the forced draw's
+        """Model tokens this session has generated so far, over its turns (the forced draw's
         position counts these only)."""
         with self._lock:
             return self._model_tokens(session_id)
@@ -331,7 +331,7 @@ class VllmTurnCore:
                  if _has_vision_encoder(checkpoint_dir) else {})
         self._forced = bool(forced)
         if self._forced:
-            # Plan 2C: every request carries its forced draw (``forced_draw.DrawBinding.extra_args``).
+            # Every request carries its forced draw (``forced_draw.DrawBinding.extra_args``).
             from reliquary.miner.vllm_generation import ForcedSeedVLLMProcessor
 
             extra["logits_processors"] = [ForcedSeedVLLMProcessor]

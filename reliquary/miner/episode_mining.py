@@ -1,4 +1,4 @@
-"""The episode-group miner's production entry point (phase 2, plan 2C): the per-window loop and its wiring.
+"""The episode-group miner's production entry point: the per-window loop and its wiring.
 
 Each poll reads the RL validator's ``/miner-state``: the window, its randomness, the announcement
 (``service_policy``: the order and the checkpoint revision), the window's end (``submission_deadline_at``)

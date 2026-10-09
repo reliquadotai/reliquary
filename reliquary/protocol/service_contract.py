@@ -163,7 +163,7 @@ SUPPORTED_V2_CAPABILITIES = frozenset({
     "in-zone-rotation/v1", PUBLIC_SEED_POOL, "legacy/v1",
 })
 
-# Phase 2 (plan 2C): an env whose groups are signed-sandbox episodes. The capability is announced only
+# An env whose groups are signed-sandbox episodes. The capability is announced only
 # for an order that has such an env (``supported_v2_capabilities``), so a single-turn order keeps its bytes.
 EPISODE_CAPABILITY = "signed-sandbox-episode/v1"
 EPISODE_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s", "memory_bytes", "pids",
@@ -171,7 +171,7 @@ EPISODE_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s", "
 EPISODE_TOOLS = frozenset({"bash", "edit"})
 # One episode is one corpus trajectory: its tokens stay under the corpus trajectory cap.
 MAX_EPISODE_TOKENS = MAX_TRAJECTORY_TOKENS
-# Ceilings of each session budget: the smaller of the review's bound and the sandbox service's own
+# Ceilings of each session budget: the smaller of our own bound and the sandbox service's own
 # maximum (reliquary_sandbox_service/settings.py: episode_max_calls le 100_000, episode_max_call_timeout_s
 # le 24 h, episode_max_pids le 65536, and the defaults of episode_max_cpu_s 3600, episode_max_wall_s 4 h,
 # episode_max_memory_bytes 8 GiB, episode_max_disk_bytes 10 GiB, which have no hard "le").
@@ -219,7 +219,7 @@ def _validate_episode(name: str, env: dict) -> None:
 
 @dataclass(frozen=True, slots=True)
 class EpisodeEnvPolicy:
-    """The ``episode`` block of one env, typed (plan 2C)."""
+    """The ``episode`` block of one env, typed."""
 
     environment: str
     sandbox_env: str

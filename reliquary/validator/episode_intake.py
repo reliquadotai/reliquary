@@ -1,4 +1,4 @@
-"""The parent-side half of an episode group's admission (phase 2, plan 2C).
+"""The parent-side half of an episode group's admission.
 
 The isolated admission child parsed the body, ran the service policy (the request's checkpoint is the
 window's announced one) and checked the miner's signatures; the transcripts are verified here, off the
@@ -6,7 +6,7 @@ event loop, because this process holds the machine directory and the session iss
 signed intake does). Then the M sessions are claimed, all or none under one hold of the issuer lock
 (each one then held against close, drain and lapse until the batcher has answered) and, once it has,
 ``settle`` marks them ``submitted`` (accepted: never paid twice) or releases them. Any refusal or
-exception after the claim releases every claim. Plan 2D's yield accounting is told how every group
+exception after the claim releases every claim. The yield accounting is told how every group
 ended (``SessionOutcomes``)."""
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ _CLAIM_REFUSALS = {
     "session_busy": (RejectReason.WORKER_DROPPED, "episode_session_busy"),
     "session_submitted": (RejectReason.HASH_DUPLICATE, "episode_session_reused"),
     "session_expired": (RejectReason.PRECOMMIT_EXPIRED, "episode_deadline"),
-    # Ruling: one paid group per precommit, even on disjoint seeds.
+    # One paid group per precommit, even on disjoint seeds.
     "precommit_submitted": (RejectReason.HASH_DUPLICATE, "episode_precommit_used"),
     "precommit_claimed": (RejectReason.RATE_LIMITED, "episode_group_in_flight"),
 }

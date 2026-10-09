@@ -272,7 +272,7 @@ def validate_rollout_selection(pool: SeedPool, selection: PoolSelection,
     """Refuse, before any proof work, a group that is not one rollout per chosen seed, in order.
 
     Rollout ``i`` must carry exactly ``selection.rollout_binding(i)``; since the selection is
-    strictly increasing, two rollouts can never claim the same seed. ``signed_episodes`` (plan 2C):
+    strictly increasing, two rollouts can never claim the same seed. ``signed_episodes``:
     the env's groups are signed episodes, so every rollout carries one, drawn from its own chosen
     seed; otherwise no rollout may carry any episode.
     """

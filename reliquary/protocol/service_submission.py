@@ -50,8 +50,8 @@ def parse_service_rollout_binding(value: Any) -> tuple[ServiceBinding, int]:
 
 def validate_service_rollout_bindings(binding: ServiceBinding | dict,
                                      commits: list[dict], *, signed_episodes: bool = False) -> None:
-    """Require the exact envelope intent and original index on every rollout. ``signed_episodes``
-    (plan 2C): every rollout carries a signed episode; otherwise none may carry any episode."""
+    """Require the exact envelope intent and original index on every rollout. ``signed_episodes``:
+    every rollout carries a signed episode; otherwise none may carry any episode."""
     if isinstance(binding, dict):
         binding = ServiceBinding.from_dict(binding)
     if not isinstance(binding, ServiceBinding) or not 2 <= len(commits) <= 64:

@@ -309,7 +309,7 @@ class SignedSweEpisodeRunner:
         self._unavailable = 0           # consecutive "not serving" refusals
         self._unconfirmed: list[_Unconfirmed] = []
 
-    # Plan 2C: a corpus episode submits its graded state as a text diff; an RL episode submits none.
+    # A corpus episode submits its graded state as a text diff; an RL episode submits none.
     requires_text_state = True
     # The named 503s that say the validator is serving, only busy (a subclass adds its routes' own).
     validator_throttles = VALIDATOR_THROTTLES

@@ -260,7 +260,7 @@ class ProofValues(WireModel):
     toploc_worst_exp: Count = 0
     toploc_worst_mant_mean: Annotated[float, Field(ge=0)] = 0.0
     toploc_worst_mant_median: Annotated[float, Field(ge=0)] = 0.0
-    # Plan 2C: an older worker omits them (None): the batcher then has no stop verdict.
+    # An older worker omits them (None): the batcher then has no stop verdict.
     episode_stop_picks_ok: bool | None = None
     episode_stop_first_bad_turn: Count | None = None
     episode_stop_cdf_miss: Probability | None = None

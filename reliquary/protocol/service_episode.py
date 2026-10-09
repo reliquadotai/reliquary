@@ -1,4 +1,4 @@
-"""Signed episodes in the v2 service RL path (phase 2, plan 2C): the miner's precommit, the session
+"""Signed episodes in the v2 service RL path: the miner's precommit, the session
 engagement it opens, and what a rollout commit binds for its episode. Pure: no I/O, no GPU."""
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ MAX_ENGAGEMENT_SEED = 127
 
 @dataclass(frozen=True, slots=True)
 class EpisodePrecommit:
-    """What a miner commits to before opening sessions (spec §4.1.2): the order, the window, the env
+    """What a miner commits to before opening sessions: the order, the window, the env
     and task, the checkpoint and the task's public seed pool. Its digest names every session it opens."""
 
     order: str
@@ -93,7 +93,7 @@ class EpisodePrecommit:
 
 
 def rl_engagement(window: int, precommit_sha256: str, seed_index: int) -> str:
-    """The engagement a session token names: ``rl:{window}:{precommit}:{seed}`` (spec §4.1.3)."""
+    """The engagement a session token names: ``rl:{window}:{precommit}:{seed}``."""
     _uint(window, "window")
     _sha(precommit_sha256, "precommit_sha256")
     _uint(seed_index, "seed_index", MAX_ENGAGEMENT_SEED)

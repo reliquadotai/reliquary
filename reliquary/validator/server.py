@@ -289,10 +289,10 @@ class _QueuedAuctionSubmission:
 # At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
 VERDICT_CAP_PER_HOTKEY = 200
 
-# Plan 2C: an episode refusal the miner may retry at once reserves no (operator, prompt) identity. The
+# An episode refusal the miner may retry at once reserves no (operator, prompt) identity. The
 # shared protocol set ``_EPISODE_RETRYABLE_STAGES`` (imports nothing: a legacy validator never loads the
 # episode modules).
-# Plan 2C: how long a clean shutdown waits for episode settlements in flight before cutting them.
+# How long a clean shutdown waits for episode settlements in flight before cutting them.
 EPISODE_DRAIN_S = 10.0
 
 
@@ -1337,7 +1337,7 @@ class _Health(BaseModel):
 
 
 def _episode_admission_fields(batcher: Any) -> dict:
-    """``signed_episode`` / ``episode_max_tokens`` of an ``AdmissionContext`` (plan 2C): set only for a
+    """``signed_episode`` / ``episode_max_tokens`` of an ``AdmissionContext``: set only for a
     signed-episode env of a v2 service window; every other batcher (legacy, a v1 contract, a single-turn
     env) gets the defaults. A contract that does not parse gets them too: the child's service policy
     refuses the group anyway."""
@@ -1470,7 +1470,7 @@ class ValidatorServer:
         )
         from reliquary.validator.http_metrics import HttpMetrics
         self.http_metrics = HttpMetrics()
-        # Plan 2C: the RL validator sets it when its order has signed-episode envs.
+        # The RL validator sets it when its order has signed-episode envs.
         self._episode_intake = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
@@ -6579,7 +6579,7 @@ class ValidatorServer:
 
     async def _admit_episode_group(self, batcher, receipt, prepared, telemetry, *,
                                    deadline: float | None = None):
-        """Plan 2C: the parent-side half of an episode group's admission (``validator.episode_intake``):
+        """The parent-side half of an episode group's admission (``validator.episode_intake``):
         the child already ran the service policy (checkpoint = the window's announced one) and the
         signatures. Returns ``(prepared, claim)``; the caller settles a claim after the batcher's answer.
         ``deadline`` (``time.monotonic``): the admission's; the intake is cut there. A cut while the
@@ -6672,7 +6672,7 @@ class ValidatorServer:
         return cut
 
     async def _persist_episode_claim(self, claim, deadline: float) -> bool:
-        """Plan 2C: the claimed sessions' ``submitted`` records written before the batcher takes the
+        """The claimed sessions' ``submitted`` records written before the batcher takes the
         group, bounded by ``deadline`` (``time.monotonic``); late counts as not stored."""
         try:
             return await asyncio.wait_for(self._episode_intake.persist(claim),
@@ -6713,7 +6713,7 @@ class ValidatorServer:
         batch_filled_reason: str | None = None
         request: BatchSubmissionRequest | None = None
         admission_started = False
-        # Plan 2C: an episode group's claimed sessions, settled in ``finally`` by the batcher's own answer.
+        # An episode group's claimed sessions, settled in ``finally`` by the batcher's own answer.
         episode_claim = None
         episode_accepted = False
         episode_hold_deadline = None
@@ -6792,7 +6792,7 @@ class ValidatorServer:
                 # Parsing and grading stay parallel; every state-changing
                 # post-grade decision follows observed ingress order.
                 if episode_claim is not None:
-                    # Plan 2C: the sessions' claim is held through this wait, bounded by this
+                    # The sessions' claim is held through this wait, bounded by this
                     # admission's deadline plus the predecessor's own wall (same batcher, so the same
                     # environment's), which may end as late as its deadline: the records' write
                     # below shares that bound. Two walls in all; the claim ttl outlives
@@ -6953,7 +6953,7 @@ class ValidatorServer:
 
             if episode_claim is not None and not await self._persist_episode_claim(
                     episode_claim, episode_hold_deadline):
-                # Plan 2C: not one ``submitted`` record stored: the batcher never takes the group (a
+                # Not one ``submitted`` record stored: the batcher never takes the group (a
                 # restart would not know its sessions paid). Retryable, the claims are released.
                 batcher.cancel_logical_group_reservation(request)
                 reject_stage = "episode_persist_failed"
@@ -7037,7 +7037,7 @@ class ValidatorServer:
                         self._finish_admission_turn(item)
                 finally:
                     if episode_claim is not None:
-                        # Plan 2C: only the batcher's acceptance pays the sessions (their records are
+                        # Only the batcher's acceptance pays the sessions (their records are
                         # already stored); any other end releases them. A tracked task, started whatever
                         # happens above, and done BEFORE the receipt: a miner told its group was refused
                         # finds its sessions and precommit free when it retries.
@@ -7588,7 +7588,7 @@ class ValidatorServer:
         self._worker_task = None
         self._code_worker_task = None
         self._extra_worker_tasks = []
-        # Plan 2C: the episode settlements the cancelled admissions left running (bounded).
+        # The episode settlements the cancelled admissions left running (bounded).
         await self._drain_episode_tasks()
         for pool in self._admission_process_pools.values():
             await asyncio.to_thread(self._terminate_admission_pool, pool)

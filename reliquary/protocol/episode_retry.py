@@ -1,4 +1,4 @@
-"""Plan 2C: which refusals of an episode group may be sent again, shared by the validator (it reserves no
+"""Which refusals of an episode group may be sent again, shared by the validator (it reserves no
 (operator, prompt) identity for them) and the miner (it resends the same group in a new envelope). Imports
 nothing: a legacy validator loads it without loading the episode modules."""
 from __future__ import annotations

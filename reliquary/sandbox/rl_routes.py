@@ -1,4 +1,4 @@
-"""``POST {prefix}/episodes/precommit`` (phase 2, plan 2C; spec §4.1.2).
+"""``POST {prefix}/episodes/precommit``.
 
 A miner signs ``{order, window, environment, task_index, checkpoint, pool_sha256, hotkey}`` for this
 validator and this route (the sandbox requests' audience rule) and posts it before opening any sandbox

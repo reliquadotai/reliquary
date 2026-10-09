@@ -90,16 +90,16 @@ REFUSAL_STATUS: dict[str, int] = {
     "job_not_signed": 409, "prompt_mismatch": 409, "prompt_unavailable": 409,
     "job_complete": 409, "request_reused": 409, "request_conflict": 409,
     "engagement_kind_unsupported": 409, "transcript_invalid": 409,
-    # plan 2C: an RL seed already consumed (emitted only for exclusive, i.e. RL, engagements)
+    # An RL seed already consumed (emitted only for exclusive, i.e. RL, engagements)
     "engagement_taken": 409,
-    # plan 2C: the RL engagement book's own refusals (rl_engagements.py); an unserved env is retried
+    # The RL engagement book's own refusals (rl_engagements.py); an unserved env is retried
     # (the env may be loading), the others are the miner's to change
     "precommit_unknown": 409, "precommit_stale": 409, "seed_out_of_pool": 409, "session_too_long": 409,
     "environment_not_served": 503,
     # the intake's claim on a session (issuer.claim); `session_claimed` is retried
     "session_submitted": 409, "session_not_submittable": 409, "session_expired": 409,
     "session_claimed": 503, "session_busy": 503,
-    # plan 2C: an episode group's claim (``claim_all``; the intake maps them, no route answers them)
+    # An episode group's claim (``claim_all``; the intake maps them, no route answers them)
     "precommit_submitted": 409, "precommit_claimed": 503,
     # per-hotkey caps
     "live_cap": 429, "prompt_live_cap": 429, "job_live_cap": 429, "open_rate_cap": 429,

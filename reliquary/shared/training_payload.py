@@ -165,7 +165,7 @@ def encode_training_payload(
     validated_spans: list[list[int] | None] = []
     assistant_spans: list[list[list[int]] | None] = []
     termination_paths: list[str | None] = []
-    # Plan 2C: the checkpoint each signed episode was generated on (None for every other rollout).
+    # The checkpoint each signed episode was generated on (None for every other rollout).
     rollout_checkpoints: list[str | None] = []
     rewards: list[float] = []
     env_names: list[str] = []

@@ -1,4 +1,4 @@
-"""Admission of a signed-episode group in the v2 service RL path (phase 2, plan 2C; spec §4.1.6). No GPU.
+"""Admission of a signed-episode group in the v2 service RL path. No GPU.
 
 Per group: the precommit (recorded, this hotkey's, order's, env's, task's, window's, checkpoint's and
 pool's) and a selection of exactly the contract's ``group_size`` seeds of its pool. Then every episode
@@ -11,7 +11,7 @@ passes steps 1-6 (signatures and chains, cheap) before ANY episode is parsed thr
    env, split, task, checkpoint), the paid-session snapshot and a graded final;
 5. the grading deadline, on this validator's clock;
 6. record 0: a tools version this build renders, the contract's tools and env package;
-7. the span structure and §5.C (``parse_signed_trajectory``): the model's calls are the signed records,
+7. the span structure and the signed parse (``parse_signed_trajectory``): the model's calls are the signed records,
    every observation is their rendering, token for token;
 8. the turn shape: short turns, the contract's turn and episode budgets, termination (a stop token or
    exactly the cap), one TOPLOC proof per span chunk, and at least CHALLENGE_K model tokens when the
@@ -23,7 +23,7 @@ passes steps 1-6 (signatures and chains, cheap) before ANY episode is parsed thr
    else is a miner ending its episode early (an in-zone vector for free).
 
 The reward is the final record's. An episode cut by a turn or token limit is a normal episode: its box
-was graded on its final state, so nothing here is "uncertain". The spec's §5.D state/diff check does not
+was graded on its final state, so nothing here is "uncertain". The corpus's state/diff check does not
 apply to RL: no diff is trained and the reward is the machine-signed final record's, so no state is
 compared here. A refusal reuses an existing wire reason (an older miner parses the enum) and names its
 check in the stage."""
@@ -87,7 +87,7 @@ _TRANSCRIPT_REASONS = {
 
 class EpisodeGroupChecker:
     """One per episode env: its contract policy, the turn renderer of the policy's tokenizer, its task
-    source (plan 2A) and the TOPLOC chunk size. ``check`` is synchronous and CPU-bound (signatures, a
+    source and the TOPLOC chunk size. ``check`` is synchronous and CPU-bound (signatures, a
     parse through the renderer): the intake runs it in a thread."""
 
     def __init__(self, *, policy, renderer, source, chunk_tokens: int,
@@ -324,7 +324,7 @@ def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened) 
 def finish_prepared(prepared, facts: EpisodeGroupFacts, contract) -> None:
     """Hand the batcher a normal prepared group, in place: the final records' rewards (validator
     authoritative), the validated spans the Episode v1 masking path trains on (policy positions, pi_old,
-    payload), no uncertain rollout (spec §4.1.6), and the phase 1 lane's verdict on the vector: None is
+    payload), no uncertain rollout, and the phase 1 lane's verdict on the vector: None is
     no observation (OUT_OF_ZONE), anything else goes on (training / exploration / unproven)."""
     from reliquary.services.admission_policy import service_lane
 

@@ -1184,7 +1184,7 @@ class ValidationService:
                     horizon = schedule.cooldown_windows(name)
                     self._cooldown_per_env[name] = CooldownMap(cooldown_windows=horizon)
                     self._content_cooldown_per_env[name] = ContentCooldownMap(cooldown_windows=horizon)
-            # An episode precommit on a task in cooldown is refused by the runtime (plan 2C): the
+            # An episode precommit on a task in cooldown is refused by the runtime: the
             # maps are looked up at call time, a new window may have replaced them.
             self._service_runtime.task_in_cooldown = self._episode_task_in_cooldown
         self._content_cooldown_health: dict[str, Any] = {
@@ -3313,7 +3313,7 @@ class ValidationService:
                 batcher.service_environment = env_name
                 episode_services = getattr(self, "_episode_services", None)
                 if episode_services is not None and env_name in episode_services.environments:
-                    # Plan 2C: an inconclusive proof hands the group's sessions back (non-blocking).
+                    # An inconclusive proof hands the group's sessions back (non-blocking).
                     batcher.episode_proof_inconclusive = episode_services.batcher_hook(env_name, target_window)
             if shared_fill_state is not None:
                 batcher.fill_state = shared_fill_state
@@ -7812,7 +7812,7 @@ class ValidationService:
         self._observation_task = asyncio.create_task(
             self._observation_publisher.run(self._observation_stop), name="service_observation_publisher")
 
-    # --- plan 2C: the RL validator's signed-sandbox side ---
+    # --- the RL validator's signed-sandbox side ---
     def _episode_task_in_cooldown(self, environment: str, task_index: int, window: int) -> bool:
         """The runtime's precommit cooldown hook (prompt cooldown only): the per-env maps are read at call
         time, a new window may have replaced them."""
@@ -7846,7 +7846,7 @@ class ValidationService:
         return (getattr(self, "_episode_windows_opened", None) or {}).get(window)
 
     def _current_service_window(self) -> int | None:
-        """Plan 2C: the service window episode admissions are open for: the active batchers' frozen
+        """The service window episode admissions are open for: the active batchers' frozen
         announcement, if this process opened that window; None between windows or for a resumed one.
         Memory only (it is read on the event loop by the routes)."""
         server = getattr(self, "server", None)
@@ -7869,7 +7869,7 @@ class ValidationService:
         proxies = list((getattr(self, "_proof_models", None) or {}).values())
         model = proxies[0] if pool is not None and proxies else getattr(self, "verify_model", None)
         if pool is not None and proxies and getattr(model, "config", None) is not None:
-            # Episode boot check only (item 14): the proxy's flat config read with its nested text_config
+            # Episode boot check only: the proxy's flat config read with its nested text_config
             # as attributes; the legacy batcher keeps resolving its stop set from the proxy as it is.
             from reliquary.validator.remote_proof import _config_namespace
 
@@ -7896,7 +7896,7 @@ class ValidationService:
         return max(float(MIN_PRECOMMIT_RETENTION_S), horizon * float(FILL_CLOSED_MAX_SECONDS))
 
     async def _start_episode_services(self) -> None:
-        """Plan 2C: the RL validator's signed-sandbox side, only when the order has signed-episode envs:
+        """The RL validator's signed-sandbox side, only when the order has signed-episode envs:
         the /rl routes on this server, the episode intake on its admission path, the RL sessions restored,
         the fleet, session and precommit-retention loops started. Refuses to start when an env with an
         episode block is not a registered signed-episode env, without the sandbox key settings, without a
@@ -7945,7 +7945,7 @@ class ValidationService:
         self._episode_tasks = [asyncio.create_task(job) for job in services.background()]
 
     def _default_episode_renderer(self, policy):
-        """The turn renderer of the policy's tokenizer over the env's tools (the §5.C parse)."""
+        """The turn renderer of the policy's tokenizer over the env's tools (the signed parse)."""
         from reliquary.environment.agentic_swe import load_turn_renderer
 
         return load_turn_renderer(str(getattr(self.tokenizer, "name_or_path", "")), tools=tuple(policy.tools))
@@ -8650,7 +8650,7 @@ class ValidationService:
                     rendered = rendered_episode_prompt(env, int(prompt_idx))
                 elif (spec.interaction_mode if spec is not None
                       else getattr(env, "interaction_mode", None)) == "signed_episode":
-                    # Plan 2C: the task source's prompt verbatim, as the batcher digests it.
+                    # The task source's prompt verbatim, as the batcher digests it.
                     rendered = str(problem["prompt"])
                 else:
                     rendered = render_canonical_prompt(

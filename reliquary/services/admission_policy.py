@@ -48,7 +48,7 @@ def validate_submission_policy(request, announcement: dict | None, *, parsed=Non
     commits = [r.commit for r in request.rollouts]
     names = {r.env_name for r in request.rollouts}
     named = next(iter(names)) if len(names) == 1 else None
-    # Plan 2C: an env whose contract entry has an episode block takes signed episodes, and only those.
+    # An env whose contract entry has an episode block takes signed episodes, and only those.
     # A v1 contract has no environments block, hence no episode env.
     signed = (contract.version == 2 and isinstance(named, str)
               and "episode" in (contract.environments.get(named) or {}))

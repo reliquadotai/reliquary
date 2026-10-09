@@ -1,4 +1,4 @@
-"""The RL validator's sandbox engagement (phase 2, plan 2C; spec §4.1.3). On that validator it replaces
+"""The RL validator's sandbox engagement. On that validator it replaces
 the refusing ``sessions.RlPrecommitEngagements`` stub, which the corpus validator keeps.
 
 A session of an RL episode group names ``rl:{window}:{precommit}:{seed}``. Its terms:
@@ -16,9 +16,9 @@ A session of an RL episode group names ``rl:{window}:{precommit}:{seed}``. Its t
 * a precommit recorded more than 24 h ago opens nothing (``precommit_stale``) and a session's
   ``wall_s + open_window_s`` stays within 24 h, so the book's taken seeds (kept ~25 h) outlive every
   session of a precommit;
-* the image and the declared limits come from the env's task source (plan 2A); the budgets from the
+* the image and the declared limits come from the env's task source; the budgets from the
   contract, raised to the task's limits;
-* plan 2D's quota is asked at every open (``SessionQuota``; permissive until then).
+* the session quota is asked at every open (``SessionQuota``; permissive for now).
 
 The token binds hotkey, engagement (precommit + seed), env, split, index (the task) and checkpoint (the
 window's); admission checks every one with ``verify_transcript``.
@@ -53,14 +53,14 @@ WINDOW_AGE_MARGIN_S = 900             # past the longest window (FILL_CLOSED_MAX
 
 
 class SessionQuota(Protocol):
-    """Plan 2D's per-hotkey session quota, asked at every RL open: None admits, a Refusal refuses."""
+    """The per-hotkey session quota, asked at every RL open: None admits, a Refusal refuses."""
 
     async def admit_open(self, hotkey: str, *, environment: str,
                          precommit_sha256: str) -> Refusal | None: ...
 
 
 class OpenQuota:
-    """No quota (until plan 2D): every open the other caps admit is admitted."""
+    """No quota: every open the other caps admit is admitted."""
 
     async def admit_open(self, hotkey: str, *, environment: str,
                          precommit_sha256: str) -> Refusal | None:
@@ -68,7 +68,7 @@ class OpenQuota:
 
 
 class SessionOutcomes(Protocol):
-    """Plan 2D's yield accounting: how every episode group ended. ``session_ids`` are the group's
+    """Yield accounting: how every episode group ended. ``session_ids`` are the group's
     sessions (empty when the group failed before its transcripts were verified)."""
 
     def group_settled(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],

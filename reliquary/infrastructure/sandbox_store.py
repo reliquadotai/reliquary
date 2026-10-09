@@ -345,7 +345,7 @@ async def list_machines(**client_kwargs) -> list[dict]:
 # -- session documents ------------------------------------------------------------
 
 SESSION_PREFIX = "reliquary/sandbox/sessions/"
-# Plan 2C: the RL validator's sessions, apart from the corpus validator's (neither restores the other's).
+# The RL validator's sessions, apart from the corpus validator's (neither restores the other's).
 RL_SESSION_PREFIX = "reliquary/sandbox/rl-sessions/"
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DAY = 86400
@@ -386,8 +386,8 @@ class SessionStoreConflict(RuntimeError):
     stored state may not move to the new one."""
 
 
-# Plan 2C: the closed status of an RL session whose paid group the proof could not judge for a reason
-# of the validator's own (``submitted`` stays: never paid, never resubmitted; plan 2D's quota skips it).
+# The closed status of an RL session whose paid group the proof could not judge for a reason
+# of the validator's own (``submitted`` stays: never paid, never resubmitted; the session quota skips it).
 SESSION_HANDED_BACK = "handed_back"
 
 

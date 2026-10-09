@@ -874,7 +874,7 @@ def episode_without_transcript(meta: dict) -> dict:
 
 
 class SignedEpisodeMetadata(BaseModel):
-    """A signed-sandbox episode inside a v2 service rollout (phase 2, plan 2C).
+    """A signed-sandbox episode inside a v2 service rollout.
 
     ``assistant_spans`` are the model's turns as ``[start, end)`` in ``tokens`` (the prompt
     included), ``stop`` the harness's stop condition, ``transcript`` the gateway's signed
@@ -918,7 +918,7 @@ class SignedEpisodeMetadata(BaseModel):
 
 
 def _check_signed_episode_commit(meta: "RolloutMetadata", tokens: list[int], proof_version: Any) -> None:
-    """Plan 2C: a signed episode is a service rollout of a public seed pool, drawn from its own seed."""
+    """A signed episode is a service rollout of a public seed pool, drawn from its own seed."""
     from reliquary.protocol.seed_pool import parse_rollout_binding
     from reliquary.protocol.service_submission import parse_service_rollout_binding
 

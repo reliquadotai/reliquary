@@ -142,7 +142,7 @@ class ServicePolicyLimit(ValueError):
 
 
 class EpisodePrecommitRefused(ValueError):
-    """An episode precommit the frozen window does not allow (plan 2C); nothing was written. ``reason`` is
+    """An episode precommit the frozen window does not allow; nothing was written. ``reason`` is
     the wire reason; ``existing`` names the live precommit of the same (hotkey, env, task, window)."""
 
     def __init__(self, reason: str, existing: str | None = None) -> None:
@@ -213,7 +213,7 @@ class ServiceRuntime:
         self.qualification = json.loads(canonical_json_bytes(qualification))
         self._round_at = drand_round_at or _drand_round_at
         self.lock = threading.RLock()
-        # Installed by the validator, which owns the per-env prompt cooldown maps (plan 2C).
+        # Installed by the validator, which owns the per-env prompt cooldown maps.
         self.task_in_cooldown: Callable[[str, int, int], bool] | None = None
         instant = _instant(now)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
@@ -955,7 +955,7 @@ class ServiceRuntime:
                                       checkpoint_hash=envelope["checkpoint"]["revision"], pool_epoch=window,
                                       randomness=row[0])
 
-    # --- episode precommits (plan 2C, spec 4.1.2) ---
+    # --- episode precommits ---
     def record_episode_precommit(self, precommit, *, now: float | None = None) -> tuple[bool, str]:
         """Record a miner's precommit against the FROZEN window: this order, an env of the window with
         an episode policy, a task of its dataset, the window's checkpoint and the task's announced pool.

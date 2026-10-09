@@ -89,7 +89,7 @@ class AdmissionContext:
     enforce_envelope_signature: bool
     enforce_legacy_merkle: bool
     service_policy: dict | None = None
-    # Plan 2C: this env's groups are signed episodes (the parent process verifies their transcripts) and
+    # This env's groups are signed episodes (the parent process verifies their transcripts) and
     # the contract's per-env maximum episode length. The defaults leave every other context unchanged.
     signed_episode: bool = False
     episode_max_tokens: int | None = None
@@ -185,7 +185,7 @@ class PreparedSubmission:
     generator_version: str | None = None
     operation_id: str | None = None
     difficulty: int | None = None
-    # Plan 2C: parsed and authenticated, but its transcripts are still to be verified by the parent
+    # Parsed and authenticated, but its transcripts are still to be verified by the parent
     # (``validator.episode_intake``); no reward, no lane yet.
     episode_pending: bool = False
 
@@ -359,7 +359,7 @@ def service_length_valid(
     """Service path only: the rollout fits the environment's own length bound.
 
     Completion length is at most ``max_new_tokens_for_environment`` (an episode: the whole episode is at most
-    its profile's ``max_episode_tokens``; a signed episode, plan 2C: its contract's ``episode_max_tokens``,
+    its profile's ``max_episode_tokens``; a signed episode: its contract's ``episode_max_tokens``,
     and it is refused without one). Shared by admission and the proof's pre-forward guard, so an oversize
     payload is refused before it can reach the GPU."""
     from reliquary.protocol.submission import is_signed_episode
@@ -469,7 +469,7 @@ def _natural_cap_termination(
 
 def submission_interaction_matches(request: BatchSubmissionRequest, environment: str) -> bool:
     """Bind wire episode metadata to the registered environment before grading: a single-turn env takes
-    no episode, an Episode v1 env only Episode v1 metadata, a signed-episode env (plan 2C) only signed
+    no episode, an Episode v1 env only Episode v1 metadata, a signed-episode env only signed
     episodes."""
     from reliquary.protocol.submission import is_signed_episode
 
@@ -1430,7 +1430,7 @@ def materialize_and_score_submission(
             deadline_monotonic,
         )
     if context.signed_episode:
-        # Plan 2C: a signed episode's reward is its final record's. The parent process verifies the
+        # A signed episode's reward is its final record's. The parent process verifies the
         # transcripts (it holds the machine directory and the session issuer) and decides the lane.
         return PreparedSubmission(
             request=request, completion_texts=[], rewards=[], rollout_hashes=parsed.rollout_hashes,

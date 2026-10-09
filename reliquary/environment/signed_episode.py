@@ -1,9 +1,9 @@
-"""A signed-sandbox episode environment as a v2 batcher holds it (phase 2, plan 2C).
+"""A signed-sandbox episode environment as a v2 batcher holds it.
 
 The batcher needs an ``Environment``: a name, a length and ``get_problem`` (the task's prompt identity,
 for the content cooldown and the admission's prompt materials). The reward never comes from here: it is
 the signed final record's, verified at admission (``reliquary.validator.episode_admission``), and
-``compute_reward`` refuses. Plan 2A supplies the task source: the prompt exactly as the harness renders
+``compute_reward`` refuses. The task source supplies the prompt exactly as the harness renders
 it, and each task's pinned image and declared limits."""
 from __future__ import annotations
 

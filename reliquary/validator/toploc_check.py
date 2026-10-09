@@ -60,7 +60,7 @@ def toploc_verdict(
 def toploc_span_verdict(
     hidden: torch.Tensor, commit: Mapping, spans
 ) -> ToplocVerdict | None:
-    """Plan 2C: TOPLOC over every model span of a signed episode, from the one full-sequence prefill
+    """TOPLOC over every model span of a signed episode, from the one full-sequence prefill
     the GRAIL check already ran. Span ``[start, end)``'s rows are ``hidden[start - 1 : end - 1]`` (the
     corpus audit's ``span_hidden_states`` rule); its proofs are the commit's list, span after span. A
     span too short to judge alone is skipped (``trajectory_outcome``); a trajectory with no judged span

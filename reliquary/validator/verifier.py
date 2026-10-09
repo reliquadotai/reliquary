@@ -144,7 +144,7 @@ class ProofResult:
     toploc_worst_exp: int = 0
     toploc_worst_mant_mean: float = 0.0
     toploc_worst_mant_median: float = 0.0
-    # Plan 2C, signed episodes only: every model turn ending on a stop token ends on the forced pick.
+    # Signed episodes only: every model turn ending on a stop token ends on the forced pick.
     # None: no such turn checked, or not a signed episode.
     episode_stop_picks_ok: bool | None = None
     episode_stop_first_bad_turn: int | None = None
@@ -543,7 +543,7 @@ def policy_token_positions(
 
 
 def signed_episode_spans(rollout_meta: dict[str, Any], seq_len: int) -> list[tuple[int, int]] | None:
-    """Plan 2C: the model spans of a signed episode; None for any other rollout, ``[]`` when malformed
+    """The model spans of a signed episode; None for any other rollout, ``[]`` when malformed
     (no proof passes an empty span list). Read strictly: integer pairs, ordered, non-empty,
     non-overlapping, inside the sequence and after the declared prompt."""
     from reliquary.protocol.submission import is_signed_episode
@@ -581,7 +581,7 @@ def _episode_stop_picks(
     stop_ids: set[int],
     seed_u_values: list[float],
 ) -> tuple[bool | None, int | None, float | None]:
-    """Plan 2C: each model turn that ends on a stop token (a natural stop or a tool-call stop) must end
+    """Each model turn that ends on a stop token (a natural stop or a tool-call stop) must end
     on the forced pick ``pick(warp(logits[t - 1]), u_j)``, ``j`` its model-token offset in the episode.
     A turn cut by its cap ends on no stop: the admission's structural check (exactly the cap) covers it.
     ``(True, None, None)`` when every checked turn passed, ``(False, turn, cdf_miss)`` at the first that did
@@ -906,7 +906,7 @@ def verify_commitment_proofs(
         # well-formed 2-element one; ignore it otherwise so a non-forced
         # force_span=[0, huge] cannot exclude every position and void the gate.
         force_span = rollout_meta.get("force_span")
-        # A signed episode (plan 2C) has no injected span: every model position was drawn.
+        # A signed episode has no injected span: every model position was drawn.
         if (signed_spans is None and rollout_meta.get("forced")
                 and isinstance(force_span, (list, tuple)) and len(force_span) == 2):
             try:

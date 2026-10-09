@@ -351,7 +351,7 @@ def pick_env_and_prompt(
 
 
 def _single_turn_envs(envs: dict, mix: list) -> tuple[dict, list]:
-    """``envs`` and ``mix`` without the signed-episode envs (plan 2C): those are mined by
+    """``envs`` and ``mix`` without the signed-episode envs: those are mined by
     ``reliquary.miner.episode_group_miner.EpisodeGroupMiner``, never as single-turn text. ValueError when
     none is left."""
     def signed(name: str) -> bool:

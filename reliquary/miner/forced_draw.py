@@ -1,4 +1,4 @@
-"""The forced draw of an RL signed episode, on the miner (phase 2, plan 2C; spec §4.1.4).
+"""The forced draw of an RL signed episode, on the miner.
 
 Every model token of an episode is drawn from ``u(pool, seed_index, position)`` where ``position`` counts
 the episode's MODEL tokens only, across turns: tool outputs and renderer markup take no position. The

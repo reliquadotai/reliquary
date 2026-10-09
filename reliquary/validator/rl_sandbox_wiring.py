@@ -1,11 +1,11 @@
-"""The RL validator's signed-sandbox side (phase 2, plan 2C): the validator's token key, the machine
+"""The RL validator's signed-sandbox side: the validator's token key, the machine
 directory and fleet, the RL session book and issuer (sessions stored under their own prefix), the session
 and precommit routes under ``/rl``, and the episode intake (one checker per episode env). Built only when
 the order has signed-episode envs; it imports reliquary-sandbox, which a validator without such an env
 never loads.
 
 Settings: the corpus validator's (``sandbox_wiring.SandboxValidatorConfig``). The RL policy is raised to
-what one hotkey's groups in flight need (``rl_sandbox_policy``); plan 2D's quota (``SessionQuota``)
+what one hotkey's groups in flight need (``rl_sandbox_policy``); the session quota (``SessionQuota``)
 decides beyond that.
 
 Windows. Episode intake (precommits, opens, groups) is open only for a window THIS process opened
@@ -16,8 +16,8 @@ session.
 Hand-back. A paid group the proof could not judge for a reason of the validator's own is handed back by
 its batcher (``episode_proof_inconclusive``, possibly on the event loop inside the seal or on a worker
 thread): ``hand_back`` only schedules the work on the loop and returns; the issuer then marks the group's
-sessions handed back in its book and its store (still ``submitted``: no same-window retry), and plan 2D's
-outcomes hear of it."""
+sessions handed back in its book and its store (still ``submitted``: no same-window retry), and the yield
+accounting hears of it."""
 from __future__ import annotations
 
 import asyncio
@@ -71,7 +71,7 @@ def stop_ids_from_metadata(config: Mapping | None, generation_config: Mapping | 
     """The EOS set ``shared.modeling.resolve_eos_token_ids`` derives, from a remote proof worker's
     reported metadata (plain dicts, nested ``text_config`` included) and the local tokenizer.
 
-    Config only (item 14): the worker reports its config and generation config, not its tokenizer's
+    Config only: the worker reports its config and generation config, not its tokenizer's
     eos, so the comparison with the batcher's set (whose proxies carry the same metadata) checks the
     configs; the real model's nested ``text_config`` eos is to be checked in remote mode before deploy."""
     from reliquary.shared.modeling import _iter_token_ids
@@ -248,7 +248,7 @@ def build_rl_episode_services(
     max_preauth_opens: int | None = None,
 ) -> RlEpisodeServices:
     """``environments``: the order's episode envs as loaded (``SignedEpisodeEnvironment``; their
-    ``source`` is plan 2A's); ``renderer_for(policy)``: the turn renderer of the policy's tokenizer over
+    ``source`` is the env's task source); ``renderer_for(policy)``: the turn renderer of the policy's tokenizer over
     the policy's tools; ``current_window()``: the service window admissions are open for (memory only:
     it is read on the event loop); ``window_started_at(window)``: when this process opened it, None for
     a window it did not open (a resumed one); ``proof_stop_ids`` / ``remote_stop_ids``: the batcher's
@@ -307,7 +307,7 @@ def build_rl_episode_services(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=RL_PREFIX, registration=registration,
         clock=clock, max_concurrent_closes=config.close_concurrency,
         close_body_timeout_s=config.close_body_timeout_s, max_preauth_closes=config.close_preauth_concurrency,
-        # the opens are bounded like the precommits (fix round 1, M2)
+        # the opens are bounded like the precommits
         open_body_timeout_s=BODY_TIMEOUT_S if open_body_timeout_s is None else open_body_timeout_s,
         max_preauth_opens=MAX_PREAUTH if max_preauth_opens is None else max_preauth_opens)
     precommit_router = build_episode_precommit_router(

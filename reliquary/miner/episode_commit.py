@@ -1,4 +1,4 @@
-"""A signed episode as the miner submits it (phase 2, plan 2C): the token sequence and model spans of one
+"""A signed episode as the miner submits it: the token sequence and model spans of one
 generate session, the stop the validator admits, and its rollout commit. One forward over the whole
 episode gives the GRAIL commitments (every token), the token logprobs at model positions and the TOPLOC
 proofs per model span; the signature binds the service binding, the pool binding and the episode (its
@@ -97,7 +97,7 @@ def episode_refusal(*, policy, renderer, prompt: str, tokens: Sequence[int], spa
                     stop: Any, transcript: Any, min_chunk_tokens: int | None = None) -> str | None:
     """Why the validator's admission would refuse this episode at its token level, or None: the episode
     length, prompt fidelity (``renderer.initial_ids(prompt)``, the validator's own render) and the
-    admission's own ``episode_shape_refusal`` (spans, §5.C parse, short turns, budgets, termination, a
+    admission's own ``episode_shape_refusal`` (spans, the signed parse, short turns, budgets, termination, a
     limit stop really reached). ``renderer`` is the miner's turn renderer of the policy's checkpoint over
     the CONTRACT's tools (``agentic_swe.load_turn_renderer(dir, tools=tuple(policy.tools))``, as the
     validator builds it); ``stop`` is ``episode_stop``'s (None is refused). The transcript's signatures

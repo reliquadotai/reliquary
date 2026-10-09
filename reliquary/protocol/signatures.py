@@ -26,7 +26,7 @@ PUBLIC_GROUP_COMMIT_DOMAIN = b"public-group-commit/v1"
 PUBLIC_GROUP_ENVELOPE_DOMAIN = b"public-group-envelope/v1"
 SERVICE_COMMIT_DOMAIN = b"service-group-commit/v1"
 SERVICE_ENVELOPE_DOMAIN = b"service-envelope/v1"
-# Plan 2C: a public-pool service rollout that carries a signed episode binds the episode too.
+# A public-pool service rollout that carries a signed episode binds the episode too.
 SERVICE_EPISODE_COMMIT_DOMAIN = b"service-episode-commit/v1"
 
 # Domain separation tag for the per-request envelope signature. Distinct
@@ -176,7 +176,7 @@ def build_service_episode_commit_binding(
     tokens: list[int], randomness_hex: str, model_name: str, layer_index: int,
     commitments: list[dict], service_binding: dict, seed_pool: dict, episode: dict,
 ) -> bytes:
-    """Plan 2C: the service commit binding of a public-pool rollout plus its signed episode (every
+    """The service commit binding of a public-pool rollout plus its signed episode (every
     field in canonical JSON and the digest of its transcript), under its own domain."""
     from reliquary.protocol.service_episode import episode_commit_material
 
@@ -899,7 +899,7 @@ def verify_sandbox_close_signature(request, *, validator_hotkey: str, path: str)
                                    str(body.get("signature") or ""))
 
 
-# Plan 2C: an episode precommit, signed by the miner for one validator and route (same audience rule
+# An episode precommit, signed by the miner for one validator and route (same audience rule
 # as the sandbox session requests). The precommit is re-parsed strictly and bound in its canonical
 # form, so it has exactly one signed encoding.
 EPISODE_PRECOMMIT_DOMAIN = b"reliquary/episode-precommit/v1"

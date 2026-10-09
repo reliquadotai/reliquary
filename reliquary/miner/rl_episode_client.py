@@ -1,4 +1,4 @@
-"""The miner side of the RL validator's episode routes (phase 2, plan 2C): the signed precommit, the RL
+"""The miner side of the RL validator's episode routes: the signed precommit, the RL
 session open (engagement ``rl_precommit``) and a signed-episode runner for ONE precommit, whose episode
 index is the SEED (every seed plays the same task prompt). Episodes that end graded are closed ``final``
 (``closed_graded``: they keep their seed), then either submitted in the group or withdrawn by their

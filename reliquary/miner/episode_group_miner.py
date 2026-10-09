@@ -1,4 +1,4 @@
-"""The episode-group miner (phase 2, plan 2C; spec §4.1).
+"""The episode-group miner.
 
 For one (env, task) of the current window: precommit; play every seed of the task's 2M public pool (the
 runner bounds the live sessions; each generate session is bound to its seed's forced draw when its trace
