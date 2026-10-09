@@ -504,3 +504,56 @@ def test_storage_guard_freezes_without_mutating_hf_or_r2(tmp_path):
     assert order == ["save", "guard"]
     assert not r2.objects
     assert (tmp_path / "publication.json").is_file()
+
+
+def _count_identity_reads(monkeypatch):
+    import reliquary.trainer.publisher as publisher_module
+
+    reads = {}
+    real = publisher_module._file_identity
+
+    def counting(path):
+        reads[path.name] = reads.get(path.name, 0) + 1
+        return real(path)
+
+    monkeypatch.setattr(publisher_module, "_file_identity", counting)
+    return reads
+
+
+def test_direct_publish_hashes_each_file_once(tmp_path, monkeypatch):
+    """Each identity read is a full pass over 8 GB of weights."""
+    reads = _count_identity_reads(monkeypatch)
+    pub = _publisher(tmp_path, _R2(), [])
+    asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=5,
+            lr_schedule_step=80,
+            trained_window_cursor=30110,
+            reason="cadence",
+        )
+    )
+    assert reads and set(reads.values()) == {1}
+
+
+def test_recovery_still_detects_a_changed_snapshot(tmp_path):
+    r2 = _R2()
+    pub = _publisher(tmp_path, r2, [], hf_fails=True)
+    with pytest.raises(RuntimeError, match="hf down"):
+        asyncio.run(
+            pub.publish(
+                object(),
+                parent_revision=FAKE_HEAD["head"],
+                checkpoint_n=5,
+                lr_schedule_step=80,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
+    weights = next(tmp_path.rglob("model.safetensors"))
+    weights.write_bytes(b"tampered")
+    from reliquary.trainer.publisher import PublicationConflict
+
+    with pytest.raises(PublicationConflict, match="content changed"):
+        asyncio.run(_publisher(tmp_path, r2, []).recover_pending())

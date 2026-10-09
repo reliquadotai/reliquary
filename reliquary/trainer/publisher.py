@@ -419,7 +419,9 @@ class TrainerPublisher:
             _fsync_directory(snapshot)
             transaction.update(state="prepared", files=files)
             write_json(self._pending, transaction)
-            return (await self._resume(transaction))["revision"]
+            return (
+                await self._resume(transaction, snapshot_verified=True)
+            )["revision"]
 
     async def recover_pending(self) -> dict | None:
         """Call before resolve_resume_point/model loading; never requires a model.
@@ -436,7 +438,11 @@ class TrainerPublisher:
                 return None
             return await self._resume(transaction)
 
-    async def _resume(self, transaction: dict) -> dict:
+    async def _resume(
+        self, transaction: dict, *, snapshot_verified: bool = False,
+    ) -> dict:
+        # snapshot_verified: publish() hashed these files under this same lock an
+        # instant ago; re-reading 8 GB only matters when resuming after a crash.
         snapshot = self._snapshot(transaction)
         revision = transaction["revision"]
         if transaction["state"] != "committed":
@@ -449,6 +455,8 @@ class TrainerPublisher:
                 )
             for name, expected in transaction["files"].items():
                 checkpoint_key(transaction["parent_revision"], name, namespace=self.namespace)
+                if snapshot_verified:
+                    continue
                 if await asyncio.to_thread(_file_identity, snapshot / name) != expected:
                     raise PublicationConflict(
                         f"local publication content changed: {name}"
