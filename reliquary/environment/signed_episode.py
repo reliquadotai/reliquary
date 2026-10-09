@@ -23,6 +23,7 @@ class EpisodeTaskSource(Protocol):
 
 class SignedEpisodeEnvironment:
     validator_authoritative_reward = True
+    interaction_mode = "signed_episode"     # what the registry entry says, for an env held unregistered
 
     def __init__(self, name: str, source: EpisodeTaskSource) -> None:
         self.name = name

@@ -8483,6 +8483,10 @@ class ValidationService:
                     )
 
                     rendered = rendered_episode_prompt(env, int(prompt_idx))
+                elif (spec.interaction_mode if spec is not None
+                      else getattr(env, "interaction_mode", None)) == "signed_episode":
+                    # Plan 2C: the task source's prompt verbatim, as the batcher digests it.
+                    rendered = str(problem["prompt"])
                 else:
                     rendered = render_canonical_prompt(
                         self.tokenizer,

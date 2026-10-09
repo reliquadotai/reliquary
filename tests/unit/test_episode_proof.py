@@ -295,3 +295,24 @@ def test_a_signed_episode_has_no_natural_close_diagnostic():
     with patch.object(verifier, "_gpu_natural_close_forced_pick_diagnostics", return_value=(True, 0.0)):
         result = _verify(_commit(tokens, hidden), logits, hidden)
     assert result.natural_close_pick_ok is None
+
+
+# --- Task 10 carries: the failed turn's CDF distance (telemetry), no BFT carve-out for a signed episode. ---
+
+def test_a_failed_stop_pick_reports_its_cdf_distance_as_telemetry():
+    logits, tokens, hidden = _episode(stop_rows=(OTHER, STOP))
+    tokens[SPANS[0][1] - 1] = STOP
+    result = _verify(_commit(tokens, hidden), logits, hidden)
+    assert result.episode_stop_picks_ok is False
+    assert result.episode_stop_cdf_miss is not None and 0.0 < result.episode_stop_cdf_miss <= 1.0
+    assert ProofValues.from_kernel(result).to_kernel().episode_stop_cdf_miss == result.episode_stop_cdf_miss
+    logits, tokens, hidden = _episode()
+    assert _verify(_commit(tokens, hidden), logits, hidden).episode_stop_cdf_miss is None
+
+
+def test_a_signed_episode_never_exempts_a_forced_span_from_the_seed_check():
+    logits, tokens, hidden = _episode()
+    commit = _commit(tokens, hidden)
+    commit["rollout"].update(forced=True, force_span=[SPANS[0][0], SPANS[0][1]])
+    result = _verify(commit, logits, hidden)
+    assert result.seed_n_positions == len(POSITIONS)

@@ -335,7 +335,12 @@ def _environment_policy(env: Any, field: str, default: Any = None) -> Any:
 
 
 def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str:
-    if _environment_policy(env, "interaction_mode", "single_turn") == "episode":
+    mode = _environment_policy(env, "interaction_mode", "single_turn")
+    if mode == "signed_episode":
+        # Plan 2C: the task source's prompt verbatim (exactly what the harness renders, which the
+        # admission compared token for token with the trajectory's prompt); never a chat template here.
+        return str(env.get_problem(prompt_idx)["prompt"])
+    if mode == "episode":
         from reliquary.environment.agentic.compat import rendered_episode_prompt
 
         return rendered_episode_prompt(env, prompt_idx)
@@ -500,6 +505,102 @@ def _with_toploc_spec(commit: dict, profile) -> dict:
     if toploc is None:
         return commit
     return {**commit, "toploc_spec": toploc.to_contract()}
+
+
+def _is_signed_episode_meta(meta: Any) -> bool:
+    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
+    episode = meta.get("episode") if isinstance(meta, dict) else None
+    return isinstance(episode, dict) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA
+
+
+def _is_signed_episode_group(pending: Any) -> bool:
+    """A pending group of signed episodes (plan 2C): any of its rollouts carries the signed schema."""
+    request = getattr(pending, "request", None)
+    return any(_is_signed_episode_meta((getattr(r, "commit", None) or {}).get("rollout"))
+               for r in (getattr(request, "rollouts", None) or ()))
+
+
+# What a signed episode's proof copy never carries: the transcript (up to 8 MiB, with a session token;
+# no proof reads it) and the BFT carve-out keys (a signed episode has no injected span: every model
+# position is drawn, so nothing may exempt one from the forced-seed check).
+_SIGNED_EPISODE_PROOF_DROPPED_META = ("forced", "force_span")
+
+
+def _proof_commit(commit: dict, profile) -> dict:
+    """What a proof (local or remote worker) receives: ``_with_toploc_spec``'s copy and, for a signed
+    episode (plan 2C), its metadata without the transcript and without any BFT carve-out claim. The
+    miner's commit is never mutated (admission re-reads it; the payload release drops it)."""
+    out = _with_toploc_spec(commit, profile)
+    meta = commit.get("rollout")
+    if not _is_signed_episode_meta(meta):
+        return out
+    episode = meta["episode"]
+    proof_meta = {k: v for k, v in meta.items() if k not in _SIGNED_EPISODE_PROOF_DROPPED_META}
+    proof_meta["episode"] = {k: v for k, v in episode.items() if k != "transcript"}
+    return {**out, "rollout": proof_meta}
+
+
+def _signed_episode_turn_cap(start: int, *, max_tokens_per_turn: int, max_episode_tokens: int) -> int:
+    """The admission's cap of the turn starting at absolute ``start`` (``check_turn_termination``)."""
+    return min(int(max_tokens_per_turn), int(max_episode_tokens) - int(start))
+
+
+def signed_episode_unchecked_turn(
+    tokens: list[int],
+    spans: list[tuple[int, int]],
+    eos_ids: set[int],
+    *,
+    max_tokens_per_turn: int,
+    max_episode_tokens: int,
+) -> int | None:
+    """The first turn that ends neither on a stop the proof checks (``eos_ids``, the stop set the proof's
+    forced-pick check uses) nor exactly at its cap, or None. The admission accepted it on a renderer stop,
+    so that stop is outside the checked set: its pick cannot be judged (the validator's configuration, no
+    verdict)."""
+    for turn, (start, end) in enumerate(spans):
+        if int(tokens[end - 1]) in eos_ids:
+            continue
+        if end - start != _signed_episode_turn_cap(
+                start, max_tokens_per_turn=max_tokens_per_turn, max_episode_tokens=max_episode_tokens):
+            return turn
+    return None
+
+
+def signed_episode_proof_refusal(
+    proof,
+    tokens: list[int],
+    spans: list[tuple[int, int]],
+    eos_ids: set[int],
+    *,
+    max_tokens_per_turn: int | None = None,
+    max_episode_tokens: int | None = None,
+) -> tuple[RejectReason, str] | None:
+    """Plan 2C: what a signed episode's proof must show beyond the Episode v1 gates.
+
+    * TOPLOC checked (a validator whose profile names no TOPLOC is no verdict) and passed on every model
+      span, whatever the profile's TOPLOC mode (``toploc``: deterministic, R31).
+    * Every turn ending on a stop token ends on the forced pick (``termination``: a forgery,
+      deterministic). A proof that has no stop verdict while a turn ends on a stop (an older remote
+      worker) is no verdict (``service_proof_capability``: no sanction).
+    * With the contract's turn limits: a turn that ends neither on a stop the proof checks nor exactly
+      at its cap ended on a stop outside the proof's stop set (the renderer's stops are not all the
+      model's): its pick is unchecked, so no verdict either -- never a pass."""
+    if not getattr(proof, "toploc_checked", False):
+        return RejectReason.GENERATION_CONTRACT_MISMATCH, "service_proof_capability"
+    if not getattr(proof, "toploc_passed", False):
+        return RejectReason.TOPLOC_FAIL, "toploc"
+    picks = getattr(proof, "episode_stop_picks_ok", None)
+    if picks is False:
+        return RejectReason.BAD_TERMINATION, "termination"
+    stops = [int(tokens[end - 1]) in eos_ids for _start, end in spans]
+    if picks is None and any(stops):
+        return RejectReason.GENERATION_CONTRACT_MISMATCH, "service_proof_capability"
+    if max_tokens_per_turn is not None and max_episode_tokens is not None and signed_episode_unchecked_turn(
+            tokens, spans, eos_ids, max_tokens_per_turn=max_tokens_per_turn,
+            max_episode_tokens=max_episode_tokens) is not None:
+        return RejectReason.GENERATION_CONTRACT_MISMATCH, "service_proof_capability"
+    return None
 
 
 def _is_missing_kwarg_typeerror(exc: TypeError, kwarg: str) -> bool:
@@ -940,6 +1041,13 @@ class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
     """
+
+    # Plan 2C: called ``(pending, stage)`` once per signed-episode group whose proof ended without a
+    # verdict for a validator-side reason (an inconclusive stage, a proof-plane fault, an audit the
+    # validator lost): the group is unpaid and unsanctioned, and the owner of its sessions releases
+    # them. A proof that FAILED for the miner's fault calls nothing: its sessions stay consumed. None
+    # (every legacy task) calls nothing.
+    episode_proof_inconclusive: Callable[[Any, str], None] | None = None
 
     def __init__(
         self,
@@ -4854,7 +4962,11 @@ class GrpoWindowBatcher:
             if callable(reward_cases):
                 code_entry_name = _entry_function_name(reward_cases(problem))
         completion_texts = [
-            self._completion_text(rollout) for rollout in request.rollouts
+            # Plan 2C: a signed episode has no completion text (its admission gave "", its reward is the
+            # signed final record's); never a decode of the trajectory and its tool outputs.
+            "" if _is_signed_episode_meta((rollout.commit or {}).get("rollout"))
+            else self._completion_text(rollout)
+            for rollout in request.rollouts
         ]
         rewards = list(pending.rewards)
         sigma = rewards_std(rewards)
@@ -4987,6 +5099,15 @@ class GrpoWindowBatcher:
                     for j in range(len(positions))]
 
         profile = _active_profile()
+        signed_episode_policy = None
+        if service_contract is not None and any(
+            _is_signed_episode_meta((r.commit or {}).get("rollout")) for r in request.rollouts
+        ):
+            try:
+                signed_episode_policy = self._service_window_contract().episode_policy(
+                    str(self.service_environment))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                signed_episode_policy = None
         for rollout_idx, rollout in enumerate(request.rollouts):
             # Never carry a validator-derived carve across re-validation of the
             # same Pydantic object. The private value is set only after the
@@ -5008,6 +5129,7 @@ class GrpoWindowBatcher:
                 list(_seed_tokens), _seed_meta
             )
             _seed_completion_len = len(_policy_positions)
+            _signed_spans = None
             if _is_episode:
                 trusted_spans = getattr(
                     rollout, "_validated_assistant_spans", None
@@ -5017,6 +5139,48 @@ class GrpoWindowBatcher:
                         RejectReason.REWARD_MISMATCH,
                         "episode_replay_binding",
                     )
+                if _is_signed_episode_meta(_seed_meta):
+                    # Plan 2C, before any forward: prove exactly the spans the admission checked, under
+                    # the window contract's turn limits, with a TOPLOC contract to judge every span.
+                    from reliquary.validator.verifier import signed_episode_spans
+
+                    _signed_spans = signed_episode_spans(_seed_meta, len(_seed_tokens))
+                    if not _signed_spans or _signed_spans != [
+                        (start, end) for start, end in trusted_spans
+                    ]:
+                        return reject(
+                            RejectReason.REWARD_MISMATCH,
+                            "episode_replay_binding",
+                        )
+                    if signed_episode_policy is None:
+                        return reject(
+                            RejectReason.GENERATION_CONTRACT_MISMATCH,
+                            "service_contract",
+                        )
+                    if toploc_proof(profile) is None:
+                        logger.error(
+                            "signed episode of %s not provable: this validator's profile names no "
+                            "TOPLOC proof (no verdict)", hk,
+                        )
+                        return reject(
+                            RejectReason.GENERATION_CONTRACT_MISMATCH,
+                            "service_proof_capability",
+                        )
+                    _unchecked_turn = signed_episode_unchecked_turn(
+                        list(_seed_tokens), _signed_spans, telemetry_eos_ids,
+                        max_tokens_per_turn=signed_episode_policy.max_tokens_per_turn,
+                        max_episode_tokens=signed_episode_policy.max_episode_tokens,
+                    )
+                    if _unchecked_turn is not None:
+                        # Refused before the forward: the stop pick of that turn could not be judged.
+                        logger.error(
+                            "signed episode of %s not provable: turn %d ends on a stop outside the proof's "
+                            "stop set %s (no verdict)", hk, _unchecked_turn, sorted(telemetry_eos_ids),
+                        )
+                        return reject(
+                            RejectReason.GENERATION_CONTRACT_MISMATCH,
+                            "service_proof_capability",
+                        )
             _seed_completion_tokens = [
                 _seed_tokens[position] for position in _policy_positions
             ]
@@ -5031,11 +5195,11 @@ class GrpoWindowBatcher:
             )
             _t_sketch += time.perf_counter() - _tmark
             seed_u = seed_uniforms(rollout_idx, rollout.commit)
-            verify_commit = _with_toploc_spec(rollout.commit, profile)
+            verify_commit = _proof_commit(rollout.commit, profile)
             try:
                 if warm_proofs is not None and rollout_idx % PROOF_WARM_ROLLOUTS == 0:
                     inputs = [
-                        (_with_toploc_spec(r.commit, profile), seed_uniforms(index, r.commit))
+                        (_proof_commit(r.commit, profile), seed_uniforms(index, r.commit))
                         for index, r in enumerate(
                             request.rollouts[rollout_idx:rollout_idx + PROOF_WARM_ROLLOUTS],
                             rollout_idx,
@@ -5055,7 +5219,7 @@ class GrpoWindowBatcher:
                 if remote_batch is not None:
                     if not prefetched_proofs:
                         from reliquary.validator.remote_proof_protocol import MAX_PROOF_BATCH
-                        inputs = [(_with_toploc_spec(r.commit, profile), seed_uniforms(index, r.commit)) for index, r in
+                        inputs = [(_proof_commit(r.commit, profile), seed_uniforms(index, r.commit)) for index, r in
                                   enumerate(request.rollouts[rollout_idx:rollout_idx + MAX_PROOF_BATCH], rollout_idx)]
                         _t_proof0 = time.perf_counter()
                         prefetched_proofs = remote_batch(inputs, proof_model, self.randomness)
@@ -5212,6 +5376,31 @@ class GrpoWindowBatcher:
                     int(getattr(proof, "toploc_worst_exp", 0)),
                 )
                 return reject(RejectReason.TOPLOC_FAIL, "toploc")
+
+            if _signed_spans is not None:
+                # Plan 2C: a signed episode's own proof gates (TOPLOC on every span, forced stop picks).
+                seed_cdf_entry["episode_stop_picks_ok"] = getattr(proof, "episode_stop_picks_ok", None)
+                seed_cdf_entry["episode_stop_first_bad_turn"] = getattr(
+                    proof, "episode_stop_first_bad_turn", None)
+                seed_cdf_entry["episode_stop_cdf_miss"] = getattr(proof, "episode_stop_cdf_miss", None)
+                _episode_refusal = signed_episode_proof_refusal(
+                    proof, list(_seed_tokens), _signed_spans, telemetry_eos_ids,
+                    max_tokens_per_turn=signed_episode_policy.max_tokens_per_turn,
+                    max_episode_tokens=signed_episode_policy.max_episode_tokens,
+                )
+                if _episode_refusal is not None:
+                    logger.warning(
+                        "signed episode proof refused hotkey=%s prompt=%d rollout=%d stage=%s "
+                        "toploc=%s/%s reason=%s stop_picks=%s first_bad_turn=%s cdf_miss=%s",
+                        hk, pi, rollout_idx, _episode_refusal[1],
+                        getattr(proof, "toploc_checked", None), getattr(proof, "toploc_passed", None),
+                        getattr(proof, "toploc_reason", None),
+                        getattr(proof, "episode_stop_picks_ok", None),
+                        getattr(proof, "episode_stop_first_bad_turn", None),
+                        getattr(proof, "episode_stop_cdf_miss", None),
+                    )
+                    return reject(_episode_refusal[0], _episode_refusal[1],
+                                  sketch_diff_max=proof.sketch_diff_max)
 
             # Termination check: rollout must end with EOS at p(EOS) >= threshold
             # or hit the protocol cap. Cap hits without a natural EOS are counted
@@ -6075,7 +6264,15 @@ class GrpoWindowBatcher:
         if verified is not None and self.service_runtime is not None:
             # On this proof-worker thread, so the SQLite transaction never runs on the event loop.
             self._prerecord_service_training(pending, verified)
-        if verified is None and count_operator_debt and operator is not None:
+        # Plan 2C: a signed-episode group the proof could not judge (validator side) is handed back and
+        # charges its operator nothing; a legacy or single-turn group keeps phase 1's accounting.
+        inconclusive_episode = (
+            verified is None and pending.proof_reject_stage in self._AUDIT_INCONCLUSIVE_STAGES
+            and self._signed_episode_pending(pending)
+        )
+        if inconclusive_episode:
+            self._episode_proof_inconclusive(pending, pending.proof_reject_stage)
+        if verified is None and count_operator_debt and operator is not None and not inconclusive_episode:
             # Proof-stage rejects already add hotkey debt in ``_reject``.
             # Auction selection has historically charged one operator failure
             # for every failed expensive proof as a second Sybil bound.
@@ -6255,6 +6452,8 @@ class GrpoWindowBatcher:
         self._non_training_per_prompt: dict[int, int] = {}
         self._payload_released: set[int] = set()
         self._service_training_receipts: dict[int, str | None] = {}
+        # Plan 2C: the signed-episode groups already handed to ``episode_proof_inconclusive``.
+        self._episode_inconclusive_notified: set[int] = set()
 
     # --- lane decision -------------------------------------------------------------------------
 
@@ -6397,9 +6596,18 @@ class GrpoWindowBatcher:
 
     @staticmethod
     def _service_token_count(request) -> int:
-        return sum(
-            len(r.commit["tokens"]) - int(r.commit["rollout"]["prompt_length"]) for r in request.rollouts
-        )
+        """Generated tokens of a group (the reward policy's ``max_tokens_per_group``). A signed episode
+        counts its admission-validated model spans only (plan 2C), never the tool outputs and markup
+        between its turns; without validated spans it is counted whole (never fewer tokens)."""
+        total = 0
+        for r in request.rollouts:
+            meta = r.commit["rollout"]
+            spans = getattr(r, "_validated_assistant_spans", None)
+            if spans is not None and _is_signed_episode_meta(meta):
+                total += sum(int(end) - int(start) for start, end in spans)
+            else:
+                total += len(r.commit["tokens"]) - int(meta["prompt_length"])
+        return total
 
     def _service_arrival_wall(self, pending) -> float:
         """Validator wall clock at which the complete signed body was received.
@@ -6755,6 +6963,7 @@ class GrpoWindowBatcher:
                         self.service_runtime.mark_audit_error(identity)
                 elif validator_lost:
                     self._mark_validator_lost(identity)
+                    self._episode_proof_inconclusive(self._exploration_pending.get(identity), "validator_lost")
 
     def audits_in_flight(self) -> int:
         with self._exploration_lock:
@@ -6846,6 +7055,7 @@ class GrpoWindowBatcher:
                                  "validator_lost (no horizon) and the fault goes to the scheduler",
                                  identity, type(exc).__name__)
                 self._mark_validator_lost(identity)
+                self._episode_proof_inconclusive(pending, "validator_lost")
                 try:
                     self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0)
                 except Exception:
@@ -6894,10 +7104,19 @@ class GrpoWindowBatcher:
             # The validator's configuration fault, never the payload's: a miner-supplied env_name must not choose the bound.
             raise RuntimeError("a service batcher has no service_environment")
         environment = str(environment)
+        episode_max_tokens = None
+        if any(_is_signed_episode_meta((r.commit or {}).get("rollout")) for r in request.rollouts):
+            # Plan 2C: a signed episode is bounded by its contract's episode limit (refused without one).
+            try:
+                episode = self._service_window_contract().episode_policy(environment)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                episode = None
+            episode_max_tokens = episode.max_episode_tokens if episode is not None else None
         for rollout in request.rollouts:
             commit = rollout.commit or {}
             tokens = list(commit.get("tokens") or [])
-            if not service_length_valid(tokens, commit.get("rollout") or {}, environment):
+            if not service_length_valid(tokens, commit.get("rollout") or {}, environment,
+                                        episode_max_tokens=episode_max_tokens):
                 raise ValueError("rollout longer than the environment's bound")
             if any(not isinstance(t, int) or isinstance(t, bool) or not 0 <= t < size for t in tokens):
                 raise ValueError("token id outside the proof model's embedding")
@@ -7019,6 +7238,7 @@ class GrpoWindowBatcher:
                 # unaudited, reason validator_lost (R25: no horizon), unpaid and unsanctioned.
                 logger.warning("exploration audit %s: the proof found a length-capped rollout; no verdict", identity)
                 self._mark_validator_lost(identity)
+                self._episode_proof_inconclusive(pending, "validator_lost")
                 self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0,
                                       service_unpaid_reason="truncated")
                 return
@@ -7028,6 +7248,7 @@ class GrpoWindowBatcher:
         elif pending.proof_reject_stage in self._AUDIT_INCONCLUSIVE_STAGES:
             logger.error("exploration audit %s inconclusive (%s); no verdict", identity, pending.proof_reject_stage)
             self._mark_validator_lost(identity)
+            self._episode_proof_inconclusive(pending, pending.proof_reject_stage)
             self._set_service_row(pending, "exploration_unaudited", exploration_fraction=0.0)
             return
         else:
@@ -7080,6 +7301,28 @@ class GrpoWindowBatcher:
             except (TypeError, ValueError, IndexError, AttributeError, OverflowError):
                 return False
         return True
+
+    def _signed_episode_pending(self, pending) -> bool:
+        """A signed-episode group (plan 2C): its env's mode says so (also once an exploration group's
+        payload was dropped), or one of its rollouts carries the signed schema."""
+        return (_environment_policy(self.env, "interaction_mode", "single_turn") == "signed_episode"
+                or _is_signed_episode_group(pending))
+
+    def _episode_proof_inconclusive(self, pending, stage: str) -> None:
+        """Plan 2C: hand a signed-episode group that the proof could not judge to the session owner
+        (once per group, never raising into the proof plane)."""
+        hook = self.episode_proof_inconclusive
+        if hook is None or pending is None or not self._signed_episode_pending(pending):
+            return
+        with self._proof_admission_lock:
+            if id(pending) in self._episode_inconclusive_notified:
+                return
+            self._episode_inconclusive_notified.add(id(pending))
+        try:
+            hook(pending, stage)
+        except Exception:
+            logger.exception("service window %s: inconclusive episode group of %s not handed back (%s)",
+                             self.window_start, getattr(pending, "hotkey", None), stage)
 
     def _mark_validator_lost(self, identity: str) -> None:
         """The validator could not audit this row (R25): unaudited, reason validator_lost, no horizon."""

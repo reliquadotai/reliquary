@@ -260,6 +260,7 @@ class ProofValues(WireModel):
     # Plan 2C: an older worker omits them (None): the batcher then has no stop verdict.
     episode_stop_picks_ok: bool | None = None
     episode_stop_first_bad_turn: Count | None = None
+    episode_stop_cdf_miss: Probability | None = None
 
     @model_validator(mode="after")
     def aligned(self):

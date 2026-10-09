@@ -148,6 +148,8 @@ class ProofResult:
     # None: no such turn checked, or not a signed episode.
     episode_stop_picks_ok: bool | None = None
     episode_stop_first_bad_turn: int | None = None
+    # Telemetry only (never a relaxation): the first failed turn's distance to its stop's CDF interval.
+    episode_stop_cdf_miss: float | None = None
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -578,14 +580,15 @@ def _episode_stop_picks(
     policy_positions: list[int],
     stop_ids: set[int],
     seed_u_values: list[float],
-) -> tuple[bool | None, int | None]:
+) -> tuple[bool | None, int | None, float | None]:
     """Plan 2C: each model turn that ends on a stop token (a natural stop or a tool-call stop) must end
     on the forced pick ``pick(warp(logits[t - 1]), u_j)``, ``j`` its model-token offset in the episode.
     A turn cut by its cap ends on no stop: the admission's structural check (exactly the cap) covers it.
-    ``(True, None)`` when every checked turn passed, ``(False, turn)`` at the first that did not (a stop
-    the u-stream does not reach fails too), ``(None, None)`` when no turn ended on a stop."""
+    ``(True, None, None)`` when every checked turn passed, ``(False, turn, cdf_miss)`` at the first that did
+    not (a stop the u-stream does not reach fails too, with no distance), ``(None, None, None)`` when no turn
+    ended on a stop. ``cdf_miss`` is telemetry only."""
     if not stop_ids:
-        return None, None
+        return None, None, None
     offset_of = {position: offset for offset, position in enumerate(policy_positions)}
     checked = False
     for turn, (_start, end) in enumerate(spans):
@@ -594,12 +597,12 @@ def _episode_stop_picks(
             continue
         offset = offset_of.get(t)
         if offset is None or offset >= len(seed_u_values):
-            return False, turn
-        exact, _ = _forced_pick_diagnostics(logits_gpu[t - 1], int(tokens[t]), seed_u_values[offset])
+            return False, turn, None
+        exact, miss = _forced_pick_diagnostics(logits_gpu[t - 1], int(tokens[t]), seed_u_values[offset])
         checked = True
         if not exact:
-            return False, turn
-    return (True, None) if checked else (None, None)
+            return False, turn, min(1.0, max(0.0, float(miss)))
+    return (True, None, None) if checked else (None, None, None)
 
 
 def proof_challenge_indices(
@@ -892,6 +895,7 @@ def verify_commitment_proofs(
     natural_close_pick_cdf_miss = None
     episode_stop_picks_ok = None
     episode_stop_first_bad_turn = None
+    episode_stop_cdf_miss = None
     if seed_u_values is not None:
         valid_t = policy_positions
         # Exclude BFT-injected force_span tokens: validator-accepted but not
@@ -902,7 +906,8 @@ def verify_commitment_proofs(
         # well-formed 2-element one; ignore it otherwise so a non-forced
         # force_span=[0, huge] cannot exclude every position and void the gate.
         force_span = rollout_meta.get("force_span")
-        if (rollout_meta.get("forced")
+        # A signed episode (plan 2C) has no injected span: every model position was drawn.
+        if (signed_spans is None and rollout_meta.get("forced")
                 and isinstance(force_span, (list, tuple)) and len(force_span) == 2):
             try:
                 fs0, fs1 = int(force_span[0]), int(force_span[1])
@@ -963,7 +968,7 @@ def verify_commitment_proofs(
                 tokenizer, seed_u_values, rollout_meta,
             )
         if signed_spans:
-            episode_stop_picks_ok, episode_stop_first_bad_turn = _episode_stop_picks(
+            episode_stop_picks_ok, episode_stop_first_bad_turn, episode_stop_cdf_miss = _episode_stop_picks(
                 logits_gpu, tokens, signed_spans, policy_positions,
                 _eos_set_from_model(model, tokenizer), seed_u_values,
             )
@@ -1070,6 +1075,7 @@ def verify_commitment_proofs(
         toploc_worst_mant_median=0.0 if toploc is None else float(toploc.worst_mant_median),
         episode_stop_picks_ok=episode_stop_picks_ok,
         episode_stop_first_bad_turn=episode_stop_first_bad_turn,
+        episode_stop_cdf_miss=episode_stop_cdf_miss,
     )
 
 
