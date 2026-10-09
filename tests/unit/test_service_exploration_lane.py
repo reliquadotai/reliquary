@@ -561,7 +561,7 @@ def test_a_passing_audit_pays_and_a_failing_one_forfeits_and_bans_through_the_ru
     assert not rt.exploration_banned("good")
 
 
-@pytest.mark.parametrize("stage", ["service_contract", "service_proof_capability"])
+@pytest.mark.parametrize("stage", ["service_contract", "service_proof_capability", "episode_replay_binding"])
 def test_a_proof_that_could_not_judge_the_group_is_no_verdict(tmp_path, stage):
     rt, b, pending = _drawn(tmp_path, "hk")
     _audit(b, pending, verified=None, stage=stage)
@@ -1823,14 +1823,25 @@ async def test_end_to_end_v2_window_seal_settle_json_replay_equals_the_runtime_m
 
 # ---------------------------------------------------------------- R31: graded audit sanction (batcher)
 
-def _audit_scoped(b, pending, *, stage, scope=None):
-    def prove(p, model=None, audit=False):
+def _audit_scoped(b, pending, *, stage, scope=None, second=None, calls=None, model=None):
+    """A failed audit at ``stage``; ``second`` = what the classification pass (statistical gates off) finds:
+    None (nothing), a ``(stage, scope)`` pair, or an exception it raises."""
+    def prove(p, model=None, audit=False, classify_only=False):
         assert audit is True
+        if calls is not None:
+            calls.append((classify_only, model, [list(r.commit["tokens"]) for r in p.request.rollouts]))
+        if classify_only:
+            assert p.proof_reject_stage == stage                 # the first pass's verdict is never touched
+            if isinstance(second, BaseException):
+                raise second
+            if second is not None:
+                p.proof_classify_stage, p.proof_classify_scope = second
+            return None
         p.proof_reject_stage = stage
         p.proof_reject_scope = scope
         return None
     b._verify_expensive = prove
-    return b._execute_exploration_audit(pending, model=None)
+    return b._execute_exploration_audit(pending, model=model)
 
 
 @pytest.mark.parametrize("stage, scope, banned", [
@@ -1902,3 +1913,125 @@ def test_r31_every_stage_an_audit_can_reject_at_is_in_the_classification_table()
     # the forced-seed scope reaches the classification on the service path only
     assert "if service_contract is not None:\n                # R31" in source
     assert "pending.proof_reject_scope = scope" in source
+
+
+# ---------------------------------------------------------------- R31 amended (F1): class by the strongest failure
+
+def _classified(tmp_path, **kwargs):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    sibling = make_pending(rt, hotkey="hk", prompt=9)
+    arrive(b, sibling)
+    ready(rt)
+    tick(b)
+    _audit_scoped(b, pending, **kwargs)
+    return rt, b, pending, sibling
+
+
+@pytest.mark.parametrize("stage, scope, second", [
+    ("logprob", None, ("toploc", None)), ("logprob", None, ("grail", None)),
+    ("distribution", None, ("token_authenticity", None)), ("forced_seed", "group", ("forced_seed", "cdf_hard_mismatch")),
+    ("boxed_answer", None, ("termination", None)), ("forced_seed", "rollout", ("all_token_authenticity", None)),
+])
+def test_r31_f1_a_statistical_failure_with_a_deterministic_one_behind_it_is_deterministic(tmp_path, stage, scope, second):
+    calls = []
+    rt, b, pending, sibling = _classified(tmp_path, stage=stage, scope=scope, second=second, calls=calls,
+                                          model="replica-3")
+    assert [c[0] for c in calls] == [False, True]                    # one audit, one classification pass
+    assert calls[1][1] == "replica-3"                                 # on the audit's own model replica
+    assert calls[1][2] == calls[0][2] and calls[1][2]                 # on the same retained tokens
+    assert rt.exploration_banned("hk")
+    assert rt.ledger.audit_log("hk")[-1]["failure_class"] == "deterministic"
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+    assert b.difficulty_auction_metadata_by_id[id(sibling)]["status"] == "exploration_forfeited"
+    assert pending.proof_reject_stage == stage                        # the verdict's stage is the first pass's
+
+
+def test_r31_f1_an_honest_group_with_one_statistical_failure_stays_statistical(tmp_path):
+    calls = []
+    rt, b, pending, sibling = _classified(tmp_path, stage="logprob", second=None, calls=calls)
+    assert [c[0] for c in calls] == [False, True]
+    assert not rt.exploration_banned("hk")
+    assert rt.ledger.audit_log("hk")[-1]["failure_class"] == "statistical"
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+    assert b.difficulty_auction_metadata_by_id[id(sibling)]["status"] == "exploration_forfeited"
+
+
+@pytest.mark.parametrize("stage, scope", [("grail", None), ("toploc", None), ("forced_seed", "cdf_hard_mismatch")])
+def test_r31_f1_a_deterministic_first_failure_needs_no_classification_pass(tmp_path, stage, scope):
+    calls = []
+    rt, b, pending, _ = _classified(tmp_path, stage=stage, scope=scope, calls=calls)
+    assert [c[0] for c in calls] == [False]
+    assert rt.exploration_banned("hk")
+
+
+def test_r31_f1_a_passing_audit_runs_no_classification_pass(tmp_path):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    calls = []
+
+    def prove(p, model=None, audit=False, classify_only=False):
+        calls.append(classify_only)
+        return SimpleNamespace(hotkey=p.hotkey)
+    b._verify_expensive = prove
+    b._execute_exploration_audit(pending, model=None)
+    assert calls == [False]
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_audit_passed"
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("CUDA out of memory"), MemoryError(), OSError("io"),
+                                 TimeoutError("slow")])
+def test_r31_f1_an_infrastructure_fault_in_the_classification_pass_keeps_the_statistical_class(tmp_path, caplog, exc):
+    with caplog.at_level(logging.ERROR, logger="reliquary.validator.batcher"):
+        rt, b, pending, sibling = _classified(tmp_path, stage="logprob", second=exc)   # does not propagate
+    assert not rt.exploration_banned("hk")
+    assert rt.ledger.audit_log("hk")[-1]["failure_class"] == "statistical"
+    # the pass/fail outcome is the audit's: still a failure, the window still forfeited
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+    assert b.difficulty_auction_metadata_by_id[id(sibling)]["status"] == "exploration_forfeited"
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) is None
+    assert any("classification pass failed" in r.getMessage() for r in caplog.records)
+    assert pending.service_observation_id not in b._audit_open.values()
+
+
+@pytest.mark.parametrize("exc", [ValueError("x"), TypeError("x"), KeyError("x"), IndexError("x")])
+def test_r31_f1_a_payload_fault_in_the_classification_pass_is_the_miners_deterministic(tmp_path, exc):
+    rt, b, pending, sibling = _classified(tmp_path, stage="distribution", second=exc)
+    assert rt.exploration_banned("hk")
+    assert rt.ledger.audit_log("hk")[-1]["failure_class"] == "deterministic"
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+
+
+@pytest.mark.parametrize("second", [("service_contract", None), ("service_proof_capability", None),
+                                    ("episode_replay_binding", None)])
+def test_r31_f1_a_classification_pass_that_cannot_judge_keeps_the_statistical_class_and_the_failure(tmp_path, caplog,
+                                                                                                    second):
+    with caplog.at_level(logging.WARNING):
+        rt, b, pending, _ = _classified(tmp_path, stage="logprob", second=second)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("could not judge the group" in m for m in messages)          # said as such, not as an unknown stage
+    assert not any("unclassified proof stage" in m for m in messages)
+    assert not rt.exploration_banned("hk")
+    assert rt.ledger.audit_log("hk")[-1]["failure_class"] == "statistical"
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+
+
+def test_r31_f1_the_tokens_are_released_only_after_the_classification_pass(tmp_path):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    seen = []
+
+    def prove(p, model=None, audit=False, classify_only=False):
+        seen.append((classify_only, len(p.request.rollouts), id(p) in b._payload_released))
+        if not classify_only:
+            p.proof_reject_stage = "logprob"
+        return None
+    b._verify_expensive = prove
+    b._execute_exploration_audit(pending, model=None)
+    assert seen == [(False, M_ROLLOUTS, False), (True, M_ROLLOUTS, False)]
+    assert not pending.request.rollouts                                 # released once the audit is over
+
+
+def test_r31_minor_episode_replay_binding_is_no_verdict_no_forfeit_no_sanction(tmp_path):
+    rt, b, pending, sibling = _classified(tmp_path, stage="episode_replay_binding")
+    assert not rt.exploration_banned("hk")
+    assert rt.ledger.audit_log("hk") == []
+    assert rt.ledger.unaudited_reason(pending.service_observation_id) == "validator_lost"
+    assert b.difficulty_auction_metadata_by_id[id(sibling)]["status"] != "exploration_forfeited"

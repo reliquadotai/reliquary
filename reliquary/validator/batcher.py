@@ -677,6 +677,10 @@ class PendingSubmission:
     proof_reject_stage: str | None = None
     # Service policy only: the forced-seed scope of a ``forced_seed`` rejection (R31 failure class).
     proof_reject_scope: str | None = None
+    # Service policy only (R31 amended): what the classification pass (``classify_only``: statistical gates
+    # off) of a failed exploration audit rejected at, and its forced-seed scope. Never read for the verdict.
+    proof_classify_stage: str | None = None
+    proof_classify_scope: str | None = None
     # Completion-token telemetry retained for training, archives and recovery
     # of windows opened under the legacy token-weighted payment policy.
     eos_tokens: int = 0
@@ -4762,9 +4766,18 @@ class GrpoWindowBatcher:
         *,
         model: Any | None = None,
         audit: bool = False,
+        classify_only: bool = False,
     ) -> ValidSubmission | None:
         """Prove one graded candidate on the GPU and run every proof-dependent
         gate. Returns the ``ValidSubmission`` on success, ``None`` on rejection.
+
+        ``classify_only`` (R31 amended, service exploration audits only): the second pass over a group an
+        audit already rejected at a STATISTICAL stage. Every statistical gate (logprob, distribution,
+        boxed answer, code semantic heuristic, forced-seed agreement floors) is off; every deterministic
+        one, including the post-loop forced-seed hard CDF mismatch, still runs. A rejection only sets
+        ``pending.proof_classify_stage`` / ``proof_classify_scope``: no ``_reject`` (no debt, no archive,
+        no verdict, no counter), no forensic record, and ``pending``'s verdict fields and lanes are never
+        touched. The return value is meaningless in this mode.
 
         Deliberately NOT called under ``self._lock``: the GRAIL forward is 5-25 s
         and holding the lock across it is what serialized admission. On rejection
@@ -4795,6 +4808,9 @@ class GrpoWindowBatcher:
             stage: str,
             **kwargs: Any,
         ) -> None:
+            if classify_only:
+                pending.proof_classify_stage = stage
+                return None
             pending.proof_reject_stage = stage
             pending.reject_response = self._reject(
                 reason,
@@ -5271,7 +5287,7 @@ class GrpoWindowBatcher:
                 # retain the unadjusted auction score after proof discovers the
                 # forgery.
                 increments_truncation = cap_truncated
-                if private_auth_forensics_enabled and (
+                if private_auth_forensics_enabled and not classify_only and (
                     not termination_ok
                     or increments_truncation
                     or low_probability_terminal
@@ -5324,7 +5340,7 @@ class GrpoWindowBatcher:
                     truncated_count += 1
                     # Validator-set flag for the overlong side of reward shaping.
                     _rdict = rollout.commit.get("rollout")
-                    if isinstance(_rdict, dict):
+                    if isinstance(_rdict, dict) and not classify_only:
                         _rdict["truncated"] = True
                     # R21: on the service path the robust rule prices every joint assignment of the
                     # capped rollouts (training), or the group is published unpaid (exploration);
@@ -5417,14 +5433,18 @@ class GrpoWindowBatcher:
             )
 
             _tmark = time.perf_counter()
-            lp_ok, lp_dev = verify_logprobs_claim(
-                tokens=rollout.commit["tokens"],
-                prompt_length=prompt_len,
-                completion_length=completion_len,
-                claimed_logprobs=claimed_lp,
-                proof=proof,
-                policy_positions=(policy_positions if _is_episode else None),
-            )
+            if classify_only:
+                # R31 amended: a statistical gate, off in the classification pass (and no counter moves).
+                lp_ok, lp_dev = True, None
+            else:
+                lp_ok, lp_dev = verify_logprobs_claim(
+                    tokens=rollout.commit["tokens"],
+                    prompt_length=prompt_len,
+                    completion_length=completion_len,
+                    claimed_logprobs=claimed_lp,
+                    proof=proof,
+                    policy_positions=(policy_positions if _is_episode else None),
+                )
             _t_lp += time.perf_counter() - _tmark
             if not lp_ok and completion_len < CHALLENGE_K:
                 # The sampled-challenge check is a deterministic fail below
@@ -5484,7 +5504,7 @@ class GrpoWindowBatcher:
                 q10 = float(dist_metrics["q10"])
                 if dist_q10_min is None or q10 < dist_q10_min:
                     dist_q10_min = q10
-            if dist_ok is False:
+            if dist_ok is False and not classify_only:     # R31 amended: statistical, off in classification
                 logger.info(
                     "reject reason=distribution_suspicious hotkey=%s %s",
                     request.miner_hotkey, dist_metrics,
@@ -5554,7 +5574,7 @@ class GrpoWindowBatcher:
                 proof=proof,
                 tokenizer=self.tokenizer,
             )
-            if not boxed_ok:
+            if not boxed_ok and not classify_only:          # R31 amended: statistical, off in classification
                 logger.info(
                     "reject reason=boxed_answer_tampered hotkey=%s %s",
                     request.miner_hotkey, boxed_metrics,
@@ -5631,7 +5651,7 @@ class GrpoWindowBatcher:
                         ):
                             all_token_auth_shadow_positive_min_prob = p
             if not all_token_shadow_ok:
-                if private_auth_forensics_enabled:
+                if private_auth_forensics_enabled and not classify_only:
                     record_all_token_auth_findings(
                         metrics=all_token_shadow_metrics,
                         window_start=self.window_start,
@@ -5699,7 +5719,7 @@ class GrpoWindowBatcher:
                             ):
                                 code_semantic_auth_positive_min_prob = p
                 if not code_auth_ok:
-                    if private_auth_forensics_enabled:
+                    if private_auth_forensics_enabled and not classify_only:
                         rollout_reward = float(
                             getattr(rollout, "reward", 0.0) or 0.0
                         )
@@ -5739,7 +5759,7 @@ class GrpoWindowBatcher:
                         rollout_reward_positive,
                         log_code_metrics,
                     )
-                    if CODE_SEMANTIC_AUTH_ENFORCE and rollout_reward_positive:
+                    if CODE_SEMANTIC_AUTH_ENFORCE and rollout_reward_positive and not classify_only:
                         return reject(
                             RejectReason.TOKEN_TAMPERED,
                             "code_semantic_auth",
@@ -5828,44 +5848,47 @@ class GrpoWindowBatcher:
         rollout_would_reject = _forced_seed_rollout_reject(
             seed_per_rollout, True,
         )
-        group_reject = seed_enforce and group_would_reject
-        rollout_reject = seed_enforce and rollout_would_reject
+        # R31 amended: the agreement floors are statistical, off in the classification pass; the hard CDF
+        # mismatch below is deterministic and stays on.
+        group_reject = seed_enforce and group_would_reject and not classify_only
+        rollout_reject = seed_enforce and rollout_would_reject and not classify_only
         cdf_enforce = (
             service_contract is not None or FORCED_SEED_CDF_ENFORCE and bool(self.current_checkpoint_hash)
         )
         cdf_would_reject = grp_seed_hard_mismatch > 0
         cdf_reject = cdf_enforce and cdf_would_reject
-        record_forced_seed_shadow(
-            hk,
-            request.prompt_idx,
-            grp_stoch,
-            grp_match,
-            per_rollout=seed_cdf_per_rollout,
-            n_positions=grp_seed_positions,
-            n_boundary_match=grp_seed_boundary_match,
-            n_hard_mismatch=grp_seed_hard_mismatch,
-            n_deterministic_hard_mismatch=(
-                grp_seed_deterministic_hard_mismatch
-            ),
-            n_miss_gt_0_01=grp_seed_miss_gt_0_01,
-            n_miss_gt_0_05=grp_seed_miss_gt_0_05,
-            n_miss_gt_0_10=grp_seed_miss_gt_0_10,
-            max_cdf_miss=grp_seed_max_cdf_miss,
-            window_start=self.window_start,
-            env_name=getattr(self.env, "name", ""),
-            checkpoint_hash=request.checkpoint_hash,
-            cdf_boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
-            ratio_group_would_reject=group_would_reject,
-            ratio_rollout_would_reject=rollout_would_reject,
-            cdf_would_reject=cdf_would_reject,
-            cdf_enforced=cdf_enforce,
-            runtime_profile=(
-                request.runtime_fingerprint.model_dump(mode="json")
-                if request.runtime_fingerprint is not None
-                else None
-            ),
-            sketch_diff_max=sketch_diff_max,
-        )
+        if not classify_only:
+            record_forced_seed_shadow(
+                hk,
+                request.prompt_idx,
+                grp_stoch,
+                grp_match,
+                per_rollout=seed_cdf_per_rollout,
+                n_positions=grp_seed_positions,
+                n_boundary_match=grp_seed_boundary_match,
+                n_hard_mismatch=grp_seed_hard_mismatch,
+                n_deterministic_hard_mismatch=(
+                    grp_seed_deterministic_hard_mismatch
+                ),
+                n_miss_gt_0_01=grp_seed_miss_gt_0_01,
+                n_miss_gt_0_05=grp_seed_miss_gt_0_05,
+                n_miss_gt_0_10=grp_seed_miss_gt_0_10,
+                max_cdf_miss=grp_seed_max_cdf_miss,
+                window_start=self.window_start,
+                env_name=getattr(self.env, "name", ""),
+                checkpoint_hash=request.checkpoint_hash,
+                cdf_boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
+                ratio_group_would_reject=group_would_reject,
+                ratio_rollout_would_reject=rollout_would_reject,
+                cdf_would_reject=cdf_would_reject,
+                cdf_enforced=cdf_enforce,
+                runtime_profile=(
+                    request.runtime_fingerprint.model_dump(mode="json")
+                    if request.runtime_fingerprint is not None
+                    else None
+                ),
+                sketch_diff_max=sketch_diff_max,
+            )
         if group_reject or rollout_reject or cdf_reject:
             if cdf_reject:
                 scope = "cdf_hard_mismatch"
@@ -5885,8 +5908,14 @@ class GrpoWindowBatcher:
             )
             if service_contract is not None:
                 # R31: a hard CDF mismatch is a deterministic forgery; the agreement floors are statistical.
-                pending.proof_reject_scope = scope
+                if classify_only:
+                    pending.proof_classify_scope = scope
+                else:
+                    pending.proof_reject_scope = scope
             return reject(RejectReason.SEED_MISMATCH, "forced_seed")
+        if classify_only:
+            # R31 amended: no deterministic failure. Nothing below is a gate; it must not touch ``pending``.
+            return None
 
         # Reward-shape metrics are still computed (they feed the softer
         # training-quarantine signal + archive telemetry) but no longer
@@ -6793,7 +6822,7 @@ class GrpoWindowBatcher:
         verified = None
         try:
             verified = self._verify_expensive(pending, model=model, audit=True)
-            self._conclude_exploration_audit(pending, verified, caps_at_admission)
+            self._conclude_exploration_audit(pending, verified, caps_at_admission, model=model)
         except BaseException as exc:
             # N3: the class is decided from the exception TYPE only. A malformed payload (the proof code's own
             # malformed-submission types are ValueError subclasses: ServiceContractError, ReleaseContractError,
@@ -6898,10 +6927,52 @@ class GrpoWindowBatcher:
         except Exception:
             logger.exception("service window %s: row %s not marked after an audit error", self.window_start, identity)
 
-    # A proof that could not judge the group is not a verdict on the miner.
-    _AUDIT_INCONCLUSIVE_STAGES = frozenset({"service_contract", "service_proof_capability"})
+    # A proof that could not judge the group is not a verdict on the miner. ``episode_replay_binding``: the
+    # replay spans admission should have bound are missing, an admission-side state problem, not evidence.
+    _AUDIT_INCONCLUSIVE_STAGES = frozenset({"service_contract", "service_proof_capability", "episode_replay_binding"})
 
-    def _conclude_exploration_audit(self, pending, verified, caps_at_admission) -> None:
+    def _classify_audit_failure(self, pending, *, model) -> str:
+        """R31 amended: the class of a failed exploration audit is that of its STRONGEST failure.
+
+        The proof stops at the first failing gate, and the miner controls the order (a genuine rollout 0 with
+        forged logprobs fails ``logprob`` before fabricated rollouts reach TOPLOC). So an audit rejected at a
+        STATISTICAL stage is proven again, on this proof-worker thread and on the same retained tokens, with
+        the statistical gates off (``classify_only``): any failure there makes it deterministic. This decides
+        the class only, never the pass/fail outcome (the audit already failed). A payload fault of the second
+        pass is the miner's (as in the audit itself): deterministic. Any other exception is the validator's:
+        the statistical class stands (logged). A stage of the second pass that cannot judge the group
+        (``_AUDIT_INCONCLUSIVE_STAGES``) leaves it statistical."""
+        from reliquary.services.exploration import AUDIT_FAILURE_DETERMINISTIC, AUDIT_FAILURE_STATISTICAL, audit_failure_class
+
+        identity = pending.service_observation_id
+        stage, scope = pending.proof_reject_stage, getattr(pending, "proof_reject_scope", None)
+        failure_class = audit_failure_class(stage, scope)
+        if failure_class != AUDIT_FAILURE_STATISTICAL:
+            return failure_class
+        pending.proof_classify_stage = pending.proof_classify_scope = None
+        try:
+            self._verify_expensive(pending, model=model, audit=True, classify_only=True)
+        except Exception as exc:
+            if self._is_payload_fault(exc):
+                logger.error("exploration audit %s: the classification pass raised on the payload (%s) after a "
+                             "%s failure: deterministic", identity, type(exc).__name__, stage)
+                return AUDIT_FAILURE_DETERMINISTIC
+            logger.exception("exploration audit %s: the classification pass failed on the validator's side (%s); "
+                             "the %s failure stays statistical", identity, type(exc).__name__, stage)
+            return failure_class
+        second, second_scope = pending.proof_classify_stage, pending.proof_classify_scope
+        if second is None:
+            return failure_class
+        if second in self._AUDIT_INCONCLUSIVE_STAGES:
+            logger.warning("exploration audit %s: the classification pass could not judge the group (%s); the %s "
+                           "failure stays statistical", identity, second, stage)
+            return failure_class
+        strongest = audit_failure_class(second, second_scope)
+        logger.error("exploration audit %s: failed at %s, and with the statistical gates off at %s (scope %s): %s",
+                     identity, stage, second, second_scope, strongest)
+        return strongest
+
+    def _conclude_exploration_audit(self, pending, verified, caps_at_admission, *, model=None) -> None:
         from reliquary.services.exploration import audit_failure_class
 
         identity = pending.service_observation_id
@@ -6937,8 +7008,7 @@ class GrpoWindowBatcher:
             return
         else:
             passed = False
-            failure_class = audit_failure_class(pending.proof_reject_stage,
-                                                getattr(pending, "proof_reject_scope", None))
+            failure_class = self._classify_audit_failure(pending, model=model)
         if not passed:
             logger.error("exploration audit %s failed at %s (scope %s): %s failure", identity,
                          pending.proof_reject_stage, getattr(pending, "proof_reject_scope", None), failure_class)

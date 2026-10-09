@@ -614,7 +614,8 @@ def _service_proof(commit, **changes):
                   completion_argmax_probs=[1.0] * size,
                   completion_argmax_ids=commit["tokens"][meta["prompt_length"]:],
                   seed_n_stochastic=size, seed_n_match=size, seed_n_positions=size,
-                  seed_n_boundary_match=size, **changes)
+                  seed_n_boundary_match=size)
+    values.update(changes)
     return ProofResult(**values)
 
 
@@ -857,3 +858,81 @@ def test_service_length_valid_completion_length_claim_is_parsed_strictly(monkeyp
     assert not service_length_valid(tokens, {"prompt_length": 0, "completion_length": "6"}, OMI)
     for bad in ("abc", None, [3], {"a": 1}, 10 ** 400):
         assert not service_length_valid(tokens, {"prompt_length": 0, "completion_length": bad}, OMI), bad
+
+
+# ---------------------------------------------------------------- R31 amended (F1): the classification pass
+
+def _two_pass(signed_request, monkeypatch, *, logprob=(), distribution=(), authenticity=(), toploc=(), proof=None):
+    """A real ``_verify_expensive`` audit of a service exploration group whose gates fail on the named rollouts
+    (rollout ``i`` carries token ``10 + i`` at position 5), then its classification pass."""
+    from reliquary.validator import batcher as batcher_module
+
+    request, announcement, _ = signed_request(purpose="exploration")
+    index = lambda tokens: tokens[5] - 10
+    def verifier(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
+        i = index(commit["tokens"])
+        changes = dict((proof or {}).get(i, {}))
+        if i in toploc:
+            changes.update(toploc_checked=True, toploc_passed=False)
+        return _service_proof(commit, **changes)
+    batcher = _deep_service_batcher(request, announcement, verifier)
+    monkeypatch.setattr(batcher_module, "proof_rejection",
+                        lambda profile, *, grail_passed, toploc_passed:
+                        "toploc_fail" if toploc_passed is False else None if grail_passed else "grail_fail")
+    monkeypatch.setattr(batcher_module, "verify_logprobs_claim",
+                        lambda **kw: (False, 9.0) if index(kw["tokens"]) in logprob else (True, 0.0))
+    monkeypatch.setattr(batcher_module, "evaluate_token_distribution",
+                        lambda **kw: (False, {}) if index(kw["tokens"]) in distribution else (True, {}))
+    monkeypatch.setattr(batcher_module, "evaluate_token_authenticity",
+                        lambda proof, **kw: (False, {}) if index(kw["tokens"]) in authenticity else (True, {}))
+    shadows = []
+    real_shadow = batcher_module.record_forced_seed_shadow
+    monkeypatch.setattr(batcher_module, "record_forced_seed_shadow",
+                        lambda *a, **k: (shadows.append(1), real_shadow(*a, **k))[1])
+    assert _prove_one(batcher, request, audit=True) is None                     # the audit fails
+    pending = batcher.pending_submissions()[-1]
+    first = (pending.proof_reject_stage, pending.proof_reject_scope)
+    before = (dict(batcher.reject_counts), batcher.proof_failure_debt(request.miner_hotkey), pending.reject_response,
+              pending.truncated_indices, pending.uncertain_indices, len(shadows))
+    pending.service_observation_id = "ab" * 32
+    klass = batcher._classify_audit_failure(pending, model=None)
+    # the classification pass changes no verdict, no count, no debt, no forensic record, no lane
+    assert (dict(batcher.reject_counts), batcher.proof_failure_debt(request.miner_hotkey), pending.reject_response,
+            pending.truncated_indices, pending.uncertain_indices, len(shadows)) == before
+    assert (pending.proof_reject_stage, pending.proof_reject_scope) == first
+    return first, (pending.proof_classify_stage, pending.proof_classify_scope), klass
+
+
+def test_r31_f1_rollout_0_fails_logprob_and_rollout_1_fails_toploc_deterministic(signed_request, monkeypatch):
+    first, second, klass = _two_pass(signed_request, monkeypatch, logprob={0}, toploc={1})
+    assert first == ("logprob", None)                                     # the miner chose what fails first
+    assert second == ("toploc", None) and klass == "deterministic"
+
+
+def test_r31_f1_a_forged_token_where_distribution_runs_before_authenticity_is_deterministic(signed_request, monkeypatch):
+    first, second, klass = _two_pass(signed_request, monkeypatch, distribution={2}, authenticity={2})
+    assert first == ("distribution", None)
+    assert second == ("token_authenticity", None) and klass == "deterministic"
+
+
+def test_r31_f1_an_honest_group_with_one_statistical_failure_is_statistical(signed_request, monkeypatch):
+    first, second, klass = _two_pass(signed_request, monkeypatch, logprob={0})
+    assert first == ("logprob", None)
+    assert second == (None, None) and klass == "statistical"
+
+
+def test_r31_f1_the_post_loop_hard_cdf_mismatch_is_checked_in_the_classification_pass(signed_request, monkeypatch):
+    first, second, klass = _two_pass(signed_request, monkeypatch, logprob={0},
+                                     proof={3: {"seed_n_hard_mismatch": 1}})
+    assert first == ("logprob", None)                                     # the audit never reached the seed gate
+    assert second == ("forced_seed", "cdf_hard_mismatch") and klass == "deterministic"
+
+
+def test_r31_f1_the_agreement_floors_are_off_in_the_classification_pass(signed_request, monkeypatch):
+    first, second, klass = _two_pass(signed_request, monkeypatch, logprob={0}, proof={3: {"seed_n_match": 0}})
+    assert first == ("logprob", None)
+    assert second == (None, None) and klass == "statistical"
+    # and the floor alone is a statistical audit failure that the classification pass confirms as such
+    first, second, klass = _two_pass(signed_request, monkeypatch, proof={3: {"seed_n_match": 0}})
+    assert first[0] == "forced_seed" and first[1] in ("group", "rollout")
+    assert second == (None, None) and klass == "statistical"

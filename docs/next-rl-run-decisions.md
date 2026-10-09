@@ -93,8 +93,13 @@ Decision:
     authenticity, forged termination, forced-seed hard CDF mismatch) bans for 24 h. A
     STATISTICAL-only failure (threshold checks) forfeits the same earnings, does not ban, and
     puts the hotkey back at 100 % audit until 20 new audits pass; it bans only when more than
-    10 % of its last 50 audits failed statistically (to recalibrate at qualification from the
-    measured honest false-reject rate). An unclassified stage counts as statistical.
+    3 of its last 20 NON-FORCED (base-rate drawn) audits failed statistically (to recalibrate at
+    qualification from the measured honest false-reject rate). An unclassified stage counts as
+    statistical. Amended 10-09: the class is that of the STRONGEST failure (an audit that fails a
+    statistical gate is re-proven with the statistical gates off; any failure there is
+    deterministic), and any failure, a deterministic one included, restarts the 20-pass
+    re-probation (a hotkey back from a ban is audited at 100 %). Missing episode replay spans
+    are no verdict (validator_lost).
   - A separate exploration proof budget, lower priority than training (never starves
     it).
   - Published observations carry `audited` / `pending` / `unproven`.

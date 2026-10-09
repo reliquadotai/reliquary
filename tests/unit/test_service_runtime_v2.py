@@ -1769,6 +1769,28 @@ def test_r31_a_statistical_failure_keeps_its_reprobation_across_a_restart(tmp_pa
     restarted.close()
 
 
+def test_r31_f3_a_hotkey_back_from_a_deterministic_ban_is_in_probation_again_across_a_restart(tmp_path):
+    contract = reward_contract(new_hotkey_audit_groups=0, audit_bps=10000)
+    rt = runtime(tmp_path, contract=contract)
+    assert explore(rt, hotkey="hk", prompt=1, now=100.0)["forced_audit"] is False          # seasoned
+    failing = explore(rt, hotkey="hk", prompt=2, now=110.0)
+    draw(rt)
+    rt.record_audit(failing["observation_id"], passed=False, now=10_000.0, failure_class="deterministic")
+    assert rt.ledger.audit_log("hk")[-1] == {"observation_id": failing["observation_id"], "verdict": "failed",
+                                             "failure_class": "deterministic", "forced": False}
+    rt.close()
+    restarted = build(tmp_path / "runtime.sqlite3", contract)
+    after = 10_000.0 + 86_401
+    assert not restarted.exploration_banned("hk", now=after)                         # the ban expired
+    open_window(restarted, 2, now=after)
+    back = explore(restarted, hotkey="hk", prompt=3, window=2, now=after + 5)
+    assert back["entitled"] is True and back["forced_audit"] is True                 # F3: 100 % audit again
+    restarted.resolve_draws(2, beacon_for_round=lambda r: BEACON, now=after + 1000)
+    (row,) = restarted.queued_audits(2)
+    assert row["past_probation"] is False
+    restarted.close()
+
+
 # ---------------------------------------------------------------- N2: the active answer is published under the lock
 
 def test_n2_the_active_answer_is_published_inside_the_runtime_lock(tmp_path):

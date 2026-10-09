@@ -66,6 +66,7 @@ ARMED = (
     ("reliquary.services.exploration", "audit_failure_class"),
     ("reliquary.services.runtime", "ServiceRuntime.apply_pending_schedule_request"),
     ("reliquary.validator.batcher", "GrpoWindowBatcher._service_pre_forward_guard"),
+    ("reliquary.validator.batcher", "GrpoWindowBatcher._classify_audit_failure"),
 )
 
 # Entry points a legacy boot / window DOES call, returning at once when there is no runtime: they are wrapped,
