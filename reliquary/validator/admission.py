@@ -89,6 +89,10 @@ class AdmissionContext:
     enforce_envelope_signature: bool
     enforce_legacy_merkle: bool
     service_policy: dict | None = None
+    # Plan 2C: this env's groups are signed episodes (the parent process verifies their transcripts) and
+    # the contract's per-env maximum episode length. The defaults leave every other context unchanged.
+    signed_episode: bool = False
+    episode_max_tokens: int | None = None
 
 
 @dataclass
@@ -181,6 +185,9 @@ class PreparedSubmission:
     generator_version: str | None = None
     operation_id: str | None = None
     difficulty: int | None = None
+    # Plan 2C: parsed and authenticated, but its transcripts are still to be verified by the parent
+    # (``validator.episode_intake``); no reward, no lane yet.
+    episode_pending: bool = False
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -346,12 +353,17 @@ def service_length_valid(
     tokens: list[int],
     meta: dict[str, Any],
     environment: str,
+    *,
+    episode_max_tokens: int | None = None,
 ) -> bool:
     """Service path only: the rollout fits the environment's own length bound.
 
     Completion length is at most ``max_new_tokens_for_environment`` (an episode: the whole episode is at most
-    its profile's ``max_episode_tokens``). Shared by admission and the proof's pre-forward guard, so an
-    oversize payload is refused before it can reach the GPU."""
+    its profile's ``max_episode_tokens``; a signed episode, plan 2C: its contract's ``episode_max_tokens``,
+    and it is refused without one). Shared by admission and the proof's pre-forward guard, so an oversize
+    payload is refused before it can reach the GPU."""
+    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
     meta = meta or {}
     try:
         prompt_length = int(meta.get("prompt_length", 0))
@@ -359,7 +371,10 @@ def service_length_valid(
         return False
     if prompt_length < 0 or prompt_length > len(tokens):
         return False
-    if isinstance(meta.get("episode"), dict):
+    episode = meta.get("episode")
+    if isinstance(episode, dict) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA:
+        return episode_max_tokens is not None and 0 < prompt_length < len(tokens) <= episode_max_tokens
+    if isinstance(episode, dict):
         limits = episode_limits_for_environment(environment)
         if limits is not None:
             return len(tokens) <= limits[1]
@@ -453,18 +468,25 @@ def _natural_cap_termination(
 
 
 def submission_interaction_matches(request: BatchSubmissionRequest, environment: str) -> bool:
-    """Bind wire episode metadata to the registered environment before grading."""
+    """Bind wire episode metadata to the registered environment before grading: a single-turn env takes
+    no episode, an Episode v1 env only Episode v1 metadata, a signed-episode env (plan 2C) only signed
+    episodes."""
+    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
+
     try:
-        episode = get_environment_spec(environment).interaction_mode == "episode"
+        mode = get_environment_spec(environment).interaction_mode
     except ValueError:
-        episode = False
+        mode = "single_turn"
     for rollout in request.rollouts:
         meta = rollout.commit.get("rollout") or {}
         value = meta.get("episode") if isinstance(meta, dict) else None
-        if episode:
-            if not isinstance(value, dict):
+        if mode not in ("episode", "signed_episode"):
+            if value is not None:
                 return False
-        elif value is not None:
+            continue
+        if not isinstance(value, dict):
+            return False
+        if (value.get("schema_version") == SIGNED_EPISODE_SCHEMA) != (mode == "signed_episode"):
             return False
     return True
 
@@ -746,6 +768,7 @@ def parse_and_validate_submission(
                     )
                 if context.service_policy is not None and not service_length_valid(
                     tokens, (rollout.commit or {}).get("rollout") or {}, context.environment,
+                    episode_max_tokens=context.episode_max_tokens,
                 ):
                     # O1: a service group (training or exploration) longer than the environment's bound would
                     # reach the proof plane as an OOM; refuse it before any retention or grading.
@@ -1405,6 +1428,14 @@ def materialize_and_score_submission(
             ),
             context,
             deadline_monotonic,
+        )
+    if context.signed_episode:
+        # Plan 2C: a signed episode's reward is its final record's. The parent process verifies the
+        # transcripts (it holds the machine directory and the session issuer) and decides the lane.
+        return PreparedSubmission(
+            request=request, completion_texts=[], rewards=[], rollout_hashes=parsed.rollout_hashes,
+            selection_digest=parsed.selection_digest, body_parse_ms=parsed.body_parse_ms,
+            preparation_ms=parsed.preparation_ms, episode_pending=True,
         )
     try:
         with _deadline(deadline_monotonic):

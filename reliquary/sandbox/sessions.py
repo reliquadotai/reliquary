@@ -83,7 +83,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Protocol
 
@@ -448,6 +448,9 @@ class SessionBook:
 
     def get(self, session_id: str) -> SessionRecord | None:
         return self._sessions.get(session_id)
+
+    def records(self) -> tuple[SessionRecord, ...]:
+        return tuple(self._sessions.values())
 
     def by_request(self, hotkey: str, request_id: str) -> SessionRecord | None:
         session_id = self._requests.get((hotkey, request_id))
@@ -825,25 +828,91 @@ class SessionIssuer:
             return Refusal("session_busy", {"session_id": session_id},
                            retry_after=self._policy.retry_after_s)
         try:
-            now = int(self._clock())
-            record = self.book.get(session_id)
-            if record is None or record.hotkey != hotkey:
-                return Refusal("session_unknown", {"session_id": session_id})
-            if record.state == SUBMITTED:
-                return Refusal("session_submitted", {"session_id": session_id})
-            deadline = record.expires_at + GRADING_GRACE_S
-            if received is not None and received > deadline:
-                return Refusal("session_expired", {"session_id": session_id,
-                                                   "deadline": deadline})
-            on_time_lapse = record.state == LAPSED and received is not None
-            if not (session_submittable(record.state) or on_time_lapse):
-                return Refusal("session_not_submittable", {"session_id": session_id,
-                                                           "state": record.state})
-            if not self.book.claim(session_id, now):
-                return Refusal("session_claimed", {"session_id": session_id},
-                               retry_after=self._policy.retry_after_s)
+            return self._claim_locked(session_id, hotkey, received, int(self._clock()))
         finally:
             self._lock.release()
+
+    def _claim_locked(self, session_id: str, hotkey: str, received: float | None,
+                      now: int) -> Refusal | None:
+        """``claim``'s checks and hold; the caller holds the issuer lock."""
+        record = self.book.get(session_id)
+        if record is None or record.hotkey != hotkey:
+            return Refusal("session_unknown", {"session_id": session_id})
+        if record.state == SUBMITTED:
+            return Refusal("session_submitted", {"session_id": session_id})
+        deadline = record.expires_at + GRADING_GRACE_S
+        if received is not None and received > deadline:
+            return Refusal("session_expired", {"session_id": session_id,
+                                               "deadline": deadline})
+        on_time_lapse = record.state == LAPSED and received is not None
+        if not (session_submittable(record.state) or on_time_lapse):
+            return Refusal("session_not_submittable", {"session_id": session_id,
+                                                       "state": record.state})
+        if not self.book.claim(session_id, now):
+            return Refusal("session_claimed", {"session_id": session_id},
+                           retry_after=self._policy.retry_after_s)
+        return None
+
+    async def claim_all(self, session_ids: Sequence[str], *, hotkey: str, received: float | None = None,
+                        precommit_sha256: str | None = None) -> tuple[str, Refusal] | None:
+        """Plan 2C: an episode group's sessions, all or none, under ONE hold of the issuer lock (no
+        close, drain, lapse or other claim interleaves): None when every one is now claimed, else the
+        first session refused and why (each session ``claim`` checks), with nothing left claimed by
+        this call. A session named twice is refused (``session_claimed``) on its second mention.
+
+        ``precommit_sha256`` (ruling: at most ONE paid group per precommit): the precommit is taken with
+        its sessions. Any OTHER session of that precommit (an RL engagement naming it) already
+        ``submitted`` refuses the group (``precommit_submitted``: another group of it was paid, even on
+        disjoint seeds); one freshly claimed by a group in flight refuses it retryably
+        (``precommit_claimed``). Durable: submitted sessions are persisted and restored."""
+        ids = [str(session_id) for session_id in session_ids]
+        first = ids[0] if ids else ""
+        try:
+            await asyncio.wait_for(self._lock.acquire(), self._policy.claim_wait_s)
+        except TimeoutError:
+            logger.warning("sandbox sessions of %s: a group claim waited %d s for the issuer lock; busy",
+                           hotkey[:12], self._policy.claim_wait_s)
+            return first, Refusal("session_busy", {"session_id": first},
+                                  retry_after=self._policy.retry_after_s)
+        try:
+            now = int(self._clock())
+            if precommit_sha256 is not None:
+                taken = self._precommit_taken(precommit_sha256, set(ids), now)
+                if taken is not None:
+                    return taken
+            held: list[str] = []
+            for session_id in ids:
+                refusal = self._claim_locked(session_id, hotkey, received, now)
+                if refusal is not None:
+                    for done in held:
+                        self.book.release_claim(done)
+                    return session_id, refusal
+                held.append(session_id)
+            return None
+        finally:
+            self._lock.release()
+
+    def _precommit_taken(self, precommit_sha256: str, own: set[str],
+                         now: int) -> tuple[str, Refusal] | None:
+        """Another group's hold on this precommit (caller holds the issuer lock), or None."""
+        from reliquary.protocol.service_episode import EpisodeWireError, parse_rl_engagement
+
+        for record in self.book.records():
+            if record.session_id in own:
+                continue
+            try:
+                _, sha, _ = parse_rl_engagement(record.engagement)
+            except EpisodeWireError:
+                continue
+            if sha != precommit_sha256:
+                continue
+            if record.state == SUBMITTED:
+                return record.session_id, Refusal("precommit_submitted",
+                                                  {"precommit_sha256": precommit_sha256})
+            if self.book.claim_fresh(record.session_id, now):
+                return record.session_id, Refusal("precommit_claimed",
+                                                  {"precommit_sha256": precommit_sha256},
+                                                  retry_after=self._policy.retry_after_s)
         return None
 
     async def release_claim(self, session_id: str) -> None:

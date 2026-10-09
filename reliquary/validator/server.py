@@ -1329,6 +1329,27 @@ class _Health(BaseModel):
     training_kl_reference: dict[str, Any] = Field(default_factory=dict)
 
 
+def _episode_admission_fields(batcher: Any) -> dict:
+    """``signed_episode`` / ``episode_max_tokens`` of an ``AdmissionContext`` (plan 2C): set only for a
+    signed-episode env of a v2 service window; every other batcher (legacy, a v1 contract, a single-turn
+    env) gets the defaults. A contract that does not parse gets them too: the child's service policy
+    refuses the group anyway."""
+    policy = getattr(batcher, "service_policy", None)
+    if not isinstance(policy, dict):
+        return {}
+    from reliquary.protocol.service_contract import ServiceContract, ServiceContractError
+
+    name = str(getattr(batcher.env, "name", ""))
+    try:
+        contract = ServiceContract.from_dict(policy["contract"])
+        if contract.version != 2 or name not in contract.environments:
+            return {}
+        episode = contract.episode_policy(name)
+    except (ServiceContractError, KeyError, TypeError, ValueError):
+        return {}
+    return {} if episode is None else {"signed_episode": True, "episode_max_tokens": episode.max_episode_tokens}
+
+
 class ValidatorServer:
     # N3: verdict keys never stored for ANY verdict of this process (set by ValidationService for a
     # service task: an early verdict must not tie a public exploration observation to its hotkey).
@@ -1442,6 +1463,8 @@ class ValidatorServer:
         )
         from reliquary.validator.http_metrics import HttpMetrics
         self.http_metrics = HttpMetrics()
+        # Plan 2C: the RL validator sets it when its order has signed-episode envs.
+        self._episode_intake = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -3680,6 +3703,7 @@ class ValidatorServer:
             enforce_envelope_signature=ENFORCE_ENVELOPE_SIGNATURE,
             enforce_legacy_merkle=LEGACY_MERKLE_ROOT_ENFORCE,
             service_policy=(batcher.service_policy if isinstance(getattr(batcher, "service_policy", None), dict) else None),
+            **_episode_admission_fields(batcher),
         )
         self._admission_contexts[cache_key] = context
         return context
@@ -6546,6 +6570,57 @@ class ValidatorServer:
         )
         return True
 
+    async def _admit_episode_group(self, batcher, receipt, prepared, telemetry):
+        """Plan 2C: the parent-side half of an episode group's admission (``validator.episode_intake``):
+        the child already ran the service policy (checkpoint = the window's announced one) and the
+        signatures. Returns ``(prepared, claim)``; the caller settles a claim after the batcher's answer."""
+        def refuse(reason: RejectReason, stage: str):
+            prepared.episode_pending = False
+            prepared.reject_reason = reason
+            prepared.reject_stage = stage
+            return prepared, None
+
+        intake = getattr(self, "_episode_intake", None)
+        policy = getattr(batcher, "service_policy", None)
+        if intake is None or not isinstance(policy, dict):
+            return refuse(RejectReason.GENERATION_CONTRACT_MISMATCH, "episode_unserved")
+        request = prepared.request
+        # The window: still this server's active one, the group's own, not sealed. (The batcher checks
+        # the seal again under its lock when it takes the group; a refusal then releases the claims.)
+        if not self._batcher_is_active(batcher):
+            return refuse(RejectReason.WINDOW_NOT_ACTIVE, "episode_window")
+        if request.window_start != getattr(batcher, "window_start", None):
+            return refuse(RejectReason.WINDOW_MISMATCH, "episode_window")
+        admission_closed = getattr(type(batcher), "_fill_proof_admission_closed", None)
+        if getattr(batcher, "seal_snapshot_started", False) is True or (
+                admission_closed is not None and admission_closed(batcher)):
+            return refuse(RejectReason.BATCH_FILLED, "episode_window_sealed")
+        # Defence in depth: the child ran the service policy (checkpoint = the announced one, an active
+        # env, exactly M seeds of its pool, the episode branch); never verify a group that skipped it.
+        from reliquary.services.admission_policy import validate_submission_policy
+
+        try:
+            await asyncio.to_thread(validate_submission_policy, request, policy)
+        except (ValueError, TypeError, KeyError):
+            return refuse(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract")
+        try:
+            received = float(getattr(telemetry, "t_body_completed", None))
+        except (TypeError, ValueError):
+            received = 0.0
+        if not 0.0 < received < float("inf"):
+            received = time.time()
+        return await intake.admit(environment=str(receipt.environment), prepared=prepared, received=received,
+                                  contract=batcher._service_window_contract())
+
+    async def _settle_episode_claim(self, claim, *, accepted: bool) -> None:
+        intake = getattr(self, "_episode_intake", None)
+        if intake is None or claim is None:
+            return
+        try:
+            await intake.settle(claim, accepted=accepted)
+        except Exception:
+            logger.exception("episode group sessions not settled")
+
     async def _process_auction_submission(
         self,
         item: _QueuedAuctionSubmission,
@@ -6568,6 +6643,9 @@ class ValidatorServer:
         batch_filled_reason: str | None = None
         request: BatchSubmissionRequest | None = None
         admission_started = False
+        # Plan 2C: an episode group's claimed sessions, settled in ``finally`` by the batcher's own answer.
+        episode_claim = None
+        episode_accepted = False
         identity_reserved = False
         cancel_identity_on_exit = False
         wall_seconds = self._admission_wall_seconds(environment)
@@ -6635,6 +6713,8 @@ class ValidatorServer:
                 deadline,
                 wall_seconds=max(0.001, deadline - time.monotonic()),
             )
+            if getattr(prepared, "episode_pending", False) is True:
+                prepared, episode_claim = await self._admit_episode_group(batcher, receipt, prepared, telemetry)
             if item.admission_predecessor is not None:
                 # Parsing and grading stay parallel; every state-changing
                 # post-grade decision follows observed ingress order.
@@ -6792,6 +6872,7 @@ class ValidatorServer:
             response = batcher.accept_prepared_submission(
                 prepared, telemetry=telemetry
             )
+            episode_accepted = bool(response.accepted)
             if response.reason is RejectReason.BATCH_FILLED:
                 # The one capacity this call refuses on.
                 batch_filled_reason = "auction_seal_snapshot_started"
@@ -6846,6 +6927,9 @@ class ValidatorServer:
                     RejectReason.WORKER_DROPPED, reject_stage
                 )
         finally:
+            if episode_claim is not None:
+                # Only the batcher's acceptance pays the sessions; any other end releases them.
+                await self._settle_episode_claim(episode_claim, accepted=episode_accepted)
             try:
                 if cancel_identity_on_exit and request is not None:
                     batcher.cancel_logical_group_reservation(request)
