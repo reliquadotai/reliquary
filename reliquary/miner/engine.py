@@ -350,6 +350,16 @@ def pick_env_and_prompt(
     raise RuntimeError("pick_env_and_prompt: all envs fully in cooldown")
 
 
+def _single_turn_mined_spec(env_name: str):
+    """The spec of an env this engine mines; a signed-episode env (plan 2C) is refused: it is mined by
+    ``reliquary.miner.episode_group_miner.EpisodeGroupMiner``, never as single-turn text."""
+    environment_spec = get_environment_spec(env_name)
+    if environment_spec.interaction_mode == "signed_episode":
+        raise ValueError(f"{env_name} is a signed-episode environment: it is mined by "
+                         "reliquary.miner.episode_group_miner.EpisodeGroupMiner")
+    return environment_spec
+
+
 def _compute_merkle_root(rollouts) -> str:
     """Compute Merkle root over rollout leaves — returns 64-char hex.
 
@@ -1000,9 +1010,9 @@ class MiningEngine:
                     continue
                 env_name, prompt_idx = picked
 
+                environment_spec = _single_turn_mined_spec(env_name)
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
-                environment_spec = get_environment_spec(env_name)
                 service_policy = getattr(state, "service_policy", None)
                 policy_value = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
                 from reliquary.protocol.seed_pool import pool_from_service_policy
