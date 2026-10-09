@@ -42,6 +42,8 @@ class Sessions:
         self.paid_calls = 0
         self.claim_gate = self.release_gate = None      # asyncio.Event: hold the call until set
         self.persisted, self.persist_ok, self.events = [], None, []   # persist_ok: how many records store
+        self.persist_gate = None                                         # asyncio.Event: a slow store
+        self.persist_raises = False
 
     async def claim_all(self, session_ids, *, hotkey, received=None, precommit_sha256=None):
         self.group_keys.append(precommit_sha256)
@@ -64,6 +66,10 @@ class Sessions:
         self.events.append("release")
 
     async def persist_submitted(self, session_ids):
+        if self.persist_gate is not None:
+            await self.persist_gate.wait()
+        if self.persist_raises:
+            raise RuntimeError("store down")
         self.persisted.extend(session_ids)
         self.events.append("persist")
         return len(session_ids) if self.persist_ok is None else self.persist_ok
@@ -448,10 +454,21 @@ def test_an_episode_group_is_taken_only_once_a_record_of_it_is_stored(tmp_path, 
         assert a.w.outcomes.calls[-1]["accepted"] is False
 
 
-@pytest.mark.parametrize("reason, stage, keeps_identity", [
+RETRYABLE_CASES = [
     (RejectReason.RATE_LIMITED, "episode_group_in_flight", False),
     (RejectReason.WORKER_DROPPED, "episode_checker_busy", False),
     (RejectReason.WORKER_DROPPED, "episode_session_busy", False),
+    (RejectReason.WORKER_DROPPED, "episode_directory", False),
+    (RejectReason.WORKER_DROPPED, "episode_persist_failed", False),
+    (RejectReason.RATE_LIMITED, "episode_checks_in_flight", False),    # retryable, never refunded
+]
+
+
+def test_every_retryable_episode_stage_is_covered_below():
+    assert {stage for _, stage, _ in RETRYABLE_CASES} == episode_intake.RETRYABLE_STAGES
+
+
+@pytest.mark.parametrize("reason, stage, keeps_identity", RETRYABLE_CASES + [
     (RejectReason.RATE_LIMITED, "episode_rate", True),
     (RejectReason.RATE_LIMITED, "episode_timeout", True),
     (RejectReason.REWARD_MISMATCH, "episode_transcript", True),
@@ -866,7 +883,8 @@ def test_checks_in_flight_are_bounded_per_hotkey_and_run_off_the_loop(tmp_path, 
 
     (prepared, claim), (refused, none) = asyncio.run(both())
     assert claim is not None and none is None and threads == [False]
-    assert (refused.reject_reason, refused.reject_stage) == (RejectReason.RATE_LIMITED, "episode_rate")
+    assert (refused.reject_reason, refused.reject_stage) == (RejectReason.RATE_LIMITED,
+                                                             "episode_checks_in_flight")
 
 
 def test_a_hotkeys_cut_checks_count_against_it_until_their_threads_return(tmp_path, monkeypatch):
@@ -901,7 +919,7 @@ def test_a_hotkeys_cut_checks_count_against_it_until_their_threads_return(tmp_pa
         refused, none = await asyncio.wait_for(
             w.intake.admit(environment=EPISODE, prepared=fresh(), received=NOW + 100, contract=CONTRACT), 2)
         assert none is None and (refused.reject_reason, refused.reject_stage) == (RejectReason.RATE_LIMITED,
-                                                                                  "episode_rate")
+                                                                                  "episode_checks_in_flight")
         assert slots.acquire(blocking=False)           # a slot is left for the other hotkeys
         slots.release()
         gate.set()
@@ -1051,3 +1069,246 @@ def test_the_book_indexes_sessions_by_precommit(tmp_path, monkeypatch):
     # The group claim reads the index, never the whole book.
     monkeypatch.setattr(env.book, "records", lambda: (_ for _ in ()).throw(AssertionError("full scan")))
     assert asyncio.run(env.issuer.claim_all(ids[1:], hotkey="5Hot", received=NOW, precommit_sha256=sha)) is None
+
+
+# -- review round 3 ---------------------------------------------------------------------------------------
+
+def test_the_in_flight_cap_is_per_operator_across_its_hotkeys(tmp_path, monkeypatch):
+    """One operator holds at most ``MAX_CHECKS_RUNNING - 1`` checks in flight across all its hotkeys."""
+    import threading
+
+    w = world(tmp_path)
+    monkeypatch.setattr(episode_intake, "_CHECKS_RUNNING", threading.BoundedSemaphore(3))
+    checker = w.intake._checkers[EPISODE]
+    real, gate = checker.check, threading.Event()
+
+    def slow(*args, **kwargs):
+        gate.wait(10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(checker, "check", slow)
+    assert episode_intake.DEFAULT_MAX_CHECKS_IN_FLIGHT == episode_intake.MAX_CHECKS_RUNNING - 1
+
+    def of(hotkey):
+        request = w.prepared.request.model_copy(update={"miner_hotkey": hotkey})
+        return dataclasses.replace(w.prepared, request=request, reject_reason=None, reject_stage=None,
+                                   episode_pending=True)
+
+    async def scenario():
+        def start(hotkey, operator):
+            return asyncio.create_task(w.intake.admit(environment=EPISODE, prepared=of(hotkey), received=NOW + 100,
+                                                      contract=CONTRACT, operator=operator))
+
+        running = [start("5Hot", "op"), start("5Hot", "op")]
+        await asyncio.sleep(0.05)
+        refused, none = await w.intake.admit(environment=EPISODE, prepared=of("5Other"), received=NOW + 100,
+                                             contract=CONTRACT, operator="op")
+        assert none is None and (refused.reject_reason, refused.reject_stage) == (RejectReason.RATE_LIMITED,
+                                                                                  "episode_checks_in_flight")
+        running.append(start("5Other", "op2"))               # another operator still gets the free slot
+        await asyncio.sleep(0.05)
+        assert w.intake._in_flight == {"op": 2, "op2": 1}
+        gate.set()
+        await asyncio.gather(*running)
+        for _ in range(100):
+            if not w.intake._in_flight:
+                break
+            await asyncio.sleep(0.01)
+        assert w.intake._in_flight == {}
+
+    asyncio.run(scenario())
+
+
+def test_the_server_refuses_a_group_whose_deadline_passed_before_the_intake(tmp_path, monkeypatch):
+    import time
+
+    register_episode_env(monkeypatch)
+    w = world(tmp_path)
+    server, batcher = server_and_batcher(tmp_path)
+    server._episode_intake = w.intake
+    prepared, claim = asyncio.run(server._admit_episode_group(
+        batcher, SimpleNamespace(environment=EPISODE), w.prepared, SimpleNamespace(t_body_completed=NOW + 100),
+        deadline=time.monotonic() - 1.0))
+    assert claim is None
+    assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.RATE_LIMITED, "episode_timeout")
+    assert w.sessions.group_keys == [] and w.intake._recent == {} and w.intake._in_flight == {}
+
+
+@pytest.mark.parametrize("where", ["claim", "precommit_lookup"])
+def test_a_cut_outside_the_check_is_the_validators_and_retryable(tmp_path, monkeypatch, where):
+    """Only a check that itself ran past the deadline is the miner's (``episode_timeout``); a cut in the
+    validator's own waits is refunded and retryable."""
+    import threading
+    import time
+
+    register_episode_env(monkeypatch)
+    w = world(tmp_path)
+    server, batcher = server_and_batcher(tmp_path)
+    server._episode_intake = w.intake
+    lookup_gate = threading.Event()
+    if where == "precommit_lookup":
+        known = w.intake._precommits
+
+        def slow_lookup(sha):
+            lookup_gate.wait(10)
+            return known(sha)
+
+        w.intake._precommits = slow_lookup
+
+    async def scenario():
+        if where == "claim":
+            w.sessions.claim_gate = asyncio.Event()
+        prepared, claim = await server._admit_episode_group(
+            batcher, SimpleNamespace(environment=EPISODE), w.prepared, SimpleNamespace(t_body_completed=NOW + 100),
+            deadline=time.monotonic() + 0.3)
+        assert claim is None
+        assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.WORKER_DROPPED,
+                                                                   "episode_checker_busy")
+        assert "episode_checker_busy" in episode_intake.RETRYABLE_STAGES
+        lookup_gate.set()
+        if where == "claim":
+            w.sessions.claim_gate.set()
+            for _ in range(20):
+                await asyncio.sleep(0)
+            await asyncio.gather(*list(w.intake._tasks))
+            assert sorted(w.sessions.released) == sorted(w.sessions.claimed) and w.sessions.held == set()
+
+    asyncio.run(scenario())
+
+
+def stages_of(a):
+    stages, real = [], a.server._record_raw_terminal
+
+    def spy(*args, **kwargs):
+        stages.append(kwargs.get("stage"))
+        return real(*args, **kwargs)
+
+    a.server._record_raw_terminal = spy
+    return stages
+
+
+def test_a_slow_store_refuses_the_group_within_its_deadline(tmp_path, monkeypatch):
+    import time
+
+    async def scenario():
+        a = auction(tmp_path, monkeypatch)
+        stages = stages_of(a)
+        a.server._admission_wall_seconds = lambda environment: 0.5
+        a.w.sessions.persist_gate = asyncio.Event()           # never set: the store hangs
+        started = time.monotonic()
+        await asyncio.wait_for(run_auction(a), 5)
+        assert time.monotonic() - started < 2.0 and stages == ["episode_persist_failed"]
+        assert a.receipt.outcome.accepted is False and a.receipt.outcome.reason is RejectReason.WORKER_DROPPED
+        assert a.accepted == [] and a.w.sessions.paid == [] and len(a.refunds) == 1
+        assert sorted(a.w.sessions.released) == sorted(a.claim.session_ids) and a.w.sessions.held == set()
+
+    asyncio.run(scenario())
+
+
+def test_a_store_that_raises_refuses_the_group(tmp_path, monkeypatch):
+    a = auction(tmp_path, monkeypatch)
+    stages = stages_of(a)
+    a.w.sessions.persist_raises = True
+    asyncio.run(run_auction(a))
+    assert stages == ["episode_persist_failed"]
+    assert a.receipt.outcome.accepted is False and a.receipt.outcome.reason is RejectReason.WORKER_DROPPED
+    assert a.accepted == [] and a.w.sessions.paid == [] and len(a.refunds) == 1
+    assert sorted(a.w.sessions.released) == sorted(a.claim.session_ids)
+
+
+def test_a_successor_is_not_refused_for_its_predecessors_latency(tmp_path, monkeypatch):
+    """The predecessor (same batcher) may end as late as its own deadline, e.g. on its store's write:
+    the successor's ingress-order wait (and its own write) is bounded by its deadline plus that wall."""
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        predecessor, completion = loop.create_future(), loop.create_future()
+        a = auction(tmp_path, monkeypatch, predecessor=predecessor, completion=completion)
+        a.server._admission_wall_seconds = lambda environment: 1.0
+        a.server._admission_order_tail[id(a.batcher)] = completion
+        loop.call_later(1.4, predecessor.set_result, None)     # past our deadline, inside the bound
+        await asyncio.wait_for(run_auction(a), 10)
+        assert a.receipt.outcome.accepted is True and a.accepted == [1]
+        assert a.w.sessions.paid == list(a.claim.session_ids)
+
+    asyncio.run(scenario())
+
+
+def test_the_longest_claim_hold_stays_inside_the_claim_ttl():
+    from reliquary.sandbox.sessions import SandboxPolicy
+
+    assert episode_intake.CLAIM_HOLD_WALLS == 2
+    assert episode_intake.CLAIM_TTL_MARGIN > episode_intake.CLAIM_HOLD_WALLS
+    assert SandboxPolicy().claim_ttl_s > episode_intake.CLAIM_HOLD_WALLS * episode_intake.ADMISSION_DEADLINE_S
+
+
+def test_a_worker_cancelled_at_shutdown_does_not_wait_on_a_hung_settlement(tmp_path, monkeypatch):
+    from reliquary.validator import server as server_module
+
+    monkeypatch.setattr(server_module, "EPISODE_DRAIN_S", 0.2)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        predecessor, completion = loop.create_future(), loop.create_future()
+        a = auction(tmp_path, monkeypatch, predecessor=predecessor, completion=completion)
+        a.server._admission_order_tail[id(a.batcher)] = completion
+        a.w.sessions.release_gate = asyncio.Event()           # the release hangs
+        task = asyncio.create_task(run_auction(a))
+        await asyncio.wait_for(a.admitted.wait(), 5)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        a.server._auction_admission_enabled = False            # ``stop`` began
+        task.cancel()                                          # ``stop`` cancels the worker once
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 3)
+        assert a.finished == [a.item] and a.receipt.terminal is True
+        assert a.w.sessions.released == []                     # left to the drain
+        assert await a.server._drain_episode_tasks(0.1) >= 1
+        predecessor.set_result(None)
+
+    asyncio.run(scenario())
+
+
+def test_a_cut_persist_still_notes_what_it_stored(tmp_path, monkeypatch):
+    from reliquary.protocol.service_episode import rl_engagement
+    from reliquary.sandbox.sessions import SUBMITTED
+
+    env, ids = _issuer_with_sessions(tmp_path, 2)
+    sha = "8" * 64
+    for n, session_id in enumerate(ids):
+        record = dataclasses.replace(env.book.get(session_id), engagement=rl_engagement(1, sha, n),
+                                     kind="rl_precommit")
+        env.book.add(record)
+        env.store.documents[session_id] = record.to_document()
+
+    async def scenario():
+        assert await env.issuer.claim_all(ids, hotkey="5Hot", received=NOW, precommit_sha256=sha) is None
+        gate = asyncio.Event()
+        real_update = env.store.update
+
+        async def slow(document):
+            await gate.wait()
+            return await real_update(document)
+
+        monkeypatch.setattr(env.store, "update", slow)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(env.issuer.persist_submitted(ids), 0.1)
+        gate.set()
+        await asyncio.gather(*list(env.issuer._tasks))
+        assert env.issuer._stored_submitted == set(ids)
+        assert all(env.store.documents[i]["state"] == SUBMITTED for i in ids)
+        assert await env.issuer.persist_submitted(ids) == len(ids)       # counted, not rewritten
+
+    asyncio.run(scenario())
+
+
+def test_the_stored_submitted_set_is_pruned_with_the_book(tmp_path):
+    from reliquary.sandbox.sessions import SUBMITTED
+
+    env, ids = _issuer_with_sessions(tmp_path, 2)
+    old, kept = ids
+    env.book.add(dataclasses.replace(env.book.get(old), state=SUBMITTED, closed_at=NOW - 10))
+    env.issuer._stored_submitted.update(ids)
+    env.clock.now = NOW + 26 * 3600
+    asyncio.run(env.issuer.maintain())
+    assert env.book.get(old) is None and env.book.get(kept) is not None
+    assert env.issuer._stored_submitted == {kept}

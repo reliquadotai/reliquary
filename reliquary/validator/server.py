@@ -292,7 +292,8 @@ VERDICT_CAP_PER_HOTKEY = 200
 # validator never loads the episode modules): an episode refusal the miner may retry at once reserves
 # no (operator, prompt) identity.
 _EPISODE_RETRYABLE_STAGES = frozenset({"episode_group_in_flight", "episode_session_busy", "episode_directory",
-                                       "episode_checker_busy", "episode_persist_failed"})
+                                       "episode_checker_busy", "episode_persist_failed",
+                                       "episode_checks_in_flight"})
 # Plan 2C: how long a clean shutdown waits for episode settlements in flight before cutting them.
 EPISODE_DRAIN_S = 10.0
 
@@ -6583,9 +6584,11 @@ class ValidatorServer:
         """Plan 2C: the parent-side half of an episode group's admission (``validator.episode_intake``):
         the child already ran the service policy (checkpoint = the window's announced one) and the
         signatures. Returns ``(prepared, claim)``; the caller settles a claim after the batcher's answer.
-        ``deadline`` (``time.monotonic``): the admission's; the intake is cut there (RATE_LIMITED
-        ``episode_timeout``: the miner's own group took too long, not refunded; what it claimed is
-        released, and a running transcript check keeps its global slot until it returns)."""
+        ``deadline`` (``time.monotonic``): the admission's; the intake is cut there. A cut while the
+        transcript check itself ran past it is the miner's (RATE_LIMITED ``episode_timeout``, not
+        refunded); a cut anywhere else (the issuer lock, the precommit lookup, the claim) is the
+        validator's (WORKER_DROPPED ``episode_checker_busy``, refunded, retryable). Either way what it
+        claimed is released, and a running check keeps its global slot until its thread returns."""
         def refuse(reason: RejectReason, stage: str):
             prepared.episode_pending = False
             prepared.reject_reason = reason
@@ -6623,16 +6626,25 @@ class ValidatorServer:
             received = time.time()
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
+            # Spent before the intake (the miner's body parse, the policy re-run): not refunded.
             return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
+        from reliquary.validator.episode_intake import CheckProgress
+
+        progress = CheckProgress()
         try:
             return await asyncio.wait_for(
                 intake.admit(environment=str(receipt.environment), prepared=prepared, received=received,
-                             contract=batcher._service_window_contract()),
+                             contract=batcher._service_window_contract(),
+                             operator=getattr(receipt, "operator", None), progress=progress),
                 remaining)
         except asyncio.TimeoutError:
-            logger.warning("episode group of %s: admission deadline reached in the intake",
-                           str(getattr(receipt, "miner_hotkey", ""))[:12])
-            return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
+            ran_past = progress.ran_past(deadline)
+            logger.warning("episode group of %s: admission deadline reached in the intake (%s)",
+                           str(getattr(receipt, "miner_hotkey", ""))[:12],
+                           "the check ran past it" if ran_past else "the validator was busy")
+            if ran_past:
+                return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
+            return refuse(RejectReason.WORKER_DROPPED, "episode_checker_busy")
 
     def _start_episode_settlement(self, claim, *, accepted: bool) -> asyncio.Task:
         """The settlement of an episode group's claims as a task of its own, kept until it ends: a
@@ -6660,6 +6672,17 @@ class ValidatorServer:
         if intake is not None:
             cut += await intake.drain(timeout)
         return cut
+
+    async def _persist_episode_claim(self, claim, deadline: float) -> bool:
+        """Plan 2C: the claimed sessions' ``submitted`` records written before the batcher takes the
+        group, bounded by ``deadline`` (``time.monotonic``); late counts as not stored."""
+        try:
+            return await asyncio.wait_for(self._episode_intake.persist(claim),
+                                          max(0.0, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            logger.warning("episode group of %s: submitted records not written by the admission deadline",
+                           str(claim.hotkey)[:12])
+            return False
 
     async def _settle_episode_claim(self, claim, *, accepted: bool) -> None:
         intake = getattr(self, "_episode_intake", None)
@@ -6695,6 +6718,7 @@ class ValidatorServer:
         # Plan 2C: an episode group's claimed sessions, settled in ``finally`` by the batcher's own answer.
         episode_claim = None
         episode_accepted = False
+        episode_hold_deadline = None
         identity_reserved = False
         cancel_identity_on_exit = False
         wall_seconds = self._admission_wall_seconds(environment)
@@ -6765,14 +6789,19 @@ class ValidatorServer:
             if getattr(prepared, "episode_pending", False) is True:
                 prepared, episode_claim = await self._admit_episode_group(batcher, receipt, prepared, telemetry,
                                                                           deadline=deadline)
+                episode_hold_deadline = deadline
             if item.admission_predecessor is not None:
                 # Parsing and grading stay parallel; every state-changing
                 # post-grade decision follows observed ingress order.
                 if episode_claim is not None:
-                    # Plan 2C: the sessions' claim is held through this wait; the admission's
-                    # deadline bounds it (the claim ttl outlives that deadline 4 times over).
+                    # Plan 2C: the sessions' claim is held through this wait, bounded by this
+                    # admission's deadline plus the predecessor's own wall (same batcher, so the same
+                    # environment's), which may end as late as its deadline: the records' write
+                    # below shares that bound. Two walls in all; the claim ttl outlives
+                    # ``CLAIM_TTL_MARGIN`` walls (asserted by the intake).
+                    episode_hold_deadline = deadline + wall_seconds
                     await asyncio.wait_for(asyncio.shield(item.admission_predecessor),
-                                           max(0.0, deadline - time.monotonic()))
+                                           max(0.0, episode_hold_deadline - time.monotonic()))
                 else:
                     await asyncio.shield(item.admission_predecessor)
             if receipt.terminal:
@@ -6924,7 +6953,8 @@ class ValidatorServer:
                 return
             admission_started = True
 
-            if episode_claim is not None and not await self._episode_intake.persist(episode_claim):
+            if episode_claim is not None and not await self._persist_episode_claim(
+                    episode_claim, episode_hold_deadline):
                 # Plan 2C: not one ``submitted`` record stored: the batcher never takes the group (a
                 # restart would not know its sessions paid). Retryable, the claims are released.
                 batcher.cancel_logical_group_reservation(request)
@@ -7016,7 +7046,14 @@ class ValidatorServer:
                         settlement = self._start_episode_settlement(episode_claim, accepted=episode_accepted)
                 if settlement is not None:
                     try:
-                        await asyncio.shield(settlement)
+                        if self._auction_admission_enabled:
+                            await asyncio.shield(settlement)
+                        else:
+                            # Shutting down: ``stop`` waits for this worker; it drains (and cuts)
+                            # what is left of the settlement itself.
+                            await asyncio.wait_for(asyncio.shield(settlement), EPISODE_DRAIN_S)
+                    except asyncio.TimeoutError:
+                        logger.error("episode settlement still running at shutdown; left to the drain")
                     except asyncio.CancelledError:
                         # A second cancellation stops this wait, never the settlement nor the
                         # bookkeeping below; it is raised again at the end.

@@ -42,27 +42,51 @@ _CLAIM_REFUSALS = {
     "precommit_claimed": (RejectReason.RATE_LIMITED, "episode_group_in_flight"),
 }
 # Refusals the miner may retry at once: the server reserves no (operator, prompt) identity for them.
-# Every other episode refusal (a bad transcript, ``episode_rate``, ``episode_timeout``: the miner's own
-# group took too long) keeps it reserved for the window like any refused group.
+# ``episode_checks_in_flight`` (the operator's in-flight cap) is retryable but not refunded (RATE_LIMITED).
+# Every other episode refusal (a bad transcript, ``episode_rate``: the per-minute budget,
+# ``episode_timeout``: the miner's own check ran past the deadline) keeps it reserved for the window
+# like any refused group.
 RETRYABLE_STAGES = frozenset({"episode_group_in_flight", "episode_session_busy", "episode_directory",
-                              "episode_checker_busy", "episode_persist_failed"})
-# Per hotkey: transcript checks (signatures, a renderer parse of M episodes) started per minute, and in
-# flight at once (until the check's thread returns, even when the admission stopped waiting for it: one
-# hotkey never holds more than ``max_checks_in_flight`` of the global slots). A refusal before the
-# checker (unserved env, stale directory) does not count.
-DEFAULT_MAX_CHECKS_PER_MINUTE = 30
-DEFAULT_MAX_CHECKS_IN_FLIGHT = 2
+                              "episode_checker_busy", "episode_persist_failed", "episode_checks_in_flight"})
 # Every intake together: transcript checks running at once (threads of their own). A check is not
 # interruptible: a cancelled admission's check keeps its slot until its thread returns. Saturated, a
 # group is refused retryably (WORKER_DROPPED, refunded: the validator's capacity, not the miner's doing).
 MAX_CHECKS_RUNNING = 3
+# Transcript checks (signatures, a renderer parse of M episodes): per hotkey, started per minute; per
+# OPERATOR (all its hotkeys together), in flight at once (until the check's thread returns, even when
+# the admission stopped waiting for it: one operator never holds more than ``max_checks_in_flight`` of
+# the global slots, one is always left to the others). A refusal before the checker (unserved env, stale
+# directory) does not count.
+DEFAULT_MAX_CHECKS_PER_MINUTE = 30
+DEFAULT_MAX_CHECKS_IN_FLIGHT = MAX_CHECKS_RUNNING - 1
 _CHECKS_RUNNING = threading.BoundedSemaphore(MAX_CHECKS_RUNNING)
 _CHECK_THREADS = ThreadPoolExecutor(max_workers=MAX_CHECKS_RUNNING, thread_name_prefix="episode-check")
 # The longest admission deadline the server gives a group (``ValidatorServer._admission_wall_seconds``)
-# and how many times over a session claim must outlive it: a claim then spans the check, the ingress-order
-# wait and the batcher's answer, and only a leaked claim reaches its ttl.
+# and how many times over a session claim must outlive it: a claim spans the check (to the deadline),
+# the ingress-order wait and the records' write (to the deadline plus the predecessor's own wall: two
+# walls in all), then the batcher's answer; only a leaked claim reaches its ttl.
 ADMISSION_DEADLINE_S = max(MATH_ADMISSION_WALL_SECONDS, CODE_ADMISSION_WALL_SECONDS)
 CLAIM_TTL_MARGIN = 4
+# The longest a server holds a claim before settling it, in admission walls (see above).
+CLAIM_HOLD_WALLS = 2
+assert CLAIM_TTL_MARGIN > CLAIM_HOLD_WALLS
+
+
+class CheckProgress:
+    """Where an ``admit`` got to, for a caller that cuts it at a deadline: did the transcript check
+    itself run past it (the miner's group took too long), or was the cut elsewhere (the validator's
+    lock wait, precommit lookup or claim)? Times are ``time.monotonic``; ``ended`` is set from the
+    check's own thread when it returns."""
+
+    def __init__(self) -> None:
+        self.started: float | None = None
+        self.ended: float | None = None
+
+    def ran_past(self, deadline: float) -> bool:
+        if self.started is None:
+            return False
+        ended = self.ended
+        return ended is None or ended >= deadline
 
 
 @dataclass(frozen=True)
@@ -134,19 +158,21 @@ class EpisodeGroupIntake:
         """Replace every checker (a new contract or task source)."""
         self._checkers = dict(checkers)
 
-    def _rate_refusal(self, hotkey: str) -> dict | None:
-        """None, and one more check of ``hotkey`` in flight (``_check_ended`` ends it); else why not."""
+    def _rate_refusal(self, hotkey: str, operator: str) -> tuple[str, dict] | None:
+        """None, and one more check of ``operator`` in flight (``_check_ended`` ends it); else the
+        refusal's stage and why. The in-flight cap reserves no identity (``episode_checks_in_flight``,
+        retryable); the per-minute budget does (``episode_rate``)."""
         now = float(self._clock())
         recent = [t for t in self._recent.get(hotkey, ()) if t > now - 60.0]
         with self._in_flight_lock:
-            running = self._in_flight.get(hotkey, 0)
+            running = self._in_flight.get(operator, 0)
             if running >= self._max_in_flight:
                 self._recent[hotkey] = recent
-                return {"in_flight": running, "max": self._max_in_flight}
+                return "episode_checks_in_flight", {"in_flight": running, "max": self._max_in_flight}
             if len(recent) >= self._max_per_minute:
                 self._recent[hotkey] = recent
-                return {"per_minute": len(recent), "max": self._max_per_minute}
-            self._in_flight[hotkey] = running + 1
+                return "episode_rate", {"per_minute": len(recent), "max": self._max_per_minute}
+            self._in_flight[operator] = running + 1
         recent.append(now)
         self._recent[hotkey] = recent
         if len(self._recent) > 4096:            # forget idle hotkeys
@@ -171,14 +197,14 @@ class EpisodeGroupIntake:
         self._report(str(request.miner_hotkey), _precommit_sha(request), session_ids, accepted=False)
         return prepared, None
 
-    def _check_ended(self, hotkey: str) -> None:
+    def _check_ended(self, operator: str) -> None:
         """Called from the event loop or from the check's own thread."""
         with self._in_flight_lock:
-            left = self._in_flight.get(hotkey, 1) - 1
+            left = self._in_flight.get(operator, 1) - 1
             if left > 0:
-                self._in_flight[hotkey] = left
+                self._in_flight[operator] = left
             else:
-                self._in_flight.pop(hotkey, None)
+                self._in_flight.pop(operator, None)
 
     def _forget_check(self, hotkey: str) -> None:
         """A check refused for capacity does not count against the hotkey's per-minute budget."""
@@ -205,9 +231,12 @@ class EpisodeGroupIntake:
             except Exception:
                 logger.exception("episode session %s claim not released (its claim ttl ends it)", session_id)
 
-    async def admit(self, *, environment: str, prepared, received: float, contract):
+    async def admit(self, *, environment: str, prepared, received: float, contract,
+                    operator: str | None = None, progress: CheckProgress | None = None):
         """Verify, claim, complete ``prepared`` in place. Returns ``(prepared, claim)``: a claim only for a
-        group the batcher may now take (the caller must ``settle`` it); None with ``prepared`` refused."""
+        group the batcher may now take (the caller must ``settle`` it); None with ``prepared`` refused.
+        ``operator``: the receipt's (the in-flight cap's key; the hotkey when unknown). ``progress``:
+        filled in for a caller that may cut this call (``CheckProgress.ran_past``)."""
         request = prepared.request
         checker = self._checkers.get(environment)
         if checker is None:
@@ -223,9 +252,10 @@ class EpisodeGroupIntake:
         if directory is None:
             return self._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_directory")
         hotkey = str(request.miner_hotkey)
-        limited = self._rate_refusal(hotkey)
+        owner = str(operator) if operator else hotkey
+        limited = self._rate_refusal(hotkey, owner)
         if limited is not None:
-            return self._refuse(prepared, RejectReason.RATE_LIMITED, "episode_rate", limited)
+            return self._refuse(prepared, RejectReason.RATE_LIMITED, *limited)
         sha = _precommit_sha(request)
         handed_off = False                  # to the check's thread, which then ends the hotkey's count
         try:
@@ -237,6 +267,8 @@ class EpisodeGroupIntake:
             try:
                 # Off the event loop: signatures and a renderer parse of M episodes. The slot is
                 # released when the check's thread returns (or never starts), not when we stop waiting.
+                if progress is not None:
+                    progress.started = time.monotonic()
                 future = _CHECK_THREADS.submit(checker.check, request, precommit=precommit, directory=directory,
                                                token_verifier=self._tokens, seen=self._seen(), received=received)
             except BaseException:
@@ -245,10 +277,12 @@ class EpisodeGroupIntake:
             handed_off = True
 
             def ended(_done) -> None:
+                if progress is not None:
+                    progress.ended = time.monotonic()
                 try:
                     _CHECKS_RUNNING.release()
                 finally:
-                    self._check_ended(hotkey)
+                    self._check_ended(owner)
 
             future.add_done_callback(ended)
             try:
@@ -260,7 +294,7 @@ class EpisodeGroupIntake:
                                     {"check": "raised"})
         finally:
             if not handed_off:
-                self._check_ended(hotkey)
+                self._check_ended(owner)
         if isinstance(outcome, EpisodeRefusal):
             return self._refuse(prepared, outcome.reason, outcome.stage, outcome.detail)
         # The checker passed, so ``sha`` is the precommit's: the precommit is taken with its sessions.
@@ -342,6 +376,6 @@ class EpisodeGroupIntake:
         self._report(claim.hotkey, claim.precommit_sha256, claim.session_ids, accepted=accepted)
 
 
-__all__ = ["ADMISSION_DEADLINE_S", "CLAIM_TTL_MARGIN", "DEFAULT_MAX_CHECKS_IN_FLIGHT",
+__all__ = ["ADMISSION_DEADLINE_S", "CLAIM_HOLD_WALLS", "CLAIM_TTL_MARGIN", "CheckProgress", "DEFAULT_MAX_CHECKS_IN_FLIGHT",
            "DEFAULT_MAX_CHECKS_PER_MINUTE", "MAX_CHECKS_RUNNING", "RETRYABLE_STAGES", "EpisodeClaim",
            "EpisodeGroupIntake", "build_episode_checker"]

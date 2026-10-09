@@ -971,7 +971,9 @@ class SessionIssuer:
         stored so by an earlier attempt counts without a write). One is enough to keep the precommit
         taken across a restart (``claim_all``'s precommit check). If the batcher then refuses the
         group, the book releases the claims while the store keeps ``submitted``: a restart reads those
-        sessions as paid (the miner may lose that group), never the reverse."""
+        sessions as paid (the miner may lose that group), never the reverse. A caller that stops
+        waiting (its admission deadline) does not cut the writes: each one still notes its session
+        stored when it lands, so a retry counts it rather than rewriting it."""
         documents, stored = {}, 0
         async with self._lock:
             now = int(self._clock())
@@ -984,12 +986,22 @@ class SessionIssuer:
                 elif session_transition_allowed(record.state, SUBMITTED):
                     documents[session_id] = replace(record, state=SUBMITTED, closed_status=STATUS_GRADED,
                                                     closed_at=now)
-        ids = list(documents)
-        written = await asyncio.gather(*(self._persist(documents[i]) for i in ids))
-        for session_id, ok in zip(ids, written):
-            if ok:
-                self._stored_submitted.add(session_id)
+        writes = [self._spawn(self._persist_submitted(documents[i])) for i in documents]
+        written = await asyncio.shield(asyncio.gather(*writes)) if writes else []
         return stored + sum(1 for ok in written if ok)
+
+    async def _persist_submitted(self, record: SessionRecord) -> bool:
+        ok = await self._persist(record)
+        if ok:
+            self._stored_submitted.add(record.session_id)
+        return ok
+
+    def _spawn(self, coroutine) -> asyncio.Task:
+        """A write as a task of its own, kept until it ends (``drain`` waits for it at shutdown)."""
+        task = asyncio.get_running_loop().create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def submitted_all(self, session_ids: Sequence[str]) -> None:
         """Plan 2C: an accepted episode group's sessions, all moved to ``submitted`` under ONE hold of the
