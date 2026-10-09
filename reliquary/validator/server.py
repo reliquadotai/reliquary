@@ -288,6 +288,14 @@ class _QueuedAuctionSubmission:
 # At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
 VERDICT_CAP_PER_HOTKEY = 200
 
+# Plan 2C: ``episode_intake.RETRYABLE_STAGES`` (kept equal by a test; not imported, so a legacy
+# validator never loads the episode modules): an episode refusal the miner may retry at once reserves
+# no (operator, prompt) identity.
+_EPISODE_RETRYABLE_STAGES = frozenset({"episode_group_in_flight", "episode_session_busy", "episode_directory",
+                                       "episode_checker_busy", "episode_persist_failed"})
+# Plan 2C: how long a clean shutdown waits for episode settlements in flight before cutting them.
+EPISODE_DRAIN_S = 10.0
+
 
 def _chain_client_fingerprint() -> dict[str, str | None]:
     """Return the chain codec versions that determine SCALE compatibility."""
@@ -6575,9 +6583,9 @@ class ValidatorServer:
         """Plan 2C: the parent-side half of an episode group's admission (``validator.episode_intake``):
         the child already ran the service policy (checkpoint = the window's announced one) and the
         signatures. Returns ``(prepared, claim)``; the caller settles a claim after the batcher's answer.
-        ``deadline`` (``time.monotonic``): the admission's; the intake is cut there (retryable refusal;
-        what it claimed is released, and a running transcript check keeps its global slot until it
-        returns)."""
+        ``deadline`` (``time.monotonic``): the admission's; the intake is cut there (RATE_LIMITED
+        ``episode_timeout``: the miner's own group took too long, not refunded; what it claimed is
+        released, and a running transcript check keeps its global slot until it returns)."""
         def refuse(reason: RejectReason, stage: str):
             prepared.episode_pending = False
             prepared.reject_reason = reason
@@ -6615,7 +6623,7 @@ class ValidatorServer:
             received = time.time()
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
-            return refuse(RejectReason.WORKER_DROPPED, "episode_timeout")
+            return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
         try:
             return await asyncio.wait_for(
                 intake.admit(environment=str(receipt.environment), prepared=prepared, received=received,
@@ -6624,7 +6632,7 @@ class ValidatorServer:
         except asyncio.TimeoutError:
             logger.warning("episode group of %s: admission deadline reached in the intake",
                            str(getattr(receipt, "miner_hotkey", ""))[:12])
-            return refuse(RejectReason.WORKER_DROPPED, "episode_timeout")
+            return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
 
     def _start_episode_settlement(self, claim, *, accepted: bool) -> asyncio.Task:
         """The settlement of an episode group's claims as a task of its own, kept until it ends: a
@@ -6634,6 +6642,24 @@ class ValidatorServer:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
         return task
+
+    async def _drain_episode_tasks(self, timeout: float = EPISODE_DRAIN_S) -> int:
+        """Clean shutdown: the episode settlements in flight, then the intake's own releases, each
+        awaited up to ``timeout`` s and cut after. Returns how many were cut."""
+        cut = 0
+        pending = [task for task in self.__dict__.get("_episode_settlements", ()) if not task.done()]
+        if pending:
+            _, late = await asyncio.wait(pending, timeout=timeout)
+            for task in late:
+                task.cancel()
+            if late:
+                await asyncio.gather(*late, return_exceptions=True)
+                logger.error("ALERT %d episode settlements cut at shutdown", len(late))
+            cut += len(late)
+        intake = getattr(self, "_episode_intake", None)
+        if intake is not None:
+            cut += await intake.drain(timeout)
+        return cut
 
     async def _settle_episode_claim(self, claim, *, accepted: bool) -> None:
         intake = getattr(self, "_episode_intake", None)
@@ -6742,7 +6768,13 @@ class ValidatorServer:
             if item.admission_predecessor is not None:
                 # Parsing and grading stay parallel; every state-changing
                 # post-grade decision follows observed ingress order.
-                await asyncio.shield(item.admission_predecessor)
+                if episode_claim is not None:
+                    # Plan 2C: the sessions' claim is held through this wait; the admission's
+                    # deadline bounds it (the claim ttl outlives that deadline 4 times over).
+                    await asyncio.wait_for(asyncio.shield(item.admission_predecessor),
+                                           max(0.0, deadline - time.monotonic()))
+                else:
+                    await asyncio.shield(item.admission_predecessor)
             if receipt.terminal:
                 response = receipt.outcome or BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.WORKER_DROPPED,
@@ -6829,7 +6861,7 @@ class ValidatorServer:
             identity_should_be_reserved = structurally_authenticated and (
                 prepared.reject_reason is not RejectReason.WORKER_DROPPED
                 or prepared.grader_failure_reason == "crash"
-            )
+            ) and prepared.reject_stage not in _EPISODE_RETRYABLE_STAGES
             if identity_should_be_reserved:
                 reserved, identity_reason, identity_stage = (
                     batcher.reserve_prepared_identity(
@@ -6892,6 +6924,19 @@ class ValidatorServer:
                 return
             admission_started = True
 
+            if episode_claim is not None and not await self._episode_intake.persist(episode_claim):
+                # Plan 2C: not one ``submitted`` record stored: the batcher never takes the group (a
+                # restart would not know its sessions paid). Retryable, the claims are released.
+                batcher.cancel_logical_group_reservation(request)
+                reject_stage = "episode_persist_failed"
+                response = batcher.reject_prepared_submission(
+                    request,
+                    RejectReason.WORKER_DROPPED,
+                    reject_stage,
+                    telemetry=telemetry,
+                )
+                return
+
             reject_stage = prepared.reject_stage or "proof"
             response = batcher.accept_prepared_submission(
                 prepared, telemetry=telemetry
@@ -6951,14 +6996,31 @@ class ValidatorServer:
                     RejectReason.WORKER_DROPPED, reject_stage
                 )
         finally:
+            settlement = None
+            cancelled_while_settling = False
             try:
                 try:
-                    if cancel_identity_on_exit and request is not None:
-                        batcher.cancel_logical_group_reservation(request)
-                    if admission_started and request is not None:
-                        batcher.finish_proof_admission(request)
+                    try:
+                        if cancel_identity_on_exit and request is not None:
+                            batcher.cancel_logical_group_reservation(request)
+                        if admission_started and request is not None:
+                            batcher.finish_proof_admission(request)
+                    finally:
+                        self._finish_admission_turn(item)
                 finally:
-                    self._finish_admission_turn(item)
+                    if episode_claim is not None:
+                        # Plan 2C: only the batcher's acceptance pays the sessions (their records are
+                        # already stored); any other end releases them. A tracked task, started whatever
+                        # happens above, and done BEFORE the receipt: a miner told its group was refused
+                        # finds its sessions and precommit free when it retries.
+                        settlement = self._start_episode_settlement(episode_claim, accepted=episode_accepted)
+                if settlement is not None:
+                    try:
+                        await asyncio.shield(settlement)
+                    except asyncio.CancelledError:
+                        # A second cancellation stops this wait, never the settlement nor the
+                        # bookkeeping below; it is raised again at the end.
+                        cancelled_while_settling = True
                 if response is None:
                     response = BatchSubmissionResponse(
                         accepted=False, reason=RejectReason.WORKER_DROPPED
@@ -7002,11 +7064,8 @@ class ValidatorServer:
                 self._admission_inflight_items.pop(receipt.receipt_id, None)
                 self._admission_inflight_requests.pop(receipt.receipt_id, None)
             finally:
-                if episode_claim is not None:
-                    # Plan 2C, LAST: the admission turn, the receipt, the refund and the counters are done
-                    # whatever happens here. Only the batcher's acceptance pays the sessions; any other end
-                    # releases them. A tracked task: a second cancellation stops this wait, not the settlement.
-                    await asyncio.shield(self._start_episode_settlement(episode_claim, accepted=episode_accepted))
+                if cancelled_while_settling:
+                    raise asyncio.CancelledError()
 
     async def _submit_worker(
         self,
@@ -7494,6 +7553,8 @@ class ValidatorServer:
         self._worker_task = None
         self._code_worker_task = None
         self._extra_worker_tasks = []
+        # Plan 2C: the episode settlements the cancelled admissions left running (bounded).
+        await self._drain_episode_tasks()
         for pool in self._admission_process_pools.values():
             await asyncio.to_thread(self._terminate_admission_pool, pool)
         self._admission_process_pools = {}

@@ -84,7 +84,7 @@ import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any, Protocol
 
 from reliquary_sandbox.attest import (
@@ -618,6 +618,8 @@ class SessionIssuer:
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
         self._refused_opens: dict[str, list[int]] = {}     # hotkey -> refusal times
+        # Plan 2C: sessions whose ``submitted`` record is stored ahead of the book (``persist_submitted``).
+        self._stored_submitted: set[str] = set()
 
     @property
     def policy(self) -> SandboxPolicy:
@@ -963,11 +965,37 @@ class SessionIssuer:
         if record is not None:
             await self._persist(record)
 
+    async def persist_submitted(self, session_ids: Sequence[str]) -> int:
+        """Plan 2C, before the batcher takes an episode group: each claimed session's ``submitted``
+        record is written (together), the book left as it is. Returns how many are stored (a session
+        stored so by an earlier attempt counts without a write). One is enough to keep the precommit
+        taken across a restart (``claim_all``'s precommit check). If the batcher then refuses the
+        group, the book releases the claims while the store keeps ``submitted``: a restart reads those
+        sessions as paid (the miner may lose that group), never the reverse."""
+        documents, stored = {}, 0
+        async with self._lock:
+            now = int(self._clock())
+            for session_id in dict.fromkeys(session_ids):
+                record = self.book.get(session_id)
+                if record is None or not self.book.is_claimed(session_id):
+                    continue
+                if session_id in self._stored_submitted:
+                    stored += 1
+                elif session_transition_allowed(record.state, SUBMITTED):
+                    documents[session_id] = replace(record, state=SUBMITTED, closed_status=STATUS_GRADED,
+                                                    closed_at=now)
+        ids = list(documents)
+        written = await asyncio.gather(*(self._persist(documents[i]) for i in ids))
+        for session_id, ok in zip(ids, written):
+            if ok:
+                self._stored_submitted.add(session_id)
+        return stored + sum(1 for ok in written if ok)
+
     async def submitted_all(self, session_ids: Sequence[str]) -> None:
         """Plan 2C: an accepted episode group's sessions, all moved to ``submitted`` under ONE hold of the
-        issuer lock (no reader sees part of the group paid), then every record written before this
-        returns (the writes run together; the caller reports acceptance only after them). A restart
-        reads them back, so the precommit stays taken (``claim_all``)."""
+        issuer lock (no reader sees part of the group paid), then every record not already stored by
+        ``persist_submitted`` written before this returns (the writes run together). A restart reads
+        them back, so the precommit stays taken (``claim_all``)."""
         records = []
         async with self._lock:
             now = int(self._clock())
@@ -979,8 +1007,9 @@ class SessionIssuer:
                     continue           # a lapsed session is paid only through a claim
                 record = self.book.settle(session_id, SUBMITTED, now=now, status=STATUS_GRADED)
                 self._tokens.pop(session_id, None)
-                if record is not None:
+                if record is not None and session_id not in self._stored_submitted:
                     records.append(record)
+                self._stored_submitted.discard(session_id)
         await asyncio.gather(*(self._persist(record) for record in records))
 
     def void_machine(self, machine_id: str) -> None:
@@ -1016,6 +1045,7 @@ class SessionIssuer:
             for record in lapsed:
                 self._tokens.pop(record.session_id, None)
             self.book.prune(now)
+            self._stored_submitted = {i for i in self._stored_submitted if self.book.get(i) is not None}
             for hotkey in [h for h, times in self._refused_opens.items()
                            if not times or times[-1] <= now - MINUTE]:
                 del self._refused_opens[hotkey]
@@ -1034,28 +1064,29 @@ class SessionIssuer:
         return Refusal("directory_unavailable", {"why": "the machine directory is stale"},
                        retry_after=self._policy.retry_after_s)
 
-    async def _persist(self, record: SessionRecord | None) -> None:
+    async def _persist(self, record: SessionRecord | None) -> bool:
         """Write the record's state (a snapshot taken now). A refused transition means a
         later state is already stored: nothing to do. Other failures are retried with
         backoff; the last one alerts (the in-memory state stays authoritative until a
-        restart, which would read the older stored state)."""
+        restart, which would read the older stored state). True only when this state is stored."""
         if record is None:
-            return
+            return False
         document = record.to_document()
         for attempt in range(PERSIST_ATTEMPTS):
             if attempt:
                 await _sleep(PERSIST_BACKOFF_S * 2 ** (attempt - 1))
             try:
                 await asyncio.wait_for(self._store.update(document), self._policy.io_timeout_s)
-                return
+                return True
             except SessionStoreConflict as exc:
                 logger.warning("sandbox session %s state %s not stored: %s",
                                record.session_id, document["state"], exc)
-                return
+                return False
             except Exception as exc:
                 failure = type(exc).__name__
         logger.error("ALERT sandbox session %s state %s not stored after %d attempts (%s)",
                      record.session_id, document["state"], PERSIST_ATTEMPTS, failure)
+        return False
 
 
 __all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "LAPSED", "LIVE", "SUBMITTED", "VOIDED",

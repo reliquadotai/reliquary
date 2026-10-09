@@ -41,8 +41,15 @@ _CLAIM_REFUSALS = {
     "precommit_submitted": (RejectReason.HASH_DUPLICATE, "episode_precommit_used"),
     "precommit_claimed": (RejectReason.RATE_LIMITED, "episode_group_in_flight"),
 }
+# Refusals the miner may retry at once: the server reserves no (operator, prompt) identity for them.
+# Every other episode refusal (a bad transcript, ``episode_rate``, ``episode_timeout``: the miner's own
+# group took too long) keeps it reserved for the window like any refused group.
+RETRYABLE_STAGES = frozenset({"episode_group_in_flight", "episode_session_busy", "episode_directory",
+                              "episode_checker_busy", "episode_persist_failed"})
 # Per hotkey: transcript checks (signatures, a renderer parse of M episodes) started per minute, and in
-# flight at once. A refusal before the checker (unserved env, stale directory) does not count.
+# flight at once (until the check's thread returns, even when the admission stopped waiting for it: one
+# hotkey never holds more than ``max_checks_in_flight`` of the global slots). A refusal before the
+# checker (unserved env, stale directory) does not count.
 DEFAULT_MAX_CHECKS_PER_MINUTE = 30
 DEFAULT_MAX_CHECKS_IN_FLIGHT = 2
 # Every intake together: transcript checks running at once (threads of their own). A check is not
@@ -116,6 +123,7 @@ class EpisodeGroupIntake:
         self._clock = clock
         self._recent: dict[str, list[float]] = {}
         self._in_flight: dict[str, int] = {}
+        self._in_flight_lock = threading.Lock()         # a check's thread ends its count
         self._tasks: set[asyncio.Task] = set()
 
     @property
@@ -127,14 +135,18 @@ class EpisodeGroupIntake:
         self._checkers = dict(checkers)
 
     def _rate_refusal(self, hotkey: str) -> dict | None:
+        """None, and one more check of ``hotkey`` in flight (``_check_ended`` ends it); else why not."""
         now = float(self._clock())
         recent = [t for t in self._recent.get(hotkey, ()) if t > now - 60.0]
-        if self._in_flight.get(hotkey, 0) >= self._max_in_flight:
-            self._recent[hotkey] = recent
-            return {"in_flight": self._in_flight[hotkey], "max": self._max_in_flight}
-        if len(recent) >= self._max_per_minute:
-            self._recent[hotkey] = recent
-            return {"per_minute": len(recent), "max": self._max_per_minute}
+        with self._in_flight_lock:
+            running = self._in_flight.get(hotkey, 0)
+            if running >= self._max_in_flight:
+                self._recent[hotkey] = recent
+                return {"in_flight": running, "max": self._max_in_flight}
+            if len(recent) >= self._max_per_minute:
+                self._recent[hotkey] = recent
+                return {"per_minute": len(recent), "max": self._max_per_minute}
+            self._in_flight[hotkey] = running + 1
         recent.append(now)
         self._recent[hotkey] = recent
         if len(self._recent) > 4096:            # forget idle hotkeys
@@ -158,6 +170,15 @@ class EpisodeGroupIntake:
         logger.info("episode group of %s refused at %s: %s", str(request.miner_hotkey)[:12], stage, detail or {})
         self._report(str(request.miner_hotkey), _precommit_sha(request), session_ids, accepted=False)
         return prepared, None
+
+    def _check_ended(self, hotkey: str) -> None:
+        """Called from the event loop or from the check's own thread."""
+        with self._in_flight_lock:
+            left = self._in_flight.get(hotkey, 1) - 1
+            if left > 0:
+                self._in_flight[hotkey] = left
+            else:
+                self._in_flight.pop(hotkey, None)
 
     def _forget_check(self, hotkey: str) -> None:
         """A check refused for capacity does not count against the hotkey's per-minute budget."""
@@ -206,7 +227,7 @@ class EpisodeGroupIntake:
         if limited is not None:
             return self._refuse(prepared, RejectReason.RATE_LIMITED, "episode_rate", limited)
         sha = _precommit_sha(request)
-        self._in_flight[hotkey] = self._in_flight.get(hotkey, 0) + 1
+        handed_off = False                  # to the check's thread, which then ends the hotkey's count
         try:
             precommit = await asyncio.to_thread(self._precommits, sha) if sha else None
             if not _CHECKS_RUNNING.acquire(blocking=False):
@@ -221,7 +242,15 @@ class EpisodeGroupIntake:
             except BaseException:
                 _CHECKS_RUNNING.release()
                 raise
-            future.add_done_callback(lambda _done: _CHECKS_RUNNING.release())
+            handed_off = True
+
+            def ended(_done) -> None:
+                try:
+                    _CHECKS_RUNNING.release()
+                finally:
+                    self._check_ended(hotkey)
+
+            future.add_done_callback(ended)
             try:
                 outcome = await asyncio.wrap_future(future)
             except Exception:
@@ -230,11 +259,8 @@ class EpisodeGroupIntake:
                 return self._refuse(prepared, RejectReason.BAD_SCHEMA, "episode_transcript",
                                     {"check": "raised"})
         finally:
-            left = self._in_flight.get(hotkey, 1) - 1
-            if left > 0:
-                self._in_flight[hotkey] = left
-            else:
-                self._in_flight.pop(hotkey, None)
+            if not handed_off:
+                self._check_ended(hotkey)
         if isinstance(outcome, EpisodeRefusal):
             return self._refuse(prepared, outcome.reason, outcome.stage, outcome.detail)
         # The checker passed, so ``sha`` is the precommit's: the precommit is taken with its sessions.
@@ -266,6 +292,31 @@ class EpisodeGroupIntake:
             return prepared, None
         return prepared, claim
 
+    async def persist(self, claim: EpisodeClaim) -> bool:
+        """Before the batcher takes the group: the sessions' ``submitted`` records written (awaited).
+        False when not one could be: the caller must not let the batcher take the group (a restart
+        would not know these sessions paid). One stored record is enough: after a restart it keeps the
+        precommit taken (``claim_all`` refuses any other group of it), and its own session is paid."""
+        try:
+            return await self._sessions.persist_submitted(claim.session_ids) > 0
+        except Exception:
+            logger.exception("episode sessions %s: submitted records not written", ",".join(claim.session_ids))
+            return False
+
+    async def drain(self, timeout: float) -> int:
+        """Clean shutdown: wait up to ``timeout`` s for the releases and settlements in flight, then
+        cancel what is left (a cut claim lapses at its ttl). Returns how many were cut."""
+        pending = [task for task in self._tasks if not task.done()]
+        if not pending:
+            return 0
+        _, late = await asyncio.wait(pending, timeout=timeout)
+        for task in late:
+            task.cancel()
+        if late:
+            await asyncio.gather(*late, return_exceptions=True)
+            logger.error("ALERT %d episode settlements cut at shutdown; their claims lapse at the ttl", len(late))
+        return len(late)
+
     async def settle(self, claim: EpisodeClaim, *, accepted: bool) -> None:
         """After the batcher's answer: accepted sessions end ``submitted``; others are released (the
         miner may submit them again). Shielded: a cancellation of the caller never leaves an accepted
@@ -277,7 +328,7 @@ class EpisodeGroupIntake:
 
     async def _settle(self, claim: EpisodeClaim, *, accepted: bool) -> None:
         if accepted:
-            # Every session of the group moved and written together, before acceptance is reported.
+            # Every session of the group moved together; a record ``persist`` could not write is retried.
             try:
                 await self._sessions.submitted_all(claim.session_ids)
             except Exception:
@@ -292,5 +343,5 @@ class EpisodeGroupIntake:
 
 
 __all__ = ["ADMISSION_DEADLINE_S", "CLAIM_TTL_MARGIN", "DEFAULT_MAX_CHECKS_IN_FLIGHT",
-           "DEFAULT_MAX_CHECKS_PER_MINUTE", "MAX_CHECKS_RUNNING", "EpisodeClaim", "EpisodeGroupIntake",
-           "build_episode_checker"]
+           "DEFAULT_MAX_CHECKS_PER_MINUTE", "MAX_CHECKS_RUNNING", "RETRYABLE_STAGES", "EpisodeClaim",
+           "EpisodeGroupIntake", "build_episode_checker"]

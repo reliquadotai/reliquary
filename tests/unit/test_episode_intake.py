@@ -41,6 +41,7 @@ class Sessions:
         self.group_keys = []
         self.paid_calls = 0
         self.claim_gate = self.release_gate = None      # asyncio.Event: hold the call until set
+        self.persisted, self.persist_ok, self.events = [], None, []   # persist_ok: how many records store
 
     async def claim_all(self, session_ids, *, hotkey, received=None, precommit_sha256=None):
         self.group_keys.append(precommit_sha256)
@@ -60,8 +61,15 @@ class Sessions:
             raise RuntimeError("store down")
         self.released.append(session_id)
         self.held.discard(session_id)
+        self.events.append("release")
+
+    async def persist_submitted(self, session_ids):
+        self.persisted.extend(session_ids)
+        self.events.append("persist")
+        return len(session_ids) if self.persist_ok is None else self.persist_ok
 
     async def submitted_all(self, session_ids):
+        self.events.append("paid")
         self.paid_calls += 1
         self.paid.extend(session_ids)
         self.held.difference_update(session_ids)
@@ -311,7 +319,8 @@ def test_the_auction_admission_runs_the_episode_intake_before_the_identity_reser
 
 # -- the real auction path: settlement by the batcher's answer, after the bookkeeping ------------------
 
-def auction(tmp_path, monkeypatch, *, accept=None, on_admit=None, predecessor=None, completion=None):
+def auction(tmp_path, monkeypatch, *, accept=None, on_admit=None, predecessor=None, completion=None,
+            refusal=None):
     """A real ``ValidatorServer._process_auction_submission`` over a real batcher and intake (fake
     sessions); only the admission child and the parent's episode verification are stubbed (the latter
     claims two sessions, as the intake would)."""
@@ -327,14 +336,32 @@ def auction(tmp_path, monkeypatch, *, accept=None, on_admit=None, predecessor=No
     from tests.unit.test_validator_server import FakeEnv, _batcher, _request
 
     batcher = _batcher()
-    monkeypatch.setattr(batcher, "reserve_prepared_identity", lambda *_a: (True, None, None))
+    reserved, accepted, refunds, at_receipt = [], [], [], []
+    monkeypatch.setattr(batcher, "reserve_prepared_identity", lambda *_a: reserved.append(1) or (True, None, None))
     monkeypatch.setattr(batcher, "start_revealed_admission", lambda *_a: (True, None))
-    monkeypatch.setattr(batcher, "accept_prepared_submission", accept or (
-        lambda prepared, **_kw: BatchSubmissionResponse(accepted=True, reason=RejectReason.SUBMITTED)))
+    take = accept or (lambda prepared, **_kw: BatchSubmissionResponse(accepted=True, reason=RejectReason.SUBMITTED))
+
+    def accept_spy(prepared, **kw):
+        accepted.append(1)
+        w.sessions.events.append("accept")
+        return take(prepared, **kw)
+
+    monkeypatch.setattr(batcher, "accept_prepared_submission", accept_spy)
     monkeypatch.setattr(batcher, "finish_proof_admission", lambda *_a: None)
     monkeypatch.setattr(type(batcher), "resolve_upload_precommit", lambda *_a, **_kw: None)
     server = ValidatorServer()
     server.set_active_batchers({FakeEnv.name: batcher})
+    real_complete = server._complete_upload_receipt
+
+    def complete_spy(receipt_, response):
+        w.sessions.events.append("receipt")
+        at_receipt.append({"released": sorted(w.sessions.released), "paid": list(w.sessions.paid),
+                           "persisted": list(w.sessions.persisted)})
+        return real_complete(receipt_, response)
+
+    server._complete_upload_receipt = complete_spy
+    real_refund = server._refund_submission_quota
+    server._refund_submission_quota = lambda *args: refunds.append(args) or real_refund(*args)
     request = _request()
     pending = PreparedSubmission(request=request, completion_texts=[], rewards=[],
                                  rollout_hashes=[bytes([i]) * 32 for i in range(M_ROLLOUTS)],
@@ -362,6 +389,10 @@ def auction(tmp_path, monkeypatch, *, accept=None, on_admit=None, predecessor=No
     async def admit_stub(batcher_, receipt_, prepared, telemetry, *, deadline=None):
         assert deadline is not None                       # the admission's deadline reaches the intake
         prepared.episode_pending = False
+        if refusal is not None:
+            prepared.reject_reason, prepared.reject_stage = refusal
+            admitted.set()
+            return prepared, None
         w.sessions.claimed.extend(claim.session_ids)
         w.sessions.held.update(claim.session_ids)
         if on_admit is not None:
@@ -377,7 +408,8 @@ def auction(tmp_path, monkeypatch, *, accept=None, on_admit=None, predecessor=No
     pool = ThreadPoolExecutor(max_workers=1)
     server._admission_materialization_pool = pool
     return SimpleNamespace(server=server, batcher=batcher, item=item, receipt=receipt, w=w, claim=claim,
-                           admitted=admitted, finished=finished, pool=pool)
+                           admitted=admitted, finished=finished, pool=pool, reserved=reserved, accepted=accepted,
+                           refunds=refunds, at_receipt=at_receipt)
 
 
 async def run_auction(a):
@@ -393,6 +425,95 @@ def test_an_accepted_episode_group_ends_submitted(tmp_path, monkeypatch):
     assert a.receipt.outcome.accepted is True and a.finished == [a.item]
     assert a.w.sessions.paid == list(a.claim.session_ids) and a.w.sessions.released == []
     assert a.w.outcomes.calls[-1]["accepted"] is True
+    # The records are stored before the batcher takes the group, and the group is settled before the
+    # miner is told it was accepted.
+    assert a.w.sessions.events == ["persist", "accept", "paid", "receipt"]
+    assert a.at_receipt == [{"released": [], "paid": list(a.claim.session_ids),
+                             "persisted": list(a.claim.session_ids)}]
+
+
+@pytest.mark.parametrize("stored, accepted", [(0, False), (1, True)])
+def test_an_episode_group_is_taken_only_once_a_record_of_it_is_stored(tmp_path, monkeypatch, stored, accepted):
+    a = auction(tmp_path, monkeypatch)
+    a.w.sessions.persist_ok = stored
+    asyncio.run(run_auction(a))
+    assert a.receipt.outcome.accepted is accepted and a.finished == [a.item]
+    if accepted:                                  # one record keeps the precommit taken across a restart
+        assert a.accepted == [1] and a.w.sessions.paid == list(a.claim.session_ids)
+    else:                                         # nothing paid, everything released, retryable
+        assert a.accepted == [] and a.w.sessions.paid == []
+        assert a.receipt.outcome.reason is RejectReason.WORKER_DROPPED and len(a.refunds) == 1
+        assert sorted(a.w.sessions.released) == sorted(a.claim.session_ids) and a.w.sessions.held == set()
+        assert a.at_receipt[0]["released"] == sorted(a.claim.session_ids)
+        assert a.w.outcomes.calls[-1]["accepted"] is False
+
+
+@pytest.mark.parametrize("reason, stage, keeps_identity", [
+    (RejectReason.RATE_LIMITED, "episode_group_in_flight", False),
+    (RejectReason.WORKER_DROPPED, "episode_checker_busy", False),
+    (RejectReason.WORKER_DROPPED, "episode_session_busy", False),
+    (RejectReason.RATE_LIMITED, "episode_rate", True),
+    (RejectReason.RATE_LIMITED, "episode_timeout", True),
+    (RejectReason.REWARD_MISMATCH, "episode_transcript", True),
+])
+def test_a_retryable_episode_refusal_reserves_no_identity(tmp_path, monkeypatch, reason, stage, keeps_identity):
+    a = auction(tmp_path, monkeypatch, refusal=(reason, stage))
+    asyncio.run(run_auction(a))
+    assert a.receipt.outcome.accepted is False and a.receipt.outcome.reason is reason
+    assert bool(a.reserved) is keeps_identity and a.accepted == []
+    assert len(a.refunds) == (1 if reason is RejectReason.WORKER_DROPPED else 0)
+
+
+def test_the_servers_retryable_episode_stages_are_the_intakes():
+    from reliquary.validator import server as server_module
+
+    assert server_module._EPISODE_RETRYABLE_STAGES == episode_intake.RETRYABLE_STAGES
+
+
+def test_the_ingress_order_wait_of_a_claimed_group_is_bounded_by_its_deadline(tmp_path, monkeypatch):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        predecessor, completion = loop.create_future(), loop.create_future()
+        a = auction(tmp_path, monkeypatch, predecessor=predecessor, completion=completion)
+        a.server._admission_wall_seconds = lambda environment: 0.5
+        a.server._admission_order_tail[id(a.batcher)] = completion
+        await asyncio.wait_for(run_auction(a), 10)
+        assert a.receipt.outcome.accepted is False and a.receipt.outcome.reason is RejectReason.WORKER_DROPPED
+        assert a.accepted == [] and sorted(a.w.sessions.released) == sorted(a.claim.session_ids)
+        assert a.at_receipt[0]["released"] == sorted(a.claim.session_ids)
+        predecessor.set_result(None)
+        await asyncio.sleep(0)
+        assert completion.done()
+
+    asyncio.run(scenario())
+
+
+def test_a_clean_shutdown_drains_the_episode_settlements(tmp_path):
+    w = world(tmp_path)
+    server = ValidatorServer()
+    server._episode_intake = w.intake
+    claim = EpisodeClaim("5Hot", "a" * 64, ("s-0", "s-1"))
+
+    async def scenario():
+        w.sessions.release_gate = asyncio.Event()
+        settlement = server._start_episode_settlement(claim, accepted=False)
+        asyncio.get_running_loop().call_later(0.1, w.sessions.release_gate.set)
+        await server.stop()
+        assert settlement.done() and sorted(w.sessions.released) == ["s-0", "s-1"]
+        # One that never ends is cut at the bound (its claim lapses at the ttl).
+        w.sessions.release_gate = asyncio.Event()
+        stuck = server._start_episode_settlement(claim, accepted=False)
+        await asyncio.sleep(0)
+        assert await server._drain_episode_tasks(0.1) >= 1
+        assert stuck.done() and not w.intake._tasks
+        # A settlement that hangs outside the intake is cut too.
+        hang = asyncio.Event()
+        w.intake.settle = lambda claim_, accepted: hang.wait()
+        hung = server._start_episode_settlement(claim, accepted=False)
+        await asyncio.sleep(0)
+        assert await server._drain_episode_tasks(0.1) == 1 and hung.cancelled()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("ending", ["batch_filled", "terminal_drain", "exception"])
@@ -415,6 +536,9 @@ def test_an_episode_group_the_batcher_does_not_take_is_released(tmp_path, monkey
     assert a.receipt.terminal is True and a.receipt.outcome.accepted is False and a.finished == [a.item]
     assert sorted(a.w.sessions.released) == sorted(a.claim.session_ids) and a.w.sessions.paid == []
     assert a.w.sessions.held == set() and a.w.outcomes.calls[-1]["accepted"] is False
+    if ending != "terminal_drain":     # released before the miner is told (a retry finds them free)
+        assert a.at_receipt == [{"released": sorted(a.claim.session_ids), "paid": [],
+                                 "persisted": list(a.claim.session_ids)}]
 
 
 def test_a_cancelled_episode_admission_finishes_its_turn_and_releases_its_sessions(tmp_path, monkeypatch):
@@ -514,7 +638,7 @@ def test_the_deadline_cuts_the_check_and_its_slot_lasts_until_the_thread_returns
             batcher, SimpleNamespace(environment=EPISODE), w.prepared, SimpleNamespace(t_body_completed=NOW + 100),
             deadline=time.monotonic() + 0.2)
         assert claim is None
-        assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.WORKER_DROPPED, "episode_timeout")
+        assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.RATE_LIMITED, "episode_timeout")
         second = dataclasses.replace(w.prepared, reject_reason=None, reject_stage=None, episode_pending=True)
         busy, none = await w.intake.admit(environment=EPISODE, prepared=second, received=NOW + 100,
                                           contract=CONTRACT)
@@ -743,6 +867,100 @@ def test_checks_in_flight_are_bounded_per_hotkey_and_run_off_the_loop(tmp_path, 
     (prepared, claim), (refused, none) = asyncio.run(both())
     assert claim is not None and none is None and threads == [False]
     assert (refused.reject_reason, refused.reject_stage) == (RejectReason.RATE_LIMITED, "episode_rate")
+
+
+def test_a_hotkeys_cut_checks_count_against_it_until_their_threads_return(tmp_path, monkeypatch):
+    """Checks cut by the admission deadline still run: they keep the hotkey's in-flight count, so one
+    hotkey never holds every global slot (here 2 of 3; the third stays free for everyone else)."""
+    import threading
+    import time
+
+    w = world(tmp_path)
+    slots = threading.BoundedSemaphore(3)
+    monkeypatch.setattr(episode_intake, "_CHECKS_RUNNING", slots)
+    checker = w.intake._checkers[EPISODE]
+    real, gate, ended = checker.check, threading.Event(), threading.Semaphore(0)
+
+    def slow(*args, **kwargs):
+        try:
+            gate.wait(10)
+            return real(*args, **kwargs)
+        finally:
+            ended.release()
+
+    monkeypatch.setattr(checker, "check", slow)
+
+    def fresh():
+        return dataclasses.replace(w.prepared, reject_reason=None, reject_stage=None, episode_pending=True)
+
+    async def scenario():
+        for _ in range(2):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(w.intake.admit(environment=EPISODE, prepared=fresh(), received=NOW + 100,
+                                                      contract=CONTRACT), 0.2)
+        refused, none = await asyncio.wait_for(
+            w.intake.admit(environment=EPISODE, prepared=fresh(), received=NOW + 100, contract=CONTRACT), 2)
+        assert none is None and (refused.reject_reason, refused.reject_stage) == (RejectReason.RATE_LIMITED,
+                                                                                  "episode_rate")
+        assert slots.acquire(blocking=False)           # a slot is left for the other hotkeys
+        slots.release()
+        gate.set()
+        for _ in range(2):
+            assert await asyncio.to_thread(ended.acquire, True, 10)
+        for _ in range(100):
+            if not w.intake._in_flight:
+                break
+            await asyncio.sleep(0.01)
+        assert w.intake._in_flight == {}
+        _, claim = await w.intake.admit(environment=EPISODE, prepared=fresh(), received=NOW + 100,
+                                        contract=CONTRACT)
+        assert claim is not None
+
+    asyncio.run(scenario())
+    time.sleep(0)
+
+
+def test_submitted_records_are_stored_before_the_batcher_takes_the_group(tmp_path, monkeypatch):
+    from reliquary.protocol.service_episode import rl_engagement
+    from reliquary.sandbox import sessions as sessions_module
+    from reliquary.sandbox.sessions import LIVE, SUBMITTED
+
+    async def no_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(sessions_module, "_sleep", no_sleep)
+    env, ids = _issuer_with_sessions(tmp_path, 4)
+    sha = "9" * 64
+    for n, session_id in enumerate(ids):
+        record = dataclasses.replace(env.book.get(session_id), engagement=rl_engagement(1, sha, n),
+                                     kind="rl_precommit")
+        env.book.add(record)
+        env.store.documents[session_id] = record.to_document()
+    group, unclaimed = ids[:3], ids[3]
+    assert asyncio.run(env.issuer.claim_all(group, hotkey="5Hot", received=NOW, precommit_sha256=sha)) is None
+    env.store.fail = True
+    assert asyncio.run(env.issuer.persist_submitted(group + [unclaimed])) == 0
+    assert all(env.store.documents[i]["state"] == LIVE for i in ids)
+    env.store.fail = False
+    assert asyncio.run(env.issuer.persist_submitted(group + [unclaimed])) == 3
+    assert all(env.store.documents[i]["state"] == SUBMITTED for i in group)
+    assert env.store.documents[unclaimed]["state"] == LIVE          # never claimed: never written
+    assert all(env.book.get(i).state == LIVE and env.book.is_claimed(i) for i in group)   # book unchanged
+    # The batcher refused: the claims are released, the store keeps ``submitted``; a retry counts them.
+    for session_id in group:
+        asyncio.run(env.issuer.release_claim(session_id))
+    assert asyncio.run(env.issuer.claim_all(group, hotkey="5Hot", received=NOW, precommit_sha256=sha)) is None
+    writes = []
+    real_update = env.store.update
+
+    async def counted(document):
+        writes.append(document["session_id"])
+        return await real_update(document)
+
+    monkeypatch.setattr(env.store, "update", counted)
+    assert asyncio.run(env.issuer.persist_submitted(group)) == 3
+    asyncio.run(env.issuer.submitted_all(group))
+    assert writes == [] and all(env.book.get(i).state == SUBMITTED for i in group)
 
 
 def test_the_checker_builder_renders_the_contracts_tools(monkeypatch):
