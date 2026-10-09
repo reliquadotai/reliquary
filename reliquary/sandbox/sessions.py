@@ -404,6 +404,9 @@ class SessionBook:
         # (submitted, closed, withdrawn, aborted, lapsed, voided): an open whose free-
         # slot read predates a bump reads the ledger again under the issuer lock.
         self._generations: dict[tuple[Any, Any], int] = {}
+        # Plan 2C: precommit sha256 -> ids of the RL sessions whose engagement names it (the group
+        # claim's one-paid-group-per-precommit check reads it under the issuer lock, no full scan).
+        self._by_precommit: dict[str, set[str]] = {}
 
     def generation(self, job_id: Any, prompt_index: Any) -> int:
         return self._generations.get((job_id, prompt_index), 0)
@@ -437,7 +440,13 @@ class SessionBook:
         return False
 
     def add(self, record: SessionRecord) -> None:
+        previous = self._sessions.get(record.session_id)
+        if previous is not None:
+            self._unindex(previous)
         self._sessions[record.session_id] = record
+        sha = _rl_precommit_of(record)
+        if sha is not None:
+            self._by_precommit.setdefault(sha, set()).add(record.session_id)
         self._requests[(record.hotkey, record.request_id)] = record.session_id
         if record.state == SUBMITTED:
             self._submitted = self._submitted | {record.session_id}
@@ -451,6 +460,19 @@ class SessionBook:
 
     def records(self) -> tuple[SessionRecord, ...]:
         return tuple(self._sessions.values())
+
+    def _unindex(self, record: SessionRecord) -> None:
+        sha = _rl_precommit_of(record)
+        ids = self._by_precommit.get(sha) if sha is not None else None
+        if ids is not None:
+            ids.discard(record.session_id)
+            if not ids:
+                del self._by_precommit[sha]
+
+    def of_precommit(self, precommit_sha256: str) -> tuple[SessionRecord, ...]:
+        """Plan 2C: the RL sessions whose engagement names this precommit (an index, not a scan)."""
+        ids = self._by_precommit.get(precommit_sha256, ())
+        return tuple(self._sessions[s] for s in sorted(ids) if s in self._sessions)
 
     def by_request(self, hotkey: str, request_id: str) -> SessionRecord | None:
         session_id = self._requests.get((hotkey, request_id))
@@ -553,6 +575,7 @@ class SessionBook:
                if r.state not in HOLDING and (r.closed_at or r.issued_at) < now - DAY - HOUR]
         for session_id in old:
             record = self._sessions.pop(session_id)
+            self._unindex(record)
             self._requests.pop((record.hotkey, record.request_id), None)
             self._claimed.pop(session_id, None)
         if old:
@@ -562,6 +585,16 @@ class SessionBook:
             live_keys = {(r.job_id, r.prompt_index) for r in self._sessions.values()}
             for key in [k for k in self._generations if k not in live_keys]:
                 del self._generations[key]
+
+
+def _rl_precommit_of(record: SessionRecord) -> str | None:
+    """The precommit an RL session's engagement names, or None (not an RL engagement)."""
+    from reliquary.protocol.service_episode import EpisodeWireError, parse_rl_engagement
+
+    try:
+        return parse_rl_engagement(record.engagement)[1]
+    except EpisodeWireError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -877,7 +910,7 @@ class SessionIssuer:
         try:
             now = int(self._clock())
             if precommit_sha256 is not None:
-                taken = self._precommit_taken(precommit_sha256, set(ids), now)
+                taken = self._precommit_taken(precommit_sha256, set(ids), now, hotkey)
                 if taken is not None:
                     return taken
             held: list[str] = []
@@ -892,19 +925,13 @@ class SessionIssuer:
         finally:
             self._lock.release()
 
-    def _precommit_taken(self, precommit_sha256: str, own: set[str],
-                         now: int) -> tuple[str, Refusal] | None:
-        """Another group's hold on this precommit (caller holds the issuer lock), or None."""
-        from reliquary.protocol.service_episode import EpisodeWireError, parse_rl_engagement
-
-        for record in self.book.records():
-            if record.session_id in own:
-                continue
-            try:
-                _, sha, _ = parse_rl_engagement(record.engagement)
-            except EpisodeWireError:
-                continue
-            if sha != precommit_sha256:
+    def _precommit_taken(self, precommit_sha256: str, own: set[str], now: int,
+                         hotkey: str) -> tuple[str, Refusal] | None:
+        """Another group's hold on this precommit (caller holds the issuer lock), or None. Only this
+        hotkey's sessions count (an RL session opens only on its opener's own precommit, so no other
+        hotkey's session can name it; never let one block it)."""
+        for record in self.book.of_precommit(precommit_sha256):
+            if record.session_id in own or record.hotkey != hotkey:
                 continue
             if record.state == SUBMITTED:
                 return record.session_id, Refusal("precommit_submitted",
@@ -935,6 +962,26 @@ class SessionIssuer:
             self._tokens.pop(session_id, None)
         if record is not None:
             await self._persist(record)
+
+    async def submitted_all(self, session_ids: Sequence[str]) -> None:
+        """Plan 2C: an accepted episode group's sessions, all moved to ``submitted`` under ONE hold of the
+        issuer lock (no reader sees part of the group paid), then every record written before this
+        returns (the writes run together; the caller reports acceptance only after them). A restart
+        reads them back, so the precommit stays taken (``claim_all``)."""
+        records = []
+        async with self._lock:
+            now = int(self._clock())
+            for session_id in session_ids:
+                claimed = self.book.is_claimed(session_id)
+                self.book.release_claim(session_id)
+                current = self.book.get(session_id)
+                if current is not None and current.state == LAPSED and not claimed:
+                    continue           # a lapsed session is paid only through a claim
+                record = self.book.settle(session_id, SUBMITTED, now=now, status=STATUS_GRADED)
+                self._tokens.pop(session_id, None)
+                if record is not None:
+                    records.append(record)
+        await asyncio.gather(*(self._persist(record) for record in records))
 
     def void_machine(self, machine_id: str) -> None:
         records = self.book.void_machine(machine_id, int(self._clock()))

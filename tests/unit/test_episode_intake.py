@@ -32,14 +32,20 @@ POLICY = CONTRACT.episode_policy(EPISODE)
 class Sessions:
     """The issuer's surface the intake uses; ``claim_all`` is all-or-none like ``SessionIssuer.claim_all``."""
 
+    policy = SimpleNamespace(claim_ttl_s=300)
+
     def __init__(self, refuse=None):
         self.claimed, self.released, self.paid, self.held = [], [], [], set()
         self.refuse = dict(refuse or {})
         self.fail_release = False
         self.group_keys = []
+        self.paid_calls = 0
+        self.claim_gate = self.release_gate = None      # asyncio.Event: hold the call until set
 
     async def claim_all(self, session_ids, *, hotkey, received=None, precommit_sha256=None):
         self.group_keys.append(precommit_sha256)
+        if self.claim_gate is not None:
+            await self.claim_gate.wait()
         for session_id in session_ids:
             if session_id in self.refuse:
                 return session_id, SimpleNamespace(reason=self.refuse[session_id], retry_after=None, detail={})
@@ -48,14 +54,17 @@ class Sessions:
         return None
 
     async def release_claim(self, session_id):
+        if self.release_gate is not None:
+            await self.release_gate.wait()
         if self.fail_release:
             raise RuntimeError("store down")
         self.released.append(session_id)
         self.held.discard(session_id)
 
-    async def submitted(self, session_id):
-        self.paid.append(session_id)
-        self.held.discard(session_id)
+    async def submitted_all(self, session_ids):
+        self.paid_calls += 1
+        self.paid.extend(session_ids)
+        self.held.difference_update(session_ids)
 
 
 class Outcomes:
@@ -101,6 +110,7 @@ def test_an_honest_group_is_completed_and_its_sessions_claimed(tmp_path):
     assert w.sessions.group_keys == [w.group.precommit.sha256]      # the precommit is taken with them
     asyncio.run(w.intake.settle(claim, accepted=True))
     assert w.sessions.paid == list(claim.session_ids) and w.sessions.released == []
+    assert w.sessions.paid_calls == 1                     # the whole group in one call
     assert w.outcomes.calls[-1] == {"hotkey": "5Hot", "precommit_sha256": w.group.precommit.sha256,
                                     "session_ids": claim.session_ids, "accepted": True}
 
@@ -124,13 +134,13 @@ def test_a_group_the_checker_refuses_claims_nothing(tmp_path):
 
 @pytest.mark.parametrize("claim_reason, reason, stage", [
     ("session_submitted", RejectReason.HASH_DUPLICATE, "episode_session_reused"),
-    ("session_claimed", RejectReason.WORKER_DROPPED, "episode_session_busy"),
+    ("session_claimed", RejectReason.RATE_LIMITED, "episode_group_in_flight"),
     ("session_busy", RejectReason.WORKER_DROPPED, "episode_session_busy"),
     ("session_expired", RejectReason.PRECOMMIT_EXPIRED, "episode_deadline"),
     ("session_not_submittable", RejectReason.REWARD_MISMATCH, "episode_transcript"),
     ("session_unknown", RejectReason.REWARD_MISMATCH, "episode_transcript"),
     ("precommit_submitted", RejectReason.HASH_DUPLICATE, "episode_precommit_used"),
-    ("precommit_claimed", RejectReason.WORKER_DROPPED, "episode_session_busy"),
+    ("precommit_claimed", RejectReason.RATE_LIMITED, "episode_group_in_flight"),
 ])
 def test_a_session_that_cannot_be_claimed_refuses_the_group_holding_nothing(tmp_path, claim_reason, reason,
                                                                             stage):
@@ -294,17 +304,278 @@ def test_the_server_refuses_an_episode_group_it_has_no_intake_for_and_delegates_
     assert fresh.sessions.paid == list(claim.session_ids)
 
 
-def test_the_auction_admission_runs_the_episode_intake_and_settles_its_claims():
+def test_the_auction_admission_runs_the_episode_intake_before_the_identity_reservation():
     source = inspect.getsource(ValidatorServer._process_auction_submission)
-    assert 'if getattr(prepared, "episode_pending", False) is True:' in source
-    assert "await self._admit_episode_group(" in source
-    # Only the batcher's own acceptance pays the sessions, settled in ``finally`` (every exit).
-    assert "episode_accepted = bool(response.accepted)" in source
-    assert source.index("episode_accepted = bool(response.accepted)") > source.index(
-        "response = batcher.accept_prepared_submission(")
-    finally_block = source[source.index("        finally:\n            if episode_claim is not None:"):]
-    assert finally_block.index("await self._settle_episode_claim(episode_claim, accepted=episode_accepted)") < 300
     assert source.index("await self._admit_episode_group(") < source.index("batcher.reserve_prepared_identity(")
+
+
+# -- the real auction path: settlement by the batcher's answer, after the bookkeeping ------------------
+
+def auction(tmp_path, monkeypatch, *, accept=None, on_admit=None, predecessor=None, completion=None):
+    """A real ``ValidatorServer._process_auction_submission`` over a real batcher and intake (fake
+    sessions); only the admission child and the parent's episode verification are stubbed (the latter
+    claims two sessions, as the intake would)."""
+    import hashlib
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import AsyncMock
+
+    from reliquary.protocol.submission import BatchSubmissionResponse
+    from reliquary.validator.observability import DrandRoundObservation, SubmitTelemetry
+    from reliquary.validator.selection_digest import compute_rollouts_selection_digest
+    from reliquary.validator.server import _QueuedAuctionSubmission, _UploadPrecommitReceipt
+    from tests.unit.test_validator_server import FakeEnv, _batcher, _request
+
+    batcher = _batcher()
+    monkeypatch.setattr(batcher, "reserve_prepared_identity", lambda *_a: (True, None, None))
+    monkeypatch.setattr(batcher, "start_revealed_admission", lambda *_a: (True, None))
+    monkeypatch.setattr(batcher, "accept_prepared_submission", accept or (
+        lambda prepared, **_kw: BatchSubmissionResponse(accepted=True, reason=RejectReason.SUBMITTED)))
+    monkeypatch.setattr(batcher, "finish_proof_admission", lambda *_a: None)
+    monkeypatch.setattr(type(batcher), "resolve_upload_precommit", lambda *_a, **_kw: None)
+    server = ValidatorServer()
+    server.set_active_batchers({FakeEnv.name: batcher})
+    request = _request()
+    pending = PreparedSubmission(request=request, completion_texts=[], rewards=[],
+                                 rollout_hashes=[bytes([i]) * 32 for i in range(M_ROLLOUTS)],
+                                 selection_digest=compute_rollouts_selection_digest(request.rollouts),
+                                 episode_pending=True)
+    server._run_admission_process = AsyncMock(return_value=pending)
+    w = world(tmp_path)
+    server._episode_intake = w.intake
+    claim = EpisodeClaim(request.miner_hotkey, "a" * 64, ("s-0", "s-1"))
+    admitted, finished = asyncio.Event(), []
+    real_finish = server._finish_admission_turn
+    server._finish_admission_turn = lambda item: finished.append(item) or real_finish(item)
+    receipt = _UploadPrecommitReceipt(
+        receipt_id="episode-receipt", precommit_signature="signed", miner_hotkey=request.miner_hotkey,
+        prompt_idx=request.prompt_idx, window_start=request.window_start, merkle_root=request.merkle_root,
+        checkpoint_hash=request.checkpoint_hash, environment=FakeEnv.name, payload_bytes=1,
+        payload_sha256=hashlib.sha256(b"1").hexdigest(), drand_round=request.drand_round,
+        protocol_version=request.protocol_version, nonce=request.nonce, expires_at_wall=time.time() + 30.0,
+        precommit_arrival_ts=time.time(),
+        drand_observation=DrandRoundObservation(
+            submitted_drand_round=request.drand_round, arrival_drand_round=request.drand_round, drand_delta=0,
+            drand_tolerance=0, drand_status="current", reject_reason=None),
+        batcher=batcher, consumed=True)
+
+    async def admit_stub(batcher_, receipt_, prepared, telemetry, *, deadline=None):
+        assert deadline is not None                       # the admission's deadline reaches the intake
+        prepared.episode_pending = False
+        w.sessions.claimed.extend(claim.session_ids)
+        w.sessions.held.update(claim.session_ids)
+        if on_admit is not None:
+            on_admit(receipt_)
+        admitted.set()
+        return prepared, claim
+
+    server._admit_episode_group = admit_stub
+    item = _QueuedAuctionSubmission(
+        raw_body=b"1", receipt=receipt, batcher=batcher,
+        telemetry=SubmitTelemetry.from_request(request, t_arrival=time.time()),
+        enqueued_monotonic=1.0, admission_predecessor=predecessor, admission_completion=completion)
+    pool = ThreadPoolExecutor(max_workers=1)
+    server._admission_materialization_pool = pool
+    return SimpleNamespace(server=server, batcher=batcher, item=item, receipt=receipt, w=w, claim=claim,
+                           admitted=admitted, finished=finished, pool=pool)
+
+
+async def run_auction(a):
+    try:
+        await a.server._process_auction_submission(a.item, asyncio.Queue())
+    finally:
+        a.pool.shutdown(wait=True)
+
+
+def test_an_accepted_episode_group_ends_submitted(tmp_path, monkeypatch):
+    a = auction(tmp_path, monkeypatch)
+    asyncio.run(run_auction(a))
+    assert a.receipt.outcome.accepted is True and a.finished == [a.item]
+    assert a.w.sessions.paid == list(a.claim.session_ids) and a.w.sessions.released == []
+    assert a.w.outcomes.calls[-1]["accepted"] is True
+
+
+@pytest.mark.parametrize("ending", ["batch_filled", "terminal_drain", "exception"])
+def test_an_episode_group_the_batcher_does_not_take_is_released(tmp_path, monkeypatch, ending):
+    from reliquary.protocol.submission import BatchSubmissionResponse
+
+    accept = on_admit = None
+    if ending == "batch_filled":
+        accept = lambda prepared, **_kw: BatchSubmissionResponse(accepted=False,  # noqa: E731
+                                                                 reason=RejectReason.BATCH_FILLED)
+    elif ending == "exception":
+        def accept(prepared, **_kw):
+            raise RuntimeError("batcher broke")
+    else:
+        def on_admit(receipt):
+            receipt.terminal = True
+            receipt.outcome = BatchSubmissionResponse(accepted=False, reason=RejectReason.WORKER_DROPPED)
+    a = auction(tmp_path, monkeypatch, accept=accept, on_admit=on_admit)
+    asyncio.run(run_auction(a))
+    assert a.receipt.terminal is True and a.receipt.outcome.accepted is False and a.finished == [a.item]
+    assert sorted(a.w.sessions.released) == sorted(a.claim.session_ids) and a.w.sessions.paid == []
+    assert a.w.sessions.held == set() and a.w.outcomes.calls[-1]["accepted"] is False
+
+
+def test_a_cancelled_episode_admission_finishes_its_turn_and_releases_its_sessions(tmp_path, monkeypatch):
+    """Cancelled while it waits for its ingress-order predecessor, then again while its claims are being
+    released: the admission turn, the receipt and the counters are done before the settlement, which
+    goes on to the end."""
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        predecessor, completion = loop.create_future(), loop.create_future()
+        a = auction(tmp_path, monkeypatch, predecessor=predecessor, completion=completion)
+        a.w.sessions.release_gate = asyncio.Event()
+        a.server._admission_order_tail[id(a.batcher)] = completion
+        task = asyncio.create_task(run_auction(a))
+        await asyncio.wait_for(a.admitted.wait(), 5)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()                                     # during the ingress-order wait
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done()                            # now waiting on the settlement
+        task.cancel()                                     # a second cancellation
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert a.finished == [a.item] and a.receipt.terminal is True
+        assert a.server._admission_inflight_items == {} and a.server._inflight_proofs == 0
+        assert a.w.sessions.released == []                # the settlement is still running
+        a.w.sessions.release_gate.set()
+        await asyncio.gather(*list(a.server._episode_settlements))
+        assert sorted(a.w.sessions.released) == sorted(a.claim.session_ids) and a.w.sessions.paid == []
+        predecessor.set_result(None)
+        await asyncio.sleep(0)
+        assert completion.done() and a.server._admission_order_tail == {}
+
+    asyncio.run(scenario())
+
+
+# -- bounds on the parent-side check ---------------------------------------------------------------------
+
+def test_the_claim_ttl_must_outlive_the_admission_deadline_by_a_wide_margin(tmp_path):
+    w = world(tmp_path)
+    kwargs = dict(checkers={}, precommits=dict().get, directory=lambda now: None, token_verifier=None,
+                  seen=frozenset)
+    short = Sessions()
+    short.policy = SimpleNamespace(claim_ttl_s=episode_intake.CLAIM_TTL_MARGIN * 45 - 1)
+    with pytest.raises(ValueError, match="claim ttl"):
+        EpisodeGroupIntake(sessions=short, admission_deadline_s=45, **kwargs)
+    bare = Sessions()
+    bare.policy = None
+    with pytest.raises(ValueError, match="claim ttl"):
+        EpisodeGroupIntake(sessions=bare, **kwargs)
+    EpisodeGroupIntake(sessions=w.sessions, admission_deadline_s=45, **kwargs)
+    from reliquary.sandbox.sessions import SandboxPolicy
+
+    assert SandboxPolicy().claim_ttl_s >= episode_intake.CLAIM_TTL_MARGIN * episode_intake.ADMISSION_DEADLINE_S
+
+
+def test_a_saturated_checker_refuses_retryably_without_spending_the_hotkeys_budget(tmp_path, monkeypatch):
+    import threading
+
+    w = world(tmp_path, intake_kwargs={"max_checks_per_minute": 1})
+    monkeypatch.setattr(episode_intake, "_CHECKS_RUNNING", threading.BoundedSemaphore(1))
+    assert episode_intake._CHECKS_RUNNING.acquire(blocking=False)          # another check runs
+    prepared, claim = admit(w)
+    assert claim is None and w.sessions.claimed == []
+    assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.WORKER_DROPPED, "episode_checker_busy")
+    episode_intake._CHECKS_RUNNING.release()
+    w.prepared.reject_reason = w.prepared.reject_stage = None
+    assert admit(w)[1] is not None                   # the busy refusal did not use the per-minute check
+    assert episode_intake.MAX_CHECKS_RUNNING == 3
+
+
+def test_the_deadline_cuts_the_check_and_its_slot_lasts_until_the_thread_returns(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    register_episode_env(monkeypatch)
+    w = world(tmp_path)
+    server, batcher = server_and_batcher(tmp_path)
+    server._episode_intake = w.intake
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(episode_intake, "_CHECKS_RUNNING", slots)
+    checker = w.intake._checkers[EPISODE]
+    real, gate, done = checker.check, threading.Event(), threading.Event()
+
+    def slow(*args, **kwargs):
+        try:
+            gate.wait(10)
+            return real(*args, **kwargs)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(checker, "check", slow)
+
+    async def scenario():
+        prepared, claim = await server._admit_episode_group(
+            batcher, SimpleNamespace(environment=EPISODE), w.prepared, SimpleNamespace(t_body_completed=NOW + 100),
+            deadline=time.monotonic() + 0.2)
+        assert claim is None
+        assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.WORKER_DROPPED, "episode_timeout")
+        second = dataclasses.replace(w.prepared, reject_reason=None, reject_stage=None, episode_pending=True)
+        busy, none = await w.intake.admit(environment=EPISODE, prepared=second, received=NOW + 100,
+                                          contract=CONTRACT)
+        assert none is None and busy.reject_stage == "episode_checker_busy"
+        gate.set()
+        await asyncio.to_thread(done.wait, 10)
+
+    asyncio.run(scenario())
+    for _ in range(100):
+        if slots.acquire(blocking=False):
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("the check's slot was never released")
+    slots.release()
+    assert w.sessions.claimed == []
+
+
+def test_a_deadline_during_the_claim_releases_what_the_claim_took(tmp_path):
+    w = world(tmp_path)
+
+    async def scenario():
+        w.sessions.claim_gate = asyncio.Event()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(w.intake.admit(environment=EPISODE, prepared=w.prepared, received=NOW + 100,
+                                                  contract=CONTRACT), 0.3)
+        assert w.sessions.claimed == []
+        w.sessions.claim_gate.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await asyncio.gather(*list(w.intake._tasks))
+
+    asyncio.run(scenario())
+    assert len(w.sessions.claimed) == M_ROLLOUTS and sorted(w.sessions.released) == sorted(w.sessions.claimed)
+    assert w.sessions.held == set()
+
+
+def test_a_check_that_raises_is_refused_unrefunded_and_frees_its_slot(tmp_path, monkeypatch, caplog):
+    import logging
+    import threading
+
+    w = world(tmp_path)
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(episode_intake, "_CHECKS_RUNNING", slots)
+
+    def broken(*args, **kwargs):
+        raise KeyError("renderer bug")
+
+    monkeypatch.setattr(w.intake._checkers[EPISODE], "check", broken)
+    with caplog.at_level(logging.ERROR, logger="reliquary.validator.episode_intake"):
+        prepared, claim = admit(w)
+    assert claim is None and w.sessions.claimed == []
+    assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.BAD_SCHEMA, "episode_transcript")
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+    import time
+    for _ in range(100):
+        if slots.acquire(blocking=False):
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("the slot of a failed check was never released")
 
 
 # -- the issuer's all-or-none group claim ------------------------------------------------------------
@@ -507,3 +778,58 @@ def test_one_paid_group_per_precommit_even_on_disjoint_seeds(tmp_path):
     assert not any(env.book.is_claimed(session_id) for session_id in second)
     # Another precommit is not affected.
     assert asyncio.run(env.issuer.claim_all(second, hotkey="5Hot", received=NOW, precommit_sha256="b" * 64)) is None
+
+
+def test_a_paid_group_keeps_its_precommit_taken_across_a_restart(tmp_path):
+    from reliquary.protocol.service_episode import rl_engagement
+    from reliquary.sandbox.sessions import SUBMITTED
+    from tests.unit.test_sandbox_sessions import build
+
+    env, ids = _issuer_with_sessions(tmp_path, 4)
+    sha = "c" * 64
+    for n, session_id in enumerate(ids):
+        record = dataclasses.replace(env.book.get(session_id), engagement=rl_engagement(1, sha, n),
+                                     kind="rl_precommit")
+        env.book.add(record)
+        env.store.documents[session_id] = record.to_document()
+    first, second = ids[:2], ids[2:]
+    assert asyncio.run(env.issuer.claim_all(first, hotkey="5Hot", received=NOW, precommit_sha256=sha)) is None
+    asyncio.run(env.issuer.submitted_all(first))
+    # Every session of the paid group is written before submitted_all returns.
+    assert all(env.store.documents[session_id]["state"] == SUBMITTED for session_id in first)
+    restarted = build(tmp_path / "restart", store=env.store)
+    asyncio.run(restarted.issuer.restore())
+    used = asyncio.run(restarted.issuer.claim_all(second, hotkey="5Hot", received=NOW, precommit_sha256=sha))
+    assert used is not None and used[1].reason == "precommit_submitted"
+    assert not any(restarted.book.is_claimed(session_id) for session_id in second)
+
+
+def test_only_the_submitters_own_sessions_hold_its_precommit(tmp_path):
+    from reliquary.protocol.service_episode import rl_engagement
+    from reliquary.sandbox.sessions import SUBMITTED
+
+    env, ids = _issuer_with_sessions(tmp_path, 3)
+    sha = "d" * 64
+    for n, session_id in enumerate(ids):
+        env.book.add(dataclasses.replace(env.book.get(session_id), engagement=rl_engagement(1, sha, n),
+                                         kind="rl_precommit"))
+    env.book.add(dataclasses.replace(env.book.get(ids[2]), hotkey="5Other", state=SUBMITTED))
+    assert asyncio.run(env.issuer.claim_all(ids[:2], hotkey="5Hot", received=NOW, precommit_sha256=sha)) is None
+
+
+def test_the_book_indexes_sessions_by_precommit(tmp_path, monkeypatch):
+    from reliquary.protocol.service_episode import rl_engagement
+
+    env, ids = _issuer_with_sessions(tmp_path, 3)
+    sha, other = "e" * 64, "f" * 64
+    for n, session_id in enumerate(ids):
+        env.book.add(dataclasses.replace(env.book.get(session_id), engagement=rl_engagement(1, sha, n),
+                                         kind="rl_precommit"))
+    assert [r.session_id for r in env.book.of_precommit(sha)] == sorted(ids)
+    env.book.add(dataclasses.replace(env.book.get(ids[0]), engagement=rl_engagement(1, other, 0)))
+    assert {r.session_id for r in env.book.of_precommit(sha)} == set(ids[1:])
+    assert [r.session_id for r in env.book.of_precommit(other)] == [ids[0]]
+    assert env.book.of_precommit("0" * 64) == ()
+    # The group claim reads the index, never the whole book.
+    monkeypatch.setattr(env.book, "records", lambda: (_ for _ in ()).throw(AssertionError("full scan")))
+    assert asyncio.run(env.issuer.claim_all(ids[1:], hotkey="5Hot", received=NOW, precommit_sha256=sha)) is None

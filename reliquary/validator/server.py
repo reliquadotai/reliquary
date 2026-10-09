@@ -6570,10 +6570,14 @@ class ValidatorServer:
         )
         return True
 
-    async def _admit_episode_group(self, batcher, receipt, prepared, telemetry):
+    async def _admit_episode_group(self, batcher, receipt, prepared, telemetry, *,
+                                   deadline: float | None = None):
         """Plan 2C: the parent-side half of an episode group's admission (``validator.episode_intake``):
         the child already ran the service policy (checkpoint = the window's announced one) and the
-        signatures. Returns ``(prepared, claim)``; the caller settles a claim after the batcher's answer."""
+        signatures. Returns ``(prepared, claim)``; the caller settles a claim after the batcher's answer.
+        ``deadline`` (``time.monotonic``): the admission's; the intake is cut there (retryable refusal;
+        what it claimed is released, and a running transcript check keeps its global slot until it
+        returns)."""
         def refuse(reason: RejectReason, stage: str):
             prepared.episode_pending = False
             prepared.reject_reason = reason
@@ -6609,8 +6613,27 @@ class ValidatorServer:
             received = 0.0
         if not 0.0 < received < float("inf"):
             received = time.time()
-        return await intake.admit(environment=str(receipt.environment), prepared=prepared, received=received,
-                                  contract=batcher._service_window_contract())
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            return refuse(RejectReason.WORKER_DROPPED, "episode_timeout")
+        try:
+            return await asyncio.wait_for(
+                intake.admit(environment=str(receipt.environment), prepared=prepared, received=received,
+                             contract=batcher._service_window_contract()),
+                remaining)
+        except asyncio.TimeoutError:
+            logger.warning("episode group of %s: admission deadline reached in the intake",
+                           str(getattr(receipt, "miner_hotkey", ""))[:12])
+            return refuse(RejectReason.WORKER_DROPPED, "episode_timeout")
+
+    def _start_episode_settlement(self, claim, *, accepted: bool) -> asyncio.Task:
+        """The settlement of an episode group's claims as a task of its own, kept until it ends: a
+        cancellation of the admission that awaits it never cuts it."""
+        tasks = self.__dict__.setdefault("_episode_settlements", set())
+        task = asyncio.get_running_loop().create_task(self._settle_episode_claim(claim, accepted=accepted))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
 
     async def _settle_episode_claim(self, claim, *, accepted: bool) -> None:
         intake = getattr(self, "_episode_intake", None)
@@ -6714,7 +6737,8 @@ class ValidatorServer:
                 wall_seconds=max(0.001, deadline - time.monotonic()),
             )
             if getattr(prepared, "episode_pending", False) is True:
-                prepared, episode_claim = await self._admit_episode_group(batcher, receipt, prepared, telemetry)
+                prepared, episode_claim = await self._admit_episode_group(batcher, receipt, prepared, telemetry,
+                                                                          deadline=deadline)
             if item.admission_predecessor is not None:
                 # Parsing and grading stay parallel; every state-changing
                 # post-grade decision follows observed ingress order.
@@ -6927,58 +6951,62 @@ class ValidatorServer:
                     RejectReason.WORKER_DROPPED, reject_stage
                 )
         finally:
-            if episode_claim is not None:
-                # Only the batcher's acceptance pays the sessions; any other end releases them.
-                await self._settle_episode_claim(episode_claim, accepted=episode_accepted)
             try:
-                if cancel_identity_on_exit and request is not None:
-                    batcher.cancel_logical_group_reservation(request)
-                if admission_started and request is not None:
-                    batcher.finish_proof_admission(request)
+                try:
+                    if cancel_identity_on_exit and request is not None:
+                        batcher.cancel_logical_group_reservation(request)
+                    if admission_started and request is not None:
+                        batcher.finish_proof_admission(request)
+                finally:
+                    self._finish_admission_turn(item)
+                if response is None:
+                    response = BatchSubmissionResponse(
+                        accepted=False, reason=RejectReason.WORKER_DROPPED
+                    )
+                if receipt.terminal and receipt.outcome is not None:
+                    response = receipt.outcome
+                else:
+                    self._complete_upload_receipt(receipt, response)
+                telemetry.mark_admission_finished()
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision(verified=True)
+                self._record_admission_latency(batcher, telemetry)
+                if (
+                    not response.accepted
+                    and response.reason is RejectReason.WORKER_DROPPED
+                    and (
+                        request is None
+                        or self._worker_drop_refunds_quota(request)
+                    )
+                ):
+                    self._refund_submission_quota(
+                        receipt.miner_hotkey,
+                        receipt.window_start,
+                    )
+                self._record_raw_terminal(
+                    receipt,
+                    telemetry,
+                    response,
+                    stage=reject_stage,
+                    batch_filled_reason=batch_filled_reason,
+                )
+                self._admission_active_by_environment[environment] = max(
+                    0,
+                    self._admission_active_by_environment[environment] - 1,
+                )
+                self._inflight_proofs = max(0, self._inflight_proofs - 1)
+                self._inflight_proofs_by_environment[environment] = max(
+                    0,
+                    self._inflight_proofs_by_environment[environment] - 1,
+                )
+                self._admission_inflight_items.pop(receipt.receipt_id, None)
+                self._admission_inflight_requests.pop(receipt.receipt_id, None)
             finally:
-                self._finish_admission_turn(item)
-            if response is None:
-                response = BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.WORKER_DROPPED
-                )
-            if receipt.terminal and receipt.outcome is not None:
-                response = receipt.outcome
-            else:
-                self._complete_upload_receipt(receipt, response)
-            telemetry.mark_admission_finished()
-            telemetry.refresh_from_batcher(batcher, at_decision=True)
-            telemetry.mark_decision(verified=True)
-            self._record_admission_latency(batcher, telemetry)
-            if (
-                not response.accepted
-                and response.reason is RejectReason.WORKER_DROPPED
-                and (
-                    request is None
-                    or self._worker_drop_refunds_quota(request)
-                )
-            ):
-                self._refund_submission_quota(
-                    receipt.miner_hotkey,
-                    receipt.window_start,
-                )
-            self._record_raw_terminal(
-                receipt,
-                telemetry,
-                response,
-                stage=reject_stage,
-                batch_filled_reason=batch_filled_reason,
-            )
-            self._admission_active_by_environment[environment] = max(
-                0,
-                self._admission_active_by_environment[environment] - 1,
-            )
-            self._inflight_proofs = max(0, self._inflight_proofs - 1)
-            self._inflight_proofs_by_environment[environment] = max(
-                0,
-                self._inflight_proofs_by_environment[environment] - 1,
-            )
-            self._admission_inflight_items.pop(receipt.receipt_id, None)
-            self._admission_inflight_requests.pop(receipt.receipt_id, None)
+                if episode_claim is not None:
+                    # Plan 2C, LAST: the admission turn, the receipt, the refund and the counters are done
+                    # whatever happens here. Only the batcher's acceptance pays the sessions; any other end
+                    # releases them. A tracked task: a second cancellation stops this wait, not the settlement.
+                    await asyncio.shield(self._start_episode_settlement(episode_claim, accepted=episode_accepted))
 
     async def _submit_worker(
         self,

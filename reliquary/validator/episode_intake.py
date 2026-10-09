@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from reliquary.constants import CODE_ADMISSION_WALL_SECONDS, MATH_ADMISSION_WALL_SECONDS
 from reliquary.protocol.submission import RejectReason
 from reliquary.sandbox.rl_engagements import NoOutcomes, SessionOutcomes
 from reliquary.validator.episode_admission import EpisodeGroupChecker, EpisodeRefusal, finish_prepared
@@ -25,19 +28,34 @@ logger = logging.getLogger(__name__)
 
 # The issuer's claim refusals; any other (``session_unknown``: not this hotkey's or not a session this
 # validator issued, ``session_not_submittable``) is a transcript the issuer's book contradicts.
+#
+# Retryable and refunded (WORKER_DROPPED) only when the validator itself could not answer (``session_busy``:
+# the issuer lock was not free in time). A session or a precommit held by another group of the same
+# hotkey in flight is the miner's own doing: retryable, never refunded (RATE_LIMITED).
 _CLAIM_REFUSALS = {
-    "session_claimed": (RejectReason.WORKER_DROPPED, "episode_session_busy"),
+    "session_claimed": (RejectReason.RATE_LIMITED, "episode_group_in_flight"),
     "session_busy": (RejectReason.WORKER_DROPPED, "episode_session_busy"),
     "session_submitted": (RejectReason.HASH_DUPLICATE, "episode_session_reused"),
     "session_expired": (RejectReason.PRECOMMIT_EXPIRED, "episode_deadline"),
     # Ruling: one paid group per precommit, even on disjoint seeds.
     "precommit_submitted": (RejectReason.HASH_DUPLICATE, "episode_precommit_used"),
-    "precommit_claimed": (RejectReason.WORKER_DROPPED, "episode_session_busy"),
+    "precommit_claimed": (RejectReason.RATE_LIMITED, "episode_group_in_flight"),
 }
 # Per hotkey: transcript checks (signatures, a renderer parse of M episodes) started per minute, and in
 # flight at once. A refusal before the checker (unserved env, stale directory) does not count.
 DEFAULT_MAX_CHECKS_PER_MINUTE = 30
 DEFAULT_MAX_CHECKS_IN_FLIGHT = 2
+# Every intake together: transcript checks running at once (threads of their own). A check is not
+# interruptible: a cancelled admission's check keeps its slot until its thread returns. Saturated, a
+# group is refused retryably (WORKER_DROPPED, refunded: the validator's capacity, not the miner's doing).
+MAX_CHECKS_RUNNING = 3
+_CHECKS_RUNNING = threading.BoundedSemaphore(MAX_CHECKS_RUNNING)
+_CHECK_THREADS = ThreadPoolExecutor(max_workers=MAX_CHECKS_RUNNING, thread_name_prefix="episode-check")
+# The longest admission deadline the server gives a group (``ValidatorServer._admission_wall_seconds``)
+# and how many times over a session claim must outlive it: a claim then spans the check, the ingress-order
+# wait and the batcher's answer, and only a leaked claim reaches its ttl.
+ADMISSION_DEADLINE_S = max(MATH_ADMISSION_WALL_SECONDS, CODE_ADMISSION_WALL_SECONDS)
+CLAIM_TTL_MARGIN = 4
 
 
 @dataclass(frozen=True)
@@ -80,7 +98,12 @@ class EpisodeGroupIntake:
                  seen: Callable[[], Collection[str]], outcomes: SessionOutcomes | None = None,
                  max_checks_per_minute: int = DEFAULT_MAX_CHECKS_PER_MINUTE,
                  max_checks_in_flight: int = DEFAULT_MAX_CHECKS_IN_FLIGHT,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 admission_deadline_s: float = ADMISSION_DEADLINE_S) -> None:
+        ttl = getattr(getattr(sessions, "policy", None), "claim_ttl_s", None)
+        if not isinstance(ttl, (int, float)) or ttl < CLAIM_TTL_MARGIN * float(admission_deadline_s):
+            raise ValueError(f"the session claim ttl ({ttl!r} s) must be at least {CLAIM_TTL_MARGIN}x the "
+                             f"admission deadline ({admission_deadline_s} s)")
         self._checkers = dict(checkers)
         self._precommits = precommits
         self._directory = directory
@@ -93,6 +116,7 @@ class EpisodeGroupIntake:
         self._clock = clock
         self._recent: dict[str, list[float]] = {}
         self._in_flight: dict[str, int] = {}
+        self._tasks: set[asyncio.Task] = set()
 
     @property
     def environments(self) -> tuple[str, ...]:
@@ -135,6 +159,24 @@ class EpisodeGroupIntake:
         self._report(str(request.miner_hotkey), _precommit_sha(request), session_ids, accepted=False)
         return prepared, None
 
+    def _forget_check(self, hotkey: str) -> None:
+        """A check refused for capacity does not count against the hotkey's per-minute budget."""
+        recent = self._recent.get(hotkey)
+        if recent:
+            recent.pop()
+
+    def _release_if_claimed(self, claiming: asyncio.Future, session_ids) -> None:
+        if claiming.cancelled() or claiming.exception() is not None or claiming.result() is not None:
+            return
+        self._spawn_release(session_ids)
+
+    def _spawn_release(self, session_ids) -> asyncio.Task:
+        """The release as a task of its own, kept until it ends (a cancelled caller never cuts it)."""
+        task = asyncio.get_running_loop().create_task(self._release(tuple(session_ids)))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
     async def _release(self, session_ids) -> None:
         for session_id in session_ids:
             try:
@@ -167,9 +209,26 @@ class EpisodeGroupIntake:
         self._in_flight[hotkey] = self._in_flight.get(hotkey, 0) + 1
         try:
             precommit = await asyncio.to_thread(self._precommits, sha) if sha else None
-            # Off the event loop: signatures and a renderer parse of M episodes.
-            outcome = await asyncio.to_thread(checker.check, request, precommit=precommit, directory=directory,
-                                              token_verifier=self._tokens, seen=self._seen(), received=received)
+            if not _CHECKS_RUNNING.acquire(blocking=False):
+                self._forget_check(hotkey)
+                return self._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_checker_busy",
+                                    {"running": MAX_CHECKS_RUNNING})
+            try:
+                # Off the event loop: signatures and a renderer parse of M episodes. The slot is
+                # released when the check's thread returns (or never starts), not when we stop waiting.
+                future = _CHECK_THREADS.submit(checker.check, request, precommit=precommit, directory=directory,
+                                               token_verifier=self._tokens, seen=self._seen(), received=received)
+            except BaseException:
+                _CHECKS_RUNNING.release()
+                raise
+            future.add_done_callback(lambda _done: _CHECKS_RUNNING.release())
+            try:
+                outcome = await asyncio.wrap_future(future)
+            except Exception:
+                logger.error("episode group of %s: the transcript check raised; refused", hotkey[:12],
+                             exc_info=True)
+                return self._refuse(prepared, RejectReason.BAD_SCHEMA, "episode_transcript",
+                                    {"check": "raised"})
         finally:
             left = self._in_flight.get(hotkey, 1) - 1
             if left > 0:
@@ -179,8 +238,15 @@ class EpisodeGroupIntake:
         if isinstance(outcome, EpisodeRefusal):
             return self._refuse(prepared, outcome.reason, outcome.stage, outcome.detail)
         # The checker passed, so ``sha`` is the precommit's: the precommit is taken with its sessions.
-        refused = await self._sessions.claim_all(outcome.session_ids, hotkey=request.miner_hotkey,
-                                                 received=received, precommit_sha256=sha)
+        claiming = asyncio.ensure_future(self._sessions.claim_all(
+            outcome.session_ids, hotkey=request.miner_hotkey, received=received, precommit_sha256=sha))
+        try:
+            refused = await asyncio.shield(claiming)
+        except asyncio.CancelledError:
+            # The admission's deadline (or a drain) cancelled us mid-claim: whatever the claim takes is
+            # released as soon as it has taken it.
+            claiming.add_done_callback(lambda done: self._release_if_claimed(done, outcome.session_ids))
+            raise
         if refused is not None:
             session_id, refusal = refused
             reason, stage = _CLAIM_REFUSALS.get(refusal.reason,
@@ -191,11 +257,11 @@ class EpisodeGroupIntake:
         try:
             finish_prepared(prepared, outcome, contract)
         except BaseException:
-            await asyncio.shield(self._release(claim.session_ids))
+            await asyncio.shield(self._spawn_release(claim.session_ids))
             self._report(hotkey, sha, claim.session_ids, accepted=False)
             raise
         if prepared.reject_reason is not None:
-            await asyncio.shield(self._release(claim.session_ids))
+            await asyncio.shield(self._spawn_release(claim.session_ids))
             self._report(hotkey, sha, claim.session_ids, accepted=False)
             return prepared, None
         return prepared, claim
@@ -204,19 +270,27 @@ class EpisodeGroupIntake:
         """After the batcher's answer: accepted sessions end ``submitted``; others are released (the
         miner may submit them again). Shielded: a cancellation of the caller never leaves an accepted
         group's sessions unpaid-for in the book (a stale claim would let them be claimed again)."""
-        await asyncio.shield(self._settle(claim, accepted=accepted))
+        task = asyncio.get_running_loop().create_task(self._settle(claim, accepted=accepted))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        await asyncio.shield(task)
 
     async def _settle(self, claim: EpisodeClaim, *, accepted: bool) -> None:
-        for session_id in claim.session_ids:
+        if accepted:
+            # Every session of the group moved and written together, before acceptance is reported.
             try:
-                if accepted:
-                    await self._sessions.submitted(session_id)
-                else:
-                    await self._sessions.release_claim(session_id)
+                await self._sessions.submitted_all(claim.session_ids)
             except Exception:
-                logger.exception("episode session %s not settled", session_id)
+                logger.exception("episode sessions %s not settled", ",".join(claim.session_ids))
+        else:
+            for session_id in claim.session_ids:
+                try:
+                    await self._sessions.release_claim(session_id)
+                except Exception:
+                    logger.exception("episode session %s not settled", session_id)
         self._report(claim.hotkey, claim.precommit_sha256, claim.session_ids, accepted=accepted)
 
 
-__all__ = ["DEFAULT_MAX_CHECKS_IN_FLIGHT", "DEFAULT_MAX_CHECKS_PER_MINUTE", "EpisodeClaim",
-           "EpisodeGroupIntake", "build_episode_checker"]
+__all__ = ["ADMISSION_DEADLINE_S", "CLAIM_TTL_MARGIN", "DEFAULT_MAX_CHECKS_IN_FLIGHT",
+           "DEFAULT_MAX_CHECKS_PER_MINUTE", "MAX_CHECKS_RUNNING", "EpisodeClaim", "EpisodeGroupIntake",
+           "build_episode_checker"]
