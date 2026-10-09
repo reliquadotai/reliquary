@@ -1720,3 +1720,50 @@ def test_announcement_checkpoint_values_are_type_checked(tmp_path, field, bad, m
     first["checkpoint"] = {**first["checkpoint"], field: bad}
     with pytest.raises(ValueError, match=message):
         ServicePolicyAnnouncement(**first)
+
+
+# ---------------------------------------------------------------- R31: graded audit sanction through the runtime
+
+def _settles(rt, ids):
+    return [(e["id"], e["status"], e["proof"]) for e in events(rt, "settle") if e["id"] in ids]
+
+
+@pytest.mark.parametrize("klass", ["deterministic", "statistical"])
+def test_r31_both_classes_forfeit_and_publish_the_same_events_only_the_ban_differs(tmp_path, klass):
+    rt = runtime(tmp_path)
+    first = explore(rt, hotkey="hk", prompt=7)
+    other = explore(rt, hotkey="hk", prompt=8, env=CODE)
+    draw(rt)
+    outcome = rt.record_audit(first["observation_id"], passed=False, now=10_000.0, failure_class=klass)
+    assert outcome.failed and set(outcome.forfeited) == {first["observation_id"], other["observation_id"]}
+    ids = {first["observation_id"], other["observation_id"]}
+    assert sorted(_settles(rt, ids))[-2:] == sorted([(first["observation_id"], "exploration_forfeited", "failed"),
+                                                     (other["observation_id"], "exploration_forfeited", "pending")])
+    assert not rt.log.is_scanned(MATH, 7) and not rt.log.is_scanned(CODE, 8)       # first scans released
+    assert rt.exploration_banned("hk", now=10_001.0) is (klass == "deterministic")
+    later = explore(rt, hotkey="hk", prompt=9, now=10_002.0)
+    if klass == "deterministic":
+        assert later["entitled"] is False and later["reason"] == "banned"
+    else:
+        assert later["entitled"] is True and later["forced_audit"] is True              # re-probation: 100 % audit
+
+
+def test_r31_a_statistical_failure_keeps_its_reprobation_across_a_restart(tmp_path):
+    contract = reward_contract(new_hotkey_audit_groups=0, audit_bps=10000)
+    rt = runtime(tmp_path, contract=contract)
+    seasoned = explore(rt, hotkey="hk", prompt=1, now=100.0)
+    assert seasoned["forced_audit"] is False
+    failing = explore(rt, hotkey="hk", prompt=2, now=110.0)
+    draw(rt)
+    rt.record_audit(failing["observation_id"], passed=False, now=10_000.0, failure_class="statistical")
+    rt.close()
+    restarted = build(tmp_path / "runtime.sqlite3", contract)
+    assert not restarted.exploration_banned("hk", now=10_001.0)
+    open_window(restarted, 2, now=10_002.0)
+    again = explore(restarted, hotkey="hk", prompt=3, window=2, now=10_010.0)
+    assert again["entitled"] is True and again["forced_audit"] is True
+    restarted.resolve_draws(2, beacon_for_round=lambda r: BEACON, now=20_000.0)
+    (row,) = restarted.queued_audits(2)
+    assert row["past_probation"] is False                                      # audited with the probationers
+    assert restarted.ledger.audit_log("hk")[-1]["failure_class"] == "statistical"
+    restarted.close()

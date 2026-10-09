@@ -675,6 +675,8 @@ class PendingSubmission:
     service_lane: str | None = None
     service_observation_id: str | None = None
     proof_reject_stage: str | None = None
+    # Service policy only: the forced-seed scope of a ``forced_seed`` rejection (R31 failure class).
+    proof_reject_scope: str | None = None
     # Completion-token telemetry retained for training, archives and recovery
     # of windows opened under the legacy token-weighted payment policy.
     eos_tokens: int = 0
@@ -5881,6 +5883,9 @@ class GrpoWindowBatcher:
                 grp_seed_hard_mismatch,
                 grp_seed_max_cdf_miss,
             )
+            if service_contract is not None:
+                # R31: a hard CDF mismatch is a deterministic forgery; the agreement floors are statistical.
+                pending.proof_reject_scope = scope
             return reject(RejectReason.SEED_MISMATCH, "forced_seed")
 
         # Reward-shape metrics are still computed (they feed the softer
@@ -6897,6 +6902,8 @@ class GrpoWindowBatcher:
     _AUDIT_INCONCLUSIVE_STAGES = frozenset({"service_contract", "service_proof_capability"})
 
     def _conclude_exploration_audit(self, pending, verified, caps_at_admission) -> None:
+        from reliquary.services.exploration import audit_failure_class
+
         identity = pending.service_observation_id
         if identity is None:
             logger.error("exploration audit of a group without an observation id: hotkey=%s prompt=%s",
@@ -6910,6 +6917,7 @@ class GrpoWindowBatcher:
                 logger.error("exploration audit %s: the proof found a length-capped rollout (%s) that "
                              "admission saw terminated: forged termination", identity, found)
                 passed = False
+                failure_class = audit_failure_class("forged_termination")
             elif found:
                 # Admission had no EOS to judge by (no ``eos_token_ids``): no evidence of a forgery, and
                 # the group cannot be paid on a termination the proof disputes. No verdict: the row ends
@@ -6921,6 +6929,7 @@ class GrpoWindowBatcher:
                 return
             else:
                 passed = True
+                failure_class = None
         elif pending.proof_reject_stage in self._AUDIT_INCONCLUSIVE_STAGES:
             logger.error("exploration audit %s inconclusive (%s); no verdict", identity, pending.proof_reject_stage)
             self._mark_validator_lost(identity)
@@ -6928,7 +6937,12 @@ class GrpoWindowBatcher:
             return
         else:
             passed = False
-        outcome = self._apply_audit_verdict(identity, passed)
+            failure_class = audit_failure_class(pending.proof_reject_stage,
+                                                getattr(pending, "proof_reject_scope", None))
+        if not passed:
+            logger.error("exploration audit %s failed at %s (scope %s): %s failure", identity,
+                         pending.proof_reject_stage, getattr(pending, "proof_reject_scope", None), failure_class)
+        outcome = self._apply_audit_verdict(identity, passed, failure_class=failure_class)
         if outcome.passed:
             self._set_service_row(pending, "exploration_audit_passed")
         elif outcome.failed:
@@ -6974,13 +6988,21 @@ class GrpoWindowBatcher:
         except Exception:
             logger.exception("service window %s: row %s not marked validator_lost", self.window_start, identity)
 
-    def _apply_audit_verdict(self, identity: str, passed: bool):
-        """``record_audit`` with its explicit outcome acted on: a row still awaiting the verdict is retried."""
+    def _apply_audit_verdict(self, identity: str, passed: bool, *, failure_class: str | None = None):
+        """``record_audit`` with its explicit outcome acted on: a row still awaiting the verdict is retried.
+        ``failure_class`` (R31) grades a failure; a failure without one is statistical (the lenient class)."""
         import time as _time
 
+        from reliquary.services.exploration import audit_failure_class
+
+        if not passed and failure_class is None:
+            failure_class = audit_failure_class(None)
         outcome = None
         for attempt in range(3):
-            outcome = self.service_runtime.record_audit(identity, passed=passed)
+            if passed:
+                outcome = self.service_runtime.record_audit(identity, passed=True)
+            else:
+                outcome = self.service_runtime.record_audit(identity, passed=False, failure_class=failure_class)
             if outcome.applied:
                 return outcome
             rows = {r["observation_id"]: r for r in self.service_runtime.exploration_rows(

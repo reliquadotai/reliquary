@@ -12,6 +12,14 @@ Rules a reader of the public log can rely on:
 * Probation: a group is forced to audit while its hotkey has fewer than ``new_hotkey_audit_groups``
   groups whose audit PASSED (same order, any window, any env, still entitled). Forfeited, unaudited
   and not-drawn groups never count, so a hotkey whose forced groups are never audited stays forced.
+  Re-probation (R31): after a STATISTICAL audit failure the hotkey is in probation again until it has
+  ``SERVICE_REPROBATION_PASSES`` passed audits concluded after its last statistical failure (same
+  counting rule). Both are derived from the persisted rows and the audit log, so they survive a reopen.
+* Graded sanction (R31): every failed audit forfeits the hotkey's entitlements of the window in every
+  env not yet finalized (unchanged). A ``deterministic`` failure also bans; a ``statistical`` one does
+  not, unless more than ``SERVICE_STATISTICAL_FAIL_BAN_BPS`` of the last
+  ``SERVICE_STATISTICAL_FAIL_WINDOW`` concluded audits of the hotkey (fixed denominator) failed
+  statistically. ``AUDIT_FAILURE_CLASS_BY_STAGE`` maps the proof stage that rejected to the class.
 * Audit horizon (per hotkey): when a (window, env) is finalized, every group still waiting for its
   draw or for its audit becomes ``unaudited``. If a hotkey has at least one DRAWN group, not
   forfeited, left unaudited, every ``not_drawn`` group OF THAT HOTKEY in that (window, env) whose
@@ -60,7 +68,14 @@ import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from reliquary.constants import PROBATION_PENDING_LIMIT
+import logging
+
+from reliquary.constants import (
+    PROBATION_PENDING_LIMIT,
+    SERVICE_REPROBATION_PASSES,
+    SERVICE_STATISTICAL_FAIL_BAN_BPS,
+    SERVICE_STATISTICAL_FAIL_WINDOW,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from reliquary.services.run_log import Observation, RunObservationLog
@@ -84,6 +99,53 @@ REFUSAL_REASONS = ("already_scanned", "banned", "finalized", "zero_price", "prob
 # comes back and room exists it is a new attempt (never a replay of the stale refusal).
 RETRYABLE_REFUSALS = ("cap", "probation_limit")
 MAX_AMOUNT = 1e12  # a pool, price or cap above this is not money; it also keeps every product finite
+
+logger = logging.getLogger(__name__)
+
+# Graded audit sanction (R31). THE table: proof stage that rejected an exploration audit -> failure class.
+# ``deterministic``: forgery evidence that an honest miner cannot produce (24 h ban + window forfeit).
+# ``statistical``: a threshold check an honest miner can fail by bad luck (window forfeit + re-probation;
+# ban only on recidivism). A stage not listed here is ``statistical`` (the lenient class), logged at warning.
+# ``forced_seed`` carries its scope: the hard CDF mismatch is deterministic, the agreement floors are not.
+# ``service_contract`` / ``service_proof_capability`` never reach it (inconclusive: no verdict), nor does
+# ``service_length`` (an audit raises it: the row's horizon, no verdict).
+AUDIT_FAILURE_DETERMINISTIC = "deterministic"
+AUDIT_FAILURE_STATISTICAL = "statistical"
+AUDIT_FAILURE_CLASSES = (AUDIT_FAILURE_DETERMINISTIC, AUDIT_FAILURE_STATISTICAL)
+AUDIT_FAILURE_CLASS_BY_STAGE = {
+    "grail": AUDIT_FAILURE_DETERMINISTIC,                         # proof sketch mismatch
+    "toploc": AUDIT_FAILURE_DETERMINISTIC,                        # TOPLOC proof mismatch
+    "termination": AUDIT_FAILURE_DETERMINISTIC,                   # EOS padding / forced terminal pick mismatch
+    "forged_termination": AUDIT_FAILURE_DETERMINISTIC,            # R26: proof-found cap where admission saw EOS
+    "force_span": AUDIT_FAILURE_DETERMINISTIC,                    # BFT force span not byte-exact
+    "service_seed_coverage": AUDIT_FAILURE_DETERMINISTIC,         # seed positions differ from sampled positions
+    "token_authenticity": AUDIT_FAILURE_DETERMINISTIC,            # token authenticity
+    "all_token_authenticity": AUDIT_FAILURE_DETERMINISTIC,        # token authenticity over every token
+    "forced_seed/cdf_hard_mismatch": AUDIT_FAILURE_DETERMINISTIC, # forced-seed hard CDF mismatch
+    "forced_seed/group": AUDIT_FAILURE_STATISTICAL,               # forced-seed agreement below the group floor
+    "forced_seed/rollout": AUDIT_FAILURE_STATISTICAL,             # forced-seed agreement below the rollout floor
+    "forced_seed": AUDIT_FAILURE_STATISTICAL,                     # forced-seed without a scope
+    "logprob": AUDIT_FAILURE_STATISTICAL,                         # logprob deviation threshold
+    "distribution": AUDIT_FAILURE_STATISTICAL,                    # token distribution threshold
+    "boxed_answer": AUDIT_FAILURE_STATISTICAL,                    # boxed-answer probability threshold
+    "code_semantic_auth": AUDIT_FAILURE_STATISTICAL,              # semantic token heuristic (positive reward)
+    "episode_replay_binding": AUDIT_FAILURE_STATISTICAL,          # replay spans missing (admission's state)
+}
+
+
+def audit_failure_class(stage: str | None, scope: str | None = None) -> str:
+    """The failure class of an audit rejected at ``stage`` (``scope``: the forced-seed scope), R31.
+
+    Unknown stage (or none) -> ``statistical`` (the lenient class), logged at warning."""
+    key = f"{stage}/{scope}" if scope else stage
+    found = AUDIT_FAILURE_CLASS_BY_STAGE.get(key) if key is not None else None
+    if found is None and scope:
+        found = AUDIT_FAILURE_CLASS_BY_STAGE.get(stage)
+    if found is None:
+        logger.warning("exploration audit failed at an unclassified proof stage %r (scope %r): "
+                       "treated as statistical (no ban)", stage, scope)
+        return AUDIT_FAILURE_STATISTICAL
+    return found
 
 
 def training_group_price(pool: float, *, picks_target: int, batch_slots: int) -> float:
@@ -168,9 +230,16 @@ class ExplorationLedger:
                 order_id TEXT NOT NULL, hotkey TEXT NOT NULL, until REAL NOT NULL, PRIMARY KEY(order_id, hotkey));
             CREATE TABLE IF NOT EXISTS exploration_late_failures(
                 order_id TEXT NOT NULL, observation_id TEXT NOT NULL, PRIMARY KEY(order_id, observation_id));
+            CREATE TABLE IF NOT EXISTS exploration_audit_log(
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, hotkey TEXT NOT NULL,
+                observation_id TEXT NOT NULL, verdict TEXT NOT NULL, failure_class TEXT);
+            CREATE INDEX IF NOT EXISTS exploration_audit_log_hotkey ON exploration_audit_log(order_id, hotkey, seq);
         """)
-        if "unaudited_reason" not in {r[1] for r in db.execute("PRAGMA table_info(exploration_entitlements)")}:
+        columns = {r[1] for r in db.execute("PRAGMA table_info(exploration_entitlements)")}
+        if "unaudited_reason" not in columns:
             db.execute("ALTER TABLE exploration_entitlements ADD COLUMN unaudited_reason TEXT")
+        if "failure_class" not in columns:
+            db.execute("ALTER TABLE exploration_entitlements ADD COLUMN failure_class TEXT")
 
     def banned(self, hotkey: str, now: float) -> bool:
         row = self.db.execute("SELECT until FROM exploration_bans WHERE order_id=? AND hotkey=?",
@@ -183,6 +252,60 @@ class ExplorationLedger:
         return int(self.db.execute(
             "SELECT COUNT(*) FROM exploration_entitlements WHERE order_id=? AND hotkey=? "
             "AND audit='passed' AND status<>'forfeited'", (self.order, hotkey)).fetchone()[0])
+
+    def _last_statistical_failure(self, hotkey: str) -> int | None:
+        return self.db.execute(
+            "SELECT MAX(seq) FROM exploration_audit_log WHERE order_id=? AND hotkey=? AND verdict='failed' "
+            "AND failure_class=?", (self.order, hotkey, AUDIT_FAILURE_STATISTICAL)).fetchone()[0]
+
+    def reprobation_passes(self, hotkey: str) -> int | None:
+        """R31: passed audits concluded after the hotkey's last STATISTICAL failure (rows still not
+        forfeited, as ``passed_audits``), or None when it never failed statistically."""
+        since = self._last_statistical_failure(hotkey)
+        if since is None:
+            return None
+        return int(self.db.execute(
+            "SELECT COUNT(*) FROM exploration_audit_log l JOIN exploration_entitlements e "
+            "ON e.observation_id=l.observation_id AND e.order_id=l.order_id WHERE l.order_id=? AND l.hotkey=? "
+            "AND l.verdict='passed' AND l.seq>? AND e.status<>'forfeited'", (self.order, hotkey, since)).fetchone()[0])
+
+    def in_probation(self, hotkey: str, new_hotkey_audit_groups: int) -> bool:
+        """Every group of the hotkey is forced to audit: a new hotkey (fewer than ``new_hotkey_audit_groups``
+        passed audits) or one in re-probation after a statistical failure (R31)."""
+        if self.passed_audits(hotkey) < new_hotkey_audit_groups:
+            return True
+        since = self.reprobation_passes(hotkey)
+        return since is not None and since < SERVICE_REPROBATION_PASSES
+
+    def recent_statistical_failures(self, hotkey: str) -> int:
+        """Statistical failures among the hotkey's last ``SERVICE_STATISTICAL_FAIL_WINDOW`` concluded audits."""
+        return int(self.db.execute(
+            "SELECT COUNT(*) FROM (SELECT verdict, failure_class FROM exploration_audit_log WHERE order_id=? "
+            "AND hotkey=? ORDER BY seq DESC LIMIT ?) WHERE verdict='failed' AND failure_class=?",
+            (self.order, hotkey, SERVICE_STATISTICAL_FAIL_WINDOW, AUDIT_FAILURE_STATISTICAL)).fetchone()[0])
+
+    def audit_log(self, hotkey: str) -> list[dict]:
+        """The hotkey's concluded audits in order: ``observation_id``, ``verdict``, ``failure_class``."""
+        return [{"observation_id": oid, "verdict": verdict, "failure_class": klass} for oid, verdict, klass in
+                self.db.execute("SELECT observation_id, verdict, failure_class FROM exploration_audit_log "
+                                "WHERE order_id=? AND hotkey=? ORDER BY seq", (self.order, hotkey))]
+
+    def _log_audit(self, hotkey: str, observation_id: str, verdict: str, failure_class: str | None = None) -> None:
+        self.db.execute("INSERT INTO exploration_audit_log(order_id, hotkey, observation_id, verdict, failure_class) "
+                        "VALUES(?,?,?,?,?)", (self.order, hotkey, observation_id, verdict, failure_class))
+
+    def _sanction(self, hotkey: str, observation_id: str, failure_class: str, now: float, ban_seconds: int) -> None:
+        """Log a newly applied failure and ban when its class (or the recidivism rule) says so (R31).
+        The forfeit is the caller's, identical for both classes."""
+        self._log_audit(hotkey, observation_id, "failed", failure_class)
+        if failure_class == AUDIT_FAILURE_DETERMINISTIC:
+            self._ban(hotkey, now, ban_seconds)
+            return
+        failures = self.recent_statistical_failures(hotkey)
+        if failures * 10000 > SERVICE_STATISTICAL_FAIL_BAN_BPS * SERVICE_STATISTICAL_FAIL_WINDOW:
+            logger.warning("exploration hotkey %s: %d statistical audit failures in its last %d audits; banned",
+                           hotkey, failures, SERVICE_STATISTICAL_FAIL_WINDOW)
+            self._ban(hotkey, now, ban_seconds)
 
     def entitlement(self, observation_id: str) -> dict | None:
         row = self.db.execute("SELECT amount, forced, draw_round FROM exploration_entitlements "
@@ -214,7 +337,7 @@ class ExplorationLedger:
             "AND amount<>? LIMIT 1", (self.order, window, environment, amount)).fetchone()
         if other is not None:  # counts are only money if one window has one price
             raise ValueError("exploration price changed inside a (window, env)")
-        if new_hotkey_audit_groups is not None and self.passed_audits(hotkey) < new_hotkey_audit_groups:
+        if new_hotkey_audit_groups is not None and self.in_probation(hotkey, new_hotkey_audit_groups):
             holding = self.db.execute(
                 "SELECT COUNT(*) FROM exploration_entitlements WHERE order_id=? AND window=? "
                 "AND hotkey=? AND status='reserved' AND audit NOT IN ('passed','unaudited','failed')",
@@ -240,7 +363,7 @@ class ExplorationLedger:
         if self.refusal(window=window, environment=environment, hotkey=hotkey, amount=amount, cap=cap,
                         now=now, new_hotkey_audit_groups=new_hotkey_audit_groups) is not None:
             return None
-        forced = self.passed_audits(hotkey) < new_hotkey_audit_groups
+        forced = self.in_probation(hotkey, new_hotkey_audit_groups)
         self.db.execute(
             "INSERT INTO exploration_entitlements(observation_id, order_id, window, environment, hotkey, "
             "prompt_idx, amount, draw_round, forced, audit, status, drawn) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)",
@@ -297,7 +420,8 @@ class ExplorationLedger:
             (self.order, window, hotkey))
         return self._forfeited(window, hotkey)
 
-    def apply_verdict(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int) -> tuple[str, list[str]]:
+    def apply_verdict(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int,
+                      failure_class: str = AUDIT_FAILURE_DETERMINISTIC) -> tuple[str, list[str]]:
         """Record an audit verdict; return ``(kind, ids)``.
 
         ``kind`` is ``"passed"`` (the row is audited-and-passed), ``"failed"`` (a failure was applied:
@@ -311,7 +435,13 @@ class ExplorationLedger:
         is ignored (``not_applied``); a failure of a DRAWN row counts as in any other state. In a
         finalized (window, env) no row of it changes: a late failure on a drawn, unaudited row bans
         once and forfeits the hotkey's entitlements of the window in the envs not yet finalized (R3).
+
+        R31: ``failure_class`` (``AUDIT_FAILURE_CLASSES``) grades the sanction of a failure: the forfeit is
+        the same for both classes; only a ``deterministic`` failure (or statistical recidivism) bans. Every
+        newly applied verdict is appended to the audit log (re-probation and recidivism read it).
         """
+        if not passed and failure_class not in AUDIT_FAILURE_CLASSES:
+            raise ValueError("unknown audit failure class")
         row = self.db.execute("SELECT window, hotkey, environment, audit, drawn, status FROM "
                               "exploration_entitlements WHERE observation_id=? AND order_id=?",
                               (observation_id, self.order)).fetchone()
@@ -327,7 +457,7 @@ class ExplorationLedger:
                 return "not_applied", []
             if self.db.execute("INSERT OR IGNORE INTO exploration_late_failures VALUES(?,?)",
                                (self.order, observation_id)).rowcount == 1:
-                self._ban(hotkey, now, ban_seconds)
+                self._sanction(hotkey, observation_id, failure_class, now, ban_seconds)
             return "failed", self._forfeit_open_envs(window, hotkey)
         if passed and state == "passed":
             return "passed", []
@@ -340,14 +470,18 @@ class ExplorationLedger:
             raise ValueError(f"exploration entitlement is not awaiting an audit ({state})")
         if passed:
             self.db.execute("UPDATE exploration_entitlements SET audit='passed' WHERE observation_id=?", (observation_id,))
+            self._log_audit(hotkey, observation_id, "passed")
             return "passed", []
-        self.db.execute("UPDATE exploration_entitlements SET audit='failed' WHERE observation_id=?", (observation_id,))
-        self._ban(hotkey, now, ban_seconds)
+        self.db.execute("UPDATE exploration_entitlements SET audit='failed', failure_class=? WHERE observation_id=?",
+                        (failure_class, observation_id))
+        self._sanction(hotkey, observation_id, failure_class, now, ban_seconds)
         return "failed", self._forfeit_open_envs(window, hotkey)
 
-    def record_audit(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int) -> list[str]:
+    def record_audit(self, observation_id: str, *, passed: bool, now: float, ban_seconds: int,
+                     failure_class: str = AUDIT_FAILURE_DETERMINISTIC) -> list[str]:
         """``apply_verdict`` without the kind: the ids whose first scan the caller must release."""
-        return self.apply_verdict(observation_id, passed=passed, now=now, ban_seconds=ban_seconds)[1]
+        return self.apply_verdict(observation_id, passed=passed, now=now, ban_seconds=ban_seconds,
+                                  failure_class=failure_class)[1]
 
     def mark_unaudited(self, observation_id: str, reason: str = UNAUDITED_HORIZON) -> None:
         if reason not in UNAUDITED_REASONS:
@@ -574,12 +708,14 @@ def record_exploration(log: "RunObservationLog", ledger: ExplorationLedger, obs:
 
 
 def apply_exploration_verdict(log: "RunObservationLog", ledger: ExplorationLedger, observation_id: str, *,
-                              passed: bool, now: float, ban_seconds: int) -> tuple[str, list[str]]:
+                              passed: bool, now: float, ban_seconds: int,
+                              failure_class: str = AUDIT_FAILURE_DETERMINISTIC) -> tuple[str, list[str]]:
     """Record an audit verdict and release the first scan of every forfeited id, atomically.
 
     Returns ``(kind, forfeited_ids)``, kind being ``passed`` / ``failed`` / ``not_applied``."""
     with _Atomic(_same_store(log, ledger)):
-        kind, forfeited = ledger.apply_verdict(observation_id, passed=passed, now=now, ban_seconds=ban_seconds)
+        kind, forfeited = ledger.apply_verdict(observation_id, passed=passed, now=now, ban_seconds=ban_seconds,
+                                               failure_class=failure_class)
         for identity in forfeited:
             log.release_first_scan(identity)
         return kind, forfeited

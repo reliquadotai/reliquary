@@ -869,6 +869,17 @@ SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS = 50_000
 # A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
 # passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
 PROBATION_PENDING_LIMIT = 4
+# Graded audit sanction (R31). A DETERMINISTIC forgery (proof/TOPLOC mismatch, token authenticity, forged
+# termination, forced-seed hard CDF mismatch) bans for the order's ``ban_seconds`` and forfeits the window.
+# A STATISTICAL-only failure (threshold checks: forced-seed agreement floors, logprob, distribution, ...)
+# forfeits the window, does NOT ban, and puts the hotkey back in probation (100 % audit) until it has
+# ``SERVICE_REPROBATION_PASSES`` new passed audits counted from that failure. Recidivism: the ban applies
+# when more than ``SERVICE_STATISTICAL_FAIL_BAN_BPS`` of ``SERVICE_STATISTICAL_FAIL_WINDOW`` (the fixed
+# denominator) of the hotkey's last concluded audits failed statistically, i.e. > 5 of the last 50.
+# TO RECALIBRATE at qualification from the measured honest false-reject rate of the statistical stages.
+SERVICE_REPROBATION_PASSES = 20
+SERVICE_STATISTICAL_FAIL_BAN_BPS = 1000
+SERVICE_STATISTICAL_FAIL_WINDOW = 50
 # Exploration audits (decision C, R15). They run as they are drawn on a plan of their own at
 # ``SERVICE_EXPLORATION_AUDIT_PRIORITY``. At most ``..._INFLIGHT`` are handed to the proof scheduler at a
 # time, so the queue order (past-probation hotkeys first) is decided at the last moment; of every

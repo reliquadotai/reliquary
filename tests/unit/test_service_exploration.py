@@ -1185,3 +1185,206 @@ def test_r25_an_old_ledger_without_the_reason_column_is_migrated_and_reads_as_ho
     assert book.unaudited_reason(oid(1)) == "unaudited"          # an old row set the horizon, as it did
     with book.db:
         book.mark_unaudited(oid(1), "validator_lost")            # the new column works on the migrated table
+
+
+# ---------------------------------------------------------------- R31: graded audit sanction
+
+from reliquary.constants import (  # noqa: E402
+    SERVICE_REPROBATION_PASSES, SERVICE_STATISTICAL_FAIL_BAN_BPS, SERVICE_STATISTICAL_FAIL_WINDOW,
+)
+from reliquary.services.exploration import (  # noqa: E402
+    AUDIT_FAILURE_CLASS_BY_STAGE, AUDIT_FAILURE_DETERMINISTIC as DET, AUDIT_FAILURE_STATISTICAL as STAT,
+    audit_failure_class,
+)
+
+
+def _dir(path):
+    path.mkdir()
+    return path
+
+
+def concluded(book, i, passed, *, klass=STAT, hotkey="hk", env="math", groups=0, now=1000.0):
+    """One drawn row of ``hotkey`` in window ``i`` (alone in its window), then its verdict."""
+    assert reserve(book, i, hotkey=hotkey, env=env, window=i, groups=groups) is not None
+    draw(book, env=env, window=i, audit_bps=10000)
+    with book.db:
+        return book.apply_verdict(oid(i), passed=passed, now=now, ban_seconds=DAY, failure_class=klass)
+
+
+def test_r31_the_constants_are_the_decided_ones():
+    assert (SERVICE_REPROBATION_PASSES, SERVICE_STATISTICAL_FAIL_BAN_BPS, SERVICE_STATISTICAL_FAIL_WINDOW) == (20, 1000, 50)
+
+
+def test_r31_a_deterministic_failure_bans_and_forfeits_and_starts_no_reprobation(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1, groups=0)
+    reserve(book, 2, env="code", groups=0)
+    draw(book, audit_bps=10000)
+    draw(book, env="code", audit_bps=10000)
+    with book.db:
+        kind, ids = book.apply_verdict(oid(1), passed=False, now=1000.0, ban_seconds=DAY, failure_class=DET)
+    assert kind == "failed" and set(ids) == {oid(1), oid(2)}            # every open env of the window
+    assert book.banned("hk", 1000.0 + DAY - 1)
+    assert book.audit_log("hk") == [{"observation_id": oid(1), "verdict": "failed", "failure_class": DET}]
+    assert book.reprobation_passes("hk") is None and not book.in_probation("hk", 0)
+
+
+def test_r31_a_statistical_failure_forfeits_the_same_rows_without_a_ban_and_reprobates(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1, groups=0)
+    reserve(book, 2, env="code", groups=0)
+    reserve(book, 3, hotkey="other", groups=0)
+    draw(book, audit_bps=10000)
+    draw(book, env="code", audit_bps=10000)
+    assert not book.in_probation("hk", 0)
+    with book.db:
+        kind, ids = book.apply_verdict(oid(1), passed=False, now=1000.0, ban_seconds=DAY, failure_class=STAT)
+    assert kind == "failed" and set(ids) == {oid(1), oid(2)}            # the forfeit is unchanged
+    assert states(book)[1] == ("failed", "forfeited") and states(book, env="code")[2][1] == "forfeited"
+    assert states(book)[3] == ("queued", "reserved")                      # another hotkey is untouched
+    assert not book.banned("hk", 1000.0)                                 # no ban
+    assert book.db.execute("SELECT failure_class FROM exploration_entitlements WHERE observation_id=?",
+                           (oid(1),)).fetchone()[0] == STAT
+    assert book.audit_log("hk") == [{"observation_id": oid(1), "verdict": "failed", "failure_class": STAT}]
+    # re-probation: 100 % audit, and the probation pending limit binds again
+    assert book.in_probation("hk", 0) and book.reprobation_passes("hk") == 0
+    for i in range(10, 10 + PROBATION_PENDING_LIMIT):
+        assert reserve(book, i, window=2, groups=0)["forced"] is True
+    assert book.refusal(window=2, environment="math", hotkey="hk", amount=0.1, cap=1.0,
+                        new_hotkey_audit_groups=0) == "probation_limit"
+    assert reserve(book, 20, window=2, groups=0) is None
+    assert reserve(book, 21, window=2, hotkey="other", groups=0)["forced"] is False
+
+
+def test_r31_reprobation_lifts_after_20_passes_counted_from_the_failure_only(tmp_path):
+    book = ledger(tmp_path)
+    for i in range(1, 31):                                               # 30 passes BEFORE the failure
+        assert concluded(book, i, True)[0] == "passed"
+    assert concluded(book, 31, False)[0] == "failed"
+    assert book.passed_audits("hk") == 30 and book.in_probation("hk", 0)   # old passes do not lift it
+    for i in range(32, 32 + SERVICE_REPROBATION_PASSES - 1):
+        concluded(book, i, True)
+        assert book.in_probation("hk", 0)
+        assert reserve(book, 1000 + i, window=i, groups=0)["forced"] is True   # 100 % audit throughout
+    assert book.reprobation_passes("hk") == SERVICE_REPROBATION_PASSES - 1
+    concluded(book, 200, True)                                           # the 20th new pass
+    assert book.reprobation_passes("hk") == SERVICE_REPROBATION_PASSES
+    assert not book.in_probation("hk", 0)
+    assert reserve(book, 2000, window=500, groups=0)["forced"] is False
+    # a replayed pass is not a new pass
+    with book.db:
+        assert book.apply_verdict(oid(200), passed=True, now=1000.0, ban_seconds=DAY) == ("passed", [])
+    assert book.reprobation_passes("hk") == SERVICE_REPROBATION_PASSES
+    # a deterministic failure does not restart the re-probation count (it bans instead)
+    concluded(book, 201, False, klass=DET)
+    assert not book.in_probation("hk", 0) and book.banned("hk", 1000.0)
+
+
+def test_r31_a_new_hotkey_stays_in_probation_while_either_counter_holds_it(tmp_path):
+    book = ledger(tmp_path)
+    for i in range(1, 4):
+        concluded(book, i, True, groups=100)
+    concluded(book, 4, False, groups=100)
+    for i in range(5, 5 + SERVICE_REPROBATION_PASSES):
+        concluded(book, i, True, groups=100)
+    assert book.reprobation_passes("hk") == SERVICE_REPROBATION_PASSES
+    assert book.in_probation("hk", 100)                                  # 23 < 100: still a new hotkey
+    assert not book.in_probation("hk", 23)
+
+
+def test_r31_an_honest_single_statistical_failure_never_bans(tmp_path):
+    book = ledger(tmp_path)
+    assert concluded(book, 1, False, groups=100)[0] == "failed"          # its very first audit: 1 of 1
+    assert not book.banned("hk", 1000.0)
+    for i in range(2, 60):
+        concluded(book, i, True)
+    concluded(book, 60, False)                                           # one more, far apart
+    assert not book.banned("hk", 1000.0)
+
+
+def test_r31_recidivism_bans_above_the_threshold_and_not_at_it(tmp_path):
+    allowed = SERVICE_STATISTICAL_FAIL_BAN_BPS * SERVICE_STATISTICAL_FAIL_WINDOW // 10000   # 5 of 50
+    book = ledger(tmp_path)
+    for i in range(1, allowed + 1):
+        concluded(book, i, False)
+    assert book.recent_statistical_failures("hk") == allowed
+    assert not book.banned("hk", 1000.0)                                 # exactly 10 %: not more than it
+    concluded(book, allowed + 1, False, now=2000.0)                      # 6 of the last 50: banned
+    assert book.banned("hk", 2000.0 + DAY - 1) and not book.banned("hk", 2000.0 + DAY)
+    # the window slides: a failure older than the last 50 audits no longer counts
+    other = ledger(_dir(tmp_path / "slide"))
+    concluded(other, 1, False, hotkey="hk")
+    for i in range(2, 2 + SERVICE_STATISTICAL_FAIL_WINDOW - allowed):    # 45 passes
+        concluded(other, i, True, hotkey="hk")
+    for i in range(100, 100 + allowed):                                  # failures 2..6; the first slid out
+        concluded(other, i, False, hotkey="hk")
+    assert other.recent_statistical_failures("hk") == allowed
+    assert not other.banned("hk", 1000.0)
+    # deterministic failures are not statistical: they never count towards recidivism
+    third = ledger(_dir(tmp_path / "det"))
+    for i in range(1, allowed + 1):
+        concluded(third, i, False, klass=DET, now=float(i))
+    concluded(third, 50, False, now=10 * DAY)
+    assert third.recent_statistical_failures("hk") == 1 and not third.banned("hk", 10 * DAY)
+
+
+def test_r31_a_late_statistical_failure_forfeits_open_envs_without_ban_once(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1, groups=100)
+    reserve(book, 2, env="code", groups=100)
+    draw(book)
+    draw(book, env="code")
+    finalize(book)                                                       # math: drawn, never audited
+    before = book.rows(1, environment="math")
+    with book.db:
+        kind, ids = book.apply_verdict(oid(1), passed=False, now=10.0, ban_seconds=100, failure_class=STAT)
+    assert (kind, ids) == ("failed", [oid(2)])
+    assert book.rows(1, environment="math") == before and not book.banned("hk", 50.0)
+    with book.db:
+        assert book.apply_verdict(oid(1), passed=False, now=20.0, ban_seconds=100, failure_class=STAT)[0] == "failed"
+    assert len(book.audit_log("hk")) == 1                                # the replay is not a second failure
+    assert book.in_probation("hk", 0)
+
+
+def test_r31_the_failure_class_and_reprobation_survive_reopen(tmp_path):
+    book = ledger(tmp_path)
+    for i in range(1, 4):
+        concluded(book, i, True)
+    concluded(book, 4, False)
+    for i in range(5, 12):
+        concluded(book, i, True)
+    log, passes = book.audit_log("hk"), book.reprobation_passes("hk")
+    book.db.close()
+    reopened = ledger(tmp_path)
+    assert reopened.audit_log("hk") == log and reopened.reprobation_passes("hk") == passes == 7
+    assert reopened.in_probation("hk", 0) and reserve(reopened, 99, window=99, groups=0)["forced"] is True
+    for i in range(12, 12 + SERVICE_REPROBATION_PASSES - 7):
+        concluded(reopened, i, True)
+    assert not reopened.in_probation("hk", 0)
+
+
+def test_r31_an_unknown_failure_class_is_refused(tmp_path):
+    book = ledger(tmp_path)
+    reserve(book, 1)
+    draw(book)
+    with pytest.raises(ValueError, match="failure class"):
+        with book.db:
+            book.apply_verdict(oid(1), passed=False, now=1.0, ban_seconds=DAY, failure_class="lenient")
+    assert states(book)[1] == ("queued", "reserved")
+
+
+def test_r31_stage_classification_table_and_unknown_stages_are_lenient_with_a_warning(caplog):
+    import logging
+    for stage in ("grail", "toploc", "termination", "forged_termination", "token_authenticity",
+                  "all_token_authenticity", "force_span", "service_seed_coverage"):
+        assert audit_failure_class(stage) == DET
+    assert audit_failure_class("forced_seed", "cdf_hard_mismatch") == DET
+    for stage, scope in (("forced_seed", "group"), ("forced_seed", "rollout"), ("forced_seed", None),
+                         ("logprob", None), ("distribution", None), ("boxed_answer", None),
+                         ("code_semantic_auth", None), ("episode_replay_binding", None)):
+        assert audit_failure_class(stage, scope) == STAT
+    assert set(AUDIT_FAILURE_CLASS_BY_STAGE.values()) == {DET, STAT}
+    with caplog.at_level(logging.WARNING, logger="reliquary.services.exploration"):
+        assert audit_failure_class("a_stage_added_later") == STAT
+        assert audit_failure_class(None) == STAT
+    assert sum("unclassified proof stage" in r.getMessage() for r in caplog.records) == 2

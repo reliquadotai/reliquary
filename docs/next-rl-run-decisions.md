@@ -89,6 +89,12 @@ Decision:
     the window's draw is known.
   - **Sanction** on a failed audit: forfeit all exploration earnings of the period, and
     no exploration for **24 h**.
+    Graded (user decision 10-09): only a DETERMINISTIC forgery (proof/TOPLOC mismatch, token
+    authenticity, forged termination, forced-seed hard CDF mismatch) bans for 24 h. A
+    STATISTICAL-only failure (threshold checks) forfeits the same earnings, does not ban, and
+    puts the hotkey back at 100 % audit until 20 new audits pass; it bans only when more than
+    10 % of its last 50 audits failed statistically (to recalibrate at qualification from the
+    measured honest false-reject rate). An unclassified stage counts as statistical.
   - A separate exploration proof budget, lower priority than training (never starves
     it).
   - Published observations carry `audited` / `pending` / `unproven`.

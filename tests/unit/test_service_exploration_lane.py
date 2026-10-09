@@ -1819,3 +1819,86 @@ async def test_end_to_end_v2_window_seal_settle_json_replay_equals_the_runtime_m
     (out,) = WeightOnlyValidator._validated_service_archives([record], declared)
     assert out["rewards_by_hotkey"] == pytest.approx(result["rewards_by_hotkey"], abs=1e-12)
     assert b.difficulty_auction_metadata_by_id[id(explored)]["status"] == "exploration_audit_passed"
+
+
+# ---------------------------------------------------------------- R31: graded audit sanction (batcher)
+
+def _audit_scoped(b, pending, *, stage, scope=None):
+    def prove(p, model=None, audit=False):
+        assert audit is True
+        p.proof_reject_stage = stage
+        p.proof_reject_scope = scope
+        return None
+    b._verify_expensive = prove
+    return b._execute_exploration_audit(pending, model=None)
+
+
+@pytest.mark.parametrize("stage, scope, banned", [
+    ("grail", None, True), ("toploc", None, True), ("termination", None, True),
+    ("token_authenticity", None, True), ("forced_seed", "cdf_hard_mismatch", True),
+    ("forced_seed", "group", False), ("forced_seed", "rollout", False), ("logprob", None, False),
+    ("distribution", None, False), ("boxed_answer", None, False),
+])
+def test_r31_the_rejecting_stage_decides_ban_or_reprobation_the_forfeit_is_the_same(tmp_path, stage, scope, banned):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    sibling = make_pending(rt, hotkey="hk", prompt=9)
+    arrive(b, sibling)
+    ready(rt)
+    tick(b)
+    _audit_scoped(b, pending, stage=stage, scope=scope)
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+    assert b.difficulty_auction_metadata_by_id[id(sibling)]["status"] == "exploration_forfeited"
+    assert rt.exploration_banned("hk") is banned
+    (entry,) = rt.ledger.audit_log("hk")
+    assert entry["failure_class"] == ("deterministic" if banned else "statistical")
+    threshold = rt.contract.reward_policy["new_hotkey_audit_groups"]
+    assert rt.ledger.in_probation("hk", threshold)
+
+
+def test_r31_a_statistical_failure_puts_a_seasoned_hotkey_back_at_100_percent_audit(tmp_path):
+    rt = make_runtime(tmp_path, reward_contract(new_hotkey_audit_groups=0, audit_bps=0))
+    b = make_batcher(rt)
+    first = make_pending(rt, hotkey="hk", prompt=7)
+    arrive(b, first)
+    assert rt.ledger.entitlement(first.service_observation_id)["forced"] is False   # seasoned: sampled audit
+    with rt.lock, rt.db:
+        rt.db.execute("UPDATE exploration_entitlements SET audit='queued', drawn=1 WHERE observation_id=?",
+                      (first.service_observation_id,))                         # drawn by the 15 % sample
+    _audit_scoped(b, first, stage="logprob")
+    assert not rt.exploration_banned("hk")
+    second = make_pending(rt, hotkey="hk", prompt=11)
+    arrive(b, second)
+    assert rt.ledger.entitlement(second.service_observation_id)["forced"] is True    # re-probation
+
+
+def test_r31_an_unclassified_stage_is_statistical_and_logged(tmp_path, caplog):
+    rt, b, pending = _drawn(tmp_path, "hk")
+    with caplog.at_level(logging.WARNING, logger="reliquary.services.exploration"):
+        _audit_scoped(b, pending, stage="a_future_stage")
+    assert not rt.exploration_banned("hk")
+    assert b.difficulty_auction_metadata_by_id[id(pending)]["status"] == "exploration_forfeited"
+    assert any("unclassified proof stage" in r.getMessage() for r in caplog.records)
+
+
+def test_r31_a_forged_termination_found_by_the_audit_is_deterministic(tmp_path, monkeypatch):
+    monkeypatch.setattr("reliquary.shared.modeling.resolve_eos_token_ids", lambda model, tokenizer: {99})
+    rt, b, pending = _drawn(tmp_path, "forger")
+    pending.request.rollouts[LAST].commit["tokens"] = [1] + [2] * 10 + [99]
+    _cap_found_by_the_proof(b)
+    b._execute_exploration_audit(pending, model=None)
+    assert rt.ledger.audit_log("forger")[-1]["failure_class"] == "deterministic"
+
+
+def test_r31_every_stage_an_audit_can_reject_at_is_in_the_classification_table():
+    import inspect
+    import re
+    from reliquary.services.exploration import AUDIT_FAILURE_CLASS_BY_STAGE
+
+    source = inspect.getsource(GrpoWindowBatcher._verify_expensive)
+    stages = set(re.findall(r'reject\(\s*RejectReason\.\w+,\s*"([a-z_]+)"', source))
+    assert {"grail", "toploc", "logprob", "forced_seed", "termination"} <= stages      # the regex sees them
+    no_verdict = set(GrpoWindowBatcher._AUDIT_INCONCLUSIVE_STAGES) | {"service_length", "service_signal"}
+    assert stages - no_verdict <= set(AUDIT_FAILURE_CLASS_BY_STAGE), stages - no_verdict - set(AUDIT_FAILURE_CLASS_BY_STAGE)
+    # the forced-seed scope reaches the classification on the service path only
+    assert "if service_contract is not None:\n                # R31" in source
+    assert "pending.proof_reject_scope = scope" in source

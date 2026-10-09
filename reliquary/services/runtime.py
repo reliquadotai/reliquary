@@ -60,7 +60,7 @@ from reliquary.protocol.service_contract import (
 from reliquary.protocol.service_schedule import ServiceSchedule, initial_schedule
 from reliquary.services.admission_policy import missing_box_problems
 from reliquary.services.exploration import (
-    AUDIT_DRAW_ROUND_OFFSET, STATUS_FORFEITED, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger,
+    AUDIT_DRAW_ROUND_OFFSET, AUDIT_FAILURE_DETERMINISTIC, STATUS_FORFEITED, STATUS_PENDING, STATUS_UNPAID, ExplorationLedger,
     UNAUDITED_HORIZON, UNAUDITED_VALIDATOR_LOST, apply_exploration_verdict, exploration_cap, exploration_price,
     finalize_exploration, record_exploration,
 )
@@ -91,7 +91,8 @@ class AuditOutcome:
     """What ``ServiceRuntime.record_audit`` did with one verdict.
 
     ``kind``: ``"passed"`` (the group is audited-and-passed), ``"failed"`` (a failure was applied:
-    the hotkey is banned and ``forfeited`` holds the ids it lost, their first scans released) or
+    ``forfeited`` holds the ids the hotkey lost, their first scans released; banned or put in
+    re-probation according to the failure class, R31) or
     ``"not_applied"`` (nothing changed: unknown id, row not awaiting an audit, a verdict that is
     moot after finalize or on a row already unaudited, or SQLite busy -- the caller may retry).
     """
@@ -1196,7 +1197,7 @@ class ServiceRuntime:
         """The audits to run, in the order to run them. Rebuilt from the ledger on every call.
 
         Rows drawn for audit, still entitled, in a (window, env) not yet finalized. Hotkeys past
-        probation (``passed_audits >= new_hotkey_audit_groups``) come first, then ascending draw
+        probation (``passed_audits >= new_hotkey_audit_groups`` and not in re-probation, R31) come first, then ascending draw
         round, then reservation order. Each row: ``observation_id``, ``environment``, ``hotkey``,
         ``prompt_idx``, ``draw_round``, ``forced``, ``past_probation``. A row whose prompt was
         trained in the window is listed like any other: R17 voids its pay, not its audit.
@@ -1212,7 +1213,7 @@ class ServiceRuntime:
                         continue
                     hotkey = row["hotkey"]
                     if hotkey not in seasoned:
-                        seasoned[hotkey] = self.ledger.passed_audits(hotkey) >= threshold
+                        seasoned[hotkey] = not self.ledger.in_probation(hotkey, threshold)
                     rows.append(((not seasoned[hotkey], row["draw_round"], env, position), {
                         "observation_id": row["observation_id"], "environment": env, "hotkey": hotkey,
                         "prompt_idx": row["prompt_idx"], "draw_round": row["draw_round"],
@@ -1242,7 +1243,8 @@ class ServiceRuntime:
         return self.db.execute("SELECT window, environment, audit, status FROM exploration_entitlements "
                                "WHERE observation_id=? AND order_id=?", (identity, self.contract.sha256)).fetchone()
 
-    def record_audit(self, identity: str, *, passed: bool, now: float | None = None) -> AuditOutcome:
+    def record_audit(self, identity: str, *, passed: bool, now: float | None = None,
+                     failure_class: str = AUDIT_FAILURE_DETERMINISTIC) -> AuditOutcome:
         """Apply one audit verdict; return an ``AuditOutcome`` (passed / failed + forfeited ids / not_applied).
 
         One transaction: the verdict, the release of every forfeited first scan and the public
@@ -1256,6 +1258,10 @@ class ServiceRuntime:
 
         Never raises on a verdict it cannot apply (unknown id, row not awaiting an audit, SQLite
         busy): it logs at error level with the observation id and returns ``not_applied``.
+
+        R31: ``failure_class`` grades a failure (``audit_failure_class`` of the rejecting proof stage):
+        the forfeit and its public ``exploration_forfeited`` events are the same for both classes; a
+        ``statistical`` failure does not ban (unless recidivist) and puts the hotkey in re-probation.
         """
         if type(passed) is not bool:
             raise ValueError("an audit verdict is a boolean")
@@ -1264,7 +1270,7 @@ class ServiceRuntime:
             with self._txn():
                 kind, forfeited = apply_exploration_verdict(
                     self.log, self.ledger, identity, passed=passed, now=instant,
-                    ban_seconds=self.contract.reward_policy["ban_seconds"])
+                    ban_seconds=self.contract.reward_policy["ban_seconds"], failure_class=failure_class)
                 if kind == "passed":
                     entry = self._entitlement_row(identity)
                     # Only a row still entitled is "pending": never after its forfeit (M1).
