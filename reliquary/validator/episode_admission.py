@@ -281,12 +281,11 @@ class EpisodeGroupChecker:
             return None
         tokens = verified.tokens
         start, end = verified.spans[-1]
-        cap = min(policy.max_tokens_per_turn, policy.max_episode_tokens - start)
-        if end - start == cap:
-            return None                                     # (a) the turn ran exactly to its cap
+        if end == policy.max_episode_tokens:                # span length == max_episode_tokens - start (absolute)
+            return None                                     # (a) the turn ran to the EPISODE cap, not a per-turn cap
         last = tokens[start:end]
         if not last or last[-1] != renderer.terminator_id:
-            return "the last turn neither reached its cap nor ended on the turn terminator"
+            return "the last turn neither reached the episode cap nor ended on the turn terminator"
         pairs = list(renderer.tool_calls(last))
         if not pairs:
             return "a turn without calls ends the episode: agent_completed, not context_length"

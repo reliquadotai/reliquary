@@ -58,9 +58,10 @@ def test_an_honest_group_gives_the_final_records_rewards(tmp_path):
 
 
 def test_an_episode_cut_by_a_limit_is_a_normal_episode(tmp_path):
-    # The last turn runs exactly to the per-turn cap with no stop token: the harness stopped it.
+    # The last turn runs exactly to the EPISODE cap with no stop token: the harness stopped it.
     w = world(tmp_path, last=[TEXT] * 11, stop="context_length")
-    facts = w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=11))
+    tokens, _, _ = _last_turn(w)
+    facts = w.check(policy=dataclasses.replace(POLICY, max_episode_tokens=len(tokens)))
     assert isinstance(facts, EpisodeGroupFacts), facts
     assert list(facts.rewards) == w.group.rewards
 
@@ -299,19 +300,27 @@ def test_an_early_cut_claimed_as_context_length_is_refused(tmp_path):
 
 
 def test_an_honest_cap_hit_after_calls_is_admitted(tmp_path):
-    # H1 (a): the last turn ran exactly to its cap, with a call in it the gateway executed.
+    # H1 (a): the last turn ran exactly to the episode cap, with a call in it the gateway executed.
     from tests.unit.test_trajectory_parse import CALL
 
     w = world(tmp_path, last=[TEXT] * 10 + [CALL], last_calls=1, stop="context_length")
-    facts = w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=11))
-    assert isinstance(facts, EpisodeGroupFacts), facts
-    assert list(facts.rewards) == w.group.rewards
-    # The cap of the episode budget: the turn ends exactly at max_episode_tokens.
     tokens, _, _ = _last_turn(w)
     assert isinstance(w.check(policy=dataclasses.replace(POLICY, max_episode_tokens=len(tokens))),
                       EpisodeGroupFacts)
-    # One token short of the cap, with no terminator: a cut, not a limit.
-    refused(w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=12)), RejectReason.BAD_TERMINATION,
+    # One token short of the episode cap, with no terminator: a cut, not a limit.
+    refused(w.check(policy=dataclasses.replace(POLICY, max_episode_tokens=len(tokens) + 1)),
+            RejectReason.BAD_TERMINATION, "episode_termination")
+
+
+def test_a_per_turn_cap_hit_far_from_the_episode_cap_is_refused(tmp_path):
+    # Ruling: a per-turn cap is no episode limit, an honest harness goes on to the next turn.
+    from tests.unit.test_trajectory_parse import CALL
+
+    w = world(tmp_path, last=[TEXT] * 10 + [CALL], last_calls=1, stop="context_length")
+    refused(w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=11)), RejectReason.BAD_TERMINATION,
+            "episode_termination")
+    w = world(tmp_path / "plain", last=[TEXT] * 11, stop="context_length")
+    refused(w.check(policy=dataclasses.replace(POLICY, max_tokens_per_turn=11)), RejectReason.BAD_TERMINATION,
             "episode_termination")
 
 
