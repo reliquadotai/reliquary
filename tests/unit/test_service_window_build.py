@@ -1564,3 +1564,25 @@ async def test_j3_a_window_healed_after_a_restart_has_no_batcher_and_still_compl
     assert [call for call in healed["records"] if call[0] == 1 and call[1]] == []   # no verdict republished
     assert svc._service_runtime.window_disposition(1) == "settled"
     assert svc._service_recovery_context == {} and svc._service_recovery_attempts == {}
+
+
+def test_n3_a_service_boot_withholds_the_prompt_from_every_verdict_and_a_legacy_boot_does_not(monkeypatch, tmp_path):
+    from reliquary.protocol.submission import RejectReason
+    from reliquary.validator.observability import SubmitTelemetry
+
+    telemetry = SubmitTelemetry(window_n=1, prompt_idx=5, hotkey="hk", merkle_root="ab" * 32, protocol_version=6,
+                                submitted_drand_round=1, t_arrival=1.0, prompt_hash_lead="feedbeef",
+                                merkle_root_lead="abab")
+    contract = _bootable_contract()
+    _persisted_folder(tmp_path).chmod(0o700)
+    svc = _boot(monkeypatch, tmp_path, contract, loaded=[MATH, CODE])
+    assert svc.server._verdict_withhold == frozenset({"prompt_idx", "prompt_hash_lead"})
+    early = svc.server.record_verdict("hk", "ab" * 32, accepted=True, reason=RejectReason.ACCEPTED, window_n=1,
+                                      telemetry=telemetry)
+    assert "prompt_idx" not in early and "prompt_hash_lead" not in early
+    svc._service_runtime.close()
+    legacy = _build_late_drop_service()
+    assert legacy.server._verdict_withhold == frozenset()
+    kept = legacy.server.record_verdict("hk", "ab" * 32, accepted=True, reason=RejectReason.ACCEPTED, window_n=1,
+                                        telemetry=telemetry)
+    assert kept["prompt_idx"] == 5 and kept["prompt_hash_lead"] == "feedbeef"

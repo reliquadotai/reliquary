@@ -1249,6 +1249,10 @@ class ValidationService:
         self.server.set_late_drop_callback(self.record_late_drop)
         # A service run never names a not-yet-opened candidate window or its stage on /health.
         self.server.service_health_redaction = self._service_runtime is not None
+        if service_contract is not None:
+            # N3: no verdict of a service process names its prompt, the EARLY one recorded at arrival
+            # included (it would tie a public exploration observation to its hotkey).
+            self.server._verdict_withhold = _SERVICE_OBSERVATION_WITHHELD
         self.server.configure_prompt_source_health(
             self._prompt_source_health_snapshot
         )

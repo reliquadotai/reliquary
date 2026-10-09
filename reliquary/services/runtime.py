@@ -327,7 +327,8 @@ class ServiceRuntime:
             limits = self.order_contract.to_dict()["limits"]
             groups, tokens = self.db.execute("SELECT groups,tokens FROM service_orders WHERE id=?", (self.order_contract.sha256,)).fetchone()
             answer = instant < start + limits["deadline_seconds"] and groups < limits["max_groups"] and tokens < limits["max_tokens"]
-        self._active_last = answer
+            # N2: published inside the lock, so two computations never publish out of order.
+            self._active_last = answer
         return answer
 
     def record_consumption(self, cursor: int) -> dict[str, float]:

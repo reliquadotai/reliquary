@@ -1330,6 +1330,11 @@ class _Health(BaseModel):
 
 
 class ValidatorServer:
+    # N3: verdict keys never stored for ANY verdict of this process (set by ValidationService for a
+    # service task: an early verdict must not tie a public exploration observation to its hotkey).
+    # Empty for legacy RL tasks and corpus jobs: their verdict bytes are unchanged.
+    _verdict_withhold: frozenset[str] = frozenset()
+
     def __init__(
         self,
         host: str = "0.0.0.0",
@@ -2729,7 +2734,8 @@ class ValidatorServer:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
 
         ``withhold``: keys never stored, whatever telemetry or ``details`` carry (m5: a service
-        exploration verdict must not name its prompt). Empty for every legacy caller.
+        exploration verdict must not name its prompt). Empty for every legacy caller. The server's
+        own ``_verdict_withhold`` (N3) is added for every verdict of the process.
 
         Called from every code path that decides a lifecycle stage:
 
@@ -2804,7 +2810,7 @@ class ValidatorServer:
             entry["sigma"] = float(sigma)
         if batch_filled_reason is not None:
             entry["batch_filled_reason"] = batch_filled_reason
-        for key in withhold:
+        for key in withhold | self._verdict_withhold:
             entry.pop(key, None)
         self._verdict_sequence_by_hotkey[hotkey] += 1
         entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]

@@ -1767,3 +1767,28 @@ def test_r31_a_statistical_failure_keeps_its_reprobation_across_a_restart(tmp_pa
     assert row["past_probation"] is False                                      # audited with the probationers
     assert restarted.ledger.audit_log("hk")[-1]["failure_class"] == "statistical"
     restarted.close()
+
+
+# ---------------------------------------------------------------- N2: the active answer is published under the lock
+
+def test_n2_the_active_answer_is_published_inside_the_runtime_lock(tmp_path):
+    held = []
+
+    class Probe(ServiceRuntime):
+        @property
+        def _active_last(self):
+            return self.__dict__["_probe_active"]
+
+        @_active_last.setter
+        def _active_last(self, value):
+            held.append(self.lock._is_owned())
+            self.__dict__["_probe_active"] = value
+
+    contract = contract_v2()
+    rt = Probe(tmp_path / "runtime.sqlite3", contract, qualification_v2(contract), now=0, drand_round_at=drand_round)
+    held.clear()                     # the constructor's own first assignment runs before the object is shared
+    assert rt.active(now=5.0) is True and rt.active_cached() is True
+    latest = rt.active()
+    assert rt.active_cached() is latest
+    assert len(held) == 2 and all(held)
+    rt.close()

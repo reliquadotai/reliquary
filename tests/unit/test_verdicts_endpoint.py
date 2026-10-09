@@ -603,3 +603,42 @@ def test_history_recovers_entire_burst_and_does_not_claim_an_open_snapshot(tmp_p
     assert client.get('/miner-verdict-history/hk/500?limit=999').status_code == 422
     metrics = client.get('/http-metrics').json()
     assert metrics['routes']['GET verdict_history']['requests'] == 5
+
+
+# ---- N3: a service process withholds the prompt from every verdict, the early one included ----------------
+
+def _early_telemetry():
+    from reliquary.validator.observability import SubmitTelemetry
+    return SubmitTelemetry(window_n=7, prompt_idx=5, hotkey="hkN3", merkle_root="ab" * 32, protocol_version=6,
+                           submitted_drand_round=100, t_arrival=1000.0, prompt_hash_lead="feedbeef",
+                           merkle_root_lead="abab", t_body_completed=1000.5)
+
+
+def _early_verdict(server, monkeypatch):
+    import reliquary.validator.server as server_module
+    monkeypatch.setattr(server_module.time, "time", lambda: 2000.0)
+    return server.record_verdict("hkN3", "ab" * 32, accepted=True, reason=RejectReason.ACCEPTED, window_n=7,
+                                 telemetry=_early_telemetry(), details={"prompt_idx": 5})
+
+
+def test_n3_a_legacy_server_keeps_the_prompt_in_its_verdicts(monkeypatch):
+    server = ValidatorServer()
+    assert server._verdict_withhold == frozenset()
+    entry = _early_verdict(server, monkeypatch)
+    assert entry["prompt_idx"] == 5 and entry["prompt_hash_lead"] == "feedbeef"
+    served = TestClient(server.app).get("/verdicts/hkN3?details=true").json()["verdicts"]
+    assert served[0]["prompt_idx"] == 5 and served[0]["prompt_hash_lead"] == "feedbeef"
+
+
+def test_n3_a_service_server_drops_the_prompt_from_every_verdict_and_nothing_else(monkeypatch):
+    legacy = _early_verdict(ValidatorServer(), monkeypatch)
+    server = ValidatorServer()
+    server._verdict_withhold = frozenset({"prompt_idx", "prompt_hash_lead"})
+    entry = _early_verdict(server, monkeypatch)
+    assert entry == {key: value for key, value in legacy.items() if key not in ("prompt_idx", "prompt_hash_lead")}
+    late = server.record_verdict("hkN3", "cd" * 32, accepted=False, reason=RejectReason.GRAIL_FAIL, window_n=7,
+                                 details={"prompt_idx": 9, "prompt_hash_lead": "00"})
+    assert "prompt_idx" not in late and "prompt_hash_lead" not in late
+    served = TestClient(server.app).get("/verdicts/hkN3?details=true").json()["verdicts"]
+    assert len(served) == 2 and not any(key in verdict for verdict in served
+                                        for key in ("prompt_idx", "prompt_hash_lead"))
