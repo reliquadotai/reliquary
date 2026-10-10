@@ -11,17 +11,19 @@ claimed (``SessionBook.precommits_held``). Each session of the precommit is then
   window the runtime settled as aborted, a group of the precommit the proof handed back, and, unless a group of
   it was used: a precommit whose verdict is ours (``VALIDATOR_STAGES``: a group the checker verified that we
   then failed), or of the window a validator restart interrupted (``decide(resumed=True)``) unless a real
-  refusal names it; and a session that RAN (a machine-signed final: its status is not in ``RAN_EXCLUDED``) of an
-  unused precommit whose opens met a capacity refusal of ours (``CAPACITY``) when fewer than M of the
-  precommit's sessions were graded (the group could not be formed);
+  refusal names it; and a session GRADED (it ran and finished: whatever else the miner's boxes did, expired,
+  failed or exhausted their budget, stays waste) of an unused precommit whose opens met a capacity refusal of ours
+  (``CAPACITY``) when fewer than M of the precommit's sessions were graded (the group could not be formed);
 * USEFUL when a group of the precommit was trained or paid as first-scan exploration in that settlement
   (``used``): the M submitted sessions and the unselected over-generated ones alike;
 * WASTED otherwise: expired, withdrawn, lapsed, ``box_failed`` (the agent's box), an unsigned
   ``open_failed`` (the miner's word: a box may run behind it), a refused group, a group accepted at intake but neither trained
   nor paid.
 
-Verdicts. A precommit's verdict only rises: CAPACITY < OURS < REFUSED < ACCEPTED < HANDED_BACK,
-so a real refusal is never cleared by a later "ours". A refusal reached before the checker verified the group
+Verdicts. A precommit's verdict only rises: CAPACITY < OURS < ACCEPTED < REFUSED < HANDED_BACK,
+so a real refusal is never cleared by a later "ours", nor by a later accepted group (a used group is useful
+whatever the verdict; an unused one in the window a restart interrupted stays waste once a real refusal named
+it). A refusal reached before the checker verified the group
 (``NO_VERDICT_STAGES``: the precommit it names is unverified, and a miner can provoke these at will: a stale
 directory, a busy checker, a window that is not open) gives no verdict at all; the miner retries it.
 
@@ -63,7 +65,7 @@ logger = logging.getLogger(__name__)
 PENDING, USEFUL, WASTED, FAULT = "pending", "useful", "wasted", "fault"
 CAPACITY, OURS, REFUSED, ACCEPTED, HANDED_BACK = "capacity", "ours", "refused", "accepted", "handed_back"
 # A verdict replaces another only when it ranks higher: a real refusal is never cleared by "ours".
-_RANK = {CAPACITY: 0, OURS: 1, REFUSED: 2, ACCEPTED: 3, HANDED_BACK: 4}
+_RANK = {CAPACITY: 0, OURS: 1, ACCEPTED: 2, REFUSED: 3, HANDED_BACK: 4}
 FAULT_STATES = frozenset({"aborted", "voided"})
 FAULT_STATUSES = frozenset({"aborted", "machine_drained", "handed_back"})
 RUNTIME_EXEC_FAILED = "runtime_exec_failed"
@@ -84,9 +86,10 @@ NO_VERDICT_STAGES = frozenset({
     "episode_policy_stale", "episode_unserved", "episode_group_in_flight", "episode_checks_in_flight",
     "admission_drain"})
 GRADED = "graded"
-RAN_EXCLUDED = frozenset({None, "open_failed", "withdrawn", "machine_drained"})
-"""Closed statuses that are no machine-signed final of a box that ran: a capacity verdict never
-neutralises them (a squatted token lapses with None; a withdrawal has no final)."""
+MACHINE_FINALS = frozenset({GRADED, "expired", "box_failed", "budget_exhausted", "aborted", "handed_back"})
+"""Closed statuses of a machine-signed final: the session's box ran. Anything else (a lapse with None, an
+``open_failed``, a withdrawal, a drain) may be a token never presented to a machine."""
+SCHEMA_VERSION = 1
 PRUNE_EVERY_S = 3600.0
 KEEP_DECIDED_S = 2 * USEFUL_HORIZON_S
 
@@ -116,6 +119,37 @@ def _rl_precommit(engagement: Any) -> tuple[int, str] | None:
     return window, sha
 
 
+class YieldLedgerUnusable(RuntimeError):
+    """The ledger's file is corrupted or of another schema version. Never started afresh in its place: a fresh
+    ledger would make every low-yield hotkey a newcomer again."""
+
+
+def _open(path: Path) -> sqlite3.Connection:
+    db = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    try:
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        tables = db.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
+        if version == 0 and tables == 0:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.executescript(_SCHEMA)
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        elif version != SCHEMA_VERSION:
+            raise YieldLedgerUnusable(f"the yield ledger {path} has schema version {version}, this validator reads "
+                                      f"version {SCHEMA_VERSION}; it was left as it is")
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        db.executescript(_SCHEMA)
+        db.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.DatabaseError as error:
+        db.close()
+        raise YieldLedgerUnusable(f"the yield ledger {path} is not a readable SQLite file ({error}); it was left as "
+                                  "it is: restore it or move it aside deliberately") from error
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
 class SessionYieldLedger:
     def __init__(self, path: str | Path, *, capacity_allowance: Callable[[str], int] | None = None,
                  clock: Callable[[], float] = time.time) -> None:
@@ -136,11 +170,13 @@ class SessionYieldLedger:
         self._accepting: int | None = None
         self._pruned_at = 0.0
         self._closed = False
-        self._db = sqlite3.connect(Path(path), timeout=30, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.executescript(_SCHEMA)
-        self._load()
+        self._db = _open(Path(path))
+        try:
+            self._load()
+        except sqlite3.DatabaseError as error:
+            self._db.close()
+            raise YieldLedgerUnusable(f"the yield ledger {path} cannot be read ({error}); it was left as it is: "
+                                      "restore it or move it aside deliberately") from error
 
     # --- the event loop's side: memory only ---
     def note_opened(self, record: Any) -> None:
@@ -262,7 +298,7 @@ class SessionYieldLedger:
                     fault = HANDED_BACK
                 if fault is None and not used and verdict == OURS:
                     fault = "validator_refused"
-                if fault is None and not used and verdict == CAPACITY and unformed and status not in RAN_EXCLUDED:
+                if fault is None and not used and verdict == CAPACITY and unformed and status == GRADED:
                     fault = "capacity_refused"     # it ran, and the group could not be formed
                 if fault is None and not used and resumed and verdict != REFUSED:
                     fault = "window_resumed"
@@ -406,11 +442,16 @@ class SessionYieldLedger:
                 self._db.close()
 
 
-def held_seconds(record: Any, now: float) -> float:
+def held_seconds(record: Any, now: float, *, presented: bool | None = None) -> float:
     """How long the session's box held its place: issue to its FIRST close (``ended_at``; ``closed_at`` for a record
     without it; now while open), capped at the token's expiry: the env-neutral volume of a useful session. A
-    submission delayed to the window's end adds nothing. The wiring passes it to
-    ``decide`` as each row's fifth element."""
+    submission delayed to the window's end adds nothing. Only a session whose box ran counts: one closed by a
+    machine-signed final (``MACHINE_FINALS``), or one the caller knows a machine listed (``presented=True``); a
+    token never presented counts nothing, never its time to expiry. The wiring passes it to ``decide`` as each
+    row's fifth element."""
+    ran = getattr(record, "closed_status", None) in MACHINE_FINALS if presented is None else bool(presented)
+    if not ran:
+        return 0.0
     end = getattr(record, "ended_at", None) or getattr(record, "closed_at", None) or now
     expires = getattr(record, "expires_at", None)
     if expires is not None:
@@ -427,17 +468,19 @@ __all__ = [
     "GRADED",
     "GRADING_POOL",
     "HANDED_BACK",
+    "MACHINE_FINALS",
     "NO_VERDICT_STAGES",
     "OPEN_REFUSED",
     "OURS",
     "PENDING",
-    "RAN_EXCLUDED",
     "REFUSED",
     "RUNTIME_EXEC_FAILED",
+    "SCHEMA_VERSION",
     "USEFUL",
     "VALIDATOR_RESTARTED",
     "VALIDATOR_STAGES",
     "WASTED",
     "SessionYieldLedger",
+    "YieldLedgerUnusable",
     "held_seconds",
 ]

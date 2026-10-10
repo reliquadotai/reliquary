@@ -1,6 +1,7 @@
 """The RL session yield ledger: useful = a group of the precommit was trained
-or paid as first-scan exploration; faults (the machine's or ours) are neither; stored per hotkey,
-aggregated through the keying point; persisted."""
+or paid as first-scan exploration; faults (the machine's or ours) are neither; stored per hotkey;
+persisted."""
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -10,6 +11,8 @@ import pytest
 from reliquary.protocol.service_episode import rl_engagement
 from reliquary.sandbox.rl_capacity import YieldStats
 from reliquary.sandbox.rl_yield import (
+    FAULT_STATUSES,
+    GRADED,
     GRADING_POOL,
     NO_VERDICT_STAGES,
     OPEN_REFUSED,
@@ -17,7 +20,11 @@ from reliquary.sandbox.rl_yield import (
     VALIDATOR_RESTARTED,
     VALIDATOR_STAGES,
     SessionYieldLedger,
+    YieldLedgerUnusable,
 )
+
+# Every closed status a session record can carry that is neither graded nor a fault of the machine or ours.
+MINERS_OWN_STATUSES = (None, "open_failed", "withdrawn", "expired", "box_failed", "budget_exhausted")
 
 A, B = "a" * 64, "b" * 64
 HOT = "5Hot"
@@ -142,15 +149,18 @@ def test_a_capacity_refusal_neutralises_only_the_sessions_that_ran_in_a_group_th
     assert led.stats(HOT).decided == decided                             # (None): 3 neutral, 2 squatted wasted
 
 
-@pytest.mark.parametrize("status", [None, "open_failed", "withdrawn"])
-def test_a_capacity_refusal_never_neutralises_a_session_that_did_not_run(tmp_path, status):
+@pytest.mark.parametrize("status", MINERS_OWN_STATUSES)
+def test_a_capacity_refusal_neutralises_only_graded_sessions(tmp_path, status):
+    assert status != GRADED and status not in FAULT_STATUSES
     led = ledger(tmp_path)
-    records = opened(led, 4)
-    for r in records:
+    records = opened(led, 7)
+    for r in records[:3]:
+        r.state, r.closed_status = "closed_graded", GRADED
+    for r in records[3:]:                    # the miner's own failures: a box it killed, a budget it ran out
         r.state, r.closed_status = ("lapsed" if status is None else "closed"), status
     led.capacity_refused(hotkey=HOT, precommit_sha256=A)
     settle(led, records, group_size=16)
-    assert led.stats(HOT).decided == 4
+    assert (led.stats(HOT).useful, led.stats(HOT).decided) == (0, 4)
 
 
 def test_a_capacity_refusal_after_a_formable_group_is_waste(tmp_path):
@@ -183,6 +193,19 @@ def test_the_window_a_restart_interrupted_is_neither_unless_really_refused(tmp_p
                           stage="episode_transcript")
     settle(led, records, resumed=True)
     assert led.stats(HOT).decided == decided
+
+
+@pytest.mark.parametrize("refused_first, used, stats", [(False, False, (0, 0)), (True, False, (0, 32)),
+                                                        (True, True, (32, 32))])
+def test_a_later_accepted_group_never_clears_a_real_refusal(tmp_path, refused_first, used, stats):
+    led = ledger(tmp_path)
+    records = opened(led, 32)
+    if refused_first:
+        led.group_settled(hotkey=HOT, precommit_sha256=A, session_ids=(), accepted=False,
+                          stage="episode_transcript")
+    led.group_settled(hotkey=HOT, precommit_sha256=A, session_ids=(), accepted=True)
+    settle(led, records, used=used, resumed=True)            # the restart's window: neutral only if never refused
+    assert (led.stats(HOT).useful, led.stats(HOT).decided) == stats
 
 
 @pytest.mark.parametrize("used, useful", [(True, 32), (False, 0)])
@@ -264,11 +287,23 @@ def test_the_useful_volume_is_counted_in_held_seconds(tmp_path):
     led.decide(A, rows, used=True, aborted=False, now=NOW)
     led.flush(NOW)
     assert led.stats(HOT).useful_s_24h == 4 * 1_800.0 and led.stats(HOT).useful_24h == 4
-    assert held_seconds(SimpleNamespace(issued_at=100, closed_at=400), 1_000) == 300.0
-    assert held_seconds(SimpleNamespace(issued_at=100, closed_at=None), 1_000) == 900.0
-    late = SimpleNamespace(issued_at=100, ended_at=400, closed_at=5_000, expires_at=10_000)
-    assert held_seconds(late, 9_000) == 300.0                         # the submission's delay counts nothing (m2)
-    assert held_seconds(SimpleNamespace(issued_at=100, closed_at=None, expires_at=700), 9_000) == 600.0
+    assert held_seconds(SimpleNamespace(issued_at=100, closed_at=400, closed_status=GRADED), 1_000) == 300.0
+    assert held_seconds(SimpleNamespace(issued_at=100, closed_at=400, closed_status="box_failed"), 1_000) == 300.0
+    assert held_seconds(SimpleNamespace(issued_at=100, closed_at=None), 1_000, presented=True) == 900.0
+    late = SimpleNamespace(issued_at=100, ended_at=400, closed_at=5_000, expires_at=10_000, closed_status=GRADED)
+    assert held_seconds(late, 9_000) == 300.0                         # the submission's delay counts nothing
+    listed = SimpleNamespace(issued_at=100, closed_at=None, expires_at=700)
+    assert held_seconds(listed, 9_000, presented=True) == 600.0
+
+
+@pytest.mark.parametrize("status", [None, "open_failed", "withdrawn", "machine_drained"])
+def test_a_token_never_presented_holds_no_seconds(status):
+    from reliquary.sandbox.rl_yield import held_seconds
+
+    squatted = SimpleNamespace(issued_at=100, closed_at=None if status is None else 300, expires_at=700,
+                               closed_status=status)
+    assert held_seconds(squatted, 9_000) == 0.0                       # never its time to expiry
+    assert held_seconds(squatted, 9_000, presented=False) == 0.0
 
 
 def test_useful_24h_forgets_what_was_decided_a_day_ago(tmp_path):
@@ -349,25 +384,79 @@ def test_a_failed_flush_keeps_its_journal(tmp_path, monkeypatch):
     assert led.flush(NOW) == 2
 
 
-def test_two_flushes_never_run_at_once_and_close_waits_for_one(tmp_path, monkeypatch):
-    led = ledger(tmp_path)
-    opened(led, 4)
-    real, inside, overlaps, started = led._apply, [0], [], threading.Event()
+def slow_apply(led, monkeypatch, events):
+    real, inside, started = led._apply, [0], threading.Event()
 
     def slow(entry):
         inside[0] += 1
-        overlaps.append(inside[0])
+        events.append(("in", inside[0]))
         started.set()
-        time.sleep(0.01)
+        time.sleep(0.02)
         real(entry)
         inside[0] -= 1
+        events.append(("out", inside[0]))
 
     monkeypatch.setattr(led, "_apply", slow)
-    threads = [threading.Thread(target=led.flush, args=(NOW,)) for _ in range(2)]
-    for t in threads:
-        t.start()
-    assert started.wait(5.0)                                 # a flush is in progress
-    led.close()                                              # waits for it, then closes
-    for t in threads:
-        t.join()
-    assert overlaps and max(overlaps) == 1
+    return started
+
+
+def test_two_flushes_never_run_at_once(tmp_path, monkeypatch):
+    led = ledger(tmp_path)
+    opened(led, 4)
+    events, flushed = [], []
+    started = slow_apply(led, monkeypatch, events)
+    first = threading.Thread(target=lambda: flushed.append(led.flush(NOW)))
+    first.start()
+    assert started.wait(5.0)                                 # the first flush is writing its journal
+    opened(led, 4, start=4)                                  # a second journal, for a second flush
+    second = threading.Thread(target=lambda: flushed.append(led.flush(NOW)))
+    second.start()
+    first.join()
+    second.join()
+    assert flushed == [4, 4]                                 # both flushes wrote a journal of their own
+    assert max(depth for kind, depth in events if kind == "in") == 1
+    led.close()
+
+
+def test_close_waits_for_the_flush_in_progress(tmp_path, monkeypatch):
+    led = ledger(tmp_path)
+    opened(led, 4)
+    events = []
+    started = slow_apply(led, monkeypatch, events)
+    flushing = threading.Thread(target=led.flush, args=(NOW,))
+    flushing.start()
+    assert started.wait(5.0)
+    led.close()
+    events.append(("closed", 0))
+    flushing.join()
+    assert events[-1] == ("closed", 0) and sum(1 for kind, _ in events if kind == "out") == 4
+    assert led.flush(NOW) == 0                               # a flush after close touches nothing
+
+
+def test_a_new_file_carries_the_schema_version(tmp_path):
+    from reliquary.sandbox.rl_yield import SCHEMA_VERSION
+
+    ledger(tmp_path).close()
+    db = sqlite3.connect(tmp_path / "rl-yield.sqlite3")
+    assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    db.close()
+    ledger(tmp_path).close()                                 # and reopens
+
+
+@pytest.mark.parametrize("damage", ["garbage", "version", "unversioned"])
+def test_a_corrupted_or_unknown_file_fails_loudly_and_is_left_as_it_is(tmp_path, damage):
+    path = tmp_path / "rl-yield.sqlite3"
+    if damage == "garbage":
+        path.write_bytes(b"not a database at all, " * 64)
+    else:
+        led = ledger(tmp_path)
+        settle(led, opened(led, 4))
+        led.close()
+        db = sqlite3.connect(path)
+        db.execute(f"PRAGMA user_version={99 if damage == 'version' else 0}")
+        db.commit()
+        db.close()
+    before = path.read_bytes()
+    with pytest.raises(YieldLedgerUnusable, match="rl-yield.sqlite3"):
+        ledger(tmp_path)
+    assert path.read_bytes() == before                       # never started afresh in its place
