@@ -80,6 +80,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -216,12 +217,76 @@ class EngagementTerms:
     # The terms' cheap preconditions read again under the issuer lock (the RL precommit's
     # window may have turned while the task resolved): a Refusal refuses the open. Corpus: None.
     still_valid: Callable[[], Refusal | None] | None = field(default=None, repr=False, compare=False)
+    # The task's prepare timeout as its gateway will read it: the token must outlive it (``token_validity_s``).
+    # None: the sandbox's default.
+    prepare_timeout_s: float | None = None
 
 
 class EngagementBook(Protocol):
     kind: str
 
     async def terms(self, hotkey: str, engagement: Mapping[str, Any]) -> EngagementTerms | Refusal: ...
+
+
+class SessionEvents(Protocol):
+    """What the RL wiring hears of its sessions (the yield ledger and the quota's index). Called on the
+    event loop after the state change; must not block. A raise is logged and dropped."""
+
+    def opened(self, record: SessionRecord) -> None: ...
+
+    def closed(self, record: SessionRecord, final: Mapping[str, Any] | None) -> None: ...
+
+
+def runtime_start_fault(final: Mapping[str, Any] | None) -> str | None:
+    """``runtime_exec_failed`` when the machine's signed final proves the runtime failed to start a
+    command (``grading._grader.runtime_exec_failed``), else None: a fault of the machine, not the miner's."""
+    grading = final.get("grading") if isinstance(final, Mapping) else None
+    label = grading.get("_grader") if isinstance(grading, Mapping) else None
+    return "runtime_exec_failed" if isinstance(label, Mapping) and label.get("runtime_exec_failed") is True else None
+
+
+GRADING_POOL_ABORT = "the grading pool stayed full"
+"""The gateway's abort reason when other miners' gradings held the machine's grading pool (its own
+hotkey's burst has another reason: an ordinary abort)."""
+LOST_OPEN_WINDOW_S = 60
+"""An open answer a validator restart can have lost: issued at most this long before the last activity
+preceding the restart (the miner's sessions HTTP timeout)."""
+
+
+def pool_abort_fault(final: Mapping[str, Any] | None) -> str | None:
+    """``grading_pool`` when the machine's signed final is an abort because other miners' gradings held its
+    grading pool: it counts toward no abort cap and frees its engagement."""
+    if (isinstance(final, Mapping) and final.get("status") == STATUS_ABORTED
+            and final.get("reason") == GRADING_POOL_ABORT):
+        return "grading_pool"
+    return None
+
+
+def _open_refused_fault(receipt: Mapping[str, Any]) -> str:
+    """The fault of a verified signed open refusal: ``open_refused:<the gateway's reason>``."""
+    document = receipt.get("document") if isinstance(receipt, Mapping) else None
+    reason = document.get("reason") if isinstance(document, Mapping) else None
+    if not isinstance(reason, str) or not reason or len(reason) > 48:
+        reason = "unnamed"
+    return f"open_refused:{reason}"
+
+
+GATEWAY_PREPARE_SLACK_S = 60
+"""The gateway refuses (401, unsigned) a token with no more than its task's prepare timeout plus this left
+at the open."""
+DEFAULT_PREPARE_TIMEOUT_S = 600
+"""A sandbox task's prepare timeout when it declares none."""
+OPEN_TRANSIT_S = 60
+"""The time a miner may take to present a fresh token to its gateway (its sessions HTTP timeout)."""
+
+
+def token_validity_s(open_window_s: int, wall_s: int, prepare_timeout_s: float | None = None) -> int:
+    """How long a session token is valid: its open window and its episode's ``wall_s``, the window
+    lengthened when it would not cover the task's preparation, the gateway's slack and the token's transit.
+    A token shorter than that is refused unsigned by every gateway, which no miner could prove."""
+    prepare = DEFAULT_PREPARE_TIMEOUT_S if prepare_timeout_s is None else prepare_timeout_s
+    floor = math.ceil(prepare) + GATEWAY_PREPARE_SLACK_S + OPEN_TRANSIT_S
+    return max(int(open_window_s), floor) + int(wall_s)
 
 
 class JobNotReady(Exception):
@@ -262,7 +327,10 @@ _FIELD_CHECKS: dict[str, Callable[[Any], bool]] = {
     "token_sha256": _is_str, "state": lambda v: v in STATES,
     "closed_status": lambda v: v is None or isinstance(v, str),
     "closed_at": lambda v: v is None or _is_int(v),
+    "fault": lambda v: v is None or (_is_str(v) and 0 < len(v) <= 64),
+    "ended_at": lambda v: v is None or _is_int(v),
 }
+_OPTIONAL_FIELDS = ("fault", "ended_at")      # absent from a document when None
 
 
 @dataclass
@@ -286,9 +354,19 @@ class SessionRecord:
     state: str = LIVE
     closed_status: str | None = None
     closed_at: int | None = None
+    # RL only, set when the issuer records faults: why this session is neither useful nor wasted for its
+    # miner's yield. Absent from the document when None (older documents keep their bytes).
+    fault: str | None = None
+    # RL only: when the session first closed (its box's end). A submission later moves ``closed_at`` but
+    # never this, so the yield weight never counts an unsubmitted tail.
+    ended_at: int | None = None
 
     def to_document(self) -> dict:
-        return {"schema": SESSION_SCHEMA, **asdict(self)}
+        document = {"schema": SESSION_SCHEMA, **asdict(self)}
+        for optional in _OPTIONAL_FIELDS:
+            if document[optional] is None:
+                del document[optional]
+        return document
 
     @classmethod
     def from_document(cls, document: Any) -> SessionRecord:
@@ -297,6 +375,8 @@ class SessionRecord:
             raise ValueError("not a session document")
         values = {}
         for f in fields(cls):
+            if f.name in _OPTIONAL_FIELDS and f.name not in document:
+                continue                                   # older documents: no fault, no end
             if f.name not in document or not _FIELD_CHECKS[f.name](document[f.name]):
                 raise ValueError(f"session document field {f.name} is missing or malformed")
             values[f.name] = document[f.name]
@@ -495,13 +575,15 @@ class SessionBook:
         """Whether an exclusive (RL) engagement is consumed. Only a machine-signed ``aborted``
         frees it, and at most ONCE: a ``voided`` session (a drain frees what the miner left ``live``, so
         it would be a selective re-roll) and every other state keep it taken, and so does a second
-        ``aborted`` record of the same engagement."""
+        ``aborted`` record of the same engagement. A pool abort caused by other miners never counts."""
         aborted = 0
         for r in self._sessions.values():
             if r.engagement != engagement:
                 continue
             if r.state != ABORTED:
                 return True
+            if r.fault == "grading_pool":
+                continue                # other miners' gradings held the pool: never counted
             aborted += 1
         return aborted >= 2
 
@@ -530,7 +612,7 @@ class SessionBook:
             return Refusal("open_rate_cap", {"opens": opens, "max": policy.max_opens_per_hour},
                            retry_after=counted[opens - policy.max_opens_per_hour] + HOUR - now)
         closed = sorted(r.closed_at or 0 for r in mine
-                        if r.state == ABORTED and (r.closed_at or 0) > now - DAY)
+                        if r.state == ABORTED and r.fault != "grading_pool" and (r.closed_at or 0) > now - DAY)
         aborted = len(closed)
         if aborted >= policy.max_aborted_per_day:
             return Refusal("aborted_cap", {"aborted": aborted, "max": policy.max_aborted_per_day},
@@ -624,7 +706,10 @@ class SessionIssuer:
     def __init__(self, *, book: SessionBook, store, fleet, signer, token_verifier,
                  engagements: Mapping[str, EngagementBook], policy: SandboxPolicy,
                  clock: Callable[[], float] = time.time,
-                 new_session_id: Callable[[], str] = lambda: uuid.uuid4().hex) -> None:
+                 new_session_id: Callable[[], str] = lambda: uuid.uuid4().hex,
+                 events: SessionEvents | None = None, record_faults: bool = False,
+                 open_refusal_check: Callable[[Mapping[str, Any], SessionRecord], bool | None] | None = None,
+                 ) -> None:
         self.book = book
         self._store, self._fleet, self._signer = store, fleet, signer
         self._token_verifier = token_verifier
@@ -636,6 +721,14 @@ class SessionIssuer:
         self._refused_opens: dict[str, list[int]] = {}     # hotkey -> refusal times
         # Sessions whose ``submitted`` record is stored ahead of the book (``persist_submitted``).
         self._stored_submitted: set[str] = set()
+        # The RL wiring's listeners and fault records (a corpus issuer has neither: its records keep their bytes).
+        self._events = events
+        self._record_faults = bool(record_faults)
+        # A gateway's signed open refusal of a session: True verified, False not, None cannot judge now.
+        self._open_refusal_check = open_refusal_check
+        self._restored: set[str] = set()       # sessions issued before this process started (their tokens lost)
+        self._last_activity = 0                # the last issue or close before the restart
+        self._lost: set[str] = set()           # restored sessions whose open answer our restart lost
 
     @property
     def policy(self) -> SandboxPolicy:
@@ -652,7 +745,27 @@ class SessionIssuer:
             except (KeyError, TypeError, ValueError):
                 logger.error("a sandbox session document is unreadable; skipped")
         self.book.restore(records)
+        self._restored = {record.session_id for record in records}
+        # The lost-open window is anchored on the last activity before the restart, not on the reload (a
+        # restart takes minutes; the opens of the minute before the crash are the ones whose answers we lost).
+        self._last_activity = max((max(int(record.issued_at), int(record.closed_at or 0)) for record in records),
+                                  default=0)
         return len(records)
+
+    def _event(self, name: str, *args) -> None:
+        if self._events is None:
+            return
+        try:
+            getattr(self._events, name)(*args)
+        except Exception:
+            logger.exception("sandbox session listener %s failed", name)
+
+    def _reported(self, session_id: str) -> bool:
+        """Whether a machine report accepted since the restart listed this session live on its gateway
+        (``Fleet.session_reported``, when the fleet has it): its miner held the token, so its open answer was
+        not lost."""
+        reported = getattr(self._fleet, "session_reported", None)
+        return bool(reported(session_id)) if callable(reported) else False
 
     def _resent(self, hotkey: str, request_id: str, digest: str) -> Grant | Refusal | None:
         """The answer to a request already granted (the same token), or None."""
@@ -663,6 +776,11 @@ class SessionIssuer:
             return Refusal("request_conflict", {"session_id": existing.session_id})
         cached = self._tokens.get(existing.session_id)
         if cached is None or existing.state != LIVE:
+            if (cached is None and existing.state == LIVE and existing.session_id in self._restored
+                    and existing.issued_at >= self._last_activity - LOST_OPEN_WINDOW_S):
+                # Our restart lost this open's answer (issued in the minute before the last activity that
+                # preceded the crash; the miner resent it).
+                self._lost.add(existing.session_id)
             return Refusal("request_reused", {"session_id": existing.session_id,
                                               "state": existing.state})
         token, address = cached
@@ -767,7 +885,8 @@ class SessionIssuer:
                     return Refusal("prompt_unavailable", {
                         "prompt_index": terms.prompt_index,
                         "slots_remaining": remaining, "reserved": reserved})
-            validity = self._policy.open_window_s + int(terms.budgets["wall_s"])
+            validity = token_validity_s(self._policy.open_window_s, int(terms.budgets["wall_s"]),
+                                        terms.prepare_timeout_s)
             placement = self._fleet.pick(image=terms.image, env=terms.env,
                                          env_package=terms.env_package, budgets=terms.budgets,
                                          validity_s=validity, now=now,
@@ -800,6 +919,7 @@ class SessionIssuer:
             self.book.add(record)
             self._fleet.note_issued(placement.machine_id, now)
             self._tokens[session_id] = (token, placement.address)
+            self._event("opened", record)
         return _Issued(Grant(session_id, token, placement.address, claims.expires_at),
                        placement.machine_id, terms.engagement)
 
@@ -809,11 +929,19 @@ class SessionIssuer:
                 "status": record.closed_status}
 
     async def close(self, *, hotkey: str, session_id: str, reason: str,
-                    transcript: Mapping[str, Any] | None) -> dict | Refusal:
+                    transcript: Mapping[str, Any] | None,
+                    open_refusal: Mapping[str, Any] | None = None) -> dict | Refusal:
         """Settle a live session from its machine's final (or a failed open), or
         withdraw a live or graded-closed one, and return the state the session is
         actually in afterwards (a claim or submission that landed meanwhile wins). The
-        transcript is verified outside the lock."""
+        transcript is verified outside the lock.
+
+        With ``record_faults`` (the RL issuer), a fault that is not the miner's is written on the record
+        before it is persisted: a failed open with the gateway's verified signed refusal
+        (``open_refused:<reason>``; a receipt that cannot be judged now is refused ``directory_unavailable``,
+        retryably), a failed open whose answer our restart lost (``validator_restarted``), a proven runtime
+        start failure (``runtime_exec_failed``) and a grading-pool abort caused by others (``grading_pool``).
+        A withdrawal never records one."""
         withdraw = reason == WITHDRAW
         closable = (LIVE, CLOSED_GRADED) if withdraw else (LIVE,)
         async with self._lock:
@@ -838,8 +966,18 @@ class SessionIssuer:
                                     checkpoint=record.checkpoint,
                                     seen_session_ids=self.book.submitted_ids(),
                                     require_graded=False)
+        final, fault = None, None
         if reason == "open_failed":
             status = "open_failed"
+            if self._record_faults:
+                verdict = (None if open_refusal is None or self._open_refusal_check is None
+                           else self._open_refusal_check(open_refusal, record))
+                if open_refusal is not None and self._open_refusal_check is not None and verdict is None:
+                    return self._directory_unavailable()     # cannot be judged now: resent, never lost
+                if verdict:
+                    fault = _open_refused_fault(open_refusal)
+                elif session_id in self._lost and not self._reported(session_id):
+                    fault = "validator_restarted"    # a machine that listed it says the miner had the token
         else:
             result = await asyncio.to_thread(verify_transcript, transcript, directory,
                                              self._token_verifier, expected)
@@ -847,6 +985,9 @@ class SessionIssuer:
                 return Refusal("transcript_invalid", {
                     "reasons": [r.value for r in result.reasons] or ["session_mismatch"]})
             status = WITHDRAWN if withdraw else result.final.status
+            final = result.final.to_dict()
+            if self._record_faults and not withdraw:
+                fault = runtime_start_fault(final) or pool_abort_fault(final)
         state = (CLOSED if withdraw else ABORTED if status == STATUS_ABORTED
                  else CLOSED_GRADED if status == STATUS_GRADED else CLOSED)
         async with self._lock:
@@ -858,6 +999,12 @@ class SessionIssuer:
                         else Refusal("session_unknown", {"session_id": session_id}))
             settled = self.book.settle(session_id, state, now=now, status=status)
             self._tokens.pop(session_id, None)
+            if settled is not None and fault is not None:
+                settled.fault = fault                    # before the record is persisted
+            if settled is not None and self._record_faults and settled.ended_at is None:
+                settled.ended_at = now                   # its box's end, never moved by a submission
+        if settled is not None:
+            self._event("closed", settled, final)
         await self._persist(settled)
         logger.info("sandbox session %s of %s closed: %s", session_id, hotkey[:12], status)
         return self._state_of(settled)
@@ -1140,7 +1287,9 @@ class SessionIssuer:
         return False
 
 
-__all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "HANDED_BACK", "LAPSED", "LIVE", "SUBMITTED", "VOIDED",
-           "CorpusEngagements", "EngagementBook", "EngagementTerms", "Grant", "JobNotReady", "Refusal",
-           "RlPrecommitEngagements", "SandboxPolicy", "SessionBook", "SessionIssuer",
-           "SessionRecord", "SignedJobView", "engagement_digest", "session_submittable"]
+__all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "DEFAULT_PREPARE_TIMEOUT_S", "GATEWAY_PREPARE_SLACK_S",
+           "GRADING_POOL_ABORT", "HANDED_BACK", "LAPSED", "LIVE", "LOST_OPEN_WINDOW_S", "OPEN_TRANSIT_S",
+           "SUBMITTED", "VOIDED", "CorpusEngagements", "EngagementBook", "EngagementTerms", "Grant",
+           "JobNotReady", "Refusal", "RlPrecommitEngagements", "SandboxPolicy", "SessionBook", "SessionEvents",
+           "SessionIssuer", "SessionRecord", "SignedJobView", "engagement_digest", "pool_abort_fault",
+           "runtime_start_fault", "session_submittable", "token_validity_s"]

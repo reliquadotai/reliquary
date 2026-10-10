@@ -72,6 +72,9 @@ from reliquary.sandbox.machines import DirectorySnapshot, snapshot_from_document
 
 logger = logging.getLogger(__name__)
 
+OPEN_REFUSAL_SKEW_S = 120
+"""How far a signed open refusal's time may lie outside its token's validity (clock skew)."""
+
 HEARTBEAT_MAX_AGE_S = 30
 STALE_AFTER_S = 60
 POLL_SECONDS = 5.0
@@ -173,6 +176,7 @@ class Fleet:
         self.drained: set[str] = set()
         self._egress_suspect = False      # the last poll heard no machine at all
         self._options_alerted: set[tuple[str, str, str | None, str]] = set()
+        self._refusal_alerted = False     # the "cannot verify open refusals" error is logged once
 
     def directory_age(self, now: float | None = None) -> float | None:
         """Seconds since the last successful directory read, or None if never read."""
@@ -399,6 +403,30 @@ class Fleet:
             if best is None or key < best:
                 best, chosen = key, Placement(entry.machine_id, entry.address)
         return chosen
+
+    def open_refusal_valid(self, receipt: Mapping[str, Any], record: Any) -> bool | None:
+        """Whether ``receipt`` is the gateway's signed refusal of ``record``'s token on its machine, signed
+        while that token was valid. None while the directory is not ready (the close is then refused
+        retryably); False when this reliquary-sandbox cannot verify receipts (one error log)."""
+        now = int(self._clock())
+        directory = self.directory_if_ready(now)
+        if directory is None:
+            return None
+        try:
+            from reliquary_sandbox.attest import open_refusal_valid
+        except ImportError:
+            if not self._refusal_alerted:
+                self._refusal_alerted = True
+                logger.error("this reliquary-sandbox cannot verify signed open refusals: re-pin it")
+            return False
+        document = receipt.get("document") if isinstance(receipt, Mapping) else None
+        at = document.get("at") if isinstance(document, Mapping) else None
+        if (type(at) is not int or at < int(record.issued_at) - OPEN_REFUSAL_SKEW_S
+                or at > int(record.expires_at) + OPEN_REFUSAL_SKEW_S):
+            return False             # a gateway signs only while the token is admissible
+        return bool(open_refusal_valid(receipt, directory, machine_id=record.machine_id,
+                                       session_id=record.session_id, token_sha256=record.token_sha256,
+                                       now=now))
 
     async def refresh_if_due(self) -> None:
         """Read the directory if its period (or, after failures, its backoff) has

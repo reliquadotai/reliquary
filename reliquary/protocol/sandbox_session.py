@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
+
+MAX_OPEN_REFUSAL_BYTES = 4096
 
 
 def sandbox_open_path(prefix: str = "/corpus") -> str:
@@ -70,6 +72,10 @@ class SandboxSessionCloseRequest(BaseModel):
     # its slot for good (the session is never paid afterwards).
     reason: Literal["final", "open_failed", "withdraw"]
     transcript: dict[str, Any] | None = None
+    # The gateway's signed refusal of this session's open (its X-Reliquary-Open-Refusal header), only with
+    # reason open_failed. The machine signed it, bound to the token: the miner's binding need not cover it,
+    # and a validator that cannot verify it counts the close as the miner's word.
+    open_refusal: dict[str, Any] | None = None
     signature: str = Field(min_length=1, max_length=256)
 
     @field_validator("transcript")
@@ -79,6 +85,15 @@ class SandboxSessionCloseRequest(BaseModel):
                                        .encode("utf-8")) > MAX_TRANSCRIPT_BYTES:
             raise ValueError(f"the transcript is over {MAX_TRANSCRIPT_BYTES} bytes")
         return value
+
+    @model_validator(mode="after")
+    def _refusal_with_a_failed_open(self):
+        if self.open_refusal is not None:
+            if self.reason != "open_failed":
+                raise ValueError("an open refusal goes with reason open_failed only")
+            if len(json.dumps(self.open_refusal, separators=(",", ":")).encode("utf-8")) > MAX_OPEN_REFUSAL_BYTES:
+                raise ValueError(f"the open refusal is over {MAX_OPEN_REFUSAL_BYTES} bytes")
+        return self
 
 
 __all__ = ["SandboxEngagement", "SandboxSessionCloseRequest", "SandboxSessionOpenRequest",

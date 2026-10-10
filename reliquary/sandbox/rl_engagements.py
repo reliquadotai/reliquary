@@ -39,7 +39,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from reliquary.sandbox.sessions import EngagementTerms, Refusal, SessionBook
+from reliquary.sandbox.sessions import (
+    EngagementTerms,
+    Refusal,
+    SessionBook,
+    token_validity_s,
+)
 from reliquary.sandbox.tasks import ResolvedTask
 
 logger = logging.getLogger(__name__)
@@ -48,7 +53,7 @@ _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _ENGAGEMENT_KEYS = frozenset({"kind", "precommit"})
 _PRECOMMIT_KEYS = frozenset({"precommit_sha256", "seed_index"})
 MAX_PRECOMMIT_AGE_S = 86_400          # the book forgets a taken seed ~25 h after its session closed
-MAX_SESSION_SPAN_S = 86_400           # wall_s + open_window_s
+MAX_SESSION_SPAN_S = 86_400           # the token's validity (sessions.token_validity_s)
 WINDOW_AGE_MARGIN_S = 900             # past the longest window (FILL_CLOSED_MAX_SECONDS)
 
 
@@ -190,14 +195,15 @@ class RlEpisodeEngagements:
         for limit_name, limit in task.limits.items():
             if limit_name in budgets:
                 budgets[limit_name] = max(budgets[limit_name], int(limit))
-        if int(budgets["wall_s"]) + self._book.policy.open_window_s > MAX_SESSION_SPAN_S:
+        prepare = getattr(task, "prepare_timeout_s", None)
+        if token_validity_s(self._book.policy.open_window_s, int(budgets["wall_s"]), prepare) > MAX_SESSION_SPAN_S:
             return Refusal("session_too_long", {"wall_s": int(budgets["wall_s"]),
                                                 "max_span_s": MAX_SESSION_SPAN_S})
         window = precommit.window
         return EngagementTerms(
             engagement=name, env=policy.sandbox_env, split=policy.split, index=precommit.task_index,
             checkpoint=precommit.checkpoint, image=task.image, env_package=policy.env_package,
-            budgets=budgets, exclusive=True, still_valid=lambda: self._stale(window))
+            budgets=budgets, exclusive=True, still_valid=lambda: self._stale(window), prepare_timeout_s=prepare)
 
 
 __all__ = ["WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements", "SessionOutcomes",

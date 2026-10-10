@@ -152,12 +152,27 @@ def signed_open_request(*, hotkey: str, job_id: str, prompt_index: int,
 
 def signed_close_request(*, hotkey: str, session_id: str, reason: str, transcript: dict | None,
                          sign_binding: Callable[[bytes], str], now: float, request_id: str,
-                         validator_hotkey: str, path: str) -> dict:
+                         validator_hotkey: str, path: str, open_refusal: dict | None = None) -> dict:
     body = {"miner_hotkey": hotkey, "request_id": request_id, "at": int(now),
             "session_id": session_id, "reason": reason, "transcript": transcript, "signature": ""}
+    if open_refusal is not None:     # the gateway's signed receipt: the machine's signature covers it
+        body["open_refusal"] = dict(open_refusal)
     body["signature"] = sign_binding(build_sandbox_close_binding(
         body, validator_hotkey=validator_hotkey, path=path))
     return body
+
+
+def open_refusal_of(exc: BaseException | None) -> dict | None:
+    """The gateway's signed open refusal carried by ``exc`` or a cause of it (the sandbox client's
+    ``EpisodeError.open_refusal``), or None."""
+    seen = 0
+    while exc is not None and seen < 8:
+        receipt = getattr(exc, "open_refusal", None)
+        if isinstance(receipt, Mapping) and set(receipt) == {"document", "signature"}:
+            return dict(receipt)
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return None
 
 
 class _NoKeys:
@@ -267,6 +282,10 @@ class SignedSweEpisodeRunner:
     consecutively; the tenth stops the hotkey (`validator_unavailable`). At most
     `max_live` sessions of this hotkey on this job are live at once (the validator's
     own cap)."""
+
+    forwards_open_refusal = False
+    """Whether a failed open's close carries the gateway's signed receipt. The corpus validators' close
+    request forbids unknown fields, so only the RL runner does."""
 
     def __init__(self, *, job, hotkey: str, sign_binding: Callable[[bytes], str], sessions,
                  model_name: str, renderer_model_dir: str, generate_url: str, sampling,
@@ -471,7 +490,8 @@ class SignedSweEpisodeRunner:
 
     # -- closes --------------------------------------------------------------------
 
-    async def _close(self, session_id: str, reason: str, transcript: dict | None) -> dict | None:
+    async def _close(self, session_id: str, reason: str, transcript: dict | None, *,
+                     open_refusal: dict | None = None) -> dict | None:
         """Report how the session ended; a throttled or timed-out report is resent after
         its `Retry-After` (at most MAX_CLOSE_WAIT_S). Returns the validator's answer
         (the session's state), or None when it was refused or never arrived. Never
@@ -482,7 +502,8 @@ class SignedSweEpisodeRunner:
                                         reason=reason, transcript=transcript,
                                         sign_binding=self._sign, now=self._clock(),
                                         request_id=self._new_request_id(),
-                                        validator_hotkey=self._validator, path=path)
+                                        validator_hotkey=self._validator, path=path,
+                                        open_refusal=open_refusal)
             last = attempt + 1 == CLOSE_ATTEMPTS
             try:
                 answer = await asyncio.to_thread(self._sessions.close, session_id, body)
@@ -507,15 +528,16 @@ class SignedSweEpisodeRunner:
         return None
 
     async def _end(self, session_id: str, slot: _Slot, reason: str,
-                   transcript: dict | None, *, bounded: bool = False) -> None:
+                   transcript: dict | None, *, bounded: bool = False,
+                   open_refusal: dict | None = None) -> None:
         """Close the session and free its live slot, whatever happens to the close."""
         try:
             if bounded:
                 with contextlib.suppress(Exception):
                     async with asyncio.timeout(CANCELLED_CLOSE_S):
-                        await self._close(session_id, reason, transcript)
+                        await self._close(session_id, reason, transcript, open_refusal=open_refusal)
             else:
-                await self._close(session_id, reason, transcript)
+                await self._close(session_id, reason, transcript, open_refusal=open_refusal)
         finally:
             slot.free()
 
@@ -539,7 +561,8 @@ class SignedSweEpisodeRunner:
             result = await runner.run(token=grant["token"], prompt=self._source.prompt(index),
                                       on_trace=on_trace)
         except Exception as exc:  # no episode result, no transcript
-            await self._end(session_id, slot, "open_failed", None)
+            await self._end(session_id, slot, "open_failed", None,
+                            open_refusal=open_refusal_of(exc) if self.forwards_open_refusal else None)
             return EpisodeResult(None, "", None, False, None, error=_describe(exc))
         except BaseException:
             # Cancelled (the episode's deadline, the miner stopping): report it, briefly.
@@ -688,5 +711,5 @@ def signed_trajectory_precheck(renderer, *, max_turns: int, job=None, tokenizer=
 
 
 __all__ = ["DEFAULT_MAX_LIVE_PER_JOB", "HttpSandboxSessions", "SignedSweEpisodeRunner",
-           "signed_close_request", "signed_open_request", "signed_trajectory_precheck",
+           "open_refusal_of", "signed_close_request", "signed_open_request", "signed_trajectory_precheck",
            "ss58_format_42", "transcript_refusal"]

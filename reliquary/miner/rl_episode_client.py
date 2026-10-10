@@ -146,6 +146,7 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
 
     requires_text_state = False
     validator_throttles = RL_THROTTLES
+    forwards_open_refusal = True          # the RL validators read the gateway's signed receipt
 
     def __init__(self, *, policy, precommit, prompt: str, hotkey: str, sign_binding, sessions, model_name: str,
                  renderer_model_dir: str, generate_url: str, sampling, harness_env: dict | None = None,

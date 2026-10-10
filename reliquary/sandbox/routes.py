@@ -371,7 +371,9 @@ def build_sandbox_sessions_router(
 
         async def settle(request, hotkey: str) -> JSONResponse:
             outcome = await issuer.close(hotkey=hotkey, session_id=session_id,
-                                         reason=request.reason, transcript=request.transcript)
+                                         reason=request.reason, transcript=request.transcript,
+                                         **({"open_refusal": request.open_refusal}
+                                            if request.open_refusal is not None else {}))
             refused = outcome_of("close", hotkey, outcome)
             if refused is not None:
                 return refused

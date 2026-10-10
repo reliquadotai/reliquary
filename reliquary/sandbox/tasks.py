@@ -21,6 +21,9 @@ class ResolvedTask:
     env_options_sha256: str | None = None
     """The digest of the env options the image and limits were computed with
     (`bridged_swe.options_sha256()`); None: no options check at placement."""
+    prepare_timeout_s: float | None = None
+    """The task's prepare timeout, as its gateway reads it: a session token must outlive it. None: the
+    sandbox's default."""
 
 
 class SweTaskResolver:
@@ -51,7 +54,9 @@ class SweTaskResolver:
         values = {} if limits is None else {
             name: int(getattr(limits, name)) for name in _LIMIT_FIELDS
             if getattr(limits, name, None) is not None}
-        return ResolvedTask(task.image, values, digest)
+        prepare = getattr(task, "prepare_timeout_s", None)
+        prepare = float(prepare) if type(prepare) in (int, float) and prepare > 0 else None
+        return ResolvedTask(task.image, values, digest, prepare)
 
     def _cached(self, index: int) -> ResolvedTask:
         with self._lock:
