@@ -50,7 +50,7 @@ def directory(machine: Signer, **kw) -> DirectorySnapshot:
 
 def claims(**overrides) -> SessionClaims:
     values = dict(session_id="s-1", hotkey="5Hot", engagement=corpus_engagement(JOB_ID, 0),
-                  env=ENV, split="train:20", index=0, image=IMAGE, checkpoint=CHECKPOINT,
+                  env=ENV, split="train", index=0, image=IMAGE, checkpoint=CHECKPOINT,
                   machine_id=MACHINE, issued_at=NOW, expires_at=NOW + 4500,
                   budgets=Budgets(**BUDGETS))
     values.update(overrides)

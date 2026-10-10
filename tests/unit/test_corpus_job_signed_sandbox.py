@@ -112,8 +112,8 @@ def test_the_bash_only_tool_set_is_allowed():
     assert job.episode.sandbox.tools == ("bash",)
 
 
-def test_the_sandbox_split_names_the_image_count():
-    assert sandbox_split(parse_job(_manifest(episode=signed_episode())).episode) == "train:20"
+def test_the_sandbox_split_is_the_one_the_bridge_serves():
+    assert sandbox_split(parse_job(_manifest(episode=signed_episode())).episode) == "train"
 
 _REAL_MANIFEST = (Path(__file__).resolve().parent.parent / "fixtures"
                   / "corpus_job_manifest_code_v1.json")

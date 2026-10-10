@@ -560,6 +560,15 @@ def is_signed_sandbox(job: JobSpec) -> bool:
     return job.episode is not None and job.episode.execution == EXECUTION_SIGNED_SANDBOX
 
 
+BRIDGED_SWESMITH_IMAGES = 20
+"""SWE-smith's image count in the split a gateway serves through the verifiers bridge
+(reliquary-swe's default)."""
+
+
 def sandbox_split(episode: EpisodeSpec) -> str:
-    """The split a session token names: reliquary-swe's `train:<num_images>`."""
-    return f"train:{episode.env.num_images}"
+    """The split a session token names: reliquary-swe's `train` (SWE-smith at its default
+    20 images, the split the bridge serves)."""
+    if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
+        raise ValueError(f"a signed reliquary-swe job serves SWE-smith at "
+                         f"{BRIDGED_SWESMITH_IMAGES} images, not {episode.env.num_images}")
+    return "train"

@@ -23,7 +23,7 @@ from tests.unit.test_corpus_job_episode import _manifest  # noqa: E402
 from tests.unit.test_corpus_job_signed_sandbox import signed_episode  # noqa: E402
 
 JOB = parse_job(_manifest(prompt_count=3, episode=signed_episode()))
-SOURCE = SignedSweSource("train:20", prompt_of=lambda s, i: "p",
+SOURCE = SignedSweSource("train", prompt_of=lambda s, i: "p",
                          row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__{i}")))
 VALIDATOR = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"      # //Bob, ss58 format 42
 
@@ -287,7 +287,7 @@ def test_a_signed_grade_round_trips_through_the_export(tmp_path):
             return self.grades.get(sid)
 
     records = Exported({"sub-1": stored}, verdicts={"sub-1": {"passed": True}})
-    source = SignedSweSource("train:20", prompt_of=lambda s, i: "Fix task 0.",
+    source = SignedSweSource("train", prompt_of=lambda s, i: "Fix task 0.",
                              row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__{i}")))
     grader = SignedEpisodeGrader(job=JOB, records=records, source=source, clock=lambda: NOW + 60)
     assert asyncio.run(grader.grade_one("sub-1"))["status"] == "ok"

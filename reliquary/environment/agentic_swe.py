@@ -203,9 +203,10 @@ def load_swe_source(num_images: int) -> SweSource:
 
 
 class SignedSweSource:
-    """The prompts of a signed-sandbox job: `reliquary_swe.sandbox.sandbox_prompt(split,
-    index)` exactly, with no restricted-network notice (the sandbox bridge runs the
-    harness in a subprocess runtime, which adds none; ruling 7 of plan 3)."""
+    """The prompts of a signed-sandbox job: the bridged task's prompt
+    (`bridged_swe.prompt_of(split, index)`) exactly, with no restricted-network notice
+    (the sandbox bridge runs the harness in a subprocess runtime, which adds none;
+    ruling 7 of plan 3)."""
 
     def __init__(self, split: str, *, prompt_of=None, row_of=None) -> None:
         self.split = split
@@ -217,7 +218,7 @@ class SignedSweSource:
     def _prompt(self, index: int) -> str:
         prompt_of = self._prompt_of
         if prompt_of is None:
-            from reliquary_swe.sandbox import sandbox_prompt as prompt_of
+            from reliquary.environment.bridged_swe import prompt_of
         return prompt_of(self.split, index)
 
     def prompt(self, index: int) -> str:
@@ -229,7 +230,7 @@ class SignedSweSource:
     def _instance_id(self, index: int) -> str:
         row_of = self._row_of
         if row_of is None:
-            from reliquary_swe.sandbox import row_for as row_of
+            from reliquary.environment.bridged_swe import row_of
         return row_of(self.split, int(index))[1].instance_id
 
     def task_for(self, index: int) -> EpisodeTask:
@@ -238,18 +239,20 @@ class SignedSweSource:
 
 def installed_env_package(package: str) -> str:
     """The `env_package` a gateway serving this install writes into record 0:
-    `<distribution>==<version>+g<16 hex>`, computed by reliquary-sandbox's own task
-    registry over the `sandbox` module's installed files (one source of truth)."""
-    from reliquary_sandbox_service.episodes.registry import env_package_of
+    `<distribution>==<version>+g<16 hex>.vfb<bridge version>`, the bridged identity
+    (`bridged_env_package_of`), computed by reliquary-sandbox's own task registry over
+    the taskset's installed files (one source of truth)."""
+    from reliquary.environment.bridged_swe import installed_env_package as bridged
 
-    return env_package_of(f"{package.replace('-', '_')}.sandbox:sandbox_task")
+    return bridged(package)
 
 
 def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None:
     """Why this process cannot serve a signed-sandbox `episode`, or None:
-    reliquary-sandbox at the job's commit, the env package at the exact version and
-    code digest record 0 will carry, its `sandbox` entry points, and (miners) the
-    verifiers bridge."""
+    SWE-smith at the 20 images the bridge serves, reliquary-sandbox at the job's commit,
+    the env package at the exact version and code digest record 0 will carry, and the
+    verifiers bridge (always: every process reads the task through it; `need_bridge` is
+    kept for callers)."""
     from reliquary import sandbox as sandbox_support
 
     if getattr(episode, "sandbox", None) is None:
@@ -258,6 +261,9 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
         sandbox_support.require_sandbox()
     except sandbox_support.SandboxUnavailable as exc:
         return str(exc)
+    if getattr(episode.env, "num_images", 20) != 20:
+        return ("a signed reliquary-swe job serves SWE-smith at its default 20 images "
+                "(the split the bridge serves)")
     refusal = sandbox_support.sandbox_commit_refusal(episode.sandbox.sandbox_commit)
     if refusal:
         return refusal
@@ -270,9 +276,9 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
     if installed != pinned.rsplit("+g", 1)[0]:
         return f"{installed} is installed, the job pins {pinned}"
     try:
-        importlib.import_module(f"{package.replace('-', '_')}.sandbox")
+        importlib.import_module(package.replace('-', '_'))
     except Exception as exc:  # an import-time pin check raises RuntimeError, not ImportError
-        return (f"{package.replace('-', '_')}.sandbox cannot be imported ({type(exc).__name__}: {exc}): "
+        return (f"{package.replace('-', '_')} cannot be imported ({type(exc).__name__}: {exc}): "
                 f"install {package} at the job's commit")
     try:
         identity = installed_env_package(package)
@@ -280,11 +286,10 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
         return f"cannot compute the installed {package} identity ({exc})"
     if identity != pinned:
         return f"{identity} is installed, the job pins {pinned}"
-    if need_bridge:
-        try:
-            importlib.import_module("reliquary_sandbox_verifiers")
-        except Exception as exc:  # the bridge refuses an unpinned verifiers with RuntimeError
-            return f"the verifiers bridge cannot load: {exc}"
+    try:
+        importlib.import_module("reliquary_sandbox_verifiers")
+    except Exception as exc:  # the bridge refuses an unpinned verifiers with RuntimeError
+        return f"the verifiers bridge cannot load: {exc}"
     return None
 
 

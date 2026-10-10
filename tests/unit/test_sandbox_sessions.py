@@ -119,7 +119,7 @@ def test_a_grant_binds_the_engagement_and_raises_budgets_to_the_tasks_limits(tmp
         env.validator.public_key_b64)})
     assert (claims.hotkey, claims.engagement, claims.env, claims.split, claims.index,
             claims.checkpoint, claims.machine_id, claims.image) == (
-        "5Hot", f"corpus:{JOB.job_id}:3", "reliquary-swe", "train:20", 3, JOB.checkpoint_sha256,
+        "5Hot", f"corpus:{JOB.job_id}:3", "reliquary-swe", "train", 3, JOB.checkpoint_sha256,
         MACHINE, IMAGE)
     assert claims.budgets.memory_bytes == 6 * 1024**3
     assert claims.expires_at == NOW + 900 + JOB.episode.sandbox.budgets.wall_s
@@ -323,12 +323,12 @@ def test_the_swe_task_resolver_reads_image_and_declared_limits():
                                  wall_s=3600, per_call_timeout_s=600, max_calls=None)
         return SimpleNamespace(image=IMAGE, limits=limits)
 
-    resolver = SweTaskResolver("train:20", sandbox_task=sandbox_task)
+    resolver = SweTaskResolver("train", sandbox_task=sandbox_task)
     task = asyncio.run(resolver.resolve(3))
     asyncio.run(resolver.resolve(3))
     assert task == ResolvedTask(IMAGE, {"memory_bytes": 4 * 1024**3, "pids": 1024,
                                         "wall_s": 3600, "per_call_timeout_s": 600})
-    assert seen == [("train:20", 3)]
+    assert seen == [("train", 3)]
 
 
 def test_a_stale_directory_refuses_an_open_retryably_before_any_placement(tmp_path):
@@ -638,7 +638,7 @@ def test_the_swe_task_resolver_cache_is_bounded_and_not_on_the_class():
         calls.append(index)
         return SimpleNamespace(image=IMAGE, limits=None)
 
-    resolver = SweTaskResolver("train:20", sandbox_task=sandbox_task, cache_size=2)
+    resolver = SweTaskResolver("train", sandbox_task=sandbox_task, cache_size=2)
     for index in (1, 2, 1, 3, 1, 2):
         asyncio.run(resolver.resolve(index))
     assert calls == [1, 2, 3, 2]

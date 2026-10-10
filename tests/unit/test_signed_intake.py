@@ -42,7 +42,7 @@ JOB = parse_job(MANIFEST)
 TOKENIZER = _Tokenizer()
 PROOF = "A" * 200
 DIFF = "diff --git a/x b/x\n"
-SOURCE = SignedSweSource("train:20", prompt_of=lambda split, index: f"Fix task {index}.")
+SOURCE = SignedSweSource("train", prompt_of=lambda split, index: f"Fix task {index}.")
 CALL_ZERO = {"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": "a.py\n"}
 
 
@@ -83,7 +83,7 @@ def session_record(session_id="s-1", *, state=LIVE, hotkey="5Hot", index=0,
     return SessionRecord(
         session_id=session_id, hotkey=hotkey, request_id="r" * 32 + session_id,
         engagement_sha256="e" * 64, kind="corpus",
-        engagement=corpus_engagement(JOB.job_id, index), env=ENV, split="train:20",
+        engagement=corpus_engagement(JOB.job_id, index), env=ENV, split="train",
         index=index, checkpoint=JOB.checkpoint_sha256, job_id=JOB.job_id, prompt_index=index,
         machine_id=MACHINE, issued_at=NOW, expires_at=expires_at, token_sha256="t" * 64,
         state=state, closed_at=closed_at)
@@ -232,7 +232,7 @@ def test_verify_transcript_is_called_with_every_expected_field(world, monkeypatc
     assert directory_ is world.fleet.snapshot and kw == {}
     assert expected == attest.Expected(
         hotkey="5Hot", engagement=corpus_engagement(JOB.job_id, 0), env=JOB.episode.sandbox.env,
-        split="train:20", index=0, checkpoint=JOB.checkpoint_sha256,
+        split="train", index=0, checkpoint=JOB.checkpoint_sha256,
         seen_session_ids=frozenset({"s-9"}), require_graded=True)
     assert {f.name for f in dataclasses.fields(attest.Expected)} == {
         "hotkey", "engagement", "env", "split", "index", "checkpoint", "seen_session_ids",
@@ -279,7 +279,7 @@ def test_a_stale_directory_is_a_retryable_refusal_not_unknown_key(world):
     (dict(session=claims(engagement=corpus_engagement("other-job", 0))), "task_mismatch"),
     (dict(session=claims(env="reliquary-terminal")), "task_mismatch"),
     (dict(session=claims(checkpoint="d" * 64)), "checkpoint_mismatch"),
-    (dict(session=claims(split="train:21")), "task_mismatch"),
+    (dict(session=claims(split="r2e")), "task_mismatch"),
 ])
 def test_every_expected_field_is_checked(world, change, expected_reason):
     answer = submit(world, **change)

@@ -273,13 +273,13 @@ def test_a_signed_source_serves_the_sandbox_prompt_without_the_notice():
         rows_asked.append((split, index))
         return None, rows[index]
 
-    source = SignedSweSource("train:20", prompt_of=prompt_of, row_of=row_of)
+    source = SignedSweSource("train", prompt_of=prompt_of, row_of=row_of)
     assert source.prompt(3) == "task 3" and source.prompt(3) == "task 3"
-    assert asked == [("train:20", 3)]                      # cached
+    assert asked == [("train", 3)]                      # cached
     assert agentic_swe.PINNED_NETWORK_NOTICE not in source.prompt(3)
     assert source.instance_id(3) == "repo__x.3"
-    assert source.task_for(3).prompt == "task 3" and source.split == "train:20"
-    assert source.task_for(3).id == "repo__x.3" and rows_asked == [("train:20", 3)]  # cached
+    assert source.task_for(3).prompt == "task 3" and source.split == "train"
+    assert source.task_for(3).id == "repo__x.3" and rows_asked == [("train", 3)]  # cached
 
 
 def _no_sandbox_install(monkeypatch):
@@ -329,5 +329,32 @@ def test_an_env_sandbox_module_that_fails_to_import_is_reported(monkeypatch):
 
     monkeypatch.setattr(agentic_swe.importlib, "import_module", import_module)
     refusal = agentic_swe.sandbox_support_refusal(job.episode)
-    assert "reliquary_swe.sandbox cannot be imported (RuntimeError: verifiers is not the pinned" \
+    assert "reliquary_swe cannot be imported (RuntimeError: verifiers is not the pinned" \
         in refusal
+
+
+def test_a_job_at_another_image_count_than_the_bridge_serves_is_refused(monkeypatch):
+    import dataclasses
+
+    job = parse_job(_manifest(episode=signed_episode()))
+    episode = dataclasses.replace(job.episode,
+                                  env=dataclasses.replace(job.episode.env, num_images=10))
+    _no_sandbox_install(monkeypatch)
+    assert "default 20 images" in agentic_swe.sandbox_support_refusal(episode)
+
+
+def test_the_verifiers_bridge_is_checked_for_every_process(monkeypatch):
+    job = parse_job(_manifest(episode=signed_episode()))
+    version = ENV_PACKAGE.split("==", 1)[1].split("+g", 1)[0]
+    _no_sandbox_install(monkeypatch)
+    monkeypatch.setattr("reliquary.sandbox.sandbox_commit_refusal", lambda pinned: None)
+    monkeypatch.setattr(agentic_swe.importlib.metadata, "version", lambda name: version)
+    monkeypatch.setattr(agentic_swe, "installed_env_package", lambda package: ENV_PACKAGE)
+
+    def import_module(name):
+        if name == "reliquary_sandbox_verifiers":
+            raise RuntimeError("verifiers is not the pinned commit")
+
+    monkeypatch.setattr(agentic_swe.importlib, "import_module", import_module)
+    refusal = agentic_swe.sandbox_support_refusal(job.episode, need_bridge=False)
+    assert refusal == "the verifiers bridge cannot load: verifiers is not the pinned commit"

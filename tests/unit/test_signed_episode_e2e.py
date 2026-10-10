@@ -67,7 +67,7 @@ CMD_OPEN, CMD_CLOSE = 8, 9
 MANIFEST = _manifest(prompt_count=3, episode=signed_episode())
 JOB = parse_job(MANIFEST)
 PROMPT_TEXT = "Write 42 to /work/answer.txt."
-SOURCE = SignedSweSource("train:20", prompt_of=lambda split, index: PROMPT_TEXT,
+SOURCE = SignedSweSource("train", prompt_of=lambda split, index: PROMPT_TEXT,
                          row_of=lambda split, index: (None, SimpleNamespace(instance_id=f"fake-{index}")))
 TOKENIZER = _Tokenizer()
 PROOF = "A" * 200

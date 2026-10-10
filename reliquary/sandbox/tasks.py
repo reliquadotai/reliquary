@@ -1,5 +1,5 @@
 """What a machine will resolve for a session: the task's image and declared limits,
-read from the same env entry point (`reliquary_swe.sandbox.sandbox_task`) so the
+read from the same bridged env a gateway serves (`bridged_swe.sandbox_task_of`) so the
 token names the image the machine runs and budgets the gateway accepts (422 below the
 task's limits)."""
 
@@ -36,7 +36,7 @@ class SweTaskResolver:
     def _resolve(self, index: int) -> ResolvedTask:
         factory = self._sandbox_task
         if factory is None:
-            from reliquary_swe.sandbox import sandbox_task as factory
+            from reliquary.environment.bridged_swe import sandbox_task_of as factory
         task = factory(self._split, index)
         limits = getattr(task, "limits", None)
         values = {} if limits is None else {

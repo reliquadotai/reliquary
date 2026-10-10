@@ -131,7 +131,7 @@ def runner(sessions, sandbox, sleeps=None, fake_time=None, max_live=4, new_reque
         job=JOB, hotkey=HOT, sign_binding=lambda binding: "sig-" + binding.hex()[:16],
         sessions=sessions, model_name="m", renderer_model_dir="/ck",
         generate_url="http://127.0.0.1:1", sampling=JOB.sampling,
-        source=SignedSweSource("train:20", prompt_of=lambda s, i: f"Fix task {i}."),
+        source=SignedSweSource("train", prompt_of=lambda s, i: f"Fix task {i}."),
         runner_factory=lambda url: sandbox, clock=lambda: NOW,
         new_request_id=new_request_id or (lambda: "a" * 32),
         sleep=fake_time.sleep, monotonic=fake_time.monotonic, max_live=max_live)
@@ -594,7 +594,7 @@ def test_the_precheck_is_the_validators_signed_parse(tmp_path):
     full_check = signed_trajectory_precheck(
         S, max_turns=40, job=JOB, chunk_tokens=32,
         tokenizer=SimpleNamespace(decode=lambda ids, **kw: ",".join(map(str, ids))),
-        source=SignedSweSource("train:20", prompt_of=lambda s, i: f"Fix task {i}."))
+        source=SignedSweSource("train", prompt_of=lambda s, i: f"Fix task {i}."))
     assert full_check(built, prompt_index=0) is None
     assert full_check(built, prompt_index=1)[0] == "prompt_not_faithful"
     assert full_check(dataclasses.replace(built, proofs=(("p", "q"), ("p",))),
@@ -685,7 +685,7 @@ def test_withdraw_and_open_interoperate_with_the_real_router_and_real_keys(tmp_p
         job=JOB, hotkey=alice.ss58_address, sign_binding=lambda b: alice.sign(b).hex(),
         sessions=sessions, model_name="m", renderer_model_dir="/ck",
         generate_url="http://127.0.0.1:1", sampling=JOB.sampling,
-        source=SignedSweSource("train:20", prompt_of=lambda s, i: f"Fix task {i}."),
+        source=SignedSweSource("train", prompt_of=lambda s, i: f"Fix task {i}."),
         runner_factory=lambda url: FakeSandboxRunner(signed), clock=lambda: NOW,
         new_request_id=lambda: next(ids))
     result, _ = asyncio.run(_run(signed_runner))
