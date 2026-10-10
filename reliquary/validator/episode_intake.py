@@ -116,7 +116,17 @@ class EpisodeGroupIntake:
     not the window contract's refuses its groups (``episode_policy_stale``) until it is rebuilt.
     ``window_open(window)``: whether this validator takes episode groups for that window (False for a
     window it resumed after a restart: what the batcher accepted before is lost with its memory, so no
-    group of it is taken again: ``episode_window_resumed``); None takes every window (tests)."""
+    group of it is taken again: ``episode_window_resumed``); None takes every window (tests).
+
+    ``checks_allowed(hotkey)``: with the RL yield quota, the in-flight check cap is the hotkey's, equal to the
+    groups it can submit now (proportional: more hotkeys gain nothing, a hotkey with nothing to submit gets
+    no check slot), and one operator's hotkeys together hold at most ``max_checks_running - 1`` checks, so
+    one slot is always left to the others; None keeps the per-operator ``max_checks_in_flight``.
+    ``max_checks_running``: this intake's own transcript-check slots (a semaphore and threads of that size);
+    None shares the module's ``MAX_CHECKS_RUNNING``. ``checks_scale(hotkey)``: how much the per-hotkey
+    per-minute check budget scales (the quota's ``cap_scale``: with the hotkey's allocation); None keeps
+    ``max_checks_per_minute`` for every hotkey. The budget holds no slot: the in-flight caps above bound what
+    any hotkey or operator holds at once, whatever its budget."""
 
     def __init__(self, *, checkers: Mapping[str, EpisodeGroupChecker], precommits: Callable[[str], Any],
                  directory: Callable[[float], Any | None], token_verifier, sessions,
@@ -125,7 +135,10 @@ class EpisodeGroupIntake:
                  max_checks_in_flight: int = DEFAULT_MAX_CHECKS_IN_FLIGHT,
                  clock: Callable[[], float] = time.monotonic,
                  admission_deadline_s: float = ADMISSION_DEADLINE_S,
-                 window_open: Callable[[int], bool] | None = None) -> None:
+                 window_open: Callable[[int], bool] | None = None,
+                 checks_allowed: Callable[[str], int] | None = None,
+                 max_checks_running: int | None = None,
+                 checks_scale: Callable[[str], float] | None = None) -> None:
         ttl = getattr(getattr(sessions, "policy", None), "claim_ttl_s", None)
         if not isinstance(ttl, (int, float)) or ttl < CLAIM_TTL_MARGIN * float(admission_deadline_s):
             raise ValueError(f"the session claim ttl ({ttl!r} s) must be at least {CLAIM_TTL_MARGIN}x the "
@@ -145,26 +158,65 @@ class EpisodeGroupIntake:
         self._in_flight_lock = threading.Lock()         # a check's thread ends its count
         self._tasks: set[asyncio.Task] = set()
         self._window_open = window_open
+        self._checks_allowed = checks_allowed
+        self._checks_scale = checks_scale
+        if max_checks_running is not None and int(max_checks_running) < 2:
+            raise ValueError("max_checks_running must be at least 2 (one slot is always left to the others)")
+        self._max_running = MAX_CHECKS_RUNNING if max_checks_running is None else int(max_checks_running)
+        # This intake's own slots, or None: the module's (read at each check, so tests can replace them).
+        self._slots: threading.BoundedSemaphore | None = None
+        self._threads: ThreadPoolExecutor | None = None
+        if max_checks_running is not None:
+            self._slots = threading.BoundedSemaphore(self._max_running)
+            self._threads = ThreadPoolExecutor(max_workers=self._max_running, thread_name_prefix="episode-check")
+        # With ``checks_allowed``: checks in flight per operator (all its hotkeys), and, per in-flight key,
+        # the operators of its running checks (in start order: ``_check_ended`` ends the last).
+        self._op_in_flight: dict[str, int] = {}
+        self._op_of: dict[str, list[str]] = {}
 
     @property
     def environments(self) -> tuple[str, ...]:
         return tuple(sorted(self._checkers))
 
-    def _rate_refusal(self, hotkey: str, operator: str) -> tuple[str, dict] | None:
-        """None, and one more check of ``operator`` in flight (``_check_ended`` ends it); else the
+    def _owner(self, hotkey: str, operator: str | None) -> str:
+        """The in-flight cap's key: the hotkey with ``checks_allowed``, else the operator."""
+        if self._checks_allowed is not None:
+            return str(hotkey)
+        return str(operator) if operator else str(hotkey)
+
+    def _rate_refusal(self, hotkey: str, owner: str, *, operator: str | None = None) -> tuple[str, dict] | None:
+        """None, and one more check of ``owner`` in flight (``_check_ended`` ends it); else the
         refusal's stage and why. The in-flight cap reserves no identity (``episode_checks_in_flight``,
-        retryable); the per-minute budget does (``episode_rate``)."""
+        retryable); the per-minute budget does (``episode_rate``). ``operator``: the receipt's (the
+        hotkey when unknown), read only with ``checks_allowed``."""
         now = float(self._clock())
         recent = [t for t in self._recent.get(hotkey, ()) if t > now - 60.0]
+        # The hooks read the quota's in-memory index (on the event loop), before the intake's lock.
+        if self._checks_allowed is None:
+            cap = self._max_in_flight
+        else:
+            cap = max(0, min(int(self._checks_allowed(hotkey)), self._max_running - 1))
+        limit = (self._max_per_minute if self._checks_scale is None
+                 else max(1, int(self._max_per_minute * float(self._checks_scale(hotkey)))))
+        op_key = str(operator) if operator else str(hotkey)
         with self._in_flight_lock:
-            running = self._in_flight.get(operator, 0)
-            if running >= self._max_in_flight:
+            running = self._in_flight.get(owner, 0)
+            if running >= cap:
                 self._recent[hotkey] = recent
-                return "episode_checks_in_flight", {"in_flight": running, "max": self._max_in_flight}
-            if len(recent) >= self._max_per_minute:
+                return "episode_checks_in_flight", {"in_flight": running, "max": cap}
+            if self._checks_allowed is not None:
+                op_running = self._op_in_flight.get(op_key, 0)
+                if op_running >= self._max_running - 1:          # one slot always left to other operators
+                    self._recent[hotkey] = recent
+                    return "episode_checks_in_flight", {"operator_in_flight": op_running,
+                                                        "max": self._max_running - 1}
+            if len(recent) >= limit:
                 self._recent[hotkey] = recent
-                return "episode_rate", {"per_minute": len(recent), "max": self._max_per_minute}
-            self._in_flight[operator] = running + 1
+                return "episode_rate", {"per_minute": len(recent), "max": limit}
+            self._in_flight[owner] = running + 1
+            if self._checks_allowed is not None:
+                self._op_in_flight[op_key] = self._op_in_flight.get(op_key, 0) + 1
+                self._op_of.setdefault(owner, []).append(op_key)
         recent.append(now)
         self._recent[hotkey] = recent
         if len(self._recent) > 4096:            # forget idle hotkeys
@@ -195,14 +247,24 @@ class EpisodeGroupIntake:
                          stage=stage)
         return prepared, None
 
-    def _check_ended(self, operator: str) -> None:
+    def _check_ended(self, owner: str) -> None:
         """Called from the event loop or from the check's own thread."""
         with self._in_flight_lock:
-            left = self._in_flight.get(operator, 1) - 1
+            left = self._in_flight.get(owner, 1) - 1
             if left > 0:
-                self._in_flight[operator] = left
+                self._in_flight[owner] = left
             else:
-                self._in_flight.pop(operator, None)
+                self._in_flight.pop(owner, None)
+            ops = self._op_of.get(owner)
+            if ops:
+                op_key = ops.pop()
+                if not ops:
+                    self._op_of.pop(owner, None)
+                op_left = self._op_in_flight.get(op_key, 1) - 1
+                if op_left > 0:
+                    self._op_in_flight[op_key] = op_left
+                else:
+                    self._op_in_flight.pop(op_key, None)
 
     def _forget_check(self, hotkey: str) -> None:
         """A check refused for capacity does not count against the hotkey's per-minute budget."""
@@ -252,27 +314,29 @@ class EpisodeGroupIntake:
         if directory is None:
             return self._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_directory")
         hotkey = str(request.miner_hotkey)
-        owner = str(operator) if operator else hotkey
-        limited = self._rate_refusal(hotkey, owner)
+        owner = self._owner(hotkey, operator)
+        limited = self._rate_refusal(hotkey, owner, operator=operator)
         if limited is not None:
             return self._refuse(prepared, RejectReason.RATE_LIMITED, *limited)
         sha = _precommit_sha(request)
         handed_off = False                  # to the check's thread, which then ends the hotkey's count
         try:
             precommit = await asyncio.to_thread(self._precommits, sha) if sha else None
-            if not _CHECKS_RUNNING.acquire(blocking=False):
+            slots = self._slots if self._slots is not None else _CHECKS_RUNNING
+            threads = self._threads if self._threads is not None else _CHECK_THREADS
+            if not slots.acquire(blocking=False):
                 self._forget_check(hotkey)
                 return self._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_checker_busy",
-                                    {"running": MAX_CHECKS_RUNNING})
+                                    {"running": self._max_running})
             try:
                 # Off the event loop: signatures and a renderer parse of M episodes. The slot is
                 # released when the check's thread returns (or never starts), not when we stop waiting.
                 if progress is not None:
                     progress.started = time.monotonic()
-                future = _CHECK_THREADS.submit(checker.check, request, precommit=precommit, directory=directory,
+                future = threads.submit(checker.check, request, precommit=precommit, directory=directory,
                                                token_verifier=self._tokens, seen=self._seen(), received=received)
             except BaseException:
-                _CHECKS_RUNNING.release()
+                slots.release()
                 raise
             handed_off = True
 
@@ -280,7 +344,7 @@ class EpisodeGroupIntake:
                 if progress is not None:
                     progress.ended = time.monotonic()
                 try:
-                    _CHECKS_RUNNING.release()
+                    slots.release()
                 finally:
                     self._check_ended(owner)
 

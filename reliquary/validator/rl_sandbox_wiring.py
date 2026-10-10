@@ -50,7 +50,7 @@ RESTORE_ATTEMPTS = 3
 RESTORE_TIMEOUT_S = 60.0
 RESTORE_BACKOFF_S = 5.0
 STOP_TIMEOUT_S = 10.0
-RL_GROUPS_IN_FLIGHT = GROUPS_IN_FLIGHT     # the intake's per-operator check cap
+RL_GROUPS_IN_FLIGHT = GROUPS_IN_FLIGHT     # the intake's per-operator check cap; with the yield quota the cap is the hotkey's submittable groups
 PRECOMMIT_PRUNE_SECONDS = 3600.0
 MIN_PRECOMMIT_RETENTION_S = 2 * 86_400
 YIELD_FLUSH_SECONDS = 10.0
@@ -357,6 +357,20 @@ def rl_registration(server) -> Callable:
     return registration
 
 
+def _check_caps(quota, clock: Callable[[], float]) -> dict:
+    """With the yield quota, the intake's check caps: a hotkey checks at most the groups it can submit now,
+    one operator at most ``MAX_CHECKS_RUNNING - 1`` at once (one slot always left to the others), on the
+    RL intake's own ``MAX_CHECKS_RUNNING`` slots, and its per-minute check budget scales with its allocation.
+    Without it, the intake's defaults (a cap per operator)."""
+    from reliquary.sandbox.rl_capacity import MAX_CHECKS_RUNNING
+    from reliquary.sandbox.rl_quota import YieldQuota
+
+    if not isinstance(quota, YieldQuota):
+        return {}
+    return {"checks_allowed": lambda hotkey: quota.groups_formable(hotkey, int(clock())),
+            "max_checks_running": MAX_CHECKS_RUNNING, "checks_scale": quota.cap_scale}
+
+
 def build_rl_episode_services(
     config, *, validator_hotkey: str, runtime, environments: Mapping[str, Any],
     renderer_for: Callable[[Any], Any], current_window: Callable[[], int | None], chunk_tokens: int,
@@ -478,7 +492,7 @@ def build_rl_episode_services(
     intake = EpisodeGroupIntake(checkers=checkers, precommits=runtime.episode_precommit,
                                 directory=fleet.directory_if_ready, token_verifier=token_verifier,
                                 sessions=issuer, seen=book.submitted_ids, outcomes=outcomes,
-                                window_open=window_open)
+                                window_open=window_open, **_check_caps(quota, clock))
     logger.info("rl episode services built for %s (validator key %s)", sorted(policies), signer.key_id)
     return RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,
                              issuer=issuer, routers=(sessions_router, precommit_router), intake=intake,
