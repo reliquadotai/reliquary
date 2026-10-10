@@ -5,7 +5,9 @@ Every ``refresh_s`` at most (and at once when the ledger's snapshot or the fleet
 allocated by weighted water-filling over entities (``rl_capacity.allocate``): each MAIN hotkey with its weight and its
 CURRENT demand, the NEWCOMER entity and the LOW_YIELD entity. A hotkey's demand is its counted sessions plus the
 ADMISSIBLE open requests it made in the last ``DEMAND_TTL_S`` (the caller records a request only after the seed and
-the session book's checks passed).
+the session book's checks passed, and withdraws it when the precommit's task then fails: ``forget``), counted by
+group: each precommit held or asked counts at least its M, as at admission. A miner sending its seeds one at a time
+shows a whole group's demand from its first request.
 
 * What the MINER is told is its POTENTIAL (``rl_capacity.potential``): its weighted share with its own demand
   unbounded, the others' as measured. Admission uses the allocation (its current demand).
@@ -132,6 +134,7 @@ class YieldQuota:
         self._last_m: dict[str, int] = {}                        # hotkey -> M of its last opened session's env
         self._opens: dict[str, deque] = {}                       # hotkey -> (issued_at, record) over its period
         self._wants: dict[str, dict[tuple[str, int], float]] = {}   # hotkey -> {(precommit, seed): last try}
+        self._want_m: dict[str, int] = {}                        # asked precommit -> M of its env
         # pooled entity -> {precommit: (hotkey, first ask, last ask, a genuine newcomer)}
         self._asks: dict[str, dict[str, tuple[str, float, float, bool]]] = {NEWCOMER: {}, LOW_YIELD: {}}
         self._lane_opens: dict[str, deque] = {NEWCOMER: deque(), LOW_YIELD: deque()}
@@ -236,8 +239,37 @@ class YieldQuota:
                 del self._wants[hotkey]
         return len(self._wants.get(hotkey, ()))
 
-    def _demand(self, hotkey: str, now: int) -> int:
-        return len(self._counted(hotkey, now)) + self._wanted(hotkey, now)
+    def _demand(self, hotkey: str, now: int, counted: list[Any] | None = None) -> int:
+        """Counted sessions plus admissible requests, by group: each precommit held or asked counts at least its
+        M (as ``committed`` does at admission), since asking for one seed of a group is asking for the group. A
+        miner that sends its seeds one at a time therefore shows a group's demand from its first request."""
+        self._wanted(hotkey, now)
+        per: dict[str | None, list[int]] = {}                    # precommit -> [sessions and requests, M]
+        for record in self._counted(hotkey, now) if counted is None else counted:
+            sha = self._sha.get(record.session_id)
+            entry = per.setdefault(sha, [0, self._m_env(getattr(record, "env", None))])
+            entry[0] += 1
+        for sha, _seed in self._wants.get(hotkey, ()):
+            entry = per.setdefault(sha, [0, self._want_m.get(sha, self._group_size)])
+            entry[0] += 1
+        return sum(max(n, m) for n, m in per.values())
+
+    def forget(self, hotkey: str, precommit_sha256: str) -> None:
+        """A request the quota admitted was then refused for its precommit's task (unresolvable, too long): its
+        precommit's requests and its place in a pooled entity's line go, at once (no demand from a precommit
+        that cannot open)."""
+        hotkey = str(hotkey)
+        wants = self._wants.get(hotkey)
+        if wants:
+            for key in [k for k in wants if k[0] == precommit_sha256]:
+                del wants[key]
+            if not wants:
+                del self._wants[hotkey]
+        for asks in self._asks.values():
+            ask = asks.get(precommit_sha256)
+            if ask is not None and ask[0] == hotkey:
+                del asks[precommit_sha256]
+        self._dirty = True
 
     def _m_env(self, environment: str | None) -> int:
         if environment is None:
@@ -321,8 +353,9 @@ class YieldQuota:
             kept: list[tuple[str, YieldStats]] = []
             for hotkey in set(self._index) | set(self._wants):
                 stats = snapshot.get(hotkey, YieldStats())
-                counted[hotkey] = len(self._counted(hotkey, now))
-                demands[hotkey] = counted[hotkey] + self._wanted(hotkey, now)
+                rows = self._counted(hotkey, now)
+                counted[hotkey] = len(rows)
+                demands[hotkey] = self._demand(hotkey, now, rows)
                 lane = self._stats_lane(stats)
                 if lane == MAIN and self._pool_kept(stats) is not None:
                     kept.append((hotkey, stats))
@@ -356,6 +389,9 @@ class YieldQuota:
                     del self._opens[hotkey]
             for hotkey in [h for h in self._last_m if h not in self._index and h not in self._opens]:
                 del self._last_m[hotkey]
+            asked = {sha for wants in self._wants.values() for sha, _seed in wants}
+            for sha in [sha for sha in self._want_m if sha not in asked]:
+                del self._want_m[sha]
             self._alloc = allocate(key[1], pool_seeds=group, main=main, newcomer_demand=entity[NEWCOMER],
                                    low_yield_demand=entity[LOW_YIELD], takes_spare=self._takes_spare)
             self._snapshot, self._claims, self._entity_demand = snapshot, main, entity
@@ -390,6 +426,7 @@ class YieldQuota:
         hotkey, now = str(hotkey), int(now)
         if precommit_sha256 is not None and seed_index is not None:
             self._wants.setdefault(hotkey, {})[(precommit_sha256, int(seed_index))] = float(now)
+            self._want_m[precommit_sha256] = self._m_env(environment)
             self._dirty = True
         if self._capacity(now) <= 0:
             return Refusal("quota_live", {"why": "no fleet capacity known yet"}, retry_after=self._retry_after_s)
@@ -500,8 +537,10 @@ class YieldQuota:
         return max(1, math.ceil(self.potential_sessions(hotkey) / self._pool_seeds))
 
     def cap_scale(self, hotkey: str) -> float:
-        """How much a per-hotkey rate constant of the session policy scales for this hotkey."""
-        return max(1.0, self.potential_sessions(hotkey) / self._pool_seeds)
+        """How much a per-hotkey rate constant of the session policy scales for this hotkey. The RL policy's
+        constants are sized for ``NEWCOMER_MAX_GROUPS`` groups in flight (a newcomer's maximum), so the scale is the
+        hotkey's potential in such sets of groups, never below 1: a newcomer keeps the policy's own budget."""
+        return max(1.0, self.potential_sessions(hotkey) / (NEWCOMER_MAX_GROUPS * self._pool_seeds))
 
     def groups_formable(self, hotkey: str, now: int) -> int:
         """Precommits of the hotkey with at least M (their env's) graded, unsubmitted sessions."""

@@ -620,7 +620,12 @@ class SessionBook:
         it would be a selective re-roll) and every other state keep it taken, and so does a second
         ``aborted`` record of the same engagement. A pool abort caused by other miners never counts."""
         aborted = 0
-        for r in self._sessions.values():
+        sha = _rl_precommit_engagement(engagement)
+        if sha is None:
+            candidates = self._sessions.values()
+        else:                               # an RL engagement: only its precommit's sessions (an index, no scan)
+            candidates = [self._sessions[s] for s in self._by_precommit.get(sha, ()) if s in self._sessions]
+        for r in candidates:
             if r.engagement != engagement:
                 continue
             if r.state != ABORTED:
@@ -728,13 +733,18 @@ class SessionBook:
 
 def _rl_precommit_of(record: SessionRecord) -> str | None:
     """The precommit an RL session's engagement names, or None (not an RL engagement)."""
+    return _rl_precommit_engagement(record.engagement)
+
+
+def _rl_precommit_engagement(engagement: str) -> str | None:
+    """The precommit an RL engagement names, or None (not an RL engagement)."""
     # Only an RL engagement is parsed: a corpus engagement never loads the RL episode module.
-    if not record.engagement.startswith("rl:"):
+    if not isinstance(engagement, str) or not engagement.startswith("rl:"):
         return None
     from reliquary.protocol.service_episode import EpisodeWireError, parse_rl_engagement
 
     try:
-        return parse_rl_engagement(record.engagement)[1]
+        return parse_rl_engagement(engagement)[1]
     except EpisodeWireError:
         return None
 

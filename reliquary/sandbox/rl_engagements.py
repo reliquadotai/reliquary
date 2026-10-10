@@ -64,7 +64,9 @@ class SessionQuota(Protocol):
 
     A quota may also define ``admit_locked(hotkey, now, *, precommit_sha256=None, seed_index=None,
     environment=None) -> Refusal | None``: the same check, run under the issuer lock against the sessions as
-    they are then (it may take a pool grant). Such a quota's ``admit_open`` also takes ``seed_index``."""
+    they are then (it may take a pool grant). Such a quota's ``admit_open`` also takes ``seed_index`` (the
+    request it records as demand), and ``forget(hotkey, precommit_sha256)``, when defined, withdraws that
+    demand when the precommit's task then fails."""
 
     async def admit_open(self, hotkey: str, *, environment: str,
                          precommit_sha256: str) -> Refusal | None: ...
@@ -144,6 +146,12 @@ class RlEpisodeEngagements:
                 return Refusal("precommit_stale", {"window": current, "why": "the window is too old"})
         return None
 
+    def _forget(self, hotkey: str, sha: str) -> None:
+        """The quota admitted a request whose precommit's task then failed: it withdraws the precommit's demand."""
+        forget = getattr(self._quota, "forget", None)
+        if forget is not None:
+            forget(hotkey, sha)
+
     async def terms(self, hotkey: str, engagement: Mapping[str, Any]) -> EngagementTerms | Refusal:
         from reliquary.protocol.service_episode import EpisodeWireError, rl_engagement
 
@@ -206,6 +214,7 @@ class RlEpisodeEngagements:
         except Exception as exc:
             logger.warning("rl session open: task %d of %s unresolved (%s)", precommit.task_index,
                            precommit.environment, type(exc).__name__)
+            self._forget(hotkey, sha)
             return Refusal("task_unavailable", {"task_index": precommit.task_index}, retry_after=retry)
         budgets = policy.budgets_dict()
         for limit_name, limit in task.limits.items():
@@ -213,6 +222,7 @@ class RlEpisodeEngagements:
                 budgets[limit_name] = max(budgets[limit_name], int(limit))
         prepare = getattr(task, "prepare_timeout_s", None)
         if token_validity_s(self._book.policy.open_window_s, int(budgets["wall_s"]), prepare) > MAX_SESSION_SPAN_S:
+            self._forget(hotkey, sha)
             return Refusal("session_too_long", {"wall_s": int(budgets["wall_s"]),
                                                 "max_span_s": MAX_SESSION_SPAN_S})
         window, environment = precommit.window, precommit.environment
@@ -223,8 +233,8 @@ class RlEpisodeEngagements:
             stale = self._stale(window)
             if stale is not None or locked is None:
                 return stale
-            return locked(hotkey, int(self._clock()), precommit_sha256=sha, seed_index=seed,
-                          environment=environment)
+            # no seed: the pre-check recorded the request (a seed taken meanwhile must leave no demand)
+            return locked(hotkey, int(self._clock()), precommit_sha256=sha, environment=environment)
 
         return EngagementTerms(
             engagement=name, env=policy.sandbox_env, split=policy.split, index=precommit.task_index,

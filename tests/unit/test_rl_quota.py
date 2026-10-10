@@ -160,15 +160,15 @@ def test_a_small_main_key_gets_its_weighted_share_under_contention_and_spare_whe
     shares = q.allocation().main
     assert shares["5Small"] == pytest.approx(shares["5Big"] / 100)          # weights 5 : 500
     alone = quota({"5Small": main_stats(5.0)})
-    want(alone, "5Small", 100)
-    assert alone.allocation().main["5Small"] == 100                         # its demand, not the fleet
+    want(alone, "5Small", 100)                                              # 3 groups of 32 seeds and 4 of a 4th
+    assert alone.allocation().main["5Small"] == 3 * P + M                   # its demand by group, not the fleet
 
 
 def test_a_dormant_main_key_holds_nothing_and_one_with_no_recent_useful_rejoins_the_newcomers():
     q = quota({"5Idle": main_stats(500.0), "5Busy": main_stats(5.0)})
-    want(q, "5Busy", 100)
+    want(q, "5Busy", 96)
     alloc = q.allocation().main
-    assert alloc.get("5Idle", 0.0) == 0.0 and alloc["5Busy"] == 100       # no demand, nothing; no history needed
+    assert alloc.get("5Idle", 0.0) == 0.0 and alloc["5Busy"] == 96        # no demand, nothing; no history needed
     stale = quota({"5Back": YieldStats(useful=180, decided=200, useful_24h=0, useful_s_24h=0.0)})
     assert stale.lane("5Back") == NEWCOMER
 
@@ -208,10 +208,10 @@ def test_the_allocation_follows_demand_within_its_refresh_and_the_ledger_at_once
     for seed in range(50):
         q.refusal("5A", NOW, precommit_sha256=sha(seed // P), seed_index=seed % P)
     assert q.allocation(NOW + 1).main["5A"] == 50
-    for seed in range(100):
+    for seed in range(96):
         q.refusal("5A", NOW + 1, precommit_sha256=sha(100 + seed // P), seed_index=seed % P)
     assert q.allocation(NOW + 1).main["5A"] == 50                           # within the refresh: unchanged
-    assert q.allocation(NOW + 2).main["5A"] == 150
+    assert q.allocation(NOW + 2).main["5A"] == 146
     ledger.table, ledger.version = {"5A": WASTEFUL}, 1
     assert "5A" not in q.allocation(NOW + 2).main                           # a new snapshot: at once
 
@@ -223,8 +223,9 @@ def test_rank_headroom_groups_scale_and_formable():
     assert q.rank("5W") == ("5W", 0.0, True) and q.rank("5New") == ("5New", 0.0, True)
     assert q.headroom("5Main", NOW) == 320                                  # admission: its current demand
     assert q.sessions_allowed("5Main") == C                                 # told: its potential
-    assert q.groups_allowed("5Main") == C // P + 1 and q.cap_scale("5Main") == C / P
+    assert q.groups_allowed("5Main") == C // P + 1 and q.cap_scale("5Main") == C / (NEWCOMER_MAX_GROUPS * P)
     assert q.groups_allowed("5W") == 1 and q.groups_allowed("5New") == NEWCOMER_MAX_GROUPS and q.cap_scale("5W") == 1.0
+    assert q.cap_scale("5New") == 1.0                                      # a newcomer: the policy's own budget
     for seed in range(M):
         hold(q, "5New", sha(1), seed, state="closed_graded", status="graded")
     for seed in range(M - 1):
@@ -426,13 +427,13 @@ def test_a_group_keeps_its_place_in_line_when_its_open_fails_after_the_check():
 
 
 def test_a_new_group_needs_the_m_of_its_env():
-    q = quota({"5A": main_stats(10.0)}, group_sizes={"small-env": 4, "big-env": 32})
-    want(q, "5A", 10)                                                     # its allocation: 10 sessions
+    q = quota({"5A": main_stats(10.0)}, capacity=10, group_sizes={"small-env": 4, "big-env": 32})
+    want(q, "5A", 10)                                                     # its allocation: the 10-session fleet
     assert q.allocation().main["5A"] == 10
     assert q.admit_locked("5A", NOW, precommit_sha256=sha(1), seed_index=0).reason == "quota_live"   # M = 16
     assert q.admit_locked("5A", NOW, precommit_sha256=sha(1), seed_index=0, environment="small-env") is None
     assert asyncio.run(q.admit_open("5A", environment="small-env", precommit_sha256=sha(2), seed_index=0)) is None
-    roomy = quota({"5A": main_stats(10.0)}, group_sizes={"big-env": 32})
+    roomy = quota({"5A": main_stats(10.0)}, capacity=20, group_sizes={"big-env": 32})
     want(roomy, "5A", 20)
     refused = asyncio.run(roomy.admit_open("5A", environment="big-env", precommit_sha256=sha(3), seed_index=0))
     assert refused.reason == "quota_live"                                 # 32 never fit in 20: nothing opened

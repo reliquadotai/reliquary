@@ -8,7 +8,8 @@ Settings: the corpus validator's (``sandbox_wiring.SandboxValidatorConfig``). Th
 what one hotkey's groups in flight need (``rl_sandbox_policy``); the session quota (``SessionQuota``)
 decides beyond that. With a yield ledger, the quota is the yield quota (``rl_quota.YieldQuota``: the fleet's
 session slots shared by weighted water-filling) and the policy's per-hotkey live and hourly-open caps are
-lifted (``NO_PER_KEY_CAP``); the daily abort cap keeps its size.
+lifted (``NO_PER_KEY_CAP``); the daily abort cap and the refused-open rate are not lifted: they scale with the
+hotkey's allocation (``SessionBook.cap_scale``, 1 for a newcomer).
 
 Windows. Episode intake (precommits, opens, groups) is open only for a window THIS process opened
 (``window_started_at``): a window resumed after a restart takes no episode group, since what its batcher
@@ -71,6 +72,17 @@ def rl_sandbox_policy(base: SandboxPolicy, pool_seeds: int, *,
         base, max_live_per_hotkey=live,
         max_opens_per_hour=max(base.max_opens_per_hour, default.max_opens_per_hour * scale),
         max_aborted_per_day=max(base.max_aborted_per_day, default.max_aborted_per_day * scale))
+
+
+def episode_group_sizes(policies: Mapping[str, Any]) -> dict[str, int]:
+    """Each episode env's group size M (half its seed pool), by every name the env goes by: the order's env name
+    (what an open names) and its sandbox env (what a session record stores). A name with two sizes is refused."""
+    sizes: dict[str, int] = {}
+    for name, policy in policies.items():
+        for key in (name, policy.sandbox_env):
+            if sizes.setdefault(key, policy.pool_seeds // 2) != policy.pool_seeds // 2:
+                raise ValueError(f"episode env name {key!r} has two group sizes; the yield quota needs one")
+    return sizes
 
 
 def stop_ids_from_metadata(config: Mapping | None, generation_config: Mapping | None, tokenizer) -> set[int]:
@@ -398,7 +410,7 @@ def build_rl_episode_services(
     yield_quota = (yield_path is not None or ledger is not None) and (quota is None or isinstance(quota, YieldQuota))
     if yield_quota:
         # The yield quota decides how many sessions a hotkey holds and opens (no fixed per-key maximum); the
-        # daily abort cap keeps its size: an abort is neutral and frees its seed.
+        # daily abort cap is not lifted (an abort is neutral and frees its seed): it scales with the allocation.
         policy = dataclasses.replace(policy, max_live_per_hotkey=NO_PER_KEY_CAP, max_opens_per_hour=NO_PER_KEY_CAP)
     signer = signer or Signer(config.key_id, load_private_key(config.key_file))
     token_verifier = Ed25519TokenVerifier({**config.retired_keys, signer.key_id: signer.public_key_b64})
@@ -422,12 +434,10 @@ def build_rl_episode_services(
         ledger = SessionYieldLedger(yield_path, clock=clock)
     if yield_quota and quota is None:
         # M by every name an env goes by: the env name an open passes and the sandbox env a session stores.
-        group_sizes = {p.sandbox_env: p.pool_seeds // 2 for p in policies.values()}
-        group_sizes.update({name: p.pool_seeds // 2 for name, p in policies.items()})
         quota = YieldQuota(ledger=ledger, pool_seeds=pool_seeds,
                            group_size=min(p.pool_seeds for p in policies.values()) // 2,
                            capacity=fleet.session_capacity, reported=getattr(fleet, "session_reported", None),
-                           group_sizes=group_sizes, retry_after_s=policy.retry_after_s, clock=clock)
+                           group_sizes=episode_group_sizes(policies), retry_after_s=policy.retry_after_s, clock=clock)
     if ledger is not None and isinstance(quota, YieldQuota):
         ledger.allow_capacity_verdicts(quota.groups_allowed)      # capacity verdicts: per hotkey and window
         book.cap_scale = quota.cap_scale                          # the per-hotkey rates scale with the allocation
@@ -479,5 +489,5 @@ def build_rl_episode_services(
 
 
 __all__ = ["MIN_PRECOMMIT_RETENTION_S", "NO_PER_KEY_CAP", "RL_GROUPS_IN_FLIGHT", "RL_PREFIX", "YIELD_FLUSH_SECONDS", "RlEpisodeServices",
-           "build_rl_episode_services", "episode_stop_set_refusal", "rl_registration", "rl_sandbox_policy",
+           "build_rl_episode_services", "episode_group_sizes", "episode_stop_set_refusal", "rl_registration", "rl_sandbox_policy",
            "stop_ids_from_metadata"]
