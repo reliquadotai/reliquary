@@ -35,15 +35,24 @@ grade executor, no replay and no vote.
 validators outside the team cannot install `reliquary[sandbox]` /
 `reliquary[sandbox-miner]` until it is published. That is the user's decision.
 
-**One reliquary-swe wheel everywhere.** `env_package` is `name==version+g<sha16>` and
-its digest depends on how the package was installed. The sandbox gateways, the
+**One reliquary-swe wheel everywhere.** reliquary-swe is served through the sandbox's
+verifiers bridge: `env_package` is `name==version+g<sha16>.vfb<bridge version>` and
+its digest depends on how the package was installed (an editable install is refused). The sandbox gateways, the
 validators and the miners install reliquary-swe from the same git wheel at the job's
 pinned commit; a different install method gives a different `env_package` and every
 transcript is refused (record 0 `env_package`) or never placed.
 
 ### Safe deployment order
 
-1. Install `reliquary[sandbox]` in the validator image, set nothing yet, and redeploy:
+**The gateways' options are the validators'.** A gateway serves reliquary-swe with
+`EPISODE_ENV_OPTIONS` (tools, splits, per-call timeout); the validator resolves each
+task's image and limits with `reliquary.environment.bridged_swe.GATEWAY_OPTIONS`. Each
+machine's capacity report publishes the digest of the options it serves the env with
+(`env_options_sha256`); a machine whose digest differs, or that publishes none, gets no
+session, and the validator logs one error naming the machine and both digests.
+
+1. Install `reliquary[sandbox]` (which includes the verifiers bridge) in the validator
+   image, set nothing yet, and redeploy:
    with no key settings and no signed job, the validator imports nothing new and
    replay jobs run exactly as before.
 2. Generate the validator key (below) and give every machine its public key.

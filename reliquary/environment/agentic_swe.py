@@ -205,8 +205,7 @@ def load_swe_source(num_images: int) -> SweSource:
 class SignedSweSource:
     """The prompts of a signed-sandbox job: the bridged task's prompt
     (`bridged_swe.prompt_of(split, index)`) exactly, with no restricted-network notice
-    (the sandbox bridge runs the harness in a subprocess runtime, which adds none;
-    ruling 7 of plan 3)."""
+    (the sandbox bridge runs the harness in a subprocess runtime, which adds none)."""
 
     def __init__(self, split: str, *, prompt_of=None, row_of=None) -> None:
         self.split = split
@@ -252,7 +251,8 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
     SWE-smith at the 20 images the bridge serves, reliquary-sandbox at the job's commit,
     the env package at the exact version and code digest record 0 will carry, and the
     verifiers bridge (always: every process reads the task through it; `need_bridge` is
-    kept for callers)."""
+    kept for callers), which must load the installed package (an editable install is
+    refused here, as the gateway refuses it)."""
     from reliquary import sandbox as sandbox_support
 
     if getattr(episode, "sandbox", None) is None:
@@ -261,9 +261,11 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
         sandbox_support.require_sandbox()
     except sandbox_support.SandboxUnavailable as exc:
         return str(exc)
-    if getattr(episode.env, "num_images", 20) != 20:
-        return ("a signed reliquary-swe job serves SWE-smith at its default 20 images "
-                "(the split the bridge serves)")
+    from reliquary.corpus.job import BRIDGED_SWESMITH_IMAGES
+
+    if getattr(episode.env, "num_images", BRIDGED_SWESMITH_IMAGES) != BRIDGED_SWESMITH_IMAGES:
+        return (f"a signed reliquary-swe job serves SWE-smith at its default "
+                f"{BRIDGED_SWESMITH_IMAGES} images (the split the bridge serves)")
     refusal = sandbox_support.sandbox_commit_refusal(episode.sandbox.sandbox_commit)
     if refusal:
         return refusal
@@ -290,6 +292,12 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
         importlib.import_module("reliquary_sandbox_verifiers")
     except Exception as exc:  # the bridge refuses an unpinned verifiers with RuntimeError
         return f"the verifiers bridge cannot load: {exc}"
+    try:
+        from reliquary.environment import bridged_swe
+
+        bridged_swe.bridged_env()
+    except Exception as exc:  # e.g. an editable install: the bridge serves packaged tasksets only
+        return f"the bridge cannot serve the installed {package} ({type(exc).__name__}: {exc})"
     return None
 
 

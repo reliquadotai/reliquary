@@ -15,8 +15,20 @@ SERVED_SPLITS = {"train": {"split": "train"}, "r2e": {"split": "r2e"},
                  "polyglot": {"split": "polyglot"}}
 GATEWAY_OPTIONS = {"tools": ["bash", "edit"], "splits": SERVED_SPLITS,
                    "defaults": {"per_call_timeout_s": 600}}
-"""The options a gateway serves reliquary-swe with (`episode_env_options`): the image and
-limits a session token names are computed with them, so they must be the gateway's."""
+"""The options this process builds reliquary-swe with, which must be the ones the gateway
+serves it with (`episode_env_options`): the image and limits a session token names are
+computed with them. The gateway is the authority: its capacity report publishes the
+digest of the options in effect, and no session is placed on a machine whose digest is
+not `options_sha256()` (`SandboxFleet.pick`)."""
+
+
+@functools.cache
+def options_sha256() -> str:
+    """The digest a gateway serving reliquary-swe with GATEWAY_OPTIONS publishes in its
+    capacity report (`env_options_sha256`), computed by the sandbox's own code."""
+    from reliquary_sandbox_verifiers.loading import options_sha256 as digest
+
+    return digest(GATEWAY_OPTIONS)
 
 
 @functools.cache

@@ -97,8 +97,9 @@ _SANDBOX_BUDGET_BOUNDS = {"max_calls": 512, "per_call_timeout_s": 600, "cpu_s": 
 # verifiers' bash harness always offers bash; edit is optional. Record 0 signs the
 # tools sorted and unique, so these are the only spellings it can carry.
 _SANDBOX_TOOL_SETS = (["bash"], ["bash", "edit"])
-# record 0's env_package: `<distribution>==<version>+g<first 16 hex of the code digest>`.
-_ENV_PACKAGE_SUFFIX_RE = re.compile(r"\A[^=+\s]+\+g[0-9a-f]{16}\Z")
+# record 0's env_package for an env served through the verifiers bridge:
+# `<distribution>==<version>+g<first 16 hex of the code digest>.vfb<bridge version>`.
+_ENV_PACKAGE_SUFFIX_RE = re.compile(r"\A[^=+\s]+\+g[0-9a-f]{16}\.vfb[1-9][0-9]*\Z")
 
 
 class JobError(ValueError):
@@ -413,7 +414,8 @@ def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
     env_package = raw["env_package"]
     if (not isinstance(env_package, str) or not env_package.startswith(f"{package}==")
             or not _ENV_PACKAGE_SUFFIX_RE.match(env_package[len(package) + 2:])):
-        raise JobError("episode.sandbox.env_package must read '<package>==<version>+g<16 hex>', "
+        raise JobError("episode.sandbox.env_package must read "
+                       "'<package>==<version>+g<16 hex>.vfb<bridge version>', "
                        "the env_package record 0 carries")
     tools = raw["tools"]
     if tools not in _SANDBOX_TOOL_SETS:
@@ -495,6 +497,10 @@ def _check_episode_job(job: JobSpec) -> None:
                            "replay_fraction_failed must be 0")
         if episode.sandbox.budgets.max_calls < episode.max_turns:
             raise JobError("episode.sandbox.budgets.max_calls must be at least episode.max_turns")
+        if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
+            raise JobError(f"a signed_sandbox job serves SWE-smith at the "
+                           f"{BRIDGED_SWESMITH_IMAGES} images the bridge serves: "
+                           f"episode.env.num_images must be {BRIDGED_SWESMITH_IMAGES}")
 
 
 def parse_job(raw: Mapping[str, Any]) -> JobSpec:

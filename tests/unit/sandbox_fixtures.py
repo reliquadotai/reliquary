@@ -89,7 +89,7 @@ def transcript(validator: Signer, machine: Signer, session: SessionClaims, *, ca
 
 def capacity_report(machine: Signer, *, at: int, machine_id=MACHINE, address=ADDRESS,
                     free=4, capacity=4, images=(IMAGE,), env_packages=None, caps=None,
-                    tools_version="reliquary-tools/1") -> dict:
+                    tools_version="reliquary-tools/1", env_options_sha256=None) -> dict:
     document = {
         "machine_id": machine_id, "public_base_url": address, "key_id": machine.key_id,
         "at": at, "capacity": capacity, "active": capacity - free, "free": free,
@@ -104,6 +104,8 @@ def capacity_report(machine: Signer, *, at: int, machine_id=MACHINE, address=ADD
                               "max_token_validity_s": 7 * 86400,
                               "max_transcript_bytes": 8 * 1024**2}),
     }
+    if env_options_sha256 is not None:
+        document["env_options_sha256"] = dict(env_options_sha256)
     return {"document": document, "signature": machine.sign(HEARTBEAT_DOMAIN, document)}
 
 

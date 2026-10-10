@@ -199,6 +199,9 @@ class EngagementTerms:
     env_package: str
     budgets: dict[str, int]
     job_id: str | None = None
+    # The digest of the env options this validator resolved the task with: a machine
+    # must publish the same one for the env (`SandboxFleet.pick`). None: not checked.
+    env_options_sha256: str | None = None
     prompt_index: int | None = None
     # The prompt's free slots as read (before the issuer lock), reservations not
     # deducted: the issuer re-checks them against its reservations under the lock.
@@ -364,6 +367,7 @@ class CorpusEngagements:
                                checkpoint=job.checkpoint_sha256, image=task.image,
                                env_package=spec.env_package, budgets=budgets,
                                job_id=job.job_id, prompt_index=index,
+                               env_options_sha256=getattr(task, "env_options_sha256", None),
                                slots_remaining=int(remaining), refresh_slots=refresh_slots)
 
 
@@ -766,7 +770,8 @@ class SessionIssuer:
             validity = self._policy.open_window_s + int(terms.budgets["wall_s"])
             placement = self._fleet.pick(image=terms.image, env=terms.env,
                                          env_package=terms.env_package, budgets=terms.budgets,
-                                         validity_s=validity, now=now)
+                                         validity_s=validity, now=now,
+                                         env_options_sha256=terms.env_options_sha256)
             if placement is None:
                 return Refusal("sandbox_capacity", {"image": terms.image},
                                retry_after=self._policy.retry_after_s)

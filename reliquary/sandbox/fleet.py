@@ -8,8 +8,9 @@ HEARTBEAT_MAX_AGE_S, it names its own machine, and its signed `public_base_url` 
 directory's address. A machine with no accepted report for STALE_AFTER_S is drained:
 no new session, and `on_drained(machine_id)` voids its live sessions with no fault to
 their miners. A session goes to the least-loaded eligible machine: active in the
-directory, fresh, holding the image and the env package at the pinned version, the
-tools version this build renders, caps no lower than the budgets and token validity,
+directory, fresh, holding the image and the env package at the pinned version (and,
+when the task names one, serving the env with the options digest the validator resolved
+it with), the tools version this build renders, caps no lower than the budgets and token validity,
 and a free slot once the tokens issued since its report are counted. "Least loaded" is
 the largest FREE FRACTION (free / capacity); equal fractions go to the smallest machine
 id, so ties bias toward lexicographically small ids (deterministic, not balanced). A machine whose
@@ -171,6 +172,7 @@ class Fleet:
         self._started = clock()
         self.drained: set[str] = set()
         self._egress_suspect = False      # the last poll heard no machine at all
+        self._options_alerted: set[tuple[str, str, str | None, str]] = set()
 
     def directory_age(self, now: float | None = None) -> float | None:
         """Seconds since the last successful directory read, or None if never read."""
@@ -337,8 +339,32 @@ class Fleet:
         horizon = int(at) - 4 * HEARTBEAT_MAX_AGE_S
         self._issued[machine_id] = [t for t in issued if t >= horizon]
 
+    def _options_differ(self, machine_id: str, document: Mapping[str, Any], env: str,
+                        expected: str) -> bool:
+        """Whether the machine serves `env` with other options than the ones this
+        validator resolves its tasks with (or publishes none for it): logged once per
+        (machine, env, published, expected), at error level."""
+        published = (document.get("env_options_sha256") or {}).get(env)
+        if published == expected:
+            return False
+        key = (machine_id, env, published, expected)
+        if key not in self._options_alerted:
+            self._options_alerted.add(key)
+            logger.error(
+                "machine %s is refused for %s: it %s, this validator builds the env with "
+                "options sha256 %s; the gateway's episode_env_options and the validator's "
+                "options must agree (no session is placed there until they do)",
+                machine_id, env,
+                "publishes no options digest for it" if published is None
+                else f"serves it with options sha256 {published}", expected)
+        return True
+
     def pick(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
-             validity_s: int, now: float) -> Placement | None:
+             validity_s: int, now: float,
+             env_options_sha256: str | None = None) -> Placement | None:
+        """The machine a new session goes to (see the module docstring), or None. With
+        `env_options_sha256`, a machine is eligible only if its report publishes that
+        digest for `env` (the gateway is the authority on the env's options)."""
         if not self.directory_ready(now):
             self._alert_stale(now)
             return None
@@ -353,6 +379,9 @@ class Fleet:
             if image not in (document.get("images") or ()):
                 continue
             if (document.get("env_packages") or {}).get(env) != env_package:
+                continue
+            if env_options_sha256 is not None and self._options_differ(
+                    entry.machine_id, document, env, env_options_sha256):
                 continue
             if document.get("tools_version") != TOOLS_VERSION:
                 continue

@@ -133,6 +133,27 @@ def test_the_installed_env_package_must_be_the_orders_pin(tmp_path):
     assert "cannot compute" in em.env_package_refusal(policy, identity_of=broken, need_bridge=False)
 
 
+@pytest.mark.parametrize("bridged", [True, False])
+def test_the_default_identity_is_the_one_the_gateway_signs(bridged):
+    """A bridged env (pinned `...+g<16 hex>.vfb<N>`) is `bridged_env_package_of`, an
+    entry-point env `env_package_of`, both computed by the sandbox over the installed
+    package (no stand-in): here pydantic, installed in every environment that runs this."""
+    from types import SimpleNamespace
+
+    episodes = pytest.importorskip("reliquary_sandbox_service.episodes")
+    pinned = (episodes.bridged_env_package_of if bridged else episodes.env_package_of)("pydantic")
+    assert pinned.endswith(".vfb2") is bridged
+    assert em.installed_env_identity("pydantic", pinned) == pinned
+    assert em.env_package_refusal(SimpleNamespace(env_package=pinned), need_bridge=False) is None
+    version, digest = pinned.split("+g", 1)
+    other_code = f"{version}+g{'0' * 16}{digest[16:]}"
+    assert other_code != pinned
+    refused = [other_code] + ([pinned.replace(".vfb2", ".vfb1")] if bridged else [])
+    for other in refused:
+        refusal = em.env_package_refusal(SimpleNamespace(env_package=other), need_bridge=False)
+        assert refusal == f"{pinned} is installed, the order pins {other}"
+
+
 # -- the stack and one window end to end --------------------------------------------------------------------
 
 

@@ -785,3 +785,29 @@ def test_a_hanging_heartbeat_summary_write_does_not_stall_the_poll(tmp_path, mon
 
 def test_the_heartbeat_summary_write_is_bounded_by_default():
     assert fleet_module.HEARTBEAT_RECORD_TIMEOUT_S == 5.0
+
+
+def test_a_machine_serving_the_env_with_other_options_gets_no_session(tmp_path, caplog):
+    """The gateway is the authority on the env's options: a machine is placed only when
+    its report publishes the digest of the options the validator resolved the task with."""
+    expected, other = "1" * 64, "2" * 64
+    fleet, machine, served, _ = make(tmp_path)
+    served[ADDRESS] = capacity_report(machine, at=NOW, env_options_sha256={ENV: expected})
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, env_options_sha256=expected, **PICK) == Placement(MACHINE, ADDRESS)
+    assert fleet.pick(now=NOW, **PICK) == Placement(MACHINE, ADDRESS)     # no digest: no check
+    caplog.set_level("ERROR", logger=fleet_module.logger.name)
+    for published in ({ENV: other}, {"other-env": expected}, None):
+        caplog.clear()
+        served[ADDRESS] = capacity_report(machine, at=NOW, env_options_sha256=published)
+        asyncio.run(fleet.poll_once())
+        assert fleet.pick(now=NOW, env_options_sha256=expected, **PICK) is None
+        assert fleet.pick(now=NOW, env_options_sha256=expected, **PICK) is None
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        if published is None:          # the same refusal as {"other-env": ...}: logged already
+            assert errors == []
+            continue
+        assert len(errors) == 1, errors                                      # once, not per pick
+        assert MACHINE in errors[0] and expected in errors[0]
+        assert (other in errors[0]) if published == {ENV: other} else \
+            ("publishes no options digest" in errors[0])

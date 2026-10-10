@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from reliquary.corpus.job import parse_job
-from reliquary.environment import agentic_swe
+from reliquary.environment import agentic_swe, bridged_swe
 from reliquary.environment.agentic_swe import (
     BASH_HARNESS_TOOLS, BASH_SENTENCE, BASH_SYSTEM_PROMPT, EDIT_SENTENCE, SignedSweSource,
     harness_system_prompt, harness_tools, pinned_tool_calls,
@@ -314,6 +314,7 @@ def test_sandbox_support_compares_the_code_digest_record_0_carries(monkeypatch):
     refusal = agentic_swe.sandbox_support_refusal(job.episode)
     assert "+gffffffffffffffff is installed" in refusal and ENV_PACKAGE in refusal
     monkeypatch.setattr(agentic_swe, "installed_env_package", lambda package: ENV_PACKAGE)
+    monkeypatch.setattr(bridged_swe, "bridged_env", lambda: object())
     assert agentic_swe.sandbox_support_refusal(job.episode) is None
 
 
@@ -358,3 +359,81 @@ def test_the_verifiers_bridge_is_checked_for_every_process(monkeypatch):
     monkeypatch.setattr(agentic_swe.importlib, "import_module", import_module)
     refusal = agentic_swe.sandbox_support_refusal(job.episode, need_bridge=False)
     assert refusal == "the verifiers bridge cannot load: verifiers is not the pinned commit"
+
+
+def _installed_reliquary_swe(tmp_path, monkeypatch, version="0.3.0"):
+    """A real installed `reliquary-swe` distribution (dist-info + RECORD) on sys.path, so
+    the identity is computed by the sandbox's own registry over its files."""
+    import importlib
+    import sys
+
+    root = tmp_path / "site"
+    (root / "reliquary_swe").mkdir(parents=True)
+    (root / "reliquary_swe" / "__init__.py").write_text("VALUE = 1\n")
+    info = root / f"reliquary_swe-{version}.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: reliquary-swe\nVersion: {version}\n")
+    (info / "top_level.txt").write_text("reliquary_swe\n")
+    (info / "RECORD").write_text(f"reliquary_swe/__init__.py,,\nreliquary_swe-{version}.dist-info/RECORD,,\n")
+    for name in [m for m in sys.modules if m == "reliquary_swe" or m.startswith("reliquary_swe.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.syspath_prepend(str(root))
+    importlib.invalidate_caches()
+
+
+def test_a_job_pinning_the_bridged_identity_parses_is_served_and_placed(tmp_path, monkeypatch):
+    """The identity the code computes for the installed package (no stand-in) is one a
+    job can pin: parse_job accepts it, sandbox_support_refusal serves it, and the fleet
+    places a session on a machine reporting it."""
+    pytest.importorskip("reliquary_sandbox_service.episodes")
+    from reliquary import sandbox
+    from reliquary.sandbox.fleet import Fleet, Placement
+    from tests.unit.sandbox_fixtures import (
+        ADDRESS, BUDGETS, ENV, IMAGE, MACHINE, NOW, capacity_report, machine_document, signer,
+    )
+    from tests.unit.test_corpus_job_signed_sandbox import sandbox_spec
+
+    _installed_reliquary_swe(tmp_path, monkeypatch)
+    identity = agentic_swe.installed_env_package("reliquary-swe")
+    assert identity.startswith("reliquary-swe==0.3.0+g") and identity.endswith(".vfb2")
+    job = parse_job(_manifest(episode=signed_episode(sandbox=sandbox_spec(
+        env_package=identity, sandbox_commit=sandbox.SANDBOX_COMMIT))))
+    assert job.episode.sandbox.env_package == identity
+    monkeypatch.setattr("reliquary.sandbox.sandbox_commit_refusal", lambda pinned: None)
+    # Building the bridged env needs the real taskset; the identity above does not.
+    monkeypatch.setattr(bridged_swe, "bridged_env", lambda: object())
+    assert agentic_swe.sandbox_support_refusal(job.episode) is None
+
+    machine = signer(tmp_path, "m", "k1")
+
+    async def read_documents():
+        return [machine_document(machine)]
+
+    async def fetch(address):
+        return capacity_report(machine, at=NOW, env_packages={ENV: identity})
+
+    fleet = Fleet(read_documents=read_documents, fetch_report=fetch, clock=lambda: NOW)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(image=IMAGE, env=ENV, env_package=job.episode.sandbox.env_package,
+                      budgets=BUDGETS, validity_s=4500, now=NOW) == Placement(MACHINE, ADDRESS)
+
+
+def test_an_install_the_bridge_cannot_serve_is_refused(monkeypatch):
+    """An editable reliquary-swe has an identity, but the bridge serves packaged tasksets
+    only: refused here, not at the first prompt."""
+    job = parse_job(_manifest(episode=signed_episode()))
+    version = ENV_PACKAGE.split("==", 1)[1].split("+g", 1)[0]
+    _no_sandbox_install(monkeypatch)
+    monkeypatch.setattr("reliquary.sandbox.sandbox_commit_refusal", lambda pinned: None)
+    monkeypatch.setattr(agentic_swe.importlib.metadata, "version", lambda name: version)
+    monkeypatch.setattr(agentic_swe.importlib, "import_module", lambda name: None)
+    monkeypatch.setattr(agentic_swe, "installed_env_package", lambda package: ENV_PACKAGE)
+
+    def unpackaged():
+        raise ValueError("reliquary-swe is unpackaged")
+
+    monkeypatch.setattr(bridged_swe, "bridged_env", unpackaged)
+    refusal = agentic_swe.sandbox_support_refusal(job.episode)
+    assert refusal == ("the bridge cannot serve the installed reliquary-swe "
+                       "(ValueError: reliquary-swe is unpackaged)")

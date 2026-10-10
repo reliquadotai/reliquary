@@ -12,8 +12,9 @@ from reliquary.corpus.job import (
 from tests.unit.test_corpus_job_episode import _episode, _manifest
 
 SANDBOX_COMMIT = "d" * 40
-# What the registry writes into record 0: `name==version+g<sha16 of the code>`.
-ENV_PACKAGE = "reliquary-swe==0.1.0a1+g0123456789abcdef"
+# What the registry writes into record 0 for an env served through the verifiers bridge:
+# `name==version+g<sha16 of the code>.vfb<bridge version>`.
+ENV_PACKAGE = "reliquary-swe==0.1.0a1+g0123456789abcdef.vfb2"
 GIB = 1024**3
 
 
@@ -74,8 +75,16 @@ def test_replay_is_never_written_explicitly():
     (signed_episode(sandbox=sandbox_spec(env_package="reliquary-swe")), "env_package"),
     (signed_episode(sandbox=sandbox_spec(env_package="other==1+g0123456789abcdef")), "env_package"),
     (signed_episode(sandbox=sandbox_spec(env_package="reliquary-swe==0.1.0a1")), "env_package"),
-    (signed_episode(sandbox=sandbox_spec(env_package="reliquary-swe==0.1.0a1+gABCDEF0123456789")), "env_package"),
+    (signed_episode(sandbox=sandbox_spec(env_package="reliquary-swe==0.1.0a1+gABCDEF0123456789.vfb2")), "env_package"),
     (signed_episode(sandbox=sandbox_spec(env_package="reliquary-swe==0.1.0a1+g0123")), "env_package"),
+    (signed_episode(sandbox=sandbox_spec(env_package="reliquary-swe==0.1.0a1+g0123456789abcdef")),
+     "vfb"),
+    (signed_episode(sandbox=sandbox_spec(env_package=ENV_PACKAGE[:-1])), "env_package"),
+    (signed_episode(sandbox=sandbox_spec(env_package=ENV_PACKAGE[:-1] + "x")), "env_package"),
+    (signed_episode(sandbox=sandbox_spec(env_package=ENV_PACKAGE[:-1] + "0")), "env_package"),
+    (signed_episode(sandbox=sandbox_spec(env_package=ENV_PACKAGE + ".vfb2")), "env_package"),
+    (signed_episode(sandbox=sandbox_spec(env_package="other==1+g0123456789abcdef.vfb2")),
+     "env_package"),
     (signed_episode(sandbox=sandbox_spec(tools=["edit"])), "tools"),
     (signed_episode(sandbox=sandbox_spec(tools=["edit", "bash"])), "tools"),
     (signed_episode(sandbox=sandbox_spec(tools=["bash", "bash"])), "tools"),
@@ -114,6 +123,15 @@ def test_the_bash_only_tool_set_is_allowed():
 
 def test_the_sandbox_split_is_the_one_the_bridge_serves():
     assert sandbox_split(parse_job(_manifest(episode=signed_episode())).episode) == "train"
+
+
+def test_a_signed_job_at_another_image_count_than_the_bridge_serves_is_never_parsed():
+    env = {"package": "reliquary-swe", "version": "a" * 40, "split": "train", "num_images": 10}
+    with pytest.raises(JobError, match="num_images must be 20"):
+        parse_job(_manifest(episode=signed_episode(env=env)))
+    replay = parse_job(_manifest(episode=_episode(env=env)))     # a replay job keeps its count
+    assert replay.episode.env.num_images == 10
+
 
 _REAL_MANIFEST = (Path(__file__).resolve().parent.parent / "fixtures"
                   / "corpus_job_manifest_code_v1.json")

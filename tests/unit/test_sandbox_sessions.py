@@ -70,7 +70,7 @@ class Clock:
 
 
 def build(tmp_path, *, remaining=2, policy=SandboxPolicy(), store=None, limits=None, clock=None,
-          jobs=None):
+          jobs=None, options_sha256=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     validator, machine = signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1")
     clock = clock or Clock()
@@ -80,7 +80,7 @@ def build(tmp_path, *, remaining=2, policy=SandboxPolicy(), store=None, limits=N
     left = {"n": remaining}
 
     async def resolve(index):
-        return ResolvedTask(IMAGE, dict(limits or {}))
+        return ResolvedTask(IMAGE, dict(limits or {}), options_sha256)
 
     async def slots(index):
         return left["n"]
@@ -124,6 +124,28 @@ def test_a_grant_binds_the_engagement_and_raises_budgets_to_the_tasks_limits(tmp
     assert claims.budgets.memory_bytes == 6 * 1024**3
     assert claims.expires_at == NOW + 900 + JOB.episode.sandbox.budgets.wall_s
     assert grant.gateway_url == ADDRESS and env.fleet.issued == [(MACHINE, NOW)]
+
+
+def test_the_options_the_task_was_resolved_with_go_to_placement(tmp_path):
+    env = build(tmp_path, options_sha256="1" * 64)
+    open_(env)
+    assert env.fleet.picked[-1]["env_options_sha256"] == "1" * 64
+    env = build(tmp_path / "none")
+    open_(env)
+    assert env.fleet.picked[-1]["env_options_sha256"] is None
+
+
+def test_the_default_resolver_carries_the_bridged_env_options_digest(monkeypatch):
+    from reliquary.environment import bridged_swe
+    from reliquary.sandbox.tasks import SweTaskResolver
+
+    task = SimpleNamespace(image=IMAGE, limits=None)
+    monkeypatch.setattr(bridged_swe, "sandbox_task_of", lambda split, index: task)
+    resolved = asyncio.run(SweTaskResolver("train").resolve(0))
+    loading = pytest.importorskip("reliquary_sandbox_verifiers.loading")
+    assert resolved.env_options_sha256 == loading.options_sha256(bridged_swe.GATEWAY_OPTIONS)
+    injected = SweTaskResolver("train", sandbox_task=lambda split, index: task)
+    assert asyncio.run(injected.resolve(0)).env_options_sha256 is None
 
 
 def test_a_resent_request_gets_the_same_token_once(tmp_path):

@@ -33,6 +33,7 @@ import gc
 import logging
 import math
 import random
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
@@ -213,6 +214,20 @@ def short_window_warning(view: EpisodeWindow, *, environments: Sequence[str], ma
     return None
 
 
+def installed_env_identity(package: str, pinned: str) -> str:
+    """The `env_package` a gateway serving this install of `package` writes into record 0,
+    in the form `pinned` takes: an env served through the verifiers bridge (`pinned` ends
+    in `.vfb<bridge version>`) is `bridged_env_package_of`, an entry-point env
+    `env_package_of`, both over the module `package` with `-` as `_` (the module the
+    gateway imports), computed by reliquary-sandbox's own registry."""
+    from reliquary_sandbox_service.episodes import bridged_env_package_of, env_package_of
+
+    module = package.replace("-", "_")
+    if re.search(r"\.vfb[0-9]+\Z", pinned):
+        return bridged_env_package_of(module)
+    return env_package_of(module)
+
+
 def env_package_refusal(policy, *, identity_of: Callable[[str], str] | None = None,
                         need_bridge: bool = True) -> str | None:
     """Why this install cannot play the order's episodes, or None: the env package installed (record 0
@@ -222,7 +237,8 @@ def env_package_refusal(policy, *, identity_of: Callable[[str], str] | None = No
 
     package = policy.env_package.split("==", 1)[0]
     if identity_of is None:
-        from reliquary.environment.agentic_swe import installed_env_package as identity_of
+        def identity_of(name: str) -> str:
+            return installed_env_identity(name, policy.env_package)
     try:
         identity = identity_of(package)
     except Exception as exc:   # an unreadable install cannot be the pinned code
@@ -770,6 +786,6 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
 
 
 __all__ = ["CheckpointChanged", "EXIT_CHECKPOINT_CHANGED", "EpisodeMinerConfig", "EpisodeMiningLoop", "EpisodeStack", "EpisodeStackDeps", "EpisodeTaskPrompts",
-           "EpisodeWindow", "GROUPS_IN_FLIGHT", "build_episode_stack", "env_package_refusal", "episode_window",
+           "EpisodeWindow", "GROUPS_IN_FLIGHT", "build_episode_stack", "env_package_refusal", "installed_env_identity", "episode_window",
            "miner_state_reader", "parse_episode_environments", "parse_harness_env", "pick_episode_task",
            "run_episode_miner", "short_window_warning"]
