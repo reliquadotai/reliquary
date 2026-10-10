@@ -505,6 +505,65 @@ def test_the_ingress_order_wait_of_a_claimed_group_is_bounded_by_its_deadline(tm
     asyncio.run(scenario())
 
 
+def test_a_raising_check_is_refused_without_a_verdict(tmp_path):
+    """A transcript check that raises is a validator bug: the group is refused as before, the yield hears
+    nothing."""
+    w = world(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("renderer bug")
+
+    w.intake._checkers[EPISODE].check = boom
+    prepared, claim = admit(w)
+    assert claim is None and (prepared.reject_reason, prepared.reject_stage) == (RejectReason.BAD_SCHEMA,
+                                                                              "episode_transcript")
+    assert w.outcomes.calls == []
+
+
+@pytest.mark.parametrize("stage", ["content_identity", "service_eligibility", "proof"])
+def test_a_claimed_group_the_batcher_refuses_is_settled_with_the_batchers_stage(tmp_path, monkeypatch, stage):
+    """Our own refusals after the claim (a missing content digest, the runtime not active) reach the yield as
+    such; a genuine refusal keeps its own stage."""
+    from reliquary.protocol.submission import BatchSubmissionResponse
+
+    def refuse(prepared, *, telemetry=None, **_kw):
+        telemetry.batcher_reject_stage = stage             # as the batcher's ``_reject`` records it
+        return BatchSubmissionResponse(accepted=False, reason=RejectReason.WORKER_DROPPED)
+
+    a = auction(tmp_path, monkeypatch, accept=refuse)
+    asyncio.run(run_auction(a))
+    assert a.receipt.outcome.accepted is False
+    assert a.w.outcomes.calls[-1]["accepted"] is False and a.w.outcomes.calls[-1]["stage"] == stage
+
+
+def test_a_claimed_group_the_runtime_refuses_at_its_identity_is_settled_as_ours(tmp_path, monkeypatch):
+    a = auction(tmp_path, monkeypatch)
+    monkeypatch.setattr(a.batcher, "reserve_prepared_identity",
+                        lambda *_a: (False, RejectReason.PROMPT_IN_COOLDOWN, "service_eligibility"))
+    asyncio.run(run_auction(a))
+    assert a.w.outcomes.calls[-1]["stage"] == "service_eligibility"
+
+
+def test_the_batchers_refusal_records_its_stage_off_the_wire():
+    import time
+
+    from reliquary.protocol.submission import BatchSubmissionResponse
+    from reliquary.validator.observability import SubmitTelemetry
+    from tests.unit.test_validator_server import _batcher, _request
+
+    batcher = _batcher()
+    request = _request()
+    telemetry = SubmitTelemetry.from_request(request, t_arrival=time.time())
+    response = batcher._reject(RejectReason.GRAIL_FAIL, hotkey="5Hot", prompt_idx=1, telemetry=telemetry,
+                               reject_stage="proof")
+    assert telemetry.batcher_reject_stage == "proof" and "batcher_reject_stage" not in telemetry.fields()
+    assert response == BatchSubmissionResponse(accepted=False, reason=RejectReason.GRAIL_FAIL)
+    prepared = PreparedSubmission(request=request, completion_texts=[], rewards=[], rollout_hashes=[],
+                                  selection_digest=None)
+    batcher.accept_prepared_submission(prepared, telemetry=telemetry)
+    assert telemetry.batcher_reject_stage == "content_identity"
+
+
 def test_a_clean_shutdown_drains_the_episode_settlements(tmp_path):
     w = world(tmp_path)
     server = ValidatorServer()

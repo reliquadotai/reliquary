@@ -181,16 +181,18 @@ class EpisodeGroupIntake:
             logger.exception("the episode outcome hook failed")
 
     def _refuse(self, prepared, reason: RejectReason, stage: str, detail: dict | None = None,
-                session_ids=()):
+                session_ids=(), *, verdict: bool = True):
         request = prepared.request
         prepared.episode_pending = False
         prepared.reject_reason = reason
         prepared.reject_stage = stage
         logger.info("episode group of %s refused at %s: %s", str(request.miner_hotkey)[:12], stage, detail or {})
         # Before the claim the precommit is unverified: a stage of the validator's own making (neutral for the
-        # miner's yield) is never reported from here, only from a claimed group's settlement.
-        self._report(str(request.miner_hotkey), _precommit_sha(request), session_ids, accepted=False,
-                     stage=None if stage in _AFTER_CLAIM_STAGES else stage)
+        # miner's yield) is never reported from here, only from a claimed group's settlement; nor is a refusal
+        # whose cause is ours (``verdict=False``). Either gives no verdict: the miner is charged nothing.
+        if verdict and stage not in _AFTER_CLAIM_STAGES:
+            self._report(str(request.miner_hotkey), _precommit_sha(request), session_ids, accepted=False,
+                         stage=stage)
         return prepared, None
 
     def _check_ended(self, operator: str) -> None:
@@ -288,8 +290,9 @@ class EpisodeGroupIntake:
             except Exception:
                 logger.error("episode group of %s: the transcript check raised; refused", hotkey[:12],
                              exc_info=True)
+                # A raising check is a validator bug (the renderer, the task source): no verdict.
                 return self._refuse(prepared, RejectReason.BAD_SCHEMA, "episode_transcript",
-                                    {"check": "raised"})
+                                    {"check": "raised"}, verdict=False)
         finally:
             if not handed_off:
                 self._check_ended(owner)

@@ -86,7 +86,8 @@ def test_without_a_used_group_every_session_is_waste(tmp_path):
 
 @pytest.mark.parametrize("stage", sorted(VALIDATOR_STAGES))
 def test_a_refusal_of_ours_after_the_check_is_neither(tmp_path, stage):
-    assert stage in {"episode_persist_failed", "admission_timeout", "admission_worker", "prompt_source"}
+    assert stage in {"episode_persist_failed", "admission_timeout", "admission_worker", "prompt_source",
+                     "content_identity", "service_eligibility"}
     led = ledger(tmp_path)
     records = opened(led, 32)
     led.group_settled(hotkey=HOT, precommit_sha256=A, session_ids=(), accepted=False, stage=stage)

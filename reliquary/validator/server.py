@@ -6718,6 +6718,7 @@ class ValidatorServer:
         # An episode group's claimed sessions, settled in ``finally`` by the batcher's own answer.
         episode_claim = None
         episode_accepted = False
+        episode_stage = None
         episode_hold_deadline = None
         identity_reserved = False
         cancel_identity_on_exit = False
@@ -6968,10 +6969,15 @@ class ValidatorServer:
                 return
 
             reject_stage = prepared.reject_stage or "proof"
+            if episode_claim is not None:
+                telemetry.batcher_reject_stage = None
             response = batcher.accept_prepared_submission(
                 prepared, telemetry=telemetry
             )
             episode_accepted = bool(response.accepted)
+            if episode_claim is not None and not episode_accepted:
+                # The batcher's own stage (ours, such as a missing content digest, or the miner's).
+                episode_stage = getattr(telemetry, "batcher_reject_stage", None)
             if response.reason is RejectReason.BATCH_FILLED:
                 # The one capacity this call refuses on.
                 batch_filled_reason = "auction_seal_snapshot_started"
@@ -7045,7 +7051,7 @@ class ValidatorServer:
                         # finds its sessions and precommit free when it retries.
                         settlement = self._start_episode_settlement(
                             episode_claim, accepted=episode_accepted,
-                            stage=None if episode_accepted else reject_stage)
+                            stage=None if episode_accepted else episode_stage or reject_stage)
                 if settlement is not None:
                     try:
                         if self._auction_admission_enabled:

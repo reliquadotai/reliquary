@@ -265,6 +265,15 @@ class RlEpisodeServices:
             return 0
         now = float(self.clock())
         decided = 0
+        try:
+            decided = await self._decide_settled(ledger, now)
+        finally:
+            # Whatever the decisions raised, the journal (verdicts, opens) is written and the snapshot refreshed.
+            await asyncio.to_thread(ledger.flush, now)
+        return decided
+
+    async def _decide_settled(self, ledger, now: float) -> int:
+        decided = 0
         if self.current_window is not None:
             ledger.note_accepting(self.current_window(), now)          # durable at this flush
         sizes = {p.sandbox_env: p.pool_seeds // 2 for p in self.policies.values()}     # M per sandbox env
@@ -291,7 +300,6 @@ class RlEpisodeServices:
                                              aborted=bool(uses.aborted), now=now,
                                              resumed=window in self.resumed_windows,
                                              group_size=None if task is None else sizes.get(task[1]))
-        await asyncio.to_thread(ledger.flush, now)
         return decided
 
     async def yield_forever(self, every_s: float) -> None:

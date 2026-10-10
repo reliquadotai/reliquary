@@ -6374,6 +6374,8 @@ class GrpoWindowBatcher:
         reject_stage: str | None = None,
         decision_ts: float | None = None,
     ) -> BatchSubmissionResponse:
+        if telemetry is not None:
+            telemetry.batcher_reject_stage = reject_stage
         with self._reject_lock:
             self.reject_counts[reason.value] = (
                 self.reject_counts.get(reason.value, 0) + 1

@@ -100,6 +100,19 @@ async def test_a_claimed_group_is_settled_with_the_servers_stage(tmp_path):
     assert services.ledger._verdicts[SHA][0] == "refused"             # a real refusal outranks ours
 
 
+@pytest.mark.parametrize("stage, verdict", [("content_identity", "ours"), ("service_eligibility", "ours"),
+                                            ("admission_identity", "refused"), ("proof", "refused")])
+async def test_the_batchers_refusals_of_a_claimed_group_are_ours_only_when_they_are(tmp_path, stage, verdict):
+    """A missing content digest and an inactive runtime are ours; a proof or identity refusal is real."""
+    from reliquary.validator.episode_intake import EpisodeClaim
+
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3", window_uses=lambda w: None)
+    record = _record("s-1", sha=SHA)
+    services.ledger.note_opened(record)
+    await services.intake.settle(EpisodeClaim(record.hotkey, SHA, ("s-1",)), accepted=False, stage=stage)
+    assert services.ledger._verdicts[SHA][0] == verdict
+
+
 def test_a_refusal_before_the_claim_never_reports_a_stage_of_ours(tmp_path):
     from types import SimpleNamespace
 
@@ -112,7 +125,7 @@ def test_a_refusal_before_the_claim_never_reports_a_stage_of_ours(tmp_path):
                                episode_pending=True, reject_reason=None, reject_stage=None)
     services.intake._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_persist_failed")
     services.intake._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_checker_busy")
-    assert [call["stage"] for call in calls] == [None, "episode_checker_busy"]
+    assert [call["stage"] for call in calls] == ["episode_checker_busy"]      # ours before the claim: no verdict
 
 
 async def test_the_server_passes_its_stage_when_it_settles_a_claim():
@@ -129,6 +142,23 @@ async def test_the_server_passes_its_stage_when_it_settles_a_claim():
     await server._start_episode_settlement(object(), accepted=False, stage="episode_persist_failed")
     await server._start_episode_settlement(object(), accepted=True)
     assert seen == [(False, "episode_persist_failed"), (True, None)]
+
+
+async def test_a_raising_decision_still_flushes_the_journal(tmp_path):
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3",
+                            window_uses=lambda w: WindowUses(aborted=False, used=frozenset()))
+    record = _record("s-1", sha=SHA, state="lapsed")
+    services.book.add(record)
+    services.ledger.note_opened(record)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("decide failed")
+
+    services.ledger.decide = boom
+    with pytest.raises(RuntimeError):
+        await services.settle_yield()
+    assert services.ledger._journal == [] and services.ledger.version == 1      # written all the same
+    await services.stop()
 
 
 def test_a_capacity_refusal_of_an_open_reaches_the_ledger(tmp_path):
@@ -209,7 +239,21 @@ async def test_the_validator_opens_the_ledger_beside_its_runtime(tmp_path, monke
     service._service_folder = tmp_path / "folder"
     service._service_folder.mkdir()
     service.server._operator_by_hotkey = {"5Hot": "5Cold"}
+    import threading
+
+    from reliquary.sandbox import rl_yield
+
+    built_on = []
+    real = rl_yield.SessionYieldLedger
+
+    def ledger(*args, **kwargs):
+        built_on.append(threading.get_ident())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rl_yield, "SessionYieldLedger", ledger)
+    loop_thread = threading.get_ident()
     await service._start_episode_services()
+    assert built_on and loop_thread not in built_on                  # SQLite opened off the event loop
     try:
         services = service._episode_services
         assert services.ledger is not None and services.intake._outcomes is services.ledger

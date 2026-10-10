@@ -74,8 +74,10 @@ VALIDATOR_RESTARTED = "validator_restarted"
 GRADING_POOL = "grading_pool"
 # Refusals of the validator's own making AFTER the checker verified the group as the precommit's: only these
 # reach the ledger through a claimed group (``EpisodeGroupIntake.settle``). Neutral unless a group of the same
-# precommit is used later.
-VALIDATOR_STAGES = frozenset({"episode_persist_failed", "admission_timeout", "admission_worker", "prompt_source"})
+# precommit is used later. ``content_identity``: our prompt content digest missing at the batcher;
+# ``service_eligibility``: the service runtime not active when the batcher took the group.
+VALIDATOR_STAGES = frozenset({"episode_persist_failed", "admission_timeout", "admission_worker", "prompt_source",
+                              "content_identity", "service_eligibility"})
 # Refusals reached BEFORE the check: the precommit they name is unverified and a miner can provoke
 # them at will, so they give no verdict (the miner retries them; a restart's window is ``decide(resumed=)``).
 # Also the retryable refusals that are not ours (the miner's own groups or checks in flight: it
