@@ -33,7 +33,8 @@ async def test_the_wiring_builds_the_ledger_as_the_outcomes_and_settles_from_the
     uses = {}
     services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3", window_uses=uses.get)
     assert services.ledger is not None and services.intake._outcomes is services.ledger
-    assert isinstance(services.issuer._events, LedgerEvents) and services.issuer._record_faults
+    assert any(isinstance(listener, LedgerEvents) for listener in services.issuer._events.listeners)
+    assert services.issuer._record_faults
     assert services.issuer._open_refusal_check == services.fleet.open_refusal_valid
     record = _record("s-1", sha=SHA, state=SUBMITTED)
     services.book.add(record)

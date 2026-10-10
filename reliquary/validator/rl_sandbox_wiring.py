@@ -6,7 +6,9 @@ never loads.
 
 Settings: the corpus validator's (``sandbox_wiring.SandboxValidatorConfig``). The RL policy is raised to
 what one hotkey's groups in flight need (``rl_sandbox_policy``); the session quota (``SessionQuota``)
-decides beyond that.
+decides beyond that. With a yield ledger, the quota is the yield quota (``rl_quota.YieldQuota``: the fleet's
+session slots shared by weighted water-filling) and the policy's per-hotkey live and hourly-open caps are
+lifted (``NO_PER_KEY_CAP``); the daily abort cap keeps its size.
 
 Windows. Episode intake (precommits, opens, groups) is open only for a window THIS process opened
 (``window_started_at``): a window resumed after a restart takes no episode group, since what its batcher
@@ -34,7 +36,7 @@ from reliquary.sandbox.rl_engagements import (
     EpisodeEnvironmentView, NoOutcomes, OpenQuota, RlEpisodeEngagements, SessionOutcomes, SessionQuota,
 )
 from reliquary.sandbox.rl_yield import held_seconds
-from reliquary.sandbox.sessions import SandboxPolicy, SessionBook, SessionIssuer
+from reliquary.sandbox.sessions import FanOutEvents, SandboxPolicy, SessionBook, SessionIssuer
 from reliquary.validator.corpus_registration import NOT_REGISTERED
 from reliquary.validator.episode_admission import EpisodeGroupChecker
 from reliquary.validator.episode_intake import EpisodeGroupIntake
@@ -51,6 +53,8 @@ RL_GROUPS_IN_FLIGHT = GROUPS_IN_FLIGHT     # the intake's per-operator check cap
 PRECOMMIT_PRUNE_SECONDS = 3600.0
 MIN_PRECOMMIT_RETENTION_S = 2 * 86_400
 YIELD_FLUSH_SECONDS = 10.0
+NO_PER_KEY_CAP = 1 << 30
+"""The policy's per-hotkey live and hourly-open caps when the yield quota decides: no fixed per-key maximum."""
 
 
 def rl_sandbox_policy(base: SandboxPolicy, pool_seeds: int, *,
@@ -120,6 +124,7 @@ class RlEpisodeServices:
     clock: Callable[[], float] = field(default=time.time, repr=False)
     precommit_retention_s: float = MIN_PRECOMMIT_RETENTION_S
     ledger: Any = field(default=None, repr=False)
+    quota: Any = field(default=None, repr=False)
     window_uses: Callable[[int], Any] | None = field(default=None, repr=False)
     policies: dict = field(default_factory=dict, repr=False)
     window_open: Callable[[int], bool] | None = field(default=None, repr=False)
@@ -152,6 +157,9 @@ class RlEpisodeServices:
         logger.info("rl sandbox sessions restored: %d", restored)
         if self.ledger is not None:
             self.ledger.reconcile(self.book.records())
+            rebuild = getattr(self.quota, "rebuild", None)
+            if rebuild is not None:
+                rebuild(self.book.records())                 # the quota's index, from the restored book
             pending = self.ledger.pending_windows()
             if (pending and self.window_open is not None and not self.window_open(pending[-1])
                     and self.ledger.accepting_at_last_flush() == pending[-1]):
@@ -383,7 +391,15 @@ def build_rl_episode_services(
                                        remote_stop_ids)
         if why is not None:
             raise ValueError(f"signed episodes cannot be proven: {why}")
-    policy = rl_sandbox_policy(config.policy or SandboxPolicy(), max(p.pool_seeds for p in policies.values()))
+    from reliquary.sandbox.rl_quota import YieldQuota
+
+    pool_seeds = max(p.pool_seeds for p in policies.values())
+    policy = rl_sandbox_policy(config.policy or SandboxPolicy(), pool_seeds)
+    yield_quota = (yield_path is not None or ledger is not None) and (quota is None or isinstance(quota, YieldQuota))
+    if yield_quota:
+        # The yield quota decides how many sessions a hotkey holds and opens (no fixed per-key maximum); the
+        # daily abort cap keeps its size: an abort is neutral and frees its seed.
+        policy = dataclasses.replace(policy, max_live_per_hotkey=NO_PER_KEY_CAP, max_opens_per_hour=NO_PER_KEY_CAP)
     signer = signer or Signer(config.key_id, load_private_key(config.key_file))
     token_verifier = Ed25519TokenVerifier({**config.retired_keys, signer.key_id: signer.public_key_b64})
     kw = dict(store_kwargs or {})
@@ -404,6 +420,17 @@ def build_rl_episode_services(
     book = SessionBook(policy)
     if ledger is None and yield_path is not None:
         ledger = SessionYieldLedger(yield_path, clock=clock)
+    if yield_quota and quota is None:
+        # M by every name an env goes by: the env name an open passes and the sandbox env a session stores.
+        group_sizes = {p.sandbox_env: p.pool_seeds // 2 for p in policies.values()}
+        group_sizes.update({name: p.pool_seeds // 2 for name, p in policies.items()})
+        quota = YieldQuota(ledger=ledger, pool_seeds=pool_seeds,
+                           group_size=min(p.pool_seeds for p in policies.values()) // 2,
+                           capacity=fleet.session_capacity, reported=getattr(fleet, "session_reported", None),
+                           group_sizes=group_sizes, retry_after_s=policy.retry_after_s, clock=clock)
+    if ledger is not None and isinstance(quota, YieldQuota):
+        ledger.allow_capacity_verdicts(quota.groups_allowed)      # capacity verdicts: per hotkey and window
+        book.cap_scale = quota.cap_scale                          # the per-hotkey rates scale with the allocation
     views = {name: EpisodeEnvironmentView(policy=p, resolve_task=environments[name].source.resolve)
              for name, p in policies.items()}
     engagements = RlEpisodeEngagements(precommits=runtime.episode_precommit, environments=views.get,
@@ -416,7 +443,9 @@ def build_rl_episode_services(
         store=session_store or sandbox_store.R2SessionStore(prefix=sandbox_store.RL_SESSION_PREFIX, **kw),
         fleet=fleet, signer=signer, token_verifier=token_verifier,
         engagements={"rl_precommit": engagements}, policy=policy, clock=clock,
-        events=None if ledger is None else LedgerEvents(ledger), record_faults=ledger is not None,
+        events=None if ledger is None else FanOutEvents(
+            LedgerEvents(ledger), quota if isinstance(quota, YieldQuota) else None),
+        record_faults=ledger is not None,
         open_refusal_check=None if ledger is None else fleet.open_refusal_valid)
     fleet.on_drained = issuer.void_machine
     sessions_router = build_sandbox_sessions_router(
@@ -445,10 +474,10 @@ def build_rl_episode_services(
                              issuer=issuer, routers=(sessions_router, precommit_router), intake=intake,
                              environments=tuple(sorted(policies)), runtime=runtime, outcomes=outcomes,
                              clock=clock, precommit_retention_s=float(precommit_retention_s),
-                             ledger=ledger, window_uses=window_uses, policies=dict(policies),
+                             ledger=ledger, quota=quota, window_uses=window_uses, policies=dict(policies),
                              window_open=window_open, current_window=current_window, operator_of=operator_of)
 
 
-__all__ = ["MIN_PRECOMMIT_RETENTION_S", "RL_GROUPS_IN_FLIGHT", "RL_PREFIX", "YIELD_FLUSH_SECONDS", "RlEpisodeServices",
+__all__ = ["MIN_PRECOMMIT_RETENTION_S", "NO_PER_KEY_CAP", "RL_GROUPS_IN_FLIGHT", "RL_PREFIX", "YIELD_FLUSH_SECONDS", "RlEpisodeServices",
            "build_rl_episode_services", "episode_stop_set_refusal", "rl_registration", "rl_sandbox_policy",
            "stop_ids_from_metadata"]

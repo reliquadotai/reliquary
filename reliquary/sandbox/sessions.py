@@ -237,6 +237,38 @@ class SessionEvents(Protocol):
     def closed(self, record: SessionRecord, final: Mapping[str, Any] | None) -> None: ...
 
 
+class FanOutEvents:
+    """Several ``SessionEvents`` listeners as one (the yield ledger and the quota's index). A listener that
+    raises is logged and the others still hear of the event."""
+
+    def __init__(self, *listeners) -> None:
+        self.listeners = tuple(listener for listener in listeners if listener is not None)
+
+    def opened(self, record: SessionRecord) -> None:
+        for listener in self.listeners:
+            try:
+                listener.opened(record)
+            except Exception:
+                logger.exception("sandbox session listener opened failed")
+
+    def closed(self, record: SessionRecord, final: Mapping[str, Any] | None) -> None:
+        for listener in self.listeners:
+            try:
+                listener.closed(record, final)
+            except Exception:
+                logger.exception("sandbox session listener closed failed")
+
+    def refused(self, hotkey: str, engagement: Mapping[str, Any], refusal: Refusal) -> None:
+        for listener in self.listeners:
+            method = getattr(listener, "refused", None)        # optional: the yield ledger has it
+            if method is None:
+                continue
+            try:
+                method(hotkey, engagement, refusal)
+            except Exception:
+                logger.exception("sandbox session listener refused failed")
+
+
 def runtime_start_fault(final: Mapping[str, Any] | None) -> str | None:
     """``runtime_exec_failed`` when the machine's signed final proves the runtime failed to start a
     command (``grading._grader.runtime_exec_failed``), else None: a fault of the machine, not the miner's."""
@@ -492,6 +524,11 @@ class SessionBook:
         # Precommit sha256 -> ids of the RL sessions whose engagement names it (the group
         # claim's one-paid-group-per-precommit check reads it under the issuer lock, no full scan).
         self._by_precommit: dict[str, set[str]] = {}
+        # Hotkey -> ids of its sessions (the per-hotkey caps read it under the issuer lock, no full scan).
+        self._by_hotkey: dict[str, set[str]] = {}
+        # How much the per-hotkey abort and refused-open rates scale for a hotkey (the RL quota sets it to
+        # the hotkey's allocation in groups; 1 everywhere else).
+        self.cap_scale: Callable[[str], float] = lambda hotkey: 1.0
 
     def generation(self, job_id: Any, prompt_index: Any) -> int:
         return self._generations.get((job_id, prompt_index), 0)
@@ -529,6 +566,7 @@ class SessionBook:
         if previous is not None:
             self._unindex(previous)
         self._sessions[record.session_id] = record
+        self._by_hotkey.setdefault(record.hotkey, set()).add(record.session_id)
         sha = _rl_precommit_of(record)
         if sha is not None:
             self._by_precommit.setdefault(sha, set()).add(record.session_id)
@@ -553,6 +591,11 @@ class SessionBook:
             ids.discard(record.session_id)
             if not ids:
                 del self._by_precommit[sha]
+        ids = self._by_hotkey.get(record.hotkey)
+        if ids is not None:
+            ids.discard(record.session_id)
+            if not ids:
+                del self._by_hotkey[record.hotkey]
 
     def of_precommit(self, precommit_sha256: str) -> tuple[SessionRecord, ...]:
         """The RL sessions whose engagement names this precommit (an index, not a scan)."""
@@ -599,7 +642,7 @@ class SessionBook:
         return self._submitted
 
     def open_refusal(self, hotkey: str, now: int) -> Refusal | None:
-        mine = [r for r in self._sessions.values() if r.hotkey == hotkey]
+        mine = [self._sessions[s] for s in self._by_hotkey.get(hotkey, ()) if s in self._sessions]
         policy = self.policy
         live = sum(1 for r in mine if self._holds(r, now))
         if live >= policy.max_live_per_hotkey:
@@ -614,9 +657,10 @@ class SessionBook:
         closed = sorted(r.closed_at or 0 for r in mine
                         if r.state == ABORTED and r.fault != "grading_pool" and (r.closed_at or 0) > now - DAY)
         aborted = len(closed)
-        if aborted >= policy.max_aborted_per_day:
-            return Refusal("aborted_cap", {"aborted": aborted, "max": policy.max_aborted_per_day},
-                           retry_after=closed[aborted - policy.max_aborted_per_day] + DAY - now)
+        cap = int(policy.max_aborted_per_day * self.cap_scale(hotkey))      # scale 1: the policy's own cap
+        if aborted >= cap:
+            return Refusal("aborted_cap", {"aborted": aborted, "max": cap},
+                           retry_after=closed[aborted - cap] + DAY - now)
         return None
 
     def engagement_refusal(self, hotkey: str, job_id: str | None, prompt_index: int | None,
@@ -792,7 +836,7 @@ class SessionIssuer:
             self._refused_opens[hotkey] = recent
         else:
             self._refused_opens.pop(hotkey, None)
-        limit = self._policy.max_refused_opens_per_minute
+        limit = int(self._policy.max_refused_opens_per_minute * self.book.cap_scale(hotkey))
         if len(recent) < limit:
             return None
         return Refusal("open_refused_rate", {"refused": len(recent), "max": limit},
@@ -1289,7 +1333,7 @@ class SessionIssuer:
 
 __all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "DEFAULT_PREPARE_TIMEOUT_S", "GATEWAY_PREPARE_SLACK_S",
            "GRADING_POOL_ABORT", "HANDED_BACK", "LAPSED", "LIVE", "LOST_OPEN_WINDOW_S", "OPEN_TRANSIT_S",
-           "SUBMITTED", "VOIDED", "CorpusEngagements", "EngagementBook", "EngagementTerms", "Grant",
+           "SUBMITTED", "VOIDED", "CorpusEngagements", "EngagementBook", "EngagementTerms", "FanOutEvents", "Grant",
            "JobNotReady", "Refusal", "RlPrecommitEngagements", "SandboxPolicy", "SessionBook", "SessionEvents",
            "SessionIssuer", "SessionRecord", "SignedJobView", "engagement_digest", "pool_abort_fault",
            "runtime_start_fault", "session_submittable", "token_validity_s"]

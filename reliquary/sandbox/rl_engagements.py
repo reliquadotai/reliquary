@@ -18,7 +18,9 @@ A session of an RL episode group names ``rl:{window}:{precommit}:{seed}``. Its t
   session of a precommit;
 * the image and the declared limits come from the env's task source; the budgets from the
   contract, raised to the task's limits;
-* the session quota is asked at every open (``SessionQuota``; permissive for now).
+* the session quota is asked at every open (``SessionQuota.admit_open``) and again under the issuer lock when
+  it offers ``admit_locked`` (the RL yield quota, ``rl_quota.YieldQuota``); a request whose seed is taken or
+  that the session book's caps refuse never reaches the quota (it is no demand).
 
 The token binds hotkey, engagement (precommit + seed), env, split, index (the task) and checkpoint (the
 window's); admission checks every one with ``verify_transcript``.
@@ -58,7 +60,11 @@ WINDOW_AGE_MARGIN_S = 900             # past the longest window (FILL_CLOSED_MAX
 
 
 class SessionQuota(Protocol):
-    """The per-hotkey session quota, asked at every RL open: None admits, a Refusal refuses."""
+    """The per-hotkey session quota, asked at every RL open: None admits, a Refusal refuses.
+
+    A quota may also define ``admit_locked(hotkey, now, *, precommit_sha256=None, seed_index=None,
+    environment=None) -> Refusal | None``: the same check, run under the issuer lock against the sessions as
+    they are then (it may take a pool grant). Such a quota's ``admit_open`` also takes ``seed_index``."""
 
     async def admit_open(self, hotkey: str, *, environment: str,
                          precommit_sha256: str) -> Refusal | None: ...
@@ -178,9 +184,17 @@ class RlEpisodeEngagements:
             name = rl_engagement(precommit.window, sha, seed)
         except EpisodeWireError:
             return Refusal("seed_out_of_pool", {"seed_index": seed, "pool_seeds": policy.pool_seeds})
+        if self._book.engagement_held(name):
+            return Refusal("engagement_taken", {"engagement": name})       # a used seed is no demand
+        refused = self._book.open_refusal(hotkey, int(self._clock()))
+        if refused is not None:
+            return refused                                                    # the book's caps first: no demand
+        locked = getattr(self._quota, "admit_locked", None)
+        seeded = {} if locked is None else {"seed_index": seed}             # OpenQuota keeps its signature
         try:
             refused = await asyncio.wait_for(
-                self._quota.admit_open(hotkey, environment=precommit.environment, precommit_sha256=sha),
+                self._quota.admit_open(hotkey, environment=precommit.environment, precommit_sha256=sha,
+                                       **seeded),
                 timeout)
         except Exception as exc:                 # fail closed, retryably: the quota cannot answer now
             logger.warning("rl session open: quota unanswered (%s)", type(exc).__name__)
@@ -201,11 +215,21 @@ class RlEpisodeEngagements:
         if token_validity_s(self._book.policy.open_window_s, int(budgets["wall_s"]), prepare) > MAX_SESSION_SPAN_S:
             return Refusal("session_too_long", {"wall_s": int(budgets["wall_s"]),
                                                 "max_span_s": MAX_SESSION_SPAN_S})
-        window = precommit.window
+        window, environment = precommit.window, precommit.environment
+
+        def still_valid() -> Refusal | None:
+            # Under the issuer lock: the window again, then the quota against the sessions as they are now (a
+            # pooled hotkey's first open of this precommit takes its pool grant here).
+            stale = self._stale(window)
+            if stale is not None or locked is None:
+                return stale
+            return locked(hotkey, int(self._clock()), precommit_sha256=sha, seed_index=seed,
+                          environment=environment)
+
         return EngagementTerms(
             engagement=name, env=policy.sandbox_env, split=policy.split, index=precommit.task_index,
             checkpoint=precommit.checkpoint, image=task.image, env_package=policy.env_package,
-            budgets=budgets, exclusive=True, still_valid=lambda: self._stale(window), prepare_timeout_s=prepare)
+            budgets=budgets, exclusive=True, still_valid=still_valid, prepare_timeout_s=prepare)
 
 
 __all__ = ["WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements", "SessionOutcomes",

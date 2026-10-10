@@ -104,6 +104,8 @@ REFUSAL_STATUS: dict[str, int] = {
     # per-hotkey caps
     "live_cap": 429, "prompt_live_cap": 429, "job_live_cap": 429, "open_rate_cap": 429,
     "aborted_cap": 429, "open_refused_rate": 429,
+    # the RL yield quota (rl_quota.py): the miner retries after Retry-After
+    "quota_live": 429, "quota_opens": 429, "quota_pool": 429, "quota_pool_opens": 429,
     # this validator cannot answer now: retry
     "sandbox_capacity": 503, "directory_unavailable": 503, "store_unavailable": 503,
     "ledger_unavailable": 503, "task_unavailable": 503, "registration_unavailable": 503,

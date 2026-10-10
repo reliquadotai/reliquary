@@ -343,6 +343,22 @@ class Fleet:
         horizon = int(at) - 4 * HEARTBEAT_MAX_AGE_S
         self._issued[machine_id] = [t for t in issued if t >= horizon]
 
+    def session_capacity(self, now: float | None = None) -> int:
+        """The session slots (``capacity`` of their last report) of the fresh, active, undrained machines: the
+        fleet size the RL yield quota shares. Memory only."""
+        now = self._clock() if now is None else now
+        if not self.directory_ready(now):
+            return 0
+        total = 0
+        for entry in self._directory.entries():
+            if entry.status != "active" or entry.machine_id in self.drained:
+                continue
+            document = self._reports.get(entry.machine_id)
+            if document is None or now - document["at"] > HEARTBEAT_MAX_AGE_S:
+                continue
+            total += max(0, int(document.get("capacity") or 0))
+        return total
+
     def _options_differ(self, machine_id: str, document: Mapping[str, Any], env: str,
                         expected: str) -> bool:
         """Whether the machine serves `env` with other options than the ones this
