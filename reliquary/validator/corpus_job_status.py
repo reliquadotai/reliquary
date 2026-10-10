@@ -118,6 +118,8 @@ async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
     pending_records = len(rebuild_ledgers(job, before).records) if job is not None else 0
     if job is None and before:
         raise ValueError("stored ledger has no job manifest")
+    if job is None:
+        raise ValueError(f"no job {job_id!r}")
     submissions = set(await records.list_submission_ids(job_id))
     verdicts = set(await records.list_verdict_ids(job_id))
     state, _ = await records.read_settlement(job_id)

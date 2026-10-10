@@ -37,7 +37,7 @@ fi
 
 echo "[setup] pip install reliquary"
 .venv/bin/pip install --upgrade pip setuptools wheel
-.venv/bin/pip install -e .
+.venv/bin/pip install -e ".[operator]"
 
 # The default torch pulled by bittensor is built for CUDA 13, which doesn't
 # run against the CUDA 12.8 driver that Targon boxes ship with. Pin to the

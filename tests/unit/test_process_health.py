@@ -45,6 +45,7 @@ def test_collect_process_health_resolves_unified_cgroup_and_zombies(tmp_path):
                 "updated_at": 990.0,
                 "workers_spawned_total": 12,
                 "worker_restarts_total": {"recycle": 4},
+                "sandbox_backend": "runsc",
                 "secret": "must-not-escape",
             }
         ),
@@ -69,6 +70,7 @@ def test_collect_process_health_resolves_unified_cgroup_and_zombies(tmp_path):
     assert snapshot["restart_recommended"] is False
     assert snapshot["grader"]["age_seconds"] == 10.0
     assert snapshot["grader"]["workers_spawned_total"] == 12
+    assert snapshot["grader"]["sandbox_backend"] == "runsc"
     assert "secret" not in snapshot["grader"]
 
 

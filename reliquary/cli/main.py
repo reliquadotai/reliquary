@@ -17,6 +17,8 @@ from pathlib import Path
 
 import typer
 
+from reliquary.cli.output import CLIGroup, JSON_OPTION, emit_result, fail, get_current_context
+
 from reliquary.constants import (
     B_BATCH,
     PROOF_PROCESS_ISOLATION,
@@ -40,7 +42,30 @@ from reliquary.validator.errors import FatalProofPlaneError
 
 _DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
 
-app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
+app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet", cls=CLIGroup,
+                  invoke_without_command=True, no_args_is_help=True)
+
+
+@app.callback()
+def cli_options(
+    ctx: typer.Context,
+    version: bool = typer.Option(False, "--version", is_eager=True, help="Show installed version."),
+    debug: bool = typer.Option(False, "--debug", help="Show local exception details."),
+) -> None:
+    ctx.meta["debug"] = debug
+    if version:
+        from reliquary import __version__
+
+        typer.echo(__version__)
+        raise typer.Exit()
+
+
+from reliquary.cli.diagnostics import context, doctor
+from reliquary.cli.platform import platform_app
+
+app.command("context")(context)
+app.command("doctor")(doctor)
+app.add_typer(platform_app)
 
 logger = logging.getLogger(__name__)
 
@@ -546,6 +571,7 @@ def tasks_create(
             "it from its own card."
         ),
     ),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
@@ -561,14 +587,16 @@ def tasks_create(
         ) if value is not None
     ]
     try:
+        model_flags = [flag for flag, value in (
+            ("--model-revision", model_revision), ("--model-architecture", model_architecture),
+            ("--from-profile", from_profile), ("--envs", envs),
+        ) if value is not None]
+        if model is None and model_flags:
+            raise ValueError(f"{', '.join(model_flags)} require --model")
         if compose_flags and (model is None or from_profile is not None):
             # The template (or compiled profile) would silently win over them.
-            typer.echo(
-                f"error: {', '.join(compose_flags)} only apply when composing a "
-                "contract: give --model without --from-profile",
-                err=True,
-            )
-            raise typer.Exit(code=1)
+            raise ValueError(f"{', '.join(compose_flags)} only apply when composing a "
+                             "contract: give --model without --from-profile")
         if model is not None and from_profile is None and profile_id is None:
             entry = _composed_task_entry(
                 task_id=task_id, model=model, model_revision=model_revision,
@@ -585,23 +613,14 @@ def tasks_create(
                 # the same trap this branch keeps finding elsewhere. This
                 # path is new, so nothing can already depend on the
                 # permissive behaviour.
-                typer.echo(
-                    "error: --profile-id has no effect with --model; use "
-                    "--from-profile to select the template",
-                    err=True,
-                )
-                raise typer.Exit(code=1)
+                raise ValueError("--profile-id has no effect with --model; use "
+                                 "--from-profile to select the template")
             if env_split is not None:
                 # Same trap as --profile-id: the contract path builds
                 # env_split=None, so the shares an operator typed would be
                 # dropped without a word.
-                typer.echo(
-                    "error: --env-split has no effect with --model; a carried "
-                    "contract declares its own environment set, selected with "
-                    "--envs",
-                    err=True,
-                )
-                raise typer.Exit(code=1)
+                raise ValueError("--env-split has no effect with --model; a carried "
+                                 "contract declares its own environment set, selected with --envs")
             # The builder cannot infer any of these (a template is not a
             # network call, and architecture needs one) -- so all three are
             # required together, and each missing one is named, not guessed.
@@ -615,10 +634,7 @@ def tasks_create(
                 if value is None
             ]
             if missing:
-                typer.echo(
-                    f"error: --model requires {', '.join(missing)}", err=True,
-                )
-                raise typer.Exit(code=1)
+                raise ValueError(f"--model requires {', '.join(missing)}")
             entry = build_contract_task_entry(
                 task_id=task_id,
                 from_profile=from_profile,
@@ -636,11 +652,7 @@ def tasks_create(
             )
         else:
             if profile_id is None:
-                typer.echo(
-                    "error: --profile-id is required unless --model is given",
-                    err=True,
-                )
-                raise typer.Exit(code=1)
+                raise ValueError("--profile-id is required unless --model is given")
             entry = build_task_entry(
                 task_id=task_id,
                 profile_id=profile_id,
@@ -655,20 +667,26 @@ def tasks_create(
         # whole fleet: both legacy fallbacks are armed by an EMPTY registry,
         # so a first entry that is not `default` un-arms them for a task
         # nobody declared. Refuse here rather than weaken the fallbacks.
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(
+        fail(str(exc), exit_code=1)
+    emit_result({"task_id": entry.task_id, "profile_id": entry.profile_id,
+                 "cap": cap, "verification": entry.verification},
         f"declared task {entry.task_id} on {entry.profile_id} with cap {cap}"
-        + (f", verified {entry.verification}" if entry.verification else "")
+        + (f", verified {entry.verification}" if entry.verification else ""), as_json=as_json,
     )
 
 
 @tasks_app.command("list")
-def tasks_list() -> None:
+def tasks_list(as_json: bool = JSON_OPTION) -> None:
     from reliquary.infrastructure.task_registry_store import read_registry
     from reliquary.shared.task_registry import total_cap
 
     entries, _ = asyncio.run(read_registry(strict=False))
+    if as_json:
+        from dataclasses import asdict
+
+        emit_result({"tasks": [asdict(entry) for _, entry in sorted(entries.items())],
+                     "total_cap": total_cap(entries)}, as_json=True)
+        return
     for task_id, entry in sorted(entries.items()):
         typer.echo(
             f"{task_id:24s} {entry.status:8s} admission={entry.admission} cap={entry.params['cap']:.3f} "
@@ -717,6 +735,7 @@ def tasks_set_cap(
         None, "--audit-ban-seconds",
         help="How long a ban lasts",
     ),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Change a live task's cap; its contract and digest are untouched."""
     from reliquary.infrastructure import task_registry_store as store
@@ -733,46 +752,51 @@ def tasks_set_cap(
             audit_ban_seconds=audit_ban_seconds,
         ))
     except (RegistryError, store.RegistryConflict) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(f"task {task_id} now has cap {cap}" + (f" and floor {floor}" if floor is not None else ""))
+        fail(str(exc), exit_code=1)
+    emit_result({"task_id": task_id, "cap": cap, "floor": floor},
+                f"task {task_id} now has cap {cap}" + (f" and floor {floor}" if floor is not None else ""),
+                as_json=as_json)
 
 
-def _task_admission(task_id: str, admission: str) -> None:
+def _task_admission(task_id: str, admission: str, *, as_json: bool = False) -> None:
     from reliquary.infrastructure.task_registry_store import RegistryConflict, set_task_admission
     from reliquary.shared.task_registry import RegistryError
 
     try:
         asyncio.run(set_task_admission(task_id, admission))
     except (RegistryError, RegistryConflict) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(f"task {task_id} admission {admission}; active state and cap unchanged")
+        fail(str(exc), exit_code=1)
+    emit_result({"task_id": task_id, "admission": admission},
+                f"task {task_id} admission {admission}; active state and cap unchanged",
+                as_json=as_json)
 
 
 @tasks_app.command("pause")
-def tasks_pause(task_id: str = typer.Option(..., "--task-id")) -> None:
+def tasks_pause(task_id: str = typer.Option(..., "--task-id"),
+                as_json: bool = JSON_OPTION) -> None:
     """Stop new corpus admissions on the control's next registry refresh; drain existing work."""
-    _task_admission(task_id, "paused")
+    _task_admission(task_id, "paused", as_json=as_json)
 
 
 @tasks_app.command("resume")
-def tasks_resume(task_id: str = typer.Option(..., "--task-id")) -> None:
+def tasks_resume(task_id: str = typer.Option(..., "--task-id"),
+                 as_json: bool = JSON_OPTION) -> None:
     """Reopen a paused active corpus task; terminal retirement cannot resume."""
-    _task_admission(task_id, "open")
+    _task_admission(task_id, "open", as_json=as_json)
 
 
 @tasks_app.command("retire")
 def tasks_retire(
     task_id: str = typer.Option(..., "--task-id"),
     retired_at: int = typer.Option(..., "--retired-at", help="drand round"),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     from reliquary.infrastructure.task_registry_store import retire_task_entry
 
     asyncio.run(retire_task_entry(task_id, retired_at))
-    typer.echo(
-        f"retired {task_id}; its cap stays reserved until its EMA tail decays"
-    )
+    emit_result({"task_id": task_id, "status": "retired", "retired_at": retired_at},
+                f"retired {task_id}; its cap stays reserved until its EMA tail decays",
+                as_json=as_json)
 
 
 @tasks_app.command("close")
@@ -782,6 +806,7 @@ def tasks_close(
         False, "--cut-tail", hidden=True,
         help="Accepted and ignored: a window-settled corpus task is no longer paid",
     ),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Close a finished corpus task: cap 0 and retired, so it is paid nothing
     new and its share of the pool is free; what it already earned keeps being
@@ -792,9 +817,8 @@ def tasks_close(
     try:
         message = asyncio.run(close_task(task_id))
     except TaskNotClosable as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(message)
+        fail(str(exc), exit_code=1)
+    emit_result({"task_id": task_id, "message": message}, message, as_json=as_json)
 
 
 @tasks_app.command("contract")
@@ -803,6 +827,7 @@ def tasks_contract(
         ..., "--task-id",
         help="Repeat for corpus tasks one validator serves together: prints their merged contract",
     ),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Print a task's carried contract, for a deployment to mount."""
     import json
@@ -816,21 +841,12 @@ def tasks_contract(
     for task_id in task_ids:
         entry = entries.get(task_id)
         if entry is None:
-            typer.echo(f"error: no task {task_id!r} in the registry", err=True)
-            raise typer.Exit(code=1)
+            fail(f"no task {task_id!r} in the registry", exit_code=1)
         if entry.contract is None:
-            typer.echo(
-                f"error: task {task_id!r} is a legacy entry and carries no contract",
-                err=True,
-            )
-            raise typer.Exit(code=1)
+            fail(f"task {task_id!r} is a legacy entry and carries no contract", exit_code=1)
         if len(task_ids) > 1 and entry.mechanism != MECHANISM_CORPUS_GENERATION:
-            typer.echo(
-                f"error: task {task_id!r} is {entry.mechanism!r}; only corpus tasks "
-                "share one validator's contract",
-                err=True,
-            )
-            raise typer.Exit(code=1)
+            fail(f"task {task_id!r} is {entry.mechanism!r}; only corpus tasks "
+                "share one validator's contract", exit_code=1)
         contracts[task_id] = entry.contract
     if len(contracts) == 1:
         contract = next(iter(contracts.values()))
@@ -838,9 +854,9 @@ def tasks_contract(
         try:
             contract = merge_corpus_contracts(contracts)
         except ValueError as exc:
-            typer.echo(f"error: {exc}", err=True)
-            raise typer.Exit(code=1) from exc
-    typer.echo(json.dumps(contract, sort_keys=True, separators=(",", ":")))
+            fail(str(exc), exit_code=1)
+    emit_result(contract, json.dumps(contract, sort_keys=True, separators=(",", ":")),
+                as_json=as_json)
 
 
 envs_app = typer.Typer(
@@ -850,7 +866,7 @@ app.add_typer(envs_app)
 
 
 @envs_app.command("list")
-def envs_list() -> None:
+def envs_list(as_json: bool = JSON_OPTION) -> None:
     """Every catalogued environment, its default budget, source profile and digest."""
     from reliquary.protocol.environment_catalog import (
         CATALOG_PROVENANCE,
@@ -859,6 +875,13 @@ def envs_list() -> None:
     )
     from reliquary.protocol.release_contract import canonical_sha256
 
+    if as_json:
+        emit_result({"environments": [{"name": name,
+                    "max_new_tokens": ENVIRONMENT_CATALOG[name].max_new_tokens,
+                    "sha256": canonical_sha256(environment_body_contract(name)),
+                    "provenance": CATALOG_PROVENANCE[name]}
+                    for name in sorted(ENVIRONMENT_CATALOG)]}, as_json=True)
+        return
     typer.echo(f"{'environment':<38} {'max_new_tokens':>14}  {'sha256':<12}  provenance")
     for name in sorted(ENVIRONMENT_CATALOG):
         digest = canonical_sha256(environment_body_contract(name))
@@ -869,7 +892,7 @@ def envs_list() -> None:
 
 
 @envs_app.command("show")
-def envs_show(name: str = typer.Argument(...)) -> None:
+def envs_show(name: str = typer.Argument(...), as_json: bool = JSON_OPTION) -> None:
     """One catalog body as JSON, with its digest, provenance and tunable fields."""
     import json
 
@@ -887,19 +910,15 @@ def envs_show(name: str = typer.Argument(...)) -> None:
             "is installed but has no catalog entry; add and review one first"
             if name in ENVIRONMENT_SPECS else "is not an environment"
         )
-        typer.echo(
-            f"error: {name!r} {reason}; catalogued: {', '.join(sorted(ENVIRONMENT_CATALOG))}",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+        fail(f"{name!r} {reason}; catalogued: {', '.join(sorted(ENVIRONMENT_CATALOG))}", exit_code=1)
     body = environment_body_contract(name)
-    typer.echo(json.dumps({
+    emit_result({
         "name": name,
         "body": body,
         "canonical_sha256": canonical_sha256(body),
         "provenance": CATALOG_PROVENANCE[name],
         "tunable_fields": sorted(TUNABLE_FIELDS),
-    }, indent=2, sort_keys=True))
+    }, as_json=as_json)
 
 
 jobs_app = typer.Typer(
@@ -1332,20 +1351,18 @@ def jobs_create(
             "those validators refuse to start."
         ),
     ),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Write the job manifest and the registry entry that pays for it."""
     from reliquary.eval.prompt_source import is_order_job_id
 
     if is_order_job_id(job_id) or is_order_job_id(task_id):
         # An order job is served only from its qualification record.
-        typer.echo(f"error: {task_id or job_id!r} is an order id: only the admin service "
-                   "declares order jobs (POST /admin/v1/jobs)", err=True)
-        raise typer.Exit(code=2)
+        fail(f"{task_id or job_id!r} is an order id: only the admin service "
+             "declares order jobs (POST /admin/v1/jobs)", exit_code=2)
     if settlement != "period-ema-v1":
-        typer.echo(f"error: --settlement {settlement!r} was removed: a corpus task is paid "
-                   "only by period-ema-v1 (its own drand periods); omit --settlement",
-                   err=True)
-        raise typer.Exit(code=1)
+        fail(f"--settlement {settlement!r} was removed: a corpus task is paid "
+             "only by period-ema-v1 (its own drand periods); omit --settlement")
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure.task_registry_store import (
         RegistryConflict,
@@ -1376,8 +1393,7 @@ def jobs_create(
             with open(episode_file, encoding="utf-8") as handle:
                 episode = json.load(handle)
     except (OSError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
     try:
         manifest, entry = prepare_corpus_job(
             job_id=job_id, task_id=task_id, model=model, model_revision=model_revision,
@@ -1402,8 +1418,7 @@ def jobs_create(
             contract_environment=contract_environment, seed=seed, episode=episode,
         )
     except (RegistryError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
     del fleet_knows_period_settlement  # every validator settles period-ema-v1 now
 
     # Before either write, so a refusal leaves nothing behind. The guard is in
@@ -1413,24 +1428,16 @@ def jobs_create(
             entry, acknowledged=fleet_knows_corpus_generation
         )
     except RegistryError as exc:
-        typer.echo(
-            f"error: {exc} Pass --fleet-knows-corpus-generation.", err=True
-        )
-        raise typer.Exit(code=1) from exc
+        fail(f"{exc} Pass --fleet-knows-corpus-generation.", exit_code=1)
 
     try:
         asyncio.run(job_store.write_job(manifest, None))
     except job_store.CorpusStoreConflict as exc:
         # Replacing a live job's manifest would change the work under miners
         # already holding slots against it.
-        typer.echo(
-            f"error: job {job_id!r} already has a manifest; pick another job id",
-            err=True,
-        )
-        raise typer.Exit(code=1) from exc
+        fail(f"job {job_id!r} already has a manifest; pick another job id", exit_code=1)
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
 
     # The registry write goes last because it is the one that can lose a race
     # or break the sum rule.
@@ -1443,37 +1450,34 @@ def jobs_create(
         try:
             asyncio.run(job_store.delete_job(job_id))
         except Exception:
-            typer.echo(
-                f"error: the task was not declared AND its manifest could not "
-                f"be removed; delete job {job_id!r} by hand before retrying",
-                err=True,
-            )
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+            fail(f"{exc}; the task was not declared AND its manifest could not "
+                 f"be removed; inspect job {job_id!r} before retrying",
+                 code="rollback_failed")
+        fail(str(exc), exit_code=1)
     except Exception as exc:
         # Transport, timeout, anything else: the put MAY have landed. Deleting
         # the manifest now is the worst outcome available -- a declared task
         # holding a cap share and refusing every submission it is paid for --
         # so leave it and make the operator look.
-        typer.echo(f"error: {exc}", err=True)
-        typer.echo(
-            f"error: the registry write for job {job_id!r} did not confirm, so "
+        if get_current_context().meta.get("debug"):
+            raise
+        fail(
+            f"the registry write for job {job_id!r} did not confirm ({type(exc).__name__}), so "
             f"its manifest is LEFT IN PLACE. Run `reliquary jobs list` to see "
             f"whether the task landed before retrying.",
-            err=True,
+            code="unknown_write_outcome",
         )
-        raise typer.Exit(code=1) from exc
 
-    typer.echo(
+    emit_result({"job_id": job_id, "task_id": entry.task_id, "cap": cap},
         f"declared job {job_id} as task {entry.task_id} on {prompt_source} "
         + (f"rows [{prompt_start}, {prompt_start + prompt_count}) " if prompt_start else "")
         + f"with cap {cap} pinned as its price"
-        + (f", verified {entry.verification}" if entry.verification else "")
+        + (f", verified {entry.verification}" if entry.verification else ""), as_json=as_json,
     )
 
 
 @jobs_app.command("list")
-def jobs_list() -> None:
+def jobs_list(as_json: bool = JSON_OPTION) -> None:
     """Every job with a manifest, and the task that declares it, if any."""
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure.task_registry_store import read_registry
@@ -1485,6 +1489,13 @@ def jobs_list() -> None:
         if entry.job_id
     }
     stored = asyncio.run(job_store.list_jobs())
+    if as_json:
+        emit_result({"jobs": [{"job_id": job_id, "has_manifest": job_id in stored,
+                     "task_id": declared[job_id].task_id if job_id in declared else None,
+                     "status": declared[job_id].status if job_id in declared else None,
+                     "cap": declared[job_id].params['cap'] if job_id in declared else None}
+                     for job_id in sorted(set(stored) | set(declared))]}, as_json=True)
+        return
     for job_id in stored:
         entry = declared.get(job_id)
         if entry is None:
@@ -1547,6 +1558,7 @@ def jobs_export(
     allow_incomplete: bool = typer.Option(
         False, "--allow-incomplete",
         help="An episode job: export before the job is drained (the counts file says so)"),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Write the verified completions of a job as JSON lines.
 
@@ -1557,12 +1569,12 @@ def jobs_export(
     was exported and what was left out (ungraded, held, voided, uncertified,
     unparseable...), when, and the quarantined executors it held.
 
-    Written to a temporary file beside `--out` and swapped in with
-    `os.replace` only once the export completes, so a mid-stream failure (the
-    record store, the grader) never leaves a truncated, valid-looking dataset
-    in its place -- and any pre-existing `--out` is untouched until then.
+    Ordinary exports replace `--out` only after completion. Episode exports
+    require fresh output and counts paths and publish the dataset last; its
+    presence marks a complete pair. After interruption, use a fresh path.
     """
     import json
+    import tempfile
 
     from reliquary.corpus.export import export_rows
     from reliquary.infrastructure import corpus_job_store as job_store
@@ -1579,9 +1591,11 @@ def jobs_export(
             raise typer.BadParameter("--sft is for episode jobs; use --apply-filter")
         if episode:
             from reliquary.corpus.delivery import episode_rows
+            from reliquary.corpus.export_bundle import require_new_episode_output
             from reliquary.environment import agentic_swe
             from reliquary.validator import corpus_job_status
 
+            require_new_episode_output(out)
             drained = bool((await corpus_job_status.stored_job_counts(
                 BucketRecordStore(), job_id))["drained"])
             if not drained and not allow_incomplete:
@@ -1599,22 +1613,27 @@ def jobs_export(
                                 source=source, counts=counts, sft_only=sft,
                                 quarantined=quarantined)
         else:
-            grade = _job_grader(job) if apply_filter else None
+            grade = _job_grader(job) if apply_filter or only_accepted else None
             rows = export_rows(job=job, records=BucketRecordStore(), grade=grade)
-        temporary = f"{out}.{os.getpid()}.tmp"
         written = 0
+        handle = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                             dir=Path(out).parent, prefix=f".{Path(out).name}-")
+        temporary = handle.name
         try:
-            with open(temporary, "w", encoding="utf-8") as handle:
+            with handle:
                 async for row in rows:
                     if episode:
                         row = {**row, "messages": json.loads(row["messages"]),
                                "turns": json.loads(row["turns"])}
-                    elif only_accepted and not row.get("accepted", True):
+                    elif only_accepted and not row.get("accepted", False):
                         continue
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     written += 1
-            os.replace(temporary, out)
+                handle.flush()
+                os.fsync(handle.fileno())
             if episode:
+                from reliquary.corpus.export_bundle import publish_episode_export
+
                 sidecar = {
                     "job_id": job_id, "drained": drained, "sft_only": sft,
                     "exported": counts.get("rows", 0),
@@ -1623,11 +1642,11 @@ def jobs_export(
                     "counts": counts, "exported_at": _time.time(),
                     "quarantined_executors": list(quarantined),
                 }
-                side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
-                with open(side_temporary, "w", encoding="utf-8") as handle:
-                    json.dump(sidecar, handle, sort_keys=True, indent=1)
-                os.replace(side_temporary, f"{out}.counts.json")
-                typer.echo(json.dumps(counts, sort_keys=True), err=True)
+                publish_episode_export(temporary, out, sidecar)
+                if not as_json:
+                    typer.echo(json.dumps(counts, sort_keys=True), err=True)
+            else:
+                os.replace(temporary, out)
         except Exception:
             try:
                 os.unlink(temporary)
@@ -1636,21 +1655,25 @@ def jobs_export(
             raise
         return written
 
-    typer.echo(f"{asyncio.run(_run())} rows written to {out}")
+    written = asyncio.run(_run())
+    emit_result({"job_id": job_id, "rows": written, "out": out},
+                f"{written} rows written to {out}", as_json=as_json)
 
 
 @jobs_app.command("status")
-def jobs_status(job_id: str = typer.Argument(...)) -> None:
+def jobs_status(job_id: str = typer.Argument(...), as_json: bool = JSON_OPTION) -> None:
     """How far a job is from drained: accepted, audited and settled counts.
 
-    Read-only. The stop procedure waits for `drained: yes` before
-    `jobs cancel`: retiring the task is a boot gate, so anything not yet
-    audited or settled when the corpus validator stops is never paid.
+    Read-only. After cancel, compatible hot controllers stop admission on
+    refresh and drain existing work. Verify drained before stopping services.
     """
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
     from reliquary.validator.corpus_job_status import stored_job_counts
 
     counts = asyncio.run(stored_job_counts(BucketRecordStore(), job_id))
+    if as_json:
+        emit_result({"job_id": job_id, **counts}, as_json=True)
+        return
     pending_window, last_window = counts["pending_window"], counts["last_window"]
     typer.echo(
         f"{job_id}: submissions={counts['submissions']} verdicts={counts['verdicts']} "
@@ -1669,6 +1692,7 @@ def jobs_miner_reset(
     job_id: str = typer.Option(..., "--job-id"),
     hotkeys: list[str] = typer.Option(None, "--hotkey", help="Repeatable"),
     all_hotkeys: bool = typer.Option(False, "--all", help="Every hotkey in the job's miners.json"),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Clear hotkeys' suspect, ban and confirmed failures in the job's miners.json.
 
@@ -1682,8 +1706,7 @@ def jobs_miner_reset(
     from reliquary.validator.corpus_miner_states import MinerStates
 
     if bool(hotkeys) == all_hotkeys:
-        typer.echo("error: name hotkeys with --hotkey, or pass --all (not both)", err=True)
-        raise typer.Exit(code=1)
+        fail("name hotkeys with --hotkey, or pass --all (not both)")
     states = MinerStates(BucketRecordStore(), job_id)
 
     def clear(m):
@@ -1703,8 +1726,10 @@ def jobs_miner_reset(
     try:
         targets = asyncio.run(_run())
     except typer.BadParameter as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
+    if as_json:
+        emit_result({"job_id": job_id, "reset": targets}, as_json=True)
+        return
     typer.echo(f"reset {len(targets)} hotkey(s) in job {job_id}: {', '.join(targets) or '-'}")
     typer.echo(
         "suspect, ban and confirmed failures cleared; audited_passed is kept, so a "
@@ -1718,6 +1743,7 @@ def jobs_miner_reset(
 def jobs_fingerprint(
     checkpoint: str = typer.Argument(..., help="HF repo id or local directory"),
     revision: str = typer.Option("", "--revision", help="HF revision (repo ids only)"),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Print the value `jobs create --checkpoint-sha256` expects for a checkpoint."""
     from pathlib import Path
@@ -1730,20 +1756,20 @@ def jobs_fingerprint(
 
         directory = Path(snapshot_download(checkpoint, revision=revision or None,
                                            allow_patterns=["*.safetensors"]))
-    typer.echo(checkpoint_fingerprint(directory))
+    digest = checkpoint_fingerprint(directory)
+    emit_result({"sha256": digest}, digest, as_json=as_json)
 
 
 @jobs_app.command("cancel")
 def jobs_cancel(
     job_id: str = typer.Option(..., "--job-id"),
     retired_at: int = typer.Option(..., "--retired-at", help="drand round"),
+    as_json: bool = JSON_OPTION,
 ) -> None:
-    """Retire the task entry. It is a BOOT gate, not a stop.
+    """Persist retirement. Compatible controllers stop admission on refresh and drain.
 
-    `resolve_task_config` refuses a retired entry at startup and `admit()`
-    never reads `status`, so a validator already serving this job keeps
-    admitting submissions until it restarts. The manifest stays either way:
-    settlement still reads it.
+    Verify the serving controller's effect with jobs status; the manifest is
+    retained for settlement. A registry acknowledgement is not a completed drain.
     """
     from reliquary.infrastructure.task_registry_store import (
         read_registry,
@@ -1753,18 +1779,15 @@ def jobs_cancel(
     entries, _ = asyncio.run(read_registry(strict=False))
     named = [entry for entry in entries.values() if entry.job_id == job_id]
     if not named:
-        typer.echo(
-            f"error: no task in the registry names job {job_id!r}", err=True
-        )
-        raise typer.Exit(code=1)
+        fail(f"no task in the registry names job {job_id!r}", exit_code=1)
     for entry in named:
         asyncio.run(retire_task_entry(entry.task_id, retired_at))
-    typer.echo(
+    emit_result({"job_id": job_id, "tasks": sorted(entry.task_id for entry in named),
+                 "status": "retired", "retired_at": retired_at},
         f"retired "
         + ", ".join(sorted(entry.task_id for entry in named))
-        + f" for job {job_id}. This stops validators that START from now on; "
-        "one already running keeps admitting submissions until it restarts. "
-        "The manifest stays for settlement."
+        + f" for job {job_id}. Compatible controllers stop admission on refresh and drain. "
+        f"Verify with jobs status {job_id}; the manifest stays for settlement.", as_json=as_json,
     )
 
 
@@ -1829,8 +1852,7 @@ def admin_serve(
     try:
         admin = build_admin_app_from_environment()
     except (ValueError, OSError, RuntimeError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
     uvicorn.run(admin, host=host, port=port, log_level=log_level.lower())
 
 
@@ -1854,11 +1876,12 @@ def eval_build_set(
         help="Rows in the range (default: to the end); with --preset, the problems drawn"),
     sample: int | None = typer.Option(None, "--sample", min=1,
                                       help="Draw this many rows from the range (needs --seed)"),
-    seed: int | None = typer.Option(None, "--seed"),
+    seed: int | None = typer.Option(None, "--seed", min=0, max=2**63 - 1),
     taskset_args: str | None = typer.Option(
         None, "--taskset-args",
         help="Verifiers only: the taskset config as JSON, frozen into the set"),
     set_id: str | None = typer.Option(None, "--set-id"),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
 
@@ -1887,11 +1910,10 @@ def eval_build_set(
                                          set_id=set_id, taskset_args=args,
                                          open_environment=sets.open_source)
     except (ValueError, FileExistsError, KeyError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
     keys = ("set_id", "env", "source", "split", "count", "index_range", "prompts_sha256",
             "grading_sha256", "disjointness", "taskset", "needs_runtime")
-    typer.echo(json.dumps({k: card[k] for k in keys if k in card}, indent=1))
+    emit_result({k: card[k] for k in keys if k in card}, as_json=as_json)
 
 
 def _admin_client(admin_url: str):
@@ -1903,7 +1925,7 @@ def _admin_client(admin_url: str):
     return AdminClient(admin_url, secret.encode())
 
 
-_ADMIN_URL = typer.Option("http://127.0.0.1:8790", "--admin-url",
+_ADMIN_URL = typer.Option("http://127.0.0.1:8790", "--admin-url", envvar="RELIQUARY_ADMIN_URL",
                           help="The admin service (reliquary admin serve)")
 
 
@@ -1920,12 +1942,17 @@ def eval_create(
     count: int | None = typer.Option(None, "--count", min=1,
                                      help="The set's first N problems (default: all)"),
     cap: float | None = typer.Option(None, "--cap", help="The job's share (admin default 0.02)"),
-    seed: int | None = typer.Option(None, "--seed"),
+    seed: int | None = typer.Option(None, "--seed", min=0, max=2**63 - 1),
     job_id: str | None = typer.Option(None, "--job-id", help="With one --set only"),
     completions: int = typer.Option(32, "--qualify-completions", min=1, max=64),
     attempt: int = typer.Option(0, "--attempt", min=0,
                                 help="Ask for a new qualification after a failed one"),
-    poll_seconds: float = typer.Option(30.0, "--poll-seconds"),
+    poll_seconds: float = typer.Option(30.0, "--poll-seconds", min=0.01),
+    timeout_seconds: float = typer.Option(21600.0, "--timeout", min=0.01,
+                                          help="Wait budget in seconds; individual requests remain bounded."),
+    wait: bool = typer.Option(True, "--wait/--no-wait",
+                              help="With --no-wait request qualification and return IDs; rerun to declare jobs."),
+    as_json: bool = JSON_OPTION,
     admin_url: str = _ADMIN_URL,
 ) -> None:
     """Qualify MODEL on each set, wait, then declare one eval job per set.
@@ -1938,47 +1965,52 @@ def eval_create(
 
     try:
         repo, revision = operator.split_model(model)
-        client = _admin_client(admin_url)
-        cards = [operator.read_set_card(set_id) for set_id in set_ids]
         prefix = os.environ.get(TASK_PREFIX_ENV, "").strip() or DEFAULT_TASK_PREFIX
-        created = operator.create_evaluations(
-            client, cards=cards, model=repo, revision=revision, samples=samples,
-            max_new_tokens=max_new_tokens, thinking=thinking,
-            sampling={"temperature": temperature, "top_p": top_p, "top_k": top_k},
-            count=count, cap=cap, seed=seed, job_id=job_id, completions=completions,
-            prefix=prefix, poll_seconds=poll_seconds, attempt=attempt,
-            log=lambda line: typer.echo(line, err=True))
-    except (ValueError, RuntimeError, TimeoutError, operator.AdminError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(json.dumps([{k: c[k] for k in ("job_id", "set_id", "qualification_id")}
-                           for c in created], indent=1))
+        with _admin_client(admin_url) as client:
+            cards = [operator.read_set_card(set_id) for set_id in set_ids]
+            created = operator.create_evaluations(
+                client, cards=cards, model=repo, revision=revision, samples=samples,
+                max_new_tokens=max_new_tokens, thinking=thinking,
+                sampling={"temperature": temperature, "top_p": top_p, "top_k": top_k},
+                count=count, cap=cap, seed=seed, job_id=job_id, completions=completions,
+                prefix=prefix, poll_seconds=poll_seconds, attempt=attempt,
+                timeout_seconds=timeout_seconds, wait=wait,
+                log=lambda line: typer.echo(line, err=True))
+    except (ValueError, RuntimeError, OSError, TimeoutError, operator.AdminError) as exc:
+        fail(str(exc))
+    emit_result([{k: c[k] for k in ("job_id", "set_id", "qualification_id", "state") if k in c}
+                 for c in created], as_json=as_json)
 
 
 @eval_app.command("status")
-def eval_status(job_id: str = typer.Option(..., "--job"), admin_url: str = _ADMIN_URL) -> None:
+def eval_status(job_id: str = typer.Option(..., "--job"), admin_url: str = _ADMIN_URL,
+                as_json: bool = JSON_OPTION) -> None:
     """An eval job's counts: submissions, verdicts, settled, drained."""
     import json
 
     from reliquary.eval import operator
 
     try:
-        status = _admin_client(admin_url).json("GET", f"/admin/v1/jobs/{job_id}/status")
+        with _admin_client(admin_url) as client:
+            operator.checked_job_id(job_id)
+            status = client.json("GET", f"/admin/v1/jobs/{job_id}/status")
     except (ValueError, operator.AdminError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(json.dumps({k: v for k, v in status.items() if k != "manifest"}, indent=1))
+        fail(str(exc))
+    emit_result({k: v for k, v in status.items() if k != "manifest"}, as_json=as_json)
 
 
 @eval_app.command("grade")
 def eval_grade(
     job_id: str = typer.Option(..., "--job"),
-    out: str | None = typer.Option(None, "--out", help="Write report.json, manifest.json, "
-                                                       "graded.parquet here"),
+    out: str | None = typer.Option(None, "--out", help="Write report.json, manifest.json and "
+                                                       "graded.parquet; remote downloads require a new or empty directory"),
     eval_id: str | None = typer.Option(None, "--eval-id", help="Default: the job id"),
     allow_incomplete: bool = typer.Option(False, "--allow-incomplete",
                                           help="Grade a drained job missing samples"),
-    poll_seconds: float = typer.Option(10.0, "--poll-seconds"),
+    poll_seconds: float = typer.Option(10.0, "--poll-seconds", min=0.01),
+    timeout_seconds: float = typer.Option(21600.0, "--timeout", min=0.01),
+    wait: bool = typer.Option(True, "--wait/--no-wait", help="Remote orders: return a running evaluation ID without waiting."),
+    as_json: bool = JSON_OPTION,
     admin_url: str = _ADMIN_URL,
 ) -> None:
     """Grade a drained eval job and write its report, manifest and graded rows.
@@ -1994,18 +2026,21 @@ def eval_grade(
 
     try:
         if not is_order_job_id(job_id):
+            if not wait:
+                raise ValueError("--no-wait is for remote order jobs; local grading runs on this host")
             if out is None:
                 raise ValueError("--out is required: the grading is written here")
             answer = asyncio.run(grade_served_job(job_id, out=out,
                                                   allow_incomplete=allow_incomplete))
         else:
-            answer = operator.grade_job(_admin_client(admin_url), job_id, out=out,
-                                        eval_id=eval_id, allow_incomplete=allow_incomplete,
-                                        poll_seconds=poll_seconds)
-    except (ValueError, TimeoutError, operator.AdminError, JobNotGradable) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(json.dumps(answer, indent=1))
+            with _admin_client(admin_url) as client:
+                answer = operator.grade_job(client, job_id, out=out,
+                                            eval_id=eval_id, allow_incomplete=allow_incomplete,
+                                            poll_seconds=poll_seconds, timeout_seconds=timeout_seconds,
+                                            wait=wait)
+    except (ValueError, OSError, TimeoutError, operator.AdminError, JobNotGradable) as exc:
+        fail(str(exc))
+    emit_result(answer, as_json=as_json)
 
 
 @eval_app.command("compare")
@@ -2014,6 +2049,7 @@ def eval_compare(
     b: str = typer.Argument(..., help="Another, on the same sets and conditions"),
     allow_ungraded: bool = typer.Option(False, "--allow-ungraded",
                                         help="Count ungraded rows as failures instead of refusing"),
+    as_json: bool = JSON_OPTION,
 ) -> None:
     """pass@1 of two gradings and their difference, with a paired bootstrap interval."""
     import json
@@ -2023,13 +2059,13 @@ def eval_compare(
     try:
         result = compare_reports(a, b, allow_ungraded=allow_ungraded)
     except (ValueError, OSError, KeyError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(json.dumps(result, indent=1))
+        fail(str(exc), exit_code=1)
+    emit_result(result, as_json=as_json)
 
 
 @eval_app.command("publish-set")
-def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote")) -> None:
+def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote"),
+                     as_json: bool = JSON_OPTION) -> None:
     """Upload a set: its three files to the subnet bucket (R2_*); a platform
     preset's prompts.jsonl and set.json to the platform bucket too
     (RELIQUARY_PLATFORM_*), which makes it orderable. An operator's set
@@ -2048,9 +2084,8 @@ def eval_publish_set(directory: str = typer.Argument(..., help="A directory buil
         answer = asyncio.run(publish_set(directory, platform=platform,
                                          subnet=SubnetEvalStore()))
     except (ValueError, OSError, RuntimeError, SetConflict) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    typer.echo(json.dumps(answer, indent=1))
+        fail(str(exc), exit_code=1)
+    emit_result(answer, as_json=as_json)
 
 
 @eval_app.command("run")
@@ -2074,8 +2109,7 @@ def eval_run(
         result = run_evaluation(platform=platform, executor_id=executor_id, work_dir=work_dir,
                                 chunk_problems=chunk_problems)
     except (ValueError, LeaseLost) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
     typer.echo(json.dumps(result) if result is not None else "no evaluation task to claim")
 
 
@@ -2089,10 +2123,10 @@ def _restart_with_served_contract(validator_url: str, job_id: str | None = None)
     that job's own task contract on a validator serving several."""
     import sys
     from pathlib import Path
-    from types import SimpleNamespace
 
     import httpx
 
+    from reliquary.corpus.job import parse_job
     from reliquary.miner.corpus_miner import (
         CorpusContractError,
         CorpusJobSelectionError,
@@ -2101,21 +2135,18 @@ def _restart_with_served_contract(validator_url: str, job_id: str | None = None)
     )
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
-    client = HttpCorpusClient(httpx.Client(base_url=validator_url, timeout=60.0), job_id=job_id)
     try:
-        raw = client.job()
-        contract = client.contract()
-    except CorpusJobSelectionError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
-    job = SimpleNamespace(job_id=raw.get("job_id"), checkpoint_repo=raw.get("checkpoint_repo"),
-                          checkpoint_revision=raw.get("checkpoint_revision"))
+        with httpx.Client(base_url=validator_url, timeout=60.0) as http:
+            client = HttpCorpusClient(http, job_id=job_id)
+            job = parse_job(client.job())
+            contract = client.contract()
+    except (CorpusJobSelectionError, ValueError) as exc:
+        fail(str(exc), exit_code=2)
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "reliquary" / "corpus"
     try:
         path = save_served_contract(contract, job, cache)
     except CorpusContractError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=4) from exc
+        fail(str(exc), exit_code=4)
     typer.echo(f"using the contract served by {validator_url}: {path}")
     os.environ[TASK_CONTRACT_ENV_VAR] = str(path)
     os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
@@ -2389,8 +2420,7 @@ def corpus_qualify(
     try:
         answer = run_qualify(control_url=control, executor_id=executor_id, model=model)
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
     typer.echo(json.dumps(answer))
 
 
@@ -2455,8 +2485,7 @@ def corpus_mine(
     try:
         job = parse_job(client.job())
     except CorpusJobSelectionError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+        fail(str(exc), exit_code=2)
     if job_id is None:
         others = [served for served in client.served_jobs() if served != job.job_id]
         if others:
@@ -2560,8 +2589,7 @@ def corpus_mine_agentic(
     try:
         job = parse_job(client.job())
     except CorpusJobSelectionError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+        fail(str(exc), exit_code=2)
     if job.episode is None:
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
@@ -2620,8 +2648,7 @@ def corpus_status(
     try:
         status = status_client.fetch_miner_status(validator_url, hotkey, job_id)
     except Exception as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+        fail(str(exc), exit_code=1)
     typer.echo(json.dumps(status, indent=2) if as_json else status_client.format_miner_status(status))
 
 
@@ -2872,14 +2899,54 @@ def _grader_bundle_python() -> Path:
     return Path(bundle) / "rootfs" / "usr" / "local" / "bin" / "python3"
 
 
-def _grader_is_running(socket_path: str, timeout: float = 0.5) -> bool:
-    """Return True iff the grader is reachable on the Unix socket."""
+def _grader_is_running(socket_path: str, timeout: float = 0.5, *,
+                       expected_backend: str | None = None,
+                       expected_sandbox: str | None = None,
+                       expected_pid: int | None = None) -> bool:
+    """Check reachability and, when requested, the grader's published readiness."""
     try:
         with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(socket_path)
-        return True
     except (FileNotFoundError, ConnectionRefusedError, _socket.timeout, OSError):
+        return False
+    if expected_backend is None:
+        return True
+
+    import json
+    from reliquary.infrastructure.process_health import (
+        DEFAULT_GRADER_HEALTH_PATH, GRADER_HEALTH_STALE_SECONDS,
+    )
+
+    try:
+        with Path(os.getenv("GRADER_HEALTH_PATH", DEFAULT_GRADER_HEALTH_PATH)).open("rb") as file:
+            raw = file.read(65537)
+        if len(raw) > 65536:
+            return False
+        health = json.loads(raw)
+        if not isinstance(health, dict):
+            return False
+        updated = health.get("updated_at")
+        if type(updated) not in (int, float) or not math.isfinite(updated):
+            return False
+        age = _time.time() - updated
+        if not -5 <= age <= GRADER_HEALTH_STALE_SECONDS:
+            return False
+        if health.get("shutdown_complete") is not False:
+            return False
+        if health.get("execution_backend") != expected_backend:
+            return False
+        if expected_sandbox is not None and health.get("sandbox_backend") != expected_sandbox:
+            return False
+        if expected_pid is not None and health.get("server_pid") != expected_pid:
+            return False
+        runtime_id = os.getenv("RELIQUARY_GRADER_RUNTIME_ID", "")
+        if runtime_id and health.get("runtime_id") != runtime_id:
+            return False
+        return expected_backend == "remote" or (
+            type(health.get("workers_alive")) is int and health["workers_alive"] > 0
+        )
+    except (OSError, ValueError, UnicodeError):
         return False
 
 
@@ -2914,20 +2981,38 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
         not remote_executor_url or remote_executor_mode == "shadow"
     )
 
-    if _grader_is_running(GRADER_SOCKET_PATH):
-        _logger.info("Grader already running at %s; reusing it", GRADER_SOCKET_PATH)
-        return
-
     if remote_executor_url and remote_executor_mode == "remote" and use_runsc is True:
         raise RuntimeError(
             "authoritative remote grader cannot be combined with local runsc"
         )
+    allow_unsandboxed = _env_flag("RELIQUARY_ALLOW_UNSANDBOXED_GRADER", "0")
+    backend = (
+        "remote" if remote_executor_url and remote_executor_mode == "remote"
+        else "local-shadow" if remote_executor_url else "local"
+    )
+    expected_sandbox = (
+        "remote" if backend == "remote"
+        else "runsc" if use_runsc is True or not allow_unsandboxed
+        else "python" if use_runsc is False else None
+    )
+    if needs_local_executor and use_runsc is False and not allow_unsandboxed:
+        raise RuntimeError("local grading requires the gVisor/runsc grader sandbox")
+    if _grader_is_running(GRADER_SOCKET_PATH):
+        if not _grader_is_running(GRADER_SOCKET_PATH, expected_backend=backend,
+                                  expected_sandbox=expected_sandbox):
+            raise RuntimeError(
+                "the existing grader has missing, stale or incompatible readiness; "
+                "stop it and start the configured grading backend"
+            )
+        _logger.info("Grader already running at %s; reusing it", GRADER_SOCKET_PATH)
+        return
+
     if remote_executor_url and remote_executor_mode == "remote":
         use_runsc = False
     elif needs_local_executor and use_runsc is None:
         use_runsc = bool(shutil.which("runsc")) and _grader_bundle_python().exists()
     if needs_local_executor and not use_runsc:
-        if not _env_flag("RELIQUARY_ALLOW_UNSANDBOXED_GRADER", "0"):
+        if not allow_unsandboxed:
             raise RuntimeError(
                 "opencodeinstruct requires the gVisor/runsc grader sandbox. "
                 "Install runsc and build the grader bundle, or set "
@@ -2978,40 +3063,51 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
             )
         ),
     )
-    _grader_proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=sanitized_env,
-        start_new_session=True,
-    )
+    try:
+        _grader_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=sanitized_env,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"could not launch grader server (errno={exc.errno})") from exc
+    process = _grader_proc
 
     def _cleanup() -> None:
-        if _grader_proc is not None and _grader_proc.poll() is None:
+        if process.poll() is None:
             try:
-                _grader_proc.terminate()
-                _grader_proc.wait(timeout=5)
+                process.terminate()
+                process.wait(timeout=5)
             except Exception:
                 try:
-                    _grader_proc.kill()
+                    process.kill()
+                    process.wait(timeout=5)
                 except Exception:
                     pass
-    atexit.register(_cleanup)
 
-    deadline = _time.time() + 15.0
-    while _time.time() < deadline:
-        if _grader_is_running(GRADER_SOCKET_PATH):
-            _logger.info("Grader server ready at %s", GRADER_SOCKET_PATH)
-            return
-        _time.sleep(0.2)
-
-    _logger.error(
-        "Grader server failed to bind %s within 15s. OCI rewards will "
-        "be 0 and all OCI submissions will be rejected. Diagnose by "
-        "running `python -m reliquary.environment.grader.server%s` manually.",
-        GRADER_SOCKET_PATH,
-        " --use-runsc" if use_runsc else "",
-    )
+    expected_sandbox = "remote" if backend == "remote" else "runsc" if use_runsc else "python"
+    deadline = _time.monotonic() + 15.0
+    try:
+        while _time.monotonic() < deadline:
+            exit_code = process.poll()
+            if exit_code is not None:
+                raise RuntimeError(f"grader server exited during startup (exit={exit_code}, backend={backend})")
+            if _grader_is_running(GRADER_SOCKET_PATH, expected_backend=backend,
+                                  expected_sandbox=expected_sandbox, expected_pid=process.pid):
+                _logger.info("Grader server ready at %s", GRADER_SOCKET_PATH)
+                atexit.register(_cleanup)
+                return
+            _time.sleep(0.2)
+        raise RuntimeError(
+            f"grader server was not ready within 15s (backend={backend}); "
+            "check the sandbox bundle and grading backend configuration"
+        )
+    except BaseException:
+        _cleanup()
+        _grader_proc = None
+        raise
 
 
 def setup_logging(level: str = "INFO"):
@@ -3331,6 +3427,64 @@ async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=Non
         job.checkpoint_revision,
     )
     return mounted
+
+
+async def _run_validator_with_weight_setter(service, subtensor, *, wallet, netuid,
+                                           signer_client) -> None:
+    """Own both workers so a stopped setter cannot leave the trainer running."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    main_loop = asyncio.get_running_loop()
+    setter_done = main_loop.create_future()
+    stopping = threading.Event()
+    setter_loop = None
+    setter_task = None
+
+    def completed(error):
+        if not setter_done.done():
+            setter_done.set_result(error)
+
+    async def run_setter():
+        nonlocal setter_loop, setter_task
+        setter_loop = asyncio.get_running_loop()
+        setter_task = asyncio.current_task()
+        if not stopping.is_set():
+            worker = WeightOnlyValidator(wallet=wallet, netuid=netuid,
+                                         signer_client=signer_client)
+            await worker.run()
+
+    def thread_main():
+        error = None
+        try:
+            asyncio.run(run_setter())
+        except BaseException as exc:
+            if not stopping.is_set():
+                error = exc
+        finally:
+            main_loop.call_soon_threadsafe(completed, error)
+
+    thread = threading.Thread(target=thread_main, name="weight-setter", daemon=True)
+    trainer = asyncio.create_task(service.run(subtensor))
+    thread.start()
+    try:
+        done, _ = await asyncio.wait((trainer, setter_done), return_when=asyncio.FIRST_COMPLETED)
+        if trainer in done:
+            await trainer
+        else:
+            raise RuntimeError("weight-setter stopped unexpectedly; restarting the validator") from setter_done.result()
+    finally:
+        stopping.set()
+        if not trainer.done():
+            trainer.cancel()
+        await asyncio.gather(trainer, return_exceptions=True)
+        if setter_loop is not None and not setter_loop.is_closed() and setter_task is not None:
+            try:
+                setter_loop.call_soon_threadsafe(setter_task.cancel)
+            except RuntimeError:
+                pass
+        await asyncio.to_thread(thread.join, 5)
+        if thread.is_alive():
+            logger.error("weight-setter did not stop within 5s during validator shutdown")
 
 
 @app.command()
@@ -3889,25 +4043,10 @@ def validate(
             # GRAIL verifier is holding) would stall set_weights too. The
             # weight setter's own subtensor (see WeightOnlyValidator.run)
             # plus its own loop here means neither side can block the other.
-            from reliquary.validator.weight_only import WeightOnlyValidator
-
-            def _run_weight_setter() -> None:
-                try:
-                    worker = WeightOnlyValidator(
-                        wallet=wallet,
-                        netuid=netuid,
-                        signer_client=signer_client,
-                    )
-                    asyncio.run(worker.run())
-                except Exception:
-                    logger.exception("weight-setter thread crashed")
-
-            threading.Thread(
-                target=_run_weight_setter,
-                name="weight-setter",
-                daemon=True,
-            ).start()
-            await service.run(subtensor)
+            await _run_validator_with_weight_setter(
+                service, subtensor, wallet=wallet, netuid=netuid,
+                signer_client=signer_client,
+            )
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 

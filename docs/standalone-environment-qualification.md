@@ -135,7 +135,7 @@ not alter the core CPU test environment. From the repository root:
 
 ```sh
 uv venv --python 3.12 .venv-external
-uv pip install --python .venv-external/bin/python -e '.[dev]' \
+uv pip install --python .venv-external/bin/python -e '.[operator,dev]' \
   'verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@b2e4e8157783b2c0dffc7821044c87f29f1c3ccf'
 mkdir -p /tmp/reliquary-external-artifact
 .venv-external/bin/python -c 'from pathlib import Path; from scripts.qualify_external_environment import download_pinned_wheel; print(download_pinned_wheel(Path("/tmp/reliquary-external-artifact")))'

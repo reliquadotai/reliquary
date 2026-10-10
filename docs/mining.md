@@ -331,7 +331,7 @@ No R2 or S3 credentials are needed on the miner — only the validator uploads t
 Hardware speed is not the protocol contract; generation/proof numerics are.
 Match the validator's pinned model, tokenizer, Torch, Transformers, attention
 implementation, dtype, and optional-kernel set. The current validated stack is
-Torch `2.7.0+cu128`, Transformers `5.9.0`, flash-linear-attention `0.5.0`, and
+Torch `2.7.0+cu128`, Transformers `5.10.4`, flash-linear-attention `0.5.0`, and
 no `causal-conv1d`. Do not install a different fast-path kernel on miners alone:
 that can increase miner-validator drift even when it improves throughput.
 
@@ -346,7 +346,7 @@ teacher forcing are not bit-identical on every supported stack.
 git clone <repo-url> reliquary
 cd reliquary
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e ".[operator]"
 ```
 
 Verify:

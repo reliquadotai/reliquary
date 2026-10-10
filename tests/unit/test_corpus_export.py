@@ -250,7 +250,7 @@ def test_jobs_export_only_accepted_drops_the_rejected_rows(jobs, records, env_sp
 
     result = CliRunner().invoke(
         app,
-        ["jobs", "export", "math-v1", "--out", str(out), "--apply-filter", "--only-accepted"],
+        ["jobs", "export", "math-v1", "--out", str(out), "--only-accepted"],
     )
 
     assert result.exit_code == 0, result.output

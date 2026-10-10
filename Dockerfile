@@ -53,7 +53,7 @@ WORKDIR /opt/reliquary
 COPY . /opt/reliquary
 RUN printf '%s\n' "${RELIQUARY_BUILD_REVISION}" \
       > /opt/reliquary/.build-revision \
- && pip install -e .
+ && pip install -e ".[operator]"
 
 # boto3 for R2 (weight-only mode + trainer archive uploads)
 RUN pip install boto3

@@ -519,7 +519,15 @@ def save_served_contract(contract: dict, job, directory) -> "Path":
     """Keep the contract the validator serves, once it is known to describe the
     job's checkpoint and to carry the toploc proof every submission needs."""
     import json
+    import os
     from pathlib import Path
+    import tempfile
+
+    from reliquary.corpus.job import JOB_ID_RE
+
+    job_id = getattr(job, "job_id", None)
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        raise CorpusContractError("the served job has an invalid job id")
 
     if (contract.get("model_id") != job.checkpoint_repo
             or contract.get("model_revision") != job.checkpoint_revision):
@@ -532,8 +540,19 @@ def save_served_contract(contract: dict, job, directory) -> "Path":
         raise CorpusContractError("the served contract carries no toploc proof")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{job.job_id}.contract.json"
-    path.write_text(json.dumps(contract, sort_keys=True, separators=(",", ":")))
+    path = directory / f"{job_id}.contract.json"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=f".{job_id}.", suffix=".tmp", delete=False) as file:
+            temporary = Path(file.name)
+            file.write(json.dumps(contract, sort_keys=True, separators=(",", ":")))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return path
 
 

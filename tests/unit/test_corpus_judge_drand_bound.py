@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import logging
 
 import pytest
@@ -89,6 +90,8 @@ def _restart(monkeypatch, *, siblings, n=20000, hours=1.0):
         runner = asyncio.ensure_future(auditor.run())
         await asyncio.sleep(hours * 3600)
         runner.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner
         return store
 
     try:

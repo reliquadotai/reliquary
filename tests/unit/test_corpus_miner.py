@@ -508,7 +508,7 @@ def test_corpus_mine_on_a_multi_job_validator_without_job_id_mines_the_default(m
     monkeypatch.setattr(httpx, "Client", lambda **kw: http)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
 
-    result = CliRunner().invoke(app, ["corpus", "mine", "--validator-url", "http://validator"])
+    result = CliRunner().invoke(app, ["--debug", "corpus", "mine", "--validator-url", "http://validator"])
 
     assert isinstance(result.exception, _Downloading), (result.output, result.exception)
     assert "mining job math" in result.output and "code" in result.output

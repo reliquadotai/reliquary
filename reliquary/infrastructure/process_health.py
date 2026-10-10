@@ -39,6 +39,7 @@ _GRADER_FIELDS = frozenset(
         "container_deletes_total",
         "container_delete_failures_total",
         "execution_backend",
+        "sandbox_backend",
         "runtime_id",
         "executor",
         "shadow",

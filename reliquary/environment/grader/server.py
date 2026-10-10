@@ -433,6 +433,10 @@ class GraderServer:
                     self._container_delete_failures_total
                 ),
                 "execution_backend": self.execution_backend,
+                "sandbox_backend": (
+                    "remote" if self.sandbox_executor is not None
+                    else "runsc" if self._uses_runsc else "python"
+                ),
                 "runtime_id": self.runtime_id,
                 "retire_worker_after_batch": self.retire_worker_after_batch,
             }

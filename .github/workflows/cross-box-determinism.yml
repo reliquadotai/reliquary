@@ -41,7 +41,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: pip install -e .
+        run: pip install -e ".[operator]"
       - name: Run determinism corpus
         env:
           PYTHONHASHSEED: "0"
@@ -86,7 +86,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: pip install -e .
+        run: pip install -e ".[operator]"
       - name: Emit Episode v1 determinism corpus
         env:
           PYTHONHASHSEED: "random"
@@ -132,7 +132,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: pip install -e .
+        run: pip install -e ".[operator]"
       - name: Emit reliquarylogic_v1 determinism corpus
         env:
           PYTHONHASHSEED: "random"
