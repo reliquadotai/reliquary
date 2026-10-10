@@ -49,6 +49,7 @@ def _paths(app) -> set[str]:
 def _services(tmp_path, *, store=None, **kwargs):
     validator, _machine = episode_signers(tmp_path / "keys")
     rt = kwargs.pop("runtime", None) or episode_runtime(tmp_path / "rt")
+    current_window = kwargs.pop("current_window", lambda: 1)
     config = SandboxValidatorConfig(key_file=Path("unused"), key_id=validator.key_id, retired_keys={})
 
     async def no_machines():
@@ -56,7 +57,7 @@ def _services(tmp_path, *, store=None, **kwargs):
 
     services = build_rl_episode_services(
         config, validator_hotkey=VALIDATOR_SS58, runtime=rt, environments={EPISODE: make_test_episode_env()},
-        renderer_for=lambda policy: FakeRenderer(), current_window=lambda: 1, chunk_tokens=32, signer=validator,
+        renderer_for=lambda policy: FakeRenderer(), current_window=current_window, chunk_tokens=32, signer=validator,
         session_store=store if store is not None else MemorySessionStore(), read_documents=no_machines, **kwargs)
     return services, rt
 

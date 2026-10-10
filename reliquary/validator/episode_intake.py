@@ -24,6 +24,7 @@ from reliquary.protocol.episode_retry import RETRYABLE_STAGES
 from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
 from reliquary.protocol.submission import RejectReason
 from reliquary.sandbox.rl_engagements import NoOutcomes, SessionOutcomes
+from reliquary.sandbox.rl_yield import VALIDATOR_STAGES as _AFTER_CLAIM_STAGES
 from reliquary.validator.episode_admission import EpisodeGroupChecker, EpisodeRefusal, finish_prepared
 
 logger = logging.getLogger(__name__)
@@ -171,10 +172,11 @@ class EpisodeGroupIntake:
                 self._recent.pop(key, None)
         return None
 
-    def _report(self, hotkey: str, precommit_sha256: str, session_ids, *, accepted: bool) -> None:
+    def _report(self, hotkey: str, precommit_sha256: str, session_ids, *, accepted: bool,
+                stage: str | None = None) -> None:
         try:
             self._outcomes.group_settled(hotkey=hotkey, precommit_sha256=precommit_sha256,
-                                         session_ids=tuple(session_ids), accepted=accepted)
+                                         session_ids=tuple(session_ids), accepted=accepted, stage=stage)
         except Exception:
             logger.exception("the episode outcome hook failed")
 
@@ -185,7 +187,10 @@ class EpisodeGroupIntake:
         prepared.reject_reason = reason
         prepared.reject_stage = stage
         logger.info("episode group of %s refused at %s: %s", str(request.miner_hotkey)[:12], stage, detail or {})
-        self._report(str(request.miner_hotkey), _precommit_sha(request), session_ids, accepted=False)
+        # Before the claim the precommit is unverified: a stage of the validator's own making (neutral for the
+        # miner's yield) is never reported from here, only from a claimed group's settlement.
+        self._report(str(request.miner_hotkey), _precommit_sha(request), session_ids, accepted=False,
+                     stage=None if stage in _AFTER_CLAIM_STAGES else stage)
         return prepared, None
 
     def _check_ended(self, operator: str) -> None:
@@ -311,11 +316,12 @@ class EpisodeGroupIntake:
             finish_prepared(prepared, outcome, contract)
         except BaseException:
             await asyncio.shield(self._spawn_release(claim.session_ids))
-            self._report(hotkey, sha, claim.session_ids, accepted=False)
+            # A validator bug after the check: ours, never the miner's refusal.
+            self._report(hotkey, sha, claim.session_ids, accepted=False, stage="admission_worker")
             raise
         if prepared.reject_reason is not None:
             await asyncio.shield(self._spawn_release(claim.session_ids))
-            self._report(hotkey, sha, claim.session_ids, accepted=False)
+            self._report(hotkey, sha, claim.session_ids, accepted=False, stage=prepared.reject_stage)
             return prepared, None
         return prepared, claim
 
@@ -344,16 +350,17 @@ class EpisodeGroupIntake:
             logger.error("ALERT %d episode settlements cut at shutdown; their claims lapse at the ttl", len(late))
         return len(late)
 
-    async def settle(self, claim: EpisodeClaim, *, accepted: bool) -> None:
+    async def settle(self, claim: EpisodeClaim, *, accepted: bool, stage: str | None = None) -> None:
         """After the batcher's answer: accepted sessions end ``submitted``; others are released (the
         miner may submit them again). Shielded: a cancellation of the caller never leaves an accepted
-        group's sessions unpaid-for in the book (a stale claim would let them be claimed again)."""
-        task = asyncio.get_running_loop().create_task(self._settle(claim, accepted=accepted))
+        group's sessions unpaid-for in the book (a stale claim would let them be claimed again). ``stage``: the
+        server's refusal stage of a group not accepted (the yield accounting reads it)."""
+        task = asyncio.get_running_loop().create_task(self._settle(claim, accepted=accepted, stage=stage))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         await asyncio.shield(task)
 
-    async def _settle(self, claim: EpisodeClaim, *, accepted: bool) -> None:
+    async def _settle(self, claim: EpisodeClaim, *, accepted: bool, stage: str | None = None) -> None:
         if accepted:
             # Every session of the group moved together; a record ``persist`` could not write is retried.
             try:
@@ -366,7 +373,8 @@ class EpisodeGroupIntake:
                     await self._sessions.release_claim(session_id)
                 except Exception:
                     logger.exception("episode session %s not settled", session_id)
-        self._report(claim.hotkey, claim.precommit_sha256, claim.session_ids, accepted=accepted)
+        self._report(claim.hotkey, claim.precommit_sha256, claim.session_ids, accepted=accepted,
+                     stage=None if accepted else stage)
 
 
 __all__ = ["ADMISSION_DEADLINE_S", "CLAIM_HOLD_WALLS", "CLAIM_TTL_MARGIN", "CheckProgress", "DEFAULT_MAX_CHECKS_IN_FLIGHT",

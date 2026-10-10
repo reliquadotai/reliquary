@@ -930,6 +930,7 @@ class ValidationService:
             raise ValueError("task-scoped checkpoints require the detached trainer")
         self._service_runtime = None
         self._service_schedule_store = None
+        self._service_folder: Path | None = None
         # The next service window as prepared at the boundary (None for every other task).
         self._candidate_service_window: dict[str, Any] | None = None
         self._candidate_service_pools: dict[str, float] | None = None
@@ -971,6 +972,7 @@ class ValidationService:
                 Path(os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")) / "service-policies" / namespace.task_id / namespace.run_id
             )
             self._service_runtime = ServiceRuntime(folder / "runtime.sqlite3", service_contract, qualification)
+            self._service_folder = folder
             # The operator's schedule requests live beside the runtime database
             # (``python -m reliquary.services.schedule --folder <this folder>``).
             self._service_schedule_store = ScheduleRequestStore(folder)
@@ -7842,6 +7844,27 @@ class ValidationService:
         for old in sorted(opened)[:-4]:
             del opened[old]
 
+    def _episode_operator_of(self, hotkey: str) -> str | None:
+        """The chain operator (coldkey) of ``hotkey`` from the registration cache: memory only (read on the event
+        loop, only to tell whether a saturation was the refused miner's own doing; the quota is per hotkey)."""
+        return (getattr(getattr(self, "server", None), "_operator_by_hotkey", None) or {}).get(hotkey)
+
+    async def _open_episode_yield_ledger(self):
+        """The RL yield ledger ``rl-yield.sqlite3`` beside ``runtime.sqlite3``, opened in a worker thread; None
+        without a service folder. A corrupted file or one of another schema stops the start (never a fresh
+        ledger in its place: every low-yield hotkey would become a newcomer again)."""
+        folder = getattr(self, "_service_folder", None)
+        if folder is None:
+            return None
+        from reliquary.sandbox.rl_yield import SessionYieldLedger, YieldLedgerUnusable
+
+        path = Path(folder) / "rl-yield.sqlite3"
+        try:
+            return await asyncio.to_thread(SessionYieldLedger, path)
+        except YieldLedgerUnusable as error:
+            logger.error("ALERT the RL yield ledger is unusable, the validator does not start: %s", error)
+            raise
+
     def _episode_window_started_at(self, window: int) -> float | None:
         return (getattr(self, "_episode_windows_opened", None) or {}).get(window)
 
@@ -7929,17 +7952,25 @@ class ValidationService:
                         if name in self.envs}
         renderer_for = getattr(self, "_episode_renderer_for", None) or self._default_episode_renderer
         proof_stops, remote_stops = self._episode_stop_sets()
-        services = build_rl_episode_services(
-            config, validator_hotkey=self.wallet.hotkey.ss58_address, runtime=runtime,
-            environments=environments, renderer_for=renderer_for,
-            current_window=self._current_service_window, chunk_tokens=toploc.chunk_tokens,
-            window_started_at=self._episode_window_started_at,
-            proof_stop_ids=proof_stops, remote_stop_ids=remote_stops,
-            precommit_retention_s=self._episode_precommit_retention_s(),
-            registration=rl_registration(self.server))
-        for router in services.routers:
-            self.server.app.include_router(router)
-        await services.start()
+        ledger = await self._open_episode_yield_ledger()
+        try:
+            services = build_rl_episode_services(
+                config, validator_hotkey=self.wallet.hotkey.ss58_address, runtime=runtime,
+                environments=environments, renderer_for=renderer_for,
+                current_window=self._current_service_window, chunk_tokens=toploc.chunk_tokens,
+                window_started_at=self._episode_window_started_at,
+                proof_stop_ids=proof_stops, remote_stop_ids=remote_stops,
+                precommit_retention_s=self._episode_precommit_retention_s(),
+                registration=rl_registration(self.server), ledger=ledger,
+                operator_of=self._episode_operator_of,
+                window_uses=None if ledger is None else runtime.window_uses)
+            for router in services.routers:
+                self.server.app.include_router(router)
+            await services.start()
+        except BaseException:
+            if ledger is not None:
+                await asyncio.to_thread(ledger.close)
+            raise
         self.server._episode_intake = services.intake
         self._episode_services = services
         self._episode_tasks = [asyncio.create_task(job) for job in services.background()]

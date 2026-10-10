@@ -71,6 +71,15 @@ logger = logging.getLogger(__name__)
 
 QUALIFICATION_SCHEMA = "service-runtime-qualification/v2"
 STATUS_PAID = "exploration_paid"
+
+
+@dataclass(frozen=True)
+class WindowUses:
+    """What a settled window used (the RL yield ledger): ``aborted`` as last settled, and the
+    ``(environment, prompt_idx, hotkey)`` of its observations settled trained or paid as exploration."""
+
+    aborted: bool
+    used: frozenset
 _EPS = 1e-12
 _BEACON = re.compile(r"[0-9a-f]{64}")
 # Published proof label of an entitlement, from its audit state in the ledger (R8).
@@ -885,6 +894,21 @@ class ServiceRuntime:
             row = self.db.execute("SELECT aborted FROM service_settled WHERE order_id=? AND window=?",
                                   (self.contract.sha256, window)).fetchone()
         return None if row is None else ("aborted" if row[0] else "settled")
+
+    def window_uses(self, window: int) -> WindowUses | None:
+        """None before the window's first settlement. Blocking (SQLite): call it in a worker thread."""
+        _integer(window, "window", 0)
+        with self.lock:
+            row = self.db.execute("SELECT aborted FROM service_settled WHERE order_id=? AND window=?",
+                                  (self.contract.sha256, window)).fetchone()
+            if row is None:
+                return None
+            used = set()
+            for observation in self.log.window_observations(window):
+                event = self.log._latest_settle(observation["id"])
+                if event is not None and event.get("status") in ("trained", STATUS_PAID):
+                    used.add((observation["environment"], int(observation["prompt_idx"]), observation["hotkey"]))
+            return WindowUses(aborted=bool(row[0]), used=frozenset(used))
 
     def _envelope(self, window: int) -> dict:
         row = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?",

@@ -74,10 +74,12 @@ class OpenQuota:
 
 class SessionOutcomes(Protocol):
     """Yield accounting: how every episode group ended. ``session_ids`` are the group's
-    sessions (empty when the group failed before its transcripts were verified)."""
+    sessions (empty when the group failed before its transcripts were verified). ``stage``: the refusal's
+    stage (None when accepted, or when the caller has none); a stage of the validator's own making makes the
+    refusal neutral for the miner's yield."""
 
     def group_settled(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],
-                      accepted: bool) -> None: ...
+                      accepted: bool, stage: str | None = None) -> None: ...
 
     def group_handed_back(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],
                           stage: str) -> None:
@@ -87,7 +89,7 @@ class SessionOutcomes(Protocol):
 
 class NoOutcomes:
     def group_settled(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],
-                      accepted: bool) -> None:
+                      accepted: bool, stage: str | None = None) -> None:
         return None
 
     def group_handed_back(self, *, hotkey: str, precommit_sha256: str, session_ids: tuple[str, ...],

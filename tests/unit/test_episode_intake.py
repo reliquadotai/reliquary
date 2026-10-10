@@ -126,7 +126,7 @@ def test_an_honest_group_is_completed_and_its_sessions_claimed(tmp_path):
     assert w.sessions.paid == list(claim.session_ids) and w.sessions.released == []
     assert w.sessions.paid_calls == 1                     # the whole group in one call
     assert w.outcomes.calls[-1] == {"hotkey": "5Hot", "precommit_sha256": w.group.precommit.sha256,
-                                    "session_ids": claim.session_ids, "accepted": True}
+                                    "session_ids": claim.session_ids, "accepted": True, "stage": None}
 
 
 def test_a_refused_decision_releases_every_claim(tmp_path):
@@ -143,7 +143,7 @@ def test_a_group_the_checker_refuses_claims_nothing(tmp_path):
     assert claim is None and w.sessions.claimed == []
     assert (prepared.reject_reason, prepared.reject_stage) == (RejectReason.PRECOMMIT_INVALID, "episode_precommit")
     assert w.outcomes.calls == [{"hotkey": "5Hot", "precommit_sha256": w.group.precommit.sha256,
-                                 "session_ids": (), "accepted": False}]
+                                 "session_ids": (), "accepted": False, "stage": "episode_precommit"}]
 
 
 @pytest.mark.parametrize("claim_reason, reason, stage", [
@@ -525,7 +525,7 @@ def test_a_clean_shutdown_drains_the_episode_settlements(tmp_path):
         assert stuck.done() and not w.intake._tasks
         # A settlement that hangs outside the intake is cut too.
         hang = asyncio.Event()
-        w.intake.settle = lambda claim_, accepted: hang.wait()
+        w.intake.settle = lambda claim_, accepted, stage=None: hang.wait()
         hung = server._start_episode_settlement(claim, accepted=False)
         await asyncio.sleep(0)
         assert await server._drain_episode_tasks(0.1) == 1 and hung.cancelled()

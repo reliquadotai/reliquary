@@ -33,6 +33,7 @@ from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
 from reliquary.sandbox.rl_engagements import (
     EpisodeEnvironmentView, NoOutcomes, OpenQuota, RlEpisodeEngagements, SessionOutcomes, SessionQuota,
 )
+from reliquary.sandbox.rl_yield import held_seconds
 from reliquary.sandbox.sessions import SandboxPolicy, SessionBook, SessionIssuer
 from reliquary.validator.corpus_registration import NOT_REGISTERED
 from reliquary.validator.episode_admission import EpisodeGroupChecker
@@ -49,6 +50,7 @@ STOP_TIMEOUT_S = 10.0
 RL_GROUPS_IN_FLIGHT = GROUPS_IN_FLIGHT     # the intake's per-operator check cap
 PRECOMMIT_PRUNE_SECONDS = 3600.0
 MIN_PRECOMMIT_RETENTION_S = 2 * 86_400
+YIELD_FLUSH_SECONDS = 10.0
 
 
 def rl_sandbox_policy(base: SandboxPolicy, pool_seeds: int, *,
@@ -117,6 +119,13 @@ class RlEpisodeServices:
     outcomes: Any = field(default_factory=NoOutcomes, repr=False)
     clock: Callable[[], float] = field(default=time.time, repr=False)
     precommit_retention_s: float = MIN_PRECOMMIT_RETENTION_S
+    ledger: Any = field(default=None, repr=False)
+    window_uses: Callable[[int], Any] | None = field(default=None, repr=False)
+    policies: dict = field(default_factory=dict, repr=False)
+    window_open: Callable[[int], bool] | None = field(default=None, repr=False)
+    current_window: Callable[[], int | None] | None = field(default=None, repr=False)
+    operator_of: Callable[[str], str | None] | None = field(default=None, repr=False)
+    resumed_windows: set = field(default_factory=set, repr=False)
     restore_attempts: int = RESTORE_ATTEMPTS
     restore_timeout_s: float = RESTORE_TIMEOUT_S
     restore_backoff_s: float = RESTORE_BACKOFF_S
@@ -141,10 +150,26 @@ class RlEpisodeServices:
                     raise
                 await asyncio.sleep(self.restore_backoff_s * 2 ** (attempt - 1))
         logger.info("rl sandbox sessions restored: %d", restored)
+        if self.ledger is not None:
+            self.ledger.reconcile(self.book.records())
+            pending = self.ledger.pending_windows()
+            if (pending and self.window_open is not None and not self.window_open(pending[-1])
+                    and self.ledger.accepting_at_last_flush() == pending[-1]):
+                # The window the restart interrupted (its groups are no longer taken) is neutral for its
+                # unused precommits; no stage a miner can send says so. Only when that window was still
+                # accepting groups at the crashed process's last flush (at most YIELD_FLUSH_SECONDS before the
+                # crash), never a window that had already ended.
+                self.resumed_windows = {pending[-1]}
+                logger.warning("rl session yield: window %d was interrupted by the restart; its unused "
+                               "precommits count for no one", pending[-1])
+            await asyncio.to_thread(self.ledger.flush)
 
     def background(self) -> list:
-        return [self.fleet.run(), self.issuer.maintain_forever(SESSION_MAINTAIN_SECONDS),
+        jobs = [self.fleet.run(), self.issuer.maintain_forever(SESSION_MAINTAIN_SECONDS),
                 self.prune_precommits_forever(PRECOMMIT_PRUNE_SECONDS)]
+        if self.ledger is not None:
+            jobs.append(self.yield_forever(YIELD_FLUSH_SECONDS))
+        return jobs
 
     async def stop(self, timeout: float = STOP_TIMEOUT_S) -> None:
         pending = [task for task in self._tasks if not task.done()]
@@ -156,6 +181,14 @@ class RlEpisodeServices:
                 await asyncio.gather(*late, return_exceptions=True)
                 logger.error("ALERT %d episode hand-backs cut at shutdown", len(late))
         await self.issuer.drain(timeout)
+        if self.ledger is not None:
+            try:
+                await self.settle_yield()
+            except Exception:
+                logger.exception("rl session yield not flushed at shutdown")
+            # After the last flush (a cancelled background flush still running in its thread holds the
+            # ledger's flush lock: close waits for it).
+            await asyncio.to_thread(self.ledger.close)
 
     # --- the batcher's hand-back hook (non-blocking) ---
     def batcher_hook(self, environment: str, window: int) -> Callable[[Any, str], None]:
@@ -222,6 +255,66 @@ class RlEpisodeServices:
                 logger.exception("episode precommit pruning failed")
             await asyncio.sleep(every_s)
 
+    # --- the yield ledger ---
+    async def settle_yield(self) -> int:
+        """Decide the precommits of every settled window (on the loop: the book is the loop's; the
+        runtime is read in a worker thread), then write the journal in a worker thread. Returns how many
+        sessions were decided."""
+        ledger = self.ledger
+        if ledger is None:
+            return 0
+        now = float(self.clock())
+        decided = 0
+        if self.current_window is not None:
+            ledger.note_accepting(self.current_window(), now)          # durable at this flush
+        sizes = {p.sandbox_env: p.pool_seeds // 2 for p in self.policies.values()}     # M per sandbox env
+        reported = getattr(self.fleet, "session_reported", None)
+        if self.window_uses is not None:
+            held = self.book.precommits_held(int(now))
+            for window in ledger.pending_windows():
+                uses = await asyncio.to_thread(self.window_uses, window)
+                if uses is None:
+                    continue                                   # not settled yet
+                used = set()
+                for environment, prompt_idx, hotkey in uses.used:
+                    policy = self.policies.get(environment)
+                    if policy is not None:
+                        used.add((hotkey, policy.sandbox_env, policy.split, int(prompt_idx)))
+                for sha in ledger.precommits_of(window):
+                    if sha in held:
+                        continue
+                    rows = [(r.session_id, r.state, r.closed_status, getattr(r, "fault", None),
+                             held_seconds(r, now, presented=_presented(reported, r.session_id)))
+                            for r in self.book.of_precommit(sha)]
+                    task = ledger.task_of(sha)
+                    decided += ledger.decide(sha, rows, used=task in used,
+                                             aborted=bool(uses.aborted), now=now,
+                                             resumed=window in self.resumed_windows,
+                                             group_size=None if task is None else sizes.get(task[1]))
+        await asyncio.to_thread(ledger.flush, now)
+        return decided
+
+    async def yield_forever(self, every_s: float) -> None:
+        """Settle and flush every ``every_s`` seconds: a verdict is durable at most that long after it."""
+        while True:
+            try:
+                await self.settle_yield()
+            except Exception:
+                logger.exception("rl session yield not settled")
+            await asyncio.sleep(every_s)
+
+
+def _presented(reported: Callable[[str], bool] | None, session_id: str) -> bool | None:
+    """True when a machine report listed the session (its box ran: its held seconds count even without a
+    machine final); None otherwise, so ``held_seconds`` falls back to the record's own final."""
+    if not callable(reported):
+        return None
+    try:
+        return True if reported(session_id) else None
+    except Exception:
+        logger.exception("the fleet could not tell whether session %s was reported", session_id)
+        return None
+
 
 def rl_registration(server) -> Callable:
     """The sandbox routes' registration check, over the RL server's registration gate."""
@@ -246,18 +339,27 @@ def build_rl_episode_services(
     signer=None, store_kwargs=None, session_store=None, read_documents=None, fetch_report=None,
     clock: Callable[[], float] = time.time, open_body_timeout_s: float | None = None,
     max_preauth_opens: int | None = None,
+    yield_path=None, ledger=None, operator_of: Callable[[str], str | None] | None = None,
+    window_uses: Callable[[int], Any] | None = None,
 ) -> RlEpisodeServices:
     """``environments``: the order's episode envs as loaded (``SignedEpisodeEnvironment``; their
     ``source`` is the env's task source); ``renderer_for(policy)``: the turn renderer of the policy's tokenizer over
     the policy's tools; ``current_window()``: the service window admissions are open for (memory only:
     it is read on the event loop); ``window_started_at(window)``: when this process opened it, None for
     a window it did not open (a resumed one); ``proof_stop_ids`` / ``remote_stop_ids``: the batcher's
-    stop set and a remote proof worker's (``episode_stop_set_refusal``, checked when given)."""
+    stop set and a remote proof worker's (``episode_stop_set_refusal``, checked when given).
+
+    ``yield_path``: the yield ledger's SQLite file (None: no ledger, sessions carry no fault and no ledger
+    hears of them), opened here, on the caller's thread; ``ledger``: an already opened ledger instead (the
+    validator opens it in a worker thread); ``operator_of(hotkey)``: the chain operator, read only to tell
+    whether a saturation was the refused miner's own doing; ``window_uses``: ``ServiceRuntime.window_uses``
+    (blocking; called in a worker thread)."""
     from reliquary_sandbox.attest import Ed25519TokenVerifier, Signer, load_private_key
 
     from reliquary.infrastructure import sandbox_store
     from reliquary.sandbox import require_sandbox
     from reliquary.sandbox.fleet import Fleet, http_fetch_report
+    from reliquary.sandbox.rl_yield import LedgerEvents, SessionYieldLedger
     from reliquary.sandbox.rl_routes import BODY_TIMEOUT_S, MAX_PREAUTH, build_episode_precommit_router
     from reliquary.sandbox.routes import build_sandbox_sessions_router
 
@@ -289,7 +391,11 @@ def build_rl_episode_services(
                   directory_refresh_s=config.directory_refresh_s,
                   directory_max_age_s=config.directory_max_age_s,
                   directory_read_timeout_s=config.directory_read_timeout_s)
+    if yield_path is not None and ledger is not None:
+        raise ValueError("pass the yield ledger's path or the ledger, not both")
     book = SessionBook(policy)
+    if ledger is None and yield_path is not None:
+        ledger = SessionYieldLedger(yield_path, clock=clock)
     views = {name: EpisodeEnvironmentView(policy=p, resolve_task=environments[name].source.resolve)
              for name, p in policies.items()}
     engagements = RlEpisodeEngagements(precommits=runtime.episode_precommit, environments=views.get,
@@ -301,7 +407,9 @@ def build_rl_episode_services(
         book=book,
         store=session_store or sandbox_store.R2SessionStore(prefix=sandbox_store.RL_SESSION_PREFIX, **kw),
         fleet=fleet, signer=signer, token_verifier=token_verifier,
-        engagements={"rl_precommit": engagements}, policy=policy, clock=clock)
+        engagements={"rl_precommit": engagements}, policy=policy, clock=clock,
+        events=None if ledger is None else LedgerEvents(ledger), record_faults=ledger is not None,
+        open_refusal_check=None if ledger is None else fleet.open_refusal_valid)
     fleet.on_drained = issuer.void_machine
     sessions_router = build_sandbox_sessions_router(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=RL_PREFIX, registration=registration,
@@ -317,7 +425,7 @@ def build_rl_episode_services(
     checkers = {name: EpisodeGroupChecker(policy=p, renderer=renderers[name], source=environments[name].source,
                                           chunk_tokens=chunk_tokens)
                 for name, p in policies.items()}
-    outcomes = outcomes or NoOutcomes()
+    outcomes = outcomes or ledger or NoOutcomes()
     window_open = (None if window_started_at is None
                    else (lambda window: isinstance(window, int) and window_started_at(window) is not None))
     intake = EpisodeGroupIntake(checkers=checkers, precommits=runtime.episode_precommit,
@@ -328,9 +436,11 @@ def build_rl_episode_services(
     return RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,
                              issuer=issuer, routers=(sessions_router, precommit_router), intake=intake,
                              environments=tuple(sorted(policies)), runtime=runtime, outcomes=outcomes,
-                             clock=clock, precommit_retention_s=float(precommit_retention_s))
+                             clock=clock, precommit_retention_s=float(precommit_retention_s),
+                             ledger=ledger, window_uses=window_uses, policies=dict(policies),
+                             window_open=window_open, current_window=current_window, operator_of=operator_of)
 
 
-__all__ = ["MIN_PRECOMMIT_RETENTION_S", "RL_GROUPS_IN_FLIGHT", "RL_PREFIX", "RlEpisodeServices",
+__all__ = ["MIN_PRECOMMIT_RETENTION_S", "RL_GROUPS_IN_FLIGHT", "RL_PREFIX", "YIELD_FLUSH_SECONDS", "RlEpisodeServices",
            "build_rl_episode_services", "episode_stop_set_refusal", "rl_registration", "rl_sandbox_policy",
            "stop_ids_from_metadata"]

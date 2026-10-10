@@ -6644,11 +6644,13 @@ class ValidatorServer:
                 return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
             return refuse(RejectReason.WORKER_DROPPED, "episode_checker_busy")
 
-    def _start_episode_settlement(self, claim, *, accepted: bool) -> asyncio.Task:
+    def _start_episode_settlement(self, claim, *, accepted: bool, stage: str | None = None) -> asyncio.Task:
         """The settlement of an episode group's claims as a task of its own, kept until it ends: a
-        cancellation of the admission that awaits it never cuts it."""
+        cancellation of the admission that awaits it never cuts it. ``stage``: this admission's refusal stage
+        of a group not accepted (the yield accounting tells ours from the miner's by it)."""
         tasks = self.__dict__.setdefault("_episode_settlements", set())
-        task = asyncio.get_running_loop().create_task(self._settle_episode_claim(claim, accepted=accepted))
+        task = asyncio.get_running_loop().create_task(
+            self._settle_episode_claim(claim, accepted=accepted, stage=stage))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
         return task
@@ -6682,12 +6684,12 @@ class ValidatorServer:
                            str(claim.hotkey)[:12])
             return False
 
-    async def _settle_episode_claim(self, claim, *, accepted: bool) -> None:
+    async def _settle_episode_claim(self, claim, *, accepted: bool, stage: str | None = None) -> None:
         intake = getattr(self, "_episode_intake", None)
         if intake is None or claim is None:
             return
         try:
-            await intake.settle(claim, accepted=accepted)
+            await intake.settle(claim, accepted=accepted, stage=stage)
         except Exception:
             logger.exception("episode group sessions not settled")
 
@@ -7041,7 +7043,9 @@ class ValidatorServer:
                         # already stored); any other end releases them. A tracked task, started whatever
                         # happens above, and done BEFORE the receipt: a miner told its group was refused
                         # finds its sessions and precommit free when it retries.
-                        settlement = self._start_episode_settlement(episode_claim, accepted=episode_accepted)
+                        settlement = self._start_episode_settlement(
+                            episode_claim, accepted=episode_accepted,
+                            stage=None if episode_accepted else reject_stage)
                 if settlement is not None:
                     try:
                         if self._auction_admission_enabled:

@@ -53,7 +53,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -80,11 +80,12 @@ VALIDATOR_STAGES = frozenset({"episode_persist_failed", "admission_timeout", "ad
 # them at will, so they give no verdict (the miner retries them; a restart's window is ``decide(resumed=)``).
 # Also the retryable refusals that are not ours (the miner's own groups or checks in flight: it
 # resends them) and a drain (``admission_drain``, at shutdown too). Pinned: NO_VERDICT_STAGES ⊇ RETRYABLE_STAGES -
-# VALIDATOR_STAGES.
+# VALIDATOR_STAGES. ``episode_prompt_source``: the validator's own prompt source failed inside the checker, so the
+# precommit is still unverified (never ours) and the miner resends it.
 NO_VERDICT_STAGES = frozenset({
     "episode_window_resumed", "episode_checker_busy", "episode_directory", "episode_session_busy",
     "episode_policy_stale", "episode_unserved", "episode_group_in_flight", "episode_checks_in_flight",
-    "admission_drain"})
+    "episode_prompt_source", "admission_drain"})
 GRADED = "graded"
 MACHINE_FINALS = frozenset({GRADED, "expired", "box_failed", "budget_exhausted", "aborted", "handed_back"})
 """Closed statuses of a machine-signed final: the session's box ran. Anything else (a lapse with None, an
@@ -459,9 +460,37 @@ def held_seconds(record: Any, now: float, *, presented: bool | None = None) -> f
     return max(0.0, float(end) - float(getattr(record, "issued_at", end)))
 
 
+CAPACITY_REASONS = frozenset({"sandbox_saturated", "open_queue_full", "task_unplaceable", "environment_unserved"})
+"""Open refusals that are our capacity, never the miner's doing: an unused precommit that met one is neither
+useful nor wasted (for its sessions that ran, in a group that could not be formed)."""
+
+
+class LedgerEvents:
+    """The RL issuer's ``SessionEvents``: every open goes to the ledger (faults live on the records), and every
+    capacity refusal of an open marks its precommit."""
+
+    def __init__(self, ledger: SessionYieldLedger) -> None:
+        self._ledger = ledger
+
+    def opened(self, record: Any) -> None:
+        self._ledger.note_opened(record)
+
+    def closed(self, record: Any, final: Mapping[str, Any] | None) -> None:
+        return None
+
+    def refused(self, hotkey: str, engagement: Any, refusal: Any) -> None:
+        if getattr(refusal, "reason", None) not in CAPACITY_REASONS or not isinstance(engagement, Mapping):
+            return
+        precommit = engagement.get("precommit")
+        sha = precommit.get("precommit_sha256") if isinstance(precommit, Mapping) else None
+        if isinstance(sha, str):
+            self._ledger.capacity_refused(hotkey=str(hotkey), precommit_sha256=sha)
+
+
 __all__ = [
     "ACCEPTED",
     "CAPACITY",
+    "CAPACITY_REASONS",
     "FAULT",
     "FAULT_STATES",
     "FAULT_STATUSES",
@@ -480,6 +509,7 @@ __all__ = [
     "VALIDATOR_RESTARTED",
     "VALIDATOR_STAGES",
     "WASTED",
+    "LedgerEvents",
     "SessionYieldLedger",
     "YieldLedgerUnusable",
     "held_seconds",
