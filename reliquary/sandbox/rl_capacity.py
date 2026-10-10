@@ -42,6 +42,8 @@ NEWCOMER_MAX_GROUPS = GROUPS_IN_FLIGHT      # groups a newcomer holds at once in
 NEWCOMER_EXIT_GROUPS = 2        # a newcomer that wasted this many groups' worth leaves for the low-yield entity
 LOW_YIELD_SHARE = 0.03          # L = max(P, floor(LOW_YIELD_SHARE x C)): the low-yield entity's hard cap
 LOW_YIELD_MAX_GROUPS = 1
+GRACE_SESSIONS = 64            # a graduate (YIELD_MIN_DECIDED <= decided < this more) stays a newcomer while MAIN
+                               # would not give it a group; read from the ledger, so it survives a restart
 
 # --- demand, tokens, refresh ---
 DEMAND_TTL_S = 30.0             # an open request (refused or waiting) counts as demand this long after its last try
@@ -187,7 +189,7 @@ def opens_for(sessions: int) -> int:
     return OPENS_PER_LIVE_PER_HOUR * int(sessions)
 
 
-__all__ = ["ALLOCATION_REFRESH_S", "ASK_FORGET_S", "DEMAND_TTL_S", "LOW_YIELD", "LOW_YIELD_MAX_GROUPS",
+__all__ = ["ALLOCATION_REFRESH_S", "ASK_FORGET_S", "DEMAND_TTL_S", "GRACE_SESSIONS", "LOW_YIELD", "LOW_YIELD_MAX_GROUPS",
            "LOW_YIELD_OPENS_PERIOD_S", "LOW_YIELD_SHARE", "MAIN", "MAX_CHECKS_RUNNING", "MIN_SERVING_MACHINES",
            "NEWCOMER", "NEWCOMER_ENTITY", "NEWCOMER_EXIT_GROUPS", "NEWCOMER_MAX_GROUPS", "NEWCOMER_SHARE",
            "NEWCOMER_TAKES_SPARE", "NEWCOMER_WEIGHT", "OPENS_PERIOD_S", "OPENS_PER_LIVE_PER_HOUR", "PRESENT_WINDOW_S",

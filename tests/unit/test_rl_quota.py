@@ -1,5 +1,6 @@
 """The allocation of RL sandbox opens: weighted water-filling over entities.
 Production regime: production constants, fleets of 216 / 2 160 / 21 600 slots, low and high MAIN demand."""
+import asyncio
 import time
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 attest = pytest.importorskip("reliquary_sandbox.attest")
 
 from reliquary.sandbox.rl_capacity import (  # noqa: E402
+    GRACE_SESSIONS,
     LOW_YIELD,
     MAIN,
     NEWCOMER,
@@ -14,6 +16,7 @@ from reliquary.sandbox.rl_capacity import (  # noqa: E402
     NEWCOMER_WEIGHT,
     PRESENT_WINDOW_S,
     USEFUL_HORIZON_S,
+    YIELD_MIN_DECIDED,
     YieldStats,
     entity_sizes,
     sessions_of,
@@ -31,6 +34,12 @@ WASTEFUL = YieldStats(useful=0, decided=200)
 def main_stats(concurrent: float, ratio: float = 0.9) -> YieldStats:
     """A MAIN hotkey that held ``concurrent`` useful sessions on average over the last 24 h."""
     return YieldStats(useful=int(200 * ratio), decided=200, useful_24h=int(concurrent * 48),
+                      useful_s_24h=concurrent * USEFUL_HORIZON_S)
+
+
+def graduate(concurrent: float, decided: int = YIELD_MIN_DECIDED + 4, ratio: float = 0.9) -> YieldStats:
+    """A hotkey that just left the newcomers: ``decided`` decided sessions, ``concurrent`` useful ones over 24 h."""
+    return YieldStats(useful=int(decided * ratio), decided=decided, useful_24h=int(concurrent * 48),
                       useful_s_24h=concurrent * USEFUL_HORIZON_S)
 
 
@@ -127,7 +136,8 @@ def test_a_hundred_fresh_hotkeys_get_no_more_than_the_newcomer_entitys_rule(capa
         got = sum(take(q, f"5F{n:03d}", first=10 * n) for n in range(100))
         assert got <= sessions_of(rule)
         if not takes_spare or load == "high":
-            assert rule <= newcomer_n + (100.0 / 132.0) * capacity * (load == "high" and takes_spare)
+            spare = (capacity - newcomer_n) * NEWCOMER_WEIGHT / (NEWCOMER_WEIGHT + 100.0)   # its weighted spare
+            assert rule <= newcomer_n + spare * (load == "high" and takes_spare) + 1e-6
         if not takes_spare:
             assert got <= newcomer_n
 
@@ -250,16 +260,16 @@ def test_a_graduate_keeps_its_newcomer_allocation_until_main_gives_as_much():
     want(q, "5Big", C, first=900_000)
     want(q, "5Grad", 2 * P)
     assert q.lane("5Grad") == NEWCOMER
-    ledger.table = {**ledger.table, "5Grad": main_stats(1.79)}           # graduates: tiny weight, 30-min sessions
+    ledger.table = {**ledger.table, "5Grad": graduate(1.79)}             # graduates: tiny weight, 30-min sessions
     ledger.version += 1
     q._alloc_key = None
-    assert q.lane("5Grad") == NEWCOMER                                    # MAIN would give it ~6: it stays
+    assert q.lane("5Grad") == NEWCOMER                                    # MAIN would give it ~6 < M: it stays
     assert take(q, "5Grad", first=50) == 2 * P                            # never below what it held
     ledger.table = {k: v for k, v in ledger.table.items() if k != "5Big"}  # the contention ends
     ledger.version += 1
     q._wants.pop("5Big", None)
     q._alloc_key = None
-    assert q.lane("5Grad") == MAIN                                        # now MAIN gives it more: it graduates
+    assert q.lane("5Grad") == MAIN                                        # now MAIN gives it a group: it leaves
 
 
 def test_a_main_key_below_one_group_never_opens_a_session_that_cannot_form_a_group():
@@ -309,7 +319,7 @@ def test_a_weak_main_key_split_into_fresh_hotkeys_is_bounded_by_the_newcomer_ent
     want(q, "5Big", C, first=900_000)
     want(q, "5Grad", 2 * P, first=800_000)
     assert q.lane("5Grad") == NEWCOMER
-    ledger.table, ledger.version = {**ledger.table, "5Grad": main_stats(1.79)}, ledger.version + 1   # graduates
+    ledger.table, ledger.version = {**ledger.table, "5Grad": graduate(1.79)}, ledger.version + 1     # graduates
     for n in range(parts):
         want(q, f"5P{n:03d}", 10 * P, first=1_000 * (n + 1))
     assert q.lane("5Grad") == NEWCOMER                                    # the grace keeps it in the entity
@@ -325,3 +335,133 @@ def test_a_weak_main_key_split_into_fresh_hotkeys_is_bounded_by_the_newcomer_ent
     assert grad <= NEWCOMER_MAX_GROUPS * P and max(got) <= NEWCOMER_MAX_GROUPS * P   # per-key groups
     assert grad + sum(got) <= sessions_of(rule)                           # graduate and parts share the entity
     assert q.allocation().main.get("5Grad", 0.0) == 0.0                   # never served from MAIN as well
+
+
+def saturated(extra, *, background=1_880.0, capacity=C):
+    """Ten incumbents of total weight ``background`` asking for the whole fleet, plus ``extra``."""
+    ledger = Ledger({**{f"5Bg{i}": main_stats(background / 10) for i in range(10)}, **extra})
+    q = YieldQuota(ledger=ledger, pool_seeds=P, group_size=M, capacity=lambda: capacity, refresh_s=0.0,
+                   clock=lambda: NOW)
+    for i in range(10):
+        want(q, f"5Bg{i}", capacity, first=900_000 + 10_000 * i)
+    return ledger, q
+
+
+def test_a_graduate_leaves_the_newcomers_as_soon_as_main_gives_it_one_group():
+    """Leaving at one group (M), not at the newcomer maximum: on a saturated fleet a graduate's weight, earned inside
+    the entity, could never reach the newcomer maximum."""
+    _, q = saturated({"5Grad": graduate(30.0)})
+    want(q, "5Grad", 2 * P)
+    assert M <= q.potential_sessions("5Grad") < NEWCOMER_MAX_GROUPS * P
+    assert q.lane("5Grad") == MAIN
+    assert take(q, "5Grad") >= M                                          # a group forms in MAIN
+
+
+def test_the_grace_is_read_from_the_ledger_ends_after_its_sessions_and_survives_a_restart():
+    for decided, lane in ((YIELD_MIN_DECIDED, NEWCOMER), (YIELD_MIN_DECIDED + GRACE_SESSIONS - 1, NEWCOMER),
+                          (YIELD_MIN_DECIDED + GRACE_SESSIONS, MAIN)):
+        ledger, q = saturated({"5Grad": graduate(1.79, decided=decided)})
+        want(q, "5Grad", 2 * P)
+        assert q.lane("5Grad") == lane
+        again = YieldQuota(ledger=ledger, pool_seeds=P, group_size=M, capacity=lambda: C, refresh_s=0.0,
+                           clock=lambda: NOW)                              # a restart: nothing in memory
+        for i in range(10):
+            want(again, f"5Bg{i}", C, first=900_000 + 10_000 * i)          # the miners ask again
+        want(again, "5Grad", 2 * P)
+        assert again.lane("5Grad") == lane
+        assert take(q, "5Grad") == (2 * P if lane == NEWCOMER else 0)   # after the grace: MAIN's share, < M
+
+
+def test_a_recovered_low_yield_key_leaves_its_pool_once_main_gives_it_a_group():
+    _, q = saturated({"5Rec": main_stats(27.0, ratio=0.85), "5Mid": main_stats(3.0, ratio=0.7),
+                      **{f"5W{j}": WASTEFUL for j in range(4)}})
+    for j in range(4):
+        want(q, f"5W{j}", P, first=1_000 * j)                              # the wasters ask first
+    want(q, "5Rec", P, first=50_000, now=NOW + 1)
+    want(q, "5Mid", P, first=60_000, now=NOW + 1)
+    wasters = 0
+    for j in range(4):
+        q._alloc_key = None
+        wasters += take(q, f"5W{j}", first=1_000 * j)
+    assert wasters <= q.allocation().low_yield_cap
+    assert q.lane("5Rec") == MAIN and take(q, "5Rec", first=50_000, now=NOW + 2) >= M
+    assert q.lane("5Mid") == LOW_YIELD                                    # recovering, MAIN below a group: kept
+
+
+def test_genuine_newcomers_go_before_graduates_in_grace():
+    q = quota({"5Main": main_stats(100.0), "5N1": YieldStats(), "5N2": YieldStats(), "5G": graduate(1.0)},
+              capacity=216, takes_spare=False)                             # N = 32: one group
+    want(q, "5Main", 216, first=900_000)
+    want(q, "5N1", P)
+    assert take(q, "5N1", first=0, groups=1) == P                         # the entity is full
+    want(q, "5G", P, first=10, now=NOW + 1)                               # the graduate asks first
+    want(q, "5N2", P, first=20, now=NOW + 2)
+    assert q.lane("5G") == NEWCOMER
+    assert q.admit_locked("5G", NOW + 1, precommit_sha256=sha(10), seed_index=0).reason == "quota_pool"
+    assert q.admit_locked("5N2", NOW + 2, precommit_sha256=sha(20), seed_index=0).reason == "quota_pool"
+    for record in q._index["5N1"].values():
+        record.state, record.closed_status = "closed", "expired"
+    q._dirty = True
+    refused = q.admit_locked("5G", NOW + 3, precommit_sha256=sha(10), seed_index=0)
+    assert refused.reason == "quota_pool"                                 # the newcomer's group waits: it goes first
+    assert q.admit_locked("5N2", NOW + 4, precommit_sha256=sha(20), seed_index=0) is None
+
+
+def test_a_group_keeps_its_place_in_line_when_its_open_fails_after_the_check():
+    q = quota({"5Main": main_stats(100.0), "5W1": WASTEFUL, "5W2": WASTEFUL, "5W3": WASTEFUL}, capacity=216)
+    want(q, "5W1", P)
+    assert take(q, "5W1", first=0, groups=1) == P
+    want(q, "5W2", P, first=10, now=NOW + 1)
+    want(q, "5W3", P, first=20, now=NOW + 2)
+    q.admit_locked("5W2", NOW + 1, precommit_sha256=sha(10), seed_index=0)
+    q.admit_locked("5W3", NOW + 2, precommit_sha256=sha(20), seed_index=0)
+    for record in q._index["5W1"].values():
+        record.state, record.closed_status = "closed", "expired"
+    q._dirty = True
+    assert q.admit_locked("5W2", NOW + 3, precommit_sha256=sha(10), seed_index=0) is None   # its open then fails
+    assert q.admit_locked("5W3", NOW + 4, precommit_sha256=sha(20), seed_index=0).reason == "quota_pool"
+    assert q.admit_locked("5W2", NOW + 5, precommit_sha256=sha(10), seed_index=0) is None   # still first
+    hold(q, "5W2", sha(10), 0)
+    assert sha(10) not in q._asks[LOW_YIELD]                               # it left the line once it opened
+
+
+def test_a_new_group_needs_the_m_of_its_env():
+    q = quota({"5A": main_stats(10.0)}, group_sizes={"small-env": 4, "big-env": 32})
+    want(q, "5A", 10)                                                     # its allocation: 10 sessions
+    assert q.allocation().main["5A"] == 10
+    assert q.admit_locked("5A", NOW, precommit_sha256=sha(1), seed_index=0).reason == "quota_live"   # M = 16
+    assert q.admit_locked("5A", NOW, precommit_sha256=sha(1), seed_index=0, environment="small-env") is None
+    assert asyncio.run(q.admit_open("5A", environment="small-env", precommit_sha256=sha(2), seed_index=0)) is None
+    roomy = quota({"5A": main_stats(10.0)}, group_sizes={"big-env": 32})
+    want(roomy, "5A", 20)
+    refused = asyncio.run(roomy.admit_open("5A", environment="big-env", precommit_sha256=sha(3), seed_index=0))
+    assert refused.reason == "quota_live"                                 # 32 never fit in 20: nothing opened
+    assert asyncio.run(roomy.admit_open("5A", environment="other", precommit_sha256=sha(4), seed_index=0)) is None
+
+
+def test_the_index_keeps_only_held_sessions_and_the_opens_of_the_period():
+    q = quota({"5A": main_stats(10.0)})
+    records = [hold(q, "5A", sha(1), seed) for seed in range(4)]
+    for record in records[:3]:
+        record.state, record.closed_status, record.expires_at = "closed", "expired", NOW - 1_000
+    q.closed(None, None)
+    assert len(q._counted("5A", NOW)) == 1 and len(q._index["5A"]) == 1
+    assert len(q._opens["5A"]) == 4                                       # the period's opens still count
+    q.allocation(NOW + 3_600 + 60)
+    assert "5A" not in q._opens                                           # past the period: forgotten
+
+
+def test_a_graduate_in_grace_starts_a_group_only_in_the_room_newcomers_leave():
+    q = quota({"5Main": main_stats(100.0), "5N": YieldStats(), "5G": graduate(1.0)}, capacity=216,
+              takes_spare=False)                                           # N = 32: one group
+    want(q, "5Main", 216, first=900_000)
+    want(q, "5N", P, first=20)                                            # a newcomer asks, nobody refused yet
+    want(q, "5G", P, first=10)
+    q._asks[NEWCOMER].clear()                                              # no group waits in line
+    assert q.lane("5G") == NEWCOMER
+    assert q.admit_locked("5G", NOW, precommit_sha256=sha(10), seed_index=0).reason == "quota_pool"
+    assert take(q, "5N", first=20, groups=1) == P                          # the newcomer's group takes the room
+    alone = quota({"5Main": main_stats(100.0), "5G": graduate(1.0)}, capacity=216, takes_spare=False)
+    want(alone, "5Main", 216, first=900_000)
+    want(alone, "5G", P, first=10)
+    assert take(alone, "5G", first=10, groups=1) == P                       # no newcomer waiting: the graduate runs
