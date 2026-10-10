@@ -13,6 +13,7 @@ from reliquary.sandbox.rl_capacity import (
     NEWCOMER_EXIT_GROUPS,
     NEWCOMER_MAX_GROUPS,
     NEWCOMER_SHARE,
+    NEWCOMER_TAKES_SPARE,
     USEFUL_HORIZON_S,
     YIELD_MIN_DECIDED,
     YieldStats,
@@ -28,6 +29,18 @@ from reliquary.sandbox.rl_capacity import (
 
 P = 32
 FLEETS = (216, 2_160, 21_600)                      # small, Task 22a's, large
+TINY = 40                                          # below one group per entity: N + L > C
+
+
+def within_capacity(alloc, capacity):
+    """Every entity's allocation together never exceeds the fleet, in sessions and in whole sessions; none is
+    negative (a negative one would hide another's excess in the sum)."""
+    parts = (alloc.newcomer, alloc.low_yield, *alloc.main.values())
+    if min(parts) < 0:
+        return False
+    total = alloc.newcomer + alloc.low_yield + sum(alloc.main.values())
+    whole = sessions_of(alloc.newcomer) + sessions_of(alloc.low_yield) + sum(map(sessions_of, alloc.main.values()))
+    return total <= capacity + 1e-6 and whole <= capacity
 
 
 def test_nothing_is_keyed_per_operator_and_no_per_key_constant_remains():
@@ -61,7 +74,7 @@ def test_water_filling_gives_min_of_demand_and_weighted_share_and_respreads_the_
     assert water_fill(100, {"a": (1.0, 0.0), "b": (5.0, 7.0)}) == pytest.approx({"a": 0.0, "b": 7.0})
 
 
-@pytest.mark.parametrize("capacity", FLEETS)
+@pytest.mark.parametrize("capacity", (TINY, *FLEETS))
 @pytest.mark.parametrize("load", ["low", "high"])
 def test_splitting_a_main_key_never_increases_its_total(capacity, load):
     rng = random.Random(capacity + len(load))
@@ -78,6 +91,7 @@ def test_splitting_a_main_key_never_increases_its_total(capacity, load):
         assert total == pytest.approx(whole.main["k0"], rel=1e-9, abs=1e-6)
         assert sum(sessions_of(split.main[f"k0/{j}"]) for j in range(k)) <= sessions_of(whole.main["k0"])
         assert split.newcomer == pytest.approx(whole.newcomer) and split.low_yield == pytest.approx(whole.low_yield)
+        assert within_capacity(whole, capacity) and within_capacity(split, capacity)
 
 
 @pytest.mark.parametrize("capacity", FLEETS)
@@ -118,6 +132,28 @@ def test_more_fresh_keys_never_grow_the_newcomer_entity_beyond_its_rule(capacity
                 assert contended.newcomer <= newcomer_n + share * (capacity - newcomer_n) + 1e-6
         else:
             assert flood.newcomer <= newcomer_n
+
+
+@pytest.mark.parametrize("capacity", FLEETS)
+def test_a_flooding_newcomer_entity_takes_the_spare_of_an_idle_fleet(capacity):
+    assert NEWCOMER_TAKES_SPARE is True                # the owner's decision: the fleet is grown by hand
+    newcomer_n, _low = entity_sizes(capacity, pool_seeds=P)
+    idle = allocate(capacity, pool_seeds=P, main={"k": (50.0, 1.0)}, newcomer_demand=100 * capacity,
+                    low_yield_demand=0)
+    assert idle.newcomer > newcomer_n and idle.newcomer == pytest.approx(capacity - 1.0)
+    assert within_capacity(idle, capacity)
+
+
+@pytest.mark.parametrize("capacity", (0, 10, 31, TINY, 63, *FLEETS))
+def test_every_entity_together_never_exceeds_the_fleet(capacity):
+    rng = random.Random(capacity)
+    for _ in range(200):
+        main = {f"k{i}": (rng.uniform(0, 300), rng.uniform(0, 3 * capacity)) for i in range(rng.randint(0, 6))}
+        got = allocate(capacity, pool_seeds=P, main=main, newcomer_demand=rng.uniform(0, 3 * capacity),
+                       low_yield_demand=rng.uniform(0, 3 * capacity), takes_spare=rng.random() < 0.5)
+        assert within_capacity(got, capacity)
+    assert within_capacity(allocate(capacity, pool_seeds=P, main={}, newcomer_demand=10 * P,
+                                    low_yield_demand=10 * P), capacity)
 
 
 @pytest.mark.parametrize("capacity", FLEETS)
