@@ -63,8 +63,8 @@ GOLDEN = {
         "4a8e0c030b8dc0cf98aa71f26659cad2586d06ebf5c24d161b9afac07ee35762",
     ),
     "teutonic-9b-reliquary-suite-v9-dev1": (
-        "9e156343e9d50b41a89472b17b9b2102bde9b3971252941bf7fb58935eae4abf",
-        "f74166ea9d53156c054100ef1f0cc9d0119841542184dd479899b6aed27a236a",
+        "a2b0a3c05f42e7e5ee164e3a1d606bc492c3f85c28b4bf7b65e4c038f9b0e2ff",
+        "9a769fca3073d27a15181ad033a7ae754128d6f00da649bfc0afda4f3eebed42",
     ),
 }
 CORPUS_CODE_V1_SHA256 = (

@@ -805,6 +805,35 @@ _SPEC_VALUES = (
         external_artifact_resource="reliquary_competitive_code/artifact.json",
     ),
     EnvironmentSpec(
+        # General and tool-use prompts for distillation, in (block, thinking
+        # mode) segments: ReliquaryForge/general-prompts-curated@02b3ef7a,
+        # fetched by the package at that revision and checked against the
+        # sha256 of every file. Graded by the package where a block has a
+        # grader, all or nothing on the text after the reasoning: IFEvalG
+        # verifiers, a parse and a JSON Schema, identity and clarification
+        # patterns, tool-call matching. None of them runs model output, so the
+        # CPU worker grades. Chat, multi-turn and safety rows have no grader
+        # and their jobs declare no filter. A corpus source for now, and only
+        # its stage-A rows (single-turn, no tools, no system): see
+        # `reliquary.eval.sets.CORPUS_SERVABLE_RANGES`.
+        name="reliquary_general_v1",
+        factory_path="reliquary_general:GeneralPromptsEnvironment",
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="text",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/checked-answer/v1",
+        environment_manifest_sha256=(
+            "fc874fefc78de44891b94401a77f71d1"
+            "b6fb4d5048e04d7908b073eb681b84f1"
+        ),
+        external_distribution="reliquary-general",
+        external_artifact_resource="reliquary_general/artifact.json",
+    ),
+    EnvironmentSpec(
         # Telecom support tickets in tau2-bench's solo mode, graded on the
         # device and the carrier's records after the last call — nothing the
         # model writes reaches the score, only what it did. Binary: one failed

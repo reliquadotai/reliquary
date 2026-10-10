@@ -282,6 +282,7 @@ class SingleTurnPromptJob:
                 f"row {position} of {self._job.prompt_source!r} is in its "
                 f"{use!r} share, kept for RL; a corpus job is never served it"
             )
+        _refuse_unless_one_user_turn(self._job, position, problem, prompt)
         # The row's identity here is its index: fidelity compares the prompt
         # text, and carrying the environment's own id would only add a way for
         # a source to hand back something `EpisodeTask` refuses.
@@ -293,6 +294,48 @@ class SingleTurnPromptJob:
         return EpisodeTask(
             id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=(),
             metadata={"system": system} if isinstance(system, str) and system else {},
+        )
+
+
+def _refuse_unless_one_user_turn(
+    job: JobSpec, position: int, problem: Mapping[str, Any], prompt: str
+) -> None:
+    """Refuse a row this path would serve as a different task.
+
+    A single-turn job renders `prompt` as one user turn and nothing else. A
+    source whose rows can carry more -- a frozen history, a task system
+    message, tools (reliquary_general_v1's metadata says so per row) -- is
+    served here only where the row is that one turn: each mark is checked on
+    its own, so a row cannot get through on a `single_turn` it contradicts.
+    A row that names the renderer it was drawn for (its thinking mode) is
+    served only through that renderer. Sources whose rows carry none of these
+    fields are unaffected.
+    """
+    reasons = []
+    if problem.get("single_turn") is False:
+        reasons.append("it is marked multi-turn")
+    if problem.get("tools"):
+        reasons.append("it carries tools")
+    messages = problem.get("messages")
+    if messages is not None and (
+        not isinstance(messages, (list, tuple))
+        or len(messages) != 1
+        or not isinstance(messages[0], Mapping)
+        or messages[0].get("role") != "user"
+        or messages[0].get("content") != prompt
+    ):
+        reasons.append("its messages are not exactly that user turn")
+    if reasons:
+        raise CorpusPromptSourceError(
+            f"row {position} of {job.prompt_source!r} is not one user turn "
+            f"({'; '.join(reasons)}); a single-turn job renders its prompt alone "
+            "and would serve it as a different task"
+        )
+    renderer = problem.get("renderer")
+    if renderer is not None and renderer != job.renderer_id:
+        raise CorpusPromptSourceError(
+            f"row {position} of {job.prompt_source!r} was drawn for renderer "
+            f"{renderer!r}; job {job.job_id!r} renders through {job.renderer_id!r}"
         )
 
 

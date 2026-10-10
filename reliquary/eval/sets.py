@@ -79,6 +79,31 @@ RL_ONLY_RANGES: tuple[UsedRange, ...] = (
               "competitive-code RL share"),
 )
 
+# Sources a corpus job may take only part of: its range must lie inside ONE of
+# these. reliquary_general_v1 lays train out as (block, thinking mode)
+# segments, each opening with its single-turn rows (one user message, no
+# tools, no system message). Stage A serves those rows of chat, safety, ifeval
+# and structured, one segment per job (one renderer); multi-turn, tool and
+# task-system rows, clarification and identity wait for stage B, which renders
+# messages and tools. Counts from the package's `segments()` at
+# ReliquaryForge/general-prompts-curated@02b3ef7a.
+CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
+    "reliquary_general_v1": tuple(
+        UsedRange("corpus", "reliquary_general_v1", "train", start, stop - start,
+                  f"{segment} single-turn (stage A)")
+        for segment, start, stop in (
+            ("chat/direct", 0, 30_141),
+            ("chat/thinking", 30_141, 51_965),
+            ("ifeval/direct", 66_291, 70_971),
+            ("ifeval/thinking", 71_720, 82_808),
+            ("structured/direct", 84_587, 86_967),
+            ("structured/thinking", 87_540, 93_067),
+            ("safety/direct", 94_476, 101_778),
+            ("safety/thinking", 101_778, 107_165),
+        )
+    ),
+}
+
 _CODE_LENGTH = 2_481_806
 _CODE_HELD_OUT = 100_000
 
@@ -159,6 +184,9 @@ SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
     "reliquary_competitive_code_v1": (
         "ReliquaryForge/competitive-code-curated@1f6e4f12",
         "reliquary_competitive_code_v1"),
+    "reliquary_general_v1": (
+        "ReliquaryForge/general-prompts-curated@02b3ef7a",
+        "reliquary_general_v1"),
 }
 
 
@@ -193,6 +221,15 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
                 f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
                 f"{held.env!r} evaluation set; this job's [{job.start}, {job.end}) reaches them"
             )
+    servable = CORPUS_SERVABLE_RANGES.get(source)
+    if servable is not None and not any(
+        allowed.start <= job.start and job.end <= allowed.end for allowed in servable
+    ):
+        raise ValueError(
+            f"{source!r} serves corpus jobs only inside its stage A ranges, one "
+            f"segment per job ({', '.join(f'[{r.start}, {r.end}) {r.what}' for r in servable)}); "
+            f"this job's [{job.start}, {job.end}) is not inside one"
+        )
     for reserved in RL_ONLY_RANGES:
         if lineage(source)[1] == lineage(reserved.source)[1] and overlaps(job, reserved):
             raise ValueError(
@@ -483,6 +520,7 @@ __all__ = [
     "open_source",
     "overlaps",
     "prompt_sha256",
+    "CORPUS_SERVABLE_RANGES",
     "RL_ONLY_RANGES",
     "refuse_held_out_overlap",
     "rl_ranges",

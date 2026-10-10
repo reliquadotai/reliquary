@@ -1371,6 +1371,24 @@ _PROFILE_VALUES = (
                 # One pass through the 2,718-problem RL share at 8 a window.
                 prompt_cooldown_windows=340,
             ),
+            "reliquary_general_v1": EnvironmentProfile(
+                # The package's largest segment budget (chat and multi-turn,
+                # thinking); a corpus job declares its own segment's, from
+                # 2,048 to 16,384. Not measured on this policy.
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="text",
+                batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/checked-answer/v1",
+                environment_manifest_sha256=(
+                    "fc874fefc78de44891b94401a77f71d1b6fb4d5048e04d7908b073eb681b84f1"
+                ),
+                # One pass through the 122,638-row train split at 16 a window.
+                prompt_cooldown_windows=7664,
+            ),
             "reliquary_telecom_solo_v1": EnvironmentProfile(
                 # For an episode this is the whole transcript, as `max_episode_tokens`.
                 max_new_tokens=49152,
