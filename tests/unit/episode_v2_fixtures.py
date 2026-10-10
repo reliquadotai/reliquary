@@ -11,7 +11,7 @@ from tests.unit.service_v2_fixtures import MATH, contract_v2_dict, qualification
 EPISODE = "reliquary_test_episode_v1"
 SANDBOX_ENV = "reliquary-swe"            # the fake gateway's env name (test_signed_episode_e2e)
 SPLIT = "train:rl"                       # accepted by reliquary_sandbox_service.episodes.testing
-ENV_PACKAGE = "reliquary-swe==0.1.0a1+g0123456789abcdef"   # test_corpus_job_signed_sandbox.ENV_PACKAGE
+ENV_PACKAGE = "reliquary-swe==0.1.0a1+g0123456789abcdef.vfb2"   # test_corpus_job_signed_sandbox.ENV_PACKAGE (bridged)
 REVISION = "d" * 40                      # contract_v2_dict's checkpoint revision
 WINDOW_BEACON = "ab" * 32
 POOL = 0.25
