@@ -115,6 +115,7 @@ def test_a_schedule_with_an_added_row_round_trips_and_never_changes_the_order_ha
     (added_block(missing_box="uncertain"), "graded"),
     (added_block(episode={"max_episode_tokens": 8192}), "max_episode_tokens"),       # above the order's bound
     (added_block(episode={"max_turns": 64}), "max_turns"),
+    (added_block(episode={"max_tokens_per_turn": 1024}), "max_tokens_per_turn"),
     (added_block(episode={"sandbox_env": SANDBOX_ENV}), "sandbox env"),               # a new sandbox env name
     (added_block(episode={"env_package": ENV_PACKAGE},
                  catalogue={"package": ENV_PACKAGE.split("+")[0]}), "distribution"),  # a new distribution
@@ -187,6 +188,17 @@ def test_a_malformed_added_row_beside_a_valid_one_is_a_schedule_error():
 
 def test_the_distribution_name_is_normalised():
     assert distribution_of("Reliquary_Terminal==0.3.0+g0.vfb2") == "reliquary-terminal"
+    assert distribution_of("Reliquary.Terminal==0.3.0") == "reliquary-terminal"   # as pip compares names
+    assert distribution_of("reliquary_-.terminal==0.3.0") == "reliquary-terminal"
+
+
+@pytest.mark.parametrize("distribution", ["reliquary.swe", "Reliquary_.SWE", "reliquary--swe"])
+def test_an_added_env_cannot_reuse_a_distribution_pip_would_overwrite(distribution):
+    # The order's episode env is reliquary-swe: pip installs any of these spellings over it.
+    block = added_block(episode={"env_package": f"{distribution}==0.1.0a1+g0123456789abcdef.vfb2"},
+                        catalogue={"package": f"{distribution}==0.1.0a1"})
+    with pytest.raises(ScheduleError, match="distribution"):
+        with_added(block=block)
 
 
 def test_a_run_without_an_episode_env_cannot_add_one():
@@ -264,3 +276,85 @@ def test_the_seed_pool_and_the_admission_context_see_an_added_env_and_only_when_
     with pytest.raises(ValueError):
         pool_from_service_policy(plain, environment=ADDED, prompt_idx=0, checkpoint_hash=revision)
     assert _episode_admission_fields(SimpleNamespace(service_policy=plain, env=SimpleNamespace(name=ADDED))) == {}
+
+
+def test_the_view_parses_its_added_rows_as_strictly_as_the_schedule():
+    schedule = with_added(active=[MATH, EPISODE, ADDED], shares={MATH: 4000, EPISODE: 3000, ADDED: 3000})
+    unbounded = schedule.to_dict()
+    unbounded["environments"][ADDED]["added"]["environment"]["episode"]["max_episode_tokens"] = 8192
+    unattested = schedule.to_dict()
+    del unattested["environments"][ADDED]["added"]["catalogue"]["conformance_sha256"]
+    not_a_block = schedule.to_dict()
+    not_a_block["environments"][ADDED]["added"] = 1
+    half_a_block = schedule.to_dict()
+    del half_a_block["environments"][ADDED]["added"]["catalogue"]
+    for value in (unbounded, unattested, not_a_block, half_a_block):
+        with pytest.raises(ScheduleError):
+            announced_contract({"contract": CONTRACT.to_dict(), "schedule": value})
+    # Without an added row the schedule is not read at all, as before: the plain order contract.
+    assert type(announced_contract({"contract": CONTRACT.to_dict(), "schedule": {"environments": 1}})) \
+        is ServiceContract
+
+
+def test_a_view_of_another_orders_schedule_is_refused():
+    with pytest.raises(ScheduleError, match="another order"):
+        with_added().contract_view(contract_v2())
+
+
+def _applied(tmp_path, *schedules):
+    rt = episode_runtime(tmp_path)
+    for index, schedule in enumerate(schedules):
+        rt.apply_schedule(schedule, request_id=f"r{index}", window=1)
+    return rt
+
+
+def _successor(schedule, edit):
+    value = schedule.to_dict()
+    value["revision"] += 1
+    edit(value["environments"])
+    return ServiceSchedule.from_dict(value, CONTRACT)
+
+
+def test_an_added_row_is_never_removed_nor_changed_by_a_later_revision(tmp_path):
+    first = with_added()
+    dropped = _successor(first, lambda rows: rows.pop(ADDED))
+    edited = _successor(first, lambda rows: rows[ADDED]["added"]["catalogue"].update(conformance_sha256="e" * 64))
+    rt = _applied(tmp_path, first)
+    with pytest.raises(ValueError, match="never removed"):
+        rt.apply_schedule(dropped, request_id="drop", window=1)
+    with pytest.raises(ValueError, match="never changes"):
+        rt.apply_schedule(edited, request_id="edit", window=1)
+    assert rt.schedule.canonical == first.canonical
+
+
+def test_a_later_revision_may_switch_an_added_env_and_its_key_order_does_not_matter(tmp_path):
+    first = with_added()
+
+    def switch_on_reordered(rows):
+        rows[ADDED] = {**rows[ADDED], "active": 1, "share_bps": 2000,
+                       "added": dict(reversed(list(rows[ADDED]["added"].items())))}
+        rows[EPISODE]["share_bps"] -= 2000
+
+    on = _successor(first, switch_on_reordered)
+    rt = _applied(tmp_path, first, on)
+    assert ADDED in rt.schedule.active_environments()
+    assert rt.schedule.added_environments() == first.added_environments()
+
+
+def test_the_batcher_serves_the_view_of_its_windows_announcement(tmp_path):
+    from types import SimpleNamespace
+
+    from reliquary.validator.batcher import GrpoWindowBatcher
+
+    rt = episode_runtime(tmp_path)
+    plain = rt.announcement(window=1, randomness=WINDOW_BEACON)
+    added = dict(plain, schedule=with_added(active=[MATH, EPISODE, ADDED],
+                                            shares={MATH: 4000, EPISODE: 3000, ADDED: 3000}).to_dict())
+    for policy, expected in ((added, True), (plain, False)):
+        batcher = SimpleNamespace(service_policy=policy)
+        batcher._service_window_contract = lambda b=batcher: GrpoWindowBatcher._service_window_contract(b)
+        contract, schedule = GrpoWindowBatcher._parsed_service_policy(batcher)
+        assert (ADDED in contract.episode_environments) is expected
+        assert (ADDED in schedule.active_environments()) is expected
+        assert contract.sha256 == CONTRACT.sha256
+        assert (type(contract) is ServiceContract) is not expected

@@ -8,7 +8,7 @@ from typing import Iterable, Mapping
 from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
 from reliquary.protocol.service_catalogue import (
     MAX_ADDED_ENVIRONMENTS,
-    catalogued,
+    overlay,
     validate_added,
 )
 from reliquary.protocol.service_contract import (
@@ -121,7 +121,19 @@ class ServiceSchedule:
 
     def contract_view(self, contract: ServiceContract) -> ServiceContract:
         """The order's contract with the envs this schedule added (the plain contract when none)."""
-        return catalogued(contract, self.to_dict())
+        if contract.sha256 != self.order_sha256:
+            raise ScheduleError("schedule belongs to another order")
+        return overlay(contract, self.added_environments())
+
+    def keeps_added_of(self, previous: ServiceSchedule) -> None:
+        """An added row is never removed nor changed: every ``added`` block of ``previous`` is in this
+        schedule, byte-identical (its activity, share and cooldown may change). ``ScheduleError`` otherwise."""
+        mine = self.added_environments()
+        for name, block in previous.added_environments().items():
+            if name not in mine:
+                raise ScheduleError(f"{name} was added to the run: its row is never removed")
+            if canonical_json_bytes(mine[name]) != canonical_json_bytes(block):
+                raise ScheduleError(f"{name} was added to the run: its added block never changes")
 
 
 def initial_schedule(contract: ServiceContract) -> ServiceSchedule:

@@ -456,8 +456,10 @@ class ServiceRuntime:
             if known[0] != payload:
                 raise ValueError("schedule request id was already used for another schedule")
             return False
-        if schedule.revision != self._schedule().revision + 1:
+        current = self._schedule()
+        if schedule.revision != current.revision + 1:
             raise ValueError("schedule revisions must increase by one")
+        schedule.keeps_added_of(current)
         self.db.execute("INSERT INTO service_schedules VALUES(?,?,?,?,?)",
                         (self.contract.sha256, schedule.revision, request_id, window, payload))
         return True

@@ -18,6 +18,7 @@ must name its conformance report."""
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -35,8 +36,9 @@ MAX_ADDED_ENVIRONMENTS = 16
 
 
 def distribution_of(env_package: str) -> str:
-    """The distribution name of a pinned env package (``name==version+...``), normalised."""
-    return str(env_package).split("==", 1)[0].replace("_", "-").lower()
+    """The distribution name of a pinned env package (``name==version+...``), normalised as pip compares
+    names (PEP 503: runs of ``-``, ``_`` and ``.`` are one ``-``, case-insensitive)."""
+    return re.sub(r"[-_.]+", "-", str(env_package).split("==", 1)[0]).lower()
 
 
 def _merged(added: Mapping[str, Any]) -> dict:
@@ -71,7 +73,9 @@ def validate_added(name: str, added: Any, existing: Mapping[str, Mapping[str, An
     bounds = [e["episode"] for e in order_environments.values() if isinstance(e, Mapping) and "episode" in e]
     if not bounds:
         raise ServiceContractError(f"{name}: the order has no episode environment to bound an added one")
-    for field in ("max_episode_tokens", "max_turns"):
+    # Bounded by the order's largest values. A miner's engine serves only envs with exactly the same caps
+    # (``check_engine_caps``): an added env whose caps differ from a launch env's needs its own engine.
+    for field in ("max_episode_tokens", "max_turns", "max_tokens_per_turn"):
         limit = max(int(bound[field]) for bound in bounds)
         if int(episode[field]) > limit:
             raise ServiceContractError(f"{name}: episode.{field} {episode[field]} is above the order's {limit} "
@@ -132,16 +136,32 @@ class CataloguedContract(ServiceContract):
             raise ServiceContractError(f"runtime lacks capabilities: {sorted(missing)}")
 
 
-def catalogued(contract: ServiceContract, schedule: Any) -> ServiceContract:
-    """``contract`` with the envs ``schedule`` (a schedule dict) added; the plain order contract when none."""
-    base = ServiceContract(contract.canonical) if isinstance(contract, CataloguedContract) else contract
-    rows = schedule.get("environments") if isinstance(schedule, Mapping) else None
-    added = {name: _merged(row["added"]) for name, row in (rows or {}).items()
-             if isinstance(row, Mapping) and isinstance(row.get("added"), Mapping)
-             and {"environment", "catalogue"} <= set(row["added"])}
+def order_of(contract: ServiceContract) -> ServiceContract:
+    """The plain order contract of ``contract`` (a view is rebuilt from the order's bytes)."""
+    return ServiceContract(contract.canonical) if isinstance(contract, CataloguedContract) else contract
+
+
+def overlay(contract: ServiceContract, added: Mapping[str, Mapping[str, Any]]) -> ServiceContract:
+    """``contract``'s order with ``added`` (``{name: added block}`` of an already validated schedule)."""
+    base = order_of(contract)
     if not added:
         return base
-    return CataloguedContract(base.canonical, canonical_json_bytes(added))
+    return CataloguedContract(base.canonical, canonical_json_bytes({name: _merged(block)
+                                                                    for name, block in added.items()}))
+
+
+def catalogued(contract: ServiceContract, schedule: Any) -> ServiceContract:
+    """``contract`` with the envs ``schedule`` (a schedule dict) added; the plain order contract when no row
+    carries ``added``. A schedule with an ``added`` row is parsed in full (``ScheduleError`` otherwise): the
+    view is never laxer than the schedule, and a malformed row is an error, never skipped."""
+    base = order_of(contract)
+    rows = schedule.get("environments") if isinstance(schedule, Mapping) else None
+    if not isinstance(rows, Mapping) or not any(isinstance(row, Mapping) and "added" in row
+                                                for row in rows.values()):
+        return base
+    from reliquary.protocol.service_schedule import ServiceSchedule
+
+    return overlay(base, ServiceSchedule.from_dict(schedule, base).added_environments())
 
 
 def announced_contract(announcement: Mapping[str, Any]) -> ServiceContract:
@@ -150,4 +170,4 @@ def announced_contract(announcement: Mapping[str, Any]) -> ServiceContract:
 
 
 __all__ = ["ADDED_FIELDS", "MAX_ADDED_ENVIRONMENTS", "CataloguedContract", "announced_contract", "catalogued",
-           "distribution_of", "validate_added"]
+           "distribution_of", "order_of", "overlay", "validate_added"]
