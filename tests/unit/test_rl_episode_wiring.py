@@ -490,6 +490,59 @@ def test_the_precommit_route_rate_limits_each_hotkey_once_it_signed(tmp_path):
     assert len(calls) == 2                                                # the third never reached the verify
 
 
+def test_the_precommit_route_asks_the_admission_before_it_records_anything(tmp_path):
+    """an unservable task is refused (409, the miner moves on) and nothing is recorded; a retryable admission
+    refusal is a 503 with Retry-After; an admitted precommit is recorded."""
+    rt = episode_runtime(tmp_path)
+    recorded, answers = [], [("task_unservable", {"task_index": 3}), ("fleet_unavailable", {}), None]
+
+    def record(value):
+        recorded.append(value)
+        return True, "a" * 64
+
+    async def admit(value):
+        return answers.pop(0)
+
+    client = _precommit_client(rt, verify=_signed_only([]), record=record, admit=admit)
+    post = lambda: client.post(f"{RL_PREFIX}/episodes/precommit",  # noqa: E731
+                               json=_precommit_body(rt, signature="good"))
+    refused = post()
+    assert refused.status_code == 409 and refused.json() == {"reason": "task_unservable", "detail": {"task_index": 3}}
+    assert recorded == []
+    retried = post()
+    assert retried.status_code == 503 and retried.json()["reason"] == "fleet_unavailable"
+    assert int(retried.headers["Retry-After"]) >= 1 and recorded == []
+    assert post().status_code == 200 and len(recorded) == 1
+
+
+def test_the_built_precommit_route_asks_the_services_admission(tmp_path):
+    """the router the wiring builds refuses through ``RlEpisodeServices.precommit_admission`` (a real signed
+    request), before the runtime records anything."""
+    import bittensor as bt
+
+    from reliquary.miner.rl_episode_client import signed_precommit_body
+    from reliquary.sandbox.rl_routes import episode_precommit_path
+
+    services, rt = _services(tmp_path)
+    seen = []
+
+    async def admission(value):
+        seen.append(value)
+        return "task_unservable", {"task_index": value.task_index}
+
+    services.precommit_admission = admission
+    app = FastAPI()
+    app.include_router(services.routers[1])
+    miner = bt.Keypair.create_from_uri("//Alice")
+    body = signed_precommit_body(precommit=episode_precommit(rt.contract, hotkey=miner.ss58_address),
+                                 sign_binding=lambda b: miner.sign(b).hex(), now=time.time(),
+                                 validator_hotkey=VALIDATOR_SS58, path=episode_precommit_path(RL_PREFIX))
+    answer = TestClient(app).post(episode_precommit_path(RL_PREFIX), json=body)
+    assert answer.status_code == 409 and answer.json()["reason"] == "task_unservable", answer.json()
+    assert len(seen) == 1 and seen[0].task_index == body["precommit"]["task_index"]
+    assert rt.episode_precommit(seen[0].sha256) is None                # nothing recorded
+
+
 def test_unsigned_requests_claiming_a_hotkey_do_not_spend_its_rate(tmp_path):
     """30 unsigned requests naming H, then H's signed one goes through."""
     rt = episode_runtime(tmp_path)

@@ -222,10 +222,7 @@ class RlEpisodeEngagements:
                            precommit.environment, type(exc).__name__)
             self._forget(hotkey, sha)
             return Refusal("task_unavailable", {"task_index": precommit.task_index}, retry_after=retry)
-        budgets = policy.budgets_dict()
-        for limit_name, limit in task.limits.items():
-            if limit_name in budgets:
-                budgets[limit_name] = max(budgets[limit_name], int(limit))
+        budgets = session_budgets(policy, task)
         prepare = getattr(task, "prepare_timeout_s", None)
         if token_validity_s(self._book.policy.open_window_s, int(budgets["wall_s"]), prepare) > MAX_SESSION_SPAN_S:
             self._forget(hotkey, sha)
@@ -251,5 +248,15 @@ class RlEpisodeEngagements:
             reserve={"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])})
 
 
+def session_budgets(policy, task) -> dict[str, int]:
+    """The session's budgets: the policy's, raised to the task's declared limits (what ``terms`` grants; the
+    precommit route's servable check uses the same)."""
+    budgets = policy.budgets_dict()
+    for limit_name, limit in task.limits.items():
+        if limit_name in budgets:
+            budgets[limit_name] = max(budgets[limit_name], int(limit))
+    return budgets
+
+
 __all__ = ["WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements", "SessionOutcomes",
-           "SessionQuota"]
+           "SessionQuota", "session_budgets"]

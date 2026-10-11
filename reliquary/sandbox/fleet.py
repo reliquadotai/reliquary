@@ -223,6 +223,22 @@ class Fleet:
         self._egress_suspect = False      # the last poll heard no machine at all
         self._options_alerted: set[tuple[str, str, str | None, str]] = set()
         self._refusal_alerted = False     # the "cannot verify open refusals" error is logged once
+        # machine -> (the report its set was built from, the report's images as a set): a report may list
+        # thousands of images (one per task), so membership is a set lookup built once per report.
+        self._image_sets: dict[str, tuple[Mapping[str, Any], frozenset[str]]] = {}
+        # (env, package, options) -> (the serving machines' reports it was built from, their images together)
+        self._served_images: dict[tuple, tuple[tuple, frozenset[str]]] = {}
+
+    def _images_of(self, machine_id: str, document: Mapping[str, Any]) -> frozenset[str]:
+        """The images ``document`` (the machine's current report) lists, as a set built once per report."""
+        cached = self._image_sets.get(machine_id)
+        if cached is not None and cached[0] is document:
+            return cached[1]
+        listed = document.get("images")
+        images = (frozenset(i for i in listed if isinstance(i, str)) if isinstance(listed, (list, tuple))
+                  else frozenset())
+        self._image_sets[machine_id] = (document, images)
+        return images
 
     def directory_age(self, now: float | None = None) -> float | None:
         """Seconds since the last successful directory read, or None if never read."""
@@ -310,6 +326,7 @@ class Fleet:
                            machine_id)
             return False
         self._reports[machine_id] = dict(document)
+        self._images_of(machine_id, self._reports[machine_id])      # once per accepted report, never per request
         self._last_ok[machine_id] = now
         listed = _listed(document.get("resources"))
         if listed:
@@ -557,7 +574,7 @@ class Fleet:
     def _serves(self, entry, document, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
                 validity_s: int, env_options_sha256: str | None) -> bool:
         """What the machine's (last) report says it serves: the image, the env, its options, the tools and caps."""
-        if image not in (document.get("images") or ()):
+        if image not in self._images_of(entry.machine_id, document):
             return False
         if (document.get("env_packages") or {}).get(env) != env_package:
             return False
@@ -582,7 +599,8 @@ class Fleet:
         poll heard none (our egress), no report is fresh, or a machine whose last report serves it is drained or
         stale. The RL open queue refuses at once only on False (final for the seed); None is retryable. With
         `reserve` (RL), a machine judged by its `resources` (see `pick`) serves the session only if its box is at
-        least the task's CPUs and its totals hold the session's CPU and memory."""
+        least the task's CPUs and its totals hold the session's CPU and memory. It answers True exactly when
+        ``servable_machines`` finds a machine (the same filters), unless the last poll heard no machine."""
         if not self.directory_ready(now) or self._egress_suspect or not self._last_ok:
             return None
         fresh = unknown = False
@@ -604,6 +622,72 @@ class Fleet:
                     return True
                 unknown = True              # it served it when last heard: drained or stale for now
         return None if unknown or not fresh else False
+
+    def servable_machines(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
+                          validity_s: int, now: float | None = None, env_options_sha256: str | None = None,
+                          reserve: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+        """The fresh active machines that could ever take this session, their load aside: exactly the open
+        path's own filters (``_fits``; with ``reserve``, ``_could_hold`` on a machine judged by its resources),
+        so a machine counted here is one ``could_place`` answers True for. The precommit route counts with it;
+        Task 13b reads who holds these machines. Memory reads only (the image test is a set lookup)."""
+        now = self._clock() if now is None else now
+        if not self.directory_ready(now):
+            return ()
+        found = []
+        for entry in self._directory.entries():
+            document = self._reports.get(entry.machine_id)
+            if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
+                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
+                continue
+            if self._could_hold(entry.machine_id, document, reserve) is not True:
+                continue
+            found.append(entry.machine_id)
+        return tuple(found)
+
+    def sessions_hostable(self, machine_ids: Collection[str], reserve: Mapping[str, Any] | None) -> int:
+        """How many sessions of this reservation these machines could hold at once, their load aside: each
+        machine's slots and, when it is judged by its resources, its totals over the session's need."""
+        total = 0
+        for machine_id in machine_ids:
+            document = self._reports.get(machine_id) or {}
+            hosts = int(document.get("capacity") or 0)
+            if self._by_resources(document, reserve):
+                resources = document.get("resources")
+                need = reservation_need(resources, reserve) if _valid_resources(resources) else None
+                if need is None:
+                    continue
+                hosts = min(hosts, resources["cpu_millis"] // max(1, need[0]),
+                            resources["memory_bytes"] // max(1, need[1]))
+            total += max(0, hosts)
+        return total
+
+    def servable(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
+                 now: float | None = None, env_options_sha256: str | None = None,
+                 reserve: Mapping[str, Any] | None = None, group_size: int = 1) -> int:
+        """How many machines ``servable_machines`` finds; 0 when, together, they could not hold ``group_size``
+        sessions at once (a precommit whose machines cannot host its group is never accepted, so a saturation of
+        its own group is never the miner's doing)."""
+        machines = self.servable_machines(image=image, env=env, env_package=env_package, budgets=budgets,
+                                          validity_s=validity_s, now=now, env_options_sha256=env_options_sha256,
+                                          reserve=reserve)
+        if int(group_size) > 1 and self.sessions_hostable(machines, reserve) < int(group_size):
+            return 0
+        return len(machines)
+
+    def images_served(self, env: str, env_package: str, *, env_options_sha256: str | None = None,
+                      now: float | None = None) -> frozenset[str]:
+        """The images the machines serving ``env`` at ``env_package`` (and options) hold, together. The union is
+        rebuilt only when one of those machines' reports changed."""
+        machines = self.serving(env, env_package, env_options_sha256=env_options_sha256, now=now)
+        documents = tuple((m, self._reports[m]) for m in machines)
+        key = (env, env_package, env_options_sha256)
+        cached = self._served_images.get(key)
+        if (cached is not None and len(cached[0]) == len(documents)
+                and all(a[0] == b[0] and a[1] is b[1] for a, b in zip(cached[0], documents))):
+            return cached[1]
+        images = frozenset().union(*(self._images_of(m, document) for m, document in documents))
+        self._served_images[key] = (documents, images)
+        return images
 
     def _could_hold(self, machine_id: str, document: Mapping[str, Any],
                     reserve: Mapping[str, Any] | None) -> bool | None:

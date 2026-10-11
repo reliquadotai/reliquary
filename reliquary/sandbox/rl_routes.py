@@ -46,6 +46,10 @@ PRECOMMIT_STATUS: dict[str, int] = {
     "environment_not_active": 409, "task_out_of_range": 409, "checkpoint_mismatch": 409,
     "pool_mismatch": 409, "precommit_exists": 409, "task_in_cooldown": 409,
     "precommit_rate": 429, "precommit_busy": 503,
+    # No machine serves the env now / the fleet view is not ready: the 2C miner sends the precommit again until
+    # the window ends. No machine serving the env can take this task: the miner moves to another task (it may be
+    # servable in a later window). None of them records anything.
+    "environment_unserved": 503, "fleet_unavailable": 503, "task_unservable": 409,
 }
 BODY_TIMEOUT_S = 10.0
 MAX_PER_MINUTE = 30
@@ -85,10 +89,13 @@ def build_episode_precommit_router(
     clock: Callable[[], float] = time.time,
     body_timeout_s: float = BODY_TIMEOUT_S, max_per_minute: int = MAX_PER_MINUTE,
     max_preauth: int = MAX_PREAUTH, max_tracked_hotkeys: int = MAX_TRACKED_HOTKEYS,
+    admit: Callable[[Any], Awaitable[tuple[str, dict] | None]] | None = None,
 ) -> APIRouter:
     """``record``: ``ServiceRuntime.record_episode_precommit`` (blocking, run in a thread);
     ``current_window``: the service window admissions are open for, or None between windows. It is
-    called on the event loop: it must read memory only (never the runtime's SQLite)."""
+    called on the event loop: it must read memory only (never the runtime's SQLite). ``admit(value)``: the RL
+    wiring's check that the env is served and the task servable, before anything is recorded; a
+    ``(reason, detail)`` answer refuses the precommit."""
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
@@ -178,6 +185,10 @@ def build_episode_precommit_router(
             return _refusal("window_not_open", {}, retry_s)
         if value.window != window:
             return _refusal("precommit_stale", {"window": window})
+        if admit is not None:
+            refused = await admit(value)
+            if refused is not None:
+                return _refusal(refused[0], refused[1], retry_s)
         try:
             created, digest = await asyncio.to_thread(record, value)
         except EpisodePrecommitRefused as refused:

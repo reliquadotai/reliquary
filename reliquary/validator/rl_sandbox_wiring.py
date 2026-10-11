@@ -157,6 +157,7 @@ class RlEpisodeServices:
     resolvers: dict = field(default_factory=dict, repr=False)
     boot_wait_s: float | None = None
     unserved_envs: set = field(default_factory=set)
+    views: dict = field(default_factory=dict, repr=False)
     _loop: Any = field(default=None, repr=False)
     _tasks: set = field(default_factory=set, repr=False)
 
@@ -272,6 +273,57 @@ class RlEpisodeServices:
             return Refusal("environment_unserved", {"environment": environment},
                            retry_after=self.book.policy.retry_after_s)
         return None
+
+    async def precommit_admission(self, value) -> tuple[str, dict] | None:
+        """Before a precommit is recorded: its env must be served, the fleet view ready, and its task servable
+        on at least ``MIN_SERVING_MACHINES`` machines by the open path's own filter, which together can host
+        its group (M sessions) at once. ``environment_unserved`` and ``fleet_unavailable`` are retryable (503);
+        ``task_unservable`` (409) only when fresh machines serve the env and the open path would refuse this
+        task on all of them. A task the source cannot resolve is left to the runtime's own checks. Nothing is
+        recorded on a refusal, so none is waste or quota. Never raises."""
+        try:
+            return await self._precommit_admission(value)
+        except Exception as exc:
+            logger.warning("episode precommit admission failed (%s): refused retryably", type(exc).__name__)
+            return "fleet_unavailable", {"environment": str(getattr(value, "environment", ""))}
+
+    async def _precommit_admission(self, value) -> tuple[str, dict] | None:
+        from reliquary.sandbox.rl_capacity import MIN_SERVING_MACHINES
+        from reliquary.sandbox.rl_engagements import session_budgets
+        from reliquary.sandbox.sessions import token_validity_s
+
+        environment = str(value.environment)
+        refusal = self.serving_refusal(environment)
+        if refusal is not None:
+            return refusal.reason, dict(refusal.detail)
+        view = self.views.get(environment)
+        if view is None:
+            return None                                # not an episode env here: the runtime refuses it
+        try:
+            task = await asyncio.wait_for(view.resolve_task(int(value.task_index)), self.book.policy.io_timeout_s)
+        except Exception:
+            return None
+        policy = view.policy
+        options = getattr(task, "env_options_sha256", None)
+        if not self.fleet.serving(policy.sandbox_env, policy.env_package, env_options_sha256=options):
+            # A stale directory or report, or no machine serving the env right now: never a final answer.
+            return "fleet_unavailable", {"environment": environment}
+        budgets = session_budgets(policy, task)
+        reserve = {"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])}
+        placement = dict(image=task.image, env=policy.sandbox_env, env_package=policy.env_package, budgets=budgets,
+                         # the open path's own token validity (its machines' caps must allow it)
+                         validity_s=token_validity_s(self.book.policy.open_window_s, int(budgets["wall_s"]),
+                                                     getattr(task, "prepare_timeout_s", None)),
+                         env_options_sha256=options, reserve=reserve)
+        machines = self.fleet.servable(**placement, group_size=policy.pool_seeds // 2)     # M at once
+        if machines >= MIN_SERVING_MACHINES:
+            return None
+        if self.fleet.could_place(**placement, now=self.clock()) is None:
+            # A machine that served it when last heard is stale or drained, or one's resources cannot be read:
+            # the open path itself would answer retryably.
+            return "fleet_unavailable", {"environment": environment}
+        return "task_unservable", {"environment": environment, "task_index": int(value.task_index),
+                                   "image": task.image, "cpu_millis": reserve["cpu_millis"], "machines": machines}
 
     async def watch_served_forever(self, every_s: float) -> None:
         """While an env is degraded: re-check every ``every_s``; serve it again once a machine reports it."""
@@ -589,10 +641,15 @@ def build_rl_episode_services(
         # the opens are bounded like the precommits
         open_body_timeout_s=BODY_TIMEOUT_S if open_body_timeout_s is None else open_body_timeout_s,
         max_preauth_opens=MAX_PREAUTH if max_preauth_opens is None else max_preauth_opens)
+    built: dict = {}             # the services, once built: the router is built before them
+
+    async def admit(value):
+        return await built["services"].precommit_admission(value)
+
     precommit_router = build_episode_precommit_router(
         record=runtime.record_episode_precommit, current_window=current_window,
         validator_hotkey=validator_hotkey, policy=policy, prefix=RL_PREFIX, registration=registration,
-        clock=clock)
+        clock=clock, admit=admit)
     checkers = {name: EpisodeGroupChecker(policy=p, renderer=renderers[name], source=environments[name].source,
                                           chunk_tokens=chunk_tokens)
                 for name, p in policies.items()}
@@ -614,8 +671,9 @@ def build_rl_episode_services(
                                             getattr(environments[name].source, "options_sha256", None))
                                      for name, p in policies.items()},
                              resolvers={name: environments[name].source.resolve for name in policies},
-                             boot_wait_s=boot_wait_s)
+                             boot_wait_s=boot_wait_s, views=views)
     engagements.serving_refusal = services.serving_refusal
+    built["services"] = services
     return services
 
 
