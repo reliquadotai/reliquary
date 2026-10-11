@@ -180,3 +180,41 @@ def test_the_unserved_refusal_is_retried():
 
     assert REFUSAL_STATUS["environment_unserved"] == 503
     assert "environment_unserved" in RL_THROTTLES          # the miner reopens; never "not serving"
+
+
+@pytest.mark.parametrize("window", ["missing", 121, 600, 0, -5, "120", 120.0, True, None])
+def test_a_resources_block_without_a_present_window_of_at_most_120_s_is_invalid(tmp_path, caplog, window):
+    """A gateway accepting a token after 120 s would open a session that neither the hold nor the quota counts
+    any more: its resources are invalid. Never a final refusal: the open cannot be judged (retryable), the env is
+    unserved (degraded) and the machine is named in an ALERT."""
+    resources = {k: v for k, v in RESOURCES.items() if k != "present_window_s"}
+    if window != "missing":
+        resources["present_window_s"] = window
+    fleet, machine, served, _ = make(tmp_path)
+    served[ADDRESS] = capacity_report(machine, at=NOW, resources=resources)
+    asyncio.run(fleet.poll_once())
+    fleet.resources_required = True
+    place = dict(image=IMAGE, env=ENV, env_package=FLEET_PACKAGE, budgets=BUDGETS, validity_s=60, now=NOW,
+                 reserve=RESERVE)
+    with caplog.at_level(logging.ERROR):
+        assert fleet.pick(**place) is None
+        assert fleet.could_place(**place) is None                      # never final for the seed
+    assert fleet.serving(ENV, FLEET_PACKAGE, now=NOW) == []
+    assert any("ALERT" in r.message and MACHINE in r.message and "present_window" in r.message
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("window", [120, 45, 10])
+def test_a_present_window_of_at_most_120_s_is_valid(tmp_path, window):
+    from reliquary.sandbox.fleet import MAX_PRESENT_WINDOW_S
+    from reliquary.sandbox.rl_capacity import PRESENT_WINDOW_S
+
+    assert MAX_PRESENT_WINDOW_S == PRESENT_WINDOW_S
+    fleet, machine, served, _ = make(tmp_path)
+    served[ADDRESS] = capacity_report(machine, at=NOW, resources={**RESOURCES, "present_window_s": window})
+    asyncio.run(fleet.poll_once())
+    fleet.resources_required = True
+    place = dict(image=IMAGE, env=ENV, env_package=FLEET_PACKAGE, budgets=BUDGETS, validity_s=60, now=NOW,
+                 reserve=RESERVE)
+    assert fleet.pick(**place) is not None and fleet.could_place(**place) is True
+    assert fleet.serving(ENV, FLEET_PACKAGE, now=NOW) == [MACHINE]

@@ -100,6 +100,10 @@ _CAPS = {"max_calls": "max_calls", "cpu_s": "max_cpu_s", "per_call_timeout_s": "
 _RESOURCE_FIELDS = ("cpu_millis", "memory_bytes", "free_cpu_millis", "free_memory_bytes", "max_box_cpu_millis",
                     "boxes_per_episode")
 MIN_BOX_CPU_MILLIS = 100          # the gateway never sizes a box below 0.1 CPU
+MAX_PRESENT_WINDOW_S = 120
+"""The longest present window a machine may publish in its ``resources`` block (``rl_capacity.PRESENT_WINDOW_S``,
+kept here so the corpus path never loads that module): a reservation and the quota stop counting an unpresented
+token after it, so a gateway accepting a token later would place a session nobody counts."""
 def reservation_need(resources: Mapping[str, Any], reserve: Mapping[str, Any]) -> tuple[int, int] | None:
     """(CPU millis, memory bytes) a session with ``reserve`` takes on a machine reporting ``resources`` (the
     gateway's own rule: its agent box of the task's CPUs, at least 0.1 CPU, and its memory budget), or None when
@@ -117,7 +121,9 @@ def _valid_resources(value: Any) -> bool:
     return (isinstance(value, Mapping)
             and all(type(value.get(name)) is int and value[name] >= 0 for name in _RESOURCE_FIELDS)
             and value["cpu_millis"] > 0 and value["memory_bytes"] > 0 and value["boxes_per_episode"] > 0
-            and value["max_box_cpu_millis"] > 0)
+            and value["max_box_cpu_millis"] > 0
+            and type(value.get("present_window_s")) is int
+            and 0 < value["present_window_s"] <= MAX_PRESENT_WINDOW_S)
 
 
 def _listed(resources: Any) -> frozenset[str]:
@@ -430,7 +436,8 @@ class Fleet:
         if machine_id not in self._no_resources_logged:
             self._no_resources_logged.add(machine_id)
             logger.error("ALERT sandbox machine %s reports no valid resources: it gets no RL session "
-                         "(set episode_cpu_millis_total and episode_memory_bytes_total on it)", machine_id)
+                         "(set episode_cpu_millis_total, episode_memory_bytes_total and an "
+                         "episode_present_window_s of at most %d s on it)", machine_id, MAX_PRESENT_WINDOW_S)
         return None
 
     def _by_resources(self, document: Mapping[str, Any], reserve: Mapping[str, Any] | None) -> bool:

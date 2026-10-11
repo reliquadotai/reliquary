@@ -21,7 +21,8 @@ from tests.unit.test_sandbox_sessions import build as build_corpus, open_ as ope
 
 RESOURCES = {"cpu_millis": 2_000, "memory_bytes": 16 * GIB, "used_cpu_millis": 0, "used_memory_bytes": 0,
              "free_cpu_millis": 2_000, "free_memory_bytes": 16 * GIB, "max_box_cpu_millis": 1_000,
-             "boxes_per_episode": 1, "cpu_overcommit_permille": 1_000, "sessions": []}
+             "boxes_per_episode": 1, "cpu_overcommit_permille": 1_000, "present_window_s": 120,
+             "sessions": []}
 RESERVE = {"cpu_millis": 1_000, "memory_bytes": 2 * GIB}
 
 
