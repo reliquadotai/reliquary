@@ -625,35 +625,48 @@ class Fleet:
 
     def servable_machines(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
                           validity_s: int, now: float | None = None, env_options_sha256: str | None = None,
-                          reserve: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+                          reserve: Mapping[str, Any] | None = None,
+                          include_unknown: bool = False) -> tuple[str, ...]:
         """The fresh active machines that could ever take this session, their load aside: exactly the open
         path's own filters (``_fits``; with ``reserve``, ``_could_hold`` on a machine judged by its resources),
-        so a machine counted here is one ``could_place`` answers True for. The precommit route counts with it;
-        Task 13b reads who holds these machines. Memory reads only (the image test is a set lookup)."""
+        so a machine counted here is one ``could_place`` answers True for. The precommit route counts with it,
+        and the saturation attribution reads who holds these machines. With ``include_unknown``, also the
+        machines ``could_place`` cannot judge now: active ones whose last report serves the session but that are
+        stale or drained, or whose resources cannot be read. Memory reads only (the image test is a set lookup)."""
         now = self._clock() if now is None else now
         if not self.directory_ready(now):
             return ()
         found = []
         for entry in self._directory.entries():
             document = self._reports.get(entry.machine_id)
-            if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
-                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
+            if not include_unknown:
+                if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
+                                  validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
+                    continue
+                if self._could_hold(entry.machine_id, document, reserve) is not True:
+                    continue
+                found.append(entry.machine_id)
                 continue
-            if self._could_hold(entry.machine_id, document, reserve) is not True:
+            if entry.status != "active" or document is None:
                 continue
-            found.append(entry.machine_id)
+            if not self._serves(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
+                                validity_s=validity_s, env_options_sha256=env_options_sha256):
+                continue
+            if self._could_hold(entry.machine_id, document, reserve) is not False:
+                found.append(entry.machine_id)       # True (fresh or not) or None (resources unreadable)
         return tuple(found)
 
     def sessions_hostable(self, machine_ids: Collection[str], reserve: Mapping[str, Any] | None) -> int:
         """How many sessions of this reservation these machines could hold at once, their load aside: each
-        machine's slots and, when it is judged by its resources, its totals over the session's need."""
+        machine's slots and, when it is judged by its resources, its totals over the session's need (its slots
+        alone when its resources cannot be read: the most it could hold)."""
         total = 0
         for machine_id in machine_ids:
             document = self._reports.get(machine_id) or {}
             hosts = int(document.get("capacity") or 0)
-            if self._by_resources(document, reserve):
-                resources = document.get("resources")
-                need = reservation_need(resources, reserve) if _valid_resources(resources) else None
+            if self._by_resources(document, reserve) and _valid_resources(document.get("resources")):
+                resources = document["resources"]
+                need = reservation_need(resources, reserve)
                 if need is None:
                     continue
                 hosts = min(hosts, resources["cpu_millis"] // max(1, need[0]),
@@ -663,13 +676,14 @@ class Fleet:
 
     def servable(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
                  now: float | None = None, env_options_sha256: str | None = None,
-                 reserve: Mapping[str, Any] | None = None, group_size: int = 1) -> int:
+                 reserve: Mapping[str, Any] | None = None, group_size: int = 1,
+                 include_unknown: bool = False) -> int:
         """How many machines ``servable_machines`` finds; 0 when, together, they could not hold ``group_size``
         sessions at once (a precommit whose machines cannot host its group is never accepted, so a saturation of
-        its own group is never the miner's doing)."""
+        its own group is never the miner's doing). ``include_unknown``: see ``servable_machines``."""
         machines = self.servable_machines(image=image, env=env, env_package=env_package, budgets=budgets,
                                           validity_s=validity_s, now=now, env_options_sha256=env_options_sha256,
-                                          reserve=reserve)
+                                          reserve=reserve, include_unknown=include_unknown)
         if int(group_size) > 1 and self.sessions_hostable(machines, reserve) < int(group_size):
             return 0
         return len(machines)

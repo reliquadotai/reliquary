@@ -2,6 +2,7 @@
 place it; a fleet view that is not ready is answered retryably, a task no serving machine can take is refused for
 the window, and nothing is recorded either way."""
 import asyncio
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -12,10 +13,13 @@ from reliquary.sandbox.rl_routes import PRECOMMIT_STATUS  # noqa: E402
 from reliquary.sandbox.sessions import token_validity_s  # noqa: E402
 from reliquary.sandbox.tasks import ResolvedTask  # noqa: E402
 from tests.unit.episode_v2_fixtures import ENV_PACKAGE, EPISODE, SANDBOX_ENV, TASK  # noqa: E402
-from tests.unit.sandbox_fixtures import ADDRESS, GIB, IMAGE, NOW, capacity_report  # noqa: E402
+from reliquary.sandbox.fleet import HEARTBEAT_MAX_AGE_S, Fleet  # noqa: E402
+from tests.unit.sandbox_fixtures import (  # noqa: E402
+    ADDRESS, GIB, IMAGE, NOW, capacity_report, machine_document, signer,
+)
 from tests.unit.test_fleet_resources import RESOURCES  # noqa: E402
 from tests.unit.test_rl_episode_wiring import _services  # noqa: E402
-from tests.unit.test_sandbox_fleet import PICK, make  # noqa: E402
+from tests.unit.test_sandbox_fleet import PICK, Clock, make  # noqa: E402
 
 OTHER = "registry.example/other@sha256:" + "b" * 64
 
@@ -124,6 +128,78 @@ def test_an_image_on_no_machine_of_a_served_env_is_refused_at_the_precommit(tmp_
     # 8 slots, but 4 000 mCPU hold only 4 sessions of 1 000: its group of 8 cannot run at once on this fleet
     reason, _ = asyncio.run(services.precommit_admission(admission(services, image=IMAGE, cpu_millis=1_000)))
     assert reason == "task_unservable"
+
+
+SECOND = "http://10.0.0.6:8080"
+
+
+def two_machine_services(tmp_path):
+    """The test env (M = 8) over two machines of 4 sessions each: its group fits only on both together."""
+    services, _ = _services(tmp_path)
+    keys = tmp_path / "two"
+    keys.mkdir()
+    first, second = signer(keys, "a", "ka"), signer(keys, "b", "kb")
+    documents = [machine_document(first), machine_document(second, machine_id="machine-2", address=SECOND)]
+    served, clock = {}, Clock()
+
+    async def read_documents():
+        return documents
+
+    async def fetch(address):
+        return served.get(address)
+
+    fleet = Fleet(read_documents=read_documents, fetch_report=fetch, clock=clock)
+    asyncio.run(fleet.refresh_directory())
+    fleet.resources_required = True
+
+    def report(signed, at, **change):
+        kw = dict(at=at, env_packages={SANDBOX_ENV: ENV_PACKAGE}, resources=RESOURCES)
+        if signed is second:
+            kw.update(machine_id="machine-2", address=SECOND)
+        kw.update(change)
+        return capacity_report(signed, **kw)
+
+    services.fleet, services.clock = fleet, clock
+    return services, fleet, clock, served, first, second, report
+
+
+def test_a_group_needing_a_machine_that_missed_its_heartbeat_is_answered_retryably(tmp_path):
+    services, fleet, clock, served, first, second, report = two_machine_services(tmp_path)
+    value = admission(services, cpu_millis=500)
+    served[ADDRESS], served[SECOND] = report(first, NOW), report(second, NOW)
+    asyncio.run(fleet.poll_once())
+    assert asyncio.run(services.precommit_admission(value)) is None                # 4 + 4 sessions hold M = 8
+    # The second machine misses its heartbeats: only the first is fresh, and alone it holds 4 of the 8.
+    clock.now = NOW + HEARTBEAT_MAX_AGE_S + 10
+    served[ADDRESS], served[SECOND] = report(first, clock.now), None
+    asyncio.run(fleet.poll_once())
+    assert "machine-2" not in fleet.drained
+    assert fleet.could_place(**task(now=clock.now, validity_s=4500)) is True       # the open path places it
+    reason, _ = asyncio.run(services.precommit_admission(value))
+    assert reason == "fleet_unavailable"                                            # never final on a gap
+
+
+def test_a_group_no_complete_fresh_view_can_host_is_refused_for_the_window(tmp_path):
+    services, fleet, clock, served, first, second, report = two_machine_services(tmp_path)
+    served[ADDRESS], served[SECOND] = report(first, NOW), report(second, NOW, images=(OTHER,))
+    asyncio.run(fleet.poll_once())
+    reason, detail = asyncio.run(services.precommit_admission(admission(services, cpu_millis=500)))
+    assert reason == "task_unservable" and detail["machines"] == 0
+
+
+async def test_a_slow_task_source_is_answered_retryably_never_admitted_unchecked(tmp_path):
+    services, _ = _services(tmp_path)
+    services.book.policy = dataclasses.replace(services.book.policy, io_timeout_s=0.01)
+    view = services.views[EPISODE]
+
+    async def slow(index):
+        await asyncio.sleep(3600)
+
+    services.views[EPISODE] = type(view)(policy=view.policy, resolve_task=slow)
+    services.fleet.serving = lambda *a, **k: pytest.fail("no fleet check without the task")
+    reason, detail = await services.precommit_admission(SimpleNamespace(environment=EPISODE, task_index=TASK,
+                                                                        window=1))
+    assert reason == "fleet_unavailable" and detail["why"] == "task_resolve_timeout"
 
 
 async def test_a_task_the_open_path_cannot_judge_now_is_answered_retryably(tmp_path):

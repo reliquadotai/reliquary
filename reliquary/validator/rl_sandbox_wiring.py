@@ -301,8 +301,11 @@ class RlEpisodeServices:
             return None                                # not an episode env here: the runtime refuses it
         try:
             task = await asyncio.wait_for(view.resolve_task(int(value.task_index)), self.book.policy.io_timeout_s)
+        except TimeoutError:
+            # The source is slow now: never admitted unchecked, never a final answer.
+            return "fleet_unavailable", {"environment": environment, "why": "task_resolve_timeout"}
         except Exception:
-            return None
+            return None                                # a task the source has not: the runtime's own checks
         policy = view.policy
         options = getattr(task, "env_options_sha256", None)
         if not self.fleet.serving(policy.sandbox_env, policy.env_package, env_options_sha256=options):
@@ -315,12 +318,18 @@ class RlEpisodeServices:
                          validity_s=token_validity_s(self.book.policy.open_window_s, int(budgets["wall_s"]),
                                                      getattr(task, "prepare_timeout_s", None)),
                          env_options_sha256=options, reserve=reserve)
-        machines = self.fleet.servable(**placement, group_size=policy.pool_seeds // 2)     # M at once
+        group = policy.pool_seeds // 2
+        machines = self.fleet.servable(**placement, group_size=group)     # M at once
         if machines >= MIN_SERVING_MACHINES:
             return None
-        if self.fleet.could_place(**placement, now=self.clock()) is None:
+        verdict = self.fleet.could_place(**placement, now=self.clock())
+        if verdict is None:
             # A machine that served it when last heard is stale or drained, or one's resources cannot be read:
             # the open path itself would answer retryably.
+            return "fleet_unavailable", {"environment": environment}
+        if verdict and self.fleet.servable(**placement, group_size=group, include_unknown=True) >= MIN_SERVING_MACHINES:
+            # Its fresh machines alone cannot host its group, but with the ones missing a heartbeat (or whose
+            # resources cannot be read now) they could: a partial view never gives a final answer.
             return "fleet_unavailable", {"environment": environment}
         return "task_unservable", {"environment": environment, "task_index": int(value.task_index),
                                    "image": task.image, "cpu_millis": reserve["cpu_millis"], "machines": machines}
@@ -649,7 +658,8 @@ def build_rl_episode_services(
     precommit_router = build_episode_precommit_router(
         record=runtime.record_episode_precommit, current_window=current_window,
         validator_hotkey=validator_hotkey, policy=policy, prefix=RL_PREFIX, registration=registration,
-        clock=clock, admit=admit)
+        clock=clock, admit=admit,
+        precheck=lambda value: runtime.record_episode_precommit(value, dry_run=True))
     checkers = {name: EpisodeGroupChecker(policy=p, renderer=renderers[name], source=environments[name].source,
                                           chunk_tokens=chunk_tokens)
                 for name, p in policies.items()}

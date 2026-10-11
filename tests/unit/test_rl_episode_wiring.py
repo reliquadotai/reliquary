@@ -515,6 +515,42 @@ def test_the_precommit_route_asks_the_admission_before_it_records_anything(tmp_p
     assert post().status_code == 200 and len(recorded) == 1
 
 
+def test_the_precommit_routes_own_final_checks_and_resends_come_before_the_admission(tmp_path):
+    """a final refusal of the runtime's checks is never hidden by a retryable admission refusal, and the resend
+    of a recorded precommit is answered without the admission."""
+    from reliquary.services.runtime import EpisodePrecommitRefused
+
+    rt = episode_runtime(tmp_path)
+    asked, recorded, checks = [], [], []
+
+    async def admit(value):
+        asked.append(value)
+        return "fleet_unavailable", {}
+
+    def record(value):
+        recorded.append(value)
+        return True, "a" * 64
+
+    def precheck(value):
+        answer = checks.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    client = _precommit_client(rt, verify=_signed_only([]), record=record, admit=admit, precheck=precheck)
+    post = lambda: client.post(f"{RL_PREFIX}/episodes/precommit",  # noqa: E731
+                               json=_precommit_body(rt, signature="good"))
+    checks.append(EpisodePrecommitRefused("task_out_of_range"))
+    answer = post()
+    assert answer.status_code == 409 and answer.json()["reason"] == "task_out_of_range"
+    checks.append((False, "b" * 64))                                     # already recorded: a resend
+    answer = post()
+    assert answer.status_code == 200 and answer.json() == {"precommit_sha256": "b" * 64, "created": False}
+    assert asked == [] and recorded == []
+    checks.append((True, "c" * 64))                                      # a new one: the admission decides
+    assert post().status_code == 503 and len(asked) == 1 and recorded == []
+
+
 def test_the_built_precommit_route_asks_the_services_admission(tmp_path):
     """the router the wiring builds refuses through ``RlEpisodeServices.precommit_admission`` (a real signed
     request), before the runtime records anything."""
@@ -541,6 +577,18 @@ def test_the_built_precommit_route_asks_the_services_admission(tmp_path):
     assert answer.status_code == 409 and answer.json()["reason"] == "task_unservable", answer.json()
     assert len(seen) == 1 and seen[0].task_index == body["precommit"]["task_index"]
     assert rt.episode_precommit(seen[0].sha256) is None                # nothing recorded
+    # once recorded, its resend is answered as before, whatever the admission would say now
+    assert rt.record_episode_precommit(seen[0]) == (True, seen[0].sha256)
+    answer = TestClient(app).post(episode_precommit_path(RL_PREFIX), json=body)
+    assert answer.status_code == 200 and answer.json()["created"] is False and len(seen) == 1
+    # a final refusal of the runtime's own checks comes before the admission
+    from reliquary.protocol.service_episode import EpisodePrecommit
+
+    late = EpisodePrecommit.from_dict({**seen[0].to_dict(), "task_index": 10**6})
+    body = signed_precommit_body(precommit=late, sign_binding=lambda b: miner.sign(b).hex(), now=time.time(),
+                                 validator_hotkey=VALIDATOR_SS58, path=episode_precommit_path(RL_PREFIX))
+    answer = TestClient(app).post(episode_precommit_path(RL_PREFIX), json=body)
+    assert answer.status_code == 409 and answer.json()["reason"] == "task_out_of_range" and len(seen) == 1
 
 
 def test_unsigned_requests_claiming_a_hotkey_do_not_spend_its_rate(tmp_path):

@@ -980,7 +980,8 @@ class ServiceRuntime:
                                       randomness=row[0])
 
     # --- episode precommits ---
-    def record_episode_precommit(self, precommit, *, now: float | None = None) -> tuple[bool, str]:
+    def record_episode_precommit(self, precommit, *, now: float | None = None,
+                                 dry_run: bool = False) -> tuple[bool, str]:
         """Record a miner's precommit against the FROZEN window: this order, an env of the window with
         an episode policy, a task of its dataset, the window's checkpoint and the task's announced pool.
         ``(created, sha256)``; the same precommit again is ``(False, sha256)``. A refusal raises
@@ -989,7 +990,9 @@ class ServiceRuntime:
         session is spent on it; the cooldown state lives in the validator, which installs
         ``task_in_cooldown(environment, task_index, window) -> bool``. Only the PROMPT cooldown (task
         index) is consulted, not the content-digest cooldown: a task whose prompt TEXT is cooling down under
-        another index is not refused here (the batcher's own checks still apply at admission). BLOCKING (SQLite): the route runs it in a thread."""
+        another index is not refused here (the batcher's own checks still apply at admission). ``dry_run``: every
+        check, nothing written (``(True, sha256)`` for a precommit that would be created). BLOCKING (SQLite): the
+        route runs it in a thread."""
         from reliquary.protocol.service_episode import EpisodePrecommit
 
         if not isinstance(precommit, EpisodePrecommit):
@@ -1035,6 +1038,8 @@ class ServiceRuntime:
             probe = self.task_in_cooldown
             if probe is not None and probe(precommit.environment, precommit.task_index, precommit.window):
                 raise EpisodePrecommitRefused("task_in_cooldown")
+            if dry_run:
+                return True, digest
             self.db.execute("INSERT INTO service_episode_precommits VALUES(?,?,?,?,?,?,?,?)",
                             (order, digest, precommit.window, precommit.environment, precommit.task_index,
                              precommit.hotkey, body, instant))

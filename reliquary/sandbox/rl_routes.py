@@ -90,12 +90,15 @@ def build_episode_precommit_router(
     body_timeout_s: float = BODY_TIMEOUT_S, max_per_minute: int = MAX_PER_MINUTE,
     max_preauth: int = MAX_PREAUTH, max_tracked_hotkeys: int = MAX_TRACKED_HOTKEYS,
     admit: Callable[[Any], Awaitable[tuple[str, dict] | None]] | None = None,
+    precheck: Callable[[Any], tuple[bool, str]] | None = None,
 ) -> APIRouter:
     """``record``: ``ServiceRuntime.record_episode_precommit`` (blocking, run in a thread);
     ``current_window``: the service window admissions are open for, or None between windows. It is
     called on the event loop: it must read memory only (never the runtime's SQLite). ``admit(value)``: the RL
     wiring's check that the env is served and the task servable, before anything is recorded; a
-    ``(reason, detail)`` answer refuses the precommit."""
+    ``(reason, detail)`` answer refuses the precommit. ``precheck``: ``record``'s own checks with nothing written
+    (blocking, run in a thread), asked before ``admit``: its final refusals are answered first, and the resend of
+    a precommit already recorded is answered at once, without the admission."""
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
@@ -177,6 +180,10 @@ def build_episode_precommit_router(
         count(hotkey, now)
         return value, hotkey
 
+    def _refused_by_record(refused) -> JSONResponse:
+        detail = {"precommit_sha256": refused.existing} if refused.existing else {}
+        return _refusal(refused.reason, detail, retry_s)
+
     async def handle(value, hotkey: str) -> JSONResponse:
         from reliquary.services.runtime import EpisodePrecommitRefused
 
@@ -186,14 +193,22 @@ def build_episode_precommit_router(
         if value.window != window:
             return _refusal("precommit_stale", {"window": window})
         if admit is not None:
+            if precheck is not None:
+                try:
+                    created, digest = await asyncio.to_thread(precheck, value)
+                except EpisodePrecommitRefused as refused:
+                    return _refused_by_record(refused)
+                if not created:                       # already recorded: its resend is answered as before
+                    logger.info("episode precommit %s of %s: %s task %d, window %d (resent)", digest[:12],
+                                hotkey[:12], value.environment, value.task_index, value.window)
+                    return _answer({"precommit_sha256": digest, "created": False})
             refused = await admit(value)
             if refused is not None:
                 return _refusal(refused[0], refused[1], retry_s)
         try:
             created, digest = await asyncio.to_thread(record, value)
         except EpisodePrecommitRefused as refused:
-            detail = {"precommit_sha256": refused.existing} if refused.existing else {}
-            return _refusal(refused.reason, detail, retry_s)
+            return _refused_by_record(refused)
         logger.info("episode precommit %s of %s: %s task %d, window %d%s", digest[:12], hotkey[:12],
                     value.environment, value.task_index, value.window, "" if created else " (resent)")
         return _answer({"precommit_sha256": digest, "created": created})

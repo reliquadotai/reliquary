@@ -27,6 +27,24 @@ def test_a_precommit_is_recorded_once_and_read_back(tmp_path):
     assert rt.episode_precommit("not a digest") is None
 
 
+def test_a_dry_run_checks_everything_and_writes_nothing(tmp_path):
+    rt = episode_runtime(tmp_path)
+    precommit = episode_precommit(rt.contract, hotkey=HOTKEY)
+    assert rt.record_episode_precommit(precommit, dry_run=True) == (True, precommit.sha256)
+    assert rt.episode_precommit(precommit.sha256) is None                       # nothing written
+    out_of_range = EpisodePrecommit.from_dict({**precommit.to_dict(), "task_index": 1000})
+    with pytest.raises(EpisodePrecommitRefused) as refused:
+        rt.record_episode_precommit(out_of_range, dry_run=True)
+    assert refused.value.reason == "task_out_of_range"
+    assert rt.record_episode_precommit(precommit) == (True, precommit.sha256)
+    assert rt.record_episode_precommit(precommit, dry_run=True) == (False, precommit.sha256)   # a resend
+    other = episode_precommit(rt.contract, hotkey=HOTKEY, task=TASK + 1)
+    rt.task_in_cooldown = lambda environment, task, window: task == TASK + 1
+    with pytest.raises(EpisodePrecommitRefused) as refused:
+        rt.record_episode_precommit(other, dry_run=True)
+    assert refused.value.reason == "task_in_cooldown"
+
+
 def test_each_hotkey_and_task_has_its_own_precommit(tmp_path):
     rt = episode_runtime(tmp_path)
     precommits = [episode_precommit(rt.contract, hotkey=HOTKEY), episode_precommit(rt.contract, hotkey="5Another"),
