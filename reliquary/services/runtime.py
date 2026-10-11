@@ -218,7 +218,8 @@ class ServiceRuntime:
             raise ValueError("the order's missing_box differs from the by-type default: " + "; ".join(problems))
         # An episode's length is bounded by the contract itself (MAX_EPISODE_TOKENS) and by the wire.
         _validate_qualification(qualification, contract)
-        self.contract = self.order_contract = contract
+        self.order_contract = contract
+        self._contract_view = contract
         self.qualification = json.loads(canonical_json_bytes(qualification))
         self._round_at = drand_round_at or _drand_round_at
         self.lock = threading.RLock()
@@ -247,6 +248,7 @@ class ServiceRuntime:
                 CREATE TABLE IF NOT EXISTS service_segments(number INTEGER PRIMARY KEY, first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL, flush_at REAL NOT NULL, sha256 TEXT, size INTEGER, windows TEXT, checkpoints TEXT, committed INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS service_index_pages(first_number INTEGER PRIMARY KEY, body BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_schedule_requests(order_id TEXT NOT NULL, request_id TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, revision INTEGER NOT NULL, window INTEGER NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, request_id));
+                CREATE TABLE IF NOT EXISTS service_schedule_waits(order_id TEXT NOT NULL, request_id TEXT NOT NULL, first_at REAL NOT NULL, first_window INTEGER NOT NULL, checks INTEGER NOT NULL, detail TEXT NOT NULL, PRIMARY KEY(order_id, request_id));
                 CREATE TABLE IF NOT EXISTS service_pending_install(order_id TEXT PRIMARY KEY, revision TEXT NOT NULL, receipt TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS service_episode_precommits(order_id TEXT NOT NULL, sha256 TEXT NOT NULL, window INTEGER NOT NULL, environment TEXT NOT NULL, task_index INTEGER NOT NULL, hotkey TEXT NOT NULL, body TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(order_id, sha256), UNIQUE(order_id, window, environment, task_index, hotkey));
             """)
@@ -274,6 +276,7 @@ class ServiceRuntime:
             self._reload_bans()
             # I1: the last answer any computation gave, read by admission without the lock (``active_cached``).
             self._active_last = self._compute_active(instant)
+            self._refresh_contract_view()
         except BaseException:
             self.db.close()
             raise
@@ -409,10 +412,23 @@ class ServiceRuntime:
             return json.loads(row[0]) if row is not None else {}
 
     # --- schedule (decisions E, G; R6) ---
+    @property
+    def contract(self) -> ServiceContract:
+        """The order's contract with the envs the latest schedule added (``service_catalogue``); its sha256,
+        bytes and ``to_dict`` are the order's. Rebuilt after every schedule appended, from the latest one read
+        back; rows only accumulate (``keeps_added_of``), so it serves every window's envs."""
+        return self._contract_view
+
+    def _refresh_contract_view(self) -> None:
+        from reliquary.protocol.service_catalogue import catalogued
+
+        with self.lock:
+            self._contract_view = catalogued(self.order_contract, self._schedule().to_dict())
+
     def _schedule(self) -> ServiceSchedule:
         payload = self.db.execute("SELECT payload FROM service_schedules WHERE order_id=? ORDER BY revision DESC LIMIT 1",
-                                  (self.contract.sha256,)).fetchone()[0]
-        return ServiceSchedule.from_dict(json.loads(payload), self.contract)
+                                  (self.order_contract.sha256,)).fetchone()[0]
+        return ServiceSchedule.from_dict(json.loads(payload), self.order_contract)
 
     @property
     def schedule(self) -> ServiceSchedule:
@@ -427,10 +443,10 @@ class ServiceRuntime:
         """
         with self.lock:
             row = self.db.execute("SELECT envelope FROM service_windows WHERE order_id=? AND window=?",
-                                  (self.contract.sha256, window)).fetchone()
+                                  (self.order_contract.sha256, window)).fetchone()
             if row is None:
                 return self._schedule()
-            return ServiceSchedule.from_dict(json.loads(row[0])["schedule"], self.contract)
+            return ServiceSchedule.from_dict(json.loads(row[0])["schedule"], self.order_contract)
 
     def apply_schedule(self, schedule: ServiceSchedule, *, request_id: str, window: int) -> bool:
         """Append the next schedule revision. It never touches an open window's envelope (R6).
@@ -441,17 +457,19 @@ class ServiceRuntime:
         """
         if not isinstance(schedule, ServiceSchedule):
             raise ValueError("a ServiceSchedule is required")
-        schedule = ServiceSchedule.from_dict(schedule.to_dict(), self.contract)  # same order, valid
+        schedule = ServiceSchedule.from_dict(schedule.to_dict(), self.order_contract)  # same order, valid
         _identifier(request_id, "schedule request_id")
         _integer(window, "window", 0)
         with self._txn():
-            return self._insert_schedule(schedule, request_id, window)
+            inserted = self._insert_schedule(schedule, request_id, window)
+        self._refresh_contract_view()
+        return inserted
 
     def _insert_schedule(self, schedule: ServiceSchedule, request_id: str, window: int) -> bool:
         """``apply_schedule``'s body; the caller holds the write transaction."""
         payload = schedule.canonical.decode()
         known = self.db.execute("SELECT payload FROM service_schedules WHERE order_id=? AND request_id=?",
-                                (self.contract.sha256, request_id)).fetchone()
+                                (self.order_contract.sha256, request_id)).fetchone()
         if known is not None:
             if known[0] != payload:
                 raise ValueError("schedule request id was already used for another schedule")
@@ -461,11 +479,12 @@ class ServiceRuntime:
             raise ValueError("schedule revisions must increase by one")
         schedule.keeps_added_of(current)
         self.db.execute("INSERT INTO service_schedules VALUES(?,?,?,?,?)",
-                        (self.contract.sha256, schedule.revision, request_id, window, payload))
+                        (self.order_contract.sha256, schedule.revision, request_id, window, payload))
         return True
 
     def apply_pending_schedule_request(self, store, *, window: int, now: float | None = None,
-                                       installed_version=None) -> ServiceSchedule:
+                                       installed_version=None, catalogue_check=None,
+                                       add_wait_max_s: float | None = None) -> ServiceSchedule:
         """Apply at most one new operator request from ``store`` and return the schedule ``window`` uses.
 
         The request file is not trusted: it is validated here again (``schedule.check_request``:
@@ -477,10 +496,17 @@ class ServiceRuntime:
         so a restart neither applies it twice nor loses it. R6: the envelope of an already open
         window is frozen, so the answer for such a window stays its frozen schedule and the change
         lands at the next window that opens.
+
+        An added env (``add``) is checked by ``catalogue_check`` (the validator's activation checks) and lands
+        at the next window like any change (R6). When those checks cannot be settled yet (``ScheduleNotYet``)
+        the request stays pending: nothing is recorded under its id, its status is "waiting" with the reason,
+        and it is checked again at the next boundary; once it has waited more than ``add_wait_max_s``
+        (default ``schedule.ADD_WAIT_MAX_S``, from its first wait, kept across restarts) it is refused.
         """
         _integer(window, "window", 0)
         try:
-            self._consume_schedule_request(store, window, _instant(now), installed_version)
+            self._consume_schedule_request(store, window, _instant(now), installed_version, catalogue_check,
+                                           add_wait_max_s)
         except Exception:  # an operator mistake or a broken disk must never stop the validator loop
             logger.exception("schedule request could not be processed (window %d)", window)
         return self.window_schedule(window)
@@ -497,9 +523,10 @@ class ServiceRuntime:
             store.report("invalid", status="refused", detail=detail, revision=revision)
         self._last_invalid_detail = detail
 
-    def _consume_schedule_request(self, store, window: int, at: float, installed_version) -> None:
-        from reliquary.services.schedule import check_request
-        order = self.contract.sha256
+    def _consume_schedule_request(self, store, window: int, at: float, installed_version, catalogue_check=None,
+                                  add_wait_max_s: float | None = None) -> None:
+        from reliquary.services.schedule import ADD_WAIT_MAX_S, ScheduleNotYet, check_request
+        order = self.order_contract.sha256
         current = self.schedule
         try:
             request = store.take()
@@ -532,9 +559,16 @@ class ServiceRuntime:
             return
         try:
             changed = check_request(request, contract=self.contract, current=current,
-                                    installed_version=installed_version)
+                                    installed_version=installed_version, catalogue_check=catalogue_check,
+                                    read_attestation=store.read_attestation)
             status, detail = "applied", (f"applied during window {window}; it takes effect at the next "
                                          f"window that opens (open windows keep their frozen schedule)")
+        except ScheduleNotYet as exc:
+            bound = ADD_WAIT_MAX_S if add_wait_max_s is None else add_wait_max_s
+            if self._wait_schedule_request(store, request_id, window, at, str(exc), bound, current.revision):
+                return
+            changed, status, detail = None, "refused", (f"{exc}; its activation checks could not be settled "
+                                                        f"within {bound:g} s, the request is refused")
         except ValueError as exc:
             changed, status, detail = None, "refused", str(exc)
         except Exception as exc:  # defensive: a request must never be half applied
@@ -548,7 +582,34 @@ class ServiceRuntime:
             revision = changed.revision if changed is not None else self._schedule().revision
             self.db.execute("INSERT INTO service_schedule_requests VALUES(?,?,?,?,?,?,?)",
                             (order, request_id, status, detail, revision, window, at))
+            self.db.execute("DELETE FROM service_schedule_waits WHERE order_id=?", (order,))
+        if changed is not None:
+            self._refresh_contract_view()
         store.report(request_id, status=status, detail=detail, revision=revision)
+
+    def _wait_schedule_request(self, store, request_id: str, window: int, at: float, reason: str,
+                               bound: float, revision: int) -> bool:
+        """Record that ``request_id``'s activation checks could not be settled at this boundary. True while
+        it may still wait (status "waiting" with the reason); False once it has waited more than ``bound``
+        seconds since its first wait, for the caller to refuse it. Never records the request id as handled."""
+        order = self.order_contract.sha256
+        with self._txn():
+            row = self.db.execute("SELECT first_at, first_window, checks FROM service_schedule_waits "
+                                  "WHERE order_id=? AND request_id=?", (order, request_id)).fetchone()
+            first_at, first_window, checks = row if row is not None else (at, window, 0)
+            if at - first_at > bound:
+                return False
+            # One request waits at a time: a replaced request's wait goes.
+            self.db.execute("DELETE FROM service_schedule_waits WHERE order_id=? AND request_id<>?",
+                            (order, request_id))
+            self.db.execute("INSERT OR REPLACE INTO service_schedule_waits VALUES(?,?,?,?,?,?)",
+                            (order, request_id, first_at, first_window, checks + 1, reason))
+        left = max(0.0, bound - (at - first_at))
+        store.report(request_id, status="waiting",
+                     detail=(f"{reason}; pending since window {first_window} ({checks + 1} boundary check(s)), "
+                             f"checked again at the next window boundary, refused if still unsettled in "
+                             f"{left:.0f} s"), revision=revision)
+        return True
 
     # --- cooldown advice (decision E): recommendation only ---
     def refresh_cooldown_advice(self, *, window: int, populations: dict[str, int]) -> dict[str, dict]:

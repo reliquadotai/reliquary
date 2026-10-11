@@ -8,6 +8,12 @@ envelope (R6). No network endpoint.
     python -m reliquary.services.schedule --folder DIR show
     python -m reliquary.services.schedule --folder DIR set --active a,b --share a=6000 --share b=4000
     python -m reliquary.services.schedule --folder DIR set --cooldown a=200
+    python -m reliquary.services.schedule --folder DIR add NAME --entry block.json --attestation report.json
+
+``add`` adds a bridged signed-episode env to the running run: its added block (``--entry``) and the
+operator's conformance report, a file of the request folder whose sha256 the block names. The validator
+runs its activation checks; when it cannot settle them yet (a stale fleet view) the request stays pending
+("waiting", with the reason) for at most ``RELIQUARY_SCHEDULE_ADD_WAIT_MAX_S`` seconds, then is refused.
 
 ``--folder`` (or ``RELIQUARY_SERVICE_SCHEDULE_FOLDER``) is required: there is no default location.
 The runtime database is read read-only, from ``<folder>/runtime.sqlite3`` unless ``--db`` is given.
@@ -16,15 +22,17 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from reliquary.protocol.service_contract import ServiceContract, _identifier
 from reliquary.protocol.service_schedule import ServiceSchedule, next_schedule
@@ -33,6 +41,9 @@ from reliquary.validator.control import write_json
 
 REQUEST_SCHEMA = "service-schedule-request/v1"
 REQUEST_FIELDS = {"schema", "request_id", "order_sha256", "revision", "active", "shares", "cooldowns"}
+OPTIONAL_REQUEST_FIELDS = frozenset({"add"})   # envs added to the running run
+ATTESTATION_MAX_BYTES = 16 * 1024 * 1024
+_ATTESTATION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 MAX_FILE_BYTES = 64 * 1024
 FOLDER_ENV = "RELIQUARY_SERVICE_SCHEDULE_FOLDER"
 DB_NAME = "runtime.sqlite3"
@@ -40,6 +51,38 @@ DB_NAME = "runtime.sqlite3"
 
 class ScheduleRefused(ValueError):
     """A schedule request that must not be applied; the message is shown to the operator."""
+
+
+class ScheduleNotYet(Exception):
+    """An added env's activation checks cannot be settled now (a stale or incomplete fleet view, an I/O
+    error): the request stays pending and is checked again at the next window boundary. Not a ValueError,
+    so no refusal path takes it for one."""
+
+
+def _wait_max_s() -> int:
+    raw = os.environ.get("RELIQUARY_SCHEDULE_ADD_WAIT_MAX_S", "3600")
+    if not (raw.isascii() and raw.isdigit()) or not 0 < int(raw) <= 7 * 86400:
+        raise ValueError("RELIQUARY_SCHEDULE_ADD_WAIT_MAX_S must be a whole number of seconds in [1, 604800]")
+    return int(raw)
+
+
+# How long a request that adds an env may wait on activation checks that cannot be settled yet, counted
+# from the first boundary that could not settle them; past it the request is refused (final). An operator
+# setting: one hour by default, enough for a gateway restart or a missed report, short enough that a dead
+# machine still listed in the directory does not hold the request (and its other changes) for long.
+ADD_WAIT_MAX_S = _wait_max_s()
+
+
+def raise_activation_problem(name: str, problem: str | None) -> None:
+    """Turn an activation answer (``validator.catalogue_activation``: None, a final problem, or a ``NotYet``)
+    into ``check_request``'s ``catalogue_check`` outcome."""
+    if problem is None:
+        return
+    from reliquary.validator.catalogue_activation import NotYet
+
+    if isinstance(problem, NotYet):
+        raise ScheduleNotYet(f"cannot add {name} yet: {problem}")
+    raise ScheduleRefused(f"cannot add {name}: {problem}")
 
 
 # ---------------------------------------------------------------- file store
@@ -59,6 +102,17 @@ def _check_owner_and_mode(info, label: str) -> None:
 def _read_json_file(folder: Path, name: str):
     """Strict JSON of ``folder/name`` or None if absent. Refuses symlinks, non-regular files,
     group/world-writable files, files over ``MAX_FILE_BYTES`` and anything but strict JSON."""
+    raw = _read_bytes(folder, name, MAX_FILE_BYTES)
+    if raw is None:
+        return None
+    try:
+        return strict_json_loads(raw)
+    except ValueError as exc:  # includes bad UTF-8, duplicate keys, NaN
+        raise ValueError(f"{name} is not strict JSON: {exc}") from exc
+
+
+def _read_bytes(folder: Path, name: str, max_bytes: int) -> bytes | None:
+    """The bytes of ``folder/name`` or None if absent, with ``_read_json_file``'s safety checks."""
     try:
         directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
     except FileNotFoundError:
@@ -79,23 +133,26 @@ def _read_json_file(folder: Path, name: str):
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"{name} is not a regular file")
         _check_owner_and_mode(info, name)
-        if info.st_size > MAX_FILE_BYTES:
-            raise ValueError(f"{name} is larger than {MAX_FILE_BYTES} bytes")
-        raw = handle.read(MAX_FILE_BYTES + 1)
-    if len(raw) > MAX_FILE_BYTES:
-        raise ValueError(f"{name} is larger than {MAX_FILE_BYTES} bytes")
-    try:
-        return strict_json_loads(raw)
-    except ValueError as exc:  # includes bad UTF-8, duplicate keys, NaN
-        raise ValueError(f"{name} is not strict JSON: {exc}") from exc
+        if info.st_size > max_bytes:
+            raise ValueError(f"{name} is larger than {max_bytes} bytes")
+        raw = handle.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{name} is larger than {max_bytes} bytes")
+    return raw
 
 
-def build_request(*, order_sha256: str, revision: int, active=None, shares=None, cooldowns=None) -> dict:
-    return {"schema": REQUEST_SCHEMA, "request_id": uuid.uuid4().hex,
-            "order_sha256": order_sha256, "revision": revision,
-            "active": None if active is None else sorted(active),
-            "shares": None if shares is None else dict(shares),
-            "cooldowns": None if cooldowns is None else dict(cooldowns)}
+def build_request(*, order_sha256: str, revision: int, active=None, shares=None, cooldowns=None,
+                  add=None) -> dict:
+    """A request file's content; ``add`` (``{env: {"environment", "catalogue", "attestation"}}``) only when
+    given, so a request that adds nothing keeps its exact fields."""
+    request = {"schema": REQUEST_SCHEMA, "request_id": uuid.uuid4().hex,
+               "order_sha256": order_sha256, "revision": revision,
+               "active": None if active is None else sorted(active),
+               "shares": None if shares is None else dict(shares),
+               "cooldowns": None if cooldowns is None else dict(cooldowns)}
+    if add is not None:
+        request["add"] = {name: dict(value) for name, value in add.items()}
+    return request
 
 
 class ScheduleRequestStore:
@@ -126,6 +183,19 @@ class ScheduleRequestStore:
         if value is not None and not isinstance(value, dict):
             raise ValueError("schedule request must be a JSON object")
         return value
+
+    def read_attestation(self, name: str) -> tuple[bytes, Any]:
+        """An attestation file of this folder (a plain name): its bytes and its strict JSON. ValueError
+        when it is absent, unsafe or not JSON."""
+        if not isinstance(name, str) or not _ATTESTATION_NAME.fullmatch(name):
+            raise ValueError("an attestation is a plain file name of the request folder")
+        raw = _read_bytes(self.folder, name, ATTESTATION_MAX_BYTES)
+        if raw is None:
+            raise ValueError(f"attestation {name} is not in the request folder")
+        try:
+            return raw, strict_json_loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"attestation {name} is not strict JSON: {exc}") from exc
 
     def report(self, request_id: str, *, status: str, detail: str, revision: int) -> None:
         self._ensure_folder()
@@ -160,17 +230,27 @@ def _integer_map(value, name: str) -> dict[str, int] | None:
 
 
 def check_request(request, *, contract: ServiceContract, current: ServiceSchedule,
-                  installed_version: Callable[[str], str | None] | None = None) -> ServiceSchedule:
+                  installed_version: Callable[[str], str | None] | None = None,
+                  catalogue_check: Callable[[str, dict, Any], None] | None = None,
+                  read_attestation: Callable[[str], tuple[bytes, Any]] | None = None) -> ServiceSchedule:
     """The schedule that ``request`` asks for, or ``ScheduleRefused``/``ValueError`` with the reason.
 
     Checks: schema and exact fields; the order hash is the running order's; ``revision`` is exactly
     ``current + 1`` (no replay, no gap); only declared envs; active shares sum to 10000; cooldowns
     within the contract's advice bounds; and, for each env that becomes active, R7: installed, and
     installed version equal to the pinned one. Nothing is mutated.
+
+    An env added by the request (``add``) needs ``read_attestation(file name) -> (bytes, json)``, which reads
+    the operator's attestation (its sha256 must be the block's ``conformance_sha256``), and
+    ``catalogue_check(name, added, attestation)``, the validator's activation checks: it raises
+    ``ScheduleRefused`` when the env cannot be activated, or ``ScheduleNotYet`` when that cannot be settled now
+    (raised from here, after every final check passed). ``contract`` may be the contract view
+    (``ServiceSchedule.contract_view``): an env added earlier is then known.
     """
     installed_version = installed_version or default_installed_version
-    if not isinstance(request, dict) or set(request) != REQUEST_FIELDS:
-        raise ScheduleRefused(f"a schedule request has exactly the fields {sorted(REQUEST_FIELDS)}")
+    if not isinstance(request, dict) or not REQUEST_FIELDS <= set(request) <= REQUEST_FIELDS | OPTIONAL_REQUEST_FIELDS:
+        raise ScheduleRefused(f"a schedule request has exactly the fields {sorted(REQUEST_FIELDS)}, and "
+                              f"optionally {sorted(OPTIONAL_REQUEST_FIELDS)}")
     if request["schema"] != REQUEST_SCHEMA:
         raise ScheduleRefused("unknown schedule request schema")
     try:
@@ -193,19 +273,44 @@ def check_request(request, *, contract: ServiceContract, current: ServiceSchedul
             raise ScheduleRefused("active must be a list of distinct environment names")
     shares = _integer_map(request["shares"], "shares")
     cooldowns = _integer_map(request["cooldowns"], "cooldowns")
-    if active is None and shares is None and cooldowns is None:
+    add = request.get("add")
+    added_blocks: dict[str, dict] = {}
+    if "add" in request:
+        if not isinstance(add, dict) or not add:
+            raise ScheduleRefused("add must name at least one environment")
+        for name, entry in add.items():
+            if not isinstance(entry, dict) or set(entry) != {"environment", "catalogue", "attestation"}:
+                raise ScheduleRefused(f"add.{name} needs exactly environment, catalogue and attestation")
+            if not isinstance(entry["attestation"], str) or not _ATTESTATION_NAME.fullmatch(entry["attestation"]):
+                raise ScheduleRefused(f"add.{name}.attestation must be a plain file name of the request folder")
+            added_blocks[name] = {"environment": entry["environment"], "catalogue": entry["catalogue"]}
+    if active is None and shares is None and cooldowns is None and not added_blocks:
         raise ScheduleRefused("the request changes nothing")
     advice = contract.advice_policy
     for env, windows in (cooldowns or {}).items():
-        if env in contract.environments and not advice["min_windows"] <= windows <= advice["max_windows"]:
+        if (env in contract.environments or env in added_blocks) and not advice["min_windows"] <= windows <= advice["max_windows"]:
             raise ScheduleRefused(f"cooldown {windows} of {env} is outside the contract's bounds "
                                   f"[{advice['min_windows']}, {advice['max_windows']}]")
     try:
-        changed = next_schedule(contract, current, active=active, shares=shares, cooldowns=cooldowns)
+        changed = next_schedule(contract, current, active=active, shares=shares, cooldowns=cooldowns,
+                                add=added_blocks or None)
     except ValueError as exc:
         raise ScheduleRefused(str(exc)) from exc
+    attestations = {}
+    for name, block in added_blocks.items():
+        if catalogue_check is None or read_attestation is None:
+            raise ScheduleRefused(f"cannot add {name}: this process cannot check an added environment")
+        try:
+            raw, attestations[name] = read_attestation(add[name]["attestation"])
+        except (ValueError, OSError) as exc:
+            raise ScheduleRefused(f"cannot add {name}: its attestation cannot be read ({exc})") from exc
+        if hashlib.sha256(raw).hexdigest() != block["catalogue"].get("conformance_sha256"):
+            raise ScheduleRefused(f"cannot add {name}: the attestation file is not the one the entry names "
+                                  f"(conformance_sha256)")
     for env in changed.active_environments():
-        if env in current.active_environments():
+        # An env added by this request is checked by ``catalogue_check``; one added earlier and switched on
+        # now is checked like any env, against the view's entry.
+        if env in current.active_environments() or env in added_blocks:
             continue
         installed = installed_version(env)
         if installed is None:
@@ -213,6 +318,10 @@ def check_request(request, *, contract: ServiceContract, current: ServiceSchedul
         if installed != contract.environments[env]["version"]:
             raise ScheduleRefused(f"cannot activate {env}: the installed version differs from the version pinned "
                                   f"by the order")
+    # Last: the activation checks are the costly ones and the only ones that may answer "not yet", so every
+    # final refusal above wins over a wait.
+    for name, block in added_blocks.items():
+        catalogue_check(name, block, attestations[name])
     return changed
 
 
@@ -281,6 +390,16 @@ def _unhandled_request(store: ScheduleRequestStore, known: dict):
     return pending
 
 
+def _local_catalogue_check(name: str, block: dict, attestation) -> None:
+    """The CLI's part of the activation checks: the attestation (the validator checks the package allowlist,
+    the install and the machines again, and is the authority)."""
+    from reliquary.validator.catalogue_activation import attestation_problem
+
+    problem = attestation_problem(attestation, block)
+    if problem is not None:
+        raise ScheduleRefused(f"cannot add {name}: the attestation: {problem}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m reliquary.services.schedule", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -295,6 +414,14 @@ def main(argv: list[str] | None = None) -> None:
     setter.add_argument("--cooldown", action="append", help="env=windows")
     setter.add_argument("--replace", action="store_true",
                         help="overwrite a pending request the validator has not handled yet (it is printed)")
+    adder = sub.add_parser("add", help="add a bridged signed-episode env to the running run (from the next "
+                                       "window; add it inactive, let miners see it announced, then `set --active`)")
+    adder.add_argument("name")
+    adder.add_argument("--entry", required=True, help="JSON file: the env's added block (bridged_episode describe)")
+    adder.add_argument("--attestation", required=True, help="the conformance report's file name in --folder")
+    adder.add_argument("--active", help="comma-separated environments that run (needs --share for each)")
+    adder.add_argument("--share", action="append", help="env=bps (active shares sum to 10000)")
+    adder.add_argument("--replace", action="store_true", help="overwrite a pending, unhandled request")
     args = parser.parse_args(argv)
     if not args.folder:
         raise SystemExit(f"error: --folder (or ${FOLDER_ENV}) is required")
@@ -302,12 +429,32 @@ def main(argv: list[str] | None = None) -> None:
     store = ScheduleRequestStore(folder)
     state = read_runtime(_open_readonly(Path(args.db) if args.db else folder / DB_NAME))
     contract, schedule = state["contract"], state["schedule"]
-    if args.command == "set":
+    if args.command in ("set", "add"):
         active = None if args.active is None else [x for x in args.active.split(",") if x]
+        add = None
+        if args.command == "add":
+            try:
+                entry = strict_json_loads(Path(args.entry).read_bytes())
+            except (OSError, ValueError) as exc:
+                raise SystemExit(f"error: --entry cannot be read as strict JSON: {exc}") from exc
+            if not isinstance(entry, dict):
+                raise SystemExit("error: --entry must hold a JSON object (the env's added block)")
+            add = {args.name: {**entry, "attestation": args.attestation}}
         request = build_request(order_sha256=contract.sha256, revision=schedule.revision + 1, active=active,
-                                shares=_pairs(args.share, "--share"), cooldowns=_pairs(args.cooldown, "--cooldown"))
+                                shares=_pairs(args.share, "--share"),
+                                cooldowns=_pairs(getattr(args, "cooldown", None), "--cooldown"), add=add)
+        # Checked against the order with the envs the latest schedule added, so an env added earlier can be
+        # switched on, given a share or a cooldown.
+        added = schedule.added_environments()
+        view = schedule.contract_view(contract)
+
+        def installed(name):
+            # An env added earlier: the validator checks its install at the boundary.
+            return added[name]["environment"]["version"] if name in added else default_installed_version(name)
+
         try:
-            check_request(request, contract=contract, current=schedule)
+            check_request(request, contract=view, current=schedule, installed_version=installed,
+                          catalogue_check=_local_catalogue_check, read_attestation=store.read_attestation)
         except ValueError as exc:
             print(f"error: request refused: {exc}", file=sys.stderr)
             raise SystemExit(2)
