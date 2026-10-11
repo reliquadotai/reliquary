@@ -261,3 +261,30 @@ def batch_request(group):
         service_binding=request.service_binding,
         rollouts=[RolloutSubmission(tokens=r.tokens, reward=r.reward, commit=r.commit, env_name=r.env_name)
                   for r in request.rollouts])
+
+
+# --- an env added to the running run ---------------------------------------------------------
+ADDED = "tmax_v2"
+ADDED_PACKAGE = "reliquary-terminal==0.3.0"
+ADDED_IDENTITY = "reliquary-terminal==0.3.0+g827598fa320ad040.vfb2"
+
+
+def added_block(*, catalogue=None, episode=None, **environment_overrides) -> dict:
+    """The ``added`` block of a schedule row (an env entry + its catalogue): a new distribution under a new
+    sandbox env name, within the order's turn and token bounds."""
+    from reliquary.constants import M_ROLLOUTS
+    from reliquary.protocol.service_contract import PUBLIC_SEED_POOL
+
+    environment = {
+        "version": "e" * 64, "dataset": {"id": "reliquary-terminal@0.3.0:tmax", "rows": 2588},
+        "sampling": {"kind": PUBLIC_SEED_POOL, "group_size": M_ROLLOUTS, "pool_seeds": 2 * M_ROLLOUTS,
+                     "renewal_windows": 1},
+        "exploration": 1, "missing_box": "graded", "cooldown_windows": 10, "share_bps": 0,
+        "episode": episode_block(**{"sandbox_env": "reliquary-terminal", "split": "tmax",
+                                    "env_package": ADDED_IDENTITY, "tools": ["bash"], **(episode or {})}),
+    }
+    environment.update(environment_overrides)
+    value = {"package": ADDED_PACKAGE, "options": {"tools": ["bash"], "splits": {"tmax": {"split": "tmax"}}},
+             "rl_split": "tmax", "image_lock_sha256": CATALOGUE_LOCK, "conformance_sha256": "f" * 64}
+    value.update(catalogue or {})
+    return {"environment": environment, "catalogue": value}

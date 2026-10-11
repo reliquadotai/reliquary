@@ -452,6 +452,11 @@ class ServiceContract:
     def environments(self) -> dict:
         return self._v2()["environments"]
 
+    @property
+    def order_environments(self) -> dict:
+        """The order's own envs (``environments`` of a plain contract; a ``CataloguedContract`` adds more)."""
+        return self.environments
+
     def catalogue_of(self, name: str) -> dict | None:
         """The public catalogue of a bridged episode env: what a miner and a validator build its task source
         from; None for an env without one."""
