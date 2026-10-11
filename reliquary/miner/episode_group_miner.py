@@ -322,6 +322,10 @@ class EpisodeGroupMiner:
         async with runner:
             try:
                 await self._play(runner, precommit, pool, played, open_until=open_until)
+                start_refused = getattr(runner, "start_refused", None)
+                if isinstance(start_refused, SessionRefused) and not played:
+                    # the group could not start in this env (its per-env share is held): its slot goes elsewhere
+                    raise SessionRefused(start_refused.reason, start_refused.detail, status=start_refused.status)
                 kept = await withdraw_inadmissible(list(played), policy=policy, renderer=renderer, prompt=prompt)
                 played.clear()
                 held = [outcome for outcome, _ in kept]

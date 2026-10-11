@@ -415,10 +415,14 @@ class SignedSweEpisodeRunner:
                 "consecutive": self._unavailable, "last": refused.reason}, status=refused.status)
         return refused
 
+    def _open_call(self, body: dict) -> Awaitable[dict]:
+        """The blocking open, in a worker thread (a subclass may use its own executor)."""
+        return asyncio.to_thread(self._sessions.open, body)
+
     async def _send_open(self, body: dict) -> dict:
         """One open, shielded: a cancellation that arrives while it is in flight still
         learns its grant (bounded), closes it and then propagates."""
-        sending = asyncio.ensure_future(asyncio.to_thread(self._sessions.open, body))
+        sending = asyncio.ensure_future(self._open_call(body))
         try:
             return await asyncio.shield(sending)
         except asyncio.CancelledError:

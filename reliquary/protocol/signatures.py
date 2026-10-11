@@ -934,3 +934,25 @@ def verify_episode_precommit_signature(hotkey: str, precommit, *, at: int, signa
     except (TypeError, ValueError, OverflowError, KeyError):
         return False
     return verify_hotkey_signature(hotkey, binding, signature)
+
+
+# A miner's request for its own RL session allocation, signed for one validator and route: only the hotkey's
+# owner learns its standing.
+RL_ALLOCATION_DOMAIN = b"reliquary/rl-allocation/v1"
+
+
+def build_rl_allocation_binding(*, hotkey: str, at: int, validator_hotkey: str, path: str) -> bytes:
+    if type(at) is not int or at < 0:
+        raise TypeError("at: non-negative integer seconds required")
+    return _bound(RL_ALLOCATION_DOMAIN, [str(hotkey).encode("utf-8"), at.to_bytes(8, "big", signed=False),
+                                         *_audience(validator_hotkey, path)])
+
+
+def verify_rl_allocation_signature(hotkey: str, *, at: int, signature: str, validator_hotkey: str,
+                                   path: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    try:
+        binding = build_rl_allocation_binding(hotkey=hotkey, at=at, validator_hotkey=validator_hotkey, path=path)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return verify_hotkey_signature(hotkey, binding, signature)

@@ -59,6 +59,9 @@ BUILD_BACKOFF_S = 5.0
 BUILD_BACKOFF_MAX_S = 300.0
 SECONDS_PER_WAVE = 300.0
 """Default time one wave of live sessions (an episode played to its end) is expected to take."""
+ENV_PAUSE_S = 60.0
+"""How long an env whose group could not start (the hotkey holds its share of the env: ``quota_env``) gets no new
+group, so the slot goes to another configured env."""
 ALLOCATION_TIMEOUT_S = 10.0
 """The validator's allocation for this hotkey is read at every poll, before the groups are filled."""
 
@@ -197,7 +200,10 @@ class EpisodeTaskPrompts:
                 if spec is None or spec.interaction_mode != "signed_episode":
                     raise ValueError(f"{name}: the order publishes no catalogue for it and it is not a "
                                      f"registered signed-episode environment")
-                self._source(name)                         # the registry path, loaded here (off the loop)
+                rows, announced = len(self._source(name)), int(contract.environments[name]["dataset"]["rows"])
+                if rows != announced:                      # the registry path, loaded here (off the loop)
+                    raise ValueError(f"{name}: the installed taskset has {rows} tasks, the order announces "
+                                     f"{announced}: its prompts would not be the validator's")
                 continue
             key = hashlib.sha256(_json.dumps(catalogue, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             if self._keys.get(name) == key:
@@ -209,7 +215,16 @@ class EpisodeTaskPrompts:
             source = (self._build_source or BridgedEpisodeSource)(config)
             if source.identity != policy.env_package:
                 raise ValueError(f"{name}: {source.identity} is installed, the order pins {policy.env_package}")
-            len(source)                                    # its taskset, loaded here (off the loop)
+            rows = len(source)                             # its taskset, loaded here (off the loop)
+            # The manifest digest covers the taskset (its rows and the identity, options, lock and split): an env
+            # loading data at run time (an upstream dataset that moved) would build other prompts than the
+            # validator's, and every group would be refused at admission.
+            installed, pinned = source.manifest_sha256(), contract.environments[name].get("version")
+            if installed != pinned:
+                announced = contract.environments[name].get("dataset", {}).get("rows")
+                raise ValueError(f"{name}: the installed taskset is not the order's (manifest {installed[:16]}, "
+                                 f"{rows} tasks; the order pins {str(pinned)[:16]}, {announced} tasks): its prompts "
+                                 f"would not be the validator's; reinstall the pinned env and its data")
             self._sources[name], self._keys[name] = source, key
 
     def _source(self, environment: str):
@@ -665,6 +680,7 @@ class EpisodeMiningLoop:
         self._ceiling = int(groups_in_flight)
         self._cap = int(groups_in_flight)
         self._allocation = allocation
+        self._paused: dict[str, float] = {}   # env -> until when it gets no new group
         self._rng = rng or random.Random()
         self._clock = clock
         self._sleep = sleep
@@ -776,7 +792,8 @@ class EpisodeMiningLoop:
         sizes = {}
         for name in self._environments:
             if name in contract.environments:
-                sizes[name] = min(int(contract.environments[name]["dataset"]["rows"]), int(self._sizes(name)))
+                # the order's task range: a bound source was checked to hold exactly that taskset
+                sizes[name] = int(contract.environments[name]["dataset"]["rows"]) if self._sizes(name) else 0
         return sizes
 
     def _fill(self, view: EpisodeWindow) -> None:
@@ -786,10 +803,11 @@ class EpisodeMiningLoop:
         if len(self._inflight) >= self._cap:
             return
         sizes = self._sizes_of(view)
+        environments = self.open_environments()
         miner = None
         while len(self._inflight) < self._cap:
             taken = {(env, task) for window, env, task in self._taken if window == view.window}
-            pick = pick_episode_task(view, environments=self._environments, sizes=sizes, taken=taken, rng=self._rng)
+            pick = pick_episode_task(view, environments=environments, sizes=sizes, taken=taken, rng=self._rng)
             if pick is None:
                 return
             environment, task_index = pick
@@ -804,12 +822,27 @@ class EpisodeMiningLoop:
             logger.info("window %d: mining %s task %d (%d groups in flight)", view.window, environment,
                         task_index, len(self._inflight))
 
+    def open_environments(self) -> tuple[str, ...]:
+        """The configured envs that may get a new group now (not paused after a group that could not start)."""
+        now = self._clock()
+        for env in [env for env, until in self._paused.items() if until <= now]:
+            del self._paused[env]
+        return tuple(env for env in self._environments if env not in self._paused)
+
     def _finished(self, task: asyncio.Task) -> None:
+        from reliquary.miner.rl_episode_client import RL_START_REFUSALS
+        from reliquary.protocol.sandbox_session import SessionRefused
+
         key = self._inflight.pop(task, None)
         if task.cancelled():
             outcome: Any = "cancelled"
         elif task.exception() is not None:
-            outcome = repr(task.exception())          # no traceback frames kept alive
+            error = task.exception()
+            if isinstance(error, SessionRefused) and error.reason in RL_START_REFUSALS and key is not None:
+                self._paused[key[1]] = self._clock() + ENV_PAUSE_S
+                logger.info("%s: the hotkey holds its share of this env; no new group there for %.0f s",
+                            key[1], ENV_PAUSE_S)
+            outcome = repr(error)                     # no traceback frames kept alive
             logger.warning("group %s ended: %s", key, outcome)
         else:
             outcome = task.result()
@@ -858,23 +891,52 @@ def miner_state_reader(url: str, *, client) -> Callable[[], Awaitable[Any]]:
     return read
 
 
-def allocation_reader(url: str, hotkey: str, *, client) -> Callable[[], Awaitable[int | None]]:
-    """``allocation()`` over ``GET {url}/rl/sessions/allocation/{hotkey}``: the groups the validator allocates to
-    this hotkey (its potential), or None when it does not answer one (any failure, a fleet it cannot size yet)."""
-    from reliquary.miner.rl_episode_client import RL_PREFIX
+def signed_allocation_body(*, hotkey: str, sign_binding: Callable[[bytes], str], now: float,
+                           validator_hotkey: str, path: str) -> dict:
+    """The body of ``POST {prefix}/sessions/allocation``: this hotkey's own allocation, signed for this validator
+    and route."""
+    from reliquary.protocol.signatures import build_rl_allocation_binding
 
-    path = f"{url.rstrip('/')}{RL_PREFIX}/sessions/allocation/{hotkey}"
+    at = int(now)
+    return {"miner_hotkey": hotkey, "at": at, "signature": sign_binding(build_rl_allocation_binding(
+        hotkey=hotkey, at=at, validator_hotkey=validator_hotkey, path=path))}
+
+
+def allocation_groups(answer: Any, environments: Sequence[str]) -> int | None:
+    """The groups to run from the route's answer: per env, the groups the hotkey's potential holds in that env's
+    pool; for a miner of several envs, the fewest (never more than any of its envs' number). None when the answer
+    gives none for the configured envs."""
+    groups = answer.get("groups") if isinstance(answer, Mapping) else None
+    if not isinstance(groups, Mapping):
+        return None
+    numbers = [groups[env] for env in environments
+               if isinstance(groups.get(env), int) and not isinstance(groups.get(env), bool)]
+    return min(numbers) if numbers else None
+
+
+def allocation_reader(url: str, hotkey: str, *, client, sign_binding: Callable[[bytes], str], validator_hotkey: str,
+                      environments: Sequence[str],
+                      clock: Callable[[], float] = time.time) -> Callable[[], Awaitable[int | None]]:
+    """``allocation()`` over the signed ``POST {url}/rl/sessions/allocation``: the groups the validator allocates to
+    this hotkey in its configured envs (``allocation_groups``), or None when it does not answer one (any failure, a
+    fleet it cannot size yet)."""
+    from reliquary.miner.rl_episode_client import RL_PREFIX
+    from reliquary.sandbox.rl_routes import episode_allocation_path
+
+    path = episode_allocation_path(RL_PREFIX)
+    target = f"{url.rstrip('/')}{path}"
 
     async def read() -> int | None:
         try:
-            response = await asyncio.wait_for(client.get(path), ALLOCATION_TIMEOUT_S)
+            body = signed_allocation_body(hotkey=hotkey, sign_binding=sign_binding, now=clock(),
+                                          validator_hotkey=validator_hotkey, path=path)
+            response = await asyncio.wait_for(client.post(target, json=body), ALLOCATION_TIMEOUT_S)
             if response.status_code != 200:
                 return None
-            groups = response.json().get("groups")
+            return allocation_groups(response.json(), environments)
         except Exception as exc:
             logger.debug("allocation: %s", type(exc).__name__)
             return None
-        return groups if isinstance(groups, int) and not isinstance(groups, bool) else None
 
     return read
 
@@ -900,7 +962,9 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
             allocation_client = (deps.async_http() if deps is not None
                                  else httpx.AsyncClient(timeout=ALLOCATION_TIMEOUT_S))
             stack.push_async_callback(allocation_client.aclose)
-            loop_kwargs["allocation"] = allocation_reader(config.validator_url, hotkey, client=allocation_client)
+            loop_kwargs["allocation"] = allocation_reader(
+                config.validator_url, hotkey, client=allocation_client, sign_binding=sign_binding,
+                validator_hotkey=config.validator_hotkey, environments=config.environments)
 
         def build(view: EpisodeWindow):
             return build_episode_stack(view, config=config, wallet=wallet, hotkey=hotkey, sign_binding=sign_binding,
@@ -926,6 +990,6 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
 
 
 __all__ = ["CheckpointChanged", "EXIT_CHECKPOINT_CHANGED", "EpisodeMinerConfig", "EpisodeMiningLoop", "EpisodeStack", "EpisodeStackDeps", "EpisodeTaskPrompts",
-           "EpisodeWindow", "GROUPS_IN_FLIGHT", "allocation_reader", "build_episode_stack", "groups_to_run", "env_package_refusal", "installed_env_identity", "episode_window",
+           "EpisodeWindow", "GROUPS_IN_FLIGHT", "allocation_groups", "allocation_reader", "signed_allocation_body", "build_episode_stack", "groups_to_run", "env_package_refusal", "installed_env_identity", "episode_window",
            "miner_state_reader", "parse_episode_environments", "parse_harness_env", "pick_episode_task",
            "run_episode_miner", "short_window_warning"]

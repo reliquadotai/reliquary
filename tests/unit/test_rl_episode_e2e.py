@@ -370,7 +370,12 @@ class Tokenizer:
 
 
 def make_runtime(path, *, catalogue=None) -> ServiceRuntime:
-    contract = episode_contract() if catalogue is None else episode_contract(catalogue=catalogue)
+    if catalogue is None:
+        contract = episode_contract()
+    else:                       # its version: the manifest of the catalogued install (1 000 tasks), as described
+        from tests.unit.episode_v2_fixtures import bridged_version
+
+        contract = episode_contract(catalogue=catalogue, episode_version=bridged_version(catalogue, ENV_PACKAGE, 1000))
     path.mkdir(parents=True, exist_ok=True)
     rt = ServiceRuntime(path / "runtime.sqlite3", contract, qualification_v2(contract), now=time.time() - 10,
                         drand_round_at=lambda instant: CLOCK["round"])

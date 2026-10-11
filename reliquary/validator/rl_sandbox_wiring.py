@@ -703,16 +703,36 @@ def _check_caps(quota, clock: Callable[[], float]) -> dict:
             "max_checks_running": MAX_CHECKS_RUNNING, "checks_scale": quota.cap_scale}
 
 
-def _allocation_of(quota, pool_seeds: int) -> Callable[[str], dict]:
-    """What ``GET /rl/sessions/allocation/{hotkey}`` answers: the hotkey's entity and its POTENTIAL (its weighted
-    share with its own demand unbounded; a pooled hotkey: its entity's maximum per member), in sessions and in groups
-    of the largest pool (at least one). Before the fleet can be sized, ``groups`` is None: the miner keeps its own
-    number rather than drop to one group."""
+ALLOCATION_ANSWER_TTL_S = 5.0
+"""How long one hotkey's answer of the allocation route is served from its snapshot before it is recomputed."""
+
+
+def _allocation_of(quota, pool_seeds: Mapping[str, int], *, clock: Callable[[], float] = time.time,
+                   ttl_s: float = ALLOCATION_ANSWER_TTL_S) -> Callable[[str], dict]:
+    """What the allocation route answers a hotkey about itself: its entity (``lane``), its POTENTIAL in sessions
+    (its weighted share with its own demand unbounded; a pooled hotkey: its entity's maximum per member) and, per
+    env, the groups that potential holds in that env's own pool size (at least one). Before the fleet can be sized,
+    ``groups`` is None: the miner keeps its own number rather than drop to one group. Each hotkey's answer is a
+    snapshot kept ``ttl_s`` (the route never recomputes a potential per call)."""
+    sizes = {str(env): int(p) for env, p in pool_seeds.items()}
+    cache: dict[str, tuple[float, dict]] = {}
+
     def allocation_of(hotkey: str) -> dict:
+        now = float(clock())
+        kept = cache.get(hotkey)
+        if kept is not None and now - kept[0] < ttl_s:
+            return kept[1]
         if not quota.capacity_known():
-            return {"hotkey": hotkey, "lane": None, "sessions": None, "groups": None, "pool_seeds": pool_seeds}
-        return {"hotkey": hotkey, "lane": quota.lane(hotkey), "sessions": quota.sessions_allowed(hotkey),
-                "groups": quota.groups_allowed(hotkey), "pool_seeds": pool_seeds}
+            answer = {"hotkey": hotkey, "lane": None, "sessions": None, "groups": None, "pool_seeds": sizes}
+        else:
+            sessions = int(quota.sessions_allowed(hotkey))
+            answer = {"hotkey": hotkey, "lane": quota.lane(hotkey), "sessions": sessions,
+                      "groups": {env: max(1, math.ceil(sessions / p)) for env, p in sizes.items()},
+                      "pool_seeds": sizes}
+        for stale in [h for h, (at, _) in cache.items() if now - at >= ttl_s]:
+            del cache[stale]
+        cache[hotkey] = (now, answer)
+        return answer
 
     return allocation_of
 
@@ -881,7 +901,10 @@ def build_rl_episode_services(
     logger.info("rl episode services built for %s (validator key %s)", sorted(policies), signer.key_id)
     routers = (sessions_router, precommit_router)
     if isinstance(quota, YieldQuota):
-        routers += (build_allocation_router(_allocation_of(quota, pool_seeds), prefix=RL_PREFIX),)
+        routers += (build_allocation_router(
+            _allocation_of(quota, {name: p.pool_seeds for name, p in policies.items()}, clock=clock),
+            validator_hotkey=validator_hotkey, policy=policy, prefix=RL_PREFIX, registration=registration,
+            clock=clock),)
     if saturation is not None:
         routers += (build_saturation_router(lambda: built["services"].cached_saturation()),)
     services = RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,

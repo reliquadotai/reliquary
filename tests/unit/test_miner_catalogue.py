@@ -24,6 +24,7 @@ from tests.unit.episode_v2_fixtures import (  # noqa: E402
     PROMPT_TEXT,
     WINDOW_BEACON,
     added_block,
+    bridged_version,
     episode_contract,
     episode_runtime,
 )
@@ -61,17 +62,34 @@ def forbidden(name):
     raise AssertionError(f"the static registry was used for {name}")
 
 
-def with_added(contract, schedule, *, active=True):
+ROWS = 40                                                           # the fake env's taskset
+
+
+def pinned_added_block():
+    """The added env's block as its operator described it: its version is the manifest of the fake install."""
+    block = added_block()
+    rows = {"id": block["environment"]["dataset"]["id"], "rows": ROWS}
+    return added_block(version=bridged_version(block["catalogue"], ADDED_IDENTITY, ROWS), dataset=rows)
+
+
+def with_added(contract, schedule, *, active=True, block=None):
+    block = block or added_block()
     if not active:
-        return next_schedule(contract, schedule, add={ADDED: added_block()})
-    return next_schedule(contract, schedule, add={ADDED: added_block()}, active=list(SHARES), shares=SHARES)
+        return next_schedule(contract, schedule, add={ADDED: block})
+    return next_schedule(contract, schedule, add={ADDED: block}, active=list(SHARES), shares=SHARES)
 
 
-def announcement(tmp_path, *, added=False, catalogue=CATALOGUE):
-    contract = episode_contract(catalogue=catalogue) if catalogue is not None else episode_contract()
+def announcement(tmp_path, *, added=False, catalogue=CATALOGUE, version=None):
+    """The window's announcement; a catalogued order pins the fake install's manifest (``version`` overrides)."""
+    if catalogue is not None:
+        version = version or bridged_version(catalogue, ENV_PACKAGE, ROWS)
+        contract = episode_contract(catalogue=catalogue, rows=ROWS, episode_version=version)
+    else:
+        contract = episode_contract()
     rt = episode_runtime(tmp_path, contract)
     value = rt.announcement(window=1, randomness=WINDOW_BEACON)
-    return value if not added else dict(value, schedule=with_added(contract, rt.schedule).to_dict())
+    return value if not added else dict(value, schedule=with_added(contract, rt.schedule,
+                                                                   block=pinned_added_block()).to_dict())
 
 
 # -- the prompts --------------------------------------------------------------------------------------------
@@ -115,6 +133,32 @@ def test_an_env_added_to_the_running_run_is_mined_from_the_schedules_catalogue(t
     assert prompts.sources[ADDED].config.package == "reliquary-terminal==0.3.0"
     assert prompts.sources[ADDED].config.rl_split == "tmax"
     assert prompts.size(ADDED) == 40 and prompts(ADDED, 0) == PROMPT_TEXT
+
+
+def test_an_install_whose_taskset_is_not_the_orders_manifest_refuses_to_start(tmp_path):
+    def build(config):                                                 # one more row than the order was described with
+        return BridgedEpisodeSource(config, env=FakeVerifiersEnv(config.rl_split, rows=ROWS + 1), identity=ENV_PACKAGE)
+
+    prompts = em.EpisodeTaskPrompts([EPISODE], load=forbidden, build_source=build)
+    with pytest.raises(ValueError, match=f"{ROWS + 1} tasks; the order pins .*{ROWS} tasks"):
+        prompts.bind(announcement(tmp_path))
+    assert prompts.sources == {}
+    other = em.EpisodeTaskPrompts([EPISODE], load=forbidden, build_source=build_source({EPISODE: ENV_PACKAGE}))
+    with pytest.raises(ValueError, match="not the order's"):           # same rows, another manifest (moved data)
+        other.bind(announcement(tmp_path / "moved", version="0" * 64))
+    matching = em.EpisodeTaskPrompts([EPISODE], load=forbidden, build_source=build_source({EPISODE: ENV_PACKAGE}))
+    matching.bind(announcement(tmp_path / "match"))
+    assert matching.sources[EPISODE].manifest_sha256() == bridged_version(CATALOGUE, ENV_PACKAGE, ROWS)
+
+
+def test_a_registered_env_whose_taskset_is_not_the_orders_size_refuses_to_start(tmp_path, monkeypatch):
+    from tests.unit.episode_v2_fixtures import register_episode_env
+
+    register_episode_env(monkeypatch)                                  # 1 000 tasks
+    rt = episode_runtime(tmp_path, episode_contract(rows=999))
+    prompts = em.EpisodeTaskPrompts([EPISODE])
+    with pytest.raises(ValueError, match="1000 tasks, the order announces 999"):
+        prompts.bind(rt.announcement(window=1, randomness=WINDOW_BEACON))
 
 
 def test_a_catalogue_that_did_not_change_is_not_rebuilt(tmp_path):

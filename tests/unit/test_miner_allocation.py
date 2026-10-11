@@ -17,7 +17,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from reliquary.miner.episode_mining import (  # noqa: E402
-    EpisodeMinerConfig, EpisodeMiningLoop, allocation_reader, groups_to_run,
+    EpisodeMinerConfig, EpisodeMiningLoop, allocation_groups, allocation_reader, groups_to_run,
 )
 from reliquary.miner.rl_episode_client import (  # noqa: E402
     RL_FINAL_REFUSALS, RL_OPENS_SIDE_BY_SIDE, RL_TASK_FINAL_REFUSALS, RL_THROTTLES, RlSignedEpisodeRunner,
@@ -28,7 +28,8 @@ from reliquary.sandbox.rl_capacity import USEFUL_HORIZON_S, YieldStats  # noqa: 
 from reliquary.sandbox.rl_quota import YieldQuota  # noqa: E402
 from reliquary.sandbox.rl_routes import PRECOMMIT_STATUS, build_allocation_router  # noqa: E402
 from reliquary.sandbox.routes import REFUSAL_STATUS  # noqa: E402
-from reliquary.sandbox.sessions import LIVE  # noqa: E402
+from reliquary.protocol.signatures import verify_rl_allocation_signature  # noqa: E402
+from reliquary.sandbox.sessions import LIVE, SandboxPolicy  # noqa: E402
 from reliquary.validator.rl_sandbox_wiring import _allocation_of  # noqa: E402
 from tests.unit.episode_v2_fixtures import EPISODE, episode_contract, episode_precommit  # noqa: E402
 from tests.unit.sandbox_fixtures import NOW  # noqa: E402
@@ -126,52 +127,117 @@ def test_the_allocation_is_read_at_every_poll_before_the_groups_are_filled():
     assert reads == [1, 1] and filled == [2, 2]
 
 
-def test_the_allocation_reader_returns_the_groups_or_none():
-    answers = {"5Ok": (200, {"groups": 7}), "5Busy": (503, {"reason": "x"}), "5Bad": (200, {"groups": True}),
-               "5Unknown": (200, {"groups": None})}
+def sign(binding: bytes) -> str:
+    return MINER.sign(binding).hex()
+
+
+def test_the_allocation_reader_signs_its_request_and_returns_its_envs_groups():
+    answers = iter([(200, {"groups": {EPISODE: 7, "other": 2}}), (200, {"groups": {EPISODE: 3, "e2": 5}}),
+                    (503, {"reason": "x"}), (200, {"groups": {EPISODE: True}}), (200, {"groups": None})])
+    bodies = []
 
     def handle(request):
-        hotkey = request.url.path.rsplit("/", 1)[1]
-        assert request.url.path == f"/rl/sessions/allocation/{hotkey}"
-        status, body = answers[hotkey]
+        import json
+
+        assert request.method == "POST" and request.url.path == "/rl/sessions/allocation"
+        bodies.append(json.loads(request.content))
+        status, body = next(answers)
         return httpx.Response(status, json=body)
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-            return [await allocation_reader("http://validator.test/", hotkey, client=client)()
-                    for hotkey in answers]
+            read = allocation_reader("http://validator.test/", MINER.ss58_address, client=client, sign_binding=sign,
+                                     validator_hotkey=VALIDATOR.ss58_address, environments=(EPISODE, "e2"),
+                                     clock=lambda: float(NOW))
+            return [await read() for _ in range(5)]
 
-    assert asyncio.run(go()) == [7, None, None, None]
+    assert asyncio.run(go()) == [7, 3, None, None, None]                # its env's number; the fewest of its envs
+    body = bodies[0]
+    assert body["miner_hotkey"] == MINER.ss58_address and body["at"] == NOW
+    assert verify_rl_allocation_signature(MINER.ss58_address, at=NOW, signature=body["signature"],
+                                          validator_hotkey=VALIDATOR.ss58_address, path="/rl/sessions/allocation")
 
 
 # --- the route -------------------------------------------------------------------------------------------------
 
-def test_the_route_serves_a_hotkeys_allocation():
+def allocation_client(allocation_of, *, clock=lambda: float(NOW), registration=None):
     app = FastAPI()
-    app.include_router(build_allocation_router(lambda hotkey: {"hotkey": hotkey, "lane": "main", "sessions": 320,
-                                                               "groups": 10, "pool_seeds": 32}))
-    client = TestClient(app)
-    body = client.get("/rl/sessions/allocation/5Hot").json()
-    assert body["groups"] == 10 and body["lane"] == "main"
-    refused = client.get("/rl/sessions/allocation/0OIl")             # not base58
-    assert refused.status_code == 400 and refused.json()["reason"] == "hotkey_invalid"
+    app.include_router(build_allocation_router(allocation_of, validator_hotkey=VALIDATOR.ss58_address,
+                                               policy=SandboxPolicy(), clock=clock, registration=registration))
+    return TestClient(app)
 
 
-def test_the_wiring_serves_the_allocation_route(tmp_path):
+def body_of(keypair=MINER, *, hotkey=None, at=NOW, validator=VALIDATOR, path="/rl/sessions/allocation"):
+    from reliquary.protocol.signatures import build_rl_allocation_binding
+
+    hotkey = hotkey or keypair.ss58_address
+    binding = build_rl_allocation_binding(hotkey=hotkey, at=at, validator_hotkey=validator.ss58_address, path=path)
+    return {"miner_hotkey": hotkey, "at": at, "signature": keypair.sign(binding).hex()}
+
+
+def test_the_route_answers_only_the_signed_callers_own_allocation():
+    asked = []
+
+    def allocation_of(hotkey):
+        asked.append(hotkey)
+        return {"hotkey": hotkey, "lane": "main", "sessions": 320, "groups": {EPISODE: 10}, "pool_seeds": {EPISODE: 32}}
+
+    client = allocation_client(allocation_of)
+    first = body_of()
+    answer = client.post("/rl/sessions/allocation", json=first)
+    assert answer.status_code == 200 and answer.json()["groups"] == {EPISODE: 10}
+    assert asked == [MINER.ss58_address]
+    unsigned = client.post("/rl/sessions/allocation", json={**body_of(at=NOW + 1), "signature": ""})
+    assert unsigned.status_code == 401 and unsigned.json()["reason"] == "signature_required"
+    other = bt.Keypair.create_from_uri("//Eve")                           # Eve signs a request naming Alice
+    foreign = client.post("/rl/sessions/allocation", json=body_of(other, hotkey=MINER.ss58_address, at=NOW + 2))
+    assert foreign.status_code == 403 and foreign.json()["reason"] == "bad_signature"
+    elsewhere = client.post("/rl/sessions/allocation", json=body_of(at=NOW + 3, validator=other))
+    assert elsewhere.status_code == 403                                   # signed for another validator
+    stale = client.post("/rl/sessions/allocation", json=body_of(at=NOW - 10_000))
+    assert stale.status_code == 400 and stale.json()["reason"] == "stale_request"
+    replay = client.post("/rl/sessions/allocation", json=first)          # the same signed request again
+    assert replay.status_code == 409 and replay.json()["reason"] == "request_reused"
+    assert asked == [MINER.ss58_address]                                  # nobody else learnt anything
+
+
+def test_the_route_refuses_an_unregistered_hotkey_and_bounds_each_hotkeys_minute():
+    from reliquary.sandbox.rl_routes import ALLOCATION_MAX_PER_MINUTE
+
+    from reliquary.validator.corpus_registration import NOT_REGISTERED
+
+    async def gate(hotkey):
+        return None if hotkey == MINER.ss58_address else NOT_REGISTERED
+
+    client = allocation_client(lambda hotkey: {"groups": {}}, registration=gate)
+    other = bt.Keypair.create_from_uri("//Eve")
+    assert client.post("/rl/sessions/allocation", json=body_of(other)).status_code == 403
+    codes = [client.post("/rl/sessions/allocation", json=body_of()).status_code
+             for _ in range(ALLOCATION_MAX_PER_MINUTE + 1)]
+    assert codes[:-1] == [200] * ALLOCATION_MAX_PER_MINUTE and codes[-1] == 429
+
+
+def test_the_wiring_serves_the_signed_allocation_route(tmp_path):
     services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
     paths = [getattr(route, "path", "") for router in services.routers for route in router.routes]
-    assert any(path.endswith("/sessions/allocation/{hotkey}") for path in paths)
+    assert "/rl/sessions/allocation" in paths
     app = FastAPI()
     for router in services.routers:
         app.include_router(router)
-    body = TestClient(app).get("/rl/sessions/allocation/5Hot").json()
-    assert body["groups"] is None                                     # no machine report yet: the miner keeps its own
+    client = TestClient(app)
+    import time as _time
+
+    body = body_of(at=int(_time.time()))
+    answer = client.post("/rl/sessions/allocation", json=body)
+    assert answer.status_code == 200, answer.json()
+    assert answer.json()["groups"] is None                            # no machine report yet: the miner keeps its own
+    assert client.get(f"/rl/sessions/allocation/{MINER.ss58_address}").status_code in (404, 405)
 
 
 def test_without_a_yield_quota_no_allocation_route(tmp_path):
     services, _ = _services(tmp_path)
     paths = [getattr(route, "path", "") for router in services.routers for route in router.routes]
-    assert not any("/sessions/allocation/" in path for path in paths)
+    assert not any("/sessions/allocation" in path for path in paths)
 
 
 class Ledger:
@@ -191,25 +257,44 @@ def test_the_first_poll_before_any_open_tells_the_potential_never_one_group():
     clock = SimpleNamespace(now=float(NOW))
     quota = YieldQuota(ledger=Ledger({"5Big": main_stats(300.0), "5Rival": main_stats(300.0)}), pool_seeds=P32,
                        group_size=P32 // 2, capacity=lambda: CAPACITY, clock=lambda: clock.now)
-    answer = _allocation_of(quota, P32)("5Big")
-    assert answer["lane"] == "main" and answer["groups"] > 4         # nothing asked yet: its share, not 1 group
+    answer = _allocation_of(quota, {EPISODE: P32}, clock=lambda: clock.now)("5Big")
+    assert answer["lane"] == "main" and answer["groups"][EPISODE] > 4    # nothing asked yet: its share, not 1 group
     told = []
 
     async def allocation():
-        told.append(answer["groups"])
-        return answer["groups"]
+        told.append(answer["groups"][EPISODE])
+        return answer["groups"][EPISODE]
 
     miner = loop(groups_in_flight=4, allocation=allocation)
     asyncio.run(miner._follow_allocation())
     assert miner._cap == 4 and told
-    fresh = _allocation_of(quota, P32)("5Fresh")
-    assert fresh["lane"] == "newcomer" and fresh["groups"] == 2       # a newcomer's maximum
+    fresh = _allocation_of(quota, {EPISODE: P32})("5Fresh")
+    assert fresh["lane"] == "newcomer" and fresh["groups"] == {EPISODE: 2}    # a newcomer's maximum
+
+
+def test_the_groups_are_counted_in_each_envs_own_pool_and_served_from_a_snapshot():
+    clock = SimpleNamespace(now=float(NOW))
+    quota = YieldQuota(ledger=Ledger({}), pool_seeds=P32, group_size=P32 // 2, capacity=lambda: CAPACITY,
+                       clock=lambda: clock.now)
+    computed = []
+    sessions_allowed = quota.sessions_allowed
+    quota.sessions_allowed = lambda hotkey: computed.append(hotkey) or sessions_allowed(hotkey)
+    answer_of = _allocation_of(quota, {"wide": 32, "narrow": 8}, clock=lambda: clock.now, ttl_s=5.0)
+    answer = answer_of("5Fresh")                                       # a newcomer: 64 sessions
+    assert answer["sessions"] == 64 and answer["groups"] == {"wide": 2, "narrow": 8}
+    for _ in range(50):
+        answer_of("5Fresh")
+    assert computed == ["5Fresh"]                                      # one computation per snapshot
+    clock.now += 5.0
+    answer_of("5Fresh")
+    assert computed == ["5Fresh", "5Fresh"]
+    assert allocation_groups(answer, ("narrow",)) == 8 and allocation_groups(answer, ("wide", "narrow")) == 2
 
 
 def test_an_unsized_fleet_tells_no_number():
     quota = YieldQuota(ledger=Ledger({"5Big": main_stats(300.0)}), pool_seeds=P32, group_size=P32 // 2,
                        capacity=lambda: 0, clock=lambda: float(NOW))
-    assert _allocation_of(quota, P32)("5Big")["groups"] is None
+    assert _allocation_of(quota, {EPISODE: P32})("5Big")["groups"] is None
 
 
 # --- the opens of one precommit --------------------------------------------------------------------------------
@@ -382,6 +467,185 @@ def test_a_validator_that_stays_down_stops_the_opens_within_the_stop_count():
     assert len(gate.sent) <= 1 + 15 + MAX_UNAVAILABLE                  # nothing is sent once the hotkey stopped
 
 
+@pytest.mark.parametrize("reason", ["precommit_unknown", "precommit_stale", "session_too_long"])
+def test_a_refusal_about_the_precommit_ends_every_seed_after_one_open(reason):
+    def answer(seed, nth, total):
+        raise refused(reason)
+
+    gate = Gate(answer)
+    runner, _ = runner_for(gate)
+    results = open_all(runner, range(16))
+    assert all(isinstance(r, SessionRefused) and r.reason == reason for r in results)
+    assert len(gate.sent) == 1
+
+
+def test_a_transport_failure_resends_the_same_open_and_counts_toward_the_stop():
+    import json
+
+    bodies = []
+
+    def answer(seed, nth, total):
+        if total <= 3:
+            raise httpx.ConnectError("unreachable")
+        return grant(seed)
+
+    gate = Gate(answer)
+    original = gate.open
+
+    def recording(body):
+        bodies.append(body)
+        return original(body)
+
+    gate.open = recording
+    runner, now = runner_for(gate)
+    (result,) = open_all(runner, [0])
+    assert result == grant(0)
+    assert len({body["request_id"] for body in bodies}) == 1 and len(bodies) == 4      # the SAME open, resent
+    assert runner._unavailable == 0 and now[0] >= 1 + 2 + 4                           # after the back-off
+    assert json.dumps(bodies[0]["engagement"]) == json.dumps(bodies[-1]["engagement"])
+
+
+def test_a_validator_unreachable_for_good_stops_the_seed_and_keeps_the_open_unconfirmed():
+    def answer(seed, nth, total):
+        raise httpx.ConnectError("unreachable")
+
+    gate = Gate(answer)
+    runner, _ = runner_for(gate)
+    (result,) = open_all(runner, [0])
+    assert isinstance(result, SessionRefused) and result.reason == "validator_unavailable"
+    assert len(gate.sent) == MAX_UNAVAILABLE and len(runner._unconfirmed) == 1        # a grant it got is closed later
+
+
+def test_a_pause_that_lands_while_an_open_waits_for_a_side_by_side_slot_is_honoured():
+    clock = []
+
+    def answer(seed, nth, total):
+        if seed == 0:
+            return grant(seed)
+        if seed == 1 and nth == 1:
+            time.sleep(0.05)
+            raise refused("quota_live", 10.0)                          # a pause while seed 5 waits for a slot
+        time.sleep(0.2)
+        return grant(seed)
+
+    gate = Gate(answer)
+    runner, now = runner_for(gate)
+    body_of_open = runner._open_body
+
+    def timed(index, request_id):                                     # when the runner decides to send (its loop)
+        clock.append((index, now[0]))
+        return body_of_open(index, request_id)
+
+    runner._open_body = timed
+    results = open_all(runner, range(8))
+    assert all(isinstance(r, dict) for r in results)
+    assert sorted(seed for seed, _ in clock[:5]) == [0, 1, 2, 3, 4] and all(at == 0.0 for _, at in clock[:5])
+    later = [at for _, at in clock[5:]]                                # every send after seed 1's refusal at 0 s
+    assert later and all(at >= 10.0 for at in later), clock
+
+
+def test_a_grant_sent_before_a_throttle_does_not_reopen_side_by_side_sending():
+    runner, _ = runner_for(Gate(lambda seed, nth, total: grant(seed)))
+    runner._fanning = True
+    before = runner._throttles
+    runner._note_refusal(refused("quota_live", 10.0))                   # a throttle meanwhile
+    runner._granted(before)                                            # the older open's grant lands
+    assert runner._fanning is False
+    runner._granted(runner._throttles)                                 # a probe granted after it: side by side again
+    assert runner._fanning is True
+
+
+def test_blocked_opens_of_many_groups_never_hold_the_threads_closes_need():
+    from reliquary.miner.rl_episode_client import RL_OPENS_IN_FLIGHT
+
+    release = threading.Event()
+
+    def answer(seed, nth, total):
+        if seed == 0:
+            return grant(seed)
+        release.wait(10)                                               # waiting in the validator's open queue
+        return grant(seed)
+
+    gates = [Gate(answer) for _ in range(8)]
+    runners = [runner_for(gate)[0] for gate in gates]
+
+    async def go():
+        tasks = [asyncio.ensure_future(runner._open(seed, _Slot(runner._live)))
+                 for runner in runners for seed in range(8)]
+        await asyncio.sleep(0.5)                                       # every group started, its opens blocked
+        blocked = sum(gate.live for gate in gates)
+        closed = await asyncio.wait_for(runners[0]._close("s-0", "final", None), 5)    # a close still goes through
+        release.set()
+        results = await asyncio.gather(*tasks)
+        return blocked, closed, results
+
+    blocked, closed, results = asyncio.run(go())
+    assert closed == {"state": "closed"}
+    assert RL_OPENS_SIDE_BY_SIDE < blocked <= RL_OPENS_IN_FLIGHT        # all groups' opens, capped process-wide
+    assert len(results) == 64 and all(isinstance(r, dict) for r in results)
+
+
+def test_a_group_refused_its_envs_share_before_it_started_frees_its_slot():
+    def answer(seed, nth, total):
+        raise refused("quota_env", 10.0)
+
+    gate = Gate(answer)
+    runner, _ = runner_for(gate)
+    results = open_all(runner, range(16))
+    assert all(isinstance(r, SessionRefused) and r.reason == "quota_env" for r in results)
+    assert len(gate.sent) == 1 and runner.start_refused.reason == "quota_env"
+
+
+def test_a_started_group_reopens_its_seeds_after_quota_env():
+    def answer(seed, nth, total):
+        if seed >= 1 and nth == 1:
+            raise refused("quota_env", 10.0)
+        return grant(seed)
+
+    gate = Gate(answer)
+    runner, _ = runner_for(gate)
+    results = open_all(runner, range(4))
+    assert all(isinstance(r, dict) for r in results) and runner.start_refused is None
+
+
+def test_the_group_miner_raises_a_group_that_could_not_start_and_the_loop_moves_to_another_env(tmp_path):
+    from reliquary.constants import M_ROLLOUTS
+    from reliquary.miner.episode_mining import ENV_PAUSE_S
+    from tests.unit.test_episode_group_miner import Clock, alternating, world
+
+    w = world(tmp_path, alternating(2 * M_ROLLOUTS), refused=set(range(2 * M_ROLLOUTS)), clock=Clock())
+    w.runner.start_refused = SessionRefused("quota_env", {}, status=429)
+    with pytest.raises(SessionRefused) as ended:
+        w.mine(open_until=NOW + 3600)
+    assert ended.value.reason == "quota_env" and w.submitted == []
+
+    clock = SimpleNamespace(now=1000.0)
+
+    async def read_state():
+        return None
+
+    async def build_stack(view):
+        raise AssertionError("not reached")
+
+    miner = EpisodeMiningLoop(environments=("swe", "tmax"), read_state=read_state, build_stack=build_stack,
+                              sizes=lambda env: 1, clock=lambda: clock.now)
+
+    async def fail():
+        raise ended.value
+
+    async def finish():
+        task = asyncio.ensure_future(fail())
+        miner._inflight[task] = (1, "swe", 3)
+        task.add_done_callback(miner._finished)
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    asyncio.run(finish())
+    assert miner.open_environments() == ("tmax",)                      # the slot goes to the other env
+    clock.now += ENV_PAUSE_S
+    assert miner.open_environments() == ("swe", "tmax")
+
+
 # --- the precommit ---------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("reason", ["environment_unserved", "fleet_unavailable", "window_not_open", "precommit_rate"])
@@ -420,14 +684,14 @@ def closed_loop(capacity, keys, life_s, *, hours=1.0, warm_s=1_200, poll_s=5, re
     ledger = Ledger({h: main_stats(w) for h, (w, _ceiling) in keys.items()})
     quota = YieldQuota(ledger=ledger, pool_seeds=P32, group_size=P32 // 2, capacity=lambda: capacity,
                        clock=lambda: clock.now)
-    told_of = _allocation_of(quota, P32)
+    told_of = _allocation_of(quota, {EPISODE: P32}, clock=lambda: clock.now, ttl_s=0.0)
     state = {h: {"run": ceiling, "groups": [], "made": 0} for h, (_w, ceiling) in keys.items()}
     held, run, made = {h: [] for h in keys}, {h: [] for h in keys}, [0]
     start = clock.now
     while clock.now < start + hours * 3_600:
         now = int(clock.now)
         for h, st in state.items():
-            st["run"] = groups_to_run(keys[h][1], told_of(h)["groups"], st["run"])
+            st["run"] = groups_to_run(keys[h][1], allocation_groups(told_of(h), (EPISODE,)), st["run"])
             for group in [g for g in st["groups"] if now >= g["start"] + life_s]:
                 for record in group["records"]:
                     record.state, record.closed_status, record.closed_at = "closed", "expired", now

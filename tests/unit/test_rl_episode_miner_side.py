@@ -695,6 +695,8 @@ def test_the_rl_named_throttles_never_stop_the_hotkey(tmp_path):
 @pytest.mark.parametrize("reason", ["precommit_unknown", "precommit_stale", "seed_out_of_pool", "engagement_taken",
                                     "session_too_long"])
 def test_a_final_refusal_ends_the_seed_and_holds_no_other_open(tmp_path, reason):
+    from reliquary.miner.rl_episode_client import RL_TASK_FINAL_REFUSALS
+
     sessions, runner, now = _scripted(tmp_path, [SessionRefused(reason, status=409)])
 
     async def go():
@@ -703,10 +705,18 @@ def test_a_final_refusal_ends_the_seed_and_holds_no_other_open(tmp_path, reason)
                 await runner.run(2)
             assert refused.value.reason == reason
             assert runner._not_before <= now[0]               # no exponential hold on the next seed's open
+            if reason in RL_TASK_FINAL_REFUSALS:              # about the precommit: no other seed of it is sent
+                with pytest.raises(SessionRefused):
+                    await runner.run(3)
+                return None
             return await runner.run(2)
 
-    assert asyncio.run(go()).ok
-    assert len(sessions.opened) == 2 and now[0] == 0.0
+    result = asyncio.run(go())
+    if reason in {"precommit_unknown", "precommit_stale", "session_too_long"}:
+        assert result is None and len(sessions.opened) == 1
+    else:
+        assert result.ok and len(sessions.opened) == 2
+    assert now[0] == 0.0
 
 
 def test_reopening_is_bounded_by_the_window(tmp_path):

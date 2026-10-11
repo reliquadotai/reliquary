@@ -44,9 +44,23 @@ def episode_block(**overrides) -> dict:
     return value
 
 
-def episode_contract_dict(*, episode=None, catalogue=None, **kwargs) -> dict:
+def bridged_version(catalogue, identity, rows) -> str:
+    """The manifest digest a bridged env's order entry pins (its ``version``) for ``catalogue`` installed as
+    ``identity`` with ``rows`` tasks in its RL split."""
+    from reliquary_sandbox_verifiers.loading import options_sha256
+
+    from reliquary.environment.bridged_episode import bridged_manifest_sha256
+
+    return bridged_manifest_sha256(identity=identity, options_sha256=options_sha256(dict(catalogue["options"])),
+                                   lock_sha256=catalogue["image_lock_sha256"], rl_split=catalogue["rl_split"],
+                                   rows=rows)
+
+
+def episode_contract_dict(*, episode=None, catalogue=None, episode_version=None, **kwargs) -> dict:
     kwargs.setdefault("envs", (MATH, EPISODE))
     value = contract_v2_dict(**kwargs)
+    if episode_version is not None:
+        value["environments"][EPISODE]["version"] = episode_version
     if episode is None:
         episode = episode_block() if catalogue is None else episode_block(split=catalogue["rl_split"])
     value["environments"][EPISODE]["episode"] = episode
