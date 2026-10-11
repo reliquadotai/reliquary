@@ -89,7 +89,8 @@ def transcript(validator: Signer, machine: Signer, session: SessionClaims, *, ca
 
 def capacity_report(machine: Signer, *, at: int, machine_id=MACHINE, address=ADDRESS,
                     free=4, capacity=4, images=(IMAGE,), env_packages=None, caps=None,
-                    tools_version="reliquary-tools/1", env_options_sha256=None) -> dict:
+                    tools_version="reliquary-tools/1", env_options_sha256=None, resources=None,
+                    env_image_locks=None) -> dict:
     document = {
         "machine_id": machine_id, "public_base_url": address, "key_id": machine.key_id,
         "at": at, "capacity": capacity, "active": capacity - free, "free": free,
@@ -106,6 +107,10 @@ def capacity_report(machine: Signer, *, at: int, machine_id=MACHINE, address=ADD
     }
     if env_options_sha256 is not None:
         document["env_options_sha256"] = dict(env_options_sha256)
+    if resources is not None:
+        document["resources"] = dict(resources)
+    if env_image_locks is not None:
+        document["env_image_locks"] = {env: dict(lock) for env, lock in env_image_locks.items()}
     return {"document": document, "signature": machine.sign(HEARTBEAT_DOMAIN, document)}
 
 

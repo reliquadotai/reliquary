@@ -11,7 +11,9 @@ their miners. A session goes to the least-loaded eligible machine: active in the
 directory, fresh, holding the image and the env package at the pinned version (and,
 when the task names one, serving the env with the options digest the validator resolved
 it with), the tools version this build renders, caps no lower than the budgets and token validity,
-and a free slot once the tokens issued since its report are counted. "Least loaded" is
+and a free slot once the tokens issued since its report are counted; for an RL session, also CPU and memory
+room on a box at least the task's size (its report's `resources`, with the reservations issued here and not yet
+in a report: `pick(reserve=)`). "Least loaded" is
 the largest FREE FRACTION (free / capacity); equal fractions go to the smallest machine
 id, so ties bias toward lexicographically small ids (deterministic, not balanced). A machine whose
 `max_transcript_bytes` is refused by `transcript_cap_refusal` is never placed.
@@ -94,6 +96,36 @@ MAX_REPORT_BYTES = 1024 * 1024
 _CAPS = {"max_calls": "max_calls", "cpu_s": "max_cpu_s", "per_call_timeout_s": "max_call_timeout_s",
          "wall_s": "max_wall_s", "memory_bytes": "max_memory_bytes", "pids": "max_pids",
          "disk_bytes": "max_disk_bytes"}
+# The fields of a report's ``resources`` block an RL placement reads (all non-negative ints).
+_RESOURCE_FIELDS = ("cpu_millis", "memory_bytes", "free_cpu_millis", "free_memory_bytes", "max_box_cpu_millis",
+                    "boxes_per_episode")
+MIN_BOX_CPU_MILLIS = 100          # the gateway never sizes a box below 0.1 CPU
+def reservation_need(resources: Mapping[str, Any], reserve: Mapping[str, Any]) -> tuple[int, int] | None:
+    """(CPU millis, memory bytes) a session with ``reserve`` takes on a machine reporting ``resources`` (the
+    gateway's own rule: its agent box of the task's CPUs, at least 0.1 CPU, and its memory budget), or None when
+    the machine's box is smaller than the task declares (never clamped: such a machine never gets it)."""
+    box = int(resources["max_box_cpu_millis"])
+    asked = reserve.get("cpu_millis")
+    if asked is not None and int(asked) > box:
+        return None
+    per_box = box if asked is None else max(MIN_BOX_CPU_MILLIS, int(asked))
+    boxes = int(resources["boxes_per_episode"])
+    return boxes * per_box, boxes * int(reserve["memory_bytes"])
+
+
+def _valid_resources(value: Any) -> bool:
+    return (isinstance(value, Mapping)
+            and all(type(value.get(name)) is int and value[name] >= 0 for name in _RESOURCE_FIELDS)
+            and value["cpu_millis"] > 0 and value["memory_bytes"] > 0 and value["boxes_per_episode"] > 0
+            and value["max_box_cpu_millis"] > 0)
+
+
+def _listed(resources: Any) -> frozenset[str]:
+    """The live session ids a ``resources`` block names (its ``used_*`` counts them)."""
+    listed = resources.get("sessions") if isinstance(resources, Mapping) else None
+    if not isinstance(listed, list):
+        return frozenset()
+    return frozenset(s for s in listed if isinstance(s, str))
 
 
 @dataclass(frozen=True)
@@ -174,6 +206,12 @@ class Fleet:
         self._last_ok: dict[str, float] = {}
         self._recorded: dict[str, float] = {}
         self._issued: dict[str, list[int]] = {}
+        # RL reservations issued here and not yet in a report: machine -> [(at, until, reserve, session id)]
+        self._reserved: dict[str, list[tuple[int, int, dict, str | None]]] = {}
+        # RL placement only on machines reporting a valid ``resources`` block (the production RL wiring sets it).
+        self.resources_required = False
+        self._no_resources_logged: set[str] = set()
+        self._listed: dict[str, float] = {}     # session id -> when an accepted report first listed it live
         self._started = clock()
         self.drained: set[str] = set()
         self._egress_suspect = False      # the last poll heard no machine at all
@@ -267,6 +305,12 @@ class Fleet:
             return False
         self._reports[machine_id] = dict(document)
         self._last_ok[machine_id] = now
+        listed = _listed(document.get("resources"))
+        if listed:
+            for session_id in listed:
+                self._listed.setdefault(session_id, now)   # it reached its gateway: its miner had the token
+            if len(self._listed) > 200_000:                  # bounded: forget what was first listed a day ago
+                self._listed = {sid: at for sid, at in self._listed.items() if at > now - 86_400}
         if machine_id in self.drained:
             self.drained.discard(machine_id)
             logger.info("machine %s heartbeats again; it gets sessions again", machine_id)
@@ -349,11 +393,73 @@ class Fleet:
         except Exception as exc:  # observability only (a timeout included)
             logger.warning("heartbeat summary of %s not written: %s", machine_id, type(exc).__name__)
 
-    def note_issued(self, machine_id: str, at: int) -> None:
+    def note_issued(self, machine_id: str, at: int, *, reserve: Mapping[str, Any] | None = None,
+                    hold_s: int | None = None, session_id: str | None = None) -> None:
+        """A session was issued on the machine at ``at``: a slot until its next report. With ``reserve`` (RL),
+        its CPU and memory are also held here until a report lists the session (its ``used`` counts it then),
+        the session leaves the book (``note_settled``), or a report made after ``at + hold_s`` (the token's
+        present window: the gateway refuses it later) does not list it, whichever comes first."""
         issued = self._issued.setdefault(machine_id, [])
         issued.append(int(at))
         horizon = int(at) - 4 * HEARTBEAT_MAX_AGE_S
         self._issued[machine_id] = [t for t in issued if t >= horizon]
+        if reserve is not None:
+            until = int(at) + int(hold_s if hold_s is not None else 4 * HEARTBEAT_MAX_AGE_S)
+            # A hold past its window counts only while the report before it is fresh: forget older ones.
+            reserved = [r for r in self._reserved.get(machine_id, ()) if r[1] >= int(at) - HEARTBEAT_MAX_AGE_S]
+            reserved.append((int(at), until, dict(reserve), session_id))
+            self._reserved[machine_id] = reserved
+
+    def note_settled(self, session_id: str) -> None:
+        """The session left the book (closed, lapsed, voided): its reservation is no longer held here; the
+        gateway's next report is the truth. A session holding nothing here (corpus) changes nothing."""
+        for machine_id, reserved in list(self._reserved.items()):
+            kept = [r for r in reserved if r[3] != session_id]
+            if len(kept) != len(reserved):
+                self._reserved[machine_id] = kept
+
+    def session_reported(self, session_id: str) -> bool:
+        """Whether a report this process accepted listed the session live on its machine: its miner held the
+        token (a restart did not lose the open's answer; the session held its box)."""
+        return session_id in self._listed
+
+    def _resources(self, machine_id: str, document: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        resources = document.get("resources")
+        if _valid_resources(resources):
+            return resources
+        if machine_id not in self._no_resources_logged:
+            self._no_resources_logged.add(machine_id)
+            logger.error("sandbox machine %s reports no valid resources: it gets no RL session "
+                         "(set episode_cpu_millis_total and episode_memory_bytes_total on it)", machine_id)
+        return None
+
+    def _by_resources(self, document: Mapping[str, Any], reserve: Mapping[str, Any] | None) -> bool:
+        """Whether this placement is judged by CPU and memory (an RL session, on a machine that reports them or
+        once they are required) rather than by slots."""
+        return reserve is not None and (self.resources_required or "resources" in document)
+
+    def _margin(self, machine_id: str, document: Mapping[str, Any], reserve: Mapping[str, Any]) -> float | None:
+        """The machine's remaining fraction (the scarcer of CPU and memory) once this session is placed; negative
+        when it has no room now; None when it never could (no valid ``resources``, a box smaller than the task,
+        totals below the need). The reservations issued here count until a report shows them (see
+        ``note_issued``): never twice past a report that lists them, never zero times before."""
+        resources = self._resources(machine_id, document)
+        if resources is None:
+            return None
+        need = reservation_need(resources, reserve)
+        if need is None or need[0] > resources["cpu_millis"] or need[1] > resources["memory_bytes"]:
+            return None
+        report_at = document["at"]
+        held = [r for r in self._reserved.get(machine_id, ()) if r[3] not in self._listed and report_at <= r[1]]
+        cpu = memory = 0
+        for _at, _until, other, _sid in held:
+            taken = reservation_need(resources, other) or (0, 0)
+            cpu, memory = cpu + taken[0], memory + taken[1]
+        free_cpu = resources["free_cpu_millis"] - cpu - need[0]
+        free_memory = resources["free_memory_bytes"] - memory - need[1]
+        if free_cpu < 0 or free_memory < 0:
+            return min(free_cpu, 0) / resources["cpu_millis"] + min(free_memory, 0) / resources["memory_bytes"]
+        return min(free_cpu / resources["cpu_millis"], free_memory / resources["memory_bytes"])
 
     def session_capacity(self, now: float | None = None) -> int:
         """The session slots (``capacity`` of their last report) of the fresh, active, undrained machines: the
@@ -393,11 +499,14 @@ class Fleet:
 
     def pick(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
              validity_s: int, now: float,
-             env_options_sha256: str | None = None, exclude: Collection[str] = ()) -> Placement | None:
+             env_options_sha256: str | None = None, exclude: Collection[str] = (),
+             reserve: Mapping[str, Any] | None = None) -> Placement | None:
         """The machine a new session goes to (see the module docstring), or None. With
         `env_options_sha256`, a machine is eligible only if its report publishes that
         digest for `env` (the gateway is the authority on the env's options). `exclude`: machines
-        held for another open (the RL open queue)."""
+        held for another open (the RL open queue). With `reserve` (RL), a machine reporting `resources` (every
+        machine, once `resources_required`) must have room for the session's CPU and memory on a box at least the
+        task's CPUs; the least loaded is then the one with the largest remaining fraction."""
         if not self.directory_ready(now):
             self._alert_stale(now)
             return None
@@ -413,7 +522,13 @@ class Fleet:
             free = self._free(entry.machine_id, document)
             if free <= 0:
                 continue
-            key = (-free / max(1, document["capacity"]), entry.machine_id)
+            if self._by_resources(document, reserve):
+                margin = self._margin(entry.machine_id, document, reserve)
+                if margin is None or margin < 0:
+                    continue
+                key = (-margin, entry.machine_id)
+            else:
+                key = (-free / max(1, document["capacity"]), entry.machine_id)
             if best is None or key < best:
                 best, chosen = key, Placement(entry.machine_id, entry.address)
         return chosen
@@ -458,7 +573,9 @@ class Fleet:
         serves it), False (no active machine serves it, by what every one of them reports) or None when it
         cannot be judged now: the directory is stale, no machine report was accepted yet (a start) or the last
         poll heard none (our egress), no report is fresh, or a machine whose last report serves it is drained or
-        stale. The RL open queue refuses at once only on False (final for the seed); None is retryable."""
+        stale. The RL open queue refuses at once only on False (final for the seed); None is retryable. With
+        `reserve` (RL), a machine judged by its `resources` (see `pick`) serves the session only if its box is at
+        least the task's CPUs and its totals hold the session's CPU and memory."""
         if not self.directory_ready(now) or self._egress_suspect or not self._last_ok:
             return None
         fresh = unknown = False
@@ -470,23 +587,42 @@ class Fleet:
                 continue
             current = entry.machine_id not in self.drained and now - document["at"] <= HEARTBEAT_MAX_AGE_S
             fresh = fresh or current
-            if self._serves(entry, document, **kw):
+            if self._serves(entry, document, **kw) and self._could_hold(entry.machine_id, document, reserve):
                 if current:
                     return True
                 unknown = True              # it served it when last heard: drained or stale for now
         return None if unknown or not fresh else False
 
+    def _could_hold(self, machine_id: str, document: Mapping[str, Any], reserve: Mapping[str, Any] | None) -> bool:
+        """Whether the machine could ever hold this session by its resources (its box size and totals, its load
+        aside); always True for a placement judged by slots."""
+        if not self._by_resources(document, reserve):
+            return True
+        resources = self._resources(machine_id, document)
+        if resources is None:
+            return False
+        need = reservation_need(resources, reserve)
+        return need is not None and need[0] <= resources["cpu_millis"] and need[1] <= resources["memory_bytes"]
+
     def nearest(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
-                now: float, env_options_sha256: str | None = None) -> str | None:
+                now: float, env_options_sha256: str | None = None,
+                reserve: Mapping[str, Any] | None = None) -> str | None:
         """The fresh machine serving this session that is closest to having room for it (the most free room,
-        full or not): the one the open queue holds for a head waiter that keeps missing."""
+        full or not): the one the open queue holds for a head waiter that keeps missing. With `reserve` (RL), room
+        is CPU and memory (see `pick`), and a machine that could never hold the session is not one."""
         best: tuple[float, str] | None = None
         for entry in self._directory.entries():
             document = self._reports.get(entry.machine_id)
             if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
                               validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
                 continue
-            key = (-self._free(entry.machine_id, document) / max(1, document["capacity"]), entry.machine_id)
+            if self._by_resources(document, reserve):
+                margin = self._margin(entry.machine_id, document, reserve)
+                if margin is None:
+                    continue
+                key = (-margin, entry.machine_id)
+            else:
+                key = (-self._free(entry.machine_id, document) / max(1, document["capacity"]), entry.machine_id)
             if best is None or key < best:
                 best = key
         return None if best is None else best[1]
@@ -578,5 +714,5 @@ _EMPTY_DIRECTORY = DirectorySnapshot()
 
 __all__ = ["DIRECTORY_BACKOFF_BASE_SECONDS", "DIRECTORY_BACKOFF_CAP_SECONDS",
            "DIRECTORY_MAX_AGE_SECONDS", "DIRECTORY_READ_TIMEOUT_SECONDS", "DIRECTORY_REFRESH_SECONDS", "FETCH_TIMEOUT_S", "HEARTBEAT_MAX_AGE_S",
-           "HEARTBEAT_RECORD_SECONDS", "HEARTBEAT_RECORD_TIMEOUT_S", "MAX_REPORT_BYTES", "POLL_SECONDS", "STALE_AFTER_S",
-           "TOOLS_VERSION", "Fleet", "Placement", "http_fetch_report"]
+           "HEARTBEAT_RECORD_SECONDS", "HEARTBEAT_RECORD_TIMEOUT_S", "MAX_REPORT_BYTES", "MIN_BOX_CPU_MILLIS", "POLL_SECONDS",
+           "STALE_AFTER_S", "TOOLS_VERSION", "Fleet", "Placement", "http_fetch_report", "reservation_need"]

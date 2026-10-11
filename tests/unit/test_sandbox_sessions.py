@@ -45,6 +45,7 @@ class FakeFleet:
     def __init__(self, snapshot, placement=Placement(MACHINE, ADDRESS)):
         self.snapshot, self.placement = snapshot, placement
         self.picked, self.issued = [], []
+        self.issued_kw, self.settled = [], []
         self.ready = True
         self.placeable = True
 
@@ -58,8 +59,12 @@ class FakeFleet:
         self.picked.append(kw)
         return self.placement
 
-    def note_issued(self, machine_id, at):
+    def note_issued(self, machine_id, at, **kw):
         self.issued.append((machine_id, at))
+        self.issued_kw.append(kw)
+
+    def note_settled(self, session_id):
+        self.settled.append(session_id)
 
     def directory(self):
         return self.snapshot

@@ -220,6 +220,9 @@ class EngagementTerms:
     # The task's prepare timeout as its gateway will read it: the token must outlive it (``token_validity_s``).
     # None: the sandbox's default.
     prepare_timeout_s: float | None = None
+    # RL: what the session reserves on its machine, {"cpu_millis": int | None, "memory_bytes": int} (the gateway
+    # reserves its agent box); placement then goes by CPU and memory. None: slots only (corpus).
+    reserve: dict[str, Any] | None = None
 
 
 class EngagementBook(Protocol):
@@ -777,6 +780,13 @@ def _reserve_of(terms) -> tuple:
     return (reserve.get("cpu_millis"), reserve.get("memory_bytes"))
 
 
+def _reserving(terms) -> dict:
+    """The ``reserve`` keyword of a placement call: only when the terms carry one (a corpus call keeps its exact
+    keywords)."""
+    reserve = getattr(terms, "reserve", None)
+    return {} if reserve is None else {"reserve": reserve}
+
+
 def _placement_class(terms) -> tuple:
     """The open queue's class: the env and the reservation's tier, NOT the image (one image per task would make
     every open its own class and bypass the queue); each waiter's own attempt filters on its image and exact
@@ -859,6 +869,18 @@ class SessionIssuer:
     def _wake(self) -> None:
         if self._queue is not None:
             self._queue.notify()
+
+    def _settled(self, records) -> None:
+        """Sessions left the book's live states: the fleet drops its hold on their reservations."""
+        settled = getattr(self._fleet, "note_settled", None)
+        if settled is None:
+            return
+        for record in records:
+            if record is not None:
+                try:
+                    settled(record.session_id)
+                except Exception:
+                    logger.exception("the fleet failed to drop the hold of session %s", record.session_id)
 
     def _reported(self, session_id: str) -> bool:
         """Whether a machine report accepted since the restart listed this session live on its gateway
@@ -1021,7 +1043,8 @@ class SessionIssuer:
         surely could take it later (anything else is answered under the lock)."""
         now = int(self._clock())
         place = dict(image=terms.image, env=terms.env, env_package=terms.env_package, budgets=terms.budgets,
-                     validity_s=self._validity(terms), now=now, env_options_sha256=terms.env_options_sha256)
+                     validity_s=self._validity(terms), now=now, env_options_sha256=terms.env_options_sha256,
+                     **_reserving(terms))
         if self._fleet.pick(**place, **({"exclude": exclude} if exclude else {})) is not None:
             return False
         return self._fleet.could_place(**place) is True
@@ -1033,7 +1056,8 @@ class SessionIssuer:
             if nearest is not None:
                 queue.hold(ticket, nearest(image=terms.image, env=terms.env, env_package=terms.env_package,
                                            budgets=terms.budgets, validity_s=self._validity(terms),
-                                           now=int(self._clock()), env_options_sha256=terms.env_options_sha256))
+                                           now=int(self._clock()), env_options_sha256=terms.env_options_sha256,
+                                           **_reserving(terms)))
         queue.missed(ticket, room=room)
 
     async def _issue_locked(self, hotkey: str, request_id: str, digest: str, engagement: Mapping[str, Any],
@@ -1079,12 +1103,13 @@ class SessionIssuer:
                                          env_package=terms.env_package, budgets=terms.budgets,
                                          validity_s=validity, now=now,
                                          env_options_sha256=terms.env_options_sha256,
-                                         **({"exclude": exclude} if exclude else {}))
+                                         **({"exclude": exclude} if exclude else {}), **_reserving(terms))
         if placement is None:
             if self._queue is not None:
                 verdict = self._fleet.could_place(
                     image=terms.image, env=terms.env, env_package=terms.env_package, budgets=terms.budgets,
-                    validity_s=validity, now=now, env_options_sha256=terms.env_options_sha256)
+                    validity_s=validity, now=now, env_options_sha256=terms.env_options_sha256,
+                    **_reserving(terms))
                 if verdict is None:                  # our outage or a start: retryable, never final for the seed
                     return Refusal("directory_unavailable", {"why": "the sandbox fleet cannot be judged now"},
                                    retry_after=self._policy.retry_after_s)
@@ -1114,7 +1139,15 @@ class SessionIssuer:
                            type(exc).__name__)
             return Refusal("store_unavailable", {}, retry_after=self._policy.retry_after_s)
         self.book.add(record)
-        self._fleet.note_issued(placement.machine_id, now)
+        reserve = getattr(terms, "reserve", None)
+        if reserve is None:
+            self._fleet.note_issued(placement.machine_id, now)
+        else:
+            from reliquary.sandbox.rl_capacity import PRESENT_WINDOW_S   # RL only: corpus never loads it
+
+            # held until a report lists it, at most the token's present window (the gateway refuses it later)
+            self._fleet.note_issued(placement.machine_id, now, reserve=reserve,
+                                    hold_s=min(validity, PRESENT_WINDOW_S), session_id=session_id)
         self._tokens[session_id] = (token, placement.address)
         self._event("opened", record)
         return _Issued(Grant(session_id, token, placement.address, claims.expires_at),
@@ -1202,6 +1235,7 @@ class SessionIssuer:
                 settled.ended_at = now                   # its box's end, never moved by a submission
         if settled is not None:
             self._event("closed", settled, final)
+            self._settled((settled,))
             self._wake()
         await self._persist(settled)
         logger.info("sandbox session %s of %s closed: %s", session_id, hotkey[:12], status)
@@ -1415,6 +1449,7 @@ class SessionIssuer:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
         if records:
+            self._settled(records)
             self._wake()
             logger.warning("machine %s drained: %d live sessions voided, no fault to their miners",
                            machine_id, len(records))
@@ -1447,6 +1482,7 @@ class SessionIssuer:
                            if not times or times[-1] <= now - MINUTE]:
                 del self._refused_opens[hotkey]
         if lapsed:
+            self._settled(lapsed)
             self._wake()
         for record in lapsed:
             await self._persist(record)

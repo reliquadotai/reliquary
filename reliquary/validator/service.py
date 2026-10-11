@@ -7963,7 +7963,7 @@ class ValidationService:
                 precommit_retention_s=self._episode_precommit_retention_s(),
                 registration=rl_registration(self.server), ledger=ledger,
                 operator_of=self._episode_operator_of,
-                window_uses=None if ledger is None else runtime.window_uses)
+                window_uses=None if ledger is None else runtime.window_uses, require_resources=True)
             for router in services.routers:
                 self.server.app.include_router(router)
             await services.start()

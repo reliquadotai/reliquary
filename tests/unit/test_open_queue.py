@@ -623,7 +623,7 @@ class Rooms:
     def nearest(self, **kw):
         return max(self.free, key=lambda m: (self.free[m], m))
 
-    def note_issued(self, machine_id, at):
+    def note_issued(self, machine_id, at, **kw):
         pass
 
     # the session listener: the open takes its CPUs

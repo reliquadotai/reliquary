@@ -384,7 +384,7 @@ def build_rl_episode_services(
     clock: Callable[[], float] = time.time, open_body_timeout_s: float | None = None,
     max_preauth_opens: int | None = None,
     yield_path=None, ledger=None, operator_of: Callable[[str], str | None] | None = None,
-    window_uses: Callable[[int], Any] | None = None,
+    window_uses: Callable[[int], Any] | None = None, require_resources: bool = False,
 ) -> RlEpisodeServices:
     """``environments``: the order's episode envs as loaded (``SignedEpisodeEnvironment``; their
     ``source`` is the env's task source); ``renderer_for(policy)``: the turn renderer of the policy's tokenizer over
@@ -397,7 +397,8 @@ def build_rl_episode_services(
     hears of them), opened here, on the caller's thread; ``ledger``: an already opened ledger instead (the
     validator opens it in a worker thread); ``operator_of(hotkey)``: the chain operator, read only to tell
     whether a saturation was the refused miner's own doing; ``window_uses``: ``ServiceRuntime.window_uses``
-    (blocking; called in a worker thread)."""
+    (blocking; called in a worker thread); ``require_resources``: RL sessions go only to machines reporting their
+    CPU and memory ``resources`` (production; a machine without them is logged once and gets none)."""
     from reliquary_sandbox.attest import Ed25519TokenVerifier, Signer, load_private_key
 
     from reliquary.infrastructure import sandbox_store
@@ -443,6 +444,7 @@ def build_rl_episode_services(
                   directory_refresh_s=config.directory_refresh_s,
                   directory_max_age_s=config.directory_max_age_s,
                   directory_read_timeout_s=config.directory_read_timeout_s)
+    fleet.resources_required = bool(require_resources)
     if yield_path is not None and ledger is not None:
         raise ValueError("pass the yield ledger's path or the ledger, not both")
     book = SessionBook(policy)

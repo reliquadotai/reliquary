@@ -239,7 +239,9 @@ class RlEpisodeEngagements:
         return EngagementTerms(
             engagement=name, env=policy.sandbox_env, split=policy.split, index=precommit.task_index,
             checkpoint=precommit.checkpoint, image=task.image, env_package=policy.env_package,
-            budgets=budgets, exclusive=True, still_valid=still_valid, prepare_timeout_s=prepare)
+            budgets=budgets, exclusive=True, still_valid=still_valid, prepare_timeout_s=prepare,
+            # the session's agent box on its machine: the task's CPUs (None: the machine's box) and memory budget
+            reserve={"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])})
 
 
 __all__ = ["WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements", "SessionOutcomes",
