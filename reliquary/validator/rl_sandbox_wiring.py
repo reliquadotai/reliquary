@@ -160,6 +160,9 @@ class RlEpisodeServices:
     views: dict = field(default_factory=dict, repr=False)
     saturation: Any = field(default=None, repr=False)
     tiers: Any = field(default=None, repr=False)
+    task_counts: dict = field(default_factory=dict, repr=False)     # env -> its tasks (for seeding the tiers)
+    raw_resolvers: dict = field(default_factory=dict, repr=False)   # env -> its source's resolve (unobserved)
+    saturation_cache: Any = field(default=None, repr=False)         # the last snapshot, computed off the request
     _loop: Any = field(default=None, repr=False)
     _tasks: set = field(default_factory=set, repr=False)
 
@@ -170,6 +173,8 @@ class RlEpisodeServices:
         wait start degraded (``require_served``): the validator starts anyway."""
         self._loop = asyncio.get_running_loop()
         await self.fleet.refresh_if_due()
+        if self.tiers is not None:
+            await self.seed_tiers()
         if self.boot_wait_s is not None:
             await self.require_served(self.boot_wait_s)
         restored = 0
@@ -215,8 +220,46 @@ class RlEpisodeServices:
         return jobs
 
     # --- the operator's saturation view and ALERTs ---
+    async def seed_tiers(self) -> None:
+        """Seed each env's per-session reservation from a sample of its own tasks (``SessionTiers.seed``): at
+        most ``TIER_SEED_TASKS`` spread evenly over its index range, within ``TIER_SEED_TIMEOUT_S``. An env whose
+        tasks cannot be counted or resolved stays learnt from what is resolved (logged). Never raises."""
+        from reliquary.sandbox.rl_capacity import TIER_SEED_TASKS, TIER_SEED_TIMEOUT_S
+
+        for name in sorted(self.policies):
+            count, resolve = self.task_counts.get(name), self.raw_resolvers.get(name)
+            if not count or resolve is None:
+                logger.warning("episode env %s: its task count is unknown; its reservation tier is learnt from the "
+                               "tasks miners resolve", name)
+                continue
+            indices = (range(count) if count <= TIER_SEED_TASKS
+                       else sorted({i * count // TIER_SEED_TASKS for i in range(TIER_SEED_TASKS)}))
+            tasks: list = []
+            deadline = time.monotonic() + TIER_SEED_TIMEOUT_S
+
+            async def sample(indices=indices, tasks=tasks, resolve=resolve, name=name) -> None:
+                failed = 0
+                for index in indices:
+                    try:
+                        tasks.append(await resolve(int(index)))
+                    except (LookupError, ValueError, OSError, RuntimeError):
+                        failed += 1                      # a task the source cannot resolve: not sampled
+                if failed:
+                    logger.warning("episode env %s: %d sampled tasks could not be resolved", name, failed)
+            try:
+                await asyncio.wait_for(sample(), max(0.0, deadline - time.monotonic()))
+            except TimeoutError:
+                logger.warning("episode env %s: %d tasks sampled for its reservation tier before the timeout",
+                               name, len(tasks))
+            except Exception:
+                logger.exception("episode env %s: its reservation tier was not seeded", name)
+                continue
+            self.tiers.seed(name, tasks)
+            logger.info("episode env %s: sessions counted at %s (from %d tasks)", name,
+                        self.tiers.reservation(name), len(tasks))
+
     def reservations(self) -> dict | None:
-        """{sandbox env: (package, reservation at its largest task tier)}: what the fleet size is counted in."""
+        """{(sandbox env, package): reservation}: what the fleet size is counted in."""
         return None if self.tiers is None else self.tiers.reservations()
 
     def free_fraction(self) -> float | None:
@@ -225,8 +268,17 @@ class RlEpisodeServices:
         return None if sessions <= 0 else free / sessions
 
     def saturation_snapshot(self) -> dict:
-        return self.saturation.snapshot(queue=self.queue, quota=self.quota, fleet=self.fleet,
-                                        reservations=self.reservations(), ledger=self.ledger, issuer=self.issuer)
+        """Computed by ``saturation_forever`` every ``SATURATION_CHECK_S`` (never on a request)."""
+        snapshot = self.saturation.snapshot(queue=self.queue, quota=self.quota, fleet=self.fleet,
+                                            reservations=self.reservations(), ledger=self.ledger, issuer=self.issuer)
+        if self.tiers is not None:
+            snapshot["reservations"] = self.tiers.view()
+        snapshot["at"] = float(self.clock())
+        return snapshot
+
+    def cached_saturation(self) -> dict | None:
+        """The last snapshot ``saturation_forever`` computed (None before the first)."""
+        return self.saturation_cache
 
     def check_saturation(self) -> list[str]:
         """One round of the operator's ALERTs (the grow-fleet one, the check slots, envs that lost every
@@ -234,20 +286,22 @@ class RlEpisodeServices:
         from reliquary.sandbox.rl_capacity import MAX_CHECKS_RUNNING
 
         monitor, alerts = self.saturation, []
-        fleet_alert = monitor.check(free_fraction=self.free_fraction())
-        if fleet_alert:
-            alerts.append(fleet_alert)
+        reservations = self.reservations()
+        envs = (self.fleet.capacity_by_env() if reservations is None
+                else self.fleet.capacity_by_env(reservations=reservations))
+        alerts.extend(monitor.check_saturated(envs, images_of=getattr(self.fleet, "image_set_images", None)))
         checker_alert = monitor.check_checker(running=MAX_CHECKS_RUNNING)
         if checker_alert:
             alerts.append(checker_alert)
-        served = {name: bool(self.fleet.serving(sandbox_env, package, env_options_sha256=options))
-                  for name, (sandbox_env, package, options) in self.served.items()}
-        lost, recovered = monitor.check_envs(served, known_lost=self.unserved_envs)
-        alerts.extend(lost)
-        for name in recovered:
-            recover = getattr(self.issuer, "unserved_recovered", None)
-            if recover is not None:
-                recover(self.served[name][0])          # its next loss is ALERTed again at the open path too
+        if self.fleet.directory_ready():                # a stale directory is the fleet's own ALERT, not every env's
+            served = {name: bool(self.fleet.serving(sandbox_env, package, env_options_sha256=options))
+                      for name, (sandbox_env, package, options) in self.served.items()}
+            lost, recovered = monitor.check_envs(served, known_lost=self.unserved_envs)
+            alerts.extend(lost)
+            for name in recovered:
+                recover = getattr(self.issuer, "unserved_recovered", None)
+                if recover is not None:
+                    recover(self.served[name][0])      # its next loss is ALERTed again at the open path too
         if self.ledger is not None:
             alerts.extend(monitor.check_capacity_verdicts(self.ledger))
         return alerts
@@ -258,6 +312,10 @@ class RlEpisodeServices:
                 self.check_saturation()
             except Exception:
                 logger.exception("the rl saturation check failed")
+            try:
+                self.saturation_cache = self.saturation_snapshot()
+            except Exception:
+                logger.exception("the rl saturation snapshot failed")
             await asyncio.sleep(every_s)
 
     # --- episode envs no machine serves: a degraded start, never a refusal to start ---
@@ -565,17 +623,55 @@ def _observing(tiers, name: str, resolve: Callable) -> Callable:
     return resolve_and_observe
 
 
-def build_saturation_router(snapshot: Callable[[], dict]):
-    """``GET {RL_PREFIX}/saturation``: the operator's saturation view (counts, sessions and times only; no
-    secret). Read-only."""
-    from fastapi import APIRouter
+def _env_names(policies: Mapping[str, Any]) -> dict[str, str]:
+    """Every name an episode env goes by (its order name, its sandbox env) -> its sandbox env."""
+    names = {}
+    for name, p in policies.items():
+        names[name] = names[p.sandbox_env] = p.sandbox_env
+    return names
+
+
+def _task_count(source: Any) -> int | None:
+    try:
+        return len(source)
+    except TypeError:                                   # a source that cannot count its tasks
+        return None
+
+
+RL_SATURATION_TOKEN_ENV = "RELIQUARY_RL_SATURATION_TOKEN"
+OBSERVATIONS_TOKEN_ENV = "RELIQUARY_SERVICE_OBSERVATIONS_TOKEN"     # server.SERVICE_OBSERVATIONS_TOKEN_ENV
+"""The operator's bearer token for ``GET /rl/saturation`` (the service observations' token when unset)."""
+
+
+def build_saturation_router(snapshot: Callable[[], dict | None]):
+    """``GET {RL_PREFIX}/saturation``: the operator's saturation view, ADMIN-ONLY like ``/service-observations``
+    (it names hotkeys and shows live scarcity): ``Authorization: Bearer <token>`` (``RELIQUARY_RL_SATURATION_TOKEN``,
+    else ``RELIQUARY_SERVICE_OBSERVATIONS_TOKEN``), compared in constant time; no token configured: 404 whatever the
+    request; a missing or wrong one: 401. It serves the snapshot the background job computed last (503 before the
+    first): a request computes nothing."""
+    import hmac
+    import os
+
+    from fastapi import APIRouter, HTTPException, Request
 
     router = APIRouter()
 
-    @router.get(f"{RL_PREFIX}/saturation")
-    async def saturation() -> dict:
-        return snapshot()
+    async def saturation(request: Request) -> dict:
+        token = os.environ.get(RL_SATURATION_TOKEN_ENV, "") or os.environ.get(OBSERVATIONS_TOKEN_ENV, "")
+        if not token:
+            raise HTTPException(status_code=404, detail="not_found")
+        supplied = request.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        cached = snapshot()
+        if cached is None:
+            raise HTTPException(status_code=503, detail="not_ready", headers={"Retry-After": "10"})
+        return cached
 
+    # The annotations are strings here (postponed): the request type is given explicitly, as FastAPI resolves them
+    # from the module's globals, where this lazily imported name is not.
+    saturation.__annotations__ = {"request": Request, "return": dict}
+    router.add_api_route(f"{RL_PREFIX}/saturation", saturation, methods=["GET"])
     return router
 
 
@@ -699,7 +795,11 @@ def build_rl_episode_services(
                            group_size=min(p.pool_seeds for p in policies.values()) // 2,
                            capacity=lambda: fleet.session_capacity(reservations=tiers.reservations()),
                            reported=getattr(fleet, "session_reported", None),
-                           group_sizes=episode_group_sizes(policies), retry_after_s=policy.retry_after_s, clock=clock)
+                           group_sizes=episode_group_sizes(policies), retry_after_s=policy.retry_after_s, clock=clock,
+                           # a hotkey's groups on one env: within its share of that env's machines
+                           env_capacities=lambda: {env: row["slots"] for env, row in fleet.capacity_by_env(
+                               reservations=tiers.reservations()).items()},
+                           env_names=_env_names(policies))
     if ledger is not None and isinstance(quota, YieldQuota):
         ledger.allow_capacity_verdicts(quota.groups_allowed)      # capacity verdicts: per hotkey and window
         book.cap_scale = quota.cap_scale                          # the per-hotkey rates scale with the allocation
@@ -765,18 +865,19 @@ def build_rl_episode_services(
     logger.info("rl episode services built for %s (validator key %s)", sorted(policies), signer.key_id)
     routers = (sessions_router, precommit_router)
     if saturation is not None:
-        routers += (build_saturation_router(lambda: built["services"].saturation_snapshot()),)
+        routers += (build_saturation_router(lambda: built["services"].cached_saturation()),)
     services = RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,
                              issuer=issuer, routers=routers, intake=intake,
                              environments=tuple(sorted(policies)), runtime=runtime, outcomes=outcomes,
                              clock=clock, precommit_retention_s=float(precommit_retention_s),
-                             ledger=ledger, quota=quota, queue=queue, window_uses=window_uses, policies=dict(policies),
+                             ledger=ledger, quota=quota, queue=queue, window_uses=window_uses, policies=policies,
                              window_open=window_open, current_window=current_window, operator_of=operator_of,
                              served={name: (p.sandbox_env, p.env_package,
                                             getattr(environments[name].source, "options_sha256", None))
                                      for name, p in policies.items()},
                              resolvers=resolvers, boot_wait_s=boot_wait_s, views=views, saturation=saturation,
-                             tiers=tiers)
+                             tiers=tiers, task_counts={name: _task_count(environments[name].source) for name in policies},
+                             raw_resolvers={name: environments[name].source.resolve for name in policies})
     engagements.serving_refusal = services.serving_refusal
     built["services"] = services
     return services

@@ -123,13 +123,20 @@ class YieldQuota:
     def __init__(self, *, ledger: Any, pool_seeds: int, group_size: int, capacity: Callable[[], int],
                  reported: Callable[[str], bool] | None = None, takes_spare: bool = NEWCOMER_TAKES_SPARE,
                  refresh_s: float = ALLOCATION_REFRESH_S, retry_after_s: int = 10,
-                 group_sizes: Mapping[str, int] | None = None, clock: Callable[[], float] = time.time) -> None:
+                 group_sizes: Mapping[str, int] | None = None, clock: Callable[[], float] = time.time,
+                 env_capacities: Callable[[], Mapping[str, int]] | None = None,
+                 env_names: Mapping[str, str] | None = None) -> None:
         self._ledger = ledger
         self._pool_seeds, self._group_size = int(pool_seeds), int(group_size)
         # env -> M (its group size), keyed by every name an env goes by: the name an open gives and the name a
         # session record stores (its sandbox env).
         self._group_sizes = {str(k): int(v) for k, v in (group_sizes or {}).items()}
         self._capacity_of = capacity
+        # Per env (its canonical name: the sandbox env), the sessions the machines serving it hold, and every name an
+        # env goes by -> that canonical name: a MAIN hotkey's groups on one env are capped at its share of the env.
+        self._env_capacities_of = env_capacities
+        self._env_names = {str(k): str(v) for k, v in (env_names or {}).items()}
+        self._env_cache: tuple[float, Mapping[str, int]] | None = None
         self._reported = reported
         self._takes_spare = bool(takes_spare)
         self._refresh_s = float(refresh_s)
@@ -293,6 +300,36 @@ class YieldQuota:
         if cached is None or now - cached[0] >= 1.0:          # a directory scan: at most once a second
             cached = self._capacity_cache = (now, int(self._capacity_of()))
         return cached[1]
+
+    def _env_capacity(self, now: float) -> Mapping[str, int]:
+        if self._env_capacities_of is None:
+            return {}
+        cached = self._env_cache
+        if cached is None or now - cached[0] >= 1.0:
+            cached = self._env_cache = (now, dict(self._env_capacities_of()))
+        return cached[1]
+
+    def _env_refusal(self, hotkey: str, now: int, allocated: float, capacity: int, groups: Mapping[Any, list],
+                     environment: str | None, m_new: int, detail: dict) -> Refusal | None:
+        """A new group of a MAIN hotkey on env e fits only within ``ceil(allocation x C_e / C)`` sessions of e
+        (its groups there, each counting at least M): a fleet whose machines do not all serve every env never lets
+        one key's allocation pile onto a scarce env (where its saturations would be ours). Retryable, opens
+        nothing, no capacity verdict."""
+        if environment is None or capacity <= 0:
+            return None
+        env = self._env_names.get(str(environment), str(environment))
+        c_env = self._env_capacity(now).get(env)
+        if c_env is None or c_env >= capacity:
+            return None
+        cap = math.ceil(float(allocated) * c_env / capacity - 1e-9)
+        held = sum(max(len(members), self._m(members)) for members in groups.values()
+                   if members and self._env_names.get(str(getattr(members[0], "env", "")),
+                                                      str(getattr(members[0], "env", ""))) == env)
+        if held + m_new <= cap:
+            return None
+        return Refusal("quota_env", {"environment": str(environment), "committed": held, "max": cap,
+                                     "env_sessions": int(c_env), "fleet_sessions": int(capacity), **detail},
+                       retry_after=self._retry_after_s)
 
     def _stats(self, hotkey: str, snapshot: Mapping[str, YieldStats] | None = None) -> YieldStats:
         snapshot = self._ledger.snapshot() if snapshot is None else snapshot
@@ -474,6 +511,9 @@ class YieldQuota:
             if (starts and committed + m_new > limit) or (not starts and len(counted) >= limit):
                 return Refusal("quota_live", {"live": len(counted), "committed": committed, "max": limit, **detail},
                                retry_after=self._retry_after_s)
+            if starts:
+                return self._env_refusal(hotkey, now, alloc.main.get(hotkey, 0.0), alloc.capacity, groups,
+                                         environment, m_new, detail)
             return None
         member_groups = _LANE_GROUPS[lane]
         member_max = member_groups * self._pool_seeds

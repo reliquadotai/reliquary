@@ -540,10 +540,10 @@ class Fleet:
         return lock["present"] > 0
 
     def session_room(self, now: float | None = None, *,
-                     reservations: Mapping[str, tuple[str, Mapping[str, Any]]] | None = None) -> tuple[int, int]:
+                     reservations: Mapping[tuple[str, str], Mapping[str, Any]] | None = None) -> tuple[int, int]:
         """(sessions, free sessions) of the fresh, active, undrained machines: the fleet size the RL yield quota
         shares, and how much of it is free now. Without ``reservations``: their slots (``capacity`` and ``free``
-        of their last reports). With ``reservations`` = {sandbox env: (env package, reserve)} (RL: what one
+        of their last reports). With ``reservations`` = {(sandbox env, env package): reserve} (RL: what one
         session of each env reserves, at its largest task tier): per machine, the sessions of the envs it serves
         (at their package, holding some of their images) its slots AND its CPU and memory can hold, at the
         LARGEST reservation among those envs (a session of any of them fits that many times), so an allocation
@@ -556,7 +556,7 @@ class Fleet:
                 free += max(0, min(int(document.get("free") or 0), int(document.get("capacity") or 0)))
                 continue
             packages = document.get("env_packages") or {}
-            room = [self._hostable(machine_id, document, reserve) for env, (package, reserve) in reservations.items()
+            room = [self._hostable(machine_id, document, reserve) for (env, package), reserve in reservations.items()
                     if packages.get(env) == package and self._holds_images(document, env)]
             if room:
                 sessions += min(hosts for hosts, _free in room)
@@ -564,12 +564,23 @@ class Fleet:
         return sessions, free
 
     def session_capacity(self, now: float | None = None, *,
-                         reservations: Mapping[str, tuple[str, Mapping[str, Any]]] | None = None) -> int:
+                         reservations: Mapping[tuple[str, str], Mapping[str, Any]] | None = None) -> int:
         """The fleet size the RL yield quota shares (``session_room``'s first figure). Memory only."""
         return self.session_room(now, reservations=reservations)[0]
 
+    def image_set_images(self, env: str, lock_sha256: str, now: float | None = None) -> frozenset[str]:
+        """The images the fresh machines reporting image lock ``lock_sha256`` for ``env`` hold, together (which
+        refused opens an image set's saturation counts). Memory reads only."""
+        now = self._clock() if now is None else now
+        found: set[str] = set()
+        for machine_id, document in self._fresh_documents(now):
+            lock = (document.get("env_image_locks") or {}).get(env)
+            if isinstance(lock, Mapping) and lock.get("sha256") == lock_sha256:
+                found |= self._images_of(machine_id, document)
+        return frozenset(found)
+
     def capacity_by_env(self, now: float | None = None, *,
-                        reservations: Mapping[str, tuple[str, Mapping[str, Any]]] | None = None) -> dict[str, dict]:
+                        reservations: Mapping[tuple[str, str], Mapping[str, Any]] | None = None) -> dict[str, dict]:
         """``{env: {"machines", "slots", "free", "image_sets": {lock sha256: {"machines", "slots", "free"}}}}``
         over the fresh, active, undrained machines (the operator's saturation view). Without ``reservations``:
         every env a report names, with the machine's slots. With them: each listed env, counting the machines
@@ -578,7 +589,7 @@ class Fleet:
         env's image-lock digest a machine reports. Memory only."""
         now = self._clock() if now is None else now
         found: dict[str, dict] = {env: {"machines": 0, "slots": 0, "free": 0, "image_sets": {}}
-                                  for env in (reservations or {})}
+                                  for env, _package in (reservations or {})}
         for machine_id, document in self._fresh_documents(now):
             packages = document.get("env_packages") or {}
             for env, package in packages.items():
@@ -586,10 +597,10 @@ class Fleet:
                     slots = max(0, int(document.get("capacity") or 0))
                     left = max(0, min(int(document.get("free") or 0), slots))
                 else:
-                    wanted = reservations.get(env)
-                    if wanted is None or wanted[0] != package or not self._holds_images(document, env):
+                    wanted = reservations.get((env, package))
+                    if wanted is None or not self._holds_images(document, env):
                         continue
-                    slots, left = self._hostable(machine_id, document, wanted[1])
+                    slots, left = self._hostable(machine_id, document, wanted)
                 row = found.setdefault(str(env), {"machines": 0, "slots": 0, "free": 0, "image_sets": {}})
                 row["machines"] += 1
                 row["slots"] += slots

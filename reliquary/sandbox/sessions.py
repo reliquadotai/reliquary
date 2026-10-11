@@ -261,15 +261,15 @@ class FanOutEvents:
             except Exception:
                 logger.exception("sandbox session listener closed failed")
 
-    def open_refused(self, reason: str, env: str | None, engagement: str | None) -> None:
-        """Every refused open (the saturation metrics): its reason, and its env and engagement when the terms were
-        read."""
+    def open_refused(self, reason: str, env: str | None, engagement: str | None, image: str | None = None) -> None:
+        """Every refused open (the saturation metrics): its reason, and its env, engagement and image when the terms
+        were read."""
         for listener in self.listeners:
             method = getattr(listener, "open_refused", None)   # optional: the saturation monitor has it
             if method is None:
                 continue
             try:
-                method(reason, env, engagement)
+                method(reason, env, engagement, image)
             except Exception:
                 logger.exception("sandbox session listener open_refused failed")
 
@@ -946,16 +946,17 @@ class SessionIssuer:
             operator = None
         return str(operator) if operator else str(hotkey)
 
-    def _own_load(self, hotkey: str, machine_ids, now: int, engagement: str) -> tuple[int, int]:
+    def _own_load(self, hotkey: str, machine_ids, now: int, engagement: str,
+                  by_share: bool = False) -> tuple[float, float]:
         """``(own, total)`` held sessions on these machines. ``own``: those of the hotkey's operator (all its hotkeys)
         less the refused open's own group (the sessions of the precommit ``engagement`` names: a servable task's
         machines host at least a whole group, so only the operator's OTHER load can make a saturation its own
         doing). ``total``: every session on them, never less than what their reports show (corpus sessions and
         anything else this book does not hold count too)."""
-        share = getattr(self._fleet, "session_share", None)
-        load = getattr(self._fleet, "load_share", None)
+        share = getattr(self._fleet, "session_share", None) if by_share else None
+        load = getattr(self._fleet, "load_share", None) if by_share else None
         owner = self._owner(hotkey)
-        if share is None or load is None:
+        if share is None or load is None:            # by session counts (and always for a corpus session)
             held = self.book.held_on(machine_ids, now)
             own = sum(count for other, count in held.items() if self._owner(other) == owner)
             own -= self.book.held_on_precommit(machine_ids, now, engagement)
@@ -1007,7 +1008,8 @@ class SessionIssuer:
         if not machines and refusal.reason == "sandbox_saturated":
             logger.info("saturation of %s judged with no servable machine in view: a capacity verdict",
                         str(hotkey)[:12])
-        own, total = self._own_load(hotkey, machines, now, terms.engagement)
+        own, total = self._own_load(hotkey, machines, now, terms.engagement,
+                                    by_share=getattr(terms, "reserve", None) is not None)
         if total and 2 * own >= total:
             return True
         if refusal.reason == "open_queue_full" and self._queue is not None:
@@ -1133,11 +1135,11 @@ class SessionIssuer:
         now = int(self._clock())
         refusal = self.book.open_refusal(hotkey, now)
         if refusal is not None:
-            self._event("open_refused", refusal.reason, None, None)
+            self._event("open_refused", refusal.reason, None, None, None)
             return refusal
         if not self._fleet.directory_ready(now):
             refusal = self._directory_unavailable()
-            self._event("open_refused", refusal.reason, None, None)
+            self._event("open_refused", refusal.reason, None, None, None)
             return refusal
         book = self._engagements.get(engagement.get("kind"))
         if book is None:
@@ -1151,13 +1153,13 @@ class SessionIssuer:
             generation = None
         terms = await book.terms(hotkey, engagement)            # reads: outside the lock
         if isinstance(terms, Refusal):
-            self._event("open_refused", terms.reason, None, None)
+            self._event("open_refused", terms.reason, None, None, None)
             self._capacity_refused(hotkey, engagement, terms)
             return terms
         outcome = await self._issue(hotkey, request_id, digest, engagement, terms, generation)
         if isinstance(outcome, Refusal):
             self._event("open_refused", outcome.reason, getattr(terms, "env", None),
-                        getattr(terms, "engagement", None))
+                        getattr(terms, "engagement", None), getattr(terms, "image", None))
         self._capacity_refused(hotkey, engagement, outcome, terms)
         return outcome
 
@@ -1338,6 +1340,8 @@ class SessionIssuer:
                     weight = None
                 if weight is not None:
                     self._weights[session_id] = float(weight)
+                if len(self._weights) > 2 * len(self.book._sessions) + 1024:     # a record left without settling
+                    self._weights = {sid: w for sid, w in self._weights.items() if self.book.get(sid) is not None}
         self._tokens[session_id] = (token, placement.address)
         self._event("opened", record)
         return _Issued(Grant(session_id, token, placement.address, claims.expires_at),

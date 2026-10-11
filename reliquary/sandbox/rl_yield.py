@@ -177,6 +177,7 @@ class SessionYieldLedger:
         # Per hotkey, since this process started: capacity verdicts given and sessions they made neutral (the
         # saturation metrics read them: a hotkey living on capacity verdicts shows the fleet is too thin for it).
         self._capacity_counts: dict[str, list[int]] = {}
+        self._decided_counts: dict[str, int] = {}     # useful or wasted sessions decided since start, per hotkey
         self._recent: dict[str, tuple[tuple[float, str, bool], ...]] = {}   # hotkey -> last decided
         self._useful_24h: dict[str, int] = {}
         self._snapshot: dict[str, YieldStats] = {}
@@ -245,6 +246,14 @@ class SessionYieldLedger:
             if hotkey is not None:
                 return tuple(self._capacity_counts.get(str(hotkey), (0, 0)))
             return {key: tuple(value) for key, value in self._capacity_counts.items()}
+
+    def session_counts(self) -> dict[str, tuple[int, int]]:
+        """``(neutral, decided)`` sessions per hotkey since this process started, over the same span: the graded
+        sessions a capacity verdict made neutral, and the useful or wasted ones (a copy)."""
+        with self._lock:
+            hotkeys = set(self._capacity_counts) | set(self._decided_counts)
+            return {key: (self._capacity_counts.get(key, (0, 0))[1], self._decided_counts.get(key, 0))
+                    for key in hotkeys}
 
     def allow_capacity_verdicts(self, allowance: Callable[[str], int]) -> None:
         """The per-hotkey, per-window cap on capacity verdicts (the wiring passes ``YieldQuota.groups_allowed``)."""
@@ -331,6 +340,8 @@ class SessionYieldLedger:
                 if fault is None and not used and resumed and verdict != REFUSED:
                     fault = "window_resumed"
                 outcome = FAULT if fault else USEFUL if used else WASTED
+                if outcome != FAULT:
+                    self._decided_counts[hotkey] = self._decided_counts.get(hotkey, 0) + 1
                 self._journal.append(("decide", session_id, hotkey, outcome, fault, float(now), float(held or 0.0)))
                 self._decided.add(session_id)
             return len(pending)

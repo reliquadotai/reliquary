@@ -75,9 +75,10 @@ class OpenQueue:
                  aging_forget_s: float = QUEUE_AGING_FORGET_S, fair_every: int = QUEUE_FAIR_EVERY,
                  hold_after_s: float | None = QUEUE_HOLD_AFTER_S,
                  clock: Callable[[], float] = time.monotonic,
-                 on_wait: Callable[[float], None] | None = None) -> None:
+                 on_wait: Callable[[float, Hashable], None] | None = None) -> None:
         self._rank, self._headroom = rank, headroom
-        # Told how long each ticket waited when it leaves (placed, refused, timed out or cancelled): the metrics.
+        # Told how long each ticket waited, and its placement class, when it leaves (placed, refused, timed out or
+        # cancelled): the metrics.
         self._on_wait = on_wait
         self._wait_s, self._aging_s, self._forget_s = float(wait_s), float(aging_s), float(aging_forget_s)
         self._max_waiting, self._max_per_key, self._fair_every = int(max_waiting), int(max_per_key), int(fair_every)
@@ -261,7 +262,7 @@ class OpenQueue:
         now = self._clock()
         if self._on_wait is not None:
             try:
-                self._on_wait(max(0.0, now - ticket.joined))
+                self._on_wait(max(0.0, now - ticket.joined), ticket.cls)
             except Exception:
                 logger.exception("the open queue's wait listener failed")
         if ticket in self._waiting:

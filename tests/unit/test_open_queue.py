@@ -712,6 +712,9 @@ class VirtualTimeLoop(asyncio.SelectorEventLoop):
 
         def select(timeout=None):
             events = real(0)
+            if not events and timeout is None:
+                # Nothing ready, no timer: every task waits on another. Fail now, never hang to the file's timeout.
+                raise RuntimeError("the simulation deadlocked: nothing ready and no timer pending")
             if not events and timeout:
                 self._now += timeout
             return events
@@ -726,7 +729,18 @@ def run_virtual(coroutine):
     try:
         return loop.run_until_complete(coroutine)
     finally:
-        loop.close()
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
+
+
+def test_a_deadlocked_simulation_fails_at_once():
+    async def stuck():
+        await asyncio.get_running_loop().create_future()           # nobody ever sets it, and no timer is pending
+
+    with pytest.raises(RuntimeError, match="deadlocked"):
+        run_virtual(stuck())
 
 
 def _simulate(tmp_path, hold_after_s, seconds=3.0, rate=80.0):

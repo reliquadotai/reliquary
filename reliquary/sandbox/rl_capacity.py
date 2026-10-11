@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Hashable, Mapping
+from typing import Any
 from dataclasses import dataclass, field
 
 from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
@@ -83,6 +84,12 @@ CHECKER_BUSY_ALERT_PER_MIN = 6          # distinct groups refused ``episode_chec
 CAPACITY_VERDICT_ALERT_SESSIONS = 32    # a hotkey's sessions a capacity verdict made neutral (since start) ...
 CAPACITY_VERDICT_ALERT_SHARE = 0.25     # ... at least this share of its decided + neutral sessions: an ALERT
 CAPACITY_VERDICT_TOP = 20               # the hotkeys the saturation view lists (most neutral sessions first)
+CAPACITY_VERDICT_SAMPLE_S = 300         # the capacity-verdict counts are sampled this often (a 24 h window)
+
+# --- the fleet size's per-session reservation, seeded at start from the env's own tasks ---
+TIER_SEED_TASKS = 512                   # tasks sampled per env (evenly over its index range)
+TIER_QUANTILE = 0.95                    # the reservation: this quantile of their CPUs and memory budgets
+TIER_SEED_TIMEOUT_S = 60.0              # the whole seeding, per env
 
 NEWCOMER_ENTITY = "\x00newcomer"        # never a hotkey (SS58 has no NUL)
 
@@ -212,56 +219,94 @@ def opens_for(sessions: int) -> int:
 
 
 class SessionTiers:
-    """What one RL session of each env reserves on its machine, at the LARGEST task tier seen: the fleet size the
-    quota shares is counted in such sessions (``Fleet.session_room(reservations=)``), so an allocation never
-    exceeds what placement can host. ``policies``: {env name: its episode policy} (read at each call: an env added
-    later counts at once).
+    """What one RL session of each env reserves on its machine: the fleet size the quota shares is counted in such
+    sessions (``Fleet.session_room(reservations=)``), so an allocation never exceeds what placement can host.
+    ``policies``: {env name: its episode policy}, read at each call (an env added later counts at once).
 
-    CPU: the largest ``cpu_millis`` among the env's resolved tasks, or the machine's whole box (None) until a task
-    was resolved, or once a task declaring no CPUs was (such a task takes the box). Memory: the largest of the
-    policy's memory budget and the resolved tasks' (a task may raise it). Every task is resolved before any of its
-    sessions opens (the precommit route resolves it), so a larger tier is known before it holds anything; the
-    fleet size then shrinks within a second. Never smaller than what was seen: the count only gets safer."""
+    SEEDED at start (``seed``) from a sample of the env's own tasks: the reservation is the ``TIER_QUANTILE`` of
+    their CPUs (a task declaring none takes the whole box: it ranks above every figure) and of their memory budgets
+    (the policy's, raised by the task). Frozen once seeded: no miner's precommit on a rare task moves it; the tasks
+    resolved above it are only counted (``view``). Until an env is seeded (its source cannot be sampled), it is
+    LEARNT from the tasks resolved so far: the largest seen, the whole box before any (never smaller than what was
+    seen)."""
 
     def __init__(self, policies: Mapping[str, object]) -> None:
         self._policies = policies
-        self._cpu: dict[str, int | None] = {}            # env -> largest cpu_millis seen (None: a whole box)
-        self._memory: dict[str, int] = {}                # env -> largest memory budget seen
+        self._cpu: dict[str, int | None] = {}            # learnt: env -> largest cpu_millis seen (None: a box)
+        self._memory: dict[str, int] = {}                # learnt: env -> largest memory budget seen
+        self._seeded: dict[str, dict] = {}               # env -> {"cpu_millis", "memory_bytes", "tasks", "above"}
+
+    def _memory_of(self, environment: str, task: object) -> int:
+        memory = int(self._policies[environment].budgets_dict().get("memory_bytes", 0))
+        limits = getattr(task, "limits", None) or {}
+        if isinstance(limits.get("memory_bytes"), int):
+            memory = max(memory, int(limits["memory_bytes"]))
+        return memory
+
+    def seed(self, environment: str, tasks: list) -> None:
+        """Freeze the env's reservation at the ``TIER_QUANTILE`` of these tasks (a sample of its own)."""
+        if environment not in self._policies or not tasks:
+            return
+        def at_quantile(values: list) -> Any:
+            ordered = sorted(values, key=lambda v: math.inf if v is None else v)
+            return ordered[max(0, math.ceil(TIER_QUANTILE * len(ordered)) - 1)]
+        cpus = [None if getattr(t, "cpu_millis", None) is None else int(t.cpu_millis) for t in tasks]
+        self._seeded[environment] = {"cpu_millis": at_quantile(cpus),
+                                     "memory_bytes": at_quantile([self._memory_of(environment, t) for t in tasks]),
+                                     "tasks": len(tasks), "above": 0}
+
+    def seeded(self, environment: str) -> bool:
+        return environment in self._seeded
 
     def observe(self, environment: str, task: object) -> None:
         """A task of ``environment`` was resolved."""
-        policy = self._policies.get(environment)
-        if policy is None:
+        if environment not in self._policies:
             return
         cpu = getattr(task, "cpu_millis", None)
+        seeded = self._seeded.get(environment)
+        if seeded is not None:
+            tier = seeded["cpu_millis"]
+            if (tier is not None and (cpu is None or int(cpu) > tier)) or (
+                    self._memory_of(environment, task) > seeded["memory_bytes"]):
+                seeded["above"] += 1                     # counted, never moving the frozen tier
+            return
         if environment not in self._cpu:
             self._cpu[environment] = None if cpu is None else int(cpu)
         elif self._cpu[environment] is not None:
             self._cpu[environment] = None if cpu is None else max(int(cpu), self._cpu[environment])
-        memory = int(policy.budgets_dict().get("memory_bytes", 0))
-        limits = getattr(task, "limits", None) or {}
-        if isinstance(limits.get("memory_bytes"), int):
-            memory = max(memory, int(limits["memory_bytes"]))
-        self._memory[environment] = max(memory, self._memory.get(environment, 0))
+        self._memory[environment] = max(self._memory_of(environment, task), self._memory.get(environment, 0))
 
     def reservation(self, environment: str) -> dict:
+        seeded = self._seeded.get(environment)
+        if seeded is not None:
+            return {"cpu_millis": seeded["cpu_millis"], "memory_bytes": seeded["memory_bytes"]}
         policy = self._policies[environment]
         memory = max(int(policy.budgets_dict().get("memory_bytes", 0)), self._memory.get(environment, 0))
         return {"cpu_millis": self._cpu.get(environment), "memory_bytes": memory}
 
-    def reservations(self) -> dict[str, tuple[str, dict]]:
-        """{sandbox env: (env package, reservation)} for ``Fleet.session_room``; two envs on one sandbox env and
+    def reservations(self) -> dict[tuple[str, str], dict]:
+        """{(sandbox env, env package): reservation} for ``Fleet.session_room``; two envs on one sandbox env and
         package keep the larger reservation."""
-        found: dict[str, tuple[str, dict]] = {}
+        found: dict[tuple[str, str], dict] = {}
         for name, policy in list(self._policies.items()):
             key, mine = (policy.sandbox_env, policy.env_package), self.reservation(name)
-            seen = found.get(key[0])
-            if seen is not None and seen[0] == key[1]:
-                other = seen[1]
+            other = found.get(key)
+            if other is not None:
                 cpu = (None if other["cpu_millis"] is None or mine["cpu_millis"] is None
                        else max(other["cpu_millis"], mine["cpu_millis"]))
                 mine = {"cpu_millis": cpu, "memory_bytes": max(other["memory_bytes"], mine["memory_bytes"])}
-            found[key[0]] = (key[1], mine)
+            found[key] = mine
+        return found
+
+    def view(self) -> dict[str, dict]:
+        """Per env: the reservation the fleet is counted in, whether it was seeded, from how many tasks, and how
+        many resolved tasks lie above it (the operator's view)."""
+        found = {}
+        for name in list(self._policies):
+            seeded = self._seeded.get(name)
+            found[name] = {**self.reservation(name), "seeded": seeded is not None,
+                           "tasks": None if seeded is None else seeded["tasks"],
+                           "above": None if seeded is None else seeded["above"]}
         return found
 
 

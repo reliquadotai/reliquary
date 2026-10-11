@@ -152,7 +152,7 @@ def test_the_queue_tells_how_long_each_ticket_waited():
     from reliquary.sandbox.open_queue import OpenQueue
 
     clock, waits = Clock(), []
-    q = OpenQueue(rank=lambda h: (h, 1.0, False), clock=clock, on_wait=waits.append)
+    q = OpenQueue(rank=lambda h: (h, 1.0, False), clock=clock, on_wait=lambda seconds, cls: waits.append(seconds))
     first, second = q.join("5A", cls="c"), q.join("5B", cls="c")
     clock.now += 4
     q.done(first, placed=True)
@@ -173,8 +173,8 @@ def test_the_issuer_tells_every_refused_open_with_its_env_and_engagement(tmp_pat
     assert refused(env, 0).reason == "sandbox_saturated"
     env.current["window"] = 2                                       # the precommit's window is over: its terms refuse
     terms_refusal = refused(env, 1)
-    assert seen[0] == ("sandbox_saturated", ENV, f"rl:1:{env.precommit.sha256}:0")
-    assert seen[1] == (terms_refusal.reason, None, None)
+    assert seen[0] == ("sandbox_saturated", ENV, f"rl:1:{env.precommit.sha256}:0", IMAGE)
+    assert seen[1] == (terms_refusal.reason, None, None, None)
 
 
 # --- the check slots ------------------------------------------------------------------------------------------
@@ -230,40 +230,85 @@ def test_the_intake_reports_its_check_times_and_busy_refusals(tmp_path, monkeypa
 def test_an_env_losing_every_machine_is_alerted_again_after_a_recovery():
     monitor = SaturationMonitor(clock=Clock())
     assert monitor.check_envs({"swe": True, "math": True}) == ([], [])
-    alerts, recovered = monitor.check_envs({"swe": False, "math": True})
+    assert monitor.check_envs({"swe": False, "math": True}) == ([], [])          # one round: a late heartbeat
+    alerts, recovered = monitor.check_envs({"swe": False, "math": True})       # two in a row: lost
     assert len(alerts) == 1 and "swe lost every sandbox machine" in alerts[0] and recovered == []
     assert monitor.check_envs({"swe": False, "math": True}) == ([], [])          # once while it lasts
     assert monitor.check_envs({"swe": True, "math": True}) == ([], ["swe"])
+    monitor.check_envs({"swe": False, "math": True})
     alerts, _ = monitor.check_envs({"swe": False, "math": True})
     assert len(alerts) == 1                                                     # a new loss: a new ALERT
     fresh = SaturationMonitor(clock=Clock())                                    # the boot already alerted it
     assert fresh.check_envs({"swe": False}, known_lost={"swe"}) == ([], [])
 
 
+def test_one_late_heartbeat_of_a_one_machine_env_is_no_loss():
+    monitor = SaturationMonitor(clock=Clock())
+    for _ in range(10):
+        assert monitor.check_envs({"swe": False}) == ([], [])
+        assert monitor.check_envs({"swe": True}) == ([], [])
+
+
 class VerdictLedger:
-    def __init__(self, counts, decided):
-        self.counts, self.decided = counts, decided
+    """The ledger's counts since start: verdicts and (neutral, decided) sessions per hotkey."""
+
+    def __init__(self, counts):
+        self.counts = counts                                      # hotkey -> [neutral, decided]
 
     def capacity_counts(self):
-        return dict(self.counts)
+        return {hotkey: (1, neutral) for hotkey, (neutral, _decided) in self.counts.items()}
 
-    def snapshot(self):
-        return {hotkey: YieldStats(decided=n) for hotkey, n in self.decided.items()}
+    def session_counts(self):
+        return {hotkey: tuple(value) for hotkey, value in self.counts.items()}
 
 
 def test_a_hotkey_living_on_capacity_verdicts_is_alerted_once_until_it_falls_back():
-    monitor = SaturationMonitor(clock=Clock())
+    clock = Clock()
+    monitor = SaturationMonitor(clock=clock)
     n = CAPACITY_VERDICT_ALERT_SESSIONS
-    ledger = VerdictLedger({"5Many": (n // 4, n), "5Few": (1, 3), "5Big": (n, n)}, {"5Many": n, "5Big": 20 * n})
+    ledger = VerdictLedger({"5Many": [n, n], "5Few": [3, 0], "5Big": [n, 20 * n]})
     alerts = monitor.check_capacity_verdicts(ledger)
     assert len(alerts) == 1 and "5Many" in alerts[0]                # 50 %; 5Few too few; 5Big under 25 %
     assert monitor.check_capacity_verdicts(ledger) == []
-    ledger.decided["5Many"] = 100 * n
+    ledger.counts["5Many"][1] += 100 * n
     assert monitor.check_capacity_verdicts(ledger) == []            # its share fell: re-armed
-    ledger.decided["5Many"] = n
+    ledger.counts["5Many"][0] += 40 * n
     assert len(monitor.check_capacity_verdicts(ledger)) == 1
     rows = monitor.snapshot(ledger=ledger)["capacity_verdicts"]
-    assert [row["hotkey"] for row in rows] == ["5Big", "5Many", "5Few"] and rows[1]["neutral_share"] == 0.5
+    assert [row["hotkey"] for row in rows] == ["5Many", "5Big", "5Few"]
+
+
+def test_an_honest_key_with_rare_verdicts_over_days_is_never_alerted():
+    """Both counts over the same 24 h: occasional verdicts never add up against a capped decided count (since start,
+    5 days give 240 neutral sessions, against the last 200 decided: 55 %)."""
+    from reliquary.sandbox.rl_capacity import CAPACITY_VERDICT_SAMPLE_S
+
+    clock = Clock()
+    monitor = SaturationMonitor(clock=clock)
+    ledger = VerdictLedger({"5Honest": [0, 0]})
+    for _hour in range(24 * 5):                                     # five days: 2 neutral, 40 decided an hour
+        ledger.counts["5Honest"][0] += 2
+        ledger.counts["5Honest"][1] += 40
+        for _ in range(3_600 // CAPACITY_VERDICT_SAMPLE_S):
+            clock.now += CAPACITY_VERDICT_SAMPLE_S
+            assert monitor.check_capacity_verdicts(ledger) == []
+    (_hotkey, _verdicts, neutral, decided, share), = monitor._rows(ledger)
+    assert 48 <= neutral <= 52 and decided >= 900 and share < 0.06
+
+
+def test_a_burst_of_verdicts_within_a_day_is_alerted_and_forgotten_after_it():
+    from reliquary.sandbox.rl_capacity import CAPACITY_VERDICT_SAMPLE_S, USEFUL_HORIZON_S
+
+    clock = Clock()
+    monitor = SaturationMonitor(clock=clock)
+    ledger = VerdictLedger({"5K": [0, 0]})
+    monitor.check_capacity_verdicts(ledger)
+    ledger.counts["5K"] = [2 * CAPACITY_VERDICT_ALERT_SESSIONS, 10]
+    assert len(monitor.check_capacity_verdicts(ledger)) == 1
+    for _ in range(int(USEFUL_HORIZON_S / CAPACITY_VERDICT_SAMPLE_S) + 2):
+        clock.now += CAPACITY_VERDICT_SAMPLE_S
+        monitor.check_capacity_verdicts(ledger)
+    assert monitor._rows(ledger) == [] and monitor._verdict_alerted == set()        # out of the window: re-armed
 
 
 # --- the fleet size, in sessions the resources hold (never the bare slots) ------------------------------------
@@ -318,7 +363,7 @@ def test_an_8_slot_machine_with_4_cpu_boxes_on_8_cpus_counts_2_sessions_and_the_
     assert sessions_of(alloc.main["5Main"]) + sessions_of(alloc.newcomer) + sessions_of(alloc.low_yield) <= 2
     assert sessions_of(alloc.main["5Main"]) == 2
     # ... and placement hosts exactly that many
-    reserve = reservations[ENV][1]
+    reserve = reservations[(ENV, ENV_PACKAGE)]
     placed = []
     for n in range(3):
         placement = fleet.pick(now=NOW, reserve=reserve, **PICK)
@@ -367,7 +412,7 @@ def test_a_machine_counts_only_for_the_envs_it_serves_with_their_images(tmp_path
 def test_a_machine_serving_two_envs_counts_at_the_larger_reservation(tmp_path):
     fleet = resource_fleet(tmp_path, env_packages={ENV: ENV_PACKAGE, "reliquary-math": "math==1"})
     small = tiers_for(cpu_millis=1_000).reservations()
-    both = {**small, "reliquary-math": ("math==1", {"cpu_millis": 4_000, "memory_bytes": 4 * GIB})}
+    both = {**small, ("reliquary-math", "math==1"): {"cpu_millis": 4_000, "memory_bytes": 4 * GIB}}
     assert fleet.session_capacity(reservations=small) == 8
     assert fleet.session_capacity(reservations=both) == 2
     view = fleet.capacity_by_env(reservations=both)
@@ -459,29 +504,52 @@ def test_a_machine_added_to_the_fleet_is_used_without_a_restart(tmp_path):
     quota_clock.now += 1.0
     assert quota.allocation().capacity == 12                        # then the new machine counts, no restart
     assert fleet.pick(now=NOW, image=IMAGE, env=ENV, env_package=ENV_PACKAGE, budgets=BUDGETS, validity_s=4500,
-                      reserve=reservations[ENV][1], exclude={MACHINE}).machine_id == "m-2"
+                      reserve=reservations[(ENV, ENV_PACKAGE)], exclude={MACHINE}).machine_id == "m-2"
 
 
 # --- the wiring --------------------------------------------------------------------------------------------------
 
-def test_the_wiring_builds_the_monitor_and_serves_the_snapshot(tmp_path):
+def test_the_wiring_builds_the_monitor_and_serves_the_cached_snapshot_behind_a_token(tmp_path, monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
+    from reliquary.validator import rl_sandbox_wiring, server
+
+    assert rl_sandbox_wiring.OBSERVATIONS_TOKEN_ENV == server.SERVICE_OBSERVATIONS_TOKEN_ENV
+    monkeypatch.delenv(rl_sandbox_wiring.RL_SATURATION_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(server.SERVICE_OBSERVATIONS_TOKEN_ENV, raising=False)
     services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
     assert isinstance(services.saturation, SaturationMonitor)
     assert services.queue._on_wait == services.saturation.record_wait
     assert services.saturation in services.issuer._events.listeners
     assert services.intake._check_metrics is services.saturation
-    assert any(getattr(route, "path", "") == "/rl/saturation" for router in services.routers
-               for route in router.routes)
     app = FastAPI()
     for router in services.routers:
         app.include_router(router)
-    body = TestClient(app).get("/rl/saturation").json()
+    client = TestClient(app)
+    calls = []
+    real = services.saturation.snapshot
+    services.saturation.snapshot = lambda **kw: calls.append(1) or real(**kw)
+    assert client.get("/rl/saturation").status_code == 404                  # no token configured: nothing shown
+    monkeypatch.setenv(server.SERVICE_OBSERVATIONS_TOKEN_ENV, "obs-token")
+    assert client.get("/rl/saturation").status_code == 401
+    assert client.get("/rl/saturation", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    good = {"Authorization": "Bearer obs-token"}
+    assert client.get("/rl/saturation", headers=good).status_code == 503     # before the first background round
+    services.check_saturation()
+    services.saturation_cache = services.saturation_snapshot()               # what saturation_forever does
+    computed = len(calls)
+    for _ in range(5):
+        body = client.get("/rl/saturation", headers=good).json()
+    assert len(calls) == computed                                            # requests compute nothing
     assert set(body) >= {"queue", "refused", "used", "fleet", "checks", "envs_lost", "capacity_verdicts",
-                         "attribution_failures"}
+                         "attribution_failures", "reservations", "saturated"}
     assert body["used"] == {"main": 0, "newcomer": 0, "low_yield": 0, "capacity": 0}
+    name = services.environments[0]
+    assert body["reservations"][name]["seeded"] is False
+    monkeypatch.setenv(rl_sandbox_wiring.RL_SATURATION_TOKEN_ENV, "own-token")   # its own token wins
+    assert client.get("/rl/saturation", headers=good).status_code == 401
+    assert client.get("/rl/saturation", headers={"Authorization": "Bearer own-token"}).status_code == 200
     jobs = services.background()
     assert any(job.__qualname__.endswith("saturation_forever") for job in jobs)
     for job in jobs:
@@ -490,27 +558,205 @@ def test_the_wiring_builds_the_monitor_and_serves_the_snapshot(tmp_path):
     assert plain.saturation is None and len(plain.routers) == 2
 
 
-def test_every_task_the_views_resolve_sets_the_tier(tmp_path):
+def test_the_background_round_refreshes_the_cached_snapshot(tmp_path):
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
+
+    async def one_round():
+        job = asyncio.ensure_future(services.saturation_forever(3600))
+        await asyncio.sleep(0.05)
+        job.cancel()
+        await asyncio.gather(job, return_exceptions=True)
+    asyncio.run(one_round())
+    assert services.cached_saturation() is not None and "at" in services.cached_saturation()
+
+
+def test_every_task_the_views_resolve_is_observed(tmp_path):
     services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
     name = services.environments[0]
-    assert all(reserve["cpu_millis"] is None for _package, reserve in services.tiers.reservations().values())
+    assert all(reserve["cpu_millis"] is None for reserve in services.tiers.reservations().values())
     seen = []
     services.tiers.observe = lambda env, task: seen.append((env, task))
     task = asyncio.run(services.views[name].resolve_task(0))
     assert seen == [(name, task)]
     assert services.resolvers[name] is services.views[name].resolve_task       # the boot's options probe too
+    assert services.tiers._policies is services.policies                        # an env added later counts
+
+
+def test_the_tiers_are_seeded_at_start_from_the_envs_own_tasks(tmp_path):
+    from reliquary.sandbox.tasks import ResolvedTask
+
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
+    name = services.environments[0]
+    asked = []
+
+    async def resolve(index):
+        asked.append(index)
+        return ResolvedTask(IMAGE, {}, cpu_millis=4_000 if index % 100 == 0 else 1_000)   # 1 % big tasks
+    services.raw_resolvers[name] = resolve
+    services.task_counts[name] = 10_000
+    asyncio.run(services.seed_tiers())
+    assert len(asked) == 512 and min(asked) == 0 and max(asked) > 9_000             # spread over the range
+    assert services.tiers.reservation(name)["cpu_millis"] == 1_000                  # the 95th percentile
+    services.tiers.observe(name, ResolvedTask(IMAGE, {}, cpu_millis=4_000))        # a rare big precommit
+    services.tiers.observe(name, ResolvedTask(IMAGE, {}, cpu_millis=None))
+    assert services.tiers.reservation(name)["cpu_millis"] == 1_000                  # never moves it
+    view = services.tiers.view()[name]
+    assert view["seeded"] and view["tasks"] == 512 and view["above"] == 2
+
+
+def test_an_env_whose_tasks_cannot_be_counted_stays_learnt(tmp_path):
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
+    name = services.environments[0]
+    services.task_counts[name] = None
+    asyncio.run(services.seed_tiers())
+    assert not services.tiers.seeded(name)
 
 
 def test_the_saturation_round_alerts_an_env_that_lost_its_machines_and_rearms_the_open_path(tmp_path):
     services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
+    asyncio.run(services.fleet.refresh_directory())
     name = services.environments[0]
     serving = {"now": False}
     services.fleet.serving = lambda *a, **kw: ["m"] if serving["now"] else []
     services.issuer._unserved_alerted.add((services.served[name][0], "pkg", None))
+    services.check_saturation()
     alerts = services.check_saturation()
     assert any("lost every sandbox machine" in text for text in alerts)
     serving["now"] = True
     assert services.check_saturation() == []
     assert services.issuer._unserved_alerted == set()      # the open path's ALERT fires again on a new loss
     serving["now"] = False
+    services.check_saturation()
     assert any("lost every sandbox machine" in text for text in services.check_saturation())
+
+
+def test_a_stale_directory_alerts_no_env(tmp_path):
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")       # the directory never read
+    assert not services.fleet.directory_ready()
+    for _ in range(3):
+        assert not any("lost every sandbox machine" in text for text in services.check_saturation())
+
+
+# --- per env and per image set: one saturated env alerts while the rest of the fleet idles -------------------
+
+def mixed_fleet(free_x, free_y=300, lock_rows=None):
+    return {"env-x": {"machines": 2, "slots": 16, "free": free_x, "image_sets": lock_rows or {}},
+            "env-y": {"machines": 98, "slots": 784, "free": free_y, "image_sets": {}}}
+
+
+def test_a_saturated_env_alerts_while_the_rest_of_the_fleet_idles():
+    clock = Clock()
+    monitor = SaturationMonitor(clock=clock)
+    fired, fleet_wide = [], []
+    for tick in range(int(SATURATION_ALERT_FOR_S / 10) + 8):       # the first minute fills the rate
+        for n in range(SATURATION_ALERT_REFUSALS_PER_MIN // 6 + 1):
+            monitor.record_refusal("sandbox_saturated", "env-x", f"rl:1:{tick}:{n}", IMAGE)
+        clock.now += 10
+        fired += monitor.check_saturated(mixed_fleet(free_x=0))
+        fleet_wide.append(monitor.check(free_fraction=300 / 800))          # the fleet as a whole is 37 % free
+    assert len(fired) == 1 and "env env-x saturated" in fired[0] and not any(fleet_wide)
+    assert monitor.snapshot()["saturated"] == ["env-x"]
+    clock.now += 120
+    assert monitor.check_saturated(mixed_fleet(free_x=0)) == [] and monitor.snapshot()["saturated"] == []
+
+
+def test_waits_of_one_env_alert_for_that_env_only():
+    clock = Clock()
+    monitor = SaturationMonitor(clock=clock)
+    fired = []
+    for _ in range(int(SATURATION_ALERT_FOR_S / 10) + 2):
+        monitor.record_wait(SATURATION_ALERT_WAIT_S * 2, ("env-x", 1024, 1 << 32))
+        clock.now += 10
+        fired += monitor.check_saturated(mixed_fleet(free_x=0, free_y=0))
+    assert len(fired) == 1 and "env-x" in fired[0]
+
+
+def test_a_saturated_image_set_alerts_by_the_refusals_of_its_images():
+    clock = Clock()
+    monitor = SaturationMonitor(clock=clock)
+    locks = {"a" * 64: {"machines": 1, "slots": 8, "free": 0}, "b" * 64: {"machines": 1, "slots": 8, "free": 8}}
+    images = {"a" * 64: frozenset({"img-a"}), "b" * 64: frozenset({"img-b"})}
+    fired = []
+    for tick in range(int(SATURATION_ALERT_FOR_S / 10) + 8):       # the first minute fills the rate
+        for n in range(SATURATION_ALERT_REFUSALS_PER_MIN // 6 + 1):
+            monitor.record_refusal("sandbox_saturated", "env-x", f"rl:1:{tick}:{n}", "img-a")
+        clock.now += 10
+        fired += monitor.check_saturated(mixed_fleet(free_x=8, lock_rows=locks),       # the env is half free
+                                         images_of=lambda env, lock: images[lock])
+    assert len(fired) == 1 and f"image set {'a' * 12} of env env-x" in fired[0]
+
+
+# --- the per-env cap of a MAIN hotkey's allocation ---------------------------------------------------------------
+
+def test_a_main_keys_groups_on_a_scarce_env_stay_within_its_share_of_that_env():
+    from reliquary.sandbox.routes import REFUSAL_STATUS
+    from reliquary.sandbox.rl_yield import CAPACITY_REASONS
+    from reliquary.sandbox.sessions import CAPACITY_REFUSALS, LIVE
+    from tests.unit.test_rl_episode_wiring import _record
+
+    clock = Clock()
+    clock.now = float(NOW)
+    caps = {"env-x": 16, "env-y": 784}
+    quota = YieldQuota(ledger=Ledger(), pool_seeds=2, group_size=1, capacity=lambda: 800, clock=clock,
+                       env_capacities=lambda: dict(caps), env_names={"x": "env-x", "env-x": "env-x",
+                                                                     "y": "env-y", "env-y": "env-y"})
+    for seed in range(400):                                          # it asks for 400 sessions: allocated 400
+        quota.refusal("5Main", NOW, precommit_sha256=f"{seed:064x}", seed_index=0, environment="x")
+    for n in range(8):                                               # 8 groups (M = 1) already on env-x
+        record = _record(f"s-{n}", sha=f"{n:064x}", hotkey="5Main", state=LIVE, issued_at=NOW, expires_at=NOW + 600)
+        record.env = "env-x"
+        quota.opened(record)
+    clock.now += 1.0
+    assert sessions_of(quota.allocation().main["5Main"]) == 400
+    refused = quota.refusal("5Main", NOW + 1, precommit_sha256="e" * 64, seed_index=0, environment="x")
+    assert refused.reason == "quota_env" and refused.detail["max"] == 8 and refused.retry_after   # ceil(400 x 16/800)
+    assert quota.refusal("5Main", NOW + 1, precommit_sha256="f" * 64, seed_index=0, environment="y") is None
+    # a seed of a started group is never cut
+    assert quota.refusal("5Main", NOW + 1, precommit_sha256=f"{0:064x}", seed_index=1, environment="x") is None
+    # retryable, never a capacity verdict, never counted by the grow-fleet ALERT
+    assert REFUSAL_STATUS["quota_env"] == 429
+    assert "quota_env" not in CAPACITY_REFUSALS and "quota_env" not in CAPACITY_REASONS
+    from reliquary.sandbox.rl_metrics import FLEET_REASONS
+    assert "quota_env" not in FLEET_REASONS
+    caps["env-x"] = 800                                              # a homogeneous fleet: no per-env cap
+    clock.now += 1.0
+    assert quota.refusal("5Main", NOW + 2, precommit_sha256="e" * 64, seed_index=0, environment="x") is None
+
+
+# --- the corpus attribution and the tiers' keys ---------------------------------------------------------------
+
+def test_a_session_without_a_reservation_is_attributed_by_counts_as_before(tmp_path):
+    from tests.unit.test_rl_engagements import build
+
+    env = build(tmp_path)
+    env.issuer._fleet.servable_machines = lambda **kw: ("m",)
+    env.issuer._fleet.session_share = lambda machine, reserve: 1.0
+    env.issuer._fleet.load_share = lambda machines: 0.0
+    seen = []
+    real = env.issuer._own_load
+    env.issuer._own_load = lambda *a, **kw: seen.append(kw.get("by_share")) or real(*a, **kw)
+    from reliquary.sandbox.sessions import Refusal
+
+    terms = SimpleNamespace(image=IMAGE, env=ENV, env_package=ENV_PACKAGE, budgets=BUDGETS, env_options_sha256=None,
+                            engagement="corpus:j:0", reserve=None, prepare_timeout_s=None)
+    env.issuer._self_caused("5Hot", terms, Refusal("sandbox_saturated", {}))
+    assert seen == [False]
+    assert real("5Hot", ("m",), NOW, "corpus:j:0") == (0, 0)        # session counts: integers, the 13b rule
+
+
+def test_two_envs_on_one_sandbox_env_at_two_packages_keep_both_reservations():
+    def policy(package, memory):
+        return SimpleNamespace(sandbox_env=ENV, env_package=package, budgets_dict=lambda: {"memory_bytes": memory})
+    tiers = SessionTiers({"a": policy("pkg==1", 2 * GIB), "b": policy("pkg==2", 4 * GIB)})
+    assert set(tiers.reservations()) == {(ENV, "pkg==1"), (ENV, "pkg==2")}
+    assert tiers.reservations()[(ENV, "pkg==2")]["memory_bytes"] == 4 * GIB
+
+
+def test_the_start_seeds_the_tiers_before_serving(tmp_path):
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
+    name = services.environments[0]
+    asyncio.run(services.start())
+    try:
+        assert services.tiers.seeded(name) and services.tiers.view()[name]["tasks"] == 512     # of its 1 000 tasks
+    finally:
+        services.ledger.close()
