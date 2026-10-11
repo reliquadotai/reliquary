@@ -42,7 +42,12 @@ def build_judge_app(served: Mapping[str, Any], feed) -> FastAPI:
         w = wiring(job_id)
         return {"unsettled": list(w.stats.unsettled()),
                 "settled_count": w.settler.settled_count, "totals": w.settler.totals,
-                "last_period": getattr(w.settler, "last_period", None)}
+                "last_period": getattr(w.settler, "last_period", None),
+                # For the front's pay estimate (`/corpus/pay`).
+                "open_periods": getattr(w.settler, "open_periods", None),
+                "open_periods_at": getattr(w.settler, "open_periods_at", None),
+                "undecided": (w.settler.undecided_since()
+                              if hasattr(w.settler, "undecided_since") else None)}
 
     @app.get("/jobs/{job_id}/miners/{hotkey}")
     async def miner(job_id: str, hotkey: str) -> dict:

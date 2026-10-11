@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
@@ -96,6 +97,11 @@ class CorpusPeriodSettler:
         self.totals: dict | None = None
         # The last period paid: work_period, verified_tokens, paid (pool share).
         self.last_period: dict | None = None
+        # Unsettled verdicts by the period they were received in (str key):
+        # verdicts, passed, verified_tokens; None before a pass has read them.
+        # What the public pay estimate projects the current period from.
+        self.open_periods: dict[str, dict] | None = None
+        self.open_periods_at: float | None = None
         self.on_settled = on_settled
         self.on_window = None
 
@@ -111,6 +117,34 @@ class CorpusPeriodSettler:
 
     def set_max_price(self, price: float | None) -> None:
         self._max_price = None if price is None else float(price)
+
+    def undecided_since(self) -> dict:
+        """When the oldest submission still undecided was received: what holds
+        the close of every period from its own. ``known`` is False while the
+        auditor (or grader) cannot tell, or holds an arrival it cannot read."""
+        try:
+            at = self._oldest_pending()
+        except LookupError:
+            return {"known": False, "at": None}
+        if at is None:
+            return {"known": True, "at": None}
+        if not math.isfinite(float(at)):
+            return {"known": False, "at": None}
+        return {"known": True, "at": float(at)}
+
+    def _count_open(self, ids, verdicts, voided, genesis: float) -> None:
+        counts: dict[str, dict] = {}
+        for sid in ids:
+            verdict = verdicts.get(sid)
+            if verdict is None:
+                continue
+            row = counts.setdefault(str(self._work_period(verdict, genesis)),
+                                    {"verdicts": 0, "passed": 0, "verified_tokens": 0})
+            row["verdicts"] += 1
+            if verdict.get("passed") and sid not in voided:
+                row["passed"] += 1
+                row["verified_tokens"] += int(verdict.get("token_count") or 0)
+        self.open_periods, self.open_periods_at = counts, self._clock()
 
     async def _off(self, func, *args):
         from reliquary.validator.corpus_judge_threads import run_in
@@ -257,6 +291,7 @@ class CorpusPeriodSettler:
         settled = await self._off(set, state["settled"])
         new_ids = await self._verdict_ids(settled)
         if not new_ids:
+            self.open_periods, self.open_periods_at = {}, self._clock()
             return None
         try:
             oldest = self._oldest_pending()
@@ -268,6 +303,7 @@ class CorpusPeriodSettler:
             payable = await self._ready(new_ids)
             new_ids = [sid for sid in new_ids if sid in payable]
             if not new_ids:
+                self.open_periods, self.open_periods_at = {}, self._clock()
                 return None
         genesis = self._genesis()
         now = self._clock()
@@ -280,6 +316,7 @@ class CorpusPeriodSettler:
         verdicts = await self._verdicts(new_ids)
         lister = getattr(self._records, "list_voided_ids", None)
         voided = set(await lister(self._job_id)) if lister is not None else set()
+        self._count_open(new_ids, verdicts, voided, genesis)
         by_period: dict[int, list[str]] = defaultdict(list)
         for sid in new_ids:
             verdict = verdicts.get(sid)
@@ -303,6 +340,7 @@ class CorpusPeriodSettler:
                          "totals": totals}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
                 self._report(state, ids)
+                self.open_periods.pop(str(period), None)
                 continue
             if earlier:
                 # A verdict for a period already paid: its close missed it (it
@@ -329,6 +367,7 @@ class CorpusPeriodSettler:
                          "totals": totals}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
                 self._report(state, ids)
+                self.open_periods.pop(str(period), None)
                 continue
             share = rewards_for(batch, pool)
             # At most CATCHUP_ENTRIES archives per entry period: a backlog settled
@@ -345,6 +384,7 @@ class CorpusPeriodSettler:
                 state["pending"].update(max_price=self._max_price, budget=budget)
             etag = await self._records.write_settlement(self._job_id, state, etag)
             last = await self._finish(state, etag)
+            self.open_periods.pop(str(period), None)
             state, etag = await self._records.read_settlement(self._job_id)
         return last
 
