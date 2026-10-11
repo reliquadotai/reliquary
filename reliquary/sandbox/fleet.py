@@ -473,33 +473,135 @@ class Fleet:
         need = reservation_need(resources, reserve)
         if need is None or need[0] > resources["cpu_millis"] or need[1] > resources["memory_bytes"]:
             return None
-        report_at = document["at"]
-        held = [r for r in self._reserved.get(machine_id, ()) if r[3] not in self._listed and report_at <= r[1]]
-        cpu = memory = 0
-        for _at, _until, other, _sid in held:
-            taken = reservation_need(resources, other) or (0, 0)
-            cpu, memory = cpu + taken[0], memory + taken[1]
+        cpu, memory = self._held(machine_id, document, resources)
         free_cpu = resources["free_cpu_millis"] - cpu - need[0]
         free_memory = resources["free_memory_bytes"] - memory - need[1]
         if free_cpu < 0 or free_memory < 0:
             return min(free_cpu, 0) / resources["cpu_millis"] + min(free_memory, 0) / resources["memory_bytes"]
         return min(free_cpu / resources["cpu_millis"], free_memory / resources["memory_bytes"])
 
-    def session_capacity(self, now: float | None = None) -> int:
-        """The session slots (``capacity`` of their last report) of the fresh, active, undrained machines: the
-        fleet size the RL yield quota shares. Memory only."""
-        now = self._clock() if now is None else now
+    def _held(self, machine_id: str, document: Mapping[str, Any], resources: Mapping[str, Any]) -> tuple[int, int]:
+        """(CPU millis, memory bytes) of the reservations issued here on the machine that its report does not show
+        yet (see ``note_issued``)."""
+        report_at = document["at"]
+        cpu = memory = 0
+        for _at, until, other, sid in self._reserved.get(machine_id, ()):
+            if sid in self._listed or report_at > until:
+                continue
+            taken = reservation_need(resources, other) or (0, 0)
+            cpu, memory = cpu + taken[0], memory + taken[1]
+        return cpu, memory
+
+    def _fresh_documents(self, now: float):
+        """(machine id, report) of the fresh, active, undrained machines (none while the directory is stale)."""
         if not self.directory_ready(now):
-            return 0
-        total = 0
+            return
         for entry in self._directory.entries():
             if entry.status != "active" or entry.machine_id in self.drained:
                 continue
             document = self._reports.get(entry.machine_id)
             if document is None or now - document["at"] > HEARTBEAT_MAX_AGE_S:
                 continue
-            total += max(0, int(document.get("capacity") or 0))
-        return total
+            yield entry.machine_id, document
+
+    def _hostable(self, machine_id: str, document: Mapping[str, Any],
+                  reserve: Mapping[str, Any]) -> tuple[int, int]:
+        """(sessions, free sessions) of reservation ``reserve`` the machine can hold, its slots included: on a
+        machine judged by its resources, also its CPU and memory totals over the session's need (the free ones
+        after the reservations issued here that its report does not show yet). A task tier larger than the
+        machine's box counts at the box (the largest session it can hold). (0, 0) when the machine's resources
+        are required but cannot be read."""
+        slots = max(0, int(document.get("capacity") or 0))
+        free = max(0, self._free(machine_id, document))
+        if not self._by_resources(document, reserve):
+            return slots, min(free, slots)
+        resources = self._resources(machine_id, document)
+        if resources is None:
+            return 0, 0
+        asked = reserve.get("cpu_millis")
+        box = int(resources["max_box_cpu_millis"])
+        need = reservation_need(resources, {**reserve, "cpu_millis": None if asked is None else min(int(asked), box)})
+        if need is None:                                     # unreachable after the clamp; kept for safety
+            return 0, 0
+        cpu, memory = max(1, need[0]), max(1, need[1])
+        held_cpu, held_memory = self._held(machine_id, document, resources)
+        hosts = min(slots, resources["cpu_millis"] // cpu, resources["memory_bytes"] // memory)
+        room = min(free, max(0, resources["free_cpu_millis"] - held_cpu) // cpu,
+                   max(0, resources["free_memory_bytes"] - held_memory) // memory)
+        return max(0, hosts), max(0, min(room, hosts))
+
+    @staticmethod
+    def _holds_images(document: Mapping[str, Any], env: str) -> bool:
+        """False when the machine's image lock for ``env`` says none of the env's images is present (it serves no
+        task of it); True otherwise (no lock reported: the images are not judged here)."""
+        lock = (document.get("env_image_locks") or {}).get(env)
+        if not isinstance(lock, Mapping) or type(lock.get("present")) is not int:
+            return True
+        return lock["present"] > 0
+
+    def session_room(self, now: float | None = None, *,
+                     reservations: Mapping[str, tuple[str, Mapping[str, Any]]] | None = None) -> tuple[int, int]:
+        """(sessions, free sessions) of the fresh, active, undrained machines: the fleet size the RL yield quota
+        shares, and how much of it is free now. Without ``reservations``: their slots (``capacity`` and ``free``
+        of their last reports). With ``reservations`` = {sandbox env: (env package, reserve)} (RL: what one
+        session of each env reserves, at its largest task tier): per machine, the sessions of the envs it serves
+        (at their package, holding some of their images) its slots AND its CPU and memory can hold, at the
+        LARGEST reservation among those envs (a session of any of them fits that many times), so an allocation
+        never exceeds what placement can host; a machine serving none of them counts nothing. Memory only."""
+        now = self._clock() if now is None else now
+        sessions = free = 0
+        for machine_id, document in self._fresh_documents(now):
+            if reservations is None:
+                sessions += max(0, int(document.get("capacity") or 0))
+                free += max(0, min(int(document.get("free") or 0), int(document.get("capacity") or 0)))
+                continue
+            packages = document.get("env_packages") or {}
+            room = [self._hostable(machine_id, document, reserve) for env, (package, reserve) in reservations.items()
+                    if packages.get(env) == package and self._holds_images(document, env)]
+            if room:
+                sessions += min(hosts for hosts, _free in room)
+                free += min(left for _hosts, left in room)
+        return sessions, free
+
+    def session_capacity(self, now: float | None = None, *,
+                         reservations: Mapping[str, tuple[str, Mapping[str, Any]]] | None = None) -> int:
+        """The fleet size the RL yield quota shares (``session_room``'s first figure). Memory only."""
+        return self.session_room(now, reservations=reservations)[0]
+
+    def capacity_by_env(self, now: float | None = None, *,
+                        reservations: Mapping[str, tuple[str, Mapping[str, Any]]] | None = None) -> dict[str, dict]:
+        """``{env: {"machines", "slots", "free", "image_sets": {lock sha256: {"machines", "slots", "free"}}}}``
+        over the fresh, active, undrained machines (the operator's saturation view). Without ``reservations``:
+        every env a report names, with the machine's slots. With them: each listed env, counting the machines
+        serving it at its package and holding some of its images, in sessions of that env's reservation (its
+        slots, CPU and memory: ``session_room``). A machine serving two envs counts in both. The image set is the
+        env's image-lock digest a machine reports. Memory only."""
+        now = self._clock() if now is None else now
+        found: dict[str, dict] = {env: {"machines": 0, "slots": 0, "free": 0, "image_sets": {}}
+                                  for env in (reservations or {})}
+        for machine_id, document in self._fresh_documents(now):
+            packages = document.get("env_packages") or {}
+            for env, package in packages.items():
+                if reservations is None:
+                    slots = max(0, int(document.get("capacity") or 0))
+                    left = max(0, min(int(document.get("free") or 0), slots))
+                else:
+                    wanted = reservations.get(env)
+                    if wanted is None or wanted[0] != package or not self._holds_images(document, env):
+                        continue
+                    slots, left = self._hostable(machine_id, document, wanted[1])
+                row = found.setdefault(str(env), {"machines": 0, "slots": 0, "free": 0, "image_sets": {}})
+                row["machines"] += 1
+                row["slots"] += slots
+                row["free"] += left
+                lock = (document.get("env_image_locks") or {}).get(env)
+                digest = lock.get("sha256") if isinstance(lock, Mapping) else None
+                if isinstance(digest, str):
+                    image_set = row["image_sets"].setdefault(digest, {"machines": 0, "slots": 0, "free": 0})
+                    image_set["machines"] += 1
+                    image_set["slots"] += slots
+                    image_set["free"] += left
+        return found
 
     def _options_differ(self, machine_id: str, document: Mapping[str, Any], env: str,
                         expected: str) -> bool:
@@ -670,6 +772,45 @@ class Fleet:
             except (TypeError, ValueError):
                 used = 0
             total += max(0, used, len(_listed(document.get("resources"))))
+        return total
+
+    def session_share(self, machine_id: str, reserve: Mapping[str, Any] | None) -> float | None:
+        """The share of the machine one session takes: on a machine placed by its resources, the larger of its
+        reservation's CPU and memory shares of the totals (``reserve`` None: one slot's share of them, as for a
+        session issued elsewhere); one slot (``1 / capacity``) otherwise. None when the machine has no report."""
+        document = self._reports.get(machine_id)
+        if not document:
+            return None
+        slots = max(1, int(document.get("capacity") or 0))
+        resources = document.get("resources")
+        if reserve is None or not _valid_resources(resources) or not self._by_resources(document, reserve):
+            return 1.0 / slots
+        need = reservation_need(resources, reserve)
+        if need is None:
+            return 1.0 / slots
+        return max(need[0] / resources["cpu_millis"], need[1] / resources["memory_bytes"], 1.0 / slots)
+
+    def load_share(self, machine_ids: Collection[str]) -> float:
+        """The machines' reported load in machine shares (``session_share``'s unit), whoever issued it: per machine
+        the largest of its used slots, its listed sessions (as shares of its slots) and its used CPU and memory (as
+        shares of its totals). Memory reads only."""
+        total = 0.0
+        for machine_id in set(machine_ids):
+            document = self._reports.get(machine_id)
+            if not document:
+                continue
+            try:
+                slots = max(1, int(document.get("capacity") or 0))
+                used = max(0, slots - int(document.get("free") or 0))
+            except (TypeError, ValueError):
+                slots, used = 1, 0
+            resources = document.get("resources")
+            shares = [used / slots, len(_listed(resources)) / slots]
+            if _valid_resources(resources):
+                shares.append(max(0, resources["cpu_millis"] - resources["free_cpu_millis"]) / resources["cpu_millis"])
+                shares.append(max(0, resources["memory_bytes"] - resources["free_memory_bytes"])
+                              / resources["memory_bytes"])
+            total += max(shares)
         return total
 
     def sessions_hostable(self, machine_ids: Collection[str], reserve: Mapping[str, Any] | None) -> int:

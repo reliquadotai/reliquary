@@ -158,6 +158,8 @@ class RlEpisodeServices:
     boot_wait_s: float | None = None
     unserved_envs: set = field(default_factory=set)
     views: dict = field(default_factory=dict, repr=False)
+    saturation: Any = field(default=None, repr=False)
+    tiers: Any = field(default=None, repr=False)
     _loop: Any = field(default=None, repr=False)
     _tasks: set = field(default_factory=set, repr=False)
 
@@ -206,7 +208,57 @@ class RlEpisodeServices:
             jobs.append(self.yield_forever(YIELD_FLUSH_SECONDS))
         if self.boot_wait_s is not None:
             jobs.append(self.watch_served_forever(POLL_SECONDS_FOR_SERVED))
+        if self.saturation is not None:
+            from reliquary.sandbox.rl_capacity import SATURATION_CHECK_S
+
+            jobs.append(self.saturation_forever(SATURATION_CHECK_S))
         return jobs
+
+    # --- the operator's saturation view and ALERTs ---
+    def reservations(self) -> dict | None:
+        """{sandbox env: (package, reservation at its largest task tier)}: what the fleet size is counted in."""
+        return None if self.tiers is None else self.tiers.reservations()
+
+    def free_fraction(self) -> float | None:
+        """The fleet's free sessions over its sessions (None when it has none)."""
+        sessions, free = self.fleet.session_room(reservations=self.reservations())
+        return None if sessions <= 0 else free / sessions
+
+    def saturation_snapshot(self) -> dict:
+        return self.saturation.snapshot(queue=self.queue, quota=self.quota, fleet=self.fleet,
+                                        reservations=self.reservations(), ledger=self.ledger, issuer=self.issuer)
+
+    def check_saturation(self) -> list[str]:
+        """One round of the operator's ALERTs (the grow-fleet one, the check slots, envs that lost every
+        machine, capacity verdicts per hotkey); returns their texts (each is logged)."""
+        from reliquary.sandbox.rl_capacity import MAX_CHECKS_RUNNING
+
+        monitor, alerts = self.saturation, []
+        fleet_alert = monitor.check(free_fraction=self.free_fraction())
+        if fleet_alert:
+            alerts.append(fleet_alert)
+        checker_alert = monitor.check_checker(running=MAX_CHECKS_RUNNING)
+        if checker_alert:
+            alerts.append(checker_alert)
+        served = {name: bool(self.fleet.serving(sandbox_env, package, env_options_sha256=options))
+                  for name, (sandbox_env, package, options) in self.served.items()}
+        lost, recovered = monitor.check_envs(served, known_lost=self.unserved_envs)
+        alerts.extend(lost)
+        for name in recovered:
+            recover = getattr(self.issuer, "unserved_recovered", None)
+            if recover is not None:
+                recover(self.served[name][0])          # its next loss is ALERTed again at the open path too
+        if self.ledger is not None:
+            alerts.extend(monitor.check_capacity_verdicts(self.ledger))
+        return alerts
+
+    async def saturation_forever(self, every_s: float) -> None:
+        while True:
+            try:
+                self.check_saturation()
+            except Exception:
+                logger.exception("the rl saturation check failed")
+            await asyncio.sleep(every_s)
 
     # --- episode envs no machine serves: a degraded start, never a refusal to start ---
     def unserved(self) -> dict[str, tuple[str, str, str | None]]:
@@ -501,6 +553,32 @@ def _presented(reported: Callable[[str], bool] | None, session_id: str) -> bool 
         return None
 
 
+def _observing(tiers, name: str, resolve: Callable) -> Callable:
+    """``resolve`` that tells ``tiers`` of every task it resolves (the env's largest reservation tier)."""
+    async def resolve_and_observe(index):
+        task = await resolve(index)
+        try:
+            tiers.observe(name, task)
+        except Exception:
+            logger.exception("the reservation tier of %s was not updated", name)
+        return task
+    return resolve_and_observe
+
+
+def build_saturation_router(snapshot: Callable[[], dict]):
+    """``GET {RL_PREFIX}/saturation``: the operator's saturation view (counts, sessions and times only; no
+    secret). Read-only."""
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    @router.get(f"{RL_PREFIX}/saturation")
+    async def saturation() -> dict:
+        return snapshot()
+
+    return router
+
+
 def rl_registration(server) -> Callable:
     """The sandbox routes' registration check, over the RL server's registration gate."""
     from reliquary.protocol.submission import RejectReason
@@ -609,23 +687,35 @@ def build_rl_episode_services(
     book = SessionBook(policy)
     if ledger is None and yield_path is not None:
         ledger = SessionYieldLedger(yield_path, clock=clock)
+    tiers = None
     if yield_quota and quota is None:
+        from reliquary.sandbox.rl_capacity import SessionTiers
+
+        # The fleet size, in sessions of each env at its largest task tier that the machines' slots, CPU and
+        # memory hold (never the bare slots: an allocation must never exceed what placement can host).
+        tiers = SessionTiers(policies)
         # M by every name an env goes by: the env name an open passes and the sandbox env a session stores.
         quota = YieldQuota(ledger=ledger, pool_seeds=pool_seeds,
                            group_size=min(p.pool_seeds for p in policies.values()) // 2,
-                           capacity=fleet.session_capacity, reported=getattr(fleet, "session_reported", None),
+                           capacity=lambda: fleet.session_capacity(reservations=tiers.reservations()),
+                           reported=getattr(fleet, "session_reported", None),
                            group_sizes=episode_group_sizes(policies), retry_after_s=policy.retry_after_s, clock=clock)
     if ledger is not None and isinstance(quota, YieldQuota):
         ledger.allow_capacity_verdicts(quota.groups_allowed)      # capacity verdicts: per hotkey and window
         book.cap_scale = quota.cap_scale                          # the per-hotkey rates scale with the allocation
-    queue = None
+    queue = saturation = None
     if isinstance(quota, YieldQuota):
         # RL opens finding no room wait in the fair queue (outside the issuer lock) instead of being refused.
         from reliquary.sandbox.open_queue import OpenQueue
+        from reliquary.sandbox.rl_metrics import SaturationMonitor
 
-        queue = OpenQueue(rank=quota.rank, headroom=lambda hotkey: quota.headroom(hotkey, int(clock())))
-    views = {name: EpisodeEnvironmentView(policy=p, resolve_task=environments[name].source.resolve)
-             for name, p in policies.items()}
+        saturation = SaturationMonitor(clock=clock)
+        queue = OpenQueue(rank=quota.rank, headroom=lambda hotkey: quota.headroom(hotkey, int(clock())),
+                          on_wait=saturation.record_wait)
+    resolvers = {name: environments[name].source.resolve for name in policies}
+    if tiers is not None:
+        resolvers = {name: _observing(tiers, name, resolve) for name, resolve in resolvers.items()}
+    views = {name: EpisodeEnvironmentView(policy=p, resolve_task=resolvers[name]) for name, p in policies.items()}
     engagements = RlEpisodeEngagements(precommits=runtime.episode_precommit, environments=views.get,
                                        current_window=current_window, book=book,
                                        recorded_at=runtime.episode_precommit_recorded_at,
@@ -637,7 +727,7 @@ def build_rl_episode_services(
         fleet=fleet, signer=signer, token_verifier=token_verifier,
         engagements={"rl_precommit": engagements}, policy=policy, clock=clock,
         events=None if ledger is None else FanOutEvents(
-            LedgerEvents(ledger), quota if isinstance(quota, YieldQuota) else None),
+            LedgerEvents(ledger), quota if isinstance(quota, YieldQuota) else None, saturation),
         record_faults=ledger is not None,
         open_refusal_check=None if ledger is None else fleet.open_refusal_valid, queue=queue,
         operator_of=operator_of if ledger is not None else None,
@@ -671,10 +761,13 @@ def build_rl_episode_services(
     intake = EpisodeGroupIntake(checkers=checkers, precommits=runtime.episode_precommit,
                                 directory=fleet.directory_if_ready, token_verifier=token_verifier,
                                 sessions=issuer, seen=book.submitted_ids, outcomes=outcomes,
-                                window_open=window_open, **_check_caps(quota, clock))
+                                window_open=window_open, check_metrics=saturation, **_check_caps(quota, clock))
     logger.info("rl episode services built for %s (validator key %s)", sorted(policies), signer.key_id)
+    routers = (sessions_router, precommit_router)
+    if saturation is not None:
+        routers += (build_saturation_router(lambda: built["services"].saturation_snapshot()),)
     services = RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,
-                             issuer=issuer, routers=(sessions_router, precommit_router), intake=intake,
+                             issuer=issuer, routers=routers, intake=intake,
                              environments=tuple(sorted(policies)), runtime=runtime, outcomes=outcomes,
                              clock=clock, precommit_retention_s=float(precommit_retention_s),
                              ledger=ledger, quota=quota, queue=queue, window_uses=window_uses, policies=dict(policies),
@@ -682,8 +775,8 @@ def build_rl_episode_services(
                              served={name: (p.sandbox_env, p.env_package,
                                             getattr(environments[name].source, "options_sha256", None))
                                      for name, p in policies.items()},
-                             resolvers={name: environments[name].source.resolve for name in policies},
-                             boot_wait_s=boot_wait_s, views=views)
+                             resolvers=resolvers, boot_wait_s=boot_wait_s, views=views, saturation=saturation,
+                             tiers=tiers)
     engagements.serving_refusal = services.serving_refusal
     built["services"] = services
     return services

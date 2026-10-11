@@ -406,6 +406,18 @@ class YieldQuota:
             self._alloc_key, self._alloc_at, self._dirty = key, now, False
         return self._alloc
 
+    def usage(self, now: float | None = None) -> dict[str, int]:
+        """The counted sessions per entity (MAIN hotkeys together, the newcomer and the low-yield entities), and
+        the fleet size the allocation shares: the operator's saturation view. From the index, never the book."""
+        now = int(self._clock() if now is None else now)
+        alloc = self.allocation(now) if self._capacity(now) > 0 else None
+        used = {MAIN: 0, NEWCOMER: 0, LOW_YIELD: 0}
+        for hotkey in list(self._index):
+            counted = len(self._counted(hotkey, now))
+            if counted:
+                used[self._lanes.get(hotkey) or self.lane(hotkey)] += counted
+        return {**used, "capacity": 0 if alloc is None else int(alloc.capacity)}
+
     def potential_sessions(self, hotkey: str) -> int:
         """The sessions the hotkey could hold if it asked for them (what the miner is told). A pooled hotkey: its
         member maximum."""

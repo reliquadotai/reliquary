@@ -71,6 +71,19 @@ QUEUE_HOLD_AFTER_S = 5.0      # a head waiter that waited this long and missed g
 # --- servable tasks ---
 MIN_SERVING_MACHINES = 1
 
+# --- saturation: what tells the operator to grow the fleet (the fleet is fixed, grown by hand) ---
+SATURATION_WINDOW_S = 300               # metrics cover the last five minutes
+SATURATION_ALERT_FOR_S = 300            # an ALERT when the condition holds this long
+SATURATION_ALERT_WAIT_S = 10.0          # p90 of the queue's waits above this
+SATURATION_ALERT_REFUSALS_PER_MIN = 30  # or DISTINCT opens refused for the fleet's capacity a minute
+SATURATION_ALERT_FREE_FRACTION = 0.05   # and only while less than this share of the fleet's sessions is free
+SATURATION_CHECK_S = 10.0
+CHECKER_BUSY_ALERT_PER_MIN = 6          # distinct groups refused ``episode_checker_busy`` a minute: raise the
+                                        # check slots (MAX_CHECKS_RUNNING), sized from the check times' p90
+CAPACITY_VERDICT_ALERT_SESSIONS = 32    # a hotkey's sessions a capacity verdict made neutral (since start) ...
+CAPACITY_VERDICT_ALERT_SHARE = 0.25     # ... at least this share of its decided + neutral sessions: an ALERT
+CAPACITY_VERDICT_TOP = 20               # the hotkeys the saturation view lists (most neutral sessions first)
+
 NEWCOMER_ENTITY = "\x00newcomer"        # never a hotkey (SS58 has no NUL)
 
 
@@ -198,12 +211,114 @@ def opens_for(sessions: int) -> int:
     return OPENS_PER_LIVE_PER_HOUR * int(sessions)
 
 
-__all__ = ["ALLOCATION_REFRESH_S", "ASK_FORGET_S", "DEMAND_TTL_S", "GRACE_SESSIONS", "LOW_YIELD", "LOW_YIELD_MAX_GROUPS",
-           "LOW_YIELD_OPENS_PERIOD_S", "LOW_YIELD_SHARE", "MAIN", "MAX_CHECKS_RUNNING", "MIN_SERVING_MACHINES",
-           "NEWCOMER", "NEWCOMER_ENTITY", "NEWCOMER_EXIT_GROUPS", "NEWCOMER_MAX_GROUPS", "NEWCOMER_SHARE",
-           "NEWCOMER_TAKES_SPARE", "NEWCOMER_WEIGHT", "OPENS_PERIOD_S", "OPENS_PER_LIVE_PER_HOUR", "PRESENT_WINDOW_S",
-           "QUEUE_AGING_FORGET_S", "QUEUE_AGING_S", "QUEUE_FAIR_EVERY", "QUEUE_HOLD_AFTER_S", "QUEUE_MAX_PER_KEY",
-           "QUEUE_MAX_WAITING", "QUEUE_WAIT_S", "USEFUL_HORIZON_S", "YIELD_FLOOR", "YIELD_FULL", "YIELD_MIN_DECIDED",
-           "YIELD_SESSIONS",
-           "Allocation", "YieldStats", "allocate", "entity_sizes", "multiplier", "opens_for", "potential", "sessions_of",
-           "standing", "water_fill", "weight"]
+class SessionTiers:
+    """What one RL session of each env reserves on its machine, at the LARGEST task tier seen: the fleet size the
+    quota shares is counted in such sessions (``Fleet.session_room(reservations=)``), so an allocation never
+    exceeds what placement can host. ``policies``: {env name: its episode policy} (read at each call: an env added
+    later counts at once).
+
+    CPU: the largest ``cpu_millis`` among the env's resolved tasks, or the machine's whole box (None) until a task
+    was resolved, or once a task declaring no CPUs was (such a task takes the box). Memory: the largest of the
+    policy's memory budget and the resolved tasks' (a task may raise it). Every task is resolved before any of its
+    sessions opens (the precommit route resolves it), so a larger tier is known before it holds anything; the
+    fleet size then shrinks within a second. Never smaller than what was seen: the count only gets safer."""
+
+    def __init__(self, policies: Mapping[str, object]) -> None:
+        self._policies = policies
+        self._cpu: dict[str, int | None] = {}            # env -> largest cpu_millis seen (None: a whole box)
+        self._memory: dict[str, int] = {}                # env -> largest memory budget seen
+
+    def observe(self, environment: str, task: object) -> None:
+        """A task of ``environment`` was resolved."""
+        policy = self._policies.get(environment)
+        if policy is None:
+            return
+        cpu = getattr(task, "cpu_millis", None)
+        if environment not in self._cpu:
+            self._cpu[environment] = None if cpu is None else int(cpu)
+        elif self._cpu[environment] is not None:
+            self._cpu[environment] = None if cpu is None else max(int(cpu), self._cpu[environment])
+        memory = int(policy.budgets_dict().get("memory_bytes", 0))
+        limits = getattr(task, "limits", None) or {}
+        if isinstance(limits.get("memory_bytes"), int):
+            memory = max(memory, int(limits["memory_bytes"]))
+        self._memory[environment] = max(memory, self._memory.get(environment, 0))
+
+    def reservation(self, environment: str) -> dict:
+        policy = self._policies[environment]
+        memory = max(int(policy.budgets_dict().get("memory_bytes", 0)), self._memory.get(environment, 0))
+        return {"cpu_millis": self._cpu.get(environment), "memory_bytes": memory}
+
+    def reservations(self) -> dict[str, tuple[str, dict]]:
+        """{sandbox env: (env package, reservation)} for ``Fleet.session_room``; two envs on one sandbox env and
+        package keep the larger reservation."""
+        found: dict[str, tuple[str, dict]] = {}
+        for name, policy in list(self._policies.items()):
+            key, mine = (policy.sandbox_env, policy.env_package), self.reservation(name)
+            seen = found.get(key[0])
+            if seen is not None and seen[0] == key[1]:
+                other = seen[1]
+                cpu = (None if other["cpu_millis"] is None or mine["cpu_millis"] is None
+                       else max(other["cpu_millis"], mine["cpu_millis"]))
+                mine = {"cpu_millis": cpu, "memory_bytes": max(other["memory_bytes"], mine["memory_bytes"])}
+            found[key[0]] = (key[1], mine)
+        return found
+
+
+__all__ = [
+    "ALLOCATION_REFRESH_S",
+    "ASK_FORGET_S",
+    "CAPACITY_VERDICT_ALERT_SESSIONS",
+    "CAPACITY_VERDICT_ALERT_SHARE",
+    "CAPACITY_VERDICT_TOP",
+    "CHECKER_BUSY_ALERT_PER_MIN",
+    "DEMAND_TTL_S",
+    "GRACE_SESSIONS",
+    "LOW_YIELD",
+    "LOW_YIELD_MAX_GROUPS",
+    "LOW_YIELD_OPENS_PERIOD_S",
+    "LOW_YIELD_SHARE",
+    "MAIN",
+    "MAX_CHECKS_RUNNING",
+    "MIN_SERVING_MACHINES",
+    "NEWCOMER",
+    "NEWCOMER_ENTITY",
+    "NEWCOMER_EXIT_GROUPS",
+    "NEWCOMER_MAX_GROUPS",
+    "NEWCOMER_SHARE",
+    "NEWCOMER_TAKES_SPARE",
+    "NEWCOMER_WEIGHT",
+    "OPENS_PERIOD_S",
+    "OPENS_PER_LIVE_PER_HOUR",
+    "PRESENT_WINDOW_S",
+    "QUEUE_AGING_FORGET_S",
+    "QUEUE_AGING_S",
+    "QUEUE_FAIR_EVERY",
+    "QUEUE_HOLD_AFTER_S",
+    "QUEUE_MAX_PER_KEY",
+    "QUEUE_MAX_WAITING",
+    "QUEUE_WAIT_S",
+    "SATURATION_ALERT_FOR_S",
+    "SATURATION_ALERT_FREE_FRACTION",
+    "SATURATION_ALERT_REFUSALS_PER_MIN",
+    "SATURATION_ALERT_WAIT_S",
+    "SATURATION_CHECK_S",
+    "SATURATION_WINDOW_S",
+    "USEFUL_HORIZON_S",
+    "YIELD_FLOOR",
+    "YIELD_FULL",
+    "YIELD_MIN_DECIDED",
+    "YIELD_SESSIONS",
+    "Allocation",
+    "SessionTiers",
+    "YieldStats",
+    "allocate",
+    "entity_sizes",
+    "multiplier",
+    "opens_for",
+    "potential",
+    "sessions_of",
+    "standing",
+    "water_fill",
+    "weight",
+]

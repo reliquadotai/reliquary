@@ -701,18 +701,49 @@ async def test_the_held_machine_is_kept_for_the_head_while_others_place_elsewher
     assert isinstance(await big, Grant) and rooms.free["m-1"] == 0 and q._hold is None
 
 
+class VirtualTimeLoop(asyncio.SelectorEventLoop):
+    """An event loop on a virtual clock: when nothing is ready it jumps to its next timer instead of sleeping, so a
+    timed simulation runs the same way whatever the machine's load (no wall clock anywhere)."""
+
+    def __init__(self):
+        super().__init__()
+        self._now = 0.0
+        real = self._selector.select
+
+        def select(timeout=None):
+            events = real(0)
+            if not events and timeout:
+                self._now += timeout
+            return events
+        self._selector.select = select
+
+    def time(self):
+        return self._now
+
+
+def run_virtual(coroutine):
+    loop = VirtualTimeLoop()
+    try:
+        return loop.run_until_complete(coroutine)
+    finally:
+        loop.close()
+
+
 def _simulate(tmp_path, hold_after_s, seconds=3.0, rate=80.0):
     """The reviewer's scenario: one 4-CPU machine, big opens needing all 4 CPUs retried in a loop by one key, and
     small 1-CPU opens from fresh keys arriving at random (~80 % load), equal scores, every session 20-60 ms, a
-    poll every 50 ms."""
+    poll every 50 ms. On a virtual clock: deterministic."""
     import random
+
+    rooms = Rooms({"m-1": 4}, {"big": 4, "small": 1})
+    # The template's terms are read in a worker thread: on a real loop, before the virtual one starts.
+    issuer = asyncio.run(rooms_issuer(tmp_path, rooms, None))
 
     async def main():
         rng = random.Random(1)
-        rooms = Rooms({"m-1": 4}, {"big": 4, "small": 1})
         q = OpenQueue(rank=lambda h: (h, 1.0, False), wait_s=0.3, fair_every=0,
-                      hold_after_s=hold_after_s)
-        issuer = await rooms_issuer(tmp_path, rooms, q)
+                      hold_after_s=hold_after_s, clock=asyncio.get_running_loop().time)
+        issuer._queue = q
         stats = {"big": 0, "big_sat": 0, "small": 0, "small_sat": 0}
         loop = asyncio.get_running_loop()
 
@@ -749,13 +780,15 @@ def _simulate(tmp_path, hold_after_s, seconds=3.0, rate=80.0):
             await asyncio.sleep(rng.expovariate(rate))
         await asyncio.gather(*smalls, tasks[0])
         tasks[1].cancel()
+        await asyncio.gather(tasks[1], return_exceptions=True)
         return stats
 
-    return asyncio.run(main())
+    return run_virtual(main())
 
 
 def test_big_reservations_no_longer_starve_while_small_ones_keep_flowing(tmp_path):
     stats = _simulate(tmp_path, hold_after_s=0.05)                 # without the hold: about half time out
+    assert stats == _simulate(tmp_path / "again", hold_after_s=0.05)    # deterministic (a virtual clock)
     assert stats["big"] >= 8 and stats["big_sat"] <= max(1, stats["big"] // 10)     # big opens place
     offered = stats["small"] + stats["small_sat"]
     assert stats["small"] >= 0.7 * offered                          # small opens keep flowing ...

@@ -261,6 +261,18 @@ class FanOutEvents:
             except Exception:
                 logger.exception("sandbox session listener closed failed")
 
+    def open_refused(self, reason: str, env: str | None, engagement: str | None) -> None:
+        """Every refused open (the saturation metrics): its reason, and its env and engagement when the terms were
+        read."""
+        for listener in self.listeners:
+            method = getattr(listener, "open_refused", None)   # optional: the saturation monitor has it
+            if method is None:
+                continue
+            try:
+                method(reason, env, engagement)
+            except Exception:
+                logger.exception("sandbox session listener open_refused failed")
+
     def refused(self, hotkey: str, engagement: Mapping[str, Any], refusal: Refusal) -> None:
         for listener in self.listeners:
             method = getattr(listener, "refused", None)        # optional: the yield ledger has it
@@ -608,6 +620,16 @@ class SessionBook:
             if not on:
                 del self._by_machine[record.machine_id]
 
+    def holding_on(self, machine_ids, now: int) -> list[SessionRecord]:
+        """The held sessions on these machines (an index, never a scan of the book)."""
+        found = []
+        for machine_id in set(machine_ids):
+            for session_id in self._by_machine.get(machine_id, ()):
+                record = self._sessions.get(session_id)
+                if record is not None and self._holds(record, now):
+                    found.append(record)
+        return found
+
     def held_on(self, machine_ids, now: int) -> dict[str, int]:
         """Held sessions per hotkey on these machines (an index, never a scan of the book)."""
         counts: dict[str, int] = {}
@@ -877,6 +899,9 @@ class SessionIssuer:
         # The sessions a hotkey's allocation entitles it to (the RL quota's): within it, a saturation is ours.
         self._entitled = entitled
         self.attribution_failures = 0          # saturation attributions that raised (a bug of ours: no verdict)
+        # RL session -> the share of its machine it reserves (``Fleet.session_share`` at issue), while it holds:
+        # the saturation attribution weighs sessions by their box size.
+        self._weights: dict[str, float] = {}
         self._restored: set[str] = set()       # sessions issued before this process started (their tokens lost)
         self._last_activity = 0                # the last issue or close before the restart
         self._lost: set[str] = set()           # restored sessions whose open answer our restart lost
@@ -927,13 +952,28 @@ class SessionIssuer:
         machines host at least a whole group, so only the operator's OTHER load can make a saturation its own
         doing). ``total``: every session on them, never less than what their reports show (corpus sessions and
         anything else this book does not hold count too)."""
-        held = self.book.held_on(machine_ids, now)
+        share = getattr(self._fleet, "session_share", None)
+        load = getattr(self._fleet, "load_share", None)
         owner = self._owner(hotkey)
-        own = sum(count for other, count in held.items() if self._owner(other) == owner)
-        own -= self.book.held_on_precommit(machine_ids, now, engagement)
-        reported = getattr(self._fleet, "reported_load", None)
-        total = max(sum(held.values()), int(reported(machine_ids)) if reported is not None else 0)
-        return max(0, own), total
+        if share is None or load is None:
+            held = self.book.held_on(machine_ids, now)
+            own = sum(count for other, count in held.items() if self._owner(other) == owner)
+            own -= self.book.held_on_precommit(machine_ids, now, engagement)
+            reported = getattr(self._fleet, "reported_load", None)
+            total = max(sum(held.values()), int(reported(machine_ids)) if reported is not None else 0)
+            return max(0, own), total
+        # By the share of its machine each session takes (its box's CPU or memory, the larger; a slot on a machine
+        # placed by slots): one 4-CPU session weighs four 1-CPU ones.
+        group = _rl_precommit_engagement(engagement)
+        own = total = 0.0
+        for record in self.book.holding_on(machine_ids, now):
+            weight = self._weights.get(record.session_id)
+            if weight is None:
+                weight = float(share(record.machine_id, None) or 0.0)      # not issued by this process: a slot
+            total += weight
+            if self._owner(record.hotkey) == owner and (group is None or _rl_precommit_of(record) != group):
+                own += weight
+        return own, max(total, float(load(machine_ids)))
 
     def _over_entitlement(self, hotkey: str, now: int) -> bool:
         """Whether the hotkey's operator holds more sessions, fleet-wide, than its hotkeys' allocations entitle it
@@ -1002,6 +1042,9 @@ class SessionIssuer:
     def _settled(self, records) -> None:
         """Sessions left the book's live states: the fleet drops its hold on their reservations."""
         settled = getattr(self._fleet, "note_settled", None)
+        for record in records:
+            if record is not None:
+                self._weights.pop(record.session_id, None)
         if settled is None:
             return
         for record in records:
@@ -1090,9 +1133,12 @@ class SessionIssuer:
         now = int(self._clock())
         refusal = self.book.open_refusal(hotkey, now)
         if refusal is not None:
+            self._event("open_refused", refusal.reason, None, None)
             return refusal
         if not self._fleet.directory_ready(now):
-            return self._directory_unavailable()
+            refusal = self._directory_unavailable()
+            self._event("open_refused", refusal.reason, None, None)
+            return refusal
         book = self._engagements.get(engagement.get("kind"))
         if book is None:
             return Refusal("engagement_kind_unsupported", {"kind": engagement.get("kind")})
@@ -1105,9 +1151,13 @@ class SessionIssuer:
             generation = None
         terms = await book.terms(hotkey, engagement)            # reads: outside the lock
         if isinstance(terms, Refusal):
+            self._event("open_refused", terms.reason, None, None)
             self._capacity_refused(hotkey, engagement, terms)
             return terms
         outcome = await self._issue(hotkey, request_id, digest, engagement, terms, generation)
+        if isinstance(outcome, Refusal):
+            self._event("open_refused", outcome.reason, getattr(terms, "env", None),
+                        getattr(terms, "engagement", None))
         self._capacity_refused(hotkey, engagement, outcome, terms)
         return outcome
 
@@ -1279,10 +1329,23 @@ class SessionIssuer:
             # held until a report lists it, at most the token's present window (the gateway refuses it later)
             self._fleet.note_issued(placement.machine_id, now, reserve=reserve,
                                     hold_s=min(validity, PRESENT_WINDOW_S), session_id=session_id)
+            share = getattr(self._fleet, "session_share", None)
+            if share is not None:
+                try:
+                    weight = share(placement.machine_id, reserve)
+                except Exception:
+                    logger.exception("the share of session %s on its machine is unknown", session_id)
+                    weight = None
+                if weight is not None:
+                    self._weights[session_id] = float(weight)
         self._tokens[session_id] = (token, placement.address)
         self._event("opened", record)
         return _Issued(Grant(session_id, token, placement.address, claims.expires_at),
                        placement.machine_id, terms.engagement)
+
+    def unserved_recovered(self, env: str) -> None:
+        """A machine serves ``env`` again: its next loss is ALERTed again."""
+        self._unserved_alerted = {key for key in self._unserved_alerted if key[0] != env}
 
     def _unserved(self, terms, now: int) -> Refusal | None:
         """An open no machine could take because no fresh machine serves its env at its exact package and options

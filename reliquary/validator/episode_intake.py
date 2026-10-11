@@ -142,7 +142,8 @@ class EpisodeGroupIntake:
                  window_open: Callable[[int], bool] | None = None,
                  checks_allowed: Callable[[str, float], Collection[str]] | None = None,
                  max_checks_running: int | None = None,
-                 checks_scale: Callable[[str], float] | None = None) -> None:
+                 checks_scale: Callable[[str], float] | None = None,
+                 check_metrics: Any = None) -> None:
         ttl = getattr(getattr(sessions, "policy", None), "claim_ttl_s", None)
         if not isinstance(ttl, (int, float)) or ttl < CLAIM_TTL_MARGIN * float(admission_deadline_s):
             raise ValueError(f"the session claim ttl ({ttl!r} s) must be at least {CLAIM_TTL_MARGIN}x the "
@@ -164,6 +165,9 @@ class EpisodeGroupIntake:
         self._window_open = window_open
         self._checks_allowed = checks_allowed
         self._checks_scale = checks_scale
+        # Told each transcript check's time (``check_time(seconds)``) and each group refused for want of a check
+        # slot (``checker_busy(hotkey, precommit_sha256)``): the saturation metrics size MAX_CHECKS_RUNNING.
+        self._check_metrics = check_metrics
         if max_checks_running is not None and int(max_checks_running) < 2:
             raise ValueError("max_checks_running must be at least 2 (one slot is always left to the others)")
         self._max_running = MAX_CHECKS_RUNNING if max_checks_running is None else int(max_checks_running)
@@ -181,6 +185,15 @@ class EpisodeGroupIntake:
     @property
     def environments(self) -> tuple[str, ...]:
         return tuple(sorted(self._checkers))
+
+    def _metric(self, name: str, *args) -> None:
+        method = getattr(self._check_metrics, name, None) if self._check_metrics is not None else None
+        if method is None:
+            return
+        try:
+            method(*args)
+        except Exception:
+            logger.exception("the episode check metric %s failed", name)
 
     def _owner(self, hotkey: str, operator: str | None) -> str:
         """The in-flight cap's key: the hotkey with ``checks_allowed``, else the operator."""
@@ -351,6 +364,7 @@ class EpisodeGroupIntake:
             threads = self._threads if self._threads is not None else _CHECK_THREADS
             if not slots.acquire(blocking=False):
                 self._forget_check(hotkey)
+                self._metric("checker_busy", hotkey, sha)
                 return self._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_checker_busy",
                                     {"running": self._max_running})
             try:
@@ -358,6 +372,7 @@ class EpisodeGroupIntake:
                 # released when the check's thread returns (or never starts), not when we stop waiting.
                 if progress is not None:
                     progress.started = time.monotonic()
+                check_started = time.monotonic()
                 future = threads.submit(checker.check, request, precommit=precommit, directory=directory,
                                                token_verifier=self._tokens, seen=self._seen(), received=received)
             except BaseException:
@@ -375,7 +390,11 @@ class EpisodeGroupIntake:
 
             future.add_done_callback(ended)
             try:
-                outcome = await asyncio.wrap_future(future)
+                try:
+                    outcome = await asyncio.wrap_future(future)
+                finally:
+                    if future.done():
+                        self._metric("check_time", time.monotonic() - check_started)
             except Exception:
                 logger.error("episode group of %s: the transcript check raised; refused", hotkey[:12],
                              exc_info=True)

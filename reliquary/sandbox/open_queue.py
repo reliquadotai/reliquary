@@ -35,6 +35,7 @@ the event loop (no lock needed)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 from collections.abc import Callable, Hashable
@@ -49,6 +50,8 @@ from reliquary.sandbox.rl_capacity import (
     QUEUE_WAIT_S,
 )
 from reliquary.sandbox.sessions import Refusal
+
+logger = logging.getLogger(__name__)
 
 
 class Ticket:
@@ -71,8 +74,11 @@ class OpenQueue:
                  max_per_key: int = QUEUE_MAX_PER_KEY, aging_s: float = QUEUE_AGING_S,
                  aging_forget_s: float = QUEUE_AGING_FORGET_S, fair_every: int = QUEUE_FAIR_EVERY,
                  hold_after_s: float | None = QUEUE_HOLD_AFTER_S,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 on_wait: Callable[[float], None] | None = None) -> None:
         self._rank, self._headroom = rank, headroom
+        # Told how long each ticket waited when it leaves (placed, refused, timed out or cancelled): the metrics.
+        self._on_wait = on_wait
         self._wait_s, self._aging_s, self._forget_s = float(wait_s), float(aging_s), float(aging_forget_s)
         self._max_waiting, self._max_per_key, self._fair_every = int(max_waiting), int(max_per_key), int(fair_every)
         self._hold_after_s = None if hold_after_s is None else float(hold_after_s)
@@ -253,6 +259,11 @@ class OpenQueue:
             return
         ticket.active = False
         now = self._clock()
+        if self._on_wait is not None:
+            try:
+                self._on_wait(max(0.0, now - ticket.joined))
+            except Exception:
+                logger.exception("the open queue's wait listener failed")
         if ticket in self._waiting:
             self._waiting.remove(ticket)
         held = self._holder is ticket

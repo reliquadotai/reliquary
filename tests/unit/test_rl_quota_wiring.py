@@ -180,7 +180,9 @@ def test_the_wiring_installs_the_yield_quota_lifts_the_per_key_caps_and_scales_t
     assert isinstance(services.quota, YieldQuota)
     assert services.issuer._engagements["rl_precommit"]._quota is services.quota
     assert services.quota in services.issuer._events.listeners
-    assert services.quota._capacity_of == services.fleet.session_capacity
+    # the fleet size in sessions each env's largest task tier fits (slots, CPU, memory), never the bare slots
+    assert services.tiers is not None
+    assert services.quota._capacity_of() == services.fleet.session_capacity(reservations=services.tiers.reservations())
     assert services.ledger._capacity_allowance == services.quota.groups_allowed
     assert services.book.cap_scale == services.quota.cap_scale
     assert services.book.policy.max_live_per_hotkey == services.book.policy.max_opens_per_hour == NO_PER_KEY_CAP

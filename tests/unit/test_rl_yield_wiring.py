@@ -264,7 +264,9 @@ async def test_the_validator_opens_the_ledger_beside_its_runtime(tmp_path, monke
         assert services.operator_of("5Hot") == "5Cold" and services.operator_of("5Other") is None
         assert services.issuer._operator_of("5Hot") == "5Cold"     # a saturation is judged by operator
         assert services.issuer._entitled == services.quota.sessions_allowed    # within it, a saturation is ours
-        assert len(service._episode_tasks) == 5            # and the yield settlement (and the served-env watch)
+        # and the yield settlement, the served-env watch and the saturation ALERTs
+        assert len(service._episode_tasks) == 6
+        assert services.saturation is not None
     finally:
         await service._stop_episode_services()
     assert services.ledger._closed
