@@ -61,7 +61,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -393,28 +393,34 @@ class Fleet:
 
     def pick(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
              validity_s: int, now: float,
-             env_options_sha256: str | None = None) -> Placement | None:
+             env_options_sha256: str | None = None, exclude: Collection[str] = ()) -> Placement | None:
         """The machine a new session goes to (see the module docstring), or None. With
         `env_options_sha256`, a machine is eligible only if its report publishes that
-        digest for `env` (the gateway is the authority on the env's options)."""
+        digest for `env` (the gateway is the authority on the env's options). `exclude`: machines
+        held for another open (the RL open queue)."""
         if not self.directory_ready(now):
             self._alert_stale(now)
             return None
         best: tuple[float, str] | None = None
         chosen: Placement | None = None
         for entry in self._directory.entries():
+            if entry.machine_id in exclude:
+                continue
             document = self._reports.get(entry.machine_id)
             if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
                               validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
                 continue
-            issued = sum(1 for at in self._issued.get(entry.machine_id, ()) if at >= document["at"])
-            free = document["free"] - issued
+            free = self._free(entry.machine_id, document)
             if free <= 0:
                 continue
             key = (-free / max(1, document["capacity"]), entry.machine_id)
             if best is None or key < best:
                 best, chosen = key, Placement(entry.machine_id, entry.address)
         return chosen
+
+    def _free(self, machine_id: str, document: Mapping[str, Any]) -> int:
+        issued = sum(1 for at in self._issued.get(machine_id, ()) if at >= document["at"])
+        return document["free"] - issued
 
     def _fits(self, entry, document, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
               validity_s: int, now: float, env_options_sha256: str | None) -> bool:
@@ -423,6 +429,12 @@ class Fleet:
             return False
         if document is None or now - document["at"] > HEARTBEAT_MAX_AGE_S:
             return False
+        return self._serves(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
+                            validity_s=validity_s, env_options_sha256=env_options_sha256)
+
+    def _serves(self, entry, document, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
+                validity_s: int, env_options_sha256: str | None) -> bool:
+        """What the machine's (last) report says it serves: the image, the env, its options, the tools and caps."""
         if image not in (document.get("images") or ()):
             return False
         if (document.get("env_packages") or {}).get(env) != env_package:
@@ -440,15 +452,44 @@ class Fleet:
         return True
 
     def could_place(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
-                    now: float, env_options_sha256: str | None = None, reserve: Mapping[str, Any] | None = None) -> bool:
-        """Whether some fresh active machine could ever take this session, its load aside: the RL open queue
-        refuses at once what no machine could take, and queues only what waits for room."""
-        if not self.directory_ready(now):
-            return False
-        return any(self._fits(entry, self._reports.get(entry.machine_id), image=image, env=env,
-                              env_package=env_package, budgets=budgets, validity_s=validity_s, now=now,
-                              env_options_sha256=env_options_sha256)
-                   for entry in self._directory.entries())
+                    now: float, env_options_sha256: str | None = None,
+                    reserve: Mapping[str, Any] | None = None) -> bool | None:
+        """Whether some machine could ever take this session, its load aside: True (a fresh active machine
+        serves it), False (no active machine serves it, by what every one of them reports) or None when it
+        cannot be judged now: the directory is stale, no machine report was accepted yet (a start) or the last
+        poll heard none (our egress), no report is fresh, or a machine whose last report serves it is drained or
+        stale. The RL open queue refuses at once only on False (final for the seed); None is retryable."""
+        if not self.directory_ready(now) or self._egress_suspect or not self._last_ok:
+            return None
+        fresh = unknown = False
+        kw = dict(image=image, env=env, env_package=env_package, budgets=budgets, validity_s=validity_s,
+                  env_options_sha256=env_options_sha256)
+        for entry in self._directory.entries():
+            document = self._reports.get(entry.machine_id)
+            if entry.status != "active" or document is None:
+                continue
+            current = entry.machine_id not in self.drained and now - document["at"] <= HEARTBEAT_MAX_AGE_S
+            fresh = fresh or current
+            if self._serves(entry, document, **kw):
+                if current:
+                    return True
+                unknown = True              # it served it when last heard: drained or stale for now
+        return None if unknown or not fresh else False
+
+    def nearest(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
+                now: float, env_options_sha256: str | None = None) -> str | None:
+        """The fresh machine serving this session that is closest to having room for it (the most free room,
+        full or not): the one the open queue holds for a head waiter that keeps missing."""
+        best: tuple[float, str] | None = None
+        for entry in self._directory.entries():
+            document = self._reports.get(entry.machine_id)
+            if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
+                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
+                continue
+            key = (-self._free(entry.machine_id, document) / max(1, document["capacity"]), entry.machine_id)
+            if best is None or key < best:
+                best = key
+        return None if best is None else best[1]
 
     def open_refusal_valid(self, receipt: Mapping[str, Any], record: Any) -> bool | None:
         """Whether ``receipt`` is the gateway's signed refusal of ``record``'s token on its machine, signed

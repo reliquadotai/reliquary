@@ -66,6 +66,7 @@ QUEUE_MAX_PER_KEY = 64
 QUEUE_AGING_S = 60.0
 QUEUE_AGING_FORGET_S = 120.0
 QUEUE_FAIR_EVERY = 4
+QUEUE_HOLD_AFTER_S = 5.0      # a head waiter that waited this long and missed gets one machine held for it
 
 # --- servable tasks ---
 MIN_SERVING_MACHINES = 1
@@ -193,7 +194,8 @@ __all__ = ["ALLOCATION_REFRESH_S", "ASK_FORGET_S", "DEMAND_TTL_S", "GRACE_SESSIO
            "LOW_YIELD_OPENS_PERIOD_S", "LOW_YIELD_SHARE", "MAIN", "MAX_CHECKS_RUNNING", "MIN_SERVING_MACHINES",
            "NEWCOMER", "NEWCOMER_ENTITY", "NEWCOMER_EXIT_GROUPS", "NEWCOMER_MAX_GROUPS", "NEWCOMER_SHARE",
            "NEWCOMER_TAKES_SPARE", "NEWCOMER_WEIGHT", "OPENS_PERIOD_S", "OPENS_PER_LIVE_PER_HOUR", "PRESENT_WINDOW_S",
-           "QUEUE_AGING_FORGET_S", "QUEUE_AGING_S", "QUEUE_FAIR_EVERY", "QUEUE_MAX_PER_KEY", "QUEUE_MAX_WAITING",
-           "QUEUE_WAIT_S", "USEFUL_HORIZON_S", "YIELD_FLOOR", "YIELD_FULL", "YIELD_MIN_DECIDED", "YIELD_SESSIONS",
+           "QUEUE_AGING_FORGET_S", "QUEUE_AGING_S", "QUEUE_FAIR_EVERY", "QUEUE_HOLD_AFTER_S", "QUEUE_MAX_PER_KEY",
+           "QUEUE_MAX_WAITING", "QUEUE_WAIT_S", "USEFUL_HORIZON_S", "YIELD_FLOOR", "YIELD_FULL", "YIELD_MIN_DECIDED",
+           "YIELD_SESSIONS",
            "Allocation", "YieldStats", "allocate", "entity_sizes", "multiplier", "opens_for", "potential", "sessions_of",
            "standing", "water_fill", "weight"]

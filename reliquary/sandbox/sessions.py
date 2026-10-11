@@ -764,11 +764,30 @@ CAPACITY_REFUSALS = frozenset({"sandbox_saturated", "open_queue_full", "task_unp
 """Open refusals that are the validator's capacity, never the miner's doing: told to ``SessionEvents.refused``."""
 
 
-def _placement_class(terms) -> tuple:
-    """The open queue's class: the env and the reservation, NOT the image (one image per task would make every
-    open its own class and bypass the queue); each waiter's own attempt filters on its image."""
+def _tier(value: Any) -> Any:
+    """A reservation rounded up to its tier (the next power of two), so that per-task reservations of one env
+    fall into a few classes rather than one each."""
+    if type(value) is not int or value <= 0:
+        return value
+    return 1 << (value - 1).bit_length()
+
+
+def _reserve_of(terms) -> tuple:
     reserve = getattr(terms, "reserve", None) or {}
-    return (terms.env, reserve.get("cpu_millis"), reserve.get("memory_bytes"))
+    return (reserve.get("cpu_millis"), reserve.get("memory_bytes"))
+
+
+def _placement_class(terms) -> tuple:
+    """The open queue's class: the env and the reservation's tier, NOT the image (one image per task would make
+    every open its own class and bypass the queue); each waiter's own attempt filters on its image and exact
+    reservation."""
+    cpu_millis, memory_bytes = _reserve_of(terms)
+    return (terms.env, _tier(cpu_millis), _tier(memory_bytes))
+
+
+_UNTALLIED_REFUSALS = frozenset({"sandbox_saturated", "open_queue_full", "directory_unavailable"})
+"""A queued issuer's refusals that are our capacity or our outage: never counted toward a hotkey's refused-open
+rate."""
 
 
 class SessionIssuer:
@@ -905,7 +924,8 @@ class SessionIssuer:
             return throttled
         outcome = await self._open(hotkey, request_id, digest, engagement)
         if isinstance(outcome, Refusal):
-            self._refused_opens.setdefault(hotkey, []).append(now)
+            if self._queue is None or outcome.reason not in _UNTALLIED_REFUSALS:
+                self._refused_opens.setdefault(hotkey, []).append(now)
             return outcome
         if isinstance(outcome, Grant):           # the same request, granted meanwhile
             return outcome
@@ -941,28 +961,41 @@ class SessionIssuer:
 
     async def _issue(self, hotkey: str, request_id: str, digest: str, engagement: Mapping[str, Any], terms,
                      generation):
-        """Issue under the lock. With an open queue (RL): an open no machine could ever take is refused at once
-        (``task_unplaceable``, final for the seed); one finding no room waits for a turn OUTSIDE the lock and tries
-        again, until its deadline (``sandbox_saturated``); a new open joins rather than placing first only when a
-        waiter of its own placement class waits. Without a queue (corpus), no room is refused at once, exactly as
-        before."""
-        queue, ticket, deadline, placed = self._queue, None, 0.0, False
-        cls = _placement_class(terms) if queue is not None else None
+        """Issue under the lock. Without a queue (corpus), no room is refused at once, exactly as before. With an
+        open queue (RL): an open no machine could ever take is refused at once (``task_unplaceable``, final for
+        the seed; one that cannot be judged now is refused retryably); one finding no room waits for a turn
+        OUTSIDE the lock and tries again, until its deadline (``sandbox_saturated``); a new open joins rather than
+        placing first only when a waiter of its own placement class waits. A turn first looks for room without
+        the lock (and not at all when its room key already missed in this sweep); a head waiter that keeps
+        missing gets a machine held for it, which nobody else takes meanwhile."""
+        queue = self._queue
+        if queue is None:
+            async with self._lock:
+                outcome = await self._issue_locked(hotkey, request_id, digest, engagement, terms, generation,
+                                                   may_place=True)
+            if outcome is _NO_CAPACITY:
+                return Refusal("sandbox_capacity", {"image": terms.image},
+                               retry_after=self._policy.retry_after_s)
+            return outcome
+        ticket, deadline, placed = None, 0.0, False
+        cls = _placement_class(terms)
         try:
             while True:
-                may_place = (queue is None or (ticket is not None and ticket.granted)
-                             or (ticket is None and not queue.waiting_in(cls)))
-                async with self._lock:
-                    outcome = await self._issue_locked(hotkey, request_id, digest, engagement, terms, generation,
-                                                       may_place=may_place)
+                granted = ticket is not None and ticket.granted
+                exclude = queue.held_for_others(ticket)
+                room = (terms.env, terms.image, _reserve_of(terms), exclude)
+                if granted and (queue.room_missed(room) or self._no_room_now(terms, exclude)):
+                    outcome = _NO_CAPACITY                    # passed over without the lock: nothing freed for it
+                else:
+                    may_place = granted or (ticket is None and not queue.waiting_in(cls))
+                    async with self._lock:
+                        outcome = await self._issue_locked(hotkey, request_id, digest, engagement, terms,
+                                                           generation, may_place=may_place, exclude=exclude)
                 if outcome is _NEVER:
                     return Refusal("task_unplaceable", {"image": terms.image, "why": "no machine can serve it"})
                 if outcome is not _NO_CAPACITY:
                     placed = isinstance(outcome, _Issued)
                     return outcome
-                if queue is None:
-                    return Refusal("sandbox_capacity", {"image": terms.image},
-                                   retry_after=self._policy.retry_after_s)
                 if ticket is None:
                     joined = queue.join(hotkey, cls=cls, engagement=terms.engagement)
                     if isinstance(joined, Refusal):
@@ -971,7 +1004,7 @@ class SessionIssuer:
                     if ticket.granted:
                         continue                                  # the turn was free: try at once
                 elif ticket.granted:
-                    queue.missed(ticket)                          # pass the turn on; wait on a fresh event
+                    self._missed(ticket, terms, room)             # pass the turn on; wait on a fresh event
                 if not await queue.turn(ticket, deadline):
                     return Refusal("sandbox_saturated", {"waiting": queue.waiting,
                                                          "waited_s": round(queue.waited(ticket), 1)},
@@ -980,8 +1013,31 @@ class SessionIssuer:
             if ticket is not None:
                 queue.done(ticket, placed=placed)               # a cancelled request hands its turn on too
 
+    def _validity(self, terms) -> int:
+        return token_validity_s(self._policy.open_window_s, int(terms.budgets["wall_s"]), terms.prepare_timeout_s)
+
+    def _no_room_now(self, terms, exclude: frozenset) -> bool:
+        """Whether a turn can be passed over without the lock: no machine has room for it now, and some machine
+        surely could take it later (anything else is answered under the lock)."""
+        now = int(self._clock())
+        place = dict(image=terms.image, env=terms.env, env_package=terms.env_package, budgets=terms.budgets,
+                     validity_s=self._validity(terms), now=now, env_options_sha256=terms.env_options_sha256)
+        if self._fleet.pick(**place, **({"exclude": exclude} if exclude else {})) is not None:
+            return False
+        return self._fleet.could_place(**place) is True
+
+    def _missed(self, ticket, terms, room) -> None:
+        queue = self._queue
+        if queue.should_hold(ticket):
+            nearest = getattr(self._fleet, "nearest", None)
+            if nearest is not None:
+                queue.hold(ticket, nearest(image=terms.image, env=terms.env, env_package=terms.env_package,
+                                           budgets=terms.budgets, validity_s=self._validity(terms),
+                                           now=int(self._clock()), env_options_sha256=terms.env_options_sha256))
+        queue.missed(ticket, room=room)
+
     async def _issue_locked(self, hotkey: str, request_id: str, digest: str, engagement: Mapping[str, Any],
-                            terms, generation, *, may_place: bool):
+                            terms, generation, *, may_place: bool, exclude: frozenset = frozenset()):
         """The checks and the issue under the issuer lock (the caller holds it): a Grant (resent), an
         ``_Issued``, a Refusal, ``_NO_CAPACITY`` or ``_NEVER``."""
         now = int(self._clock())
@@ -1022,14 +1078,18 @@ class SessionIssuer:
             placement = self._fleet.pick(image=terms.image, env=terms.env,
                                          env_package=terms.env_package, budgets=terms.budgets,
                                          validity_s=validity, now=now,
-                                         env_options_sha256=terms.env_options_sha256)
+                                         env_options_sha256=terms.env_options_sha256,
+                                         **({"exclude": exclude} if exclude else {}))
         if placement is None:
-            if self._queue is not None and not self._fleet.could_place(
+            if self._queue is not None:
+                verdict = self._fleet.could_place(
                     image=terms.image, env=terms.env, env_package=terms.env_package, budgets=terms.budgets,
-                    validity_s=validity, now=now, env_options_sha256=terms.env_options_sha256):
-                if not self._fleet.directory_ready(now):
-                    return self._directory_unavailable()     # our outage, never final for the seed
-                return _NEVER
+                    validity_s=validity, now=now, env_options_sha256=terms.env_options_sha256)
+                if verdict is None:                  # our outage or a start: retryable, never final for the seed
+                    return Refusal("directory_unavailable", {"why": "the sandbox fleet cannot be judged now"},
+                                   retry_after=self._policy.retry_after_s)
+                if verdict is False:
+                    return _NEVER
             return _NO_CAPACITY
         session_id = self._new_id()
         claims = SessionClaims(

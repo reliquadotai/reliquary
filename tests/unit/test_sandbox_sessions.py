@@ -49,7 +49,7 @@ class FakeFleet:
         self.placeable = True
 
     def could_place(self, **kw):
-        return self.placeable
+        return None if not self.ready else self.placeable
 
     def directory_ready(self, now=None):
         return self.ready
