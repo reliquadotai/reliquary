@@ -455,7 +455,9 @@ def test_a_ban_voids_a_generation_orders_pending_records():
 
 # sha256 of the canonical (archive, settlement state) of the run below, on the
 # period settler that pays every corpus task since 2026-10-08.
-GEN_SETTLEMENT_GOLDEN = "7b6222ab6128d107f306f9e988b1f4d4d715269e814e7c785e5b12244b1c8566"
+# Moved 2026-10-11: the state now records `period_paid` (token price ceiling); the
+# archive is unchanged.
+GEN_SETTLEMENT_GOLDEN = "320a944fe1f1e8ddb60e163ec2e3c668d0c3368e8c49a44f714b62bd3db1e5bd"
 
 
 def test_a_generation_order_settles_through_the_order_archives():
