@@ -24,13 +24,16 @@ BUDGETS = {"max_calls": 64, "per_call_timeout_s": 600, "cpu_s": 3600, "wall_s": 
 
 # The fixture env's public catalogue (its order entry's `catalogue`), as a bridged env would publish it. Its
 # lock digest is the one of CATALOGUE_IMAGES (computed as the sandbox computes it), so a fake verifiers env
-# whose lock is CATALOGUE_IMAGES passes the source's lock check.
+# whose lock is CATALOGUE_IMAGES passes the source's lock check. Its RL split is a split name the bridge
+# accepts (SPLIT is not one) and the fake gateway serves; an order built with it uses that episode split.
+CATALOGUE_SPLIT = "train"
 CATALOGUE_IMAGES = {"base": "registry.example/swe@sha256:" + "a" * 64}
 CATALOGUE_LOCK = hashlib.sha256(json.dumps({"version": 1, "images": dict(sorted(CATALOGUE_IMAGES.items()))},
                                            sort_keys=True, separators=(",", ":"),
                                            ensure_ascii=True).encode("ascii")).hexdigest()
-CATALOGUE = {"package": "reliquary-swe==0.1.0a1", "options": {}, "rl_split": SPLIT,
-             "image_lock_sha256": CATALOGUE_LOCK}
+CATALOGUE = {"package": "reliquary-swe==0.1.0a1",
+             "options": {"tools": ["bash", "edit"], "splits": {CATALOGUE_SPLIT: {"split": CATALOGUE_SPLIT}}},
+             "rl_split": CATALOGUE_SPLIT, "image_lock_sha256": CATALOGUE_LOCK}
 
 
 def episode_block(**overrides) -> dict:
@@ -44,7 +47,9 @@ def episode_block(**overrides) -> dict:
 def episode_contract_dict(*, episode=None, catalogue=None, **kwargs) -> dict:
     kwargs.setdefault("envs", (MATH, EPISODE))
     value = contract_v2_dict(**kwargs)
-    value["environments"][EPISODE]["episode"] = episode_block() if episode is None else episode
+    if episode is None:
+        episode = episode_block() if catalogue is None else episode_block(split=catalogue["rl_split"])
+    value["environments"][EPISODE]["episode"] = episode
     if catalogue is not None:
         value["environments"][EPISODE]["catalogue"] = dict(catalogue)
     return value

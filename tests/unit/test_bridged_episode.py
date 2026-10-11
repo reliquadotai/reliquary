@@ -198,11 +198,28 @@ def test_an_order_without_a_catalogue_keeps_its_bytes():
     ({"options": {"api_key": "x"}}, "credential"),                        # the catalogue is public
     ({"options": {"splits": {"tmax": {"client_secret": "x"}}}}, "credential"),
     ({"options": {"auth": [{"Bearer": "x"}]}}, "credential"),
+    ({"options": {**CATALOGUE["options"], "defaults": {"note": "hf_" + "a" * 30}}}, "credential"),   # values too
+    ({"options": {**CATALOGUE["options"], "x": ["https://user:pass@example.org/data"]}}, "credential"),
+    ({"options": {**CATALOGUE["options"], "x": "-----BEGIN OPENSSH PRIVATE KEY-----"}}, "credential"),
+    ({"options": {"tools": ["bash", "edit"]}}, "not a split the options serve"),     # the bridge serves `rl` only
+    ({"options": {**CATALOGUE["options"], "splits": {"other": {"split": "other"}}}}, "not a split"),
+    ({"options": {**CATALOGUE["options"], "tools": ["bash"]}}, "episode tools"),
+    ({"options": {"splits": CATALOGUE["options"]["splits"]}}, None),          # default tools: bash and edit
+    ({"options": {**CATALOGUE["options"], "tools": ["edit", "bash"]}}, None),   # the bridge sorts them
     ({"extra": 1}, "catalogue"),
 ])
 def test_a_malformed_catalogue_is_refused(change, why):
+    if why is None:
+        episode_contract(catalogue={**CATALOGUE, **change})
+        return
     with pytest.raises(ServiceContractError, match=why):
         episode_contract(catalogue={**CATALOGUE, **change})
+
+
+def test_ordinary_option_values_are_not_taken_for_credentials():
+    options = {**CATALOGUE["options"], "defaults": {"per_call_timeout_s": 600},
+               "x": ["https://example.org/data", "task-sk-1", "ghp", "the hf_ prefix"]}
+    assert episode_contract(catalogue={**CATALOGUE, "options": options}).catalogue_of(EPISODE)["options"] == options
 
 
 def test_a_catalogue_needs_a_bridged_identity():
@@ -269,7 +286,8 @@ def test_describe_gives_an_entry_and_a_catalogue_the_order_accepts():
     pytest.importorskip("reliquary_sandbox_verifiers")
     episode = {"sandbox_env": "reliquary-swe", "tools": ["bash", "edit"], "max_turns": 8,
                "max_tokens_per_turn": 512, "max_episode_tokens": 4096, "budgets": dict(BUDGETS)}
-    block = describe(name=EPISODE, package=CATALOGUE["package"], rl_split=CATALOGUE["rl_split"], options={},
+    block = describe(name=EPISODE, package=CATALOGUE["package"], rl_split=CATALOGUE["rl_split"],
+                     options=CATALOGUE["options"],
                      episode=episode, cooldown_windows=10, attestation=b"report",
                      env=FakeEnv(images=CATALOGUE_IMAGES, split=CATALOGUE["rl_split"]), identity=ENV_PACKAGE)
     assert block["catalogue"] == {**CATALOGUE, "conformance_sha256": hashlib.sha256(b"report").hexdigest()}
@@ -279,3 +297,102 @@ def test_describe_gives_an_entry_and_a_catalogue_the_order_accepts():
     contract = ServiceContract.from_dict(value)
     assert contract.episode_policy(EPISODE).env_package == ENV_PACKAGE
     assert contract.environments[EPISODE]["dataset"]["rows"] == 5
+
+
+# --- the validator's CLI mix: catalogue envs of the order are built at start, never resolved from the registry ---
+
+def _cli():
+    from reliquary.cli import main as cli
+
+    return cli
+
+
+def test_the_cli_mix_accepts_the_orders_catalogue_envs():
+    cli = _cli()
+    contract = episode_contract(catalogue=CATALOGUE)
+    assert cli._resolve_cli_environment_mix(f"openmathinstruct,{EPISODE}", service_contract=contract) == [
+        ("openmathinstruct", cli.B_BATCH), (EPISODE, cli.B_BATCH)]
+    assert cli._resolve_cli_environment_mix(f"{EPISODE},openmathinstruct", service_contract=contract) == [
+        (EPISODE, cli.B_BATCH), ("openmathinstruct", cli.B_BATCH)]                       # the operator's order
+    assert cli._resolve_cli_environment_mix(EPISODE, service_contract=contract) == [(EPISODE, cli.B_BATCH)]
+
+
+def test_the_cli_mix_without_a_catalogue_goes_through_the_registry():
+    cli = _cli()
+    with pytest.raises(ValueError, match="Unknown environment"):
+        cli._resolve_cli_environment_mix(f"openmathinstruct,{EPISODE}")
+    with pytest.raises(ValueError, match="Unknown environment"):              # an episode env with no catalogue
+        cli._resolve_cli_environment_mix(f"openmathinstruct,{EPISODE}", service_contract=episode_contract())
+    with pytest.raises(ValueError, match="duplicate"):
+        cli._resolve_cli_environment_mix(f"{EPISODE},openmathinstruct,{EPISODE}",
+                                         service_contract=episode_contract(catalogue=CATALOGUE))
+    with pytest.raises(ValueError, match="at least one"):
+        cli._resolve_cli_environment_mix(f"{EPISODE},", service_contract=episode_contract(catalogue=CATALOGUE))
+
+
+def test_a_catalogue_on_an_installed_env_name_is_refused_early(monkeypatch):
+    from types import MappingProxyType
+
+    from reliquary.validator.task_config import TaskConfigError, _service_env_caps
+    from tests.unit.episode_v2_fixtures import episode_spec
+
+    cli = _cli()
+    monkeypatch.setattr(registry, "ENVIRONMENT_SPECS",
+                        MappingProxyType({**registry.ENVIRONMENT_SPECS, EPISODE: episode_spec()}))
+    contract = episode_contract(catalogue=CATALOGUE)
+    with pytest.raises(ValueError, match="installed in this image"):
+        cli._resolve_cli_environment_mix(EPISODE, service_contract=contract)
+    from tests.unit.service_v2_fixtures import MATH
+
+    with pytest.raises(TaskConfigError, match="installed in this build"):
+        _service_env_caps(SimpleNamespace(task_id="rl"), cap=0.5,
+                          contract=episode_contract(catalogue=CATALOGUE, shares={MATH: 0, EPISODE: 10000}))
+
+
+# --- the validator's start: the catalogue env is built into its envs, its manifest compared with the order ---
+
+def _validator(contract):
+    from reliquary.validator.service import ValidationService
+
+    me = object.__new__(ValidationService)
+    me._service_runtime = SimpleNamespace(contract=contract)
+    return me
+
+
+def _fake_build(monkeypatch, rows=5):
+    real_build = bridged_episode.build_environment
+    monkeypatch.setattr(bridged_episode, "build_environment", lambda config: real_build(
+        config, env=FakeEnv(rows=rows, images=CATALOGUE_IMAGES, split=CATALOGUE["rl_split"]), identity=ENV_PACKAGE))
+
+
+def test_the_validator_loads_its_catalogue_env_as_a_signed_episode_env(monkeypatch):
+    pytest.importorskip("reliquary_sandbox_verifiers")
+    monkeypatch.setattr(registry, "_CATALOGUE_SPECS", {})
+    _fake_build(monkeypatch)
+    me = _validator(episode_contract(catalogue=CATALOGUE))
+    envs = me._load_launch_environments([EPISODE])
+    assert isinstance(envs[EPISODE], SignedEpisodeEnvironment) and envs[EPISODE].name == EPISODE
+    assert registry.find_environment_spec(EPISODE).environment_manifest_sha256 == envs[EPISODE].source.manifest_sha256()
+
+
+def test_a_catalogue_env_whose_order_version_is_not_its_manifest_is_refused(monkeypatch):
+    pytest.importorskip("reliquary_sandbox_verifiers")
+    from reliquary.services.runtime import protocol_slot_geometry
+
+    monkeypatch.setattr(registry, "_CATALOGUE_SPECS", {})
+    _fake_build(monkeypatch)
+    me = _validator(episode_contract(catalogue=CATALOGUE, rows=5))
+    me.envs = me._load_launch_environments([EPISODE])
+    me.env_targets = {EPISODE: protocol_slot_geometry()[1]}
+    assert me._service_environment_problem(EPISODE) == "is installed at another version than the one the order pins"
+    value = episode_contract_dict(catalogue=CATALOGUE, rows=5)
+    value["environments"][EPISODE]["version"] = me.envs[EPISODE].source.manifest_sha256()
+    me._service_runtime = SimpleNamespace(contract=ServiceContract.from_dict(value))
+    assert me._service_environment_problem(EPISODE) is None
+
+
+def test_a_catalogue_split_must_be_the_episode_split():
+    from tests.unit.episode_v2_fixtures import episode_block
+
+    with pytest.raises(ServiceContractError, match="must be the episode split"):
+        episode_contract(episode=episode_block(), catalogue=CATALOGUE)        # the episode split is SPLIT

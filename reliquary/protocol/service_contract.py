@@ -246,6 +246,18 @@ _CREDENTIAL_KEY = re.compile(r"(?i)(secret|passw|credential|api[_-]?key|private[
                              r"auth[_-]?token|bearer)")
 
 
+# A value that looks like a secret, whatever its key (best effort: well-known token shapes and URLs carrying a
+# password; an arbitrary opaque string cannot be told from an ordinary option value).
+_CREDENTIAL_VALUE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|\b(?:sk|rk)-[A-Za-z0-9_-]{16,}"
+    r"|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"
+    r"|\bhf_[A-Za-z0-9]{20,}"
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    r"|\bxox[abprs]-[A-Za-z0-9-]{10,}"
+    r"|://[^/\s:@]+:[^/\s@]+@")
+
+
 def _credential_keys(value: Any, path: str = "") -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
@@ -257,7 +269,14 @@ def _credential_keys(value: Any, path: str = "") -> list[str]:
     elif isinstance(value, list):
         for n, item in enumerate(value):
             found.extend(_credential_keys(item, f"{path}[{n}]"))
+    elif isinstance(value, str) and _CREDENTIAL_VALUE.search(value):
+        found.append(path or "<value>")
     return found
+
+
+# What the sandbox bridge serves when the options name no tools or no splits (``VerifiersEnvOptions``).
+_BRIDGE_DEFAULT_TOOLS = ("bash", "edit")
+_BRIDGE_DEFAULT_SPLITS = ("rl",)
 
 
 def validate_catalogue(name: str, catalogue: Any, episode: Mapping[str, Any]) -> None:
@@ -284,6 +303,14 @@ def validate_catalogue(name: str, catalogue: Any, episode: Mapping[str, Any]) ->
     if secrets:
         raise ServiceContractError(f"{name}.catalogue.options: {', '.join(secrets[:4])} looks like a credential; the "
                                    f"catalogue is public (pass credentials to the gateway another way)")
+    splits = options.get("splits", dict.fromkeys(_BRIDGE_DEFAULT_SPLITS))
+    if not isinstance(splits, dict) or catalogue["rl_split"] not in splits:
+        raise ServiceContractError(f"{name}: catalogue.rl_split {catalogue['rl_split']!r} is not a split the options "
+                                   f"serve (options.splits)")
+    tools = options.get("tools", list(_BRIDGE_DEFAULT_TOOLS))
+    if (not isinstance(tools, list) or any(not isinstance(tool, str) for tool in tools)
+            or sorted(set(tools)) != episode.get("tools")):
+        raise ServiceContractError(f"{name}: catalogue.options.tools must be the episode tools {episode.get('tools')!r}")
     _sha(catalogue["image_lock_sha256"], f"{name}.catalogue.image_lock_sha256")
     if "conformance_sha256" in catalogue:
         _sha(catalogue["conformance_sha256"], f"{name}.catalogue.conformance_sha256")

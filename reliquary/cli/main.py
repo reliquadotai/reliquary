@@ -2857,13 +2857,34 @@ def watch_verdicts(
         pass
 
 
-def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
+def _resolve_cli_environment_mix(value: str, *, service_contract=None) -> list[tuple[str, int]]:
+    """The validator's env mix. An episode env of the service order that carries a public catalogue is built
+    from it at start (``ValidationService._build_bridged``, which checks its identity, lock and manifest), so it
+    is neither installed nor in the protocol profile: it is accepted here with the protocol's group count. Every
+    other name goes through the registry and the profile, unchanged."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
     names = [name.strip() for name in value.split(",")]
-    return resolve_environment_mix(
-        names,
+    if not names or any(not name for name in names):
+        raise ValueError("at least one environment must be selected")
+    if len(set(names)) != len(names):
+        raise ValueError("environment selection contains duplicate names")
+    bridged = set()
+    if service_contract is not None:
+        for name in names:
+            if (name in service_contract.episode_environments
+                    and service_contract.catalogue_of(name) is not None):
+                if name in ENVIRONMENT_SPECS:
+                    raise ValueError(f"environment {name!r} is installed in this image and also carries a "
+                                     f"catalogue in the service order: rename the bridged env")
+                bridged.add(name)
+    others = [name for name in names if name not in bridged]
+    resolved = dict(resolve_environment_mix(
+        others,
         profile_environments=ACTIVE_PROTOCOL_PROFILE.environments,
         default_batch_target=B_BATCH,
-    )
+    )) if others else {}
+    return [(name, B_BATCH if name in bridged else resolved[name]) for name in names]
 
 
 def _raise_open_file_limit() -> None:
@@ -3824,7 +3845,11 @@ def validate(
                     raise typer.Exit(code=4) from exc
                 return
 
-            mix = _resolve_cli_environment_mix(environments)
+            # A service order's catalogue envs are built from the order at start; a task without a service
+            # contract resolves its mix exactly as before.
+            service_contract = getattr(task_config, "service_contract", None)
+            mix = (_resolve_cli_environment_mix(environments) if service_contract is None
+                   else _resolve_cli_environment_mix(environments, service_contract=service_contract))
             env_names = [name for name, _target in mix]
             if "opencodeinstruct" in env_names:
                 _ensure_grader_running()

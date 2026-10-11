@@ -1070,9 +1070,7 @@ class ValidationService:
             if any(int(target) <= 0 for _name, target in self.env_mix):
                 raise ValueError("environment targets must be positive")
             env_names = [n for n, _ in self.env_mix]
-            bridged = self._launch_bridged_configs()
-            self.envs = {name: (self._build_bridged(bridged[name]) if name in bridged
-                                else load_environments([name])[name]) for name in env_names}
+            self.envs = self._load_launch_environments(env_names)
 
         self.env_targets = {
             str(name): int(target) for name, target in self.env_mix
@@ -2766,6 +2764,12 @@ class ValidationService:
 
 
     # ----- service-contract/v2 window wiring. Reached only with a service runtime. -----
+
+    def _load_launch_environments(self, env_names: list[str]) -> dict:
+        """The mix's envs: the order's catalogue envs built through the bridge, every other one installed."""
+        bridged = self._launch_bridged_configs()
+        return {name: (self._build_bridged(bridged[name]) if name in bridged
+                       else load_environments([name])[name]) for name in env_names}
 
     def _launch_bridged_configs(self) -> dict:
         """The order's episode envs served through the verifiers bridge: those whose entry carries a public

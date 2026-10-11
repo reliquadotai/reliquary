@@ -186,6 +186,10 @@ def _service_env_caps(entry: TaskEntry, *, cap: float, contract: ServiceContract
             f"every other env: graded): " + "; ".join(problems))
     caps = {}
     for name, env in contract.environments.items():
+        if "catalogue" in env and ENVIRONMENT_SPECS.get(name) is not None:
+            raise TaskConfigError(
+                f"task {entry.task_id!r}: environment {name!r} carries a catalogue but is installed in this build; "
+                f"a bridged env needs a name of its own")
         if env["share_bps"] <= 0:  # declared but inactive at launch (initial_schedule): no check, cap 0
             caps[name] = 0.0
             continue
