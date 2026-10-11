@@ -28,8 +28,11 @@ it). A refusal reached before the checker verified the group
 directory, a busy checker, a window that is not open) gives no verdict at all; the miner retries it.
 
 Capacity verdicts. At most ``capacity_allowance(hotkey)`` precommits of a hotkey get one per
-window (the groups its quota lets it hold, set by the wiring with ``allow_capacity_verdicts``); the issuer gives
-none for a saturation the miner's own operator caused.
+window (the groups its quota lets it hold, set by the wiring with ``allow_capacity_verdicts``). The ledger itself
+never asks who caused a saturation: the RL issuer tells it of a ``sandbox_saturated`` or ``open_queue_full``
+refusal only when the refused miner's operator (all its hotkeys, by the registration's coldkey) held less than half
+of the held sessions on the machines that could take the open, beyond the open's own group, and less than half of a
+full queue's tickets (``SessionIssuer._self_caused``). An issuer built without ``operator_of`` judges by hotkey.
 
 Keys. Everything is per hotkey. ``stats(hotkey)`` reads the snapshot of the last flush: the
 yield is useful / decided over the hotkey's last ``YIELD_SESSIONS`` decided sessions, ``useful_24h`` its useful
@@ -210,7 +213,8 @@ class SessionYieldLedger:
 
     def capacity_refused(self, *, hotkey: str, precommit_sha256: str) -> None:
         """An open of this precommit was refused for our capacity (saturated, the queue full, never placeable,
-        an unserved env), and not by a saturation its own operator caused (the issuer checked):
+        an unserved env). Nothing is checked here about who caused it: the issuer calls this only for a
+        saturation or a full queue its own operator's load did not cause (``SessionIssuer._self_caused``);
         unless a group of it is used or really refused, its sessions that ran are neither when the group could
         not be formed (``decide``). At most ``capacity_allowance(hotkey)`` precommits per hotkey and window."""
         with self._lock:
@@ -463,8 +467,9 @@ def held_seconds(record: Any, now: float, *, presented: bool | None = None) -> f
 
 
 CAPACITY_REASONS = frozenset({"sandbox_saturated", "open_queue_full", "task_unplaceable", "environment_unserved"})
-"""Open refusals that are our capacity, never the miner's doing: an unused precommit that met one is neither
-useful nor wasted (for its sessions that ran, in a group that could not be formed)."""
+"""Open refusals that are our capacity: an unused precommit that met one is neither useful nor wasted (for its
+sessions that ran, in a group that could not be formed). The issuer leaves out a saturation or a full queue of the
+refused miner's own operator's making before it tells the ledger."""
 
 
 class LedgerEvents:

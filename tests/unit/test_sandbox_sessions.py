@@ -48,9 +48,13 @@ class FakeFleet:
         self.issued_kw, self.settled = [], []
         self.ready = True
         self.placeable = True
+        self.machines = (MACHINE,)
 
     def could_place(self, **kw):
         return None if not self.ready else self.placeable
+
+    def servable_machines(self, **kw):
+        return self.machines
 
     def directory_ready(self, now=None):
         return self.ready

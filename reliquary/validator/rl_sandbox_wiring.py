@@ -639,7 +639,8 @@ def build_rl_episode_services(
         events=None if ledger is None else FanOutEvents(
             LedgerEvents(ledger), quota if isinstance(quota, YieldQuota) else None),
         record_faults=ledger is not None,
-        open_refusal_check=None if ledger is None else fleet.open_refusal_valid, queue=queue)
+        open_refusal_check=None if ledger is None else fleet.open_refusal_valid, queue=queue,
+        operator_of=operator_of if ledger is not None else None)
     fleet.on_drained = issuer.void_machine
     if queue is not None:
         fleet.on_polled = queue.notify                            # each poll may show freed room

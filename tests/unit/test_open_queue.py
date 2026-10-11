@@ -297,17 +297,21 @@ async def test_a_queue_full_refusal_is_a_capacity_refusal_but_a_second_ticket_is
     env = build(tmp_path)
     env.issuer._events = listener = Refusals()
     env.issuer._fleet.placement = None
-    env.issuer._queue = q = queue(wait_s=5.0, max_waiting=1)
+    env.issuer._queue = q = queue(wait_s=5.0, max_waiting=3)
     first = opening(env, 0, "a" * 32)
     await until(lambda: q.waiting == 1 and q._holder is None and not env.issuer._lock.locked())
+    again = await env.issuer.open(hotkey=HOTKEY, request_id="c" * 32, engagement=engagement(env.precommit, 0))
+    assert again.reason == "open_queued"
+    others = [q.join("5Other", cls=("elsewhere", None, None)) for _ in range(3)]   # another miner fills it
+    assert q.keys() == [HOTKEY, "5Other", "5Other"]
     full = await env.issuer.open(hotkey=HOTKEY, request_id="b" * 32, engagement=engagement(env.precommit, 1))
     assert full.reason == "open_queue_full" and full.retry_after
-    again = await env.issuer.open(hotkey=HOTKEY, request_id="c" * 32, engagement=engagement(env.precommit, 0))
-    assert again.reason in {"open_queued", "open_queue_full"}
-    assert listener.seen.count("open_queue_full") >= 1 and "open_queued" not in listener.seen
+    assert listener.seen == ["open_queue_full"]
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
+    for ticket in others:
+        q.done(ticket)
     assert not q.busy
 
 
