@@ -144,8 +144,8 @@ class ScheduleRequestStore:
 def default_installed_version(name: str) -> str | None:
     """The manifest hash of the installed env ``name`` (None if not installed), as
     ``validator.task_config._service_env_caps`` reads it."""
-    from reliquary.environment.registry import ENVIRONMENT_SPECS
-    return getattr(ENVIRONMENT_SPECS.get(name), "environment_manifest_sha256", None)
+    from reliquary.environment.registry import find_environment_spec
+    return getattr(find_environment_spec(name), "environment_manifest_sha256", None)
 
 
 def _integer_map(value, name: str) -> dict[str, int] | None:

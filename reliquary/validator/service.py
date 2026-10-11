@@ -1070,7 +1070,9 @@ class ValidationService:
             if any(int(target) <= 0 for _name, target in self.env_mix):
                 raise ValueError("environment targets must be positive")
             env_names = [n for n, _ in self.env_mix]
-            self.envs = load_environments(env_names)
+            bridged = self._launch_bridged_configs()
+            self.envs = {name: (self._build_bridged(bridged[name]) if name in bridged
+                                else load_environments([name])[name]) for name in env_names}
 
         self.env_targets = {
             str(name): int(target) for name, target in self.env_mix
@@ -2764,6 +2766,35 @@ class ValidationService:
 
 
     # ----- service-contract/v2 window wiring. Reached only with a service runtime. -----
+
+    def _launch_bridged_configs(self) -> dict:
+        """The order's episode envs served through the verifiers bridge: those whose entry carries a public
+        ``catalogue``. ``{env: BridgedEnvConfig}``."""
+        from reliquary.environment.bridged_episode import BridgedEnvConfig
+
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None:
+            return {}
+        contract = runtime.contract
+        configs = {}
+        for name in contract.episode_environments:
+            catalogue = contract.catalogue_of(name)
+            if catalogue is not None:
+                configs[name] = BridgedEnvConfig.from_catalogue(name, catalogue)
+        return configs
+
+    def _build_bridged(self, config):
+        """A bridged episode env of the order: built, its identity checked against the order's pin, its spec
+        registered (the manifest is its version, which ``_service_environment_problem`` compares)."""
+        from reliquary.environment.bridged_episode import build_environment, catalogue_spec
+        from reliquary.environment.registry import register_catalogue_spec
+
+        environment = build_environment(config)
+        pinned = self._service_runtime.contract.episode_policy(config.environment).env_package
+        if environment.source.identity != pinned:
+            raise ValueError(f"{config.environment}: {environment.source.identity} is installed, the order pins {pinned}")
+        register_catalogue_spec(catalogue_spec(config.environment, environment.source.manifest_sha256()))
+        return environment
 
     def _service_installed_version(self, name: str) -> str | None:
         from reliquary.services.schedule import default_installed_version
@@ -7929,11 +7960,11 @@ class ValidationService:
         if runtime is None or not runtime.contract.episode_environments:
             return
         from reliquary.constants import ACTIVE_PROTOCOL_PROFILE
-        from reliquary.environment.registry import ENVIRONMENT_SPECS
+        from reliquary.environment.registry import find_environment_spec
         from reliquary.protocol.profiles import toploc_proof
 
         for name in runtime.contract.episode_environments:
-            spec = ENVIRONMENT_SPECS.get(name)
+            spec = find_environment_spec(name)
             if spec is None or spec.interaction_mode != "signed_episode":
                 raise ValueError(f"{name} has an episode block but is not a registered signed-episode environment")
         from reliquary.validator.rl_sandbox_wiring import (

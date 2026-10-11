@@ -2,6 +2,8 @@
 """Builders for signed-episode environments in the v2 service RL path (phase 2)."""
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 
 from reliquary.protocol.service_contract import ServiceContract
@@ -20,6 +22,16 @@ GIB = 1024**3
 BUDGETS = {"max_calls": 64, "per_call_timeout_s": 600, "cpu_s": 3600, "wall_s": 3600,
            "memory_bytes": 4 * GIB, "pids": 1024, "disk_bytes": 10 * GIB}
 
+# The fixture env's public catalogue (its order entry's `catalogue`), as a bridged env would publish it. Its
+# lock digest is the one of CATALOGUE_IMAGES (computed as the sandbox computes it), so a fake verifiers env
+# whose lock is CATALOGUE_IMAGES passes the source's lock check.
+CATALOGUE_IMAGES = {"base": "registry.example/swe@sha256:" + "a" * 64}
+CATALOGUE_LOCK = hashlib.sha256(json.dumps({"version": 1, "images": dict(sorted(CATALOGUE_IMAGES.items()))},
+                                           sort_keys=True, separators=(",", ":"),
+                                           ensure_ascii=True).encode("ascii")).hexdigest()
+CATALOGUE = {"package": "reliquary-swe==0.1.0a1", "options": {}, "rl_split": SPLIT,
+             "image_lock_sha256": CATALOGUE_LOCK}
+
 
 def episode_block(**overrides) -> dict:
     value = {"kind": "signed-sandbox-episode/v1", "sandbox_env": SANDBOX_ENV, "split": SPLIT,
@@ -29,10 +41,12 @@ def episode_block(**overrides) -> dict:
     return value
 
 
-def episode_contract_dict(*, episode=None, **kwargs) -> dict:
+def episode_contract_dict(*, episode=None, catalogue=None, **kwargs) -> dict:
     kwargs.setdefault("envs", (MATH, EPISODE))
     value = contract_v2_dict(**kwargs)
     value["environments"][EPISODE]["episode"] = episode_block() if episode is None else episode
+    if catalogue is not None:
+        value["environments"][EPISODE]["catalogue"] = dict(catalogue)
     return value
 
 

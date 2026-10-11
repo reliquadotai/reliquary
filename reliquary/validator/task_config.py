@@ -189,6 +189,11 @@ def _service_env_caps(entry: TaskEntry, *, cap: float, contract: ServiceContract
         if env["share_bps"] <= 0:  # declared but inactive at launch (initial_schedule): no check, cap 0
             caps[name] = 0.0
             continue
+        if "catalogue" in env:
+            # A bridged episode env is not installed in the registry: the validator builds it from its public
+            # catalogue at start and refuses an order whose version is not the built env's manifest.
+            caps[name] = cap * env["share_bps"] / 10000
+            continue
         spec = ENVIRONMENT_SPECS.get(name)
         installed = getattr(spec, "environment_manifest_sha256", None)
         if installed != env["version"]:

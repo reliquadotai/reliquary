@@ -237,6 +237,98 @@ class EpisodeEnvPolicy:
 
 
 
+CATALOGUE_FIELDS = frozenset({"package", "options", "rl_split", "image_lock_sha256"})
+MAX_CATALOGUE_OPTIONS_BYTES = 16 * 1024
+_PACKAGE_PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}==[A-Za-z0-9][A-Za-z0-9.!_-]{0,127}\Z")
+_BRIDGED_SUFFIX = re.compile(r"\.vfb[0-9]+\Z")
+# An option key that looks like a credential: the catalogue is public (it is in the order).
+_CREDENTIAL_KEY = re.compile(r"(?i)(secret|passw|credential|api[_-]?key|private[_-]?key|access[_-]?key|"
+                             r"auth[_-]?token|bearer)")
+
+
+def _credential_keys(value: Any, path: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            where = f"{path}.{key}" if path else str(key)
+            if _CREDENTIAL_KEY.search(str(key)):
+                found.append(where)
+            found.extend(_credential_keys(item, where))
+    elif isinstance(value, list):
+        for n, item in enumerate(value):
+            found.extend(_credential_keys(item, f"{path}[{n}]"))
+    return found
+
+
+def validate_catalogue(name: str, catalogue: Any, episode: Mapping[str, Any]) -> None:
+    """The public catalogue of a bridged episode env: what miners and validators build its task source from.
+    ``conformance_sha256`` is optional here (an env added to a running run must carry it)."""
+    fields = set(CATALOGUE_FIELDS)
+    if isinstance(catalogue, dict) and "conformance_sha256" in catalogue:
+        fields.add("conformance_sha256")
+    _object(catalogue, fields, f"{name}.catalogue")
+    package = catalogue["package"]
+    if not isinstance(package, str) or not _PACKAGE_PIN.fullmatch(package):
+        raise ServiceContractError(f"{name}.catalogue.package must be name==version")
+    env_package = episode.get("env_package")
+    if (not isinstance(env_package, str) or not env_package.startswith(package + "+")
+            or not _BRIDGED_SUFFIX.search(env_package)):
+        raise ServiceContractError(f"{name}: episode.env_package must be the bridged identity of {package} "
+                                   f"(name==version+g<hash>.vfb<N>)")
+    if catalogue["rl_split"] != episode.get("split"):
+        raise ServiceContractError(f"{name}: catalogue.rl_split must be the episode split {episode.get('split')!r}")
+    options = catalogue["options"]
+    if not isinstance(options, dict) or len(canonical_json_bytes(options)) > MAX_CATALOGUE_OPTIONS_BYTES:
+        raise ServiceContractError(f"{name}.catalogue.options: an object of at most {MAX_CATALOGUE_OPTIONS_BYTES} bytes")
+    secrets = _credential_keys(options)
+    if secrets:
+        raise ServiceContractError(f"{name}.catalogue.options: {', '.join(secrets[:4])} looks like a credential; the "
+                                   f"catalogue is public (pass credentials to the gateway another way)")
+    _sha(catalogue["image_lock_sha256"], f"{name}.catalogue.image_lock_sha256")
+    if "conformance_sha256" in catalogue:
+        _sha(catalogue["conformance_sha256"], f"{name}.catalogue.conformance_sha256")
+
+
+def validate_environment(name: Any, env: Any) -> int:
+    """One v2 environment entry, the order's own or one added to the running run. Returns its ``share_bps``."""
+    if not isinstance(name, str) or not _ENV_ID.fullmatch(name):
+        raise ServiceContractError(f"invalid environment id {name!r}")
+    env_fields = {"version", "dataset", "sampling", "exploration", "missing_box",
+                  "cooldown_windows", "share_bps"}
+    if isinstance(env, dict) and "episode" in env:
+        env_fields = env_fields | {"episode"}
+        if "catalogue" in env:
+            env_fields = env_fields | {"catalogue"}
+    _object(env, env_fields, f"environment {name}")
+    _sha(env["version"], f"{name}.version")
+    dataset = _object(env["dataset"], {"id", "rows"}, f"{name}.dataset")
+    if not isinstance(dataset["id"], str) or not _DATASET_ID.fullmatch(dataset["id"]) or ".." in dataset["id"]:
+        raise ServiceContractError(f"{name}.dataset.id: canonical identifier required")
+    _integer(dataset["rows"], f"{name}.dataset.rows", 1, 2**31)
+    sampling = env["sampling"]
+    if not isinstance(sampling, dict) or not isinstance(sampling.get("kind"), str) or sampling["kind"] not in _V2_SAMPLING:
+        raise ServiceContractError(f"{name}: unknown sampling policy")
+    params = _V2_SAMPLING[sampling["kind"]]
+    _object(sampling, {"kind", *params}, f"{name}.sampling")
+    for field_name, bounds in params.items():
+        _integer(sampling[field_name], f"{name}.sampling.{field_name}", *bounds)
+    if sampling["kind"] == PUBLIC_SEED_POOL and sampling["pool_seeds"] != 2 * sampling["group_size"]:
+        raise ServiceContractError(f"{name}.sampling.pool_seeds must be exactly 2 x group_size")
+    if sampling["kind"] == PUBLIC_SEED_POOL and sampling["renewal_windows"] != 1:
+        raise ServiceContractError(f"{name}.sampling.renewal_windows must be 1: a public seed pool renews every window")
+    if type(env["exploration"]) is not int or env["exploration"] not in (0, 1):
+        raise ServiceContractError(f"{name}.exploration must be 0 or 1")
+    if env["missing_box"] not in ("uncertain", "graded"):
+        raise ServiceContractError(f"{name}.missing_box must be uncertain or graded")
+    _integer(env["cooldown_windows"], f"{name}.cooldown_windows", 0, 1_000_000)
+    share = _integer(env["share_bps"], f"{name}.share_bps", 0, 10000)
+    if "episode" in env:
+        _validate_episode(name, env)
+        if "catalogue" in env:
+            validate_catalogue(name, env["catalogue"], env["episode"])
+    return share
+
+
 def _validate_v2(value: dict) -> None:
     _object(value, _V2_FIELDS, "contract")
     if value["service_kind"] != "adaptive_training":
@@ -274,37 +366,7 @@ def _validate_v2(value: dict) -> None:
         raise ServiceContractError("environments: 1..16 entries required")
     total = 0
     for name, env in environments.items():
-        if not isinstance(name, str) or not _ENV_ID.fullmatch(name):
-            raise ServiceContractError(f"invalid environment id {name!r}")
-        env_fields = {"version", "dataset", "sampling", "exploration", "missing_box",
-                      "cooldown_windows", "share_bps"}
-        if isinstance(env, dict) and "episode" in env:
-            env_fields = env_fields | {"episode"}
-        _object(env, env_fields, f"environment {name}")
-        _sha(env["version"], f"{name}.version")
-        dataset = _object(env["dataset"], {"id", "rows"}, f"{name}.dataset")
-        if not isinstance(dataset["id"], str) or not _DATASET_ID.fullmatch(dataset["id"]) or ".." in dataset["id"]:
-            raise ServiceContractError(f"{name}.dataset.id: canonical identifier required")
-        _integer(dataset["rows"], f"{name}.dataset.rows", 1, 2**31)
-        sampling = env["sampling"]
-        if not isinstance(sampling, dict) or not isinstance(sampling.get("kind"), str) or sampling["kind"] not in _V2_SAMPLING:
-            raise ServiceContractError(f"{name}: unknown sampling policy")
-        params = _V2_SAMPLING[sampling["kind"]]
-        _object(sampling, {"kind", *params}, f"{name}.sampling")
-        for field_name, bounds in params.items():
-            _integer(sampling[field_name], f"{name}.sampling.{field_name}", *bounds)
-        if sampling["kind"] == PUBLIC_SEED_POOL and sampling["pool_seeds"] != 2 * sampling["group_size"]:
-            raise ServiceContractError(f"{name}.sampling.pool_seeds must be exactly 2 x group_size")
-        if sampling["kind"] == PUBLIC_SEED_POOL and sampling["renewal_windows"] != 1:
-            raise ServiceContractError(f"{name}.sampling.renewal_windows must be 1: a public seed pool renews every window")
-        if type(env["exploration"]) is not int or env["exploration"] not in (0, 1):
-            raise ServiceContractError(f"{name}.exploration must be 0 or 1")
-        if env["missing_box"] not in ("uncertain", "graded"):
-            raise ServiceContractError(f"{name}.missing_box must be uncertain or graded")
-        _integer(env["cooldown_windows"], f"{name}.cooldown_windows", 0, 1_000_000)
-        total += _integer(env["share_bps"], f"{name}.share_bps", 0, 10000)
-        if "episode" in env:
-            _validate_episode(name, env)
+        total += validate_environment(name, env)
     if total != 10000:
         raise ServiceContractError("environment share_bps must sum to 10000")
     limits = _object(value["limits"], {"max_groups", "max_tokens", "deadline_seconds"}, "limits")
@@ -362,6 +424,12 @@ class ServiceContract:
     @property
     def environments(self) -> dict:
         return self._v2()["environments"]
+
+    def catalogue_of(self, name: str) -> dict | None:
+        """The public catalogue of a bridged episode env: what a miner and a validator build its task source
+        from; None for an env without one."""
+        env = self.environments.get(name)
+        return None if env is None else env.get("catalogue")
 
     def environment(self, name: str) -> dict:
         environments = self.environments
