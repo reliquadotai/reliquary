@@ -42,6 +42,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from reliquary.constants import CODE_ADMISSION_WALL_SECONDS, MATH_ADMISSION_WALL_SECONDS
 from reliquary.sandbox.rl_capacity import (
     ALLOCATION_REFRESH_S,
     ASK_FORGET_S,
@@ -70,6 +71,7 @@ from reliquary.sandbox.rl_capacity import (
 from reliquary.sandbox.sessions import (
     ABORTED,
     CLOSED_GRADED,
+    GRADING_GRACE_S,
     LAPSED,
     LIVE,
     VOIDED,
@@ -80,6 +82,9 @@ from reliquary.sandbox.sessions import (
 _LANE_GROUPS = {NEWCOMER: NEWCOMER_MAX_GROUPS, LOW_YIELD: LOW_YIELD_MAX_GROUPS}
 _LANE_PERIOD = {MAIN: OPENS_PERIOD_S, NEWCOMER: OPENS_PERIOD_S, LOW_YIELD: LOW_YIELD_OPENS_PERIOD_S}
 _LATE_GRADED_S = 60          # a lapsed graded session may still be claimed by a group received in time
+# A group received by its sessions' deadline is admitted within its admission wall, and the lapse sweep runs after
+# that deadline: the index keeps a lapsed graded session for as long as such a group can still claim it.
+assert _LATE_GRADED_S >= max(MATH_ADMISSION_WALL_SECONDS, CODE_ADMISSION_WALL_SECONDS)
 _NOT_COUNTED = (ABORTED, VOIDED)
 
 
@@ -542,15 +547,27 @@ class YieldQuota:
         hotkey's potential in such sets of groups, never below 1: a newcomer keeps the policy's own budget."""
         return max(1.0, self.potential_sessions(hotkey) / (NEWCOMER_MAX_GROUPS * self._pool_seeds))
 
-    def groups_formable(self, hotkey: str, now: int) -> int:
-        """Precommits of the hotkey with at least M (their env's) graded, unsubmitted sessions."""
+    def submittable(self, hotkey: str, now: int, received: float | None = None) -> frozenset[str]:
+        """The precommits of the hotkey with at least M (their env's) graded, unsubmitted sessions: the groups it
+        can submit. A lapsed graded session counts as the issuer's claim judges it: for a group ``received`` by
+        the session's deadline (``expires_at + GRADING_GRACE_S``); without ``received``, while it lapsed in the
+        last minute."""
         now = int(now)
-        graded: dict[str | None, list[Any]] = {}
+        graded: dict[str, list[Any]] = {}
         for record in self._records(str(hotkey), now):
-            fresh_lapse = record.state == LAPSED and (record.closed_at or 0) >= now - _LATE_GRADED_S
-            if record.closed_status == "graded" and (record.state == CLOSED_GRADED or fresh_lapse):
-                graded.setdefault(self._sha.get(record.session_id), []).append(record)
-        return sum(1 for members in graded.values() if len(members) >= self._m(members))
+            if record.state == LAPSED:
+                late = ((record.closed_at or 0) >= now - _LATE_GRADED_S if received is None
+                        else float(received) <= record.expires_at + GRADING_GRACE_S)
+            else:
+                late = False
+            sha = self._sha.get(record.session_id)
+            if sha is not None and record.closed_status == "graded" and (record.state == CLOSED_GRADED or late):
+                graded.setdefault(sha, []).append(record)
+        return frozenset(sha for sha, members in graded.items() if len(members) >= self._m(members))
+
+    def groups_formable(self, hotkey: str, now: int, received: float | None = None) -> int:
+        """How many groups the hotkey can submit (``submittable``)."""
+        return len(self.submittable(hotkey, now, received))
 
 
 __all__ = ["YieldQuota"]

@@ -118,10 +118,14 @@ class EpisodeGroupIntake:
     window it resumed after a restart: what the batcher accepted before is lost with its memory, so no
     group of it is taken again: ``episode_window_resumed``); None takes every window (tests).
 
-    ``checks_allowed(hotkey)``: with the RL yield quota, the in-flight check cap is the hotkey's, equal to the
-    groups it can submit now (proportional: more hotkeys gain nothing, a hotkey with nothing to submit gets
-    no check slot), and one operator's hotkeys together hold at most ``max_checks_running - 1`` checks, so
-    one slot is always left to the others; None keeps the per-operator ``max_checks_in_flight``.
+    ``checks_allowed(hotkey, received)``: with the RL yield quota, the precommits of the groups the hotkey can
+    submit (for a group received at ``received``, judged as the session claim judges it). A group naming any
+    other precommit is refused before it takes a check slot (no verdict: it may be submittable a moment
+    later), and the in-flight check cap is the hotkey's, equal to how many there are (proportional: more
+    hotkeys gain nothing, a hotkey with nothing to submit gets no check slot); one operator's hotkeys
+    together hold at most ``max_checks_running - 1`` checks, so one slot is always left to the others. A
+    hook that raises refuses the group the same way (retryable, no verdict, no slot). None keeps the
+    per-operator ``max_checks_in_flight``.
     ``max_checks_running``: this intake's own transcript-check slots (a semaphore and threads of that size);
     None shares the module's ``MAX_CHECKS_RUNNING``. ``checks_scale(hotkey)``: how much the per-hotkey
     per-minute check budget scales (the quota's ``cap_scale``: with the hotkey's allocation); None keeps
@@ -136,7 +140,7 @@ class EpisodeGroupIntake:
                  clock: Callable[[], float] = time.monotonic,
                  admission_deadline_s: float = ADMISSION_DEADLINE_S,
                  window_open: Callable[[int], bool] | None = None,
-                 checks_allowed: Callable[[str], int] | None = None,
+                 checks_allowed: Callable[[str, float], Collection[str]] | None = None,
                  max_checks_running: int | None = None,
                  checks_scale: Callable[[str], float] | None = None) -> None:
         ttl = getattr(getattr(sessions, "policy", None), "claim_ttl_s", None)
@@ -184,20 +188,26 @@ class EpisodeGroupIntake:
             return str(hotkey)
         return str(operator) if operator else str(hotkey)
 
-    def _rate_refusal(self, hotkey: str, owner: str, *, operator: str | None = None) -> tuple[str, dict] | None:
+    def _rate_refusal(self, hotkey: str, owner: str, *, operator: str | None = None,
+                      submittable: int | None = None) -> tuple[str, dict] | None:
         """None, and one more check of ``owner`` in flight (``_check_ended`` ends it); else the
         refusal's stage and why. The in-flight cap reserves no identity (``episode_checks_in_flight``,
         retryable); the per-minute budget does (``episode_rate``). ``operator``: the receipt's (the
-        hotkey when unknown), read only with ``checks_allowed``."""
+        hotkey when unknown), and ``submittable`` (how many groups the hotkey can submit), read only with
+        ``checks_allowed``."""
         now = float(self._clock())
         recent = [t for t in self._recent.get(hotkey, ()) if t > now - 60.0]
-        # The hooks read the quota's in-memory index (on the event loop), before the intake's lock.
         if self._checks_allowed is None:
             cap = self._max_in_flight
         else:
-            cap = max(0, min(int(self._checks_allowed(hotkey)), self._max_running - 1))
-        limit = (self._max_per_minute if self._checks_scale is None
-                 else max(1, int(self._max_per_minute * float(self._checks_scale(hotkey)))))
+            cap = max(0, min(int(submittable or 0), self._max_running - 1))
+        limit = self._max_per_minute
+        if self._checks_scale is not None:
+            try:                    # the quota's memory, on the event loop, before the intake's lock
+                limit = max(1, int(self._max_per_minute * float(self._checks_scale(hotkey))))
+            except Exception:
+                logger.exception("the episode check budget's scale failed for %s; the base budget applies",
+                                 hotkey[:12])
         op_key = str(operator) if operator else str(hotkey)
         with self._in_flight_lock:
             running = self._in_flight.get(owner, 0)
@@ -315,10 +325,25 @@ class EpisodeGroupIntake:
             return self._refuse(prepared, RejectReason.WORKER_DROPPED, "episode_directory")
         hotkey = str(request.miner_hotkey)
         owner = self._owner(hotkey, operator)
-        limited = self._rate_refusal(hotkey, owner, operator=operator)
+        sha = _precommit_sha(request)
+        submittable = None
+        if self._checks_allowed is not None:
+            # Before any check slot: a group of a precommit the hotkey cannot submit (junk, or sessions not
+            # graded yet) costs no check. Retryable, no verdict (the hotkey owns no such precommit, or it may
+            # become submittable).
+            try:
+                groups = frozenset(self._checks_allowed(hotkey, received))
+            except Exception:
+                logger.exception("the episode check cap's hook failed for %s; group refused retryably", hotkey[:12])
+                return self._refuse(prepared, RejectReason.RATE_LIMITED, "episode_checks_in_flight",
+                                    {"submittable": "unknown"}, verdict=False)
+            if sha not in groups:
+                return self._refuse(prepared, RejectReason.RATE_LIMITED, "episode_checks_in_flight",
+                                    {"precommit": "not_submittable", "submittable": len(groups)}, verdict=False)
+            submittable = len(groups)
+        limited = self._rate_refusal(hotkey, owner, operator=operator, submittable=submittable)
         if limited is not None:
             return self._refuse(prepared, RejectReason.RATE_LIMITED, *limited)
-        sha = _precommit_sha(request)
         handed_off = False                  # to the check's thread, which then ends the hotkey's count
         try:
             precommit = await asyncio.to_thread(self._precommits, sha) if sha else None

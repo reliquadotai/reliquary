@@ -358,16 +358,17 @@ def rl_registration(server) -> Callable:
 
 
 def _check_caps(quota, clock: Callable[[], float]) -> dict:
-    """With the yield quota, the intake's check caps: a hotkey checks at most the groups it can submit now,
-    one operator at most ``MAX_CHECKS_RUNNING - 1`` at once (one slot always left to the others), on the
-    RL intake's own ``MAX_CHECKS_RUNNING`` slots, and its per-minute check budget scales with its allocation.
-    Without it, the intake's defaults (a cap per operator)."""
+    """With the yield quota, the intake's check caps: a hotkey checks only the groups it can submit now (as the
+    session claim judges them), at most as many at once as there are; one operator at most
+    ``MAX_CHECKS_RUNNING - 1`` at once (one slot always left to the others), on the RL intake's own
+    ``MAX_CHECKS_RUNNING`` slots; and its per-minute check budget scales with its allocation. Without it, the
+    intake's defaults (a cap per operator)."""
     from reliquary.sandbox.rl_capacity import MAX_CHECKS_RUNNING
     from reliquary.sandbox.rl_quota import YieldQuota
 
     if not isinstance(quota, YieldQuota):
         return {}
-    return {"checks_allowed": lambda hotkey: quota.groups_formable(hotkey, int(clock())),
+    return {"checks_allowed": lambda hotkey, received: quota.submittable(hotkey, int(clock()), received),
             "max_checks_running": MAX_CHECKS_RUNNING, "checks_scale": quota.cap_scale}
 
 
