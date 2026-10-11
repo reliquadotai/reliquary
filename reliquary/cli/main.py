@@ -1547,6 +1547,13 @@ def jobs_export(
     allow_incomplete: bool = typer.Option(
         False, "--allow-incomplete",
         help="An episode job: export before the job is drained (the counts file says so)"),
+    dedupe: bool = typer.Option(
+        False, "--dedupe",
+        help="Write a completion once (same token ids), the first copy"),
+    dedupe_against: list[str] = typer.Option(
+        None, "--dedupe-against",
+        help="Repeatable. Leave out a completion already in a passing submission of this "
+             "job (a v1 on the same prompts); implies --dedupe"),
 ) -> None:
     """Write the verified completions of a job as JSON lines.
 
@@ -1556,6 +1563,12 @@ def jobs_export(
     `--allow-incomplete`, and always writes `{out}.counts.json`: drained, what
     was exported and what was left out (ungraded, held, voided, uncertified,
     unparseable...), when, and the quarantined executors it held.
+
+    A single-turn job writes only finished completions (EOS last and, in a
+    thinking render, one `</think>`); `--apply-filter` grades the answer after
+    `</think>` and annotates every row, keeping the wrong ones unless
+    `--only-accepted`. Its counts (left-out completions by reason) go to stderr
+    and `{out}.counts.json` too.
 
     Written to a temporary file beside `--out` and swapped in with
     `os.replace` only once the export completes, so a mid-stream failure (the
@@ -1575,6 +1588,10 @@ def jobs_export(
         episode = job.episode is not None
         if episode and (apply_filter or only_accepted):
             raise typer.BadParameter("an episode job is filtered by its grades: use --sft")
+        if episode and (dedupe or dedupe_against):
+            raise typer.BadParameter("an episode job is not deduplicated by completion")
+        if job_id in (dedupe_against or ()):
+            raise typer.BadParameter("a job cannot be deduplicated against itself")
         if sft and not episode:
             raise typer.BadParameter("--sft is for episode jobs; use --apply-filter")
         if episode:
@@ -1600,7 +1617,17 @@ def jobs_export(
                                 quarantined=quarantined)
         else:
             grade = _job_grader(job) if apply_filter else None
-            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade)
+            counts = {}
+            seen = None
+            if dedupe or dedupe_against:
+                from reliquary.corpus.export import job_fingerprints
+
+                for other in dedupe_against or ():
+                    if (await job_store.read_job(other))[0] is None:
+                        raise typer.BadParameter(f"no job {other!r} to dedupe against")
+                seen = await job_fingerprints(BucketRecordStore(), list(dedupe_against or ()))
+            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade, counts=counts,
+                               seen=seen)
         temporary = f"{out}.{os.getpid()}.tmp"
         written = 0
         try:
@@ -1623,6 +1650,17 @@ def jobs_export(
                     "counts": counts, "exported_at": _time.time(),
                     "quarantined_executors": list(quarantined),
                 }
+                side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
+                with open(side_temporary, "w", encoding="utf-8") as handle:
+                    json.dump(sidecar, handle, sort_keys=True, indent=1)
+                os.replace(side_temporary, f"{out}.counts.json")
+                typer.echo(json.dumps(counts, sort_keys=True), err=True)
+            else:
+                sidecar = {"job_id": job_id, "filter_applied": apply_filter,
+                           "only_accepted": only_accepted, "exported": written,
+                           "dedupe_against": sorted(dedupe_against or ())
+                           if (dedupe or dedupe_against) else None,
+                           "counts": counts, "exported_at": _time.time()}
                 side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
                 with open(side_temporary, "w", encoding="utf-8") as handle:
                     json.dump(sidecar, handle, sort_keys=True, indent=1)

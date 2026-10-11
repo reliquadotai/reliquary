@@ -510,7 +510,7 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin, monkeypa
     sid = "1" * 64
     admin.records.verdicts = {sid: {"passed": True}}
     admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
-                                "completions": [{"text": "a", "tokens": [1]}]}}
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
     admin.records.settlement = {"settled": [sid], "pending": None}
     first = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-1"})
     assert first.status_code == 202 and first.json()["state"] == "running"
@@ -614,7 +614,7 @@ def test_a_missing_raw_source_preserves_the_original_admin_delivery(admin, monke
     sid = "1" * 64
     admin.records.verdicts = {sid: {"passed": True}}
     admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
-                                "completions": [{"text": "a", "tokens": [1]}]}}
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
     admin.records.settlement = {"settled": [sid], "pending": None}
     path, body = "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-raw-missing"}
     assert admin("POST", path, body).status_code == 202
@@ -859,3 +859,28 @@ def test_an_operator_catalog_job_is_declared_byte_identically(admin):
     digest = hashlib.sha256(json.dumps(document, sort_keys=True,
                                        separators=(",", ":")).encode()).hexdigest()
     assert digest == CATALOG_JOB_GOLDEN
+
+
+def test_keep_rejected_without_a_filter_to_apply_is_refused(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    sid = "1" * 64
+    admin.records.verdicts = {sid: {"passed": True}}
+    admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
+    response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                     {"delivery_id": "order-keep", "keep_rejected": True})
+    assert response.status_code == 422
+    assert "keep_rejected" in response.json()["detail"]
+    assert not (admin.platform / "deliveries" / "order-keep").exists()
+
+
+def test_a_delivery_dedupes_against_a_known_job_in_scope(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    path = "/admin/v1/jobs/math-a/deliveries"
+    for body, detail in (({"dedupe_against": ["math-a"]}, "dedupe_against_itself"),
+                         ({"dedupe_against": ["math-ghost"]}, "dedupe_against_unknown"),
+                         ({"dedupe_against": ["other-a"]}, "outside_admin_scope")):
+        response = admin("POST", path, {"delivery_id": "order-dedupe", **body})
+        assert response.status_code in (409, 422) and detail in response.json()["detail"]
+    assert not (admin.platform / "deliveries" / "order-dedupe").exists()
