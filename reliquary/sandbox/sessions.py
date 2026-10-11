@@ -795,9 +795,12 @@ def _placement_class(terms) -> tuple:
     return (terms.env, _tier(cpu_millis), _tier(memory_bytes))
 
 
-_UNTALLIED_REFUSALS = frozenset({"sandbox_saturated", "open_queue_full", "directory_unavailable"})
+_UNTALLIED_REFUSALS = frozenset({"sandbox_saturated", "open_queue_full", "directory_unavailable",
+                                 "environment_unserved"})
 """A queued issuer's refusals that are our capacity or our outage: never counted toward a hotkey's refused-open
 rate."""
+_NEVER_TALLIED = frozenset({"environment_unserved"})
+"""Refusals that are our state whether or not the issuer queues (an env no machine serves): never tallied."""
 
 
 class SessionIssuer:
@@ -817,6 +820,7 @@ class SessionIssuer:
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
         self._refused_opens: dict[str, list[int]] = {}     # hotkey -> refusal times
+        self._unserved_alerted: set[tuple] = set()          # (env, package, options) already ALERTed
         # Sessions whose ``submitted`` record is stored ahead of the book (``persist_submitted``).
         self._stored_submitted: set[str] = set()
         # The RL wiring's listeners and fault records (a corpus issuer has neither: its records keep their bytes).
@@ -946,7 +950,8 @@ class SessionIssuer:
             return throttled
         outcome = await self._open(hotkey, request_id, digest, engagement)
         if isinstance(outcome, Refusal):
-            if self._queue is None or outcome.reason not in _UNTALLIED_REFUSALS:
+            if outcome.reason not in _NEVER_TALLIED and (
+                    self._queue is None or outcome.reason not in _UNTALLIED_REFUSALS):
                 self._refused_opens.setdefault(hotkey, []).append(now)
             return outcome
         if isinstance(outcome, Grant):           # the same request, granted meanwhile
@@ -1114,7 +1119,8 @@ class SessionIssuer:
                     return Refusal("directory_unavailable", {"why": "the sandbox fleet cannot be judged now"},
                                    retry_after=self._policy.retry_after_s)
                 if verdict is False:
-                    return _NEVER
+                    unserved = self._unserved(terms, now)
+                    return _NEVER if unserved is None else unserved
             return _NO_CAPACITY
         session_id = self._new_id()
         claims = SessionClaims(
@@ -1152,6 +1158,25 @@ class SessionIssuer:
         self._event("opened", record)
         return _Issued(Grant(session_id, token, placement.address, claims.expires_at),
                        placement.machine_id, terms.engagement)
+
+    def _unserved(self, terms, now: int) -> Refusal | None:
+        """An open no machine could take because no fresh machine serves its env at its exact package and options
+        (the fleet lost the env, a rolling upgrade, options drift): our state, refused retryably
+        (``environment_unserved``, an ALERT once per identity), never final for the seed. None when some machine
+        serves the env: then this task itself fits nowhere (``task_unplaceable``)."""
+        serving = getattr(self._fleet, "serving", None)
+        if serving is None:
+            return None
+        if serving(terms.env, terms.env_package, env_options_sha256=terms.env_options_sha256, now=now):
+            return None
+        key = (terms.env, terms.env_package, terms.env_options_sha256)
+        if key not in self._unserved_alerted:
+            self._unserved_alerted.add(key)
+            reported = getattr(self._fleet, "reported_packages", lambda env: [])(terms.env)
+            logger.error("ALERT no sandbox machine serves %s at %s (options sha256 %s); machines report %s: its "
+                         "opens are refused (environment_unserved, retryable) until one does", terms.env,
+                         terms.env_package, terms.env_options_sha256, ", ".join(reported) or "nothing")
+        return Refusal("environment_unserved", {"environment": terms.env}, retry_after=self._policy.retry_after_s)
 
     @staticmethod
     def _state_of(record: SessionRecord) -> dict:

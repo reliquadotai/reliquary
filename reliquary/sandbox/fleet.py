@@ -496,7 +496,7 @@ class Fleet:
         if key not in self._options_alerted:
             self._options_alerted.add(key)
             logger.error(
-                "machine %s is refused for %s: it %s, this validator builds the env with "
+                "ALERT machine %s is refused for %s: it %s, this validator builds the env with "
                 "options sha256 %s; the gateway's episode_env_options and the validator's "
                 "options must agree (no session is placed there until they do)",
                 machine_id, env,

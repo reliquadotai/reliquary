@@ -218,3 +218,105 @@ def test_a_present_window_of_at_most_120_s_is_valid(tmp_path, window):
                  reserve=RESERVE)
     assert fleet.pick(**place) is not None and fleet.could_place(**place) is True
     assert fleet.serving(ENV, FLEET_PACKAGE, now=NOW) == [MACHINE]
+
+
+# --- our state is never charged to the miner: an unserved env is retryable and untallied ------------------------
+
+def _set_task_digest(env, digest):
+    engagements = env.issuer._engagements["rl_precommit"]
+    view = engagements._environments(EPISODE)
+
+    async def resolve(index):
+        return ResolvedTask(IMAGE, {}, digest)
+
+    engagements._environments = lambda name: type(view)(policy=view.policy, resolve_task=resolve)
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_unserved_refusals_never_trip_the_refused_open_rate(tmp_path, queued):
+    from reliquary.sandbox.sessions import Grant, Refusal
+    from tests.unit.test_open_queue import queue
+
+    env = build(tmp_path)
+    if queued:
+        env.issuer._queue = queue(wait_s=1.0)
+    engagements = env.issuer._engagements["rl_precommit"]
+    engagements.serving_refusal = lambda environment: Refusal("environment_unserved", {}, retry_after=10)
+    limit = env.book.policy.max_refused_opens_per_minute
+    for n in range(limit + 5):
+        assert open_(env, 0, request_id=f"{n:032x}").reason == "environment_unserved"
+    engagements.serving_refusal = lambda environment: None             # served again (or another env)
+    assert isinstance(open_(env, 0, request_id="f" * 32), Grant)
+
+
+def _real_fleet(tmp_path, env, **report):
+    from tests.unit.test_open_queue import queue
+
+    fleet, machine, served, _ = make(tmp_path / "fleet")
+    served[ADDRESS] = capacity_report(machine, at=NOW, **report)
+    asyncio.run(fleet.poll_once())
+    env.issuer._fleet = fleet
+    env.issuer._queue = queue(wait_s=1.0)
+    return fleet
+
+
+@pytest.mark.parametrize("report", [
+    {"env_packages": {SANDBOX_ENV: ENV_PACKAGE.removesuffix(".vfb2")}},          # no .vfb<N>: a rolling upgrade
+    {"env_packages": {"another-env": ENV_PACKAGE}},                              # the env left the fleet
+])
+def test_an_env_no_fresh_machine_serves_is_refused_retryably_mid_run(tmp_path, caplog, report):
+    (tmp_path / "fleet").mkdir()
+    env = build(tmp_path)
+    _real_fleet(tmp_path, env, **report)
+    with caplog.at_level(logging.ERROR):
+        refused = open_(env, 0)
+        again = open_(env, 1)
+    assert refused.reason == again.reason == "environment_unserved" and refused.retry_after
+    assert sum("ALERT" in r.message and ENV_PACKAGE in r.message for r in caplog.records) == 1   # once
+
+
+def test_a_served_env_whose_task_fits_nowhere_stays_unplaceable(tmp_path):
+    (tmp_path / "fleet").mkdir()
+    env = build(tmp_path)
+    _real_fleet(tmp_path, env, env_packages={SANDBOX_ENV: ENV_PACKAGE}, images=("registry.example/other@sha256:"
+                                                                                 + "b" * 64,))
+    refused = open_(env, 0)
+    assert refused.reason == "task_unplaceable" and not refused.retry_after
+
+
+def test_options_drift_is_retryable_and_alerted_never_unplaceable(tmp_path, caplog):
+    (tmp_path / "fleet").mkdir()
+    env = build(tmp_path)
+    _set_task_digest(env, DIGEST)
+    _real_fleet(tmp_path, env, env_packages={SANDBOX_ENV: ENV_PACKAGE}, env_options_sha256={SANDBOX_ENV: "9" * 64})
+    with caplog.at_level(logging.ERROR):
+        refused = open_(env, 0)
+    assert refused.reason == "environment_unserved" and refused.retry_after
+    assert any(r.message.startswith("ALERT machine") and DIGEST in r.message for r in caplog.records)
+
+
+async def test_the_boot_check_compares_the_options_the_tasks_are_resolved_with(tmp_path):
+    services, _ = _services(tmp_path, boot_wait_s=0.0)
+
+    async def resolve(index):
+        return ResolvedTask(IMAGE, {}, DIGEST)
+
+    services.resolvers[EPISODE] = resolve
+    asked = []
+    services.fleet.serving = lambda *args, **kwargs: asked.append(kwargs.get("env_options_sha256")) or []
+    await services.start()
+    assert services.served[EPISODE] == (SANDBOX_ENV, ENV_PACKAGE, DIGEST)
+    assert asked and set(asked) == {DIGEST} and services.unserved_envs == {EPISODE}
+    await services.stop()
+
+
+async def test_a_task_that_cannot_be_resolved_at_boot_leaves_the_options_unknown(tmp_path):
+    services, _ = _services(tmp_path, boot_wait_s=0.0)
+
+    async def broken(index):
+        raise OSError("dataset unreachable")
+
+    services.resolvers[EPISODE] = broken
+    await services.start()                                               # never raises
+    assert services.served[EPISODE] == (SANDBOX_ENV, ENV_PACKAGE, None)
+    await services.stop()

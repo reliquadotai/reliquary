@@ -57,6 +57,8 @@ YIELD_FLUSH_SECONDS = 10.0
 BOOT_FLEET_WAIT_S = 120.0
 """At start, how long the validator waits for a machine serving each episode env before starting it degraded."""
 POLL_SECONDS_FOR_SERVED = 5.0
+OPTIONS_PROBE_TIMEOUT_S = 30.0
+"""At start, how long resolving an env's first task to learn its options digest may take."""
 """How often a degraded env is re-checked (the fleet's poll period; kept here: no fleet import at module level)."""
 NO_PER_KEY_CAP = 1 << 30
 """The policy's per-hotkey live and hourly-open caps when the yield quota decides: no fixed per-key maximum."""
@@ -152,6 +154,7 @@ class RlEpisodeServices:
     restore_timeout_s: float = RESTORE_TIMEOUT_S
     restore_backoff_s: float = RESTORE_BACKOFF_S
     served: dict = field(default_factory=dict, repr=False)
+    resolvers: dict = field(default_factory=dict, repr=False)
     boot_wait_s: float | None = None
     unserved_envs: set = field(default_factory=set)
     _loop: Any = field(default=None, repr=False)
@@ -229,6 +232,7 @@ class RlEpisodeServices:
         """At start: poll the machines until every episode env is served, for at most ``timeout_s``; the envs
         still unserved then start degraded (refused retryably, an ALERT). Never raises."""
         deadline = time.monotonic() + float(timeout_s)
+        await self._learn_options()
         missing: dict = {}
         while True:
             try:
@@ -243,6 +247,24 @@ class RlEpisodeServices:
         self.unserved_envs = set(missing)
         if missing:
             self._alert_unserved(missing)
+
+    async def _learn_options(self) -> None:
+        """The options digest each env's tasks are resolved with (its first task's, as every open will carry it),
+        for the envs whose source does not state one: the boot check then compares options too. A task that
+        cannot be resolved now leaves the digest unknown (logged): each open still checks its own task's."""
+        for name, (sandbox_env, package, options) in sorted(self.served.items()):
+            resolve = self.resolvers.get(name)
+            if options is not None or resolve is None:
+                continue
+            try:
+                task = await asyncio.wait_for(resolve(0), OPTIONS_PROBE_TIMEOUT_S)
+            except Exception as exc:
+                logger.warning("episode env %s: its options digest is unknown at start (%s): the boot check "
+                               "compares its package only", name, type(exc).__name__)
+                continue
+            digest = getattr(task, "env_options_sha256", None)
+            if digest is not None:
+                self.served[name] = (sandbox_env, package, str(digest))
 
     def serving_refusal(self, environment: str) -> Refusal | None:
         """``environment_unserved`` (retryable) for a degraded env; None otherwise."""
@@ -591,6 +613,7 @@ def build_rl_episode_services(
                              served={name: (p.sandbox_env, p.env_package,
                                             getattr(environments[name].source, "options_sha256", None))
                                      for name, p in policies.items()},
+                             resolvers={name: environments[name].source.resolve for name in policies},
                              boot_wait_s=boot_wait_s)
     engagements.serving_refusal = services.serving_refusal
     return services
