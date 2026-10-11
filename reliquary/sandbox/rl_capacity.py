@@ -78,16 +78,24 @@ NEWCOMER_ENTITY = "\x00newcomer"        # never a hotkey (SS58 has no NUL)
 class YieldStats:
     """``useful`` and ``decided`` (useful + wasted) among the hotkey's last ``YIELD_SESSIONS`` decided sessions;
     ``useful_24h`` and ``useful_s_24h``: its useful sessions decided in the last ``USEFUL_HORIZON_S``, and their held
-    seconds (issue to close: an env-neutral volume)."""
+    seconds (issue to close: an env-neutral volume); ``capacity_neutral``: its graded sessions the ledger still keeps
+    that a capacity verdict made neither useful nor wasted. They count toward graduation (``graduation``), never
+    toward the yield, so a hotkey whose sessions are all capacity-neutral cannot stay a newcomer forever."""
 
     useful: int = 0
     decided: int = 0
     useful_24h: int = 0
     useful_s_24h: float = 0.0
+    capacity_neutral: int = 0
 
     @property
     def yield_ratio(self) -> float:
         return self.useful / self.decided if self.decided else 0.0
+
+    @property
+    def graduation(self) -> int:
+        """The sessions that count toward leaving the newcomers: decided ones plus capacity-neutral graded ones."""
+        return self.decided + self.capacity_neutral
 
 
 def multiplier(yield_ratio: float) -> float:
@@ -99,7 +107,7 @@ def multiplier(yield_ratio: float) -> float:
 
 
 def standing(stats: YieldStats, *, pool_seeds: int) -> str:
-    if stats.decided < YIELD_MIN_DECIDED:
+    if stats.graduation < YIELD_MIN_DECIDED:
         if stats.decided >= NEWCOMER_EXIT_GROUPS * int(pool_seeds) and stats.yield_ratio <= YIELD_FLOOR:
             return LOW_YIELD
         return NEWCOMER

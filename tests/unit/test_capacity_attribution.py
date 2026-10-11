@@ -5,6 +5,7 @@ import pytest
 
 attest = pytest.importorskip("reliquary_sandbox.attest")
 
+from reliquary.protocol.service_episode import rl_engagement  # noqa: E402
 from reliquary.sandbox.sessions import LIVE, SandboxPolicy, SessionBook  # noqa: E402
 from tests.unit.sandbox_fixtures import MACHINE, NOW  # noqa: E402
 from tests.unit.test_open_queue import Refusals, queue  # noqa: E402
@@ -117,8 +118,8 @@ def test_a_failing_attribution_gives_no_verdict(tmp_path):
     assert listener.seen == []
 
 
-@pytest.mark.parametrize("holder, fault", [(HOTKEY, None), ("5Other", "open_refused:no_free_slot")])
-def test_a_signed_machine_full_refusal_is_ours_only_when_others_filled_the_machine(tmp_path, holder, fault):
+@pytest.mark.parametrize("holder", [HOTKEY, "5Other"])
+def test_a_signed_machine_full_refusal_is_ours_whoever_filled_the_machine(tmp_path, holder):
     env = build(tmp_path)
     env.issuer._record_faults = True
     env.issuer._open_refusal_check = lambda receipt, record: True
@@ -126,7 +127,60 @@ def test_a_signed_machine_full_refusal_is_ours_only_when_others_filled_the_machi
     others_hold(env, 3, hotkey=holder)
     asyncio.run(env.issuer.close(hotkey=HOTKEY, session_id=grant.session_id, reason="open_failed",
                                  transcript=None, open_refusal=RECEIPT))
-    assert env.book.get(grant.session_id).fault == fault
+    assert env.book.get(grant.session_id).fault == "open_refused:no_free_slot"
+
+
+def test_load_the_book_does_not_hold_is_never_the_miners(tmp_path):
+    env = build(tmp_path)
+    _q, listener = saturating(env)
+    others_hold(env, 1, hotkey=HOTKEY)                   # its other precommit: the only RL session on the machine
+    env.issuer._fleet.reported_load = lambda machines: 7 if MACHINE in machines else 0   # a corpus job fills it
+    assert refused(env, 0).reason == "sandbox_saturated"
+    assert listener.seen == ["sandbox_saturated"]
+
+
+@pytest.mark.parametrize("entitled, seen", [(8, ["sandbox_saturated"]), (3, [])])
+def test_within_its_allocation_a_saturation_is_never_the_miners(tmp_path, entitled, seen):
+    env = build(tmp_path)
+    _q, listener = saturating(env)
+    others_hold(env, 4, hotkey=HOTKEY)                   # 4 held: within an allocation of 8, beyond one of 3
+    env.issuer._entitled = lambda hotkey: entitled if hotkey == HOTKEY else 0
+    assert refused(env, 0).reason == "sandbox_saturated"
+    assert listener.seen == seen
+
+
+@pytest.mark.parametrize("sybil_entitled, seen", [(4, ["sandbox_saturated"]), (0, [])])
+def test_the_entitlement_is_the_operators_hotkeys_together(tmp_path, sybil_entitled, seen):
+    env = build(tmp_path)
+    _q, listener = saturating(env, operators={HOTKEY: "cold", "5Sybil": "cold"})
+    others_hold(env, 3, hotkey=HOTKEY)
+    others_hold(env, 3, hotkey="5Sybil")                 # 6 held by the operator
+    env.issuer._entitled = {HOTKEY: 2, "5Sybil": sybil_entitled}.get
+    assert refused(env, 0).reason == "sandbox_saturated"
+    assert listener.seen == seen
+
+
+def test_a_full_queue_of_its_own_groups_tickets_is_not_its_doing(tmp_path):
+    env = build(tmp_path)
+    q, listener = saturating(env, max_waiting=2, wait_s=5.0)
+    q.join("5Holder", cls=("elsewhere", None, None))     # holds the turn
+    q.join(HOTKEY, cls=("elsewhere", None, None), engagement=rl_engagement(1, env.precommit.sha256, 5))
+    q.join("5Other", cls=("elsewhere", None, None))
+    assert refused(env, 0).reason == "open_queue_full"
+    assert listener.seen == ["open_queue_full"]           # its own group's ticket is not its other load
+
+
+def test_attribution_failures_are_counted(tmp_path):
+    env = build(tmp_path)
+    _q, _listener = saturating(env)
+
+    def broken(**kw):
+        raise RuntimeError("fleet")
+
+    env.issuer._fleet.servable_machines = broken
+    refused(env, 0)
+    refused(env, 1)
+    assert env.issuer.attribution_failures == 2
 
 
 def test_another_signed_refusal_is_ours_whoever_holds_the_machine(tmp_path):
@@ -156,3 +210,18 @@ def test_the_book_counts_who_holds_a_machine_from_an_index():
     assert book.held_on((MACHINE,), NOW) == {"5A": 1, "5B": 1}
     book.prune(NOW + 3 * 86_400)                          # pruned records leave the machine index
     assert "s-0" not in book._by_machine.get(MACHINE, set())
+
+
+@pytest.mark.parametrize("free, listed, load", [(4, 0, 0), (1, 0, 3), (4, 2, 2), (3, 3, 3)])
+def test_a_machines_reported_load_is_its_used_slots_or_listed_sessions(tmp_path, free, listed, load):
+    from tests.unit.sandbox_fixtures import ADDRESS, capacity_report
+    from tests.unit.test_fleet_resources import RESOURCES
+    from tests.unit.test_sandbox_fleet import make
+
+    fleet, machine, served, clock = make(tmp_path)
+    clock.now = NOW
+    served[ADDRESS] = capacity_report(machine, at=NOW, free=free,
+                                      resources={**RESOURCES, "sessions": [f"s-{n}" for n in range(listed)]})
+    asyncio.run(fleet.poll_once())
+    assert fleet.reported_load((MACHINE,)) == load
+    assert fleet.reported_load(("other",)) == 0

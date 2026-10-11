@@ -164,6 +164,24 @@ def test_a_capacity_refusal_neutralises_only_graded_sessions(tmp_path, status):
     assert (led.stats(HOT).useful, led.stats(HOT).decided) == (0, 4)
 
 
+def test_capacity_neutral_sessions_count_toward_graduation_never_toward_the_yield(tmp_path):
+    from reliquary.sandbox.rl_capacity import LOW_YIELD, NEWCOMER, YIELD_MIN_DECIDED, standing
+
+    led = ledger(tmp_path)
+    records = opened(led, 7)
+    for r in records[:3]:
+        r.state, r.closed_status = "closed_graded", GRADED
+    led.capacity_refused(hotkey=HOT, precommit_sha256=A)
+    settle(led, records, group_size=16)
+    stats = led.stats(HOT)
+    assert (stats.useful, stats.decided, stats.capacity_neutral, stats.graduation) == (0, 4, 3, 7)
+    assert led.capacity_counts(HOT) == (1, 3) and led.capacity_counts() == {HOT: (1, 3)}
+    assert ledger(tmp_path).stats(HOT).capacity_neutral == 3                 # read back after a restart
+    # a hotkey living on capacity verdicts leaves the newcomers (for the low-yield entity: it is useful to nobody)
+    assert standing(YieldStats(capacity_neutral=YIELD_MIN_DECIDED - 1), pool_seeds=8) == NEWCOMER
+    assert standing(YieldStats(capacity_neutral=YIELD_MIN_DECIDED), pool_seeds=8) == LOW_YIELD
+
+
 def test_a_capacity_refusal_after_a_formable_group_is_waste(tmp_path):
     led = ledger(tmp_path)
     records = opened(led, 20)

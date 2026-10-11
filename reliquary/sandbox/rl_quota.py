@@ -18,8 +18,9 @@ shows a whole group's demand from its first request.
   allocation is below M never opens a session that cannot form a group.
 * LEAVING A POOL (read from the ledger, so it survives a restart): a hotkey whose ledger standing is MAIN stays in a
   pooled entity while its MAIN potential is below one group (M), only
-  - as a newcomer while ``YIELD_MIN_DECIDED <= decided < YIELD_MIN_DECIDED + GRACE_SESSIONS`` (the graduation
-    grace: bounded, it ends after ``GRACE_SESSIONS`` more decided sessions), or
+  - as a newcomer while ``YIELD_MIN_DECIDED <= graduation < YIELD_MIN_DECIDED + GRACE_SESSIONS`` (the graduation
+    grace: bounded, it ends after ``GRACE_SESSIONS`` more decided sessions; ``YieldStats.graduation`` also counts
+    graded sessions a capacity verdict made neutral), or
   - in the low-yield entity while its yield is below ``YIELD_FULL`` (a recovering hotkey keeps its one group).
   Splitting a hotkey into parts below one group therefore buys at most the pooled entities' rules.
 * Pooled members: at most ``NEWCOMER_MAX_GROUPS`` / ``LOW_YIELD_MAX_GROUPS`` groups each. First opens of groups are
@@ -306,7 +307,7 @@ class YieldQuota:
     @staticmethod
     def _pool_kept(stats: YieldStats) -> str | None:
         """The pooled entity a MAIN-standing hotkey stays in while MAIN would not give it a group (or None)."""
-        if YIELD_MIN_DECIDED <= stats.decided < YIELD_MIN_DECIDED + GRACE_SESSIONS:
+        if YIELD_MIN_DECIDED <= stats.graduation < YIELD_MIN_DECIDED + GRACE_SESSIONS:
             return NEWCOMER                       # the graduation grace, bounded by the ledger's count
         if stats.yield_ratio < YIELD_FULL:
             return LOW_YIELD                      # a recovering hotkey keeps its group
@@ -342,7 +343,7 @@ class YieldQuota:
         return self._settle_lane(hotkey, self._stats(hotkey), capacity, self._claims, self._entity_demand)
 
     def _genuine(self, hotkey: str) -> bool:
-        return self._stats(hotkey, self._snapshot or None).decided < YIELD_MIN_DECIDED
+        return self._stats(hotkey, self._snapshot or None).graduation < YIELD_MIN_DECIDED
 
     def allocation(self, now: float | None = None) -> Allocation:
         now = int(self._clock() if now is None else now)
@@ -384,7 +385,7 @@ class YieldQuota:
             for hotkey, lane in lanes.items():
                 if lane != MAIN:
                     lane_counted[lane] += counted[hotkey]
-                if lane == NEWCOMER and snapshot.get(hotkey, YieldStats()).decided < YIELD_MIN_DECIDED:
+                if lane == NEWCOMER and snapshot.get(hotkey, YieldStats()).graduation < YIELD_MIN_DECIDED:
                     member_max = _LANE_GROUPS[NEWCOMER] * group
                     genuine_waiting += max(0, min(demands[hotkey], member_max) - counted[hotkey])
             for lane, opens in self._lane_opens.items():

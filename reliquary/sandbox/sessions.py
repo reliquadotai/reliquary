@@ -618,6 +618,15 @@ class SessionBook:
                     counts[record.hotkey] = counts.get(record.hotkey, 0) + 1
         return counts
 
+    def hotkeys(self) -> tuple[str, ...]:
+        """The hotkeys with a session in the book."""
+        return tuple(self._by_hotkey)
+
+    def held_by(self, hotkeys, now: int) -> int:
+        """Held sessions of these hotkeys, fleet-wide (from the per-hotkey index)."""
+        return sum(1 for hotkey in set(hotkeys) for s in self._by_hotkey.get(hotkey, ())
+                   if s in self._sessions and self._holds(self._sessions[s], now))
+
     def held_on_precommit(self, machine_ids, now: int, engagement: str) -> int:
         """Held sessions on these machines of the precommit the RL ``engagement`` names (its own group); 0 for
         an engagement that is not RL."""
@@ -794,9 +803,8 @@ _NEVER = object()
 """``_issue_locked``'s answer when no fresh machine could ever take the open (queued issuers only)."""
 CAPACITY_REFUSALS = frozenset({"sandbox_saturated", "open_queue_full", "task_unplaceable", "environment_unserved"})
 """Open refusals that are the validator's capacity: told to ``SessionEvents.refused``, except a saturation or a full
-queue of the refused miner's own operator's making (``SessionIssuer._self_caused``)."""
-MACHINE_FULL_REASONS = frozenset({"no_free_slot", "no_free_resources"})
-"""A gateway's signed open refusals for a full machine: judged like a saturation at close."""
+queue of the refused miner's own operator's making (``SessionIssuer._self_caused``). A gateway's signed refusal of
+a token (``no_free_slot`` included) is ours whoever filled the machine: our placement chose it."""
 
 
 def _tier(value: Any) -> Any:
@@ -842,7 +850,8 @@ class SessionIssuer:
                  new_session_id: Callable[[], str] = lambda: uuid.uuid4().hex,
                  events: SessionEvents | None = None, record_faults: bool = False,
                  open_refusal_check: Callable[[Mapping[str, Any], SessionRecord], bool | None] | None = None,
-                 queue=None, operator_of: Callable[[str], str | None] | None = None) -> None:
+                 queue=None, operator_of: Callable[[str], str | None] | None = None,
+                 entitled: Callable[[str], int] | None = None) -> None:
         self.book = book
         self._store, self._fleet, self._signer = store, fleet, signer
         self._token_verifier = token_verifier
@@ -865,6 +874,9 @@ class SessionIssuer:
         self._queue = queue
         # The chain operator of a hotkey (the registration's coldkey): a saturation is judged by operator.
         self._operator_of = operator_of
+        # The sessions a hotkey's allocation entitles it to (the RL quota's): within it, a saturation is ours.
+        self._entitled = entitled
+        self.attribution_failures = 0          # saturation attributions that raised (a bug of ours: no verdict)
         self._restored: set[str] = set()       # sessions issued before this process started (their tokens lost)
         self._last_activity = 0                # the last issue or close before the restart
         self._lost: set[str] = set()           # restored sessions whose open answer our restart lost
@@ -910,50 +922,62 @@ class SessionIssuer:
         return str(operator) if operator else str(hotkey)
 
     def _own_load(self, hotkey: str, machine_ids, now: int, engagement: str) -> tuple[int, int]:
-        """``(own, total)`` held sessions on these machines: ``own`` those of the hotkey's operator (all its
-        hotkeys) less the refused open's own group (the sessions of the precommit ``engagement`` names: a servable
-        task's machines host at least a whole group, so only the operator's OTHER load can make a saturation its
-        own doing)."""
+        """``(own, total)`` held sessions on these machines. ``own``: those of the hotkey's operator (all its hotkeys)
+        less the refused open's own group (the sessions of the precommit ``engagement`` names: a servable task's
+        machines host at least a whole group, so only the operator's OTHER load can make a saturation its own
+        doing). ``total``: every session on them, never less than what their reports show (corpus sessions and
+        anything else this book does not hold count too)."""
         held = self.book.held_on(machine_ids, now)
-        total = sum(held.values())
         owner = self._owner(hotkey)
         own = sum(count for other, count in held.items() if self._owner(other) == owner)
         own -= self.book.held_on_precommit(machine_ids, now, engagement)
+        reported = getattr(self._fleet, "reported_load", None)
+        total = max(sum(held.values()), int(reported(machine_ids)) if reported is not None else 0)
         return max(0, own), total
 
+    def _over_entitlement(self, hotkey: str, now: int) -> bool:
+        """Whether the hotkey's operator holds more sessions, fleet-wide, than its hotkeys' allocations entitle it
+        to. Without an allocation (no RL quota) every operator is taken as over it (the share rule alone)."""
+        if self._entitled is None:
+            return True
+        owner = self._owner(hotkey)
+        hotkeys = {str(hotkey)} | {other for other in self.book.hotkeys() if self._owner(other) == owner}
+        held = self.book.held_by(hotkeys, now)
+        return held > sum(max(0, int(self._entitled(other))) for other in hotkeys)
+
     def _self_caused(self, hotkey: str, terms, refusal: Refusal) -> bool:
-        """Whether the refused miner's own operator held the capacity it was refused for: at least half of the
-        held sessions on the machines that could take this open (beyond the open's own group), or, for a full
-        queue, at least half of its waiting tickets. By operator whatever the quota's keying: another hotkey of
-        the same coldkey is the same miner. Only a saturation or a full queue can be of a miner's making; an
-        open no machine could ever take, or an env no machine serves, never is."""
+        """Whether the refused miner's own operator caused the saturation it was refused for. Only a saturation or
+        a full queue can be; an open no machine could ever take, or an env no machine serves, never is. Both of:
+        * its operator (by coldkey whatever the quota's keying: another hotkey of the same coldkey is the same
+          miner) holds more sessions fleet-wide than its hotkeys' allocations entitle it to (within them, the
+          capacity was ours to provide);
+        * it held at least half of the sessions on the machines that could take this open (beyond the open's own
+          group; the total never below the machines' reported load), or, for a full queue, at least half of the
+          waiting tickets (beyond its own group's)."""
         if refusal.reason not in ("sandbox_saturated", "open_queue_full"):
             return False
         now = int(self._clock())
+        if not self._over_entitlement(hotkey, now):
+            return False
         servable = getattr(self._fleet, "servable_machines", None)
         machines = () if servable is None else servable(
             image=terms.image, env=terms.env, env_package=terms.env_package, budgets=terms.budgets,
             validity_s=self._validity(terms), now=now, env_options_sha256=terms.env_options_sha256,
             **_reserving(terms))
+        if not machines and refusal.reason == "sandbox_saturated":
+            logger.info("saturation of %s judged with no servable machine in view: a capacity verdict",
+                        str(hotkey)[:12])
         own, total = self._own_load(hotkey, machines, now, terms.engagement)
         if total and 2 * own >= total:
             return True
         if refusal.reason == "open_queue_full" and self._queue is not None:
-            keys = self._queue.keys()
+            tickets = self._queue.tickets()
             owner = self._owner(hotkey)
-            mine = sum(1 for key in keys if self._owner(key) == owner)
-            return bool(keys) and 2 * mine >= len(keys)
+            group = _rl_precommit_engagement(terms.engagement)
+            mine = sum(1 for key, engagement in tickets if self._owner(key) == owner
+                       and (group is None or _rl_precommit_engagement(engagement) != group))
+            return bool(tickets) and 2 * mine >= len(tickets)
         return False
-
-    def _machine_full_self_caused(self, record: SessionRecord, receipt: Mapping[str, Any], now: int) -> bool:
-        """A gateway signs ``no_free_slot`` / ``no_free_resources`` whoever filled its machine: the refusal is
-        the miner's own doing (no fault recorded) when its operator held at least half of the machine's held
-        sessions beyond the refused session's own group, by the same rule as a saturation."""
-        document = receipt.get("document") if isinstance(receipt, Mapping) else None
-        if not isinstance(document, Mapping) or document.get("reason") not in MACHINE_FULL_REASONS:
-            return False
-        own, total = self._own_load(record.hotkey, (record.machine_id,), now, record.engagement)
-        return bool(total) and 2 * own >= total
 
     def _capacity_refused(self, hotkey: str, engagement: Mapping[str, Any], outcome, terms=None) -> None:
         if not isinstance(outcome, Refusal) or outcome.reason not in CAPACITY_REFUSALS:
@@ -962,6 +986,7 @@ class SessionIssuer:
             try:
                 self_caused = self._self_caused(hotkey, terms, outcome)
             except Exception:
+                self.attribution_failures += 1
                 logger.exception("the saturation attribution failed; no capacity verdict")
                 self_caused = True                  # never a neutral verdict we could not justify
             if self_caused:
@@ -1329,10 +1354,7 @@ class SessionIssuer:
                            else self._open_refusal_check(open_refusal, record))
                 if open_refusal is not None and self._open_refusal_check is not None and verdict is None:
                     return self._directory_unavailable()     # cannot be judged now: resent, never lost
-                if verdict and self._machine_full_self_caused(record, open_refusal, now):
-                    logger.info("signed refusal of session %s: its own operator's load filled the machine; "
-                                "no fault", session_id)
-                elif verdict:
+                if verdict:
                     fault = _open_refused_fault(open_refusal)
                 elif session_id in self._lost and not self._reported(session_id):
                     fault = "validator_restarted"    # a machine that listed it says the miner had the token
@@ -1653,7 +1675,7 @@ class SessionIssuer:
 
 
 __all__ = ["ABORTED", "CAPACITY_REFUSALS", "CLOSED", "CLOSED_GRADED", "DEFAULT_PREPARE_TIMEOUT_S",
-           "GATEWAY_PREPARE_SLACK_S", "GRADING_POOL_ABORT", "HANDED_BACK", "LAPSED", "LIVE", "LOST_OPEN_WINDOW_S", "MACHINE_FULL_REASONS", "OPEN_TRANSIT_S",
+           "GATEWAY_PREPARE_SLACK_S", "GRADING_POOL_ABORT", "HANDED_BACK", "LAPSED", "LIVE", "LOST_OPEN_WINDOW_S", "OPEN_TRANSIT_S",
            "SUBMITTED", "VOIDED", "CorpusEngagements", "EngagementBook", "EngagementTerms", "FanOutEvents", "Grant",
            "JobNotReady", "Refusal", "RlPrecommitEngagements", "SandboxPolicy", "SessionBook", "SessionEvents",
            "SessionIssuer", "SessionRecord", "SignedJobView", "engagement_digest", "pool_abort_fault",

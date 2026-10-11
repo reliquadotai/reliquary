@@ -104,6 +104,10 @@ class OpenQueue:
         """The keys of the waiting tickets (the turn's holder excluded): who fills the queue."""
         return [ticket.key for ticket in self._waiting]
 
+    def tickets(self) -> list[tuple[str, str | None]]:
+        """``(key, engagement)`` of the waiting tickets (the turn's holder excluded)."""
+        return [(ticket.key, ticket.engagement) for ticket in self._waiting]
+
     def waiting_in(self, cls: Hashable) -> bool:
         return any(ticket.cls == cls for ticket in self._tickets())
 

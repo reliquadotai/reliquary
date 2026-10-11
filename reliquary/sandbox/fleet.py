@@ -656,6 +656,22 @@ class Fleet:
                 found.append(entry.machine_id)       # True (fresh or not) or None (resources unreadable)
         return tuple(found)
 
+    def reported_load(self, machine_ids: Collection[str]) -> int:
+        """The sessions these machines' last reports say they hold, whoever issued them (corpus sessions and
+        other validators' included): per machine its used slots (``capacity - free``) or the live sessions its
+        ``resources`` block lists, whichever is larger. Memory reads only."""
+        total = 0
+        for machine_id in set(machine_ids):
+            document = self._reports.get(machine_id)
+            if not document:
+                continue
+            try:
+                used = int(document.get("capacity") or 0) - int(document.get("free") or 0)
+            except (TypeError, ValueError):
+                used = 0
+            total += max(0, used, len(_listed(document.get("resources"))))
+        return total
+
     def sessions_hostable(self, machine_ids: Collection[str], reserve: Mapping[str, Any] | None) -> int:
         """How many sessions of this reservation these machines could hold at once, their load aside: each
         machine's slots and, when it is judged by its resources, its totals over the session's need (its slots

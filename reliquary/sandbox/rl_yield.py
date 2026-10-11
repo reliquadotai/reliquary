@@ -29,10 +29,14 @@ directory, a busy checker, a window that is not open) gives no verdict at all; t
 
 Capacity verdicts. At most ``capacity_allowance(hotkey)`` precommits of a hotkey get one per
 window (the groups its quota lets it hold, set by the wiring with ``allow_capacity_verdicts``). The ledger itself
-never asks who caused a saturation: the RL issuer tells it of a ``sandbox_saturated`` or ``open_queue_full``
-refusal only when the refused miner's operator (all its hotkeys, by the registration's coldkey) held less than half
-of the held sessions on the machines that could take the open, beyond the open's own group, and less than half of a
-full queue's tickets (``SessionIssuer._self_caused``). An issuer built without ``operator_of`` judges by hotkey.
+never asks who caused a saturation: the RL issuer leaves out a ``sandbox_saturated`` or ``open_queue_full`` refusal
+only when the refused miner's operator (all its hotkeys, by the registration's coldkey; by hotkey when the issuer
+has no ``operator_of``) holds more sessions than its hotkeys' allocations AND held at least half of the sessions on
+the machines that could take the open (beyond the open's own group; the total never below the machines' reported
+load), or of a full queue's tickets (beyond its own group's) (``SessionIssuer._self_caused``). A gateway's signed
+open refusal is always ours (a fault on the record). Graded sessions a capacity verdict made neutral count toward
+graduation (``YieldStats.capacity_neutral``), never toward the yield, so a hotkey cannot stay a newcomer on them;
+``capacity_counts`` gives each hotkey's capacity verdicts and neutral sessions since the process started.
 
 Keys. Everything is per hotkey. ``stats(hotkey)`` reads the snapshot of the last flush: the
 yield is useful / decided over the hotkey's last ``YIELD_SESSIONS`` decided sessions, ``useful_24h`` its useful
@@ -75,6 +79,7 @@ RUNTIME_EXEC_FAILED = "runtime_exec_failed"
 OPEN_REFUSED = "open_refused"
 VALIDATOR_RESTARTED = "validator_restarted"
 GRADING_POOL = "grading_pool"
+CAPACITY_REFUSED = "capacity_refused"
 # Refusals of the validator's own making AFTER the checker verified the group as the precommit's: only these
 # reach the ledger through a claimed group (``EpisodeGroupIntake.settle``). Neutral unless a group of the same
 # precommit is used later. ``content_identity``: our prompt content digest missing at the batcher;
@@ -169,6 +174,9 @@ class SessionYieldLedger:
         self._tasks: dict[str, tuple[str, str, str, int]] = {}      # precommit -> (hotkey, env, split, index)
         self._verdicts: dict[str, tuple[str, str]] = {}             # precommit -> (verdict, hotkey)
         self._decided: set[str] = set()
+        # Per hotkey, since this process started: capacity verdicts given and sessions they made neutral (the
+        # saturation metrics read them: a hotkey living on capacity verdicts shows the fleet is too thin for it).
+        self._capacity_counts: dict[str, list[int]] = {}
         self._recent: dict[str, tuple[tuple[float, str, bool], ...]] = {}   # hotkey -> last decided
         self._useful_24h: dict[str, int] = {}
         self._snapshot: dict[str, YieldStats] = {}
@@ -226,7 +234,17 @@ class SessionYieldLedger:
                 if taken >= int(self._capacity_allowance(str(hotkey))):
                     logger.info("yield: capacity verdicts of %s in window %d at their cap", str(hotkey)[:12], window)
                     return
-        self._verdict(precommit_sha256, hotkey, CAPACITY)
+        if self._verdict(precommit_sha256, hotkey, CAPACITY):
+            with self._lock:
+                self._capacity_counts.setdefault(str(hotkey), [0, 0])[0] += 1
+
+    def capacity_counts(self, hotkey: str | None = None):
+        """``(verdicts, neutral sessions)`` of a hotkey since this process started, or, without one, every
+        hotkey's (a copy)."""
+        with self._lock:
+            if hotkey is not None:
+                return tuple(self._capacity_counts.get(str(hotkey), (0, 0)))
+            return {key: tuple(value) for key, value in self._capacity_counts.items()}
 
     def allow_capacity_verdicts(self, allowance: Callable[[str], int]) -> None:
         """The per-hotkey, per-window cap on capacity verdicts (the wiring passes ``YieldQuota.groups_allowed``)."""
@@ -245,20 +263,22 @@ class SessionYieldLedger:
                           stage: str) -> None:
         self._verdict(precommit_sha256, hotkey, HANDED_BACK)
 
-    def _verdict(self, sha: str, hotkey: str, verdict: str) -> None:
+    def _verdict(self, sha: str, hotkey: str, verdict: str) -> bool:
+        """Whether the verdict was taken (it ranks above the precommit's current one)."""
         with self._lock:
             sessions = self._pending.get(sha)
             if not sessions:
-                return                      # no pending session of it: nothing a verdict could decide
+                return False                # no pending session of it: nothing a verdict could decide
             if any(owner != hotkey for owner in sessions.values()):
                 logger.warning("yield: a %s verdict of %s names a precommit of another hotkey; ignored",
                                verdict, str(hotkey)[:12])
-                return
+                return False
             current = self._verdicts.get(sha)
             if current is not None and _RANK[current[0]] >= _RANK[verdict]:
-                return
+                return False
             self._verdicts[sha] = (verdict, hotkey)
             self._journal.append(("verdict", sha, hotkey, verdict, float(self._clock())))
+            return True
 
     def pending_windows(self) -> tuple[int, ...]:
         with self._lock:
@@ -306,7 +326,8 @@ class SessionYieldLedger:
                 if fault is None and not used and verdict == OURS:
                     fault = "validator_refused"
                 if fault is None and not used and verdict == CAPACITY and unformed and status == GRADED:
-                    fault = "capacity_refused"     # it ran, and the group could not be formed
+                    fault = CAPACITY_REFUSED       # it ran, and the group could not be formed
+                    self._capacity_counts.setdefault(hotkey, [0, 0])[1] += 1
                 if fault is None and not used and resumed and verdict != REFUSED:
                     fault = "window_resumed"
                 outcome = FAULT if fault else USEFUL if used else WASTED
@@ -339,7 +360,7 @@ class SessionYieldLedger:
     def _stats_of(rows: tuple[tuple[float, str, bool], ...], useful_24h: tuple[int, float]) -> YieldStats:
         last = heapq.nlargest(YIELD_SESSIONS, rows, key=lambda row: (row[0], row[1]))
         return YieldStats(useful=sum(1 for row in last if row[2]), decided=len(last), useful_24h=int(useful_24h[0]),
-                          useful_s_24h=float(useful_24h[1]))
+                          useful_s_24h=float(useful_24h[1]), capacity_neutral=int(useful_24h[2]))
 
     # --- the worker thread's side ---
     def flush(self, now: float | None = None) -> int:
@@ -361,7 +382,8 @@ class SessionYieldLedger:
             recent, useful = {}, {}
             for hotkey in hotkeys:
                 recent[hotkey], useful[hotkey] = self._read_hotkey(hotkey, now)
-            snapshot = {hotkey: self._stats_of(rows, useful[hotkey]) for hotkey, rows in recent.items() if rows}
+            snapshot = {hotkey: self._stats_of(rows, useful[hotkey]) for hotkey, rows in recent.items()
+                        if rows or useful[hotkey][2]}
             # Replaced whole (never mutated in place): the loop's readers see the old or the new snapshot.
             self._recent, self._useful_24h, self._snapshot = recent, useful, snapshot
             self.version += 1
@@ -395,15 +417,19 @@ class SessionYieldLedger:
         else:
             raise ValueError(f"unknown yield journal entry {kind!r}")
 
-    def _read_hotkey(self, hotkey: str, now: float) -> tuple[tuple[tuple[float, str, bool], ...], tuple[int, float]]:
+    def _read_hotkey(self, hotkey: str, now: float) -> tuple[tuple[tuple[float, str, bool], ...],
+                                                             tuple[int, float, int]]:
         rows = self._db.execute(
             "SELECT opened_at, session_id, outcome FROM yield_sessions WHERE hotkey=? AND outcome IN (?, ?) "
             "ORDER BY opened_at DESC, session_id DESC LIMIT ?", (hotkey, USEFUL, WASTED, YIELD_SESSIONS)).fetchall()
         count, seconds = self._db.execute(
             "SELECT COUNT(*), COALESCE(SUM(held_s), 0) FROM yield_sessions WHERE hotkey=? AND outcome=? "
             "AND decided_at>=?", (hotkey, USEFUL, now - USEFUL_HORIZON_S)).fetchone()
+        (neutral,) = self._db.execute(
+            "SELECT COUNT(*) FROM yield_sessions WHERE hotkey=? AND outcome=? AND fault=?",
+            (hotkey, FAULT, CAPACITY_REFUSED)).fetchone()
         return (tuple((float(at), str(sid), outcome == USEFUL) for at, sid, outcome in rows),
-                (int(count), float(seconds)))
+                (int(count), float(seconds), int(neutral)))
 
 
     def _prune(self, now: float) -> None:
@@ -438,7 +464,7 @@ class SessionYieldLedger:
         for (hotkey,) in self._db.execute("SELECT DISTINCT hotkey FROM yield_sessions").fetchall():
             self._recent[hotkey], self._useful_24h[hotkey] = self._read_hotkey(hotkey, now)
         self._snapshot = {hotkey: self._stats_of(rows, self._useful_24h[hotkey])
-                          for hotkey, rows in self._recent.items() if rows}
+                          for hotkey, rows in self._recent.items() if rows or self._useful_24h[hotkey][2]}
         row = self._db.execute("SELECT value FROM yield_meta WHERE key='accepting'").fetchone()
         self._accepting = int(row[0]) if row is not None and row[0] else None
 

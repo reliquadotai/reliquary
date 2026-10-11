@@ -227,7 +227,7 @@ async def test_start_reconciles_the_restored_book(tmp_path):
 def test_without_a_yield_path_nothing_changes(tmp_path):
     services, _ = _services(tmp_path)
     assert services.ledger is None and services.issuer._events is None and not services.issuer._record_faults
-    assert services.issuer._operator_of is None
+    assert services.issuer._operator_of is None and services.issuer._entitled is None
 
 
 # --- the validator opens the ledger beside its runtime ---
@@ -263,6 +263,7 @@ async def test_the_validator_opens_the_ledger_beside_its_runtime(tmp_path, monke
         assert services.window_uses == service._service_runtime.window_uses
         assert services.operator_of("5Hot") == "5Cold" and services.operator_of("5Other") is None
         assert services.issuer._operator_of("5Hot") == "5Cold"     # a saturation is judged by operator
+        assert services.issuer._entitled == services.quota.sessions_allowed    # within it, a saturation is ours
         assert len(service._episode_tasks) == 5            # and the yield settlement (and the served-env watch)
     finally:
         await service._stop_episode_services()
