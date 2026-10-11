@@ -25,7 +25,8 @@ from reliquary.protocol.signatures import build_episode_precommit_binding, build
 logger = logging.getLogger(__name__)
 
 RL_PREFIX = "/rl"
-RL_THROTTLES = VALIDATOR_THROTTLES | {"open_busy", "environment_not_served", "sandbox_saturated", "open_queue_full"}
+RL_THROTTLES = VALIDATOR_THROTTLES | {"open_busy", "environment_not_served", "sandbox_saturated", "open_queue_full",
+                                      "environment_unserved"}
 """The RL routes' named 503s: the validator is serving (an unserved env may be loading, the sandbox fleet may be
 saturated); the seed is reopened, and they never count as "not serving"."""
 RL_FINAL_REFUSALS = frozenset({"precommit_unknown", "precommit_stale", "seed_out_of_pool", "engagement_taken",

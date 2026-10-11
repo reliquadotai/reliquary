@@ -37,7 +37,7 @@ from reliquary.sandbox.rl_engagements import (
     EpisodeEnvironmentView, NoOutcomes, OpenQuota, RlEpisodeEngagements, SessionOutcomes, SessionQuota,
 )
 from reliquary.sandbox.rl_yield import held_seconds
-from reliquary.sandbox.sessions import FanOutEvents, SandboxPolicy, SessionBook, SessionIssuer
+from reliquary.sandbox.sessions import FanOutEvents, Refusal, SandboxPolicy, SessionBook, SessionIssuer
 from reliquary.validator.corpus_registration import NOT_REGISTERED
 from reliquary.validator.episode_admission import EpisodeGroupChecker
 from reliquary.validator.episode_intake import EpisodeGroupIntake
@@ -54,6 +54,10 @@ RL_GROUPS_IN_FLIGHT = GROUPS_IN_FLIGHT     # the intake's per-operator check cap
 PRECOMMIT_PRUNE_SECONDS = 3600.0
 MIN_PRECOMMIT_RETENTION_S = 2 * 86_400
 YIELD_FLUSH_SECONDS = 10.0
+BOOT_FLEET_WAIT_S = 120.0
+"""At start, how long the validator waits for a machine serving each episode env before starting it degraded."""
+POLL_SECONDS_FOR_SERVED = 5.0
+"""How often a degraded env is re-checked (the fleet's poll period; kept here: no fleet import at module level)."""
 NO_PER_KEY_CAP = 1 << 30
 """The policy's per-hotkey live and hourly-open caps when the yield quota decides: no fixed per-key maximum."""
 
@@ -147,15 +151,21 @@ class RlEpisodeServices:
     restore_attempts: int = RESTORE_ATTEMPTS
     restore_timeout_s: float = RESTORE_TIMEOUT_S
     restore_backoff_s: float = RESTORE_BACKOFF_S
+    served: dict = field(default_factory=dict, repr=False)
+    boot_wait_s: float | None = None
+    unserved_envs: set = field(default_factory=set)
     _loop: Any = field(default=None, repr=False)
     _tasks: set = field(default_factory=set, repr=False)
 
     async def start(self) -> None:
         """Before serving: the directory read once (the fleet retries on its own), then the RL sessions
         restored (bounded, retried). A restore that still fails raises: a validator that lost its sessions
-        would hand a taken seed out again."""
+        would hand a taken seed out again. With ``boot_wait_s``, the episode envs no machine serves after that
+        wait start degraded (``require_served``): the validator starts anyway."""
         self._loop = asyncio.get_running_loop()
         await self.fleet.refresh_if_due()
+        if self.boot_wait_s is not None:
+            await self.require_served(self.boot_wait_s)
         restored = 0
         for attempt in range(1, self.restore_attempts + 1):
             try:
@@ -190,7 +200,70 @@ class RlEpisodeServices:
                 self.prune_precommits_forever(PRECOMMIT_PRUNE_SECONDS)]
         if self.ledger is not None:
             jobs.append(self.yield_forever(YIELD_FLUSH_SECONDS))
+        if self.boot_wait_s is not None:
+            jobs.append(self.watch_served_forever(POLL_SECONDS_FOR_SERVED))
         return jobs
+
+    # --- episode envs no machine serves: a degraded start, never a refusal to start ---
+    def unserved(self) -> dict[str, tuple[str, str, str | None]]:
+        """The episode envs no fresh active machine serves at their pinned identity (and options)."""
+        return {name: served for name, served in self.served.items()
+                if not self.fleet.serving(served[0], served[1], env_options_sha256=served[2])}
+
+    def _alert_unserved(self, missing: Mapping[str, tuple[str, str, str | None]]) -> None:
+        def reported(sandbox_env: str, package: str) -> str:
+            packages = self.fleet.reported_packages(sandbox_env)
+            text = ", ".join(packages) or "nothing"
+            if package in packages:
+                text += (" (a machine names it but is stale, drained, publishes other options or no valid "
+                         "resources)")
+            return text
+
+        details = "; ".join(
+            f"{name}: the order pins {package} for {sandbox_env}, machines report {reported(sandbox_env, package)}"
+            for name, (sandbox_env, package, _options) in sorted(missing.items()))
+        logger.error("ALERT no sandbox machine serves these episode environments: %s; they are refused "
+                     "(environment_unserved) until a machine serves them", details)
+
+    async def require_served(self, timeout_s: float) -> None:
+        """At start: poll the machines until every episode env is served, for at most ``timeout_s``; the envs
+        still unserved then start degraded (refused retryably, an ALERT). Never raises."""
+        deadline = time.monotonic() + float(timeout_s)
+        missing: dict = {}
+        while True:
+            try:
+                await self.fleet.poll_once()
+                missing = self.unserved()
+            except Exception:
+                logger.exception("the served check failed at start")
+                missing = dict(self.served)
+            if not missing or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(POLL_SECONDS_FOR_SERVED)
+        self.unserved_envs = set(missing)
+        if missing:
+            self._alert_unserved(missing)
+
+    def serving_refusal(self, environment: str) -> Refusal | None:
+        """``environment_unserved`` (retryable) for a degraded env; None otherwise."""
+        if environment in self.unserved_envs:
+            return Refusal("environment_unserved", {"environment": environment},
+                           retry_after=self.book.policy.retry_after_s)
+        return None
+
+    async def watch_served_forever(self, every_s: float) -> None:
+        """While an env is degraded: re-check every ``every_s``; serve it again once a machine reports it."""
+        while True:
+            try:
+                if self.unserved_envs:
+                    missing = self.unserved()
+                    recovered = self.unserved_envs - set(missing)
+                    if recovered:
+                        logger.warning("episode environments served again: %s", ", ".join(sorted(recovered)))
+                    self.unserved_envs = self.unserved_envs & set(missing)
+            except Exception:
+                logger.exception("the served check failed")
+            await asyncio.sleep(every_s)
 
     async def stop(self, timeout: float = STOP_TIMEOUT_S) -> None:
         pending = [task for task in self._tasks if not task.done()]
@@ -385,6 +458,7 @@ def build_rl_episode_services(
     max_preauth_opens: int | None = None,
     yield_path=None, ledger=None, operator_of: Callable[[str], str | None] | None = None,
     window_uses: Callable[[int], Any] | None = None, require_resources: bool = False,
+    boot_wait_s: float | None = None,
 ) -> RlEpisodeServices:
     """``environments``: the order's episode envs as loaded (``SignedEpisodeEnvironment``; their
     ``source`` is the env's task source); ``renderer_for(policy)``: the turn renderer of the policy's tokenizer over
@@ -398,7 +472,9 @@ def build_rl_episode_services(
     validator opens it in a worker thread); ``operator_of(hotkey)``: the chain operator, read only to tell
     whether a saturation was the refused miner's own doing; ``window_uses``: ``ServiceRuntime.window_uses``
     (blocking; called in a worker thread); ``require_resources``: RL sessions go only to machines reporting their
-    CPU and memory ``resources`` (production; a machine without them is logged once and gets none)."""
+    CPU and memory ``resources`` (production; a machine without them is logged once and gets none);
+    ``boot_wait_s``: at start, wait at most this long for a machine serving each episode env, then start the
+    unserved ones degraded (None: no check)."""
     from reliquary_sandbox.attest import Ed25519TokenVerifier, Signer, load_private_key
 
     from reliquary.infrastructure import sandbox_store
@@ -506,14 +582,20 @@ def build_rl_episode_services(
                                 sessions=issuer, seen=book.submitted_ids, outcomes=outcomes,
                                 window_open=window_open, **_check_caps(quota, clock))
     logger.info("rl episode services built for %s (validator key %s)", sorted(policies), signer.key_id)
-    return RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,
+    services = RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,
                              issuer=issuer, routers=(sessions_router, precommit_router), intake=intake,
                              environments=tuple(sorted(policies)), runtime=runtime, outcomes=outcomes,
                              clock=clock, precommit_retention_s=float(precommit_retention_s),
                              ledger=ledger, quota=quota, queue=queue, window_uses=window_uses, policies=dict(policies),
-                             window_open=window_open, current_window=current_window, operator_of=operator_of)
+                             window_open=window_open, current_window=current_window, operator_of=operator_of,
+                             served={name: (p.sandbox_env, p.env_package,
+                                            getattr(environments[name].source, "options_sha256", None))
+                                     for name, p in policies.items()},
+                             boot_wait_s=boot_wait_s)
+    engagements.serving_refusal = services.serving_refusal
+    return services
 
 
-__all__ = ["MIN_PRECOMMIT_RETENTION_S", "NO_PER_KEY_CAP", "RL_GROUPS_IN_FLIGHT", "RL_PREFIX", "YIELD_FLUSH_SECONDS", "RlEpisodeServices",
+__all__ = ["BOOT_FLEET_WAIT_S", "MIN_PRECOMMIT_RETENTION_S", "NO_PER_KEY_CAP", "RL_GROUPS_IN_FLIGHT", "RL_PREFIX", "YIELD_FLUSH_SECONDS", "RlEpisodeServices",
            "build_rl_episode_services", "episode_group_sizes", "episode_stop_set_refusal", "rl_registration", "rl_sandbox_policy",
            "stop_ids_from_metadata"]

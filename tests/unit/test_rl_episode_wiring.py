@@ -149,6 +149,8 @@ def _service(tmp_path, monkeypatch, *, runtime, key=True, stops=STOPS):
 
     fake = _FakeMultiObjectR2()
     monkeypatch.setattr(sandbox_store, "get_s3_client", lambda **kw: fake)
+    # no machine in these tests: the boot wait for a serving machine would only delay the degraded start
+    monkeypatch.setattr("reliquary.validator.rl_sandbox_wiring.BOOT_FLEET_WAIT_S", 0.0)
     if key:
         validator_dir = tmp_path / "validator-key"
         validator_dir.mkdir(parents=True, exist_ok=True)
@@ -193,7 +195,9 @@ async def test_an_episode_order_mounts_its_routes_and_its_intake(tmp_path, monke
     try:
         assert PATHS <= _paths(service.server.app)
         assert service.server._episode_intake is service._episode_services.intake
-        assert len(service._episode_tasks) == 3            # fleet, session maintenance, precommit pruning
+        # fleet, session maintenance, precommit pruning, the served-env watch (the boot wait is on)
+        assert len(service._episode_tasks) == 4
+        assert service._episode_services.boot_wait_s == 0.0      # the service passes BOOT_FLEET_WAIT_S
         intake = service._episode_services.intake
         # wiring: the intake takes groups only for a window this process noted
         assert intake._window_open(5) is False

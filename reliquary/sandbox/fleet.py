@@ -429,7 +429,7 @@ class Fleet:
             return resources
         if machine_id not in self._no_resources_logged:
             self._no_resources_logged.add(machine_id)
-            logger.error("sandbox machine %s reports no valid resources: it gets no RL session "
+            logger.error("ALERT sandbox machine %s reports no valid resources: it gets no RL session "
                          "(set episode_cpu_millis_total and episode_memory_bytes_total on it)", machine_id)
         return None
 
@@ -587,22 +587,69 @@ class Fleet:
                 continue
             current = entry.machine_id not in self.drained and now - document["at"] <= HEARTBEAT_MAX_AGE_S
             fresh = fresh or current
-            if self._serves(entry, document, **kw) and self._could_hold(entry.machine_id, document, reserve):
+            if not self._serves(entry, document, **kw):
+                continue
+            hold = self._could_hold(entry.machine_id, document, reserve)
+            if hold is None:
+                unknown = True              # resources required, none valid reported: our configuration
+            elif hold:
                 if current:
                     return True
                 unknown = True              # it served it when last heard: drained or stale for now
         return None if unknown or not fresh else False
 
-    def _could_hold(self, machine_id: str, document: Mapping[str, Any], reserve: Mapping[str, Any] | None) -> bool:
+    def _could_hold(self, machine_id: str, document: Mapping[str, Any],
+                    reserve: Mapping[str, Any] | None) -> bool | None:
         """Whether the machine could ever hold this session by its resources (its box size and totals, its load
-        aside); always True for a placement judged by slots."""
+        aside); always True for a placement judged by slots; None when it is judged by resources but reports no
+        valid ``resources`` block (an operator's configuration miss, ALERTed: never a final verdict for a seed)."""
         if not self._by_resources(document, reserve):
             return True
         resources = self._resources(machine_id, document)
         if resources is None:
-            return False
+            return None
         need = reservation_need(resources, reserve)
         return need is not None and need[0] <= resources["cpu_millis"] and need[1] <= resources["memory_bytes"]
+
+    def serving(self, env: str, env_package: str, *, env_options_sha256: str | None = None,
+                lock_sha256: str | None = None, min_present: int | None = None,
+                now: float | None = None) -> list[str]:
+        """The active, fresh, undrained machines whose report serves ``env`` at exactly ``env_package`` (with a
+        valid ``resources`` block when resources are required); with ``env_options_sha256``, under that options
+        digest; with ``lock_sha256``, under that image lock with at least ``min_present`` of its locked images
+        present (default: all of them). Memory reads only."""
+        now = self._clock() if now is None else now
+        if not self.directory_ready(now):
+            return []
+        found = []
+        for entry in self._directory.entries():
+            if entry.status != "active" or entry.machine_id in self.drained:
+                continue
+            document = self._reports.get(entry.machine_id)
+            if document is None or now - document["at"] > HEARTBEAT_MAX_AGE_S:
+                continue
+            if (document.get("env_packages") or {}).get(env) != env_package:
+                continue
+            if self.resources_required and self._resources(entry.machine_id, document) is None:
+                continue
+            if (env_options_sha256 is not None
+                    and (document.get("env_options_sha256") or {}).get(env) != env_options_sha256):
+                continue
+            if lock_sha256 is not None:
+                lock = (document.get("env_image_locks") or {}).get(env)
+                if (not isinstance(lock, Mapping) or lock.get("sha256") != lock_sha256
+                        or type(lock.get("images")) is not int or type(lock.get("present")) is not int):
+                    continue
+                wanted = lock["images"] if min_present is None else min(int(min_present), lock["images"])
+                if lock["present"] < wanted:
+                    continue
+            found.append(entry.machine_id)
+        return sorted(found)
+
+    def reported_packages(self, env: str) -> list[str]:
+        """Every ``env_package`` the accepted reports name for ``env`` (for an operator's error message)."""
+        return sorted({str(package) for document in list(self._reports.values())
+                       if (package := (document.get("env_packages") or {}).get(env)) is not None})
 
     def nearest(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
                 now: float, env_options_sha256: str | None = None,

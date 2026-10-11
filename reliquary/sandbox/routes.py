@@ -110,6 +110,7 @@ REFUSAL_STATUS: dict[str, int] = {
     # no machine could ever take (final for that seed)
     "sandbox_saturated": 503, "open_queue_full": 503, "open_queue_key_full": 429, "open_queued": 429,
     "task_unplaceable": 409,
+    "environment_unserved": 503,          # a degraded episode env (no machine serves it yet): retry
     # this validator cannot answer now: retry
     "sandbox_capacity": 503, "directory_unavailable": 503, "store_unavailable": 503,
     "ledger_unavailable": 503, "task_unavailable": 503, "registration_unavailable": 503,

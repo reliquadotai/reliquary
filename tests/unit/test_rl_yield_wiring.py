@@ -261,7 +261,7 @@ async def test_the_validator_opens_the_ledger_beside_its_runtime(tmp_path, monke
         assert (tmp_path / "folder" / "rl-yield.sqlite3").exists()
         assert services.window_uses == service._service_runtime.window_uses
         assert services.operator_of("5Hot") == "5Cold" and services.operator_of("5Other") is None
-        assert len(service._episode_tasks) == 4            # and the yield settlement
+        assert len(service._episode_tasks) == 5            # and the yield settlement (and the served-env watch)
     finally:
         await service._stop_episode_services()
     assert services.ledger._closed

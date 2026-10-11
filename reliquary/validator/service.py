@@ -7936,7 +7936,9 @@ class ValidationService:
             spec = ENVIRONMENT_SPECS.get(name)
             if spec is None or spec.interaction_mode != "signed_episode":
                 raise ValueError(f"{name} has an episode block but is not a registered signed-episode environment")
-        from reliquary.validator.rl_sandbox_wiring import build_rl_episode_services, rl_registration
+        from reliquary.validator.rl_sandbox_wiring import (
+            BOOT_FLEET_WAIT_S, build_rl_episode_services, rl_registration,
+        )
         from reliquary.validator.sandbox_wiring import SandboxValidatorConfig
 
         toploc = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
@@ -7963,7 +7965,8 @@ class ValidationService:
                 precommit_retention_s=self._episode_precommit_retention_s(),
                 registration=rl_registration(self.server), ledger=ledger,
                 operator_of=self._episode_operator_of,
-                window_uses=None if ledger is None else runtime.window_uses, require_resources=True)
+                window_uses=None if ledger is None else runtime.window_uses, require_resources=True,
+                boot_wait_s=BOOT_FLEET_WAIT_S)
             for router in services.routers:
                 self.server.app.include_router(router)
             await services.start()

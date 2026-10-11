@@ -162,7 +162,8 @@ def test_a_machine_without_resources_gets_no_rl_session_once_resources_are_requi
         assert fleet.pick(now=NOW, reserve=reserve, **PICK) is None
         fleet.pick(now=NOW, reserve=reserve, **PICK)
     assert sum("reports no valid resources" in r.message for r in caplog.records) == 1   # once per machine
-    assert fleet.could_place(now=NOW, reserve=reserve, **PICK) is False
+    # a configuration miss of ours: retryable (cannot be judged), never final for the seed
+    assert fleet.could_place(now=NOW, reserve=reserve, **PICK) is None
     assert fleet.nearest(now=NOW, reserve=reserve, **PICK) is None
     assert fleet.pick(now=NOW, **PICK) is not None                      # corpus: slots, unchanged
 

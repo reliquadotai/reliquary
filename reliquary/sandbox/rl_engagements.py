@@ -133,6 +133,8 @@ class RlEpisodeEngagements:
         self._current_window = current_window
         self._book = book
         self._quota = quota or OpenQuota()
+        # set by the RL wiring: a degraded (unserved) episode env is refused retryably before any placement
+        self.serving_refusal: Callable[[str], Refusal | None] | None = None
 
     def _stale(self, window: int) -> Refusal | None:
         from reliquary.constants import FILL_CLOSED_MAX_SECONDS
@@ -185,6 +187,10 @@ class RlEpisodeEngagements:
         view = self._environments(precommit.environment)
         if view is None:
             return Refusal("environment_not_served", {"environment": precommit.environment})
+        if self.serving_refusal is not None:
+            refusal = self.serving_refusal(precommit.environment)      # a degraded env: no machine serves it
+            if refusal is not None:
+                return refusal
         policy = view.policy
         if seed >= policy.pool_seeds:
             return Refusal("seed_out_of_pool", {"seed_index": seed, "pool_seeds": policy.pool_seeds})
@@ -240,6 +246,7 @@ class RlEpisodeEngagements:
             engagement=name, env=policy.sandbox_env, split=policy.split, index=precommit.task_index,
             checkpoint=precommit.checkpoint, image=task.image, env_package=policy.env_package,
             budgets=budgets, exclusive=True, still_valid=still_valid, prepare_timeout_s=prepare,
+            env_options_sha256=getattr(task, "env_options_sha256", None),
             # the session's agent box on its machine: the task's CPUs (None: the machine's box) and memory budget
             reserve={"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])})
 
