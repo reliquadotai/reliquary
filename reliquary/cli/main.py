@@ -2887,6 +2887,24 @@ def _resolve_cli_environment_mix(value: str, *, service_contract=None) -> list[t
     return [(name, B_BATCH if name in bridged else resolved[name]) for name in names]
 
 
+def _resolve_legacy_miner_mix(value: str) -> list[tuple[str, int]]:
+    """The legacy miner's env mix: installed envs of the protocol profile only. It never mines a signed-episode
+    env, so an env described by an RL order's public catalogue is never routed here: its name is refused with
+    a pointer to ``mine-episodes``, which builds it from the announcement."""
+    from reliquary.environment.registry import find_environment_spec
+
+    try:
+        return _resolve_cli_environment_mix(value)
+    except ValueError as exc:
+        unknown = [name for name in (part.strip() for part in value.split(",")) if name
+                   and find_environment_spec(name) is None]
+        if not unknown:
+            raise
+        raise ValueError(f"{exc}. {', '.join(unknown)} is not installed: a signed-episode env of an RL order "
+                         f"(described by its catalogue) is mined by `reliquary mine-episodes --episode-envs`, "
+                         f"never by `mine`") from exc
+
+
 def _raise_open_file_limit() -> None:
     """Lift the soft RLIMIT_NOFILE to the hard cap; Docker's 1024 default
     starved the controller of sockets (EMFILE) on 2026-09-22."""
@@ -3256,7 +3274,7 @@ def mine(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    mix = _resolve_cli_environment_mix(environments)
+    mix = _resolve_legacy_miner_mix(environments)
     env_names = [name for name, _target in mix]
     logger.info(
         "Starting Reliquary miner (network=%s, netuid=%d, envs=%s)",
@@ -3447,7 +3465,13 @@ def mine(
 @app.command("mine-episodes")
 def mine_episodes(
     episode_envs: str = typer.Option(
-        ..., "--episode-envs", help="Comma-separated signed-episode environments to mine"),
+        ..., "--episode-envs",
+        help="Comma-separated signed-episode environments to mine: registered ones, or envs the order's public "
+             "catalogue describes (built from the announcement; the installed env package must be the order's "
+             "pin). An env added to the running run is mined once the announcement names it: add its name "
+             "after it is announced, and restart the miner (the stack binds its prompts when it is built). One "
+             "miner engine serves envs with equal episode caps only: an env with other caps needs a miner "
+             "process of its own"),
     validator_url: str = typer.Option(..., "--validator-url", help="The RL validator's URL"),
     validator_hotkey: str = typer.Option(
         ..., "--validator-hotkey",

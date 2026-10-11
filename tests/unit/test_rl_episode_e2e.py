@@ -77,9 +77,10 @@ from reliquary.validator.sandbox_wiring import SandboxValidatorConfig  # noqa: E
 from reliquary.validator.server import ValidatorServer, _QueuedAuctionSubmission, _UploadPrecommitReceipt  # noqa: E402
 from reliquary.validator.service import ValidationService  # noqa: E402
 from reliquary.validator.weight_only import WeightOnlyValidator  # noqa: E402
+from reliquary.environment.bridged_episode import BridgedEpisodeSource  # noqa: E402
 from tests.unit.episode_v2_fixtures import (  # noqa: E402
-    EPISODE, POOL, REVISION, TASK, WINDOW_BEACON, episode_contract, make_test_episode_env,
-    register_episode_env,
+    CATALOGUE, CATALOGUE_IMAGES, ENV_PACKAGE, EPISODE, POOL, PROMPT_TEXT, REVISION, TASK, WINDOW_BEACON,
+    episode_contract, make_test_episode_env, register_episode_env,
 )
 from tests.unit.service_v2_fixtures import qualification_v2  # noqa: E402
 from tests.unit.test_corpus_service import _r2_client, fake_r2  # noqa: E402, F401
@@ -95,6 +96,10 @@ FORGER = bt.Keypair.create_from_uri("//Charlie")
 URL = "http://validator.test"
 RANDOMNESS = "cd" * 32                     # the window's randomness (``test_episode_mining.miner_state``)
 FORGED_TASK = TASK + 1
+# The catalogue changes the order's sha256, so every public pool: in the catalogued order's pool of task
+# TASK + 1, the draws of the forger's M lowest seeds all pick the answer (nothing to forge in its group). Task
+# TASK + 4's mix both commands among them, as task TASK + 1 does in the plain order.
+CATALOGUED_FORGED_TASK = TASK + 4
 PICKS, SLOTS = protocol_slot_geometry()
 TOPLOC = TOPLOC_DEPLOYED_DEFAULTS
 CAPACITY = 4 * M_ROLLOUTS                  # both pools live at once on the one machine
@@ -364,8 +369,8 @@ class Tokenizer:
     eos_token_id = TERM
 
 
-def make_runtime(path) -> ServiceRuntime:
-    contract = episode_contract()
+def make_runtime(path, *, catalogue=None) -> ServiceRuntime:
+    contract = episode_contract() if catalogue is None else episode_contract(catalogue=catalogue)
     path.mkdir(parents=True, exist_ok=True)
     rt = ServiceRuntime(path / "runtime.sqlite3", contract, qualification_v2(contract), now=time.time() - 10,
                         drand_round_at=lambda instant: CLOCK["round"])
@@ -535,11 +540,12 @@ class Miners:
             async_http=lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=self.validator.server.app)),
             package_refusal=lambda policy: None)
 
-    def run(self, keypair, cheat, task):
-        """``run_episode_miner`` for ``keypair``, offered the one task ``task`` (all others in cooldown)."""
+    def run(self, keypair, cheat, task, *, task_prompts=None):
+        """``run_episode_miner`` for ``keypair``, offered the one task ``task`` (all others in cooldown).
+        ``task_prompts``: the miner's prompts (the registry's by default)."""
         stop = asyncio.Event()
         state = miner_state(self.validator.rt, cooldown=set(range(1000)) - {task}, prompt_range=(0, 1000))
-        config = em.EpisodeMinerConfig(environments=(EPISODE,), validator_url=URL,
+        config = em.EpisodeMinerConfig(environments=em.parse_episode_environments(EPISODE), validator_url=URL,
                                        validator_hotkey=VALIDATOR.ss58_address, groups_in_flight=1)
 
         async def read_state():
@@ -550,8 +556,39 @@ class Miners:
 
         task_ = asyncio.ensure_future(em.run_episode_miner(
             config=config, wallet=SimpleNamespace(hotkey=keypair), stop=stop, deps=self.deps(keypair, cheat),
-            task_prompts=em.EpisodeTaskPrompts([EPISODE]), read_state=read_state, sleep=poll))
+            task_prompts=task_prompts or em.EpisodeTaskPrompts([EPISODE]), read_state=read_state, sleep=poll))
         return stop, task_
+
+
+class CatalogueVerifiersEnv:
+    """The verifiers env a miner installs for the order's catalogue: every task's prompt is the validator's
+    (``PROMPT_TEXT``), every task's image the fake gateway's, and its lock is the catalogue's."""
+
+    def __init__(self, split):
+        self.split = split
+        self.lock = SimpleNamespace(images=dict(CATALOGUE_IMAGES))
+
+    def taskset(self, split):
+        assert split == self.split
+        return list(range(1000))
+
+    def task(self, split, index):
+        assert split == self.split
+        return SimpleNamespace(data=SimpleNamespace(prompt=PROMPT_TEXT))
+
+    def sandbox_task(self, split, index):
+        return SimpleNamespace(image=testing.FAKE_IMAGE, limits=SimpleNamespace(cpus=None, memory_bytes=None))
+
+
+def catalogue_prompts():
+    """A miner that knows the env from the order's catalogue only: the static registry is never used."""
+    def forbidden(name):
+        raise AssertionError(f"the miner used the static registry for {name}")
+
+    def build_source(config):
+        return BridgedEpisodeSource(config, env=CatalogueVerifiersEnv(config.rl_split), identity=ENV_PACKAGE)
+
+    return em.EpisodeTaskPrompts([EPISODE], load=forbidden, build_source=build_source)
 
 
 # -- helpers ------------------------------------------------------------------------------------------------------
@@ -609,30 +646,39 @@ def quick(monkeypatch):
 # -- the test --------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("catalogued", [False, True], ids=["registered", "catalogued"])
 async def test_two_miners_one_window_precommit_sessions_choice_proof_audit_settlement_replay(
-        wide_gateway, r2, tmp_path, monkeypatch):  # noqa: F811
+        wide_gateway, r2, tmp_path, monkeypatch, catalogued):  # noqa: F811
+    """``catalogued``: the order's entry carries a public catalogue, and the miners know the env from it only
+    (their prompts are built from the announcement); the validator side is the same."""
     register_episode_env(monkeypatch)
     await sandbox_store.register_machine(
         machine_id=wide_gateway.settings.machine_id, address=wide_gateway.url, provider="local",
         capacity=CAPACITY, key_id=wide_gateway.machine.key_id, public_key_b64=wide_gateway.machine.public_key_b64,
         valid_from=0, now=time.time())
-    rt = make_runtime(tmp_path / "rt")
+    rt = make_runtime(tmp_path / "rt", catalogue=CATALOGUE if catalogued else None)
     v = Validator(wide_gateway, rt, tmp_path)
     await v.start()
     miners = Miners(v, asyncio.get_running_loop())
     b, services, server = v.batcher, v.services, v.server
     two_m = 2 * M_ROLLOUTS
     try:
-        honest_stop, honest = miners.run(HONEST, None, TASK)
-        forger_stop, forger = miners.run(FORGER, forger_cheat, FORGED_TASK)
+        prompts = {key: catalogue_prompts() if catalogued else None for key in ("honest", "forger")}
+        honest_stop, honest = miners.run(HONEST, None, TASK, task_prompts=prompts["honest"])
+        forged_task = CATALOGUED_FORGED_TASK if catalogued else FORGED_TASK
+        forger_stop, forger = miners.run(FORGER, forger_cheat, forged_task, task_prompts=prompts["forger"])
 
         # 1. Both groups reach the batcher: every seed of each 2M pool opened once, played and closed final.
         await until(lambda: len(v.receipts) >= 2 and all(r.terminal for r in v.receipts[:2]), 300,
                     "both groups admitted")
+        if catalogued:
+            for prompts_ in prompts.values():
+                source = prompts_.sources[EPISODE]
+                assert isinstance(source, BridgedEpisodeSource) and source.config.rl_split == CATALOGUE["rl_split"]
         for receipt in v.receipts[:2]:
             # Admitted into the pool (the miner reads it on ``/miner-verdicts``): its kept episodes are its group.
             assert receipt.outcome.accepted and receipt.outcome.reason is RejectReason.ACCEPTED, receipt.outcome
-        for hotkey, task in ((HONEST.ss58_address, TASK), (FORGER.ss58_address, FORGED_TASK)):
+        for hotkey, task in ((HONEST.ss58_address, TASK), (FORGER.ss58_address, forged_task)):
             precommit = rt.episode_precommit_sha(window=1, environment=EPISODE, task_index=task, hotkey=hotkey)
             sessions = sessions_of(services, hotkey)
             assert sorted(sessions) == list(range(two_m))

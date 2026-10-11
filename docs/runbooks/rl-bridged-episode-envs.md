@@ -81,3 +81,28 @@ the image nor in the protocol profile. The validator then:
    - the row count, compared with `dataset.rows`.
 
 A catalogue env whose name is also an installed env is refused. A bridged env needs a name of its own.
+
+## 4. Mining it
+
+Miners need no code for a catalogue env either. `reliquary mine-episodes --episode-envs <name>` accepts the
+name of an env the order's catalogue describes. When the stack is built, the miner reads the announcement and
+builds the same task source as the validator, from the same catalogue, over its own install of the env
+package. It refuses to start (exit 4) when:
+
+- the installed identity is not the order's `episode.env_package`;
+- the installed lock is not the catalogue's `image_lock_sha256`;
+- the announcement does not name the env.
+
+So a miner installs exactly the pinned wheel (`pip install --no-deps`) and the reliquary-sandbox bridge. The
+legacy `mine` command never mines these envs and refuses their names.
+
+An env added to a running run (a schedule row carrying `added`) is mined the same way, from the row's
+catalogue. The miner binds its prompts once, when its stack is built, so:
+
+1. wait until the announcement names the new env;
+2. install its pinned package;
+3. add its name to `--episode-envs` and restart the miner.
+
+One miner engine serves only envs whose episode caps (`max_episode_tokens`, `max_tokens_per_turn`) are equal.
+An added env whose caps differ from a launch env's is refused beside it at start: mine it with a miner process
+of its own (`--episode-envs <added env>` alone, on its own `--generate-port`).

@@ -22,9 +22,12 @@ start); ``HttpRlEpisodes`` over the validator's ``/rl`` routes; ``RlSignedEpisod
 ``hf_prover`` over the HF model at the announced revision (same GPU as vLLM: ``gpu_memory_utilization``
 is vLLM's share); ``submit_batch_v2`` with the wallet (a new envelope per send) and the verdict poll.
 
-The task prompt is the validator's: the registry environment's task source, ``source.prompt(index)``
-(the same loader and code path the validator's episode admission uses), with the installed env package
-checked against the order's pin."""
+The task prompt is the validator's: built from the order's (or the schedule's) public catalogue through the
+same bridged task source, or, for a registered env without a catalogue, the registry environment's task
+source, with the installed env package checked against the order's pin. An env added to the running run is
+mined after a restart with its name in ``--episode-envs`` (the prompts are bound when the stack is built).
+One engine serves every configured env: their episode caps must be equal (``check_engine_caps``), so an env
+whose caps differ from another's is mined by a miner process of its own."""
 from __future__ import annotations
 
 import asyncio
@@ -134,36 +137,102 @@ def pick_episode_task(view: EpisodeWindow, *, environments: Sequence[str], sizes
 
 
 class EpisodeTaskPrompts:
-    """``task_prompt(environment, task)``: the registry environment's task source, exactly as the
-    validator loads it (``load_environment(name).source.prompt(index)``); never re-rendered."""
+    """``task_prompt(environment, task)``: exactly the validator's task source, never re-rendered.
 
-    def __init__(self, environments: Sequence[str], *, load: Callable[[str], Any] | None = None) -> None:
-        from reliquary.environment.registry import get_environment_spec
+    A bridged env (its order entry, or the schedule row that added it, carries a public ``catalogue``) is built
+    from the announcement (``bind``): the same ``BridgedEpisodeSource`` the validator builds, over this
+    install of the env package, which must be the order's pinned identity. A registered signed-episode env
+    without a catalogue is loaded from the registry (``load_environment(name).source``). A configured env the
+    announcement does not name yet (an env to be added) has no prompts (size 0); it is mined after a restart
+    once announced (``bind`` runs once per stack)."""
+
+    def __init__(self, environments: Sequence[str], *, load: Callable[[str], Any] | None = None,
+                 build_source: Callable[[Any], Any] | None = None) -> None:
+        from reliquary.environment.registry import find_environment_spec
 
         if load is None:
             from reliquary.environment import load_environment as load
-        self._environments = {}
-        for name in environments:
-            if get_environment_spec(name).interaction_mode != "signed_episode":
+        self._load, self._build_source = load, build_source
+        self._names = tuple(environments)
+        for name in self._names:
+            spec = find_environment_spec(name)
+            if spec is not None and spec.interaction_mode != "signed_episode":
                 raise ValueError(f"{name} is not a signed-episode environment")
-            self._environments[name] = load(name)
+        self._sources: dict[str, Any] = {}
+        self._keys: dict[str, str] = {}
+
+    @property
+    def sources(self) -> dict[str, Any]:
+        return dict(self._sources)
+
+    def bind(self, announcement: Mapping[str, Any]) -> None:
+        """Build (or refresh) each configured env's source from the announcement. Blocking (a bridged env loads
+        its package and its taskset): run it in a worker thread. ValueError: refusal to start."""
+        import hashlib
+        import json as _json
+
+        from reliquary.environment.bridged_episode import BridgedEnvConfig, BridgedEpisodeSource
+        from reliquary.environment.registry import find_environment_spec
+        from reliquary.protocol.service_catalogue import announced_contract
+
+        contract = announced_contract(announcement)
+        for name in self._names:
+            if name not in contract.environments:
+                continue                                   # not announced yet (an env to be added)
+            catalogue = contract.catalogue_of(name)
+            if catalogue is None:
+                spec = find_environment_spec(name)
+                if spec is None or spec.interaction_mode != "signed_episode":
+                    raise ValueError(f"{name}: the order publishes no catalogue for it and it is not a "
+                                     f"registered signed-episode environment")
+                self._source(name)                         # the registry path, loaded here (off the loop)
+                continue
+            key = hashlib.sha256(_json.dumps(catalogue, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if self._keys.get(name) == key:
+                continue
+            policy = contract.episode_policy(name)
+            if policy is None:
+                raise ValueError(f"{name} is not a signed-episode environment of the announced order")
+            config = BridgedEnvConfig.from_catalogue(name, catalogue)
+            source = (self._build_source or BridgedEpisodeSource)(config)
+            if source.identity != policy.env_package:
+                raise ValueError(f"{name}: {source.identity} is installed, the order pins {policy.env_package}")
+            len(source)                                    # its taskset, loaded here (off the loop)
+            self._sources[name], self._keys[name] = source, key
+
+    def _source(self, environment: str):
+        source = self._sources.get(environment)
+        if source is None:
+            source = self._sources[environment] = self._load(environment).source
+        return source
 
     def __call__(self, environment: str, task_index: int) -> str:
-        return self._environments[environment].source.prompt(int(task_index))
+        return self._source(environment).prompt(int(task_index))
 
     def size(self, environment: str) -> int:
-        return len(self._environments[environment].source)
+        if environment not in self._sources:
+            from reliquary.environment.registry import find_environment_spec
+
+            if environment not in self._names or find_environment_spec(environment) is None:
+                return 0                                   # not configured, or not announced/bound yet
+        return len(self._source(environment))
 
 
 def parse_episode_environments(value: str) -> tuple[str, ...]:
-    """``--episode-envs``: distinct registered signed-episode environments (ValueError otherwise)."""
-    from reliquary.environment.registry import get_environment_spec
+    """``--episode-envs``: distinct env ids. A registered one must be a signed-episode env (ValueError
+    otherwise); an unregistered one is resolved from the announced catalogue when the stack is built (the
+    order's entry, or the schedule row that added it)."""
+    from reliquary.environment.registry import find_environment_spec
+    from reliquary.protocol.service_contract import _ENV_ID
 
     names = tuple(dict.fromkeys(name.strip() for name in value.split(",") if name.strip()))
     if not names:
         raise ValueError("--episode-envs names no environment")
     for name in names:
-        if get_environment_spec(name).interaction_mode != "signed_episode":
+        if not _ENV_ID.fullmatch(name):
+            raise ValueError(f"{name!r} is not an environment id")
+        spec = find_environment_spec(name)
+        if spec is not None and spec.interaction_mode != "signed_episode":
             raise ValueError(f"{name} is not a signed-episode environment (the legacy `mine` mines it)")
     return names
 
@@ -474,8 +543,17 @@ async def build_episode_stack(view: EpisodeWindow, *, config: EpisodeMinerConfig
     first = policies[config.environments[0]]
     total, per_turn = int(first.max_episode_tokens), int(first.max_tokens_per_turn)
     # Before anything loads: one engine serves every configured environment, so their caps must agree.
-    for policy in policies.values():
-        check_engine_caps(policy, max_total_tokens=total, max_tokens_per_turn=per_turn, max_model_len=total)
+    for name, policy in policies.items():
+        try:
+            check_engine_caps(policy, max_total_tokens=total, max_tokens_per_turn=per_turn, max_model_len=total)
+        except ValueError as exc:
+            raise ValueError(f"{name}: {exc}; one miner engine serves only envs with the caps of "
+                             f"{config.environments[0]}: mine {name} with a miner process of its own") from exc
+    bind = getattr(task_prompt, "bind", None)
+    if bind is not None:
+        # Still before anything loads: the prompts are the announced catalogue's (an install that is not the
+        # order's pin refuses to start).
+        await asyncio.to_thread(bind, view.announcement)
 
     closers: list = []
     try:
