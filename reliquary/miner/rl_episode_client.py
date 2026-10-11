@@ -25,11 +25,13 @@ from reliquary.protocol.signatures import build_episode_precommit_binding, build
 logger = logging.getLogger(__name__)
 
 RL_PREFIX = "/rl"
-RL_THROTTLES = VALIDATOR_THROTTLES | {"open_busy", "environment_not_served"}
-"""The RL routes' named 503s: the validator is serving (an unserved env may be loading); the seed is reopened."""
+RL_THROTTLES = VALIDATOR_THROTTLES | {"open_busy", "environment_not_served", "sandbox_saturated", "open_queue_full"}
+"""The RL routes' named 503s: the validator is serving (an unserved env may be loading, the sandbox fleet may be
+saturated); the seed is reopened, and they never count as "not serving"."""
 RL_FINAL_REFUSALS = frozenset({"precommit_unknown", "precommit_stale", "seed_out_of_pool", "engagement_taken",
-                               "session_too_long"})
-"""The RL engagement book's own 4xx: the seed is the miner's to change, never reopened."""
+                               "session_too_long", "task_unplaceable"})
+"""The RL engagement book's own 4xx, and an open no machine could ever take: the seed is the miner's to change,
+never reopened."""
 
 
 def check_engine_caps(policy, *, max_total_tokens: int, max_tokens_per_turn: int, max_model_len: int) -> None:

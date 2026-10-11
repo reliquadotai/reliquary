@@ -1,11 +1,22 @@
 """The fair open queue of RL sandbox sessions at saturation."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 attest = pytest.importorskip("reliquary_sandbox.attest")
 
 from reliquary.sandbox.open_queue import OpenQueue  # noqa: E402
+from reliquary.miner.rl_episode_client import RL_FINAL_REFUSALS, RL_THROTTLES  # noqa: E402
+from reliquary.miner.signed_episode import SignedSweEpisodeRunner  # noqa: E402
+from reliquary.protocol.sandbox_session import SessionRefused  # noqa: E402
+from reliquary.sandbox.fleet import Placement  # noqa: E402
+from reliquary.sandbox.routes import REFUSAL_STATUS  # noqa: E402
+from reliquary.sandbox.sessions import Grant, _placement_class  # noqa: E402
+from tests.unit.sandbox_fixtures import ADDRESS, MACHINE  # noqa: E402
+from tests.unit.test_rl_engagements import HOTKEY, build, close, engagement, open_  # noqa: E402
+from tests.unit.test_rl_episode_wiring import _services  # noqa: E402
+from tests.unit.test_sandbox_fleet import make  # noqa: E402
 
 A, B = ("env-a", 500, 1), ("env-b", 500, 1)          # placement classes (env, cpu_millis, memory_bytes)
 
@@ -184,3 +195,251 @@ async def test_done_is_idempotent_and_frees_the_engagement():
     q.done(ticket)
     assert not q.busy and not q.waiting_in(A)
     assert q.join("a", cls=A, engagement="rl:1:x:0").granted
+
+
+# --- the issuer with the queue ---------------------------------------------------------------------------------
+
+def opening(env, seed, request_id):
+    return asyncio.ensure_future(env.issuer.open(hotkey=HOTKEY, request_id=request_id,
+                                                 engagement=engagement(env.precommit, seed)))
+
+
+async def until(predicate, seconds=2.0):
+    for _ in range(int(seconds / 0.01)):
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition never met")
+
+
+class Refusals:
+    def __init__(self):
+        self.seen = []
+
+    def opened(self, record):
+        pass
+
+    def closed(self, record, final):
+        pass
+
+    def refused(self, hotkey, engagement, refusal):
+        self.seen.append(refusal.reason)
+
+
+async def test_an_open_waits_outside_the_lock_for_room_then_gets_it(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue(wait_s=5.0)
+    env.issuer._fleet.placement = None
+    task = opening(env, 0, "a" * 32)
+    await until(lambda: q.busy and not env.issuer._lock.locked() and q._holder is None)
+    env.issuer._fleet.placement = Placement(MACHINE, ADDRESS)
+    q.notify()
+    assert isinstance(await task, Grant)
+    assert not q.busy
+
+
+async def test_no_room_until_the_deadline_is_refused_saturated_and_told_to_the_listeners(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue(wait_s=0.05)
+    env.issuer._events = listener = Refusals()
+    env.issuer._fleet.placement = None
+    refused = await env.issuer.open(hotkey=HOTKEY, request_id="a" * 32, engagement=engagement(env.precommit, 0))
+    assert refused.reason == "sandbox_saturated" and refused.retry_after
+    assert listener.seen == ["sandbox_saturated"]                 # the ledger makes the precommit neutral
+    assert not q.busy
+
+
+async def test_an_open_no_machine_could_ever_take_is_refused_at_once_and_never_queued(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue(wait_s=5.0)
+    env.issuer._events = listener = Refusals()
+    env.issuer._fleet.placement = None
+    env.issuer._fleet.placeable = False
+    refused = await env.issuer.open(hotkey=HOTKEY, request_id="a" * 32, engagement=engagement(env.precommit, 0))
+    assert refused.reason == "task_unplaceable" and refused.detail["why"] == "no machine can serve it"
+    assert not refused.retry_after and not q.busy and listener.seen == ["task_unplaceable"]
+
+
+async def test_a_stale_directory_while_queued_is_retryable_never_unplaceable(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue(wait_s=5.0)
+    env.issuer._events = listener = Refusals()
+    env.issuer._fleet.placement = None
+    task = opening(env, 0, "a" * 32)
+    await until(lambda: q.waiting == 1 and q._holder is None and not env.issuer._lock.locked())
+    env.issuer._fleet.ready = False                  # our directory went stale while it waited
+    env.issuer._fleet.placeable = False
+    q.notify()
+    refused = await task
+    assert refused.reason == "directory_unavailable" and refused.retry_after
+    assert listener.seen == [] and not q.busy
+
+
+async def test_a_queue_full_refusal_is_a_capacity_refusal_but_a_second_ticket_is_not(tmp_path):
+    env = build(tmp_path)
+    env.issuer._events = listener = Refusals()
+    env.issuer._fleet.placement = None
+    env.issuer._queue = q = queue(wait_s=5.0, max_waiting=1)
+    first = opening(env, 0, "a" * 32)
+    await until(lambda: q.waiting == 1 and q._holder is None and not env.issuer._lock.locked())
+    full = await env.issuer.open(hotkey=HOTKEY, request_id="b" * 32, engagement=engagement(env.precommit, 1))
+    assert full.reason == "open_queue_full" and full.retry_after
+    again = await env.issuer.open(hotkey=HOTKEY, request_id="c" * 32, engagement=engagement(env.precommit, 0))
+    assert again.reason in {"open_queued", "open_queue_full"}
+    assert listener.seen.count("open_queue_full") >= 1 and "open_queued" not in listener.seen
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not q.busy
+
+
+async def test_an_unplaceable_high_score_waiter_never_blocks_a_placeable_open(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue({"5Rich": 1000.0, HOTKEY: 1.0}, wait_s=5.0)
+    rich = q.join("5Rich", cls=("reliquary-swe", 4000, 4))      # holds the turn, waits in another class
+    assert rich.granted
+    grant = await env.issuer.open(hotkey=HOTKEY, request_id="a" * 32, engagement=engagement(env.precommit, 0))
+    assert isinstance(grant, Grant)                  # another class: placed at once, not behind the rich waiter
+
+
+async def test_a_new_open_does_not_jump_a_waiter_of_its_own_class(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue(wait_s=5.0)
+    env.issuer._fleet.placement = None
+    waiting = opening(env, 0, "a" * 32)              # no room: it tried, and waits in its class
+    await until(lambda: q.waiting == 1 and q._holder is None and not env.issuer._lock.locked())
+    picked = len(env.issuer._fleet.picked)
+    env.issuer._fleet.placement = Placement(MACHINE, ADDRESS)
+    late = opening(env, 1, "b" * 32)                 # room now, but a waiter of its class is ahead
+    await until(lambda: q.waiting == 2)
+    assert not late.done() and len(env.issuer._fleet.picked) == picked
+    q.notify()                                       # the wake-up: the older waiter first, then the late one
+    assert isinstance(await waiting, Grant) and isinstance(await late, Grant)
+
+
+async def test_a_newcomer_with_another_image_queues_behind_a_better_waiter_of_its_class(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue({"5Rich": 9.0, HOTKEY: 1.0}, wait_s=5.0)
+    terms = await env.issuer._engagements["rl_precommit"].terms(HOTKEY, engagement(env.precommit, 1))
+    cls = _placement_class(terms)
+    assert terms.image not in cls                    # per-task images share their env's class
+    rich = q.join("5Rich", cls=cls)                  # a better waiter of the class (another task's image)
+    q.missed(rich)                                   # no room for its image now: it waits for the next wake-up
+    late = opening(env, 1, "b" * 32)                 # room exists for this image, but the class has a waiter
+    await until(lambda: q.waiting == 2)
+    q.notify()
+    assert rich.granted and not late.done()          # the better waiter tries first
+    q.done(rich, placed=True)
+    assert isinstance(await late, Grant)
+
+
+async def test_a_cancelled_waiter_passes_its_turn(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue(wait_s=5.0)
+    env.issuer._fleet.placement = None
+    gone = opening(env, 0, "a" * 32)
+    await until(lambda: q.waiting == 1 and q._holder is None)
+    stays = opening(env, 1, "b" * 32)
+    await until(lambda: q.waiting == 2)
+    gone.cancel()                                    # the miner's request was cut: its ticket must leave
+    with pytest.raises(asyncio.CancelledError):
+        await gone
+    assert q.waiting == 1
+    env.issuer._fleet.placement = Placement(MACHINE, ADDRESS)
+    q.notify()
+    assert isinstance(await asyncio.wait_for(stays, 2.0), Grant)
+    assert not q.busy
+
+
+async def test_a_waiter_cancelled_while_it_holds_the_turn_hands_it_on(tmp_path):
+    env = build(tmp_path)
+    env.issuer._queue = q = queue({"5Other": 0.5, HOTKEY: 1.0}, wait_s=5.0)
+    env.issuer._fleet.placement = None
+    gone = opening(env, 0, "a" * 32)
+    await until(lambda: q.waiting == 1 and q._holder is None and not env.issuer._lock.locked())
+    other = q.join("5Other", cls=_placement_class(
+        await env.issuer._engagements["rl_precommit"].terms(HOTKEY, engagement(env.precommit, 1))))
+    async with env.issuer._lock:                     # the holder is granted, then blocks on the issuer lock
+        q.notify()
+        assert q._holder is not None and q._holder.key == HOTKEY and not other.granted
+        await asyncio.sleep(0.02)
+        gone.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await gone
+    assert other.granted                             # the turn passed on at once
+
+
+def test_a_close_a_voided_machine_and_a_lapse_each_wake_the_queue(tmp_path):
+    env = build(tmp_path)
+    woken = []
+    env.issuer._queue = q = queue()
+    q.notify = lambda: woken.append(1)
+    first, second, third = (open_(env, seed) for seed in range(3))   # room: placed directly, no wake-up
+    assert all(isinstance(grant, Grant) for grant in (first, second, third)) and woken == []
+    assert close(env, first, "aborted")["state"] == "aborted"         # a freed slot
+    assert woken == [1]
+
+    async def void():
+        env.issuer.void_machine(MACHINE)
+        await env.issuer.drain(2.0)
+    asyncio.run(void())                                               # a drained machine's sessions
+    assert woken == [1, 1]
+    env.issuer._clock.now += 10 ** 6
+    asyncio.run(env.issuer.maintain())                                # nothing live left to lapse: no wake-up
+    assert woken == [1, 1]
+
+
+def test_a_lapse_wakes_the_queue(tmp_path):
+    env = build(tmp_path)
+    woken = []
+    env.issuer._queue = q = queue()
+    q.notify = lambda: woken.append(1)
+    assert isinstance(open_(env, 0), Grant)
+    env.issuer._clock.now += 10 ** 6                                  # past its token's expiry
+    asyncio.run(env.issuer.maintain())
+    assert woken == [1]
+
+
+def test_without_a_queue_no_room_is_refused_at_once_as_before(tmp_path):
+    env = build(tmp_path)
+    env.issuer._fleet.placement = None
+    refused = asyncio.run(env.issuer.open(hotkey=HOTKEY, request_id="a" * 32,
+                                          engagement=engagement(env.precommit, 0)))
+    assert refused.reason == "sandbox_capacity" and "why" not in refused.detail
+
+
+def test_the_queue_refusals_are_retried_by_the_miner():
+    assert REFUSAL_STATUS["sandbox_saturated"] == REFUSAL_STATUS["open_queue_full"] == 503
+    assert REFUSAL_STATUS["open_queue_key_full"] == REFUSAL_STATUS["open_queued"] == 429
+    assert REFUSAL_STATUS["task_unplaceable"] == 409
+
+
+def test_the_2c_miner_reopens_under_saturation_and_drops_an_unplaceable_seed():
+    assert {"sandbox_saturated", "open_queue_full"} <= RL_THROTTLES
+    assert "task_unplaceable" in RL_FINAL_REFUSALS
+    runner = SimpleNamespace(validator_throttles=RL_THROTTLES, _backoff=0, _unavailable=0,
+                             _hold_opens=lambda seconds: None)
+    for _ in range(12):                              # more than MAX_UNAVAILABLE in a row
+        answer = SignedSweEpisodeRunner._note_refusal(
+            runner, SessionRefused("sandbox_saturated", {}, status=503, retry_after=10))
+        assert answer.reason == "sandbox_saturated"  # never validator_unavailable
+
+
+def test_the_wiring_builds_the_queue_with_the_quota_and_wakes_it_on_each_poll(tmp_path):
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
+    assert isinstance(services.queue, OpenQueue) and services.issuer._queue is services.queue
+    assert services.fleet.on_polled == services.queue.notify
+    assert services.queue._headroom("5Nobody") >= 0            # headroom(h) -> quota.headroom(h, now)
+
+
+def test_without_a_yield_quota_the_wiring_builds_no_queue(tmp_path):
+    services, _ = _services(tmp_path)
+    assert services.queue is None and services.issuer._queue is None and services.fleet.on_polled is None
+
+
+def test_the_poll_listener_fires_on_an_early_return_too(tmp_path):
+    fleet, _machine, _served, _clock = make(tmp_path)        # no machine answers: poll_once returns early
+    calls = []
+    fleet.on_polled = lambda: calls.append(1)
+    asyncio.run(fleet.poll_once())
+    assert calls == [1]

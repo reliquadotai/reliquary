@@ -756,6 +756,21 @@ class _Issued:
     engagement: str
 
 
+_NO_CAPACITY = object()
+"""``_issue_locked``'s answer when no machine has room now (or a waiter of the open's class is ahead)."""
+_NEVER = object()
+"""``_issue_locked``'s answer when no fresh machine could ever take the open (queued issuers only)."""
+CAPACITY_REFUSALS = frozenset({"sandbox_saturated", "open_queue_full", "task_unplaceable", "environment_unserved"})
+"""Open refusals that are the validator's capacity, never the miner's doing: told to ``SessionEvents.refused``."""
+
+
+def _placement_class(terms) -> tuple:
+    """The open queue's class: the env and the reservation, NOT the image (one image per task would make every
+    open its own class and bypass the queue); each waiter's own attempt filters on its image."""
+    reserve = getattr(terms, "reserve", None) or {}
+    return (terms.env, reserve.get("cpu_millis"), reserve.get("memory_bytes"))
+
+
 class SessionIssuer:
     def __init__(self, *, book: SessionBook, store, fleet, signer, token_verifier,
                  engagements: Mapping[str, EngagementBook], policy: SandboxPolicy,
@@ -763,7 +778,7 @@ class SessionIssuer:
                  new_session_id: Callable[[], str] = lambda: uuid.uuid4().hex,
                  events: SessionEvents | None = None, record_faults: bool = False,
                  open_refusal_check: Callable[[Mapping[str, Any], SessionRecord], bool | None] | None = None,
-                 ) -> None:
+                 queue=None) -> None:
         self.book = book
         self._store, self._fleet, self._signer = store, fleet, signer
         self._token_verifier = token_verifier
@@ -780,6 +795,9 @@ class SessionIssuer:
         self._record_faults = bool(record_faults)
         # A gateway's signed open refusal of a session: True verified, False not, None cannot judge now.
         self._open_refusal_check = open_refusal_check
+        # The RL open queue (``open_queue.OpenQueue``): opens finding no room wait there, outside the lock. A corpus
+        # issuer has none: no room is refused at once.
+        self._queue = queue
         self._restored: set[str] = set()       # sessions issued before this process started (their tokens lost)
         self._last_activity = 0                # the last issue or close before the restart
         self._lost: set[str] = set()           # restored sessions whose open answer our restart lost
@@ -807,12 +825,21 @@ class SessionIssuer:
         return len(records)
 
     def _event(self, name: str, *args) -> None:
-        if self._events is None:
+        method = getattr(self._events, name, None) if self._events is not None else None
+        if method is None:                       # a listener may lack an optional method (``refused``)
             return
         try:
-            getattr(self._events, name)(*args)
+            method(*args)
         except Exception:
             logger.exception("sandbox session listener %s failed", name)
+
+    def _capacity_refused(self, hotkey: str, engagement: Mapping[str, Any], outcome) -> None:
+        if isinstance(outcome, Refusal) and outcome.reason in CAPACITY_REFUSALS:
+            self._event("refused", hotkey, engagement, outcome)
+
+    def _wake(self) -> None:
+        if self._queue is not None:
+            self._queue.notify()
 
     def _reported(self, session_id: str) -> bool:
         """Whether a machine report accepted since the restart listed this session live on its gateway
@@ -906,74 +933,130 @@ class SessionIssuer:
             generation = None
         terms = await book.terms(hotkey, engagement)            # reads: outside the lock
         if isinstance(terms, Refusal):
+            self._capacity_refused(hotkey, engagement, terms)
             return terms
-        async with self._lock:
-            now = int(self._clock())
-            resent = self._resent(hotkey, request_id, digest)    # the same request, raced
-            if resent is not None:
-                return resent
-            refusal = (self.book.open_refusal(hotkey, now)
-                       or self.book.engagement_refusal(hotkey, terms.job_id,
-                                                       terms.prompt_index, now))
+        outcome = await self._issue(hotkey, request_id, digest, engagement, terms, generation)
+        self._capacity_refused(hotkey, engagement, outcome)
+        return outcome
+
+    async def _issue(self, hotkey: str, request_id: str, digest: str, engagement: Mapping[str, Any], terms,
+                     generation):
+        """Issue under the lock. With an open queue (RL): an open no machine could ever take is refused at once
+        (``task_unplaceable``, final for the seed); one finding no room waits for a turn OUTSIDE the lock and tries
+        again, until its deadline (``sandbox_saturated``); a new open joins rather than placing first only when a
+        waiter of its own placement class waits. Without a queue (corpus), no room is refused at once, exactly as
+        before."""
+        queue, ticket, deadline, placed = self._queue, None, 0.0, False
+        cls = _placement_class(terms) if queue is not None else None
+        try:
+            while True:
+                may_place = (queue is None or (ticket is not None and ticket.granted)
+                             or (ticket is None and not queue.waiting_in(cls)))
+                async with self._lock:
+                    outcome = await self._issue_locked(hotkey, request_id, digest, engagement, terms, generation,
+                                                       may_place=may_place)
+                if outcome is _NEVER:
+                    return Refusal("task_unplaceable", {"image": terms.image, "why": "no machine can serve it"})
+                if outcome is not _NO_CAPACITY:
+                    placed = isinstance(outcome, _Issued)
+                    return outcome
+                if queue is None:
+                    return Refusal("sandbox_capacity", {"image": terms.image},
+                                   retry_after=self._policy.retry_after_s)
+                if ticket is None:
+                    joined = queue.join(hotkey, cls=cls, engagement=terms.engagement)
+                    if isinstance(joined, Refusal):
+                        return joined
+                    ticket, deadline = joined, queue.deadline()
+                    if ticket.granted:
+                        continue                                  # the turn was free: try at once
+                elif ticket.granted:
+                    queue.missed(ticket)                          # pass the turn on; wait on a fresh event
+                if not await queue.turn(ticket, deadline):
+                    return Refusal("sandbox_saturated", {"waiting": queue.waiting,
+                                                         "waited_s": round(queue.waited(ticket), 1)},
+                                   retry_after=self._policy.retry_after_s)
+        finally:
+            if ticket is not None:
+                queue.done(ticket, placed=placed)               # a cancelled request hands its turn on too
+
+    async def _issue_locked(self, hotkey: str, request_id: str, digest: str, engagement: Mapping[str, Any],
+                            terms, generation, *, may_place: bool):
+        """The checks and the issue under the issuer lock (the caller holds it): a Grant (resent), an
+        ``_Issued``, a Refusal, ``_NO_CAPACITY`` or ``_NEVER``."""
+        now = int(self._clock())
+        resent = self._resent(hotkey, request_id, digest)    # the same request, raced
+        if resent is not None:
+            return resent
+        refusal = (self.book.open_refusal(hotkey, now)
+                   or self.book.engagement_refusal(hotkey, terms.job_id,
+                                                   terms.prompt_index, now))
+        if refusal is not None:
+            return refusal
+        if terms.still_valid is not None:
+            refusal = terms.still_valid()
             if refusal is not None:
                 return refusal
-            if terms.still_valid is not None:
-                refusal = terms.still_valid()
-                if refusal is not None:
-                    return refusal
-            if terms.exclusive and self.book.engagement_held(terms.engagement):
-                return Refusal("engagement_taken", {"engagement": terms.engagement})
-            if terms.slots_remaining is not None:
-                remaining = terms.slots_remaining
-                moved = generation != self.book.generation(terms.job_id, terms.prompt_index)
-                if moved and terms.refresh_slots is not None:
-                    # One bounded read under the lock (a claim waits at most claim_wait_s).
-                    remaining = await terms.refresh_slots()
-                    if isinstance(remaining, Refusal):
-                        return remaining
-                    if remaining is None:
-                        return Refusal("job_complete", {"job_id": terms.job_id})
-                    now = int(self._clock())
-                reserved = self.book.reserved(terms.job_id, terms.prompt_index, now)
-                if remaining - reserved <= 0:
-                    return Refusal("prompt_unavailable", {
-                        "prompt_index": terms.prompt_index,
-                        "slots_remaining": remaining, "reserved": reserved})
-            validity = token_validity_s(self._policy.open_window_s, int(terms.budgets["wall_s"]),
-                                        terms.prepare_timeout_s)
+        if terms.exclusive and self.book.engagement_held(terms.engagement):
+            return Refusal("engagement_taken", {"engagement": terms.engagement})
+        if terms.slots_remaining is not None:
+            remaining = terms.slots_remaining
+            moved = generation != self.book.generation(terms.job_id, terms.prompt_index)
+            if moved and terms.refresh_slots is not None:
+                # One bounded read under the lock (a claim waits at most claim_wait_s).
+                remaining = await terms.refresh_slots()
+                if isinstance(remaining, Refusal):
+                    return remaining
+                if remaining is None:
+                    return Refusal("job_complete", {"job_id": terms.job_id})
+                now = int(self._clock())
+            reserved = self.book.reserved(terms.job_id, terms.prompt_index, now)
+            if remaining - reserved <= 0:
+                return Refusal("prompt_unavailable", {
+                    "prompt_index": terms.prompt_index,
+                    "slots_remaining": remaining, "reserved": reserved})
+        validity = token_validity_s(self._policy.open_window_s, int(terms.budgets["wall_s"]),
+                                    terms.prepare_timeout_s)
+        placement = None
+        if may_place:
             placement = self._fleet.pick(image=terms.image, env=terms.env,
                                          env_package=terms.env_package, budgets=terms.budgets,
                                          validity_s=validity, now=now,
                                          env_options_sha256=terms.env_options_sha256)
-            if placement is None:
-                return Refusal("sandbox_capacity", {"image": terms.image},
-                               retry_after=self._policy.retry_after_s)
-            session_id = self._new_id()
-            claims = SessionClaims(
-                session_id=session_id, hotkey=hotkey, engagement=terms.engagement, env=terms.env,
-                split=terms.split, index=terms.index, image=terms.image,
-                checkpoint=terms.checkpoint, machine_id=placement.machine_id, issued_at=now,
-                expires_at=now + validity, budgets=Budgets(**terms.budgets))
-            token = issue_session_token(claims, self._signer)
-            record = SessionRecord(
-                session_id=session_id, hotkey=hotkey, request_id=request_id,
-                engagement_sha256=digest, kind=str(engagement.get("kind")),
-                engagement=terms.engagement, env=terms.env,
-                split=terms.split, index=terms.index, checkpoint=terms.checkpoint,
-                job_id=terms.job_id, prompt_index=terms.prompt_index,
-                machine_id=placement.machine_id, issued_at=now, expires_at=claims.expires_at,
-                token_sha256=token_sha256(token))
-            try:
-                await asyncio.wait_for(self._store.create(record.to_document()),
-                                       self._policy.io_timeout_s)
-            except Exception as exc:
-                logger.warning("sandbox session %s not stored (%s): not issued", session_id,
-                               type(exc).__name__)
-                return Refusal("store_unavailable", {}, retry_after=self._policy.retry_after_s)
-            self.book.add(record)
-            self._fleet.note_issued(placement.machine_id, now)
-            self._tokens[session_id] = (token, placement.address)
-            self._event("opened", record)
+        if placement is None:
+            if self._queue is not None and not self._fleet.could_place(
+                    image=terms.image, env=terms.env, env_package=terms.env_package, budgets=terms.budgets,
+                    validity_s=validity, now=now, env_options_sha256=terms.env_options_sha256):
+                if not self._fleet.directory_ready(now):
+                    return self._directory_unavailable()     # our outage, never final for the seed
+                return _NEVER
+            return _NO_CAPACITY
+        session_id = self._new_id()
+        claims = SessionClaims(
+            session_id=session_id, hotkey=hotkey, engagement=terms.engagement, env=terms.env,
+            split=terms.split, index=terms.index, image=terms.image,
+            checkpoint=terms.checkpoint, machine_id=placement.machine_id, issued_at=now,
+            expires_at=now + validity, budgets=Budgets(**terms.budgets))
+        token = issue_session_token(claims, self._signer)
+        record = SessionRecord(
+            session_id=session_id, hotkey=hotkey, request_id=request_id,
+            engagement_sha256=digest, kind=str(engagement.get("kind")),
+            engagement=terms.engagement, env=terms.env,
+            split=terms.split, index=terms.index, checkpoint=terms.checkpoint,
+            job_id=terms.job_id, prompt_index=terms.prompt_index,
+            machine_id=placement.machine_id, issued_at=now, expires_at=claims.expires_at,
+            token_sha256=token_sha256(token))
+        try:
+            await asyncio.wait_for(self._store.create(record.to_document()),
+                                   self._policy.io_timeout_s)
+        except Exception as exc:
+            logger.warning("sandbox session %s not stored (%s): not issued", session_id,
+                           type(exc).__name__)
+            return Refusal("store_unavailable", {}, retry_after=self._policy.retry_after_s)
+        self.book.add(record)
+        self._fleet.note_issued(placement.machine_id, now)
+        self._tokens[session_id] = (token, placement.address)
+        self._event("opened", record)
         return _Issued(Grant(session_id, token, placement.address, claims.expires_at),
                        placement.machine_id, terms.engagement)
 
@@ -1059,6 +1142,7 @@ class SessionIssuer:
                 settled.ended_at = now                   # its box's end, never moved by a submission
         if settled is not None:
             self._event("closed", settled, final)
+            self._wake()
         await self._persist(settled)
         logger.info("sandbox session %s of %s closed: %s", session_id, hotkey[:12], status)
         return self._state_of(settled)
@@ -1271,6 +1355,7 @@ class SessionIssuer:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
         if records:
+            self._wake()
             logger.warning("machine %s drained: %d live sessions voided, no fault to their miners",
                            machine_id, len(records))
 
@@ -1301,6 +1386,8 @@ class SessionIssuer:
             for hotkey in [h for h, times in self._refused_opens.items()
                            if not times or times[-1] <= now - MINUTE]:
                 del self._refused_opens[hotkey]
+        if lapsed:
+            self._wake()
         for record in lapsed:
             await self._persist(record)
 
@@ -1341,8 +1428,8 @@ class SessionIssuer:
         return False
 
 
-__all__ = ["ABORTED", "CLOSED", "CLOSED_GRADED", "DEFAULT_PREPARE_TIMEOUT_S", "GATEWAY_PREPARE_SLACK_S",
-           "GRADING_POOL_ABORT", "HANDED_BACK", "LAPSED", "LIVE", "LOST_OPEN_WINDOW_S", "OPEN_TRANSIT_S",
+__all__ = ["ABORTED", "CAPACITY_REFUSALS", "CLOSED", "CLOSED_GRADED", "DEFAULT_PREPARE_TIMEOUT_S",
+           "GATEWAY_PREPARE_SLACK_S", "GRADING_POOL_ABORT", "HANDED_BACK", "LAPSED", "LIVE", "LOST_OPEN_WINDOW_S", "OPEN_TRANSIT_S",
            "SUBMITTED", "VOIDED", "CorpusEngagements", "EngagementBook", "EngagementTerms", "FanOutEvents", "Grant",
            "JobNotReady", "Refusal", "RlPrecommitEngagements", "SandboxPolicy", "SessionBook", "SessionEvents",
            "SessionIssuer", "SessionRecord", "SignedJobView", "engagement_digest", "pool_abort_fault",

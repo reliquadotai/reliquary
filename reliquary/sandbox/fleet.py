@@ -167,6 +167,8 @@ class Fleet:
         self._clock = clock
         self._record = record_heartbeat
         self.on_drained = on_drained
+        # Called after every poll, early returns included (the RL open queue's wake-up).
+        self.on_polled: Callable[[], None] | None = None
         self._directory = DirectorySnapshot()
         self._reports: dict[str, dict] = {}
         self._last_ok: dict[str, float] = {}
@@ -271,6 +273,16 @@ class Fleet:
         return True
 
     async def poll_once(self) -> None:
+        try:
+            await self._poll_once()
+        finally:
+            if self.on_polled is not None:
+                try:
+                    self.on_polled()
+                except Exception:
+                    logger.exception("the poll listener failed")
+
+    async def _poll_once(self) -> None:
         now = self._clock()
         if not self.directory_ready(now):
             # Nothing can be verified; and a machine is not drained for our own outage.
@@ -391,25 +403,9 @@ class Fleet:
         best: tuple[float, str] | None = None
         chosen: Placement | None = None
         for entry in self._directory.entries():
-            if entry.status != "active" or entry.machine_id in self.drained:
-                continue
             document = self._reports.get(entry.machine_id)
-            if document is None or now - document["at"] > HEARTBEAT_MAX_AGE_S:
-                continue
-            if image not in (document.get("images") or ()):
-                continue
-            if (document.get("env_packages") or {}).get(env) != env_package:
-                continue
-            if env_options_sha256 is not None and self._options_differ(
-                    entry.machine_id, document, env, env_options_sha256):
-                continue
-            if document.get("tools_version") != TOOLS_VERSION:
-                continue
-            caps = document.get("caps") or {}
-            if any(type(caps.get(cap)) is not int or budgets[name] > caps[cap]
-                   for name, cap in _CAPS.items()):
-                continue
-            if type(caps.get("max_token_validity_s")) is not int or validity_s > caps["max_token_validity_s"]:
+            if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
+                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
                 continue
             issued = sum(1 for at in self._issued.get(entry.machine_id, ()) if at >= document["at"])
             free = document["free"] - issued
@@ -419,6 +415,40 @@ class Fleet:
             if best is None or key < best:
                 best, chosen = key, Placement(entry.machine_id, entry.address)
         return chosen
+
+    def _fits(self, entry, document, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
+              validity_s: int, now: float, env_options_sha256: str | None) -> bool:
+        """The checks of a machine that do not depend on its free room (shared by ``pick`` and ``could_place``)."""
+        if entry.status != "active" or entry.machine_id in self.drained:
+            return False
+        if document is None or now - document["at"] > HEARTBEAT_MAX_AGE_S:
+            return False
+        if image not in (document.get("images") or ()):
+            return False
+        if (document.get("env_packages") or {}).get(env) != env_package:
+            return False
+        if env_options_sha256 is not None and self._options_differ(
+                entry.machine_id, document, env, env_options_sha256):
+            return False
+        if document.get("tools_version") != TOOLS_VERSION:
+            return False
+        caps = document.get("caps") or {}
+        if any(type(caps.get(cap)) is not int or budgets[name] > caps[cap] for name, cap in _CAPS.items()):
+            return False
+        if type(caps.get("max_token_validity_s")) is not int or validity_s > caps["max_token_validity_s"]:
+            return False
+        return True
+
+    def could_place(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
+                    now: float, env_options_sha256: str | None = None, reserve: Mapping[str, Any] | None = None) -> bool:
+        """Whether some fresh active machine could ever take this session, its load aside: the RL open queue
+        refuses at once what no machine could take, and queues only what waits for room."""
+        if not self.directory_ready(now):
+            return False
+        return any(self._fits(entry, self._reports.get(entry.machine_id), image=image, env=env,
+                              env_package=env_package, budgets=budgets, validity_s=validity_s, now=now,
+                              env_options_sha256=env_options_sha256)
+                   for entry in self._directory.entries())
 
     def open_refusal_valid(self, receipt: Mapping[str, Any], record: Any) -> bool | None:
         """Whether ``receipt`` is the gateway's signed refusal of ``record``'s token on its machine, signed

@@ -137,6 +137,7 @@ class RlEpisodeServices:
     precommit_retention_s: float = MIN_PRECOMMIT_RETENTION_S
     ledger: Any = field(default=None, repr=False)
     quota: Any = field(default=None, repr=False)
+    queue: Any = field(default=None, repr=False)
     window_uses: Callable[[int], Any] | None = field(default=None, repr=False)
     policies: dict = field(default_factory=dict, repr=False)
     window_open: Callable[[int], bool] | None = field(default=None, repr=False)
@@ -456,6 +457,12 @@ def build_rl_episode_services(
     if ledger is not None and isinstance(quota, YieldQuota):
         ledger.allow_capacity_verdicts(quota.groups_allowed)      # capacity verdicts: per hotkey and window
         book.cap_scale = quota.cap_scale                          # the per-hotkey rates scale with the allocation
+    queue = None
+    if isinstance(quota, YieldQuota):
+        # RL opens finding no room wait in the fair queue (outside the issuer lock) instead of being refused.
+        from reliquary.sandbox.open_queue import OpenQueue
+
+        queue = OpenQueue(rank=quota.rank, headroom=lambda hotkey: quota.headroom(hotkey, int(clock())))
     views = {name: EpisodeEnvironmentView(policy=p, resolve_task=environments[name].source.resolve)
              for name, p in policies.items()}
     engagements = RlEpisodeEngagements(precommits=runtime.episode_precommit, environments=views.get,
@@ -471,8 +478,10 @@ def build_rl_episode_services(
         events=None if ledger is None else FanOutEvents(
             LedgerEvents(ledger), quota if isinstance(quota, YieldQuota) else None),
         record_faults=ledger is not None,
-        open_refusal_check=None if ledger is None else fleet.open_refusal_valid)
+        open_refusal_check=None if ledger is None else fleet.open_refusal_valid, queue=queue)
     fleet.on_drained = issuer.void_machine
+    if queue is not None:
+        fleet.on_polled = queue.notify                            # each poll may show freed room
     sessions_router = build_sandbox_sessions_router(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=RL_PREFIX, registration=registration,
         clock=clock, max_concurrent_closes=config.close_concurrency,
@@ -499,7 +508,7 @@ def build_rl_episode_services(
                              issuer=issuer, routers=(sessions_router, precommit_router), intake=intake,
                              environments=tuple(sorted(policies)), runtime=runtime, outcomes=outcomes,
                              clock=clock, precommit_retention_s=float(precommit_retention_s),
-                             ledger=ledger, quota=quota, window_uses=window_uses, policies=dict(policies),
+                             ledger=ledger, quota=quota, queue=queue, window_uses=window_uses, policies=dict(policies),
                              window_open=window_open, current_window=current_window, operator_of=operator_of)
 
 

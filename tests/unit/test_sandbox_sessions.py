@@ -46,6 +46,10 @@ class FakeFleet:
         self.snapshot, self.placement = snapshot, placement
         self.picked, self.issued = [], []
         self.ready = True
+        self.placeable = True
+
+    def could_place(self, **kw):
+        return self.placeable
 
     def directory_ready(self, now=None):
         return self.ready
