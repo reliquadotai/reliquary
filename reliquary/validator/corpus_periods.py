@@ -57,6 +57,57 @@ def pay_ceiling(params) -> float | None:
     return ceiling
 
 
+# A period task's price ceiling (``task_registry.set_cap(token_price=...)``):
+# a period pays min(cap, price x its verified tokens), the rest burns. The
+# settler reads only the pool-share price; the alpha price it came from, the
+# miner emission per period used to convert it and when, are kept to audit it.
+MAX_PRICE_PARAM = "max_price_per_token"
+MAX_PRICE_ALPHA_PARAM = "max_price_alpha_per_mtoken"
+MAX_PRICE_EMISSION_PARAM = "max_price_miner_alpha_per_period"
+MAX_PRICE_SET_AT_PARAM = "max_price_set_at"
+MAX_PRICE_PARAMS = (MAX_PRICE_PARAM, MAX_PRICE_ALPHA_PARAM, MAX_PRICE_EMISSION_PARAM,
+                    MAX_PRICE_SET_AT_PARAM)
+
+
+def price_params(alpha_per_mtoken: float, miner_alpha_per_period: float,
+                 set_at: float) -> dict[str, float]:
+    """The registry params of a ceiling of ``alpha_per_mtoken`` alpha per
+    million verified tokens: a share of the pool is a share of the miners'
+    emission, so one token may pay ``alpha / 1e6 / miner_alpha_per_period``
+    (an archive's share is paid out in full over its EMA tail)."""
+    alpha, emission = float(alpha_per_mtoken), float(miner_alpha_per_period)
+    if not (math.isfinite(alpha) and alpha > 0):
+        raise ValueError(f"the price must be a positive number of alpha, got {alpha_per_mtoken!r}")
+    if not (math.isfinite(emission) and emission > 0):
+        raise ValueError(f"the miner emission must be positive, got {miner_alpha_per_period!r}")
+    return {MAX_PRICE_PARAM: alpha / 1e6 / emission, MAX_PRICE_ALPHA_PARAM: alpha,
+            MAX_PRICE_EMISSION_PARAM: emission, MAX_PRICE_SET_AT_PARAM: float(set_at)}
+
+
+def max_price(params) -> float | None:
+    """The most one verified token may pay, in pool share; None: no ceiling."""
+    if not isinstance(params, Mapping) or params.get(MAX_PRICE_PARAM) is None:
+        return None
+    return float(params[MAX_PRICE_PARAM])
+
+
+def period_budget(cap: float, price: float | None, tokens: int) -> float:
+    """What a period of ``tokens`` verified tokens may pay in all."""
+    if price is None:
+        return float(cap)
+    return min(float(cap), float(price) * int(tokens))
+
+
+def price_view(params) -> dict | None:
+    """The ceiling as the public job status shows it; None without one."""
+    if max_price(params) is None:
+        return None
+    return {"max_price_alpha_per_mtoken": params.get(MAX_PRICE_ALPHA_PARAM),
+            "max_price_pool_share_per_token": float(params[MAX_PRICE_PARAM]),
+            "miner_alpha_per_period": params.get(MAX_PRICE_EMISSION_PARAM),
+            "set_at": params.get(MAX_PRICE_SET_AT_PARAM)}
+
+
 def archive_bound(recorded, ceiling: float | None) -> float | None:
     """What one archive may pay: the cap it was settled under (``recorded``,
     absent from archives written before it was kept), never past the task's
@@ -132,6 +183,11 @@ def replay(archives: Iterable[Mapping], current_period: int, *,
 
 __all__ = [
     "CATCHUP_ENTRIES",
+    "MAX_PRICE_ALPHA_PARAM",
+    "MAX_PRICE_EMISSION_PARAM",
+    "MAX_PRICE_PARAM",
+    "MAX_PRICE_PARAMS",
+    "MAX_PRICE_SET_AT_PARAM",
     "PERIOD_ALPHA",
     "PERIOD_EPOCH",
     "PERIOD_EMA_N",
@@ -143,8 +199,12 @@ __all__ = [
     "closed_through",
     "entry_for",
     "is_period_task",
+    "max_price",
     "pay_ceiling",
+    "period_budget",
     "period_end",
     "period_of",
+    "price_params",
+    "price_view",
     "replay",
 ]

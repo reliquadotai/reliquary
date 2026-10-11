@@ -680,10 +680,25 @@ def tasks_list() -> None:
 @tasks_app.command("set-cap")
 def tasks_set_cap(
     task_id: str = typer.Option(..., "--task-id"),
-    cap: float = typer.Option(..., "--cap", help="The task's new share of the pool"),
+    cap: float = typer.Option(
+        None, "--cap", help="The task's new share of the pool; omitted, the cap is kept",
+    ),
     floor: float = typer.Option(
         None, "--floor",
         help="New price floor; omitted, an RL task keeps its floor and a corpus task's follows the cap",
+    ),
+    max_price_alpha_per_mtoken: float = typer.Option(
+        None, "--max-price-alpha-per-mtoken",
+        help="Period corpus task: the most a period pays per million verified tokens, in "
+             "alpha; a period pays min(cap, price x tokens), the rest burns",
+    ),
+    miner_emission_alpha_per_day: float = typer.Option(
+        None, "--miner-emission-alpha-per-day",
+        help="Miner alpha emitted per day, to convert the price to a pool share; "
+             "omitted, read on-chain (alpha out per block, less the owner cut, halved)",
+    ),
+    clear_max_price: bool = typer.Option(
+        False, "--clear-max-price", help="Remove the task's price ceiling: the cap alone",
     ),
     min_incentive_share: float = typer.Option(
         None, "--min-incentive-share",
@@ -718,10 +733,34 @@ def tasks_set_cap(
         help="How long a ban lasts",
     ),
 ) -> None:
-    """Change a live task's cap; its contract and digest are untouched."""
+    """Change a live task's cap or price ceiling; its contract and digest are untouched."""
     from reliquary.infrastructure import task_registry_store as store
     from reliquary.shared.task_registry import RegistryError
 
+    priced = {}
+    if clear_max_price and max_price_alpha_per_mtoken is not None:
+        typer.echo("error: --clear-max-price and --max-price-alpha-per-mtoken conflict", err=True)
+        raise typer.Exit(code=1)
+    if miner_emission_alpha_per_day is not None and max_price_alpha_per_mtoken is None:
+        typer.echo("error: --miner-emission-alpha-per-day converts --max-price-alpha-per-mtoken",
+                   err=True)
+        raise typer.Exit(code=1)
+    if clear_max_price:
+        priced = {"token_price": None}
+    elif max_price_alpha_per_mtoken is not None:
+        try:
+            token_price, source = _token_price(max_price_alpha_per_mtoken,
+                                               miner_emission_alpha_per_day)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        priced = {"token_price": token_price}
+    if cap is None and not priced and all(v is None for v in (
+            floor, min_incentive_share, audit_q, audit_probation_submissions,
+            audit_hold_seconds, audit_suspect_seconds, audit_ban_after_failures,
+            audit_ban_window_seconds, audit_ban_seconds)):
+        typer.echo("error: nothing to change: give --cap or a price option", err=True)
+        raise typer.Exit(code=1)
     try:
         asyncio.run(store.set_task_cap(
             task_id, cap, floor=floor, min_incentive_share=min_incentive_share, audit_q=audit_q,
@@ -731,11 +770,59 @@ def tasks_set_cap(
             audit_ban_after_failures=audit_ban_after_failures,
             audit_ban_window_seconds=audit_ban_window_seconds,
             audit_ban_seconds=audit_ban_seconds,
+            **priced,
         ))
     except (RegistryError, store.RegistryConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    typer.echo(f"task {task_id} now has cap {cap}" + (f" and floor {floor}" if floor is not None else ""))
+    if cap is not None:
+        typer.echo(f"task {task_id} now has cap {cap}"
+                   + (f" and floor {floor}" if floor is not None else ""))
+    if clear_max_price:
+        typer.echo(f"task {task_id} has no price ceiling: each period pays its cap")
+    elif priced:
+        typer.echo(_describe_token_price(task_id, priced["token_price"], source))
+
+
+def _token_price(alpha_per_mtoken: float, miner_alpha_per_day: float | None):
+    """The registry params of a price ceiling, and where the miner emission
+    that converts it came from (the flag, or the chain now)."""
+    import time
+
+    from reliquary.validator import corpus_periods as cp
+
+    blocks = cp.PERIOD_SECONDS / 12.0
+    if miner_alpha_per_day is not None:
+        emission = float(miner_alpha_per_day) * cp.PERIOD_SECONDS / 86400.0
+        source = f"{miner_alpha_per_day} miner alpha per day (given)"
+    else:
+        read = asyncio.run(_read_miner_emission())
+        emission = read["miner_alpha_per_block"] * blocks
+        source = (f"on-chain netuid {read['netuid']}: alpha out {read['alpha_out_per_block']:.6f}"
+                  f"/block, owner cut {read['owner_cut']:.4f}")
+    return cp.price_params(alpha_per_mtoken, emission, time.time()), source
+
+
+async def _read_miner_emission() -> dict:
+    from reliquary.infrastructure.chain import close_subtensor, get_subtensor, miner_alpha_per_block
+
+    subtensor = await get_subtensor()
+    try:
+        return await miner_alpha_per_block(subtensor)
+    finally:
+        await close_subtensor(subtensor)
+
+
+def _describe_token_price(task_id: str, params, source: str) -> str:
+    from reliquary.validator import corpus_periods as cp
+
+    price = params[cp.MAX_PRICE_PARAM]
+    emission = params[cp.MAX_PRICE_EMISSION_PARAM]
+    return (f"task {task_id} max price {params[cp.MAX_PRICE_ALPHA_PARAM]} alpha per million "
+            f"verified tokens = {price:.6g} pool share per token "
+            f"({emission:.4f} miner alpha per {cp.PERIOD_SECONDS} s period; {source}); "
+            f"a period pays its whole cap from {0.01 / price / 1e6:.4g} M verified "
+            f"tokens per 0.01 of cap")
 
 
 def _task_admission(task_id: str, admission: str) -> None:

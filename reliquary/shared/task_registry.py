@@ -57,6 +57,15 @@ SETTLEMENT_PERIOD_EMA = "period-ema-v1"
 # A period task's highest cap paid, kept when its cap is lowered so the pay it
 # already earned is not cut (``validator.corpus_periods.pay_ceiling``).
 TAIL_CAP_PARAM = "tail_cap"
+# A period task's price ceiling, written together or not at all
+# (``validator.corpus_periods.price_params``, which names the same keys): the
+# pool share one verified token may pay, the alpha per million tokens it was
+# converted from, the miner alpha per period used, and when.
+MAX_PRICE_PARAM = "max_price_per_token"
+MAX_PRICE_PARAMS = (MAX_PRICE_PARAM, "max_price_alpha_per_mtoken",
+                    "max_price_miner_alpha_per_period", "max_price_set_at")
+# Omitted from ``set_cap``: the price ceiling is kept as it is.
+KEEP = object()
 
 # Float addition of exact decimals is not exact; 1.0 must not fail by 1e-16.
 _SUM_TOLERANCE = 1e-9
@@ -128,6 +137,26 @@ def _validate_incentive_floor(params: Mapping[str, Any]) -> None:
         )
 
 
+def _validate_token_price(entry: TaskEntry) -> None:
+    declared = [f for f in MAX_PRICE_PARAMS if f in entry.params]
+    if not declared:
+        return
+    if len(declared) != len(MAX_PRICE_PARAMS):
+        missing = sorted(set(MAX_PRICE_PARAMS) - set(declared))
+        raise RegistryError(f"task {entry.task_id!r} price ceiling misses {', '.join(missing)}")
+    if (entry.mechanism != MECHANISM_CORPUS_GENERATION
+            or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
+        raise RegistryError(f"task {entry.task_id!r}: a price ceiling applies to a corpus "
+                            f"task settled by period ({SETTLEMENT_PERIOD_EMA})")
+    price, alpha, emission, _ = (_number(entry.params[f], f) for f in MAX_PRICE_PARAMS)
+    if price <= 0 or alpha <= 0 or emission <= 0:
+        raise RegistryError(f"task {entry.task_id!r} price ceiling must be positive; "
+                            "remove it to pay the cap alone")
+    if not math.isclose(price, alpha / 1e6 / emission, rel_tol=1e-9):
+        raise RegistryError(f"task {entry.task_id!r} price {price} is not {alpha} alpha per "
+                            f"million tokens at {emission} miner alpha per period")
+
+
 def validate_entry(entry: TaskEntry) -> None:
     """Everything checkable about one entry without reading the image or R2."""
     try:
@@ -187,6 +216,7 @@ def validate_entry(entry: TaskEntry) -> None:
         tail = _number(entry.params[TAIL_CAP_PARAM], TAIL_CAP_PARAM)
         if not 0.0 <= tail <= 1.0:
             raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
+    _validate_token_price(entry)
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
         raise RegistryError(f"floor {floor} exceeds cap {cap}")
@@ -353,7 +383,7 @@ def retire_task(
 def set_cap(
     entries: Mapping[str, TaskEntry],
     task_id: str,
-    cap: float,
+    cap: float | None,
     floor: float | None = None,
     min_incentive_share: float | None = None,
     audit_q: float | None = None,
@@ -363,8 +393,13 @@ def set_cap(
     audit_ban_after_failures: int | None = None,
     audit_ban_window_seconds: float | None = None,
     audit_ban_seconds: float | None = None,
+    *,
+    token_price: Mapping[str, float] | None | object = KEEP,
 ) -> dict[str, TaskEntry]:
     """Change one live entry's cap (and optionally floor), nothing else.
+
+    ``cap`` None keeps the cap. ``token_price`` (``corpus_periods.price_params``)
+    sets a period task's price ceiling, None removes it, omitted keeps it.
 
     The contract and its digest stay as they are: a cap is what the task may
     pay, not how it generates. A corpus task's price follows its cap unless a
@@ -377,6 +412,8 @@ def set_cap(
     if task_id not in entries:
         raise RegistryError(f"task {task_id!r} is not in the registry")
     entry = entries[task_id]
+    if cap is None:
+        cap = _number(entry.params.get("cap"), "cap")
     if entry.status != "active":
         # A retired cap is reserved while its EMA decays; changing it would
         # hand out budget that is still being paid.
@@ -414,6 +451,11 @@ def set_cap(
         params["audit_ban_window_seconds"] = float(audit_ban_window_seconds)
     if audit_ban_seconds is not None:
         params["audit_ban_seconds"] = float(audit_ban_seconds)
+    if token_price is not KEEP:
+        for field in MAX_PRICE_PARAMS:
+            params.pop(field, None)
+        if token_price is not None:
+            params.update({f: float(token_price[f]) for f in MAX_PRICE_PARAMS})
     updated = {**entries, task_id: replace(entry, params=params)}
     validate_registry(updated)
     return updated

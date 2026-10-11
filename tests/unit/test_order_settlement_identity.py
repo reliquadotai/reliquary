@@ -16,7 +16,9 @@ import json
 from tests.unit.test_corpus_settlement import _Archives, _Records, _settler, _v
 
 # sha256 of the canonical JSON, computed when the period settler took over (2026-10-08).
-SETTLEMENT_GOLDEN = "4a56f422de86aacb2de4c94cfe809dffe237d41473f0af728bc715094d47f465"
+# Moved 2026-10-11: the settlement state now records `period_paid` (what each period
+# has paid, for the token price ceiling); the archives -- the payment -- are unchanged.
+SETTLEMENT_GOLDEN = "ad05aa665d096f09b705caebb8fa820e81d98107d0efd9c5761407d214c299dc"
 
 
 def _canonical(document) -> str:

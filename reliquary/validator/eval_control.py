@@ -1018,6 +1018,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         renderer_for_job,
     )
     from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.validator import corpus_periods as cp
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
     from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
     from reliquary.validator.corpus_validator import (
@@ -1094,7 +1095,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
             archives=R2PeriodArchives(guard=settle_archives),
             oldest_pending=lambda: w.auditor.oldest_pending_received_at(),
-            on_settled=w.stats.settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS)
+            on_settled=w.stats.settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
+            max_price=cp.max_price(entry.params))
         w.auditor = eval_auditor(
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,

@@ -382,6 +382,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     # auditor holds nothing undecided received in it -- and, for an episode
     # job, its grader nothing ungraded or held (ruling P21).
     from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.validator import corpus_periods as cp
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
 
     grader = getattr(w, "grader", None)
@@ -393,7 +394,8 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
         archives=R2PeriodArchives(guard=archives), oldest_pending=oldest_of(*sources),
         on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
         executor=judge_threads.codec,
-        ready=grader.ready if grader is not None else None)
+        ready=grader.ready if grader is not None else None,
+        max_price=cp.max_price(w.entry.params))
     w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                               tokenizer=tokenizer, proof=proof, params=params,
                               miner_states=MinerStates(judge_records, w.job.job_id),
@@ -531,6 +533,9 @@ class JudgedElsewhere:
 
     def set_cap(self, cap: float) -> None:
         # The judge process reads the registry itself (`refresh_caps`).
+        return None
+
+    def set_max_price(self, price) -> None:
         return None
 
     async def pending_ids(self) -> list[str]:
