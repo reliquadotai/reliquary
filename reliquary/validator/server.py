@@ -1344,11 +1344,12 @@ def _episode_admission_fields(batcher: Any) -> dict:
     policy = getattr(batcher, "service_policy", None)
     if not isinstance(policy, dict):
         return {}
-    from reliquary.protocol.service_contract import ServiceContract, ServiceContractError
+    from reliquary.protocol.service_catalogue import announced_contract
+    from reliquary.protocol.service_contract import ServiceContractError
 
     name = str(getattr(batcher.env, "name", ""))
     try:
-        contract = ServiceContract.from_dict(policy["contract"])
+        contract = announced_contract(policy)
         if contract.version != 2 or name not in contract.environments:
             return {}
         episode = contract.episode_policy(name)

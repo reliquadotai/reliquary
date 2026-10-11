@@ -296,10 +296,10 @@ class EpisodeGroupMiner:
         sent past it, and the seeds still playing then are cancelled."""
         from reliquary.miner.episode_commit import withdraw_inadmissible
         from reliquary.protocol.seed_pool import pool_from_service_policy
-        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_catalogue import announced_contract
         from reliquary.protocol.service_episode import EpisodePrecommit
 
-        contract = ServiceContract.from_dict(announcement["contract"])
+        contract = announced_contract(announcement)
         policy = contract.episode_policy(environment)
         if policy is None:
             raise ValueError(f"{environment} is not an episode environment of this order")

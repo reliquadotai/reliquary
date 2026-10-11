@@ -13,7 +13,9 @@ def parse_service_announcement(announcement: dict, *, contract: ServiceContract 
     from reliquary.protocol.service_schedule import ServiceSchedule
 
     if contract is None:
-        contract = ServiceContract.from_dict(announcement["contract"])
+        from reliquary.protocol.service_catalogue import announced_contract
+
+        contract = announced_contract(announcement)
     if contract.version != 2:
         raise ValueError("only service-contract/v2 runs RL")
     contract.require_capabilities(set(announcement["supported_capabilities"]))

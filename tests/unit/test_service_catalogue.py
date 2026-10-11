@@ -18,14 +18,18 @@ from reliquary.protocol.service_schedule import (
     initial_schedule,
     next_schedule,
 )
+from reliquary.protocol.submission import ServicePolicyAnnouncement
+from reliquary.services.admission_policy import parse_service_announcement
 from tests.unit.episode_v2_fixtures import (
     ADDED,
     ADDED_IDENTITY,
     ENV_PACKAGE,
     EPISODE,
     SANDBOX_ENV,
+    WINDOW_BEACON,
     added_block,
     episode_contract,
+    episode_runtime,
 )
 from tests.unit.service_v2_fixtures import MATH, contract_v2
 
@@ -228,3 +232,35 @@ def test_the_view_requires_the_added_envs_capabilities():
     view.require_capabilities(supported)
     with pytest.raises(ServiceContractError, match="capabilities"):
         view.require_capabilities(supported - {"signed-sandbox-episode/v1"})
+
+
+def test_the_announcement_of_a_window_with_an_added_env_parses_on_both_sides(tmp_path):
+    rt = episode_runtime(tmp_path)
+    value = rt.announcement(window=1, randomness=WINDOW_BEACON)
+    value = dict(value, schedule=with_added(active=[MATH, EPISODE, ADDED],
+                                            shares={MATH: 4000, EPISODE: 3000, ADDED: 3000}).to_dict())
+    ServicePolicyAnnouncement(**value)
+    contract, schedule = parse_service_announcement(value)
+    assert contract.sha256 == CONTRACT.sha256 and ADDED in contract.episode_environments
+    assert ADDED in schedule.active_environments()
+
+
+def test_the_seed_pool_and_the_admission_context_see_an_added_env_and_only_when_added(tmp_path):
+    from types import SimpleNamespace
+
+    from reliquary.protocol.seed_pool import pool_from_service_policy
+    from reliquary.validator.server import _episode_admission_fields
+
+    rt = episode_runtime(tmp_path)
+    plain = rt.announcement(window=1, randomness=WINDOW_BEACON)
+    added = dict(plain, schedule=with_added(active=[MATH, EPISODE, ADDED],
+                                            shares={MATH: 4000, EPISODE: 3000, ADDED: 3000}).to_dict())
+    revision = plain["checkpoint"]["revision"]
+    pool = pool_from_service_policy(added, environment=ADDED, prompt_idx=0, checkpoint_hash=revision)
+    assert pool is not None and pool.environment == ADDED
+    fields = _episode_admission_fields(SimpleNamespace(service_policy=added, env=SimpleNamespace(name=ADDED)))
+    assert fields["signed_episode"] is True
+    # Without the added row the order alone is served: the env is unknown, exactly as before.
+    with pytest.raises(ValueError):
+        pool_from_service_policy(plain, environment=ADDED, prompt_idx=0, checkpoint_hash=revision)
+    assert _episode_admission_fields(SimpleNamespace(service_policy=plain, env=SimpleNamespace(name=ADDED))) == {}

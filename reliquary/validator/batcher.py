@@ -6522,13 +6522,13 @@ class GrpoWindowBatcher:
     def _service_window_contract(self):
         """m6: the contract of the window's frozen announcement, parsed once per window (the batcher
         lives one window; a new announcement object is parsed again). Service tasks only."""
-        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_catalogue import announced_contract
 
         policy = self.service_policy
         cached = getattr(self, "_service_policy_contract", None)
         if cached is not None and cached[0] is policy:
             return cached[1]
-        contract = ServiceContract.from_dict(policy["contract"])
+        contract = announced_contract(policy)
         self._service_policy_contract = (policy, contract)
         return contract
 

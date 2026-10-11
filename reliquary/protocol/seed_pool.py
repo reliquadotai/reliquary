@@ -149,7 +149,9 @@ def pool_from_service_policy(value: Any, *, environment: str, prompt_idx: int,
         value = value.model_dump()
     if not isinstance(value, dict) or set(value) != _ANNOUNCEMENT_FIELDS:
         raise SeedPoolError("invalid service policy announcement")
-    contract = ServiceContract.from_dict(value["contract"])
+    from reliquary.protocol.service_catalogue import announced_contract
+
+    contract = announced_contract(value)
     if contract.version != 2:
         raise SeedPoolError("only service-contract/v2 announces public pools")
     supported = value["supported_capabilities"]

@@ -428,9 +428,9 @@ class ServicePolicyAnnouncement(BaseModel):
 
     @model_validator(mode="after")
     def _validate_contract_capabilities(self):
-        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_catalogue import announced_contract
         from reliquary.protocol.service_schedule import ServiceSchedule
-        contract = ServiceContract.from_dict(self.contract)
+        contract = announced_contract({"contract": self.contract, "schedule": self.schedule})
         if contract.version != 2:
             raise ValueError("RL announcements carry service-contract/v2")
         if any(not 1 <= len(capability) <= 256 for capability in self.supported_capabilities):

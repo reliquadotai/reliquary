@@ -203,10 +203,10 @@ async def maybe_pull_checkpoint(
 
     service_policy = getattr(state, "service_policy", None)
     if service_policy is not None:
-        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_catalogue import announced_contract
 
         policy = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
-        contract = ServiceContract.from_dict(policy["contract"])
+        contract = announced_contract(policy)
         active_checkpoint_namespace().require_policy(contract.to_dict()["policies"]["checkpoint"])
     remote_identity = checkpoint_identity_from_state(state)
     if remote_identity is None:
@@ -1588,11 +1588,11 @@ class MiningEngine:
         return rewards
 
     def _service_submission_binding(self, policy, generations, problem, env) -> dict:
-        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_catalogue import announced_contract
         from reliquary.protocol.service_submission import ServiceBinding
         from reliquary.services.scoring import classify_signal
 
-        contract = ServiceContract.from_dict(policy["contract"])
+        contract = announced_contract(policy)
         value = contract.to_dict()
         rewards = (self._local_group_rewards(generations, problem, env)
                    if value["scoring"]["weights_bps"] == {"reward": 10000}

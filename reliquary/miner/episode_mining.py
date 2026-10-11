@@ -466,10 +466,10 @@ async def build_episode_stack(view: EpisodeWindow, *, config: EpisodeMinerConfig
     from reliquary.miner.episode_group_miner import EpisodeGroupMiner, http_verdicts
     from reliquary.miner.forced_draw import ForcedDraws
     from reliquary.miner.rl_episode_client import RL_PREFIX, HttpRlEpisodes, check_engine_caps
-    from reliquary.protocol.service_contract import ServiceContract
+    from reliquary.protocol.service_catalogue import announced_contract
 
     deps = deps or EpisodeStackDeps()
-    contract = ServiceContract.from_dict(view.announcement["contract"])
+    contract = announced_contract(view.announcement)
     policies = _episode_policies(contract, config.environments, deps.package_refusal)
     first = policies[config.environments[0]]
     total, per_turn = int(first.max_episode_tokens), int(first.max_tokens_per_turn)
@@ -656,9 +656,9 @@ class EpisodeMiningLoop:
         await self._cancel_inflight()
 
     def _sizes_of(self, view: EpisodeWindow) -> dict[str, int]:
-        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.protocol.service_catalogue import announced_contract
 
-        contract = ServiceContract.from_dict(view.announcement["contract"])
+        contract = announced_contract(view.announcement)
         sizes = {}
         for name in self._environments:
             if name in contract.environments:
@@ -769,11 +769,10 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
 
         def preflight(view: EpisodeWindow) -> str | None:
             # The new order's pins, checked now: the restarted miner would refuse to start on them.
-            from reliquary.protocol.service_contract import ServiceContract
+            from reliquary.protocol.service_catalogue import announced_contract
 
             try:
-                _episode_policies(ServiceContract.from_dict(view.announcement["contract"]), config.environments,
-                                  package_refusal)
+                _episode_policies(announced_contract(view.announcement), config.environments, package_refusal)
             except ValueError as exc:
                 return str(exc)
             return None
