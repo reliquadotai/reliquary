@@ -919,6 +919,30 @@ class Fleet:
             found.append(entry.machine_id)
         return sorted(found)
 
+    def view_complete(self, env: str, env_package: str, *, env_options_sha256: str | None = None,
+                      now: float | None = None) -> bool:
+        """Whether a shortfall of the machines serving ``env`` at ``env_package`` (and options) is a final answer:
+        the directory is young enough, the last poll heard some machine, and no active machine whose last report
+        serves it is stale or drained, or judged by resources it cannot report (``could_place``'s "cannot judge
+        now", per env). False: the view is incomplete, and a shortfall is "not yet". Memory reads only."""
+        now = self._clock() if now is None else now
+        if not self.directory_ready(now) or self._egress_suspect or not self._last_ok:
+            return False
+        for entry in self._directory.entries():
+            document = self._reports.get(entry.machine_id)
+            if entry.status != "active" or document is None:
+                continue
+            if (document.get("env_packages") or {}).get(env) != env_package:
+                continue
+            if (env_options_sha256 is not None
+                    and (document.get("env_options_sha256") or {}).get(env) != env_options_sha256):
+                continue
+            if entry.machine_id in self.drained or now - document["at"] > HEARTBEAT_MAX_AGE_S:
+                return False
+            if self.resources_required and self._resources(entry.machine_id, document) is None:
+                return False
+        return True
+
     def reported_packages(self, env: str) -> list[str]:
         """Every ``env_package`` the accepted reports name for ``env`` (for an operator's error message)."""
         return sorted({str(package) for document in list(self._reports.values())
