@@ -703,6 +703,20 @@ def _check_caps(quota, clock: Callable[[], float]) -> dict:
             "max_checks_running": MAX_CHECKS_RUNNING, "checks_scale": quota.cap_scale}
 
 
+def _allocation_of(quota, pool_seeds: int) -> Callable[[str], dict]:
+    """What ``GET /rl/sessions/allocation/{hotkey}`` answers: the hotkey's entity and its POTENTIAL (its weighted
+    share with its own demand unbounded; a pooled hotkey: its entity's maximum per member), in sessions and in groups
+    of the largest pool (at least one). Before the fleet can be sized, ``groups`` is None: the miner keeps its own
+    number rather than drop to one group."""
+    def allocation_of(hotkey: str) -> dict:
+        if not quota.capacity_known():
+            return {"hotkey": hotkey, "lane": None, "sessions": None, "groups": None, "pool_seeds": pool_seeds}
+        return {"hotkey": hotkey, "lane": quota.lane(hotkey), "sessions": quota.sessions_allowed(hotkey),
+                "groups": quota.groups_allowed(hotkey), "pool_seeds": pool_seeds}
+
+    return allocation_of
+
+
 def build_rl_episode_services(
     config, *, validator_hotkey: str, runtime, environments: Mapping[str, Any],
     renderer_for: Callable[[Any], Any], current_window: Callable[[], int | None], chunk_tokens: int,
@@ -738,7 +752,9 @@ def build_rl_episode_services(
     from reliquary.sandbox import require_sandbox
     from reliquary.sandbox.fleet import Fleet, http_fetch_report
     from reliquary.sandbox.rl_yield import LedgerEvents, SessionYieldLedger
-    from reliquary.sandbox.rl_routes import BODY_TIMEOUT_S, MAX_PREAUTH, build_episode_precommit_router
+    from reliquary.sandbox.rl_routes import (
+        BODY_TIMEOUT_S, MAX_PREAUTH, build_allocation_router, build_episode_precommit_router,
+    )
     from reliquary.sandbox.routes import build_sandbox_sessions_router
 
     require_sandbox()
@@ -864,6 +880,8 @@ def build_rl_episode_services(
                                 window_open=window_open, check_metrics=saturation, **_check_caps(quota, clock))
     logger.info("rl episode services built for %s (validator key %s)", sorted(policies), signer.key_id)
     routers = (sessions_router, precommit_router)
+    if isinstance(quota, YieldQuota):
+        routers += (build_allocation_router(_allocation_of(quota, pool_seeds), prefix=RL_PREFIX),)
     if saturation is not None:
         routers += (build_saturation_router(lambda: built["services"].cached_saturation()),)
     services = RlEpisodeServices(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book,

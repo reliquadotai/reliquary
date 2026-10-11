@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
@@ -50,7 +51,10 @@ PRECOMMIT_STATUS: dict[str, int] = {
     # the window ends. No machine serving the env can take this task: the miner moves to another task (it may be
     # servable in a later window). None of them records anything.
     "environment_unserved": 503, "fleet_unavailable": 503, "task_unservable": 409,
+    # the allocation route: not a hotkey address
+    "hotkey_invalid": 400,
 }
+_SS58_LIKE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{1,64}\Z")
 BODY_TIMEOUT_S = 10.0
 MAX_PER_MINUTE = 30
 MAX_PREAUTH = 8
@@ -216,5 +220,24 @@ def build_episode_precommit_router(
     return router
 
 
+def episode_allocation_path(prefix: str = "/rl") -> str:
+    return f"{prefix}/sessions/allocation/{{hotkey}}"
+
+
+def build_allocation_router(allocation_of: Callable[[str], dict], *, prefix: str = "/rl") -> APIRouter:
+    """``GET {prefix}/sessions/allocation/{hotkey}``: the hotkey's allocation as the reference miner reads it (how
+    many groups to run). Memory only; public numbers (a quota refusal carries them too)."""
+    router = APIRouter()
+
+    @router.get(episode_allocation_path(prefix))
+    async def allocation(hotkey: str) -> JSONResponse:
+        if not _SS58_LIKE.fullmatch(hotkey):
+            return _refusal("hotkey_invalid", {"hotkey": hotkey[:64]})
+        return JSONResponse(allocation_of(hotkey), headers={"Cache-Control": "no-store"})
+
+    return router
+
+
 __all__ = ["BODY_TIMEOUT_S", "MAX_PER_MINUTE", "MAX_PREAUTH", "MAX_TRACKED_HOTKEYS", "EpisodePrecommitRequest",
-           "PRECOMMIT_STATUS", "build_episode_precommit_router", "episode_precommit_path"]
+           "PRECOMMIT_STATUS", "build_allocation_router", "build_episode_precommit_router",
+           "episode_allocation_path", "episode_precommit_path"]

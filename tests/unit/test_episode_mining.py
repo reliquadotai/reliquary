@@ -449,7 +449,7 @@ def loop_world(rt, states, **kwargs):
     return loop, built
 
 
-def test_at_most_two_groups_are_in_flight(tmp_path):
+def test_the_default_two_groups_are_in_flight_and_the_ceiling_has_no_upper_bound(tmp_path):
     rt = episode_runtime(tmp_path / "rt")
     states = [miner_state(rt)]
     loop, built = loop_world(rt, states)
@@ -472,12 +472,15 @@ def test_at_most_two_groups_are_in_flight(tmp_path):
     asyncio.run(scenario())
     tasks = [started[2] for started in built[0].started]
     assert len(set(tasks)) == 4                     # a task is mined once per window
-    for groups in (0, 3):
-        with pytest.raises(ValueError, match="1..2"):
-            em.EpisodeMiningLoop(environments=[EPISODE], read_state=None, build_stack=None, sizes=len,
-                                 groups_in_flight=groups)
-    with pytest.raises(ValueError, match="1..2"):
-        config(groups_in_flight=3)
+    with pytest.raises(ValueError, match="at least 1"):
+        em.EpisodeMiningLoop(environments=[EPISODE], read_state=None, build_stack=None, sizes=len,
+                             groups_in_flight=0)
+    with pytest.raises(ValueError, match="at least 1"):
+        config(groups_in_flight=0)
+    # the miner's own ceiling: the validator's allocation sets how many run below it
+    assert em.EpisodeMiningLoop(environments=[EPISODE], read_state=None, build_stack=None, sizes=len,
+                                groups_in_flight=3)._cap == 3
+    assert config(groups_in_flight=3).groups_in_flight == 3
     from reliquary.validator.rl_sandbox_wiring import RL_GROUPS_IN_FLIGHT
 
     assert em.GROUPS_IN_FLIGHT == RL_GROUPS_IN_FLIGHT
@@ -725,9 +728,13 @@ def test_the_cli_maps_its_flags_and_refuses_a_single_turn_env(monkeypatch, tmp_p
     refused = runner.invoke(app, ["mine-episodes", "--episode-envs", MATH, "--validator-url", URL,
                                   "--validator-hotkey", VALIDATOR.ss58_address])
     assert refused.exit_code == 2 and "not a signed-episode" in refused.output
-    too_many = runner.invoke(app, ["mine-episodes", "--episode-envs", EPISODE, "--validator-url", URL,
-                                   "--validator-hotkey", VALIDATOR.ss58_address, "--groups-in-flight", "3"])
-    assert too_many.exit_code == 2
+    none = runner.invoke(app, ["mine-episodes", "--episode-envs", EPISODE, "--validator-url", URL,
+                               "--validator-hotkey", VALIDATOR.ss58_address, "--groups-in-flight", "0"])
+    assert none.exit_code == 2
+    ceiling = runner.invoke(app, ["mine-episodes", "--episode-envs", EPISODE, "--validator-url", URL,
+                                  "--validator-hotkey", VALIDATOR.ss58_address, "--groups-in-flight", "6"])
+    assert ceiling.exit_code == 0, ceiling.output
+    assert seen["config"].groups_in_flight == 6
     secrets = tmp_path / "harness.env"
     secrets.write_text("# harness secrets\nexport API_KEY=sk-file\nA=from-file\n\n")
     result = runner.invoke(app, ["mine-episodes", "--episode-envs", EPISODE, "--validator-url", URL,

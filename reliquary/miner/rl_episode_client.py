@@ -9,6 +9,8 @@ The runner's ``EpisodeResult.stop`` is the harness's raw stop condition: before 
 the episode's token cap ``agent_completed``; the validator wants ``context_length``)."""
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -16,8 +18,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from reliquary.miner.signed_episode import (
-    GRADING_GRACE_S, OPEN_WINDOW_S, THROTTLED, VALIDATOR_THROTTLES, HttpSandboxSessions, SignedSweEpisodeRunner,
-    _claims_of, _compact, _NoKeys,
+    GRADING_GRACE_S, MAX_UNAVAILABLE, OPEN_WINDOW_S, THROTTLED, VALIDATOR_THROTTLES, HttpSandboxSessions,
+    SignedSweEpisodeRunner, _claims_of, _compact, _NoKeys,
 )
 from reliquary.protocol.sandbox_session import SessionRefused, sandbox_open_path
 from reliquary.protocol.signatures import build_episode_precommit_binding, build_sandbox_open_binding
@@ -33,6 +35,23 @@ RL_FINAL_REFUSALS = frozenset({"precommit_unknown", "precommit_stale", "seed_out
                                "session_too_long", "task_unplaceable"})
 """The RL engagement book's own 4xx, and an open no machine could ever take: the seed is the miner's to change,
 never reopened."""
+RL_TASK_FINAL_REFUSALS = frozenset({"task_unplaceable"})
+"""Final for every seed of the precommit (they all play its one task): after one, the runner sends no other open of
+that precommit, so a task no machine can take costs one refused open, not one per seed."""
+
+RL_OPENS_SIDE_BY_SIDE = 4
+"""Opens of one started group in flight at once (each may wait in the validator's open queue): enough to keep the
+group's seeds queued under saturation, few enough not to burst the validator's open path."""
+
+_FANNED: contextvars.ContextVar[bool] = contextvars.ContextVar("rl_open_fanned", default=False)
+"""Set (per seed task) while an open is sent side by side with the precommit's other opens."""
+
+
+def _not_serving(refused: SessionRefused) -> bool:
+    """A refusal that says the validator is not serving (no answer, 404, an unnamed 5xx): the runner's consecutive
+    count decides when to stop (``validator_unavailable``); until then the seed is reopened."""
+    return (refused.status is None or refused.status == 404
+            or (refused.status >= 500 and refused.reason not in RL_THROTTLES))
 
 
 def check_engine_caps(policy, *, max_total_tokens: int, max_tokens_per_turn: int, max_model_len: int) -> None:
@@ -145,7 +164,18 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
     """``SignedSweEpisodeRunner`` for one precommit: ``run(seed_index, on_session)`` opens that seed's
     session (engagement ``rl_precommit``), plays the task prompt through the harness and returns the
     episode. Its graded state is not a diff (``requires_text_state`` False); its transcript is checked
-    with the RL binding before it is kept."""
+    with the RL binding before it is kept.
+
+    Opens. Until a seed of the precommit is granted, its opens go one at a time (a probe): the validator's yield
+    quota counts a whole group of demand from one request, so a group that cannot start yet costs one refused open
+    per ``Retry-After``, never one per seed (refused opens count toward the hotkey's refused-open rate). Once a seed
+    is granted (the group started: the quota never cuts it), the other seeds are sent side by side
+    (``RL_OPENS_SIDE_BY_SIDE`` at once), each waiting in the validator's open queue for its own turn; any throttle makes the next open a probe again. A refusal that is
+    not the seed's to change is retried for the SAME seed until the window ends: a throttle (429, 503, a named
+    throttle: the yield quota's ``quota_*``, the open queue's, an unserved env, a stale directory) after its
+    ``Retry-After``, and a "not serving" answer after the back-off, until the consecutive count stops the hotkey
+    (only a probe's answer counts: side-by-side opens all fail together). So a group whose first seeds opened is
+    never given up for a refusal of ours. ``task_unplaceable`` ends every seed of the precommit."""
 
     requires_text_state = False
     validator_throttles = RL_THROTTLES
@@ -166,29 +196,85 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                          max_live=max_live or policy.pool_seeds, **kwargs)
         self._policy, self._precommit = policy, precommit
         self._open_until = open_until
+        self._fanning = False                 # a seed was granted and no throttle since: opens go side by side
+        self._side_by_side = asyncio.Semaphore(RL_OPENS_SIDE_BY_SIDE)
+        self._task_refused: SessionRefused | None = None
 
     async def _open(self, index: int, slot) -> dict:
-        """The seed's open; a throttled one (429, 503, a named throttle) is sent again for the SAME seed once
-        its Retry-After has passed, while that is before ``open_until`` (the window; by default
-        OPEN_WINDOW_S from the first send). Any other refusal ends the seed."""
+        """The seed's open; a throttled one (429, 503, a named throttle) or a "not serving" one is sent again for
+        the SAME seed once its wait has passed, while that is before ``open_until`` (the window; by default
+        OPEN_WINDOW_S from the first send). A final refusal (the seed's or the task's) or the hotkey's stop
+        (``validator_unavailable``) ends the seed."""
         until = self._open_until if self._open_until is not None else self._clock() + OPEN_WINDOW_S
         while True:
             try:
-                return await super()._open(index, slot)
+                grant = await self._open_once(index, slot)
             except SessionRefused as refused:
+                if refused.reason in RL_TASK_FINAL_REFUSALS and self._task_refused is None:
+                    self._task_refused = refused
                 reopen = (not slot.keep and refused.reason not in RL_FINAL_REFUSALS
                           and refused.reason != "validator_unavailable"
-                          and (refused.status in THROTTLED or refused.reason in RL_THROTTLES))
+                          and (refused.status in THROTTLED or refused.reason in RL_THROTTLES
+                               or _not_serving(refused)))
                 wait = max(0.0, self._not_before - self._monotonic())
                 if not reopen or self._clock() + wait >= until:
                     raise
                 logger.info("seed %d open throttled (%s): reopened in %.0f s", index, refused.reason, wait)
+                continue
+            self._fanning = True
+            return grant
+
+    def _task_refusal(self) -> SessionRefused | None:
+        """What ends every open of the precommit without sending it: its task no machine can take, or the
+        validator stopped serving (the consecutive count reached MAX_UNAVAILABLE)."""
+        if self._unavailable >= MAX_UNAVAILABLE:
+            return SessionRefused("validator_unavailable", {"consecutive": self._unavailable})
+        refused = self._task_refused
+        if refused is None:
+            return None
+        return SessionRefused(refused.reason, refused.detail, status=refused.status)
+
+    async def _open_once(self, index: int, slot) -> dict:
+        """One open of the seed: behind the runner's gate and its lost opens' recovery, then sent alone (a probe)
+        or, once the group started, side by side with the others."""
+        refused = self._task_refusal()
+        if refused is not None:
+            raise refused
+        lock = self._open_lock
+        await lock.acquire()
+        held = True
+        try:
+            await self._wait_gate()
+            await self._recover()
+            refused = self._task_refusal()
+            if refused is not None:
+                raise refused
+            if not self._fanning:
+                return await self._send_attempts(index, slot)
+            await self._side_by_side.acquire()
+            lock.release()
+            held = False
+        finally:
+            if held:
+                lock.release()
+        fanned = _FANNED.set(True)
+        try:
+            return await self._send_attempts(index, slot)
+        finally:
+            _FANNED.reset(fanned)
+            self._side_by_side.release()
 
     def _note_refusal(self, refused: SessionRefused) -> SessionRefused:
         # A 409 is about this seed (taken, out of the pool, a stale precommit): the other seeds' opens
         # are not held behind it.
         if refused.status == 409 and not refused.retry_after:
             self._unavailable = 0
+            return refused
+        self._fanning = False                 # the next open is a probe
+        if _FANNED.get():
+            # Sent side by side: the other opens in flight fail with it, so it neither counts toward the hotkey's
+            # stop nor grows the back-off; the probe that follows does.
+            self._hold_opens(refused.retry_after or 1.0)
             return refused
         return super()._note_refusal(refused)
 
@@ -203,5 +289,7 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                                      seed_index=index, now=now)
 
 
-__all__ = ["HttpRlEpisodes", "RL_FINAL_REFUSALS", "RL_PREFIX", "RL_THROTTLES", "RlSignedEpisodeRunner",
+__all__ = ["HttpRlEpisodes", "RL_FINAL_REFUSALS", "RL_OPENS_SIDE_BY_SIDE", "RL_PREFIX", "RL_TASK_FINAL_REFUSALS",
+           "RL_THROTTLES",
+           "RlSignedEpisodeRunner",
            "check_engine_caps", "rl_transcript_refusal", "signed_precommit_body", "signed_rl_open_request"]

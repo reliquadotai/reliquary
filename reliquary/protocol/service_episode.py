@@ -14,8 +14,9 @@ from reliquary.protocol.submission import (  # noqa: F401  (re-exported)
 )
 
 PRECOMMIT_SCHEMA = "reliquary/episode-precommit/v1"
-# Episode groups of one operator in flight at once: the validator's per-operator check cap, which the
-# miner never exceeds. Each group holds its 2M pool sessions plus one being reopened after a signed abort.
+# Episode groups a newcomer holds at once (the newcomer entity's maximum per hotkey) and the reference miner's
+# default before the validator's allocation answers. Each group holds its 2M pool sessions plus one being reopened
+# after a signed abort.
 GROUPS_IN_FLIGHT = 2
 RL_ENGAGEMENT_PREFIX = "rl"
 MAX_SAFE_INTEGER = 2**53 - 1

@@ -457,27 +457,32 @@ class SignedSweEpisodeRunner:
         async with self._open_lock:
             await self._wait_gate()
             await self._recover()
-            request_id = self._new_request_id()
-            for attempt in range(OPEN_ATTEMPTS):
-                try:
-                    grant = await self._send_open(self._open_body(index, request_id))
-                except SessionRefused as refused:
-                    if attempt:
-                        await self._close_reused(refused)
-                    raise self._note_refusal(refused) from None
-                except Exception as exc:
-                    # A lost answer: the same request id returns the same grant.
-                    logger.warning("sandbox session open for prompt %d failed (%s), attempt %d",
-                                   index, type(exc).__name__, attempt + 1)
-                    if attempt + 1 < OPEN_ATTEMPTS:
-                        await self._sleep(2.0 ** attempt)
-                    continue
-                self._backoff = self._unavailable = 0
-                return grant
-            slot.keep = True
-            self._unconfirmed.append(_Unconfirmed(
-                index, request_id, slot, self._monotonic() + self.deadline(index)))
-            raise self._note_refusal(SessionRefused("validator_unreachable"))
+            return await self._send_attempts(index, slot)
+
+    async def _send_attempts(self, index: int, slot: _Slot) -> dict:
+        """One signed open of `index`, resent (same request id) after transport errors; a refusal
+        moves the gate (`_note_refusal`) and is raised."""
+        request_id = self._new_request_id()
+        for attempt in range(OPEN_ATTEMPTS):
+            try:
+                grant = await self._send_open(self._open_body(index, request_id))
+            except SessionRefused as refused:
+                if attempt:
+                    await self._close_reused(refused)
+                raise self._note_refusal(refused) from None
+            except Exception as exc:
+                # A lost answer: the same request id returns the same grant.
+                logger.warning("sandbox session open for prompt %d failed (%s), attempt %d",
+                               index, type(exc).__name__, attempt + 1)
+                if attempt + 1 < OPEN_ATTEMPTS:
+                    await self._sleep(2.0 ** attempt)
+                continue
+            self._backoff = self._unavailable = 0
+            return grant
+        slot.keep = True
+        self._unconfirmed.append(_Unconfirmed(
+            index, request_id, slot, self._monotonic() + self.deadline(index)))
+        raise self._note_refusal(SessionRefused("validator_unreachable"))
 
     async def _close_reused(self, refused: SessionRefused) -> None:
         """`request_reused` names a session our lost open was granted; if it is still

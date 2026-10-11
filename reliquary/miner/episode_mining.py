@@ -4,8 +4,9 @@ Each poll reads the RL validator's ``/miner-state``: the window, its randomness,
 (``service_policy``: the order and the checkpoint revision), the window's end (``submission_deadline_at``)
 and, per environment, the prompt range, the cooldown and whether it accepts groups. It picks
 (environment, task) among the configured signed-episode environments (never a task in cooldown, nor one
-this miner already took in the window) and runs at most ``groups_in_flight`` (<= 2, the validator's
-per-operator cap) ``EpisodeGroupMiner.mine_task`` at once. When the announced checkpoint (revision) or
+this miner already took in the window) and runs as many ``EpisodeGroupMiner.mine_task`` at once as the
+validator allocates to its hotkey (``GET /rl/sessions/allocation/{hotkey}``: its potential, in groups), never more
+than its own ceiling ``groups_in_flight`` and never fewer than one (``groups_to_run``). When the announced checkpoint (revision) or
 order (contract sha) changes, no new group starts, the groups in flight are drained (bounded by
 ``drain_s``, then cancelled), the stack is closed and the process exits with ``EXIT_CHECKPOINT_CHANGED``
 (75): the miner runs under a supervisor that restarts it (systemd ``Restart=always``, a docker restart
@@ -58,6 +59,17 @@ BUILD_BACKOFF_S = 5.0
 BUILD_BACKOFF_MAX_S = 300.0
 SECONDS_PER_WAVE = 300.0
 """Default time one wave of live sessions (an episode played to its end) is expected to take."""
+ALLOCATION_TIMEOUT_S = 10.0
+"""The validator's allocation for this hotkey is read at every poll, before the groups are filled."""
+
+
+def groups_to_run(ceiling: int, announced: int | None, current: int) -> int:
+    """The groups the miner runs: what the validator announces (its potential, in groups), never above its own
+    ceiling (its GPU), never below one (its requests are its demand); the current value when the validator does
+    not answer."""
+    if announced is None:
+        return int(current)
+    return min(int(ceiling), max(1, int(announced)))
 
 
 class CheckpointChanged(Exception):
@@ -475,8 +487,8 @@ class EpisodeMinerConfig:
     def __post_init__(self) -> None:
         if not self.environments:
             raise ValueError("at least one signed-episode environment is needed")
-        if not 1 <= int(self.groups_in_flight) <= GROUPS_IN_FLIGHT:
-            raise ValueError(f"groups in flight must be 1..{GROUPS_IN_FLIGHT} (the validator's per-operator cap)")
+        if int(self.groups_in_flight) < 1:
+            raise ValueError("groups in flight must be at least 1 (the validator's allocation sets it while mining)")
         if self.max_live is not None and int(self.max_live) < 1:
             raise ValueError("max_live must be positive")
 
@@ -626,8 +638,10 @@ async def build_episode_stack(view: EpisodeWindow, *, config: EpisodeMinerConfig
 
 
 class EpisodeMiningLoop:
-    """Poll the window; build the stack on the announced checkpoint once; keep up to ``groups_in_flight``
-    groups mining. ``read_state()`` -> ``MinerState`` (or None); ``build_stack(window)`` -> ``EpisodeStack``
+    """Poll the window; build the stack on the announced checkpoint once; keep groups mining: as many as the
+    validator allocates to this hotkey (``allocation()`` -> groups, or None when it does not answer), at most
+    ``groups_in_flight`` (the miner's own ceiling, also the value used until the first answer), at least one.
+    A lower allocation starts no new group; the groups in flight finish. ``read_state()`` -> ``MinerState`` (or None); ``build_stack(window)`` -> ``EpisodeStack``
     (a ValueError is a refusal to start and ends the loop; any other error is logged and the build retried
     at a later poll, with a bounded backoff); ``sizes(environment)`` -> tasks the miner's source holds.
     A new (revision, contract sha) drains the groups in flight (``drain_s``, then cancelled) and raises
@@ -640,14 +654,17 @@ class EpisodeMiningLoop:
                  rng: random.Random | None = None, clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep, poll_s: float = STATE_POLL_S,
                  drain_s: float = DRAIN_S, preflight: Callable[[EpisodeWindow], str | None] | None = None,
-                 max_live: int | None = None, seconds_per_wave: float = SECONDS_PER_WAVE) -> None:
-        if not 1 <= int(groups_in_flight) <= GROUPS_IN_FLIGHT:
-            raise ValueError(f"groups in flight must be 1..{GROUPS_IN_FLIGHT} (the validator's per-operator cap)")
+                 max_live: int | None = None, seconds_per_wave: float = SECONDS_PER_WAVE,
+                 allocation: Callable[[], Awaitable[int | None]] | None = None) -> None:
+        if int(groups_in_flight) < 1:
+            raise ValueError("groups in flight must be at least 1 (the validator's allocation sets it while mining)")
         self._environments = tuple(environments)
         self._read_state = read_state
         self._build_stack = build_stack
         self._sizes = sizes
+        self._ceiling = int(groups_in_flight)
         self._cap = int(groups_in_flight)
+        self._allocation = allocation
         self._rng = rng or random.Random()
         self._clock = clock
         self._sleep = sleep
@@ -684,8 +701,27 @@ class EpisodeMiningLoop:
                 return None
         elif view.key != self.stack_key:
             await self._restart(view)
+        await self._follow_allocation()
         self._fill(view)
         return view
+
+    async def _follow_allocation(self) -> None:
+        """Run as many groups in flight as the validator allocates to this hotkey (``groups_to_run``: never above
+        the ceiling, never below one); keep the last value when the validator does not answer."""
+        if self._allocation is None:
+            return
+        try:
+            groups = await self._allocation()
+        except Exception as exc:
+            logger.debug("allocation unavailable: %s", exc)
+            return
+        if isinstance(groups, bool) or not isinstance(groups, int):
+            groups = None
+        cap = groups_to_run(self._ceiling, groups, self._cap)
+        if cap != self._cap:
+            logger.info("the validator allocates %s groups to this hotkey: %d groups in flight (ceiling %d)",
+                        groups, cap, self._ceiling)
+        self._cap = cap
 
     async def _build(self, view: EpisodeWindow) -> bool:
         if self._clock() < self._next_build_at:
@@ -822,6 +858,27 @@ def miner_state_reader(url: str, *, client) -> Callable[[], Awaitable[Any]]:
     return read
 
 
+def allocation_reader(url: str, hotkey: str, *, client) -> Callable[[], Awaitable[int | None]]:
+    """``allocation()`` over ``GET {url}/rl/sessions/allocation/{hotkey}``: the groups the validator allocates to
+    this hotkey (its potential), or None when it does not answer one (any failure, a fleet it cannot size yet)."""
+    from reliquary.miner.rl_episode_client import RL_PREFIX
+
+    path = f"{url.rstrip('/')}{RL_PREFIX}/sessions/allocation/{hotkey}"
+
+    async def read() -> int | None:
+        try:
+            response = await asyncio.wait_for(client.get(path), ALLOCATION_TIMEOUT_S)
+            if response.status_code != 200:
+                return None
+            groups = response.json().get("groups")
+        except Exception as exc:
+            logger.debug("allocation: %s", type(exc).__name__)
+            return None
+        return groups if isinstance(groups, int) and not isinstance(groups, bool) else None
+
+    return read
+
+
 async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio.Event | None = None,
                             deps: EpisodeStackDeps | None = None, task_prompts: EpisodeTaskPrompts | None = None,
                             read_state: Callable[[], Awaitable[Any]] | None = None, **loop_kwargs) -> None:
@@ -838,6 +895,12 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
         if read_state is None:
             client = await stack.enter_async_context(httpx.AsyncClient(timeout=30.0))
             read_state = miner_state_reader(config.validator_url, client=client)
+        if "allocation" not in loop_kwargs:
+            # Its own client, closed with the miner (the state reader's exists only when it is built here).
+            allocation_client = (deps.async_http() if deps is not None
+                                 else httpx.AsyncClient(timeout=ALLOCATION_TIMEOUT_S))
+            stack.push_async_callback(allocation_client.aclose)
+            loop_kwargs["allocation"] = allocation_reader(config.validator_url, hotkey, client=allocation_client)
 
         def build(view: EpisodeWindow):
             return build_episode_stack(view, config=config, wallet=wallet, hotkey=hotkey, sign_binding=sign_binding,
@@ -863,6 +926,6 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
 
 
 __all__ = ["CheckpointChanged", "EXIT_CHECKPOINT_CHANGED", "EpisodeMinerConfig", "EpisodeMiningLoop", "EpisodeStack", "EpisodeStackDeps", "EpisodeTaskPrompts",
-           "EpisodeWindow", "GROUPS_IN_FLIGHT", "build_episode_stack", "env_package_refusal", "installed_env_identity", "episode_window",
+           "EpisodeWindow", "GROUPS_IN_FLIGHT", "allocation_reader", "build_episode_stack", "groups_to_run", "env_package_refusal", "installed_env_identity", "episode_window",
            "miner_state_reader", "parse_episode_environments", "parse_harness_env", "pick_episode_task",
            "run_episode_miner", "short_window_warning"]

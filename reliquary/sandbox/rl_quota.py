@@ -580,6 +580,10 @@ class YieldQuota:
         return self.refusal(hotkey, int(now), precommit_sha256=precommit_sha256, seed_index=seed_index,
                             environment=environment)
 
+    def capacity_known(self) -> bool:
+        """Whether the fleet can be sized now (fresh machine reports): before, nothing is allocated."""
+        return self._capacity(self._clock()) > 0
+
     def rank(self, hotkey: str) -> tuple[str, float, bool]:
         """The open queue's (key, score, pooled)."""
         if self.lane(hotkey) == MAIN:

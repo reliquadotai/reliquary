@@ -3486,8 +3486,9 @@ def mine_episodes(
     max_live: int = typer.Option(
         0, "--max-live", min=0, help="Live sessions per group (0 = every seed of the pool at once)"),
     groups_in_flight: int = typer.Option(
-        2, "--groups-in-flight", min=1, max=2,
-        help="Episode groups mined at once (at most 2: the validator's per-operator cap)"),
+        2, "--groups-in-flight", min=1,
+        help="Most episode groups mined at once (your GPU's ceiling); the validator's allocation for your hotkey "
+             "sets how many run, never more than this"),
     harness_env: list[str] = typer.Option(
         [], "--harness-env",
         help="KEY=VALUE passed to the episode harness (repeatable; no secrets here: ps shows them)"),
