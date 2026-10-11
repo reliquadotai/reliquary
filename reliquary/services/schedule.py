@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -44,6 +45,9 @@ REQUEST_FIELDS = {"schema", "request_id", "order_sha256", "revision", "active", 
 OPTIONAL_REQUEST_FIELDS = frozenset({"add"})   # envs added to the running run
 ATTESTATION_MAX_BYTES = 16 * 1024 * 1024
 _ATTESTATION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+# Read errors of an attestation that say nothing about the file and may pass: the request waits.
+TRANSIENT_READ_ERRNOS = frozenset({errno.EIO, errno.EMFILE, errno.ENFILE, errno.EAGAIN, errno.EINTR,
+                                   errno.ENOMEM, errno.EBUSY})
 MAX_FILE_BYTES = 64 * 1024
 FOLDER_ENV = "RELIQUARY_SERVICE_SCHEDULE_FOLDER"
 DB_NAME = "runtime.sqlite3"
@@ -111,8 +115,10 @@ def _read_json_file(folder: Path, name: str):
         raise ValueError(f"{name} is not strict JSON: {exc}") from exc
 
 
-def _read_bytes(folder: Path, name: str, max_bytes: int) -> bytes | None:
-    """The bytes of ``folder/name`` or None if absent, with ``_read_json_file``'s safety checks."""
+def _read_bytes(folder: Path, name: str, max_bytes: int, *, transient_raises: bool = False) -> bytes | None:
+    """The bytes of ``folder/name`` or None if absent, with ``_read_json_file``'s safety checks. With
+    ``transient_raises``, opening the file with an errno of ``TRANSIENT_READ_ERRNOS`` raises that OSError
+    (otherwise every open error is a ValueError)."""
     try:
         directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
     except FileNotFoundError:
@@ -125,6 +131,8 @@ def _read_bytes(folder: Path, name: str, max_bytes: int) -> bytes | None:
         except FileNotFoundError:
             return None
         except OSError as exc:  # ELOOP for a symlink
+            if transient_raises and exc.errno in TRANSIENT_READ_ERRNOS:
+                raise
             raise ValueError(f"{name} cannot be opened safely ({exc.strerror})") from exc
     finally:
         os.close(directory)
@@ -186,10 +194,10 @@ class ScheduleRequestStore:
 
     def read_attestation(self, name: str) -> tuple[bytes, Any]:
         """An attestation file of this folder (a plain name): its bytes and its strict JSON. ValueError
-        when it is absent, unsafe or not JSON."""
+        when it is absent, unsafe or not JSON; OSError when it cannot be read now (``TRANSIENT_READ_ERRNOS``)."""
         if not isinstance(name, str) or not _ATTESTATION_NAME.fullmatch(name):
             raise ValueError("an attestation is a plain file name of the request folder")
-        raw = _read_bytes(self.folder, name, ATTESTATION_MAX_BYTES)
+        raw = _read_bytes(self.folder, name, ATTESTATION_MAX_BYTES, transient_raises=True)
         if raw is None:
             raise ValueError(f"attestation {name} is not in the request folder")
         try:
@@ -249,6 +257,8 @@ def check_request(request, *, contract: ServiceContract, current: ServiceSchedul
     """
     installed_version = installed_version or default_installed_version
     if not isinstance(request, dict) or not REQUEST_FIELDS <= set(request) <= REQUEST_FIELDS | OPTIONAL_REQUEST_FIELDS:
+        if not isinstance(request, dict) or not OPTIONAL_REQUEST_FIELDS & set(request):
+            raise ScheduleRefused(f"a schedule request has exactly the fields {sorted(REQUEST_FIELDS)}")
         raise ScheduleRefused(f"a schedule request has exactly the fields {sorted(REQUEST_FIELDS)}, and "
                               f"optionally {sorted(OPTIONAL_REQUEST_FIELDS)}")
     if request["schema"] != REQUEST_SCHEMA:
@@ -296,17 +306,35 @@ def check_request(request, *, contract: ServiceContract, current: ServiceSchedul
                                 add=added_blocks or None)
     except ValueError as exc:
         raise ScheduleRefused(str(exc)) from exc
+    for name, block in added_blocks.items():
+        # The entry's own cooldown, unless the request's ``cooldowns`` (checked above) sets it.
+        windows = block["environment"]["cooldown_windows"]
+        if name not in (cooldowns or {}) and not advice["min_windows"] <= windows <= advice["max_windows"]:
+            raise ScheduleRefused(f"cannot add {name}: its cooldown {windows} is outside the contract's bounds "
+                                  f"[{advice['min_windows']}, {advice['max_windows']}]")
+    # Every added env is evaluated before deciding: any final refusal wins over any wait, and names its env.
+    final: ScheduleRefused | None = None
+    waits: list[str] = []
     attestations = {}
     for name, block in added_blocks.items():
         if catalogue_check is None or read_attestation is None:
             raise ScheduleRefused(f"cannot add {name}: this process cannot check an added environment")
         try:
             raw, attestations[name] = read_attestation(add[name]["attestation"])
-        except (ValueError, OSError) as exc:
-            raise ScheduleRefused(f"cannot add {name}: its attestation cannot be read ({exc})") from exc
+        except OSError as exc:
+            if exc.errno in TRANSIENT_READ_ERRNOS:
+                waits.append(f"cannot add {name} yet: its attestation cannot be read now ({exc})")
+                continue
+            final = final or ScheduleRefused(f"cannot add {name}: its attestation cannot be read ({exc})")
+            continue
+        except ValueError as exc:
+            final = final or ScheduleRefused(f"cannot add {name}: its attestation cannot be read ({exc})")
+            continue
         if hashlib.sha256(raw).hexdigest() != block["catalogue"].get("conformance_sha256"):
-            raise ScheduleRefused(f"cannot add {name}: the attestation file is not the one the entry names "
-                                  f"(conformance_sha256)")
+            final = final or ScheduleRefused(f"cannot add {name}: the attestation file is not the one the entry "
+                                             f"names (conformance_sha256)")
+    if final is not None:
+        raise final
     for env in changed.active_environments():
         # An env added by this request is checked by ``catalogue_check``; one added earlier and switched on
         # now is checked like any env, against the view's entry.
@@ -318,11 +346,27 @@ def check_request(request, *, contract: ServiceContract, current: ServiceSchedul
         if installed != contract.environments[env]["version"]:
             raise ScheduleRefused(f"cannot activate {env}: the installed version differs from the version pinned "
                                   f"by the order")
-    # Last: the activation checks are the costly ones and the only ones that may answer "not yet", so every
-    # final refusal above wins over a wait.
+    # Last: the activation checks are the costly ones and may answer "not yet"; every final refusal above wins
+    # over a wait, and all of them run (an env that cannot be settled yet never hides another's refusal).
     for name, block in added_blocks.items():
-        catalogue_check(name, block, attestations[name])
+        if name not in attestations:
+            continue                        # its attestation is waiting already
+        try:
+            catalogue_check(name, block, attestations[name])
+        except ScheduleNotYet as exc:
+            waits.append(_naming(name, str(exc), "cannot add {name} yet: "))
+        except ScheduleRefused as exc:
+            final = final or ScheduleRefused(_naming(name, str(exc), "cannot add {name}: "))
+    if final is not None:
+        raise final
+    if waits:
+        raise ScheduleNotYet("; ".join(waits))
     return changed
+
+
+def _naming(name: str, reason: str, prefix: str) -> str:
+    """``reason``, prefixed so that it names ``name`` when it does not already."""
+    return reason if name in reason else prefix.format(name=name) + reason
 
 
 # ---------------------------------------------------------------- reading the runtime database

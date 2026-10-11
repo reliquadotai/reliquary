@@ -460,9 +460,10 @@ class ServiceRuntime:
         schedule = ServiceSchedule.from_dict(schedule.to_dict(), self.order_contract)  # same order, valid
         _identifier(request_id, "schedule request_id")
         _integer(window, "window", 0)
-        with self._txn():
-            inserted = self._insert_schedule(schedule, request_id, window)
-        self._refresh_contract_view()
+        with self.lock:  # the view is rebuilt before any reader can see the new schedule
+            with self._txn():
+                inserted = self._insert_schedule(schedule, request_id, window)
+            self._refresh_contract_view()
         return inserted
 
     def _insert_schedule(self, schedule: ServiceSchedule, request_id: str, window: int) -> bool:
@@ -535,6 +536,7 @@ class ServiceRuntime:
             return
         if request is None:
             self._last_invalid_detail = None
+            self._withdraw_waits(store, current.revision)
             return
         request_id = request.get("request_id") if isinstance(request, dict) else None
         try:
@@ -573,18 +575,19 @@ class ServiceRuntime:
             changed, status, detail = None, "refused", str(exc)
         except Exception as exc:  # defensive: a request must never be half applied
             changed, status, detail = None, "refused", f"internal error while checking the request: {type(exc).__name__}"
-        with self._txn():
+        with self.lock:  # the view is rebuilt before any reader can see the new schedule
+            with self._txn():
+                if changed is not None:
+                    try:
+                        self._insert_schedule(changed, request_id, window)
+                    except ValueError as exc:  # raced with another applier
+                        changed, status, detail = None, "refused", str(exc)
+                revision = changed.revision if changed is not None else self._schedule().revision
+                self.db.execute("INSERT INTO service_schedule_requests VALUES(?,?,?,?,?,?,?)",
+                                (order, request_id, status, detail, revision, window, at))
+                self.db.execute("DELETE FROM service_schedule_waits WHERE order_id=?", (order,))
             if changed is not None:
-                try:
-                    self._insert_schedule(changed, request_id, window)
-                except ValueError as exc:  # raced with another applier
-                    changed, status, detail = None, "refused", str(exc)
-            revision = changed.revision if changed is not None else self._schedule().revision
-            self.db.execute("INSERT INTO service_schedule_requests VALUES(?,?,?,?,?,?,?)",
-                            (order, request_id, status, detail, revision, window, at))
-            self.db.execute("DELETE FROM service_schedule_waits WHERE order_id=?", (order,))
-        if changed is not None:
-            self._refresh_contract_view()
+                self._refresh_contract_view()
         store.report(request_id, status=status, detail=detail, revision=revision)
 
     def _wait_schedule_request(self, store, request_id: str, window: int, at: float, reason: str,
@@ -597,19 +600,39 @@ class ServiceRuntime:
             row = self.db.execute("SELECT first_at, first_window, checks FROM service_schedule_waits "
                                   "WHERE order_id=? AND request_id=?", (order, request_id)).fetchone()
             first_at, first_window, checks = row if row is not None else (at, window, 0)
-            if at - first_at > bound:
+            elapsed = max(0.0, at - first_at)  # a clock that went back never lengthens the wait
+            if elapsed > bound:
                 return False
             # One request waits at a time: a replaced request's wait goes.
             self.db.execute("DELETE FROM service_schedule_waits WHERE order_id=? AND request_id<>?",
                             (order, request_id))
             self.db.execute("INSERT OR REPLACE INTO service_schedule_waits VALUES(?,?,?,?,?,?)",
                             (order, request_id, first_at, first_window, checks + 1, reason))
-        left = max(0.0, bound - (at - first_at))
+        left = max(0.0, bound - elapsed)
         store.report(request_id, status="waiting",
                      detail=(f"{reason}; pending since window {first_window} ({checks + 1} boundary check(s)), "
                              f"checked again at the next window boundary, refused if still unsettled in "
                              f"{left:.0f} s"), revision=revision)
         return True
+
+    def _withdraw_waits(self, store, revision: int) -> None:
+        """The request file is gone: a request that was waiting is withdrawn (its wait row goes, its status
+        says so). Nothing is written when nothing waited."""
+        order = self.order_contract.sha256
+        with self.lock:
+            rows = self.db.execute("SELECT request_id FROM service_schedule_waits WHERE order_id=?",
+                                   (order,)).fetchall()
+        if not rows:
+            return
+        with self._txn():
+            self.db.execute("DELETE FROM service_schedule_waits WHERE order_id=?", (order,))
+        status = None
+        with contextlib.suppress(ValueError, OSError):
+            status = store.status()
+        if status and status.get("status") == "waiting" and status.get("request_id") in {r[0] for r in rows}:
+            store.report(status["request_id"], status="withdrawn",
+                         detail="the request file was removed while the request was waiting; nothing was applied",
+                         revision=revision)
 
     # --- cooldown advice (decision E): recommendation only ---
     def refresh_cooldown_advice(self, *, window: int, populations: dict[str, int]) -> dict[str, dict]:

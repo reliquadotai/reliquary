@@ -423,3 +423,284 @@ def test_without_an_add_request_no_wait_is_written(tmp_path):
     assert store.status()["status"] == "applied"
     with sqlite3.connect(tmp_path / "runtime.sqlite3") as db:
         assert db.execute("SELECT COUNT(*) FROM service_schedule_waits").fetchone() == (0,)
+
+
+# ---------------------------------------------------------------- fix round
+
+@pytest.mark.parametrize("windows", [0, 100_001])
+def test_an_added_entrys_own_cooldown_outside_the_bounds_is_refused(windows):
+    contract = episode_contract()
+    current = initial_schedule(contract)
+    assert contract.advice_policy["max_windows"] == 100_000
+    entry = added_block(catalogue={"conformance_sha256": hashlib.sha256(ATTESTATION).hexdigest()},
+                        cooldown_windows=windows)
+    req = request(contract, current, add={ADDED: {**entry, "attestation": "conformance.json"}})
+    with pytest.raises(ScheduleRefused, match=f"cannot add {ADDED}: its cooldown {windows} is outside"):
+        check_request(req, contract=contract, current=current, catalogue_check=accept, read_attestation=reader)
+    # The request's own cooldowns map, within the bounds, decides instead.
+    req = request(contract, current, add={ADDED: {**entry, "attestation": "conformance.json"}},
+                  cooldowns={ADDED: 10})
+    changed = check_request(req, contract=contract, current=current, catalogue_check=accept,
+                            read_attestation=reader)
+    assert changed.cooldown_windows(ADDED) == 10
+
+
+def test_switching_on_an_env_added_earlier_checks_its_install(tmp_path):
+    rt, store, _ = runtime_with_added(tmp_path, active=False)
+    pinned = rt.contract.environments[ADDED]["version"]
+    installed = {}                                              # what this validator has, changed below
+
+    def switch_on():
+        store.write(build_request(order_sha256=rt.contract.sha256, revision=rt.schedule.revision + 1,
+                                  active=[MATH, EPISODE, ADDED], shares=SHARES))
+        rt.apply_pending_schedule_request(store, window=2, catalogue_check=accept, installed_version=installed.get)
+        return store.status()
+
+    status = switch_on()
+    assert status["status"] == "refused" and "not installed" in status["detail"]
+    installed[ADDED] = "0" * 64
+    status = switch_on()
+    assert status["status"] == "refused" and "installed version differs" in status["detail"]
+    assert ADDED not in rt.schedule.active_environments()
+    installed[ADDED] = pinned
+    assert switch_on()["status"] == "applied" and ADDED in rt.schedule.active_environments()
+
+
+SECOND = "tmax_v3"
+
+
+def two_adds(contract, current):
+    second = added_block(catalogue={"conformance_sha256": hashlib.sha256(ATTESTATION).hexdigest(),
+                                    "package": "reliquary-other==0.1.0"},
+                         episode={"sandbox_env": "reliquary-other",
+                                  "env_package": "reliquary-other==0.1.0+g0123456789abcdef.vfb2"})
+    return request(contract, current, add={ADDED: {**block(), "attestation": "conformance.json"},
+                                           SECOND: {**second, "attestation": "conformance.json"}})
+
+
+@pytest.mark.parametrize("order", [(ADDED, SECOND), (SECOND, ADDED)])
+def test_with_several_adds_a_final_refusal_wins_and_names_its_env(order):
+    contract = episode_contract()
+    current = initial_schedule(contract)
+    waiting, refused = order
+    seen = []
+
+    def check(name, added, attestation):
+        seen.append(name)
+        if name == waiting:
+            raise ScheduleNotYet("the fleet's view is stale")
+        raise ScheduleRefused("0 machine(s) serve it")
+
+    with pytest.raises(ScheduleRefused, match=f"cannot add {refused}: 0 machine"):
+        check_request(two_adds(contract, current), contract=contract, current=current, catalogue_check=check,
+                      read_attestation=reader)
+    assert sorted(seen) == sorted([ADDED, SECOND])
+
+
+def test_with_several_adds_all_waiting_the_request_waits_with_every_reason():
+    contract = episode_contract()
+    current = initial_schedule(contract)
+
+    def check(name, added, attestation):
+        raise ScheduleNotYet(f"cannot add {name} yet: stale")
+
+    with pytest.raises(ScheduleNotYet) as caught:
+        check_request(two_adds(contract, current), contract=contract, current=current, catalogue_check=check,
+                      read_attestation=reader)
+    assert ADDED in str(caught.value) and SECOND in str(caught.value)
+
+
+def safe_folder(tmp_path):
+    folder = tmp_path / "requests"
+    folder.mkdir(mode=0o700)
+    return folder
+
+
+def test_the_attestation_is_read_safely_a_symlink(tmp_path):
+    folder = safe_folder(tmp_path)
+    target = tmp_path / "elsewhere.json"
+    target.write_bytes(ATTESTATION)
+    os.chmod(target, 0o600)
+    (folder / "conformance.json").symlink_to(target)
+    with pytest.raises(ValueError, match="cannot be opened safely"):
+        ScheduleRequestStore(folder).read_attestation("conformance.json")
+
+
+def test_the_attestation_is_read_safely_not_a_regular_file(tmp_path):
+    folder = safe_folder(tmp_path)
+    os.mkfifo(folder / "conformance.json", 0o600)
+    with pytest.raises(ValueError, match="not a regular file"):
+        ScheduleRequestStore(folder).read_attestation("conformance.json")
+
+
+def test_the_attestation_is_read_safely_writable_by_others(tmp_path):
+    folder = safe_folder(tmp_path)
+    (folder / "conformance.json").write_bytes(ATTESTATION)
+    os.chmod(folder / "conformance.json", 0o602)
+    with pytest.raises(ValueError, match="writable by group or others"):
+        ScheduleRequestStore(folder).read_attestation("conformance.json")
+
+
+def test_the_attestation_is_read_safely_bounded(tmp_path, monkeypatch):
+    from reliquary.services import schedule
+
+    folder = safe_folder(tmp_path)
+    (folder / "conformance.json").write_bytes(ATTESTATION)
+    os.chmod(folder / "conformance.json", 0o600)
+    assert ScheduleRequestStore(folder).read_attestation("conformance.json")[0] == ATTESTATION
+    monkeypatch.setattr(schedule, "ATTESTATION_MAX_BYTES", len(ATTESTATION) - 1)
+    with pytest.raises(ValueError, match="larger than"):
+        ScheduleRequestStore(folder).read_attestation("conformance.json")
+
+
+@pytest.mark.parametrize("code", ["EIO", "EMFILE", "EAGAIN"])
+def test_a_transient_attestation_read_error_waits(code):
+    import errno
+
+    contract = episode_contract()
+    current = initial_schedule(contract)
+
+    def failing(name):
+        raise OSError(getattr(errno, code), os.strerror(getattr(errno, code)))
+
+    with pytest.raises(ScheduleNotYet, match="cannot be read now"):
+        check_request(request(contract, current), contract=contract, current=current, catalogue_check=accept,
+                      read_attestation=failing)
+
+
+def test_a_lasting_attestation_read_error_is_final():
+    import errno
+
+    contract = episode_contract()
+    current = initial_schedule(contract)
+
+    def failing(name):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    with pytest.raises(ScheduleRefused, match="cannot be read"):
+        check_request(request(contract, current), contract=contract, current=current, catalogue_check=accept,
+                      read_attestation=failing)
+
+
+def test_the_store_lets_a_transient_open_error_through(tmp_path, monkeypatch):
+    import errno
+
+    from reliquary.services import schedule
+
+    folder = safe_folder(tmp_path)
+    (folder / "conformance.json").write_bytes(ATTESTATION)
+    os.chmod(folder / "conformance.json", 0o600)
+    real_open = os.open
+
+    def fake_open(path, flags, *args, **kwargs):
+        if path == "conformance.json":
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(schedule.os, "open", fake_open)
+    with pytest.raises(OSError) as caught:
+        ScheduleRequestStore(folder).read_attestation("conformance.json")
+    assert not isinstance(caught.value, ValueError) and caught.value.errno == errno.EMFILE
+    # The request file keeps its old behaviour: any open error is a ValueError.
+    with pytest.raises(ValueError, match="cannot be opened safely"):
+        schedule._read_json_file(folder, "conformance.json")
+
+
+def test_a_clock_that_goes_back_never_lengthens_the_wait(tmp_path):
+    rt, store, _ = pending_runtime(tmp_path)
+    rt.apply_pending_schedule_request(store, window=1, now=10_000.0, catalogue_check=not_yet, add_wait_max_s=600)
+    rt.apply_pending_schedule_request(store, window=2, now=5_000.0, catalogue_check=not_yet, add_wait_max_s=600)
+    status = store.status()
+    assert status["status"] == "waiting" and "unsettled in 600 s" in status["detail"]
+    rt.apply_pending_schedule_request(store, window=3, now=10_601.0, catalogue_check=not_yet, add_wait_max_s=600)
+    assert store.status()["status"] == "refused"
+
+
+def test_a_request_removed_while_waiting_is_withdrawn(tmp_path):
+    rt, store, req = pending_runtime(tmp_path)
+    rt.apply_pending_schedule_request(store, window=1, now=1_000.0, catalogue_check=not_yet)
+    store.request_path.unlink()
+    rt.apply_pending_schedule_request(store, window=2, now=1_010.0, catalogue_check=not_yet)
+    status = store.status()
+    assert status["request_id"] == req["request_id"] and status["status"] == "withdrawn"
+    assert rt.db.execute("SELECT COUNT(*) FROM service_schedule_waits").fetchone() == (0,)
+    assert recorded(rt, req["request_id"]) is None
+
+
+def test_no_request_and_no_wait_writes_nothing(tmp_path):
+    rt = episode_runtime(tmp_path)
+    store = ScheduleRequestStore(tmp_path)
+    rt.apply_pending_schedule_request(store, window=1)
+    assert store.status() is None
+
+
+class TrackedLock:
+    """An RLock that remembers whether it was ever fully released since ``mark``."""
+
+    def __init__(self):
+        import threading
+
+        self._lock, self.depth, self.released = threading.RLock(), 0, False
+
+    def acquire(self, *args, **kwargs):
+        got = self._lock.acquire(*args, **kwargs)
+        if got:
+            self.depth += 1
+        return got
+
+    def release(self):
+        self.depth -= 1
+        if self.depth == 0:
+            self.released = True
+        self._lock.release()
+
+    __enter__ = acquire
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def watch_view_refresh(rt):
+    """Each view rebuild records whether the lock was released between the last commit and the rebuild."""
+    import contextlib
+
+    lock, gaps, txn, refresh = TrackedLock(), [], rt._txn, rt._refresh_contract_view
+    rt.lock = lock
+
+    @contextlib.contextmanager
+    def tracked_txn():
+        with txn():
+            yield
+        lock.released = lock.depth == 0                      # the commit has just released it, or not
+
+    def tracked_refresh():
+        gaps.append(lock.released)
+        refresh()
+
+    rt._txn, rt._refresh_contract_view = tracked_txn, tracked_refresh
+    return gaps
+
+
+def test_the_view_is_rebuilt_before_the_lock_is_released(tmp_path):
+    rt = episode_runtime(tmp_path)
+    folder_with_attestation(tmp_path)
+    gaps = watch_view_refresh(rt)
+    store = ScheduleRequestStore(tmp_path)
+    store.write(request(rt.contract, rt.schedule))
+    rt.apply_pending_schedule_request(store, window=1, catalogue_check=accept)
+    changed = next_schedule(rt.order_contract, rt.schedule, cooldowns={MATH: 12})
+    rt.apply_schedule(changed, request_id="direct", window=1)
+    assert gaps == [False, False] and ADDED in rt.contract.environments
+
+
+def test_a_malformed_request_without_add_keeps_its_refusal_text():
+    contract = episode_contract()
+    current = initial_schedule(contract)
+    bad = build_request(order_sha256=contract.sha256, revision=1, cooldowns={MATH: 10})
+    bad["extra"] = 1
+    expected = ("a schedule request has exactly the fields ['active', 'cooldowns', 'order_sha256', 'request_id', "
+                "'revision', 'schema', 'shares']")
+    for value in (bad, {k: v for k, v in bad.items() if k not in ("extra", "shares")}, ["not", "a", "dict"]):
+        with pytest.raises(ScheduleRefused) as caught:
+            check_request(value, contract=contract, current=current)
+        assert str(caught.value) == expected
